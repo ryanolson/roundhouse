@@ -17,9 +17,10 @@ because it knows the exact token prefix, it can ask *which engine already has
 this prefix cached* and route accordingly. Statefulness and routing are not two
 features — the first is what makes the second possible.
 
-> **Status: exploratory walking skeleton.** The session core, routing layer, and
-> embedded Dynamo integration are real and tested. The HTTP/SSE, WebSocket, and
-> gRPC transports and the Redis store are not yet implemented.
+> **Status: exploratory walking skeleton.** The session core, routing layer,
+> embedded Dynamo integration, streaming turn engine, and HTTP/SSE transport
+> are real and tested. The WebSocket and gRPC transports and the Redis store
+> are not yet implemented.
 
 Roundhouse depends on Dynamo but is not part of it. It pins two Dynamo crates
 (`dynamo-kv-router` with the `standalone-selection` feature, and `dynamo-tokens`)
@@ -40,7 +41,7 @@ crates.io, the pin becomes a plain version.
 | `roundhouse-core` | Session state machine, event log, lease, context assembly, routing vocabulary and policies |
 | `roundhouse-fleet` | Local Dynamo fleet (embedded selection service) and frontier providers |
 | `roundhouse-store-redis` | Redis Streams `SessionStore` *(not yet implemented)* |
-| `roundhouse-server` | Turn engine and binary; HTTP transports *(not yet implemented)* |
+| `roundhouse-server` | Turn engine, HTTP/SSE transport, and the binary |
 
 ## Design
 
@@ -159,6 +160,19 @@ selection plane runs inside the test binary.
 - **A failed turn settles** — the response terminates with an incomplete event,
   the lease comes back immediately, and the same turn id is retryable without
   waiting out a TTL.
+- **Streaming is genuine** — deltas are durable in the log before the response
+  completes, a stream that breaks halfway commits its partial (which the ledger
+  reads as prefill evidence), and TTFT is derivable from the log: first delta
+  minus the routing decision that preceded it.
+- **A turn outlives its lease** — the heartbeat renews while the turn works, so
+  a model call longer than the TTL commits instead of being fenced at its own
+  finish line; a displaced owner still loses, and a hung provider settles at
+  the turn deadline instead of renewing forever.
+- **The log is the streaming bus** — the SSE transport tails the same event log
+  that serves replay and audit, so live frames, reconnect frames, and log
+  entries are one thing; resumption from `starting_after` or `Last-Event-ID`
+  is exact, and a deduplicated retry replays the original response's entries
+  ending on its terminal event.
 - **Reservations settle** — load returns to zero; a consumed `selection_id`
   cannot be booked twice.
 - **Failover loses nothing** — killing the owner mid-session, a successor claims
@@ -168,7 +182,8 @@ selection plane runs inside the test binary.
 
 ## Not yet built
 
-HTTP/SSE, WebSocket, and gRPC transports; the Redis store; real provider
-clients for OpenAI and Anthropic; and resuming an interrupted generation from
-its partial output — the partial is already durable in the log, so the
-groundwork is there.
+WebSocket and gRPC transports; the Redis store; real provider clients for
+OpenAI and Anthropic; cross-process fencing tokens on the lease (within a
+node, turns are serialized by the engine; across nodes, by node identity and
+TTL); and resuming an interrupted generation from its partial output — the
+partial is already durable in the log, so the groundwork is there.

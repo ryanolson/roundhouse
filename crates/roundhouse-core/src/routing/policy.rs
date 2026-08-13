@@ -6,6 +6,51 @@
 //! These are native implementations behind [`RoutingPolicy`]. Switchyard slots
 //! in as a third implementation of the same trait rather than replacing it,
 //! which is what keeps a pre-alpha dependency from becoming load-bearing.
+//!
+//! # What routing our own build taught us
+//!
+//! Roundhouse was itself built by a multi-model agent system that had to make
+//! the same choice this module makes — which model gets which turn — and its
+//! working rules are recorded here because they name what the current
+//! vocabulary can and cannot express.
+//!
+//! The rules that worked:
+//!
+//! - **Route on cost-of-being-wrong, not on task size.** A large mechanical
+//!   diff went to a cheap model; a ten-line change to a fencing invariant did
+//!   not. The scoring axes below (prefill, dollars, latency) are all *supply*
+//!   side; the driver of that decision is a *demand*-side property of the turn
+//!   itself — call it stakes.
+//! - **Verifiability discounts required quality.** When a turn's output is
+//!   cheaply checkable after the fact (tests, review), a mid-tier model plus
+//!   verification dominated a top-tier model unverified. When verification is
+//!   expensive or impossible — research that gates a design, and reviews
+//!   themselves — the strongest model was worth it. This asymmetry is exactly
+//!   the shape [`EscalationPolicy`] implements: generation routed down, audits
+//!   routed up.
+//! - **Contract-defining turns escalate.** Output that becomes other turns'
+//!   input spec (plans, protocol designs, review verdicts) amplifies its
+//!   errors downstream; those turns always got the strongest model, and the
+//!   escalation that mattered was event-driven — at phase boundaries, when
+//!   work was about to be committed — not periodic. `audit_every` is the
+//!   periodic approximation of that; a boundary signal would be better.
+//! - **Escalate on failed verification rather than iterating at the same
+//!   tier.** A cheap model that failed its check was not retried; the turn was
+//!   re-run one tier up.
+//! - **Availability is a routing input, not an exception.** When the preferred
+//!   tier returned overload errors twice in a row, the work moved to a
+//!   different model rather than queueing behind the outage. This one the
+//!   vocabulary below *can* already express: overload is exactly what
+//!   `Candidate::load` and `expected_ttft_ms` exist to carry, and a policy
+//!   that scores them is already making that call.
+//!
+//! What the vocabulary is missing to express these: [`RoutingContext`] carries
+//! no demand-side signal — no stakes, no verifiability, no "this turn's output
+//! closes a task" marker. `quality_prior` and `min_quality` can encode a
+//! per-*deployment* floor but not a per-*turn* one. The cheapest honest next
+//! step is a client-supplied per-turn quality floor; a turn classifier can
+//! come later, and until such a signal exists a stakes-aware policy here would
+//! be dead code, so none is shipped.
 
 use async_trait::async_trait;
 

@@ -83,6 +83,18 @@ redis = { version = "0.27", default-features = false, features = [
 # Declaring it here with `vendored` would build libzmq from source; we instead
 # rely on the system `libzmq3-dev`, matching how Dynamo itself builds.
 
+# Required by the codex-rs dev-dependencies in `roundhouse-server` (the
+# Responses-API conformance oracle): codex's workspace requests tungstenite
+# features (`proxy`, `deflate`) that exist only on OpenAI's forks, and a
+# `[patch]` section does not travel with a git dependency, so the consumer
+# must restate it. Scope check: axum's websocket feature pins the 0.26 series,
+# a different semver line that keeps resolving from crates.io — these patches
+# affect only the 0.27/0.28 requirements inside the codex crates, which sit in
+# dev-dependencies and never reach the shipped binary.
+[patch.crates-io]
+tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186" }
+tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f" }
+
 [profile.dev]
 # The KV-router dependency tree is large; without this a debug build of the
 # workspace is dominated by dependency codegen we never step through.
