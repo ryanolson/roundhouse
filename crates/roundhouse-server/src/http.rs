@@ -21,6 +21,11 @@
 //! [`SessionStore`] now would shape the trait around a backend that does not
 //! exist yet, and [`MemoryStore`](roundhouse_core::store::MemoryStore) could
 //! not honor it.
+//!
+//! What a second transport needs is `pub(crate)` rather than private:
+//! [`responses_api`](crate::responses_api) follows the same log and answers the
+//! same pre-stream failures, and a second copy of the cursor or of the error
+//! vocabulary would be a second thing to keep in agreement with this one.
 
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
@@ -51,10 +56,10 @@ use crate::engine::Engine;
 ///
 /// Short enough that a client cannot perceive the added latency on a token
 /// delta, long enough that an idle stream is not a busy loop against the store.
-const POLL_INTERVAL: Duration = Duration::from_millis(25);
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Events read per store round trip.
-const READ_BATCH: usize = 256;
+pub(crate) const READ_BATCH: usize = 256;
 
 /// How long a settled stream waits for its turn task to unwind.
 ///
@@ -165,7 +170,7 @@ impl InputItem {
 /// them; this covers only what can go wrong first — a body we cannot read, a
 /// session that does not exist, a store that is down.
 #[derive(Debug)]
-struct ApiError {
+pub(crate) struct ApiError {
     status: StatusCode,
     code: &'static str,
     message: String,
@@ -180,7 +185,7 @@ impl ApiError {
         }
     }
 
-    fn unprocessable(message: impl Into<String>) -> Self {
+    pub(crate) fn unprocessable(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::UNPROCESSABLE_ENTITY,
             code: "invalid_request",
@@ -188,7 +193,7 @@ impl ApiError {
         }
     }
 
-    fn internal(code: &'static str, message: impl Into<String>) -> Self {
+    pub(crate) fn internal(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code,
@@ -205,7 +210,7 @@ impl IntoResponse for ApiError {
 }
 
 /// Classify a store failure raised before streaming began.
-fn store_error(session_id: &SessionId, error: StoreError) -> ApiError {
+pub(crate) fn store_error(session_id: &SessionId, error: StoreError) -> ApiError {
     match error {
         StoreError::SessionNotFound(_) => ApiError::not_found(session_id),
         other => ApiError::internal("store_error", other.to_string()),
@@ -217,7 +222,7 @@ fn store_error(session_id: &SessionId, error: StoreError) -> ApiError {
 /// Done by hand rather than through [`axum::Json`] so that a missing or wrong
 /// `Content-Type` is not a separate failure mode from malformed JSON: both are
 /// the client sending something this endpoint cannot read, and both are 422.
-fn parse_body<B: serde::de::DeserializeOwned>(body: &Bytes) -> Result<B, ApiError> {
+pub(crate) fn parse_body<B: serde::de::DeserializeOwned>(body: &Bytes) -> Result<B, ApiError> {
     serde_json::from_slice(body)
         .map_err(|error| ApiError::unprocessable(format!("malformed request body: {error}")))
 }
@@ -390,14 +395,14 @@ fn resume_cursor(params: &HashMap<String, String>, headers: &HeaderMap) -> Resul
 // ---------------------------------------------------------------------------
 
 /// A read cursor over one session's log.
-struct LogTail<S: SessionStore> {
+pub(crate) struct LogTail<S: SessionStore> {
     store: Arc<S>,
     session_id: SessionId,
     cursor: u64,
 }
 
 impl<S: SessionStore> LogTail<S> {
-    fn new(store: Arc<S>, session_id: SessionId, after_seq: u64) -> Self {
+    pub(crate) fn new(store: Arc<S>, session_id: SessionId, after_seq: u64) -> Self {
         Self {
             store,
             session_id,
@@ -406,14 +411,14 @@ impl<S: SessionStore> LogTail<S> {
     }
 
     /// One batch after `after_seq`, leaving the follow cursor alone.
-    async fn read(&self, after_seq: u64) -> Result<Vec<SessionEvent>, StoreError> {
+    pub(crate) async fn read(&self, after_seq: u64) -> Result<Vec<SessionEvent>, StoreError> {
         self.store
             .read_events(&self.session_id, after_seq, READ_BATCH)
             .await
     }
 
     /// Everything appended since the last call, advancing the follow cursor.
-    async fn drain(&mut self) -> Result<Vec<SessionEvent>, StoreError> {
+    pub(crate) async fn drain(&mut self) -> Result<Vec<SessionEvent>, StoreError> {
         let events = self.read(self.cursor).await?;
         if let Some(last) = events.last() {
             self.cursor = last.seq;

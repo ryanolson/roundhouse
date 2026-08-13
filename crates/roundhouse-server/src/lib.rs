@@ -17,13 +17,20 @@
 //! [`http`] puts a transport in front of that sequence without joining it: it
 //! streams turns by tailing the same log the engine writes to, so the wire
 //! protocol has no state of its own to keep in agreement.
+//!
+//! [`responses_api`] is a second transport over that same log, speaking the
+//! OpenAI Responses API so existing agents can drive Roundhouse unmodified. It
+//! adds no state either: a client's resent conversation is checked against the
+//! log as a prefix rather than remembered alongside it.
 
 pub mod engine;
 pub mod http;
+pub mod responses_api;
 pub mod tokenizer;
 
 pub use engine::{
     EchoLocalExecutor, Engine, EngineConfig, EngineError, LocalExecution, LocalExecutor, TurnResult,
 };
 pub use http::router;
+pub use responses_api::responses_router;
 pub use tokenizer::HfTokenizer;

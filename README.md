@@ -180,6 +180,34 @@ selection plane runs inside the test binary.
 - **Retries do not regenerate** — a re-sent `turn_id` replays the existing
   response instead of opening a second turn.
 
+## Codex as the compliance oracle
+
+`POST /v1/responses` is an OpenAI Responses API surface over the same event
+log: point a stock [Codex CLI](https://github.com/openai/codex) at it with a
+custom provider (`base_url = "http://host:port/v1"`, `wire_api = "responses"`,
+`requires_openai_auth = false`) and it streams `response.*` events end to end.
+
+The conformance tests do not re-implement the spec — they depend on Codex's
+own client crates (`codex-api`, pinned by git revision as dev-dependencies)
+and drive our endpoint through the exact parser a real agent runs. That
+catches the failure class a hand-written spec test cannot: Codex silently
+drops a known item type with a malformed body, so only its parser can prove
+we never emit one. The suite covers the full event sequence, the
+`output_item.added`-before-delta ordering its client enforces, terminal
+semantics (`response.completed` ends the stream; `response.failed` and
+`response.incomplete` require the server to close the body), usage projection
+(`cached_input_tokens` lands in Codex's `input_tokens_details.cached_tokens`),
+and a real-socket round trip through Codex's HTTP stack.
+
+The integration is also the thesis in miniature. Codex-over-HTTP re-sends the
+whole conversation every turn (`previous_response_id` is a websocket feature),
+and it names the conversation with `prompt_cache_key`. Against an append-only
+log that resent history is a *claim*, not input: the surface checks it as a
+prefix of the session named by the cache key and admits only the suffix — so a
+stateless client gets stateful routing, one accumulated warm prefix, and
+idempotent retries (the turn id is a content hash of the conversation) without
+knowing any of it is happening.
+
 ## Not yet built
 
 WebSocket and gRPC transports; the Redis store; real provider clients for

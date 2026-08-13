@@ -28,7 +28,7 @@ use roundhouse_core::context::ByteTokenizer;
 use roundhouse_core::routing::{AffinityPolicy, CacheModel, ProviderPricing};
 use roundhouse_core::store::MemoryStore;
 use roundhouse_fleet::{EchoFrontierClient, FrontierModelSpec, StaticFrontierCatalog};
-use roundhouse_server::{EchoLocalExecutor, Engine, EngineConfig, http};
+use roundhouse_server::{EchoLocalExecutor, Engine, EngineConfig, http, responses_api};
 use tracing_subscriber::EnvFilter;
 
 /// The echo provider's catalog entry.
@@ -77,6 +77,11 @@ async fn main() -> anyhow::Result<()> {
     // harness or a container asks the OS to pick, and only this side knows what
     // it picked.
     tracing::info!(addr = %listener.local_addr()?, "roundhouse listening");
-    axum::serve(listener, http::router(engine, store)).await?;
+    // Both surfaces, one process and one log: the native transport, which
+    // exposes sessions and the log itself, and the Responses API, which lets an
+    // agent written against OpenAI drive the same sessions unmodified.
+    let app = http::router(Arc::clone(&engine), Arc::clone(&store))
+        .merge(responses_api::responses_router(engine, store));
+    axum::serve(listener, app).await?;
     Ok(())
 }
