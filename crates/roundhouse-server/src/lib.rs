@@ -15,7 +15,9 @@
 //! reservation silently inflates the router's view of a worker forever.
 
 pub mod engine;
+pub mod tokenizer;
 
 pub use engine::{
     EchoLocalExecutor, Engine, EngineConfig, EngineError, LocalExecution, LocalExecutor, TurnResult,
 };
+pub use tokenizer::HfTokenizer;
