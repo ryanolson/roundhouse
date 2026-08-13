@@ -3,7 +3,7 @@
 
 //! End-to-end tests for the claims this design rests on.
 //!
-//! Three things are worth proving, and none of them need a GPU:
+//! Four things are worth proving, and none of them need a GPU:
 //!
 //! 1. A client sends a constant number of bytes per turn while the context it
 //!    is reasoning over grows without bound. That is the reason to be stateful.
@@ -11,24 +11,28 @@
 //!    earlier turn wins a later one it would otherwise lose.
 //! 3. Killing the owning process mid-session loses nothing. A successor claims
 //!    the lease, replays the log, and continues.
+//! 4. The token stream the routing hashes describe is the one actually
+//!    dispatched. If those ever diverge, every cache-locality number the system
+//!    reports is fiction.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use roundhouse_core::context::ByteTokenizer;
-use roundhouse_core::event::SessionEventKind;
+use async_trait::async_trait;
+use roundhouse_core::context::{ByteTokenizer, ContextAssembler};
+use roundhouse_core::event::{SessionEventKind, Usage};
 use roundhouse_core::ids::{SessionId, TurnId};
-use roundhouse_core::item::Item;
+use roundhouse_core::item::{Item, Role};
 use roundhouse_core::routing::{
     AffinityPolicy, CacheLedger, CacheModel, ProviderPricing, RoutingPolicy, Target,
 };
 use roundhouse_core::session::Session;
 use roundhouse_core::store::MemoryStore;
 use roundhouse_fleet::{
-    EchoFrontierClient, EmbeddedFleet, FrontierModelSpec, KvRouterConfig, LocalFleet,
+    EchoFrontierClient, EmbeddedFleet, FleetError, FrontierModelSpec, KvRouterConfig, LocalFleet,
     SelectionServiceBuilder, StaticFrontierCatalog, WorkerRegistration,
 };
-use roundhouse_server::{EchoLocalExecutor, Engine, EngineConfig};
+use roundhouse_server::{EchoLocalExecutor, Engine, EngineConfig, LocalExecution, LocalExecutor};
 
 const BLOCK_SIZE: u32 = 16;
 const LOCAL_MODEL: &str = "local";
@@ -327,6 +331,18 @@ async fn a_retried_turn_replays_instead_of_regenerating() {
     assert_eq!(retry.response_id, first.response_id);
     assert!(retry.decision.is_none(), "a replay must not route again");
 
+    // A replay is a redelivery, not a re-derivation. The client must receive
+    // the provider's own bytes -- not the `<|assistant|>`-prefixed form the
+    // prompt is built from -- and the accounting it was originally billed.
+    assert_eq!(first.text, "frontier answer");
+    assert_eq!(retry.text, first.text);
+    assert_ne!(
+        first.usage,
+        Usage::default(),
+        "the echo frontier client reports real numbers"
+    );
+    assert_eq!(retry.usage, first.usage);
+
     let session = Session::open(store, session_id, "probe", 10_000, CacheLedger::new())
         .await
         .unwrap();
@@ -377,4 +393,85 @@ async fn a_local_worker_wins_and_its_reservation_settles() {
         .map(|load| load.potential_prefill_tokens)
         .sum();
     assert_eq!(residual, 0, "reservation must be released after the turn");
+}
+
+/// A [`LocalExecutor`] that keeps every payload it was handed.
+#[derive(Default)]
+struct CapturingExecutor {
+    dispatched: Mutex<Vec<Vec<u32>>>,
+}
+
+#[async_trait]
+impl LocalExecutor for CapturingExecutor {
+    async fn execute(
+        &self,
+        _endpoint: &str,
+        prompt_tokens: &[u32],
+        _expected_output_tokens: Option<u32>,
+    ) -> Result<LocalExecution, FleetError> {
+        self.dispatched.lock().unwrap().push(prompt_tokens.to_vec());
+        Ok(LocalExecution {
+            text: "local answer".to_string(),
+            output_tokens: 2,
+        })
+    }
+}
+
+/// The premise the routing rests on: what was hashed is what was dispatched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_worker_receives_exactly_the_tokens_the_router_was_quoted_on() {
+    let store = Arc::new(MemoryStore::new());
+    let fleet = embedded_fleet().await;
+    let executor = Arc::new(CapturingExecutor::default());
+    let engine = Engine::new(
+        store.clone(),
+        ByteTokenizer,
+        Arc::clone(&executor) as Arc<dyn LocalExecutor>,
+        frontier_catalog(),
+        Arc::new(EchoFrontierClient::new("frontier answer")),
+        Arc::new(AffinityPolicy::new()),
+        config(),
+    )
+    .with_fleet(Arc::clone(&fleet) as Arc<dyn LocalFleet>);
+
+    let session_id = SessionId::generate();
+    engine.create_session(&session_id).await.unwrap();
+
+    // Two turns: with a single item in the context, a per-item token stream and
+    // a separator-joined one are indistinguishable.
+    for turn in 0..2 {
+        let result = engine
+            .run_turn(
+                &session_id,
+                TurnId::new(format!("t{turn}")),
+                vec![Item::user_text(format!(
+                    "question {turn} for the local model"
+                ))],
+            )
+            .await
+            .unwrap();
+        assert!(
+            result.decision.expect("turn must route").target.is_local(),
+            "the capture proves nothing unless local won"
+        );
+    }
+
+    // The context as it stood at the last dispatch: every item committed up to
+    // and including that turn's user input, but not the reply it went on to
+    // produce.
+    let session = Session::open(store, session_id, "probe", 10_000, CacheLedger::new())
+        .await
+        .unwrap();
+    let mut items = session.state().items.clone();
+    let reply = items.pop().expect("the turn committed an assistant item");
+    assert_eq!(reply.role, Role::Assistant);
+    let at_dispatch = ContextAssembler::rehydrate(ByteTokenizer, BLOCK_SIZE, items);
+
+    let dispatched = executor.dispatched.lock().unwrap();
+    assert_eq!(dispatched.len(), 2);
+    assert_eq!(
+        dispatched[1],
+        at_dispatch.buffer().tokens(),
+        "the worker must prefill the very token stream the hashes describe"
+    );
 }

@@ -48,12 +48,21 @@ pub struct LocalExecution {
 /// Separate from [`LocalFleet`], which only decides *where* a turn should go.
 /// Splitting them keeps the routing decision testable without a worker to talk
 /// to, and lets the real implementation be swapped for a mock in tests.
+///
+/// The prompt arrives as token ids rather than text, and that is the invariant
+/// the whole cache thesis rests on: these are the exact ids the context
+/// assembler hashed into the block and sequence hashes the turn was priced and
+/// routed on. Re-tokenizing text here would break that for any real BPE, where
+/// `encode(a) + encode(b) != encode(a + b)` at an item boundary — the worker
+/// would then prefill a token stream whose blocks hash differently from the
+/// ones we matched against, and overlap would be zero forever. Dynamo engines
+/// take prompt token ids directly, so passing them through costs nothing.
 #[async_trait]
 pub trait LocalExecutor: Send + Sync + 'static {
     async fn execute(
         &self,
         endpoint: &str,
-        prompt: &str,
+        prompt_tokens: &[u32],
         expected_output_tokens: Option<u32>,
     ) -> Result<LocalExecution, FleetError>;
 }
@@ -76,7 +85,7 @@ impl LocalExecutor for EchoLocalExecutor {
     async fn execute(
         &self,
         _endpoint: &str,
-        _prompt: &str,
+        _prompt_tokens: &[u32],
         _expected_output_tokens: Option<u32>,
     ) -> Result<LocalExecution, FleetError> {
         Ok(LocalExecution {
@@ -200,12 +209,21 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         )
         .await?;
 
-        let admission = session.begin_turn(turn_id, input).await?;
+        let admission = session.begin_turn(turn_id.clone(), input).await?;
         let response_id = admission.response_id().clone();
         if let TurnAdmission::Deduplicated(_) = admission {
             // A retry of a completed turn. Replay rather than regenerate: the
-            // client already paid for this answer.
+            // client already paid for this answer, and the accounting it was
+            // billed under is durable in the log, so report that rather than a
+            // second, fabricated one.
             let text = replay_output(&session, &response_id).await?;
+            // Present by construction: the same projection that deduplicated
+            // this turn is the one that recorded its usage.
+            let usage = session
+                .state()
+                .completed_usage_for(&turn_id)
+                .cloned()
+                .unwrap_or_default();
             let last_seq = session.last_seq();
             // Release on this path too. Returning while still holding the lease
             // would lock the session out until the TTL lapsed, turning a
@@ -215,7 +233,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                 response_id,
                 text,
                 decision: None,
-                usage: Usage::default(),
+                usage,
                 last_seq,
                 deduplicated: true,
             });
@@ -304,7 +322,6 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             .await?;
 
         // --- execute -------------------------------------------------------
-        let prompt = render_prompt(assembler.items());
         let (text, usage) = match &decision.target {
             Target::Local { .. } => {
                 let quote = local_quote
@@ -322,7 +339,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                     .local_executor
                     .execute(
                         &quote.endpoint,
-                        &prompt,
+                        assembler.buffer().tokens(),
                         Some(self.config.expected_output_tokens),
                     )
                     .await;
@@ -349,7 +366,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                     .frontier_client
                     .execute(&FrontierQuote {
                         target: decision.target.clone(),
-                        prompt,
+                        prompt: assembler.rendered(),
                         // Stable for the life of the session: providers use it
                         // to steer requests to the same cache node, so varying
                         // it would defeat the hit we just routed on.
@@ -399,20 +416,11 @@ fn fold_frontier_chunks(chunks: Vec<FrontierChunk>) -> (String, Usage) {
     (text, usage)
 }
 
-/// Deterministic prompt rendering.
-///
-/// Determinism is load-bearing rather than cosmetic: a rendering that varied
-/// between turns would change the token prefix and invalidate every cached
-/// block after the first divergence.
-fn render_prompt(items: &[Item]) -> String {
-    items
-        .iter()
-        .map(Item::render)
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 /// Recover a completed response's text from the log.
+///
+/// Contents, not [`Item::render`]: the render adds the `<|role|>` prefix the
+/// prompt needs, and a client replaying a completed turn must get back the
+/// bytes the provider produced rather than the prompt encoding of them.
 async fn replay_output<S: SessionStore>(
     session: &Session<S>,
     response_id: &ResponseId,
@@ -422,7 +430,6 @@ async fn replay_output<S: SessionStore>(
         .items
         .iter()
         .filter(|item| item.response_id.as_ref() == Some(response_id))
-        .map(Item::render)
-        .collect::<Vec<_>>()
-        .join(""))
+        .map(|item| item.content.render())
+        .collect())
 }

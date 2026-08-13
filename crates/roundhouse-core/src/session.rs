@@ -49,6 +49,17 @@ impl TurnAdmission {
     }
 }
 
+/// What a completed turn produced.
+///
+/// The usage is kept, not just the response id, because a deduplicated retry
+/// has to answer with the accounting the original turn reported. Recomputing it
+/// is not an option — the token counts came from the provider — and reporting
+/// zeros would tell a client its turn was free.
+struct CompletedTurn {
+    response_id: ResponseId,
+    usage: Usage,
+}
+
 /// State derived from the event log.
 #[derive(Default)]
 pub struct SessionState {
@@ -57,7 +68,7 @@ pub struct SessionState {
     /// Number of turns started so far; the index the next turn will use.
     pub turn_index: u64,
     /// Turn ids that reached a terminal state, and what they produced.
-    completed_turns: HashMap<TurnId, ResponseId>,
+    completed_turns: HashMap<TurnId, CompletedTurn>,
     /// Turn ids currently in flight.
     open_turns: HashMap<TurnId, ResponseId>,
     pub last_seq: u64,
@@ -83,8 +94,10 @@ impl SessionState {
                 self.ledger
                     .record(&decision.chosen, event.at_ms, decision.isl_tokens);
             }
-            SessionEventKind::ResponseCompleted { response_id, .. }
-            | SessionEventKind::ResponseIncomplete { response_id, .. } => {
+            SessionEventKind::ResponseCompleted { response_id, usage }
+            | SessionEventKind::ResponseIncomplete {
+                response_id, usage, ..
+            } => {
                 // A turn is only settled once its response terminates, which is
                 // what makes a re-sent turn after a mid-generation crash
                 // restartable rather than deduplicated into a partial answer.
@@ -96,7 +109,13 @@ impl SessionState {
                 {
                     self.open_turns.remove(&turn_id);
                     if matches!(event.kind, SessionEventKind::ResponseCompleted { .. }) {
-                        self.completed_turns.insert(turn_id, response_id.clone());
+                        self.completed_turns.insert(
+                            turn_id,
+                            CompletedTurn {
+                                response_id: response_id.clone(),
+                                usage: usage.clone(),
+                            },
+                        );
                     }
                 }
             }
@@ -108,7 +127,16 @@ impl SessionState {
     }
 
     pub fn completed_response_for(&self, turn_id: &TurnId) -> Option<&ResponseId> {
-        self.completed_turns.get(turn_id)
+        self.completed_turns
+            .get(turn_id)
+            .map(|completed| &completed.response_id)
+    }
+
+    /// Usage reported when `turn_id` completed, for replaying it verbatim.
+    pub fn completed_usage_for(&self, turn_id: &TurnId) -> Option<&Usage> {
+        self.completed_turns
+            .get(turn_id)
+            .map(|completed| &completed.usage)
     }
 }
 

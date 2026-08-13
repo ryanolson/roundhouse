@@ -18,6 +18,15 @@
 //! ids, so a session that can be served by two different tokenizer families
 //! needs one buffer per family. Frontier providers expose no hashes at all, and
 //! are costed from the routing ledger instead.
+//!
+//! The buffer, not any rendered string, is the canonical prompt. Items are
+//! encoded one at a time as they are pushed, so under a real BPE the buffer can
+//! differ from an encoding of the concatenated text — a merge never crosses an
+//! item boundary here. Local dispatch therefore ships these exact token ids,
+//! which is what makes "the hashes describe the payload that was dispatched"
+//! true by construction rather than by convention.
+//! [`ContextAssembler::rendered`] exists for frontier providers, which accept
+//! only text and tokenize it on their side.
 
 use dynamo_kv_router::protocols::{
     BlockHashOptions, LocalBlockHash, compute_block_hash_for_seq, compute_next_seq_hash,
@@ -208,6 +217,19 @@ impl<T: Tokenizer> ContextAssembler<T> {
         &self.items
     }
 
+    /// The textual counterpart of the token buffer.
+    ///
+    /// Renders are concatenated with no separator: [`Item::render`] already
+    /// prefixes `<|role|>`, so every item is self-delimiting and there is
+    /// exactly one canonical rendering for a caller to produce. For a
+    /// concatenation-preserving tokenizer such as [`ByteTokenizer`],
+    /// `encode(rendered())` equals [`Self::buffer`]'s tokens exactly. A real
+    /// BPE may merge across an item boundary, which is why the per-item buffer
+    /// stays canonical and this text is only ever handed to frontier providers.
+    pub fn rendered(&self) -> String {
+        self.items.iter().map(Item::render).collect()
+    }
+
     pub fn buffer(&self) -> &TokenBuffer {
         &self.buffer
     }
@@ -216,6 +238,7 @@ impl<T: Tokenizer> ContextAssembler<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ids::ResponseId;
 
     const BLOCK: u32 = 16;
 
@@ -300,6 +323,24 @@ mod tests {
             previous = current;
         }
         assert_eq!(assembler.items().len(), 11);
+    }
+
+    #[test]
+    fn the_rendered_prompt_tokenizes_to_exactly_the_buffer() {
+        let mut assembler = ContextAssembler::new(ByteTokenizer, BLOCK);
+        assembler.push(Item::system_text("you are a careful assistant"));
+        assembler.push(Item::user_text("first question"));
+        assembler.push(Item::assistant_text("first answer", ResponseId::new("r1")));
+        assembler.push(Item::user_text("second question"));
+
+        // The hashes we route on are computed over the buffer, so any text form
+        // of the same context must tokenize back to it. A separator between
+        // items -- or any other second rendering -- would put the router on a
+        // prefix nobody ever sends.
+        assert_eq!(
+            ByteTokenizer.encode(&assembler.rendered()),
+            assembler.buffer().tokens()
+        );
     }
 
     #[test]
