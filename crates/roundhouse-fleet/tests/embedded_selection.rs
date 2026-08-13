@@ -58,20 +58,13 @@ async fn register(fleet: &EmbeddedFleet, worker_id: u64) {
 }
 
 fn query_from(assembler: &ContextAssembler<ByteTokenizer>) -> FleetQuery {
-    FleetQuery {
-        model_name: MODEL.to_string(),
-        routing_group: "default".to_string(),
-        block_hashes: assembler
-            .buffer()
-            .block_hashes()
-            .iter()
-            .map(|hash| hash.0)
-            .collect(),
-        sequence_hashes: assembler.buffer().sequence_hashes().to_vec(),
-        isl_tokens: assembler.buffer().isl_tokens(),
-        expected_output_tokens: Some(128),
-        session_id: Some("sess_integration".to_string()),
-    }
+    FleetQuery::for_buffer(
+        assembler.buffer(),
+        MODEL,
+        "default",
+        Some(128),
+        Some("sess_integration".to_string()),
+    )
 }
 
 fn assembler_with_turns(turns: usize) -> ContextAssembler<ByteTokenizer> {

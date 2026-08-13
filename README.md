@@ -146,6 +146,19 @@ selection plane runs inside the test binary.
 - **A quote can be abandoned for free** — the fleet prices identically afterwards.
 - **Routing reacts to cache state** — a warmed target is priced below its prompt
   length on the following turn.
+- **Local cache hits are measured, not modelled** — a real mock vLLM engine
+  (`dynamo-mocker`) executes the turns and publishes KV events over ZMQ in the
+  engine-native wire format; the embedded selection service indexes them, and a
+  repeat turn under the real TinyLlama BPE prices at ~2% of its prompt length
+  (32 of 1536 tokens), with every complete block of the prior context matched.
+- **What was hashed is what is dispatched** — local execution consumes the token
+  buffer's ids verbatim, and the canonical rendering tokenizes back to the
+  buffer exactly; a captured dispatch is byte-identical to the quoted stream.
+- **Replays are redeliveries** — a retried turn returns byte-identical text and
+  the original usage, not a re-rendering with zeroed accounting.
+- **A failed turn settles** — the response terminates with an incomplete event,
+  the lease comes back immediately, and the same turn id is retryable without
+  waiting out a TTL.
 - **Reservations settle** — load returns to zero; a consumed `selection_id`
   cannot be booked twice.
 - **Failover loses nothing** — killing the owner mid-session, a successor claims
@@ -155,8 +168,7 @@ selection plane runs inside the test binary.
 
 ## Not yet built
 
-HTTP/SSE, WebSocket, and gRPC transports; the Redis store; a real tokenizer
-(the trait exists, with a byte-level test implementation); real provider
+HTTP/SSE, WebSocket, and gRPC transports; the Redis store; real provider
 clients for OpenAI and Anthropic; and resuming an interrupted generation from
 its partial output — the partial is already durable in the log, so the
 groundwork is there.

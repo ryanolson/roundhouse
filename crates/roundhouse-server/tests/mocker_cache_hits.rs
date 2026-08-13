@@ -289,20 +289,13 @@ async fn wait_for_indexed_prefix(
     let assembler = ContextAssembler::rehydrate(tokenizer(), BLOCK_SIZE, items);
     // Built exactly as the engine builds it, so the hashes probed here are the
     // hashes the next turn will be priced on.
-    let query = FleetQuery {
-        model_name: LOCAL_MODEL.to_string(),
-        routing_group: ROUTING_GROUP.to_string(),
-        block_hashes: assembler
-            .buffer()
-            .block_hashes()
-            .iter()
-            .map(|hash| hash.0)
-            .collect(),
-        sequence_hashes: assembler.buffer().sequence_hashes().to_vec(),
-        isl_tokens: assembler.buffer().isl_tokens(),
-        expected_output_tokens: Some(MAX_OUTPUT_TOKENS),
-        session_id: None,
-    };
+    let query = FleetQuery::for_buffer(
+        assembler.buffer(),
+        LOCAL_MODEL,
+        ROUTING_GROUP,
+        Some(MAX_OUTPUT_TOKENS),
+        None,
+    );
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     let mut best = 0;

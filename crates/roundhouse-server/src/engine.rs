@@ -239,7 +239,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             });
         }
 
-        let outcome = self.dispatch(&mut session, session_id, &response_id).await;
+        let outcome = self.dispatch(&mut session, &response_id).await;
 
         // The one settle seam. Every admitted turn terminates its response and
         // hands back the lease, whichever way the body went: returning while
@@ -292,7 +292,6 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
     async fn dispatch(
         &self,
         session: &mut Session<S>,
-        session_id: &SessionId,
         response_id: &ResponseId,
     ) -> Result<(String, Usage, Decision), EngineError> {
         // Rebuild the prompt from the committed log, so what we price is
@@ -309,20 +308,13 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         let local_quote = match &self.fleet {
             Some(fleet) => {
                 fleet
-                    .price(&FleetQuery {
-                        model_name: self.config.local_model.clone(),
-                        routing_group: self.config.routing_group.clone(),
-                        block_hashes: assembler
-                            .buffer()
-                            .block_hashes()
-                            .iter()
-                            .map(|hash| hash.0)
-                            .collect(),
-                        sequence_hashes: assembler.buffer().sequence_hashes().to_vec(),
-                        isl_tokens,
-                        expected_output_tokens: Some(self.config.expected_output_tokens),
-                        session_id: Some(session_id.to_string()),
-                    })
+                    .price(&FleetQuery::for_buffer(
+                        assembler.buffer(),
+                        self.config.local_model.clone(),
+                        self.config.routing_group.clone(),
+                        Some(self.config.expected_output_tokens),
+                        Some(session.session_id().to_string()),
+                    ))
                     .await?
             }
             None => None,
@@ -346,7 +338,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         let decision = self
             .policy
             .choose(&RoutingContext {
-                session_id,
+                session_id: session.session_id(),
                 turn_index,
                 isl_tokens,
                 candidates: &candidates,
@@ -426,7 +418,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                         // Stable for the life of the session: providers use it
                         // to steer requests to the same cache node, so varying
                         // it would defeat the hit we just routed on.
-                        prompt_cache_key: session_id.to_string(),
+                        prompt_cache_key: session.session_id().to_string(),
                         expected_output_tokens: Some(self.config.expected_output_tokens),
                     })
                     .await?;

@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use dynamo_kv_router::services::selection::{
     PromptRequest, ReservationRequest, SelectRequest, SelectionService, WorkerRequest,
 };
+use roundhouse_core::context::TokenBuffer;
 use roundhouse_core::routing::{Candidate, Target};
 
 #[derive(Debug, thiserror::Error)]
@@ -55,6 +56,29 @@ pub struct FleetQuery {
 }
 
 impl FleetQuery {
+    /// Build a query from an assembled context's token buffer.
+    ///
+    /// The one place buffer hashes are unpacked for the wire, so every caller
+    /// — the engine and the integration tests probing on its behalf — queries
+    /// on exactly the same view of the context.
+    pub fn for_buffer(
+        buffer: &TokenBuffer,
+        model_name: impl Into<String>,
+        routing_group: impl Into<String>,
+        expected_output_tokens: Option<u32>,
+        session_id: Option<String>,
+    ) -> Self {
+        Self {
+            model_name: model_name.into(),
+            routing_group: routing_group.into(),
+            block_hashes: buffer.block_hashes().iter().map(|hash| hash.0).collect(),
+            sequence_hashes: buffer.sequence_hashes().to_vec(),
+            isl_tokens: buffer.isl_tokens(),
+            expected_output_tokens,
+            session_id,
+        }
+    }
+
     /// Build a query-only select request under a caller-minted id.
     ///
     /// The service only caches booking inputs when `select` carries a
