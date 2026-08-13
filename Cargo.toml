@@ -36,6 +36,19 @@ dynamo-kv-router = { git = "https://github.com/ai-dynamo/dynamo.git", rev = "ac7
     "standalone-selection",
 ] }
 dynamo-tokens = { git = "https://github.com/ai-dynamo/dynamo.git", rev = "ac7b7513790ef1d619b46f805aea03c9f21200ba" }
+# The mock engine (tests only): simulates vLLM/SGLang scheduling and prefix
+# caching without GPUs, and publishes KV events in the vLLM native wire format
+# via `zmq-events`. This is what lets the cache-hit path be *measured* rather
+# than asserted. Pure Rust — no cudarc, no nixl, no dynamo-runtime.
+dynamo-mocker = { git = "https://github.com/ai-dynamo/dynamo.git", rev = "ac7b7513790ef1d619b46f805aea03c9f21200ba", default-features = false, features = [
+    "zmq-events",
+] }
+
+# Same major/minor and feature shape as Dynamo's own `lib/llm` pin, minus the
+# network-facing features: tokenizer files are loaded from disk only.
+tokenizers = { version = "0.21.4", default-features = false, features = [
+    "onig",
+] }
 
 # Pins match the Dynamo workspace so a future move into `lib/` is a no-op.
 anyhow = "1"
