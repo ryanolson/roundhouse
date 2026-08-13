@@ -51,8 +51,10 @@ impl Default for Weights {
 /// quality constraints.
 pub struct AffinityPolicy {
     weights: Weights,
-    /// Skip local candidates whose load exceeds this. Frontier candidates
-    /// report no load and are never excluded by it.
+    /// Skip local candidates whose load exceeds this, in potential prefill
+    /// tokens booked on the worker — the unit of [`Candidate::load`], so the
+    /// ceiling is a token count and not a utilization fraction. Frontier
+    /// candidates report no load and are never excluded by it.
     max_load: Option<f64>,
     min_quality: f64,
 }
@@ -77,6 +79,8 @@ impl AffinityPolicy {
         self
     }
 
+    /// Exclude local candidates carrying more than `max_load` potential
+    /// prefill tokens.
     pub fn with_max_load(mut self, max_load: f64) -> Self {
         self.max_load = Some(max_load);
         self
@@ -221,6 +225,8 @@ mod tests {
     use crate::ids::SessionId;
     use crate::routing::{CacheLedger, Target};
 
+    /// `load` is in booked prefill tokens, the unit a real fleet reports, so
+    /// these numbers are on the same scale an operator would calibrate against.
     fn local(worker_id: u64, prefill: f64, load: f64) -> Candidate {
         Candidate {
             target: Target::Local {
@@ -267,22 +273,22 @@ mod tests {
 
     #[tokio::test]
     async fn the_warmest_worker_wins_all_else_equal() {
-        let candidates = vec![local(1, 9_000.0, 0.1), local(2, 500.0, 0.1)];
+        let candidates = vec![local(1, 9_000.0, 2_000.0), local(2, 500.0, 2_000.0)];
         let decision = choose(&AffinityPolicy::new(), &candidates, 1).await;
         assert_eq!(decision.target, candidates[1].target);
     }
 
     #[tokio::test]
     async fn an_overloaded_worker_is_excluded_even_when_warmest() {
-        let candidates = vec![local(1, 500.0, 0.99), local(2, 9_000.0, 0.05)];
-        let policy = AffinityPolicy::new().with_max_load(0.8);
+        let candidates = vec![local(1, 500.0, 120_000.0), local(2, 9_000.0, 1_000.0)];
+        let policy = AffinityPolicy::new().with_max_load(50_000.0);
         let decision = choose(&policy, &candidates, 1).await;
         assert_eq!(decision.target, candidates[1].target);
     }
 
     #[tokio::test]
     async fn a_free_local_worker_beats_a_paid_frontier_at_equal_prefill() {
-        let candidates = vec![local(1, 1_000.0, 0.1), frontier(1_000.0, 0.30)];
+        let candidates = vec![local(1, 1_000.0, 2_000.0), frontier(1_000.0, 0.30)];
         let decision = choose(&AffinityPolicy::new(), &candidates, 1).await;
         assert!(decision.target.is_local());
     }
@@ -292,15 +298,15 @@ mod tests {
         // The whole point of one comparable axis: a large enough cache
         // advantage should pull the turn to the frontier despite it costing
         // real money and having worse TTFT.
-        let candidates = vec![local(1, 100_000.0, 0.5), frontier(200.0, 0.02)];
+        let candidates = vec![local(1, 100_000.0, 20_000.0), frontier(200.0, 0.02)];
         let decision = choose(&AffinityPolicy::new(), &candidates, 1).await;
         assert!(!decision.target.is_local(), "{}", decision.rationale);
     }
 
     #[tokio::test]
     async fn no_admissible_candidate_is_an_error_not_a_bad_choice() {
-        let candidates = vec![local(1, 500.0, 0.99)];
-        let policy = AffinityPolicy::new().with_max_load(0.5);
+        let candidates = vec![local(1, 500.0, 120_000.0)];
+        let policy = AffinityPolicy::new().with_max_load(50_000.0);
         let session_id = SessionId::new("s");
         let ledger = CacheLedger::new();
         let ctx = RoutingContext {
@@ -318,7 +324,7 @@ mod tests {
 
     #[tokio::test]
     async fn escalation_audits_periodically_but_never_on_the_first_turn() {
-        let candidates = vec![local(1, 100.0, 0.1), frontier(50_000.0, 5.0)];
+        let candidates = vec![local(1, 100.0, 2_000.0), frontier(50_000.0, 5.0)];
         let policy = EscalationPolicy::new(AffinityPolicy::new(), 4);
 
         assert!(choose(&policy, &candidates, 0).await.target.is_local());

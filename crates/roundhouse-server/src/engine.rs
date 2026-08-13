@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use roundhouse_core::context::{ContextAssembler, Tokenizer};
-use roundhouse_core::event::Usage;
+use roundhouse_core::event::{IncompleteReason, Usage};
 use roundhouse_core::ids::{ResponseId, SessionId, TurnId};
 use roundhouse_core::item::Item;
 use roundhouse_core::now_ms;
@@ -239,6 +239,62 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             });
         }
 
+        let outcome = self.dispatch(&mut session, session_id, &response_id).await;
+
+        // The one settle seam. Every admitted turn terminates its response and
+        // hands back the lease, whichever way the body went: returning while
+        // still holding the lease would lock the session out until the TTL
+        // lapsed, and leaving the response open would strand every poller of
+        // `is_terminal` and make the next retry duplicate this turn's input
+        // forever rather than replay it.
+        let settled = match outcome {
+            Ok((text, usage, decision)) => {
+                let committed = session.complete(&response_id, &text, usage.clone()).await;
+                committed
+                    .map(|()| (text, usage, decision))
+                    .map_err(EngineError::from)
+            }
+            Err(error) => {
+                // Terminating a failed dispatch is also what tells the cache
+                // ledger the prompt reached the provider. Best-effort: the
+                // usual reason this append fails is a lost lease, and the
+                // original error is the better diagnosis.
+                let _ = session
+                    .mark_incomplete(
+                        &response_id,
+                        "",
+                        IncompleteReason::UpstreamError,
+                        Usage::default(),
+                    )
+                    .await;
+                Err(error)
+            }
+        };
+        let last_seq = session.last_seq();
+        let _ = session.release().await;
+
+        let (text, usage, decision) = settled?;
+        Ok(TurnResult {
+            response_id,
+            text,
+            decision: Some(decision),
+            usage,
+            last_seq,
+            deduplicated: false,
+        })
+    }
+
+    /// Price every option, choose one, record the choice, and execute it.
+    ///
+    /// Split out so that all of it is fallible in one place: every step here
+    /// leaves a response open and a lease held, and [`Engine::run_turn`] is the
+    /// only thing allowed to settle either.
+    async fn dispatch(
+        &self,
+        session: &mut Session<S>,
+        session_id: &SessionId,
+        response_id: &ResponseId,
+    ) -> Result<(String, Usage, Decision), EngineError> {
         // Rebuild the prompt from the committed log, so what we price is
         // exactly what a successor would reconstruct.
         let assembler = ContextAssembler::rehydrate(
@@ -308,7 +364,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         // part of the audit trail.
         session
             .record_routing(
-                &response_id,
+                response_id,
                 DecisionRecord {
                     chosen: decision.target.clone(),
                     rationale: decision.rationale.clone(),
@@ -378,18 +434,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             }
         };
 
-        session.complete(&response_id, &text, usage.clone()).await?;
-        let last_seq = session.last_seq();
-        session.release().await?;
-
-        Ok(TurnResult {
-            response_id,
-            text,
-            decision: Some(decision),
-            usage,
-            last_seq,
-            deduplicated: false,
-        })
+        Ok((text, usage, decision))
     }
 }
 

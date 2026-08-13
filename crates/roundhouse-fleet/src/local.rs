@@ -114,6 +114,9 @@ pub struct LocalQuote {
     /// the scheduler's own weighting.
     pub longest_matched_tokens: u32,
     pub isl_tokens: usize,
+    /// Potential prefill tokens already booked on this worker, absolute rather
+    /// than a fraction of capacity. `None` when the router has no load entry
+    /// for it yet. See [`EmbeddedFleet::load_for`].
     pub load: Option<f64>,
 }
 
@@ -273,6 +276,9 @@ impl EmbeddedFleet {
     /// Uses potential prefill tokens rather than request count: a single
     /// long-context request loads a worker far more than several short ones,
     /// and prefill tokens are the same unit the rest of the decision is in.
+    /// The number is absolute, so a load ceiling is calibrated in tokens —
+    /// normalizing it would take a capacity denominator (`total_kv_blocks`)
+    /// the catalog does not carry.
     async fn load_for(&self, model_name: &str, worker_id: u64) -> Option<f64> {
         self.service
             .loads(Some(model_name), Some(&self.routing_group))
@@ -438,7 +444,8 @@ mod tests {
             effective_prefill_tokens: 512,
             longest_matched_tokens: 3_584,
             isl_tokens: 4_096,
-            load: Some(0.25),
+            // Booked prefill tokens, the unit the selection service reports.
+            load: Some(24_000.0),
         };
 
         let candidate = quote.to_candidate(0.6, 90.0);
@@ -447,7 +454,7 @@ mod tests {
             candidate.expected_cost_usd, 0.0,
             "local capacity is not priced in dollars"
         );
-        assert_eq!(candidate.load, Some(0.25));
+        assert_eq!(candidate.load, Some(24_000.0));
         assert!(candidate.cache_hit_ratio(4_096) > 0.87);
         assert_eq!(
             candidate.target,

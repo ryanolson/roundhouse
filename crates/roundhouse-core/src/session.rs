@@ -15,7 +15,7 @@ use std::sync::Arc;
 use crate::event::{IncompleteReason, SessionEvent, SessionEventKind, Usage};
 use crate::ids::{ResponseId, SessionId, TurnId};
 use crate::item::Item;
-use crate::routing::{CacheLedger, DecisionRecord};
+use crate::routing::{CacheLedger, DecisionRecord, Target};
 use crate::store::{Lease, SessionStore, StoreError};
 
 /// How many events to pull per replay batch.
@@ -60,6 +60,12 @@ struct CompletedTurn {
     usage: Usage,
 }
 
+/// Where a dispatch went and how much prompt it carried.
+struct PendingRouting {
+    target: Target,
+    isl_tokens: u64,
+}
+
 /// State derived from the event log.
 #[derive(Default)]
 pub struct SessionState {
@@ -71,6 +77,24 @@ pub struct SessionState {
     completed_turns: HashMap<TurnId, CompletedTurn>,
     /// Turn ids currently in flight.
     open_turns: HashMap<TurnId, ResponseId>,
+    /// Routing facts of responses that have not terminated yet.
+    ///
+    /// `Routed` is committed before execution, so it records an intent rather
+    /// than a transmission and is the wrong evidence for the cache ledger: a
+    /// dispatch that failed on the way out would leave a phantom warm prefix
+    /// on that target, and the retry would then be priced against a cache that
+    /// does not exist — phantom-warm frontier beating genuinely cheaper local
+    /// workers. The fold therefore happens at the terminal event, and only
+    /// when that event proves the prompt was processed: a completion always
+    /// does, an incomplete does only when its usage shows billed input
+    /// (partial output cannot exist without a prefill, but the engine also
+    /// terminates dispatches that failed before anything was sent, and those
+    /// carry an empty usage). A response that never terminates — the process
+    /// died mid-flight, and nobody knows what the provider saw — records
+    /// nothing. Cold is the conservative reading in both unproven cases,
+    /// because over-claiming warmth is the exact mispricing this fold exists
+    /// to prevent.
+    pending_routings: HashMap<ResponseId, PendingRouting>,
     pub last_seq: u64,
 }
 
@@ -90,14 +114,37 @@ impl SessionState {
                 self.turn_index += 1;
                 self.open_turns.insert(turn_id.clone(), response_id.clone());
             }
-            SessionEventKind::Routed { decision, .. } => {
-                self.ledger
-                    .record(&decision.chosen, event.at_ms, decision.isl_tokens);
+            SessionEventKind::Routed {
+                response_id,
+                decision,
+            } => {
+                // Held rather than recorded; see `pending_routings`.
+                self.pending_routings.insert(
+                    response_id.clone(),
+                    PendingRouting {
+                        target: decision.chosen.clone(),
+                        isl_tokens: decision.isl_tokens,
+                    },
+                );
             }
             SessionEventKind::ResponseCompleted { response_id, usage }
             | SessionEventKind::ResponseIncomplete {
                 response_id, usage, ..
             } => {
+                // Recorded at the terminal event's timestamp — when the
+                // provider stopped holding the prompt, which is what the TTL
+                // runs from — and only under the evidence rule documented on
+                // `pending_routings`.
+                if let Some(routing) = self.pending_routings.remove(response_id) {
+                    let processed =
+                        matches!(event.kind, SessionEventKind::ResponseCompleted { .. })
+                            || usage.input_tokens > 0;
+                    if processed {
+                        self.ledger
+                            .record(&routing.target, event.at_ms, routing.isl_tokens);
+                    }
+                }
+
                 // A turn is only settled once its response terminates, which is
                 // what makes a re-sent turn after a mid-generation crash
                 // restartable rather than deduplicated into a partial answer.
@@ -152,8 +199,8 @@ impl<S: SessionStore> Session<S> {
     /// Claim a session and rebuild its state from the log.
     ///
     /// `ledger` carries the cache-model and pricing configuration; replayed
-    /// dispatches are recorded into it, so what comes back reflects both static
-    /// configuration and session history.
+    /// dispatches that reached a terminal event are folded into it, so what
+    /// comes back reflects both static configuration and session history.
     pub async fn open(
         store: Arc<S>,
         session_id: SessionId,
@@ -290,6 +337,10 @@ impl<S: SessionStore> Session<S> {
     }
 
     /// Record the routing choice before any execution begins.
+    ///
+    /// This is the audit trail, not yet ledger evidence: the dispatch is only
+    /// folded into the cache ledger once its response terminates. See
+    /// [`SessionState`]'s pending routings.
     pub async fn record_routing(
         &mut self,
         response_id: &ResponseId,
@@ -499,6 +550,120 @@ mod tests {
             .unwrap();
         assert!(matches!(retry, TurnAdmission::Started(_)));
         assert_ne!(retry.response_id(), &response_id);
+    }
+
+    #[tokio::test]
+    async fn a_dispatch_that_never_terminates_leaves_the_target_cold() {
+        let store = Arc::new(MemoryStore::new());
+        let (_, mut session) = new_session(store, "node-a").await;
+
+        let admission = session
+            .begin_turn(TurnId::new("t1"), vec![Item::user_text("hello")])
+            .await
+            .unwrap();
+        let target = Target::Frontier {
+            provider: "anthropic".into(),
+            model: "claude".into(),
+        };
+        session
+            .record_routing(admission.response_id(), decision_for(target.clone(), 8_192))
+            .await
+            .unwrap();
+
+        // The process died before the response terminated, so nothing is known
+        // about what the provider saw. Claiming a warm prefix here would price
+        // the retry against a cache that may not exist.
+        assert!(session.ledger().state_for(&target).is_none());
+    }
+
+    #[tokio::test]
+    async fn an_incomplete_response_records_its_dispatch_at_the_terminal_event() {
+        let store = Arc::new(MemoryStore::new());
+        let (_, mut session) = new_session(store, "node-a").await;
+
+        let admission = session
+            .begin_turn(TurnId::new("t1"), vec![Item::user_text("hello")])
+            .await
+            .unwrap();
+        let response_id = admission.response_id().clone();
+        let target = Target::Frontier {
+            provider: "anthropic".into(),
+            model: "claude".into(),
+        };
+        let checkpoint = session.last_seq();
+        session
+            .record_routing(&response_id, decision_for(target.clone(), 8_192))
+            .await
+            .unwrap();
+        session
+            .mark_incomplete(
+                &response_id,
+                "partial",
+                IncompleteReason::UpstreamError,
+                Usage {
+                    input_tokens: 8_192,
+                    cached_input_tokens: 0,
+                    output_tokens: 3,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Billed input is the proof the prompt was prefilled: the prefix is
+        // warm even though the response never completed.
+        let state = session
+            .ledger()
+            .state_for(&target)
+            .expect("an incomplete with billed input is ledger evidence");
+        assert_eq!(state.last_prefix_tokens, 8_192);
+
+        let terminal = session
+            .events_since(checkpoint, 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|event| event.is_terminal())
+            .expect("the response terminated");
+        assert_eq!(
+            state.last_call_at_ms, terminal.at_ms,
+            "the TTL runs from when the provider stopped holding the prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_incomplete_response_with_no_billed_input_leaves_the_target_cold() {
+        let store = Arc::new(MemoryStore::new());
+        let (_, mut session) = new_session(store, "node-a").await;
+
+        let admission = session
+            .begin_turn(TurnId::new("t1"), vec![Item::user_text("hello")])
+            .await
+            .unwrap();
+        let response_id = admission.response_id().clone();
+        let target = Target::Frontier {
+            provider: "anthropic".into(),
+            model: "claude".into(),
+        };
+        session
+            .record_routing(&response_id, decision_for(target.clone(), 8_192))
+            .await
+            .unwrap();
+        // The engine terminates a dispatch that failed before anything was
+        // sent with exactly this shape: incomplete, empty usage.
+        session
+            .mark_incomplete(
+                &response_id,
+                "",
+                IncompleteReason::UpstreamError,
+                Usage::default(),
+            )
+            .await
+            .unwrap();
+
+        // No billed input, no evidence the provider ever saw the prompt --
+        // claiming a warm prefix here is precisely the phantom the ledger fold
+        // must not produce.
+        assert!(session.ledger().state_for(&target).is_none());
     }
 
     #[tokio::test]

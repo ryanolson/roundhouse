@@ -106,8 +106,14 @@ pub struct Candidate {
     /// Relative capability, 0.0..=1.0. Supplied by configuration, not measured.
     pub quality_prior: f64,
 
-    /// Queue depth or equivalent pressure signal. `None` for frontier targets,
-    /// whose load is not observable to us.
+    /// Potential prefill tokens already booked on the worker: the same currency
+    /// as `expected_prefill_tokens`, which is the point — pressure and cost sit
+    /// on one axis instead of needing a conversion between queue depth and
+    /// tokens. Absolute, not a fraction of capacity: expressing it as a
+    /// utilization ratio would need a capacity denominator the fleet does not
+    /// report.
+    ///
+    /// `None` for frontier targets, whose load is not observable to us.
     pub load: Option<f64>,
 }
 

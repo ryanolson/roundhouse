@@ -16,11 +16,12 @@
 //!    reports is fiction.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use roundhouse_core::context::{ByteTokenizer, ContextAssembler};
-use roundhouse_core::event::{SessionEventKind, Usage};
+use roundhouse_core::event::{IncompleteReason, SessionEventKind, Usage};
 use roundhouse_core::ids::{SessionId, TurnId};
 use roundhouse_core::item::{Item, Role};
 use roundhouse_core::routing::{
@@ -29,8 +30,9 @@ use roundhouse_core::routing::{
 use roundhouse_core::session::Session;
 use roundhouse_core::store::MemoryStore;
 use roundhouse_fleet::{
-    EchoFrontierClient, EmbeddedFleet, FleetError, FrontierModelSpec, KvRouterConfig, LocalFleet,
-    SelectionServiceBuilder, StaticFrontierCatalog, WorkerRegistration,
+    EchoFrontierClient, EmbeddedFleet, FleetError, FrontierChunk, FrontierClient, FrontierError,
+    FrontierModelSpec, FrontierQuote, KvRouterConfig, LocalFleet, SelectionServiceBuilder,
+    StaticFrontierCatalog, WorkerRegistration,
 };
 use roundhouse_server::{EchoLocalExecutor, Engine, EngineConfig, LocalExecution, LocalExecutor};
 
@@ -351,6 +353,113 @@ async fn a_retried_turn_replays_instead_of_regenerating() {
         1,
         "a retry must not open a second turn"
     );
+}
+
+/// A [`FrontierClient`] whose first call fails and whose later calls behave.
+#[derive(Default)]
+struct FlakyFrontierClient {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl FrontierClient for FlakyFrontierClient {
+    async fn execute(&self, quote: &FrontierQuote) -> Result<Vec<FrontierChunk>, FrontierError> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(FrontierError::Upstream("provider exploded".into()));
+        }
+        EchoFrontierClient::new("frontier answer")
+            .execute(quote)
+            .await
+    }
+}
+
+/// A failed dispatch must leave the session usable rather than wedged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_turn_terminates_its_response_and_frees_the_session() {
+    let store = Arc::new(MemoryStore::new());
+    let engine = Engine::new(
+        store.clone(),
+        ByteTokenizer,
+        Arc::new(EchoLocalExecutor::new("local answer")),
+        frontier_catalog(),
+        Arc::new(FlakyFrontierClient::default()),
+        Arc::new(AffinityPolicy::new()),
+        config(),
+    );
+    let session_id = SessionId::generate();
+    engine.create_session(&session_id).await.unwrap();
+
+    let failed = engine
+        .run_turn(
+            &session_id,
+            TurnId::new("t0"),
+            vec![Item::user_text("hello")],
+        )
+        .await;
+    assert!(failed.is_err(), "the provider failed, so the turn must too");
+
+    // The failure is durable and terminal. Opening the session from a
+    // *different* node is also the proof that the lease came back: a live lease
+    // held by the engine's node would refuse this claim outright.
+    let probe = Session::open(
+        store.clone(),
+        session_id.clone(),
+        "probe",
+        10_000,
+        CacheLedger::new(),
+    )
+    .await
+    .expect("the failed turn must not hold the session hostage until its TTL");
+    let terminal: Vec<_> = probe
+        .events_since(0, 1000)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.is_terminal())
+        .collect();
+    assert_eq!(terminal.len(), 1, "the failed response must have ended");
+    assert!(
+        matches!(
+            terminal[0].kind,
+            SessionEventKind::ResponseIncomplete {
+                reason: IncompleteReason::UpstreamError,
+                ..
+            }
+        ),
+        "an unterminated response would strand every poller of is_terminal"
+    );
+    probe.release().await.unwrap();
+
+    // Immediately retryable on the same engine, without waiting out the TTL.
+    let retry = engine
+        .run_turn(
+            &session_id,
+            TurnId::new("t0"),
+            vec![Item::user_text("hello")],
+        )
+        .await
+        .expect("the same turn id must be runnable again after a failure");
+    assert!(
+        !retry.deduplicated,
+        "the first attempt never completed, so this must generate"
+    );
+    assert_eq!(retry.text, "frontier answer");
+
+    let probe = Session::open(store, session_id, "probe-2", 10_000, CacheLedger::new())
+        .await
+        .unwrap();
+    let user_items = probe
+        .state()
+        .items
+        .iter()
+        .filter(|item| item.role == Role::User)
+        .count();
+    // Twice, once per attempt: the log is append-only and a fresh attempt
+    // re-appends its input. That duplication is the documented cost of retrying
+    // a turn that failed rather than completed — reusing the failed turn's
+    // items instead would need input-hash matching, which does not exist yet.
+    // Deduplication only covers turns that *completed*, which this one did not.
+    assert_eq!(user_items, 2);
 }
 
 /// The full stack against a real embedded selection service.
