@@ -12,6 +12,8 @@
 //! prompting in a way that defeats it is the obvious failure mode.
 
 use async_trait::async_trait;
+use futures::StreamExt;
+use futures::stream::BoxStream;
 use roundhouse_core::routing::{CacheLedger, CacheModel, Candidate, ProviderPricing, Target};
 
 /// A frontier model we may route to.
@@ -105,6 +107,13 @@ impl StaticFrontierCatalog {
     }
 }
 
+/// A provider's response as it is produced.
+///
+/// Boxed rather than an associated type so the trait stays object-safe: the
+/// engine holds one `Arc<dyn FrontierClient>` for a catalog of providers whose
+/// transports have nothing in common.
+pub type FrontierStream = BoxStream<'static, Result<FrontierChunk, FrontierError>>;
+
 /// One streamed chunk from a provider.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FrontierChunk {
@@ -114,6 +123,33 @@ pub enum FrontierChunk {
         cached_input_tokens: u64,
         output_tokens: u64,
     },
+}
+
+impl FrontierChunk {
+    /// A completed response presented as a stream.
+    ///
+    /// The adapter any non-streaming backend reaches for: one text chunk, one
+    /// accounting chunk. Keeping it here, next to the chunk type, means a
+    /// backend that cannot stream still feeds the same durable-delta fold as
+    /// one that can, instead of growing a second path for output to reach the
+    /// log — with the honest cost that no delta lands any earlier than the
+    /// last token does.
+    pub fn whole_response(
+        text: String,
+        input_tokens: u64,
+        cached_input_tokens: u64,
+        output_tokens: u64,
+    ) -> FrontierStream {
+        futures::stream::iter([
+            Ok(FrontierChunk::OutputText(text)),
+            Ok(FrontierChunk::Done {
+                input_tokens,
+                cached_input_tokens,
+                output_tokens,
+            }),
+        ])
+        .boxed()
+    }
 }
 
 /// What a provider was asked to do.
@@ -137,12 +173,16 @@ pub enum FrontierError {
 
 /// Executes a turn against a hosted provider.
 ///
-/// Streaming is modelled as a whole-response `Vec` for the walking skeleton;
-/// the session layer already appends deltas incrementally, so swapping this for
-/// a real byte stream does not change the state machine.
+/// The stream is the contract, not a convenience: the session layer appends
+/// each delta durably as it arrives, so a process that dies mid-generation
+/// leaves the partial answer in the log for its successor to resume from.
+/// Handing back a whole response instead would make that impossible, and would
+/// also erase time-to-first-token — the quantity the routing is optimizing for
+/// — from the record, since the log would only ever show the moment the last
+/// byte landed.
 #[async_trait]
 pub trait FrontierClient: Send + Sync + 'static {
-    async fn execute(&self, quote: &FrontierQuote) -> Result<Vec<FrontierChunk>, FrontierError>;
+    async fn execute(&self, quote: &FrontierQuote) -> Result<FrontierStream, FrontierError>;
 }
 
 /// Deterministic [`FrontierClient`] for tests and offline runs.
@@ -160,16 +200,13 @@ impl EchoFrontierClient {
 
 #[async_trait]
 impl FrontierClient for EchoFrontierClient {
-    async fn execute(&self, quote: &FrontierQuote) -> Result<Vec<FrontierChunk>, FrontierError> {
-        let input_tokens = quote.prompt.len() as u64;
-        Ok(vec![
-            FrontierChunk::OutputText(self.reply.clone()),
-            FrontierChunk::Done {
-                input_tokens,
-                cached_input_tokens: 0,
-                output_tokens: self.reply.len() as u64,
-            },
-        ])
+    async fn execute(&self, quote: &FrontierQuote) -> Result<FrontierStream, FrontierError> {
+        Ok(FrontierChunk::whole_response(
+            self.reply.clone(),
+            quote.prompt.len() as u64,
+            0,
+            self.reply.len() as u64,
+        ))
     }
 }
 
@@ -243,7 +280,7 @@ mod tests {
     #[tokio::test]
     async fn the_echo_client_reports_usage() {
         let client = EchoFrontierClient::new("hello");
-        let chunks = client
+        let stream = client
             .execute(&FrontierQuote {
                 target: Target::Frontier {
                     provider: "anthropic".into(),
@@ -255,6 +292,7 @@ mod tests {
             })
             .await
             .unwrap();
+        let chunks: Vec<_> = stream.map(|chunk| chunk.unwrap()).collect().await;
 
         assert_eq!(chunks[0], FrontierChunk::OutputText("hello".into()));
         assert!(matches!(

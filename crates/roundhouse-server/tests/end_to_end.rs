@@ -14,8 +14,10 @@
 //! 4. The token stream the routing hashes describe is the one actually
 //!    dispatched. If those ever diverge, every cache-locality number the system
 //!    reports is fiction.
+//!
+//! What a turn survives — a lease shorter than itself, a hung provider, a
+//! stream that breaks halfway — is proved next door, in `turn_lifecycle.rs`.
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -24,46 +26,17 @@ use roundhouse_core::context::{ByteTokenizer, ContextAssembler};
 use roundhouse_core::event::{IncompleteReason, SessionEventKind, Usage};
 use roundhouse_core::ids::{SessionId, TurnId};
 use roundhouse_core::item::{Item, Role};
-use roundhouse_core::routing::{
-    AffinityPolicy, CacheLedger, CacheModel, ProviderPricing, RoutingPolicy, Target,
-};
+use roundhouse_core::routing::{AffinityPolicy, CacheLedger, RoutingPolicy, Target};
 use roundhouse_core::session::Session;
 use roundhouse_core::store::MemoryStore;
 use roundhouse_fleet::{
-    EchoFrontierClient, EmbeddedFleet, FleetError, FrontierChunk, FrontierClient, FrontierError,
-    FrontierModelSpec, FrontierQuote, KvRouterConfig, LocalFleet, SelectionServiceBuilder,
-    StaticFrontierCatalog, WorkerRegistration,
+    EchoFrontierClient, FleetError, FrontierClient, FrontierError, FrontierQuote, FrontierStream,
+    LocalFleet,
 };
 use roundhouse_server::{EchoLocalExecutor, Engine, EngineConfig, LocalExecution, LocalExecutor};
 
-const BLOCK_SIZE: u32 = 16;
-const LOCAL_MODEL: &str = "local";
-const MINUTE: u64 = 60_000;
-
-fn frontier_catalog() -> StaticFrontierCatalog {
-    StaticFrontierCatalog::new(vec![FrontierModelSpec {
-        provider: "anthropic".into(),
-        model: "claude".into(),
-        cache_model: CacheModel::Deterministic { ttl_ms: 5 * MINUTE },
-        pricing: ProviderPricing {
-            input_per_mtok_usd: 3.0,
-            cached_input_per_mtok_usd: 0.3,
-            cache_write_per_mtok_usd: 3.75,
-            output_per_mtok_usd: 15.0,
-        },
-        quality_prior: 0.95,
-        base_ttft_ms: 350.0,
-        ttft_ms_per_uncached_token: 0.002,
-    }])
-}
-
-fn config() -> EngineConfig {
-    EngineConfig {
-        block_size: BLOCK_SIZE,
-        local_model: LOCAL_MODEL.to_string(),
-        ..Default::default()
-    }
-}
+mod common;
+use common::{BLOCK_SIZE, LOCAL_MODEL, config, embedded_fleet, frontier_catalog};
 
 fn engine_without_fleet(
     store: Arc<MemoryStore>,
@@ -78,31 +51,6 @@ fn engine_without_fleet(
         policy,
         config(),
     )
-}
-
-async fn embedded_fleet() -> Arc<EmbeddedFleet> {
-    let service = SelectionServiceBuilder::new(KvRouterConfig {
-        use_kv_events: false,
-        router_queue_threshold: None,
-        ..Default::default()
-    })
-    .indexer_threads(1)
-    .build()
-    .await
-    .expect("selection service should start");
-    let fleet = Arc::new(EmbeddedFleet::new(Arc::new(service)));
-    fleet
-        .register_worker(WorkerRegistration {
-            worker_id: 1,
-            model_name: LOCAL_MODEL.to_string(),
-            routing_group: "default".to_string(),
-            endpoint: "http://worker-1:8000".to_string(),
-            block_size: BLOCK_SIZE,
-            kv_events_endpoints: HashMap::new(),
-        })
-        .await
-        .unwrap();
-    fleet
 }
 
 /// The headline claim: constant client cost, growing server-side context.
@@ -363,7 +311,7 @@ struct FlakyFrontierClient {
 
 #[async_trait]
 impl FrontierClient for FlakyFrontierClient {
-    async fn execute(&self, quote: &FrontierQuote) -> Result<Vec<FrontierChunk>, FrontierError> {
+    async fn execute(&self, quote: &FrontierQuote) -> Result<FrontierStream, FrontierError> {
         if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
             return Err(FrontierError::Upstream("provider exploded".into()));
         }

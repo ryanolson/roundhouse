@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::event::{IncompleteReason, SessionEvent, SessionEventKind, Usage};
 use crate::ids::{ResponseId, SessionId, TurnId};
@@ -187,6 +188,21 @@ impl SessionState {
     }
 }
 
+/// A running lease renewal, alive for exactly as long as this handle is.
+///
+/// Dropping it stops the renewal at that instant rather than at the next tick,
+/// so the lease a finished turn leaves behind lapses on the normal failover
+/// clock instead of being carried by a task nobody is watching any more.
+pub struct LeaseHeartbeat {
+    task: tokio::task::AbortHandle,
+}
+
+impl Drop for LeaseHeartbeat {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 /// A leased, projected session.
 pub struct Session<S: SessionStore> {
     store: Arc<S>,
@@ -270,6 +286,64 @@ impl<S: SessionStore> Session<S> {
                 Ok(true)
             }
             None => Ok(false),
+        }
+    }
+
+    /// Renew this session's lease every `every_ms` until the handle is dropped.
+    ///
+    /// A model call routinely outlasts any TTL worth failing over on, and the
+    /// TTL cannot simply be raised to cover it: it *is* the failover clock, the
+    /// time a successor must wait before it may assume this node is gone.
+    /// Renewal separates the two, so the lease lives as long as the owner is
+    /// demonstrably alive while a genuinely dead owner is still replaced one
+    /// TTL after its last tick.
+    ///
+    /// Renewal extends a lease that is still valid and does nothing else. The
+    /// moment the store says otherwise — `None`, or an error that leaves the
+    /// renewal unproven — the task stops for good. Re-acquiring here is
+    /// the tempting repair and it is exactly the split-brain bug: a successor
+    /// has already been admitted on the strength of this lease lapsing, and a
+    /// second writer appending into the same log is the one thing leases exist
+    /// to prevent. Stopping instead leaves fencing to fail this owner's next
+    /// append, which is the correct outcome and the one the store guarantees.
+    ///
+    /// Renewal is only safe because the work it covers is bounded; an owner
+    /// that is alive but stuck must still lose the session. The engine's
+    /// `turn_deadline_ms` is what supplies that bound.
+    pub fn heartbeat(&self, every_ms: u64, ttl_ms: u64) -> LeaseHeartbeat {
+        let store = Arc::clone(&self.store);
+        // The task owns a clone, so it renews without the session handle. Both
+        // stay usable: [`SessionStore::append_events`] validates against the
+        // store's current record rather than against the handle's copy of
+        // `expires_at_ms`.
+        let mut lease = self.lease.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(every_ms)).await;
+                match store.renew_lease(&lease, ttl_ms).await {
+                    Ok(Some(renewed)) => lease = renewed,
+                    Ok(None) => {
+                        tracing::warn!(
+                            session_id = %lease.session_id,
+                            node_id = %lease.node_id,
+                            "lease lost; stopping renewal rather than re-acquiring"
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            session_id = %lease.session_id,
+                            node_id = %lease.node_id,
+                            %error,
+                            "lease renewal failed; stopping renewal"
+                        );
+                        return;
+                    }
+                }
+            }
+        });
+        LeaseHeartbeat {
+            task: task.abort_handle(),
         }
     }
 
@@ -726,6 +800,63 @@ mod tests {
             .await;
         assert!(matches!(
             result,
+            Err(SessionError::Store(StoreError::LeaseLost { .. }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_keeps_a_writer_alive_past_its_lease_ttl() {
+        let store = Arc::new(MemoryStore::new());
+        let sid = SessionId::generate();
+        store.create_session(&sid, "affinity").await.unwrap();
+        let mut session = Session::open(store, sid, "node-a", 200, CacheLedger::new())
+            .await
+            .unwrap();
+
+        let _heartbeat = session.heartbeat(60, 200);
+        // Longer than the TTL. Unrenewed, the append below is fenced and
+        // whatever produced it is thrown away.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        session
+            .begin_turn(TurnId::new("t1"), vec![Item::user_text("hello")])
+            .await
+            .expect("a renewed lease is still the single writer");
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_stops_at_takeover_instead_of_stealing_the_session_back() {
+        let store = Arc::new(MemoryStore::new());
+        let sid = SessionId::generate();
+        store.create_session(&sid, "affinity").await.unwrap();
+        let mut displaced = Session::open(
+            store.clone(),
+            sid.clone(),
+            "node-a",
+            200,
+            CacheLedger::new(),
+        )
+        .await
+        .unwrap();
+        let _heartbeat = displaced.heartbeat(60, 200);
+
+        store.expire_lease_now(&sid).await;
+        let mut successor = Session::open(store, sid, "node-b", TTL, CacheLedger::new())
+            .await
+            .unwrap();
+
+        // Several renewal ticks. A heartbeat that treated a lost lease as
+        // something to re-acquire would put two writers on one log here.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        successor
+            .begin_turn(TurnId::new("t1"), vec![Item::user_text("hello")])
+            .await
+            .expect("the successor is the owner and stays the owner");
+        assert!(matches!(
+            displaced
+                .begin_turn(TurnId::new("t2"), vec![Item::user_text("hello")])
+                .await,
             Err(SessionError::Store(StoreError::LeaseLost { .. }))
         ));
     }

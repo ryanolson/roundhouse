@@ -73,6 +73,13 @@ pub trait SessionStore: Send + Sync + 'static {
     ) -> Result<Option<Lease>, StoreError>;
 
     /// Extend a held lease. `None` means it was lost and must be re-acquired.
+    ///
+    /// Validated the same way as [`SessionStore::append_events`]: against the
+    /// stored record, so the caller may renew from a handle it has not
+    /// refreshed. That is what lets a background heartbeat renew a lease the
+    /// session handle is still using, and it is also why `None` here is
+    /// final — the record now belongs to someone else, and the only correct
+    /// response is to stop rather than to re-acquire behind the successor.
     async fn renew_lease(&self, lease: &Lease, ttl_ms: u64) -> Result<Option<Lease>, StoreError>;
 
     async fn release_lease(&self, lease: &Lease) -> Result<(), StoreError>;
@@ -81,6 +88,15 @@ pub trait SessionStore: Send + Sync + 'static {
     ///
     /// Fails with [`StoreError::LeaseLost`] if `lease` is no longer valid, so a
     /// stalled writer cannot interleave with its successor.
+    ///
+    /// A [`Lease`] is an identity — which node holds which session — and not a
+    /// snapshot of ownership: validity is decided against the store's *current*
+    /// record, so a handle whose own `expires_at_ms` has passed still appends
+    /// while the record it names is live. Renewal is therefore free to happen
+    /// on a separate task from the writes, and the session layer relies on it:
+    /// its heartbeat renews the record while every append continues to go
+    /// through the original handle. An implementation that instead rejected a
+    /// stale-looking handle would fail every append made during a long turn.
     async fn append_events(
         &self,
         lease: &Lease,

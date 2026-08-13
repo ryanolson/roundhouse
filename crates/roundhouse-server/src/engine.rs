@@ -3,9 +3,13 @@
 
 //! Turn execution.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::future::Future;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use roundhouse_core::context::{ContextAssembler, Tokenizer};
 use roundhouse_core::event::{IncompleteReason, Usage};
 use roundhouse_core::ids::{ResponseId, SessionId, TurnId};
@@ -19,8 +23,9 @@ use roundhouse_core::session::{Session, SessionError, TurnAdmission};
 use roundhouse_core::store::SessionStore;
 use roundhouse_fleet::{
     FleetError, FleetQuery, FrontierChunk, FrontierClient, FrontierError, FrontierQuote,
-    LocalFleet, StaticFrontierCatalog,
+    FrontierStream, LocalFleet, LocalQuote, StaticFrontierCatalog,
 };
+use tokio::time::Instant;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -34,6 +39,8 @@ pub enum EngineError {
     Frontier(#[from] FrontierError),
     #[error("chosen target `{0:?}` had no matching quote")]
     UnresolvableTarget(Target),
+    #[error("turn exceeded its deadline of {0} ms")]
+    TurnDeadline(u64),
 }
 
 /// What a local worker produced.
@@ -107,6 +114,15 @@ pub struct EngineConfig {
     /// Latency floor attributed to a local worker before prefill.
     pub local_base_ttft_ms: f64,
     pub expected_output_tokens: u32,
+    /// Bounds the model work of a single turn.
+    ///
+    /// The lease heartbeat keeps an owner alive for as long as its turn runs,
+    /// and that is only safe because a turn cannot run forever. Without this
+    /// bound a provider that accepts a request and then goes silent would leave
+    /// an owner that is alive but producing nothing renewing its lease
+    /// indefinitely, and the session would never fail over to anyone able to
+    /// make progress. The deadline is what makes the heartbeat safe.
+    pub turn_deadline_ms: u64,
 }
 
 impl Default for EngineConfig {
@@ -120,6 +136,66 @@ impl Default for EngineConfig {
             local_quality_prior: 0.6,
             local_base_ttft_ms: 60.0,
             expected_output_tokens: 256,
+            turn_deadline_ms: 120_000,
+        }
+    }
+}
+
+/// A dispatch that produced an answer.
+struct Completed {
+    text: String,
+    usage: Usage,
+    decision: Decision,
+}
+
+/// A dispatch that did not, and everything that survived it.
+///
+/// The partial and the evidence are not diagnostics; they are what the settle
+/// seam commits. The partial is durable output a successor can resume from, and
+/// the evidence is what the cache ledger reads to decide whether the target is
+/// warm — which is why it must describe what actually happened rather than what
+/// was intended.
+struct Failed {
+    error: EngineError,
+    partial: String,
+    evidence: Usage,
+}
+
+impl Failed {
+    /// A failure with nothing to show for it.
+    ///
+    /// No delta ever arrived, so there is no proof the prompt reached the
+    /// provider and the empty usage keeps the ledger's reading of that target
+    /// cold. Over-claiming warmth here is the mispricing the evidence rule on
+    /// `SessionState`'s pending routings exists to prevent.
+    fn before_output(error: impl Into<EngineError>) -> Self {
+        Self {
+            error: error.into(),
+            partial: String::new(),
+            evidence: Usage::default(),
+        }
+    }
+
+    /// A failure once the answer had begun.
+    ///
+    /// A delta cannot exist without a prefill, so a non-empty partial is proof
+    /// the whole prompt was processed and the evidence bills it as input. The
+    /// output and cached counts stay zero: the provider never reported them,
+    /// and a fabricated count would be billed to a client as if measured.
+    fn mid_stream(error: impl Into<EngineError>, partial: String, isl_tokens: u64) -> Self {
+        let evidence = if partial.is_empty() {
+            Usage::default()
+        } else {
+            Usage {
+                input_tokens: isl_tokens,
+                cached_input_tokens: 0,
+                output_tokens: 0,
+            }
+        };
+        Self {
+            error: error.into(),
+            partial,
+            evidence,
         }
     }
 }
@@ -146,6 +222,18 @@ pub struct Engine<S: SessionStore, T: Tokenizer + Clone> {
     frontier_client: Arc<dyn FrontierClient>,
     policy: Arc<dyn RoutingPolicy>,
     config: EngineConfig,
+    /// One gate per session, held for the whole of [`Engine::run_turn`].
+    ///
+    /// The lease fences *nodes*; it deliberately re-grants to its own node so a
+    /// recovering process is not locked out by its previous life. Within one
+    /// node that leniency would let two concurrent turns on a session both pass
+    /// admission and interleave their writes, so turns are serialized here.
+    /// Entries are never removed — bounded by the sessions this process serves,
+    /// which is acceptable for a single-process skeleton. The cross-process
+    /// version of this guarantee is a fencing token on [`Lease`]
+    /// (`roundhouse_core::store::Lease`) that every store call validates; that
+    /// replaces this map when the Redis store arrives.
+    turn_gates: Mutex<HashMap<SessionId, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
@@ -167,7 +255,19 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             frontier_client,
             policy,
             config,
+            turn_gates: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The serialization gate for one session's turns.
+    fn turn_gate(&self, session_id: &SessionId) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(
+            self.turn_gates
+                .lock()
+                .expect("turn-gate map poisoned")
+                .entry(session_id.clone())
+                .or_default(),
+        )
     }
 
     pub fn with_fleet(mut self, fleet: Arc<dyn LocalFleet>) -> Self {
@@ -200,6 +300,10 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         turn_id: TurnId,
         input: Vec<Item>,
     ) -> Result<TurnResult, EngineError> {
+        // See `turn_gates`: within this node, one turn at a time per session.
+        let gate = self.turn_gate(session_id);
+        let _turn = gate.lock().await;
+
         let mut session = Session::open(
             Arc::clone(&self.store),
             session_id.clone(),
@@ -239,6 +343,14 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             });
         }
 
+        // Held across dispatch *and* settle. A model call outlives the lease TTL
+        // routinely, and without renewal every one of those turns would be
+        // fenced at commit and throw away an answer already paid for; the
+        // settle's own appends land after the whole stream, so they need the
+        // lease just as much. Renewing at a third of the TTL tolerates two lost
+        // ticks before a live owner is declared dead.
+        let _heartbeat = session.heartbeat(self.config.lease_ttl_ms / 3, self.config.lease_ttl_ms);
+
         let outcome = self.dispatch(&mut session, &response_id).await;
 
         // The one settle seam. Every admitted turn terminates its response and
@@ -248,29 +360,41 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         // `is_terminal` and make the next retry duplicate this turn's input
         // forever rather than replay it.
         let settled = match outcome {
-            Ok((text, usage, decision)) => {
+            Ok(Completed {
+                text,
+                usage,
+                decision,
+            }) => {
                 let committed = session.complete(&response_id, &text, usage.clone()).await;
                 committed
                     .map(|()| (text, usage, decision))
                     .map_err(EngineError::from)
             }
-            Err(error) => {
-                // Terminating a failed dispatch is also what tells the cache
-                // ledger the prompt reached the provider. Best-effort: the
+            Err(Failed {
+                error,
+                partial,
+                evidence,
+            }) => {
+                // Terminating a failed dispatch is what commits the partial for
+                // a successor to resume from, and what tells the cache ledger
+                // whether the prompt reached the provider. Best-effort: the
                 // usual reason this append fails is a lost lease, and the
                 // original error is the better diagnosis.
                 let _ = session
                     .mark_incomplete(
                         &response_id,
-                        "",
+                        partial,
                         IncompleteReason::UpstreamError,
-                        Usage::default(),
+                        evidence,
                     )
                     .await;
                 Err(error)
             }
         };
         let last_seq = session.last_seq();
+        // Stop renewing before handing the lease back, so no renewal can land
+        // after the release and re-own a session this node has finished with.
+        drop(_heartbeat);
         let _ = session.release().await;
 
         let (text, usage, decision) = settled?;
@@ -288,12 +412,92 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
     ///
     /// Split out so that all of it is fallible in one place: every step here
     /// leaves a response open and a lease held, and [`Engine::run_turn`] is the
-    /// only thing allowed to settle either.
+    /// only thing allowed to settle either. The error boundary inside is the
+    /// moment the stream opens — everything before it fails as a plain
+    /// [`EngineError`] with nothing to show, everything after fails as
+    /// [`Failed`] carrying the partial — so the conversion happens exactly once,
+    /// at the seam [`Engine::plan`] returns through.
     async fn dispatch(
         &self,
         session: &mut Session<S>,
         response_id: &ResponseId,
-    ) -> Result<(String, Usage, Decision), EngineError> {
+    ) -> Result<Completed, Failed> {
+        // One deadline for every model await in this turn, taken before any of
+        // them: a provider that hangs after accepting the request settles the
+        // turn here rather than leaving a stuck owner renewing its lease. Store
+        // appends are deliberately not under it — the heartbeat renews through
+        // the same store, so a hung store stops the renewals by itself and
+        // cannot keep the lease alive.
+        let deadline_at = Instant::now() + Duration::from_millis(self.config.turn_deadline_ms);
+
+        let (mut stream, decision, isl_tokens) = self
+            .plan(session, response_id, deadline_at)
+            .await
+            .map_err(Failed::before_output)?;
+
+        // One fold for both targets: a response is a stream of deltas, and each
+        // one becomes durable as it arrives rather than at the end. That is
+        // what lets a successor resume a half-written answer, and what makes
+        // TTFT a measured quantity — the first `OutputTextDelta.at_ms` in the
+        // log minus the `Routed.at_ms` before it — instead of the model's own
+        // estimate of itself.
+        let mut text = String::new();
+        let mut usage = Usage::default();
+        loop {
+            let chunk = match tokio::time::timeout_at(deadline_at, stream.next()).await {
+                Ok(Some(Ok(chunk))) => chunk,
+                Ok(Some(Err(error))) => {
+                    return Err(Failed::mid_stream(error, text, isl_tokens as u64));
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    return Err(Failed::mid_stream(
+                        self.deadline_struck(),
+                        text,
+                        isl_tokens as u64,
+                    ));
+                }
+            };
+            match chunk {
+                FrontierChunk::OutputText(part) => {
+                    // Durable before it is accumulated: what the client is told
+                    // it received must never be ahead of what the log holds.
+                    if let Err(error) = session.append_output(response_id, &part).await {
+                        return Err(Failed::mid_stream(error, text, isl_tokens as u64));
+                    }
+                    text.push_str(&part);
+                }
+                FrontierChunk::Done {
+                    input_tokens,
+                    cached_input_tokens,
+                    output_tokens,
+                } => {
+                    usage = Usage {
+                        input_tokens,
+                        cached_input_tokens,
+                        output_tokens,
+                    };
+                }
+            }
+        }
+
+        Ok(Completed {
+            text,
+            usage,
+            decision,
+        })
+    }
+
+    /// Everything up to the opened stream: price, choose, record, connect.
+    ///
+    /// Nothing here has produced output yet, so every failure is a plain
+    /// [`EngineError`]; [`Engine::dispatch`] converts at its seam.
+    async fn plan(
+        &self,
+        session: &mut Session<S>,
+        response_id: &ResponseId,
+        deadline_at: Instant,
+    ) -> Result<(FrontierStream, Decision, usize), EngineError> {
         // Rebuild the prompt from the committed log, so what we price is
         // exactly what a successor would reconstruct.
         let assembler = ContextAssembler::rehydrate(
@@ -307,15 +511,17 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         // --- price every option -------------------------------------------
         let local_quote = match &self.fleet {
             Some(fleet) => {
-                fleet
-                    .price(&FleetQuery::for_buffer(
+                self.bounded(
+                    deadline_at,
+                    fleet.price(&FleetQuery::for_buffer(
                         assembler.buffer(),
                         self.config.local_model.clone(),
                         self.config.routing_group.clone(),
                         Some(self.config.expected_output_tokens),
                         Some(session.session_id().to_string()),
-                    ))
-                    .await?
+                    )),
+                )
+                .await?
             }
             None => None,
         };
@@ -336,14 +542,16 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
 
         // --- choose --------------------------------------------------------
         let decision = self
-            .policy
-            .choose(&RoutingContext {
-                session_id: session.session_id(),
-                turn_index,
-                isl_tokens,
-                candidates: &candidates,
-                ledger: session.ledger(),
-            })
+            .bounded(
+                deadline_at,
+                self.policy.choose(&RoutingContext {
+                    session_id: session.session_id(),
+                    turn_index,
+                    isl_tokens,
+                    candidates: &candidates,
+                    ledger: session.ledger(),
+                }),
+            )
             .await?;
 
         let chosen = candidates
@@ -369,8 +577,8 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             )
             .await?;
 
-        // --- execute -------------------------------------------------------
-        let (text, usage) = match &decision.target {
+        // --- connect -------------------------------------------------------
+        let stream = match &decision.target {
             Target::Local { .. } => {
                 let quote = local_quote
                     .as_ref()
@@ -379,78 +587,103 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                     .fleet
                     .as_ref()
                     .ok_or_else(|| EngineError::UnresolvableTarget(decision.target.clone()))?;
-
-                // Book only now that local has actually won. Had the frontier
-                // won, the pending selection would simply expire unclaimed.
-                let reservation = Arc::clone(fleet).reserve(quote).await?;
-                let outcome = self
-                    .local_executor
-                    .execute(
-                        &quote.endpoint,
-                        assembler.buffer().tokens(),
-                        Some(self.config.expected_output_tokens),
-                    )
-                    .await;
-
-                // Settle regardless of outcome. A leaked reservation would
-                // permanently distort this worker's load.
-                reservation.prefill_complete().await?;
-                let settled = reservation.release().await;
-                let outcome = outcome?;
-                settled?;
-
-                let cached = isl_tokens.saturating_sub(quote.effective_prefill_tokens);
-                (
-                    outcome.text,
-                    Usage {
-                        input_tokens: isl_tokens as u64,
-                        cached_input_tokens: cached as u64,
-                        output_tokens: outcome.output_tokens,
-                    },
+                self.local_stream(
+                    fleet,
+                    quote,
+                    assembler.buffer().tokens(),
+                    isl_tokens,
+                    deadline_at,
                 )
+                .await?
             }
             Target::Frontier { .. } => {
-                let chunks = self
-                    .frontier_client
-                    .execute(&FrontierQuote {
-                        target: decision.target.clone(),
-                        prompt: assembler.rendered(),
-                        // Stable for the life of the session: providers use it
-                        // to steer requests to the same cache node, so varying
-                        // it would defeat the hit we just routed on.
-                        prompt_cache_key: session.session_id().to_string(),
-                        expected_output_tokens: Some(self.config.expected_output_tokens),
-                    })
-                    .await?;
-                fold_frontier_chunks(chunks)
+                let quote = FrontierQuote {
+                    target: decision.target.clone(),
+                    prompt: assembler.rendered(),
+                    // Stable for the life of the session: providers use it to
+                    // steer requests to the same cache node, so varying it
+                    // would defeat the hit we just routed on.
+                    prompt_cache_key: session.session_id().to_string(),
+                    expected_output_tokens: Some(self.config.expected_output_tokens),
+                };
+                self.bounded(deadline_at, self.frontier_client.execute(&quote))
+                    .await?
             }
         };
 
-        Ok((text, usage, decision))
+        Ok((stream, decision, isl_tokens))
     }
-}
 
-/// Concatenate a provider's chunks into a response plus usage.
-fn fold_frontier_chunks(chunks: Vec<FrontierChunk>) -> (String, Usage) {
-    let mut text = String::new();
-    let mut usage = Usage::default();
-    for chunk in chunks {
-        match chunk {
-            FrontierChunk::OutputText(part) => text.push_str(&part),
-            FrontierChunk::Done {
-                input_tokens,
-                cached_input_tokens,
-                output_tokens,
-            } => {
-                usage = Usage {
-                    input_tokens,
-                    cached_input_tokens,
-                    output_tokens,
-                };
-            }
+    /// Run a local worker and present what it produced as a stream.
+    ///
+    /// An adapter at the boundary rather than streaming: [`LocalExecutor`]
+    /// returns a whole [`LocalExecution`], so both chunks here are synthesized
+    /// after it returns and no delta lands any earlier than the last token
+    /// does. Real local streaming arrives with a worker client that can emit
+    /// deltas, and [`LocalExecutor`]'s signature does not change until it does.
+    /// Keeping the adapter here means the durable-delta fold is already the
+    /// only path any response takes, so that client replaces this function
+    /// instead of adding a second way for output to reach the log.
+    async fn local_stream(
+        &self,
+        fleet: &Arc<dyn LocalFleet>,
+        quote: &LocalQuote,
+        prompt_tokens: &[u32],
+        isl_tokens: usize,
+        deadline_at: Instant,
+    ) -> Result<FrontierStream, EngineError> {
+        // Book only now that local has actually won. Had the frontier won, the
+        // pending selection would simply expire unclaimed.
+        let reservation = self
+            .bounded(deadline_at, Arc::clone(fleet).reserve(quote))
+            .await?;
+        let outcome = tokio::time::timeout_at(
+            deadline_at,
+            self.local_executor.execute(
+                &quote.endpoint,
+                prompt_tokens,
+                Some(self.config.expected_output_tokens),
+            ),
+        )
+        .await;
+
+        // Settle regardless of outcome, a struck deadline included, and never
+        // under the deadline: these are in-process selection-service calls, not
+        // model awaits, and bounding them by a deadline that already struck
+        // would guarantee the very leak — a reservation dropped unreleased,
+        // permanently distorting this worker's load — that settling exists to
+        // prevent. Release always runs; the first failure in temporal order
+        // (prefill, execution, release) is the one reported.
+        let prefill = reservation.prefill_complete().await;
+        let released = reservation.release().await;
+        prefill?;
+        let outcome = outcome.map_err(|_| self.deadline_struck())??;
+        released?;
+
+        let cached = isl_tokens.saturating_sub(quote.effective_prefill_tokens);
+        Ok(FrontierChunk::whole_response(
+            outcome.text,
+            isl_tokens as u64,
+            cached as u64,
+            outcome.output_tokens,
+        ))
+    }
+
+    /// Run one model-facing future under the turn deadline.
+    async fn bounded<T2, E, F>(&self, deadline_at: Instant, future: F) -> Result<T2, EngineError>
+    where
+        F: Future<Output = Result<T2, E>>,
+        EngineError: From<E>,
+    {
+        match tokio::time::timeout_at(deadline_at, future).await {
+            Ok(result) => result.map_err(EngineError::from),
+            Err(_) => Err(self.deadline_struck()),
         }
     }
-    (text, usage)
+
+    fn deadline_struck(&self) -> EngineError {
+        EngineError::TurnDeadline(self.config.turn_deadline_ms)
+    }
 }
 
 /// Recover a completed response's text from the log.

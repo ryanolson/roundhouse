@@ -21,7 +21,7 @@ pub mod local;
 
 pub use frontier::{
     EchoFrontierClient, FrontierChunk, FrontierClient, FrontierError, FrontierModelSpec,
-    FrontierQuote, StaticFrontierCatalog,
+    FrontierQuote, FrontierStream, StaticFrontierCatalog,
 };
 pub use local::{
     EmbeddedFleet, FleetError, FleetQuery, LocalFleet, LocalQuote, Reservation, WorkerRegistration,

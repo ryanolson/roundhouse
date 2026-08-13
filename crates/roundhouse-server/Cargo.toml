@@ -39,3 +39,9 @@ uuid = { workspace = true }
 # The end-to-end cache-hit proof drives a real mock engine that publishes KV
 # events into the embedded selection service. See tests/mocker_cache_hits.rs.
 dynamo-mocker = { workspace = true }
+
+# The SSE tests drive the router as a `tower::Service` and read response bodies
+# frame by frame, which is the only way to assert on a stream that has not ended
+# yet. Both are already in the tree as axum dependencies. See tests/http_sse.rs.
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
