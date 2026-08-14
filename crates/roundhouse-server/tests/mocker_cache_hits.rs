@@ -135,6 +135,7 @@ impl LocalExecutor for MockerExecutor {
         Ok(LocalExecution {
             text: REPLY.to_string(),
             output_tokens,
+            reasoning_tokens: 0,
         })
     }
 }

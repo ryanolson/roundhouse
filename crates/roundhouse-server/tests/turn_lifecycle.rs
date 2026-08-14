@@ -78,6 +78,7 @@ impl LocalExecutor for SlowLocalExecutor {
         Ok(LocalExecution {
             text: "local answer".to_string(),
             output_tokens: 2,
+            reasoning_tokens: 0,
         })
     }
 }
@@ -251,6 +252,7 @@ impl LocalExecutor for HangingLocalExecutor {
         Ok(LocalExecution {
             text: "local answer".to_string(),
             output_tokens: 2,
+            reasoning_tokens: 0,
         })
     }
 }
@@ -503,6 +505,7 @@ async fn deltas_are_durable_before_the_response_completes() {
             input_tokens: 40,
             cached_input_tokens: 0,
             output_tokens: 3,
+            reasoning_tokens: 0,
         }))
         .await
         .unwrap();

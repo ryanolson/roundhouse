@@ -24,6 +24,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::event::Usage;
 use crate::routing::Target;
 
 /// How a target's prefix cache expires.
@@ -111,6 +112,61 @@ impl ProviderPricing {
             cache_write_per_mtok_usd: 0.0,
             output_per_mtok_usd: 0.0,
         }
+    }
+
+    /// The rate an uncached prompt token is billed at.
+    ///
+    /// Uncached prompt tokens are also *written* into the cache, so a provider
+    /// that charges a premium for the write bills them at that rate rather
+    /// than the plain input rate. A zero cache-write rate means the provider
+    /// does not price the write separately, not that writes are free.
+    pub fn effective_write_per_mtok_usd(&self) -> f64 {
+        if self.cache_write_per_mtok_usd > 0.0 {
+            self.cache_write_per_mtok_usd
+        } else {
+            self.input_per_mtok_usd
+        }
+    }
+
+    /// Price a call from its token counts.
+    ///
+    /// The one definition of what a call costs. Both the routing quote, which
+    /// works in fractional expected tokens, and the metrics rollup, which works
+    /// in measured integer counts, go through here — a second copy of this
+    /// arithmetic would let the dashboard's "what we paid" drift from the
+    /// router's "what we thought it would cost", and the gap between those two
+    /// numbers is exactly what tells you the cache model is wrong.
+    pub fn price_tokens(&self, uncached_input: f64, cached_input: f64, output: f64) -> f64 {
+        const PER_MTOK: f64 = 1e-6;
+        uncached_input * self.effective_write_per_mtok_usd() * PER_MTOK
+            + cached_input * self.cached_input_per_mtok_usd * PER_MTOK
+            + output * self.output_per_mtok_usd * PER_MTOK
+    }
+
+    /// Price a measured call.
+    ///
+    /// Reasoning tokens are not added: they are already inside
+    /// `output_tokens`, and every provider that reports them bills them as
+    /// ordinary output.
+    pub fn price(&self, usage: &Usage) -> f64 {
+        self.price_tokens(
+            usage.uncached_input_tokens() as f64,
+            usage.cached_input_tokens as f64,
+            usage.output_tokens as f64,
+        )
+    }
+
+    /// What the cached portion of a call saved against paying full freight.
+    ///
+    /// Measured money, not a counterfactual about routing: these tokens were
+    /// sent, the provider reported them as cache reads, and the difference
+    /// between the two published rates is the discount it applied. The whole
+    /// design exists to make this number large.
+    pub fn cache_savings(&self, usage: &Usage) -> f64 {
+        const PER_MTOK: f64 = 1e-6;
+        let discount =
+            (self.effective_write_per_mtok_usd() - self.cached_input_per_mtok_usd).max(0.0);
+        usage.cached_input_tokens as f64 * discount * PER_MTOK
     }
 }
 
@@ -207,19 +263,7 @@ impl CacheLedger {
         let (_, pricing) = self.model_for(target);
         let cached = self.expected_cached_tokens(target, now_ms, isl_tokens);
         let uncached = (isl_tokens as f64 - cached).max(0.0);
-
-        // Uncached prompt tokens are also written into the cache, so they are
-        // priced at the write rate when the provider charges one.
-        let write_rate = if pricing.cache_write_per_mtok_usd > 0.0 {
-            pricing.cache_write_per_mtok_usd
-        } else {
-            pricing.input_per_mtok_usd
-        };
-
-        let per_mtok = 1e-6;
-        uncached * write_rate * per_mtok
-            + cached * pricing.cached_input_per_mtok_usd * per_mtok
-            + expected_output_tokens as f64 * pricing.output_per_mtok_usd * per_mtok
+        pricing.price_tokens(uncached, cached, expected_output_tokens as f64)
     }
 }
 

@@ -15,7 +15,7 @@ use std::sync::Arc;
 use roundhouse_core::routing::{CacheModel, ProviderPricing};
 use roundhouse_fleet::{
     EmbeddedFleet, FrontierModelSpec, KvRouterConfig, SelectionServiceBuilder,
-    StaticFrontierCatalog, WorkerRegistration,
+    StaticFrontierCatalog, WireProtocol, WorkerRegistration,
 };
 use roundhouse_server::EngineConfig;
 
@@ -28,6 +28,7 @@ pub fn frontier_catalog() -> StaticFrontierCatalog {
     StaticFrontierCatalog::new(vec![FrontierModelSpec {
         provider: "anthropic".into(),
         model: "claude".into(),
+        wire_protocol: WireProtocol::AnthropicMessages,
         cache_model: CacheModel::Deterministic { ttl_ms: 5 * MINUTE },
         pricing: ProviderPricing {
             input_per_mtok_usd: 3.0,

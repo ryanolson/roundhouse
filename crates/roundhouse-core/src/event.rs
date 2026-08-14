@@ -17,6 +17,14 @@ use crate::item::Item;
 use crate::routing::DecisionRecord;
 
 /// Token accounting for one completed model call.
+///
+/// Two of these four fields are *components* of the other two rather than
+/// additions to them: `cached_input_tokens` is part of `input_tokens`, and
+/// `reasoning_tokens` is part of `output_tokens`. Both providers Roundhouse
+/// targets report them that way — OpenAI nests them under
+/// `input_tokens_details` / `output_tokens_details`, and Anthropic bills
+/// thinking as ordinary output — so storing them as separate addends would
+/// double-count every total downstream, including the one billed to a client.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u64,
@@ -27,11 +35,85 @@ pub struct Usage {
     /// whole design exists to maximize.
     pub cached_input_tokens: u64,
     pub output_tokens: u64,
+    /// Portion of `output_tokens` spent on reasoning the client never sees.
+    ///
+    /// Zero for models without a thinking mode, which is why it carries a
+    /// serde default: logs written before this field existed deserialize as
+    /// "no reasoning" rather than failing, and that reading is correct for
+    /// every model that was routable at the time.
+    #[serde(default)]
+    pub reasoning_tokens: u64,
+    /// Whether these counts came from the provider or from our own tokenizer.
+    ///
+    /// Load-bearing for the metrics layer rather than diagnostic. A streaming
+    /// OpenAI-compatible endpoint reports no usage at all unless the request
+    /// asked for it, and an unreported call folded into a rollup as zero
+    /// tokens and zero dollars is indistinguishable from a saving — the
+    /// dashboard would look its best exactly when its instrumentation was
+    /// broken. Marking the call keeps that gap visible as a gap.
+    #[serde(default)]
+    pub accounting: Accounting,
+}
+
+/// Where a [`Usage`]'s counts came from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Accounting {
+    /// The provider (or, locally, the scheduler) reported them.
+    ///
+    /// The default, and the right reading for every log written before this
+    /// field existed: usage was only ever recorded from a provider's own
+    /// accounting chunk, so a record that predates the field was reported.
+    #[default]
+    Reported,
+    /// The provider returned no usage and these are Roundhouse's own counts.
+    ///
+    /// Input is trustworthy — it is the prompt we tokenized and routed on —
+    /// and output is a tokenization of what we received. Cached input is not
+    /// estimated at all but left at zero, because no local evidence bears on
+    /// what a remote cache did, and guessing high would inflate the one number
+    /// this whole system is judged by.
+    Estimated,
 }
 
 impl Usage {
+    /// Billable tokens for this call.
+    ///
+    /// Cached input and reasoning output are deliberately absent: they are
+    /// already inside the two terms. See the type's own note.
     pub fn total(&self) -> u64 {
         self.input_tokens + self.output_tokens
+    }
+
+    /// Prompt tokens that were not served from cache, and so had to be
+    /// prefilled. The complement of the quantity the routing optimizes for.
+    pub fn uncached_input_tokens(&self) -> u64 {
+        self.input_tokens.saturating_sub(self.cached_input_tokens)
+    }
+
+    /// Output tokens the client actually received, i.e. excluding reasoning.
+    pub fn visible_output_tokens(&self) -> u64 {
+        self.output_tokens.saturating_sub(self.reasoning_tokens)
+    }
+
+    /// Accumulate another call into this one.
+    ///
+    /// Saturating rather than wrapping: a metrics rollup that wrapped at
+    /// `u64::MAX` would report a near-zero total for the busiest deployment on
+    /// the fleet, which is the one case where the number matters most.
+    pub fn add(&mut self, other: &Usage) {
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.cached_input_tokens = self
+            .cached_input_tokens
+            .saturating_add(other.cached_input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.reasoning_tokens = self.reasoning_tokens.saturating_add(other.reasoning_tokens);
+        // Provenance degrades on contact: a total that mixes reported and
+        // estimated calls is an estimate, and rounding that up to "reported"
+        // would launder exactly the uncertainty this field exists to carry.
+        if other.accounting == Accounting::Estimated {
+            self.accounting = Accounting::Estimated;
+        }
     }
 }
 

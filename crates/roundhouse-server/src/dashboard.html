@@ -1,0 +1,774 @@
+<!doctype html>
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+The Roundhouse metrics dashboard.
+
+One file, no build step, no request to any host but this one: a deployment that
+can reach the API can see this page, and an air-gapped fleet — where a dashboard
+matters most — does not render blank because a CDN was unreachable.
+
+Everything here is a view of GET /v1/metrics. There is no state on this page
+that the API does not have, so a hard refresh loses nothing.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Roundhouse Metrics</title>
+<style>
+  /* Palette. Light values on :root, dark redefined under both the OS setting
+     and an explicit toggle, so a wall display can be pinned either way. Only
+     the tokens change between modes; nothing below references a raw hex. */
+  :root {
+    color-scheme: light;
+    --page:            #f9f9f7;
+    --surface:         #fcfcfb;
+    --text-primary:    #0b0b0b;
+    --text-secondary:  #52514e;
+    --text-muted:      #898781;
+    --gridline:        #e1e0d9;
+    --baseline:        #c3c2b7;
+    --border:          rgba(11, 11, 11, 0.10);
+    --good:            #006300;
+    --warning:         #fab219;
+    --critical:        #d03b3b;
+    /* Categorical slots, in stack order. Validated as a set against this
+       surface: worst adjacent pair ΔE 9.1 under protanopia, 22.9 normal. */
+    --cached-input:    #2a78d6;
+    --uncached-input:  #eb6834;
+    --output:          #1baf7a;
+    --reasoning:       #eda100;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --page:            #0d0d0d;
+      --surface:         #1a1a19;
+      --text-primary:    #ffffff;
+      --text-secondary:  #c3c2b7;
+      --text-muted:      #898781;
+      --gridline:        #2c2c2a;
+      --baseline:        #383835;
+      --border:          rgba(255, 255, 255, 0.10);
+      --good:            #0ca30c;
+      --warning:         #fab219;
+      --critical:        #d03b3b;
+      --cached-input:    #3987e5;
+      --uncached-input:  #d95926;
+      --output:          #199e70;
+      --reasoning:       #c98500;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page:            #0d0d0d;
+    --surface:         #1a1a19;
+    --text-primary:    #ffffff;
+    --text-secondary:  #c3c2b7;
+    --text-muted:      #898781;
+    --gridline:        #2c2c2a;
+    --baseline:        #383835;
+    --border:          rgba(255, 255, 255, 0.10);
+    --good:            #0ca30c;
+    --warning:         #fab219;
+    --critical:        #d03b3b;
+    --cached-input:    #3987e5;
+    --uncached-input:  #d95926;
+    --output:          #199e70;
+    --reasoning:       #c98500;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 32px 28px 64px;
+    background: var(--page);
+    color: var(--text-primary);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; }
+
+  /* --- header ---------------------------------------------------------- */
+  header {
+    display: flex; align-items: baseline; gap: 16px;
+    flex-wrap: wrap; margin-bottom: 28px;
+  }
+  h1 { font-size: 20px; font-weight: 600; margin: 0; letter-spacing: -0.01em; }
+  .window { color: var(--text-muted); font-size: 13px; }
+  .spacer { flex: 1 1 auto; }
+  button {
+    font: inherit; font-size: 13px; color: var(--text-secondary);
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 7px; padding: 5px 11px; cursor: pointer;
+  }
+  button:hover { color: var(--text-primary); }
+  .pulse {
+    display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+    background: var(--good); margin-right: 7px; vertical-align: middle;
+  }
+  .pulse.stale { background: var(--critical); }
+
+  /* --- cards ----------------------------------------------------------- */
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 12px; padding: 20px 22px; margin-bottom: 18px;
+  }
+  .card h2 {
+    font-size: 12px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.07em; color: var(--text-muted);
+    margin: 0 0 4px;
+  }
+  .card .note {
+    font-size: 12.5px; color: var(--text-muted); margin: 0 0 18px;
+    max-width: 70ch;
+  }
+
+  /* --- hero ------------------------------------------------------------ */
+  .hero-value {
+    font-size: 56px; font-weight: 650; letter-spacing: -0.025em;
+    line-height: 1.05; margin: 6px 0 2px; color: var(--good);
+  }
+  .hero-sub { color: var(--text-secondary); font-size: 13.5px; }
+  .split {
+    display: grid; gap: 20px 34px; margin-top: 22px;
+    grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  }
+  .split-label {
+    font-size: 12px; color: var(--text-muted);
+    display: flex; align-items: center; gap: 7px;
+  }
+  .split-value {
+    font-size: 23px; font-weight: 600; letter-spacing: -0.015em;
+    margin-top: 3px;
+  }
+  .split-note { font-size: 12px; color: var(--text-muted); margin-top: 3px; }
+
+  /* Provenance chips. Text, never color alone: "estimated" is a claim about
+     how much to trust the number beside it, and it has to survive a
+     screenshot in grayscale. */
+  .chip {
+    display: inline-block; font-size: 10.5px; font-weight: 600;
+    letter-spacing: 0.05em; text-transform: uppercase;
+    padding: 2px 7px; border-radius: 5px;
+    border: 1px solid var(--border); color: var(--text-secondary);
+    white-space: nowrap;
+  }
+
+  /* --- KPI row --------------------------------------------------------- */
+  .kpis {
+    display: grid; gap: 14px; margin-bottom: 18px;
+    grid-template-columns: repeat(auto-fit, minmax(212px, 1fr));
+  }
+  .kpi { background: var(--surface); border: 1px solid var(--border);
+         border-radius: 12px; padding: 16px 18px; }
+  .kpi-label { font-size: 12px; color: var(--text-muted); }
+  .kpi-value {
+    font-size: 26px; font-weight: 600; letter-spacing: -0.02em; margin-top: 4px;
+  }
+  .kpi-note { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+
+  /* --- stacked bars ---------------------------------------------------- */
+  /* A 2px surface gap separates segments rather than a stroke around each:
+     a border would darken every boundary and read as a fifth class. */
+  .stack { display: flex; height: 12px; border-radius: 4px; overflow: hidden; gap: 2px; }
+  .seg { height: 100%; min-width: 0; }
+  .seg:first-child { border-radius: 4px 0 0 4px; }
+  .seg:last-child  { border-radius: 0 4px 4px 0; }
+  .seg:only-child  { border-radius: 4px; }
+  .seg.cached-input   { background: var(--cached-input); }
+  .seg.uncached-input { background: var(--uncached-input); }
+  .seg.output         { background: var(--output); }
+  .seg.reasoning      { background: var(--reasoning); }
+  .stack-empty {
+    height: 12px; border-radius: 4px; background: var(--gridline);
+  }
+
+  .legend {
+    display: flex; flex-wrap: wrap; gap: 18px;
+    margin: 0 0 16px; font-size: 12.5px; color: var(--text-secondary);
+  }
+  .legend span { display: inline-flex; align-items: center; gap: 7px; }
+  .swatch { width: 10px; height: 10px; border-radius: 3px; flex: none; }
+
+  /* --- tables ---------------------------------------------------------- */
+  .scroll { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: right; padding: 9px 10px; white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; padding-left: 0; }
+  th:last-child, td:last-child { padding-right: 0; }
+  thead th {
+    font-size: 11px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.06em; color: var(--text-muted);
+    border-bottom: 1px solid var(--baseline); padding-bottom: 7px;
+  }
+  tbody tr { border-bottom: 1px solid var(--gridline); }
+  tbody tr:last-child { border-bottom: none; }
+  /* Columns of figures align only with tabular figures; the hero number
+     deliberately keeps proportional ones. */
+  td.num, th.num { font-variant-numeric: tabular-nums; }
+  td.name { font-weight: 550; }
+  th.text, td.text { text-align: left; }
+  .sub { display: block; font-size: 11.5px; color: var(--text-muted); font-weight: 400; }
+  .bar-cell { width: 210px; min-width: 160px; }
+  .dim { color: var(--text-muted); }
+
+  /* --- mode split ------------------------------------------------------ */
+  .modes { display: grid; gap: 20px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+  .mode-head { display: flex; align-items: baseline; gap: 10px; }
+  .mode-name { font-weight: 600; font-size: 14px; }
+  .mode-share { color: var(--text-muted); font-size: 12.5px; }
+  .meter {
+    height: 8px; border-radius: 4px; background: var(--gridline);
+    margin: 10px 0 12px; overflow: hidden;
+  }
+  .meter-fill { height: 100%; border-radius: 4px; background: var(--cached-input); }
+  .meter-fill.frontier { background: var(--uncached-input); }
+  .mode-facts { display: flex; gap: 26px; font-size: 12.5px; color: var(--text-secondary); }
+  .mode-facts b { display: block; font-size: 17px; font-weight: 600;
+                  color: var(--text-primary); font-variant-numeric: tabular-nums; }
+
+  /* --- tooltip --------------------------------------------------------- */
+  #tip {
+    position: fixed; z-index: 10; pointer-events: none; opacity: 0;
+    transition: opacity 90ms ease; background: var(--surface);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 9px 11px; font-size: 12.5px; line-height: 1.45;
+    box-shadow: 0 6px 22px rgba(0,0,0,0.16); max-width: 280px;
+  }
+  #tip b { font-variant-numeric: tabular-nums; }
+
+  .empty { color: var(--text-muted); padding: 26px 0; text-align: center; }
+  .banner {
+    border: 1px solid var(--border); border-left: 3px solid var(--warning);
+    border-radius: 8px; padding: 11px 14px; margin-bottom: 18px;
+    font-size: 13px; color: var(--text-secondary); background: var(--surface);
+  }
+  .banner strong { color: var(--text-primary); }
+  code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px; color: var(--text-secondary);
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Roundhouse</h1>
+    <span class="window" id="window">connecting…</span>
+    <span class="spacer"></span>
+    <span class="window"><span class="pulse" id="pulse"></span><span id="freshness">—</span></span>
+    <button id="theme" type="button">Theme</button>
+  </header>
+
+  <div id="alerts"></div>
+
+  <section class="card">
+    <h2>Estimated savings</h2>
+    <div class="hero-value" id="savings-total">$0.00</div>
+    <div class="hero-sub" id="savings-sub">against issuing every turn to a hosted endpoint at list price</div>
+    <div class="split">
+      <div class="split-item">
+        <div class="split-label">Provider cache discount <span class="chip">measured</span></div>
+        <div class="split-value" id="savings-cache">$0.00</div>
+        <div class="split-note">Prompt tokens a provider billed at its cache-read rate.</div>
+      </div>
+      <div class="split-item">
+        <div class="split-label">Served locally instead <span class="chip">estimated</span></div>
+        <div class="split-value" id="savings-routing">$0.00</div>
+        <div class="split-note" id="savings-routing-note">Priced against each local model's correlary.</div>
+      </div>
+      <div class="split-item">
+        <div class="split-label">Router's own quote <span class="chip">cross-check</span></div>
+        <div class="split-value dim" id="savings-quoted">$0.00</div>
+        <div class="split-note">What the router priced the hosted alternative at, at decision time. Not added in.</div>
+      </div>
+    </div>
+  </section>
+
+  <div class="kpis">
+    <div class="kpi">
+      <div class="kpi-label">Spent on hosted endpoints</div>
+      <div class="kpi-value" id="kpi-spend">$0.00</div>
+      <div class="kpi-note" id="kpi-spend-note">measured</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">Tokens served</div>
+      <div class="kpi-value" id="kpi-tokens">0</div>
+      <div class="kpi-note" id="kpi-calls">0 calls · 0 sessions</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">Prompt served from cache</div>
+      <div class="kpi-value" id="kpi-cache">0%</div>
+      <div class="kpi-note" id="kpi-cache-note">of all prompt tokens</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">Accounting coverage</div>
+      <div class="kpi-value" id="kpi-coverage">100%</div>
+      <div class="kpi-note" id="kpi-coverage-note">of calls reported by the provider</div>
+    </div>
+  </div>
+
+  <section class="card">
+    <h2>Where turns ran</h2>
+    <p class="note">
+      Our own fleet bills nothing and costs GPU time; a hosted endpoint bills real
+      money. The share below is of billed tokens, not of turns.
+    </p>
+    <div class="modes" id="modes"></div>
+  </section>
+
+  <section class="card">
+    <h2>Tokens by model</h2>
+    <p class="note">
+      Cached and uncached input sum to the prompt; reasoning is part of output, not
+      an addition to it, so the four segments sum to the total.
+    </p>
+    <div class="legend">
+      <span><i class="swatch" style="background:var(--cached-input)"></i>Cached input</span>
+      <span><i class="swatch" style="background:var(--uncached-input)"></i>Uncached input</span>
+      <span><i class="swatch" style="background:var(--output)"></i>Output</span>
+      <span><i class="swatch" style="background:var(--reasoning)"></i>Reasoning</span>
+    </div>
+    <div class="scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>Model</th>
+            <th class="bar-cell">Breakdown</th>
+            <th class="num">Input</th>
+            <th class="num">Cached</th>
+            <th class="num">Output</th>
+            <th class="num">Reasoning</th>
+            <th class="num">Calls</th>
+            <th class="num">Cost</th>
+          </tr>
+        </thead>
+        <tbody id="models"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>By provider</h2>
+    <div class="scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>Provider</th>
+            <th class="bar-cell">Breakdown</th>
+            <th class="num">Models</th>
+            <th class="num">Calls</th>
+            <th class="num">Tokens</th>
+            <th class="num">Cache hit</th>
+            <th class="num">Cost</th>
+          </tr>
+        </thead>
+        <tbody id="providers"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Local models and their correlaries</h2>
+    <p class="note">
+      A local model bills nothing, so its saving is what a comparable hosted model
+      would have charged for the same tokens. That stand-in is chosen here — by
+      declaration where someone has stated one, otherwise as the nearest hosted
+      model by traffic shape among those of comparable capability.
+    </p>
+    <div class="scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>Local model</th>
+            <th>Priced as</th>
+            <th class="text">Basis</th>
+            <th class="num">Would have cost</th>
+          </tr>
+        </thead>
+        <tbody id="correlaries"></tbody>
+      </table>
+    </div>
+  </section>
+</div>
+
+<div id="tip" role="tooltip"></div>
+
+<script>
+(() => {
+  "use strict";
+
+  const POLL_MS = 5000;
+  /** Past this without a successful poll the header stops claiming to be live. */
+  const STALE_MS = 15000;
+
+  const CLASSES = [
+    { key: "cached_input", css: "cached-input",   label: "Cached input" },
+    { key: "uncached",     css: "uncached-input", label: "Uncached input" },
+    { key: "visible",      css: "output",         label: "Output" },
+    { key: "reasoning",    css: "reasoning",      label: "Reasoning" },
+  ];
+
+  const $ = (id) => document.getElementById(id);
+  let lastOk = 0;
+
+  // --- formatting ---------------------------------------------------------
+
+  const nf = new Intl.NumberFormat("en-US");
+  const compact = new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 });
+
+  function tokens(n) {
+    return n >= 100000 ? compact.format(n) : nf.format(n);
+  }
+
+  /* Sub-cent figures are shown to four places rather than rounded to $0.00.
+     Early in a deployment every real number is sub-cent, and a dashboard that
+     rounds them all away looks broken rather than new. */
+  function usd(n) {
+    if (!isFinite(n)) return "—";
+    if (n === 0) return "$0.00";
+    const abs = Math.abs(n);
+    const digits = abs < 0.01 ? 4 : abs < 1000 ? 2 : 0;
+    return "$" + n.toLocaleString("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits });
+  }
+
+  const pct = (x) => (x * 100).toFixed(x >= 0.995 || x === 0 ? 0 : 1) + "%";
+
+  function ago(ms) {
+    const s = Math.round(ms / 1000);
+    if (s < 2) return "just now";
+    if (s < 60) return s + "s ago";
+    return Math.round(s / 60) + "m ago";
+  }
+
+  /** Split a token breakdown into the four disjoint classes the stack shows. */
+  function parts(t) {
+    return {
+      cached_input: t.cached_input,
+      uncached: t.uncached_input,
+      visible: Math.max(0, t.output - t.reasoning),
+      reasoning: t.reasoning,
+    };
+  }
+
+  // --- rendering ----------------------------------------------------------
+
+  function stack(t) {
+    const p = parts(t);
+    const total = CLASSES.reduce((sum, c) => sum + p[c.key], 0);
+    if (total === 0) {
+      const empty = document.createElement("div");
+      empty.className = "stack-empty";
+      empty.title = "no tokens recorded";
+      return empty;
+    }
+    const el = document.createElement("div");
+    el.className = "stack";
+    for (const c of CLASSES) {
+      const value = p[c.key];
+      if (value === 0) continue;
+      const seg = document.createElement("div");
+      seg.className = "seg " + c.css;
+      seg.style.flexGrow = String(value);
+      seg.style.flexBasis = "0";
+      // Both a hover tooltip and a title: the title is what survives a
+      // keyboard user, a screenshot, and printing.
+      const share = pct(value / total);
+      seg.title = `${c.label}: ${nf.format(value)} (${share})`;
+      seg.dataset.tip = `<b>${c.label}</b><br>${nf.format(value)} tokens · ${share}`;
+      el.appendChild(seg);
+    }
+    return el;
+  }
+
+  function cell(html, cls) {
+    const td = document.createElement("td");
+    if (cls) td.className = cls;
+    td.innerHTML = html;
+    return td;
+  }
+
+  const esc = (s) => String(s).replace(/[&<>"]/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+  function renderModels(models) {
+    const body = $("models");
+    body.textContent = "";
+    if (!models.length) {
+      body.appendChild(emptyRow(8, "No turns recorded yet."));
+      return;
+    }
+    for (const m of models) {
+      const tr = document.createElement("tr");
+      const where = m.mode === "local" ? "local · " + esc(m.provider) : esc(m.provider);
+      tr.appendChild(cell(`${esc(m.model)}<span class="sub">${where}</span>`, "name"));
+
+      const bar = document.createElement("td");
+      bar.className = "bar-cell";
+      bar.appendChild(stack(m.tokens));
+      tr.appendChild(bar);
+
+      tr.appendChild(cell(tokens(m.tokens.input), "num"));
+      tr.appendChild(cell(
+        m.tokens.cached_input > 0
+          ? `${tokens(m.tokens.cached_input)}<span class="sub">${pct(m.tokens.cache_hit)}</span>`
+          : '<span class="dim">—</span>',
+        "num"));
+      tr.appendChild(cell(tokens(m.tokens.output), "num"));
+      tr.appendChild(cell(
+        m.tokens.reasoning > 0 ? tokens(m.tokens.reasoning) : '<span class="dim">n/a</span>',
+        "num"));
+      tr.appendChild(cell(
+        m.coverage.estimated_calls > 0
+          ? `${nf.format(m.calls)}<span class="sub">${nf.format(m.coverage.estimated_calls)} unreported</span>`
+          : nf.format(m.calls),
+        "num"));
+
+      // Local rows show what they would have cost, marked as the estimate it
+      // is; hosted rows show what they did cost.
+      tr.appendChild(cell(
+        m.mode === "local"
+          ? (m.shadow_usd > 0
+              ? `<span class="dim">${usd(m.shadow_usd)}</span><span class="sub">avoided</span>`
+              : '<span class="dim">unpriced</span>')
+          : usd(m.billed_usd),
+        "num"));
+      body.appendChild(tr);
+    }
+  }
+
+  function renderProviders(providers) {
+    const body = $("providers");
+    body.textContent = "";
+    if (!providers.length) {
+      body.appendChild(emptyRow(7, "No providers used yet."));
+      return;
+    }
+    for (const p of providers) {
+      const tr = document.createElement("tr");
+      tr.appendChild(cell(
+        `${esc(p.provider)}<span class="sub">${p.mode === "local" ? "our fleet" : "hosted"}</span>`,
+        "name"));
+      const bar = document.createElement("td");
+      bar.className = "bar-cell";
+      bar.appendChild(stack(p.tokens));
+      tr.appendChild(bar);
+      tr.appendChild(cell(nf.format(p.models), "num"));
+      tr.appendChild(cell(nf.format(p.calls), "num"));
+      tr.appendChild(cell(tokens(p.tokens.total), "num"));
+      tr.appendChild(cell(pct(p.tokens.cache_hit), "num"));
+      tr.appendChild(cell(
+        p.mode === "local"
+          ? `<span class="dim">${usd(p.shadow_usd)}</span><span class="sub">avoided</span>`
+          : usd(p.billed_usd),
+        "num"));
+      body.appendChild(tr);
+    }
+  }
+
+  function renderModes(modes, totalTokens) {
+    const host = $("modes");
+    host.textContent = "";
+    for (const m of modes) {
+      const share = totalTokens > 0 ? m.tokens.total / totalTokens : 0;
+      const local = m.mode === "local";
+      const div = document.createElement("div");
+      div.innerHTML = `
+        <div class="mode-head">
+          <span class="mode-name">${local ? "Our fleet" : "Hosted endpoints"}</span>
+          <span class="mode-share">${pct(share)} of billed tokens</span>
+        </div>
+        <div class="meter"><div class="meter-fill${local ? "" : " frontier"}"
+             style="width:${(share * 100).toFixed(2)}%"></div></div>
+        <div class="mode-facts">
+          <span>${local ? "Would have cost" : "Cost"}<b>${usd(local ? m.shadow_usd : m.billed_usd)}</b></span>
+          <span>Calls<b>${nf.format(m.calls)}</b></span>
+          <span>Tokens<b>${tokens(m.tokens.total)}</b></span>
+        </div>`;
+      host.appendChild(div);
+    }
+  }
+
+  const BASIS = {
+    declared:  (b) => ({ label: "Declared", note: b.note || "stated by configuration" }),
+    inferred:  (b) => ({
+      label: "Inferred",
+      note: `nearest of ${b.considered} comparable model${b.considered === 1 ? "" : "s"} by traffic shape (distance ${b.shape_distance.toFixed(3)})`,
+    }),
+    unpriced:  (b) => ({ label: "Not priced", note: b.reason }),
+  };
+
+  function renderCorrelaries(models) {
+    const body = $("correlaries");
+    body.textContent = "";
+    const locals = models.filter((m) => m.mode === "local" && m.correlary);
+    if (!locals.length) {
+      body.appendChild(emptyRow(4, "Nothing has been served locally yet."));
+      return;
+    }
+    for (const m of locals) {
+      const c = m.correlary;
+      const basis = (BASIS[c.basis.kind] || (() => ({ label: c.basis.kind, note: "" })))(c.basis);
+      const tr = document.createElement("tr");
+      tr.appendChild(cell(esc(m.model), "name"));
+      tr.appendChild(cell(
+        c.reference
+          ? `${esc(c.reference.model)}<span class="sub">${esc(c.reference.provider)}</span>`
+          : '<span class="dim">—</span>'));
+      tr.appendChild(cell(
+        `<span class="chip">${esc(basis.label)}</span><span class="sub">${esc(basis.note)}</span>`,
+        "text"));
+      tr.appendChild(cell(
+        c.reference ? usd(m.shadow_usd) : '<span class="dim">—</span>', "num"));
+      body.appendChild(tr);
+    }
+  }
+
+  function emptyRow(span, text) {
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.colSpan = span;
+    td.className = "empty";
+    td.textContent = text;
+    tr.appendChild(td);
+    return tr;
+  }
+
+  function renderAlerts(data) {
+    const host = $("alerts");
+    host.textContent = "";
+    const notes = [];
+
+    if (data.coverage.estimated_calls > 0) {
+      notes.push(`<strong>${nf.format(data.coverage.estimated_calls)} of
+        ${nf.format(data.coverage.calls)} calls came back without provider usage</strong>, so their
+        tokens are counted from our own tokenizer and their cache reads from
+        neither. Streaming OpenAI-compatible endpoints report nothing unless the
+        request sets <code>stream_options.include_usage</code>. Every figure below
+        understates by whatever those calls actually cost.`);
+    }
+    const unpriced = data.models.filter(
+      (m) => m.mode === "local" && m.correlary && m.correlary.basis.kind === "unpriced");
+    if (unpriced.length) {
+      notes.push(`<strong>${unpriced.length} local model${unpriced.length === 1 ? " has" : "s have"}
+        no correlary</strong>, so ${unpriced.length === 1 ? "its" : "their"} traffic contributes
+        nothing to the savings figure. See the correlary table below.`);
+    }
+    const freeHosted = data.models.filter(
+      (m) => m.mode === "frontier" && m.tokens.total > 0 && m.billed_usd === 0);
+    if (freeHosted.length) {
+      notes.push(`<strong>${freeHosted.length} hosted model${freeHosted.length === 1 ? "" : "s"}
+        served tokens at no cost</strong>, which almost always means a missing rate card
+        rather than a free provider: ${esc(freeHosted.map((m) => m.provider + "/" + m.model).join(", "))}.`);
+    }
+
+    for (const note of notes) {
+      const div = document.createElement("div");
+      div.className = "banner";
+      div.innerHTML = note;
+      host.appendChild(div);
+    }
+  }
+
+  function render(data) {
+    // Derive the ratios the tables want once, so no renderer recomputes them.
+    const withRatio = (t) => Object.assign({}, t, {
+      cache_hit: t.input > 0 ? t.cached_input / t.input : 0,
+    });
+    data.tokens = withRatio(data.tokens);
+    data.models.forEach((m) => { m.tokens = withRatio(m.tokens); });
+    data.providers.forEach((p) => { p.tokens = withRatio(p.tokens); });
+
+    $("savings-total").textContent = usd(data.savings.total_usd);
+    $("savings-cache").textContent = usd(data.savings.cache_savings_usd);
+    $("savings-routing").textContent = usd(data.savings.routing_savings_usd);
+    $("savings-quoted").textContent = usd(data.savings.routing_savings_at_decision_usd);
+    $("savings-routing-note").textContent =
+      `Priced against each local model's correlary, gated at ±${data.capability_band.toFixed(2)} of quality prior.`;
+
+    $("kpi-spend").textContent = usd(data.savings.frontier_spend_usd);
+    $("kpi-tokens").textContent = tokens(data.tokens.total);
+    $("kpi-calls").textContent =
+      `${nf.format(data.calls)} calls · ${nf.format(data.turns)} turns · ${nf.format(data.sessions)} sessions`;
+    $("kpi-cache").textContent = pct(data.tokens.cache_hit);
+    $("kpi-cache-note").textContent = `${tokens(data.tokens.cached_input)} of ${tokens(data.tokens.input)} prompt tokens`;
+    $("kpi-coverage").textContent = pct(data.coverage_fraction);
+    $("kpi-coverage-note").textContent = data.coverage.estimated_calls === 0
+      ? "every call reported by its provider"
+      : `${nf.format(data.coverage.estimated_calls)} calls unreported`;
+
+    renderAlerts(data);
+    renderModes(data.serving_modes, data.tokens.total);
+    renderModels(data.models);
+    renderProviders(data.providers);
+    renderCorrelaries(data.models);
+
+    const from = data.first_event_at_ms;
+    $("window").textContent = from
+      ? `since ${new Date(from).toLocaleString()}`
+      : "no traffic recorded yet";
+  }
+
+  // --- tooltip ------------------------------------------------------------
+
+  const tip = $("tip");
+  document.addEventListener("mousemove", (e) => {
+    const target = e.target.closest("[data-tip]");
+    if (!target) { tip.style.opacity = "0"; return; }
+    tip.innerHTML = target.dataset.tip;
+    tip.style.opacity = "1";
+    // Flip before the viewport edge rather than after, so a segment on the
+    // right of a wide table still shows its whole tooltip.
+    const box = tip.getBoundingClientRect();
+    const x = e.clientX + 14 + box.width > window.innerWidth
+      ? e.clientX - box.width - 14 : e.clientX + 14;
+    tip.style.left = Math.max(8, x) + "px";
+    tip.style.top = Math.max(8, e.clientY - box.height - 12) + "px";
+  });
+
+  // --- polling ------------------------------------------------------------
+
+  function freshness() {
+    const pulse = $("pulse");
+    if (!lastOk) { $("freshness").textContent = "waiting…"; return; }
+    const age = Date.now() - lastOk;
+    pulse.classList.toggle("stale", age > STALE_MS);
+    $("freshness").textContent = age > STALE_MS
+      ? "stale · last update " + ago(age)
+      : "live · updated " + ago(age);
+  }
+
+  async function poll() {
+    try {
+      const response = await fetch("/v1/metrics", { headers: { accept: "application/json" } });
+      if (!response.ok) throw new Error("HTTP " + response.status);
+      render(await response.json());
+      lastOk = Date.now();
+    } catch (error) {
+      // Keep the last good numbers on screen and mark them stale. Blanking the
+      // page on a dropped poll would make a transient network blip look like a
+      // fleet that stopped serving.
+      $("window").textContent = "cannot reach /v1/metrics — " + error.message;
+    }
+    freshness();
+  }
+
+  $("theme").addEventListener("click", () => {
+    const root = document.documentElement;
+    const dark = root.getAttribute("data-theme") === "dark"
+      || (!root.hasAttribute("data-theme")
+          && window.matchMedia("(prefers-color-scheme: dark)").matches);
+    root.setAttribute("data-theme", dark ? "light" : "dark");
+  });
+
+  poll();
+  setInterval(poll, POLL_MS);
+  setInterval(freshness, 1000);
+})();
+</script>
+</body>
+</html>
