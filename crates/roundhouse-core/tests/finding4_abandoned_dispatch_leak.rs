@@ -172,8 +172,7 @@ impl Log {
 /// so once the log is fully folded there is no dispatch the fold is legitimately
 /// still waiting on. Anything left in `pending` is unreclaimable.
 #[test]
-#[ignore = "F4: validated defect, unfixed — abandoned dispatches are never retired from the pending map"]
-fn abandoned_dispatches_are_not_retired_when_their_turn_is_retried() {
+fn abandoned_dispatches_are_retired_when_their_turn_is_retried() {
     const ABANDONED: usize = 500;
 
     let mut log = Log::new("sess-leak");
@@ -212,8 +211,7 @@ fn abandoned_dispatches_are_not_retired_when_their_turn_is_retried() {
 /// pending entries. `Session::open_observed` feeds replayed batches to the
 /// metrics observer, so this is the real restart path and not a synthetic one.
 #[test]
-#[ignore = "F4: validated defect, unfixed — abandoned dispatches are never retired from the pending map"]
-fn a_restart_rebuilds_the_abandoned_entries_rather_than_clearing_them() {
+fn a_restart_reconstructs_the_same_retired_state() {
     const ABANDONED: usize = 50;
 
     let mut log = Log::new("sess-restart");
@@ -232,14 +230,15 @@ fn a_restart_rebuilds_the_abandoned_entries_rather_than_clearing_them() {
     rebuilt.extend(&log.events);
 
     assert_eq!(
-        leaked_live, rebuilt.pending_dispatches(),
-        "live and rebuilt folds must agree, which is the property that makes \
-         the leak survive every restart"
+        leaked_live,
+        rebuilt.pending_dispatches(),
+        "live and rebuilt folds must agree -- supersession is driven off log \
+         contents, so a replay retires exactly what the live fold retired"
     );
     assert_eq!(
         rebuilt.pending_dispatches(),
         0,
-        "a restarted process reconstructed {} abandoned dispatches from the log",
+        "a restarted process must not reconstruct abandoned dispatches; it held {}",
         rebuilt.pending_dispatches()
     );
 }
@@ -279,4 +278,45 @@ fn settled_dispatches_are_retired_by_either_terminal_event() {
         0,
         "a terminal event of either kind retires the dispatch"
     );
+}
+
+/// What supersession does *not* cover, stated rather than glossed.
+///
+/// A turn abandoned and never retried — the client gave up, or the process died
+/// and nobody re-sent — has no second `TurnStarted` to prove it was abandoned,
+/// so its entry stays. That residue is bounded by abandoned-and-never-retried
+/// turns rather than by all abandoned dispatches, which is the difference
+/// between growth on every failover and growth only when a failover is also
+/// given up on. Retiring it needs an event-time horizon (the engine's own turn
+/// deadline is the natural one) and is deliberately not done here: a wall-clock
+/// eviction would make the fold non-deterministic under replay, which is the
+/// one property the whole projection rests on.
+#[test]
+fn a_turn_abandoned_and_never_retried_is_the_documented_residue() {
+    let mut log = Log::new("sess-residue");
+    log.abandoned_turn("turn-given-up-on", local());
+    log.completed_turn("turn-that-finished", local());
+
+    let mut fold = MetricsFold::new();
+    fold.extend(&log.events);
+
+    assert_eq!(
+        fold.pending_dispatches(),
+        1,
+        "the abandoned-and-never-retried dispatch is still held"
+    );
+    assert_eq!(
+        fold.open_turns(),
+        1,
+        "and its turn is still open, since nothing in the log says otherwise"
+    );
+
+    // The turn that did settle leaves nothing behind, so the residue really is
+    // one entry per given-up-on turn and not one per turn.
+    let mut settled_only = MetricsFold::new();
+    let mut clean = Log::new("sess-clean");
+    clean.completed_turn("turn-that-finished", local());
+    settled_only.extend(&clean.events);
+    assert_eq!(settled_only.pending_dispatches(), 0);
+    assert_eq!(settled_only.open_turns(), 0);
 }

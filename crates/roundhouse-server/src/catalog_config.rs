@@ -306,7 +306,7 @@ pub fn from_env() -> Result<Option<CatalogConfig>, CatalogError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use roundhouse_core::metrics::CorrelaryBasis;
+    use roundhouse_core::metrics::{Correlary, PricedBasis};
 
     const SAMPLE: &str = r#"{
       "models": [
@@ -362,11 +362,12 @@ mod tests {
         let correlary = metrics
             .pricing
             .resolve("llama", 0.62, None, &HashMap::new());
-        assert_eq!(correlary.reference.unwrap().model, "claude-sonnet");
-        match correlary.basis {
-            CorrelaryBasis::Declared { note } => {
-                assert!(note.contains("internal eval"), "the note is shown verbatim");
-            }
+        assert_eq!(correlary.reference().unwrap().model, "claude-sonnet");
+        match &correlary {
+            Correlary::Priced {
+                basis: PricedBasis::Declared { note },
+                ..
+            } => assert!(note.contains("internal eval"), "the note is shown verbatim"),
             other => panic!("expected a declared basis, got {other:?}"),
         }
     }

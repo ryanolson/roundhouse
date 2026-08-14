@@ -58,7 +58,9 @@ const DUPLICATE_IDENTITY: &str = r#"{
 /// The same catalog with the second entry removed: valid, and the baseline
 /// the sub-claim tests mutate one field of.
 fn single_model() -> String {
-    let start = DUPLICATE_IDENTITY.find("    },\n    {").expect("two entries");
+    let start = DUPLICATE_IDENTITY
+        .find("    },\n    {")
+        .expect("two entries");
     let end = DUPLICATE_IDENTITY.rfind("  ]").expect("closing bracket");
     format!(
         "{}    }}\n{}",
@@ -133,7 +135,10 @@ fn duplicate_identity_is_refused_by_the_catalog_boundary() {
         .expect_err("a duplicated model identity must not parse");
 
     let message = error.to_string();
-    assert!(message.contains("duplicate.json"), "names the file: {message}");
+    assert!(
+        message.contains("duplicate.json"),
+        "names the file: {message}"
+    );
     assert!(
         message.contains("anthropic/claude-sonnet"),
         "names the offending identity: {message}"
@@ -156,7 +161,7 @@ fn a_valid_catalog_prices_the_same_call_identically_on_both_sides() {
     let mut fold = MetricsFold::new();
     fold.extend(&one_frontier_call(one_mtok_of_uncached_input()));
     let snapshot = MetricsSnapshot::build(&fold, &config.metrics_config(), 3_000);
-    let dashboard_price = snapshot.models[0].billed_usd;
+    let dashboard_price = snapshot.models[0].billed_usd();
 
     assert_eq!(
         router_price, dashboard_price,
@@ -188,7 +193,10 @@ fn a_correlary_naming_an_unknown_model_is_refused() {
 #[test]
 fn a_negative_price_is_refused_by_the_catalog_boundary() {
     let json = single_model()
-        .replace("\"input_per_mtok_usd\": 3.0", "\"input_per_mtok_usd\": -3.0")
+        .replace(
+            "\"input_per_mtok_usd\": 3.0",
+            "\"input_per_mtok_usd\": -3.0",
+        )
         .replace(
             "\"cache_write_per_mtok_usd\": 3.75",
             "\"cache_write_per_mtok_usd\": -3.75",
@@ -205,7 +213,7 @@ fn a_negative_price_is_refused_by_the_catalog_boundary() {
         let mut fold = MetricsFold::new();
         fold.extend(&one_frontier_call(one_mtok_of_uncached_input()));
         let snapshot = MetricsSnapshot::build(&fold, &config.metrics_config(), 3_000);
-        let billed = snapshot.models[0].billed_usd;
+        let billed = snapshot.models[0].billed_usd();
         assert!(
             billed >= 0.0,
             "a negative rate card bills a real call at ${billed}, i.e. the \
@@ -227,8 +235,10 @@ fn a_negative_price_is_refused_by_the_catalog_boundary() {
 /// format. Kept as a passing test so the reason is on the record.
 #[test]
 fn a_nonfinite_price_cannot_be_expressed_in_the_config_format() {
-    let overflow =
-        single_model().replace("\"input_per_mtok_usd\": 3.0", "\"input_per_mtok_usd\": 1e400");
+    let overflow = single_model().replace(
+        "\"input_per_mtok_usd\": 3.0",
+        "\"input_per_mtok_usd\": 1e400",
+    );
     let error = CatalogConfig::from_json(&overflow, "overflow.json")
         .expect_err("serde_json refuses a float literal it cannot represent");
     assert!(error.to_string().contains("overflow.json"));
@@ -253,7 +263,10 @@ fn an_out_of_range_quality_prior_is_refused() {
              documented 0.0..=1.0 the capability gate compares against"
         );
     }
-    assert!(parsed.is_err(), "a quality_prior of 42.0 parsed successfully");
+    assert!(
+        parsed.is_err(),
+        "a quality_prior of 42.0 parsed successfully"
+    );
 }
 
 /// Sub-claim: is the `cache_write_per_mtok_usd == 0` sentinel ambiguous?

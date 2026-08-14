@@ -243,8 +243,8 @@ fn a_fully_estimated_hosted_model_is_not_published_as_measured_spend() {
     // The per-model row carries the same split, so a reader does not have to
     // infer it from the headline.
     let row = &snapshot.models[0];
-    assert_eq!(row.billed_measured_usd, 0.0);
-    assert!((row.billed_estimated_usd - row.billed_usd).abs() < 1e-12);
+    assert_eq!(row.billed_measured_usd(), 0.0);
+    assert!((row.billed_estimated_usd() - row.billed_usd()).abs() < 1e-12);
     assert_eq!(row.coverage.estimated_tokens, snapshot.tokens.total);
 }
 

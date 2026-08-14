@@ -87,7 +87,10 @@ struct SerializingFrontierClient {
 impl FrontierClient for SerializingFrontierClient {
     async fn execute(&self, quote: &FrontierQuote) -> Result<FrontierStream, FrontierError> {
         let Target::Frontier { model, .. } = &quote.target else {
-            return Err(FrontierError::UnknownProvider(format!("{:?}", quote.target)));
+            return Err(FrontierError::UnknownProvider(format!(
+                "{:?}",
+                quote.target
+            )));
         };
         let mut body = json!({
             "model": model,

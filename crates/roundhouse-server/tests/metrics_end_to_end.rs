@@ -309,11 +309,12 @@ async fn local_traffic_with_no_correlary_is_reported_unpriced() {
     let local: Vec<_> = snapshot
         .models
         .iter()
-        .filter(|m| m.mode == ServingMode::Local)
+        .filter(|m| m.mode() == ServingMode::Local)
         .collect();
     for model in local {
         assert_eq!(
-            model.shadow_usd, 0.0,
+            model.shadow_usd(),
+            0.0,
             "a model with no defensible stand-in must not be shadow-priced"
         );
     }

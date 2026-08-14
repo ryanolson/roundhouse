@@ -53,11 +53,12 @@ use std::sync::{Arc, RwLock};
 use serde::{Deserialize, Serialize};
 
 use crate::event::{Accounting, SessionEvent, SessionEventKind, Usage};
-use crate::ids::{ResponseId, SessionId};
+use crate::ids::{ResponseId, SessionId, TurnId};
 use crate::routing::{DecisionRecord, Target};
 
 pub use pricing::{
-    Correlary, CorrelaryBasis, DEFAULT_CAPABILITY_BAND, ReferenceModel, ShadowPricing, TokenShape,
+    Correlary, CorrelaryBasis, DEFAULT_CAPABILITY_BAND, IncoherentCorrelary, PricedBasis,
+    ReferenceModel, ShadowPricing, TokenShape,
 };
 
 /// The provider name local targets are grouped under.
@@ -185,6 +186,22 @@ pub struct MetricsFold {
     /// Highest sequence number folded per session.
     watermarks: HashMap<SessionId, u64>,
     pending: HashMap<ResponseId, Pending>,
+    /// The response each open turn is currently on, and the inverse.
+    ///
+    /// Kept so an abandoned dispatch can be *retired* rather than waited on
+    /// forever. A turn whose owner was fenced mid-dispatch never gets a
+    /// terminal event — the settle seam's append is best-effort on exactly
+    /// that path — but the client's retry re-admits the same `turn_id` under a
+    /// fresh `ResponseId`, and a second `TurnStarted` for a turn is positive
+    /// proof that the previous response was abandoned. That is a supersession
+    /// rule rather than a heuristic, and it is driven entirely off log
+    /// contents, so a live fold and a replay still agree.
+    ///
+    /// Both maps drain: at a terminal event, and at supersession. What they do
+    /// not cover is a turn abandoned and then never retried, which stays until
+    /// the process ends.
+    response_of_turn: HashMap<TurnId, ResponseId>,
+    turn_of_response: HashMap<ResponseId, TurnId>,
     turns: u64,
     first_at_ms: Option<u64>,
     last_at_ms: Option<u64>,
@@ -217,7 +234,23 @@ impl MetricsFold {
         );
 
         match &event.kind {
-            SessionEventKind::TurnStarted { .. } => self.turns += 1,
+            SessionEventKind::TurnStarted {
+                turn_id,
+                response_id,
+            } => {
+                self.turns += 1;
+                // A second start for this turn means the first response will
+                // never terminate. Retire it now rather than hold it forever.
+                if let Some(abandoned) = self
+                    .response_of_turn
+                    .insert(turn_id.clone(), response_id.clone())
+                {
+                    self.pending.remove(&abandoned);
+                    self.turn_of_response.remove(&abandoned);
+                }
+                self.turn_of_response
+                    .insert(response_id.clone(), turn_id.clone());
+            }
             SessionEventKind::Routed {
                 response_id,
                 decision,
@@ -234,6 +267,10 @@ impl MetricsFold {
             | SessionEventKind::ResponseIncomplete {
                 response_id, usage, ..
             } => {
+                // Settled: this response is nobody's open turn any more.
+                if let Some(turn_id) = self.turn_of_response.remove(response_id) {
+                    self.response_of_turn.remove(&turn_id);
+                }
                 let Some(pending) = self.pending.remove(response_id) else {
                     return true;
                 };
@@ -291,6 +328,15 @@ impl MetricsFold {
     /// what the fold is still holding rather than only on what it has counted.
     pub fn pending_dispatches(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Turns admitted whose response has not terminated.
+    ///
+    /// Companion to [`Self::pending_dispatches`]: a turn appears here from its
+    /// `TurnStarted` and leaves at its terminal event or when a retry
+    /// supersedes it, so the two counts drain together.
+    pub fn open_turns(&self) -> usize {
+        self.response_of_turn.len()
     }
 
     /// Traffic shape per hosted model, for inferring correlaries.
@@ -426,37 +472,118 @@ impl Coverage {
     }
 }
 
+/// What a row's money means, which depends on where it ran.
+///
+/// One tagged value rather than a `mode` field beside two mutually exclusive
+/// money fields that were each zero when the other applied. That shape let a
+/// row claim to be local and to have been billed, and it made every consumer
+/// re-derive which fields were meaningful from `mode` — the repeated
+/// conditional the review objected to, which was a symptom rather than the
+/// defect.
+///
+/// Flattened on the wire, so the serialized row still carries `mode` and its
+/// money at the top level and consumers are unaffected. The difference is that
+/// the fields which do not apply are now absent rather than zero, and a zero
+/// that is really zero is no longer indistinguishable from one that is
+/// "not applicable".
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum ModelAccounting {
+    /// Served by our own fleet: bills nothing, priced against a correlary.
+    Local {
+        /// What this traffic would have cost on its correlary. Zero when the
+        /// correlary is [`Correlary::Unpriced`].
+        shadow_usd: f64,
+        correlary: Correlary,
+    },
+    /// Issued to an external endpoint: bills real money.
+    Frontier {
+        /// The sum of the two below.
+        billed_usd: f64,
+        /// Priced from counts the provider reported.
+        billed_measured_usd: f64,
+        /// Priced from our own tokenizer, because the provider reported
+        /// nothing. Not smaller or larger than the truth — unknown, since a
+        /// tokenizer mismatch cuts either way.
+        billed_estimated_usd: f64,
+        /// The discount the provider's own cache applied. Wholly measured: an
+        /// unreported call carries no cache reads to guess at.
+        cache_savings_usd: f64,
+    },
+}
+
 /// One model's row.
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelMetrics {
-    pub mode: ServingMode,
     pub provider: String,
     pub model: String,
     pub calls: u64,
     pub tokens: TokenBreakdown,
     pub coverage: Coverage,
-    /// Money actually billed. Always zero for [`ServingMode::Local`].
-    ///
-    /// The sum of the two fields below. Kept as its own field so a consumer
-    /// that does not care about provenance reads one number, and one that does
-    /// cannot mistake the total for the measured part.
-    pub billed_usd: f64,
-    /// The part of `billed_usd` priced from counts the provider reported.
-    pub billed_measured_usd: f64,
-    /// The part priced from Roundhouse's own tokenizer, because the provider
-    /// reported nothing. Not a smaller number than the truth or a larger one —
-    /// an unknown one, since a tokenizer mismatch cuts either way.
-    pub billed_estimated_usd: f64,
-    /// What this traffic would have cost on its correlary. Zero for hosted
-    /// models, which are billed rather than shadow-priced, and zero for local
-    /// models whose correlary is [`CorrelaryBasis::Unpriced`].
-    pub shadow_usd: f64,
-    /// The discount the provider's own cache applied. Zero for local, whose
-    /// cache saves GPU time rather than money.
-    pub cache_savings_usd: f64,
-    /// Present only for local models.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub correlary: Option<Correlary>,
+    #[serde(flatten)]
+    pub accounting: ModelAccounting,
+}
+
+impl ModelMetrics {
+    pub fn mode(&self) -> ServingMode {
+        match self.accounting {
+            ModelAccounting::Local { .. } => ServingMode::Local,
+            ModelAccounting::Frontier { .. } => ServingMode::Frontier,
+        }
+    }
+
+    /// Money billed. Structurally zero for a local row.
+    pub fn billed_usd(&self) -> f64 {
+        match self.accounting {
+            ModelAccounting::Local { .. } => 0.0,
+            ModelAccounting::Frontier { billed_usd, .. } => billed_usd,
+        }
+    }
+
+    pub fn billed_measured_usd(&self) -> f64 {
+        match self.accounting {
+            ModelAccounting::Local { .. } => 0.0,
+            ModelAccounting::Frontier {
+                billed_measured_usd,
+                ..
+            } => billed_measured_usd,
+        }
+    }
+
+    pub fn billed_estimated_usd(&self) -> f64 {
+        match self.accounting {
+            ModelAccounting::Local { .. } => 0.0,
+            ModelAccounting::Frontier {
+                billed_estimated_usd,
+                ..
+            } => billed_estimated_usd,
+        }
+    }
+
+    /// What this would have cost hosted. Structurally zero for a hosted row,
+    /// which is billed rather than shadow-priced.
+    pub fn shadow_usd(&self) -> f64 {
+        match self.accounting {
+            ModelAccounting::Local { shadow_usd, .. } => shadow_usd,
+            ModelAccounting::Frontier { .. } => 0.0,
+        }
+    }
+
+    pub fn cache_savings_usd(&self) -> f64 {
+        match self.accounting {
+            ModelAccounting::Local { .. } => 0.0,
+            ModelAccounting::Frontier {
+                cache_savings_usd, ..
+            } => cache_savings_usd,
+        }
+    }
+
+    pub fn correlary(&self) -> Option<&Correlary> {
+        match &self.accounting {
+            ModelAccounting::Local { correlary, .. } => Some(correlary),
+            ModelAccounting::Frontier { .. } => None,
+        }
+    }
 }
 
 /// A provider's rollup across its models.
@@ -621,7 +748,7 @@ impl MetricsSnapshot {
                 estimated_tokens: counters.estimated_usage.total(),
             };
 
-            let (billed, shadow_usd, cache_savings_usd, correlary) = match key.mode {
+            let accounting = match key.mode {
                 ServingMode::Frontier => {
                     // A hosted model with no rate card bills an unknown amount,
                     // and zero is the wrong guess. It is reported as zero
@@ -639,8 +766,13 @@ impl MetricsSnapshot {
                     // Wholly measured: an unreported call carries
                     // `cached_input_tokens: 0`, so it contributes nothing here
                     // rather than a guess.
-                    let cache = rate.map_or(0.0, |r| r.pricing.cache_savings(&total_usage));
-                    (billed, 0.0, cache, None)
+                    ModelAccounting::Frontier {
+                        billed_usd: billed.total(),
+                        billed_measured_usd: billed.measured,
+                        billed_estimated_usd: billed.estimated,
+                        cache_savings_usd: rate
+                            .map_or(0.0, |r| r.pricing.cache_savings(&total_usage)),
+                    }
                 }
                 ServingMode::Local => {
                     let shape = TokenShape::from_rollup(&total_usage, counters.calls);
@@ -650,24 +782,20 @@ impl MetricsSnapshot {
                         shape,
                         &frontier_shapes,
                     );
-                    let shadow = correlary.shadow_cost_usd(&total_usage);
-                    (Billed::default(), shadow, 0.0, Some(correlary))
+                    ModelAccounting::Local {
+                        shadow_usd: correlary.shadow_cost_usd(&total_usage),
+                        correlary,
+                    }
                 }
             };
 
             models.push(ModelMetrics {
-                mode: key.mode,
                 provider: key.provider.clone(),
                 model: key.model.clone(),
                 calls: counters.calls,
                 tokens,
                 coverage,
-                billed_usd: billed.total(),
-                billed_measured_usd: billed.measured,
-                billed_estimated_usd: billed.estimated,
-                shadow_usd,
-                cache_savings_usd,
-                correlary,
+                accounting,
             });
         }
 
@@ -694,12 +822,12 @@ impl MetricsSnapshot {
             calls += model.calls;
         }
 
-        let cache_savings_usd = models.iter().map(|m| m.cache_savings_usd).sum();
-        let routing_savings_usd = models.iter().map(|m| m.shadow_usd).sum();
+        let cache_savings_usd = models.iter().map(|m| m.cache_savings_usd()).sum();
+        let routing_savings_usd = models.iter().map(|m| m.shadow_usd()).sum();
         let savings = Savings {
-            frontier_spend_usd: models.iter().map(|m| m.billed_usd).sum(),
-            frontier_spend_measured_usd: models.iter().map(|m| m.billed_measured_usd).sum(),
-            frontier_spend_estimated_usd: models.iter().map(|m| m.billed_estimated_usd).sum(),
+            frontier_spend_usd: models.iter().map(|m| m.billed_usd()).sum(),
+            frontier_spend_measured_usd: models.iter().map(|m| m.billed_measured_usd()).sum(),
+            frontier_spend_estimated_usd: models.iter().map(|m| m.billed_estimated_usd()).sum(),
             cache_savings_usd,
             routing_savings_usd,
             routing_savings_at_decision_usd: fold
@@ -748,17 +876,17 @@ impl Billed {
 
 /// Ordering key for the model table: everything a row is worth, billed or not.
 fn total_dollars(model: &ModelMetrics) -> f64 {
-    model.billed_usd + model.shadow_usd
+    model.billed_usd() + model.shadow_usd()
 }
 
 fn roll_up_providers(models: &[ModelMetrics]) -> Vec<ProviderMetrics> {
     let mut by_provider: BTreeMap<(ServingMode, String), ProviderMetrics> = BTreeMap::new();
     for model in models {
         let entry = by_provider
-            .entry((model.mode, model.provider.clone()))
+            .entry((model.mode(), model.provider.clone()))
             .or_insert_with(|| ProviderMetrics {
                 provider: model.provider.clone(),
-                mode: model.mode,
+                mode: model.mode(),
                 calls: 0,
                 tokens: TokenBreakdown::default(),
                 coverage: Coverage::default(),
@@ -772,11 +900,11 @@ fn roll_up_providers(models: &[ModelMetrics]) -> Vec<ProviderMetrics> {
         entry.calls += model.calls;
         entry.tokens.add(&model.tokens);
         entry.coverage.add(&model.coverage);
-        entry.billed_usd += model.billed_usd;
-        entry.billed_measured_usd += model.billed_measured_usd;
-        entry.billed_estimated_usd += model.billed_estimated_usd;
-        entry.shadow_usd += model.shadow_usd;
-        entry.cache_savings_usd += model.cache_savings_usd;
+        entry.billed_usd += model.billed_usd();
+        entry.billed_measured_usd += model.billed_measured_usd();
+        entry.billed_estimated_usd += model.billed_estimated_usd();
+        entry.shadow_usd += model.shadow_usd();
+        entry.cache_savings_usd += model.cache_savings_usd();
         entry.models += 1;
     }
     let mut providers: Vec<_> = by_provider.into_values().collect();
@@ -810,16 +938,16 @@ fn roll_up_modes(models: &[ModelMetrics]) -> Vec<ServingModeMetrics> {
     for model in models {
         let entry = modes
             .iter_mut()
-            .find(|m| m.mode == model.mode)
+            .find(|m| m.mode == model.mode())
             .expect("every serving mode has a row");
         entry.calls += model.calls;
         entry.tokens.add(&model.tokens);
         entry.coverage.add(&model.coverage);
-        entry.billed_usd += model.billed_usd;
-        entry.billed_measured_usd += model.billed_measured_usd;
-        entry.billed_estimated_usd += model.billed_estimated_usd;
-        entry.shadow_usd += model.shadow_usd;
-        entry.cache_savings_usd += model.cache_savings_usd;
+        entry.billed_usd += model.billed_usd();
+        entry.billed_measured_usd += model.billed_measured_usd();
+        entry.billed_estimated_usd += model.billed_estimated_usd();
+        entry.shadow_usd += model.shadow_usd();
+        entry.cache_savings_usd += model.cache_savings_usd();
     }
     modes
 }
@@ -1103,7 +1231,7 @@ mod tests {
         let local_row = snapshot
             .models
             .iter()
-            .find(|m| m.mode == ServingMode::Local)
+            .find(|m| m.mode() == ServingMode::Local)
             .unwrap();
         assert_eq!(local_row.provider, LOCAL_PROVIDER);
     }

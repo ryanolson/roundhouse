@@ -160,13 +160,155 @@ pub enum CorrelaryBasis {
     Unpriced { reason: String },
 }
 
-/// A local model and the hosted model it is priced against.
+/// How a *priced* correlary was arrived at.
+///
+/// The same two cases as [`CorrelaryBasis`] minus `Unpriced`, which is not a
+/// basis for a price but the absence of one.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Correlary {
-    pub local_model: String,
-    /// `None` exactly when the basis is [`CorrelaryBasis::Unpriced`].
-    pub reference: Option<ReferenceModel>,
-    pub basis: CorrelaryBasis,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PricedBasis {
+    Declared {
+        note: String,
+    },
+    Inferred {
+        shape_distance: f64,
+        considered: usize,
+    },
+}
+
+/// A local model and the hosted model it is priced against.
+///
+/// One tagged value rather than `Option<ReferenceModel>` beside a basis that
+/// separately says whether a price exists. Those two encoded the same fact
+/// twice and could disagree — a correlary carrying a reference model *and* an
+/// `Unpriced` basis charged a full shadow price while the dashboard printed
+/// "contributes nothing to the savings figure" from the same record. Nothing
+/// in the tree built one, but every field was `pub` and the type derived
+/// `Deserialize`, so the wire was an open door. Here the invalid state cannot
+/// be named.
+///
+/// The serialized shape is unchanged — `{ local_model, reference, basis }` —
+/// so consumers keep working; the difference is that deserialization now
+/// validates instead of accepting anything.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(into = "CorrelaryWire", try_from = "CorrelaryWire")]
+pub enum Correlary {
+    /// A stand-in was found, so this model's traffic carries a shadow price.
+    Priced {
+        local_model: String,
+        reference: ReferenceModel,
+        basis: PricedBasis,
+    },
+    /// No stand-in could be justified. Contributes nothing to the saving.
+    Unpriced { local_model: String, reason: String },
+}
+
+/// The wire form, kept as its own type so the JSON contract is stated in one
+/// place rather than implied by whatever the enum happens to derive.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CorrelaryWire {
+    local_model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reference: Option<ReferenceModel>,
+    basis: CorrelaryBasis,
+}
+
+impl From<Correlary> for CorrelaryWire {
+    fn from(correlary: Correlary) -> Self {
+        match correlary {
+            Correlary::Priced {
+                local_model,
+                reference,
+                basis,
+            } => Self {
+                local_model,
+                reference: Some(reference),
+                basis: match basis {
+                    PricedBasis::Declared { note } => CorrelaryBasis::Declared { note },
+                    PricedBasis::Inferred {
+                        shape_distance,
+                        considered,
+                    } => CorrelaryBasis::Inferred {
+                        shape_distance,
+                        considered,
+                    },
+                },
+            },
+            Correlary::Unpriced {
+                local_model,
+                reason,
+            } => Self {
+                local_model,
+                reference: None,
+                basis: CorrelaryBasis::Unpriced { reason },
+            },
+        }
+    }
+}
+
+/// Why a serialized correlary was refused.
+#[derive(Debug, thiserror::Error)]
+#[error("a correlary for `{local_model}` is {described}, which cannot be true of the same record")]
+pub struct IncoherentCorrelary {
+    local_model: String,
+    described: &'static str,
+}
+
+impl TryFrom<CorrelaryWire> for Correlary {
+    type Error = IncoherentCorrelary;
+
+    fn try_from(wire: CorrelaryWire) -> Result<Self, Self::Error> {
+        let incoherent = |described| IncoherentCorrelary {
+            local_model: wire.local_model.clone(),
+            described,
+        };
+        match (wire.reference, wire.basis) {
+            (Some(reference), CorrelaryBasis::Declared { note }) => Ok(Correlary::Priced {
+                local_model: wire.local_model,
+                reference,
+                basis: PricedBasis::Declared { note },
+            }),
+            (
+                Some(reference),
+                CorrelaryBasis::Inferred {
+                    shape_distance,
+                    considered,
+                },
+            ) => Ok(Correlary::Priced {
+                local_model: wire.local_model,
+                reference,
+                basis: PricedBasis::Inferred {
+                    shape_distance,
+                    considered,
+                },
+            }),
+            (None, CorrelaryBasis::Unpriced { reason }) => Ok(Correlary::Unpriced {
+                local_model: wire.local_model,
+                reason,
+            }),
+            (Some(_), CorrelaryBasis::Unpriced { .. }) => {
+                Err(incoherent("unpriced yet carries a reference model"))
+            }
+            (None, _) => Err(incoherent("priced yet names no reference model")),
+        }
+    }
+}
+
+impl Correlary {
+    pub fn local_model(&self) -> &str {
+        match self {
+            Correlary::Priced { local_model, .. } | Correlary::Unpriced { local_model, .. } => {
+                local_model
+            }
+        }
+    }
+
+    pub fn reference(&self) -> Option<&ReferenceModel> {
+        match self {
+            Correlary::Priced { reference, .. } => Some(reference),
+            Correlary::Unpriced { .. } => None,
+        }
+    }
 }
 
 impl Correlary {
@@ -182,9 +324,12 @@ impl Correlary {
     /// conversation — so carrying our measured cache ratio across is the
     /// defensible reading, and it is the conservative one.
     pub fn shadow_cost_usd(&self, usage: &Usage) -> f64 {
-        self.reference
-            .as_ref()
-            .map_or(0.0, |reference| reference.pricing.price(usage))
+        match self {
+            Correlary::Priced { reference, .. } => reference.pricing.price(usage),
+            // Not a zero that some branch remembered to return: there is no
+            // rate card in this arm to price against.
+            Correlary::Unpriced { .. } => 0.0,
+        }
     }
 }
 
@@ -278,10 +423,10 @@ impl ShadowPricing {
                 .iter()
                 .find(|r| r.provider == declared.provider && r.model == declared.model);
             return match reference {
-                Some(reference) => Correlary {
+                Some(reference) => Correlary::Priced {
                     local_model: local_model.to_string(),
-                    reference: Some(reference.clone()),
-                    basis: CorrelaryBasis::Declared {
+                    reference: reference.clone(),
+                    basis: PricedBasis::Declared {
                         note: declared.note.clone(),
                     },
                 },
@@ -289,15 +434,12 @@ impl ShadowPricing {
                 // is the only safe answer: silently falling back to inference
                 // would quietly overrule an explicit human decision, and the
                 // configuration error would never surface.
-                None => Correlary {
+                None => Correlary::Unpriced {
                     local_model: local_model.to_string(),
-                    reference: None,
-                    basis: CorrelaryBasis::Unpriced {
-                        reason: format!(
-                            "declared correlary `{}/{}` has no rate card",
-                            declared.provider, declared.model
-                        ),
-                    },
+                    reason: format!(
+                        "declared correlary `{}/{}` has no rate card",
+                        declared.provider, declared.model
+                    ),
                 },
             };
         }
@@ -349,10 +491,10 @@ impl ShadowPricing {
                 .then_with(|| (&a.0.provider, &a.0.model).cmp(&(&b.0.provider, &b.0.model)))
         });
         let (reference, shape_distance) = scored[0];
-        Correlary {
+        Correlary::Priced {
             local_model: local_model.to_string(),
-            reference: Some(reference.clone()),
-            basis: CorrelaryBasis::Inferred {
+            reference: reference.clone(),
+            basis: PricedBasis::Inferred {
                 shape_distance,
                 considered: scored.len(),
             },
@@ -361,10 +503,9 @@ impl ShadowPricing {
 }
 
 fn unpriced(local_model: &str, reason: String) -> Correlary {
-    Correlary {
+    Correlary::Unpriced {
         local_model: local_model.to_string(),
-        reference: None,
-        basis: CorrelaryBasis::Unpriced { reason },
+        reason,
     }
 }
 
@@ -456,8 +597,14 @@ mod tests {
         let local = TokenShape::from_rollup(&usage(10_000, 5_000, 500, 0), 10);
         let correlary = pricer.resolve("llama", 0.6, local, &observed);
 
-        assert_eq!(correlary.reference.unwrap().model, "big");
-        assert!(matches!(correlary.basis, CorrelaryBasis::Declared { .. }));
+        assert_eq!(correlary.reference().unwrap().model, "big");
+        assert!(matches!(
+            correlary,
+            Correlary::Priced {
+                basis: PricedBasis::Declared { .. },
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -473,8 +620,8 @@ mod tests {
         let local = TokenShape::from_rollup(&usage(10_000, 5_000, 500, 0), 10);
         let correlary = pricer.resolve("tiny-7b", 0.35, local, &observed);
 
-        assert!(correlary.reference.is_none());
-        assert!(matches!(correlary.basis, CorrelaryBasis::Unpriced { .. }));
+        assert!(correlary.reference().is_none());
+        assert!(matches!(correlary, Correlary::Unpriced { .. }));
         assert_eq!(
             correlary.shadow_cost_usd(&usage(10_000, 5_000, 500, 0)),
             0.0,
@@ -504,9 +651,12 @@ mod tests {
         let local = TokenShape::from_rollup(&usage(20_000, 10_000, 300, 0), 10);
         let correlary = pricer.resolve("llama", 0.6, local, &observed);
 
-        assert_eq!(correlary.reference.unwrap().model, "terse");
-        match correlary.basis {
-            CorrelaryBasis::Inferred { considered, .. } => assert_eq!(considered, 2),
+        assert_eq!(correlary.reference().unwrap().model, "terse");
+        match &correlary {
+            Correlary::Priced {
+                basis: PricedBasis::Inferred { considered, .. },
+                ..
+            } => assert_eq!(*considered, 2),
             other => panic!("expected an inferred basis, got {other:?}"),
         }
     }
@@ -517,7 +667,7 @@ mod tests {
         let local = TokenShape::from_rollup(&usage(1_000, 0, 100, 0), 1);
 
         let correlary = pricer.resolve("llama", 0.6, local, &HashMap::new());
-        assert!(correlary.reference.is_none());
+        assert!(correlary.reference().is_none());
     }
 
     #[test]
@@ -541,7 +691,7 @@ mod tests {
             &observed,
         );
         assert!(
-            correlary.reference.is_none(),
+            correlary.reference().is_none(),
             "a misconfigured declaration must not silently fall back to inference"
         );
     }

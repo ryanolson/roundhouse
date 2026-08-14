@@ -1,279 +1,303 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Validation of review finding F5: "invalid-state DTOs".
+//! Review finding F5: `Correlary` and `ModelMetrics` accepted states their own
+//! documentation calls impossible.
 //!
-//! The claim under test is narrow and mechanical: `Correlary` encodes its
-//! invariant as `Option<ReferenceModel>` beside a separate `CorrelaryBasis`
-//! tag, and its own doc comment states the invariant — "`None` exactly when
-//! the basis is [`CorrelaryBasis::Unpriced`]". Nothing enforces it. Both
-//! fields are `pub` and the type is `Deserialize`, so a contradictory value is
-//! constructible by any consumer of the public API and by any JSON that
-//! reaches `serde`.
+//! They did, through the public API and through serde. Nothing in the tree
+//! constructed one — `ShadowPricing::resolve` was coherent on every branch —
+//! so the consequence was latent rather than live, but the fields were all
+//! `pub` and `Correlary` derived `Deserialize`, and the failure mode was the
+//! bad direction: a correlary carrying a reference model *and* an `Unpriced`
+//! basis charges a full shadow price while the dashboard prints "contributes
+//! nothing to the savings figure" from the same record — silently inflating
+//! the number the product is judged by.
 //!
-//! These tests assert the invariant the doc comment claims. They fail where it
-//! is not actually enforced.
+//! Both are now tagged enums, so the contradictions are unrepresentable rather
+//! than merely unconstructed. **The first two assertions of this file are that
+//! certain code no longer compiles**, which no runtime test can express: they
+//! are recorded here as prose beside the code that replaced them, and the
+//! compiler enforces them on every build.
+//!
+//! What *is* still runtime-testable is the deserialization ingress, which is
+//! where an incoherent value could arrive from outside the crate's control.
 
-use std::collections::HashMap;
-
-use roundhouse_core::event::Usage;
+use roundhouse_core::event::{Accounting, Usage};
 use roundhouse_core::metrics::{
-    Correlary, CorrelaryBasis, ReferenceModel, ShadowPricing, TokenShape,
+    Correlary, MetricsConfig, ModelAccounting, PricedBasis, ReferenceModel, ServingMode,
+    ShadowPricing, TokenShape,
 };
 use roundhouse_core::routing::ProviderPricing;
+use std::collections::HashMap;
 
-fn expensive_rate_card() -> ProviderPricing {
-    ProviderPricing {
-        input_per_mtok_usd: 3.0,
-        cached_input_per_mtok_usd: 0.3,
-        cache_write_per_mtok_usd: 3.75,
-        output_per_mtok_usd: 15.0,
-    }
-}
+const HOSTED: ProviderPricing = ProviderPricing {
+    input_per_mtok_usd: 3.0,
+    cached_input_per_mtok_usd: 0.3,
+    cache_write_per_mtok_usd: 3.75,
+    output_per_mtok_usd: 15.0,
+};
 
 fn reference() -> ReferenceModel {
     ReferenceModel {
         provider: "anthropic".into(),
-        model: "claude-sonnet".into(),
-        pricing: expensive_rate_card(),
-        quality_prior: 0.62,
+        model: "claude".into(),
+        pricing: HOSTED,
+        quality_prior: 0.6,
     }
 }
 
-fn usage() -> Usage {
+fn usage(input: u64, output: u64) -> Usage {
     Usage {
-        input_tokens: 1_000_000,
+        input_tokens: input,
         cached_input_tokens: 0,
-        output_tokens: 1_000_000,
+        output_tokens: output,
         reasoning_tokens: 0,
-        ..Default::default()
+        accounting: Accounting::Reported,
     }
 }
 
-/// The invariant `Correlary`'s doc comment states, written as a predicate.
+/// Was: `Correlary { reference: Some(..), basis: Unpriced { .. } }`.
 ///
-/// A correlary is coherent when the presence of a reference model agrees with
-/// what the basis says was decided: `Unpriced` means no stand-in was found and
-/// therefore no price can be charged; `Declared` and `Inferred` both name a
-/// stand-in and therefore must carry one.
-fn is_coherent(correlary: &Correlary) -> bool {
-    match (&correlary.reference, &correlary.basis) {
-        (None, CorrelaryBasis::Unpriced { .. }) => true,
-        (Some(_), CorrelaryBasis::Declared { .. } | CorrelaryBasis::Inferred { .. }) => true,
-        _ => false,
-    }
-}
-
-/// (b) reference: Some + basis: Unpriced.
-///
-/// The basis says no stand-in could be justified and no shadow price was
-/// charged. `shadow_cost_usd` charges one anyway, because it reads the
-/// `Option` and never looks at the basis.
+/// That literal no longer names anything — `Correlary` has two variants and
+/// neither has both a reference and an unpriced basis — so the case this test
+/// used to demonstrate is now a compile error. What remains testable is that
+/// the two arms behave the way their names promise.
 #[test]
-#[ignore = "F5: validated defect, unfixed — Correlary and ModelMetrics accept states their own docs call impossible"]
-fn an_unpriced_correlary_cannot_also_carry_a_reference_model() {
-    let contradictory = Correlary {
-        local_model: "llama-70b".into(),
-        reference: Some(reference()),
-        basis: CorrelaryBasis::Unpriced {
-            reason: "no hosted model within 0.10 of quality prior 0.50".into(),
-        },
+fn an_unpriced_correlary_carries_no_reference_and_no_price() {
+    let unpriced = Correlary::Unpriced {
+        local_model: "llama".into(),
+        reason: "no capability-comparable hosted model".into(),
     };
 
-    let charged = contradictory.shadow_cost_usd(&usage());
-    let json = serde_json::to_value(&contradictory).unwrap();
-
-    assert!(
-        is_coherent(&contradictory),
-        "Correlary's own doc comment says `reference` is `None` *exactly when* the basis \
-         is Unpriced, but the public API accepts the contradiction and prices it.\n\
-         \n\
-         shadow_cost_usd  = ${charged:.2}   (expected $0.00 for an unpriced basis)\n\
-         serialized JSON  = {json}\n\
-         \n\
-         The dashboard reads exactly this document. dashboard.html renders the basis chip \
-         from `basis.kind` and the dollar column from `c.reference ? usd(m.shadow_usd) : dash`, \
-         so this row reads \"Not priced\" beside a reference model and a positive dollar \
-         figure; and the note driven by `basis.kind === \"unpriced\"` tells the reader this \
-         model's traffic \"contributes nothing to the savings figure\" while its \
-         shadow_usd is summed into savings.routing_savings_usd."
+    assert!(unpriced.reference().is_none());
+    assert_eq!(
+        unpriced.shadow_cost_usd(&usage(1_000_000, 100_000)),
+        0.0,
+        "the unpriced arm has no rate card to price against, so this is \
+         structurally zero rather than a zero some branch remembered to return"
     );
 }
 
-/// (b), the other direction: reference: None + basis: Declared.
+/// Was: `Correlary { reference: None, basis: Declared { .. } }`.
 ///
-/// A human stated an equivalence; the type lets the reference go missing, and
-/// the shadow price silently collapses to zero while the dashboard still shows
-/// the "Declared" chip and the operator's note.
+/// Also a compile error now: `Correlary::Priced` takes a `ReferenceModel`, not
+/// an `Option<ReferenceModel>`, so a declared correlary cannot be missing the
+/// model it was declared against.
 #[test]
-#[ignore = "F5: validated defect, unfixed — Correlary and ModelMetrics accept states their own docs call impossible"]
-fn a_declared_correlary_cannot_be_missing_its_reference_model() {
-    let contradictory = Correlary {
-        local_model: "llama-70b".into(),
-        reference: None,
-        basis: CorrelaryBasis::Declared {
-            note: "within 2 points on our internal eval".into(),
+fn a_priced_correlary_always_has_the_model_it_is_priced_against() {
+    let priced = Correlary::Priced {
+        local_model: "llama".into(),
+        reference: reference(),
+        basis: PricedBasis::Declared {
+            note: "matched on our eval suite".into(),
         },
     };
 
-    let charged = contradictory.shadow_cost_usd(&usage());
-
+    assert_eq!(priced.reference().map(|r| r.model.as_str()), Some("claude"));
     assert!(
-        is_coherent(&contradictory),
-        "a Declared basis with no reference is constructible through the public API. \
-         The declaration is still rendered to the reader (chip + note), but \
-         shadow_cost_usd = ${charged:.2}, so the declared equivalence contributes nothing \
-         and nothing anywhere says so."
+        priced.shadow_cost_usd(&usage(1_000_000, 0)) > 0.0,
+        "and it prices, because the reference is not optional"
     );
 }
 
-/// The same contradiction arriving through `serde`, not through a struct
-/// literal. `Correlary` derives `Deserialize`, so this is an untrusted-input
-/// ingress and not only an API-shape complaint.
+/// The ingress that types alone do not close: a value arriving from outside
+/// the crate. `/v1/metrics` is a public document, and anything round-tripping
+/// it back in gets validated rather than trusted.
 #[test]
-#[ignore = "F5: validated defect, unfixed — Correlary and ModelMetrics accept states their own docs call impossible"]
 fn deserialization_rejects_a_contradictory_correlary() {
-    let json = r#"{
-      "local_model": "llama-70b",
-      "reference": {
-        "provider": "anthropic",
-        "model": "claude-sonnet",
-        "pricing": {
-          "input_per_mtok_usd": 3.0,
-          "cached_input_per_mtok_usd": 0.3,
-          "cache_write_per_mtok_usd": 3.75,
-          "output_per_mtok_usd": 15.0
+    let unpriced_but_referenced = serde_json::json!({
+        "local_model": "llama",
+        "reference": {
+            "provider": "anthropic",
+            "model": "claude",
+            "pricing": {
+                "input_per_mtok_usd": 3.0,
+                "cached_input_per_mtok_usd": 0.3,
+                "cache_write_per_mtok_usd": 3.75,
+                "output_per_mtok_usd": 15.0
+            },
+            "quality_prior": 0.6
         },
-        "quality_prior": 0.62
-      },
-      "basis": { "kind": "unpriced", "reason": "no comparable hosted model" }
-    }"#;
+        "basis": { "kind": "unpriced", "reason": "no comparable model" }
+    });
+    let error = serde_json::from_value::<Correlary>(unpriced_but_referenced)
+        .expect_err("unpriced yet carrying a reference model must be refused");
+    assert!(
+        error
+            .to_string()
+            .contains("unpriced yet carries a reference"),
+        "the error says which contradiction: {error}"
+    );
 
-    let parsed: Result<Correlary, _> = serde_json::from_str(json);
+    let priced_but_unreferenced = serde_json::json!({
+        "local_model": "llama",
+        "basis": { "kind": "declared", "note": "matched on our eval suite" }
+    });
+    let error = serde_json::from_value::<Correlary>(priced_but_unreferenced)
+        .expect_err("declared yet naming no reference model must be refused");
+    assert!(
+        error.to_string().contains("names no reference model"),
+        "{error}"
+    );
+}
 
-    match parsed {
-        Err(_) => {} // the invariant is enforced at the deserialization boundary
-        Ok(correlary) => panic!(
-            "serde accepted a correlary that is unpriced and priced at once: \
-             basis = {:?}, reference = {:?}, shadow_cost_usd = ${:.2}",
-            correlary.basis,
-            correlary.reference.as_ref().map(|r| &r.model),
-            correlary.shadow_cost_usd(&usage()),
-        ),
+/// The wire contract did not move, so consumers built against the previous
+/// shape keep working. The dashboard reads `basis.kind` and `reference`.
+#[test]
+fn the_serialized_shape_is_unchanged() {
+    let priced = Correlary::Priced {
+        local_model: "llama".into(),
+        reference: reference(),
+        basis: PricedBasis::Inferred {
+            shape_distance: 0.25,
+            considered: 3,
+        },
+    };
+    let json = serde_json::to_value(&priced).unwrap();
+    assert_eq!(json["local_model"], "llama");
+    assert_eq!(json["reference"]["model"], "claude");
+    assert_eq!(json["basis"]["kind"], "inferred");
+    assert_eq!(json["basis"]["considered"], 3);
+
+    let unpriced = Correlary::Unpriced {
+        local_model: "tiny".into(),
+        reason: "nothing comparable".into(),
+    };
+    let json = serde_json::to_value(&unpriced).unwrap();
+    assert_eq!(json["basis"]["kind"], "unpriced");
+    assert!(
+        json.get("reference").is_none(),
+        "an unpriced correlary omits the field rather than nulling it"
+    );
+
+    // And both round-trip, so the validating ingress accepts what we emit.
+    for correlary in [priced, unpriced] {
+        let text = serde_json::to_string(&correlary).unwrap();
+        assert_eq!(serde_json::from_str::<Correlary>(&text).unwrap(), correlary);
     }
 }
 
-/// Control: the crate's own constructor never produces an incoherent value.
+/// Was: `ModelMetrics { mode: Local, billed_usd: 42.0, .. }`.
 ///
-/// This is what separates "unenforced invariant" from "live miscomputation".
-/// `ShadowPricing::resolve` is the only in-tree path that builds a `Correlary`,
-/// and every branch of it is coherent — including the one the module documents
-/// as the trap, a declaration naming a model with no rate card.
+/// Now a compile error — the money lives inside `ModelAccounting`, whose
+/// variant *is* the mode, so a local row has no `billed_usd` field to set and
+/// a hosted row has no `correlary`. The accessors report the structural zero.
+#[test]
+fn a_model_row_cannot_contradict_its_own_serving_mode() {
+    let local = ModelAccounting::Local {
+        shadow_usd: 12.5,
+        correlary: Correlary::Unpriced {
+            local_model: "llama".into(),
+            reason: "nothing comparable".into(),
+        },
+    };
+    let row = roundhouse_core::metrics::ModelMetrics {
+        provider: "dynamo".into(),
+        model: "llama".into(),
+        calls: 3,
+        tokens: Default::default(),
+        coverage: Default::default(),
+        accounting: local,
+    };
+
+    assert_eq!(row.mode(), ServingMode::Local);
+    assert_eq!(row.billed_usd(), 0.0, "a local row bills nothing, by shape");
+    assert_eq!(row.cache_savings_usd(), 0.0);
+    assert_eq!(row.shadow_usd(), 12.5);
+    assert!(row.correlary().is_some());
+
+    let hosted = roundhouse_core::metrics::ModelMetrics {
+        provider: "anthropic".into(),
+        model: "claude".into(),
+        calls: 1,
+        tokens: Default::default(),
+        coverage: Default::default(),
+        accounting: ModelAccounting::Frontier {
+            billed_usd: 4.0,
+            billed_measured_usd: 3.0,
+            billed_estimated_usd: 1.0,
+            cache_savings_usd: 0.5,
+        },
+    };
+    assert_eq!(hosted.mode(), ServingMode::Frontier);
+    assert_eq!(
+        hosted.shadow_usd(),
+        0.0,
+        "a hosted row is billed, not shadowed"
+    );
+    assert!(
+        hosted.correlary().is_none(),
+        "and it has no stand-in, because it is the thing others stand in for"
+    );
+
+    // The flattened wire form still carries `mode` and the applicable money at
+    // the top level, so the dashboard's `m.mode === "local"` branch is intact.
+    let json = serde_json::to_value(&row).unwrap();
+    assert_eq!(json["mode"], "local");
+    assert_eq!(json["shadow_usd"], 12.5);
+    assert!(
+        json.get("billed_usd").is_none(),
+        "absent, not a misleading zero"
+    );
+}
+
+/// Control: the one in-tree constructor is coherent on every branch. If this
+/// failed, the tests above would be guarding a door nobody uses.
 #[test]
 fn shadow_pricing_resolve_never_produces_an_incoherent_correlary() {
-    let shape = TokenShape::from_rollup(&usage(), 10);
+    let pricer = ShadowPricing::new(vec![reference()]).declare(
+        "declared-model",
+        "anthropic",
+        "claude",
+        "stated",
+    );
     let mut observed = HashMap::new();
     observed.insert(
-        ("anthropic".to_string(), "claude-sonnet".to_string()),
-        TokenShape::from_rollup(&usage(), 10).unwrap(),
+        ("anthropic".to_string(), "claude".to_string()),
+        TokenShape::from_rollup(&usage(10_000, 1_000), 10).unwrap(),
     );
 
-    let pricing = ShadowPricing::new(vec![reference()]);
-    let cases = vec![
-        // inferred: gate passes, hosted model has observed traffic
-        pricing.resolve("llama-70b", 0.62, shape, &observed),
-        // unpriced: nothing within the capability band
-        pricing.resolve("tiny", 0.01, shape, &observed),
-        // unpriced: no local traffic to compare
-        pricing.resolve("llama-70b", 0.62, None, &observed),
-        // unpriced: no comparable hosted model has been called
-        pricing.resolve("llama-70b", 0.62, shape, &HashMap::new()),
-        // declared, resolvable
-        ShadowPricing::new(vec![reference()])
-            .declare("llama-70b", "anthropic", "claude-sonnet", "eval parity")
-            .resolve("llama-70b", 0.62, shape, &observed),
-        // declared against a model with no rate card
-        ShadowPricing::new(vec![reference()])
-            .declare("llama-70b", "openai", "gpt-nonexistent", "eval parity")
-            .resolve("llama-70b", 0.62, shape, &observed),
+    let cases = [
+        (
+            "declared-model",
+            0.6,
+            Some(TokenShape::from_rollup(&usage(10_000, 1_000), 10).unwrap()),
+        ),
+        (
+            "inferred-model",
+            0.6,
+            TokenShape::from_rollup(&usage(10_000, 1_000), 10),
+        ),
+        ("no-shape", 0.6, None),
+        (
+            "wrong-capability",
+            0.05,
+            TokenShape::from_rollup(&usage(10_000, 1_000), 10),
+        ),
+        ("bad-declaration", 0.6, None),
     ];
-
-    for correlary in &cases {
-        assert!(
-            is_coherent(correlary),
-            "ShadowPricing::resolve produced an incoherent correlary: {correlary:?}"
-        );
+    for (model, quality, shape) in cases {
+        let correlary = pricer.resolve(model, quality, shape, &observed);
+        // Coherence is now a type-level property, so the check that remains is
+        // that the value agrees with itself when priced.
+        let priced = correlary.shadow_cost_usd(&usage(1_000_000, 0));
+        match (&correlary, priced > 0.0) {
+            (Correlary::Priced { .. }, true) | (Correlary::Unpriced { .. }, false) => {}
+            (correlary, priced_nonzero) => panic!(
+                "{model}: {correlary:?} priced-nonzero={priced_nonzero} disagrees with its own arm"
+            ),
+        }
     }
-}
 
-/// (c) ModelMetrics: `mode` plus mutually exclusive money fields plus an
-/// optional comparison, with nothing tying them together.
-///
-/// The doc comments state three invariants: `billed_usd` is "always zero for
-/// [`ServingMode::Local`]", `shadow_usd` is "zero for hosted models", and
-/// `correlary` is "present only for local models". All three are constructible
-/// false through the public API.
-///
-/// Weaker than the `Correlary` case on purpose, and the report says so: no
-/// library function *consumes* a `ModelMetrics` built outside the crate, so
-/// this is a DTO-shape fact rather than a reachable miscomputation.
-#[test]
-#[ignore = "F5: validated defect, unfixed — Correlary and ModelMetrics accept states their own docs call impossible"]
-fn model_metrics_cannot_contradict_its_own_serving_mode() {
-    use roundhouse_core::metrics::{Coverage, ModelMetrics, ServingMode, TokenBreakdown};
-
-    let incoherent = vec![
-        // local, yet billed money and carrying no correlary
-        ModelMetrics {
-            mode: ServingMode::Local,
-            provider: "roundhouse".into(),
-            model: "llama-70b".into(),
-            calls: 4,
-            tokens: TokenBreakdown::default(),
-            coverage: Coverage::default(),
-            billed_measured_usd: 0.0,
-            billed_estimated_usd: 0.0,
-            billed_usd: 42.0,
-            shadow_usd: 0.0,
-            cache_savings_usd: 0.0,
-            correlary: None,
-        },
-        // hosted, yet shadow-priced against a correlary it cannot have
-        ModelMetrics {
-            mode: ServingMode::Frontier,
-            provider: "anthropic".into(),
-            model: "claude-sonnet".into(),
-            calls: 4,
-            tokens: TokenBreakdown::default(),
-            coverage: Coverage::default(),
-            billed_measured_usd: 0.0,
-            billed_estimated_usd: 0.0,
-            billed_usd: 10.0,
-            shadow_usd: 7.0,
-            cache_savings_usd: 0.0,
-            correlary: Some(Correlary {
-                local_model: "llama-70b".into(),
-                reference: Some(reference()),
-                basis: CorrelaryBasis::Declared { note: "n/a".into() },
-            }),
-        },
-    ];
-
-    for row in &incoherent {
-        let coherent = match row.mode {
-            ServingMode::Local => row.billed_usd == 0.0 && row.correlary.is_some(),
-            ServingMode::Frontier => row.shadow_usd == 0.0 && row.correlary.is_none(),
-        };
-        assert!(
-            coherent,
-            "ModelMetrics accepts a row contradicting its own documented invariants: \
-             mode={:?} billed_usd={} shadow_usd={} correlary={}\n\
-             serialized: {}",
-            row.mode,
-            row.billed_usd,
-            row.shadow_usd,
-            if row.correlary.is_some() { "Some" } else { "None" },
-            serde_json::to_string(row).unwrap(),
-        );
-    }
+    // And a MetricsConfig built the ordinary way resolves the same values.
+    let config = MetricsConfig::new(ShadowPricing::new(vec![reference()]).declare(
+        "llama",
+        "anthropic",
+        "claude",
+        "",
+    ));
+    assert!(matches!(
+        config.pricing.resolve("llama", 0.6, None, &HashMap::new()),
+        Correlary::Priced { .. }
+    ));
 }
