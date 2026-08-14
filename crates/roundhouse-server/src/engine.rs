@@ -663,8 +663,18 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                 .await?
             }
             Target::Frontier { .. } => {
+                // The dialect travels with the request. A client cannot ask the
+                // catalog itself — it holds one `Arc<dyn FrontierClient>` for
+                // providers whose transports have nothing in common — so
+                // whatever it needs to serialize correctly has to arrive in the
+                // quote or not at all.
+                let spec = self
+                    .frontier_catalog
+                    .spec_for(&decision.target)
+                    .ok_or_else(|| EngineError::UnresolvableTarget(decision.target.clone()))?;
                 let quote = FrontierQuote {
                     target: decision.target.clone(),
+                    wire_protocol: spec.wire_protocol,
                     prompt: assembler.rendered(),
                     // Stable for the life of the session: providers use it to
                     // steer requests to the same cache node, so varying it

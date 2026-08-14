@@ -137,10 +137,32 @@ struct Counters {
     calls: u64,
     /// Calls whose usage the provider never reported. See [`Accounting`].
     estimated_calls: u64,
-    usage: Usage,
+    /// Tokens the provider itself counted.
+    reported_usage: Usage,
+    /// Tokens Roundhouse counted because the provider did not.
+    ///
+    /// Kept apart from `reported_usage` rather than summed into it, and this is
+    /// the whole point: pricing is linear in tokens, so two accumulators can be
+    /// priced independently at no cost, while one accumulator makes the split
+    /// unrecoverable the instant the first estimated call lands. Merging first
+    /// and reporting a call-weighted coverage ratio afterwards does not
+    /// substitute — a 50%-of-calls ratio is consistent with 95% or 5% of the
+    /// dollars being measured, because calls differ in size by orders of
+    /// magnitude.
+    estimated_usage: Usage,
     /// Summed over locally-served turns: the cheapest frontier option the
     /// router had quoted at the moment it chose local.
     quoted_alternative_usd: f64,
+}
+
+impl Counters {
+    /// Both provenances together, for the figures that are about volume rather
+    /// than confidence.
+    fn total_usage(&self) -> Usage {
+        let mut total = self.reported_usage.clone();
+        total.add(&self.estimated_usage);
+        total
+    }
 }
 
 /// A dispatch waiting for its response to terminate.
@@ -230,10 +252,13 @@ impl MetricsFold {
 
                 let counters = self.models.entry(pending.key).or_default();
                 counters.calls += 1;
-                if usage.accounting == Accounting::Estimated {
-                    counters.estimated_calls += 1;
+                match usage.accounting {
+                    Accounting::Reported => counters.reported_usage.add(usage),
+                    Accounting::Estimated => {
+                        counters.estimated_calls += 1;
+                        counters.estimated_usage.add(usage);
+                    }
                 }
-                counters.usage.add(usage);
                 if let Some(alternative) = pending.best_frontier_alternative_usd {
                     counters.quoted_alternative_usd += alternative;
                 }
@@ -274,7 +299,7 @@ impl MetricsFold {
             .iter()
             .filter(|(key, _)| key.mode == ServingMode::Frontier)
             .filter_map(|(key, counters)| {
-                TokenShape::from_rollup(&counters.usage, counters.calls)
+                TokenShape::from_rollup(&counters.total_usage(), counters.calls)
                     .map(|shape| ((key.provider.clone(), key.model.clone()), shape))
             })
             .collect()
@@ -362,6 +387,15 @@ pub struct Coverage {
     pub calls: u64,
     pub reported_calls: u64,
     pub estimated_calls: u64,
+    /// Billed tokens the provider counted.
+    pub reported_tokens: u64,
+    /// Billed tokens Roundhouse counted in its place.
+    ///
+    /// Present because the call-weighted ratio above is a poor proxy for it:
+    /// one unreported 200k-token turn and one reported 2k-token turn is 50%
+    /// coverage by calls and 1% by tokens, and it is the token figure that
+    /// tracks the money.
+    pub estimated_tokens: u64,
 }
 
 impl Coverage {
@@ -371,6 +405,24 @@ impl Coverage {
         } else {
             self.reported_calls as f64 / self.calls as f64
         }
+    }
+
+    /// Share of billed tokens the provider counted, 0.0..=1.0.
+    pub fn reported_token_fraction(&self) -> f64 {
+        let total = self.reported_tokens + self.estimated_tokens;
+        if total == 0 {
+            1.0
+        } else {
+            self.reported_tokens as f64 / total as f64
+        }
+    }
+
+    fn add(&mut self, other: &Coverage) {
+        self.calls += other.calls;
+        self.reported_calls += other.reported_calls;
+        self.estimated_calls += other.estimated_calls;
+        self.reported_tokens += other.reported_tokens;
+        self.estimated_tokens += other.estimated_tokens;
     }
 }
 
@@ -384,7 +436,17 @@ pub struct ModelMetrics {
     pub tokens: TokenBreakdown,
     pub coverage: Coverage,
     /// Money actually billed. Always zero for [`ServingMode::Local`].
+    ///
+    /// The sum of the two fields below. Kept as its own field so a consumer
+    /// that does not care about provenance reads one number, and one that does
+    /// cannot mistake the total for the measured part.
     pub billed_usd: f64,
+    /// The part of `billed_usd` priced from counts the provider reported.
+    pub billed_measured_usd: f64,
+    /// The part priced from Roundhouse's own tokenizer, because the provider
+    /// reported nothing. Not a smaller number than the truth or a larger one —
+    /// an unknown one, since a tokenizer mismatch cuts either way.
+    pub billed_estimated_usd: f64,
     /// What this traffic would have cost on its correlary. Zero for hosted
     /// models, which are billed rather than shadow-priced, and zero for local
     /// models whose correlary is [`CorrelaryBasis::Unpriced`].
@@ -404,7 +466,10 @@ pub struct ProviderMetrics {
     pub mode: ServingMode,
     pub calls: u64,
     pub tokens: TokenBreakdown,
+    pub coverage: Coverage,
     pub billed_usd: f64,
+    pub billed_measured_usd: f64,
+    pub billed_estimated_usd: f64,
     pub shadow_usd: f64,
     pub cache_savings_usd: f64,
     pub models: usize,
@@ -416,7 +481,10 @@ pub struct ServingModeMetrics {
     pub mode: ServingMode,
     pub calls: u64,
     pub tokens: TokenBreakdown,
+    pub coverage: Coverage,
     pub billed_usd: f64,
+    pub billed_measured_usd: f64,
+    pub billed_estimated_usd: f64,
     pub shadow_usd: f64,
     pub cache_savings_usd: f64,
 }
@@ -424,10 +492,23 @@ pub struct ServingModeMetrics {
 /// The headline, decomposed by how much each part can be trusted.
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 pub struct Savings {
-    /// Measured. Money billed by hosted providers.
+    /// Money billed by hosted providers: `measured + estimated` below.
+    ///
+    /// Not labelled "measured" as a whole, which it was and which was wrong.
+    /// A provider that reports no usage still bills, and the tokens standing in
+    /// for its silence are ours, not its.
     pub frontier_spend_usd: f64,
+    /// The part of `frontier_spend_usd` priced from provider-reported counts.
+    pub frontier_spend_measured_usd: f64,
+    /// The part priced from our own tokenizer, because the provider was silent.
+    pub frontier_spend_estimated_usd: f64,
     /// Measured. The discount hosted caches applied to prompt tokens they had
     /// already seen.
+    ///
+    /// Wholly measured even when coverage is partial, and not by luck: an
+    /// unreported call records `cached_input_tokens: 0` because nothing
+    /// observable bears on what a remote cache did, so an estimated call
+    /// contributes exactly zero here rather than a guess.
     pub cache_savings_usd: f64,
     /// Estimated. What local traffic would have cost on its correlary — a call
     /// that never happened, priced against a model chosen by [`pricing`].
@@ -459,7 +540,14 @@ pub struct MetricsSnapshot {
     pub tokens: TokenBreakdown,
     pub savings: Savings,
     pub coverage: Coverage,
+    /// Share of *calls* the provider accounted for.
     pub coverage_fraction: f64,
+    /// Share of billed *tokens* the provider accounted for.
+    ///
+    /// The one to quote next to a dollar figure: spend tracks tokens, and a
+    /// deployment can have most of its calls reported and most of its tokens
+    /// not, or the reverse.
+    pub coverage_token_fraction: f64,
     pub models: Vec<ModelMetrics>,
     pub providers: Vec<ProviderMetrics>,
     pub serving_modes: Vec<ServingModeMetrics>,
@@ -523,14 +611,17 @@ impl MetricsSnapshot {
 
         let mut models = Vec::with_capacity(fold.models.len());
         for (key, counters) in &fold.models {
-            let tokens = TokenBreakdown::from_usage(&counters.usage);
+            let total_usage = counters.total_usage();
+            let tokens = TokenBreakdown::from_usage(&total_usage);
             let coverage = Coverage {
                 calls: counters.calls,
                 reported_calls: counters.calls.saturating_sub(counters.estimated_calls),
                 estimated_calls: counters.estimated_calls,
+                reported_tokens: counters.reported_usage.total(),
+                estimated_tokens: counters.estimated_usage.total(),
             };
 
-            let (billed_usd, shadow_usd, cache_savings_usd, correlary) = match key.mode {
+            let (billed, shadow_usd, cache_savings_usd, correlary) = match key.mode {
                 ServingMode::Frontier => {
                     // A hosted model with no rate card bills an unknown amount,
                     // and zero is the wrong guess. It is reported as zero
@@ -538,20 +629,29 @@ impl MetricsSnapshot {
                     // dashboard as a row that used tokens for free — the shape
                     // of a missing rate card rather than of a bargain.
                     let rate = config.rate_card(&key.provider, &key.model);
-                    let billed = rate.map_or(0.0, |r| r.pricing.price(&counters.usage));
-                    let cache = rate.map_or(0.0, |r| r.pricing.cache_savings(&counters.usage));
+                    // Priced per provenance, which costs nothing extra because
+                    // `price` is linear in tokens, and is the only way the two
+                    // parts can be reported apart afterwards.
+                    let billed = Billed {
+                        measured: rate.map_or(0.0, |r| r.pricing.price(&counters.reported_usage)),
+                        estimated: rate.map_or(0.0, |r| r.pricing.price(&counters.estimated_usage)),
+                    };
+                    // Wholly measured: an unreported call carries
+                    // `cached_input_tokens: 0`, so it contributes nothing here
+                    // rather than a guess.
+                    let cache = rate.map_or(0.0, |r| r.pricing.cache_savings(&total_usage));
                     (billed, 0.0, cache, None)
                 }
                 ServingMode::Local => {
-                    let shape = TokenShape::from_rollup(&counters.usage, counters.calls);
+                    let shape = TokenShape::from_rollup(&total_usage, counters.calls);
                     let correlary = config.pricing.resolve(
                         &key.model,
                         config.local_quality(&key.model),
                         shape,
                         &frontier_shapes,
                     );
-                    let shadow = correlary.shadow_cost_usd(&counters.usage);
-                    (0.0, shadow, 0.0, Some(correlary))
+                    let shadow = correlary.shadow_cost_usd(&total_usage);
+                    (Billed::default(), shadow, 0.0, Some(correlary))
                 }
             };
 
@@ -562,7 +662,9 @@ impl MetricsSnapshot {
                 calls: counters.calls,
                 tokens,
                 coverage,
-                billed_usd,
+                billed_usd: billed.total(),
+                billed_measured_usd: billed.measured,
+                billed_estimated_usd: billed.estimated,
                 shadow_usd,
                 cache_savings_usd,
                 correlary,
@@ -588,9 +690,7 @@ impl MetricsSnapshot {
         let mut calls = 0;
         for model in &models {
             tokens.add(&model.tokens);
-            coverage.calls += model.coverage.calls;
-            coverage.reported_calls += model.coverage.reported_calls;
-            coverage.estimated_calls += model.coverage.estimated_calls;
+            coverage.add(&model.coverage);
             calls += model.calls;
         }
 
@@ -598,6 +698,8 @@ impl MetricsSnapshot {
         let routing_savings_usd = models.iter().map(|m| m.shadow_usd).sum();
         let savings = Savings {
             frontier_spend_usd: models.iter().map(|m| m.billed_usd).sum(),
+            frontier_spend_measured_usd: models.iter().map(|m| m.billed_measured_usd).sum(),
+            frontier_spend_estimated_usd: models.iter().map(|m| m.billed_estimated_usd).sum(),
             cache_savings_usd,
             routing_savings_usd,
             routing_savings_at_decision_usd: fold
@@ -619,11 +721,28 @@ impl MetricsSnapshot {
             savings,
             coverage,
             coverage_fraction: coverage.reported_fraction(),
+            coverage_token_fraction: coverage.reported_token_fraction(),
             models,
             providers,
             serving_modes,
             capability_band: config.pricing.capability_band(),
         }
+    }
+}
+
+/// A billed figure, split by how its tokens were counted.
+///
+/// A two-field struct rather than a pair, because `(f64, f64)` at a call site
+/// is exactly the shape that gets transposed once and never noticed.
+#[derive(Debug, Clone, Copy, Default)]
+struct Billed {
+    measured: f64,
+    estimated: f64,
+}
+
+impl Billed {
+    fn total(&self) -> f64 {
+        self.measured + self.estimated
     }
 }
 
@@ -642,14 +761,20 @@ fn roll_up_providers(models: &[ModelMetrics]) -> Vec<ProviderMetrics> {
                 mode: model.mode,
                 calls: 0,
                 tokens: TokenBreakdown::default(),
+                coverage: Coverage::default(),
                 billed_usd: 0.0,
+                billed_measured_usd: 0.0,
+                billed_estimated_usd: 0.0,
                 shadow_usd: 0.0,
                 cache_savings_usd: 0.0,
                 models: 0,
             });
         entry.calls += model.calls;
         entry.tokens.add(&model.tokens);
+        entry.coverage.add(&model.coverage);
         entry.billed_usd += model.billed_usd;
+        entry.billed_measured_usd += model.billed_measured_usd;
+        entry.billed_estimated_usd += model.billed_estimated_usd;
         entry.shadow_usd += model.shadow_usd;
         entry.cache_savings_usd += model.cache_savings_usd;
         entry.models += 1;
@@ -674,7 +799,10 @@ fn roll_up_modes(models: &[ModelMetrics]) -> Vec<ServingModeMetrics> {
             mode,
             calls: 0,
             tokens: TokenBreakdown::default(),
+            coverage: Coverage::default(),
             billed_usd: 0.0,
+            billed_measured_usd: 0.0,
+            billed_estimated_usd: 0.0,
             shadow_usd: 0.0,
             cache_savings_usd: 0.0,
         })
@@ -686,7 +814,10 @@ fn roll_up_modes(models: &[ModelMetrics]) -> Vec<ServingModeMetrics> {
             .expect("every serving mode has a row");
         entry.calls += model.calls;
         entry.tokens.add(&model.tokens);
+        entry.coverage.add(&model.coverage);
         entry.billed_usd += model.billed_usd;
+        entry.billed_measured_usd += model.billed_measured_usd;
+        entry.billed_estimated_usd += model.billed_estimated_usd;
         entry.shadow_usd += model.shadow_usd;
         entry.cache_savings_usd += model.cache_savings_usd;
     }

@@ -55,6 +55,18 @@ const DUPLICATE_IDENTITY: &str = r#"{
   ]
 }"#;
 
+/// The same catalog with the second entry removed: valid, and the baseline
+/// the sub-claim tests mutate one field of.
+fn single_model() -> String {
+    let start = DUPLICATE_IDENTITY.find("    },\n    {").expect("two entries");
+    let end = DUPLICATE_IDENTITY.rfind("  ]").expect("closing bracket");
+    format!(
+        "{}    }}\n{}",
+        &DUPLICATE_IDENTITY[..start],
+        &DUPLICATE_IDENTITY[end..]
+    )
+}
+
 fn target() -> Target {
     Target::Frontier {
         provider: "anthropic".into(),
@@ -108,52 +120,74 @@ fn one_frontier_call(usage: Usage) -> Vec<SessionEvent> {
     ]
 }
 
-/// The headline claim: one config file, two prices for one model identity, and
-/// the router and the dashboard end up on opposite sides of it.
+/// The headline claim: one config file, two prices for one model identity,
+/// putting the router and the dashboard on opposite sides of it.
+///
+/// Now refused at the boundary. The assertion is deliberately about the parse
+/// rather than about reconciling the two lookups: making `rate_card` take the
+/// last match instead of the first would silence this test while leaving the
+/// operator's ambiguous file accepted, which is the wrong fix.
 #[test]
-#[ignore = "F3: validated defect, unfixed — the catalog is not a validated boundary"]
-fn duplicate_identity_splits_the_router_price_from_the_dashboard_price() {
-    let config = CatalogConfig::from_json(DUPLICATE_IDENTITY, "duplicate.json")
-        .expect("parsing accepts a duplicated model identity");
-    assert_eq!(
-        config.catalog().models().len(),
-        2,
-        "precondition: both entries survived parsing as distinct catalog rows"
-    );
+fn duplicate_identity_is_refused_by_the_catalog_boundary() {
+    let error = CatalogConfig::from_json(DUPLICATE_IDENTITY, "duplicate.json")
+        .expect_err("a duplicated model identity must not parse");
 
-    // Router side: the ledger is seeded from the catalog, and a routing quote
-    // is priced from whatever it holds for this target.
+    let message = error.to_string();
+    assert!(message.contains("duplicate.json"), "names the file: {message}");
+    assert!(
+        message.contains("anthropic/claude-sonnet"),
+        "names the offending identity: {message}"
+    );
+}
+
+/// And with the ambiguity gone, the invariant the whole config file exists to
+/// uphold actually holds: one identity, one price, both sides.
+#[test]
+fn a_valid_catalog_prices_the_same_call_identically_on_both_sides() {
+    let config = CatalogConfig::from_json(&single_model(), "single.json").unwrap();
+
+    // Router side: the ledger is seeded from the catalog.
     let mut ledger = CacheLedger::new();
     config.catalog().apply_to_ledger(&mut ledger);
     let (_model, router_pricing) = ledger.model_for(&target());
     let router_price = router_pricing.price(&one_mtok_of_uncached_input());
 
-    // Dashboard side: the same config's metrics config, applied to a fold that
-    // recorded one call to that same target.
+    // Dashboard side: the same config's metrics config over a recorded call.
     let mut fold = MetricsFold::new();
     fold.extend(&one_frontier_call(one_mtok_of_uncached_input()));
     let snapshot = MetricsSnapshot::build(&fold, &config.metrics_config(), 3_000);
-    assert_eq!(
-        snapshot.models.len(),
-        1,
-        "the fold keys by model identity, so the duplicate is invisible here"
-    );
     let dashboard_price = snapshot.models[0].billed_usd;
 
     assert_eq!(
         router_price, dashboard_price,
-        "one catalog file, one model identity, one million uncached prompt \
-         tokens: the router priced this call at ${router_price} and the \
-         dashboard billed it at ${dashboard_price}. The stated invariant is \
-         that these are the same number."
+        "the price a turn is chosen on and the price it is reported at must be \
+         one number"
     );
+    assert!(router_price > 0.0, "and a real one");
+}
+
+/// A correlary naming a model absent from the catalog used to degrade silently
+/// inside `ShadowPricing::resolve`: the local model was reported unpriced, with
+/// a reason nobody reads naming a rate card nobody noticed was missing.
+#[test]
+fn a_correlary_naming_an_unknown_model_is_refused() {
+    let json = single_model().replace(
+        "  ]\n}",
+        r#"  ],
+  "correlaries": [
+    { "local_model": "llama", "provider": "anthropic", "model": "typo", "note": "" }
+  ]
+}"#,
+    );
+    let error = CatalogConfig::from_json(&json, "correlary.json")
+        .expect_err("a correlary must name a model this catalog prices");
+    assert!(error.to_string().contains("typo"), "{error}");
 }
 
 /// Sub-claim: are negative prices accepted?
 #[test]
-#[ignore = "F3: validated defect, unfixed — the catalog is not a validated boundary"]
 fn a_negative_price_is_refused_by_the_catalog_boundary() {
-    let json = DUPLICATE_IDENTITY
+    let json = single_model()
         .replace("\"input_per_mtok_usd\": 3.0", "\"input_per_mtok_usd\": -3.0")
         .replace(
             "\"cache_write_per_mtok_usd\": 3.75",
@@ -194,12 +228,12 @@ fn a_negative_price_is_refused_by_the_catalog_boundary() {
 #[test]
 fn a_nonfinite_price_cannot_be_expressed_in_the_config_format() {
     let overflow =
-        DUPLICATE_IDENTITY.replace("\"input_per_mtok_usd\": 3.0", "\"input_per_mtok_usd\": 1e400");
+        single_model().replace("\"input_per_mtok_usd\": 3.0", "\"input_per_mtok_usd\": 1e400");
     let error = CatalogConfig::from_json(&overflow, "overflow.json")
         .expect_err("serde_json refuses a float literal it cannot represent");
     assert!(error.to_string().contains("overflow.json"));
 
-    let nan = DUPLICATE_IDENTITY.replace("\"input_per_mtok_usd\": 3.0", "\"input_per_mtok_usd\": NaN");
+    let nan = single_model().replace("\"input_per_mtok_usd\": 3.0", "\"input_per_mtok_usd\": NaN");
     assert!(CatalogConfig::from_json(&nan, "nan.json").is_err());
 }
 
@@ -208,9 +242,8 @@ fn a_nonfinite_price_cannot_be_expressed_in_the_config_format() {
 /// It is documented as 0.0..=1.0 and it gates the capability comparison, so a
 /// value outside that range silently widens or closes the gate.
 #[test]
-#[ignore = "F3: validated defect, unfixed — the catalog is not a validated boundary"]
 fn an_out_of_range_quality_prior_is_refused() {
-    let prior = DUPLICATE_IDENTITY.replace("\"quality_prior\": 0.62", "\"quality_prior\": 42.0");
+    let prior = single_model().replace("\"quality_prior\": 0.62", "\"quality_prior\": 42.0");
     let parsed = CatalogConfig::from_json(&prior, "prior.json");
     if let Ok(config) = &parsed {
         let observed = config.catalog().models()[0].quality_prior;
@@ -232,7 +265,7 @@ fn an_out_of_range_quality_prior_is_refused() {
 /// billed as input -- so both readings produce the same dollars.
 #[test]
 fn a_zero_cache_write_rate_bills_uncached_input_at_the_input_rate() {
-    let zero_write = DUPLICATE_IDENTITY.replace(
+    let zero_write = single_model().replace(
         "\"cache_write_per_mtok_usd\": 3.75",
         "\"cache_write_per_mtok_usd\": 0.0",
     );

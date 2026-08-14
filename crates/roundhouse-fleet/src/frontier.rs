@@ -110,6 +110,24 @@ impl StaticFrontierCatalog {
         )
     }
 
+    /// The entry a chosen target came from.
+    ///
+    /// Sound because the configuration boundary refuses a catalog listing one
+    /// `(provider, model)` twice — see `CatalogConfig::validate` in
+    /// `roundhouse-server`. That check is what makes this a lookup rather than
+    /// a guess: `Target` alone cannot distinguish two entries for one model
+    /// served over different dialects, which is exactly the shape the boundary
+    /// rejects. A catalog built by hand rather than parsed carries that
+    /// obligation itself.
+    pub fn spec_for(&self, target: &Target) -> Option<&FrontierModelSpec> {
+        let Target::Frontier { provider, model } = target else {
+            return None;
+        };
+        self.models
+            .iter()
+            .find(|spec| &spec.provider == provider && &spec.model == model)
+    }
+
     /// Price every frontier model against the current prompt.
     pub fn quote(
         &self,
@@ -207,6 +225,16 @@ impl FrontierChunk {
 #[derive(Debug, Clone)]
 pub struct FrontierQuote {
     pub target: Target,
+    /// The dialect this request must be serialized in.
+    ///
+    /// Carried here rather than looked up by the client, because this is the
+    /// only argument [`FrontierClient::execute`] receives and
+    /// [`crate::usage`] makes enforcing usage reporting the client's
+    /// obligation. Without it the obligation cannot be discharged from inside
+    /// the trait at all, and `Target` is not a substitute: it keys on provider
+    /// and model, and one model served over two dialects is an ordinary
+    /// deployment.
+    pub wire_protocol: WireProtocol,
     pub prompt: String,
     /// Stable per-session key. Providers use it to steer requests to the same
     /// cache node, so it must not vary turn to turn.
@@ -339,6 +367,7 @@ mod tests {
                     provider: "anthropic".into(),
                     model: "claude".into(),
                 },
+                wire_protocol: WireProtocol::AnthropicMessages,
                 prompt: "some prompt".into(),
                 prompt_cache_key: "sess_x".into(),
                 expected_output_tokens: None,

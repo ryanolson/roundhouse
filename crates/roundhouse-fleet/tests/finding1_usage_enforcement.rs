@@ -9,15 +9,12 @@
 //! only argument a `FrontierClient` is actually handed — a `&FrontierQuote` —
 //! and asks whether an implementer can discharge that obligation from it.
 //!
-//! Adjudicated P2, not the P3 the first pass landed on. Nothing can misreport
-//! today — the sole client is a stub, and `Accounting::Estimated` is wired end
-//! to end — which argues the severity down. What argues it back up is that
-//! `Engine` holds *one* `Arc<dyn FrontierClient>` "for a catalog of providers
-//! whose transports have nothing in common", so a client per protocol is not
-//! the escape hatch it looks like, and `target_alone_does_not_identify_a_dialect`
-//! below closes the other one. The seam cannot support the architecture the
-//! engine has already committed to, and `usage.rs` meanwhile advertises two
-//! defences when only the second has a live path.
+//! It could not, and that was the defect: `Engine` holds *one*
+//! `Arc<dyn FrontierClient>` "for a catalog of providers whose transports have
+//! nothing in common", so a client per protocol was never the escape hatch it
+//! looked like, and `target_alone_does_not_identify_a_dialect` below closes the
+//! other one. `FrontierQuote` now carries the dialect, so the obligation can be
+//! discharged from inside the trait.
 
 use std::sync::Mutex;
 
@@ -56,7 +53,12 @@ fn quote_as_the_engine_builds_it(catalog: &StaticFrontierCatalog) -> FrontierQuo
     catalog.apply_to_ledger(&mut ledger);
     let candidate = catalog.quote(&ledger, 0, 1_000, 500).remove(0);
 
+    let spec = catalog
+        .spec_for(&candidate.target)
+        .expect("the catalog priced this target, so it owns its spec");
+
     FrontierQuote {
+        wire_protocol: spec.wire_protocol,
         target: candidate.target,
         prompt: "how many tokens did that turn bill?".into(),
         prompt_cache_key: "sess_finding1".into(),
@@ -64,22 +66,13 @@ fn quote_as_the_engine_builds_it(catalog: &StaticFrontierCatalog) -> FrontierQuo
     }
 }
 
-/// Recover the wire protocol from a quote, using only what the `FrontierClient`
-/// trait gives an implementer.
+/// What a client holding a quote can see of the dialect.
 ///
-/// `FrontierQuote` exposes four public fields and no methods, so its `Debug`
-/// rendering is the exhaustive view of what a client holding one can see. If
-/// the dialect were reachable at this seam at all, it would show up here.
+/// Now a plain field read. It stays a named function because the point of the
+/// test below is that an implementer reaches this from `&FrontierQuote` alone,
+/// with no catalog and no second source of truth in scope.
 fn protocol_of(quote: &FrontierQuote) -> Option<WireProtocol> {
-    let visible = format!("{quote:?}");
-    [
-        (WireProtocol::OpenAiChatCompletions, "OpenAiChatCompletions"),
-        (WireProtocol::OpenAiResponses, "OpenAiResponses"),
-        (WireProtocol::AnthropicMessages, "AnthropicMessages"),
-    ]
-    .into_iter()
-    .find(|(_, name)| visible.contains(name))
-    .map(|(protocol, _)| protocol)
+    Some(quote.wire_protocol)
 }
 
 /// The provider client the README lists under "Not yet built", reduced to the
@@ -116,7 +109,6 @@ impl FrontierClient for SerializingFrontierClient {
 }
 
 #[test]
-#[ignore = "F1: validated defect, unfixed — no non-test caller can reach enforce_usage_reporting until FrontierQuote carries the dialect"]
 fn the_quote_a_frontier_client_receives_carries_the_wire_protocol() {
     let catalog = chat_completions_catalog();
     let quote = quote_as_the_engine_builds_it(&catalog);
@@ -129,13 +121,12 @@ fn the_quote_a_frontier_client_receives_carries_the_wire_protocol() {
     assert_eq!(
         protocol_of(&quote),
         Some(WireProtocol::OpenAiChatCompletions),
-        "the quote handed to a FrontierClient does not carry the dialect the \
-         catalog declared; visible fields are only: {quote:?}",
+        "the quote handed to a FrontierClient must carry the dialect the \
+         catalog declared; quote was: {quote:?}",
     );
 }
 
 #[tokio::test]
-#[ignore = "F1: validated defect, unfixed — no non-test caller can reach enforce_usage_reporting until FrontierQuote carries the dialect"]
 async fn a_frontier_client_asks_the_provider_to_report_usage() {
     let catalog = chat_completions_catalog();
     let quote = quote_as_the_engine_builds_it(&catalog);
@@ -171,12 +162,14 @@ fn enforcement_works_the_instant_the_protocol_is_known() {
     assert_eq!(body["stream_options"]["include_usage"], json!(true));
 }
 
-/// The one out-of-band route open to an implementer — hand the client its own
-/// copy of the catalog and look the spec up by `quote.target` — is not sound in
-/// general: `Target::Frontier` keys on provider and model only, and one model
-/// served over two dialects is an ordinary deployment (OpenAI serves `gpt-x` on
-/// both Chat Completions and Responses). Passes today; it documents why the
-/// workaround is not a substitute for carrying the dialect on the quote.
+/// Why the dialect had to travel on the quote rather than be looked up.
+///
+/// `Target::Frontier` keys on provider and model only, so a catalog holding one
+/// model over two dialects — OpenAI serves `gpt-x` on both Chat Completions and
+/// Responses — cannot be disambiguated by target. `spec_for` would silently
+/// return the first. That is why `CatalogConfig` refuses a duplicated identity
+/// outright: the boundary check is what makes the lookup in the engine a lookup
+/// rather than a coin flip, and this test is the reason it cannot be relaxed.
 #[test]
 fn target_alone_does_not_identify_a_dialect() {
     let spec = |wire_protocol| FrontierModelSpec {

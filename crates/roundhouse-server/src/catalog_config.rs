@@ -20,7 +20,7 @@
 //! to the spec therefore changes the format by construction, rather than
 //! leaving a hand-written schema to fall behind it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use serde::Deserialize;
@@ -64,6 +64,27 @@ pub struct CatalogConfig {
     pub capability_band: f64,
 }
 
+/// A value the capability gate compares must live on the scale the gate is
+/// defined on. Outside it, a band silently widens to admit everything or closes
+/// to admit nothing, and either way the gate stops being a gate.
+fn unit_interval(
+    path: &str,
+    model: &str,
+    field: &'static str,
+    value: f64,
+) -> Result<(), CatalogError> {
+    if (0.0..=1.0).contains(&value) {
+        return Ok(());
+    }
+    Err(CatalogError::InvalidValue {
+        path: path.to_string(),
+        model: model.to_string(),
+        field,
+        value,
+        expected: "the capability scale is 0.0..=1.0",
+    })
+}
+
 fn default_local_quality() -> f64 {
     0.5
 }
@@ -88,6 +109,31 @@ pub enum CatalogError {
     },
     #[error("catalog `{path}` lists no models, so no turn could be routed anywhere")]
     Empty { path: String },
+    #[error(
+        "catalog `{path}` lists `{provider}/{model}` more than once. Two prices for one model          identity do not resolve the same way on both sides: the router seeds its ledger by          insertion and keeps the last, while the dashboard looks up a rate card by search and          finds the first, so the price a turn is chosen on and the price it is reported at would          differ silently"
+    )]
+    DuplicateModel {
+        path: String,
+        provider: String,
+        model: String,
+    },
+    #[error("catalog `{path}`: `{model}` has {field} = {value}, but {expected}")]
+    InvalidValue {
+        path: String,
+        model: String,
+        field: &'static str,
+        value: f64,
+        expected: &'static str,
+    },
+    #[error(
+        "catalog `{path}`: the correlary for `{local_model}` names `{provider}/{model}`, which          is not in this catalog, so that model's traffic would silently go unpriced"
+    )]
+    UnknownCorrelaryTarget {
+        path: String,
+        local_model: String,
+        provider: String,
+        model: String,
+    },
 }
 
 impl CatalogConfig {
@@ -105,7 +151,102 @@ impl CatalogConfig {
                 path: path.to_string(),
             });
         }
+        config.validate(path)?;
         Ok(config)
+    }
+
+    /// Refuse a catalog that cannot mean one thing.
+    ///
+    /// This is the boundary the whole "one rate card" argument rests on. Both
+    /// halves of the process resolve a model identity, and they do it
+    /// differently — `CacheLedger::register` inserts into a map, so the last
+    /// entry wins, while `MetricsConfig::rate_card` searches a list, so the
+    /// first does. Reconciling the two lookups instead would be the wrong fix:
+    /// it would pick a winner on the operator's behalf and leave an ambiguous
+    /// file accepted. Making the ambiguity unrepresentable is what keeps the
+    /// stated invariant true rather than merely usually true.
+    ///
+    /// Every check here is about a value that changes a dollar figure or gates
+    /// a comparison. Non-finite prices are deliberately absent: JSON has no
+    /// `NaN` literal and `serde_json` refuses a float it cannot represent, so
+    /// parsing has already rejected them and a guard here would be dead code
+    /// dressed as diligence.
+    fn validate(&self, path: &str) -> Result<(), CatalogError> {
+        let mut seen: HashSet<(&str, &str)> = HashSet::new();
+        for spec in &self.models {
+            if !seen.insert((spec.provider.as_str(), spec.model.as_str())) {
+                return Err(CatalogError::DuplicateModel {
+                    path: path.to_string(),
+                    provider: spec.provider.clone(),
+                    model: spec.model.clone(),
+                });
+            }
+
+            let label = format!("{}/{}", spec.provider, spec.model);
+            let rates = [
+                ("input_per_mtok_usd", spec.pricing.input_per_mtok_usd),
+                (
+                    "cached_input_per_mtok_usd",
+                    spec.pricing.cached_input_per_mtok_usd,
+                ),
+                (
+                    "cache_write_per_mtok_usd",
+                    spec.pricing.cache_write_per_mtok_usd,
+                ),
+                ("output_per_mtok_usd", spec.pricing.output_per_mtok_usd),
+                ("base_ttft_ms", spec.base_ttft_ms),
+                (
+                    "ttft_ms_per_uncached_token",
+                    spec.ttft_ms_per_uncached_token,
+                ),
+            ];
+            for (field, value) in rates {
+                // A negative rate does not merely mis-price: it reports the
+                // fleet as having been *paid* to serve traffic, which reads on
+                // the dashboard as an enormous saving.
+                if value < 0.0 {
+                    return Err(CatalogError::InvalidValue {
+                        path: path.to_string(),
+                        model: label.clone(),
+                        field,
+                        value,
+                        expected: "rates and latencies cannot be negative",
+                    });
+                }
+            }
+            unit_interval(path, &label, "quality_prior", spec.quality_prior)?;
+        }
+
+        // A correlary naming a model that is not here degrades silently inside
+        // `ShadowPricing::resolve` — the local model is reported unpriced, and
+        // the reason names a rate card nobody notices is missing.
+        for correlary in &self.correlaries {
+            let known = self
+                .models
+                .iter()
+                .any(|m| m.provider == correlary.provider && m.model == correlary.model);
+            if !known {
+                return Err(CatalogError::UnknownCorrelaryTarget {
+                    path: path.to_string(),
+                    local_model: correlary.local_model.clone(),
+                    provider: correlary.provider.clone(),
+                    model: correlary.model.clone(),
+                });
+            }
+        }
+
+        // The gate's own inputs, on the same 0.0..=1.0 scale it compares.
+        unit_interval(path, "<catalog>", "capability_band", self.capability_band)?;
+        unit_interval(
+            path,
+            "<catalog>",
+            "default_local_quality",
+            self.default_local_quality,
+        )?;
+        for (model, prior) in &self.local_quality {
+            unit_interval(path, model, "local_quality", *prior)?;
+        }
+        Ok(())
     }
 
     pub fn load(path: impl AsRef<Path>) -> Result<Self, CatalogError> {

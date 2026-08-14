@@ -33,7 +33,14 @@ The order is not negotiable:
    an ordinary outcome, not an awkward one.
 4. **Only then fix it**, and keep the test.
 
-Where validation lands before the fix does, mark the failing assertions
+The order is about evidence, not about stopping. Validating and fixing in one
+pass is the normal case — the test comes first so the fix is aimed at the real
+defect, not so anyone waits for permission between the two. Ruling and fix land
+together unless something genuinely needs a decision: the finding turns out to
+be a design question, the fix is far larger than the defect, or two valid
+remedies point different ways. Then say so and ask.
+
+Where validation really does land before the fix, mark the failing assertions
 `#[ignore = "<finding>: <why it fails>"]` rather than leaving the suite red or
 deleting the evidence, and keep any passing control tests live — the controls
 are what prove the failing ones are not tautological. Be honest about what that
@@ -77,13 +84,29 @@ comparable per-model pricing across providers and is the intended input to the
 correlary table: it is one place where the hosted equivalents of an open-weights
 model we serve ourselves can be priced against each other.
 
-Two cautions if that becomes an import rather than a lookup. OpenRouter prices
-a *route to* a model, so the same model appears at several prices depending on
-the upstream provider — pick deliberately rather than taking the first. And a
-price is not a capability claim: the capability gate in
-`roundhouse-core/src/metrics/pricing.rs` exists precisely because cheap
-lookups make it easy to price a small model against a flagship, which inflates
-the one number the whole dashboard is judged by.
+OpenRouter also publishes per-model **intelligence indexes and benchmark
+scores**, and those are the natural source for the other half of a catalog
+entry: `quality_prior`, which is what the capability gate in
+`roundhouse-core/src/metrics/pricing.rs` compares when it decides whether two
+models may be priced against each other. Today that number is hand-written
+configuration, and `FrontierModelSpec` says so — "configuration, not
+measurement". Sourcing it from a published index makes the gate defensible
+rather than asserted, which matters because the gate is the only thing stopping
+a small local model being priced against a flagship.
+
+Three cautions if any of that becomes an import rather than a lookup:
+
+- OpenRouter prices a *route to* a model, so the same model appears at several
+  prices depending on the upstream provider. Pick deliberately rather than
+  taking the first — and note that the catalog boundary now **rejects** two
+  entries for one `(provider, model)`, precisely because the router and the
+  dashboard would otherwise resolve that ambiguity differently.
+- Normalize an index to the 0.0..=1.0 scale `quality_prior` is defined on, and
+  record which index and which snapshot date it came from. An unversioned score
+  silently re-ranks models when the upstream leaderboard moves.
+- A price is not a capability claim, and neither is a benchmark score a price.
+  Keeping them separate fields sourced from separate columns is what stops a
+  cheap lookup from inflating the one number the whole dashboard is judged by.
 
 ## Comment and doc style
 

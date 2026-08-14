@@ -308,7 +308,7 @@ that the API does not have, so a hard refresh loses nothing.
     <div class="kpi">
       <div class="kpi-label">Accounting coverage</div>
       <div class="kpi-value" id="kpi-coverage">100%</div>
-      <div class="kpi-note" id="kpi-coverage-note">of calls reported by the provider</div>
+      <div class="kpi-note" id="kpi-coverage-note">of billed tokens reported by the provider</div>
     </div>
   </div>
 
@@ -535,7 +535,9 @@ that the API does not have, so a hard refresh loses nothing.
           ? (m.shadow_usd > 0
               ? `<span class="dim">${usd(m.shadow_usd)}</span><span class="sub">avoided</span>`
               : '<span class="dim">unpriced</span>')
-          : usd(m.billed_usd),
+          : m.billed_estimated_usd > 0
+            ? `${usd(m.billed_usd)}<span class="sub">${usd(m.billed_measured_usd)} measured</span>`
+            : usd(m.billed_usd),
         "num"));
       body.appendChild(tr);
     }
@@ -645,11 +647,14 @@ that the API does not have, so a hard refresh loses nothing.
 
     if (data.coverage.estimated_calls > 0) {
       notes.push(`<strong>${nf.format(data.coverage.estimated_calls)} of
-        ${nf.format(data.coverage.calls)} calls came back without provider usage</strong>, so their
-        tokens are counted from our own tokenizer and their cache reads from
-        neither. Streaming OpenAI-compatible endpoints report nothing unless the
-        request sets <code>stream_options.include_usage</code>. Every figure below
-        understates by whatever those calls actually cost.`);
+        ${nf.format(data.coverage.calls)} calls came back without provider usage</strong>
+        (${pct(1 - data.coverage_token_fraction)} of billed tokens), so their tokens are
+        counted from our own tokenizer and their cache reads from neither. Streaming
+        OpenAI-compatible endpoints report nothing unless the request sets
+        <code>stream_options.include_usage</code>. Hosted spend is split into measured
+        and estimated parts below; the estimated part could be high or low, since a
+        tokenizer mismatch cuts either way. The cache discount is unaffected — an
+        unreported call contributes zero cache reads rather than a guess.`);
     }
     const unpriced = data.models.filter(
       (m) => m.mode === "local" && m.correlary && m.correlary.basis.kind === "unpriced");
@@ -691,15 +696,28 @@ that the API does not have, so a hard refresh loses nothing.
       `Priced against each local model's correlary, gated at ±${data.capability_band.toFixed(2)} of quality prior.`;
 
     $("kpi-spend").textContent = usd(data.savings.frontier_spend_usd);
+    // Never the bare word "measured" unless it is: this label was a hardcoded
+    // literal, so it read "measured" even at zero coverage.
+    const spend = data.savings;
+    const measuredShare = spend.frontier_spend_usd > 0
+      ? spend.frontier_spend_measured_usd / spend.frontier_spend_usd
+      : 1;
+    $("kpi-spend-note").textContent = spend.frontier_spend_usd === 0
+      ? "nothing billed yet"
+      : measuredShare >= 0.9995
+        ? "measured"
+        : `${pct(measuredShare)} measured · ${usd(spend.frontier_spend_estimated_usd)} estimated`;
     $("kpi-tokens").textContent = tokens(data.tokens.total);
     $("kpi-calls").textContent =
       `${nf.format(data.calls)} calls · ${nf.format(data.turns)} turns · ${nf.format(data.sessions)} sessions`;
     $("kpi-cache").textContent = pct(data.tokens.cache_hit);
     $("kpi-cache-note").textContent = `${tokens(data.tokens.cached_input)} of ${tokens(data.tokens.input)} prompt tokens`;
-    $("kpi-coverage").textContent = pct(data.coverage_fraction);
+    // Token-weighted, because spend tracks tokens: a deployment can have most
+    // of its calls reported and most of its tokens not, or the reverse.
+    $("kpi-coverage").textContent = pct(data.coverage_token_fraction);
     $("kpi-coverage-note").textContent = data.coverage.estimated_calls === 0
       ? "every call reported by its provider"
-      : `${nf.format(data.coverage.estimated_calls)} calls unreported`;
+      : `${nf.format(data.coverage.estimated_calls)} of ${nf.format(data.coverage.calls)} calls unreported`;
 
     renderAlerts(data);
     renderModes(data.serving_modes, data.tokens.total);
