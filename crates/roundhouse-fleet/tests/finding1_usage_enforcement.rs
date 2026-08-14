@@ -8,6 +8,16 @@
 //! makes every catalog entry declare its `wire_protocol`. This exercises the
 //! only argument a `FrontierClient` is actually handed — a `&FrontierQuote` —
 //! and asks whether an implementer can discharge that obligation from it.
+//!
+//! Adjudicated P2, not the P3 the first pass landed on. Nothing can misreport
+//! today — the sole client is a stub, and `Accounting::Estimated` is wired end
+//! to end — which argues the severity down. What argues it back up is that
+//! `Engine` holds *one* `Arc<dyn FrontierClient>` "for a catalog of providers
+//! whose transports have nothing in common", so a client per protocol is not
+//! the escape hatch it looks like, and `target_alone_does_not_identify_a_dialect`
+//! below closes the other one. The seam cannot support the architecture the
+//! engine has already committed to, and `usage.rs` meanwhile advertises two
+//! defences when only the second has a live path.
 
 use std::sync::Mutex;
 

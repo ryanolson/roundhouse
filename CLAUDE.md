@@ -33,6 +33,15 @@ The order is not negotiable:
    an ordinary outcome, not an awkward one.
 4. **Only then fix it**, and keep the test.
 
+Where validation lands before the fix does, mark the failing assertions
+`#[ignore = "<finding>: <why it fails>"]` rather than leaving the suite red or
+deleting the evidence, and keep any passing control tests live — the controls
+are what prove the failing ones are not tautological. Be honest about what that
+buys: **an ignored test enforces nothing.** It is documentation with a `cargo
+test -- --ignored` entry point, not a safety net, so removing the ignore is the
+first step of the fix and not a cleanup afterwards. A defect fixed while its
+test stays ignored has bought nothing at all.
+
 A finding that is real but whose stated mechanism is wrong must be reported as
 partially valid with the correction spelled out. Fixing the described mechanism
 rather than the actual one leaves the defect in place behind a passing test,
