@@ -260,6 +260,14 @@ impl MetricsFold {
         self.turns
     }
 
+    /// Dispatches that were routed but whose response has not terminated.
+    ///
+    /// Observability for the size of the pending map, so a test can assert on
+    /// what the fold is still holding rather than only on what it has counted.
+    pub fn pending_dispatches(&self) -> usize {
+        self.pending.len()
+    }
+
     /// Traffic shape per hosted model, for inferring correlaries.
     fn frontier_shapes(&self) -> HashMap<(String, String), TokenShape> {
         self.models
