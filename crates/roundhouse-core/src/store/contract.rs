@@ -14,9 +14,12 @@
 //! so one shared backend instance — one real Redis — can host the whole suite
 //! without cross-test interference.
 //!
-//! Every public test here must also be called from [`run_all`]. That function
-//! is the conformance entry point for backend crates, and a test missing from
-//! it silently exempts every backend except the memory one.
+//! The [`store_contract_suite!`](crate::store_contract_suite) macro is the
+//! single list of these tests. A backend instantiates the whole suite with
+//! one macro call, so it gets every test or none of them — there is no wiring
+//! step where a test can be forgotten for one backend and silently enforced
+//! only for the others. The functions stay public so a failing invariant can
+//! be re-run alone while debugging.
 
 use async_trait::async_trait;
 
@@ -57,6 +60,18 @@ async fn fresh_session<S: SessionStore>(store: &S) -> SessionId {
         "a freshly generated id must not already exist"
     );
     sid
+}
+
+/// A fresh session with `node-a` holding its lease — the position every
+/// mutating test starts from.
+async fn held<S: SessionStore>(store: &S) -> (SessionId, Lease) {
+    let sid = fresh_session(store).await;
+    let lease = store
+        .acquire_lease(&sid, "node-a", TTL_MS)
+        .await
+        .unwrap()
+        .expect("nothing contends for a fresh session's lease");
+    (sid, lease)
 }
 
 /// Filler payload for tests that care about sequencing, not content.
@@ -138,12 +153,7 @@ pub async fn a_live_lease_blocks_others_and_retakes_for_its_holder<S: SessionSto
 }
 
 pub async fn an_expired_lease_is_takeable_and_the_loser_cannot_append<S: LeaseControl>(store: &S) {
-    let sid = fresh_session(store).await;
-    let stale = store
-        .acquire_lease(&sid, "node-a", TTL_MS)
-        .await
-        .unwrap()
-        .unwrap();
+    let (sid, stale) = held(store).await;
 
     store.force_expire_lease(&sid).await;
     let fresh = store
@@ -165,12 +175,7 @@ pub async fn an_expired_lease_is_takeable_and_the_loser_cannot_append<S: LeaseCo
 }
 
 pub async fn a_released_lease_is_gone_not_renewable<S: SessionStore>(store: &S) {
-    let sid = fresh_session(store).await;
-    let lease = store
-        .acquire_lease(&sid, "node-a", TTL_MS)
-        .await
-        .unwrap()
-        .unwrap();
+    let (sid, lease) = held(store).await;
     store.release_lease(&lease).await.unwrap();
 
     assert!(
@@ -188,12 +193,7 @@ pub async fn a_released_lease_is_gone_not_renewable<S: SessionStore>(store: &S) 
 }
 
 pub async fn release_by_a_non_holder_leaves_the_lease_standing<S: SessionStore>(store: &S) {
-    let sid = fresh_session(store).await;
-    let held = store
-        .acquire_lease(&sid, "node-a", TTL_MS)
-        .await
-        .unwrap()
-        .unwrap();
+    let (sid, holder) = held(store).await;
 
     // A handle the store never granted. Release is compare-and-delete, so it
     // must not evict the holder on a stranger's say-so.
@@ -213,7 +213,7 @@ pub async fn release_by_a_non_holder_leaves_the_lease_standing<S: SessionStore>(
         "the holder must still hold after a non-holder's release"
     );
     store
-        .append_events(&held, vec![text_event("still mine")])
+        .append_events(&holder, vec![text_event("still mine")])
         .await
         .unwrap();
 }
@@ -225,12 +225,7 @@ pub async fn release_by_a_non_holder_leaves_the_lease_standing<S: SessionStore>(
 /// the record on a separate task while every append continues through the
 /// original handle.
 pub async fn a_stale_handle_works_while_the_record_is_live<S: SessionStore>(store: &S) {
-    let sid = fresh_session(store).await;
-    let lease = store
-        .acquire_lease(&sid, "node-a", TTL_MS)
-        .await
-        .unwrap()
-        .unwrap();
+    let (_sid, lease) = held(store).await;
     let stale_handle = Lease {
         expires_at_ms: 0,
         ..lease.clone()
@@ -251,12 +246,7 @@ pub async fn a_stale_handle_works_while_the_record_is_live<S: SessionStore>(stor
 }
 
 pub async fn appends_assign_contiguous_seqs_and_replay_is_gapless<S: SessionStore>(store: &S) {
-    let sid = fresh_session(store).await;
-    let lease = store
-        .acquire_lease(&sid, "node-a", TTL_MS)
-        .await
-        .unwrap()
-        .unwrap();
+    let (sid, lease) = held(store).await;
 
     let first = store
         .append_events(
@@ -289,12 +279,7 @@ pub async fn appends_assign_contiguous_seqs_and_replay_is_gapless<S: SessionStor
 }
 
 pub async fn read_events_pages_oldest_first_and_reproduces_the_append<S: SessionStore>(store: &S) {
-    let sid = fresh_session(store).await;
-    let lease = store
-        .acquire_lease(&sid, "node-a", TTL_MS)
-        .await
-        .unwrap()
-        .unwrap();
+    let (sid, lease) = held(store).await;
 
     // One of each easily built kind, so a backend that persists events by
     // taking them apart (fields in a Redis stream entry, say) proves it can
@@ -354,18 +339,13 @@ pub async fn read_events_pages_oldest_first_and_reproduces_the_append<S: Session
 }
 
 pub async fn last_seq_is_zero_when_empty_and_tracks_the_tail<S: SessionStore>(store: &S) {
-    let sid = fresh_session(store).await;
+    let (sid, lease) = held(store).await;
     assert_eq!(
         store.last_seq(&sid).await.unwrap(),
         0,
-        "an empty session reads as seq 0"
+        "an empty session reads as seq 0; holding the lease appends nothing"
     );
 
-    let lease = store
-        .acquire_lease(&sid, "node-a", TTL_MS)
-        .await
-        .unwrap()
-        .unwrap();
     store
         .append_events(&lease, vec![text_event("one"), text_event("two")])
         .await
@@ -374,12 +354,7 @@ pub async fn last_seq_is_zero_when_empty_and_tracks_the_tail<S: SessionStore>(st
 }
 
 pub async fn renew_fails_once_the_lease_was_taken_over<S: LeaseControl>(store: &S) {
-    let sid = fresh_session(store).await;
-    let lease = store
-        .acquire_lease(&sid, "node-a", TTL_MS)
-        .await
-        .unwrap()
-        .unwrap();
+    let (sid, lease) = held(store).await;
     assert!(store.renew_lease(&lease, TTL_MS).await.unwrap().is_some());
 
     store.force_expire_lease(&sid).await;
@@ -394,22 +369,62 @@ pub async fn renew_fails_once_the_lease_was_taken_over<S: LeaseControl>(store: &
     );
 }
 
-/// The whole contract, against one store instance.
+/// Instantiate the whole conformance suite against one backend.
 ///
-/// This is the conformance entry point for backend crates: one integration
-/// test calling this against a real backend runs every assertion in the
-/// module. The individual functions stay public so a failing invariant can be
-/// re-run alone while debugging.
-pub async fn run_all<S: LeaseControl>(store: &S) {
-    create_is_idempotent_and_reports_existing(store).await;
-    unknown_sessions_are_not_found(store).await;
-    a_live_lease_blocks_others_and_retakes_for_its_holder(store).await;
-    an_expired_lease_is_takeable_and_the_loser_cannot_append(store).await;
-    a_released_lease_is_gone_not_renewable(store).await;
-    release_by_a_non_holder_leaves_the_lease_standing(store).await;
-    a_stale_handle_works_while_the_record_is_live(store).await;
-    appends_assign_contiguous_seqs_and_replay_is_gapless(store).await;
-    read_events_pages_oldest_first_and_reproduces_the_append(store).await;
-    last_seq_is_zero_when_empty_and_tracks_the_tail(store).await;
-    renew_fails_once_the_lease_was_taken_over(store).await;
+/// This macro is the single list of contract tests. It expands to one
+/// `#[tokio::test]` per test in [`contract`](crate::store::contract), each
+/// with its own name in the runner's output, so a backend gets the entire
+/// suite in one call — there is no per-test wiring step where one test can be
+/// forgotten for one backend while the others keep enforcing it.
+///
+/// `$make` is evaluated inside each generated test, so every test gets a
+/// fresh store and a backend whose construction is async passes an `.await`
+/// expression. Leading attributes are forwarded to every generated test —
+/// that is how an infrastructure-gated backend applies its
+/// `#[ignore = "…"]` reason suite-wide.
+///
+/// ```ignore
+/// // In-memory: nothing to gate on.
+/// roundhouse_core::store_contract_suite!(MemoryStore::new());
+///
+/// // Redis: the whole suite behind the harness-reported ignore gate.
+/// roundhouse_core::store_contract_suite!(
+///     #[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
+///     connect_from_env().await
+/// );
+/// ```
+///
+/// Only usable where the `contract` module is compiled: this crate's own
+/// tests, or a dependent with the `test-support` feature on its
+/// dev-dependency.
+#[macro_export]
+macro_rules! store_contract_suite {
+    ($(#[$attr:meta])* $make:expr) => {
+        $crate::store_contract_suite!(@tests ($(#[$attr])*) $make;
+            create_is_idempotent_and_reports_existing,
+            unknown_sessions_are_not_found,
+            a_live_lease_blocks_others_and_retakes_for_its_holder,
+            an_expired_lease_is_takeable_and_the_loser_cannot_append,
+            a_released_lease_is_gone_not_renewable,
+            release_by_a_non_holder_leaves_the_lease_standing,
+            a_stale_handle_works_while_the_record_is_live,
+            appends_assign_contiguous_seqs_and_replay_is_gapless,
+            read_events_pages_oldest_first_and_reproduces_the_append,
+            last_seq_is_zero_when_empty_and_tracks_the_tail,
+            renew_fails_once_the_lease_was_taken_over,
+        );
+    };
+    // One test per recursion step rather than one repetition over the names:
+    // the attribute group is captured at depth one, and macro_rules cannot
+    // re-expand it inside a second repetition.
+    (@tests ($(#[$attr:meta])*) $make:expr; $name:ident $(, $rest:ident)* $(,)?) => {
+        #[tokio::test]
+        $(#[$attr])*
+        async fn $name() {
+            let store = $make;
+            $crate::store::contract::$name(&store).await;
+        }
+        $crate::store_contract_suite!(@tests ($(#[$attr])*) $make; $($rest),*);
+    };
+    (@tests ($(#[$attr:meta])*) $make:expr; ) => {};
 }

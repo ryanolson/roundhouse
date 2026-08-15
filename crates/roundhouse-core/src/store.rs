@@ -322,75 +322,12 @@ impl MemoryStore {
 mod tests {
     //! The memory store's conformance run.
     //!
-    //! The assertions live in [`contract`], not here — this module only
-    //! instantiates them, one `#[tokio::test]` per contract test so a failure
-    //! names the violated invariant. A backend crate does the same against
-    //! its real store (or calls `contract::run_all` once).
+    //! The assertions live in [`contract`](super::contract) and the macro is
+    //! the list; this module only points both at [`MemoryStore`]. Each
+    //! contract test still gets its own `#[tokio::test]`, so a failure names
+    //! the violated invariant.
 
     use super::MemoryStore;
-    use super::contract;
 
-    #[tokio::test]
-    async fn create_is_idempotent_and_reports_existing() {
-        contract::create_is_idempotent_and_reports_existing(&MemoryStore::new()).await;
-    }
-
-    #[tokio::test]
-    async fn unknown_sessions_are_not_found() {
-        contract::unknown_sessions_are_not_found(&MemoryStore::new()).await;
-    }
-
-    #[tokio::test]
-    async fn a_live_lease_blocks_others_and_retakes_for_its_holder() {
-        contract::a_live_lease_blocks_others_and_retakes_for_its_holder(&MemoryStore::new()).await;
-    }
-
-    #[tokio::test]
-    async fn an_expired_lease_is_takeable_and_the_loser_cannot_append() {
-        contract::an_expired_lease_is_takeable_and_the_loser_cannot_append(&MemoryStore::new())
-            .await;
-    }
-
-    #[tokio::test]
-    async fn a_released_lease_is_gone_not_renewable() {
-        contract::a_released_lease_is_gone_not_renewable(&MemoryStore::new()).await;
-    }
-
-    #[tokio::test]
-    async fn release_by_a_non_holder_leaves_the_lease_standing() {
-        contract::release_by_a_non_holder_leaves_the_lease_standing(&MemoryStore::new()).await;
-    }
-
-    #[tokio::test]
-    async fn a_stale_handle_works_while_the_record_is_live() {
-        contract::a_stale_handle_works_while_the_record_is_live(&MemoryStore::new()).await;
-    }
-
-    #[tokio::test]
-    async fn appends_assign_contiguous_seqs_and_replay_is_gapless() {
-        contract::appends_assign_contiguous_seqs_and_replay_is_gapless(&MemoryStore::new()).await;
-    }
-
-    #[tokio::test]
-    async fn read_events_pages_oldest_first_and_reproduces_the_append() {
-        contract::read_events_pages_oldest_first_and_reproduces_the_append(&MemoryStore::new())
-            .await;
-    }
-
-    #[tokio::test]
-    async fn last_seq_is_zero_when_empty_and_tracks_the_tail() {
-        contract::last_seq_is_zero_when_empty_and_tracks_the_tail(&MemoryStore::new()).await;
-    }
-
-    #[tokio::test]
-    async fn renew_fails_once_the_lease_was_taken_over() {
-        contract::renew_fails_once_the_lease_was_taken_over(&MemoryStore::new()).await;
-    }
-
-    /// The composed entry point a backend crate calls; run here too so the
-    /// memory store proves the whole-suite path works, not just the pieces.
-    #[tokio::test]
-    async fn run_all_covers_the_suite_on_one_shared_store() {
-        contract::run_all(&MemoryStore::new()).await;
-    }
+    crate::store_contract_suite!(MemoryStore::new());
 }

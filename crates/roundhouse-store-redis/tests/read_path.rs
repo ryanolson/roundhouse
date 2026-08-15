@@ -31,10 +31,17 @@ use roundhouse_store_redis::{RedisSessionStore, RedisStoreConfig};
 
 const URL_VAR: &str = "ROUNDHOUSE_TEST_REDIS_URL";
 
-/// The store under test. Reaching this at all means `--include-ignored` asked
-/// for the real backend, so a missing variable is a runner error to report,
-/// not a skip.
-async fn store() -> (RedisSessionStore, RedisStoreConfig, String) {
+/// The store under test, its key layout, and a raw connection for writing
+/// what the store must then read. Reaching this at all means
+/// `--include-ignored` asked for the real backend, so a missing variable is a
+/// runner error to report, not a skip.
+struct Rig {
+    store: RedisSessionStore,
+    config: RedisStoreConfig,
+    raw: redis::aio::MultiplexedConnection,
+}
+
+async fn rig() -> Rig {
     let url = std::env::var(URL_VAR).unwrap_or_else(|_| {
         panic!("--include-ignored asks for the real backend; set {URL_VAR} to a reachable Redis")
     });
@@ -42,44 +49,47 @@ async fn store() -> (RedisSessionStore, RedisStoreConfig, String) {
     let store = RedisSessionStore::connect(config.clone())
         .await
         .expect("Redis named by the env var must be reachable");
-    (store, config, url)
+    let raw = redis::Client::open(url.as_str())
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    Rig { store, config, raw }
 }
 
-/// Append entries exactly as the M3 fenced script will write them.
-async fn raw_append(
-    url: &str,
-    config: &RedisStoreConfig,
-    session_id: &SessionId,
-    first_seq: u64,
-    kinds: Vec<SessionEventKind>,
-) -> Vec<SessionEvent> {
-    let client = redis::Client::open(url).unwrap();
-    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
-
-    let mut events = Vec::with_capacity(kinds.len());
-    for (offset, kind) in kinds.into_iter().enumerate() {
-        let seq = first_seq + offset as u64;
-        // Deterministic timestamps so equality below asserts the store read
-        // back what was written, not something it re-stamped.
-        let at_ms = 1_700_000_000_000 + seq;
-        let _: String = redis::cmd("XADD")
-            .arg(config.log_key(session_id))
-            .arg(format!("{seq}-0"))
-            .arg("at_ms")
-            .arg(at_ms)
-            .arg("kind")
-            .arg(serde_json::to_string(&kind).unwrap())
-            .query_async(&mut conn)
-            .await
-            .unwrap();
-        events.push(SessionEvent {
-            seq,
-            session_id: session_id.clone(),
-            at_ms,
-            kind,
-        });
+impl Rig {
+    /// Append entries exactly as the M3 fenced script will write them.
+    async fn raw_append(
+        &mut self,
+        session_id: &SessionId,
+        first_seq: u64,
+        kinds: Vec<SessionEventKind>,
+    ) -> Vec<SessionEvent> {
+        let mut events = Vec::with_capacity(kinds.len());
+        for (offset, kind) in kinds.into_iter().enumerate() {
+            let seq = first_seq + offset as u64;
+            // Deterministic timestamps so equality below asserts the store
+            // read back what was written, not something it re-stamped.
+            let at_ms = 1_700_000_000_000 + seq;
+            let _: String = redis::cmd("XADD")
+                .arg(self.config.log_key(session_id))
+                .arg(format!("{seq}-0"))
+                .arg("at_ms")
+                .arg(at_ms)
+                .arg("kind")
+                .arg(serde_json::to_string(&kind).unwrap())
+                .query_async(&mut self.raw)
+                .await
+                .unwrap();
+            events.push(SessionEvent {
+                seq,
+                session_id: session_id.clone(),
+                at_ms,
+                kind,
+            });
+        }
+        events
     }
-    events
 }
 
 /// One of every event kind, so the field-wise persistence proves it can take
@@ -169,17 +179,35 @@ fn every_event_kind() -> Vec<SessionEventKind> {
     ]
 }
 
+/// Coverage slot per variant. The exhaustive match is the point: a new
+/// [`SessionEventKind`] refuses to compile here until [`every_event_kind`]
+/// (and the slot count in its test) is taught about it, so the test name
+/// "every" stays a checked claim rather than a hopeful one.
+fn variant_slot(kind: &SessionEventKind) -> usize {
+    use SessionEventKind as K;
+    match kind {
+        K::SessionCreated { .. } => 0,
+        K::TurnStarted { .. } => 1,
+        K::ItemAppended { .. } => 2,
+        K::Routed { .. } => 3,
+        K::OutputTextDelta { .. } => 4,
+        K::ResponseCompleted { .. } => 5,
+        K::ResponseIncomplete { .. } => 6,
+        K::TurnDeduplicated { .. } => 7,
+        K::Error { .. } => 8,
+    }
+}
+
 #[tokio::test]
 #[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
 async fn create_is_idempotent_and_reports_existing() {
-    let (store, _, _) = store().await;
-    contract::create_is_idempotent_and_reports_existing(&store).await;
+    contract::create_is_idempotent_and_reports_existing(&rig().await.store).await;
 }
 
 #[tokio::test]
 #[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
 async fn the_read_path_reports_unknown_sessions_as_not_found() {
-    let (store, _, _) = store().await;
+    let store = rig().await.store;
     let sid = SessionId::generate(); // minted but never created
     assert!(matches!(
         store.read_events(&sid, 0, 16).await,
@@ -194,7 +222,7 @@ async fn the_read_path_reports_unknown_sessions_as_not_found() {
 #[tokio::test]
 #[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
 async fn an_empty_session_reads_as_seq_zero_with_no_events() {
-    let (store, _, _) = store().await;
+    let store = rig().await.store;
     let sid = SessionId::generate();
     assert!(store.create_session(&sid, "affinity").await.unwrap());
     assert_eq!(store.last_seq(&sid).await.unwrap(), 0);
@@ -204,11 +232,22 @@ async fn an_empty_session_reads_as_seq_zero_with_no_events() {
 #[tokio::test]
 #[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
 async fn every_event_kind_reads_back_identically_and_paging_is_gapless() {
-    let (store, config, url) = store().await;
-    let sid = SessionId::generate();
-    assert!(store.create_session(&sid, "affinity").await.unwrap());
-    let written = raw_append(&url, &config, &sid, 1, every_event_kind()).await;
+    let kinds = every_event_kind();
+    let mut covered = [false; 9];
+    for kind in &kinds {
+        covered[variant_slot(kind)] = true;
+    }
+    assert!(
+        covered.into_iter().all(|seen| seen),
+        "every_event_kind() must live up to its name"
+    );
 
+    let mut rig = rig().await;
+    let sid = SessionId::generate();
+    assert!(rig.store.create_session(&sid, "affinity").await.unwrap());
+    let written = rig.raw_append(&sid, 1, kinds).await;
+
+    let store = &rig.store;
     assert_eq!(store.last_seq(&sid).await.unwrap(), written.len() as u64);
     assert_eq!(
         store.read_events(&sid, 0, 100).await.unwrap(),
@@ -229,24 +268,22 @@ async fn every_event_kind_reads_back_identically_and_paging_is_gapless() {
 #[tokio::test]
 #[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
 async fn a_corrupted_log_fails_loudly_rather_than_dropping_events() {
-    let (store, config, url) = store().await;
-    let client = redis::Client::open(url.as_str()).unwrap();
-    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    let mut rig = rig().await;
 
     // An entry missing the fields the wire format requires.
     let sid = SessionId::generate();
-    assert!(store.create_session(&sid, "affinity").await.unwrap());
+    assert!(rig.store.create_session(&sid, "affinity").await.unwrap());
     let _: String = redis::cmd("XADD")
-        .arg(config.log_key(&sid))
+        .arg(rig.config.log_key(&sid))
         .arg("1-0")
         .arg("garbage")
         .arg("x")
-        .query_async(&mut conn)
+        .query_async(&mut rig.raw)
         .await
         .unwrap();
     assert!(
         matches!(
-            store.read_events(&sid, 0, 16).await,
+            rig.store.read_events(&sid, 0, 16).await,
             Err(StoreError::Backend(_))
         ),
         "an unreadable entry is corruption to report, not an event to skip"
@@ -255,9 +292,9 @@ async fn a_corrupted_log_fails_loudly_rather_than_dropping_events() {
     // An entry some foreign writer added with an auto-generated id: it breaks
     // the seq==id invariant every read relies on, so both read paths refuse.
     let sid = SessionId::generate();
-    assert!(store.create_session(&sid, "affinity").await.unwrap());
+    assert!(rig.store.create_session(&sid, "affinity").await.unwrap());
     let _: String = redis::cmd("XADD")
-        .arg(config.log_key(&sid))
+        .arg(rig.config.log_key(&sid))
         .arg("*")
         .arg("at_ms")
         .arg(1u64)
@@ -268,15 +305,15 @@ async fn a_corrupted_log_fails_loudly_rather_than_dropping_events() {
             })
             .unwrap(),
         )
-        .query_async(&mut conn)
+        .query_async(&mut rig.raw)
         .await
         .unwrap();
     assert!(matches!(
-        store.read_events(&sid, 0, 16).await,
+        rig.store.read_events(&sid, 0, 16).await,
         Err(StoreError::Backend(_))
     ));
     assert!(matches!(
-        store.last_seq(&sid).await,
+        rig.store.last_seq(&sid).await,
         Err(StoreError::Backend(_))
     ));
 }
