@@ -300,7 +300,7 @@ pub async fn read_events_pages_oldest_first_and_reproduces_the_append<S: Session
     // taking them apart (fields in a Redis stream entry, say) proves it can
     // put them back together.
     let response_id = ResponseId::generate();
-    let kinds = vec![
+    let kinds = [
         SessionEventKind::SessionCreated {
             model_policy: "affinity".into(),
         },
