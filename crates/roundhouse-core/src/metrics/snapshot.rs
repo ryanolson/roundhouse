@@ -344,7 +344,13 @@ pub struct MetricsSnapshot {
     pub first_event_at_ms: Option<u64>,
     pub last_event_at_ms: Option<u64>,
     pub sessions: usize,
+    /// Turns *admitted*, which is not the same as turns a client asked for: a
+    /// turn abandoned mid-dispatch and retried is admitted twice and appears
+    /// here twice, while `calls` counts it once because only one dispatch
+    /// reached a provider. The dashboard prints both, and `turns` exceeding
+    /// `calls` is the shape of a deployment that has been failing over.
     pub turns: u64,
+    /// Dispatches that reached a provider and were accounted for.
     pub calls: u64,
     pub tokens: TokenBreakdown,
     pub savings: Savings,

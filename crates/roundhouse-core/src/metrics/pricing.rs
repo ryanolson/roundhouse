@@ -78,6 +78,13 @@ pub struct TokenShape {
     pub output_ratio: f64,
     /// Cached fraction of the prompt. A model serving long-running sessions
     /// looks nothing like one serving one-shot requests.
+    ///
+    /// Biased low for a model whose provider reports usage unreliably: an
+    /// unreported call records no cache reads by policy, so the model looks
+    /// colder than it is and drifts away from genuinely cold candidates it
+    /// might otherwise match. Second-order — inference is gated on capability
+    /// and overridden by any declaration — but it is a reason to declare a
+    /// correlary rather than infer one when coverage is poor.
     pub cache_ratio: f64,
     /// Thinking as a fraction of output. Near 1.0 for a reasoning model working
     /// hard, exactly 0.0 for a model with no thinking mode.

@@ -79,6 +79,14 @@ struct Pending {
 pub struct MetricsFold {
     pub(super) models: BTreeMap<ModelKey, Counters>,
     /// Highest sequence number folded per session.
+    ///
+    /// Gains an entry per session and never loses one, which makes it the
+    /// fastest-growing state in this struct — faster than the abandoned-
+    /// dispatch residue documented below, since it grows on every session
+    /// rather than only on failed ones. It cannot simply be pruned: it *is*
+    /// the idempotency guarantee, and forgetting a session means re-folding
+    /// its log on the next replay. Bounding it means windowing on event time,
+    /// which is a deliberate change to make with the residue, not before it.
     watermarks: HashMap<SessionId, u64>,
     pending: HashMap<ResponseId, Pending>,
     /// The response each open turn is currently on, and the inverse.
