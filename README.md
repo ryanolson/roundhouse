@@ -139,9 +139,19 @@ them into one:
 
 | Figure | Basis |
 |---|---|
-| Spent on hosted endpoints | **Measured.** Reported token counts against the configured rate card. |
-| Provider cache discount | **Measured.** Cache-read tokens the provider reported, times the gap between its two published rates. |
+| Spent on hosted endpoints | **Split.** Reported against the rate card, and reported *apart* from the part priced off our own tokenizer when a provider stayed silent — see below. |
+| Provider cache discount | **Measured**, wholly, even at partial coverage. An unreported call records zero cache reads rather than a guess, so it contributes nothing here. |
 | Served locally instead | **Estimated.** A counterfactual: what our own fleet's traffic would have cost on a comparable hosted model. |
+
+Hosted spend is not one number labelled measured. The fold keeps
+provider-reported and self-counted tokens in separate accumulators and prices
+each — free, because pricing is linear in tokens — so `frontier_spend_usd`
+carries `frontier_spend_measured_usd` and `frontier_spend_estimated_usd`
+beside it. Merging first and reporting a call-weighted coverage ratio
+afterwards does not substitute: one unreported 200k-token turn beside a
+reported 2k-token turn is 50% coverage by calls and 1% by tokens, and it is the
+token figure that tracks the money. Both are reported;
+`coverage_token_fraction` is the one to quote next to a dollar.
 
 Only the third needs an argument. A local worker bills nothing, so its saving is
 the difference against a call that never happened — which means naming a hosted
@@ -194,13 +204,18 @@ when its instrumentation was broken. Two defences, and both are needed:
 - `WireProtocol::enforce_usage_reporting` rewrites an outbound request to ask
   for accounting. It only ever *adds*, and never overrides a field the caller
   set — silently disagreeing with a request is worse than an unaccounted call,
-  because an unaccounted call is at least marked.
+  because an unaccounted call is at least marked. The dialect travels on the
+  `FrontierQuote`, because that is the only argument a `FrontierClient` gets
+  and the engine holds one client for providers whose transports have nothing
+  in common: a client cannot look the dialect up, so it has to arrive.
 - Anything that still comes back without usage is recorded as
   `Accounting::Estimated`: input from the prompt we tokenized and routed on,
   output from our own tokenizer over what we received, and cached input left at
-  zero because nothing observable bears on what a remote cache did. The
-  dashboard reports the resulting coverage and says plainly that those figures
-  understate.
+  zero because nothing observable bears on what a remote cache did. Those calls
+  are priced separately and reported as the estimated half of hosted spend.
+  Note the direction is *unknown*, not low: a tokenizer mismatch cuts either
+  way. Only the cache discount is safe to call understated, because its
+  estimated contribution is pinned to zero.
 
 ### Configuring it
 
