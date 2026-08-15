@@ -10,7 +10,13 @@
 //! has to provide an append-only log plus a lease.
 //!
 //! Two implementations are expected: the [`MemoryStore`] here (tests, single
-//! process) and a Redis Streams backend in `roundhouse-store-redis`.
+//! process) and a Redis Streams backend in `roundhouse-store-redis`. What the
+//! two must agree on is executable rather than prose: `store::contract` holds
+//! the trait's guarantees as a generic test suite, and every backend —
+//! including the memory one — is judged by that identical suite.
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod contract;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -314,136 +320,77 @@ impl MemoryStore {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    //! The memory store's conformance run.
+    //!
+    //! The assertions live in [`contract`], not here — this module only
+    //! instantiates them, one `#[tokio::test]` per contract test so a failure
+    //! names the violated invariant. A backend crate does the same against
+    //! its real store (or calls `contract::run_all` once).
 
-    async fn store_with_session() -> (MemoryStore, SessionId) {
-        let store = MemoryStore::new();
-        let sid = SessionId::generate();
-        assert!(store.create_session(&sid, "affinity").await.unwrap());
-        (store, sid)
-    }
+    use super::MemoryStore;
+    use super::contract;
 
     #[tokio::test]
     async fn create_is_idempotent_and_reports_existing() {
-        let (store, sid) = store_with_session().await;
-        assert!(!store.create_session(&sid, "affinity").await.unwrap());
+        contract::create_is_idempotent_and_reports_existing(&MemoryStore::new()).await;
     }
 
     #[tokio::test]
-    async fn a_live_lease_blocks_another_node() {
-        let (store, sid) = store_with_session().await;
-        assert!(
-            store
-                .acquire_lease(&sid, "node-a", 5_000)
-                .await
-                .unwrap()
-                .is_some()
-        );
-        assert!(
-            store
-                .acquire_lease(&sid, "node-b", 5_000)
-                .await
-                .unwrap()
-                .is_none()
-        );
+    async fn unknown_sessions_are_not_found() {
+        contract::unknown_sessions_are_not_found(&MemoryStore::new()).await;
+    }
+
+    #[tokio::test]
+    async fn a_live_lease_blocks_others_and_retakes_for_its_holder() {
+        contract::a_live_lease_blocks_others_and_retakes_for_its_holder(&MemoryStore::new()).await;
     }
 
     #[tokio::test]
     async fn an_expired_lease_is_takeable_and_the_loser_cannot_append() {
-        let (store, sid) = store_with_session().await;
-        let stale = store
-            .acquire_lease(&sid, "node-a", 5_000)
-            .await
-            .unwrap()
-            .unwrap();
-
-        store.expire_lease_now(&sid).await;
-        let fresh = store
-            .acquire_lease(&sid, "node-b", 5_000)
-            .await
-            .unwrap()
-            .unwrap();
-
-        // The successor writes; the displaced owner is fenced out.
-        store
-            .append_events(
-                &fresh,
-                vec![SessionEventKind::Error {
-                    message: "ok".into(),
-                }],
-            )
-            .await
-            .unwrap();
-        let err = store
-            .append_events(
-                &stale,
-                vec![SessionEventKind::Error {
-                    message: "no".into(),
-                }],
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(err, StoreError::LeaseLost { .. }));
+        contract::an_expired_lease_is_takeable_and_the_loser_cannot_append(&MemoryStore::new())
+            .await;
     }
 
     #[tokio::test]
-    async fn sequence_numbers_are_contiguous_and_replay_is_gapless() {
-        let (store, sid) = store_with_session().await;
-        let lease = store
-            .acquire_lease(&sid, "node-a", 5_000)
-            .await
-            .unwrap()
-            .unwrap();
+    async fn a_released_lease_is_gone_not_renewable() {
+        contract::a_released_lease_is_gone_not_renewable(&MemoryStore::new()).await;
+    }
 
-        let first = store
-            .append_events(
-                &lease,
-                vec![
-                    SessionEventKind::SessionCreated {
-                        model_policy: "affinity".into(),
-                    },
-                    SessionEventKind::Error {
-                        message: "one".into(),
-                    },
-                ],
-            )
-            .await
-            .unwrap();
-        assert_eq!(first.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2]);
+    #[tokio::test]
+    async fn release_by_a_non_holder_leaves_the_lease_standing() {
+        contract::release_by_a_non_holder_leaves_the_lease_standing(&MemoryStore::new()).await;
+    }
 
-        let second = store
-            .append_events(
-                &lease,
-                vec![SessionEventKind::Error {
-                    message: "two".into(),
-                }],
-            )
-            .await
-            .unwrap();
-        assert_eq!(second[0].seq, 3);
-        assert_eq!(store.last_seq(&sid).await.unwrap(), 3);
+    #[tokio::test]
+    async fn a_stale_handle_works_while_the_record_is_live() {
+        contract::a_stale_handle_works_while_the_record_is_live(&MemoryStore::new()).await;
+    }
 
-        // Resume from seq 1 yields exactly the tail, with no gap or repeat.
-        let tail = store.read_events(&sid, 1, 100).await.unwrap();
-        assert_eq!(tail.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![2, 3]);
+    #[tokio::test]
+    async fn appends_assign_contiguous_seqs_and_replay_is_gapless() {
+        contract::appends_assign_contiguous_seqs_and_replay_is_gapless(&MemoryStore::new()).await;
+    }
+
+    #[tokio::test]
+    async fn read_events_pages_oldest_first_and_reproduces_the_append() {
+        contract::read_events_pages_oldest_first_and_reproduces_the_append(&MemoryStore::new())
+            .await;
+    }
+
+    #[tokio::test]
+    async fn last_seq_is_zero_when_empty_and_tracks_the_tail() {
+        contract::last_seq_is_zero_when_empty_and_tracks_the_tail(&MemoryStore::new()).await;
     }
 
     #[tokio::test]
     async fn renew_fails_once_the_lease_was_taken_over() {
-        let (store, sid) = store_with_session().await;
-        let lease = store
-            .acquire_lease(&sid, "node-a", 5_000)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(store.renew_lease(&lease, 5_000).await.unwrap().is_some());
+        contract::renew_fails_once_the_lease_was_taken_over(&MemoryStore::new()).await;
+    }
 
-        store.expire_lease_now(&sid).await;
-        store
-            .acquire_lease(&sid, "node-b", 5_000)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(store.renew_lease(&lease, 5_000).await.unwrap().is_none());
+    /// The composed entry point a backend crate calls; run here too so the
+    /// memory store proves the whole-suite path works, not just the pieces.
+    #[tokio::test]
+    async fn run_all_covers_the_suite_on_one_shared_store() {
+        contract::run_all(&MemoryStore::new()).await;
     }
 }
