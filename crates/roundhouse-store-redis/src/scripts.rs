@@ -32,7 +32,7 @@ use roundhouse_core::store::StoreError;
 const ACQUIRE: &str = r"
 if redis.call('EXISTS', KEYS[1]) == 0 then return {'NOSESSION'} end
 local holder = redis.call('GET', KEYS[2])
-if holder ~= false and holder ~= ARGV[1] then return {'HELD'} end
+if holder ~= false and holder ~= ARGV[1] then return {'REFUSED'} end
 redis.call('SET', KEYS[2], ARGV[1], 'PX', ARGV[2])
 local t = redis.call('TIME')
 return {'OK', tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)}
@@ -146,7 +146,7 @@ impl Scripts {
             .invoke_async(conn)
             .await
             .map_err(super::backend)?;
-        decode_lease_reply(&reply, "HELD")
+        decode_lease_reply(&reply)
     }
 
     pub(crate) async fn renew(
@@ -166,7 +166,7 @@ impl Scripts {
             .invoke_async(conn)
             .await
             .map_err(super::backend)?;
-        decode_lease_reply(&reply, "REFUSED")
+        decode_lease_reply(&reply)
     }
 
     pub(crate) async fn release(
@@ -224,11 +224,13 @@ impl Scripts {
     }
 }
 
-/// Acquire and renew share a reply shape; only the refusal tag differs.
-fn decode_lease_reply(reply: &[Value], refusal: &str) -> Result<LeaseOutcome, StoreError> {
+/// Acquire and renew share a reply shape — and deliberately one refusal tag,
+/// because the caller cannot act differently on "held by another" versus
+/// "no longer yours": both mean the tenure is not this node's to use.
+fn decode_lease_reply(reply: &[Value]) -> Result<LeaseOutcome, StoreError> {
     match (tag_of(reply), int_at(reply, 1)) {
         (Some("OK"), Some(now_ms)) => Ok(LeaseOutcome::Granted { now_ms }),
-        (Some(tag), _) if tag == refusal => Ok(LeaseOutcome::Refused),
+        (Some("REFUSED"), _) => Ok(LeaseOutcome::Refused),
         (Some("NOSESSION"), _) => Ok(LeaseOutcome::NoSession),
         _ => Err(unexpected(reply)),
     }

@@ -189,33 +189,25 @@ pub fn every_event_kind() -> Vec<SessionEventKind> {
     ]
 }
 
-/// How many variants [`every_event_kind`] must cover.
-pub const EVENT_KIND_COUNT: usize = 9;
-
-/// Coverage slot per variant. The exhaustive match is the point: a new
-/// [`SessionEventKind`] refuses to compile here until [`every_event_kind`]
-/// (and [`EVENT_KIND_COUNT`]) is taught about it, so "every" stays a checked
-/// claim rather than a hopeful one.
-pub fn variant_slot(kind: &SessionEventKind) -> usize {
-    use SessionEventKind as K;
-    match kind {
-        K::SessionCreated { .. } => 0,
-        K::TurnStarted { .. } => 1,
-        K::ItemAppended { .. } => 2,
-        K::Routed { .. } => 3,
-        K::OutputTextDelta { .. } => 4,
-        K::ResponseCompleted { .. } => 5,
-        K::ResponseIncomplete { .. } => 6,
-        K::TurnDeduplicated { .. } => 7,
-        K::Error { .. } => 8,
-    }
-}
-
-/// Assert the list lives up to its name.
+/// Assert the list lives up to its name. The exhaustive match is the point:
+/// a new [`SessionEventKind`] refuses to compile here until
+/// [`every_event_kind`] is taught about it, so "every" stays a checked claim
+/// rather than a hopeful one.
 pub fn assert_covers_every_variant(kinds: &[SessionEventKind]) {
-    let mut covered = [false; EVENT_KIND_COUNT];
+    use SessionEventKind as K;
+    let mut covered = [false; 9];
     for kind in kinds {
-        covered[variant_slot(kind)] = true;
+        covered[match kind {
+            K::SessionCreated { .. } => 0,
+            K::TurnStarted { .. } => 1,
+            K::ItemAppended { .. } => 2,
+            K::Routed { .. } => 3,
+            K::OutputTextDelta { .. } => 4,
+            K::ResponseCompleted { .. } => 5,
+            K::ResponseIncomplete { .. } => 6,
+            K::TurnDeduplicated { .. } => 7,
+            K::Error { .. } => 8,
+        }] = true;
     }
     assert!(
         covered.into_iter().all(|seen| seen),

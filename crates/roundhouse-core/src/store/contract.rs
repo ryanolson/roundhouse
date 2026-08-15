@@ -338,12 +338,16 @@ pub async fn read_events_pages_oldest_first_and_reproduces_the_append<S: Session
     );
 }
 
-pub async fn last_seq_is_zero_when_empty_and_tracks_the_tail<S: SessionStore>(store: &S) {
+pub async fn an_empty_session_reads_as_empty_and_seqs_track_the_tail<S: SessionStore>(store: &S) {
     let (sid, lease) = held(store).await;
     assert_eq!(
         store.last_seq(&sid).await.unwrap(),
         0,
         "an empty session reads as seq 0; holding the lease appends nothing"
+    );
+    assert!(
+        store.read_events(&sid, 0, 16).await.unwrap().is_empty(),
+        "an empty session replays as no events, not as an error"
     );
 
     store
@@ -420,7 +424,7 @@ macro_rules! store_contract_suite {
             a_stale_handle_works_while_the_record_is_live,
             appends_assign_contiguous_seqs_and_replay_is_gapless,
             read_events_pages_oldest_first_and_reproduces_the_append,
-            last_seq_is_zero_when_empty_and_tracks_the_tail,
+            an_empty_session_reads_as_empty_and_seqs_track_the_tail,
             renew_fails_once_the_lease_was_taken_over,
         );
     };

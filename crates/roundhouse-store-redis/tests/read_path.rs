@@ -1,15 +1,16 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The M2 read path against a real Redis.
+//! The wire format proven from outside the crate, and the corruption harness.
 //!
 //! These tests write through `common::Rig::raw_append`, which produces
 //! byte-for-byte the entries the fenced append script produces (explicit
-//! `<seq>-0` ids, `at_ms` and `kind` fields). That was the point of M2:
-//! prove the read side of the wire format before the write side existed —
-//! and it stays the corruption harness now that M3 is real, because raw
-//! writes are how a foreign writer's damage is simulated. The full contract
-//! suite runs in `contract.rs`.
+//! `<seq>-0` ids, `at_ms` and `kind` fields). Together with the real-append
+//! round-trip in `contract.rs`, that pins the on-disk format as the contract:
+//! script-written and externally written entries are interchangeable, so the
+//! format cannot drift silently inside the script. Raw writes are also how a
+//! foreign writer's damage is simulated. Everything the shared contract suite
+//! covers lives in `contract.rs` alone — nothing here repeats it.
 //!
 //! Gated with `#[ignore]` because that is the one skip the test harness
 //! *reports*: a plain `cargo test` prints the ignored count with the reason
@@ -23,38 +24,7 @@ mod common;
 use common::{assert_covers_every_variant, every_event_kind, rig};
 use roundhouse_core::event::SessionEventKind;
 use roundhouse_core::ids::SessionId;
-use roundhouse_core::store::{SessionStore, StoreError, contract};
-
-#[tokio::test]
-#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
-async fn create_is_idempotent_and_reports_existing() {
-    contract::create_is_idempotent_and_reports_existing(&rig().await.store).await;
-}
-
-#[tokio::test]
-#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
-async fn the_read_path_reports_unknown_sessions_as_not_found() {
-    let store = rig().await.store;
-    let sid = SessionId::generate(); // minted but never created
-    assert!(matches!(
-        store.read_events(&sid, 0, 16).await,
-        Err(StoreError::SessionNotFound(_))
-    ));
-    assert!(matches!(
-        store.last_seq(&sid).await,
-        Err(StoreError::SessionNotFound(_))
-    ));
-}
-
-#[tokio::test]
-#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
-async fn an_empty_session_reads_as_seq_zero_with_no_events() {
-    let store = rig().await.store;
-    let sid = SessionId::generate();
-    assert!(store.create_session(&sid, "affinity").await.unwrap());
-    assert_eq!(store.last_seq(&sid).await.unwrap(), 0);
-    assert!(store.read_events(&sid, 0, 16).await.unwrap().is_empty());
-}
+use roundhouse_core::store::{SessionStore, StoreError};
 
 #[tokio::test]
 #[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
