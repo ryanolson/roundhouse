@@ -18,8 +18,8 @@ this prefix cached* and route accordingly. Statefulness and routing are not two
 features — the first is what makes the second possible.
 
 > **Status: exploratory walking skeleton.** The session core, routing layer,
-> embedded Dynamo integration, streaming turn engine, and HTTP/SSE transport
-> are real and tested. The WebSocket and gRPC transports and the Redis store
+> embedded Dynamo integration, streaming turn engine, HTTP/SSE transport, and
+> Redis session store are real and tested. The WebSocket and gRPC transports
 > are not yet implemented.
 
 Roundhouse depends on Dynamo but is not part of it. It pins two Dynamo crates
@@ -40,7 +40,7 @@ crates.io, the pin becomes a plain version.
 |---|---|
 | `roundhouse-core` | Session state machine, event log, lease, context assembly, routing vocabulary and policies, metrics projection |
 | `roundhouse-fleet` | Local Dynamo fleet (embedded selection service) and frontier providers |
-| `roundhouse-store-redis` | Redis Streams `SessionStore` *(not yet implemented)* |
+| `roundhouse-store-redis` | Redis Streams `SessionStore`: entry id == seq, `PX` lease on the Redis clock, fenced appends via Lua. Selected by `ROUNDHOUSE_REDIS_URL`; absent means in-memory sessions that die with the process |
 | `roundhouse-server` | Turn engine, HTTP/SSE transport, metrics API and dashboard, and the binary |
 
 ## Design

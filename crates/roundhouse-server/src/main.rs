@@ -8,10 +8,15 @@
 //! environment variable, because a flag parser here would be the first place a
 //! deployment concern leaked into the composition root.
 //!
-//! The wiring is the offline demo set — [`MemoryStore`], [`ByteTokenizer`],
-//! [`EchoLocalExecutor`], [`EchoFrontierClient`] — so the process starts and
-//! serves with no Redis, no GPU, no provider account and no model assets.
-//! Sessions accordingly live only as long as the process.
+//! The store is the one seam a deployment selects here: `ROUNDHOUSE_REDIS_URL`
+//! set means sessions live in that Redis and survive this process;
+//! absent means [`MemoryStore`] and sessions die with it. A URL that is set
+//! but unreachable stops the process at startup — falling back to memory
+//! would silently demote "durable" to "until the next restart", which is the
+//! one property the variable exists to promise. The rest of the wiring is the
+//! offline demo set — [`ByteTokenizer`], [`EchoLocalExecutor`],
+//! [`EchoFrontierClient`] — so the process serves with no GPU, no provider
+//! account and no model assets.
 //!
 //! The catalog carries one entry, for the echo provider wired below — not a
 //! rate card. The no-baked-rate-cards rule (`roundhouse-fleet/src/frontier.rs`)
@@ -32,13 +37,14 @@ use std::sync::Arc;
 use roundhouse_core::context::ByteTokenizer;
 use roundhouse_core::metrics::MetricsConfig;
 use roundhouse_core::routing::{AffinityPolicy, CacheModel, ProviderPricing};
-use roundhouse_core::store::MemoryStore;
+use roundhouse_core::store::{MemoryStore, SessionStore};
 use roundhouse_fleet::{
     EchoFrontierClient, FrontierModelSpec, StaticFrontierCatalog, WireProtocol,
 };
 use roundhouse_server::{
     EchoLocalExecutor, Engine, EngineConfig, catalog_config, http, metrics_api, responses_api,
 };
+use roundhouse_store_redis::{RedisSessionStore, RedisStoreConfig};
 use tracing_subscriber::EnvFilter;
 
 /// The echo provider's catalog entry.
@@ -61,6 +67,9 @@ fn echo_catalog() -> StaticFrontierCatalog {
 /// Where to bind, as `host:port`.
 const ADDR_VAR: &str = "ROUNDHOUSE_ADDR";
 const DEFAULT_ADDR: &str = "127.0.0.1:8080";
+
+/// Where sessions live, as a `redis://` URL. Absent means in-memory.
+const REDIS_VAR: &str = "ROUNDHOUSE_REDIS_URL";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -90,17 +99,6 @@ async fn main() -> anyhow::Result<()> {
     };
     let metrics_config = Arc::new(metrics_config);
 
-    let store = Arc::new(MemoryStore::new());
-    let engine = Arc::new(Engine::new(
-        Arc::clone(&store),
-        ByteTokenizer,
-        Arc::new(EchoLocalExecutor::new("local answer")),
-        catalog,
-        Arc::new(EchoFrontierClient::new("frontier answer")),
-        Arc::new(AffinityPolicy::new()),
-        EngineConfig::default(),
-    ));
-
     let addr: SocketAddr = std::env::var(ADDR_VAR)
         .unwrap_or_else(|_| DEFAULT_ADDR.to_string())
         .parse()?;
@@ -114,6 +112,49 @@ async fn main() -> anyhow::Result<()> {
         "dashboard at http://{}/v1/metrics/dashboard",
         listener.local_addr()?
     );
+
+    // The two arms monomorphize `serve` twice; that is the entire cost of
+    // keeping the engine generic over its store. The URL itself is never
+    // logged — a `redis://` URL may carry credentials.
+    match std::env::var(REDIS_VAR) {
+        Ok(url) => {
+            let store = RedisSessionStore::connect(RedisStoreConfig::new(url)).await?;
+            tracing::info!(var = REDIS_VAR, "sessions are durable in Redis");
+            serve(Arc::new(store), catalog, metrics_config, listener).await
+        }
+        Err(_) => {
+            tracing::warn!(
+                var = REDIS_VAR,
+                "no Redis configured; sessions are in-memory and die with this process"
+            );
+            serve(
+                Arc::new(MemoryStore::new()),
+                catalog,
+                metrics_config,
+                listener,
+            )
+            .await
+        }
+    }
+}
+
+/// Compose the engine and the three surfaces over whichever store was chosen.
+async fn serve<S: SessionStore>(
+    store: Arc<S>,
+    catalog: StaticFrontierCatalog,
+    metrics_config: Arc<MetricsConfig>,
+    listener: tokio::net::TcpListener,
+) -> anyhow::Result<()> {
+    let engine = Arc::new(Engine::new(
+        Arc::clone(&store),
+        ByteTokenizer,
+        Arc::new(EchoLocalExecutor::new("local answer")),
+        catalog,
+        Arc::new(EchoFrontierClient::new("frontier answer")),
+        Arc::new(AffinityPolicy::new()),
+        EngineConfig::default(),
+    ));
+
     // Three surfaces, one process and one log: the native transport, which
     // exposes sessions and the log itself; the Responses API, which lets an
     // agent written against OpenAI drive the same sessions unmodified; and the

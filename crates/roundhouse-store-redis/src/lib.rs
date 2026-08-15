@@ -39,8 +39,9 @@
 //! concurrent writers. Requires Redis ≥ 6.2 (exclusive `XRANGE` starts,
 //! effects-replicated scripts).
 //!
-//! **Status: through M3 of `PLAN.md`.** The store is complete and passes the
-//! same contract suite as `MemoryStore`; wiring it into the binary is M4.
+//! The store passes the same contract suite as `MemoryStore` — instantiated
+//! by the same `store_contract_suite!` macro — and the binary selects it when
+//! `ROUNDHOUSE_REDIS_URL` is set (see `roundhouse-server`'s `main.rs`).
 
 mod scripts;
 
