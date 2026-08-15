@@ -16,7 +16,9 @@ async-trait = { workspace = true }
 redis = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-thiserror = { workspace = true }
+
+[dev-dependencies]
+# `test-support` is the conformance suite: the same assertions that judge
+# `MemoryStore` judge this store, which is the whole portability argument.
+roundhouse-core = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true }
-tracing = { workspace = true }
-uuid = { workspace = true }

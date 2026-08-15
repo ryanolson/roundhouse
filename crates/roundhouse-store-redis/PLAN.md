@@ -207,9 +207,15 @@ makes "flexible enough for another backend" checkable rather than asserted:
 3. **Run the suite against both stores.** For `MemoryStore` it runs always
    (proving the extraction changed nothing); for `RedisSessionStore` it runs
    in `crates/roundhouse-store-redis/tests/` against a real Redis named by
-   `ROUNDHOUSE_TEST_REDIS_URL`, and *visibly skips* (prints why, returns)
-   when the variable is unset — a suite that fails without infrastructure
-   teaches people to ignore red.
+   `ROUNDHOUSE_TEST_REDIS_URL`, gated by `#[ignore = "needs a real Redis…"]`
+   and opted into with `--include-ignored` — a suite that fails without
+   infrastructure teaches people to ignore red. `#[ignore]` rather than an
+   env-var check that returns early, because it is the one skip the harness
+   *reports*: the early return would print "passed" for tests that verified
+   nothing, and asking for the tests without the variable set fails loudly
+   instead of skipping again. (M2 learned this the honest way — the
+   eprintln-and-return version's notices were swallowed by libtest's output
+   capture.)
 4. **Redis-only adversarial tests**, beyond the shared suite: two nodes racing
    acquire-after-expiry with the loser's in-flight append rejected;
    interleaved append/renew from separate connections proving script
