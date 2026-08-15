@@ -24,23 +24,14 @@ use roundhouse_core::routing::{AffinityPolicy, CacheLedger};
 use roundhouse_core::session::Session;
 use roundhouse_fleet::EchoFrontierClient;
 use roundhouse_server::{EchoLocalExecutor, Engine, EngineConfig};
-use roundhouse_store_redis::{RedisSessionStore, RedisStoreConfig};
+use roundhouse_store_redis::RedisSessionStore;
+use roundhouse_store_redis::test_support::connect_from_env;
 
 mod common;
 use common::{config, frontier_catalog};
 
 async fn store_from_env() -> Arc<RedisSessionStore> {
-    let url = std::env::var("ROUNDHOUSE_TEST_REDIS_URL").unwrap_or_else(|_| {
-        panic!(
-            "--include-ignored asks for the real backend; \
-             set ROUNDHOUSE_TEST_REDIS_URL to a reachable Redis"
-        )
-    });
-    Arc::new(
-        RedisSessionStore::connect(RedisStoreConfig::new(url))
-            .await
-            .expect("Redis named by the env var must be reachable"),
-    )
+    Arc::new(connect_from_env().await)
 }
 
 /// The offline-demo engine shape from `main.rs`, over Redis instead.

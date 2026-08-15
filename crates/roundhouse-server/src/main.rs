@@ -34,6 +34,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use anyhow::Context;
 use roundhouse_core::context::ByteTokenizer;
 use roundhouse_core::metrics::MetricsConfig;
 use roundhouse_core::routing::{AffinityPolicy, CacheModel, ProviderPricing};
@@ -118,7 +119,9 @@ async fn main() -> anyhow::Result<()> {
     // logged — a `redis://` URL may carry credentials.
     match std::env::var(REDIS_VAR) {
         Ok(url) => {
-            let store = RedisSessionStore::connect(RedisStoreConfig::new(url)).await?;
+            let store = RedisSessionStore::connect(RedisStoreConfig::new(url))
+                .await
+                .with_context(|| format!("connecting to the Redis named by {REDIS_VAR}"))?;
             tracing::info!(var = REDIS_VAR, "sessions are durable in Redis");
             serve(Arc::new(store), catalog, metrics_config, listener).await
         }

@@ -5,6 +5,10 @@ SPDX-License-Identifier: Apache-2.0
 
 # Plan: the stateful store component (Redis first, backend-portable by contract)
 
+> **Status: delivered.** All four milestones landed; this document remains as
+> the design rationale. Where implementation diverged from the plan, the text
+> says so inline (the `#[ignore]` gating in §4.3 is the notable case).
+
 This crate is the durable half of the statefulness claim in the README. The
 plan below is written against the code as it stands: the abstraction already
 exists and is already consumed everywhere — `SessionStore` in

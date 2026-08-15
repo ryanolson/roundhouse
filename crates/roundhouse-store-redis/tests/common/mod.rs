@@ -3,17 +3,19 @@
 
 //! Fixtures shared by the integration-test binaries.
 //!
-//! One canonical copy: the connection helper, the every-variant event list,
-//! and its coverage guard live here rather than one copy per test binary.
+//! One canonical copy: the every-variant event list and its coverage guard
+//! live here rather than one copy per test binary; the connection helpers
+//! come from the crate's own `test_support` module, which the server's
+//! durability test shares too.
 //! Each binary compiles its own copy via `mod common;`, and none uses every
-//! item, so the module opts out of dead-code analysis rather than sprinkling
-//! `allow`s per item.
+//! item, so the module opts out of dead-code and unused-import analysis
+//! rather than sprinkling `allow`s per item.
 //!
 //! Everything here presumes `--include-ignored` already opted into the real
 //! backend, which is why a missing `ROUNDHOUSE_TEST_REDIS_URL` panics instead
 //! of skipping: it is a runner error to report, not infrastructure to wait
 //! for.
-#![allow(dead_code)]
+#![allow(dead_code, unused_imports)]
 
 use roundhouse_core::event::{Accounting, IncompleteReason, SessionEvent, SessionEventKind, Usage};
 use roundhouse_core::ids::{ResponseId, SessionId, TurnId};
@@ -22,20 +24,7 @@ use roundhouse_core::routing::{Candidate, DecisionRecord, Target};
 use roundhouse_core::store::SessionStore;
 use roundhouse_store_redis::{RedisSessionStore, RedisStoreConfig};
 
-pub const URL_VAR: &str = "ROUNDHOUSE_TEST_REDIS_URL";
-
-pub fn url_from_env() -> String {
-    std::env::var(URL_VAR).unwrap_or_else(|_| {
-        panic!("--include-ignored asks for the real backend; set {URL_VAR} to a reachable Redis")
-    })
-}
-
-/// The store under test, connected to the Redis the environment names.
-pub async fn connect_from_env() -> RedisSessionStore {
-    RedisSessionStore::connect(RedisStoreConfig::new(url_from_env()))
-        .await
-        .expect("Redis named by the env var must be reachable")
-}
+pub use roundhouse_store_redis::test_support::{connect_from_env, url_from_env};
 
 /// The store under test, its key layout, and a raw connection for writing
 /// what the store must then read (or for sabotaging it from outside).

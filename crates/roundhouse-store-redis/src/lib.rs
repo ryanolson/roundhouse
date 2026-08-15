@@ -54,25 +54,21 @@ use roundhouse_core::ids::SessionId;
 use roundhouse_core::now_ms;
 use roundhouse_core::store::{Lease, SessionStore, StoreError};
 
-/// Where and under what namespace sessions live.
+/// Every key this store writes starts here. A constant, not configuration:
+/// nothing selects a different prefix today, and an untested knob would be a
+/// promise nobody checked. If two deployments ever must share an instance,
+/// the setter returns with the test that proves isolation.
+const KEY_PREFIX: &str = "rh";
+
+/// Where sessions live, and the key layout they map to.
 #[derive(Debug, Clone)]
 pub struct RedisStoreConfig {
     url: String,
-    key_prefix: String,
 }
 
 impl RedisStoreConfig {
     pub fn new(url: impl Into<String>) -> Self {
-        Self {
-            url: url.into(),
-            key_prefix: "rh".into(),
-        }
-    }
-
-    /// Namespace the keys, e.g. to let two deployments share an instance.
-    pub fn with_key_prefix(mut self, prefix: impl Into<String>) -> Self {
-        self.key_prefix = prefix.into();
-        self
+        Self { url: url.into() }
     }
 
     // The key layout is public, documented API rather than an internal detail:
@@ -82,15 +78,15 @@ impl RedisStoreConfig {
     // slot, which is what keeps the lease-fenced append single-slot scriptable.
 
     pub fn meta_key(&self, session_id: &SessionId) -> String {
-        format!("{}:{{{}}}:meta", self.key_prefix, session_id)
+        format!("{KEY_PREFIX}:{{{session_id}}}:meta")
     }
 
     pub fn lease_key(&self, session_id: &SessionId) -> String {
-        format!("{}:{{{}}}:lease", self.key_prefix, session_id)
+        format!("{KEY_PREFIX}:{{{session_id}}}:lease")
     }
 
     pub fn log_key(&self, session_id: &SessionId) -> String {
-        format!("{}:{{{}}}:log", self.key_prefix, session_id)
+        format!("{KEY_PREFIX}:{{{session_id}}}:log")
     }
 }
 
@@ -420,6 +416,40 @@ impl RedisSessionStore {
                 Err(StoreError::SessionNotFound(session_id.clone()))
             }
         }
+    }
+}
+
+/// Fixtures for this crate's integration tests and for dependent crates'
+/// (the server's durability test). Feature-gated for the same reason as the
+/// [`LeaseControl`](roundhouse_core::store::contract::LeaseControl) impl
+/// below: one canonical copy instead of a per-crate near-duplicate — the env
+/// var's name and the fail-loudly-instead-of-skip policy are a contract, and
+/// two drifting copies of a contract is how tests end up reading different
+/// variables — but never part of a production build.
+#[cfg(feature = "test-support")]
+pub mod test_support {
+    use super::{RedisSessionStore, RedisStoreConfig};
+
+    /// The one variable every Redis-gated integration test reads.
+    pub const URL_VAR: &str = "ROUNDHOUSE_TEST_REDIS_URL";
+
+    /// Panics rather than skips: reaching this at all means
+    /// `--include-ignored` asked for the real backend, so a missing variable
+    /// is a runner error to report, not infrastructure to wait for.
+    pub fn url_from_env() -> String {
+        std::env::var(URL_VAR).unwrap_or_else(|_| {
+            panic!(
+                "--include-ignored asks for the real backend; \
+                 set {URL_VAR} to a reachable Redis"
+            )
+        })
+    }
+
+    /// The store under test, connected to the Redis the environment names.
+    pub async fn connect_from_env() -> RedisSessionStore {
+        RedisSessionStore::connect(RedisStoreConfig::new(url_from_env()))
+            .await
+            .expect("Redis named by the env var must be reachable")
     }
 }
 
