@@ -92,8 +92,8 @@ async fn turns_driven_through_the_engine_reach_the_dashboard() {
 
     // Both rollup axes cover exactly the same calls, because they are two
     // groupings of one set of events rather than two measurements.
-    let by_provider: u64 = snapshot.providers.iter().map(|p| p.calls).sum();
-    let by_mode: u64 = snapshot.serving_modes.iter().map(|m| m.calls).sum();
+    let by_provider: u64 = snapshot.providers.iter().map(|p| p.totals.calls).sum();
+    let by_mode: u64 = snapshot.serving_modes.iter().map(|m| m.totals.calls).sum();
     assert_eq!(by_provider, snapshot.calls);
     assert_eq!(by_mode, snapshot.calls);
     assert_eq!(

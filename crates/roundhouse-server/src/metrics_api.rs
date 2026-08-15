@@ -209,6 +209,44 @@ mod tests {
         // Both rollup axes are present, and both serving modes always appear.
         assert_eq!(json["providers"][0]["provider"], "anthropic");
         assert_eq!(json["serving_modes"].as_array().unwrap().len(), 2);
+
+        // The aggregates carry their money and volume at the top level of the
+        // row, not nested. They are a flattened `Rollup` internally, and the
+        // whole point of flattening was that consumers could not tell — this
+        // pins that, because a `flatten` silently dropped or renamed is a
+        // dashboard column that reads `undefined` rather than a build error.
+        let provider = &json["providers"][0];
+        for key in [
+            "calls",
+            "tokens",
+            "coverage",
+            "billed_usd",
+            "shadow_usd",
+            "models",
+        ] {
+            assert!(
+                provider.get(key).is_some(),
+                "provider rollup lost `{key}`: {provider}"
+            );
+        }
+        assert_eq!(provider["calls"], 1);
+        let mode = &json["serving_modes"][0];
+        for key in ["mode", "calls", "tokens", "billed_usd"] {
+            assert!(
+                mode.get(key).is_some(),
+                "serving-mode rollup lost `{key}`: {mode}"
+            );
+        }
+
+        // And a model row still flattens its accounting: `mode` beside only
+        // the money that applies to it.
+        let row = &json["models"][0];
+        assert_eq!(row["mode"], "frontier");
+        assert!(row.get("billed_usd").is_some());
+        assert!(
+            row.get("shadow_usd").is_none(),
+            "a hosted row must not carry a shadow price, not even a zero one"
+        );
     }
 
     #[tokio::test]

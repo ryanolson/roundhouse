@@ -139,14 +139,19 @@ fn ratio(part: f64, whole: f64) -> f64 {
     if whole <= 0.0 { 0.0 } else { part / whole }
 }
 
-/// How a correlary was arrived at.
+/// How a correlary was arrived at, as it appears on the wire.
 ///
 /// Serialized alongside every shadow-priced figure so a reader can tell a
 /// number resting on a procurement decision from one resting on a similarity
 /// metric — they are not the same claim and should not be quoted the same way.
+///
+/// Private, and deliberately so: it is the JSON tag, not a type callers reason
+/// with. [`Correlary`] is what Rust code matches on, and exporting a second,
+/// looser spelling of the same three cases invites exactly the priced/unpriced
+/// disagreement that type is shaped to prevent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum CorrelaryBasis {
+enum CorrelaryBasis {
     /// Someone stated this equivalence. The note is theirs.
     Declared { note: String },
     /// Chosen as the nearest capability-comparable model by traffic shape.

@@ -175,6 +175,27 @@ pub enum SessionEventKind {
     },
 }
 
+/// Notified of every event a session commits.
+///
+/// Lives beside the events it observes rather than beside its first
+/// implementer. The session state machine is the lower layer, and having it
+/// import its own observation seam from the metrics module — a reporting
+/// concern built on top of it — pointed the dependency backwards. Anything
+/// else wanting to watch the log, an exporter or a tracer, hangs off this same
+/// seam instead of growing a second one.
+///
+/// Called while the session holds its lease and before the commit returns, so
+/// an implementation must not block or await. A few integer additions is the
+/// budget.
+///
+/// Implementations must be idempotent by `(session, seq)`. A session feeds its
+/// replay through here as well as its subsequent commits, so an observer
+/// without that property double-counts every session opened more than once,
+/// which is every session that takes more than one turn.
+pub trait SessionObserver: Send + Sync + 'static {
+    fn observe(&self, events: &[SessionEvent]);
+}
+
 /// A sealed log entry. `seq` is assigned by the store on append and is
 /// contiguous and strictly increasing within a session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

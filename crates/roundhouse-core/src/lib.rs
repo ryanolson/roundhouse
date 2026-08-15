@@ -22,7 +22,7 @@ pub mod routing;
 pub mod session;
 pub mod store;
 
-pub use event::{Accounting, SessionEvent, SessionEventKind, Usage};
+pub use event::{Accounting, SessionEvent, SessionEventKind, SessionObserver, Usage};
 pub use ids::{ResponseId, SessionId, TurnId};
 pub use item::{Item, ItemContent, Role};
 pub use metrics::{MetricsConfig, MetricsFold, MetricsSnapshot, ServingMode};

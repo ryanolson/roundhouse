@@ -299,3 +299,56 @@ fn a_zero_cache_write_rate_bills_uncached_input_at_the_input_rate() {
         spec.pricing.input_per_mtok_usd * 1e-6 * 1_000_000.0
     );
 }
+
+/// An operator-facing message is the whole product of a refused config, so it
+/// has to read as prose.
+///
+/// A multi-line Rust string literal without `\` continuations keeps the source
+/// indentation, which then renders as a ten-space gap mid-sentence to the one
+/// person the refusal exists to help. That is invisible in source review and
+/// invisible to an assertion on a substring that happens to sit inside one
+/// line, which is how it shipped the first time.
+#[test]
+fn refusal_messages_read_as_prose() {
+    let cases: Vec<(&str, String)> = vec![
+        ("duplicate", DUPLICATE_IDENTITY.to_string()),
+        (
+            "unknown correlary",
+            single_model().replace(
+                "  ]\n}",
+                r#"  ],
+  "correlaries": [
+    { "local_model": "llama", "provider": "anthropic", "model": "absent", "note": "" }
+  ]
+}"#,
+            ),
+        ),
+        (
+            "negative price",
+            single_model().replace(
+                "\"input_per_mtok_usd\": 3.0",
+                "\"input_per_mtok_usd\": -3.0",
+            ),
+        ),
+        (
+            "out-of-range prior",
+            single_model().replace("\"quality_prior\": 0.62", "\"quality_prior\": 42.0"),
+        ),
+        ("empty", r#"{ "models": [] }"#.to_string()),
+    ];
+
+    for (label, json) in cases {
+        let message = CatalogConfig::from_json(&json, "cfg.json")
+            .expect_err(&format!("{label} must be refused"))
+            .to_string();
+        assert!(
+            !message.contains("  "),
+            "the `{label}` refusal contains a run of spaces, so it renders \
+             broken to an operator: {message:?}"
+        );
+        assert!(
+            message.contains("cfg.json"),
+            "the `{label}` refusal must name the file: {message}"
+        );
+    }
+}

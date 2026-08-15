@@ -110,7 +110,11 @@ pub enum CatalogError {
     #[error("catalog `{path}` lists no models, so no turn could be routed anywhere")]
     Empty { path: String },
     #[error(
-        "catalog `{path}` lists `{provider}/{model}` more than once. Two prices for one model          identity do not resolve the same way on both sides: the router seeds its ledger by          insertion and keeps the last, while the dashboard looks up a rate card by search and          finds the first, so the price a turn is chosen on and the price it is reported at would          differ silently"
+        "catalog `{path}` lists `{provider}/{model}` more than once. Two prices for one \
+         model identity do not resolve the same way on both sides: the router seeds its \
+         ledger by insertion and keeps the last, while the dashboard looks up a rate card \
+         by search and finds the first, so the price a turn is chosen on and the price it \
+         is reported at would differ silently"
     )]
     DuplicateModel {
         path: String,
@@ -126,7 +130,8 @@ pub enum CatalogError {
         expected: &'static str,
     },
     #[error(
-        "catalog `{path}`: the correlary for `{local_model}` names `{provider}/{model}`, which          is not in this catalog, so that model's traffic would silently go unpriced"
+        "catalog `{path}`: the correlary for `{local_model}` names `{provider}/{model}`, \
+         which is not in this catalog, so that model's traffic would silently go unpriced"
     )]
     UnknownCorrelaryTarget {
         path: String,

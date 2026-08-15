@@ -13,10 +13,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::event::{IncompleteReason, SessionEvent, SessionEventKind, Usage};
+use crate::event::{IncompleteReason, SessionEvent, SessionEventKind, SessionObserver, Usage};
 use crate::ids::{ResponseId, SessionId, TurnId};
 use crate::item::Item;
-use crate::metrics::SessionObserver;
 use crate::routing::{CacheLedger, DecisionRecord, Target};
 use crate::store::{Lease, SessionStore, StoreError};
 
