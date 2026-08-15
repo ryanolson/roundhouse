@@ -4236,8 +4236,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "futures",
  "redis",
  "roundhouse-core",
+ "roundhouse-store-redis",
  "serde",
  "serde_json",
  "tokio",

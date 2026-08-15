@@ -17,8 +17,18 @@ redis = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+[features]
+# Compiles this store's `LeaseControl` impl, the hook the shared conformance
+# suite uses to expire a lease without waiting out its TTL. A feature rather
+# than `cfg(test)` because integration tests build the library without
+# `cfg(test)`; the self-dev-dependency below turns it on for exactly those
+# builds and nothing else.
+test-support = ["roundhouse-core/test-support"]
+
 [dev-dependencies]
 # `test-support` is the conformance suite: the same assertions that judge
 # `MemoryStore` judge this store, which is the whole portability argument.
 roundhouse-core = { workspace = true, features = ["test-support"] }
+roundhouse-store-redis = { path = ".", features = ["test-support"] }
+futures = { workspace = true }
 tokio = { workspace = true }

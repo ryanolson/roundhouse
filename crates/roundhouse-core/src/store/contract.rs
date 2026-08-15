@@ -379,9 +379,11 @@ pub async fn renew_fails_once_the_lease_was_taken_over<S: LeaseControl>(store: &
 ///
 /// `$make` is evaluated inside each generated test, so every test gets a
 /// fresh store and a backend whose construction is async passes an `.await`
-/// expression. Leading attributes are forwarded to every generated test —
-/// that is how an infrastructure-gated backend applies its
-/// `#[ignore = "…"]` reason suite-wide.
+/// expression. The optional `ignore = "…"` prefix stamps that reason as
+/// `#[ignore]` on every generated test — how an infrastructure-gated backend
+/// applies its gate suite-wide. (A keyword form rather than forwarded
+/// attributes because `macro_rules` cannot disambiguate free attributes from
+/// the expression that follows them.)
 ///
 /// ```ignore
 /// // In-memory: nothing to gate on.
@@ -389,7 +391,7 @@ pub async fn renew_fails_once_the_lease_was_taken_over<S: LeaseControl>(store: &
 ///
 /// // Redis: the whole suite behind the harness-reported ignore gate.
 /// roundhouse_core::store_contract_suite!(
-///     #[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
+///     ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored",
 ///     connect_from_env().await
 /// );
 /// ```
@@ -399,8 +401,16 @@ pub async fn renew_fails_once_the_lease_was_taken_over<S: LeaseControl>(store: &
 /// dev-dependency.
 #[macro_export]
 macro_rules! store_contract_suite {
-    ($(#[$attr:meta])* $make:expr) => {
-        $crate::store_contract_suite!(@tests ($(#[$attr])*) $make;
+    (ignore = $reason:literal, $make:expr $(,)?) => {
+        $crate::store_contract_suite!(@list (#[ignore = $reason]) $make);
+    };
+    ($make:expr $(,)?) => {
+        $crate::store_contract_suite!(@list () $make);
+    };
+    // The single list. Both public arms land here, so gated and ungated
+    // backends cannot drift apart in coverage.
+    (@list $attrs:tt $make:expr) => {
+        $crate::store_contract_suite!(@tests $attrs $make;
             create_is_idempotent_and_reports_existing,
             unknown_sessions_are_not_found,
             a_live_lease_blocks_others_and_retakes_for_its_holder,

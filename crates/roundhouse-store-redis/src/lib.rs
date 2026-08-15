@@ -33,11 +33,16 @@
 //! durable as the Redis it lives in (AOF `appendfsync`, replication). This
 //! crate does not try to out-engineer the operator's persistence config.
 //!
-//! Requires Redis ≥ 6.2 (exclusive `XRANGE` starts).
+//! The write path lives in [`scripts`]: the lease is a `SET PX` key on the
+//! Redis clock, and lease-check plus append is one atomic Lua script, which
+//! is what makes the fencing the trait promises actually hold under
+//! concurrent writers. Requires Redis ≥ 6.2 (exclusive `XRANGE` starts,
+//! effects-replicated scripts).
 //!
-//! **Status: through M2 of `PLAN.md`.** Session creation and the read path are
-//! real; the lease and the fenced append land in M3 and until then those
-//! methods return a [`StoreError::Backend`] saying so.
+//! **Status: through M3 of `PLAN.md`.** The store is complete and passes the
+//! same contract suite as `MemoryStore`; wiring it into the binary is M4.
+
+mod scripts;
 
 use redis::aio::ConnectionManager;
 use redis::streams::StreamRangeReply;
@@ -106,6 +111,7 @@ struct SessionMeta {
 pub struct RedisSessionStore {
     config: RedisStoreConfig,
     conn: ConnectionManager,
+    scripts: std::sync::Arc<scripts::Scripts>,
 }
 
 impl RedisSessionStore {
@@ -114,7 +120,11 @@ impl RedisSessionStore {
     pub async fn connect(config: RedisStoreConfig) -> Result<Self, StoreError> {
         let client = redis::Client::open(config.url.as_str()).map_err(backend)?;
         let conn = ConnectionManager::new(client).await.map_err(backend)?;
-        Ok(Self { config, conn })
+        Ok(Self {
+            config,
+            conn,
+            scripts: std::sync::Arc::new(scripts::Scripts::new()),
+        })
     }
 
     /// `SessionNotFound` unless the session's meta key exists.
@@ -217,27 +227,95 @@ impl SessionStore for RedisSessionStore {
 
     async fn acquire_lease(
         &self,
-        _session_id: &SessionId,
-        _node_id: &str,
-        _ttl_ms: u64,
+        session_id: &SessionId,
+        node_id: &str,
+        ttl_ms: u64,
     ) -> Result<Option<Lease>, StoreError> {
-        Err(not_yet("acquire_lease"))
+        let outcome = self
+            .scripts
+            .acquire(
+                &mut self.conn.clone(),
+                &self.config.meta_key(session_id),
+                &self.config.lease_key(session_id),
+                node_id,
+                ttl_ms,
+            )
+            .await?;
+        self.lease_from(outcome, session_id, node_id, ttl_ms)
     }
 
-    async fn renew_lease(&self, _lease: &Lease, _ttl_ms: u64) -> Result<Option<Lease>, StoreError> {
-        Err(not_yet("renew_lease"))
+    async fn renew_lease(&self, lease: &Lease, ttl_ms: u64) -> Result<Option<Lease>, StoreError> {
+        let outcome = self
+            .scripts
+            .renew(
+                &mut self.conn.clone(),
+                &self.config.meta_key(&lease.session_id),
+                &self.config.lease_key(&lease.session_id),
+                &lease.node_id,
+                ttl_ms,
+            )
+            .await?;
+        self.lease_from(outcome, &lease.session_id, &lease.node_id, ttl_ms)
     }
 
-    async fn release_lease(&self, _lease: &Lease) -> Result<(), StoreError> {
-        Err(not_yet("release_lease"))
+    async fn release_lease(&self, lease: &Lease) -> Result<(), StoreError> {
+        self.scripts
+            .release(
+                &mut self.conn.clone(),
+                &self.config.lease_key(&lease.session_id),
+                &lease.node_id,
+            )
+            .await
     }
 
     async fn append_events(
         &self,
-        _lease: &Lease,
-        _kinds: Vec<SessionEventKind>,
+        lease: &Lease,
+        kinds: Vec<SessionEventKind>,
     ) -> Result<Vec<SessionEvent>, StoreError> {
-        Err(not_yet("append_events"))
+        let payloads: Vec<String> = kinds
+            .iter()
+            .map(|kind| {
+                serde_json::to_string(kind).expect("event kinds are plain data and serialize")
+            })
+            .collect();
+
+        let outcome = self
+            .scripts
+            .append(
+                &mut self.conn.clone(),
+                &self.config.meta_key(&lease.session_id),
+                &self.config.lease_key(&lease.session_id),
+                &self.config.log_key(&lease.session_id),
+                &lease.node_id,
+                &payloads,
+            )
+            .await?;
+
+        match outcome {
+            scripts::AppendOutcome::Appended { at_ms, last_seq } => {
+                // The script numbered this batch (last_seq - n, last_seq];
+                // rebuild the events from what was sent rather than re-reading.
+                let first_seq = last_seq - kinds.len() as u64 + 1;
+                Ok(kinds
+                    .into_iter()
+                    .enumerate()
+                    .map(|(offset, kind)| SessionEvent {
+                        seq: first_seq + offset as u64,
+                        session_id: lease.session_id.clone(),
+                        at_ms,
+                        kind,
+                    })
+                    .collect())
+            }
+            scripts::AppendOutcome::Fenced => Err(StoreError::LeaseLost {
+                session_id: lease.session_id.clone(),
+                node_id: lease.node_id.clone(),
+            }),
+            scripts::AppendOutcome::NoSession => {
+                Err(StoreError::SessionNotFound(lease.session_id.clone()))
+            }
+        }
     }
 
     async fn read_events(
@@ -316,13 +394,46 @@ impl SessionStore for RedisSessionStore {
     }
 }
 
-/// The M3 boundary, kept honest: a method that does not exist yet errors
-/// rather than pretending. `unimplemented!` would abort the caller's whole
-/// process, which is a hostile way for a store to say "wait for the next
-/// milestone".
-fn not_yet(method: &str) -> StoreError {
-    StoreError::Backend(anyhow::anyhow!(
-        "RedisSessionStore::{method} is not implemented yet: the lease and the \
-         fenced append land in M3 (see PLAN.md)"
-    ))
+impl RedisSessionStore {
+    /// Translate a lease-script outcome into the trait's vocabulary.
+    ///
+    /// `expires_at_ms` comes from the Redis clock the script read, so the
+    /// handle states the truth about the record it names. It is informational
+    /// either way: per the trait, validity is always decided against the
+    /// stored record, never against the handle's copy.
+    fn lease_from(
+        &self,
+        outcome: scripts::LeaseOutcome,
+        session_id: &SessionId,
+        node_id: &str,
+        ttl_ms: u64,
+    ) -> Result<Option<Lease>, StoreError> {
+        match outcome {
+            scripts::LeaseOutcome::Granted { now_ms } => Ok(Some(Lease {
+                session_id: session_id.clone(),
+                node_id: node_id.to_string(),
+                expires_at_ms: now_ms + ttl_ms,
+            })),
+            scripts::LeaseOutcome::Refused => Ok(None),
+            scripts::LeaseOutcome::NoSession => {
+                Err(StoreError::SessionNotFound(session_id.clone()))
+            }
+        }
+    }
+}
+
+/// The conformance suite's expiry lever: deleting the lease key is exactly
+/// what `PX` would eventually do, so takeover behaves as if the TTL had run
+/// out. Feature-gated because it exists for the shared contract tests, not
+/// for production code — nothing outside a test build may depend on it.
+#[cfg(feature = "test-support")]
+#[async_trait::async_trait]
+impl roundhouse_core::store::contract::LeaseControl for RedisSessionStore {
+    async fn force_expire_lease(&self, session_id: &SessionId) {
+        let _: i64 = redis::cmd("DEL")
+            .arg(self.config.lease_key(session_id))
+            .query_async(&mut self.conn.clone())
+            .await
+            .expect("the test Redis must accept a DEL");
+    }
 }
