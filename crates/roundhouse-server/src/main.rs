@@ -19,16 +19,26 @@
 //! stale in source; the echo provider is this binary's own stub, its "pricing"
 //! is free, and without any entry there would be nothing to route to and every
 //! turn would terminate `response_incomplete` — a demo that cannot demo.
-//! Swapping in real providers replaces this entry with supplied configuration.
+//! `ROUNDHOUSE_CATALOG` is how a real deployment replaces it: see
+//! [`catalog_config`](roundhouse_server::catalog_config).
+//!
+//! Under the stub every dollar figure on the dashboard is zero, which is
+//! correct — nothing was billed — and is why the offline demo is a demo of the
+//! token breakdown rather than of the savings.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use roundhouse_core::context::ByteTokenizer;
+use roundhouse_core::metrics::MetricsConfig;
 use roundhouse_core::routing::{AffinityPolicy, CacheModel, ProviderPricing};
 use roundhouse_core::store::MemoryStore;
-use roundhouse_fleet::{EchoFrontierClient, FrontierModelSpec, StaticFrontierCatalog};
-use roundhouse_server::{EchoLocalExecutor, Engine, EngineConfig, http, responses_api};
+use roundhouse_fleet::{
+    EchoFrontierClient, FrontierModelSpec, StaticFrontierCatalog, WireProtocol,
+};
+use roundhouse_server::{
+    EchoLocalExecutor, Engine, EngineConfig, catalog_config, http, metrics_api, responses_api,
+};
 use tracing_subscriber::EnvFilter;
 
 /// The echo provider's catalog entry.
@@ -39,6 +49,7 @@ fn echo_catalog() -> StaticFrontierCatalog {
     StaticFrontierCatalog::new(vec![FrontierModelSpec {
         provider: "echo".into(),
         model: "echo".into(),
+        wire_protocol: WireProtocol::OpenAiChatCompletions,
         cache_model: CacheModel::Deterministic { ttl_ms: 5 * 60_000 },
         pricing: ProviderPricing::free(),
         quality_prior: 0.5,
@@ -57,12 +68,34 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
 
+    // A catalog that was named but cannot be read stops the process. Falling
+    // back to the free stub would serve every turn under prices nobody chose
+    // and then report savings against them.
+    let config = catalog_config::from_env()?;
+    let (catalog, metrics_config) = match &config {
+        Some(config) => {
+            tracing::info!(models = config.models.len(), "catalog loaded");
+            (config.catalog(), config.metrics_config())
+        }
+        None => {
+            tracing::warn!(
+                var = catalog_config::CATALOG_VAR,
+                "no catalog configured; serving the offline echo stub, \
+                 for which every price is zero"
+            );
+            let catalog = echo_catalog();
+            let pricing = catalog.shadow_pricing();
+            (catalog, MetricsConfig::new(pricing))
+        }
+    };
+    let metrics_config = Arc::new(metrics_config);
+
     let store = Arc::new(MemoryStore::new());
     let engine = Arc::new(Engine::new(
         Arc::clone(&store),
         ByteTokenizer,
         Arc::new(EchoLocalExecutor::new("local answer")),
-        echo_catalog(),
+        catalog,
         Arc::new(EchoFrontierClient::new("frontier answer")),
         Arc::new(AffinityPolicy::new()),
         EngineConfig::default(),
@@ -77,10 +110,19 @@ async fn main() -> anyhow::Result<()> {
     // harness or a container asks the OS to pick, and only this side knows what
     // it picked.
     tracing::info!(addr = %listener.local_addr()?, "roundhouse listening");
-    // Both surfaces, one process and one log: the native transport, which
-    // exposes sessions and the log itself, and the Responses API, which lets an
-    // agent written against OpenAI drive the same sessions unmodified.
+    tracing::info!(
+        "dashboard at http://{}/v1/metrics/dashboard",
+        listener.local_addr()?
+    );
+    // Three surfaces, one process and one log: the native transport, which
+    // exposes sessions and the log itself; the Responses API, which lets an
+    // agent written against OpenAI drive the same sessions unmodified; and the
+    // metrics surface, which reports on both by folding the same log.
     let app = http::router(Arc::clone(&engine), Arc::clone(&store))
+        .merge(metrics_api::metrics_router(
+            engine.metrics(),
+            metrics_config,
+        ))
         .merge(responses_api::responses_router(engine, store));
     axum::serve(listener, app).await?;
     Ok(())

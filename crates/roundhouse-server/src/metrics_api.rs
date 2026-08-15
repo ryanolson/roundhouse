@@ -1,0 +1,274 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! The metrics surface: one JSON document and the page that renders it.
+//!
+//! Reads only, and takes no lease. The numbers come from
+//! [`MetricsRecorder`](roundhouse_core::metrics::MetricsRecorder), which every
+//! session has been feeding as it commits, so answering a request here is a
+//! fold already done rather than a sweep over the log. A dashboard polling
+//! every few seconds must not cost the store anything, or watching the fleet
+//! becomes a load on the fleet.
+//!
+//! The page is served from this binary rather than shipped as a separate
+//! frontend. It is a single self-contained file with no build step, no package
+//! manifest, and no request to any host but this one — a deployment that can
+//! reach the API can see the dashboard, with nothing else to install and no CDN
+//! to be blocked by an air-gapped network.
+
+use std::sync::Arc;
+
+use axum::Router;
+use axum::extract::State;
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
+
+use roundhouse_core::metrics::{MetricsConfig, MetricsRecorder};
+use roundhouse_core::now_ms;
+
+/// The dashboard, inlined at build time.
+///
+/// `include_str!` rather than a file read at startup: the page is part of the
+/// binary's contract, and a deployment that copied the executable without the
+/// asset directory would otherwise serve a 404 where its metrics used to be.
+const DASHBOARD_HTML: &str = include_str!("dashboard.html");
+
+#[derive(Clone)]
+struct MetricsState {
+    recorder: Arc<MetricsRecorder>,
+    config: Arc<MetricsConfig>,
+}
+
+/// Mount the metrics endpoints.
+///
+/// `config` carries the rate card and the declared correlaries. It is passed
+/// here rather than read from the engine because pricing is a reporting
+/// concern: repricing history under a corrected rate card must not require
+/// touching the thing that serves traffic.
+pub fn metrics_router(recorder: Arc<MetricsRecorder>, config: Arc<MetricsConfig>) -> Router {
+    Router::new()
+        .route("/v1/metrics", get(snapshot))
+        .route("/v1/metrics/dashboard", get(dashboard))
+        .with_state(MetricsState { recorder, config })
+}
+
+/// `GET /v1/metrics`
+///
+/// The whole snapshot in one document. Deliberately not paginated or filtered:
+/// it is bounded by the number of models a deployment serves, not by traffic,
+/// and a dashboard that had to stitch several requests together could render a
+/// state that never existed — provider totals from one instant beside a savings
+/// figure from another.
+async fn snapshot(State(state): State<MetricsState>) -> Response {
+    let snapshot = state.recorder.snapshot(&state.config, now_ms());
+    match serde_json::to_vec(&snapshot) {
+        Ok(body) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/json"),
+                // A stale metrics page is a misleading one, and the numbers
+                // change on every turn.
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            body,
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({
+                "error": {
+                    "code": "metrics_encode_failed",
+                    "message": error.to_string(),
+                }
+            })
+            .to_string(),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /v1/metrics/dashboard`
+async fn dashboard() -> Response {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        DASHBOARD_HTML,
+    )
+        .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use roundhouse_core::event::{SessionEvent, SessionEventKind, Usage};
+    use roundhouse_core::ids::{ResponseId, SessionId};
+    use roundhouse_core::metrics::{ReferenceModel, ShadowPricing};
+    use roundhouse_core::routing::{DecisionRecord, ProviderPricing, Target};
+    use tower::ServiceExt;
+
+    fn config() -> Arc<MetricsConfig> {
+        Arc::new(MetricsConfig::new(ShadowPricing::new(vec![
+            ReferenceModel {
+                provider: "anthropic".into(),
+                model: "claude".into(),
+                pricing: ProviderPricing {
+                    input_per_mtok_usd: 3.0,
+                    cached_input_per_mtok_usd: 0.3,
+                    cache_write_per_mtok_usd: 3.75,
+                    output_per_mtok_usd: 15.0,
+                },
+                quality_prior: 0.6,
+            },
+        ])))
+    }
+
+    fn recorder_with_one_call() -> Arc<MetricsRecorder> {
+        let recorder = Arc::new(MetricsRecorder::new());
+        let session_id = SessionId::new("s1");
+        let response_id = ResponseId::new("r1");
+        recorder.record(&[
+            SessionEvent {
+                seq: 1,
+                session_id: session_id.clone(),
+                at_ms: 1_000,
+                kind: SessionEventKind::Routed {
+                    response_id: response_id.clone(),
+                    decision: DecisionRecord {
+                        chosen: Target::Frontier {
+                            provider: "anthropic".into(),
+                            model: "claude".into(),
+                        },
+                        rationale: "test".into(),
+                        policy: "test".into(),
+                        isl_tokens: 10_000,
+                        expected_prefill_tokens: 10_000.0,
+                        expected_cost_usd: 0.03,
+                        considered: vec![],
+                    },
+                },
+            },
+            SessionEvent {
+                seq: 2,
+                session_id,
+                at_ms: 1_100,
+                kind: SessionEventKind::ResponseCompleted {
+                    response_id,
+                    usage: Usage {
+                        input_tokens: 10_000,
+                        cached_input_tokens: 8_000,
+                        output_tokens: 500,
+                        reasoning_tokens: 100,
+                        ..Default::default()
+                    },
+                },
+            },
+        ]);
+        recorder
+    }
+
+    async fn get(path: &str) -> (StatusCode, String, String) {
+        let app = metrics_router(recorder_with_one_call(), config());
+        let response = app
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .map(|v| v.to_str().unwrap().to_string())
+            .unwrap_or_default();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            content_type,
+            String::from_utf8(body.to_vec()).unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn the_snapshot_carries_the_full_breakdown() {
+        let (status, content_type, body) = get("/v1/metrics").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(content_type, "application/json");
+
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["calls"], 1);
+        assert_eq!(json["tokens"]["input"], 10_000);
+        assert_eq!(json["tokens"]["cached_input"], 8_000);
+        assert_eq!(json["tokens"]["reasoning"], 100);
+        assert!(json["savings"]["cache_savings_usd"].as_f64().unwrap() > 0.0);
+        assert!(json["savings"]["frontier_spend_usd"].as_f64().unwrap() > 0.0);
+
+        // Both rollup axes are present, and both serving modes always appear.
+        assert_eq!(json["providers"][0]["provider"], "anthropic");
+        assert_eq!(json["serving_modes"].as_array().unwrap().len(), 2);
+
+        // The aggregates carry their money and volume at the top level of the
+        // row, not nested. They are a flattened `Rollup` internally, and the
+        // whole point of flattening was that consumers could not tell — this
+        // pins that, because a `flatten` silently dropped or renamed is a
+        // dashboard column that reads `undefined` rather than a build error.
+        let provider = &json["providers"][0];
+        for key in [
+            "calls",
+            "tokens",
+            "coverage",
+            "billed_usd",
+            "shadow_usd",
+            "models",
+        ] {
+            assert!(
+                provider.get(key).is_some(),
+                "provider rollup lost `{key}`: {provider}"
+            );
+        }
+        assert_eq!(provider["calls"], 1);
+        let mode = &json["serving_modes"][0];
+        for key in ["mode", "calls", "tokens", "billed_usd"] {
+            assert!(
+                mode.get(key).is_some(),
+                "serving-mode rollup lost `{key}`: {mode}"
+            );
+        }
+
+        // And a model row still flattens its accounting: `mode` beside only
+        // the money that applies to it.
+        let row = &json["models"][0];
+        assert_eq!(row["mode"], "frontier");
+        assert!(row.get("billed_usd").is_some());
+        assert!(
+            row.get("shadow_usd").is_none(),
+            "a hosted row must not carry a shadow price, not even a zero one"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_dashboard_is_self_contained() {
+        let (status, content_type, body) = get("/v1/metrics/dashboard").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(content_type.starts_with("text/html"));
+
+        // A page that reached for a CDN would render blank on an air-gapped
+        // deployment, which is where a fleet dashboard most needs to work.
+        for offender in [
+            "http://",
+            "https://",
+            "//cdn",
+            "<script src",
+            "<link rel=\"stylesheet\"",
+        ] {
+            assert!(
+                !body.contains(offender),
+                "the dashboard must not reference `{offender}`"
+            );
+        }
+        assert!(body.contains("/v1/metrics"), "the page must poll the API");
+    }
+}

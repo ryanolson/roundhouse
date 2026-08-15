@@ -470,6 +470,7 @@ impl LocalExecutor for CapturingExecutor {
         Ok(LocalExecution {
             text: "local answer".to_string(),
             output_tokens: 2,
+            reasoning_tokens: 0,
         })
     }
 }

@@ -14,13 +14,29 @@
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
+use serde::{Deserialize, Serialize};
+
+use roundhouse_core::metrics::{ReferenceModel, ShadowPricing};
 use roundhouse_core::routing::{CacheLedger, CacheModel, Candidate, ProviderPricing, Target};
 
+use crate::usage::WireProtocol;
+
 /// A frontier model we may route to.
-#[derive(Debug, Clone)]
+///
+/// Deserializable so a deployment's catalog file is this struct rather than a
+/// parallel schema that has to be kept in agreement with it. Adding a field
+/// here is then a change to the config format by construction, which is the
+/// only way the two stay honest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrontierModelSpec {
     pub provider: String,
     pub model: String,
+    /// The dialect this target speaks, which decides what a client has to add
+    /// to an outbound request before the provider will account for the call at
+    /// all. See [`crate::usage`] — on the most common dialect, forgetting it
+    /// costs every token and every dollar on this model's row of the
+    /// dashboard.
+    pub wire_protocol: WireProtocol,
     pub cache_model: CacheModel,
     pub pricing: ProviderPricing,
     /// Relative capability, 0.0..=1.0. Configuration, not measurement.
@@ -67,6 +83,49 @@ impl StaticFrontierCatalog {
         for spec in &self.models {
             ledger.register(&spec.target(), spec.cache_model, spec.pricing);
         }
+    }
+
+    /// The rate card and capability priors this catalog implies.
+    ///
+    /// Derived rather than configured separately, because a deployment that
+    /// stated its prices twice would have them disagree the first time one
+    /// copy was updated — and the two copies are the number the router chooses
+    /// on and the number the dashboard reports saving. They must be the same
+    /// number or neither means anything.
+    ///
+    /// Correlaries are not derived here: which hosted model our own Llama
+    /// stands in for is a claim about capability that this catalog does not
+    /// contain. The caller declares those on the result.
+    pub fn shadow_pricing(&self) -> ShadowPricing {
+        ShadowPricing::new(
+            self.models
+                .iter()
+                .map(|spec| ReferenceModel {
+                    provider: spec.provider.clone(),
+                    model: spec.model.clone(),
+                    pricing: spec.pricing,
+                    quality_prior: spec.quality_prior,
+                })
+                .collect(),
+        )
+    }
+
+    /// The entry a chosen target came from.
+    ///
+    /// Sound because the configuration boundary refuses a catalog listing one
+    /// `(provider, model)` twice — see `CatalogConfig::validate` in
+    /// `roundhouse-server`. That check is what makes this a lookup rather than
+    /// a guess: `Target` alone cannot distinguish two entries for one model
+    /// served over different dialects, which is exactly the shape the boundary
+    /// rejects. A catalog built by hand rather than parsed carries that
+    /// obligation itself.
+    pub fn spec_for(&self, target: &Target) -> Option<&FrontierModelSpec> {
+        let Target::Frontier { provider, model } = target else {
+            return None;
+        };
+        self.models
+            .iter()
+            .find(|spec| &spec.provider == provider && &spec.model == model)
     }
 
     /// Price every frontier model against the current prompt.
@@ -122,6 +181,14 @@ pub enum FrontierChunk {
         input_tokens: u64,
         cached_input_tokens: u64,
         output_tokens: u64,
+        /// Thinking tokens, already counted inside `output_tokens`.
+        ///
+        /// Reported separately because a reasoning model can spend most of a
+        /// turn's output budget here without the client seeing a byte of it,
+        /// and a dashboard that folded it into ordinary output would show a
+        /// verbose answer where the truth is an expensive silence. Zero for
+        /// providers and models that do not reason.
+        reasoning_tokens: u64,
     },
 }
 
@@ -139,6 +206,7 @@ impl FrontierChunk {
         input_tokens: u64,
         cached_input_tokens: u64,
         output_tokens: u64,
+        reasoning_tokens: u64,
     ) -> FrontierStream {
         futures::stream::iter([
             Ok(FrontierChunk::OutputText(text)),
@@ -146,6 +214,7 @@ impl FrontierChunk {
                 input_tokens,
                 cached_input_tokens,
                 output_tokens,
+                reasoning_tokens,
             }),
         ])
         .boxed()
@@ -156,6 +225,16 @@ impl FrontierChunk {
 #[derive(Debug, Clone)]
 pub struct FrontierQuote {
     pub target: Target,
+    /// The dialect this request must be serialized in.
+    ///
+    /// Carried here rather than looked up by the client, because this is the
+    /// only argument [`FrontierClient::execute`] receives and
+    /// [`crate::usage`] makes enforcing usage reporting the client's
+    /// obligation. Without it the obligation cannot be discharged from inside
+    /// the trait at all, and `Target` is not a substitute: it keys on provider
+    /// and model, and one model served over two dialects is an ordinary
+    /// deployment.
+    pub wire_protocol: WireProtocol,
     pub prompt: String,
     /// Stable per-session key. Providers use it to steer requests to the same
     /// cache node, so it must not vary turn to turn.
@@ -206,6 +285,7 @@ impl FrontierClient for EchoFrontierClient {
             quote.prompt.len() as u64,
             0,
             self.reply.len() as u64,
+            0,
         ))
     }
 }
@@ -220,6 +300,7 @@ mod tests {
         StaticFrontierCatalog::new(vec![FrontierModelSpec {
             provider: "anthropic".into(),
             model: "claude".into(),
+            wire_protocol: WireProtocol::AnthropicMessages,
             cache_model: CacheModel::Deterministic { ttl_ms: 5 * MINUTE },
             pricing: ProviderPricing {
                 input_per_mtok_usd: 3.0,
@@ -286,6 +367,7 @@ mod tests {
                     provider: "anthropic".into(),
                     model: "claude".into(),
                 },
+                wire_protocol: WireProtocol::AnthropicMessages,
                 prompt: "some prompt".into(),
                 prompt_cache_key: "sess_x".into(),
                 expected_output_tokens: None,

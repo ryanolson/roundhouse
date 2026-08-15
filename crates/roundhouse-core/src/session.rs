@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::event::{IncompleteReason, SessionEvent, SessionEventKind, Usage};
+use crate::event::{IncompleteReason, SessionEvent, SessionEventKind, SessionObserver, Usage};
 use crate::ids::{ResponseId, SessionId, TurnId};
 use crate::item::Item;
 use crate::routing::{CacheLedger, DecisionRecord, Target};
@@ -209,6 +209,9 @@ pub struct Session<S: SessionStore> {
     session_id: SessionId,
     lease: Lease,
     state: SessionState,
+    /// Watches every event this session commits, and every event it replayed
+    /// on open. See [`Session::open_observed`].
+    observer: Option<Arc<dyn SessionObserver>>,
 }
 
 impl<S: SessionStore> Session<S> {
@@ -223,6 +226,26 @@ impl<S: SessionStore> Session<S> {
         node_id: &str,
         lease_ttl_ms: u64,
         ledger: CacheLedger,
+    ) -> Result<Self, SessionError> {
+        Self::open_observed(store, session_id, node_id, lease_ttl_ms, ledger, None).await
+    }
+
+    /// Claim a session with something watching its log.
+    ///
+    /// The observer sees the replay as well as subsequent commits, which is
+    /// what lets a restarted process recover derived state for the sessions it
+    /// picks back up rather than only for the turns it goes on to serve. That
+    /// is only sound because the metrics fold is idempotent by `(session,
+    /// seq)`; an observer without that property would double-count every
+    /// session that is opened twice, which is every session that takes more
+    /// than one turn.
+    pub async fn open_observed(
+        store: Arc<S>,
+        session_id: SessionId,
+        node_id: &str,
+        lease_ttl_ms: u64,
+        ledger: CacheLedger,
+        observer: Option<Arc<dyn SessionObserver>>,
     ) -> Result<Self, SessionError> {
         let lease = store
             .acquire_lease(&session_id, node_id, lease_ttl_ms)
@@ -245,6 +268,9 @@ impl<S: SessionStore> Session<S> {
             for event in &batch {
                 state.apply(event);
             }
+            if let Some(observer) = &observer {
+                observer.observe(&batch);
+            }
             cursor = batch.last().map_or(cursor, |event| event.seq);
         }
 
@@ -253,6 +279,7 @@ impl<S: SessionStore> Session<S> {
             session_id,
             lease,
             state,
+            observer,
         })
     }
 
@@ -363,6 +390,12 @@ impl<S: SessionStore> Session<S> {
         let events = self.store.append_events(&self.lease, kinds).await?;
         for event in &events {
             self.state.apply(event);
+        }
+        // After the projection, not before: an observer that read session state
+        // in response would otherwise see it one commit behind the events it
+        // was just handed.
+        if let Some(observer) = &self.observer {
+            observer.observe(&events);
         }
         Ok(events)
     }
@@ -678,6 +711,8 @@ mod tests {
                     input_tokens: 8_192,
                     cached_input_tokens: 0,
                     output_tokens: 3,
+                    reasoning_tokens: 0,
+                    ..Default::default()
                 },
             )
             .await

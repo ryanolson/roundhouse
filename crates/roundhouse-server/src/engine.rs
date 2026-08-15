@@ -11,9 +11,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::StreamExt;
 use roundhouse_core::context::{ContextAssembler, Tokenizer};
-use roundhouse_core::event::{IncompleteReason, Usage};
+use roundhouse_core::event::{Accounting, IncompleteReason, SessionObserver, Usage};
 use roundhouse_core::ids::{ResponseId, SessionId, TurnId};
 use roundhouse_core::item::Item;
+use roundhouse_core::metrics::MetricsRecorder;
 use roundhouse_core::now_ms;
 use roundhouse_core::routing::{
     CacheLedger, Candidate, Decision, DecisionRecord, RoutingContext, RoutingError, RoutingPolicy,
@@ -48,6 +49,14 @@ pub enum EngineError {
 pub struct LocalExecution {
     pub text: String,
     pub output_tokens: u64,
+    /// Thinking tokens, already counted inside `output_tokens`.
+    ///
+    /// A locally served model reasons no less than a hosted one, and the
+    /// metrics layer compares the two on this axis, so the local path reports
+    /// it rather than assuming zero. An engine that does not separate thinking
+    /// from answer leaves this at zero, which reads as "not applicable" and is
+    /// the honest answer for a model with no thinking mode.
+    pub reasoning_tokens: u64,
 }
 
 /// Dispatches a prompt to a chosen local worker.
@@ -98,6 +107,7 @@ impl LocalExecutor for EchoLocalExecutor {
         Ok(LocalExecution {
             text: self.reply.clone(),
             output_tokens: self.reply.len() as u64,
+            reasoning_tokens: 0,
         })
     }
 }
@@ -190,6 +200,10 @@ impl Failed {
                 input_tokens: isl_tokens,
                 cached_input_tokens: 0,
                 output_tokens: 0,
+                reasoning_tokens: 0,
+                // Inferred from the existence of a delta rather than counted
+                // by anyone, so it is marked as what it is.
+                accounting: Accounting::Estimated,
             }
         };
         Self {
@@ -222,6 +236,13 @@ pub struct Engine<S: SessionStore, T: Tokenizer + Clone> {
     frontier_client: Arc<dyn FrontierClient>,
     policy: Arc<dyn RoutingPolicy>,
     config: EngineConfig,
+    /// Folds every event this node commits into the dashboard's aggregates.
+    ///
+    /// Owned by the engine rather than passed in, so a deployment cannot end
+    /// up serving turns with no accounting behind them. The fold is a handful
+    /// of integer additions per event; there is no configuration under which
+    /// leaving it out would be worth the empty dashboard.
+    metrics: Arc<MetricsRecorder>,
     /// One gate per session, held for the whole of [`Engine::run_turn`].
     ///
     /// The lease fences *nodes*; it deliberately re-grants to its own node so a
@@ -255,8 +276,14 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             frontier_client,
             policy,
             config,
+            metrics: Arc::new(MetricsRecorder::new()),
             turn_gates: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The running token and dollar aggregates for everything this node served.
+    pub fn metrics(&self) -> Arc<MetricsRecorder> {
+        Arc::clone(&self.metrics)
     }
 
     /// The serialization gate for one session's turns.
@@ -304,12 +331,17 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         let gate = self.turn_gate(session_id);
         let _turn = gate.lock().await;
 
-        let mut session = Session::open(
+        // Observed rather than plain: the session feeds the metrics fold both
+        // its replay and its subsequent commits, so a node that restarts and
+        // picks a session back up recovers that session's accounting instead
+        // of reporting only what it served since booting.
+        let mut session = Session::open_observed(
             Arc::clone(&self.store),
             session_id.clone(),
             &self.config.node_id,
             self.config.lease_ttl_ms,
             self.seeded_ledger(),
+            Some(Arc::clone(&self.metrics) as Arc<dyn SessionObserver>),
         )
         .await?;
 
@@ -442,7 +474,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         // log minus the `Routed.at_ms` before it — instead of the model's own
         // estimate of itself.
         let mut text = String::new();
-        let mut usage = Usage::default();
+        let mut reported: Option<Usage> = None;
         loop {
             let chunk = match tokio::time::timeout_at(deadline_at, stream.next()).await {
                 Ok(Some(Ok(chunk))) => chunk,
@@ -471,21 +503,55 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                     input_tokens,
                     cached_input_tokens,
                     output_tokens,
+                    reasoning_tokens,
                 } => {
-                    usage = Usage {
+                    reported = Some(Usage {
                         input_tokens,
                         cached_input_tokens,
                         output_tokens,
-                    };
+                        reasoning_tokens,
+                        accounting: Accounting::Reported,
+                    });
                 }
             }
         }
+
+        // A stream that ended without an accounting chunk is the common case
+        // this system has to survive, not an anomaly: a streaming
+        // OpenAI-compatible endpoint sends no usage unless the request asked
+        // for it, and a gateway in the path can drop it even when it did.
+        // Recording `Usage::default()` there would bill the turn as zero
+        // tokens for zero dollars, which on a frontier target is
+        // indistinguishable from a saving — so the gap is filled from what we
+        // do know and stamped as an estimate.
+        let usage = reported.unwrap_or_else(|| self.estimated_usage(&text, isl_tokens));
 
         Ok(Completed {
             text,
             usage,
             decision,
         })
+    }
+
+    /// Stand in for a provider that reported nothing.
+    ///
+    /// Input is not really an estimate — it is the prompt this engine
+    /// tokenized, hashed, and routed on, so it is the same number the provider
+    /// would have counted barring a tokenizer mismatch. Output is a genuine
+    /// estimate: our tokenizer over the text we received. Cached input stays
+    /// zero because nothing observable here bears on what a remote cache did,
+    /// and the conservative direction is the one that understates the saving
+    /// rather than inventing it.
+    fn estimated_usage(&self, text: &str, isl_tokens: usize) -> Usage {
+        Usage {
+            input_tokens: isl_tokens as u64,
+            cached_input_tokens: 0,
+            output_tokens: self.tokenizer.encode(text).len() as u64,
+            // Thinking is not recoverable from the visible text: a provider
+            // that withheld its accounting also withheld this.
+            reasoning_tokens: 0,
+            accounting: Accounting::Estimated,
+        }
     }
 
     /// Everything up to the opened stream: price, choose, record, connect.
@@ -597,8 +663,18 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                 .await?
             }
             Target::Frontier { .. } => {
+                // The dialect travels with the request. A client cannot ask the
+                // catalog itself — it holds one `Arc<dyn FrontierClient>` for
+                // providers whose transports have nothing in common — so
+                // whatever it needs to serialize correctly has to arrive in the
+                // quote or not at all.
+                let spec = self
+                    .frontier_catalog
+                    .spec_for(&decision.target)
+                    .ok_or_else(|| EngineError::UnresolvableTarget(decision.target.clone()))?;
                 let quote = FrontierQuote {
                     target: decision.target.clone(),
+                    wire_protocol: spec.wire_protocol,
                     prompt: assembler.rendered(),
                     // Stable for the life of the session: providers use it to
                     // steer requests to the same cache node, so varying it
@@ -666,6 +742,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             isl_tokens as u64,
             cached as u64,
             outcome.output_tokens,
+            outcome.reasoning_tokens,
         ))
     }
 

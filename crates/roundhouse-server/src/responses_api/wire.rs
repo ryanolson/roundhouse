@@ -287,6 +287,10 @@ fn message_item(text: &str) -> Value {
 /// client already reads. `cache_write_tokens` stays zero because no provider
 /// Roundhouse routes to reports it separately yet, and a number invented here
 /// would be billed as if it had been measured.
+///
+/// `reasoning_tokens` rides in `output_tokens_details` for the same reason it
+/// is stored that way: it is a component of `output_tokens`, not an addition
+/// to it, so a client that checks the details against the total still balances.
 pub(super) fn completed_frame(response_id: &ResponseId, usage: &Usage) -> Event {
     frame(
         "response.completed",
@@ -301,7 +305,9 @@ pub(super) fn completed_frame(response_id: &ResponseId, usage: &Usage) -> Event 
                         "cache_write_tokens": 0,
                     },
                     "output_tokens": usage.output_tokens,
-                    "output_tokens_details": null,
+                    "output_tokens_details": {
+                        "reasoning_tokens": usage.reasoning_tokens,
+                    },
                     "total_tokens": usage.total(),
                 },
             },

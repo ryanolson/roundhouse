@@ -18,6 +18,7 @@
 
 pub mod frontier;
 pub mod local;
+pub mod usage;
 
 pub use frontier::{
     EchoFrontierClient, FrontierChunk, FrontierClient, FrontierError, FrontierModelSpec,
@@ -26,6 +27,7 @@ pub use frontier::{
 pub use local::{
     EmbeddedFleet, FleetError, FleetQuery, LocalFleet, LocalQuote, Reservation, WorkerRegistration,
 };
+pub use usage::WireProtocol;
 
 /// Re-exported so callers can configure and own the embedded service without
 /// depending on `dynamo-kv-router` directly.

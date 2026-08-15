@@ -17,13 +17,15 @@ pub mod context;
 pub mod event;
 pub mod ids;
 pub mod item;
+pub mod metrics;
 pub mod routing;
 pub mod session;
 pub mod store;
 
-pub use event::{SessionEvent, SessionEventKind};
+pub use event::{Accounting, SessionEvent, SessionEventKind, SessionObserver, Usage};
 pub use ids::{ResponseId, SessionId, TurnId};
 pub use item::{Item, ItemContent, Role};
+pub use metrics::{MetricsConfig, MetricsFold, MetricsSnapshot, ServingMode};
 pub use session::{Session, SessionError};
 pub use store::{Lease, SessionStore, StoreError};
 

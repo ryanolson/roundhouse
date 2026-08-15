@@ -22,15 +22,24 @@
 //! OpenAI Responses API so existing agents can drive Roundhouse unmodified. It
 //! adds no state either: a client's resent conversation is checked against the
 //! log as a prefix rather than remembered alongside it.
+//!
+//! [`metrics_api`] reports on all of it. Token counts, dollars, and the savings
+//! figure are folded out of the same log as everything else — see
+//! [`roundhouse_core::metrics`] — so the dashboard cannot disagree with the
+//! audit trail it summarizes.
 
+pub mod catalog_config;
 pub mod engine;
 pub mod http;
+pub mod metrics_api;
 pub mod responses_api;
 pub mod tokenizer;
 
+pub use catalog_config::{CatalogConfig, CatalogError};
 pub use engine::{
     EchoLocalExecutor, Engine, EngineConfig, EngineError, LocalExecution, LocalExecutor, TurnResult,
 };
 pub use http::router;
+pub use metrics_api::metrics_router;
 pub use responses_api::responses_router;
 pub use tokenizer::HfTokenizer;
