@@ -45,7 +45,7 @@ use roundhouse_fleet::{
 use roundhouse_server::{
     EchoLocalExecutor, Engine, EngineConfig, catalog_config, http, metrics_api, responses_api,
 };
-use roundhouse_store_redis::{RedisSessionStore, RedisStoreConfig};
+use roundhouse_store_redis::RedisSessionStore;
 use tracing_subscriber::EnvFilter;
 
 /// The echo provider's catalog entry.
@@ -119,7 +119,7 @@ async fn main() -> anyhow::Result<()> {
     // logged — a `redis://` URL may carry credentials.
     match std::env::var(REDIS_VAR) {
         Ok(url) => {
-            let store = RedisSessionStore::connect(RedisStoreConfig::new(url))
+            let store = RedisSessionStore::connect(url)
                 .await
                 .with_context(|| format!("connecting to the Redis named by {REDIS_VAR}"))?;
             tracing::info!(var = REDIS_VAR, "sessions are durable in Redis");

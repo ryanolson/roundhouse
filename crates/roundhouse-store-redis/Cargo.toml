@@ -16,6 +16,7 @@ async-trait = { workspace = true }
 redis = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+uuid = { workspace = true }
 
 [features]
 # Compiles this store's `LeaseControl` impl, the hook the shared conformance

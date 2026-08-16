@@ -8,36 +8,33 @@
 //! come from the crate's own `test_support` module, which the server's
 //! durability test shares too.
 //! Each binary compiles its own copy via `mod common;`, and none uses every
-//! item, so the module opts out of dead-code and unused-import analysis
-//! rather than sprinkling `allow`s per item.
+//! item, so the module opts out of dead-code analysis rather than sprinkling
+//! `allow`s per item.
 //!
 //! Everything here presumes `--include-ignored` already opted into the real
 //! backend, which is why a missing `ROUNDHOUSE_TEST_REDIS_URL` panics instead
 //! of skipping: it is a runner error to report, not infrastructure to wait
 //! for.
-#![allow(dead_code, unused_imports)]
+#![allow(dead_code)]
 
 use roundhouse_core::event::{Accounting, IncompleteReason, SessionEvent, SessionEventKind, Usage};
 use roundhouse_core::ids::{ResponseId, SessionId, TurnId};
 use roundhouse_core::item::Item;
 use roundhouse_core::routing::{Candidate, DecisionRecord, Target};
 use roundhouse_core::store::SessionStore;
-use roundhouse_store_redis::{RedisSessionStore, RedisStoreConfig};
-
-pub use roundhouse_store_redis::test_support::{connect_from_env, url_from_env};
+use roundhouse_store_redis::RedisSessionStore;
+use roundhouse_store_redis::test_support;
 
 /// The store under test, its key layout, and a raw connection for writing
 /// what the store must then read (or for sabotaging it from outside).
 pub struct Rig {
     pub store: RedisSessionStore,
-    pub config: RedisStoreConfig,
     pub raw: redis::aio::MultiplexedConnection,
 }
 
 pub async fn rig() -> Rig {
     let url = url_from_env();
-    let config = RedisStoreConfig::new(&url);
-    let store = RedisSessionStore::connect(config.clone())
+    let store = RedisSessionStore::connect(&url)
         .await
         .expect("Redis named by the env var must be reachable");
     let raw = redis::Client::open(url.as_str())
@@ -45,7 +42,23 @@ pub async fn rig() -> Rig {
         .get_multiplexed_async_connection()
         .await
         .unwrap();
-    Rig { store, config, raw }
+    Rig { store, raw }
+}
+
+pub async fn connect_from_env() -> RedisSessionStore {
+    test_support::connect_from_env().await
+}
+
+pub fn url_from_env() -> String {
+    test_support::url_from_env()
+}
+
+pub fn lease_key(session_id: &SessionId) -> String {
+    test_support::lease_key(session_id)
+}
+
+pub fn log_key(session_id: &SessionId) -> String {
+    test_support::log_key(session_id)
 }
 
 impl Rig {
@@ -64,7 +77,7 @@ impl Rig {
             // back what was written, not something it re-stamped.
             let at_ms = 1_700_000_000_000 + seq;
             let _: String = redis::cmd("XADD")
-                .arg(self.config.log_key(session_id))
+                .arg(log_key(session_id))
                 .arg(format!("{seq}-0"))
                 .arg("at_ms")
                 .arg(at_ms)

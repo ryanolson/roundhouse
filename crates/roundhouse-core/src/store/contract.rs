@@ -94,6 +94,7 @@ pub async fn unknown_sessions_are_not_found<S: SessionStore>(store: &S) {
     let ghost = Lease {
         session_id: sid.clone(),
         node_id: "node-a".into(),
+        fencing_token: uuid::Uuid::new_v4(),
         expires_at_ms: u64::MAX,
     };
 
@@ -117,6 +118,10 @@ pub async fn unknown_sessions_are_not_found<S: SessionStore>(store: &S) {
         Err(StoreError::SessionNotFound(_))
     ));
     assert!(matches!(
+        store.read_events(&sid, 0, 0).await,
+        Err(StoreError::SessionNotFound(_))
+    ));
+    assert!(matches!(
         store.last_seq(&sid).await,
         Err(StoreError::SessionNotFound(_))
     ));
@@ -125,15 +130,13 @@ pub async fn unknown_sessions_are_not_found<S: SessionStore>(store: &S) {
     store.release_lease(&ghost).await.unwrap();
 }
 
-pub async fn a_live_lease_blocks_others_and_retakes_for_its_holder<S: SessionStore>(store: &S) {
+pub async fn a_live_lease_blocks_others_and_retakes_with_a_fresh_fence<S: SessionStore>(store: &S) {
     let sid = fresh_session(store).await;
-    assert!(
-        store
-            .acquire_lease(&sid, "node-a", TTL_MS)
-            .await
-            .unwrap()
-            .is_some()
-    );
+    let original = store
+        .acquire_lease(&sid, "node-a", TTL_MS)
+        .await
+        .unwrap()
+        .expect("a fresh session has no competing holder");
     assert!(
         store
             .acquire_lease(&sid, "node-b", TTL_MS)
@@ -142,14 +145,21 @@ pub async fn a_live_lease_blocks_others_and_retakes_for_its_holder<S: SessionSto
             .is_none(),
         "a live lease held elsewhere must block acquisition"
     );
-    assert!(
-        store
-            .acquire_lease(&sid, "node-a", TTL_MS)
-            .await
-            .unwrap()
-            .is_some(),
-        "the holder re-acquiring is recovery, not competition, and must succeed"
-    );
+    let retaken = store
+        .acquire_lease(&sid, "node-a", TTL_MS)
+        .await
+        .unwrap()
+        .expect("the holder re-acquiring is recovery, not competition");
+
+    let error = store
+        .append_events(&original, vec![text_event("stale tenure")])
+        .await
+        .expect_err("re-acquisition must fence handles from the holder's previous tenure");
+    assert!(matches!(error, StoreError::LeaseLost { .. }));
+    store
+        .append_events(&retaken, vec![text_event("current tenure")])
+        .await
+        .expect("the freshly granted tenure must remain writable");
 }
 
 pub async fn an_expired_lease_is_takeable_and_the_loser_cannot_append<S: LeaseControl>(store: &S) {
@@ -200,6 +210,7 @@ pub async fn release_by_a_non_holder_leaves_the_lease_standing<S: SessionStore>(
     let never_granted = Lease {
         session_id: sid.clone(),
         node_id: "node-b".into(),
+        fencing_token: uuid::Uuid::new_v4(),
         expires_at_ms: u64::MAX,
     };
     store.release_lease(&never_granted).await.unwrap();
@@ -417,7 +428,7 @@ macro_rules! store_contract_suite {
         $crate::store_contract_suite!(@tests $attrs $make;
             create_is_idempotent_and_reports_existing,
             unknown_sessions_are_not_found,
-            a_live_lease_blocks_others_and_retakes_for_its_holder,
+            a_live_lease_blocks_others_and_retakes_with_a_fresh_fence,
             an_expired_lease_is_takeable_and_the_loser_cannot_append,
             a_released_lease_is_gone_not_renewable,
             release_by_a_non_holder_leaves_the_lease_standing,

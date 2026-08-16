@@ -21,7 +21,7 @@
 
 mod common;
 
-use common::{assert_covers_every_variant, every_event_kind, rig};
+use common::{assert_covers_every_variant, every_event_kind, log_key, rig};
 use roundhouse_core::event::SessionEventKind;
 use roundhouse_core::ids::SessionId;
 use roundhouse_core::store::{SessionStore, StoreError};
@@ -64,7 +64,7 @@ async fn a_corrupted_log_fails_loudly_rather_than_dropping_events() {
     let sid = SessionId::generate();
     assert!(rig.store.create_session(&sid, "affinity").await.unwrap());
     let _: String = redis::cmd("XADD")
-        .arg(rig.config.log_key(&sid))
+        .arg(log_key(&sid))
         .arg("1-0")
         .arg("garbage")
         .arg("x")
@@ -84,7 +84,7 @@ async fn a_corrupted_log_fails_loudly_rather_than_dropping_events() {
     let sid = SessionId::generate();
     assert!(rig.store.create_session(&sid, "affinity").await.unwrap());
     let _: String = redis::cmd("XADD")
-        .arg(rig.config.log_key(&sid))
+        .arg(log_key(&sid))
         .arg("*")
         .arg("at_ms")
         .arg(1u64)

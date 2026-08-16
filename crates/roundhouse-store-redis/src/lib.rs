@@ -10,7 +10,7 @@
 //! | Key | Type | Holds |
 //! |---|---|---|
 //! | `rh:{<session_id>}:meta` | string | JSON `{model_policy, created_at_ms}`, written `SET NX` |
-//! | `rh:{<session_id>}:lease` | string | holder's `node_id`, expiry enforced by Redis `PX` |
+//! | `rh:{<session_id>}:lease` | hash | holder `node_id` + fencing token, expiry enforced by Redis `PEXPIRE` |
 //! | `rh:{<session_id>}:log` | stream | one entry per event, explicit id `<seq>-0` |
 //!
 //! The log's wire format is the load-bearing decision. Entries are added with
@@ -33,8 +33,8 @@
 //! durable as the Redis it lives in (AOF `appendfsync`, replication). This
 //! crate does not try to out-engineer the operator's persistence config.
 //!
-//! The write path lives in [`scripts`]: the lease is a `SET PX` key on the
-//! Redis clock, and lease-check plus append is one atomic Lua script, which
+//! The write path lives in [`scripts`]: the lease is a TTL'd hash on the Redis
+//! clock, and lease-check plus append is one atomic Lua script, which
 //! is what makes the fencing the trait promises actually hold under
 //! concurrent writers. Requires Redis ≥ 6.2 (exclusive `XRANGE` starts,
 //! effects-replicated scripts).
@@ -44,69 +44,24 @@
 //! `ROUNDHOUSE_REDIS_URL` is set (see `roundhouse-server`'s `main.rs`).
 
 mod scripts;
+#[cfg(feature = "test-support")]
+pub mod test_support;
 
 use redis::aio::ConnectionManager;
 use redis::streams::StreamRangeReply;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use roundhouse_core::event::{SessionEvent, SessionEventKind};
 use roundhouse_core::ids::SessionId;
 use roundhouse_core::now_ms;
 use roundhouse_core::store::{Lease, SessionStore, StoreError};
 
-/// Every key this store writes starts here. A constant, not configuration:
-/// nothing selects a different prefix today, and an untested knob would be a
-/// promise nobody checked. If two deployments ever must share an instance,
-/// the setter returns with the test that proves isolation.
-const KEY_PREFIX: &str = "rh";
-
-/// Where sessions live, and the key layout they map to.
-#[derive(Debug, Clone)]
-pub struct RedisStoreConfig {
-    url: String,
-}
-
-impl RedisStoreConfig {
-    pub fn new(url: impl Into<String>) -> Self {
-        Self { url: url.into() }
-    }
-
-    // The key layout is public, documented API rather than an internal detail:
-    // an operator debugging a deployment sees these keys, and the tests write
-    // through them to prove the wire format from outside the crate. The braces
-    // are a Redis Cluster hash tag — every key of one session hashes to one
-    // slot, which is what keeps the lease-fenced append single-slot scriptable.
-
-    pub fn meta_key(&self, session_id: &SessionId) -> String {
-        format!("{KEY_PREFIX}:{{{session_id}}}:meta")
-    }
-
-    pub fn lease_key(&self, session_id: &SessionId) -> String {
-        format!("{KEY_PREFIX}:{{{session_id}}}:lease")
-    }
-
-    pub fn log_key(&self, session_id: &SessionId) -> String {
-        format!("{KEY_PREFIX}:{{{session_id}}}:log")
-    }
-}
-
-/// The value under `…:meta`.
-///
-/// `created_at_ms` is the client's clock and is informational only — nothing
-/// orders on it. Lease expiry and event timestamps, where a single clock
-/// authority *does* matter, use the Redis clock (M3).
-#[derive(Serialize, Deserialize)]
-struct SessionMeta {
-    model_policy: String,
-    created_at_ms: u64,
-}
-
 /// Redis implementation of [`SessionStore`].
 ///
 /// Cheap to clone: clones share one auto-reconnecting multiplexed connection.
 #[derive(Clone)]
 pub struct RedisSessionStore {
-    config: RedisStoreConfig,
     conn: ConnectionManager,
     scripts: std::sync::Arc<scripts::Scripts>,
 }
@@ -114,11 +69,10 @@ pub struct RedisSessionStore {
 impl RedisSessionStore {
     /// Connect and fail fast: a store that cannot reach its Redis at startup
     /// should stop the process there, not on the first session.
-    pub async fn connect(config: RedisStoreConfig) -> Result<Self, StoreError> {
-        let client = redis::Client::open(config.url.as_str()).map_err(backend)?;
+    pub async fn connect(url: impl AsRef<str>) -> Result<Self, StoreError> {
+        let client = redis::Client::open(url.as_ref()).map_err(backend)?;
         let conn = ConnectionManager::new(client).await.map_err(backend)?;
         Ok(Self {
-            config,
             conn,
             scripts: std::sync::Arc::new(scripts::Scripts::new()),
         })
@@ -135,6 +89,38 @@ impl RedisSessionStore {
             Err(StoreError::SessionNotFound(session_id.clone()))
         }
     }
+}
+
+/// Every key this store writes starts here. A constant, not configuration:
+/// nothing selects a different prefix today, and an untested knob would be a
+/// promise nobody checked. A future prefix parameter requires an isolation
+/// test.
+const KEY_PREFIX: &str = "rh";
+
+// The braces are a Redis Cluster hash tag. Every key for one session hashes to
+// one slot, which keeps the lease-fenced append single-slot scriptable. The
+// keys are an internal storage detail. Feature-gated test helpers expose them
+// only to the external wire-format tests that write raw Redis data.
+fn meta_key(session_id: &SessionId) -> String {
+    format!("{KEY_PREFIX}:{{{session_id}}}:meta")
+}
+
+fn lease_key(session_id: &SessionId) -> String {
+    format!("{KEY_PREFIX}:{{{session_id}}}:lease")
+}
+
+fn log_key(session_id: &SessionId) -> String {
+    format!("{KEY_PREFIX}:{{{session_id}}}:log")
+}
+
+/// The value under `…:meta`.
+///
+/// `created_at_ms` is informational only — nothing orders on it. Lease expiry
+/// and event timestamps, where a single clock authority matters, use Redis.
+#[derive(Serialize, Deserialize)]
+struct SessionMeta {
+    model_policy: String,
+    created_at_ms: u64,
 }
 
 fn backend(error: redis::RedisError) -> StoreError {
@@ -197,6 +183,27 @@ fn event_of(
     })
 }
 
+/// Translate a lease-script outcome into the trait's vocabulary.
+fn lease_from(
+    outcome: scripts::LeaseOutcome,
+    session_id: &SessionId,
+    node_id: &str,
+    fencing_token: Uuid,
+    ttl_ms: u64,
+) -> Result<Option<Lease>, StoreError> {
+    match outcome {
+        scripts::LeaseOutcome::Granted { now_ms } => Ok(Some(Lease {
+            session_id: session_id.clone(),
+            node_id: node_id.to_string(),
+            fencing_token,
+            // Informational only: scripts check the live Redis record.
+            expires_at_ms: now_ms.saturating_add(ttl_ms),
+        })),
+        scripts::LeaseOutcome::Refused => Ok(None),
+        scripts::LeaseOutcome::NoSession => Err(StoreError::SessionNotFound(session_id.clone())),
+    }
+}
+
 #[async_trait::async_trait]
 impl SessionStore for RedisSessionStore {
     async fn create_session(
@@ -213,7 +220,7 @@ impl SessionStore for RedisSessionStore {
         // NX both answers "did it exist" and refuses to overwrite the policy
         // an earlier creation recorded.
         let created: Option<String> = redis::cmd("SET")
-            .arg(self.config.meta_key(session_id))
+            .arg(meta_key(session_id))
             .arg(meta)
             .arg("NX")
             .query_async(&mut self.conn.clone())
@@ -228,39 +235,52 @@ impl SessionStore for RedisSessionStore {
         node_id: &str,
         ttl_ms: u64,
     ) -> Result<Option<Lease>, StoreError> {
+        let fencing_token = Uuid::new_v4();
+        let token_text = fencing_token.simple().to_string();
+        let identity = scripts::LeaseIdentity::new(node_id, &token_text);
         let outcome = self
             .scripts
             .acquire(
                 &mut self.conn.clone(),
-                &self.config.meta_key(session_id),
-                &self.config.lease_key(session_id),
-                node_id,
+                &meta_key(session_id),
+                &lease_key(session_id),
+                identity,
                 ttl_ms,
             )
             .await?;
-        self.lease_from(outcome, session_id, node_id, ttl_ms)
+        lease_from(outcome, session_id, node_id, fencing_token, ttl_ms)
     }
 
     async fn renew_lease(&self, lease: &Lease, ttl_ms: u64) -> Result<Option<Lease>, StoreError> {
+        let token_text = lease.fencing_token.simple().to_string();
+        let identity = scripts::LeaseIdentity::new(&lease.node_id, &token_text);
         let outcome = self
             .scripts
             .renew(
                 &mut self.conn.clone(),
-                &self.config.meta_key(&lease.session_id),
-                &self.config.lease_key(&lease.session_id),
-                &lease.node_id,
+                &meta_key(&lease.session_id),
+                &lease_key(&lease.session_id),
+                identity,
                 ttl_ms,
             )
             .await?;
-        self.lease_from(outcome, &lease.session_id, &lease.node_id, ttl_ms)
+        lease_from(
+            outcome,
+            &lease.session_id,
+            &lease.node_id,
+            lease.fencing_token,
+            ttl_ms,
+        )
     }
 
     async fn release_lease(&self, lease: &Lease) -> Result<(), StoreError> {
+        let token_text = lease.fencing_token.simple().to_string();
+        let identity = scripts::LeaseIdentity::new(&lease.node_id, &token_text);
         self.scripts
             .release(
                 &mut self.conn.clone(),
-                &self.config.lease_key(&lease.session_id),
-                &lease.node_id,
+                &lease_key(&lease.session_id),
+                identity,
             )
             .await
     }
@@ -270,6 +290,8 @@ impl SessionStore for RedisSessionStore {
         lease: &Lease,
         kinds: Vec<SessionEventKind>,
     ) -> Result<Vec<SessionEvent>, StoreError> {
+        let token_text = lease.fencing_token.simple().to_string();
+        let identity = scripts::LeaseIdentity::new(&lease.node_id, &token_text);
         let payloads: Vec<String> = kinds
             .iter()
             .map(|kind| {
@@ -281,10 +303,10 @@ impl SessionStore for RedisSessionStore {
             .scripts
             .append(
                 &mut self.conn.clone(),
-                &self.config.meta_key(&lease.session_id),
-                &self.config.lease_key(&lease.session_id),
-                &self.config.log_key(&lease.session_id),
-                &lease.node_id,
+                &meta_key(&lease.session_id),
+                &lease_key(&lease.session_id),
+                &log_key(&lease.session_id),
+                identity,
                 &payloads,
             )
             .await?;
@@ -321,18 +343,18 @@ impl SessionStore for RedisSessionStore {
         after_seq: u64,
         limit: usize,
     ) -> Result<Vec<SessionEvent>, StoreError> {
-        if limit == 0 {
-            // XRANGE treats COUNT 0 as unlimited; the trait means "none".
-            return Ok(Vec::new());
-        }
-        let log_key = self.config.log_key(session_id);
+        let log_key = log_key(session_id);
+        // XRANGE treats COUNT 0 as unlimited. Fetch at most one entry for a
+        // zero-limit request, then discard it below. The pipelined EXISTS still
+        // enforces SessionNotFound without a second round trip or branch.
+        let redis_limit = limit.max(1);
 
         // `(` is an exclusive start. Ids are always `<seq>-0`, so excluding
         // exactly `after_seq-0` is precisely "seq > after_seq" — with no
         // arithmetic on `after_seq` that could overflow at u64::MAX.
         let (exists, range): (bool, StreamRangeReply) = redis::pipe()
-            .exists(self.config.meta_key(session_id))
-            .xrange_count(&log_key, format!("({after_seq}-0"), "+", limit)
+            .exists(meta_key(session_id))
+            .xrange_count(&log_key, format!("({after_seq}-0"), "+", redis_limit)
             .query_async(&mut self.conn.clone())
             .await
             .map_err(backend)?;
@@ -341,6 +363,7 @@ impl SessionStore for RedisSessionStore {
         let events: Vec<SessionEvent> = range
             .ids
             .iter()
+            .take(limit)
             .map(|entry| event_of(entry, session_id, &log_key))
             .collect::<Result<_, _>>()?;
 
@@ -362,9 +385,9 @@ impl SessionStore for RedisSessionStore {
     }
 
     async fn last_seq(&self, session_id: &SessionId) -> Result<u64, StoreError> {
-        let log_key = self.config.log_key(session_id);
+        let log_key = log_key(session_id);
         let (exists, len, newest): (bool, u64, StreamRangeReply) = redis::pipe()
-            .exists(self.config.meta_key(session_id))
+            .exists(meta_key(session_id))
             .xlen(&log_key)
             .xrevrange_count(&log_key, "+", "-", 1)
             .query_async(&mut self.conn.clone())
@@ -388,83 +411,5 @@ impl SessionStore for RedisSessionStore {
             )));
         }
         Ok(last)
-    }
-}
-
-impl RedisSessionStore {
-    /// Translate a lease-script outcome into the trait's vocabulary.
-    ///
-    /// `expires_at_ms` comes from the Redis clock the script read, so the
-    /// handle states the truth about the record it names. It is informational
-    /// either way: per the trait, validity is always decided against the
-    /// stored record, never against the handle's copy.
-    fn lease_from(
-        &self,
-        outcome: scripts::LeaseOutcome,
-        session_id: &SessionId,
-        node_id: &str,
-        ttl_ms: u64,
-    ) -> Result<Option<Lease>, StoreError> {
-        match outcome {
-            scripts::LeaseOutcome::Granted { now_ms } => Ok(Some(Lease {
-                session_id: session_id.clone(),
-                node_id: node_id.to_string(),
-                expires_at_ms: now_ms + ttl_ms,
-            })),
-            scripts::LeaseOutcome::Refused => Ok(None),
-            scripts::LeaseOutcome::NoSession => {
-                Err(StoreError::SessionNotFound(session_id.clone()))
-            }
-        }
-    }
-}
-
-/// Fixtures for this crate's integration tests and for dependent crates'
-/// (the server's durability test). Feature-gated for the same reason as the
-/// [`LeaseControl`](roundhouse_core::store::contract::LeaseControl) impl
-/// below: one canonical copy instead of a per-crate near-duplicate — the env
-/// var's name and the fail-loudly-instead-of-skip policy are a contract, and
-/// two drifting copies of a contract is how tests end up reading different
-/// variables — but never part of a production build.
-#[cfg(feature = "test-support")]
-pub mod test_support {
-    use super::{RedisSessionStore, RedisStoreConfig};
-
-    /// The one variable every Redis-gated integration test reads.
-    pub const URL_VAR: &str = "ROUNDHOUSE_TEST_REDIS_URL";
-
-    /// Panics rather than skips: reaching this at all means
-    /// `--include-ignored` asked for the real backend, so a missing variable
-    /// is a runner error to report, not infrastructure to wait for.
-    pub fn url_from_env() -> String {
-        std::env::var(URL_VAR).unwrap_or_else(|_| {
-            panic!(
-                "--include-ignored asks for the real backend; \
-                 set {URL_VAR} to a reachable Redis"
-            )
-        })
-    }
-
-    /// The store under test, connected to the Redis the environment names.
-    pub async fn connect_from_env() -> RedisSessionStore {
-        RedisSessionStore::connect(RedisStoreConfig::new(url_from_env()))
-            .await
-            .expect("Redis named by the env var must be reachable")
-    }
-}
-
-/// The conformance suite's expiry lever: deleting the lease key is exactly
-/// what `PX` would eventually do, so takeover behaves as if the TTL had run
-/// out. Feature-gated because it exists for the shared contract tests, not
-/// for production code — nothing outside a test build may depend on it.
-#[cfg(feature = "test-support")]
-#[async_trait::async_trait]
-impl roundhouse_core::store::contract::LeaseControl for RedisSessionStore {
-    async fn force_expire_lease(&self, session_id: &SessionId) {
-        let _: i64 = redis::cmd("DEL")
-            .arg(self.config.lease_key(session_id))
-            .query_async(&mut self.conn.clone())
-            .await
-            .expect("the test Redis must accept a DEL");
     }
 }

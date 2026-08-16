@@ -5,9 +5,9 @@ SPDX-License-Identifier: Apache-2.0
 
 # Plan: the stateful store component (Redis first, backend-portable by contract)
 
-> **Status: delivered.** All four milestones landed; this document remains as
-> the design rationale. Where implementation diverged from the plan, the text
-> says so inline (the `#[ignore]` gating in §4.3 is the notable case).
+> **Status: delivered.** All four milestones landed. This document records the
+> as-built design, including the fencing-token change from the implementation
+> review.
 
 This crate is the durable half of the statefulness claim in the README. The
 plan below is written against the code as it stands: the abstraction already
@@ -35,13 +35,14 @@ The contract a backend must satisfy, extracted from the trait docs and the
 - **Fenced append.** `append_events` validates the lease against the store's
   *current* record, atomically with the append. A displaced writer fails with
   `LeaseLost`; it can never interleave with its successor.
-- **Lease is an identity, not a snapshot.** A handle whose own `expires_at_ms`
-  has passed still appends while the stored record it names is live. The
-  session heartbeat renews on a separate task from the writer and depends on
-  this.
-- **Acquisition:** idempotent for the holding node; blocked by another live
-  holder; an expired lease is takeable. `renew_lease → None` is final — the
-  caller stops rather than re-acquiring behind a successor.
+- **Lease is a tenure identity, not an expiry snapshot.** A handle whose own
+  `expires_at_ms` has passed still appends while the stored node-plus-token
+  record it names is live. The session heartbeat renews on a separate task from
+  the writer and depends on this.
+- **Acquisition:** another live holder blocks acquisition. An expired lease is
+  takeable. A successful re-take by the holding node mints a fresh fencing
+  token. Handles from its previous tenure then fail. `renew_lease → None` is
+  final. The caller stops rather than re-acquiring behind a successor.
 - **Sequencing:** `seq` starts at 1, is contiguous per session, and is assigned
   by the store at append time. `read_events(after_seq)` returns oldest-first
   with no gap or repeat; `last_seq` is 0 for an empty session.
@@ -76,7 +77,7 @@ the first client is single-node:
 | Key | Type | Holds |
 |---|---|---|
 | `rh:{<session_id>}:meta` | string | JSON `{model_policy, created_at_ms}`, written with `SET NX` |
-| `rh:{<session_id>}:lease` | string | holder's `node_id`, with `PX` expiry |
+| `rh:{<session_id>}:lease` | hash | holder's `node_id` and fencing token, with key expiry |
 | `rh:{<session_id>}:log` | stream | one entry per event, explicit ID `<seq>-0` |
 
 `create_session` is `SET NX` on `meta`; the reply distinguishes created from
@@ -108,54 +109,51 @@ core-crate concern and the scripts never move.
 `read_events`/`last_seq` pipeline an `EXISTS meta` alongside the read to
 distinguish "empty session" from `SessionNotFound`.
 
-### Lease: a `SET PX` key, on the Redis clock
+### Lease: a TTL'd hash, on the Redis clock
 
-The lease is a string key whose value is the holder's `node_id` and whose
-*expiry is enforced by Redis itself* via `PX`. This deliberately moves the
-lease clock from process time (`now_ms()`, fine for the single-process
-`MemoryStore`) to the store's clock: a multi-node deployment is exactly the
-deployment where node clocks skew, and a lease whose validity two nodes
-compute from two different clocks is a fencing hole. One clock authority, and
-it's the one all writers already agree on by construction.
+The lease hash stores `node_id` plus a UUID fencing token, and its *expiry is
+enforced by Redis itself* via `PEXPIRE`. The Redis clock replaces the process
+clock that `MemoryStore` uses. Node clocks can differ in a multi-node
+deployment. One Redis clock prevents that difference from opening a fencing
+hole.
 
 Four operations, each one Lua script executed via `redis::Script` (which
 handles `EVALSHA`-with-`NOSCRIPT`-fallback):
 
-- **acquire** — fail `SessionNotFound` if `meta` absent; if lease key absent
-  or already ours, `SET PX ttl`; else return "held". Idempotent re-take by the
-  holder, blocked for everyone else, and expiry-is-takeable comes free from
-  `PX` — an expired key is an absent key.
-- **renew** — if lease value == our `node_id`, `PEXPIRE`; else "lost", which
-  the session layer treats as final.
+- **acquire** — fail `SessionNotFound` if `meta` is absent. If the lease is
+  absent or already names this node, write the new token and apply the TTL.
+  Otherwise, return refused. A re-take starts a new tenure and fences every
+  older handle.
+- **renew** — if both `node_id` and fencing token match, apply `PEXPIRE`.
+  Otherwise, return refused. The session layer treats refusal as final.
 - **release** — compare-and-`DEL` (delete only if still ours).
 - **append** — the heart, and the reason these are scripts at all: *fence and
-  append must be one atomic step*. Check `meta` exists → check lease value ==
-  `node_id` → read max entry ID → `XADD` each event at `max+1, max+2, …` with
-  `at_ms` from Redis `TIME` → return the assigned seqs and timestamp, from
-  which the Rust side rebuilds the `SessionEvent`s without a re-read. Scripts
-  replicate by effects (the default since Redis 5), so `TIME` inside the
-  script is replication-safe.
+  append must be one atomic step*. Check `meta` exists → check node and token →
+  read max entry ID → `XADD` each event at `max+1, max+2, …` with `at_ms` from
+  Redis `TIME` → return the assigned seqs and timestamp, from which the Rust
+  side rebuilds the `SessionEvent`s without a re-read. Scripts replicate by
+  effects (the default since Redis 5), so `TIME` inside the script is
+  replication-safe.
 
-Scripts return small status sentinels (`OK` / `NOSESSION` / `LEASELOST` /
-`HELD`), mapped in Rust to `Ok`, `StoreError::SessionNotFound`,
-`StoreError::LeaseLost`, and `Ok(None)` respectively. Transport and protocol
-failures map to `StoreError::Backend`.
+Scripts return small status sentinels (`OK`, `NOSESSION`, `REFUSED`, `FENCED`,
+and `CORRUPT`), decoded into typed internal outcomes and then mapped to the
+trait's `Ok`, `SessionNotFound`, `LeaseLost`, or `Backend` vocabulary.
 
 The returned `Lease.expires_at_ms` is computed from Redis `TIME + ttl` and is
 informational: by the trait's own doc, validity is always decided against the
 stored record, never against the handle's copy — the session layer already
 depends on that.
 
-### Client, config, durability
+### Client, configuration, and durability
 
 - **Client:** `redis` 0.27 `ConnectionManager` (already pinned in the
   workspace with `tokio-rustls-comp`, `streams`, `script`,
   `connection-manager` — the feature set was chosen for exactly this design).
   Multiplexed, auto-reconnecting; one manager per store, cheap to clone.
-- **Config:** a `RedisStoreConfig { url, key_prefix }` built by the composition
-  root from `ROUNDHOUSE_REDIS_URL`. The prefix defaults to `rh` and exists so
-  two deployments can share an instance in a pinch — not for multi-tenancy
-  claims.
+- **Boundary:** the composition root passes `ROUNDHOUSE_REDIS_URL` directly to
+  `RedisSessionStore::connect`. There is no one-field configuration wrapper or
+  untested key-prefix parameter. `rh` is an internal constant. Raw key helpers
+  exist only under `test-support` for the wire-format tests.
 - **Durability is a deployment fact, not a code path.** The log is as durable
   as the Redis it lives in (AOF `appendfsync`, replication). The crate docs
   state this the way `frontier.rs` states the rate-card rule; the code does
@@ -174,8 +172,8 @@ require Redis. Mapping each obligation:
 |---|---|---|
 | Append-only per-session log | stream key per session | one stream, subject `rh.sess.<id>` per session (JetStream prefers subjects-in-a-stream over a stream per session) |
 | Store-assigned contiguous `seq` | entry ID `<seq>-0` assigned in-script | seq carried in the message, enforced by publish with `Nats-Expected-Last-Subject-Sequence` CAS; retry on conflict |
-| Fenced append, atomic with fencing check | Lua: check lease + `XADD` in one script | lease epoch in a KV bucket read-before-publish + the CAS above; a displaced writer's CAS fails |
-| Lease with store-side expiry | `SET PX` / `PEXPIRE` | KV bucket entry with per-key TTL (NATS ≥ 2.11) or expiry timestamp in the value, updated with revision CAS |
+| Fenced append, atomic with fencing check | Lua: check node + tenure token, then `XADD` in one script | lease epoch in a KV bucket read-before-publish + the CAS above. A displaced writer's CAS fails |
+| Lease with store-side expiry | TTL'd hash + `PEXPIRE` | KV bucket entry with per-key TTL (NATS ≥ 2.11) or expiry timestamp in the value, updated with revision CAS |
 | `read_events(after_seq)` poll | `XRANGE` | direct get by subject sequence / ordered pull consumer from a known position |
 | `last_seq` | `XREVRANGE COUNT 1` | stream info, last sequence for subject |
 
@@ -249,13 +247,6 @@ workspace green:
 
 ## 6. Open questions (decisions deliberately not made here)
 
-- **Lease epochs.** Fencing is by `node_id`, in `MemoryStore` and in this
-  plan alike. The ABA case — node A loses the session, B holds and releases,
-  A re-acquires, and a *stale handle from A's first tenure* validates again —
-  is inherited from the current contract, not introduced by Redis. The fix is
-  a fencing token/epoch on `Lease`, which is a core-trait change touching the
-  heartbeat contract, so it should be its own finding-shaped change with its
-  own failing test, not a rider on this crate.
 - **Blocking tail.** `XREAD BLOCK` (and a JetStream push consumer) could
   replace follower polling; needs the optional-capability shape sketched in §1
   and a latency number showing the poll interval actually costs something.

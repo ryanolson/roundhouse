@@ -18,7 +18,7 @@
 
 mod common;
 
-use common::{assert_covers_every_variant, connect_from_env, every_event_kind, rig};
+use common::{assert_covers_every_variant, connect_from_env, every_event_kind, lease_key, rig};
 use roundhouse_core::event::SessionEventKind;
 use roundhouse_core::store::{SessionStore, StoreError};
 
@@ -71,7 +71,7 @@ async fn concurrent_acquisition_after_expiry_admits_exactly_one_node() {
         .unwrap()
         .unwrap();
     let _: () = redis::cmd("DEL")
-        .arg(rig.config.lease_key(&sid))
+        .arg(lease_key(&sid))
         .query_async(&mut rig.raw.clone())
         .await
         .unwrap();

@@ -28,12 +28,14 @@ use roundhouse_core::store::StoreError;
 ///
 /// An absent lease key *is* an expired lease — `PX` deletes it — so takeover
 /// needs no expiry arithmetic here. Re-acquisition by the current holder is
-/// recovery, not competition, and refreshes the TTL.
+/// recovery, not competition, but it replaces the fencing token so handles
+/// from the holder's previous tenure fail immediately.
 const ACQUIRE: &str = r"
 if redis.call('EXISTS', KEYS[1]) == 0 then return {'NOSESSION'} end
-local holder = redis.call('GET', KEYS[2])
+local holder = redis.call('HGET', KEYS[2], 'node_id')
 if holder ~= false and holder ~= ARGV[1] then return {'REFUSED'} end
-redis.call('SET', KEYS[2], ARGV[1], 'PX', ARGV[2])
+redis.call('HSET', KEYS[2], 'node_id', ARGV[1], 'fencing_token', ARGV[2])
+redis.call('PEXPIRE', KEYS[2], ARGV[3])
 local t = redis.call('TIME')
 return {'OK', tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)}
 ";
@@ -43,8 +45,9 @@ return {'OK', tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)}
 /// caller's tenure is over and only acquire may start a new one.
 const RENEW: &str = r"
 if redis.call('EXISTS', KEYS[1]) == 0 then return {'NOSESSION'} end
-if redis.call('GET', KEYS[2]) ~= ARGV[1] then return {'REFUSED'} end
-redis.call('PEXPIRE', KEYS[2], ARGV[2])
+if redis.call('HGET', KEYS[2], 'node_id') ~= ARGV[1] then return {'REFUSED'} end
+if redis.call('HGET', KEYS[2], 'fencing_token') ~= ARGV[2] then return {'REFUSED'} end
+redis.call('PEXPIRE', KEYS[2], ARGV[3])
 local t = redis.call('TIME')
 return {'OK', tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)}
 ";
@@ -53,7 +56,11 @@ return {'OK', tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)}
 /// hold — or a session that no longer exists — is the cleanup path racing
 /// reality, not an error worth reporting.
 const RELEASE: &str = r"
-if redis.call('GET', KEYS[1]) == ARGV[1] then redis.call('DEL', KEYS[1]) end
+if redis.call('HGET', KEYS[1], 'node_id') == ARGV[1]
+  and redis.call('HGET', KEYS[1], 'fencing_token') == ARGV[2]
+then
+  redis.call('DEL', KEYS[1])
+end
 return {'OK'}
 ";
 
@@ -69,7 +76,8 @@ return {'OK'}
 /// near that.
 const APPEND: &str = r"
 if redis.call('EXISTS', KEYS[1]) == 0 then return {'NOSESSION'} end
-if redis.call('GET', KEYS[2]) ~= ARGV[1] then return {'FENCED'} end
+if redis.call('HGET', KEYS[2], 'node_id') ~= ARGV[1] then return {'FENCED'} end
+if redis.call('HGET', KEYS[2], 'fencing_token') ~= ARGV[2] then return {'FENCED'} end
 local last = 0
 local newest = redis.call('XREVRANGE', KEYS[3], '+', '-', 'COUNT', 1)
 if #newest > 0 then
@@ -79,7 +87,7 @@ if #newest > 0 then
 end
 local t = redis.call('TIME')
 local at_ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
-for i = 2, #ARGV do
+for i = 3, #ARGV do
   last = last + 1
   redis.call('XADD', KEYS[3], last .. '-0', 'at_ms', at_ms, 'kind', ARGV[i])
 end
@@ -108,6 +116,25 @@ pub(crate) enum AppendOutcome {
     NoSession,
 }
 
+/// The two fields every lease script checks together.
+///
+/// Keeping them in one value prevents a call site from mixing two leases.
+/// This value also keeps the script boundary compact.
+#[derive(Clone, Copy)]
+pub(crate) struct LeaseIdentity<'a> {
+    node_id: &'a str,
+    fencing_token: &'a str,
+}
+
+impl<'a> LeaseIdentity<'a> {
+    pub(crate) fn new(node_id: &'a str, fencing_token: &'a str) -> Self {
+        Self {
+            node_id,
+            fencing_token,
+        }
+    }
+}
+
 /// The four scripts, compiled once per store.
 ///
 /// `redis::Script` sends `EVALSHA` and falls back to `EVAL` on `NOSCRIPT`,
@@ -134,14 +161,15 @@ impl Scripts {
         conn: &mut ConnectionManager,
         meta_key: &str,
         lease_key: &str,
-        node_id: &str,
+        identity: LeaseIdentity<'_>,
         ttl_ms: u64,
     ) -> Result<LeaseOutcome, StoreError> {
         let reply: Vec<Value> = self
             .acquire
             .key(meta_key)
             .key(lease_key)
-            .arg(node_id)
+            .arg(identity.node_id)
+            .arg(identity.fencing_token)
             .arg(ttl_ms)
             .invoke_async(conn)
             .await
@@ -154,14 +182,15 @@ impl Scripts {
         conn: &mut ConnectionManager,
         meta_key: &str,
         lease_key: &str,
-        node_id: &str,
+        identity: LeaseIdentity<'_>,
         ttl_ms: u64,
     ) -> Result<LeaseOutcome, StoreError> {
         let reply: Vec<Value> = self
             .renew
             .key(meta_key)
             .key(lease_key)
-            .arg(node_id)
+            .arg(identity.node_id)
+            .arg(identity.fencing_token)
             .arg(ttl_ms)
             .invoke_async(conn)
             .await
@@ -173,12 +202,13 @@ impl Scripts {
         &self,
         conn: &mut ConnectionManager,
         lease_key: &str,
-        node_id: &str,
+        identity: LeaseIdentity<'_>,
     ) -> Result<(), StoreError> {
         let _: Vec<Value> = self
             .release
             .key(lease_key)
-            .arg(node_id)
+            .arg(identity.node_id)
+            .arg(identity.fencing_token)
             .invoke_async(conn)
             .await
             .map_err(super::backend)?;
@@ -191,7 +221,7 @@ impl Scripts {
         meta_key: &str,
         lease_key: &str,
         log_key: &str,
-        node_id: &str,
+        identity: LeaseIdentity<'_>,
         kind_payloads: &[String],
     ) -> Result<AppendOutcome, StoreError> {
         let mut invocation = self.append.prepare_invoke();
@@ -199,7 +229,8 @@ impl Scripts {
             .key(meta_key)
             .key(lease_key)
             .key(log_key)
-            .arg(node_id);
+            .arg(identity.node_id)
+            .arg(identity.fencing_token);
         for payload in kind_payloads {
             invocation.arg(payload.as_str());
         }
