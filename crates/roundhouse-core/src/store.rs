@@ -10,7 +10,13 @@
 //! has to provide an append-only log plus a lease.
 //!
 //! Two implementations are expected: the [`MemoryStore`] here (tests, single
-//! process) and a Redis Streams backend in `roundhouse-store-redis`.
+//! process) and a Redis Streams backend in `roundhouse-store-redis`. What the
+//! two must agree on is executable rather than prose: `store::contract` holds
+//! the trait's guarantees as a generic test suite, and every backend —
+//! including the memory one — is judged by that identical suite.
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod contract;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -22,6 +28,7 @@ use tokio::sync::RwLock;
 use crate::event::{SessionEvent, SessionEventKind};
 use crate::ids::SessionId;
 use crate::now_ms;
+use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -36,7 +43,7 @@ pub enum StoreError {
     Backend(#[from] anyhow::Error),
 }
 
-/// Proof that a node is the single writer for a session.
+/// Proof that one node tenure is the single writer for a session.
 ///
 /// Every mutating call takes one. A node whose lease has expired — because it
 /// stalled, or was partitioned, or died and came back — fails its next append
@@ -46,6 +53,12 @@ pub enum StoreError {
 pub struct Lease {
     pub session_id: SessionId,
     pub node_id: String,
+    /// Uniquely identifies this ownership tenure.
+    ///
+    /// When a node re-acquires a lease, the store mints a new token. This token
+    /// fences every handle from the previous tenure. The node id identifies
+    /// the owner. This token identifies the current acquisition.
+    pub fencing_token: Uuid,
     pub expires_at_ms: u64,
 }
 
@@ -65,6 +78,8 @@ pub trait SessionStore: Send + Sync + 'static {
     ) -> Result<bool, StoreError>;
 
     /// Claim single-writer ownership, or `None` if another live node holds it.
+    /// Every successful acquisition mints a fresh fencing token, including a
+    /// re-acquisition by the current node, so older handles cannot revive.
     async fn acquire_lease(
         &self,
         session_id: &SessionId,
@@ -89,10 +104,10 @@ pub trait SessionStore: Send + Sync + 'static {
     /// Fails with [`StoreError::LeaseLost`] if `lease` is no longer valid, so a
     /// stalled writer cannot interleave with its successor.
     ///
-    /// A [`Lease`] is an identity — which node holds which session — and not a
-    /// snapshot of ownership: validity is decided against the store's *current*
+    /// A [`Lease`] is a tenure identity — node plus fencing token — and not an
+    /// expiry snapshot: validity is decided against the store's *current*
     /// record, so a handle whose own `expires_at_ms` has passed still appends
-    /// while the record it names is live. Renewal is therefore free to happen
+    /// while the tenure it names is live. Renewal is therefore free to happen
     /// on a separate task from the writes, and the session layer relies on it:
     /// its heartbeat renews the record while every append continues to go
     /// through the original handle. An implementation that instead rejected a
@@ -121,9 +136,25 @@ pub trait SessionStore: Send + Sync + 'static {
 
 #[derive(Default)]
 struct SessionRecord {
-    model_policy: String,
+    _model_policy: String,
     events: Vec<SessionEvent>,
     lease: Option<Lease>,
+}
+
+impl SessionRecord {
+    fn is_current_tenure(&self, lease: &Lease) -> bool {
+        self.lease.as_ref().is_some_and(|current| {
+            current.node_id == lease.node_id && current.fencing_token == lease.fencing_token
+        })
+    }
+
+    fn is_held_by(&self, lease: &Lease, now: u64) -> bool {
+        self.is_current_tenure(lease)
+            && self
+                .lease
+                .as_ref()
+                .is_some_and(|current| !current.is_expired_at(now))
+    }
 }
 
 /// Non-durable [`SessionStore`] for tests and single-process runs.
@@ -142,6 +173,7 @@ impl MemoryStore {
 
     /// Force-expire a session's lease. Test hook for simulating a dead owner
     /// without waiting out a TTL.
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn expire_lease_now(&self, session_id: &SessionId) {
         if let Some(record) = self.sessions.write().await.get_mut(session_id)
             && let Some(lease) = record.lease.as_mut()
@@ -165,7 +197,7 @@ impl SessionStore for MemoryStore {
         sessions.insert(
             session_id.clone(),
             SessionRecord {
-                model_policy: model_policy.to_string(),
+                _model_policy: model_policy.to_string(),
                 ..Default::default()
             },
         );
@@ -197,7 +229,8 @@ impl SessionStore for MemoryStore {
         let lease = Lease {
             session_id: session_id.clone(),
             node_id: node_id.to_string(),
-            expires_at_ms: now + ttl_ms,
+            fencing_token: Uuid::new_v4(),
+            expires_at_ms: now.saturating_add(ttl_ms),
         };
         record.lease = Some(lease.clone());
         Ok(Some(lease))
@@ -209,28 +242,24 @@ impl SessionStore for MemoryStore {
             .get_mut(&lease.session_id)
             .ok_or_else(|| StoreError::SessionNotFound(lease.session_id.clone()))?;
 
-        match &record.lease {
-            Some(current)
-                if current.node_id == lease.node_id && !current.is_expired_at(now_ms()) =>
-            {
+        let now = now_ms();
+        match record.is_held_by(lease, now) {
+            true => {
                 let renewed = Lease {
-                    expires_at_ms: now_ms() + ttl_ms,
+                    expires_at_ms: now.saturating_add(ttl_ms),
                     ..lease.clone()
                 };
                 record.lease = Some(renewed.clone());
                 Ok(Some(renewed))
             }
-            _ => Ok(None),
+            false => Ok(None),
         }
     }
 
     async fn release_lease(&self, lease: &Lease) -> Result<(), StoreError> {
         let mut sessions = self.sessions.write().await;
         if let Some(record) = sessions.get_mut(&lease.session_id)
-            && record
-                .lease
-                .as_ref()
-                .is_some_and(|current| current.node_id == lease.node_id)
+            && record.is_current_tenure(lease)
         {
             record.lease = None;
         }
@@ -247,9 +276,7 @@ impl SessionStore for MemoryStore {
             .get_mut(&lease.session_id)
             .ok_or_else(|| StoreError::SessionNotFound(lease.session_id.clone()))?;
 
-        let held = record.lease.as_ref().is_some_and(|current| {
-            current.node_id == lease.node_id && !current.is_expired_at(now_ms())
-        });
+        let held = record.is_held_by(lease, now_ms());
         if !held {
             return Err(StoreError::LeaseLost {
                 session_id: lease.session_id.clone(),
@@ -301,149 +328,16 @@ impl SessionStore for MemoryStore {
     }
 }
 
-impl MemoryStore {
-    /// Test accessor for the policy recorded at creation.
-    pub async fn model_policy(&self, session_id: &SessionId) -> Option<String> {
-        self.sessions
-            .read()
-            .await
-            .get(session_id)
-            .map(|record| record.model_policy.clone())
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    //! The memory store's conformance run.
+    //!
+    //! The assertions live in [`contract`](super::contract) and the macro is
+    //! the list; this module only points both at [`MemoryStore`]. Each
+    //! contract test still gets its own `#[tokio::test]`, so a failure names
+    //! the violated invariant.
 
-    async fn store_with_session() -> (MemoryStore, SessionId) {
-        let store = MemoryStore::new();
-        let sid = SessionId::generate();
-        assert!(store.create_session(&sid, "affinity").await.unwrap());
-        (store, sid)
-    }
+    use super::MemoryStore;
 
-    #[tokio::test]
-    async fn create_is_idempotent_and_reports_existing() {
-        let (store, sid) = store_with_session().await;
-        assert!(!store.create_session(&sid, "affinity").await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn a_live_lease_blocks_another_node() {
-        let (store, sid) = store_with_session().await;
-        assert!(
-            store
-                .acquire_lease(&sid, "node-a", 5_000)
-                .await
-                .unwrap()
-                .is_some()
-        );
-        assert!(
-            store
-                .acquire_lease(&sid, "node-b", 5_000)
-                .await
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn an_expired_lease_is_takeable_and_the_loser_cannot_append() {
-        let (store, sid) = store_with_session().await;
-        let stale = store
-            .acquire_lease(&sid, "node-a", 5_000)
-            .await
-            .unwrap()
-            .unwrap();
-
-        store.expire_lease_now(&sid).await;
-        let fresh = store
-            .acquire_lease(&sid, "node-b", 5_000)
-            .await
-            .unwrap()
-            .unwrap();
-
-        // The successor writes; the displaced owner is fenced out.
-        store
-            .append_events(
-                &fresh,
-                vec![SessionEventKind::Error {
-                    message: "ok".into(),
-                }],
-            )
-            .await
-            .unwrap();
-        let err = store
-            .append_events(
-                &stale,
-                vec![SessionEventKind::Error {
-                    message: "no".into(),
-                }],
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(err, StoreError::LeaseLost { .. }));
-    }
-
-    #[tokio::test]
-    async fn sequence_numbers_are_contiguous_and_replay_is_gapless() {
-        let (store, sid) = store_with_session().await;
-        let lease = store
-            .acquire_lease(&sid, "node-a", 5_000)
-            .await
-            .unwrap()
-            .unwrap();
-
-        let first = store
-            .append_events(
-                &lease,
-                vec![
-                    SessionEventKind::SessionCreated {
-                        model_policy: "affinity".into(),
-                    },
-                    SessionEventKind::Error {
-                        message: "one".into(),
-                    },
-                ],
-            )
-            .await
-            .unwrap();
-        assert_eq!(first.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2]);
-
-        let second = store
-            .append_events(
-                &lease,
-                vec![SessionEventKind::Error {
-                    message: "two".into(),
-                }],
-            )
-            .await
-            .unwrap();
-        assert_eq!(second[0].seq, 3);
-        assert_eq!(store.last_seq(&sid).await.unwrap(), 3);
-
-        // Resume from seq 1 yields exactly the tail, with no gap or repeat.
-        let tail = store.read_events(&sid, 1, 100).await.unwrap();
-        assert_eq!(tail.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![2, 3]);
-    }
-
-    #[tokio::test]
-    async fn renew_fails_once_the_lease_was_taken_over() {
-        let (store, sid) = store_with_session().await;
-        let lease = store
-            .acquire_lease(&sid, "node-a", 5_000)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(store.renew_lease(&lease, 5_000).await.unwrap().is_some());
-
-        store.expire_lease_now(&sid).await;
-        store
-            .acquire_lease(&sid, "node-b", 5_000)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(store.renew_lease(&lease, 5_000).await.unwrap().is_none());
-    }
+    crate::store_contract_suite!(MemoryStore::new());
 }

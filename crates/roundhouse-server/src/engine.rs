@@ -114,6 +114,10 @@ impl LocalExecutor for EchoLocalExecutor {
 
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
+    /// Identity presented to the session lease.
+    ///
+    /// It must be unique for every live engine. The default mints one so two
+    /// server processes cannot accidentally present themselves as one holder.
     pub node_id: String,
     pub lease_ttl_ms: u64,
     pub block_size: u32,
@@ -138,7 +142,7 @@ pub struct EngineConfig {
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
-            node_id: "node-0".to_string(),
+            node_id: format!("node_{}", uuid::Uuid::new_v4().simple()),
             lease_ttl_ms: 10_000,
             block_size: 16,
             local_model: "local".to_string(),
@@ -245,15 +249,11 @@ pub struct Engine<S: SessionStore, T: Tokenizer + Clone> {
     metrics: Arc<MetricsRecorder>,
     /// One gate per session, held for the whole of [`Engine::run_turn`].
     ///
-    /// The lease fences *nodes*; it deliberately re-grants to its own node so a
-    /// recovering process is not locked out by its previous life. Within one
-    /// node that leniency would let two concurrent turns on a session both pass
-    /// admission and interleave their writes, so turns are serialized here.
+    /// This gate serializes turns inside one engine before they contend for the
+    /// store lease. Across engines, the lease's fencing token is the authority:
+    /// every acquisition mints a new tenure and the store rejects stale handles.
     /// Entries are never removed — bounded by the sessions this process serves,
-    /// which is acceptable for a single-process skeleton. The cross-process
-    /// version of this guarantee is a fencing token on [`Lease`]
-    /// (`roundhouse_core::store::Lease`) that every store call validates; that
-    /// replaces this map when the Redis store arrives.
+    /// which is acceptable for a single-process skeleton.
     turn_gates: Mutex<HashMap<SessionId, Arc<tokio::sync::Mutex<()>>>>,
 }
 

@@ -25,5 +25,12 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 
+[features]
+# Exposes `store::contract`, the executable SessionStore conformance suite,
+# for backend crates' integration tests (dev-dependencies only). Purely
+# additive: no production code is gated on it, so enabling it cannot change
+# shipped behavior.
+test-support = []
+
 [dev-dependencies]
 tokio = { workspace = true }

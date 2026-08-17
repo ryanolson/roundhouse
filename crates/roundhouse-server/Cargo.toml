@@ -39,6 +39,9 @@ uuid = { workspace = true }
 # The end-to-end cache-hit proof drives a real mock engine that publishes KV
 # events into the embedded selection service. See tests/mocker_cache_hits.rs.
 dynamo-mocker = { workspace = true }
+# `test-support` adds the canonical Redis test fixtures (env var + connect)
+# shared with the store's own integration tests. See tests/redis_store.rs.
+roundhouse-store-redis = { workspace = true, features = ["test-support"] }
 
 # The SSE tests drive the router as a `tower::Service` and read response bodies
 # frame by frame, which is the only way to assert on a stream that has not ended

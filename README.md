@@ -18,8 +18,8 @@ this prefix cached* and route accordingly. Statefulness and routing are not two
 features — the first is what makes the second possible.
 
 > **Status: exploratory walking skeleton.** The session core, routing layer,
-> embedded Dynamo integration, streaming turn engine, and HTTP/SSE transport
-> are real and tested. The WebSocket and gRPC transports and the Redis store
+> embedded Dynamo integration, streaming turn engine, HTTP/SSE transport, and
+> Redis session store are real and tested. The WebSocket and gRPC transports
 > are not yet implemented.
 
 Roundhouse depends on Dynamo but is not part of it. It pins two Dynamo crates
@@ -40,7 +40,7 @@ crates.io, the pin becomes a plain version.
 |---|---|
 | `roundhouse-core` | Session state machine, event log, lease, context assembly, routing vocabulary and policies, metrics projection |
 | `roundhouse-fleet` | Local Dynamo fleet (embedded selection service) and frontier providers |
-| `roundhouse-store-redis` | Redis Streams `SessionStore` *(not yet implemented)* |
+| `roundhouse-store-redis` | Redis Streams `SessionStore`: entry id == seq, `PX` lease on the Redis clock, fenced appends via Lua. Selected by `ROUNDHOUSE_REDIS_URL`; absent means in-memory sessions that die with the process |
 | `roundhouse-server` | Turn engine, HTTP/SSE transport, metrics API and dashboard, and the binary |
 
 ## Design
@@ -341,16 +341,14 @@ knowing any of it is happening.
 
 ## Not yet built
 
-WebSocket and gRPC transports; the Redis store; real provider clients for
-OpenAI and Anthropic; cross-process fencing tokens on the lease (within a
-node, turns are serialized by the engine; across nodes, by node identity and
-TTL); and resuming an interrupted generation from its partial output — the
-partial is already durable in the log, so the groundwork is there.
+Roundhouse does not have WebSocket and gRPC transports. It does not have real
+provider clients for OpenAI and Anthropic. It also cannot resume an interrupted
+generation from its partial output. The partial output is already durable in
+the log.
 
 Metrics are per-process: the recorder folds what this node served plus whatever
 it replayed from the sessions it opened. A fleet-wide view means either scraping
-each node or folding the shared log centrally, which is a job for the Redis
-store rather than for another counter. The dashboard also reports totals over
-all history with no time-window selector, because the in-memory fold keeps no
-per-interval buckets; adding a window means bucketing the fold, not querying it
-differently.
+each node or running a shared fold over the Redis log rather than adding another
+per-process counter. The dashboard also reports totals over all history with no
+time-window selector, because the in-memory fold keeps no per-interval buckets.
+A time window requires buckets in the fold, not a different query.
