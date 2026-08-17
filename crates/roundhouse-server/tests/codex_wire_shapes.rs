@@ -90,6 +90,11 @@ impl AuthProvider for NoAuth {
     fn add_auth_headers(&self, _headers: &mut HeaderMap) {}
 }
 
+/// A provider that retries nothing, deliberately duplicated from
+/// `codex_conformance.rs`'s rather than shared: M0's evidence is that
+/// conformance is untouched, and consolidating both into `common` is M1's
+/// job, when a third caller appears. Retries here would replay the identical
+/// canned body and double every event `drive` counts.
 fn provider() -> Provider {
     Provider {
         name: "roundhouse-wire-shapes".to_string(),
@@ -192,7 +197,7 @@ fn usage_object(input_tokens: u64, output_tokens: u64) -> Value {
 /// hand-written check would think to look at — is what proves a skipped
 /// optional (`id`, `encrypted_function_args`,
 /// `internal_chat_message_metadata_passthrough`) is really missing from the
-/// object, not merely absent from this test's attention. A `namespace: null`
+/// object, not merely absent from this test's attention. An `id: null`
 /// slipping through here would still resolve *this* assertion by accident if
 /// the check only compared individual fields; comparing the whole `Value`
 /// does not allow that.
@@ -327,7 +332,7 @@ async fn a_function_call_done_frame_parses_without_a_preceding_added() {
 ///
 /// The fixture also carries one `response.custom_tool_call_input.delta`
 /// control frame, interspersed with the frames under test. That event name
-/// *is* handled (sse/responses.rs:363-372) and is proven by upstream's own
+/// *is* handled (sse/responses.rs:365-375) and is proven by upstream's own
 /// `parses_tool_call_input_deltas` (sse/responses.rs:974-1002) to yield
 /// `ResponseEvent::ToolCallInputDelta`. Without it, this test cannot tell "no
 /// frame in this fixture reaches the parser" apart from "this specific event
@@ -352,7 +357,7 @@ async fn function_call_argument_deltas_are_not_observed_by_this_client() {
         json!({ "type": "response.created", "response": { "id": "resp_wire_2" } }),
     )];
     // Control: an event name process_responses_event does handle
-    // (sse/responses.rs:363-372), placed in the same body via the same
+    // (sse/responses.rs:365-375), placed in the same body via the same
     // sse_frame/drive path as the frames under test. This is what proves the
     // fixture's bytes actually reach the parser — a mutated `"delta": 42`
     // (dropped before decoding as `ResponsesStreamEvent`, sse/responses.rs
