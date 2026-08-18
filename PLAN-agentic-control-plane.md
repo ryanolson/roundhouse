@@ -439,6 +439,12 @@ configuration, not protocol work:
   declares its own `env_key` (`model-provider/src/auth.rs:186-203`). Leave
   `requires_openai_auth` unset: that keeps the plain bearer path and avoids
   the Agent-Identity bootstrap, which would call `auth.openai.com` directly.
+  **Caveat:** NeMo Relay ships `requires_openai_auth = true` in the same
+  position against `codex-cli ≥ 0.143.0` (`crates/cli/src/agents/codex/launch.rs:199-206`
+  at `c37b551`), directly contradicting this ruling, which was read from
+  rev `6344a65`. One read is stale or the flag changed meaning; resolving
+  it against current codex source in device-login mode is M7's first
+  verification item (see `SYNERGY-nemo-relay.md` §S1).
 - The wire shape is the **same Responses API** roundhouse already speaks —
   only the base URL and headers differ by auth mode. The upstream target for
   ChatGPT-authed traffic is `https://chatgpt.com/backend-api/codex` (whether
