@@ -356,6 +356,23 @@ one predicate — local candidates are already priced at `expected_cost_usd: 0.0
 (`crates/roundhouse-fleet/src/local.rs:161-171`), so
 `candidate.expected_cost_usd <= granted_usd` with a zero grant excludes every
 frontier candidate and admits every local one. No branch, no special case.
+
+**The overload escape valve** (a ruling made after the original draft): under
+`DegradeToLocal`, when the budget is exhausted *and* the local pool cannot
+serve — every local candidate load-rejected or no local capacity at all —
+the turn overflows back to frontier rather than failing. The budget is a
+ceiling on choice, not a tourniquet on service. Three rules keep it honest:
+the overspend settles into `committed_usd` like any other spend, so the
+ledger visibly exceeds its limit rather than hiding the excess; every
+overflow dispatch is a marked fact on its `DecisionRecord`, so "served on
+frontier past exhaustion because local was saturated" is its own dashboard
+number; and overflow relaxes only the budget axis — the allow filter and
+quality floor still bind, and a spent frontier *cadence* is not bypassed,
+because cadence is policy and overflow is a budget valve. Configurable
+(default on for degrade mode; meaningless and rejected with `Refuse`), and a
+degrade-mode budget with overflow off in a deployment with no local capacity
+is refused at startup, the same promise-keeping check the cadence already
+gets.
 The turn is recorded with `budget_state: Exhausted` on the `DecisionRecord`
 (`#[serde(default)]`), because a project that stayed under budget by serving
 400 turns on a 7B model has not had the same month as one that never needed
