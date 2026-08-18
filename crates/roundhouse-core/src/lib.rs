@@ -17,6 +17,7 @@ pub mod context;
 pub mod control;
 pub mod event;
 pub mod ids;
+pub mod interject;
 pub mod item;
 pub mod metrics;
 pub mod routing;
@@ -30,6 +31,7 @@ pub use control::{
 };
 pub use event::{Accounting, SessionEvent, SessionEventKind, SessionObserver, Usage};
 pub use ids::{ResponseId, SessionId, TurnId};
+pub use interject::{Interjection, InterjectionContext, Interjector};
 pub use item::{Item, ItemContent, Role};
 pub use metrics::{MetricsConfig, MetricsFold, MetricsSnapshot, ServingMode};
 pub use session::{Session, SessionError, TerminalSettlement};

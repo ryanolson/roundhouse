@@ -30,6 +30,7 @@ use codex_api::{
     ApiError, AuthProvider, Provider, ResponseEvent, ResponsesApiRequest, RetryConfig,
 };
 use codex_client::{HttpTransport, Request, Response, StreamResponse, TransportError};
+use codex_protocol::ResponseItemId;
 use codex_protocol::models::{ContentItem, FunctionCallOutputPayload, ResponseItem};
 
 /// Ceiling on a whole exchange.
@@ -299,6 +300,89 @@ pub fn function_call_output_item(call_id: &str, output_text: &str) -> ResponseIt
         output: FunctionCallOutputPayload::from_text(output_text.to_string()),
         internal_chat_message_metadata_passthrough: None,
     }
+}
+
+/// The model's own scratch space, which this surface drops on the way in.
+///
+/// Built from Codex's own type for the reason every builder here is: the
+/// suites that send one are asserting that a *real* agent's reasoning item
+/// does not disturb a prefix, and a hand-written `{"type":"reasoning"}` would
+/// only prove that our own idea of one does not.
+pub fn reasoning_item(id: &str) -> ResponseItem {
+    ResponseItem::Reasoning {
+        id: Some(ResponseItemId::new(id)),
+        summary: Vec::new(),
+        content: None,
+        encrypted_content: None,
+        internal_chat_message_metadata_passthrough: None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reading the bytes, for the assertions a parser cannot make
+// ---------------------------------------------------------------------------
+
+/// One SSE frame as it left the server: its `event:` name and its parsed
+/// `data:` payload.
+///
+/// Codex's parser is forgiving by design — it ignores what it does not
+/// recognize — so it cannot prove that *nothing extra* went out, or that the
+/// terminal frame was last. That is what reading the bytes is for, and it is
+/// why the two suites that make an exhaustive frame-list assertion share one
+/// reader rather than each keeping its own idea of how an SSE body splits.
+#[derive(Debug)]
+pub struct Frame {
+    pub name: String,
+    pub payload: serde_json::Value,
+}
+
+impl Frame {
+    /// The payload's own `type` tag, which is what a client reads.
+    pub fn kind(&self) -> &str {
+        self.payload["type"]
+            .as_str()
+            .expect("every frame this surface emits is typed")
+    }
+}
+
+/// Every frame in a finished SSE body, in order.
+///
+/// Collected whole rather than read incrementally because the endpoints these
+/// suites drive always end their own stream; a body that did not would be
+/// caught by [`EXCHANGE_TIMEOUT`] rather than hanging the run.
+pub async fn frames(body: Body) -> Vec<Frame> {
+    let bytes = tokio::time::timeout(EXCHANGE_TIMEOUT, body.collect())
+        .await
+        .expect("the SSE stream stalled")
+        .expect("body")
+        .to_bytes();
+    let text = std::str::from_utf8(&bytes).expect("SSE bodies are UTF-8");
+
+    text.split("\n\n")
+        .filter(|raw| !raw.trim().is_empty())
+        .filter_map(|raw| {
+            let mut name = None;
+            let mut data = None;
+            for line in raw.lines() {
+                // A line starting with `:` is a keep-alive comment.
+                let Some((field, value)) =
+                    line.split_once(':').filter(|(field, _)| !field.is_empty())
+                else {
+                    continue;
+                };
+                let value = value.strip_prefix(' ').unwrap_or(value);
+                match field {
+                    "event" => name = Some(value.to_string()),
+                    "data" => data = Some(value.to_string()),
+                    _ => {}
+                }
+            }
+            Some(Frame {
+                name: name?,
+                payload: serde_json::from_str(&data?).expect("frame data must be JSON"),
+            })
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

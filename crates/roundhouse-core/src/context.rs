@@ -239,6 +239,7 @@ impl<T: Tokenizer> ContextAssembler<T> {
 mod tests {
     use super::*;
     use crate::ids::ResponseId;
+    use crate::item::{ItemContent, Role};
 
     const BLOCK: u32 = 16;
 
@@ -340,6 +341,56 @@ mod tests {
         assert_eq!(
             ByteTokenizer.encode(&assembler.rendered()),
             assembler.buffer().tokens()
+        );
+    }
+
+    #[test]
+    fn a_rehydrated_log_containing_an_emitted_tool_call_needs_no_new_branch() {
+        // The other half of "reusing `ItemAppended` costs zero changes here",
+        // checked rather than asserted. An emitted tool call is an ordinary
+        // `Item` whose content already has a rendering, so the assembler sees
+        // nothing new; had it needed a branch, a steered session's successor
+        // would rehydrate a different prompt than the node it replaced and
+        // every block hash after the steer would move.
+        let items = vec![
+            Item::system_text("you are a careful assistant"),
+            Item::user_text("first question"),
+            Item {
+                role: Role::Assistant,
+                content: ItemContent::ToolCall {
+                    call_id: "rhsteer_resp_1".into(),
+                    name: "fetch_steer".into(),
+                    arguments: r#"{"steer_id":"rhsteer_resp_1"}"#.into(),
+                },
+                response_id: Some(ResponseId::new("resp_1")),
+            },
+            Item {
+                role: Role::Tool,
+                content: ItemContent::ToolResult {
+                    call_id: "rhsteer_resp_1".into(),
+                    output: r#"{"directive":"narrow the search"}"#.into(),
+                },
+                response_id: None,
+            },
+            Item::user_text("second question"),
+        ];
+
+        let mut original = ContextAssembler::new(ByteTokenizer, BLOCK);
+        for item in items.clone() {
+            original.push(item);
+        }
+        let restored = ContextAssembler::rehydrate(ByteTokenizer, BLOCK, items);
+
+        assert_eq!(restored.buffer().tokens(), original.buffer().tokens());
+        assert_eq!(
+            restored.buffer().sequence_hashes(),
+            original.buffer().sequence_hashes()
+        );
+        assert_eq!(
+            ByteTokenizer.encode(&restored.rendered()),
+            restored.buffer().tokens(),
+            "and the text form a frontier provider is handed still tokenizes \
+             back to the buffer the router priced"
         );
     }
 

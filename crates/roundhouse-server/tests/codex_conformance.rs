@@ -43,7 +43,7 @@ use roundhouse_fleet::{EchoFrontierClient, StaticFrontierCatalog};
 use roundhouse_server::{ControlPlane, EchoLocalExecutor, Engine, EngineConfig, responses_router};
 
 mod common;
-use common::codex::{EXCHANGE_TIMEOUT, NoAuth, RouterTransport, collect, request, user_message};
+use common::codex::{NoAuth, RouterTransport, collect, frames, request, user_message};
 use common::frontier_catalog;
 
 /// What the echo provider answers with, and therefore what a turn's assistant
@@ -459,15 +459,7 @@ async fn ordering_is_enforced_at_the_frame_level() {
     assert_eq!(response.headers()[CONTENT_TYPE], "text/event-stream");
 
     let frames = frames(response.into_body()).await;
-    let types: Vec<String> = frames
-        .iter()
-        .map(|frame| {
-            frame.payload["type"]
-                .as_str()
-                .expect("a typed frame")
-                .to_string()
-        })
-        .collect();
+    let types: Vec<&str> = frames.iter().map(|frame| frame.kind()).collect();
     assert_eq!(
         types,
         vec![
@@ -491,11 +483,11 @@ async fn ordering_is_enforced_at_the_frame_level() {
     // and by the id it was told.
     let added = types
         .iter()
-        .position(|kind| kind == "response.output_item.added")
+        .position(|kind| *kind == "response.output_item.added")
         .expect("the item is announced");
     let delta = types
         .iter()
-        .position(|kind| kind == "response.output_text.delta")
+        .position(|kind| *kind == "response.output_text.delta")
         .expect("the answer is streamed");
     assert!(added < delta);
     assert_eq!(frames[added].payload["item"]["id"], "msg_1");
@@ -646,49 +638,4 @@ async fn a_live_socket_round_trip() {
     );
     assert_eq!(answer(&events), ANSWER);
     assert!(!response_id(&events).is_empty());
-}
-
-// ---------------------------------------------------------------------------
-// SSE framing, for the one test that reads the bytes
-// ---------------------------------------------------------------------------
-
-#[derive(Debug)]
-struct Frame {
-    name: String,
-    payload: serde_json::Value,
-}
-
-async fn frames(body: Body) -> Vec<Frame> {
-    let bytes = tokio::time::timeout(EXCHANGE_TIMEOUT, body.collect())
-        .await
-        .expect("the SSE stream stalled")
-        .expect("body")
-        .to_bytes();
-    let text = std::str::from_utf8(&bytes).expect("SSE bodies are UTF-8");
-
-    text.split("\n\n")
-        .filter(|raw| !raw.trim().is_empty())
-        .filter_map(|raw| {
-            let mut name = None;
-            let mut data = None;
-            for line in raw.lines() {
-                // A line starting with `:` is a keep-alive comment.
-                let Some((field, value)) =
-                    line.split_once(':').filter(|(field, _)| !field.is_empty())
-                else {
-                    continue;
-                };
-                let value = value.strip_prefix(' ').unwrap_or(value);
-                match field {
-                    "event" => name = Some(value.to_string()),
-                    "data" => data = Some(value.to_string()),
-                    _ => {}
-                }
-            }
-            Some(Frame {
-                name: name?,
-                payload: serde_json::from_str(&data?).expect("frame data must be JSON"),
-            })
-        })
-        .collect()
 }

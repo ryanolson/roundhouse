@@ -16,6 +16,7 @@ use roundhouse_core::event::{IncompleteReason, Usage};
 use roundhouse_core::ids::{ResponseId, TurnId};
 use roundhouse_core::item::{Item, ItemContent, Role};
 
+use crate::dialect::ClientDialect;
 use crate::http::ApiError;
 
 /// The id of the one message item a response produces.
@@ -24,6 +25,16 @@ use crate::http::ApiError;
 /// decoration: a client discards an item id that has none, and an item it cannot
 /// name is an item it cannot attach deltas to.
 const MESSAGE_ITEM_ID: &str = "msg_1";
+
+/// The id space an emitted function-call item is named in.
+///
+/// Separate from [`MESSAGE_ITEM_ID`] and not merely different: a client indexes
+/// items by id and attaches deltas by it, so a call sharing the message's id
+/// would be the message as far as the client is concerned. One response emits
+/// at most one call — a steered turn commits its item and its completion in one
+/// batch and dispatches nothing — so the response's own id makes the item's id
+/// unique without a counter to keep.
+const FUNCTION_CALL_ITEM_PREFIX: &str = "fc_";
 
 // ---------------------------------------------------------------------------
 // Canonicalizing a resent conversation
@@ -278,6 +289,88 @@ fn message_item(text: &str) -> Value {
     })
 }
 
+// ---------------------------------------------------------------------------
+// A tool call this deployment emitted
+// ---------------------------------------------------------------------------
+
+/// One synthetic call, and everything needed to spell it on this wire.
+///
+/// A named struct rather than five positional arguments repeated across two
+/// builders: the two frames must carry *the same* item — a client that was
+/// announced one call and handed another has no way to reconcile them — and
+/// building both from one value is how that stops being a thing to remember.
+///
+/// The three content fields are borrowed straight from the stored
+/// [`ItemContent::ToolCall`], never rebuilt: `arguments` in particular is
+/// minted once at emission and echoed here verbatim, which is what makes the
+/// client's own verbatim resend of it match the stored item by construction. A
+/// re-serialization here — even a semantically identical one, with keys in a
+/// different order — would canonicalize to a different item next turn and fork
+/// the session.
+pub(super) struct EmittedCall<'a> {
+    /// How this deployment's clients spell a tool call. See [`ClientDialect`].
+    pub dialect: &'a ClientDialect,
+    /// The response that emitted the call, which names the wire item.
+    pub response_id: &'a ResponseId,
+    pub call_id: &'a str,
+    /// The bare tool name as the log holds it, with no namespace folded in.
+    pub name: &'a str,
+    pub arguments: &'a str,
+}
+
+impl EmittedCall<'_> {
+    /// The item both frames carry.
+    ///
+    /// The match is the dialect's, and it is a match rather than a namespace
+    /// interpolated into a fixed shape because a second dialect changes the
+    /// *shape* — a flat `mcp__roundhouse__fetch_steer` with no `namespace`
+    /// field at all — and not just the string.
+    fn item(&self) -> Value {
+        match self.dialect {
+            ClientDialect::CodexResponses { namespace } => json!({
+                "type": "function_call",
+                "id": format!("{FUNCTION_CALL_ITEM_PREFIX}{}", self.response_id),
+                // A separate field, never folded into `name`: Codex dispatches
+                // on an exact `ToolName { name, namespace }` lookup and nothing
+                // in its tree splits a flat name back apart, so a folded name
+                // resolves against nothing and comes back to the model as
+                // `unsupported call: …`.
+                "namespace": namespace,
+                "name": self.name,
+                "call_id": self.call_id,
+                "arguments": self.arguments,
+            }),
+        }
+    }
+}
+
+/// `response.output_item.added`, announcing an emitted call.
+///
+/// Carries the complete item rather than an empty shell, unlike the message
+/// path's [`item_added_frame`]: a message is announced empty because its text
+/// arrives as deltas afterwards, and a call's arguments never do — argument
+/// deltas are traced and dropped by the pinned client, so anything not in this
+/// frame and its `done` twin is not on the wire at all.
+pub(super) fn tool_call_added_frame(call: &EmittedCall<'_>) -> Event {
+    frame(
+        "response.output_item.added",
+        json!({ "type": "response.output_item.added", "item": call.item() }),
+    )
+}
+
+/// `response.output_item.done`, the frame the client actually dispatches off.
+///
+/// The pinned Codex client builds its tool call from whatever item arrives
+/// here, with no dependency on the `added` frame before it — which is why this
+/// one carries the whole item and why `added` is a courtesy rather than a
+/// prerequisite.
+pub(super) fn tool_call_done_frame(call: &EmittedCall<'_>) -> Event {
+    frame(
+        "response.output_item.done",
+        json!({ "type": "response.output_item.done", "item": call.item() }),
+    )
+}
+
 /// `response.completed`, which ends the stream.
 ///
 /// `id` and `total_tokens` are load-bearing: a client parses this event into its
@@ -354,7 +447,6 @@ pub(super) fn failed_frame(response_id: Option<&ResponseId>, message: &str) -> E
 }
 
 #[cfg(test)]
-#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -392,6 +484,137 @@ mod tests {
         assert_eq!(items, vec![Item::system_text("be brief"), user("hi")]);
 
         assert!(canonicalize("", &[json!({ "type": "web_search_call" })]).is_err());
+    }
+
+    /// The canonical bytes of an emitted call, pinned whole.
+    ///
+    /// Whole rather than field by field, for the reason
+    /// `codex_wire_shapes.rs` gives about the same object: a field-by-field
+    /// check cannot see a field that should not be there, and an extra key —
+    /// or a `namespace` that quietly became part of `name` — is exactly the
+    /// drift that leaves Codex's exact `HashMap` lookup with nothing to match.
+    /// The failure would be silent on our side and arrive as `unsupported
+    /// call: …` on the model's.
+    ///
+    /// Pinned on the item rather than on the two frames because
+    /// [`axum::response::sse::Event`] exposes no reader — the frames
+    /// themselves are asserted byte for byte in `steering_emission.rs`, which
+    /// reads a real response body. Both builders render through
+    /// [`EmittedCall::item`], so this is what they carry.
+    #[test]
+    fn an_emitted_call_renders_the_golden_item_under_the_codex_dialect() {
+        let response_id = ResponseId::new("resp_01J");
+        let dialect = ClientDialect::CodexResponses {
+            namespace: "mcp__roundhouse".to_string(),
+        };
+        let call = EmittedCall {
+            dialect: &dialect,
+            response_id: &response_id,
+            call_id: "rhsteer_resp_01J",
+            name: "fetch_steer",
+            arguments: r#"{"steer_id":"rhsteer_resp_01J"}"#,
+        };
+
+        assert_eq!(
+            call.item(),
+            json!({
+                "type": "function_call",
+                "id": "fc_resp_01J",
+                "namespace": "mcp__roundhouse",
+                "name": "fetch_steer",
+                "call_id": "rhsteer_resp_01J",
+                "arguments": r#"{"steer_id":"rhsteer_resp_01J"}"#,
+            })
+        );
+    }
+
+    /// The call's item id is its own, and never the message's.
+    ///
+    /// A control for the pin above: with one dialect and one hard-coded
+    /// namespace, the golden test would pass just as well if the id were
+    /// `msg_1`, and a client that indexes items by id would then have the call
+    /// and the assistant message as one item.
+    #[test]
+    fn an_emitted_calls_item_id_is_not_the_message_item_id() {
+        let response_id = ResponseId::new("resp_02K");
+        let dialect = ClientDialect::default();
+        let call = EmittedCall {
+            dialect: &dialect,
+            response_id: &response_id,
+            call_id: "rhsteer_resp_02K",
+            name: "fetch_steer",
+            arguments: "{}",
+        };
+        let id = call.item()["id"]
+            .as_str()
+            .expect("the item is named")
+            .to_string();
+        assert_ne!(id, MESSAGE_ITEM_ID);
+        assert!(id.starts_with(FUNCTION_CALL_ITEM_PREFIX));
+        assert!(
+            id.contains(response_id.as_str()),
+            "the id is minted from the response, so two responses cannot \
+             collide on it: {id}"
+        );
+    }
+
+    /// An emitted call and the client's resend of it are the same item.
+    ///
+    /// The single fact the whole steering choreography rests on, asserted at
+    /// the seam where it could break: the projection puts a `namespace` and an
+    /// `id` on the wire, and canonicalization must read neither. If it did,
+    /// the claimed prefix would disagree with the stored one on the very next
+    /// turn and the session would rebind to a cold generation — silently, since
+    /// every turn would still answer.
+    #[test]
+    fn the_clients_resend_of_an_emitted_call_canonicalizes_back_to_it() {
+        let response_id = ResponseId::new("resp_03L");
+        let dialect = ClientDialect::default();
+        let call = EmittedCall {
+            dialect: &dialect,
+            response_id: &response_id,
+            call_id: "rhsteer_resp_03L",
+            name: "fetch_steer",
+            arguments: r#"{"steer_id":"rhsteer_resp_03L"}"#,
+        };
+
+        let resent = canonicalize("", &[call.item()]).expect("the emitted item is resendable");
+        assert_eq!(
+            resent,
+            vec![Item::tool_call(
+                "rhsteer_resp_03L",
+                "fetch_steer",
+                r#"{"steer_id":"rhsteer_resp_03L"}"#,
+            )],
+            "the wire's namespace and item id must leave no trace in the \
+             canonical item: {resent:#?}"
+        );
+    }
+
+    /// The turn id of a fixed pre-M4-shaped conversation, pinned as a literal.
+    ///
+    /// The idempotency story rests on this hash being a pure function of the
+    /// conversation, stable across processes, machines, and releases: a client
+    /// retry hashes to the same turn and replays instead of paying twice. An
+    /// unchanged-code argument held that property through M4; a literal holds
+    /// it through every future change, because any edit to `Item::render`, the
+    /// FNV constants, or canonicalization that moves historical hashes fails
+    /// here first — and such an edit orphans every in-flight retry, so it must
+    /// be a decision, not a side effect.
+    #[test]
+    fn the_turn_id_of_a_fixed_conversation_is_pinned() {
+        let claimed = canonicalize(
+            "be brief",
+            &[
+                serde_json::json!({"type": "message", "role": "user", "content": "hello"}),
+                serde_json::json!({"type": "function_call", "call_id": "call_1",
+                                    "name": "search", "arguments": "{\"q\":\"rust\"}"}),
+                serde_json::json!({"type": "function_call_output", "call_id": "call_1",
+                                    "output": "3 hits"}),
+            ],
+        )
+        .expect("a fixed, well-formed conversation canonicalizes");
+        assert_eq!(turn_id_for(&claimed).to_string(), "turn_6a7aaa94e5b59fd2");
     }
 
     #[test]

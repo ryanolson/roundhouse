@@ -34,6 +34,7 @@
 
 pub mod catalog_config;
 pub mod control_config;
+pub mod dialect;
 pub mod engine;
 pub mod http;
 pub mod metrics_api;
@@ -44,6 +45,7 @@ pub use catalog_config::{CatalogConfig, CatalogError};
 pub use control_config::{
     Admission, AuthError, ControlPlane, ControlPlaneConfig, ControlPlaneError, KeyScope,
 };
+pub use dialect::{ClientDialect, DEFAULT_MCP_NAMESPACE};
 pub use engine::{
     EchoLocalExecutor, Engine, EngineConfig, EngineError, LocalExecution, LocalExecutor, TurnResult,
 };

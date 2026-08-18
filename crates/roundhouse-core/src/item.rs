@@ -115,6 +115,37 @@ impl Item {
         }
     }
 
+    /// A tool call, with no provenance.
+    ///
+    /// `response_id` is deliberately `None`, and it is the constructor's whole
+    /// point: a call built here is just a call. Only
+    /// [`Session::complete_with_item`](crate::session::Session::complete_with_item)
+    /// stamps a response onto one, which is what lets a stamped `ToolCall` in
+    /// the log mean "this deployment emitted it" rather than "somebody set a
+    /// field". The input path cannot produce a stamp — the wire layer's
+    /// canonicalization sets `None` on everything a client sends — so the
+    /// provenance marker is not something a client can forge.
+    ///
+    /// The name is the bare one. A namespace belongs to a client dialect and
+    /// lives in the wire projection: canonicalization ignores it on the way
+    /// in, so a namespaced resend and a flat one arrive as this same item, and
+    /// the log keeps one spelling per tool.
+    pub fn tool_call(
+        call_id: impl Into<String>,
+        name: impl Into<String>,
+        arguments: impl Into<String>,
+    ) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: ItemContent::ToolCall {
+                call_id: call_id.into(),
+                name: name.into(),
+                arguments: arguments.into(),
+            },
+            response_id: None,
+        }
+    }
+
     /// Deterministic prompt rendering for a single item.
     pub fn render(&self) -> String {
         format!("<|{}|>{}", self.role.as_str(), self.content.render())

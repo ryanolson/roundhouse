@@ -229,6 +229,24 @@ pub struct ControlPlaneConfig {
     /// `KeyScope::Admin` acts on the deployment, not from inside a project.
     #[serde(default)]
     pub admin_keys: Vec<String>,
+    /// The namespace this deployment's synthetic tool calls are rendered
+    /// under, or `None` for
+    /// [`DEFAULT_MCP_NAMESPACE`](crate::dialect::DEFAULT_MCP_NAMESPACE).
+    ///
+    /// Deployment-wide rather than per-project, and that is a claim rather
+    /// than a simplification: the namespace has to match what the *client's*
+    /// MCP registration calls this server, and one deployment serves one
+    /// endpoint, so a per-project namespace would be a name no project could
+    /// make its own agent use. It sits in this file because this is where a
+    /// deployment already names the things its clients say back to it — the
+    /// keys they present and the session namespace their conversations are
+    /// qualified into.
+    ///
+    /// Read through [`ControlPlane::client_dialect`](super::ControlPlane::client_dialect)
+    /// and nowhere else, so an open deployment and a configured one answer the
+    /// same question in one place.
+    #[serde(default)]
+    pub mcp_namespace: Option<String>,
     /// The finished turn-key lookup table: `key_sha256` to the complete
     /// [`Admission`] the key resolves to — its membership, its fully-resolved
     /// [`TurnPolicy`] (its project's policy narrowed by its own overrides),
@@ -304,6 +322,12 @@ pub enum ControlPlaneError {
          `keys` and/or `admin_keys` -- one secret must resolve to exactly one scope"
     )]
     DuplicateHash { path: String, key_sha256: String },
+    #[error(
+        "control-plane config `{path}`: `mcp_namespace` is `{namespace}` -- it must be \
+         non-empty and free of whitespace, because it is matched by an agent's exact \
+         tool-name lookup and a namespace nothing can name emits calls nothing can dispatch"
+    )]
+    BadMcpNamespace { path: String, namespace: String },
     #[error(
         "control-plane config `{path}`: {entry}'s min_quality {min_quality} is outside \
          0.0..=1.0"
@@ -602,6 +626,20 @@ impl ControlPlaneConfig {
                     budget,
                 },
             );
+        }
+
+        // Rejected at the boundary rather than trimmed or defaulted at the
+        // projection: a namespace that is empty or carries whitespace renders
+        // a call an agent's exact lookup can never match, so the turn would
+        // complete and the steer would silently do nothing. An operator-authored
+        // name that means nothing must fail to load, not fail to work.
+        if let Some(namespace) = &self.mcp_namespace
+            && (namespace.is_empty() || namespace.chars().any(char::is_whitespace))
+        {
+            return Err(ControlPlaneError::BadMcpNamespace {
+                path: path.to_string(),
+                namespace: namespace.clone(),
+            });
         }
 
         for hash in &self.admin_keys {

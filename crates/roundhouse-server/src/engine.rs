@@ -21,6 +21,7 @@ use roundhouse_core::context::{ContextAssembler, Tokenizer};
 use roundhouse_core::control::{MemorySpendLedger, SpendError, SpendLedger, TurnPolicy};
 use roundhouse_core::event::{Accounting, IncompleteReason, SessionObserver, Usage};
 use roundhouse_core::ids::{ResponseId, SessionId, TurnId};
+use roundhouse_core::interject::{Interjection, InterjectionContext, Interjector};
 use roundhouse_core::item::Item;
 use roundhouse_core::metrics::MetricsRecorder;
 use roundhouse_core::now_ms;
@@ -28,7 +29,7 @@ use roundhouse_core::routing::{
     CacheLedger, Candidate, Decision, DecisionRecord, RoutingContext, RoutingError, RoutingPolicy,
     Target,
 };
-use roundhouse_core::session::{Session, SessionError, TurnAdmission};
+use roundhouse_core::session::{LeaseHeartbeat, Session, SessionError, TurnAdmission};
 use roundhouse_core::store::SessionStore;
 use roundhouse_fleet::{
     FleetError, FleetQuery, FrontierChunk, FrontierClient, FrontierError, FrontierQuote,
@@ -326,7 +327,9 @@ impl Failed {
 pub struct TurnResult {
     pub response_id: ResponseId,
     pub text: String,
-    /// `None` when the turn was deduplicated and no routing happened.
+    /// `None` when no routing happened: the turn was deduplicated onto an
+    /// earlier response, or answered at the interjection seam without ever
+    /// being planned.
     pub decision: Option<Decision>,
     pub usage: Usage,
     /// Sequence number after the turn; the cursor a client resumes from.
@@ -364,6 +367,20 @@ pub struct Engine<S: SessionStore, T: Tokenizer + Clone> {
     /// together on purpose: a durable log beside a ledger that forgets would
     /// re-grant a month's budget on every restart.
     spend: Arc<dyn SpendLedger>,
+    /// What decides whether an admitted turn is dispatched or answered here.
+    ///
+    /// Never an `Option`. The default occupant
+    /// ([`interject::production_default`](roundhouse_core::interject::production_default))
+    /// decides `Proceed` and is what ships, so "no interjector configured" and
+    /// "an interjector that never interjects" are one state rather than two
+    /// spellings of it — and this turn's path has no `None` branch on it that a
+    /// reader has to evaluate before believing what the seam does.
+    ///
+    /// **M6 replaces the occupant and nothing else.** The trigger, the arms,
+    /// the judge side-call and the verdict-to-action map all arrive as a type
+    /// installed through [`Engine::with_interjector`]; the seam's position in
+    /// [`Engine::run_turn`] and its two answers are fixed here.
+    interjector: Arc<dyn Interjector>,
     /// One gate per session, held for the whole of [`Engine::run_turn`].
     ///
     /// This gate serializes turns inside one engine before they contend for the
@@ -395,6 +412,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             config,
             metrics: Arc::new(MetricsRecorder::new()),
             spend: Arc::new(MemorySpendLedger::new()),
+            interjector: roundhouse_core::interject::production_default(),
             turn_gates: Mutex::new(HashMap::new()),
         }
     }
@@ -428,6 +446,24 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
     /// default is honest rather than fail-open.
     pub fn with_spend_ledger(mut self, spend: Arc<dyn SpendLedger>) -> Self {
         self.spend = spend;
+        self
+    }
+
+    /// Consult `interjector` instead of the production default before each
+    /// admitted turn is planned.
+    ///
+    /// A builder for the same reason [`Self::with_fleet`] and
+    /// [`Self::with_spend_ledger`] are: it is a deployment's choice, not a fact
+    /// every caller has to state, and the default is a real occupant rather
+    /// than an absence — see [`Self::interjector`].
+    ///
+    /// **Its production caller is M6.** Until the validator exists, the only
+    /// thing that installs an occupant is `steering_emission.rs`, which is
+    /// where the decision to steer has to come from while there is nothing to
+    /// make it: a test-only *type*, but not a test-only code path — the engine
+    /// consults this field on every turn either way.
+    pub fn with_interjector(mut self, interjector: Arc<dyn Interjector>) -> Self {
+        self.interjector = interjector;
         self
     }
 
@@ -574,6 +610,36 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         // ticks before a live owner is declared dead.
         let _heartbeat = session.heartbeat(self.config.lease_ttl_ms / 3, self.config.lease_ttl_ms);
 
+        // The interjection seam. Its whole contract — consulted before the turn
+        // is planned, with the session's projection and never with the
+        // candidate list — is written at [`roundhouse_core::interject`]; what
+        // this site owes it is the *position*, and the position is the
+        // contract's load-bearing half.
+        //
+        // After the dedup short-circuit above, so a retry of a turn that
+        // already *completed* — every steered turn, by construction — replays
+        // the log and never reaches here: whatever the occupant costs is spent
+        // once, not once per attempt. (A turn that failed is re-admitted and
+        // re-decided, which is right: nothing was answered, so there is no
+        // decision to reuse.) After the heartbeat, so an occupant that takes a
+        // network round trip cannot lose the lease it is deciding under. And
+        // *before* `dispatch`, which is what makes the accounting below true
+        // rather than merely tidy — nothing has been priced, no `Routed`
+        // exists, and no grant has been opened.
+        let interjection = self
+            .interjector
+            .consider(&InterjectionContext {
+                state: session.state(),
+                policy: admission.policy.as_ref(),
+                response_id: &response_id,
+            })
+            .await;
+        if let Interjection::Complete { item, usage } = interjection {
+            return self
+                .complete_steered(session, response_id, item, usage, admission, _heartbeat)
+                .await;
+        }
+
         let outcome = self.dispatch(&mut session, &response_id, admission).await;
 
         // The one settle seam. Every admitted turn terminates its response and
@@ -637,6 +703,73 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             response_id,
             text,
             decision: Some(decision),
+            usage,
+            last_seq,
+            deduplicated: false,
+        })
+    }
+
+    /// Answer an admitted turn with `item` instead of running it, and settle.
+    ///
+    /// Split out of [`Engine::run_turn`] because it is a whole second way for a
+    /// turn to end and inlining it would put a second settle-and-release
+    /// sequence in the middle of the first. It takes the session and the
+    /// heartbeat *by value* for the same reason: this path ends the turn, and
+    /// owning both is what says so — the heartbeat stops renewing before the
+    /// lease is handed back, so no renewal can land after the release and
+    /// re-own a session this node has finished with.
+    ///
+    /// **Completed, never incomplete.** Only a completion registers in the
+    /// session's completed turns, so an incomplete steered turn would re-enter
+    /// the seam on every retry and never settle — and `response.incomplete`
+    /// reads as an error in the client rather than as a call to run.
+    ///
+    /// **Nothing is booked for the turn.** No `Routed` was recorded, because
+    /// the seam is consulted before `plan`, so the fold's dispatch-to-terminal
+    /// pairing finds nothing for this response and books no model row, and the
+    /// cache ledger records no warm prefix. `settle` still runs, and that is
+    /// deliberate rather than redundant: it prices this terminal event at zero
+    /// (a settlement carrying no target owes nobody anything) and advances the
+    /// ledger's per-session watermark, so the *next* turn's repair sees a
+    /// settle that has already been applied instead of re-driving a turn that
+    /// never took a grant. Every terminal event this engine writes goes through
+    /// the one settle seam; that is what keeps the seam's own claim true.
+    ///
+    /// The usage is the interjection's, reported to the client as this turn's
+    /// cost. Reporting `Usage::default()` instead would make this deployment's
+    /// own dashboard exceed what clients were told they spent, which is the one
+    /// direction an accounting error must never run.
+    async fn complete_steered(
+        &self,
+        mut session: Session<S>,
+        response_id: ResponseId,
+        item: Item,
+        usage: Usage,
+        admission: &Admission,
+        heartbeat: LeaseHeartbeat,
+    ) -> Result<TurnResult, EngineError> {
+        let committed = session
+            .complete_with_item(&response_id, item, usage.clone())
+            .await;
+        // Money after the log, always, and for the reason the dispatched path
+        // gives: the settle is priced from the terminal event's own usage, so
+        // it cannot run until that event exists.
+        let spend = self.settle(&session, admission).await;
+        let last_seq = session.last_seq();
+        drop(heartbeat);
+        let _ = session.release().await;
+
+        committed?;
+        spend?;
+        Ok(TurnResult {
+            response_id,
+            // A steered turn produced no assistant text, and this is the
+            // honest report of that rather than a rendering of the call: the
+            // call reaches the client as a wire item, and a caller of this
+            // function that concatenated `text` into a transcript must not
+            // find a tool call in it.
+            text: String::new(),
+            decision: None,
             usage,
             last_seq,
             deduplicated: false,

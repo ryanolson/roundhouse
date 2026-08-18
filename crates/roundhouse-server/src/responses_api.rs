@@ -53,17 +53,19 @@ use roundhouse_core::context::Tokenizer;
 use roundhouse_core::control::Principal;
 use roundhouse_core::event::{IncompleteReason, SessionEvent, SessionEventKind};
 use roundhouse_core::ids::{ResponseId, SessionId, TurnId};
-use roundhouse_core::item::Item;
+use roundhouse_core::item::{Item, ItemContent};
 use roundhouse_core::store::SessionStore;
 
 use crate::control_config::ControlPlane;
+use crate::dialect::ClientDialect;
 use crate::engine::Engine;
 use crate::http::{ApiError, LogTail, POLL_INTERVAL, READ_BATCH, parse_body, store_error};
 
 mod wire;
 use wire::{
-    canonicalize, completed_frame, created_frame, delta_frame, failed_frame, incomplete_frame,
-    item_added_frame, item_done_frame, turn_id_for,
+    EmittedCall, canonicalize, completed_frame, created_frame, delta_frame, failed_frame,
+    incomplete_frame, item_added_frame, item_done_frame, tool_call_added_frame,
+    tool_call_done_frame, turn_id_for,
 };
 
 /// Engine and store handles, plus this node's cache-key bindings.
@@ -238,6 +240,10 @@ where
         queued: VecDeque::new(),
         item_open: false,
         text: String::new(),
+        // Read once and carried, rather than consulted per frame: a
+        // reconfiguration must not be able to change a namespace half way
+        // through a response the client is still reading.
+        dialect: state.plane.client_dialect().clone(),
         phase: Phase::Tailing,
     };
 
@@ -458,6 +464,9 @@ struct ResponsesFollower<S: SessionStore> {
     item_open: bool,
     /// Deltas so far, which `response.output_item.done` repeats in full.
     text: String,
+    /// How an emitted tool call is spelled for this client, fixed for the life
+    /// of the response. See [`ClientDialect`].
+    dialect: ClientDialect,
     phase: Phase,
 }
 
@@ -568,11 +577,59 @@ impl<S: SessionStore> ResponsesFollower<S> {
             | SessionEventKind::ResponseIncomplete { response_id, .. } => {
                 self.response_id.as_ref() == Some(response_id)
             }
+            // Claimed exactly when there is something to project, asked
+            // through the one predicate `project` renders from. See
+            // [`Self::emitted_call`].
+            SessionEventKind::ItemAppended { item } => self.emitted_call(item).is_some(),
             SessionEventKind::SessionCreated { .. }
-            | SessionEventKind::ItemAppended { .. }
             | SessionEventKind::Routed { .. }
             | SessionEventKind::Error { .. } => false,
         }
+    }
+
+    /// The tool call `item` carries, if *this response* emitted it.
+    ///
+    /// One predicate rather than a condition in [`Self::concerns`] and a
+    /// matching one in [`Self::project`]. The first draft had both, and the
+    /// duplication was not merely untidy: with the narrowing written twice,
+    /// neither copy was load-bearing on its own, so a test that removed one
+    /// stayed green and the narrowness claim was unfalsifiable. Asking once
+    /// makes "claimed" and "projected" the same answer by construction —
+    /// there is no entry this stream claims and then silently drops.
+    ///
+    /// The narrowing is two questions, and returning the call's parts is what
+    /// makes both structural rather than remembered:
+    ///
+    /// - **Content.** Only a `ToolCall` has a `call_id`, a `name` and
+    ///   `arguments` to render, so a widened predicate would not compile. It
+    ///   matters because an assistant text item is *already* on the wire
+    ///   through the delta path: forwarding it here would emit a second
+    ///   `response.output_item.done` for the same message, and a client reads
+    ///   that as the answer arriving twice.
+    /// - **Provenance.** The frame's item id is minted from the response that
+    ///   emitted the call, so an item with no stamp has no id to be given —
+    ///   and an item a client sent never has one, because canonicalization
+    ///   sets `None` on everything on the input path. The equality is the half
+    ///   that is a real choice: a replay re-reads the whole log, so every call
+    ///   this session ever emitted passes through here, and only the one this
+    ///   response emitted may go out.
+    fn emitted_call<'a>(&'a self, item: &'a Item) -> Option<EmittedCall<'a>> {
+        let ItemContent::ToolCall {
+            call_id,
+            name,
+            arguments,
+        } = &item.content
+        else {
+            return None;
+        };
+        let response_id = item.response_id.as_ref()?;
+        (self.response_id.as_ref() == Some(response_id)).then_some(EmittedCall {
+            dialect: &self.dialect,
+            response_id,
+            call_id,
+            name,
+            arguments,
+        })
     }
 
     /// Queue what one log entry becomes on the wire.
@@ -655,8 +712,30 @@ impl<S: SessionStore> ResponsesFollower<S> {
                 self.queued.push_back(incomplete_frame(response_id, reason));
                 Step::End
             }
+            // A tool call this response emitted, which `concerns` has already
+            // narrowed to exactly that. Two frames, both carrying the whole
+            // item: the client dispatches off the `done`, and no argument
+            // deltas go out at all because the pinned parser traces and drops
+            // them — so anything not in these two frames is not on the wire.
+            //
+            // `item_open` is deliberately untouched. It tracks the *message*
+            // item, whose `done` the completion below emits; a steered turn
+            // produces no deltas and so leaves it false, which is what makes
+            // the four-frame sequence four frames rather than five with an
+            // empty message on the end.
+            SessionEventKind::ItemAppended { item } => {
+                if let Some(call) = self.emitted_call(item) {
+                    // Built before either is queued, because `call` borrows
+                    // this follower and the queue needs it back mutably. The
+                    // pair is built together for a second reason too: a client
+                    // announced one call and handed another has no way to
+                    // reconcile them.
+                    let frames = [tool_call_added_frame(&call), tool_call_done_frame(&call)];
+                    self.queued.extend(frames);
+                }
+                Step::Continue
+            }
             SessionEventKind::SessionCreated { .. }
-            | SessionEventKind::ItemAppended { .. }
             | SessionEventKind::Routed { .. }
             | SessionEventKind::Error { .. } => Step::Continue,
         }
@@ -695,7 +774,7 @@ impl<S: SessionStore> ResponsesFollower<S> {
 
 #[cfg(test)]
 mod tests {
-    use roundhouse_core::item::{ItemContent, Role};
+    use roundhouse_core::item::Role;
 
     use super::*;
 

@@ -16,7 +16,7 @@ use std::time::Duration;
 use crate::control::{FrontierHistory, Principal};
 use crate::event::{IncompleteReason, SessionEvent, SessionEventKind, SessionObserver, Usage};
 use crate::ids::{ResponseId, SessionId, TurnId};
-use crate::item::Item;
+use crate::item::{Item, ItemContent};
 use crate::routing::{CacheLedger, DecisionRecord, ProviderPricing, Target};
 use crate::store::{Lease, SessionStore, StoreError};
 
@@ -171,6 +171,28 @@ pub struct SessionState {
     /// `None` until a response terminates, which is also the honest answer for
     /// a session whose only turns are still open.
     last_settlement: Option<TerminalSettlement>,
+    /// Steers this deployment emitted that no client has answered yet, keyed
+    /// by `call_id` and valued by the log timestamp of the `ItemAppended` that
+    /// opened each one.
+    ///
+    /// The timestamp is what makes fulfilment latency derivable from the
+    /// projection and the log alone — the closing item's own `at_ms` minus
+    /// this one — without a second table to keep in step with the first.
+    ///
+    /// Filled by an `ItemAppended` whose item is a `ToolCall` *bearing a
+    /// response id*, and cleared by an `ItemAppended` whose item is a
+    /// `ToolResult` naming the same call. Provenance rather than shape is what
+    /// selects the opening item: everything on the input path canonicalizes
+    /// with no response id, so a client cannot open a steer by sending a tool
+    /// call. One writer, one event kind, no second source of truth.
+    ///
+    /// `pub(crate)` rather than `pub` because its consumer is M6's trigger —
+    /// the open-steer exclusion that stops a steer re-triggering the
+    /// validation that emitted it. It ships with M4 anyway because it is a
+    /// fact about M4's items: the events that fill it are emitted here, and a
+    /// projection added later against an older log is a projection nobody has
+    /// replayed.
+    pub(crate) open_steers: HashMap<String, u64>,
     pub last_seq: u64,
 }
 
@@ -182,7 +204,40 @@ impl SessionState {
     fn apply(&mut self, event: &SessionEvent) {
         self.last_seq = event.seq;
         match &event.kind {
-            SessionEventKind::ItemAppended { item } => self.items.push(item.clone()),
+            SessionEventKind::ItemAppended { item } => {
+                // The conversation itself is untouched by steering: an emitted
+                // tool call is an ordinary item arriving on the ordinary path,
+                // which is the whole reason this kind was reused rather than a
+                // second item-carrying kind added. A second kind would have
+                // given this fold, the wire layer's stored-items projection and
+                // the context assembler two sources for one conversation, and
+                // the first site to forget the second kind forks every steered
+                // session.
+                self.items.push(item.clone());
+                // The projection beside it, folded from the same event. See
+                // `open_steers`.
+                match &item.content {
+                    ItemContent::ToolCall { call_id, .. } => {
+                        // Provenance, not shape. An item on the input path
+                        // canonicalizes with no response id, so this arm is
+                        // unreachable for anything a client sent — including
+                        // the client's own verbatim resend of the very call it
+                        // is about to answer, which must not re-open the steer
+                        // its output closes.
+                        if item.response_id.is_some() {
+                            self.open_steers.insert(call_id.clone(), event.at_ms);
+                        }
+                    }
+                    ItemContent::ToolResult { call_id, .. } => {
+                        // Keyed on the call id and not on "a result arrived":
+                        // an agent runs its own tools between our turns, and
+                        // closing on any of those would report a steer
+                        // fulfilled that nobody answered.
+                        self.open_steers.remove(call_id);
+                    }
+                    ItemContent::Text { .. } => {}
+                }
+            }
             SessionEventKind::TurnStarted {
                 turn_id,
                 response_id,
@@ -616,6 +671,62 @@ impl<S: SessionStore> Session<S> {
         Ok(())
     }
 
+    /// Close a response successfully, committing `item` as what it produced.
+    ///
+    /// The sibling of [`Session::complete`], for a turn answered with
+    /// something other than assistant text — today, a steered turn's synthetic
+    /// tool call. `complete` is left exactly as it was rather than generalized:
+    /// it hardcodes an assistant item because that is the right shape for every
+    /// dispatched turn, and its callers' event streams are pinned to it.
+    ///
+    /// **The response id is stamped here rather than read off the item.** That
+    /// is what makes a committed item bearing a response id mean "this response
+    /// emitted it": everything on the input path arrives through
+    /// [`Session::begin_turn`] carrying none, and this is the only method that
+    /// puts one on anything but assistant text. A caller that had to supply the
+    /// stamp itself could forget it, and a forgotten stamp is an emitted call
+    /// that no projection can tell from a client's own.
+    ///
+    /// **One append batch, never two.** The item and the completion are a
+    /// decision and its realization. Committed separately, a process that died
+    /// between them would leave a session holding an emitted tool call whose
+    /// turn never completed: the retry would not deduplicate, the same call
+    /// would be emitted a second time, and the client would hold two calls with
+    /// one id. The store numbers a batch contiguously within one call, so the
+    /// window does not exist rather than being narrow — the same property
+    /// [`Session::begin_turn`] admits a turn and its input under.
+    ///
+    /// The usage is whatever produced the decision; the turn itself dispatched
+    /// nothing, which is why nothing here records a
+    /// [`SessionEventKind::Routed`]. A turn that reaches its completion with no
+    /// routing of its own is priced at nothing by every projection that pairs a
+    /// dispatch with its terminal event — the metrics fold books no model row
+    /// for it and the cache ledger records no warm prefix — while the client is
+    /// still told what its turn genuinely cost. See
+    /// [`interject`](crate::interject) for why the decision is taken before the
+    /// turn is planned, which is what makes that pairing absent rather than
+    /// merely unused.
+    pub async fn complete_with_item(
+        &mut self,
+        response_id: &ResponseId,
+        item: Item,
+        usage: Usage,
+    ) -> Result<(), SessionError> {
+        let item = Item {
+            response_id: Some(response_id.clone()),
+            ..item
+        };
+        self.commit(vec![
+            SessionEventKind::ItemAppended { item },
+            SessionEventKind::ResponseCompleted {
+                response_id: response_id.clone(),
+                usage,
+            },
+        ])
+        .await?;
+        Ok(())
+    }
+
     /// Close a response without a complete answer.
     ///
     /// The partial text is committed as an assistant item so the successor can
@@ -677,10 +788,19 @@ impl<S: SessionStore> Session<S> {
 mod tests {
     use super::*;
     use crate::control::Principal;
+    use crate::item::{ItemContent, Role};
     use crate::routing::{Candidate, Target};
     use crate::store::MemoryStore;
+    use async_trait::async_trait;
+    use std::sync::Mutex;
 
     const TTL: u64 = 30_000;
+
+    /// The steer a test emits: one call id, one name, one argument string,
+    /// minted once and reused by every party the way the real one is.
+    const STEER_CALL_ID: &str = "rhsteer_resp_1";
+    const STEER_NAME: &str = "fetch_steer";
+    const STEER_ARGS: &str = r#"{"steer_id":"rhsteer_resp_1"}"#;
 
     async fn new_session(store: Arc<MemoryStore>, node: &str) -> (SessionId, Session<MemoryStore>) {
         let sid = SessionId::generate();
@@ -1253,5 +1373,416 @@ mod tests {
         // Projecting to one response drops the session-level events.
         let scoped = session.response_events(&response_id, 0, 100).await.unwrap();
         assert!(scoped.iter().all(|e| e.response_id() == Some(&response_id)));
+    }
+
+    // -----------------------------------------------------------------------
+    // The steered turn: a turn that completes carrying an emitted tool call.
+    // -----------------------------------------------------------------------
+
+    /// A store that remembers the shape of every append batch.
+    ///
+    /// Contiguous sequence numbers are *not* evidence of atomicity — two
+    /// separate appends produce contiguous seqs too — so this double exists to
+    /// make the one assertion seq inspection cannot: that the item and the
+    /// completion reached the log in a single call, leaving no window for a
+    /// crash to land between a decision and its realization.
+    struct BatchRecordingStore {
+        inner: MemoryStore,
+        batches: Mutex<Vec<Vec<SessionEventKind>>>,
+    }
+
+    impl BatchRecordingStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryStore::new(),
+                batches: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// Drop the record so far, so an assertion is about the batches the
+        /// method under test produced rather than about the setup's.
+        fn forget_batches(&self) {
+            self.batches.lock().expect("batch record poisoned").clear();
+        }
+
+        fn batches(&self) -> Vec<Vec<SessionEventKind>> {
+            self.batches.lock().expect("batch record poisoned").clone()
+        }
+    }
+
+    #[async_trait]
+    impl SessionStore for BatchRecordingStore {
+        async fn create_session(
+            &self,
+            session_id: &SessionId,
+            model_policy: &str,
+        ) -> Result<bool, StoreError> {
+            self.inner.create_session(session_id, model_policy).await
+        }
+
+        async fn acquire_lease(
+            &self,
+            session_id: &SessionId,
+            node_id: &str,
+            ttl_ms: u64,
+        ) -> Result<Option<Lease>, StoreError> {
+            self.inner.acquire_lease(session_id, node_id, ttl_ms).await
+        }
+
+        async fn renew_lease(
+            &self,
+            lease: &Lease,
+            ttl_ms: u64,
+        ) -> Result<Option<Lease>, StoreError> {
+            self.inner.renew_lease(lease, ttl_ms).await
+        }
+
+        async fn release_lease(&self, lease: &Lease) -> Result<(), StoreError> {
+            self.inner.release_lease(lease).await
+        }
+
+        async fn append_events(
+            &self,
+            lease: &Lease,
+            kinds: Vec<SessionEventKind>,
+        ) -> Result<Vec<SessionEvent>, StoreError> {
+            let appended = self.inner.append_events(lease, kinds).await?;
+            // Recorded only on success: a rejected append wrote nothing, and
+            // counting it would let a fenced writer look like a second batch.
+            self.batches
+                .lock()
+                .expect("batch record poisoned")
+                .push(appended.iter().map(|event| event.kind.clone()).collect());
+            Ok(appended)
+        }
+
+        async fn read_events(
+            &self,
+            session_id: &SessionId,
+            after_seq: u64,
+            limit: usize,
+        ) -> Result<Vec<SessionEvent>, StoreError> {
+            self.inner.read_events(session_id, after_seq, limit).await
+        }
+
+        async fn last_seq(&self, session_id: &SessionId) -> Result<u64, StoreError> {
+            self.inner.last_seq(session_id).await
+        }
+    }
+
+    /// The item a steered turn completes with, built the way the emission
+    /// builds it: bare name, no namespace, arguments minted once.
+    fn steer_call() -> Item {
+        Item::tool_call(STEER_CALL_ID, STEER_NAME, STEER_ARGS)
+    }
+
+    /// The client's half of the round trip: the output it appends after
+    /// running the call, canonicalized exactly as `canonical_item` produces it
+    /// — role `tool`, no response id.
+    fn tool_result(call_id: &str, output: &str) -> Item {
+        Item {
+            role: Role::Tool,
+            content: ItemContent::ToolResult {
+                call_id: call_id.into(),
+                output: output.into(),
+            },
+            response_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_with_item_appends_the_item_and_completes_in_one_batch() {
+        let store = Arc::new(BatchRecordingStore::new());
+        let session_id = SessionId::generate();
+        store.create_session(&session_id, "affinity").await.unwrap();
+        let mut session = Session::open(
+            Arc::clone(&store),
+            session_id,
+            "node-a",
+            TTL,
+            CacheLedger::new(),
+        )
+        .await
+        .unwrap();
+
+        let admission = session
+            .begin_turn(TurnId::new("t1"), vec![Item::user_text("q")])
+            .await
+            .unwrap();
+        let response_id = admission.response_id().clone();
+        store.forget_batches();
+
+        session
+            .complete_with_item(&response_id, steer_call(), Usage::default())
+            .await
+            .unwrap();
+
+        let batches = store.batches();
+        assert_eq!(
+            batches.len(),
+            1,
+            "the emitted item and the completion are a decision and its \
+             realization: committed in two appends, a crash between them \
+             leaves a session holding a tool call whose turn never completed, \
+             so the client's retry does not deduplicate and the same call is \
+             emitted twice"
+        );
+        assert!(
+            matches!(
+                batches[0].as_slice(),
+                [
+                    SessionEventKind::ItemAppended { .. },
+                    SessionEventKind::ResponseCompleted { .. }
+                ]
+            ),
+            "the batch is the item then the completion, in that order: {:?}",
+            batches[0]
+        );
+
+        // And the store's own numbering makes the pair contiguous, which is
+        // what a replay reads them back as.
+        let events = session.events_since(0, 100).await.unwrap();
+        let item_seq = events
+            .iter()
+            .find(|event| {
+                matches!(&event.kind, SessionEventKind::ItemAppended { item }
+                    if matches!(item.content, ItemContent::ToolCall { .. }))
+            })
+            .expect("the emitted item is in the log")
+            .seq;
+        let completed_seq = events
+            .iter()
+            .find(|event| matches!(event.kind, SessionEventKind::ResponseCompleted { .. }))
+            .expect("the response completed")
+            .seq;
+        assert_eq!(completed_seq, item_seq + 1);
+    }
+
+    #[tokio::test]
+    async fn the_appended_item_carries_the_response_stamp_and_renders_as_a_tool_call() {
+        let store = Arc::new(MemoryStore::new());
+        let (_, mut session) = new_session(store, "node-a").await;
+
+        let admission = session
+            .begin_turn(TurnId::new("t1"), vec![Item::user_text("q")])
+            .await
+            .unwrap();
+        let response_id = admission.response_id().clone();
+        session
+            .complete_with_item(&response_id, steer_call(), Usage::default())
+            .await
+            .unwrap();
+
+        let emitted = session
+            .state()
+            .items
+            .last()
+            .expect("the item was committed");
+        assert_eq!(
+            emitted.response_id,
+            Some(response_id),
+            "the stamp is the provenance marker the whole design rests on: an \
+             item bearing this response's id is one this response emitted, and \
+             every item on the input path carries none"
+        );
+        assert_eq!(
+            emitted.role,
+            Role::Assistant,
+            "the role `canonical_item` gives an incoming `function_call`, so \
+             the client's resend of this very call compares equal to it under \
+             prefix admission, which compares role and content only"
+        );
+        assert_eq!(
+            emitted.content,
+            ItemContent::ToolCall {
+                call_id: STEER_CALL_ID.into(),
+                name: STEER_NAME.into(),
+                arguments: STEER_ARGS.into(),
+            },
+            "arguments are stored as minted, never re-serialized: the client \
+             echoes the string back verbatim and it has to match by \
+             construction"
+        );
+        assert!(
+            !STEER_NAME.contains("__"),
+            "the log stores the bare tool name; the namespace lives only in \
+             the wire projection, so a namespaced resend and a flat one \
+             canonicalize to this same stored item"
+        );
+        assert!(
+            emitted.render().contains(STEER_NAME),
+            "an emitted call is an ordinary item on the ordinary path: it \
+             renders into the prompt like every other one"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_with_item_registers_the_turn_for_dedup_like_complete_does() {
+        let store = Arc::new(MemoryStore::new());
+        let (_, mut session) = new_session(store, "node-a").await;
+
+        let admission = session
+            .begin_turn(TurnId::new("t1"), vec![Item::user_text("q")])
+            .await
+            .unwrap();
+        let response_id = admission.response_id().clone();
+        let billed = Usage {
+            input_tokens: 40,
+            output_tokens: 7,
+            ..Usage::default()
+        };
+        session
+            .complete_with_item(&response_id, steer_call(), billed.clone())
+            .await
+            .unwrap();
+
+        let retry = session
+            .begin_turn(TurnId::new("t1"), vec![Item::user_text("q")])
+            .await
+            .unwrap();
+        assert_eq!(
+            retry,
+            TurnAdmission::Deduplicated(response_id),
+            "a steered turn completes, so its retry replays -- an incomplete \
+             one would re-enter the interjection on every retry and never settle"
+        );
+        assert_eq!(
+            session.state().completed_usage_for(&TurnId::new("t1")),
+            Some(&billed),
+            "the retry is answered with the accounting the interjection \
+             supplied, the same as any completed turn's"
+        );
+        assert_eq!(
+            session
+                .state()
+                .items
+                .iter()
+                .filter(
+                    |item| matches!(&item.content, ItemContent::ToolCall { call_id, .. }
+                    if call_id == STEER_CALL_ID)
+                )
+                .count(),
+            1,
+            "and the call is emitted once, not once per retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_emitted_tool_call_opens_a_steer_and_the_matching_result_closes_it() {
+        let store = Arc::new(MemoryStore::new());
+        let (_, mut session) = new_session(store, "node-a").await;
+
+        let admission = session
+            .begin_turn(TurnId::new("t1"), vec![Item::user_text("q")])
+            .await
+            .unwrap();
+        let response_id = admission.response_id().clone();
+        session
+            .complete_with_item(&response_id, steer_call(), Usage::default())
+            .await
+            .unwrap();
+
+        let opened_at = *session
+            .state()
+            .open_steers
+            .get(STEER_CALL_ID)
+            .expect("an emitted tool call opens a steer");
+
+        // The client answers: it resends the call verbatim -- canonicalized
+        // with no response id, exactly as `canonical_item` produces it -- and
+        // appends the output it got.
+        session
+            .begin_turn(
+                TurnId::new("t2"),
+                vec![
+                    Item::user_text("q"),
+                    steer_call(),
+                    tool_result(STEER_CALL_ID, "{\"directive\":\"narrow the search\"}"),
+                ],
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !session.state().open_steers.contains_key(STEER_CALL_ID),
+            "the client's output for this call id closes it -- one writer, one \
+             event kind, no second source of truth"
+        );
+
+        // Fulfilment latency is derivable from the projection and the log
+        // alone, which is the reason the opening timestamp is what the
+        // projection holds.
+        let closed_at = session
+            .events_since(0, 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|event| {
+                matches!(&event.kind, SessionEventKind::ItemAppended { item }
+                    if matches!(&item.content, ItemContent::ToolResult { call_id, .. }
+                        if call_id == STEER_CALL_ID))
+            })
+            .expect("the closing item is in the log")
+            .at_ms;
+        assert!(
+            closed_at >= opened_at,
+            "latency is closed_at - opened_at, and it cannot be negative"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unrelated_tool_result_leaves_the_steer_open() {
+        let store = Arc::new(MemoryStore::new());
+        let (_, mut session) = new_session(store, "node-a").await;
+
+        let admission = session
+            .begin_turn(TurnId::new("t1"), vec![Item::user_text("q")])
+            .await
+            .unwrap();
+        let response_id = admission.response_id().clone();
+        session
+            .complete_with_item(&response_id, steer_call(), Usage::default())
+            .await
+            .unwrap();
+
+        // The agent's own tooling, running its own call, in the same turn the
+        // steer is still waiting on. Closing on any result rather than on the
+        // matching one would report a steer fulfilled that nobody answered.
+        session
+            .begin_turn(
+                TurnId::new("t2"),
+                vec![tool_result("call_the_agent_made", "42")],
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            session.state().open_steers.contains_key(STEER_CALL_ID),
+            "only the matching call id closes a steer"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_sent_tool_call_in_input_opens_no_steer() {
+        let store = Arc::new(MemoryStore::new());
+        let (_, mut session) = new_session(store, "node-a").await;
+
+        // The agent telling us about a call it made itself. Identical in shape
+        // to an emitted one and different in provenance: an input item carries
+        // no response id, because `canonical_item` sets none.
+        session
+            .begin_turn(
+                TurnId::new("t1"),
+                vec![Item::tool_call("call_the_agent_made", "grep", "{}")],
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            session.state().open_steers.is_empty(),
+            "a steer is opened by provenance, not by shape -- otherwise a \
+             client could open one by sending a tool call, and M6's \
+             open-steer exclusion would be a knob the client turns"
+        );
     }
 }
