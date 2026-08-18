@@ -187,13 +187,13 @@ async fn serve<S: SessionStore>(
     // One control plane behind all three, not one each: a key that pays for a
     // turn on one surface and is unknown to another would be a deployment with
     // two answers to the same question.
-    let app = http::router_under(Arc::clone(&plane), Arc::clone(&engine), Arc::clone(&store))
-        .merge(metrics_api::metrics_router_under(
+    let app = http::router(Arc::clone(&plane), Arc::clone(&engine), Arc::clone(&store))
+        .merge(metrics_api::metrics_router(
             Arc::clone(&plane),
             engine.metrics(),
             metrics_config,
         ))
-        .merge(responses_api::responses_router_under(plane, engine, store));
+        .merge(responses_api::responses_router(plane, engine, store));
     axum::serve(listener, app).await?;
     Ok(())
 }

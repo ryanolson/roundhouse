@@ -20,7 +20,7 @@ use roundhouse_core::control::Principal;
 use roundhouse_core::ids::{SessionId, TurnId};
 use roundhouse_core::item::Item;
 use roundhouse_core::metrics::{
-    MetricsConfig, MetricsFold, MetricsSnapshot, ServingMode, ShadowPricing,
+    MetricsConfig, MetricsFold, MetricsSnapshot, Scope, ServingMode, ShadowPricing,
 };
 use roundhouse_core::routing::{AffinityPolicy, RoutingPolicy};
 use roundhouse_core::store::{MemoryStore, SessionStore};
@@ -273,7 +273,7 @@ async fn the_live_numbers_match_a_cold_rebuild_from_the_log() {
             rebuilt.extend(&batch);
         }
     }
-    let rebuilt = MetricsSnapshot::build(&rebuilt, &metrics_config(), 0);
+    let rebuilt = MetricsSnapshot::build(&rebuilt, Scope::Deployment, &metrics_config(), 0);
 
     assert_eq!(live.calls, rebuilt.calls);
     assert_eq!(live.turns, rebuilt.turns);

@@ -14,7 +14,7 @@
 
 use roundhouse_core::event::{Accounting, SessionEvent, SessionEventKind, Usage};
 use roundhouse_core::ids::{ResponseId, SessionId};
-use roundhouse_core::metrics::{MetricsFold, MetricsSnapshot};
+use roundhouse_core::metrics::{MetricsFold, MetricsSnapshot, Scope};
 use roundhouse_core::routing::{CacheLedger, DecisionRecord, Target};
 use roundhouse_server::CatalogConfig;
 
@@ -160,7 +160,8 @@ fn a_valid_catalog_prices_the_same_call_identically_on_both_sides() {
     // Dashboard side: the same config's metrics config over a recorded call.
     let mut fold = MetricsFold::new();
     fold.extend(&one_frontier_call(one_mtok_of_uncached_input()));
-    let snapshot = MetricsSnapshot::build(&fold, &config.metrics_config(), 3_000);
+    let snapshot =
+        MetricsSnapshot::build(&fold, Scope::Deployment, &config.metrics_config(), 3_000);
     let dashboard_price = snapshot.models[0].billed_usd();
 
     assert_eq!(
@@ -212,7 +213,8 @@ fn a_negative_price_is_refused_by_the_catalog_boundary() {
     if let Ok(config) = &parsed {
         let mut fold = MetricsFold::new();
         fold.extend(&one_frontier_call(one_mtok_of_uncached_input()));
-        let snapshot = MetricsSnapshot::build(&fold, &config.metrics_config(), 3_000);
+        let snapshot =
+            MetricsSnapshot::build(&fold, Scope::Deployment, &config.metrics_config(), 3_000);
         let billed = snapshot.models[0].billed_usd();
         assert!(
             billed >= 0.0,

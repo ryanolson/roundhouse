@@ -31,7 +31,7 @@ use roundhouse_core::ids::SessionId;
 use roundhouse_core::routing::AffinityPolicy;
 use roundhouse_core::store::{MemoryStore, SessionStore};
 use roundhouse_fleet::{EchoFrontierClient, StaticFrontierCatalog};
-use roundhouse_server::{EchoLocalExecutor, Engine, EngineConfig, router};
+use roundhouse_server::{ControlPlane, EchoLocalExecutor, Engine, EngineConfig, router};
 
 mod common;
 use common::frontier_catalog;
@@ -62,7 +62,10 @@ fn transport_with(catalog: StaticFrontierCatalog) -> (Router, Arc<MemoryStore>) 
         Arc::new(AffinityPolicy::new()),
         EngineConfig::default(),
     ));
-    (router(engine, Arc::clone(&store)), store)
+    (
+        router(ControlPlane::open(), engine, Arc::clone(&store)),
+        store,
+    )
 }
 
 // ---------------------------------------------------------------------------

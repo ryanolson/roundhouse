@@ -606,7 +606,10 @@ mod tests {
         let (_, mut session) = new_session(store, "node-a").await;
         let principal = Principal::new("acme", "ada");
 
-        session.record_created("affinity", &principal).await.unwrap();
+        session
+            .record_created("affinity", &principal)
+            .await
+            .unwrap();
 
         let events = session.events_since(0, 10).await.unwrap();
         assert_eq!(events.len(), 1);

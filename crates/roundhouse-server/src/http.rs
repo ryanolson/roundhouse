@@ -35,7 +35,6 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::header::AUTHORIZATION;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -46,7 +45,7 @@ use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 
 use roundhouse_core::context::Tokenizer;
-use roundhouse_core::control::{KeyScope, Principal};
+use roundhouse_core::control::Principal;
 use roundhouse_core::event::{SessionEvent, SessionEventKind};
 use roundhouse_core::ids::{ResponseId, SessionId, TurnId};
 use roundhouse_core::item::{Item, Role};
@@ -92,30 +91,19 @@ impl<S: SessionStore, T: Tokenizer + Clone> Clone for Transport<S, T> {
     }
 }
 
-/// The transport's routes.
+/// The transport's routes, gated by a control plane.
+///
+/// One constructor, and the plane is required rather than defaulted: who may
+/// drive these routes is not a detail a call site should be able to leave out,
+/// and an unconfigured deployment says so by passing
+/// [`ControlPlane::open`](crate::control_config::ControlPlane::open). A
+/// convenience overload that supplied `Open` for you was one grep away from
+/// looking like the *normal* way to mount this.
 ///
 /// The store is passed alongside the engine rather than borrowed out of it: the
 /// streaming endpoints only read, and reading through the engine would suggest
 /// a coupling to turn execution that deliberately does not exist.
-pub fn router<S, T>(engine: Arc<Engine<S, T>>, store: Arc<S>) -> Router
-where
-    S: SessionStore,
-    T: Tokenizer + Clone + Send + Sync + 'static,
-{
-    router_under(Arc::new(ControlPlane::Open), engine, store)
-}
-
-/// The same routes, gated by a control plane.
-///
-/// Two constructors rather than one with an `Option`, because the two-argument
-/// form is what an unconfigured deployment *means* — no key, no namespace —
-/// and spelling that as `Open` at every call site would put the decision in
-/// the caller instead of in the name.
-pub fn router_under<S, T>(
-    plane: Arc<ControlPlane>,
-    engine: Arc<Engine<S, T>>,
-    store: Arc<S>,
-) -> Router
+pub fn router<S, T>(plane: Arc<ControlPlane>, engine: Arc<Engine<S, T>>, store: Arc<S>) -> Router
 where
     S: SessionStore,
     T: Tokenizer + Clone + Send + Sync + 'static,
@@ -228,25 +216,6 @@ impl ApiError {
             message: message.into(),
         }
     }
-
-    /// A session id the caller's key does not reach.
-    ///
-    /// 403 rather than 404: the caller is authenticated and the id is
-    /// well-formed, it simply belongs to somebody else. The message names the
-    /// prefix that *would* have worked and never says whether the session
-    /// exists — namespaced ids are guessable in a way cache keys were not, and
-    /// "not found" versus "forbidden" would turn this endpoint into an
-    /// existence oracle over other tenants' sessions.
-    fn out_of_namespace(principal: &Principal) -> Self {
-        Self {
-            status: StatusCode::FORBIDDEN,
-            code: "session_out_of_namespace",
-            message: format!(
-                "a session id must begin with `{}` for this key",
-                principal.namespace_prefix()
-            ),
-        }
-    }
 }
 
 /// The auth vocabulary, in this transport's error shape.
@@ -264,57 +233,29 @@ impl From<AuthError> for ApiError {
     }
 }
 
-/// The `Authorization` header, if the client sent one this transport can read.
+/// Refuse a session id outside the caller's namespace, in this transport's
+/// error shape.
 ///
-/// A header that is present but not ASCII is malformed rather than missing.
-/// Reporting it as missing would tell a client to add a key it already sent,
-/// which is the least actionable of the four answers in the table.
-fn authorization(headers: &HeaderMap) -> Result<Option<&str>, AuthError> {
-    match headers.get(AUTHORIZATION) {
-        None => Ok(None),
-        Some(value) => value.to_str().map(Some).map_err(|_| AuthError::MalformedKey),
-    }
-}
-
-/// Resolve the caller of a turn-serving surface to the membership it spends as.
-///
-/// The fourth row of the error table — `wrong_key_kind` — is decided here
-/// rather than inside `ControlPlane::resolve`, because whether an admin key is
-/// the wrong key depends on what the route wanted and only the route knows
-/// that. Both turn surfaces want exactly this answer, so there is one place
-/// for them to disagree with instead of two.
-///
-/// An admin key is refused rather than quietly given a principal of its own:
-/// an admin acts on the deployment and has no membership to bill, and the
-/// alternative — minting one — would put spend on a row no project owns.
-pub(crate) fn turn_principal(
-    plane: &ControlPlane,
-    headers: &HeaderMap,
-) -> Result<Principal, ApiError> {
-    match plane.resolve(authorization(headers)?)? {
-        KeyScope::Turn(principal) => Ok(principal),
-        KeyScope::Admin => Err(AuthError::WrongKeyKind.into()),
-    }
-}
-
-/// Refuse a session id outside the caller's namespace.
-///
-/// In [`ControlPlane::Open`] there is no namespace and every id passes, which
-/// is what keeps an unconfigured deployment's client-supplied ids working
-/// unchanged. In a configured one this is the whole of the native surface's
-/// authorization: session ids are the only thing this transport takes as
-/// input, and it streams the raw log — items, routing decisions, prices — for
-/// whichever one it is given.
+/// The decision itself is [`ControlPlane::contains`] — one function pair mints
+/// and checks the convention, and this is only the half that turns a `false`
+/// into the refusal a client reads. In [`ControlPlane::Open`] there is no
+/// namespace and every id passes, which is what keeps an unconfigured
+/// deployment's client-supplied ids working unchanged. In a configured one
+/// this is the whole of a session route's authorization: session ids are the
+/// only thing these transports take as input, and they stream the raw log —
+/// items, routing decisions, prices — for whichever one they are given.
 pub(crate) fn in_namespace(
     plane: &ControlPlane,
     principal: &Principal,
     session_id: &SessionId,
 ) -> Result<(), ApiError> {
-    match plane.session_prefix(principal) {
-        None => Ok(()),
-        Some(prefix) if session_id.as_str().starts_with(&prefix) => Ok(()),
-        Some(_) => Err(ApiError::out_of_namespace(principal)),
+    if plane.contains(principal, session_id) {
+        return Ok(());
     }
+    Err(AuthError::OutOfNamespace {
+        prefix: principal.namespace_prefix(),
+    }
+    .into())
 }
 
 impl IntoResponse for ApiError {
@@ -360,24 +301,27 @@ where
     S: SessionStore,
     T: Tokenizer + Clone + Send + Sync + 'static,
 {
-    let principal = turn_principal(&state.plane, &headers)?;
+    let principal = state.plane.turn_principal(&headers)?;
     let request: CreateSessionBody = if body.is_empty() {
         CreateSessionBody::default()
     } else {
         parse_body(&body)?
     };
 
-    // A minted id is namespaced, not just a checked one. An id this endpoint
-    // handed back that the caller's own key could not then use on
-    // `/v1/sessions/{id}/responses` would be a session created and immediately
-    // unreachable — the check below is what would refuse it.
-    let session_id = match (request.session_id, state.plane.session_prefix(&principal)) {
-        (Some(supplied), _) => {
+    // A minted id is namespaced, not just a checked one, and it is minted by
+    // the same pair that checks: an id this endpoint handed back that the
+    // caller's own key could not then use on `/v1/sessions/{id}/responses`
+    // would be a session created and immediately unreachable.
+    let session_id = match request.session_id {
+        Some(supplied) => {
             in_namespace(&state.plane, &principal, &supplied)?;
             supplied
         }
-        (None, None) => SessionId::generate(),
-        (None, Some(prefix)) => SessionId::new(format!("{prefix}{}", SessionId::generate())),
+        None => SessionId::new(
+            state
+                .plane
+                .qualify(&principal, SessionId::generate().as_str()),
+        ),
     };
     let created = state
         .engine
@@ -409,7 +353,7 @@ where
     let session_id = SessionId::new(session_id);
     // Before the body, and before the store: a key that may not touch this
     // session must not learn whether it exists, and must not cost a round trip.
-    let principal = turn_principal(&state.plane, &headers)?;
+    let principal = state.plane.turn_principal(&headers)?;
     in_namespace(&state.plane, &principal, &session_id)?;
     let request: CreateResponseBody = parse_body(&body)?;
     let input = request
@@ -473,7 +417,7 @@ where
     let session_id = SessionId::new(session_id);
     // This endpoint streams the raw log — items, routing decisions, prices —
     // so the namespace check is the whole of its authorization.
-    let principal = turn_principal(&state.plane, &headers)?;
+    let principal = state.plane.turn_principal(&headers)?;
     in_namespace(&state.plane, &principal, &session_id)?;
     let cursor = resume_cursor(&params, &headers)?;
 

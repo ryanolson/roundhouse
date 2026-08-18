@@ -141,17 +141,30 @@ struct Deployment {
 }
 
 fn metrics_config() -> Arc<MetricsConfig> {
-    Arc::new(MetricsConfig::new(ShadowPricing::new(vec![ReferenceModel {
-        provider: "anthropic".into(),
-        model: "claude".into(),
-        pricing: ProviderPricing {
-            input_per_mtok_usd: 3.0,
-            cached_input_per_mtok_usd: 0.3,
-            cache_write_per_mtok_usd: 3.75,
-            output_per_mtok_usd: 15.0,
+    Arc::new(MetricsConfig::new(ShadowPricing::new(vec![
+        ReferenceModel {
+            provider: "anthropic".into(),
+            model: "claude".into(),
+            pricing: ProviderPricing {
+                input_per_mtok_usd: 3.0,
+                cached_input_per_mtok_usd: 0.3,
+                cache_write_per_mtok_usd: 3.75,
+                output_per_mtok_usd: 15.0,
+            },
+            quality_prior: 0.95,
         },
-        quality_prior: 0.95,
-    }])))
+    ])))
+}
+
+/// The two-tenant configured deployment every gated test below starts from.
+///
+/// `ensure_rustls_crypto_provider` belongs here rather than at the top of each
+/// test: Codex's client installs a rustls provider on first use, and the one
+/// test that forgot the call would fail for a reason with nothing to do with
+/// tenancy.
+fn two_tenants() -> Deployment {
+    ensure_rustls_crypto_provider();
+    deployment(configured())
 }
 
 fn deployment(plane: Arc<ControlPlane>) -> Deployment {
@@ -167,21 +180,17 @@ fn deployment(plane: Arc<ControlPlane>) -> Deployment {
     ));
     let metrics = engine.metrics();
     let metrics_config = metrics_config();
-    let app = http::router_under(
-        Arc::clone(&plane),
-        Arc::clone(&engine),
-        Arc::clone(&store),
-    )
-    .merge(metrics_api::metrics_router_under(
-        Arc::clone(&plane),
-        Arc::clone(&metrics),
-        Arc::clone(&metrics_config),
-    ))
-    .merge(responses_api::responses_router_under(
-        plane,
-        engine,
-        Arc::clone(&store),
-    ));
+    let app = http::router(Arc::clone(&plane), Arc::clone(&engine), Arc::clone(&store))
+        .merge(metrics_api::metrics_router(
+            Arc::clone(&plane),
+            Arc::clone(&metrics),
+            Arc::clone(&metrics_config),
+        ))
+        .merge(responses_api::responses_router(
+            plane,
+            engine,
+            Arc::clone(&store),
+        ));
     Deployment {
         app,
         store,
@@ -298,7 +307,7 @@ async fn no_such_session(store: &MemoryStore, session_id: &str) -> bool {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn open_mode_serves_exactly_as_before() {
     ensure_rustls_crypto_provider();
-    let rig = deployment(Arc::new(ControlPlane::Open));
+    let rig = deployment(ControlPlane::open());
 
     let events = turn(
         &rig.app,
@@ -418,8 +427,7 @@ fn turn_body(cache_key: &str, text: &str) -> String {
 /// at a demonstrated defect.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_principals_using_one_cache_key_do_not_share_a_session() {
-    ensure_rustls_crypto_provider();
-    let rig = deployment(configured());
+    let rig = two_tenants();
 
     let mine = turn(
         &rig.app,
@@ -455,7 +463,10 @@ async fn two_principals_using_one_cache_key_do_not_share_a_session() {
     // Neither log contains a trace of the other. Rendered rather than compared
     // item-by-item, so a leak in any field of any item is caught, not only one
     // that happens to be an exact `Item::user_text`.
-    let mine_text: String = mine_items.iter().map(|item| item.content.render()).collect();
+    let mine_text: String = mine_items
+        .iter()
+        .map(|item| item.content.render())
+        .collect();
     let theirs_text: String = theirs_items
         .iter()
         .map(|item| item.content.render())
@@ -503,8 +514,7 @@ async fn two_principals_using_one_cache_key_do_not_share_a_session() {
 /// be wrong in whichever direction nobody was looking.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_turn_is_attributed_to_the_principal_that_paid_for_it() {
-    ensure_rustls_crypto_provider();
-    let rig = deployment(configured());
+    let rig = two_tenants();
 
     turn(
         &rig.app,
@@ -540,7 +550,10 @@ async fn a_turn_is_attributed_to_the_principal_that_paid_for_it() {
     assert_eq!(all["sessions"], 2);
 
     let tokens = |doc: &serde_json::Value| doc["tokens"]["input"].as_u64().expect("input tokens");
-    assert!(tokens(&mine) > 0, "acme's own tokens must be counted: {mine}");
+    assert!(
+        tokens(&mine) > 0,
+        "acme's own tokens must be counted: {mine}"
+    );
     assert_ne!(
         tokens(&mine),
         tokens(&theirs),
@@ -573,8 +586,7 @@ async fn a_turn_is_attributed_to_the_principal_that_paid_for_it() {
     let deployment_spend = spend(&all);
     assert!(deployment_spend > 0.0, "the fixture must spend something");
     assert!(
-        ((spend(&mine) + spend(&theirs)) - deployment_spend).abs()
-            <= deployment_spend * 1e-12,
+        ((spend(&mine) + spend(&theirs)) - deployment_spend).abs() <= deployment_spend * 1e-12,
         "the per-principal spend must sum to the deployment's: {} + {} != {}",
         spend(&mine),
         spend(&theirs),
@@ -591,14 +603,21 @@ async fn a_turn_is_attributed_to_the_principal_that_paid_for_it() {
 /// trip.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unknown_key_is_refused_before_a_session_is_created() {
-    ensure_rustls_crypto_provider();
-    let rig = deployment(configured());
+    let rig = two_tenants();
     let body = turn_body("main", "hello");
 
     for (key, status, code) in [
         (None, StatusCode::UNAUTHORIZED, "missing_key"),
-        (Some("not-a-roundhouse-key"), StatusCode::UNAUTHORIZED, "malformed_key"),
-        (Some(unknown_key().as_str()), StatusCode::UNAUTHORIZED, "unknown_key"),
+        (
+            Some("not-a-roundhouse-key"),
+            StatusCode::UNAUTHORIZED,
+            "malformed_key",
+        ),
+        (
+            Some(unknown_key().as_str()),
+            StatusCode::UNAUTHORIZED,
+            "unknown_key",
+        ),
     ] {
         let (got, payload) = send(&rig.app, "POST", "/v1/responses", key, &body).await;
         assert_eq!(got, status, "for key {key:?}: {payload}");
@@ -622,8 +641,7 @@ async fn an_unknown_key_is_refused_before_a_session_is_created() {
 /// the session exists or not.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_native_surface_session_outside_the_callers_namespace_is_refused() {
-    ensure_rustls_crypto_provider();
-    let rig = deployment(configured());
+    let rig = two_tenants();
 
     // Globex creates one of its own, so the id acme reaches for below really
     // exists — a refusal that only worked on absent sessions would prove
@@ -639,7 +657,11 @@ async fn a_native_surface_session_outside_the_callers_namespace_is_refused() {
     assert_eq!(status, StatusCode::OK);
 
     for (uri, method, body) in [
-        ("/v1/sessions", "POST", r#"{"session_id":"globex/bob/private"}"#),
+        (
+            "/v1/sessions",
+            "POST",
+            r#"{"session_id":"globex/bob/private"}"#,
+        ),
         (
             "/v1/sessions/globex%2Fbob%2Fprivate/responses",
             "POST",
@@ -648,7 +670,11 @@ async fn a_native_surface_session_outside_the_callers_namespace_is_refused() {
         ("/v1/sessions/globex%2Fbob%2Fprivate/events", "GET", ""),
     ] {
         let (status, payload) = send(&rig.app, method, uri, Some(&acme_key()), body).await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "for {method} {uri}: {payload}");
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "for {method} {uri}: {payload}"
+        );
         assert_eq!(
             payload["error"]["code"], "session_out_of_namespace",
             "for {method} {uri}"
@@ -711,8 +737,7 @@ async fn a_native_surface_session_outside_the_callers_namespace_is_refused() {
 /// anyone remembering to add it here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn replaying_a_log_recovers_the_principal() {
-    ensure_rustls_crypto_provider();
-    let rig = deployment(configured());
+    let rig = two_tenants();
 
     turn(
         &rig.app,
@@ -769,8 +794,7 @@ async fn replaying_a_log_recovers_the_principal() {
 /// actually express; the rest of the admin plane is a later milestone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_admin_key_cannot_serve_a_turn_and_a_turn_key_sees_only_its_own_metrics() {
-    ensure_rustls_crypto_provider();
-    let rig = deployment(configured());
+    let rig = two_tenants();
 
     // One real turn each, so there is something to see and something to hide.
     turn(
@@ -794,7 +818,11 @@ async fn an_admin_key_cannot_serve_a_turn_and_a_turn_key_sees_only_its_own_metri
         ("POST", "/v1/sessions", "{}".to_string()),
     ] {
         let (status, payload) = send(&rig.app, method, uri, Some(&admin_key()), &body).await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "for {method} {uri}: {payload}");
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "for {method} {uri}: {payload}"
+        );
         assert_eq!(payload["error"]["code"], "wrong_key_kind");
     }
     assert!(
@@ -837,8 +865,7 @@ async fn an_admin_key_cannot_serve_a_turn_and_a_turn_key_sees_only_its_own_metri
 /// the claim the whole key format was chosen to make good on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_codex_client_parses_a_full_turn_under_a_bearer_key() {
-    ensure_rustls_crypto_provider();
-    let rig = deployment(configured());
+    let rig = two_tenants();
 
     let events = turn(
         &rig.app,

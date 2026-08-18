@@ -127,6 +127,10 @@ impl RouterTransport {
     }
 }
 
+// The `Err` type is `codex_client`'s and the trait fixes the signature, so
+// there is nothing here to box: silencing it once at the impl beats the same
+// warning multiplied across every test binary that links this file.
+#[allow(clippy::result_large_err)]
 impl HttpTransport for RouterTransport {
     async fn execute(&self, request: Request) -> Result<Response, TransportError> {
         let url = request.url.clone();

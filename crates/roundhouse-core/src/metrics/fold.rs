@@ -10,10 +10,21 @@
 //! price would require replaying every session. Tokens are facts, so tokens
 //! are what is accumulated. [`super::snapshot`] applies the rate card.
 //!
-//! The seam between the two is three fields and one method, which is itself
-//! the argument that it is a real seam rather than a line drawn through one
-//! idea.
+//! The seam between the two is one method — [`MetricsFold::view`] — and the
+//! [`ScopeView`] it hands back, which is itself the argument that it is a real
+//! seam rather than a line drawn through one idea.
+//!
+//! ## One accumulator
+//!
+//! Everything is folded per principal, and the deployment's answers are
+//! *derived* from those rows rather than accumulated beside them. That is a
+//! deliberate trade of a little work per poll for the elimination of a whole
+//! class of bug: two accumulators fed at two sites drift the first time one
+//! path returns early, silently and permanently, and the drift shows up as a
+//! project's bill disagreeing with the deployment's. One accumulator cannot
+//! disagree with itself. See [`MetricsFold::by_principal`].
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 
 use crate::control::PrincipalKey;
@@ -60,6 +71,21 @@ impl Counters {
         total.add(&self.estimated_usage);
         total
     }
+
+    /// Add another row into this one, field by field.
+    ///
+    /// The one definition of what merging two rows means, and the reason a
+    /// deployment-wide row can be *derived* from its tenants' rather than
+    /// accumulated in parallel with them. Every field has to be listed here or
+    /// the deployment quietly under-reports it, which is why this sits beside
+    /// the fields rather than in the caller that happens to need it.
+    pub(super) fn absorb(&mut self, other: &Counters) {
+        self.calls += other.calls;
+        self.estimated_calls += other.estimated_calls;
+        self.reported_usage.add(&other.reported_usage);
+        self.estimated_usage.add(&other.estimated_usage);
+        self.quoted_alternative_usd += other.quoted_alternative_usd;
+    }
 }
 
 /// A dispatch waiting for its response to terminate.
@@ -70,7 +96,19 @@ struct Pending {
     best_frontier_alternative_usd: Option<f64>,
 }
 
-/// Folds session events into token and dollar aggregates.
+/// Whose numbers a report is about.
+///
+/// An enum rather than an `Option<&PrincipalKey>`, because `None` reads like a
+/// default and this is a choice: the deployment-wide document is what an admin
+/// gets, one principal's is what a turn key gets, and the difference between
+/// them is what stops a tenant reading its neighbours' traffic.
+#[derive(Debug, Clone, Copy)]
+pub enum Scope<'a> {
+    Deployment,
+    Principal(&'a PrincipalKey),
+}
+
+/// Folds session events into token aggregates.
 ///
 /// Idempotent by `(session, seq)`: an event already folded is ignored. That is
 /// what lets a live feed and a rebuild-from-log coexist without double
@@ -78,20 +116,20 @@ struct Pending {
 /// session it had already been watching.
 #[derive(Default)]
 pub struct MetricsFold {
-    pub(super) models: BTreeMap<ModelKey, Counters>,
-    /// The same counters again, split by who paid for them.
+    /// Counters, split by who paid for them. The only token accumulator here.
     ///
-    /// A second grouping of one set of events rather than a second count of
-    /// them: every row here is written by the same [`settle`] call that writes
-    /// the deployment-wide row, from the same event, inside the same
-    /// idempotency gate. That is what lets "the per-principal fold and the
-    /// deployment fold sum to the same totals" be asserted by a test instead
-    /// of hoped for — two accumulators updated at two sites would drift the
-    /// first time one path returned early, and the drift would be silent.
+    /// There is no deployment-wide copy beside this one, and its absence is the
+    /// design. A second accumulator would have to be written by the same code
+    /// path on pain of drift, and "on pain of drift" is a property held by
+    /// review rather than by the compiler — the first early return that skipped
+    /// one of the two would make a project's bill and the deployment's report
+    /// disagree, silently and forever. Deployment answers are summed out of
+    /// these rows on the way out instead (see [`Self::view`]), so drift is not
+    /// unlikely, it is unrepresentable.
     ///
     /// Keyed by [`PrincipalKey`] rather than by [`Principal`](crate::control::Principal)
     /// so that usage nobody can be charged for still lands somewhere visible.
-    pub(super) by_principal: BTreeMap<PrincipalKey, BTreeMap<ModelKey, Counters>>,
+    by_principal: BTreeMap<PrincipalKey, BTreeMap<ModelKey, Counters>>,
     /// Who each session belongs to, learned from its `SessionCreated`.
     ///
     /// Sound because that event is written into an empty log and so carries
@@ -131,13 +169,11 @@ pub struct MetricsFold {
     /// the process ends.
     response_of_turn: HashMap<TurnId, ResponseId>,
     turn_of_response: HashMap<ResponseId, TurnId>,
-    turns: u64,
     /// Turns admitted, split by who admitted them.
     ///
-    /// Beside the deployment counter for the same reason `by_principal` sits
-    /// beside `models`: a scoped report that filtered its rows but kept this
-    /// number deployment-wide would tell a tenant how busy its neighbours are,
-    /// in a field nobody thinks to check. See [`Self::totals_for`].
+    /// Per principal for the same reason the counters are: a scoped report that
+    /// filtered its rows but kept this number deployment-wide would tell a
+    /// tenant how busy its neighbours are, in a field nobody thinks to check.
     turns_of_principal: BTreeMap<PrincipalKey, u64>,
     /// The first and last event time seen for each principal.
     ///
@@ -146,17 +182,7 @@ pub struct MetricsFold {
     /// deployment's uptime, and would disclose when anyone else was last
     /// active.
     window_of_principal: BTreeMap<PrincipalKey, (u64, u64)>,
-    pub(super) first_at_ms: Option<u64>,
-    pub(super) last_at_ms: Option<u64>,
 }
-
-/// The rows of a fold that is empty for the principal asked about.
-///
-/// A principal with no counters is an ordinary answer — a key that has never
-/// served a turn — not a lookup failure, so [`MetricsFold::rows`] hands back
-/// an empty map rather than an `Option` every caller would have to unwrap into
-/// the same thing.
-static NO_ROWS: BTreeMap<ModelKey, Counters> = BTreeMap::new();
 
 /// The volume figures a snapshot carries that are not per-model.
 ///
@@ -169,6 +195,40 @@ pub(super) struct ScopeTotals {
     pub(super) turns: u64,
     pub(super) first_at_ms: Option<u64>,
     pub(super) last_at_ms: Option<u64>,
+}
+
+/// One scope's rows and volume figures, resolved together.
+///
+/// Together rather than by two lookups, because the failure being designed out
+/// is a report whose money is scoped and whose session count is not: with one
+/// value there is no second call for a caller to forget to scope. The rows are
+/// borrowed for a principal and owned for the deployment — the deployment's are
+/// summed on demand rather than kept — and [`Cow`] is what lets both answers
+/// have one type without copying a tenant's rows to say so.
+pub(super) struct ScopeView<'a> {
+    pub(super) rows: Cow<'a, BTreeMap<ModelKey, Counters>>,
+    pub(super) totals: ScopeTotals,
+}
+
+impl ScopeView<'_> {
+    /// Traffic shape per hosted model, for inferring correlaries.
+    ///
+    /// Off this view's own rows, so a scoped report infers its counterfactual
+    /// from its own traffic. Reading the deployment's shapes into one tenant's
+    /// report would price that tenant's local turns against a similarity
+    /// argument built out of somebody else's prompts — a number that moves when
+    /// a neighbour's workload changes, which is not a number anyone can defend
+    /// on a bill.
+    pub(super) fn frontier_shapes(&self) -> HashMap<(String, String), TokenShape> {
+        self.rows
+            .iter()
+            .filter(|(key, _)| key.mode == ServingMode::Frontier)
+            .filter_map(|(key, counters)| {
+                TokenShape::from_rollup(&counters.total_usage(), counters.calls)
+                    .map(|shape| ((key.provider.clone(), key.model.clone()), shape))
+            })
+            .collect()
+    }
 }
 
 impl MetricsFold {
@@ -184,26 +244,47 @@ impl MetricsFold {
         }
         *watermark = event.seq;
 
+        // Identity first, above everything that could want it. A session's very
+        // first event *is* its `SessionCreated`, and this is what teaches the
+        // fold whose the session is; learning it inside the match below, after
+        // the window had already been widened, filed that one event under
+        // `Unattributed` and started every scoped window one event late.
+        //
+        // Only ever an insert, never a change: the event is written once into
+        // an empty log, so a session cannot be reattributed part-way through
+        // and have half its spend land elsewhere.
+        if let SessionEventKind::SessionCreated {
+            principal: Some(principal),
+            ..
+        } = &event.kind
+        {
+            self.principal_of_session
+                .insert(event.session_id.clone(), PrincipalKey::from(principal));
+        }
+
+        // Resolved once, and widened here rather than after the match: two of
+        // the arms below return early, and a terminal event that settles no
+        // call — a dispatch that died before reaching the provider — is still
+        // an event this principal's window has to reach. Above the match there
+        // is no arm that can return past it.
+        //
         // Timestamps come from every event, not only the ones that carry
         // tokens: the window a rate is computed over is wall-clock, and a
         // session that opened an hour ago and has yet to complete a turn has
         // still been running for an hour.
-        self.first_at_ms = Some(
-            self.first_at_ms
-                .map_or(event.at_ms, |at| at.min(event.at_ms)),
-        );
-        self.last_at_ms = Some(
-            self.last_at_ms
-                .map_or(event.at_ms, |at| at.max(event.at_ms)),
-        );
+        let payer = self.principal_for(&event.session_id);
+        let window = self
+            .window_of_principal
+            .entry(payer.clone())
+            .or_insert((event.at_ms, event.at_ms));
+        window.0 = window.0.min(event.at_ms);
+        window.1 = window.1.max(event.at_ms);
 
         match &event.kind {
             SessionEventKind::TurnStarted {
                 turn_id,
                 response_id,
             } => {
-                self.turns += 1;
-                let payer = self.principal_for(&event.session_id);
                 *self.turns_of_principal.entry(payer).or_default() += 1;
                 // A second start for this turn means the first response will
                 // never terminate. Retire it now rather than hold it forever.
@@ -253,53 +334,23 @@ impl MetricsFold {
                     return true;
                 }
 
-                // Both accumulators, one definition of the arithmetic, and
-                // neither reachable without the other: every early return
-                // above this point skips both, so there is no path on which
-                // one fold books a call the other does not.
-                let payer = self.principal_for(&event.session_id);
-                let key = pending.key;
-                settle(
-                    self.models.entry(key.clone()).or_default(),
-                    usage,
-                    pending.best_frontier_alternative_usd,
-                );
                 settle(
                     self.by_principal
                         .entry(payer)
                         .or_default()
-                        .entry(key)
+                        .entry(pending.key)
                         .or_default(),
                     usage,
                     pending.best_frontier_alternative_usd,
                 );
             }
-            SessionEventKind::SessionCreated { principal, .. } => {
-                // Only ever an insert, never a change: the event is written
-                // once into an empty log, so a session cannot be reattributed
-                // part-way through and have half its spend land elsewhere.
-                if let Some(principal) = principal {
-                    self.principal_of_session
-                        .insert(event.session_id.clone(), PrincipalKey::from(principal));
-                }
-            }
-            SessionEventKind::ItemAppended { .. }
+            SessionEventKind::SessionCreated { .. }
+            | SessionEventKind::ItemAppended { .. }
             | SessionEventKind::OutputTextDelta { .. }
             | SessionEventKind::TurnDeduplicated { .. }
             | SessionEventKind::Error { .. } => {}
         }
 
-        // After the match, never before: a session's very first event *is* its
-        // `SessionCreated`, and the arm above is what taught this fold whose
-        // it is. Widening the window first would file that one event under
-        // `Unattributed` and leave every scoped window starting one event late.
-        let payer = self.principal_for(&event.session_id);
-        let window = self
-            .window_of_principal
-            .entry(payer)
-            .or_insert((event.at_ms, event.at_ms));
-        window.0 = window.0.min(event.at_ms);
-        window.1 = window.1.max(event.at_ms);
         true
     }
 
@@ -319,68 +370,71 @@ impl MetricsFold {
             .unwrap_or(PrincipalKey::Unattributed)
     }
 
-    /// Every principal this fold has counters for, marked row included.
+    /// The rows and volume figures a report is built over.
     ///
-    /// The public half of the per-principal seam: it names the rows a scoped
-    /// report would be built over. The counters themselves stay behind
-    /// `pub(super)`, reached the same way the deployment-wide rows are — see
-    /// `by_principal` — because [`Counters`] is money-free by design and
-    /// pricing happens in [`snapshot`](super::snapshot), on the way out, and
-    /// nowhere else.
-    pub fn principals(&self) -> Vec<PrincipalKey> {
-        self.by_principal.keys().cloned().collect()
-    }
-
-    /// The counter rows a report is built over: the deployment's, or one
-    /// principal's.
+    /// The one place a scope is resolved, so a report cannot read the
+    /// deployment's rows by forgetting to ask for its own.
     ///
-    /// The one place the two are chosen between, so a scoped report cannot
-    /// read the deployment's rows by forgetting to ask.
-    pub(super) fn rows(&self, scope: Option<&PrincipalKey>) -> &BTreeMap<ModelKey, Counters> {
+    /// The deployment's answers are all derived here — its rows summed out of
+    /// the per-principal ones, its sessions counted off the watermarks, its
+    /// turns and window folded over the per-principal maps. That costs an
+    /// O(principals x models) pass and an O(sessions) scan per call, which is
+    /// per dashboard poll and not per event, and it is the price of the
+    /// property in [`Self::by_principal`]: there is nothing for the deployment
+    /// figures to drift *from*, because they are a function of the only
+    /// accumulator there is.
+    pub(super) fn view(&self, scope: Scope<'_>) -> ScopeView<'_> {
         match scope {
-            None => &self.models,
-            Some(key) => self.by_principal.get(key).unwrap_or(&NO_ROWS),
-        }
-    }
-
-    /// The volume and window figures for the same scope.
-    ///
-    /// Sessions are counted by scanning the watermarks through
-    /// [`Self::principal_for`] rather than kept as a fourth per-principal map:
-    /// the answer is already implied by state the fold must keep anyway, and a
-    /// separate counter would be a second thing to keep in agreement with it —
-    /// exactly the drift `by_principal` was shaped to avoid. The scan is
-    /// O(sessions) once per request against a dashboard poll, not per event.
-    pub(super) fn totals_for(&self, scope: Option<&PrincipalKey>) -> ScopeTotals {
-        match scope {
-            None => ScopeTotals {
-                sessions: self.watermarks.len(),
-                turns: self.turns,
-                first_at_ms: self.first_at_ms,
-                last_at_ms: self.last_at_ms,
+            Scope::Deployment => ScopeView {
+                rows: Cow::Owned(self.deployment_rows()),
+                totals: ScopeTotals {
+                    sessions: self.watermarks.len(),
+                    turns: self.turns_of_principal.values().sum(),
+                    first_at_ms: self.window_of_principal.values().map(|(f, _)| *f).min(),
+                    last_at_ms: self.window_of_principal.values().map(|(_, l)| *l).max(),
+                },
             },
-            Some(key) => {
+            Scope::Principal(key) => {
                 let window = self.window_of_principal.get(key).copied();
-                ScopeTotals {
-                    sessions: self
-                        .watermarks
-                        .keys()
-                        .filter(|session| self.principal_for(session) == *key)
-                        .count(),
-                    turns: self.turns_of_principal.get(key).copied().unwrap_or(0),
-                    first_at_ms: window.map(|(first, _)| first),
-                    last_at_ms: window.map(|(_, last)| last),
+                ScopeView {
+                    // A principal with no counters is an ordinary answer — a key
+                    // that has never served a turn — not a lookup failure, so
+                    // this is an empty map rather than an `Option` every caller
+                    // would unwrap into the same thing.
+                    rows: match self.by_principal.get(key) {
+                        Some(rows) => Cow::Borrowed(rows),
+                        None => Cow::Owned(BTreeMap::new()),
+                    },
+                    totals: ScopeTotals {
+                        sessions: self
+                            .watermarks
+                            .keys()
+                            .filter(|session| self.principal_for(session) == *key)
+                            .count(),
+                        turns: self.turns_of_principal.get(key).copied().unwrap_or(0),
+                        first_at_ms: window.map(|(first, _)| first),
+                        last_at_ms: window.map(|(_, last)| last),
+                    },
                 }
             }
         }
     }
 
-    pub fn sessions(&self) -> usize {
-        self.watermarks.len()
+    /// Every principal's rows added together, which is what the deployment's
+    /// row for a model *is*. See [`Counters::absorb`].
+    fn deployment_rows(&self) -> BTreeMap<ModelKey, Counters> {
+        let mut merged: BTreeMap<ModelKey, Counters> = BTreeMap::new();
+        for rows in self.by_principal.values() {
+            for (key, counters) in rows {
+                merged.entry(key.clone()).or_default().absorb(counters);
+            }
+        }
+        merged
     }
 
+    /// Turns admitted across the deployment.
     pub fn turns(&self) -> u64 {
-        self.turns
+        self.turns_of_principal.values().sum()
     }
 
     /// Dispatches that were routed but whose response has not terminated.
@@ -399,37 +453,14 @@ impl MetricsFold {
     pub fn open_turns(&self) -> usize {
         self.response_of_turn.len()
     }
-
-}
-
-/// Traffic shape per hosted model, for inferring correlaries.
-///
-/// Takes the rows rather than the whole fold so a scoped report infers its
-/// counterfactual from its own traffic. Reading the deployment's shapes into
-/// one tenant's report would price that tenant's local turns against a
-/// similarity argument built out of somebody else's prompts — a number that
-/// moves when a neighbour's workload changes, which is not a number anyone can
-/// defend on a bill.
-pub(super) fn frontier_shapes(
-    rows: &BTreeMap<ModelKey, Counters>,
-) -> HashMap<(String, String), TokenShape> {
-    rows.iter()
-        .filter(|(key, _)| key.mode == ServingMode::Frontier)
-        .filter_map(|(key, counters)| {
-            TokenShape::from_rollup(&counters.total_usage(), counters.calls)
-                .map(|shape| ((key.provider.clone(), key.model.clone()), shape))
-        })
-        .collect()
 }
 
 /// Book one settled dispatch into a row.
 ///
-/// A free function with one caller-visible definition, called once per
-/// accumulator. It exists precisely so the deployment-wide fold and the
-/// per-principal fold cannot say different things about the same call: the
-/// alternative — two inlined copies of this arithmetic — drifts the first time
-/// one of them grows a case the other does not, and the drift shows up as a
-/// project's bill quietly disagreeing with the deployment's.
+/// A free function rather than an inlined block: it is the definition of what
+/// booking a call means, and keeping it named and in one piece is what makes
+/// [`Counters::absorb`] — the merge that has to stay in step with it — obviously
+/// its counterpart rather than a second, unrelated list of fields.
 fn settle(counters: &mut Counters, usage: &Usage, best_frontier_alternative_usd: Option<f64>) {
     counters.calls += 1;
     match usage.accounting {
@@ -460,4 +491,371 @@ fn best_frontier_alternative(decision: &DecisionRecord) -> Option<f64> {
         .filter(|candidate| !candidate.target.is_local())
         .map(|candidate| candidate.expected_cost_usd)
         .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+}
+
+#[cfg(test)]
+pub(super) mod tests {
+    use super::*;
+    use crate::control::Principal;
+    use crate::event::{Accounting, IncompleteReason};
+    use crate::routing::{Candidate, Target};
+
+    // The fixtures live here, with the fold they build logs for, and are
+    // re-used by the snapshot-level tests one module up. Two builders would be
+    // two clocks, and a test that compared a window across them would be
+    // asserting about the fixtures rather than about the fold.
+
+    pub(crate) fn local(model: &str) -> Target {
+        Target::Local {
+            worker_id: 7,
+            dp_rank: 0,
+            model: model.into(),
+        }
+    }
+
+    pub(crate) fn frontier(provider: &str, model: &str) -> Target {
+        Target::Frontier {
+            provider: provider.into(),
+            model: model.into(),
+        }
+    }
+
+    pub(crate) fn candidate(target: Target, cost: f64) -> Candidate {
+        Candidate {
+            target,
+            expected_prefill_tokens: 0.0,
+            matched_prefix_tokens: 0,
+            expected_ttft_ms: 0.0,
+            expected_cost_usd: cost,
+            quality_prior: 0.6,
+            load: None,
+        }
+    }
+
+    pub(crate) fn usage(input: u64, cached: u64, output: u64, reasoning: u64) -> Usage {
+        Usage {
+            input_tokens: input,
+            cached_input_tokens: cached,
+            output_tokens: output,
+            reasoning_tokens: reasoning,
+            accounting: Accounting::Reported,
+        }
+    }
+
+    pub(crate) fn principal(project: &str, user: &str) -> Principal {
+        Principal::new(project, user)
+    }
+
+    /// A minimal session log: one turn routed to `target` and completed.
+    ///
+    /// Built by hand rather than by driving the engine so the fold can be
+    /// tested against logs the engine cannot currently produce — a provider
+    /// that reported nothing, a dispatch that died before sending.
+    pub(crate) struct LogBuilder {
+        session: SessionId,
+        events: Vec<SessionEvent>,
+        at_ms: u64,
+    }
+
+    impl LogBuilder {
+        pub(crate) fn new(session: &str) -> Self {
+            Self {
+                session: SessionId::new(session),
+                events: Vec::new(),
+                at_ms: 1_000,
+            }
+        }
+
+        pub(crate) fn push(&mut self, kind: SessionEventKind) -> &mut Self {
+            self.at_ms += 10;
+            self.events.push(SessionEvent {
+                seq: self.events.len() as u64 + 1,
+                session_id: self.session.clone(),
+                at_ms: self.at_ms,
+                kind,
+            });
+            self
+        }
+
+        pub(crate) fn turn(
+            &mut self,
+            response: &str,
+            target: Target,
+            considered: Vec<Candidate>,
+            usage: Usage,
+        ) -> &mut Self {
+            let response_id = ResponseId::new(response);
+            self.push(SessionEventKind::TurnStarted {
+                turn_id: TurnId::new(format!("turn-{response}")),
+                response_id: response_id.clone(),
+            });
+            self.push(SessionEventKind::Routed {
+                response_id: response_id.clone(),
+                decision: DecisionRecord {
+                    chosen: target,
+                    rationale: "test".into(),
+                    policy: "test".into(),
+                    isl_tokens: usage.input_tokens,
+                    expected_prefill_tokens: 0.0,
+                    expected_cost_usd: 0.0,
+                    considered,
+                },
+            });
+            self.push(SessionEventKind::ResponseCompleted { response_id, usage });
+            self
+        }
+
+        /// Open the log the way the engine does: identity first, at seq 1.
+        ///
+        /// `None` is what a log written before the control plane looks like —
+        /// and so is never calling this at all, which is why both shapes are
+        /// exercised below.
+        pub(crate) fn created(&mut self, principal: Option<Principal>) -> &mut Self {
+            self.push(SessionEventKind::SessionCreated {
+                model_policy: "affinity".into(),
+                principal,
+            })
+        }
+
+        pub(crate) fn events(&self) -> &[SessionEvent] {
+            &self.events
+        }
+    }
+
+    fn claude() -> ModelKey {
+        ModelKey {
+            mode: ServingMode::Frontier,
+            provider: "anthropic".into(),
+            model: "claude".into(),
+        }
+    }
+
+    /// A terminal event that books nothing still belongs to somebody.
+    ///
+    /// The fixture is the shape the engine really produces: a dispatch that
+    /// died before reaching the provider, so its `ResponseIncomplete` carries
+    /// empty usage and settles no call. It is still an event in this session,
+    /// at this time, and the deployment's window widens for it. A scoped window
+    /// that stops one event short reports a tenant's rate over a shorter
+    /// interval than the traffic it is computed from, and does so silently.
+    ///
+    /// This is the regression test for the widening having once sat *after* the
+    /// match, past two early returns.
+    #[test]
+    fn a_terminal_event_that_settles_nothing_still_widens_the_scoped_window() {
+        let ada = principal("acme", "ada");
+        let mut log = LogBuilder::new("acme/ada/main");
+        log.created(Some(ada.clone()));
+        log.turn(
+            "r1",
+            frontier("anthropic", "claude"),
+            vec![],
+            usage(1_000, 0, 100, 0),
+        );
+        // No `Routed`, empty usage: both of the terminal arm's early returns
+        // are on this path.
+        log.push(SessionEventKind::ResponseIncomplete {
+            response_id: ResponseId::new("r2"),
+            reason: IncompleteReason::UpstreamError,
+            usage: Usage::default(),
+        });
+
+        let mut fold = MetricsFold::new();
+        fold.extend(log.events());
+
+        // One principal owns every session in this fold, so the two windows are
+        // the same window seen through two scopes.
+        let deployment = fold.view(Scope::Deployment).totals;
+        let scoped = fold
+            .view(Scope::Principal(&PrincipalKey::from(&ada)))
+            .totals;
+        assert_eq!(scoped.first_at_ms, deployment.first_at_ms);
+        assert_eq!(
+            scoped.last_at_ms, deployment.last_at_ms,
+            "the sole principal's window must reach the deployment's last event"
+        );
+        // And the settled-nothing event really is the last one, or the fixture
+        // could pass without exercising anything.
+        let last = log.events().last().expect("the log is non-empty").at_ms;
+        assert_eq!(scoped.last_at_ms, Some(last));
+    }
+
+    /// The window is widened before identity is known only for a log that never
+    /// declares one — never for a log whose first event declares it.
+    ///
+    /// The control for the test above: it pins the ordering from the other
+    /// side, so hoisting the widening above the identity insert instead of
+    /// below it would fail here rather than pass both.
+    #[test]
+    fn a_sessions_first_event_lands_in_its_own_window_not_the_marked_row() {
+        let ada = principal("acme", "ada");
+        let mut log = LogBuilder::new("acme/ada/main");
+        log.created(Some(ada.clone()));
+
+        let mut fold = MetricsFold::new();
+        fold.extend(log.events());
+
+        let created_at = log.events()[0].at_ms;
+        let scoped = fold
+            .view(Scope::Principal(&PrincipalKey::from(&ada)))
+            .totals;
+        assert_eq!(
+            scoped.first_at_ms,
+            Some(created_at),
+            "the `SessionCreated` is the principal's own first event"
+        );
+        let marked = fold
+            .view(Scope::Principal(&PrincipalKey::Unattributed))
+            .totals;
+        assert_eq!(
+            marked.first_at_ms, None,
+            "nothing in this log is unattributed, so the marked row has no window at all"
+        );
+    }
+
+    #[test]
+    fn unattributed_usage_is_folded_under_its_own_key_and_never_into_a_project() {
+        let mut attributed = LogBuilder::new("s1");
+        attributed.created(Some(principal("acme", "ada")));
+        attributed.turn(
+            "r1",
+            frontier("anthropic", "claude"),
+            vec![],
+            usage(1_000, 0, 100, 0),
+        );
+
+        // A session from before the control plane: no `SessionCreated` at all.
+        // Its tokens are real and have to be counted somewhere, but nobody can
+        // say whose they were.
+        let mut legacy = LogBuilder::new("s2");
+        legacy.turn(
+            "r2",
+            frontier("anthropic", "claude"),
+            vec![],
+            usage(7_000, 0, 700, 0),
+        );
+
+        let mut fold = MetricsFold::new();
+        fold.extend(attributed.events());
+        fold.extend(legacy.events());
+
+        let key = claude();
+        let acme = fold
+            .by_principal
+            .get(&PrincipalKey::from(&principal("acme", "ada")))
+            .expect("the attributed session has a row");
+        assert_eq!(
+            acme[&key].reported_usage.input_tokens, 1_000,
+            "a project is charged for its own turns and no others"
+        );
+
+        let unattributed = fold
+            .by_principal
+            .get(&PrincipalKey::Unattributed)
+            .expect("pre-control-plane usage is marked, not dropped");
+        assert_eq!(unattributed[&key].reported_usage.input_tokens, 7_000);
+
+        // The deployment total still sees both: marked is not the same as
+        // excluded. This is `Counters::absorb` merging two principals' rows for
+        // one model, which is the only way a deployment row is ever produced.
+        assert_eq!(
+            fold.deployment_rows()[&key].reported_usage.input_tokens,
+            8_000
+        );
+        assert_eq!(
+            fold.by_principal.keys().cloned().collect::<Vec<_>>(),
+            vec![
+                PrincipalKey::from(&principal("acme", "ada")),
+                PrincipalKey::Unattributed,
+            ],
+            "the marked row is a row a reader can see the size of, not a silent remainder"
+        );
+    }
+
+    /// Every field of `Counters` survives the merge.
+    ///
+    /// `absorb` is a hand-written list of fields, which is the one shape that
+    /// fails by omission rather than by compile error: a field added to
+    /// `Counters` and forgotten here reads as zero on the deployment's row
+    /// while the tenant's is correct. Two principals whose rows differ in every
+    /// field is what makes a dropped one visible.
+    #[test]
+    fn merging_two_principals_rows_carries_every_counter() {
+        let mut ada = LogBuilder::new("s1");
+        ada.created(Some(principal("acme", "ada")));
+        ada.turn(
+            "r1",
+            local("llama"),
+            vec![candidate(frontier("anthropic", "claude"), 0.042)],
+            usage(10_000, 8_000, 500, 40),
+        );
+
+        let mut bo = LogBuilder::new("s2");
+        bo.created(Some(principal("acme", "bo")));
+        bo.turn(
+            "r2",
+            local("llama"),
+            vec![candidate(frontier("anthropic", "claude"), 0.008)],
+            Usage {
+                accounting: Accounting::Estimated,
+                ..usage(3_000, 1_000, 200, 0)
+            },
+        );
+
+        let mut fold = MetricsFold::new();
+        fold.extend(ada.events());
+        fold.extend(bo.events());
+
+        let key = ModelKey {
+            mode: ServingMode::Local,
+            provider: crate::metrics::LOCAL_PROVIDER.into(),
+            model: "llama".into(),
+        };
+        let merged = &fold.deployment_rows()[&key];
+        assert_eq!(merged.calls, 2);
+        assert_eq!(merged.estimated_calls, 1, "one of the two was unreported");
+        assert_eq!(merged.reported_usage.input_tokens, 10_000);
+        assert_eq!(merged.reported_usage.cached_input_tokens, 8_000);
+        assert_eq!(merged.reported_usage.output_tokens, 500);
+        assert_eq!(merged.reported_usage.reasoning_tokens, 40);
+        assert_eq!(
+            merged.estimated_usage.input_tokens, 3_000,
+            "the provenance split has to survive the merge, or a deployment \
+             reports as measured what a tenant reports as estimated"
+        );
+        assert_eq!(merged.estimated_usage.output_tokens, 200);
+        assert!((merged.quoted_alternative_usd - 0.05).abs() < 1e-12);
+    }
+
+    #[test]
+    fn replaying_the_same_events_leaves_the_fold_unchanged() {
+        let mut ada = LogBuilder::new("s1");
+        ada.created(Some(principal("acme", "ada")));
+        ada.turn(
+            "r1",
+            frontier("anthropic", "claude"),
+            vec![],
+            usage(10_000, 8_000, 500, 0),
+        );
+        let mut legacy = LogBuilder::new("s2");
+        legacy.turn("r2", local("llama"), vec![], usage(1_000, 0, 100, 0));
+
+        let mut fold = MetricsFold::new();
+        fold.extend(ada.events());
+        fold.extend(legacy.events());
+        let by_principal = fold.by_principal.clone();
+        let turns = fold.turns();
+
+        // A restarted process replaying a log it has already been watching,
+        // which is the normal case for every session that takes a second turn.
+        assert_eq!(fold.extend(ada.events()), 0);
+        assert_eq!(fold.extend(legacy.events()), 0);
+
+        assert_eq!(
+            fold.by_principal, by_principal,
+            "idempotency by (session, seq) has to cover the attributed fold, \
+             or a replay doubles what a project is billed"
+        );
+        assert_eq!(fold.turns(), turns);
+    }
 }

@@ -58,9 +58,7 @@ use roundhouse_core::store::SessionStore;
 
 use crate::control_config::ControlPlane;
 use crate::engine::Engine;
-use crate::http::{
-    ApiError, LogTail, POLL_INTERVAL, READ_BATCH, parse_body, store_error, turn_principal,
-};
+use crate::http::{ApiError, LogTail, POLL_INTERVAL, READ_BATCH, parse_body, store_error};
 
 mod wire;
 use wire::{
@@ -111,24 +109,13 @@ impl<S: SessionStore, T: Tokenizer + Clone> Clone for Compat<S, T> {
     }
 }
 
-/// The compatibility surface's routes.
+/// The compatibility surface's route, gated by a control plane.
 ///
 /// Separate from [`http::router`](crate::http::router) rather than folded into
 /// it: the two speak different vocabularies over the same log, and merging them
-/// into one `Router` is the composition root's decision to make.
-pub fn responses_router<S, T>(engine: Arc<Engine<S, T>>, store: Arc<S>) -> Router
-where
-    S: SessionStore,
-    T: Tokenizer + Clone + Send + Sync + 'static,
-{
-    responses_router_under(Arc::new(ControlPlane::Open), engine, store)
-}
-
-/// The same route, gated by a control plane.
-///
-/// See [`http::router_under`](crate::http::router_under) for why this is a
-/// second constructor rather than an `Option` on the first.
-pub fn responses_router_under<S, T>(
+/// into one `Router` is the composition root's decision to make. One
+/// constructor with a required plane, for the reason given there.
+pub fn responses_router<S, T>(
     plane: Arc<ControlPlane>,
     engine: Arc<Engine<S, T>>,
     store: Arc<S>,
@@ -193,7 +180,7 @@ where
     // Before the body is even read: an unauthenticated request must cost this
     // process a hash lookup and nothing else, and must not be able to name a
     // session — which is what parsing the body would let it do.
-    let principal = turn_principal(&state.plane, &headers)?;
+    let principal = state.plane.turn_principal(&headers)?;
     let request: ResponsesRequest = parse_body(&body)?;
     if !request.stream {
         return Err(ApiError::unprocessable(
@@ -304,19 +291,19 @@ impl<S: SessionStore, T: Tokenizer + Clone> Compat<S, T> {
     /// The client's cache key inside its caller's namespace.
     ///
     /// A cache key is chosen by the client and nothing stops two of them
-    /// choosing `main`. Before this, both got the session called `main`: one
-    /// log, one lease, one warm prefix, and each tenant's conversation visible
-    /// in the other's prompt. The prefix is unambiguous because a project or
-    /// user id may not contain `/` — the config's slug rule is what buys that,
-    /// and it is why the rule is at the config boundary rather than here.
+    /// choosing `main`. Before namespacing, both got the session called `main`:
+    /// one log, one lease, one warm prefix, and each tenant's conversation
+    /// visible in the other's prompt.
     ///
-    /// In [`ControlPlane::Open`] there is no prefix at all, so an existing
-    /// deployment's session ids are exactly what they were.
+    /// Deferred to [`ControlPlane::qualify`] rather than spelled here, because
+    /// the id this mints is the id the native surface's namespace check will
+    /// later be asked about: minting and checking are one function pair, and
+    /// two spellings of the convention is how a namespace stops being one. The
+    /// prefix it produces is unambiguous because a project or user id may not
+    /// contain `/` — the config's slug rule is what buys that, and it is why
+    /// the rule is at the config boundary rather than here.
     fn namespaced_key(&self, principal: &Principal, cache_key: &str) -> String {
-        match self.plane.session_prefix(principal) {
-            Some(prefix) => format!("{prefix}{cache_key}"),
-            None => cache_key.to_string(),
-        }
+        self.plane.qualify(principal, cache_key)
     }
 
     /// The generation this namespaced key is currently bound to.

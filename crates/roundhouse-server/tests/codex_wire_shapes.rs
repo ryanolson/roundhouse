@@ -155,7 +155,12 @@ fn usage_object(input_tokens: u64, output_tokens: u64) -> Value {
 #[test]
 fn a_namespaced_function_call_round_trips_through_codex_protocol() {
     let arguments = r#"{"cursor":null}"#.to_string();
-    let item = function_call_item("fetch_steer", Some("mcp__roundhouse"), "rhsteer_x", &arguments);
+    let item = function_call_item(
+        "fetch_steer",
+        Some("mcp__roundhouse"),
+        "rhsteer_x",
+        &arguments,
+    );
 
     let value = serde_json::to_value(&item).expect("a FunctionCall item always serializes");
     assert_eq!(
@@ -386,7 +391,10 @@ async fn function_call_argument_deltas_are_not_observed_by_this_client() {
          frames in between: {events:#?}"
     );
     assert!(matches!(events[0], ResponseEvent::Created));
-    assert!(matches!(events[1], ResponseEvent::ToolCallInputDelta { .. }));
+    assert!(matches!(
+        events[1],
+        ResponseEvent::ToolCallInputDelta { .. }
+    ));
     assert!(matches!(events[2], ResponseEvent::OutputItemDone(_)));
     assert!(matches!(events[3], ResponseEvent::Completed { .. }));
 }

@@ -66,7 +66,7 @@ use crate::control::PrincipalKey;
 use crate::event::{SessionEvent, SessionObserver};
 use crate::routing::Target;
 
-pub use fold::MetricsFold;
+pub use fold::{MetricsFold, Scope};
 pub use pricing::{
     Correlary, DEFAULT_CAPABILITY_BAND, IncoherentCorrelary, PricedBasis, ReferenceModel,
     ShadowPricing, TokenShape,
@@ -167,15 +167,17 @@ impl MetricsRecorder {
 
     pub fn snapshot(&self, config: &MetricsConfig, generated_at_ms: u64) -> MetricsSnapshot {
         let fold = self.fold.read().unwrap_or_else(|e| e.into_inner());
-        MetricsSnapshot::build(&fold, config, generated_at_ms)
+        MetricsSnapshot::build(&fold, Scope::Deployment, config, generated_at_ms)
     }
 
     /// The same report, restricted to one principal's share of the same fold.
     ///
-    /// What a turn key is answered with. A separate method rather than an
-    /// `Option` on [`Self::snapshot`] so that "this document is somebody's
-    /// only" is a decision at the call site, visible in the surface that
-    /// serves it, rather than a `None` that reads like a default.
+    /// What a turn key is answered with. A separate method rather than a
+    /// [`Scope`] argument on [`Self::snapshot`] so that "this document is
+    /// somebody's only" is a decision named at the call site, in the surface
+    /// that serves it. The two are one function underneath — the scope seam is
+    /// [`MetricsSnapshot::build`] — so there is no second pricing walk for
+    /// these two entry points to disagree over.
     pub fn snapshot_for(
         &self,
         scope: &PrincipalKey,
@@ -183,7 +185,7 @@ impl MetricsRecorder {
         generated_at_ms: u64,
     ) -> MetricsSnapshot {
         let fold = self.fold.read().unwrap_or_else(|e| e.into_inner());
-        MetricsSnapshot::build_for(&fold, Some(scope), config, generated_at_ms)
+        MetricsSnapshot::build(&fold, Scope::Principal(scope), config, generated_at_ms)
     }
 }
 
@@ -195,13 +197,16 @@ impl SessionObserver for MetricsRecorder {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use super::*;
-    use crate::control::{Principal, PrincipalKey};
-    use crate::event::{Accounting, IncompleteReason, SessionEvent, SessionEventKind, Usage};
-    use crate::ids::{ResponseId, SessionId, TurnId};
-    use crate::routing::{Candidate, DecisionRecord, ProviderPricing};
+    // The log fixtures live with the fold they build logs for; see
+    // `fold::tests`. One builder means one clock, so a test that compares a
+    // window across two logs is asserting about the fold rather than about two
+    // fixtures that happened to agree.
+    use crate::control::PrincipalKey;
+    use crate::event::{Accounting, IncompleteReason, SessionEventKind, Usage};
+    use crate::ids::{ResponseId, TurnId};
+    use crate::metrics::fold::tests::{LogBuilder, candidate, frontier, local, principal, usage};
+    use crate::routing::{DecisionRecord, ProviderPricing};
 
     const HOSTED: ProviderPricing = ProviderPricing {
         input_per_mtok_usd: 3.0,
@@ -209,143 +214,6 @@ mod tests {
         cache_write_per_mtok_usd: 3.75,
         output_per_mtok_usd: 15.0,
     };
-
-    fn local(model: &str) -> Target {
-        Target::Local {
-            worker_id: 7,
-            dp_rank: 0,
-            model: model.into(),
-        }
-    }
-
-    fn frontier(provider: &str, model: &str) -> Target {
-        Target::Frontier {
-            provider: provider.into(),
-            model: model.into(),
-        }
-    }
-
-    fn candidate(target: Target, cost: f64) -> Candidate {
-        Candidate {
-            target,
-            expected_prefill_tokens: 0.0,
-            matched_prefix_tokens: 0,
-            expected_ttft_ms: 0.0,
-            expected_cost_usd: cost,
-            quality_prior: 0.6,
-            load: None,
-        }
-    }
-
-    fn usage(input: u64, cached: u64, output: u64, reasoning: u64) -> Usage {
-        Usage {
-            input_tokens: input,
-            cached_input_tokens: cached,
-            output_tokens: output,
-            reasoning_tokens: reasoning,
-            accounting: Accounting::Reported,
-        }
-    }
-
-    /// A minimal session log: one turn routed to `target` and completed.
-    ///
-    /// Built by hand rather than by driving the engine so the fold can be
-    /// tested against logs the engine cannot currently produce — a provider
-    /// that reported nothing, a dispatch that died before sending.
-    struct LogBuilder {
-        session: SessionId,
-        events: Vec<SessionEvent>,
-        at_ms: u64,
-    }
-
-    impl LogBuilder {
-        fn new(session: &str) -> Self {
-            Self {
-                session: SessionId::new(session),
-                events: Vec::new(),
-                at_ms: 1_000,
-            }
-        }
-
-        fn push(&mut self, kind: SessionEventKind) -> &mut Self {
-            self.at_ms += 10;
-            self.events.push(SessionEvent {
-                seq: self.events.len() as u64 + 1,
-                session_id: self.session.clone(),
-                at_ms: self.at_ms,
-                kind,
-            });
-            self
-        }
-
-        fn turn(
-            &mut self,
-            response: &str,
-            target: Target,
-            considered: Vec<Candidate>,
-            usage: Usage,
-        ) -> &mut Self {
-            let response_id = ResponseId::new(response);
-            self.push(SessionEventKind::TurnStarted {
-                turn_id: TurnId::new(format!("turn-{response}")),
-                response_id: response_id.clone(),
-            });
-            self.push(SessionEventKind::Routed {
-                response_id: response_id.clone(),
-                decision: DecisionRecord {
-                    chosen: target,
-                    rationale: "test".into(),
-                    policy: "test".into(),
-                    isl_tokens: usage.input_tokens,
-                    expected_prefill_tokens: 0.0,
-                    expected_cost_usd: 0.0,
-                    considered,
-                },
-            });
-            self.push(SessionEventKind::ResponseCompleted { response_id, usage });
-            self
-        }
-
-        /// Open the log the way the engine does: identity first, at seq 1.
-        ///
-        /// `None` is what a log written before the control plane looks like —
-        /// and so is never calling this at all, which is why both shapes are
-        /// exercised below.
-        fn created(&mut self, principal: Option<Principal>) -> &mut Self {
-            self.push(SessionEventKind::SessionCreated {
-                model_policy: "affinity".into(),
-                principal,
-            })
-        }
-
-        fn events(&self) -> &[SessionEvent] {
-            &self.events
-        }
-    }
-
-    fn principal(project: &str, user: &str) -> Principal {
-        Principal::new(project, user)
-    }
-
-    /// Add every principal's rows back together, field by field.
-    ///
-    /// Deliberately not sharing an `add` with the fold: the claim under test is
-    /// that two accumulators fed from one `apply` agree, and re-using the
-    /// fold's own arithmetic to check it would make the assertion circular.
-    fn summed_over_principals(fold: &MetricsFold) -> BTreeMap<ModelKey, fold::Counters> {
-        let mut summed: BTreeMap<ModelKey, fold::Counters> = BTreeMap::new();
-        for rows in fold.by_principal.values() {
-            for (key, counters) in rows {
-                let into = summed.entry(key.clone()).or_default();
-                into.calls += counters.calls;
-                into.estimated_calls += counters.estimated_calls;
-                into.reported_usage.add(&counters.reported_usage);
-                into.estimated_usage.add(&counters.estimated_usage);
-                into.quoted_alternative_usd += counters.quoted_alternative_usd;
-            }
-        }
-        summed
-    }
 
     fn config() -> MetricsConfig {
         MetricsConfig::new(
@@ -361,7 +229,7 @@ mod tests {
     }
 
     fn snapshot(fold: &MetricsFold) -> MetricsSnapshot {
-        MetricsSnapshot::build(fold, &config(), 9_999)
+        MetricsSnapshot::build(fold, Scope::Deployment, &config(), 9_999)
     }
 
     #[test]
@@ -628,154 +496,6 @@ mod tests {
     }
 
     #[test]
-    fn unattributed_usage_is_folded_under_its_own_key_and_never_into_a_project() {
-        let mut attributed = LogBuilder::new("s1");
-        attributed.created(Some(principal("acme", "ada")));
-        attributed.turn(
-            "r1",
-            frontier("anthropic", "claude"),
-            vec![],
-            usage(1_000, 0, 100, 0),
-        );
-
-        // A session from before the control plane: no `SessionCreated` at all.
-        // Its tokens are real and have to be counted somewhere, but nobody can
-        // say whose they were.
-        let mut legacy = LogBuilder::new("s2");
-        legacy.turn(
-            "r2",
-            frontier("anthropic", "claude"),
-            vec![],
-            usage(7_000, 0, 700, 0),
-        );
-
-        let mut fold = MetricsFold::new();
-        fold.extend(attributed.events());
-        fold.extend(legacy.events());
-
-        let key = ModelKey {
-            mode: ServingMode::Frontier,
-            provider: "anthropic".into(),
-            model: "claude".into(),
-        };
-        let acme = fold
-            .by_principal
-            .get(&PrincipalKey::from(&principal("acme", "ada")))
-            .expect("the attributed session has a row");
-        assert_eq!(
-            acme[&key].reported_usage.input_tokens, 1_000,
-            "a project is charged for its own turns and no others"
-        );
-
-        let unattributed = fold
-            .by_principal
-            .get(&PrincipalKey::Unattributed)
-            .expect("pre-control-plane usage is marked, not dropped");
-        assert_eq!(unattributed[&key].reported_usage.input_tokens, 7_000);
-
-        // The deployment total still sees both: marked is not the same as
-        // excluded.
-        assert_eq!(fold.models[&key].reported_usage.input_tokens, 8_000);
-        assert_eq!(
-            fold.principals(),
-            vec![
-                PrincipalKey::from(&principal("acme", "ada")),
-                PrincipalKey::Unattributed,
-            ],
-            "the marked row is a row a reader can see the size of, not a silent remainder"
-        );
-    }
-
-    #[test]
-    fn the_by_principal_fold_and_the_deployment_fold_report_the_same_totals() {
-        let mut ada = LogBuilder::new("s1");
-        ada.created(Some(principal("acme", "ada")));
-        ada.turn(
-            "r1",
-            frontier("anthropic", "claude"),
-            vec![],
-            usage(10_000, 8_000, 500, 40),
-        );
-        ada.turn(
-            "r2",
-            local("llama"),
-            vec![candidate(frontier("anthropic", "claude"), 0.042)],
-            usage(12_000, 9_000, 600, 0),
-        );
-
-        let mut bo = LogBuilder::new("s2");
-        bo.created(Some(principal("acme", "bo")));
-        // An unreported call, so the provenance split has to survive the second
-        // accumulator too — a per-principal row that quietly merged estimated
-        // into reported would still sum correctly on tokens.
-        bo.turn(
-            "r3",
-            frontier("anthropic", "claude"),
-            vec![],
-            Usage {
-                accounting: Accounting::Estimated,
-                ..usage(3_000, 0, 200, 0)
-            },
-        );
-
-        // A different project, and a legacy log, both of which have to land in
-        // the sum without landing in each other.
-        let mut cy = LogBuilder::new("s3");
-        cy.created(Some(principal("beta", "cy")));
-        cy.turn("r4", local("llama"), vec![], usage(5_000, 1_000, 250, 0));
-        let mut legacy = LogBuilder::new("s4");
-        legacy.turn("r5", local("llama"), vec![], usage(900, 0, 90, 0));
-
-        let mut fold = MetricsFold::new();
-        for log in [&ada, &bo, &cy, &legacy] {
-            fold.extend(log.events());
-        }
-
-        assert_eq!(
-            fold.by_principal.len(),
-            4,
-            "three memberships and the marked row"
-        );
-        assert_eq!(
-            summed_over_principals(&fold),
-            fold.models,
-            "the two folds are the same arithmetic over the same events, so they cannot disagree"
-        );
-    }
-
-    #[test]
-    fn replaying_the_same_events_leaves_both_folds_unchanged() {
-        let mut ada = LogBuilder::new("s1");
-        ada.created(Some(principal("acme", "ada")));
-        ada.turn(
-            "r1",
-            frontier("anthropic", "claude"),
-            vec![],
-            usage(10_000, 8_000, 500, 0),
-        );
-        let mut legacy = LogBuilder::new("s2");
-        legacy.turn("r2", local("llama"), vec![], usage(1_000, 0, 100, 0));
-
-        let mut fold = MetricsFold::new();
-        fold.extend(ada.events());
-        fold.extend(legacy.events());
-        let models = fold.models.clone();
-        let by_principal = fold.by_principal.clone();
-
-        // A restarted process replaying a log it has already been watching,
-        // which is the normal case for every session that takes a second turn.
-        assert_eq!(fold.extend(ada.events()), 0);
-        assert_eq!(fold.extend(legacy.events()), 0);
-
-        assert_eq!(fold.models, models);
-        assert_eq!(
-            fold.by_principal, by_principal,
-            "idempotency by (session, seq) has to cover the attributed fold too, \
-             or a replay doubles what a project is billed"
-        );
-    }
-
-    #[test]
     fn reasoning_tokens_stay_inside_output() {
         let mut log = LogBuilder::new("s1");
         log.turn(
@@ -847,10 +567,10 @@ mod tests {
         fold.extend(legacy.events());
 
         let config = config();
-        let deployment = MetricsSnapshot::build(&fold, &config, 9_999);
-        let scoped = MetricsSnapshot::build_for(
+        let deployment = MetricsSnapshot::build(&fold, Scope::Deployment, &config, 9_999);
+        let scoped = MetricsSnapshot::build(
             &fold,
-            Some(&PrincipalKey::from(&acme)),
+            Scope::Principal(&PrincipalKey::from(&acme)),
             &config,
             9_999,
         );
@@ -874,31 +594,16 @@ mod tests {
             "the fixture must actually distinguish the two windows"
         );
 
-        // And the scoped documents still add up to the deployment's, which is
-        // the property that makes a per-tenant bill defensible.
-        let unattributed =
-            MetricsSnapshot::build_for(&fold, Some(&PrincipalKey::Unattributed), &config, 9_999);
-        let ours = MetricsSnapshot::build_for(
-            &fold,
-            Some(&PrincipalKey::from(&globex)),
-            &config,
-            9_999,
-        );
-        assert_eq!(
-            scoped.tokens.total + ours.tokens.total + unattributed.tokens.total,
-            deployment.tokens.total
-        );
-        assert_eq!(
-            scoped.calls + ours.calls + unattributed.calls,
-            deployment.calls
-        );
-        assert_eq!(
-            scoped.turns + ours.turns + unattributed.turns,
-            deployment.turns
-        );
-        assert_eq!(
-            scoped.sessions + ours.sessions + unattributed.sessions,
-            deployment.sessions
-        );
+        // The scoped documents adding up to the deployment's was asserted here
+        // and no longer is, deliberately. It was a real claim while two folds
+        // were accumulated side by side; now the deployment's rows, turns and
+        // sessions are *summed out of* the per-principal ones on the way out
+        // (see `MetricsFold::view`), so the assertion reduces to `x == x`. The
+        // property is now held by construction, and a test that cannot fail is
+        // worse than no test: it reads as coverage.
+        //
+        // The half that is still a claim is above — a scoped document that
+        // filtered its rows but not its window, session count or turn count.
+        // That one can regress, so that one stays.
     }
 }

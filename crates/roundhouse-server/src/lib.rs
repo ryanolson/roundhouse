@@ -37,11 +37,13 @@ pub mod responses_api;
 pub mod tokenizer;
 
 pub use catalog_config::{CatalogConfig, CatalogError};
-pub use control_config::{AuthError, ControlPlane, ControlPlaneConfig, ControlPlaneError};
+pub use control_config::{
+    AuthError, ControlPlane, ControlPlaneConfig, ControlPlaneError, KeyScope,
+};
 pub use engine::{
     EchoLocalExecutor, Engine, EngineConfig, EngineError, LocalExecution, LocalExecutor, TurnResult,
 };
-pub use http::{router, router_under};
-pub use metrics_api::{metrics_router, metrics_router_under};
-pub use responses_api::{responses_router, responses_router_under};
+pub use http::router;
+pub use metrics_api::metrics_router;
+pub use responses_api::responses_router;
 pub use tokenizer::HfTokenizer;

@@ -15,11 +15,18 @@
 //! belongs to; the membership has no need to know which secret proved it. Were
 //! the credential a field, every construction site would have to produce one —
 //! and an unconfigured deployment, which authenticates nothing, has none to
-//! give. The choice is between an `Option<KeyId>` that is always `None` on the
+//! give. The choice is between an optional key id that is always absent on the
 //! open path and a type where the question cannot be asked. The second keeps
 //! the invalid state unrepresentable, and it is what lets the open-mode default
 //! below be an ordinary value rather than a special case threaded through the
 //! engine.
+//!
+//! It follows that **no key vocabulary lives here at all.** What a presented
+//! key is allowed to do is a property of the thing that resolves it, so the
+//! scope enum sits beside `ControlPlane::resolve` in the server crate. A key
+//! *record* — the id an audit line or a revocation names — has no producer yet;
+//! it arrives with the admin plane, and it will arrive next to the resolver
+//! too, not here.
 //!
 //! **[`PrincipalKey`] has an `Unattributed` arm and it is not a `None`.** Logs
 //! written before the control plane existed carry no identity, and they are not
@@ -44,12 +51,6 @@ string_id!(
     "user",
     "Identifies one human: a stable handle (email or SSO subject), not a display\nname.\n\nA user is only ever encountered through a membership, never alone: the same\nperson on two projects is two [`Principal`]s, because their budget and their\nmodel access differ per project."
 );
-string_id!(
-    KeyId,
-    "key",
-    "Identifies one API key *record* — never the secret itself.\n\nThe secret is held only as a hash (see the control-plane config), so this is\nwhat an audit line, a revocation, or an admin listing refers to."
-);
-
 /// The resolved caller: one membership, and nothing about how it was proved.
 ///
 /// Total by construction — there is no code path below the extractor that can
@@ -85,10 +86,16 @@ impl Principal {
 
     /// The prefix every session id belonging to this principal starts with.
     ///
-    /// Defined once, here, because two places have to agree on it exactly: the
-    /// generator that mints a namespaced session id and the check that refuses
-    /// a client-supplied id from outside the caller's namespace. Two spellings
-    /// of the same convention is how a namespace stops being one.
+    /// **The one spelling of the namespace convention.** Everything else that
+    /// touches it is built on this: the server's `ControlPlane::qualify` mints
+    /// ids with it, `ControlPlane::contains` checks them against it, and the
+    /// refusal that names the prefix a caller should have used reads it from
+    /// here too. It stays in core rather than moving up beside those, because
+    /// the shape `{project}/{user}/` is a fact about a [`Principal`] — the
+    /// [`Display`](fmt::Display) impl below is the same string without the
+    /// trailing slash — while *whether a deployment namespaces at all* is a
+    /// fact about the deployment, and belongs with the control plane. Two
+    /// spellings of one convention is how a namespace stops being one.
     ///
     /// Unambiguous because `/` cannot occur inside either id — project and user
     /// ids are validated as slugs where they are configured — so the prefix
@@ -106,32 +113,6 @@ impl fmt::Display for Principal {
     }
 }
 
-/// What a presented key is allowed to do.
-///
-/// An enum rather than a `role` field beside an optional principal, because the
-/// two arms carry genuinely different data: an admin key has no membership to
-/// spend against, and a turn key has no business mutating tenancy. Matching on
-/// this at the extractor is what makes "an admin key served a turn" a shape the
-/// code cannot express, rather than a check somebody has to remember.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum KeyScope {
-    /// Pays for turns as one membership.
-    Turn(Principal),
-    /// Reads and writes the control plane itself. Deliberately carries no
-    /// principal: an admin acts on the deployment, not from inside a project.
-    Admin,
-}
-
-impl KeyScope {
-    /// The membership this key spends as, if it spends at all.
-    pub fn principal(&self) -> Option<&Principal> {
-        match self {
-            KeyScope::Turn(principal) => Some(principal),
-            KeyScope::Admin => None,
-        }
-    }
-}
-
 /// The grouping the metrics fold accumulates against.
 ///
 /// Distinct from [`Principal`] because a fold must be total over every log it
@@ -140,24 +121,15 @@ impl KeyScope {
 /// best-guess project.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PrincipalKey {
-    Attributed { project: ProjectId, user: UserId },
+    Attributed {
+        project: ProjectId,
+        user: UserId,
+    },
     /// Usage from a log that names no principal.
     ///
     /// Ordered last so it sorts to the bottom of a report rather than into the
     /// middle of the projects.
     Unattributed,
-}
-
-impl PrincipalKey {
-    /// The principal this key stands for, or `None` for [`Self::Unattributed`].
-    pub fn principal(&self) -> Option<Principal> {
-        match self {
-            PrincipalKey::Attributed { project, user } => {
-                Some(Principal::new(project.clone(), user.clone()))
-            }
-            PrincipalKey::Unattributed => None,
-        }
-    }
 }
 
 impl From<&Principal> for PrincipalKey {
@@ -227,18 +199,8 @@ mod tests {
     }
 
     #[test]
-    fn an_admin_key_has_no_membership_to_spend_as() {
-        assert_eq!(KeyScope::Admin.principal(), None);
-        let principal = Principal::new("acme", "ada");
-        assert_eq!(
-            KeyScope::Turn(principal.clone()).principal(),
-            Some(&principal)
-        );
-    }
-
-    #[test]
     fn unattributed_sorts_after_every_project() {
-        let mut keys = vec![
+        let mut keys = [
             PrincipalKey::Unattributed,
             PrincipalKey::from(&Principal::new("zeta", "zoe")),
             PrincipalKey::from(&Principal::new("acme", "ada")),
