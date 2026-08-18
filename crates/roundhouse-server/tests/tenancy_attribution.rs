@@ -51,7 +51,7 @@ use roundhouse_server::{
 
 mod common;
 use common::codex::{NoAuth, RouterTransport, StaticToken, collect, request, user_message};
-use common::frontier_catalog;
+use common::{frontier_catalog, path_segment};
 
 /// What the echo provider answers with, and therefore what every turn here
 /// contains.
@@ -656,20 +656,21 @@ async fn a_native_surface_session_outside_the_callers_namespace_is_refused() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
+    let theirs = path_segment("globex/bob/private");
     for (uri, method, body) in [
         (
-            "/v1/sessions",
+            "/v1/sessions".to_string(),
             "POST",
             r#"{"session_id":"globex/bob/private"}"#,
         ),
         (
-            "/v1/sessions/globex%2Fbob%2Fprivate/responses",
+            format!("/v1/sessions/{theirs}/responses"),
             "POST",
             r#"{"turn_id":"t1","input":[{"role":"user","text":"hello"}]}"#,
         ),
-        ("/v1/sessions/globex%2Fbob%2Fprivate/events", "GET", ""),
+        (format!("/v1/sessions/{theirs}/events"), "GET", ""),
     ] {
-        let (status, payload) = send(&rig.app, method, uri, Some(&acme_key()), body).await;
+        let (status, payload) = send(&rig.app, method, &uri, Some(&acme_key()), body).await;
         assert_eq!(
             status,
             StatusCode::FORBIDDEN,
@@ -719,7 +720,10 @@ async fn a_native_surface_session_outside_the_callers_namespace_is_refused() {
         status_of(
             &rig.app,
             "GET",
-            "/v1/sessions/acme%2Fada%2Fmine/events?starting_after=0",
+            &format!(
+                "/v1/sessions/{}/events?starting_after=0",
+                path_segment("acme/ada/mine")
+            ),
             Some(&acme_key()),
         )
         .await,

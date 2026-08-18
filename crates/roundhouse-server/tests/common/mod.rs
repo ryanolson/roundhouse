@@ -35,6 +35,19 @@ pub const BLOCK_SIZE: u32 = 16;
 pub const LOCAL_MODEL: &str = "local";
 pub const MINUTE: u64 = 60_000;
 
+/// A namespaced session id as one path segment.
+///
+/// A Configured deployment's ids carry `/`, and a route parameter matches a
+/// single segment, so the separators have to be escaped or the request routes
+/// nowhere. Spelled out here rather than worked around silently because a
+/// `404` from a mistyped path and a `404` from an unescaped id read
+/// identically — and shared rather than written per suite because a
+/// hand-written `%2F` literal in a URL is the same fact stated a second time,
+/// where the next reader cannot tell an escape from a typo.
+pub fn path_segment(session_id: &str) -> String {
+    session_id.replace('/', "%2F")
+}
+
 /// One priced frontier model, so a turn always has somewhere to go.
 pub fn frontier_catalog() -> StaticFrontierCatalog {
     StaticFrontierCatalog::new(vec![FrontierModelSpec {

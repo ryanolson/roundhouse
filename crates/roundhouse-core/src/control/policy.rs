@@ -37,10 +37,24 @@
 //!
 //! **The cadence counts dispatches, not successes.** See [`FrontierCadence`].
 
+use std::fmt;
+
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::routing::{Candidate, Target};
+
+/// The version tag every canonical policy string opens with, and therefore
+/// part of every digest in every log.
+///
+/// **The rule: when the golden pins in
+/// `the_digest_of_two_known_policies_is_pinned_to_a_literal` fail, the
+/// encoding changed and this constant gets bumped** — before, not instead of,
+/// updating the literals. A log spans the change; two encodings sharing one
+/// version tag makes a fingerprint from either side of it unreadable, which is
+/// the one property the digest exists to have. Editing the pinned literals
+/// alone is the shortcut that costs it.
+const DIGEST_VERSION: &str = "v1";
 
 /// Patterns naming the targets a principal may be routed to.
 ///
@@ -74,8 +88,18 @@ use crate::routing::{Candidate, Target};
 /// representable (two disjoint layers), and cannot be detected here — the
 /// catalog it would be checked against is a different file. That check belongs
 /// where both are loaded, and the process refuses to serve without it.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(try_from = "Vec<String>")]
+/// # Not deserializable, on purpose
+///
+/// There is no `Deserialize` impl and no `TryFrom<Vec<String>>`. Both existed
+/// and neither was ever used: the configuration boundary reads raw
+/// `Vec<String>` into its own `PolicyConfig` and calls [`Self::parse`]
+/// explicitly, precisely so a malformed pattern is refused *naming the entry
+/// it came from* rather than as a bare serde error naming a JSON path. A
+/// `Deserialize` impl here is therefore not a convenience but a second door
+/// into the same room, and the one behind it produces the worse error — so it
+/// is gone, and this paragraph is here so it does not come back as an
+/// obvious-looking addition.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TargetFilter {
     /// Conjunction of disjunctions: every layer must admit, and within a layer
     /// any pattern does.
@@ -90,6 +114,24 @@ pub enum FilterError {
         "target pattern `{pattern}` uses `{token}`, which this dialect does not support: the only metacharacter is `*`, and it already crosses `/`"
     )]
     Unsupported {
+        pattern: String,
+        token: &'static str,
+    },
+    /// A pattern carrying a character the digest encoding reserves.
+    ///
+    /// Separate from [`Self::Unsupported`] because the reason is different and
+    /// an operator has to be told which one applies: `**` is syntax this
+    /// matcher does not implement, while a comma is syntax the *fingerprint*
+    /// cannot represent. See [`TurnPolicy::canonical`] — the two are one
+    /// edit apart and have to stay that way.
+    ///
+    /// [`TurnPolicy::canonical`]: TargetFilter::canonical
+    #[error(
+        "target pattern `{pattern}` contains {token}, which the policy digest's canonical \
+         encoding uses to separate patterns and layers: one pattern carrying it would encode \
+         as two, and would fingerprint identically to a filter that really has two"
+    )]
+    Unencodable {
         pattern: String,
         token: &'static str,
     },
@@ -119,10 +161,45 @@ impl TargetFilter {
                 if pattern.is_empty() {
                     return Err(FilterError::EmptyPattern);
                 }
+                // Two rejection lists, refusing for two different reasons.
+                //
+                // These four are dialects this matcher does not implement.
+                // Taken literally instead, a filter would quietly match
+                // nothing, route every turn local, and look exactly like a
+                // cost win.
                 for token in ["**", "?", "[", "{"] {
                     if pattern.contains(token) {
                         return Err(FilterError::Unsupported { pattern, token });
                     }
+                }
+                // These are the characters `TargetFilter::canonical` builds
+                // the digest input out of: it joins a layer's patterns with
+                // `,` and the layers with `;`. A pattern carrying either
+                // encodes as two patterns, so `["a,b"]` — which admits
+                // nothing — and `["a", "b"]` — which admits both — produce
+                // the identical canonical string and the identical
+                // fingerprint. Whitespace and control characters go with them
+                // because they cannot appear in a `policy_identity` either
+                // (both halves are `provider/model`) and because a pattern
+                // that differs from another only by a trailing newline is a
+                // second spelling of one policy, which is exactly what
+                // canonicalization exists to rule out.
+                //
+                // Refused here rather than escaped there: escaping keeps the
+                // collision reachable through any later encoding change, and
+                // would have to be gotten right inside the one function whose
+                // output is pinned by golden digest.
+                if let Some(offender) = pattern
+                    .chars()
+                    .find(|c| matches!(c, ',' | ';') || c.is_whitespace() || c.is_control())
+                {
+                    let token = match offender {
+                        ',' => "a comma",
+                        ';' => "a semicolon",
+                        c if c.is_whitespace() => "whitespace",
+                        _ => "a control character",
+                    };
+                    return Err(FilterError::Unencodable { pattern, token });
                 }
                 Ok(pattern)
             })
@@ -157,6 +234,14 @@ impl TargetFilter {
     /// conjunction of disjunctions means the same thing however it is written
     /// — so two policies that differ only in the order an operator listed
     /// their patterns must not read as different policies in the audit trail.
+    ///
+    /// **The two separators below are the reason [`Self::parse`] refuses `,`
+    /// and `;` inside a pattern**, and its second rejection list names this
+    /// function for the same reason this comment names that one. Nothing else
+    /// makes the encoding injective: a pattern free to contain a separator
+    /// turns one layer into two and hands two policies with different
+    /// admissible sets the same fingerprint. Changing a separator here means
+    /// changing the rejection list there, in the same edit.
     fn canonical(&self) -> String {
         let mut layers: Vec<String> = self
             .layers
@@ -172,11 +257,47 @@ impl TargetFilter {
     }
 }
 
+impl fmt::Display for TargetFilter {
+    /// The layered intersection, spelled the way the filter reads: alternatives
+    /// within a layer separated by `|` and parenthesized, layers joined by
+    /// ` & ` because every one of them must admit.
+    ///
+    /// For the operator staring at a startup refusal. A
+    /// [`TurnPolicy::digest`] tells them that two keys differ; it never tells
+    /// them which pattern they mistyped, and the pattern is the entire content
+    /// of the mistake. Deliberately *not* [`Self::canonical`], whose whole job
+    /// is to be a stable digest input — sorting and separators there answer to
+    /// the audit trail, and a rendering that answered to both would be one
+    /// change away from silently moving every digest in a deployment's log.
+    ///
+    /// The absent filter renders as `*`, which is what it means and what an
+    /// operator would have written for it.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.layers.is_empty() {
+            return f.write_str("*");
+        }
+        for (index, layer) in self.layers.iter().enumerate() {
+            if index > 0 {
+                f.write_str(" & ")?;
+            }
+            match layer.as_slice() {
+                [only] => f.write_str(only)?,
+                many => write!(f, "({})", many.join("|"))?,
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Match `value` against a pattern whose only metacharacter is `*`.
 ///
 /// The textbook two-pointer walk with one backtrack point rather than a
-/// regex: it is linear in practice, allocation-free, and — the reason that
-/// matters here — it has no dialect. A regex crate would silently give `.`,
+/// regex: it is linear in practice, allocates the two `char` vectors and
+/// nothing else, and — the reason that matters here — it has no dialect. (The
+/// vectors buy indexing by character rather than by byte, so a multi-byte
+/// pattern cannot be split mid-character by the backtrack; a byte walk would
+/// be allocation-free and wrong for any non-ASCII model name.) A regex crate
+/// would silently give `.`,
 /// `+` and anchoring meanings the documented dialect does not have, and the
 /// first operator to write `anthropic/claude.*` would get a filter that means
 /// something other than what it reads as.
@@ -207,14 +328,6 @@ fn glob_match(pattern: &str, value: &str) -> bool {
     pattern[p..].iter().all(|c| *c == '*')
 }
 
-impl TryFrom<Vec<String>> for TargetFilter {
-    type Error = FilterError;
-
-    fn try_from(patterns: Vec<String>) -> Result<Self, Self::Error> {
-        Self::parse(patterns)
-    }
-}
-
 /// How often a session may reach for a hosted model.
 ///
 /// At most `max_frontier` frontier dispatches in any window of `per_turns`
@@ -224,6 +337,16 @@ impl TryFrom<Vec<String>> for TargetFilter {
 /// turn serves locally. That is deliberately not the same thing as a filter
 /// admitting nothing (see [`TurnPolicy::admits`]).
 ///
+/// **"Serves locally" is a promise about the fleet, and this type cannot keep
+/// it alone.** A deployment with no local capacity has nowhere for a spent
+/// window to go, and the second turn of every rationed session would fail
+/// exactly as an empty filter does — the opposite of the paragraph above. The
+/// composition root is where a cadence and a fleet are both visible, so that
+/// is where the promise is checked: a configured key whose policy carries a
+/// cadence and leaves nothing under [`TurnPolicy::admits_when_spent`] stops
+/// the process at startup rather than being discovered one turn at a time.
+/// The paragraph above is therefore true of any deployment that booted.
+///
 /// **The counting basis is dispatch, not success.** A [`Routed`] event whose
 /// target was a frontier model spends a ration even if the dispatch then
 /// failed. The alternative — count only turns that completed — makes a
@@ -232,7 +355,18 @@ impl TryFrom<Vec<String>> for TargetFilter {
 /// hold.
 ///
 /// [`Routed`]: crate::event::SessionEventKind::Routed
+/// The one policy type that *is* deserializable, because it is the one whose
+/// config shape is identical to its runtime shape — two required integers,
+/// nothing to convert and no entry name an error would want to carry that the
+/// enclosing `PolicyConfig` does not already supply.
+///
+/// `deny_unknown_fields` because serde's does not recurse: the attribute on
+/// `PolicyConfig` guards the three axes and stops at their boundary, so
+/// without this a stale or misspelled key *inside* a cadence object was
+/// accepted and dropped, and an operator got a cadence they did not write with
+/// nothing to tell them a line had been ignored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FrontierCadence {
     pub max_frontier: u32,
     pub per_turns: u32,
@@ -292,9 +426,10 @@ impl FrontierHistory {
     /// is the right reading: a cadence of "two per twenty" on a session five
     /// turns old has spent whatever those five turns spent.
     pub fn frontier_in_last(&self, turns: u32) -> u32 {
-        let window = (turns as usize).min(self.dispatches.len());
-        self.dispatches[self.dispatches.len() - window..]
+        self.dispatches
             .iter()
+            .rev()
+            .take(turns as usize)
             .filter(|to_frontier| **to_frontier)
             .count() as u32
     }
@@ -305,8 +440,10 @@ impl FrontierHistory {
 /// Immutable for the turn. Everything that consults it does so through
 /// [`Self::admits`], and the candidate set is filtered by the same policy
 /// before the router ever sees it — see the note there on why both exist.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+/// Not deserializable, for the reason [`TargetFilter`] is not: the
+/// configuration boundary reads its own `PolicyConfig` shape and converts,
+/// because only it can name the entry an error belongs to.
+#[derive(Debug, Clone, PartialEq)]
 pub struct TurnPolicy {
     /// Lowest [`Candidate::quality_prior`] this principal may be routed to.
     ///
@@ -319,11 +456,13 @@ pub struct TurnPolicy {
     pub frontier_cadence: Option<FrontierCadence>,
 }
 
-impl Default for TurnPolicy {
-    fn default() -> Self {
-        Self::unrestricted()
-    }
-}
+// No `Default` impl, and its absence is deliberate. There was one, returning
+// `unrestricted()`, and its only reason to exist was the `#[serde(default)]`
+// attribute above — which is gone with the `Deserialize` derive. Reaching for
+// the most permissive policy in the system should be a sentence a reader can
+// find, the same argument `Principal::default_open` is written out for; a
+// `..Default::default()` that quietly widens a policy is the one spelling of
+// it nobody would notice in review.
 
 impl TurnPolicy {
     /// The policy an open-mode deployment, and any principal with no
@@ -340,9 +479,33 @@ impl TurnPolicy {
         }
     }
 
-    /// Whether `candidate` is one this principal may be routed to.
+    /// Whether `candidate` is one this principal may *ever* be routed to.
     ///
-    /// **The one admissibility question in the system.** Every
+    /// The history-independent half: the quality floor and the allow filter,
+    /// the two axes whose answer is the same on every turn of every session.
+    /// A candidate this refuses is unreachable for as long as the policy
+    /// stands, which is what makes it the right question for the two callers
+    /// that are not choosing a target:
+    ///
+    /// - the engine's pre-`choose` filter, which decides what belongs in
+    ///   `DecisionRecord::considered` — a cadence-rationed model belongs
+    ///   there, because the counterfactual against it is true;
+    /// - the startup cross-check, which asks whether a key can route anywhere
+    ///   at all before the process agrees to serve it.
+    ///
+    /// Both used to spell this as `admits(candidate, &FrontierHistory::default())`
+    /// — the same answer, obtained by fabricating a session history and
+    /// leaving a paragraph of comment to explain which question the fabrication
+    /// stood for. Naming the question is the fix; the fabricated history is
+    /// what a reader had to decode.
+    pub fn permits(&self, candidate: &Candidate) -> bool {
+        candidate.quality_prior >= self.min_quality && self.allow.matches(&candidate.target)
+    }
+
+    /// Whether `candidate` is one this principal may be routed to *on this
+    /// turn*, given what the session has already spent.
+    ///
+    /// **The one admissibility question the router asks.** Every
     /// [`RoutingPolicy`](crate::routing::RoutingPolicy) consults this and none
     /// re-derives it, including the escalation audit branch, which would
     /// otherwise escalate straight past a quality floor it never asked about.
@@ -351,26 +514,43 @@ impl TurnPolicy {
     /// candidate was refused, and a reason nobody reads is a field that goes
     /// stale.
     pub fn admits(&self, candidate: &Candidate, history: &FrontierHistory) -> bool {
-        if candidate.quality_prior < self.min_quality {
-            return false;
-        }
-        if !self.allow.matches(&candidate.target) {
-            return false;
-        }
-        // The cadence is a frontier knob and only a frontier knob. That
-        // asymmetry is the whole behavior: when the window is spent the hosted
-        // options go inadmissible and the local ones do not, so the turn
-        // *serves*, locally, instead of failing. Contrast an `allow` filter
-        // that matches nothing, which leaves no admissible candidate at all
-        // and must fail the turn — a filter that quietly routed everything
-        // local would look exactly like a cost win.
-        if !candidate.target.is_local()
-            && let Some(cadence) = &self.frontier_cadence
-            && !cadence.admits_another(history)
-        {
-            return false;
-        }
-        true
+        self.permits(candidate) && self.cadence_allows(candidate, history)
+    }
+
+    /// Whether `candidate` survives a *fully spent* cadence window.
+    ///
+    /// The question a deployment has to answer before it boots, and the one
+    /// neither of the two above asks: [`Self::permits`] ignores the cadence
+    /// and [`Self::admits`] needs a session that does not exist yet. What is
+    /// left when the ration is gone is every permitted local target and, if
+    /// there is no cadence to spend, everything [`Self::permits`] allows.
+    ///
+    /// Stated as a function rather than as `admits(candidate, &spent_window)`
+    /// because there is no honest way for a caller outside this crate to build
+    /// a spent window: [`FrontierHistory::record`] is deliberately
+    /// crate-private, since the only truthful producer is the session
+    /// projection. A history assembled by hand to ask a question is a second
+    /// answer to something the log already answers — so the question moved
+    /// here instead.
+    pub fn admits_when_spent(&self, candidate: &Candidate) -> bool {
+        self.permits(candidate) && (candidate.target.is_local() || self.frontier_cadence.is_none())
+    }
+
+    /// The cadence axis alone: does one more dispatch to `candidate` fit?
+    ///
+    /// The cadence is a frontier knob and only a frontier knob. That asymmetry
+    /// is the whole behavior: when the window is spent the hosted options go
+    /// inadmissible and the local ones do not, so the turn *serves*, locally,
+    /// instead of failing. Contrast an `allow` filter that matches nothing,
+    /// which leaves no admissible candidate at all and must fail the turn — a
+    /// filter that quietly routed everything local would look exactly like a
+    /// cost win.
+    fn cadence_allows(&self, candidate: &Candidate, history: &FrontierHistory) -> bool {
+        candidate.target.is_local()
+            || match &self.frontier_cadence {
+                Some(cadence) => cadence.admits_another(history),
+                None => true,
+            }
     }
 
     /// Apply a narrowing overlay. Total, and can only shrink.
@@ -418,6 +598,10 @@ impl TurnPolicy {
     /// sorted, the float taken by its bits rather than by a formatting
     /// decision, and SHA-256 rather than [`std::hash`], whose output is
     /// explicitly not stable across releases.
+    ///
+    /// The canonical string opens with [`DIGEST_VERSION`], and the rule that
+    /// makes that tag worth carrying is stated there: golden digests are
+    /// pinned by test, and when they move the constant moves with them.
     pub fn digest(&self) -> String {
         let cadence = match &self.frontier_cadence {
             Some(cadence) => format!("{}/{}", cadence.max_frontier, cadence.per_turns),
@@ -434,12 +618,12 @@ impl TurnPolicy {
             self.min_quality
         };
         let canonical = format!(
-            "v1\nmin_quality={:016x}\nallow={}\ncadence={cadence}\n",
+            "{DIGEST_VERSION}\nmin_quality={:016x}\nallow={}\ncadence={cadence}\n",
             floor.to_bits(),
             self.allow.canonical(),
         );
         let full = Sha256::digest(canonical.as_bytes());
-        // Half the hash: this is a fingerprint an operator reads off a log
+        // A quarter of the hash: this is a fingerprint an operator reads off a log
         // line beside a decision, not a signature. 64 bits is far past the
         // point where two policies in one deployment collide.
         hex::encode(&full[..8])
@@ -481,8 +665,10 @@ impl TurnPolicy {
 /// sentinel here would be `min_quality: 0.0`, which is a real policy — the
 /// unrestricted one — and an override that accidentally spelled it would read
 /// as "lower the floor to nothing" rather than "leave it alone".
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+/// Not deserializable, for the reason [`TargetFilter`] is not: an override
+/// arrives as the configuration boundary's own `PolicyConfig` and is converted
+/// there, where an error can name the key it belongs to.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PolicyOverrides {
     pub min_quality: Option<f64>,
     pub allow: Option<TargetFilter>,
@@ -600,6 +786,68 @@ mod tests {
             TargetFilter::parse([""]).unwrap_err(),
             FilterError::EmptyPattern
         );
+
+        // The characters `canonical()` separates on, refused for a different
+        // reason from the four above — not "this dialect does not support it"
+        // but "this dialect cannot encode it". See the collision test below.
+        for (pattern, token) in [
+            ("anthropic/*,local/*", ","),
+            ("anthropic/*;local/*", ";"),
+            ("anthropic/ claude", " "),
+            ("anthropic/claude\n", "whitespace"),
+            ("anthropic/\tclaude", "whitespace"),
+        ] {
+            assert!(
+                TargetFilter::parse([pattern]).is_err(),
+                "`{pattern}` carries `{token}`, which the digest encoding uses"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pattern_may_not_carry_the_characters_the_digest_encoding_separates_on() {
+        // A proven collision, not a hypothetical. `canonical()` joins the
+        // patterns of a layer with "," and the layers with ";", and `parse`
+        // used to accept both characters inside a pattern — so
+        // `["anthropic/*,local/*"]`, one literal pattern matching *nothing*,
+        // and `["anthropic/*", "local/*"]`, two patterns admitting *both*,
+        // canonicalized to the identical string and fingerprinted identically
+        // as `e1ce5cdcb9eb30b7`. Two policies with opposite admissible sets
+        // sharing one digest is the audit trail reporting a constraint that
+        // was never in force.
+        //
+        // Escaping in `canonical()` was the alternative and is the worse one:
+        // it would keep the collision reachable through any future encoding
+        // change and would have to be gotten right in a function whose output
+        // is pinned by golden digest. Refusing the characters at the one
+        // constructor keeps the encoding total by construction.
+        for hostile in ["anthropic/*,local/*", "anthropic/*;local/*"] {
+            assert!(
+                TargetFilter::parse([hostile]).is_err(),
+                "`{hostile}` is one pattern that encodes as two, and would collide"
+            );
+        }
+
+        // The control, and it is what makes the assertion above about the
+        // *separator* rather than about strictness: the same two patterns
+        // written as a real layer parse, and digest apart from a filter that
+        // names only one of them.
+        let both = TurnPolicy {
+            allow: filter(&["anthropic/*", "local/*"]),
+            ..TurnPolicy::unrestricted()
+        };
+        let one = TurnPolicy {
+            allow: filter(&["anthropic/*"]),
+            ..TurnPolicy::unrestricted()
+        };
+        assert_ne!(both.digest(), one.digest());
+        assert_eq!(
+            both.digest(),
+            "e1ce5cdcb9eb30b7",
+            "the disputed fingerprint still belongs to this policy -- the fix \
+             was to make it unreachable from the other side, not to renumber \
+             every filter in every existing log"
+        );
     }
 
     #[test]
@@ -685,6 +933,85 @@ mod tests {
         assert!(
             TurnPolicy::unrestricted().admits(&hosted, &history(&[true, true, true])),
             "no cadence means no window"
+        );
+    }
+
+    #[test]
+    fn permits_ignores_the_cadence_and_admits_when_spent_is_what_survives_it() {
+        // The three questions, told apart on one policy. `permits` is the
+        // history-independent pair, `admits` adds this session's spend, and
+        // `admits_when_spent` is what is left when the ration is gone — the
+        // question the startup check asks and the only one of the three a
+        // caller outside this crate could not otherwise spell, since there is
+        // no honest way to build a spent `FrontierHistory`.
+        let policy = TurnPolicy {
+            min_quality: 0.5,
+            allow: filter(&["anthropic/*", "local/*"]),
+            frontier_cadence: Some(FrontierCadence {
+                max_frontier: 1,
+                per_turns: 3,
+            }),
+        };
+        let hosted = candidate(frontier("anthropic", "claude"), 0.95);
+        let own = candidate(local("llama"), 0.6);
+        let excluded = candidate(frontier("openai", "gpt-5"), 0.99);
+        let too_cheap = candidate(local("tiny"), 0.1);
+
+        assert!(
+            policy.permits(&hosted),
+            "the cadence is not permits' business"
+        );
+        assert!(policy.permits(&own));
+        assert!(!policy.permits(&excluded), "the filter is");
+        assert!(!policy.permits(&too_cheap), "and so is the floor");
+
+        assert!(policy.admits(&hosted, &history(&[])));
+        assert!(
+            !policy.admits(&hosted, &history(&[true])),
+            "a spent window is the difference between admits and permits"
+        );
+
+        assert!(
+            !policy.admits_when_spent(&hosted),
+            "a spent window leaves no hosted target"
+        );
+        assert!(
+            policy.admits_when_spent(&own),
+            "and leaves every permitted local one -- which is what makes the \
+             turn serve rather than fail"
+        );
+        assert!(!policy.admits_when_spent(&excluded));
+
+        // With no cadence there is no window to spend, so the question
+        // degenerates to `permits` rather than to "local only".
+        let no_cadence = TurnPolicy {
+            frontier_cadence: None,
+            ..policy.clone()
+        };
+        assert!(
+            no_cadence.admits_when_spent(&hosted),
+            "nothing to spend, nothing to run out of"
+        );
+        assert!(!no_cadence.admits_when_spent(&excluded));
+    }
+
+    #[test]
+    fn a_filter_displays_as_the_intersection_an_operator_wrote() {
+        // For the startup refusal: a digest says two keys differ, never which
+        // pattern was mistyped.
+        assert_eq!(TargetFilter::allow_all().to_string(), "*");
+        assert_eq!(filter(&["anthropic/*"]).to_string(), "anthropic/*");
+        assert_eq!(
+            filter(&["anthropic/*", "local/*"]).to_string(),
+            "(anthropic/*|local/*)"
+        );
+        // Narrowing appends a layer, and every layer must admit -- so the
+        // rendering has to show a conjunction and not a longer list.
+        assert_eq!(
+            filter(&["anthropic/*", "local/*"])
+                .intersect(&filter(&["local/*"]))
+                .to_string(),
+            "(anthropic/*|local/*) & local/*"
         );
     }
 
@@ -885,6 +1212,44 @@ mod tests {
             TurnPolicy::unrestricted().digest(),
             String::new(),
             "the unrestricted policy has a real digest; the empty string is reserved for pre-M2 logs"
+        );
+    }
+
+    #[test]
+    fn the_digest_of_two_known_policies_is_pinned_to_a_literal() {
+        // The determinism claim, finally with a test that can fail. Everything
+        // in `the_policy_digest_is_deterministic` compares one run of
+        // `digest()` against another run of `digest()`, so it holds just as
+        // well after a change to `canonical()` that renumbers every policy in
+        // every log this deployment has ever written. These two literals are
+        // the thing that notices.
+        //
+        // **When this fails, the encoding changed.** That is not a test to
+        // update: bump `DIGEST_VERSION` so old and new fingerprints are
+        // distinguishable in a log that spans the change, and then update
+        // these literals to match. Editing the literal alone silently merges
+        // two encodings under one version.
+        assert_eq!(
+            TurnPolicy::unrestricted().digest(),
+            "4ec325a715649c8e",
+            "the policy every open-mode deployment routes under"
+        );
+        assert_eq!(
+            TurnPolicy {
+                min_quality: 0.85,
+                allow: filter(&["anthropic/*", "local/*"]),
+                frontier_cadence: Some(FrontierCadence {
+                    max_frontier: 1,
+                    per_turns: 4,
+                }),
+            }
+            .digest(),
+            "5719acfed66d8f90",
+            "every axis populated, so every axis is pinned"
+        );
+        assert!(
+            TurnPolicy::unrestricted().digest().len() == 16,
+            "a quarter of the hash, hex-encoded"
         );
     }
 }

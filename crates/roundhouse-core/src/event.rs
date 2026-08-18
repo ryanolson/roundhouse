@@ -119,6 +119,20 @@ impl Usage {
 }
 
 /// Why a response stopped short.
+///
+/// **Adding a variant is a one-way door, and that is a decision rather than an
+/// oversight.** Every other growth in this file — [`Usage::reasoning_tokens`],
+/// `SessionCreated::principal` — carries a serde default so that a *new* build
+/// keeps reading an *old* log. This enum's compatibility runs the other way:
+/// an old build cannot read a log containing a variant it has never heard of,
+/// so a rollback past the release that added `policy_refused` fails to
+/// deserialize any session that recorded one. That is accepted, not
+/// mitigated. The alternatives are an `Other(String)` catch-all, which turns
+/// every unknown reason into a shrug the surfaces then have to translate
+/// anyway, or never naming a new reason at all — which is how a refusal ends
+/// up filed as an upstream error forever. A reason is a small, closed,
+/// operator-facing vocabulary; a rollback across a vocabulary change is a
+/// migration, and pretending otherwise is what would make it a silent one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IncompleteReason {

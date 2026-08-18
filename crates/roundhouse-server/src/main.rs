@@ -36,7 +36,6 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use roundhouse_core::context::ByteTokenizer;
-use roundhouse_core::control::FrontierHistory;
 use roundhouse_core::metrics::MetricsConfig;
 use roundhouse_core::routing::{
     AffinityPolicy, CacheLedger, CacheModel, Candidate, ProviderPricing,
@@ -78,10 +77,12 @@ const REDIS_VAR: &str = "ROUNDHOUSE_REDIS_URL";
 
 /// Prompt shape the startup cross-check quotes the catalog under.
 ///
-/// Nominal, and it does not affect the answer: [`TurnPolicy::admits`] reads a
+/// Nominal, and it does not affect the answer: [`TurnPolicy::permits`] reads a
 /// candidate's target identity and its quality prior, and a quote's length
 /// moves neither. It is here so the check goes through the same quoting path
 /// the router does rather than assembling candidates by hand.
+///
+/// [`TurnPolicy::permits`]: roundhouse_core::control::TurnPolicy::permits
 const PROBE_ISL_TOKENS: u64 = 1_024;
 const PROBE_OSL_TOKENS: u64 = 256;
 
@@ -118,43 +119,46 @@ fn reachable_candidates(catalog: &StaticFrontierCatalog) -> Vec<Candidate> {
 ///
 /// Asking it is the same load-or-die posture both loaders already take. A
 /// policy that admits nothing does not degrade — every turn it serves ends in
-/// `no_viable_candidate` — so starting anyway would turn one mistyped pattern
-/// into a tenant whose every request fails, discovered by the tenant.
+/// `policy_refused` — so starting anyway would turn one mistyped pattern into
+/// a tenant whose every request fails, discovered by the tenant.
 ///
 /// Per key rather than per project, and that is not a shortcut: a key's
 /// effective policy is its project's narrowed by its own overrides, so a
 /// project whose filter is fine can still hold a key whose override intersects
 /// it down to nothing — and a turn arrives on a key.
+///
+/// The question is [`TurnPolicy::permits`] and deliberately not
+/// [`TurnPolicy::admits`]: this asks whether a target is reachable *at all*
+/// under the policy's history-independent axes, and a cadence-rationed model
+/// is reachable on some turns. Feeding `admits` a synthetic unspent window to
+/// get the same answer is how this used to be written, and it left the reader
+/// to work out from a fabricated [`FrontierHistory`] which question was being
+/// asked. What a *spent* window leaves is the separate question
+/// [`refuse_cadences_with_nothing_to_serve`] asks, one call below.
+///
+/// [`TurnPolicy::permits`]: roundhouse_core::control::TurnPolicy::permits
+/// [`TurnPolicy::admits`]: roundhouse_core::control::TurnPolicy::admits
+/// [`FrontierHistory`]: roundhouse_core::control::FrontierHistory
 fn refuse_policies_that_admit_nothing(
     plane: &ControlPlane,
     reachable: &[Candidate],
 ) -> anyhow::Result<()> {
-    let ControlPlane::Configured { turn_keys, .. } = plane else {
-        // Open mode resolves every request to the unrestricted policy, which
-        // admits whatever was quoted. There is nothing to disagree with.
-        return Ok(());
-    };
-    // The window a fresh session starts with, so a cadence is never what makes
-    // a policy look empty here: a rationed frontier model is one this key
-    // reaches on some turns, and refusing to boot over it would be refusing
-    // the knob working.
-    let unspent = FrontierHistory::default();
-    // Collected and sorted rather than reported on the first hit: `turn_keys`
-    // is a hash map, so a deployment with two bad entries would otherwise be
-    // told about a different one on each restart.
-    let mut refused: Vec<String> = turn_keys
-        .values()
-        .filter(|(_principal, policy)| {
-            !reachable
-                .iter()
-                .any(|candidate| policy.admits(candidate, &unspent))
-        })
+    // Collected and sorted rather than reported on the first hit: the table is
+    // a hash map, so a deployment with two bad entries would otherwise be told
+    // about a different one on each restart. `configured_admissions` yields
+    // nothing in open mode, which is the accurate answer — every request there
+    // resolves to the unrestricted policy, and there is nothing to disagree
+    // with.
+    let mut refused: Vec<String> = plane
+        .configured_admissions()
+        .filter(|(_principal, policy)| !reachable.iter().any(|candidate| policy.permits(candidate)))
         .map(|(principal, policy)| {
             format!(
-                "project `{}`, user `{}` (policy {})",
+                "project `{}`, user `{}` (policy {}, allow {})",
                 principal.project,
                 principal.user,
-                policy.digest()
+                policy.digest(),
+                policy.allow,
             )
         })
         .collect();
@@ -164,6 +168,61 @@ fn refuse_policies_that_admit_nothing(
             "these control-plane keys admit none of the {} model(s) this deployment can route to, \
              so every one of their turns would fail: {}",
             reachable.len(),
+            refused.join("; ")
+        );
+    }
+    Ok(())
+}
+
+/// Refuse to serve a key whose cadence promises a local fallback this
+/// deployment cannot provide.
+///
+/// A [`FrontierCadence`] is not a filter, and every document in this tree says
+/// so in the same words: when the trailing window is spent, hosted targets go
+/// inadmissible and *the turn serves locally instead of failing*. That sentence
+/// is a promise about the fleet, made in a file that cannot see one. In a
+/// deployment with no local capacity wired, the second turn of every rationed
+/// session has nowhere to go and terminates `policy_refused` — the cadence
+/// behaving exactly like the empty filter it is documented as the opposite of.
+///
+/// So the promise is checked where the fleet is finally visible, which is the
+/// same place [`refuse_policies_that_admit_nothing`] checks the other half.
+/// The two are separate functions because they are separate questions with
+/// separate remedies: that one says "this policy names nothing", this one says
+/// "this policy names something for the first turn only". Reported together
+/// would leave an operator unsure which sentence to go and edit.
+///
+/// Only keys whose policy carries a cadence are asked. A policy with no
+/// cadence never spends a window, so it has no spent-window behavior to
+/// promise.
+fn refuse_cadences_with_nothing_to_serve(
+    plane: &ControlPlane,
+    reachable: &[Candidate],
+) -> anyhow::Result<()> {
+    let mut refused: Vec<String> = plane
+        .configured_admissions()
+        .filter(|(_principal, policy)| policy.frontier_cadence.is_some())
+        .filter(|(_principal, policy)| {
+            !reachable
+                .iter()
+                .any(|candidate| policy.admits_when_spent(candidate))
+        })
+        .map(|(principal, policy)| {
+            format!(
+                "project `{}`, user `{}` (policy {}, allow {})",
+                principal.project,
+                principal.user,
+                policy.digest(),
+                policy.allow,
+            )
+        })
+        .collect();
+    refused.sort();
+    if !refused.is_empty() {
+        anyhow::bail!(
+            "these control-plane keys carry a frontier_cadence, which promises that a spent \
+             window serves locally; this deployment has no local fleet to serve it, so their \
+             every turn after the ration would fail instead: {}",
             refused.join("; ")
         );
     }
@@ -205,8 +264,12 @@ async fn main() -> anyhow::Result<()> {
     // every tenant's turns landing in one unnamespaced session space.
     let plane = Arc::new(ControlPlane::from_env()?);
     match &*plane {
-        ControlPlane::Configured { turn_keys, .. } => tracing::info!(
-            memberships = turn_keys.len(),
+        // Counted through the accessor rather than by reaching into
+        // `Configured { turn_keys, .. }`: the table's layout has exactly one
+        // reader outside its own module, and this is not going to be the
+        // second one for the sake of a log line.
+        ControlPlane::Configured { .. } => tracing::info!(
+            memberships = plane.configured_admissions().count(),
             var = control_config::CONTROL_PLANE_VAR,
             "control plane loaded; a key is required on every surface"
         ),
@@ -218,9 +281,12 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Both files are loaded now, and only now can they be compared. See the
-    // function: neither loader can see the other, so a policy naming no model
-    // this deployment has is a mistake nothing before this point could catch.
-    refuse_policies_that_admit_nothing(&plane, &reachable_candidates(&catalog))?;
+    // functions: neither loader can see the other, so a policy naming no model
+    // this deployment has — or promising a local fallback it does not have —
+    // is a mistake nothing before this point could catch.
+    let reachable = reachable_candidates(&catalog);
+    refuse_policies_that_admit_nothing(&plane, &reachable)?;
+    refuse_cadences_with_nothing_to_serve(&plane, &reachable)?;
 
     let addr: SocketAddr = std::env::var(ADDR_VAR)
         .unwrap_or_else(|_| DEFAULT_ADDR.to_string())
@@ -342,6 +408,11 @@ mod tests {
             message.contains("project `acme`, user `ada`"),
             "the refusal has to name the entry an operator would go and fix: {message}"
         );
+        assert!(
+            message.contains("allow anthropic/*"),
+            "and the patterns themselves, not only their hash: a digest tells an \
+             operator that two keys differ, never which one they mistyped: {message}"
+        );
 
         // Probe: the same failure through the other axis. A floor above every
         // quality prior in the catalog leaves nothing admissible just as surely.
@@ -369,8 +440,9 @@ mod tests {
     #[test]
     fn a_cadence_is_never_what_makes_a_policy_look_empty_at_startup() {
         // A rationed frontier model is one this key reaches on some turns, so
-        // booting must not refuse over it — the check asks about an unspent
-        // window for exactly this reason.
+        // this check must not refuse over it — it asks `permits`, the
+        // history-independent axes, for exactly this reason. Whether the
+        // *spent* window has anything left is the next test's subject.
         refuse_policies_that_admit_nothing(
             &plane_with_policy(
                 serde_json::json!({ "frontier_cadence": { "max_frontier": 1, "per_turns": 10 } }),
@@ -380,13 +452,89 @@ mod tests {
         .expect("a cadence rations a target, it does not remove it");
     }
 
+    /// One local worker, priced the way a quote would price it.
+    ///
+    /// Hand-built rather than quoted, because [`reachable_candidates`] quotes
+    /// the catalog and this binary attaches no fleet — the whole subject of
+    /// the two tests below is what changes when a deployment *does*.
+    fn local_candidate() -> Candidate {
+        Candidate {
+            target: roundhouse_core::routing::Target::Local {
+                worker_id: 1,
+                dp_rank: 0,
+                model: "llama".into(),
+            },
+            expected_prefill_tokens: PROBE_ISL_TOKENS as f64,
+            matched_prefix_tokens: 0,
+            expected_ttft_ms: 60.0,
+            expected_cost_usd: 0.0,
+            quality_prior: 0.6,
+            load: Some(0.0),
+        }
+    }
+
     #[test]
-    fn an_open_deployment_has_no_policies_to_cross_check() {
-        refuse_policies_that_admit_nothing(
-            &ControlPlane::Open,
+    fn a_cadence_with_no_local_fleet_to_fall_back_on_refuses_to_serve() {
+        // The promise a cadence makes, checked against the fleet for the first
+        // time: "when the window is spent, hosted targets go inadmissible and
+        // the turn serves locally". This binary wires no fleet, so for a
+        // rationed key that sentence is false from the second turn onwards —
+        // and it was false silently, since the other cross-check asks only
+        // about the unspent window.
+        let cadence = serde_json::json!({
+            "frontier_cadence": { "max_frontier": 1, "per_turns": 10 }
+        });
+        let error = refuse_cadences_with_nothing_to_serve(
+            &plane_with_policy(cadence.clone()),
             &reachable_candidates(&echo_catalog()),
         )
-        .expect("open mode resolves to the unrestricted policy");
+        .expect_err("a cadence with no local capacity behind it must stop the process");
+        let message = error.to_string();
+        assert!(
+            message.contains("project `acme`, user `ada`"),
+            "the refusal has to name the key an operator would go and fix: {message}"
+        );
+        assert!(
+            message.contains("spent window serves locally")
+                && message.contains("no local fleet to serve it"),
+            "and it has to name the promise it is enforcing: {message}"
+        );
+
+        // Acceptance: the identical policy on a deployment that does quote a
+        // local candidate. Same key, same cadence, and the check is satisfied
+        // — which is what makes the refusal above about the fleet rather than
+        // about the cadence.
+        let mut with_fleet = reachable_candidates(&echo_catalog());
+        with_fleet.push(local_candidate());
+        refuse_cadences_with_nothing_to_serve(&plane_with_policy(cadence), &with_fleet)
+            .expect("a spent window has somewhere to go when a local worker is quoted");
+    }
+
+    #[test]
+    fn a_policy_with_no_cadence_promises_nothing_about_a_spent_window() {
+        // The control that keeps the check above from being "refuse every
+        // fleetless deployment": a policy that never rations never spends a
+        // window, so it has no spent-window behavior to make good on.
+        for policy in [
+            serde_json::json!({}),
+            serde_json::json!({ "allow": ["echo/echo"] }),
+            serde_json::json!({ "min_quality": 0.5 }),
+        ] {
+            refuse_cadences_with_nothing_to_serve(
+                &plane_with_policy(policy.clone()),
+                &reachable_candidates(&echo_catalog()),
+            )
+            .unwrap_or_else(|error| panic!("{policy} carries no cadence: {error}"));
+        }
+    }
+
+    #[test]
+    fn an_open_deployment_has_no_policies_to_cross_check() {
+        let reachable = reachable_candidates(&echo_catalog());
+        refuse_policies_that_admit_nothing(&ControlPlane::Open, &reachable)
+            .expect("open mode resolves to the unrestricted policy");
+        refuse_cadences_with_nothing_to_serve(&ControlPlane::Open, &reachable)
+            .expect("and the unrestricted policy carries no cadence");
         // And the empty catalog is the deployment's problem, not this check's:
         // with nothing quoted there is nothing to disagree about, and the
         // routing layer's own `NoCandidates` is the accurate answer.

@@ -57,7 +57,7 @@ use roundhouse_server::{
 
 mod common;
 use common::codex::{request, user_message};
-use common::{BLOCK_SIZE, LOCAL_MODEL, MINUTE, embedded_fleet};
+use common::{BLOCK_SIZE, LOCAL_MODEL, MINUTE, embedded_fleet, path_segment};
 
 /// What each executor answers with, so a target is legible in the answer as
 /// well as in the log.
@@ -292,17 +292,6 @@ async fn native_turn(app: &Router, secret: &str, session_id: &str, turn_id: &str
         text.contains("event: response_completed"),
         "turn `{turn_id}` did not complete: {text}"
     );
-}
-
-/// A namespaced session id as one path segment.
-///
-/// A Configured deployment's ids carry `/`, and a route parameter matches a
-/// single segment, so the separators have to be escaped or the request routes
-/// nowhere. That is a fact about the native surface rather than about policy —
-/// it is spelled out here rather than worked around silently because a `404`
-/// from a mistyped path and a `404` from an unescaped id read identically.
-fn path_segment(session_id: &str) -> String {
-    session_id.replace('/', "%2F")
 }
 
 async fn create_session(app: &Router, secret: &str, session_id: &str) {

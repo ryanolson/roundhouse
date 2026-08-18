@@ -100,8 +100,15 @@ pub struct AffinityPolicy {
     /// tokens booked on the worker — the unit of [`Candidate::load`], so the
     /// ceiling is a token count and not a utilization fraction. Frontier
     /// candidates report no load and are never excluded by it.
+    ///
+    /// The whole of this policy instance's own tuning. There used to be a
+    /// `min_quality` beside it, with a paragraph explaining how a deployment's
+    /// floor and a tenant's floor compose; it had no caller anywhere in the
+    /// tree, and the concept belongs to
+    /// [`TurnPolicy`](crate::control::TurnPolicy), which is where every floor
+    /// a turn is actually subject to now lives. Two knobs spelling one concept
+    /// is how a deployment ends up with two answers to "what is the floor".
     max_load: Option<f64>,
-    min_quality: f64,
 }
 
 impl Default for AffinityPolicy {
@@ -115,7 +122,6 @@ impl AffinityPolicy {
         Self {
             weights: Weights::default(),
             max_load: None,
-            min_quality: 0.0,
         }
     }
 
@@ -131,30 +137,47 @@ impl AffinityPolicy {
         self
     }
 
-    pub fn with_min_quality(mut self, min_quality: f64) -> Self {
-        self.min_quality = min_quality;
-        self
-    }
-
-    /// Candidates this policy will score, under both the deployment's own
-    /// constraints and the caller's.
+    /// Candidates this policy will score, under both the caller's
+    /// entitlements and the deployment's own tuning.
     ///
-    /// The two are separate on purpose: `min_quality` and `max_load` here are
-    /// operator tuning of *this* policy instance, while
-    /// [`TurnPolicy`](crate::control::TurnPolicy) is what the principal is
-    /// entitled to. Neither subsumes the other — a deployment can tune below a
-    /// tenant's floor, and a tenant cannot tune around a busy worker — so both
-    /// apply and the tighter of each pair wins by construction.
-    fn admissible<'a>(&self, ctx: &'a RoutingContext<'_>) -> Vec<&'a Candidate> {
-        ctx.candidates
+    /// **The order of the two filters is the blame.** The turn policy runs
+    /// first, so an empty set at that point is a refusal *this deployment made
+    /// about this tenant* — [`RoutingError::PolicyRefused`], which a retry
+    /// cannot fix and only an operator widening a policy can. What survives it
+    /// is then filtered by `max_load`, this policy instance's own tuning, and
+    /// an empty set at *that* point is a busy fleet —
+    /// [`RoutingError::NoViableCandidate`], which the next turn may well not
+    /// hit.
+    ///
+    /// The two are separate on purpose and neither subsumes the other: a
+    /// deployment can tune around a busy worker that a tenant is perfectly
+    /// entitled to, and a tenant's entitlements say nothing about load. One
+    /// combined filter would still route identically and would have exactly
+    /// one answer for why it routed nowhere — which is the answer that sends
+    /// half the readers to the wrong system.
+    fn admissible<'a>(
+        &self,
+        ctx: &'a RoutingContext<'_>,
+    ) -> Result<Vec<&'a Candidate>, RoutingError> {
+        let entitled: Vec<&Candidate> = ctx
+            .candidates
             .iter()
-            .filter(|c| c.quality_prior >= self.min_quality)
+            .filter(|c| ctx.turn_policy.admits(c, ctx.frontier_history))
+            .collect();
+        if entitled.is_empty() {
+            return Err(RoutingError::PolicyRefused);
+        }
+        let viable: Vec<&Candidate> = entitled
+            .into_iter()
             .filter(|c| match (self.max_load, c.load) {
                 (Some(ceiling), Some(load)) => load <= ceiling,
                 _ => true,
             })
-            .filter(|c| ctx.turn_policy.admits(c, ctx.frontier_history))
-            .collect()
+            .collect();
+        if viable.is_empty() {
+            return Err(RoutingError::NoViableCandidate);
+        }
+        Ok(viable)
     }
 }
 
@@ -168,10 +191,7 @@ impl RoutingPolicy for AffinityPolicy {
         if ctx.candidates.is_empty() {
             return Err(RoutingError::NoCandidates);
         }
-        let pool = self.admissible(ctx);
-        if pool.is_empty() {
-            return Err(RoutingError::NoViableCandidate);
-        }
+        let pool = self.admissible(ctx)?;
 
         let prefill = normalize(
             &pool
@@ -263,6 +283,12 @@ impl RoutingPolicy for EscalationPolicy {
         // `is_audit_turn` because it *is* still an audit turn: it escalates to
         // the best admissible target, which is what "narrowing clamps the
         // escalation rather than cancelling it" means.
+        //
+        // The turn policy is the only filter on this branch — it applies no
+        // `max_load`, deliberately, since an audit is worth reaching a busy
+        // worker for — so an empty set here has exactly one cause and is
+        // reported as it: `PolicyRefused`, never the fleet-shaped
+        // `NoViableCandidate`.
         let best = ctx
             .candidates
             .iter()
@@ -272,7 +298,7 @@ impl RoutingPolicy for EscalationPolicy {
                     .partial_cmp(&b.quality_prior)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
-            .ok_or(RoutingError::NoViableCandidate)?;
+            .ok_or(RoutingError::PolicyRefused)?;
 
         Ok(Decision {
             target: best.target.clone(),
@@ -425,13 +451,20 @@ mod tests {
 
     #[tokio::test]
     async fn no_admissible_candidate_is_an_error_not_a_bad_choice() {
+        // Every worker is over the ceiling this policy instance was tuned
+        // with, and nothing about the caller's entitlements refused anything —
+        // so the blame is the fleet's, not the tenant's.
         let candidates = vec![local(1, 500.0, 120_000.0)];
         let policy = AffinityPolicy::new().with_max_load(50_000.0);
         let fixture = Fixture::open();
-        assert!(matches!(
-            policy.choose(&fixture.ctx(&candidates, 1)).await,
-            Err(RoutingError::NoViableCandidate)
-        ));
+        assert!(
+            matches!(
+                policy.choose(&fixture.ctx(&candidates, 1)).await,
+                Err(RoutingError::NoViableCandidate)
+            ),
+            "an overloaded fleet is not a policy refusal: the caller here is \
+             under the unrestricted policy and could not have been refused by it"
+        );
     }
 
     #[tokio::test]
@@ -577,11 +610,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_empty_admissible_set_is_no_viable_candidate_not_local() {
+    async fn an_empty_admissible_set_is_a_policy_refusal_not_a_local_fallback() {
         // A filter that matches nothing routes every turn to a free local
         // worker and looks exactly like a cost win, which is why it fails the
         // turn instead. The startup cross-check against the catalog is what
         // makes this rare; this is what makes it loud when it happens anyway.
+        //
+        // And it fails as `PolicyRefused` on both policies, ordinary turn and
+        // audit turn alike: nothing here is overloaded, nothing was tuned out,
+        // and the only thing that emptied the set is the tenant's own filter.
         let candidates = mixed_fleet();
         let fixture = Fixture::under(TurnPolicy {
             allow: TargetFilter::parse(["mistral/*"]).unwrap(),
@@ -596,13 +633,51 @@ mod tests {
                 assert!(
                     matches!(
                         policy.choose(&fixture.ctx(&candidates, turn)).await,
-                        Err(RoutingError::NoViableCandidate)
+                        Err(RoutingError::PolicyRefused)
                     ),
-                    "{} turn {turn} degraded silently instead of failing",
+                    "{} turn {turn} degraded silently, or blamed the fleet for a \
+                     refusal this deployment made",
                     policy.name()
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_busy_fleet_and_a_refused_tenant_are_told_apart_on_the_same_candidate_set() {
+        // The pair, side by side, because the distinction is only visible as a
+        // difference: one candidate set, two ways of emptying it, two
+        // different things for an operator to go and look at.
+        let overloaded = vec![local(1, 500.0, 120_000.0)];
+        let tuned = AffinityPolicy::new().with_max_load(50_000.0);
+        let open = Fixture::open();
+        assert!(matches!(
+            tuned.choose(&open.ctx(&overloaded, 1)).await,
+            Err(RoutingError::NoViableCandidate)
+        ));
+
+        // The identical worker, well under any ceiling, refused by the tenant's
+        // filter instead.
+        let idle = vec![local(1, 500.0, 0.0)];
+        let filtered = Fixture::under(TurnPolicy {
+            allow: TargetFilter::parse(["mistral/*"]).unwrap(),
+            ..TurnPolicy::unrestricted()
+        });
+        assert!(matches!(
+            AffinityPolicy::new().choose(&filtered.ctx(&idle, 1)).await,
+            Err(RoutingError::PolicyRefused)
+        ));
+
+        // And when both would empty it, the tenant's filter is reported: it is
+        // the one a retry cannot get past, and the one whose remedy is an edit
+        // rather than a wait.
+        assert!(
+            matches!(
+                tuned.choose(&filtered.ctx(&overloaded, 1)).await,
+                Err(RoutingError::PolicyRefused)
+            ),
+            "the refusal a retry cannot fix is the one worth reporting"
+        );
     }
 
     #[tokio::test]

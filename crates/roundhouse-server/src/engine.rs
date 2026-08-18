@@ -11,7 +11,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::StreamExt;
 use roundhouse_core::context::{ContextAssembler, Tokenizer};
-use roundhouse_core::control::{FrontierHistory, TurnPolicy};
+use roundhouse_core::control::TurnPolicy;
 use roundhouse_core::event::{Accounting, IncompleteReason, SessionObserver, Usage};
 use roundhouse_core::ids::{ResponseId, SessionId, TurnId};
 use roundhouse_core::item::Item;
@@ -238,13 +238,23 @@ impl Failed {
     /// it under `UpstreamError` without anyone having to decide.
     fn incomplete_reason(&self) -> IncompleteReason {
         match &self.error {
-            EngineError::Routing(RoutingError::NoViableCandidate) => {
-                IncompleteReason::PolicyRefused
-            }
-            // `NoCandidates` is deliberately not a refusal: nothing was quoted
-            // at all, which is a fleet and a catalog with nothing in them
-            // rather than a decision anyone made about this tenant.
-            EngineError::Routing(RoutingError::NoCandidates | RoutingError::Policy(_))
+            EngineError::Routing(RoutingError::PolicyRefused) => IncompleteReason::PolicyRefused,
+            // Neither of the other two empty-set arms is a refusal, and each
+            // for its own reason. `NoCandidates`: nothing was quoted at all,
+            // which is a fleet and a catalog with nothing in them rather than
+            // a decision anyone made about this tenant. `NoViableCandidate`:
+            // candidates were quoted *and the tenant was entitled to them*,
+            // and the deployment's own routing constraints — a load ceiling
+            // over a busy fleet — took the rest. Calling that a policy refusal
+            // tells the client that widening a policy is the fix for an
+            // overloaded worker, and sends the operator to read a `TurnPolicy`
+            // that is not the problem. It is the blame this failure carried
+            // before M2 split the two.
+            EngineError::Routing(
+                RoutingError::NoCandidates
+                | RoutingError::NoViableCandidate
+                | RoutingError::Policy(_),
+            )
             | EngineError::Session(_)
             | EngineError::Fleet(_)
             | EngineError::Frontier(_)
@@ -707,21 +717,20 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         // has to be able to ask. Filtering only there would not do either, for
         // the reason above. Both, therefore, through one predicate.
         //
-        // The window it asks about is the *unspent* one, and that is the whole
+        // The question is `permits` and not `admits`, and that is the whole
         // difference between the two calls. A cadence-rationed frontier model
-        // is not unreachable, it is not available this turn — so it stays in
+        // is not unreachable, it is not available *this turn* — so it stays in
         // `considered` and the counterfactual against it is true, while
         // `admits` at the routing site sees the session's real history and
         // rations it. A model excluded by the filter or the quality floor is
         // unreachable on every turn of this principal's, and goes.
-        let unspent = FrontierHistory::default();
         let quoted = candidates.len();
-        candidates.retain(|candidate| turn_policy.admits(candidate, &unspent));
+        candidates.retain(|candidate| turn_policy.permits(candidate));
         if candidates.is_empty() && quoted > 0 {
             // Not `NoCandidates`: the fleet and the catalog answered, and it is
             // this deployment's own policy that left nothing. Reporting the
             // fleet as empty would send an operator to look at the workers.
-            return Err(RoutingError::NoViableCandidate.into());
+            return Err(RoutingError::PolicyRefused.into());
         }
 
         // --- choose --------------------------------------------------------
@@ -904,4 +913,102 @@ async fn replay_output<S: SessionStore>(
         .filter(|item| item.response_id.as_ref() == Some(response_id))
         .map(|item| item.content.render())
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use roundhouse_core::control::{FrontierHistory, TargetFilter};
+    use roundhouse_core::ids::SessionId;
+    use roundhouse_core::routing::{AffinityPolicy, RoutingContext};
+
+    fn local(load: f64) -> Candidate {
+        Candidate {
+            target: Target::Local {
+                worker_id: 1,
+                dp_rank: 0,
+                model: "llama".into(),
+            },
+            expected_prefill_tokens: 500.0,
+            matched_prefix_tokens: 0,
+            expected_ttft_ms: 100.0,
+            expected_cost_usd: 0.0,
+            quality_prior: 0.6,
+            load: Some(load),
+        }
+    }
+
+    /// What the router answers, run through the same mapping the settle seam
+    /// uses — which is the whole subject: a routing error's blame is only
+    /// observable as the reason written into the log.
+    async fn logged_reason(
+        policy: &dyn RoutingPolicy,
+        turn_policy: &TurnPolicy,
+        candidates: &[Candidate],
+    ) -> IncompleteReason {
+        let session_id = SessionId::new("s");
+        let ledger = CacheLedger::new();
+        let frontier_history = FrontierHistory::default();
+        let error = policy
+            .choose(&RoutingContext {
+                session_id: &session_id,
+                turn_index: 1,
+                isl_tokens: 1_000,
+                candidates,
+                ledger: &ledger,
+                turn_policy,
+                frontier_history: &frontier_history,
+            })
+            .await
+            .expect_err("every case here empties the pool");
+        Failed::before_output(error).incomplete_reason()
+    }
+
+    #[tokio::test]
+    async fn a_pool_emptied_by_the_policys_own_tuning_is_not_blamed_on_the_tenant() {
+        // `max_load` is operator tuning of this `AffinityPolicy` instance --
+        // every local worker is busy. Nothing about the *tenant's* entitlements
+        // refused anything, so `policy_refused` would send an operator to read
+        // a `TurnPolicy` that is not the problem, and would tell the client
+        // that widening a policy is what fixes it. It is fleet-shaped
+        // exhaustion, which is what `upstream_error` has always meant.
+        let candidates = [local(120_000.0)];
+        assert_eq!(
+            logged_reason(
+                &AffinityPolicy::new().with_max_load(50_000.0),
+                &TurnPolicy::unrestricted(),
+                &candidates,
+            )
+            .await,
+            IncompleteReason::UpstreamError,
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pool_emptied_by_the_turn_policy_is_blamed_on_the_policy() {
+        // The control, and the reason the test above is not simply "never say
+        // policy_refused": the identical fleet under a filter that names
+        // nothing on it is a refusal this deployment made about this tenant,
+        // and it is the one terminal reason a retry cannot fix.
+        let candidates = [local(0.0)];
+        let filtered = TurnPolicy {
+            allow: TargetFilter::parse(["mistral/*"]).expect("well-formed"),
+            ..TurnPolicy::unrestricted()
+        };
+        assert_eq!(
+            logged_reason(&AffinityPolicy::new(), &filtered, &candidates).await,
+            IncompleteReason::PolicyRefused,
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_fleet_is_neither_a_refusal_nor_this_deployments_fault_to_report() {
+        // `NoCandidates` predates all of this: nothing was quoted at all, which
+        // is a fleet and a catalog with nothing in them rather than a decision
+        // anyone made about this tenant.
+        assert_eq!(
+            logged_reason(&AffinityPolicy::new(), &TurnPolicy::unrestricted(), &[]).await,
+            IncompleteReason::UpstreamError,
+        );
+    }
 }

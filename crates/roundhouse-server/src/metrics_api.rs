@@ -141,8 +141,11 @@ fn scoped_snapshot(
         ControlPlane::Open => Ok(state.recorder.snapshot(&state.config, at_ms)),
         ControlPlane::Configured { .. } => match state.plane.scope(headers)? {
             KeyScope::Admin => Ok(state.recorder.snapshot(&state.config, at_ms)),
-            KeyScope::Turn(principal) => Ok(state.recorder.snapshot_for(
-                &PrincipalKey::from(&principal),
+            // The admission's policy is not consulted here and is not meant to
+            // be: what a key may *route to* has no bearing on what it may
+            // *read about itself*.
+            KeyScope::Turn(admission) => Ok(state.recorder.snapshot_for(
+                &PrincipalKey::from(&admission.principal),
                 &state.config,
                 at_ms,
             )),

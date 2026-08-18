@@ -220,11 +220,38 @@ pub struct DecisionRecord {
     pub turn_policy_digest: String,
 }
 
+/// Why no target was chosen.
+///
+/// The three empty-set arms are told apart by *whose decision emptied the
+/// set*, because that is the only thing a reader of the log can act on. They
+/// are three because the answers differ: `NoCandidates` sends an operator to
+/// the fleet and the catalog, `PolicyRefused` sends them to the control-plane
+/// file, and `NoViableCandidate` sends them to the deployment's own routing
+/// tuning or to the workers it excluded. Collapsing any two of them means one
+/// of those readers is sent to the wrong system.
 #[derive(Debug, thiserror::Error)]
 pub enum RoutingError {
+    /// Nothing was quoted at all.
     #[error("no candidates available for routing")]
     NoCandidates,
-    #[error("no candidate satisfied the policy constraints")]
+    /// Candidates were quoted, and this turn's [`TurnPolicy`] admitted none of
+    /// them.
+    ///
+    /// A decision this deployment made about this tenant, and the one terminal
+    /// outcome a retry cannot change: the same turn under the same policy
+    /// refuses again, and only an operator widening the policy moves it. It
+    /// reaches the log as
+    /// [`IncompleteReason::PolicyRefused`](crate::event::IncompleteReason::PolicyRefused).
+    #[error("no target this turn's policy admits was available")]
+    PolicyRefused,
+    /// Candidates were quoted, the turn's policy admitted some, and the
+    /// deployment's own routing constraints excluded the rest.
+    ///
+    /// A busy fleet, not a refused tenant. Reporting it as a policy refusal
+    /// would tell a client that widening a policy is the fix for an overloaded
+    /// worker, and send an operator to read a `TurnPolicy` that is not the
+    /// problem.
+    #[error("no candidate satisfied the routing policy's own constraints")]
     NoViableCandidate,
     #[error("policy failure: {0}")]
     Policy(#[from] anyhow::Error),
