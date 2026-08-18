@@ -1,0 +1,27 @@
+   Compiling roundhouse-core v0.1.0 (/home/user/roundhouse/crates/roundhouse-core)
+   Compiling roundhouse-store-redis v0.1.0 (/home/user/roundhouse/crates/roundhouse-store-redis)
+    Finished `test` profile [optimized + debuginfo] target(s) in 9.77s
+     Running tests/spend_contract.rs (target/debug/deps/spend_contract-56c907bedb45e39e)
+
+running 17 tests
+test a_hold_whose_owner_died_is_expired_lazily_by_the_next_grant ... ok
+test a_grant_never_exceeds_the_project_remaining ... ok
+test a_grant_never_exceeds_the_member_ceiling_even_when_the_project_has_room ... ok
+test a_held_grant_is_released_once_its_ttl_lapses ... ok
+test a_non_finite_request_is_refused_through_the_trait ... ok
+test a_second_grant_under_one_response_id_replaces_the_hold_rather_than_stacking ... ok
+test a_settle_at_or_below_the_watermark_is_a_no_op ... ok
+test a_sub_dollar_grant_is_not_truncated_to_zero ... ok
+test a_monthly_window_resets_committed_at_its_boundary ... ok
+test concurrent_grants_cannot_jointly_exceed_the_limit ... ok
+test an_exhausted_project_grants_zero_rather_than_erroring ... ok
+test settle_is_idempotent_by_session_and_seq ... ok
+test settling_above_the_hold_overcommits_rather_than_capping ... ok
+test settling_below_the_hold_returns_the_difference ... ok
+test share_allocations_summing_past_one_are_accepted_and_the_project_limit_still_binds ... ok
+test the_two_backends_agree_on_a_grant_settle_replay_sequence ... ok
+test open_grant_and_settle_grant_are_single_round_trips ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+EXIT=0

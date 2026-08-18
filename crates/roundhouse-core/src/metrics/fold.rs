@@ -601,6 +601,7 @@ pub(super) mod tests {
                     considered,
                     turn_policy_digest: String::new(),
                     budget_state: Default::default(),
+                    rate_card: None,
                 },
             });
             self.push(SessionEventKind::ResponseCompleted { response_id, usage });

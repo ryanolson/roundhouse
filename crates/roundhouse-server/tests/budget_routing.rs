@@ -55,8 +55,8 @@ use codex_utils_rustls_provider::ensure_rustls_crypto_provider;
 
 use roundhouse_core::context::ByteTokenizer;
 use roundhouse_core::control::{
-    Balance, BalanceQuery, BudgetState, BudgetTerms, Grant, GrantRequest, MemorySpendLedger,
-    Principal, Settled, Settlement, SpendError, SpendLedger,
+    Balance, BalanceQuery, BudgetState, BudgetTerms, Grant, GrantRequest, LedgerState,
+    MemorySpendLedger, Principal, Settled, Settlement, SpendError, SpendLedger,
 };
 use roundhouse_core::event::{Accounting, IncompleteReason, SessionEvent, SessionEventKind, Usage};
 use roundhouse_core::ids::{ResponseId, SessionId};
@@ -130,6 +130,16 @@ fn assert_usd(actual: f64, expected: f64, what: &str) {
 
 /// One hosted model, priced on output alone at a round rate.
 fn metered_catalog() -> StaticFrontierCatalog {
+    catalog_priced_at(OUTPUT_PER_MTOK_USD)
+}
+
+/// The same catalog at a different rate — an operator's edited price list.
+///
+/// Parameterized rather than copied because the repair claim below turns on
+/// exactly one difference between two catalogs: a turn that ran under one rate
+/// card must settle at that card and not at whatever the successor process was
+/// started with.
+fn catalog_priced_at(output_per_mtok_usd: f64) -> StaticFrontierCatalog {
     StaticFrontierCatalog::new(vec![FrontierModelSpec {
         provider: "anthropic".into(),
         model: "claude".into(),
@@ -142,7 +152,7 @@ fn metered_catalog() -> StaticFrontierCatalog {
             input_per_mtok_usd: 0.0,
             cached_input_per_mtok_usd: 0.0,
             cache_write_per_mtok_usd: 0.0,
-            output_per_mtok_usd: OUTPUT_PER_MTOK_USD,
+            output_per_mtok_usd,
         },
         quality_prior: 0.95,
         base_ttft_ms: 1.0,
@@ -258,32 +268,51 @@ fn plane_with_a_raised_limit() -> Arc<ControlPlane> {
 /// work: an unbudgeted admission must not touch the ledger at all, and "the
 /// numbers came out the same" cannot tell a skipped call from a call that
 /// happened to grant everything.
+///
+/// The two halves of a turn's spend are counted apart because they are two
+/// claims, and one total cannot make either: "a turn reserved budget and gave
+/// it back" needs both to be one, and a reader of `calls() > 1` cannot tell
+/// that from two grants and no settle at all. Reads are counted separately
+/// again, since every assertion in this file that inspects a balance would
+/// otherwise inflate the number it is about to assert on.
 #[derive(Default)]
 struct CountingLedger {
     inner: MemorySpendLedger,
-    calls: AtomicUsize,
+    grants: AtomicUsize,
+    settles: AtomicUsize,
+    reads: AtomicUsize,
 }
 
 impl CountingLedger {
+    fn grants(&self) -> usize {
+        self.grants.load(Ordering::SeqCst)
+    }
+
+    fn settles(&self) -> usize {
+        self.settles.load(Ordering::SeqCst)
+    }
+
+    /// Everything this ledger was ever asked, for the claim that it was asked
+    /// nothing.
     fn calls(&self) -> usize {
-        self.calls.load(Ordering::SeqCst)
+        self.grants() + self.settles() + self.reads.load(Ordering::SeqCst)
     }
 }
 
 #[async_trait]
 impl SpendLedger for CountingLedger {
     async fn open_grant(&self, request: GrantRequest) -> Result<Grant, SpendError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.grants.fetch_add(1, Ordering::SeqCst);
         self.inner.open_grant(request).await
     }
 
     async fn settle_grant(&self, settlement: Settlement) -> Result<Settled, SpendError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.settles.fetch_add(1, Ordering::SeqCst);
         self.inner.settle_grant(settlement).await
     }
 
     async fn balance(&self, query: BalanceQuery) -> Result<Balance, SpendError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.reads.fetch_add(1, Ordering::SeqCst);
         self.inner.balance(query).await
     }
 }
@@ -368,6 +397,10 @@ struct Fixture {
     /// An existing log to pick up rather than a fresh one — a successor
     /// process, from the store's point of view.
     store: Option<Arc<MemoryStore>>,
+    /// The rate card this process was started with. A successor is free to
+    /// have a different one: a catalog is a file an operator edits, and the
+    /// log it picks up was written under whatever the file said at the time.
+    catalog: StaticFrontierCatalog,
 }
 
 impl Default for Fixture {
@@ -378,6 +411,7 @@ impl Default for Fixture {
             frontier: Arc::new(EchoFrontierClient::new(FRONTIER_ANSWER)),
             ledger: Arc::new(MemorySpendLedger::new()),
             store: None,
+            catalog: metered_catalog(),
         }
     }
 }
@@ -401,7 +435,7 @@ async fn rig(plane: Arc<ControlPlane>, fixture: Fixture) -> Rig {
         Arc::clone(&store),
         ByteTokenizer,
         Arc::new(EchoLocalExecutor::new(LOCAL_ANSWER)),
-        metered_catalog(),
+        fixture.catalog,
         fixture.frontier,
         Arc::new(AffinityPolicy::new().with_weights(weights)),
         EngineConfig {
@@ -751,7 +785,10 @@ async fn an_exhausted_frontier_budget_routes_local_instead_of_failing() {
     );
     assert_usd(balance.held_usd, 0.0, "every hold was settled or released");
     assert_eq!(balance.project_remaining_usd, 0.0);
-    assert_eq!(balance.state, BudgetState::Exhausted);
+    // A `LedgerState`, not a `BudgetState`: what the ledger holds cannot
+    // spell the overflow valve's mark, so the narrower type is what a balance
+    // reports and the wider one is what the decision below records.
+    assert_eq!(balance.state, LedgerState::Exhausted);
 }
 
 // ---------------------------------------------------------------------------
@@ -1015,11 +1052,12 @@ async fn a_local_turn_consumes_no_frontier_budget() {
     );
     assert_eq!(
         balance.state,
-        BudgetState::Unconstrained,
+        LedgerState::Unconstrained,
         "an untouched budget is untouched"
     );
-    assert!(
-        counted.calls() > 1,
+    assert_eq!(
+        (counted.grants(), counted.settles()),
+        (1, 1),
         "and the control that keeps every assertion above from being about a \
          ledger nobody wired: the turn did open a grant and did settle it, \
          both for nothing"
@@ -1195,6 +1233,118 @@ async fn a_lost_settle_is_repaired_by_the_next_open_of_the_same_session() {
     );
 }
 
+/// A settle the log holds is priced by the card that was in force when the turn
+/// ran, not by whatever the catalog says today.
+///
+/// The repair and the live settle have to charge the same number or the repair
+/// is not a repair — that is the whole claim `TerminalSettlement` is projected
+/// from the log for. A price list is a file an operator edits, so the
+/// two moments genuinely can see different catalogs, and the only account of
+/// the turn that cannot drift is the one written down beside the decision.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_repair_settles_the_same_number_the_live_settle_would_have() {
+    let first = fleeted(control_plane()).await;
+    let session = bound("metered", "ada", "reprice");
+    create_session(&first.app, &key("metered"), &session).await;
+    native_turn(&first.app, &key("metered"), &session, "t0", "hello").await;
+    assert_usd(
+        balance(&first, "metered", "ada").await.committed_usd,
+        ACTUAL_TURN_USD,
+        "the live settle, which is the number the repair has to reproduce",
+    );
+
+    // The operator halves the price and restarts. The ledger is fresh, so the
+    // successor's first act on this session is to re-drive a settle it never
+    // saw — and re-sending the completed turn deduplicates, so the repair is
+    // the only thing that can move the number.
+    let successor = rig(
+        control_plane(),
+        Fixture {
+            store: Some(Arc::clone(&first.store)),
+            catalog: catalog_priced_at(OUTPUT_PER_MTOK_USD / 2.0),
+            ..Default::default()
+        },
+    )
+    .await;
+    native_turn(&successor.app, &key("metered"), &session, "t0", "hello").await;
+
+    assert_usd(
+        balance(&successor, "metered", "ada").await.committed_usd,
+        ACTUAL_TURN_USD,
+        "the repair charged today's price for a turn that ran at yesterday's",
+    );
+}
+
+/// A successor whose catalog no longer lists a model the log routed to still
+/// serves turns that have nothing to do with that model.
+///
+/// The failure this pins is a *brick*, not a wrong number. The repair runs
+/// before the turn is even admitted and while the lease is held, so a settle
+/// that cannot be priced fails every attempt at the session forever — and the
+/// turn it fails is one the dropped model was never a candidate for. Dropping a
+/// model from a catalog is an ordinary operator edit; it must cost the
+/// deployment a settle it can no longer price, which is visible drift, and not
+/// a session it can no longer serve.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_successor_whose_catalog_dropped_a_model_does_not_brick_the_session() {
+    let first = fleeted(control_plane()).await;
+    let budgeted = bound("metered", "ada", "dropped");
+    let budgetless = bound("openhanded", "ada", "dropped");
+    for (secret, session) in [("metered", &budgeted), ("openhanded", &budgetless)] {
+        create_session(&first.app, &key(secret), session).await;
+        native_turn(&first.app, &key(secret), session, "t0", "hello").await;
+        assert_eq!(
+            route_sequence(&first.store, session).await,
+            vec!["anthropic/claude"],
+            "both logs have to reach the model that is about to disappear, or \
+             neither says anything about a catalog that dropped it"
+        );
+    }
+
+    // The operator removes the model and restarts. Both logs still hold a turn
+    // dispatched to it; only one of the two projects has a budget, which is
+    // the single difference the assertions below turn on.
+    let successor = rig(
+        control_plane(),
+        Fixture {
+            store: Some(Arc::clone(&first.store)),
+            catalog: StaticFrontierCatalog::new(Vec::new()),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let body = native_body(&successor.app, &key("metered"), &budgeted, "t1", "hello").await;
+    assert!(
+        body.contains("event: response_completed"),
+        "a settle the catalog can no longer price must not take the turn after \
+         it down with it: {body}"
+    );
+    assert_eq!(
+        route_sequence(&successor.store, &budgeted).await.pop(),
+        Some("local/local".to_string()),
+        "and the turn goes to the healthy local worker, which is where a \
+         deployment with no hosted models left has always sent it"
+    );
+
+    // Twice, because the brick was permanent: the repair runs on every open,
+    // so a failing one fails every attempt at this session rather than one.
+    native_turn(&successor.app, &key("metered"), &budgeted, "t2", "hello").await;
+
+    // The control, and it is what says the budget is the axis: the same
+    // successor, the same dropped model, the same shape of log — under a
+    // project with no budget, which never settles anything and so never had a
+    // price to look up.
+    native_turn(
+        &successor.app,
+        &key("openhanded"),
+        &budgetless,
+        "t1",
+        "hello",
+    )
+    .await;
+}
+
 /// A deduplicated retry opens no second grant.
 ///
 /// The client already paid for this answer and the accounting it was billed
@@ -1346,5 +1496,9 @@ async fn open_mode_and_budgetless_projects_route_byte_identically_to_m2() {
     // ledger nobody wired: the same deployment, the same prompt, a key whose
     // project does have a budget.
     responses_turn(&configured.app, &key("metered"), "hello", "chat").await;
-    assert!(counted.calls() > 0, "a budgeted key does reach the ledger");
+    assert_eq!(
+        (counted.grants(), counted.settles()),
+        (1, 1),
+        "a budgeted key does reach the ledger, on both halves of the turn"
+    );
 }

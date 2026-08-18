@@ -27,6 +27,20 @@ use roundhouse_core::control::{Allocation, Budget, BudgetWindow, DEFAULT_WARN_AT
 
 use super::config::ControlPlaneError;
 
+/// Whether `value` fails the "must be a positive number of dollars" rule that
+/// every ceiling in this file is judged by.
+///
+/// **`NaN` fails it**, and that is the whole reason this is a named function
+/// rather than `value <= 0.0` written twice. `NaN <= 0.0` is *false*, so the
+/// direct spelling waves a `NaN` limit through to a ledger where it then loses
+/// every comparison too and grants zero forever — a budget that refuses every
+/// turn, configured by an operator who wrote a number. Spelled through
+/// [`f64::partial_cmp`] because that is the only comparison that admits the
+/// third answer: strictly greater, or anything else.
+fn not_positive(value: f64) -> bool {
+    !matches!(value.partial_cmp(&0.0), Some(std::cmp::Ordering::Greater))
+}
+
 /// The `"on_exhaustion"` tag, read as raw config data.
 ///
 /// A config-only type rather than deserializing straight into
@@ -63,7 +77,9 @@ impl BudgetConfig {
     /// Judge and resolve into the real [`Budget`] the ledger is checked
     /// against, naming `entry` (a project label) on every rejection.
     pub(super) fn to_budget(&self, path: &str, entry: &str) -> Result<Budget, ControlPlaneError> {
-        if self.limit_usd <= 0.0 {
+        // See `not_positive`: this is not `<= 0.0`, and the difference is a
+        // `NaN` limit reaching a ledger that would then grant zero forever.
+        if not_positive(self.limit_usd) {
             return Err(ControlPlaneError::BudgetLimitNotPositive {
                 path: path.to_string(),
                 entry: entry.to_string(),
@@ -113,8 +129,15 @@ impl BudgetConfig {
 /// fall out with no custom (de)serialization to keep in sync by hand. The
 /// unit arm follows the same convention: `"pooled"` as a bare string, the
 /// ordinary reading of a variant with nothing to carry.
+///
+/// `deny_unknown_fields` for the reason [`BudgetConfig`] carries it, which is
+/// not the obvious one: a *missing* required field already fails without it.
+/// What it closes is an operator writing the ceiling they meant *beside* the
+/// field name serde reads — `{ "limit_usd": 5.0, "limit_used": 9.0 }` resolves
+/// silently to a $5 cap, and nothing in the file or the log ever says which of
+/// the two numbers won.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum AllocationConfig {
     /// No member ceiling -- this key may spend the whole project budget.
     Pooled,
@@ -136,9 +159,24 @@ impl AllocationConfig {
     ) -> Result<Allocation, ControlPlaneError> {
         match self {
             AllocationConfig::Pooled => Ok(Allocation::Pooled),
-            AllocationConfig::Capped { limit_usd } => Ok(Allocation::Capped {
-                limit_usd: *limit_usd,
-            }),
+            AllocationConfig::Capped { limit_usd } => {
+                // The same rule `BudgetConfig::to_budget` applies to a project
+                // limit, through the same predicate and for the same reasons.
+                // Both ceilings bind identically at runtime — the ledger takes
+                // the minimum of whatever it is given — so a cap of zero
+                // refuses every turn this key sends, which is a revoked key
+                // written as a budget rather than a budget.
+                if not_positive(*limit_usd) {
+                    return Err(ControlPlaneError::MemberCapNotPositive {
+                        path: path.to_string(),
+                        entry: entry.to_string(),
+                        limit_usd: *limit_usd,
+                    });
+                }
+                Ok(Allocation::Capped {
+                    limit_usd: *limit_usd,
+                })
+            }
             AllocationConfig::Share { fraction } => {
                 if !(*fraction > 0.0 && *fraction <= 1.0) {
                     return Err(ControlPlaneError::ShareFractionOutOfRange {
@@ -214,5 +252,122 @@ mod tests {
             AllocationConfig::Pooled.to_allocation("p", "e").unwrap(),
             Allocation::Pooled
         );
+    }
+
+    #[test]
+    fn a_zero_member_cap_is_refused_the_way_a_zero_project_limit_is() {
+        // The two ceilings bind identically at runtime — the ledger takes the
+        // minimum of whatever it is given — so a cap of zero refuses every
+        // turn a key ever sends, exactly as a project limit of zero refuses
+        // every turn a project ever sends. One of those was refused at the
+        // boundary and the other was not, and the asymmetry had no reason: a
+        // key that may spend nothing is a revoked key spelled as a budget, and
+        // the operator who wrote it will be reading a `min_quality` error
+        // somewhere else wondering why their turns degrade.
+        let error = AllocationConfig::Capped { limit_usd: 0.0 }
+            .to_allocation("path", "key `ada@acme`")
+            .expect_err("a member cap of zero must be refused at the boundary");
+        match error {
+            ControlPlaneError::MemberCapNotPositive {
+                entry, limit_usd, ..
+            } => {
+                assert_eq!(
+                    entry, "key `ada@acme`",
+                    "the message names the entry an operator has to go and edit"
+                );
+                assert_eq!(limit_usd, 0.0);
+            }
+            other => panic!("expected MemberCapNotPositive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_negative_member_cap_is_refused() {
+        assert!(matches!(
+            AllocationConfig::Capped { limit_usd: -1.0 }.to_allocation("path", "e"),
+            Err(ControlPlaneError::MemberCapNotPositive { .. })
+        ));
+    }
+
+    #[test]
+    fn a_positive_member_cap_validates() {
+        // The control, without which the two refusals above would be equally
+        // satisfied by a boundary that refused every cap.
+        assert_eq!(
+            AllocationConfig::Capped { limit_usd: 5.0 }
+                .to_allocation("path", "e")
+                .unwrap(),
+            Allocation::Capped { limit_usd: 5.0 }
+        );
+    }
+
+    #[test]
+    fn a_ceiling_that_is_not_a_number_is_refused_rather_than_passing_every_comparison() {
+        // **`NaN <= 0.0` is false**, so the obvious spelling of "refuse a
+        // non-positive limit" lets a `NaN` through — and a `NaN` limit reaches
+        // the ledger, where it loses every comparison there too and grants
+        // zero for the life of the deployment. Both ceilings are therefore
+        // written as "must be greater than zero" negated, which a `NaN` fails.
+        assert!(matches!(
+            config(f64::NAN, OnExhaustionConfig::DegradeToLocal, None, None).to_budget("p", "e"),
+            Err(ControlPlaneError::BudgetLimitNotPositive { .. })
+        ));
+        assert!(matches!(
+            AllocationConfig::Capped {
+                limit_usd: f64::NAN
+            }
+            .to_allocation("p", "e"),
+            Err(ControlPlaneError::MemberCapNotPositive { .. })
+        ));
+        // And the controls, which are what stop the two assertions above from
+        // being about a boundary that refuses everything.
+        assert!(
+            config(1.0, OnExhaustionConfig::DegradeToLocal, None, None)
+                .to_budget("p", "e")
+                .is_ok()
+        );
+        assert!(
+            AllocationConfig::Capped { limit_usd: 1.0 }
+                .to_allocation("p", "e")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_misspelled_allocation_field_is_refused_rather_than_silently_ignored() {
+        // The failure mode `deny_unknown_fields` closes, and it is not the
+        // obvious one: a *missing* required field already fails, because serde
+        // says so. What passed silently was an operator writing the cap they
+        // meant *beside* the field name serde reads — the allocation resolves
+        // to the wrong ceiling, and nothing in the file or the log says which
+        // of the two numbers won.
+        let error = serde_json::from_str::<AllocationConfig>(
+            r#"{"capped": {"limit_usd": 5.0, "limit_used": 9.0}}"#,
+        )
+        .expect_err("a field name nothing reads must be refused, not dropped");
+        assert!(
+            error.to_string().contains("limit_used"),
+            "the message has to name the field the operator misspelled: {error}"
+        );
+
+        // The same for a share, where the stray field is a plausible one: an
+        // operator writing both a fraction and a dollar cap has asked for two
+        // different allocations and must be told, not silently given one.
+        assert!(
+            serde_json::from_str::<AllocationConfig>(
+                r#"{"share": {"fraction": 0.5, "limit_usd": 5.0}}"#
+            )
+            .is_err()
+        );
+
+        // The controls: both well-spelled shapes still parse.
+        assert!(matches!(
+            serde_json::from_str::<AllocationConfig>(r#"{"capped": {"limit_usd": 5.0}}"#).unwrap(),
+            AllocationConfig::Capped { limit_usd } if limit_usd == 5.0
+        ));
+        assert!(matches!(
+            serde_json::from_str::<AllocationConfig>(r#""pooled""#).unwrap(),
+            AllocationConfig::Pooled
+        ));
     }
 }

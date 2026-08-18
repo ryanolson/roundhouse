@@ -24,15 +24,102 @@
 //! suite with one macro call, so it gets every test or none of them — there is
 //! no wiring step where a test can be forgotten for one backend and silently
 //! enforced only for the others.
+//!
+//! The fixtures below ([`fresh_principal`], [`terms`], [`assert_usd`]) are
+//! `pub` for the same reason the assertions are: a backend's own adversarial
+//! tests, which live outside this crate, were otherwise writing a second
+//! deliberately-identical copy of each — and two copies of "dollars compare to
+//! the cent" is one edit away from two different tolerances.
+//!
+//! [`MONTH_START_CASES`] is here for a related reason and is not a
+//! [`SpendLedger`] assertion at all: it is the table of calendar boundaries the
+//! two *calendar ports* answer, one in Rust and one in Lua, and it lives beside
+//! the suite because the same "both backends answer one list" argument is what
+//! makes it worth having.
 
-use crate::control::budget::{Allocation, Budget, BudgetState, BudgetWindow, Exhaustion};
-use crate::control::spend::{BalanceQuery, BudgetTerms, GrantRequest, Settlement, SpendLedger};
+use crate::control::budget::{Allocation, Budget, BudgetWindow, Exhaustion};
+use crate::control::spend::{
+    BalanceQuery, BudgetTerms, GrantRequest, LedgerState, Settlement, SpendError, SpendLedger,
+};
 use crate::control::{Principal, ProjectId};
 use crate::ids::{ResponseId, SessionId};
 
 /// Hold TTL used throughout the suite. Never waited out — expiry is reached by
 /// supplying a later `now_ms`.
 const TTL_MS: u64 = 60_000;
+
+/// One calendar boundary, as a question both ports are asked.
+///
+/// `what` is carried so a failure names the case rather than only the two
+/// numbers that disagreed.
+#[derive(Debug, Clone, Copy)]
+pub struct MonthStartCase {
+    pub what: &'static str,
+    pub now_ms: u64,
+    pub month_start_ms: u64,
+}
+
+/// The month boundaries the Rust and Lua calendar ports must both compute.
+///
+/// **Two implementations of Hinnant's civil-calendar algorithm exist in this
+/// repo, in two languages, and neither can call the other**: the Rust one is
+/// private to [`spend`](super) precisely so a window boundary cannot be
+/// composed from parts by a caller, and the Lua one runs inside a Redis script
+/// sandbox. What keeps them honest is that both are executed against this one
+/// list — the Rust port in `spend`'s own unit tests, the Lua port through an
+/// embedded interpreter in `roundhouse-store-redis`.
+///
+/// The cases are the three places a hand-rolled calendar goes wrong: a year
+/// rollover (the algorithm's era arithmetic), a leap February (the one day a
+/// month-length table gets wrong), and a boundary instant (which of the two
+/// windows it belongs to). Every timestamp was produced by `date -u -d`.
+pub const MONTH_START_CASES: &[MonthStartCase] = &[
+    MonthStartCase {
+        what: "a mid-month instant, 2026-08-18",
+        now_ms: 1_787_011_200_000,
+        month_start_ms: 1_785_542_400_000,
+    },
+    MonthStartCase {
+        what: "the boundary instant belongs to the window it opens, 2026-08-01",
+        now_ms: 1_785_542_400_000,
+        month_start_ms: 1_785_542_400_000,
+    },
+    MonthStartCase {
+        what: "the last millisecond of December is still December, 2026-12-31T23:59:59.999Z",
+        now_ms: 1_798_761_599_999,
+        month_start_ms: 1_796_083_200_000,
+    },
+    MonthStartCase {
+        what: "and the next millisecond rolls the year over, 2027-01-01",
+        now_ms: 1_798_761_600_000,
+        month_start_ms: 1_798_761_600_000,
+    },
+    MonthStartCase {
+        what: "a leap day is in the February that has one, 2028-02-29T12:00:00Z",
+        now_ms: 1_835_438_400_000,
+        month_start_ms: 1_832_976_000_000,
+    },
+    MonthStartCase {
+        what: "the last second of a leap February, 2028-02-29T23:59:59Z",
+        now_ms: 1_835_481_599_000,
+        month_start_ms: 1_832_976_000_000,
+    },
+    MonthStartCase {
+        what: "the March that follows it, 2028-03-01",
+        now_ms: 1_835_481_600_000,
+        month_start_ms: 1_835_481_600_000,
+    },
+    MonthStartCase {
+        what: "a February with no leap day, 2027-02-28T12:00:00Z",
+        now_ms: 1_803_816_000_000,
+        month_start_ms: 1_801_440_000_000,
+    },
+    MonthStartCase {
+        what: "the epoch, where the era arithmetic's own origin sits",
+        now_ms: 0,
+        month_start_ms: 0,
+    },
+];
 
 /// 2026-08-18T00:00:00Z. An arbitrary but real instant, so the monthly-window
 /// test is reasoning about a calendar month somebody could look up.
@@ -45,22 +132,25 @@ const SEPTEMBER_1: u64 = 1_788_220_800_000;
 /// same way a Rust one does; a contract that demanded bit equality would be
 /// asserting an implementation detail rather than a balance.
 #[track_caller]
-fn assert_usd(actual: f64, expected: f64, what: &str) {
+pub fn assert_usd(actual: f64, expected: f64, what: &str) {
     assert!(
         (actual - expected).abs() < 1e-6,
         "{what}: expected ${expected}, got ${actual}"
     );
 }
 
-/// A membership nothing else in the suite shares.
-fn fresh_principal(user: &str) -> Principal {
+/// A membership nothing else in the suite shares — nor anything in a backend's
+/// own tests, which is why this is `pub`: one shared Redis hosts both.
+pub fn fresh_principal(user: &str) -> Principal {
     Principal::new(
         ProjectId::new(format!("proj_{}", uuid::Uuid::new_v4().simple())),
         user,
     )
 }
 
-fn terms(limit_usd: f64, allocation: Allocation) -> BudgetTerms {
+/// The suite's ordinary terms: a total window, the valve armed, warning at
+/// four fifths.
+pub fn terms(limit_usd: f64, allocation: Allocation) -> BudgetTerms {
     BudgetTerms {
         budget: Budget {
             limit_usd,
@@ -92,6 +182,9 @@ fn request(
     }
 }
 
+/// Takes the whole [`BudgetTerms`] and hands the settle only the window it
+/// reads, so the tests below keep saying "under these terms" while the type
+/// keeps carrying one field.
 fn settlement(
     principal: &Principal,
     response_id: &str,
@@ -106,7 +199,7 @@ fn settlement(
         seq,
         response_id: ResponseId::new(response_id),
         actual_usd,
-        terms: terms.clone(),
+        window: terms.budget.window,
         now_ms,
     }
 }
@@ -272,6 +365,20 @@ pub async fn a_held_grant_is_released_once_its_ttl_lapses<L: SpendLedger>(ledger
         "inside the TTL the hold still binds",
     );
 
+    // **The boundary instant, pinned.** A hold placed at 0 with a TTL of
+    // `TTL_MS` expires *at* `TTL_MS`, not one millisecond after: the
+    // convention is that a hold survives while `now_ms` is strictly before its
+    // expiry, which the memory ledger spells `expires_at_ms > now_ms` (retain)
+    // and the Lua one spells `expires <= now_ms` (delete). Two languages, one
+    // convention — and an off-by-one between them would only ever show up in
+    // the single millisecond neither `TTL_MS - 1` nor `TTL_MS + 1` visits.
+    let boundary = ledger.balance(query(&ada, &terms, TTL_MS)).await.unwrap();
+    assert_usd(
+        boundary.held_usd,
+        0.0,
+        "the hold is gone at exactly its expiry, not one millisecond later",
+    );
+
     // Expired by the next call that looks, not by a timer.
     let after = ledger
         .balance(query(&ada, &terms, TTL_MS + 1))
@@ -389,7 +496,7 @@ pub async fn settling_above_the_hold_overcommits_rather_than_capping<L: SpendLed
         0.0,
         "remaining floors at zero rather than going negative",
     );
-    assert_eq!(balance.state, BudgetState::Exhausted);
+    assert_eq!(balance.state, LedgerState::Exhausted);
 }
 
 pub async fn a_settle_at_or_below_the_watermark_is_a_no_op<L: SpendLedger>(ledger: &L) {
@@ -450,11 +557,10 @@ pub async fn an_exhausted_project_grants_zero_rather_than_erroring<L: SpendLedge
         .await
         .unwrap();
     assert_usd(grant.granted_usd, 0.0, "nothing left to grant");
-    assert_eq!(grant.state, BudgetState::Exhausted);
-    assert!(
-        !grant.state.overflowed(),
-        "a ledger cannot observe the fleet, so it can never report an overflow"
-    );
+    assert_eq!(grant.state, LedgerState::Exhausted);
+    // "A ledger can never report an overflow" used to be asserted here. It is
+    // now a fact about the type: `Grant::state` is a `LedgerState`, which has
+    // no such variant, so the assertion could not fail and could not compile.
 
     // And the warn threshold, since it is the state one step before this one:
     // a fresh project past 80% of its limit is warned, not exhausted.
@@ -468,7 +574,7 @@ pub async fn an_exhausted_project_grants_zero_rather_than_erroring<L: SpendLedge
         .await
         .unwrap();
     assert_usd(warned.granted_usd, 0.5, "a warned budget still grants");
-    assert_eq!(warned.state, BudgetState::Warned);
+    assert_eq!(warned.state, LedgerState::Warned);
 
     // **`Exhausted` means this turn got nothing**, and the boundary case is
     // where that matters: a grant that takes the very last dollar is not
@@ -485,7 +591,7 @@ pub async fn an_exhausted_project_grants_zero_rather_than_erroring<L: SpendLedge
     assert_usd(last.granted_usd, 10.0, "the whole budget, in one grant");
     assert_ne!(
         last.state,
-        BudgetState::Exhausted,
+        LedgerState::Exhausted,
         "a grant of the entire budget is not a grant of nothing"
     );
     // The next one is, and that is the turn the valve is for.
@@ -494,7 +600,143 @@ pub async fn an_exhausted_project_grants_zero_rather_than_erroring<L: SpendLedge
         .await
         .unwrap();
     assert_usd(after.granted_usd, 0.0, "now there is nothing");
-    assert_eq!(after.state, BudgetState::Exhausted);
+    assert_eq!(after.state, LedgerState::Exhausted);
+}
+
+pub async fn a_second_grant_under_one_response_id_replaces_the_hold_rather_than_stacking<
+    L: SpendLedger,
+>(
+    ledger: &L,
+) {
+    // **A turn has one hold**, and this is the guarantee the trait states that
+    // no other test reaches. The engine never opens a second grant under one
+    // `ResponseId` — a deduplicated retry short-circuits before `plan` — so a
+    // backend that accumulated holds instead of replacing them would pass
+    // every other assertion in this suite. The failure it hides is a project
+    // that runs out of budget it never spent, one leaked hold at a time, and
+    // it self-heals only after a TTL nobody is waiting on.
+    let ada = fresh_principal("ada");
+    let terms = terms(10.0, Allocation::Pooled);
+
+    let first = ledger
+        .open_grant(request(&ada, "r1", 4.0, &terms, 0))
+        .await
+        .unwrap();
+    assert_usd(first.granted_usd, 4.0, "the first hold");
+
+    let second = ledger
+        .open_grant(request(&ada, "r1", 6.0, &terms, 0))
+        .await
+        .unwrap();
+    assert_usd(
+        second.granted_usd,
+        6.0,
+        "the re-grant is computed against a pool its own earlier hold is not in",
+    );
+
+    let balance = ledger.balance(query(&ada, &terms, 0)).await.unwrap();
+    assert_usd(balance.held_usd, 6.0, "one hold, at the second amount");
+    assert_usd(
+        balance.project_remaining_usd,
+        4.0,
+        "and $4 of the $10 limit is still there — stacked holds would have left $0",
+    );
+
+    // **The step the two assertions above cannot make on their own.** A hash
+    // keyed by response id replaces on write in both backends, so a re-grant
+    // that computed what was available *with its own earlier hold still
+    // counted* would land on exactly the numbers checked above whenever the
+    // two amounts happen to sum to the limit — which $4 and $6 do. Asking for
+    // the whole limit is what separates the two: replaced, it is affordable;
+    // merely overwritten after the fact, it is capped at what the first hold
+    // left behind.
+    let third = ledger
+        .open_grant(request(&ada, "r1", 10.0, &terms, 0))
+        .await
+        .unwrap();
+    assert_usd(
+        third.granted_usd,
+        10.0,
+        "the whole limit — a hold still counted against its own replacement would cap this at $4",
+    );
+    let balance = ledger.balance(query(&ada, &terms, 0)).await.unwrap();
+    assert_usd(balance.held_usd, 10.0, "still one hold");
+    assert_usd(
+        balance.project_remaining_usd,
+        0.0,
+        "and it is the whole pool",
+    );
+}
+
+pub async fn a_non_finite_request_is_refused_through_the_trait<L: SpendLedger>(ledger: &L) {
+    // Refused rather than clamped, at whichever boundary the amount enters
+    // through — which is why this is a contract test and not two private ones.
+    // A `NaN` loses every `<` comparison it takes part in, so a clamped `NaN`
+    // request grants zero and a clamped `NaN` settle books nothing, and in
+    // both cases a provider bills for a turn the ledger recorded as free.
+    let ada = fresh_principal("ada");
+    let terms = terms(10.0, Allocation::Pooled);
+
+    for (what, requested_usd) in [
+        ("not a number", f64::NAN),
+        ("infinite", f64::INFINITY),
+        ("negative", -1.0),
+    ] {
+        assert!(
+            matches!(
+                ledger
+                    .open_grant(request(&ada, "r1", requested_usd, &terms, 0))
+                    .await,
+                Err(SpendError::InvalidAmount {
+                    field: "requested_usd",
+                    ..
+                })
+            ),
+            "an amount that is {what} must be refused, not clamped"
+        );
+    }
+
+    // The control: the same request with a real amount is granted, so the
+    // refusals above are about the amount rather than about the request.
+    assert_usd(
+        ledger
+            .open_grant(request(&ada, "r1", 1.0, &terms, 0))
+            .await
+            .unwrap()
+            .granted_usd,
+        1.0,
+        "the control",
+    );
+
+    // A settle that could not be priced must not arrive as zero either: that
+    // is the direction where a clamp becomes free frontier traffic.
+    assert!(matches!(
+        ledger
+            .settle_grant(settlement(&ada, "r1", 1, f64::INFINITY, &terms, 0))
+            .await,
+        Err(SpendError::InvalidAmount {
+            field: "actual_usd",
+            ..
+        })
+    ));
+    assert!(matches!(
+        ledger
+            .settle_grant(settlement(&ada, "r1", 1, f64::NAN, &terms, 0))
+            .await,
+        Err(SpendError::InvalidAmount {
+            field: "actual_usd",
+            ..
+        })
+    ));
+    // And its control: a real settle at the same seq applies.
+    assert!(
+        ledger
+            .settle_grant(settlement(&ada, "r1", 1, 0.5, &terms, 0))
+            .await
+            .unwrap()
+            .applied,
+        "the control: a refused settle left no watermark behind"
+    );
 }
 
 pub async fn a_monthly_window_resets_committed_at_its_boundary<L: SpendLedger>(ledger: &L) {
@@ -517,7 +759,7 @@ pub async fn a_monthly_window_resets_committed_at_its_boundary<L: SpendLedger>(l
         .balance(query(&ada, &monthly, AUGUST_18))
         .await
         .unwrap();
-    assert_eq!(spent.state, BudgetState::Exhausted);
+    assert_eq!(spent.state, LedgerState::Exhausted);
     assert_usd(spent.committed_usd, 10.0, "August's spend");
 
     // Evaluated on access against the supplied clock: no background task ever
@@ -528,7 +770,7 @@ pub async fn a_monthly_window_resets_committed_at_its_boundary<L: SpendLedger>(l
         .unwrap();
     assert_usd(september.committed_usd, 0.0, "a new window");
     assert_usd(september.project_remaining_usd, 10.0, "and a full budget");
-    assert_eq!(september.state, BudgetState::Unconstrained);
+    assert_eq!(september.state, LedgerState::Unconstrained);
     assert_usd(
         ledger
             .open_grant(request(&ada, "r2", 10.0, &monthly, SEPTEMBER_1))
@@ -554,7 +796,7 @@ pub async fn a_monthly_window_resets_committed_at_its_boundary<L: SpendLedger>(l
             .await
             .unwrap()
             .state,
-        BudgetState::Exhausted,
+        LedgerState::Exhausted,
         "a total window has no boundary to roll over"
     );
 
@@ -611,7 +853,7 @@ pub async fn share_allocations_summing_past_one_are_accepted_and_the_project_lim
         0.0,
         "an over-subscribed project runs out where the project limit is, not where the shares sum",
     );
-    assert_eq!(third.state, BudgetState::Exhausted);
+    assert_eq!(third.state, LedgerState::Exhausted);
 }
 
 /// Instantiate the whole conformance suite against one backend.
@@ -660,6 +902,8 @@ macro_rules! spend_ledger_contract_suite {
             settling_above_the_hold_overcommits_rather_than_capping,
             a_settle_at_or_below_the_watermark_is_a_no_op,
             an_exhausted_project_grants_zero_rather_than_erroring,
+            a_second_grant_under_one_response_id_replaces_the_hold_rather_than_stacking,
+            a_non_finite_request_is_refused_through_the_trait,
             a_monthly_window_resets_committed_at_its_boundary,
             share_allocations_summing_past_one_are_accepted_and_the_project_limit_still_binds,
         );

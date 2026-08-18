@@ -125,6 +125,45 @@ pub struct GrantRequest {
     pub now_ms: u64,
 }
 
+/// What a ledger can observe about a position.
+///
+/// Three states where [`BudgetState`] has four, and the missing one is the
+/// whole reason this type exists. [`BudgetState::ExhaustedOverflow`] records
+/// that a turn went to frontier *anyway* because the local pool could not take
+/// it — a fact about the fleet. A ledger holds a counter and two ceilings and
+/// has never seen a worker, so it cannot know whether that happened.
+///
+/// Stating that in prose is what this replaces: it was a sentence in
+/// [`Grant`]'s doc, a sentence in [`BudgetState`]'s, a comment in the Redis
+/// backend's reply decoder, and a runtime assertion in [`contract`] — four
+/// copies of an invariant, none of which the compiler read. Widening happens
+/// in exactly one place, [`From<LedgerState> for BudgetState`], and the
+/// narrower type is what every ledger answer is typed as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LedgerState {
+    /// Plenty left.
+    Unconstrained,
+    /// Past [`Budget::warn_at`] of the binding ceiling.
+    Warned,
+    /// Nothing left to grant.
+    Exhausted,
+}
+
+impl From<LedgerState> for BudgetState {
+    /// Widen a ledger's answer into the vocabulary a decision is recorded in.
+    ///
+    /// Total and one-way: every ledger state is a budget state, and the one
+    /// budget state that is not a ledger state is produced at the router's
+    /// valve site rather than converted into from anything.
+    fn from(state: LedgerState) -> Self {
+        match state {
+            LedgerState::Unconstrained => BudgetState::Unconstrained,
+            LedgerState::Warned => BudgetState::Warned,
+            LedgerState::Exhausted => BudgetState::Exhausted,
+        }
+    }
+}
+
 /// What one turn may spend.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Grant {
@@ -132,10 +171,7 @@ pub struct Grant {
     /// ordinary answer, not an error: an exhausted project degrades to local
     /// through the admissibility predicate rather than failing here.
     pub granted_usd: f64,
-    /// Never [`BudgetState::ExhaustedOverflow`] — a ledger cannot observe the
-    /// fleet, so it cannot know whether the local pool could serve. That
-    /// variant is produced at exactly one place, and it is not here.
-    pub state: BudgetState,
+    pub state: LedgerState,
 }
 
 impl Grant {
@@ -144,11 +180,12 @@ impl Grant {
     /// The one conversion between the ledger's answer and the per-turn datum
     /// [`RoutingContext`](crate::routing::RoutingContext) carries, so the
     /// ceiling the router enforces and the ceiling the ledger reserved cannot
-    /// be two different numbers.
+    /// be two different numbers — and the one place a [`LedgerState`] widens
+    /// into the four-armed [`BudgetState`] a decision is recorded in.
     pub fn turn_budget(&self, on_exhaustion: Exhaustion) -> TurnBudget {
         TurnBudget::Granted {
             ceiling_usd: self.granted_usd,
-            state: self.state,
+            state: self.state.into(),
             on_exhaustion,
         }
     }
@@ -169,7 +206,16 @@ pub struct Settlement {
     /// but never zero because a price could not be found, which is an error
     /// rather than a free turn.
     pub actual_usd: f64,
-    pub terms: BudgetTerms,
+    /// The window this spend lands in — and the only thing a settle needs of
+    /// the [`BudgetTerms`] a grant is judged against.
+    ///
+    /// A settle applies a realized amount and releases a hold; it never asks
+    /// what was left, so a limit and an allocation would be two ceilings
+    /// nothing on this path reads. Carrying them anyway would let a caller
+    /// settle under terms that disagreed with the grant's without anything
+    /// noticing, because nothing would look. Both backends read exactly this
+    /// field and no other.
+    pub window: BudgetWindow,
     pub now_ms: u64,
 }
 
@@ -202,7 +248,7 @@ pub struct Balance {
     /// `None` when the membership is [`Allocation::Pooled`] — there is no
     /// second ceiling, which is not the same as a ceiling of zero.
     pub member_remaining_usd: Option<f64>,
-    pub state: BudgetState,
+    pub state: LedgerState,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -226,11 +272,28 @@ pub enum SpendError {
     Backend(#[from] anyhow::Error),
 }
 
-fn check_amount(field: &'static str, value: f64) -> Result<(), SpendError> {
-    if !value.is_finite() || value < 0.0 {
-        return Err(SpendError::InvalidAmount { field, value });
+impl SpendError {
+    /// Refuse an amount that is not a finite, non-negative number of dollars.
+    ///
+    /// **Public because every backend needs it, and a second copy is how the
+    /// rule stops being one rule.** A `NaN` loses every `<` comparison it is
+    /// ever part of, so a `NaN` that reaches a ledger's arithmetic does not
+    /// blow up — it grants zero, or books a settle at zero, and the project's
+    /// committed total stays where it was while a provider bills for the turn.
+    /// That is unpriced frontier traffic recorded as free, which is the one
+    /// accounting lie this module exists to make impossible, and it has to be
+    /// impossible at whichever boundary the amount enters through rather than
+    /// only the in-memory one.
+    ///
+    /// A backend that pushes the amount into another language needs it most:
+    /// Lua has no `Result` to fail into, so the refusal has to happen on this
+    /// side of the wire or not at all.
+    pub fn check_amount(field: &'static str, value: f64) -> Result<(), SpendError> {
+        if !value.is_finite() || value < 0.0 {
+            return Err(SpendError::InvalidAmount { field, value });
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 /// Durable committed spend, with authorization holds.
@@ -448,9 +511,9 @@ fn state_for(
     user: &UserId,
     terms: &BudgetTerms,
     available: f64,
-) -> BudgetState {
+) -> LedgerState {
     if available <= 0.0 {
-        return BudgetState::Exhausted;
+        return LedgerState::Exhausted;
     }
     // Warn on whichever ceiling is closer to its own edge: a member three
     // quarters through a share nobody else is near is the one who needs telling.
@@ -458,29 +521,50 @@ fn state_for(
     let mut warned = project_used >= terms.budget.warn_level_usd();
     if let Some(ceiling) = terms.member_ceiling_usd() {
         let member_used = account.member_committed(user) + account.member_held_usd(user);
-        warned |= member_used >= ceiling * terms.budget.warn_at;
+        warned |= member_used >= terms.budget.warn_level_for(ceiling);
     }
     if warned {
-        BudgetState::Warned
+        LedgerState::Warned
     } else {
-        BudgetState::Unconstrained
+        LedgerState::Unconstrained
     }
+}
+
+/// The project's account, rolled to `now_ms` before anything reads it.
+///
+/// Every operation's first two lines, spelled once: create-if-absent, then
+/// [`ProjectAccount::settle_time`]. Three copies of them was three places a
+/// fourth operation could forget the roll, and a read that skipped it would
+/// report a lapsed hold as live and last month's spend as this month's.
+///
+/// `or_default` leaves `window_started_ms` at zero rather than seeding it from
+/// the caller's clock, which the very next line then rolls forward: a project
+/// nobody has spent under and one nobody has touched since the epoch are the
+/// same account, and seeding it was a third spelling of the window rule.
+fn account_for<'a>(
+    projects: &'a mut HashMap<ProjectId, ProjectAccount>,
+    project: &ProjectId,
+    window: BudgetWindow,
+    now_ms: u64,
+) -> &'a mut ProjectAccount {
+    let account = projects.entry(project.clone()).or_default();
+    account.settle_time(window, now_ms);
+    account
 }
 
 #[async_trait]
 impl SpendLedger for MemorySpendLedger {
     async fn open_grant(&self, request: GrantRequest) -> Result<Grant, SpendError> {
-        check_amount("requested_usd", request.requested_usd)?;
-        check_amount("limit_usd", request.terms.budget.limit_usd)?;
+        SpendError::check_amount("requested_usd", request.requested_usd)?;
+        SpendError::check_amount("limit_usd", request.terms.budget.limit_usd)?;
 
         let mut projects = self.projects.lock().await;
-        let account = projects
-            .entry(request.principal.project.clone())
-            .or_insert_with(|| ProjectAccount {
-                window_started_ms: window_start_ms(request.terms.budget.window, request.now_ms),
-                ..Default::default()
-            });
-        account.settle_time(request.terms.budget.window, request.now_ms);
+        let account = account_for(
+            &mut projects,
+            &request.principal.project,
+            request.terms.budget.window,
+            request.now_ms,
+        );
 
         // A turn has one hold. Replacing rather than accumulating is what makes
         // a re-grant under the same response id — which the engine avoids and a
@@ -514,19 +598,15 @@ impl SpendLedger for MemorySpendLedger {
     }
 
     async fn settle_grant(&self, settlement: Settlement) -> Result<Settled, SpendError> {
-        check_amount("actual_usd", settlement.actual_usd)?;
+        SpendError::check_amount("actual_usd", settlement.actual_usd)?;
 
         let mut projects = self.projects.lock().await;
-        let account = projects
-            .entry(settlement.principal.project.clone())
-            .or_insert_with(|| ProjectAccount {
-                window_started_ms: window_start_ms(
-                    settlement.terms.budget.window,
-                    settlement.now_ms,
-                ),
-                ..Default::default()
-            });
-        account.settle_time(settlement.terms.budget.window, settlement.now_ms);
+        let account = account_for(
+            &mut projects,
+            &settlement.principal.project,
+            settlement.window,
+            settlement.now_ms,
+        );
 
         let watermark = account
             .watermarks
@@ -566,16 +646,15 @@ impl SpendLedger for MemorySpendLedger {
     }
 
     async fn balance(&self, query: BalanceQuery) -> Result<Balance, SpendError> {
-        check_amount("limit_usd", query.terms.budget.limit_usd)?;
+        SpendError::check_amount("limit_usd", query.terms.budget.limit_usd)?;
 
         let mut projects = self.projects.lock().await;
-        let account = projects
-            .entry(query.principal.project.clone())
-            .or_insert_with(|| ProjectAccount {
-                window_started_ms: window_start_ms(query.terms.budget.window, query.now_ms),
-                ..Default::default()
-            });
-        account.settle_time(query.terms.budget.window, query.now_ms);
+        let account = account_for(
+            &mut projects,
+            &query.principal.project,
+            query.terms.budget.window,
+            query.now_ms,
+        );
 
         let left = remaining(account, &query.principal.user, &query.terms);
         let state = state_for(
@@ -609,20 +688,26 @@ mod tests {
 
     #[test]
     fn a_month_boundary_is_computed_without_a_calendar_dependency() {
-        // 2026-08-18T00:00:00Z and 2026-08-01T00:00:00Z, from `date -u -d`.
-        let mid_august = 1_787_011_200_000u64;
-        let august_first = 1_785_542_400_000u64;
-        assert_eq!(month_start_ms(mid_august), august_first);
-        assert_eq!(
-            month_start_ms(august_first),
-            august_first,
-            "the boundary instant belongs to the window it opens"
-        );
-        // The one arithmetic edge a hand-rolled calendar gets wrong: a leap day.
-        // 2028-02-29T12:00:00Z falls in the February that has one.
+        // The cases are not spelled here. `MONTH_START_CASES` is the one list
+        // both calendar ports answer — this Rust one and the Lua one in
+        // `roundhouse-store-redis`, which runs the identical table through an
+        // embedded interpreter. A case added there is a case both ports have
+        // to get right; a case added to only one of two local lists is how the
+        // ports drift.
+        for case in contract::MONTH_START_CASES {
+            assert_eq!(
+                month_start_ms(case.now_ms),
+                case.month_start_ms,
+                "{}: month_start_ms({})",
+                case.what,
+                case.now_ms
+            );
+        }
+
+        // The day arithmetic behind one of those cases, which the shared table
+        // cannot express because the Lua port returns only a month start: the
+        // leap day is a real February 29th and not a March 1st off by one.
         let leap_day = 1_835_438_400_000u64;
-        let february_2028 = 1_832_976_000_000u64;
-        assert_eq!(month_start_ms(leap_day), february_2028);
         assert_eq!(
             civil_from_days((leap_day / MS_PER_DAY) as i64),
             (2028, 2, 29)
@@ -630,80 +715,23 @@ mod tests {
 
         // `Total` has no boundary to roll over, which is what makes it never
         // reset.
+        let mid_august = 1_787_011_200_000u64;
         assert_eq!(window_start_ms(BudgetWindow::Total, mid_august), 0);
         assert_eq!(
             window_start_ms(BudgetWindow::Monthly, mid_august),
-            august_first
+            1_785_542_400_000
         );
-    }
-
-    #[tokio::test]
-    async fn an_amount_that_is_not_a_number_of_dollars_is_refused_rather_than_clamped() {
-        let ledger = MemorySpendLedger::new();
-        let terms = BudgetTerms {
-            budget: Budget {
-                limit_usd: 10.0,
-                window: BudgetWindow::Total,
-                on_exhaustion: Exhaustion::degrade_with_overflow(),
-                warn_at: 0.8,
-            },
-            allocation: Allocation::Pooled,
-        };
-        let request = GrantRequest {
-            principal: Principal::new("acme", "ada"),
-            session_id: SessionId::new("s"),
-            response_id: ResponseId::new("r"),
-            requested_usd: f64::NAN,
-            ttl_ms: 1_000,
-            terms: terms.clone(),
-            now_ms: 0,
-        };
-        assert!(matches!(
-            ledger.open_grant(request.clone()).await,
-            Err(SpendError::InvalidAmount {
-                field: "requested_usd",
-                ..
-            })
-        ));
-        assert!(
-            ledger
-                .open_grant(GrantRequest {
-                    requested_usd: 1.0,
-                    ..request
-                })
-                .await
-                .is_ok(),
-            "the control: a real amount is granted"
-        );
-
-        // A settle that cannot be priced must not arrive here as zero, so a
-        // non-number is refused on this side too.
-        assert!(matches!(
-            ledger
-                .settle_grant(Settlement {
-                    principal: Principal::new("acme", "ada"),
-                    session_id: SessionId::new("s"),
-                    seq: 1,
-                    response_id: ResponseId::new("r"),
-                    actual_usd: f64::INFINITY,
-                    terms,
-                    now_ms: 0,
-                })
-                .await,
-            Err(SpendError::InvalidAmount {
-                field: "actual_usd",
-                ..
-            })
-        ));
     }
 
     #[test]
     fn a_grant_converts_into_the_ceiling_the_router_enforces() {
         // One conversion, so the number the ledger reserved and the number the
-        // router compares against cannot drift apart.
+        // router compares against cannot drift apart — and one widening, so
+        // the four-armed state a decision records has exactly one door in from
+        // the three-armed state a ledger can observe.
         let grant = Grant {
             granted_usd: 0.0,
-            state: BudgetState::Exhausted,
+            state: LedgerState::Exhausted,
         };
         let budget = grant.turn_budget(Exhaustion::degrade_with_overflow());
         assert_eq!(budget.state(), BudgetState::Exhausted);
@@ -713,5 +741,17 @@ mod tests {
             grant.turn_budget(Exhaustion::Refuse).refuses(),
             "the same grant under a refusing project"
         );
+
+        // The widening is total and order-preserving: no ledger state may
+        // arrive at the router as the valve's mark, which is the invariant
+        // `LedgerState` replaced four prose copies of.
+        for (ledger_state, budget_state) in [
+            (LedgerState::Unconstrained, BudgetState::Unconstrained),
+            (LedgerState::Warned, BudgetState::Warned),
+            (LedgerState::Exhausted, BudgetState::Exhausted),
+        ] {
+            assert_eq!(BudgetState::from(ledger_state), budget_state);
+            assert!(!BudgetState::from(ledger_state).overflowed());
+        }
     }
 }

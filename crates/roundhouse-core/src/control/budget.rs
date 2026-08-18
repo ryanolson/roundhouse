@@ -63,9 +63,10 @@ pub const DEFAULT_WARN_AT: f64 = 0.8;
 /// therefore always means a real ceiling somebody wrote down.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Budget {
-    /// Dollars. Validated positive at the configuration boundary — a zero
-    /// limit would refuse every turn from boot, which nobody writes on purpose
-    /// and which `Exhaustion::Refuse` with a real limit expresses honestly.
+    /// Dollars. Validated finite and positive at the configuration boundary —
+    /// a zero limit would refuse every turn from boot, which nobody writes on
+    /// purpose and which `Exhaustion::Refuse` with a real limit expresses
+    /// honestly.
     pub limit_usd: f64,
     pub window: BudgetWindow,
     pub on_exhaustion: Exhaustion,
@@ -75,9 +76,21 @@ pub struct Budget {
 }
 
 impl Budget {
-    /// The committed-plus-held level at which grants start warning.
+    /// The committed-plus-held level at which grants start warning, on a
+    /// ceiling of `ceiling_usd`.
+    ///
+    /// Takes the ceiling rather than reading [`Self::limit_usd`] because
+    /// *both* ceilings warn on the same fraction — a member three quarters
+    /// through a share nobody else is near is the one who needs telling — and
+    /// a second `ceiling * warn_at` spelled inline at the member site is how
+    /// one configured fraction quietly becomes two different thresholds.
+    pub fn warn_level_for(&self, ceiling_usd: f64) -> f64 {
+        ceiling_usd * self.warn_at
+    }
+
+    /// The project ceiling's own warn level.
     pub fn warn_level_usd(&self) -> f64 {
-        self.limit_usd * self.warn_at
+        self.warn_level_for(self.limit_usd)
     }
 }
 
@@ -228,23 +241,16 @@ pub enum BudgetState {
     /// committed spend like any other, so the ledger visibly exceeds its limit
     /// rather than hiding the excess.
     ///
-    /// Never returned by the ledger — a [`SpendLedger`](super::spend::SpendLedger)
-    /// cannot observe the fleet, so it cannot know this happened. It is
-    /// produced at exactly one place, the router's admissibility resolution,
-    /// and a contract test pins the ledger's half of that.
+    /// Produced at exactly one place, the router's admissibility resolution.
+    /// A [`SpendLedger`](super::spend::SpendLedger) cannot even spell it: a
+    /// ledger's answers carry [`LedgerState`](super::spend::LedgerState),
+    /// whose three variants are the ones a counter and two ceilings can
+    /// observe. That used to be a sentence repeated in three doc comments and
+    /// a contract assertion; it is a compile error now.
     ExhaustedOverflow,
 }
 
 impl BudgetState {
-    /// Whether the budget had nothing left to grant, whatever the turn then did
-    /// about it.
-    pub fn is_exhausted(&self) -> bool {
-        matches!(
-            self,
-            BudgetState::Exhausted | BudgetState::ExhaustedOverflow
-        )
-    }
-
     /// Whether this turn was re-admitted to frontier by the overflow valve.
     pub fn overflowed(&self) -> bool {
         matches!(self, BudgetState::ExhaustedOverflow)
@@ -577,11 +583,9 @@ mod tests {
         // Overflow implies exhaustion, and that is what the fourth variant buys
         // over a flag: there is no value in this type meaning "overflowed while
         // unconstrained".
-        assert!(BudgetState::ExhaustedOverflow.is_exhausted());
         assert!(BudgetState::ExhaustedOverflow.overflowed());
-        assert!(BudgetState::Exhausted.is_exhausted());
         assert!(!BudgetState::Exhausted.overflowed());
-        assert!(!BudgetState::Warned.is_exhausted());
+        assert!(!BudgetState::Warned.overflowed());
     }
 
     #[test]
@@ -596,7 +600,7 @@ mod tests {
     }
 
     #[test]
-    fn the_warn_level_is_a_fraction_of_the_limit() {
+    fn the_warn_level_is_a_fraction_of_whichever_ceiling_is_being_judged() {
         let budget = Budget {
             limit_usd: 50.0,
             window: BudgetWindow::Monthly,
@@ -604,5 +608,13 @@ mod tests {
             warn_at: DEFAULT_WARN_AT,
         };
         assert_eq!(budget.warn_level_usd(), 40.0);
+        // The member ceiling warns on the same configured fraction, through
+        // the same function — which is the point of the function existing.
+        assert_eq!(budget.warn_level_for(10.0), 8.0);
+        assert_eq!(
+            budget.warn_level_usd(),
+            budget.warn_level_for(budget.limit_usd),
+            "the project level is the general one applied to the project ceiling"
+        );
     }
 }

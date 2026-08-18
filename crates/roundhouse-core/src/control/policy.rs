@@ -361,7 +361,8 @@ fn glob_match(pattern: &str, value: &str) -> bool {
 /// enclosing `PolicyConfig` does not already supply.
 ///
 /// `deny_unknown_fields` because serde's does not recurse: the attribute on
-/// `PolicyConfig` guards the three axes and stops at their boundary, so
+/// `PolicyConfig` guards the three policy axes — [`TurnPolicy::min_quality`],
+/// [`TurnPolicy::allow`] and this one — and stops at their boundary, so
 /// without this a stale or misspelled key *inside* a cadence object was
 /// accepted and dropped, and an operator got a cadence they did not write with
 /// nothing to tell them a line had been ignored.
@@ -505,9 +506,15 @@ impl TurnPolicy {
     /// Whether `candidate` is one this principal may be routed to *on this
     /// turn*, given what the session has already spent.
     ///
-    /// **The one admissibility question the router asks.** Every
-    /// [`RoutingPolicy`](crate::routing::RoutingPolicy) consults this and none
-    /// re-derives it, including the escalation audit branch, which would
+    /// **The policy-axes half of admissibility**, and all three of them: the
+    /// two [`Self::permits`] answers plus the cadence. The router asks it
+    /// through
+    /// [`RoutingContext::admissible`](crate::routing::RoutingContext::admissible),
+    /// which conjoins it with the budget — the one axis that is not a policy's
+    /// to answer for, because a policy is resolved once at admission and a
+    /// grant is opened on every turn. Every
+    /// [`RoutingPolicy`](crate::routing::RoutingPolicy) reaches it that way and
+    /// none re-derives it, including the escalation audit branch, which would
     /// otherwise escalate straight past a quality floor it never asked about.
     ///
     /// A `bool` rather than a reason: nothing downstream branches on *why* a

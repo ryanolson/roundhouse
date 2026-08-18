@@ -168,9 +168,8 @@ pub struct RoutingContext<'a> {
     /// Arrives as *data* rather than as a second `Arc<dyn RoutingPolicy>`: the
     /// engine keeps exactly one policy object, and tenancy is a constraint on
     /// what that policy may choose rather than a different way of choosing.
-    /// Every implementation consults it through
-    /// [`TurnPolicy::admits`](crate::control::TurnPolicy::admits) and none
-    /// re-derives it.
+    /// Every implementation consults it through [`Self::admissible`], which is
+    /// where it is conjoined with the budget, and none re-derives it.
     pub turn_policy: &'a TurnPolicy,
     /// The session's frontier dispatches per routed turn, which is what
     /// [`FrontierCadence`](crate::control::FrontierCadence) is evaluated
@@ -210,11 +209,32 @@ impl<'a> Admitted<'a> {
         &self.pool
     }
 
-    /// The budget situation to record on this turn's decision — including
-    /// [`BudgetState::ExhaustedOverflow`], which is *produced* here and exists
-    /// nowhere upstream.
-    pub fn budget_state(&self) -> BudgetState {
-        self.budget_state
+    /// Mint the decision for `target`, with `rationale` as the policy's own
+    /// account of why.
+    ///
+    /// **The one place a [`Decision`]'s three coupled fields are filled in
+    /// together.** Two of the three are this type's to answer for: the budget
+    /// state — including [`BudgetState::ExhaustedOverflow`], which is
+    /// *produced* by the admissibility resolution and exists nowhere upstream
+    /// of it — and the valve's justification appended to the rationale. Neither
+    /// is reachable any other way: the state is a private field and
+    /// [`Self::annotate`] is a private method, so a third [`RoutingPolicy`]
+    /// implementation cannot assemble a `Decision` by hand at all without
+    /// visibly inventing a budget state — which is a different thing from
+    /// quietly omitting one, and the difference is the whole of what used to be
+    /// a paragraph on [`Decision::budget_state`] asking to be obeyed.
+    ///
+    /// `target` is not checked against [`Self::pool`]. A policy that returned
+    /// something it was never offered is a bug this type cannot see — the pool
+    /// holds borrows into the caller's candidate slice — and the engine's own
+    /// `UnresolvableTarget` is where that is already caught, against the
+    /// authoritative set.
+    pub fn decide(&self, target: Target, rationale: String) -> Decision {
+        Decision {
+            target,
+            rationale: self.annotate(rationale),
+            budget_state: self.budget_state,
+        }
     }
 
     /// The admissible candidate with the highest quality prior.
@@ -242,7 +262,11 @@ impl<'a> Admitted<'a> {
     /// Appended rather than woven in, so an ordinary decision's rationale is
     /// byte-identical to the one a pre-budget deployment wrote — the M1
     /// compatibility pin depends on exactly that.
-    pub fn annotate(&self, rationale: String) -> String {
+    ///
+    /// Private, and that is [`Self::decide`]'s doing: a policy that could take
+    /// the annotated rationale without the budget state that explains it could
+    /// still write half a decision.
+    fn annotate(&self, rationale: String) -> String {
         match self.budget_state.overflowed() {
             true => rationale + OVERFLOW_NOTE,
             false => rationale,
@@ -255,44 +279,43 @@ impl<'a> RoutingContext<'a> {
         self.candidates.iter().find(|c| &c.target == target)
     }
 
-    /// **The one admissibility question the router asks**: may this turn be
-    /// dispatched to `candidate`?
+    /// The policy axes of admissibility, with the budget lifted — **the
+    /// overflow valve's question, and the first filter
+    /// [`Self::admissible`] applies.**
     ///
-    /// Three axes, two owners, and the split is the same one M2 named. The
-    /// allow filter and the quality floor are *reachability* — the same answer
-    /// on every turn of every session — and belong to
+    /// Named rather than spelled as a full admissibility check with a
+    /// fabricated [`TurnBudget::Unlimited`] handed in. A synthesized budget
+    /// would be a second answer to "what did the ledger grant this turn", and
+    /// the M2 review blocked on exactly that shape — a fabricated argument
+    /// standing in for a question nobody had named. The valve relaxes precisely
+    /// one axis, and the name is what says which.
+    fn admits_past_the_budget(&self, candidate: &Candidate) -> bool {
+        self.turn_policy.admits(candidate, self.frontier_history)
+    }
+
+    /// **The one admissibility question the router asks**: which candidates may
+    /// this turn be dispatched to, and — when there are none — whose decision
+    /// emptied the set.
+    ///
+    /// Four axes, two owners, and the split is the same one M2 named. The allow
+    /// filter and the quality floor are *reachability* — the same answer on
+    /// every turn of every session — and belong to
     /// [`TurnPolicy::permits`](crate::control::TurnPolicy::permits). The
     /// cadence and the budget are *this-turn* axes: a rationed model is
     /// reachable next turn and a budget-excluded one is reachable next month,
     /// which is why neither belongs in `permits` and why a candidate excluded
     /// by either still belongs in `considered` with its counterfactual saving
-    /// intact.
+    /// intact. The first three are the policy's, which is why they arrive
+    /// together through [`Self::admits_past_the_budget`]; the fourth is the
+    /// ledger's.
     ///
     /// The conjunction lives here rather than inside `TurnPolicy` because the
     /// budget is not a property of a policy — a policy is resolved once at
     /// admission and a grant is opened between `quote` and `choose` on every
-    /// turn. Threading a `TurnBudget` into `TurnPolicy::admits` would make one
+    /// turn. Threading a `TurnBudget` into
+    /// [`TurnPolicy::admits`](crate::control::TurnPolicy::admits) would make one
     /// type answer for two clocks; this context is the thing that already holds
     /// both.
-    pub fn admits(&self, candidate: &Candidate) -> bool {
-        self.admits_past_the_budget(candidate) && self.budget.admits(candidate)
-    }
-
-    /// The same question with the budget axis lifted — **the overflow valve's
-    /// question, and its only caller.**
-    ///
-    /// Named rather than spelled as [`Self::admits`] with a fabricated
-    /// [`TurnBudget::Unlimited`] handed in. A synthesized budget would be a
-    /// second answer to "what did the ledger grant this turn", and the M2
-    /// review blocked on exactly that shape — a fabricated argument standing in
-    /// for a question nobody had named. The valve relaxes precisely one axis,
-    /// and the name is what says which.
-    pub fn admits_past_the_budget(&self, candidate: &Candidate) -> bool {
-        self.turn_policy.admits(candidate, self.frontier_history)
-    }
-
-    /// The candidates this turn may be dispatched to, and — when there are
-    /// none — whose decision emptied the set.
     ///
     /// **One piece of code decides all three outcomes**, because they are three
     /// answers to one question and a second implementation of any of them would
@@ -374,6 +397,12 @@ pub struct Decision {
     /// overflow valve had to open, and a caller re-deriving the state from the
     /// grant it handed in would record every overflow as an ordinary
     /// exhausted turn.
+    ///
+    /// It is filled in by [`Admitted::decide`] and there is nowhere else to
+    /// get it from — the readers that used to hand it out are private to this
+    /// module — which is what turned "remember to carry this" from a paragraph
+    /// every future [`RoutingPolicy`] had to read into a thing the module
+    /// boundary decides.
     pub budget_state: BudgetState,
 }
 
@@ -419,6 +448,27 @@ pub struct DecisionRecord {
     /// treatment, and same reason, as [`Self::turn_policy_digest`] above.
     #[serde(default)]
     pub budget_state: BudgetState,
+    /// The rate card in force when this decision was made.
+    ///
+    /// A fact about the turn, exactly like the two fields above it, and
+    /// recorded for the same reason: what the spend ledger charges has to be
+    /// derivable from the log alone. A settle is driven twice — once by the
+    /// process that ran the turn and, if that process died first, once by the
+    /// successor that replays its log — and pricing either of them against the
+    /// *live* catalog makes the two answers depend on which file the process
+    /// happened to boot with. A price list is a file an operator edits, so
+    /// that is not a hypothetical: dropping a model is an ordinary edit, and
+    /// against a live catalog it turns every later settle of a turn that used
+    /// it into an error.
+    ///
+    /// `None` for a local dispatch, which bills capacity and not dollars, and
+    /// for the pre-M3 logs the serde default covers. A frontier decision
+    /// carrying `None` is therefore exactly one thing: a turn from before this
+    /// field existed, whose settle can no longer be priced from the log. That
+    /// is drift a repair reports and skips — see the settle seam in
+    /// `roundhouse-server`'s engine — rather than a turn anyone can fix now.
+    #[serde(default)]
+    pub rate_card: Option<ProviderPricing>,
 }
 
 /// Why no target was chosen.
@@ -615,6 +665,12 @@ mod tests {
             considered: Vec::new(),
             turn_policy_digest: "0123456789abcdef".into(),
             budget_state: BudgetState::ExhaustedOverflow,
+            rate_card: Some(ProviderPricing {
+                input_per_mtok_usd: 3.0,
+                cached_input_per_mtok_usd: 0.3,
+                cache_write_per_mtok_usd: 3.75,
+                output_per_mtok_usd: 15.0,
+            }),
         };
         let encoded = serde_json::to_string(&record).unwrap();
         assert!(
@@ -623,7 +679,9 @@ mod tests {
         );
         assert_eq!(
             serde_json::from_str::<DecisionRecord>(&encoded).unwrap(),
-            record
+            record,
+            "the card has to survive the round trip too, or a settle re-driven \
+             from this log prices the turn at nothing"
         );
 
         // Byte-for-byte what a `Routed` decision serialized to at M2 — with a
@@ -649,6 +707,12 @@ mod tests {
         assert!(
             !recovered.budget_state.overflowed(),
             "and it certainly did not overflow one"
+        );
+        assert_eq!(
+            recovered.rate_card, None,
+            "and it recorded no rate card, because there was no field to record \
+             one in -- which is why a repair reports such a settle as drift \
+             rather than pricing it at zero"
         );
     }
 }

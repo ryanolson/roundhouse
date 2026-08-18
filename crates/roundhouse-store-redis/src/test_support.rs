@@ -10,10 +10,7 @@
 use roundhouse_core::control::ProjectId;
 use roundhouse_core::ids::SessionId;
 
-use crate::spend::{
-    account_key as spend_account_key_impl, holds_key as spend_holds_key_impl,
-    watermarks_key as spend_watermarks_key_impl,
-};
+use crate::spend::holds_key as spend_holds_key_impl;
 use crate::{RedisSessionStore, lease_key as store_lease_key, log_key as store_log_key};
 
 /// The one variable every Redis-gated integration test reads.
@@ -46,18 +43,16 @@ pub fn log_key(session_id: &SessionId) -> String {
     store_log_key(session_id)
 }
 
-/// The raw spend-ledger keys, for tests that inspect the hash fields
-/// directly rather than only through [`SpendLedger`](roundhouse_core::control::SpendLedger).
-pub fn spend_account_key(project: &ProjectId) -> String {
-    spend_account_key_impl(project)
-}
-
+/// The raw holds key, for the one test that inspects the hash field a hold
+/// occupies rather than only the balance it is derived into.
+///
+/// Its two siblings — the account and watermark keys — were exported here too
+/// and never called. A test-support export with no caller is not a spare
+/// affordance: it is an untested surface that reads as a supported one, and
+/// the key format it pins is already pinned by
+/// `the_project_and_member_keys_share_one_hash_tag` beside the real functions.
 pub fn spend_holds_key(project: &ProjectId) -> String {
     spend_holds_key_impl(project)
-}
-
-pub fn spend_watermarks_key(project: &ProjectId) -> String {
-    spend_watermarks_key_impl(project)
 }
 
 /// The conformance suite's expiry lever. Deleting the key is exactly what

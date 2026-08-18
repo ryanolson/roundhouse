@@ -32,4 +32,7 @@ test-support = ["roundhouse-core/test-support"]
 roundhouse-core = { workspace = true, features = ["test-support"] }
 roundhouse-store-redis = { path = ".", features = ["test-support"] }
 futures = { workspace = true }
+# Executes `spend/scripts.rs`'s `LUA_PRELUDE` in-process, so the Lua calendar
+# port answers the same table of cases the Rust one does without a live Redis.
+mlua = { workspace = true }
 tokio = { workspace = true }

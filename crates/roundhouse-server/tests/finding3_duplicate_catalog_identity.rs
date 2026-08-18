@@ -110,6 +110,11 @@ fn one_frontier_call(usage: Usage) -> Vec<SessionEvent> {
                     considered: Vec::new(),
                     turn_policy_digest: String::new(),
                     budget_state: BudgetState::Unconstrained,
+                    // The subject here is the *metrics* fold, which prices
+                    // from the catalog it is handed — the ambiguity this
+                    // finding is about. What a settle would charge is the
+                    // decision's own card and a separate question.
+                    rate_card: None,
                 },
             },
         },

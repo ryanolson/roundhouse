@@ -417,6 +417,7 @@ mod tests {
                 considered: vec![],
                 turn_policy_digest: String::new(),
                 budget_state: Default::default(),
+                rate_card: None,
             },
         });
         // Failed before anything was sent: empty usage is the engine's way of
@@ -459,6 +460,7 @@ mod tests {
                 considered: vec![],
                 turn_policy_digest: String::new(),
                 budget_state: Default::default(),
+                rate_card: None,
             },
         });
         log.push(SessionEventKind::ResponseIncomplete {

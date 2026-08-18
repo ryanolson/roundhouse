@@ -17,7 +17,7 @@ use crate::control::{FrontierHistory, Principal};
 use crate::event::{IncompleteReason, SessionEvent, SessionEventKind, SessionObserver, Usage};
 use crate::ids::{ResponseId, SessionId, TurnId};
 use crate::item::Item;
-use crate::routing::{CacheLedger, DecisionRecord, Target};
+use crate::routing::{CacheLedger, DecisionRecord, ProviderPricing, Target};
 use crate::store::{Lease, SessionStore, StoreError};
 
 /// How many events to pull per replay batch.
@@ -62,10 +62,14 @@ struct CompletedTurn {
     usage: Usage,
 }
 
-/// Where a dispatch went and how much prompt it carried.
+/// Where a dispatch went, how much prompt it carried, and at what price.
 struct PendingRouting {
     target: Target,
     isl_tokens: u64,
+    /// The rate card the decision recorded. See
+    /// [`DecisionRecord::rate_card`] for why a settle reads the log's card and
+    /// never a live one.
+    rate_card: Option<ProviderPricing>,
 }
 
 /// A response that terminated, and everything needed to charge it for.
@@ -75,6 +79,14 @@ struct PendingRouting {
 /// settle has only the log to work from, so if the live settle read its inputs
 /// from anywhere else the two would be settling from two different accounts of
 /// the same turn.
+///
+/// **The price is one of those inputs**, which it was not at first. A settle
+/// priced against the running process's catalog is priced against a file an
+/// operator edits, so the two moments really could see different numbers — and
+/// a repair against a catalog that had *dropped* the model could see no number
+/// at all, which failed the settle, which failed every turn of the session
+/// after it. [`Self::rate_card`] is that hole closed at the seam it was open
+/// at: the card travels in the log beside the target it prices.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TerminalSettlement {
     pub response_id: ResponseId,
@@ -88,6 +100,16 @@ pub struct TerminalSettlement {
     /// reached no provider and so owes nobody anything, which makes the
     /// absence a fact rather than a missing value.
     pub target: Option<Target>,
+    /// The rate card that was in force when the turn was routed, as its
+    /// decision recorded it — the price half of "projected from the log rather
+    /// than handed across from whatever produced it".
+    ///
+    /// Carried beside the target rather than folded into it, because the two
+    /// absences mean different things and a settle has to tell them apart: no
+    /// target is a turn that reached nobody and owes nothing, while a frontier
+    /// target with no card is a turn routed before the card was recorded, which
+    /// no process alive can price. See [`DecisionRecord::rate_card`].
+    pub rate_card: Option<ProviderPricing>,
     /// What the terminal event reported, estimate or measurement alike. An
     /// estimate is what a provider that reported nothing gets charged on, and
     /// it is charged exactly as a measurement would be.
@@ -179,6 +201,7 @@ impl SessionState {
                     PendingRouting {
                         target: decision.chosen.clone(),
                         isl_tokens: decision.isl_tokens,
+                        rate_card: decision.rate_card,
                     },
                 );
             }
@@ -211,6 +234,7 @@ impl SessionState {
                 self.last_settlement = Some(TerminalSettlement {
                     response_id: response_id.clone(),
                     seq: event.seq,
+                    rate_card: routing.as_ref().and_then(|routing| routing.rate_card),
                     target: routing.map(|routing| routing.target),
                     usage: usage.clone(),
                 });
@@ -667,8 +691,23 @@ mod tests {
         (sid, session)
     }
 
+    /// A hosted rate card, so a decision under test carries the price its
+    /// settle will be driven from.
+    fn card() -> ProviderPricing {
+        ProviderPricing {
+            input_per_mtok_usd: 3.0,
+            cached_input_per_mtok_usd: 0.3,
+            cache_write_per_mtok_usd: 3.75,
+            output_per_mtok_usd: 15.0,
+        }
+    }
+
+    /// A decision priced the way the engine prices one: a card for a hosted
+    /// target, none for a local worker, which bills capacity rather than
+    /// dollars.
     fn decision_for(target: Target, isl: u64) -> DecisionRecord {
         DecisionRecord {
+            rate_card: (!target.is_local()).then(card),
             chosen: target,
             rationale: "test".into(),
             policy: "affinity".into(),
@@ -828,6 +867,13 @@ mod tests {
         assert_eq!(settlement.target, Some(target));
         assert_eq!(settlement.usage, billed);
         assert_eq!(
+            settlement.rate_card,
+            Some(card()),
+            "the price travels with the target it prices: a settle that had to \
+             look the card up somewhere else would be reading a file, and a \
+             file is not the same thing twice"
+        );
+        assert_eq!(
             settlement.seq,
             session.last_seq(),
             "the seq is the terminal event's own, which is what makes the \
@@ -860,6 +906,12 @@ mod tests {
             settlement.target, None,
             "a turn that routed nowhere owes nothing, and the absence is what \
              says so"
+        );
+        assert_eq!(
+            settlement.rate_card, None,
+            "and there is no card, because there was nothing to price -- which \
+             is a different absence from a hosted turn whose card the log never \
+             recorded"
         );
 
         // And a successor that replays this log arrives at the same answer,

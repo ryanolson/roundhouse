@@ -228,6 +228,7 @@ mod tests {
                         considered: vec![],
                         turn_policy_digest: String::new(),
                         budget_state: BudgetState::Unconstrained,
+                        rate_card: None,
                     },
                 },
             },

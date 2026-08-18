@@ -5,8 +5,10 @@
 //! adversarial cases only a real backend can exercise.
 //!
 //! The macro invocation is the milestone's headline, in the same idiom as
-//! `contract.rs`: the *same* eleven assertions that judge `MemorySpendLedger`
-//! now judge this store. `the_project_and_member_keys_share_one_hash_tag`
+//! `contract.rs`: the *same* assertions that judge `MemorySpendLedger` judge
+//! this store, whatever the list grows to — the macro is the list, so a test
+//! added there is added here with no wiring step.
+//! `the_project_and_member_keys_share_one_hash_tag`
 //! needs no live Redis — key strings are pure formatting — so it lives as a
 //! unit test beside `account_key`/`holds_key`/`watermarks_key` in
 //! `src/spend.rs` instead of being duplicated here as an ignore-gated test
@@ -18,9 +20,10 @@
 
 mod common;
 
+use roundhouse_core::control::spend::contract::{assert_usd, fresh_principal, terms};
 use roundhouse_core::control::{
-    Allocation, Balance, BalanceQuery, Budget, BudgetTerms, BudgetWindow, Exhaustion, GrantRequest,
-    MemorySpendLedger, Principal, ProjectId, Settlement, SpendLedger,
+    Allocation, Balance, BalanceQuery, BudgetTerms, GrantRequest, MemorySpendLedger, Principal,
+    Settlement, SpendLedger,
 };
 use roundhouse_core::ids::{ResponseId, SessionId};
 use roundhouse_store_redis::RedisSpendLedger;
@@ -45,38 +48,16 @@ async fn raw_from_env() -> redis::aio::MultiplexedConnection {
         .unwrap()
 }
 
-/// A membership nothing else in this file shares, mirroring
-/// `roundhouse_core::control::spend::contract::fresh_principal` — private to
-/// that module, so this is the second, deliberately identical, copy.
-fn fresh_principal(user: &str) -> Principal {
-    Principal::new(
-        ProjectId::new(format!("proj_{}", uuid::Uuid::new_v4().simple())),
-        user,
-    )
-}
-
+/// `fresh_principal`, `assert_usd` and `terms` are imported from the contract
+/// module rather than restated here.
+///
+/// They used to be a second, deliberately identical copy — including the
+/// comment saying so. Two spellings of "dollars compare to the cent" is one
+/// edit away from two tolerances, and two spellings of "mint a project nothing
+/// else shares" is one edit away from these adversarial tests colliding with
+/// the suite above on the shared Redis they both run against.
 fn pooled_terms(limit_usd: f64) -> BudgetTerms {
-    BudgetTerms {
-        budget: Budget {
-            limit_usd,
-            window: BudgetWindow::Total,
-            on_exhaustion: Exhaustion::degrade_with_overflow(),
-            warn_at: 0.8,
-        },
-        allocation: Allocation::Pooled,
-    }
-}
-
-/// Dollars compare to the cent, not to the bit — the same tolerance the
-/// shared contract suite uses, for the same reason: Redis accumulates
-/// through Lua's doubles, which need not round identically to Rust's on
-/// every intermediate step.
-#[track_caller]
-fn assert_usd(actual: f64, expected: f64, what: &str) {
-    assert!(
-        (actual - expected).abs() < 1e-6,
-        "{what}: expected ${expected}, got ${actual}"
-    );
+    terms(limit_usd, Allocation::Pooled)
 }
 
 /// A hold whose process died before settling: nobody calls `settle_grant`
@@ -280,7 +261,7 @@ async fn open_grant_and_settle_grant_are_single_round_trips() {
                 seq: attempt + 1,
                 response_id: ResponseId::new(format!("settle-probe-{attempt}")),
                 actual_usd: 0.5,
-                terms: terms.clone(),
+                window: terms.budget.window,
                 now_ms: 0,
             })
             .await
@@ -342,7 +323,7 @@ async fn the_two_backends_agree_on_a_grant_settle_replay_sequence() {
                 seq: 1,
                 response_id: ResponseId::new("r1"),
                 actual_usd: 2.0,
-                terms: terms.clone(),
+                window: terms.budget.window,
                 now_ms: 0,
             })
             .await
@@ -356,7 +337,7 @@ async fn the_two_backends_agree_on_a_grant_settle_replay_sequence() {
                 seq: 1,
                 response_id: ResponseId::new("r1"),
                 actual_usd: 2.0,
-                terms: terms.clone(),
+                window: terms.budget.window,
                 now_ms: 0,
             })
             .await
@@ -369,7 +350,7 @@ async fn the_two_backends_agree_on_a_grant_settle_replay_sequence() {
                 seq: 1,
                 response_id: ResponseId::new("r2"),
                 actual_usd: 9.0,
-                terms: terms.clone(),
+                window: terms.budget.window,
                 now_ms: 0,
             })
             .await

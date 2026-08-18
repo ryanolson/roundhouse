@@ -87,6 +87,17 @@ redis = { version = "0.27", default-features = false, features = [
     "script",
     "connection-manager",
 ] }
+# Tests only (`roundhouse-store-redis` dev-dependency): an embedded Lua 5.4, so
+# the spend ledger's Lua prelude can be *executed* against the same table of
+# calendar cases the Rust port is executed against. Without it the two ports
+# only agree where a live Redis is reachable, which is exactly where the suite
+# is ignore-gated. `vendored` builds Lua from the bundled C source rather than
+# linking a system liblua: no OpenSSL, no pkg-config, and the same answer on
+# every machine that has a C compiler.
+mlua = { version = "0.12", default-features = false, features = [
+    "lua54",
+    "vendored",
+] }
 
 # `zmq` is pulled in transitively by `dynamo-kv-router/standalone-selection`.
 # Declaring it here with `vendored` would build libzmq from source; we instead

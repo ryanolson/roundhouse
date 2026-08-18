@@ -98,6 +98,7 @@ fn log(calls: &[Usage]) -> Vec<SessionEvent> {
                     considered: vec![],
                     turn_policy_digest: String::new(),
                     budget_state: Default::default(),
+                    rate_card: None,
                 },
             },
         );

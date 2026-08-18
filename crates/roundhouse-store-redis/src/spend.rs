@@ -81,21 +81,6 @@ fn member_ceiling_arg(terms: &BudgetTerms) -> String {
         .unwrap_or_default()
 }
 
-/// Refuses a non-finite or negative dollar amount before it ever reaches
-/// Lua, where a `NaN` would otherwise travel silently: every comparison
-/// against `NaN` is false, so a `NaN` `requested_usd` would lose every `<`
-/// comparison in `OPEN_GRANT` and grant zero — a fail-open the house rule
-/// forbids (no `unwrap_or(most-permissive)` on the request path). Mirrors
-/// `check_amount` in `roundhouse_core::control::spend`, which is private to
-/// that module for the same reason its own doc gives: the check belongs at
-/// every boundary an amount enters through, not only the memory one.
-fn check_amount(field: &'static str, value: f64) -> Result<(), SpendError> {
-    if !value.is_finite() || value < 0.0 {
-        return Err(SpendError::InvalidAmount { field, value });
-    }
-    Ok(())
-}
-
 fn backend(error: redis::RedisError) -> SpendError {
     SpendError::Backend(anyhow::Error::new(error))
 }
@@ -126,8 +111,8 @@ impl RedisSpendLedger {
 #[async_trait]
 impl SpendLedger for RedisSpendLedger {
     async fn open_grant(&self, request: GrantRequest) -> Result<Grant, SpendError> {
-        check_amount("requested_usd", request.requested_usd)?;
-        check_amount("limit_usd", request.terms.budget.limit_usd)?;
+        SpendError::check_amount("requested_usd", request.requested_usd)?;
+        SpendError::check_amount("limit_usd", request.terms.budget.limit_usd)?;
 
         let member_ceiling = member_ceiling_arg(&request.terms);
         let account = account_key(&request.principal.project);
@@ -158,7 +143,7 @@ impl SpendLedger for RedisSpendLedger {
     }
 
     async fn settle_grant(&self, settlement: Settlement) -> Result<Settled, SpendError> {
-        check_amount("actual_usd", settlement.actual_usd)?;
+        SpendError::check_amount("actual_usd", settlement.actual_usd)?;
 
         let account = account_key(&settlement.principal.project);
         let holds = holds_key(&settlement.principal.project);
@@ -177,7 +162,7 @@ impl SpendLedger for RedisSpendLedger {
                     response_id: settlement.response_id.as_str(),
                     actual_usd: settlement.actual_usd,
                     now_ms: settlement.now_ms,
-                    window_mode: window_mode(settlement.terms.budget.window),
+                    window_mode: window_mode(settlement.window),
                 },
             )
             .await?;
@@ -199,7 +184,7 @@ impl SpendLedger for RedisSpendLedger {
     }
 
     async fn balance(&self, query: BalanceQuery) -> Result<Balance, SpendError> {
-        check_amount("limit_usd", query.terms.budget.limit_usd)?;
+        SpendError::check_amount("limit_usd", query.terms.budget.limit_usd)?;
 
         let member_ceiling = member_ceiling_arg(&query.terms);
         let account = account_key(&query.principal.project);
@@ -289,23 +274,10 @@ mod tests {
         assert_eq!(member_ceiling_arg(&capped), "5");
     }
 
-    #[test]
-    fn an_amount_that_is_not_a_number_of_dollars_is_refused_before_it_reaches_lua() {
-        assert!(matches!(
-            check_amount("requested_usd", f64::NAN),
-            Err(SpendError::InvalidAmount {
-                field: "requested_usd",
-                ..
-            })
-        ));
-        assert!(matches!(
-            check_amount("requested_usd", f64::INFINITY),
-            Err(SpendError::InvalidAmount { .. })
-        ));
-        assert!(matches!(
-            check_amount("requested_usd", -1.0),
-            Err(SpendError::InvalidAmount { .. })
-        ));
-        assert!(check_amount("requested_usd", 1.0).is_ok(), "the control");
-    }
+    // `an_amount_that_is_not_a_number_of_dollars_is_refused_before_it_reaches_lua`
+    // used to sit here, and its twin in `roundhouse_core::control::spend`'s own
+    // test module: two private tests of one rule, each only ever run against
+    // one backend. It is `a_non_finite_request_is_refused_through_the_trait` in
+    // the shared contract suite now, which judges every backend through the
+    // trait rather than judging one helper through its own copy of the check.
 }

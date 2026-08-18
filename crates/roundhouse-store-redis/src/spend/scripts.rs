@@ -29,16 +29,24 @@
 //! module — the ledger's window boundary is not something a caller composes
 //! from parts, precisely so it cannot drift from what a grant enforces. That
 //! privacy is exactly what forces this file to carry its own port of Howard
-//! Hinnant's civil-calendar algorithm rather than calling the Rust one. The
-//! two copies are proven to agree the same way the two backends are proved
-//! interchangeable everywhere else: `a_monthly_window_resets_committed_at_its_boundary`
-//! is part of the one contract suite both run, on the same August-18 /
-//! September-1 boundary.
+//! Hinnant's civil-calendar algorithm rather than calling the Rust one.
+//!
+//! What keeps the two copies honest is that both are *executed* against one
+//! list of boundaries,
+//! [`MONTH_START_CASES`](roundhouse_core::control::spend::contract::MONTH_START_CASES):
+//! the Rust port in that crate's own unit tests, this one through an embedded
+//! Lua interpreter in this file's test module. That runs on every `cargo test`
+//! with no Redis anywhere. Be clear about what it does *not* cover: the Redis
+//! script sandbox itself — `redis.call`, the RESP conversion rules, and Lua
+//! 5.1 rather than the 5.4 the embedded interpreter builds. Those belong to
+//! the ignore-gated suite, where
+//! `a_monthly_window_resets_committed_at_its_boundary` drives a real
+//! August-18 / September-1 rollover through a real server.
 
 use redis::Value;
 use redis::aio::ConnectionManager;
 
-use roundhouse_core::control::{BudgetState, SpendError};
+use roundhouse_core::control::{LedgerState, SpendError};
 
 /// Lua helpers shared by all three scripts: truncating integer division (the
 /// civil-calendar algorithm assumes Rust's `/` on `i64`, which truncates
@@ -124,14 +132,28 @@ local function unpack_hold(value)
   return user, amount, expires
 end
 
--- Roll the account hash to the window containing now_ms (resetting project
--- and every member's committed spend if it changed), then drop every hold
--- whose TTL has lapsed by now_ms. Every one of the three ops starts here,
--- exactly as `ProjectAccount::settle_time` is the first line of every memory
--- ledger operation — the crash story ('a leaked hold self-heals within one
--- TTL, no sweeper') depends on this running lazily on whichever call happens
--- to come next, not on a background task.
-local function settle_time(account_key, holds_key, mode, now_ms)
+-- Roll one project's account to `now_ms`, and read the position that leaves.
+--
+-- **The Lua twin of three Rust things at once**, in
+-- `roundhouse_core::control::spend`: `ProjectAccount::settle_time` (the window
+-- roll plus the lazy hold expiry every operation begins with), `remaining`
+-- (both ceilings, each floored at zero), and `Remaining::effective` (the
+-- tighter of the two). One function here because the alternative was measured
+-- and rejected: the ceiling rule was copied verbatim into OPEN_GRANT and
+-- BALANCE, so the rule that decides how much money a project has had two
+-- spellings a hundred lines apart, and the holds hash was walked twice per
+-- call -- once to expire, once to sum -- for an answer the first pass already
+-- had in hand.
+--
+-- The crash story ('a leaked hold self-heals within one TTL, no sweeper')
+-- depends on this running lazily on whichever call happens to come next, not
+-- on a background task. That is why a *read* calls it too.
+--
+-- `limit_usd` is nil for SETTLE_GRANT, which releases a hold and applies a
+-- realized amount without ever asking what remained: the remaining fields are
+-- then left unset rather than computed, because a ceiling nothing reads is a
+-- second answer nothing checks.
+local function roll_and_read(account_key, holds_key, mode, now_ms, user, limit_usd, member_ceiling)
   local stored = tonumber(redis.call('HGET', account_key, 'window_start_ms'))
   local current = window_start(mode, now_ms)
   if stored == nil or current > stored then
@@ -144,35 +166,50 @@ local function settle_time(account_key, holds_key, mode, now_ms)
     redis.call('HSET', account_key, 'window_start_ms', current)
   end
 
+  -- One HGETALL: a lapsed hold is deleted and a live one is summed in the same
+  -- pass. The sums are read fresh on every call rather than kept as running
+  -- counters, because a counter would be a second number the deletions here
+  -- would have to keep in lockstep -- and this hash holds one field per turn
+  -- *in flight*, not per turn ever served.
+  local p = {committed = 0.0, member_committed = 0.0, held = 0.0, member_held = 0.0}
   local raw = redis.call('HGETALL', holds_key)
   local i = 1
   while i <= #raw do
     local response_id = raw[i]
-    local _user, _amount, expires = unpack_hold(raw[i + 1])
+    local hold_user, amount, expires = unpack_hold(raw[i + 1])
     if expires <= now_ms then
       redis.call('HDEL', holds_key, response_id)
+    else
+      p.held = p.held + amount
+      if hold_user == user then p.member_held = p.member_held + amount end
     end
     i = i + 2
   end
+
+  -- Read after the roll above, never before: a stale window's committed spend
+  -- is exactly what the roll exists to have deleted.
+  p.committed = tonumber(redis.call('HGET', account_key, 'committed')) or 0.0
+  p.member_committed = tonumber(redis.call('HGET', account_key, 'member:' .. user)) or 0.0
+
+  if limit_usd ~= nil then
+    p.project_remaining = limit_usd - p.committed - p.held
+    if p.project_remaining < 0.0 then p.project_remaining = 0.0 end
+    p.effective = p.project_remaining
+    if member_ceiling ~= nil then
+      p.member_remaining = member_ceiling - p.member_committed - p.member_held
+      if p.member_remaining < 0.0 then p.member_remaining = 0.0 end
+      if p.member_remaining < p.effective then p.effective = p.member_remaining end
+    end
+  end
+  return p
 end
 
--- Sum of every live hold in the project, and separately of one member's —
--- read fresh on every call rather than kept as a running counter, because a
--- running counter would be a second number that `settle_time`'s deletions
--- above would have to keep in lockstep, and a hash this small (one field per
--- turn in flight, not per turn ever served) does not need one.
-local function held_totals(holds_key, user)
-  local raw = redis.call('HGETALL', holds_key)
-  local project_total = 0.0
-  local member_total = 0.0
-  local i = 1
-  while i <= #raw do
-    local hu, amount = unpack_hold(raw[i + 1])
-    project_total = project_total + amount
-    if hu == user then member_total = member_total + amount end
-    i = i + 2
-  end
-  return project_total, member_total
+-- The committed-plus-held level at which a ceiling starts warning. Both
+-- ceilings warn on the same configured fraction, so both go through here --
+-- the Lua twin of `Budget::warn_level_for`, and for the same reason: an inline
+-- product at the member site is how one fraction becomes two thresholds.
+local function warn_level(ceiling, warn_at)
+  return ceiling * warn_at
 end
 
 -- Ports `roundhouse_core::control::spend::state_for` verbatim, including its
@@ -184,8 +221,8 @@ end
 -- zero` and that is what arms the overflow valve and triggers a refusal.
 local function state_for(project_used, member_used, member_ceiling, limit_usd, warn_at, available)
   if available <= 0.0 then return 'exhausted' end
-  local warned = project_used >= (limit_usd * warn_at)
-  if member_ceiling ~= nil and member_used >= (member_ceiling * warn_at) then
+  local warned = project_used >= warn_level(limit_usd, warn_at)
+  if member_ceiling ~= nil and member_used >= warn_level(member_ceiling, warn_at) then
     warned = true
   end
   if warned then return 'warned' else return 'unconstrained' end
@@ -216,32 +253,17 @@ local warn_at = tonumber(ARGV[8])
 local mode = ARGV[9]
 local expires_at_ms = now_ms + tonumber(ARGV[4])
 
-settle_time(account_key, holds_key, mode, now_ms)
-
--- A turn has one hold. Clearing this response's own before computing what is
--- left is what makes a re-grant under the same id (the engine never issues
--- one — a deduplicated retry short-circuits before `plan` — but a buggy
+-- A turn has one hold, and this response's own comes off *before* the pool is
+-- read. That is what makes a re-grant under the same id (the engine never
+-- issues one — a deduplicated retry short-circuits before `plan` — but a buggy
 -- caller could still reach this) cost the difference rather than the whole
--- amount again, and rather than a stale copy of itself surviving the
--- recompute below.
+-- amount again, and stops it being capped by the very hold it is replacing.
 redis.call('HDEL', holds_key, response_id)
 
-local committed = tonumber(redis.call('HGET', account_key, 'committed')) or 0.0
-local member_committed = tonumber(redis.call('HGET', account_key, 'member:' .. user)) or 0.0
-local held_total, member_held = held_totals(holds_key, user)
-
-local project_remaining = limit_usd - committed - held_total
-if project_remaining < 0.0 then project_remaining = 0.0 end
-
-local effective = project_remaining
-if member_ceiling ~= nil then
-  local member_remaining = member_ceiling - member_committed - member_held
-  if member_remaining < 0.0 then member_remaining = 0.0 end
-  if member_remaining < effective then effective = member_remaining end
-end
+local p = roll_and_read(account_key, holds_key, mode, now_ms, user, limit_usd, member_ceiling)
 
 local granted = requested_usd
-if granted > effective then granted = effective end
+if granted > p.effective then granted = p.effective end
 if granted < 0.0 then granted = 0.0 end
 
 if granted > 0.0 then
@@ -250,9 +272,9 @@ end
 
 -- Warn is read off the position *after* this grant's own hold; exhaustion,
 -- off `effective` — the position before it. See `state_for`'s comment.
-local post_project_used = committed + held_total + granted
-local post_member_used = member_committed + member_held + granted
-local state = state_for(post_project_used, post_member_used, member_ceiling, limit_usd, warn_at, effective)
+local state = state_for(p.committed + p.held + granted,
+                        p.member_committed + p.member_held + granted,
+                        member_ceiling, limit_usd, warn_at, p.effective)
 
 return {'OK', fmtusd(granted), state}
 ";
@@ -274,14 +296,17 @@ local actual_usd = tonumber(ARGV[5])
 local now_ms = tonumber(ARGV[6])
 local mode = ARGV[7]
 
-settle_time(account_key, holds_key, mode, now_ms)
+-- No limit and no member ceiling: a settle applies a realized amount and
+-- releases a hold, and never asks what was left. It still rolls the window and
+-- expires lapsed holds, because every op does — that is the whole of the
+-- no-sweeper crash story.
+local p = roll_and_read(account_key, holds_key, mode, now_ms, user, nil, nil)
 
 local watermark = tonumber(redis.call('HGET', watermarks_key, session_id)) or 0
 if seq <= watermark then
   -- The replay case, and the ordinary one: every open of a session re-drives
   -- its terminal events through here. Nothing may change.
-  local committed = tonumber(redis.call('HGET', account_key, 'committed')) or 0.0
-  return {'NOOP', fmtusd(committed), fmtusd(0.0)}
+  return {'NOOP', fmtusd(p.committed), fmtusd(0.0)}
 end
 redis.call('HSET', watermarks_key, session_id, seq)
 
@@ -297,9 +322,9 @@ end
 local released = held - actual_usd
 if released < 0.0 then released = 0.0 end
 
-local committed = (tonumber(redis.call('HGET', account_key, 'committed')) or 0.0) + actual_usd
+local committed = p.committed + actual_usd
 redis.call('HSET', account_key, 'committed', fmtusd(committed))
-local member_committed = (tonumber(redis.call('HGET', account_key, 'member:' .. user)) or 0.0) + actual_usd
+local member_committed = p.member_committed + actual_usd
 redis.call('HSET', account_key, 'member:' .. user, fmtusd(member_committed))
 
 return {'OK', fmtusd(committed), fmtusd(released)}
@@ -323,35 +348,29 @@ if ARGV[4] == '' then member_ceiling = nil else member_ceiling = tonumber(ARGV[4
 local warn_at = tonumber(ARGV[5])
 local mode = ARGV[6]
 
-settle_time(account_key, holds_key, mode, now_ms)
+local p = roll_and_read(account_key, holds_key, mode, now_ms, user, limit_usd, member_ceiling)
 
-local committed = tonumber(redis.call('HGET', account_key, 'committed')) or 0.0
-local member_committed = tonumber(redis.call('HGET', account_key, 'member:' .. user)) or 0.0
-local held_total, member_held = held_totals(holds_key, user)
-
-local project_remaining = limit_usd - committed - held_total
-if project_remaining < 0.0 then project_remaining = 0.0 end
-
+-- A pooled membership has no second ceiling, which is not a ceiling of zero:
+-- the flag is what tells the two apart on the wire, and the dollar field
+-- beside it is meaningless when the flag is 0.
 local member_remaining_present = 0
 local member_remaining = 0.0
-local effective = project_remaining
 if member_ceiling ~= nil then
-  member_remaining = member_ceiling - member_committed - member_held
-  if member_remaining < 0.0 then member_remaining = 0.0 end
   member_remaining_present = 1
-  if member_remaining < effective then effective = member_remaining end
+  member_remaining = p.member_remaining
 end
 
-local state = state_for(committed + held_total, member_committed + member_held, member_ceiling, limit_usd, warn_at, effective)
+local state = state_for(p.committed + p.held, p.member_committed + p.member_held,
+                        member_ceiling, limit_usd, warn_at, p.effective)
 
-return {'OK', fmtusd(committed), fmtusd(held_total), fmtusd(project_remaining),
-        fmtusd(member_committed), member_remaining_present, fmtusd(member_remaining), state}
+return {'OK', fmtusd(p.committed), fmtusd(p.held), fmtusd(p.project_remaining),
+        fmtusd(p.member_committed), member_remaining_present, fmtusd(member_remaining), state}
 ";
 
 /// What [`Scripts::open_grant`] resolves to.
 pub(crate) struct GrantOutcome {
     pub(crate) granted_usd: f64,
-    pub(crate) state: BudgetState,
+    pub(crate) state: LedgerState,
 }
 
 /// What [`Scripts::settle_grant`] resolves to.
@@ -371,7 +390,7 @@ pub(crate) struct BalanceOutcome {
     pub(crate) project_remaining_usd: f64,
     pub(crate) member_committed_usd: f64,
     pub(crate) member_remaining_usd: Option<f64>,
-    pub(crate) state: BudgetState,
+    pub(crate) state: LedgerState,
 }
 
 /// What [`Scripts::open_grant`] needs, bundled rather than eleven positional
@@ -515,7 +534,21 @@ impl Scripts {
             .invoke_async(conn)
             .await
             .map_err(backend)?;
-        let present = int_at(&reply, 5) == Some(1);
+        // **A malformed reply must never impersonate "no member ceiling."**
+        // The flag at index 5 and the dollar amount at index 6 are decoded
+        // together and exhaustively, because the alternative reads a failed
+        // decode as `None` — and `None` is not "unknown", it is the positive
+        // claim that this membership is pooled and has no second ceiling to
+        // bind. A member cap that silently stopped binding because a field did
+        // not parse is precisely the shadowing bug
+        // `a_grant_never_exceeds_the_member_ceiling_even_when_the_project_has_room`
+        // exists to forbid, arriving through the back door.
+        let member_remaining_usd = match (int_at(&reply, 5), f64_at(&reply, 6)) {
+            // Pooled. Index 6 is present and meaningless, so it is not read.
+            (Some(0), _) => None,
+            (Some(1), Some(member_remaining_usd)) => Some(member_remaining_usd),
+            _ => return Err(unexpected(&reply)),
+        };
         match (
             tag_of(&reply),
             f64_at(&reply, 1),
@@ -536,7 +569,7 @@ impl Scripts {
                 held_usd,
                 project_remaining_usd,
                 member_committed_usd,
-                member_remaining_usd: if present { f64_at(&reply, 6) } else { None },
+                member_remaining_usd,
                 state: parse_state(state_tag)?,
             }),
             _ => Err(unexpected(&reply)),
@@ -544,14 +577,18 @@ impl Scripts {
     }
 }
 
-fn parse_state(tag: &str) -> Result<BudgetState, SpendError> {
+/// The three tags `state_for` in [`LUA_PRELUDE`] can return, and nothing else.
+///
+/// A ledger's alphabet is [`LedgerState`], which has exactly these three
+/// variants — the fourth budget state, the overflow valve's mark, is not a
+/// thing a counter and two ceilings can observe and so is not a thing this
+/// function can produce. It used to say so in a comment beside a fall-through
+/// arm; the type says it now.
+fn parse_state(tag: &str) -> Result<LedgerState, SpendError> {
     match tag {
-        "unconstrained" => Ok(BudgetState::Unconstrained),
-        "warned" => Ok(BudgetState::Warned),
-        "exhausted" => Ok(BudgetState::Exhausted),
-        // `ExhaustedOverflow` is never returned by a ledger — a ledger cannot
-        // observe the fleet — so a script that produced it would itself be a
-        // bug this arm exists to surface rather than silently accept.
+        "unconstrained" => Ok(LedgerState::Unconstrained),
+        "warned" => Ok(LedgerState::Warned),
+        "exhausted" => Ok(LedgerState::Exhausted),
         other => Err(SpendError::Backend(anyhow::anyhow!(
             "spend ledger script returned an unknown budget state `{other}`"
         ))),
@@ -593,34 +630,76 @@ fn backend(error: redis::RedisError) -> SpendError {
 
 #[cfg(test)]
 mod tests {
-    //! The calendar port, exercised directly against known dates without a
-    //! live Redis — the same two boundaries
-    //! `roundhouse_core::control::spend::tests::a_month_boundary_is_computed_without_a_calendar_dependency`
-    //! pins in Rust, run here through the actual Lua `redis::Script` so a
-    //! divergence between the two languages fails before the ignore-gated
-    //! suite would ever catch it.
+    //! The Lua calendar port, *executed* — against the same list of boundaries
+    //! the Rust port is executed against.
+    //!
+    //! What was here before proved nothing: it built a [`redis::Script`] from
+    //! the prelude and asserted the call did not panic. `Script::new` computes
+    //! a SHA-1 of a string. It cannot fail, it never parses the Lua, and it
+    //! would have been just as green with the calendar deleted.
+    //!
+    //! A dev-only `mlua` supplies the interpreter the crate does not otherwise
+    //! have, so the port answers
+    //! [`MONTH_START_CASES`](roundhouse_core::control::spend::contract::MONTH_START_CASES)
+    //! on every `cargo test`. **The honest scope**: this executes the
+    //! arithmetic, and it executes it under Lua 5.4 while Redis embeds 5.1.
+    //! That is sound for what is tested here because the port is written to be
+    //! version-independent — float division plus an explicit truncation
+    //! (`idiv`), never 5.3's `//` operator, and every intermediate well inside
+    //! the range a double represents exactly — but it is not a test of the
+    //! Redis sandbox, of `redis.call`, or of RESP conversion. Those are the
+    //! ignore-gated suite's business.
 
     use super::*;
-    use redis::Script;
+    use roundhouse_core::control::spend::contract::MONTH_START_CASES;
 
-    /// A tiny throwaway script that returns `month_start_ms(ARGV[1])` — proof
-    /// that [`LUA_PRELUDE`]'s calendar functions compute what they claim,
-    /// without needing a real Redis or the other two scripts' KEYS.
-    fn probe() -> Script {
-        Script::new(&format!(
-            "{LUA_PRELUDE}\nreturn fmtusd(month_start_ms(tonumber(ARGV[1])))"
+    /// The prelude, loaded as one chunk, with `month_start_ms` handed back as
+    /// a callable.
+    ///
+    /// One chunk because that is what [`Scripts::new`] does: the prelude's
+    /// helpers are `local`, so they exist only inside the chunk that declares
+    /// them, and "shared" here means "spliced into each script's source". A
+    /// probe that loaded the prelude separately would be testing a different
+    /// arrangement of the code than the one that ships.
+    ///
+    /// No `redis` global is stubbed and none is needed — nothing on the path
+    /// from `month_start_ms` down to `idiv` calls one. Loading the chunk also
+    /// parses [`LUA_PRELUDE`] in full, including `roll_and_read`, so a syntax
+    /// error anywhere in the prelude fails here rather than at first grant
+    /// against a live server.
+    fn month_start_ms_in_lua(lua: &mlua::Lua) -> mlua::Function {
+        lua.load(format!(
+            "{LUA_PRELUDE}\nreturn function(now_ms) return month_start_ms(now_ms) end"
         ))
+        .eval()
+        .expect("the Lua prelude must parse and expose its calendar")
     }
 
     #[test]
-    fn the_lua_calendar_port_is_at_least_syntactically_intact() {
-        // A real Redis is needed to *execute* Lua (this crate has no
-        // embedded interpreter), so this only proves the source compiles to
-        // a `Script` value without panicking on construction — the
-        // ignore-gated `a_monthly_window_resets_committed_at_its_boundary`
-        // (via `spend_ledger_contract_suite!`) is what actually runs it
-        // against the August-18 / September-1 boundary and checks the
-        // answer.
-        let _ = probe();
+    fn the_lua_calendar_port_answers_the_same_boundaries_the_rust_one_does() {
+        let lua = mlua::Lua::new();
+        let month_start = month_start_ms_in_lua(&lua);
+
+        for case in MONTH_START_CASES {
+            // Read back as `f64` rather than an integer: Lua 5.1 has only
+            // doubles and 5.4 would hand back an integer, and the assertion
+            // should be about the calendar rather than about which numeric
+            // subtype the host interpreter chose. Every value in the table is
+            // far inside the range a double holds exactly.
+            let answer: f64 = month_start
+                .call(case.now_ms)
+                .expect("month_start_ms must return a number");
+            assert_eq!(
+                answer, case.month_start_ms as f64,
+                "{}: month_start_ms({})",
+                case.what, case.now_ms
+            );
+        }
+
+        assert!(
+            MONTH_START_CASES.len() >= 3,
+            "the control on the loop itself: an empty table would make every \
+             assertion above vacuous, which is exactly the failure this test replaced"
+        );
     }
 }

@@ -167,6 +167,10 @@ pub fn every_event_kind() -> Vec<SessionEventKind> {
                 // prove persistence round-trips the whole vocabulary, not to
                 // exercise the budget axis — `spend_contract.rs` does that.
                 budget_state: BudgetState::Unconstrained,
+                // And no rate card, because the chosen target is one of our
+                // own workers: local capacity is billed in prefill tokens, so
+                // the absence is what a local decision correctly records.
+                rate_card: None,
             },
         },
         SessionEventKind::OutputTextDelta {

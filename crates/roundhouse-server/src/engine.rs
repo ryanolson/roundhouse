@@ -2,6 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Turn execution.
+//!
+//! The money half lives in [`spend`]: what a turn may reserve, what it is
+//! charged, and how a settle lost to a crash is put right. It is one module
+//! down rather than one screen down because it answers to a different clock —
+//! a durable counter two processes race for, rather than a model call under a
+//! deadline — and because everything in it has to be as true for a successor
+//! replaying a log as for the process that wrote it.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -11,9 +18,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::StreamExt;
 use roundhouse_core::context::{ContextAssembler, Tokenizer};
-use roundhouse_core::control::{
-    GrantRequest, MemorySpendLedger, Settlement, SpendError, SpendLedger, TurnBudget, TurnPolicy,
-};
+use roundhouse_core::control::{MemorySpendLedger, SpendError, SpendLedger, TurnPolicy};
 use roundhouse_core::event::{Accounting, IncompleteReason, SessionObserver, Usage};
 use roundhouse_core::ids::{ResponseId, SessionId, TurnId};
 use roundhouse_core::item::Item;
@@ -23,7 +28,7 @@ use roundhouse_core::routing::{
     CacheLedger, Candidate, Decision, DecisionRecord, RoutingContext, RoutingError, RoutingPolicy,
     Target,
 };
-use roundhouse_core::session::{Session, SessionError, TerminalSettlement, TurnAdmission};
+use roundhouse_core::session::{Session, SessionError, TurnAdmission};
 use roundhouse_core::store::SessionStore;
 use roundhouse_fleet::{
     FleetError, FleetQuery, FrontierChunk, FrontierClient, FrontierError, FrontierQuote,
@@ -33,15 +38,7 @@ use tokio::time::Instant;
 
 use crate::control_config::Admission;
 
-/// How long a grant's hold outlives the turn that took it.
-///
-/// The turn deadline plus slack, and both halves matter. Shorter than the
-/// deadline and a slow turn's own hold would lapse underneath it, to be
-/// re-granted to the next turn while the first is still running — the budget
-/// spent twice. Much longer and a dead process's reservation would strand its
-/// project's money for the difference. There is no sweeper: the next call to
-/// touch the project is what expires it.
-const GRANT_TTL_SLACK_MS: u64 = 30_000;
+mod spend;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -63,14 +60,24 @@ pub enum EngineError {
     /// and a monthly window lifts on its own.
     #[error("the project's budget is spent and it refuses rather than degrading to local")]
     BudgetRefused,
-    /// A frontier dispatch settled against a catalog that cannot price it.
+    /// A frontier dispatch whose decision recorded no rate card.
     ///
-    /// Loud rather than free. Every other route to a zero settle here is a
+    /// Loud rather than free. Every other route to a zero settle is a
     /// statement — a local dispatch cost nothing, a turn that reached no
     /// provider owes nothing — and treating "we could not find the rate card"
     /// as a fourth one would book unpriced frontier traffic as a saving, which
     /// is the one accounting lie the whole ledger exists to make impossible.
-    #[error("a frontier dispatch to `{0:?}` settled against a catalog that cannot price it")]
+    ///
+    /// **Two readings, and only one of them is a bug.** Reached from a live
+    /// settle it means this build routed to a hosted model and wrote a decision
+    /// with no price on it, which cannot happen through `plan` and is a defect
+    /// if it ever does. Reached from a repair it means the log predates the
+    /// recorded card, which is not a defect and not fixable now: that turn's
+    /// spend is lost to drift, and [`Engine::repair_settle`] logs it and moves
+    /// on rather than failing a session over a turn nobody can price any more.
+    /// It is emphatically *not* what it used to be — "the catalog no longer
+    /// lists this model" — because a settle no longer asks a catalog anything.
+    #[error("a frontier dispatch to `{0:?}` settled against a decision that recorded no rate card")]
     UnpricedSettlement(Target),
     #[error("chosen target `{0:?}` had no matching quote")]
     UnresolvableTarget(Target),
@@ -303,8 +310,9 @@ impl Failed {
             // the budget said nothing at all: `Spend` is this deployment's own
             // ledger being unreachable — the same class of failure as its
             // session store, which is why it sits beside `Session` — and
-            // `UnpricedSettlement` is its catalog disagreeing with its own
-            // router about a target the router just chose.
+            // `UnpricedSettlement` is this build having written a hosted
+            // decision with no price on it, which is a defect in this process
+            // rather than anything a tenant did.
             | EngineError::Spend(_)
             | EngineError::UnpricedSettlement(_)
             | EngineError::UnresolvableTarget(_)
@@ -496,8 +504,15 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         // died between its log commit and its settle left exactly one turn's
         // spend unapplied, and this is where it is put right — before anything
         // else this turn does, so the grant below is opened against a balance
-        // that already includes it. See `Engine::settle`.
-        self.settle(&session, admission).await?;
+        // that already includes it.
+        //
+        // It cannot fail the turn, and that containment is the whole reason it
+        // is spelled `repair_settle` rather than `settle` with a `?`: this
+        // point is past the lease and before the response, so a failure here
+        // has nothing to terminate and would repeat on every open of the same
+        // session. See `Engine::repair_settle` for what a skipped repair
+        // costs and where a ledger outage is reported instead.
+        self.repair_settle(&session, admission).await;
 
         // Identity, written once, into an empty log. This is the only place in
         // the system that can do it race-free and needs no flag to stay
@@ -800,7 +815,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         // --- drop what this principal could never use ------------------------
         //
         // The second half of the policy's reach into routing, and it exists for
-        // a different reason from the first. `TurnPolicy::admits` inside each
+        // a different reason from the first. `ctx.admissible` inside each
         // `RoutingPolicy` is the *behavior* half: it decides what may be
         // chosen. This is the *accounting* half: `considered` is what the
         // dashboard's counterfactual is priced against — `best_frontier_alternative`
@@ -900,6 +915,22 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                     // and reconstructing it from the grant would lose every
                     // overflow.
                     budget_state: decision.budget_state,
+                    // The price this turn is going to be settled at, written
+                    // down while the catalog that quoted it is still the one
+                    // in front of us. Every later reader of this event — this
+                    // process's own settle, and a successor's repair — prices
+                    // from here rather than from whatever catalog it booted
+                    // with, which is what makes the two agree by construction
+                    // and what stops an edited price list from re-pricing, or
+                    // failing to price at all, a turn that is already over.
+                    //
+                    // `None` for a local target, which `spec_for` answers by
+                    // construction: local capacity is billed in prefill
+                    // tokens, not dollars.
+                    rate_card: self
+                        .frontier_catalog
+                        .spec_for(&decision.target)
+                        .map(|spec| spec.pricing),
                 },
             )
             .await?;
@@ -949,121 +980,6 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         };
 
         Ok((stream, decision, isl_tokens))
-    }
-
-    /// Reserve what this turn may spend, or discover there is nothing to
-    /// reserve.
-    ///
-    /// **An admission with no budget configured never touches the ledger.**
-    /// That is the whole of the open-mode cost promise, and it is a skipped
-    /// call rather than a very large ceiling: [`TurnBudget::Unlimited`] is a
-    /// distinct arm precisely so that "no budget was configured" and "a budget
-    /// granted a great deal" cannot be confused for one another by anything
-    /// downstream, including a reader of this function.
-    ///
-    /// The hold is keyed by `ResponseId`, so a turn has exactly one — and a
-    /// deduplicated retry never arrives here at all, because
-    /// [`Session::begin_turn`] short-circuits before `plan` is reached. A retry
-    /// that did open a second grant would reserve a turn's budget against a
-    /// turn that is not going to happen, and a client reconnecting through a
-    /// flaky link could exhaust a project without spending a cent at any
-    /// provider.
-    async fn open_grant(
-        &self,
-        session: &Session<S>,
-        response_id: &ResponseId,
-        candidates: &[Candidate],
-        admission: &Admission,
-    ) -> Result<TurnBudget, EngineError> {
-        let Some(terms) = &admission.budget else {
-            return Ok(TurnBudget::Unlimited);
-        };
-        let grant = self
-            .spend
-            .open_grant(GrantRequest {
-                principal: admission.principal.clone(),
-                session_id: session.session_id().clone(),
-                response_id: response_id.clone(),
-                requested_usd: admission
-                    .policy
-                    .dearest_admissible_frontier_usd(candidates, &session.state().frontier_history),
-                ttl_ms: self.config.turn_deadline_ms + GRANT_TTL_SLACK_MS,
-                terms: terms.clone(),
-                now_ms: now_ms(),
-            })
-            .await?;
-        Ok(grant.turn_budget(terms.budget.on_exhaustion))
-    }
-
-    /// Apply this session's most recent terminal event to the spend ledger.
-    ///
-    /// **One function called at two moments, because it is one operation.**
-    /// Just after a session is opened it is the *repair*: a process that died
-    /// between its log commit and its settle left exactly one turn's spend
-    /// unapplied — the last one, since turns are serialized and each settles
-    /// before the next is admitted — and re-driving it here rides on the
-    /// replay [`Session::open_observed`] has already performed. Just after this
-    /// turn's own commit it is the *settle*, and by then the log's last
-    /// terminal event is this turn's. Both go through the same operation, which
-    /// is idempotent by `(session, seq)`: the repair costs one no-op call when
-    /// there was nothing to repair, and the settle costs one no-op call when
-    /// the repair already did it.
-    ///
-    /// Written as one function rather than two because the alternative is two
-    /// pieces of code that must agree forever about how a terminal event is
-    /// priced — and the day they stop agreeing, a repaired settle charges a
-    /// different number than the settle it replaced, which is drift nobody can
-    /// see without reading both.
-    ///
-    /// Not bounded by the turn deadline, deliberately: that deadline exists to
-    /// stop a hung *provider* from holding a lease open, and the ledger is this
-    /// deployment's own store — the same reasoning that keeps the session
-    /// store's appends out from under it.
-    async fn settle(&self, session: &Session<S>, admission: &Admission) -> Result<(), EngineError> {
-        let Some(terms) = &admission.budget else {
-            return Ok(());
-        };
-        let Some(settlement) = session.state().last_settlement() else {
-            return Ok(());
-        };
-        self.spend
-            .settle_grant(Settlement {
-                principal: admission.principal.clone(),
-                session_id: session.session_id().clone(),
-                seq: settlement.seq,
-                response_id: settlement.response_id.clone(),
-                actual_usd: self.settled_cost_usd(settlement)?,
-                terms: terms.clone(),
-                now_ms: now_ms(),
-            })
-            .await?;
-        Ok(())
-    }
-
-    /// What one terminated response is to be charged, in dollars.
-    ///
-    /// Priced from the usage the log actually holds and never from what was
-    /// expected, which is what makes an estimate consume budget: a provider
-    /// that reports nothing gets [`Engine::estimated_usage`] standing in for
-    /// it, and that estimate is charged exactly as a measurement would be. The
-    /// alternative — writing an unreported call off as free — would let a
-    /// provider with unreliable accounting spend a project's whole month
-    /// without moving its committed total by a cent.
-    ///
-    /// Three ways to reach zero, each a statement rather than a fallback: a
-    /// local dispatch bills capacity and not dollars, a response that carries
-    /// no target never reached a provider, and a genuinely free rate card is
-    /// free. A frontier target the catalog cannot price is none of those and is
-    /// an error — see [`EngineError::UnpricedSettlement`].
-    fn settled_cost_usd(&self, settlement: &TerminalSettlement) -> Result<f64, EngineError> {
-        match &settlement.target {
-            None | Some(Target::Local { .. }) => Ok(0.0),
-            Some(target) => self
-                .frontier_catalog
-                .spec_for(target)
-                .map(|spec| spec.pricing.price(&settlement.usage))
-                .ok_or_else(|| EngineError::UnpricedSettlement(target.clone())),
-        }
     }
 
     /// Run a local worker and present what it produced as a stream.
@@ -1160,7 +1076,7 @@ async fn replay_output<S: SessionStore>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use roundhouse_core::control::{FrontierHistory, TargetFilter};
+    use roundhouse_core::control::{FrontierHistory, TargetFilter, TurnBudget};
     use roundhouse_core::ids::SessionId;
     use roundhouse_core::routing::{AffinityPolicy, RoutingContext};
 

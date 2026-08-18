@@ -178,10 +178,9 @@ impl RoutingPolicy for AffinityPolicy {
 
         let winner = pool[best_index];
         let hit_ratio = winner.cache_hit_ratio(ctx.isl_tokens);
-        Ok(Decision {
-            target: winner.target.clone(),
-            budget_state: admitted.budget_state(),
-            rationale: admitted.annotate(format!(
+        Ok(admitted.decide(
+            winner.target.clone(),
+            format!(
                 "score {:.4} over {} candidate(s); expected prefill {:.0} of {} tokens ({:.0}% cached), ${:.5}",
                 best_score,
                 pool.len(),
@@ -189,8 +188,8 @@ impl RoutingPolicy for AffinityPolicy {
                 ctx.isl_tokens,
                 hit_ratio * 100.0,
                 winner.expected_cost_usd,
-            )),
-        })
+            ),
+        ))
     }
 }
 
@@ -255,14 +254,13 @@ impl RoutingPolicy for EscalationPolicy {
         let admitted = ctx.admissible(None)?;
         let best = admitted.highest_quality();
 
-        Ok(Decision {
-            target: best.target.clone(),
-            budget_state: admitted.budget_state(),
-            rationale: admitted.annotate(format!(
+        Ok(admitted.decide(
+            best.target.clone(),
+            format!(
                 "audit turn (every {}); escalated to highest quality prior {:.2}",
                 self.audit_every, best.quality_prior
-            )),
-        })
+            ),
+        ))
     }
 }
 

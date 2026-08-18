@@ -58,8 +58,8 @@ pub use policy::{
     FilterError, FrontierCadence, FrontierHistory, PolicyOverrides, TargetFilter, TurnPolicy,
 };
 pub use spend::{
-    Balance, BalanceQuery, BudgetTerms, Grant, GrantRequest, MemorySpendLedger, Settled,
-    Settlement, SpendError, SpendLedger,
+    Balance, BalanceQuery, BudgetTerms, Grant, GrantRequest, LedgerState, MemorySpendLedger,
+    Settled, Settlement, SpendError, SpendLedger,
 };
 
 use crate::ids::string_id;
