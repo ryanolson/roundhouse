@@ -133,6 +133,13 @@ impl Usage {
 /// up filed as an upstream error forever. A reason is a small, closed,
 /// operator-facing vocabulary; a rollback across a vocabulary change is a
 /// migration, and pretending otherwise is what would make it a silent one.
+///
+/// `budget_exhausted` is the second variant added under that posture, and it
+/// pays for itself the same way the first did: three terminal refusals, three
+/// systems. [`Self::PolicyRefused`] names the control-plane file,
+/// [`Self::BudgetExhausted`] names the budget, and [`Self::UpstreamError`]
+/// names the fleet. Collapsing any two of them sends an operator to the wrong
+/// one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IncompleteReason {
@@ -158,6 +165,23 @@ pub enum IncompleteReason {
     /// with a separate "could not be served" terminal render it as that rather
     /// than as a truncated answer — see `responses_api`.
     PolicyRefused,
+    /// The project's budget is spent and it is configured to refuse rather than
+    /// degrade to its own fleet.
+    ///
+    /// Distinct from [`Self::PolicyRefused`] on the axis that decides what
+    /// anybody does next. A policy refusal is *terminal for this turn under
+    /// this configuration* — the same turn refuses again forever, and only a
+    /// widened policy moves it. A budget refusal is a limit an admin can raise,
+    /// and it lifts on its own at the next monthly boundary, so the turn stays
+    /// retryable and a client that backs off and retries is behaving correctly
+    /// rather than hammering a wall.
+    ///
+    /// It is also distinct from a *degraded* turn, which is not an incomplete
+    /// response at all: degrade-to-local serves the turn, and the fact that its
+    /// budget was spent is recorded on the
+    /// [`DecisionRecord`](crate::routing::DecisionRecord) rather than as a
+    /// terminal reason. Only `Exhaustion::Refuse` reaches here.
+    BudgetExhausted,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -333,6 +357,44 @@ mod tests {
                 principal: None,
             },
             "an absent principal is `None`, which the fold marks rather than guesses at"
+        );
+    }
+
+    #[test]
+    fn three_refusals_name_three_systems() {
+        // The blame vocabulary, pinned as wire strings because a surface
+        // renders them and an operator greps them. Each one sends its reader to
+        // a different place: the control-plane file, the budget, the fleet.
+        for (reason, wire) in [
+            (IncompleteReason::PolicyRefused, "\"policy_refused\""),
+            (IncompleteReason::BudgetExhausted, "\"budget_exhausted\""),
+            (IncompleteReason::UpstreamError, "\"upstream_error\""),
+        ] {
+            assert_eq!(serde_json::to_string(&reason).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_str::<IncompleteReason>(wire).unwrap(),
+                reason
+            );
+        }
+        assert_ne!(
+            IncompleteReason::BudgetExhausted,
+            IncompleteReason::PolicyRefused,
+            "collapsing the two would tell a client to widen a policy when the \
+             fix is to raise a limit -- and would hide that this one lifts on \
+             its own at the next window boundary"
+        );
+
+        // A budget refusal is a terminal log fact with no usage: nothing was
+        // dispatched, so there is nothing to have consumed.
+        let event = SessionEventKind::ResponseIncomplete {
+            response_id: ResponseId::new("resp_1"),
+            reason: IncompleteReason::BudgetExhausted,
+            usage: Usage::default(),
+        };
+        assert_eq!(
+            serde_json::from_str::<SessionEventKind>(&serde_json::to_string(&event).unwrap())
+                .unwrap(),
+            event
         );
     }
 

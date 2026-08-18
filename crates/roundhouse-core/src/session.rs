@@ -68,6 +68,32 @@ struct PendingRouting {
     isl_tokens: u64,
 }
 
+/// A response that terminated, and everything needed to charge it for.
+///
+/// The spend ledger's view of a turn, projected from the log rather than
+/// handed across from whatever produced it: the repair that re-drives a lost
+/// settle has only the log to work from, so if the live settle read its inputs
+/// from anywhere else the two would be settling from two different accounts of
+/// the same turn.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TerminalSettlement {
+    pub response_id: ResponseId,
+    /// The log sequence number of the terminal event, and half of the
+    /// idempotency key a settle is applied under.
+    pub seq: u64,
+    /// Where the turn was dispatched.
+    ///
+    /// `None` for a response that terminated before any routing decision was
+    /// recorded — a refusal, or a failure while pricing the options. That turn
+    /// reached no provider and so owes nobody anything, which makes the
+    /// absence a fact rather than a missing value.
+    pub target: Option<Target>,
+    /// What the terminal event reported, estimate or measurement alike. An
+    /// estimate is what a provider that reported nothing gets charged on, and
+    /// it is charged exactly as a measurement would be.
+    pub usage: Usage,
+}
+
 /// State derived from the event log.
 #[derive(Default)]
 pub struct SessionState {
@@ -109,6 +135,20 @@ pub struct SessionState {
     /// frontier traffic of every session retrying through it, at the moment
     /// the knob is most supposed to hold.
     pub frontier_history: FrontierHistory,
+    /// The most recent response to terminate, priced-ready.
+    ///
+    /// **One entry rather than a list, and that is a claim about the log
+    /// rather than a convenience.** A session's turns are serialized — the
+    /// engine gates them per session within a process and the store's lease
+    /// fences them across processes — and every turn applies its spend before
+    /// the next is admitted. So whenever a session is opened, at most one
+    /// terminal event can still be unsettled, and it is the last one. Keeping
+    /// the whole history here would be an unbounded second copy of the log,
+    /// held to support a repair that can only ever concern its final entry.
+    ///
+    /// `None` until a response terminates, which is also the honest answer for
+    /// a session whose only turns are still open.
+    last_settlement: Option<TerminalSettlement>,
     pub last_seq: u64,
 }
 
@@ -150,7 +190,8 @@ impl SessionState {
                 // provider stopped holding the prompt, which is what the TTL
                 // runs from — and only under the evidence rule documented on
                 // `pending_routings`.
-                if let Some(routing) = self.pending_routings.remove(response_id) {
+                let routing = self.pending_routings.remove(response_id);
+                if let Some(routing) = &routing {
                     let processed =
                         matches!(event.kind, SessionEventKind::ResponseCompleted { .. })
                             || usage.input_tokens > 0;
@@ -159,6 +200,20 @@ impl SessionState {
                             .record(&routing.target, event.at_ms, routing.isl_tokens);
                     }
                 }
+
+                // The spend ledger's view of the same event, and note that it
+                // is folded under *no* evidence rule: the cache ledger asks
+                // whether a provider processed the prompt, while a settlement
+                // asks what the log says this turn is to be charged. A
+                // dispatch that never reached anyone is priced at zero by
+                // carrying no target, not by being left out — leaving it out
+                // would strand its hold for a whole TTL.
+                self.last_settlement = Some(TerminalSettlement {
+                    response_id: response_id.clone(),
+                    seq: event.seq,
+                    target: routing.map(|routing| routing.target),
+                    usage: usage.clone(),
+                });
 
                 // A turn is only settled once its response terminates, which is
                 // what makes a re-sent turn after a mid-generation crash
@@ -192,6 +247,17 @@ impl SessionState {
         self.completed_turns
             .get(turn_id)
             .map(|completed| &completed.response_id)
+    }
+
+    /// The most recent response to terminate, and what it is to be charged
+    /// for.
+    ///
+    /// The one input the spend ledger's settle takes, both when this turn
+    /// commits its own terminal event and when a successor replays a log whose
+    /// last settle was lost to a crash. See [`Self::last_settlement`] on why
+    /// one entry is enough for both.
+    pub fn last_settlement(&self) -> Option<&TerminalSettlement> {
+        self.last_settlement.as_ref()
     }
 
     /// Usage reported when `turn_id` completed, for replaying it verbatim.
@@ -611,6 +677,7 @@ mod tests {
             expected_cost_usd: 0.0,
             considered: Vec::<Candidate>::new(),
             turn_policy_digest: String::new(),
+            budget_state: Default::default(),
         }
     }
 
@@ -714,6 +781,99 @@ mod tests {
             .unwrap();
         assert!(matches!(retry, TurnAdmission::Started(_)));
         assert_ne!(retry.response_id(), &response_id);
+    }
+
+    #[tokio::test]
+    async fn the_settlement_projection_names_the_last_terminal_event_and_where_it_went() {
+        // The spend ledger's whole input, and the property that makes one
+        // entry enough: a session's turns are serialized, so the only spend
+        // that can still be unapplied when a successor opens the log is the
+        // last one's.
+        let store = Arc::new(MemoryStore::new());
+        let (session_id, mut session) = new_session(Arc::clone(&store), "node-a").await;
+        assert!(
+            session.state().last_settlement().is_none(),
+            "a session with no terminated response owes nobody anything"
+        );
+
+        let target = Target::Frontier {
+            provider: "anthropic".into(),
+            model: "claude".into(),
+        };
+        let first = session
+            .begin_turn(TurnId::new("t1"), vec![Item::user_text("hello")])
+            .await
+            .unwrap();
+        let first_id = first.response_id().clone();
+        session
+            .record_routing(&first_id, decision_for(target.clone(), 100))
+            .await
+            .unwrap();
+        let billed = Usage {
+            input_tokens: 100,
+            output_tokens: 20,
+            ..Usage::default()
+        };
+        session
+            .complete(&first_id, "hi", billed.clone())
+            .await
+            .unwrap();
+
+        let settlement = session
+            .state()
+            .last_settlement()
+            .expect("a completed response is a settlement")
+            .clone();
+        assert_eq!(settlement.response_id, first_id);
+        assert_eq!(settlement.target, Some(target));
+        assert_eq!(settlement.usage, billed);
+        assert_eq!(
+            settlement.seq,
+            session.last_seq(),
+            "the seq is the terminal event's own, which is what makes the \
+             settle idempotent across a replay that assigns the same numbers"
+        );
+
+        // A response that terminated without ever routing carries no target,
+        // and that is what prices it at zero: it reached no provider.
+        let second = session
+            .begin_turn(TurnId::new("t2"), vec![Item::user_text("again")])
+            .await
+            .unwrap();
+        let second_id = second.response_id().clone();
+        session
+            .mark_incomplete(
+                &second_id,
+                "",
+                IncompleteReason::BudgetExhausted,
+                Usage::default(),
+            )
+            .await
+            .unwrap();
+        let settlement = session
+            .state()
+            .last_settlement()
+            .expect("a refused response terminates too")
+            .clone();
+        assert_eq!(settlement.response_id, second_id);
+        assert_eq!(
+            settlement.target, None,
+            "a turn that routed nowhere owes nothing, and the absence is what \
+             says so"
+        );
+
+        // And a successor that replays this log arrives at the same answer,
+        // which is the whole basis of the repair.
+        session.release().await.unwrap();
+        let successor = Session::open(store, session_id, "node-b", TTL, CacheLedger::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            successor.state().last_settlement().cloned(),
+            Some(settlement),
+            "a replay has to reconstruct the settlement identically, or the \
+             repair would charge a different number than the settle it replaces"
+        );
     }
 
     #[tokio::test]

@@ -29,6 +29,31 @@
     "rejected at load, naming both the key and the project it belongs to, rather",
     "than silently clamped. Ada's key below tightens the floor from 0.5 to 0.8",
     "and the cadence from 2-per-10 to 1-per-10; it could not loosen either.",
+    "A project's \"budget\" sets its spending ceiling: limit_usd, a window",
+    "(\"total\" for the life of the project, \"monthly\" resetting each UTC",
+    "calendar month), on_exhaustion (\"degrade_to_local\" keeps serving from",
+    "the local fleet once the limit is spent, \"refuse\" stops the turn with a",
+    "retryable error), and warn_at (default 0.8 -- the fraction of the limit",
+    "past which a grant comes back marked Warned, before anything actually",
+    "degrades). \"overflow_when_local_saturated\" lives beside on_exhaustion",
+    "and only means something under degrade_to_local: when true (the default)",
+    "a turn that finds the local pool itself full is re-admitted to frontier",
+    "rather than failing, and the overspend is booked rather than hidden.",
+    "Setting it under \"refuse\" is rejected at load, naming the project --",
+    "overflow is a degrade-mode valve, and a project that refuses on",
+    "exhaustion never promised local service in the first place. Acme's",
+    "budget below spells the flag out explicitly, but true is also what an",
+    "absent flag would mean.",
+    "A key's \"allocation\" gives that membership its own ceiling on top of",
+    "its project's -- both bind, and the tighter one wins. Absent means",
+    "\"pooled\": no second ceiling, the key may spend up to the whole project",
+    "budget. \"capped\" is an absolute dollar figure; \"share\" is a fraction of",
+    "the project limit, so it tracks a later increase instead of freezing a",
+    "dollar amount. Shares are ceilings, not a partition: several keys' shares",
+    "may sum past 1.0, and the project limit is what stops all of them",
+    "together -- validation does not refuse an over-subscribed set of shares.",
+    "Bob's key below is capped at a flat $100; Cara's is a 25% share of",
+    "whatever acme's limit currently is.",
     "Point ROUNDHOUSE_CONTROL_PLANE at your copy."
   ],
 
@@ -40,12 +65,21 @@
         "min_quality": 0.5,
         "allow": ["anthropic/*", "local/*"],
         "frontier_cadence": { "max_frontier": 2, "per_turns": 10 }
+      },
+      "budget": {
+        "limit_usd": 500.0,
+        "window": "monthly",
+        "on_exhaustion": "degrade_to_local",
+        "overflow_when_local_saturated": true,
+        "warn_at": 0.8
       }
     }
   ],
 
   "users": [
-    { "id": "ada" }
+    { "id": "ada" },
+    { "id": "bob" },
+    { "id": "cara" }
   ],
 
   "keys": [
@@ -57,6 +91,18 @@
         "min_quality": 0.8,
         "frontier_cadence": { "max_frontier": 1, "per_turns": 10 }
       }
+    },
+    {
+      "project": "acme",
+      "user": "bob",
+      "key_sha256": "f18332befc03bf721896be34b6707c92110ec9a26ce4f9f9072538d982cee696",
+      "allocation": { "capped": { "limit_usd": 100.0 } }
+    },
+    {
+      "project": "acme",
+      "user": "cara",
+      "key_sha256": "bea0b042b0aed9afb409c9ccb75bdac3b1d12d3fe054dafffe84ce3a4ccb55da",
+      "allocation": { "share": { "fraction": 0.25 } }
     }
   ],
 

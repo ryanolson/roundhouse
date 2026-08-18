@@ -600,6 +600,7 @@ pub(super) mod tests {
                     expected_cost_usd: 0.0,
                     considered,
                     turn_policy_digest: String::new(),
+                    budget_state: Default::default(),
                 },
             });
             self.push(SessionEventKind::ResponseCompleted { response_id, usage });

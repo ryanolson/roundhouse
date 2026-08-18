@@ -181,6 +181,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
+    use roundhouse_core::control::BudgetState;
     use roundhouse_core::event::{SessionEvent, SessionEventKind, Usage};
     use roundhouse_core::ids::{ResponseId, SessionId};
     use roundhouse_core::metrics::{ReferenceModel, ShadowPricing};
@@ -226,6 +227,7 @@ mod tests {
                         expected_cost_usd: 0.03,
                         considered: vec![],
                         turn_policy_digest: String::new(),
+                        budget_state: BudgetState::Unconstrained,
                     },
                 },
             },

@@ -611,24 +611,37 @@ impl<S: SessionStore> ResponsesFollower<S> {
             // terminal shapes for a response that produced none — `incomplete`
             // means the model stopped short, `failed` means the request was
             // not served — and a client that read `response.incomplete` for a
-            // policy refusal would report a model that ran out of room. The
-            // log's own vocabulary is finer than the wire's here, so this is
-            // the one place a reason is translated rather than forwarded, and
-            // the translation is one-to-one: every other reason is a real
-            // attempt that stopped.
+            // refusal would report a model that ran out of room. The log's own
+            // vocabulary is finer than the wire's here, so this is the one
+            // place a reason is translated rather than forwarded.
+            //
+            // Two reasons land on `failed`, and they are the two under which
+            // nothing was dispatched at all. They keep separate messages
+            // because the remedies are opposite: a policy refusal is answered
+            // by an operator widening a policy and never by retrying, and a
+            // budget refusal is answered by an admin raising a limit — or by
+            // waiting for the window to roll — after which the identical
+            // request succeeds. Every remaining reason really is an attempt
+            // that stopped, and forwards unchanged.
             SessionEventKind::ResponseIncomplete {
                 response_id,
-                reason: IncompleteReason::PolicyRefused,
+                reason:
+                    reason @ (IncompleteReason::PolicyRefused | IncompleteReason::BudgetExhausted),
                 // Nothing was dispatched, so there is nothing to report; and
                 // this dialect's `failed` frame has no place to put usage even
                 // when there is some. Bound by name so a field added here
                 // cannot be dropped without someone reading this line.
                 usage: _,
             } => {
-                self.queued.push_back(failed_frame(
-                    Some(response_id),
-                    "no target this key may use was admissible for this turn",
-                ));
+                let message = match reason {
+                    IncompleteReason::BudgetExhausted => {
+                        "this project's budget is spent and it is configured to refuse rather \
+                         than serve locally"
+                    }
+                    _ => "no target this key may use was admissible for this turn",
+                };
+                self.queued
+                    .push_back(failed_frame(Some(response_id), message));
                 Step::End
             }
             SessionEventKind::ResponseIncomplete {

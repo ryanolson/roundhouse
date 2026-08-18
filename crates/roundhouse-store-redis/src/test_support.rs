@@ -7,8 +7,13 @@
 //! can prove the wire format without turning storage internals into production
 //! API. This module only exists under the `test-support` feature.
 
+use roundhouse_core::control::ProjectId;
 use roundhouse_core::ids::SessionId;
 
+use crate::spend::{
+    account_key as spend_account_key_impl, holds_key as spend_holds_key_impl,
+    watermarks_key as spend_watermarks_key_impl,
+};
 use crate::{RedisSessionStore, lease_key as store_lease_key, log_key as store_log_key};
 
 /// The one variable every Redis-gated integration test reads.
@@ -39,6 +44,20 @@ pub fn lease_key(session_id: &SessionId) -> String {
 /// The raw log key used by wire-format tests.
 pub fn log_key(session_id: &SessionId) -> String {
     store_log_key(session_id)
+}
+
+/// The raw spend-ledger keys, for tests that inspect the hash fields
+/// directly rather than only through [`SpendLedger`](roundhouse_core::control::SpendLedger).
+pub fn spend_account_key(project: &ProjectId) -> String {
+    spend_account_key_impl(project)
+}
+
+pub fn spend_holds_key(project: &ProjectId) -> String {
+    spend_holds_key_impl(project)
+}
+
+pub fn spend_watermarks_key(project: &ProjectId) -> String {
+    spend_watermarks_key_impl(project)
 }
 
 /// The conformance suite's expiry lever. Deleting the key is exactly what

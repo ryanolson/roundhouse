@@ -8,15 +8,19 @@
 //! environment variable, because a flag parser here would be the first place a
 //! deployment concern leaked into the composition root.
 //!
-//! The store is the one seam a deployment selects here: `ROUNDHOUSE_REDIS_URL`
-//! set means sessions live in that Redis and survive this process;
-//! absent means [`MemoryStore`] and sessions die with it. A URL that is set
-//! but unreachable stops the process at startup — falling back to memory
-//! would silently demote "durable" to "until the next restart", which is the
-//! one property the variable exists to promise. The rest of the wiring is the
-//! offline demo set — [`ByteTokenizer`], [`EchoLocalExecutor`],
-//! [`EchoFrontierClient`] — so the process serves with no GPU, no provider
-//! account and no model assets.
+//! Durability is the one seam a deployment selects here, and it selects both
+//! halves of it at once: `ROUNDHOUSE_REDIS_URL` set means sessions *and*
+//! committed spend live in that Redis and survive this process; absent means
+//! [`MemoryStore`] and [`MemorySpendLedger`], both of which die with it. A URL
+//! that is set but unreachable stops the process at startup — falling back to
+//! memory would silently demote "durable" to "until the next restart", which
+//! is the one property the variable exists to promise, and it would demote it
+//! for the ledger too: a process that forgets a month's spend on restart hands
+//! the budget back while the log that proves it was spent survives.
+//!
+//! The rest of the wiring is the offline demo set — [`ByteTokenizer`],
+//! [`EchoLocalExecutor`], [`EchoFrontierClient`] — so the process serves with
+//! no GPU, no provider account and no model assets.
 //!
 //! The catalog carries one entry, for the echo provider wired below — not a
 //! rate card. The no-baked-rate-cards rule (`roundhouse-fleet/src/frontier.rs`)
@@ -36,6 +40,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use roundhouse_core::context::ByteTokenizer;
+use roundhouse_core::control::{MemorySpendLedger, SpendLedger, TurnBudget};
 use roundhouse_core::metrics::MetricsConfig;
 use roundhouse_core::routing::{
     AffinityPolicy, CacheLedger, CacheModel, Candidate, ProviderPricing,
@@ -45,10 +50,10 @@ use roundhouse_fleet::{
     EchoFrontierClient, FrontierModelSpec, StaticFrontierCatalog, WireProtocol,
 };
 use roundhouse_server::{
-    ControlPlane, EchoLocalExecutor, Engine, EngineConfig, catalog_config, control_config, http,
-    metrics_api, responses_api,
+    Admission, ControlPlane, EchoLocalExecutor, Engine, EngineConfig, catalog_config,
+    control_config, http, metrics_api, responses_api,
 };
-use roundhouse_store_redis::RedisSessionStore;
+use roundhouse_store_redis::{RedisSessionStore, RedisSpendLedger};
 use tracing_subscriber::EnvFilter;
 
 /// The echo provider's catalog entry.
@@ -134,7 +139,7 @@ fn reachable_candidates(catalog: &StaticFrontierCatalog) -> Vec<Candidate> {
 /// get the same answer is how this used to be written, and it left the reader
 /// to work out from a fabricated [`FrontierHistory`] which question was being
 /// asked. What a *spent* window leaves is the separate question
-/// [`refuse_cadences_with_nothing_to_serve`] asks, one call below.
+/// [`refuse_promises_of_a_local_fallback`] asks, one call below.
 ///
 /// [`TurnPolicy::permits`]: roundhouse_core::control::TurnPolicy::permits
 /// [`TurnPolicy::admits`]: roundhouse_core::control::TurnPolicy::admits
@@ -151,16 +156,12 @@ fn refuse_policies_that_admit_nothing(
     // with.
     let mut refused: Vec<String> = plane
         .configured_admissions()
-        .filter(|(_principal, policy)| !reachable.iter().any(|candidate| policy.permits(candidate)))
-        .map(|(principal, policy)| {
-            format!(
-                "project `{}`, user `{}` (policy {}, allow {})",
-                principal.project,
-                principal.user,
-                policy.digest(),
-                policy.allow,
-            )
+        .filter(|admission| {
+            !reachable
+                .iter()
+                .any(|candidate| admission.policy.permits(candidate))
         })
+        .map(describe)
         .collect();
     refused.sort();
     if !refused.is_empty() {
@@ -174,56 +175,117 @@ fn refuse_policies_that_admit_nothing(
     Ok(())
 }
 
-/// Refuse to serve a key whose cadence promises a local fallback this
-/// deployment cannot provide.
+/// How a refusal names the key an operator has to go and edit.
 ///
-/// A [`FrontierCadence`] is not a filter, and every document in this tree says
-/// so in the same words: when the trailing window is spent, hosted targets go
-/// inadmissible and *the turn serves locally instead of failing*. That sentence
-/// is a promise about the fleet, made in a file that cannot see one. In a
-/// deployment with no local capacity wired, the second turn of every rationed
-/// session has nowhere to go and terminates `policy_refused` — the cadence
-/// behaving exactly like the empty filter it is documented as the opposite of.
+/// One spelling for both checks below. A digest tells an operator that two
+/// keys differ and never which one they mistyped, so the patterns go in beside
+/// it.
+fn describe(admission: &Admission) -> String {
+    format!(
+        "project `{}`, user `{}` (policy {}, allow {})",
+        admission.principal.project,
+        admission.principal.user,
+        admission.policy.digest(),
+        admission.policy.allow,
+    )
+}
+
+/// What a [`FrontierCadence`] promises about a window it has spent.
 ///
-/// So the promise is checked where the fleet is finally visible, which is the
+/// [`FrontierCadence`]: roundhouse_core::control::FrontierCadence
+const CADENCE_PROMISE: &str =
+    "its frontier_cadence promises that a spent window serves locally instead of failing";
+
+/// What a degrade-mode [`Budget`] with the overflow valve off promises about a
+/// limit it has spent.
+///
+/// [`Budget`]: roundhouse_core::control::Budget
+const BUDGET_PROMISE: &str = "its budget degrades to local with overflow_when_local_saturated off, \
+     which promises that an exhausted budget serves locally instead of failing";
+
+/// Every promise this key's configuration makes about a *spent* allowance that
+/// this deployment cannot keep.
+///
+/// **Two configurations, one promise, one check.** A cadence spends a
+/// per-session ration and a degrade-mode budget spends money, but both say the
+/// same sentence when their allowance runs out — *the hosted options go
+/// inadmissible and the turn serves locally instead of failing* — and both say
+/// it in a file that cannot see a fleet. Whether the sentence is true depends
+/// on one fact either way: is anything this key may reach still admissible
+/// once the allowance is gone? Asking it twice, in two functions with two
+/// lookalike error messages, would be two spellings of one question, and the
+/// second one is where the answers start to differ.
+///
+/// Each promise is asked in the vocabulary of the thing that made it, through
+/// the same predicate the router will apply at runtime rather than a
+/// restatement of it — [`TurnPolicy::admits_when_spent`] for the cadence, and
+/// [`TurnBudget::exhausted`] plus [`TurnPolicy::permits`] for the budget.
+/// A key that makes neither promise is asked nothing, which is why a
+/// deployment with no cadences and no budgets is unaffected by this check.
+///
+/// The budget half asks `permits` and not `admits_when_spent`: an exhausted
+/// budget and a spent cadence are separate allowances, and a key that has run
+/// out of one has not necessarily run out of the other. Where a key really does
+/// exhaust both, the cadence half of this same list has already refused it.
+///
+/// [`TurnPolicy::admits_when_spent`]: roundhouse_core::control::TurnPolicy::admits_when_spent
+/// [`TurnPolicy::permits`]: roundhouse_core::control::TurnPolicy::permits
+fn unkeepable_promises(admission: &Admission, reachable: &[Candidate]) -> Vec<&'static str> {
+    let mut broken = Vec::new();
+    if admission.policy.frontier_cadence.is_some()
+        && !reachable
+            .iter()
+            .any(|candidate| admission.policy.admits_when_spent(candidate))
+    {
+        broken.push(CADENCE_PROMISE);
+    }
+    if let Some(terms) = &admission.budget {
+        // Only one exhaustion setting promises local service at all: `Refuse`
+        // never made the promise, and the valve keeps it on frontier. See
+        // `Exhaustion::promises_local_service`.
+        if terms.budget.on_exhaustion.promises_local_service() {
+            let spent = TurnBudget::exhausted(terms.budget.on_exhaustion);
+            if !reachable
+                .iter()
+                .any(|candidate| admission.policy.permits(candidate) && spent.admits(candidate))
+            {
+                broken.push(BUDGET_PROMISE);
+            }
+        }
+    }
+    broken
+}
+
+/// Refuse to serve a key that promises a local fallback this deployment cannot
+/// provide.
+///
+/// The promise is checked where the fleet is finally visible, which is the
 /// same place [`refuse_policies_that_admit_nothing`] checks the other half.
-/// The two are separate functions because they are separate questions with
-/// separate remedies: that one says "this policy names nothing", this one says
-/// "this policy names something for the first turn only". Reported together
-/// would leave an operator unsure which sentence to go and edit.
-///
-/// Only keys whose policy carries a cadence are asked. A policy with no
-/// cadence never spends a window, so it has no spent-window behavior to
-/// promise.
-fn refuse_cadences_with_nothing_to_serve(
+/// Those two stay separate functions because they are separate questions with
+/// separate remedies: that one says "this policy names nothing at all", this
+/// one says "this configuration names something for as long as an allowance
+/// lasts". Reported together would leave an operator unsure which sentence to
+/// go and edit. What is *not* separate is the pair of promises inside this
+/// one — see [`unkeepable_promises`].
+fn refuse_promises_of_a_local_fallback(
     plane: &ControlPlane,
     reachable: &[Candidate],
 ) -> anyhow::Result<()> {
     let mut refused: Vec<String> = plane
         .configured_admissions()
-        .filter(|(_principal, policy)| policy.frontier_cadence.is_some())
-        .filter(|(_principal, policy)| {
-            !reachable
-                .iter()
-                .any(|candidate| policy.admits_when_spent(candidate))
-        })
-        .map(|(principal, policy)| {
-            format!(
-                "project `{}`, user `{}` (policy {}, allow {})",
-                principal.project,
-                principal.user,
-                policy.digest(),
-                policy.allow,
-            )
+        .filter_map(|admission| {
+            let broken = unkeepable_promises(admission, reachable);
+            (!broken.is_empty())
+                .then(|| format!("{} — {}", describe(admission), broken.join("; and ")))
         })
         .collect();
     refused.sort();
     if !refused.is_empty() {
         anyhow::bail!(
-            "these control-plane keys carry a frontier_cadence, which promises that a spent \
-             window serves locally; this deployment has no local fleet to serve it, so their \
-             every turn after the ration would fail instead: {}",
-            refused.join("; ")
+            "these control-plane keys promise that a spent allowance serves locally; this \
+             deployment has no local capacity to serve it, so their turns would fail instead \
+             of degrading: {}",
+            refused.join(" | ")
         );
     }
     Ok(())
@@ -286,7 +348,7 @@ async fn main() -> anyhow::Result<()> {
     // is a mistake nothing before this point could catch.
     let reachable = reachable_candidates(&catalog);
     refuse_policies_that_admit_nothing(&plane, &reachable)?;
-    refuse_cadences_with_nothing_to_serve(&plane, &reachable)?;
+    refuse_promises_of_a_local_fallback(&plane, &reachable)?;
 
     let addr: SocketAddr = std::env::var(ADDR_VAR)
         .unwrap_or_else(|_| DEFAULT_ADDR.to_string())
@@ -305,21 +367,43 @@ async fn main() -> anyhow::Result<()> {
     // The two arms monomorphize `serve` twice; that is the entire cost of
     // keeping the engine generic over its store. The URL itself is never
     // logged — a `redis://` URL may carry credentials.
+    //
+    // One variable selects *both* durable backends, and they are chosen
+    // together on purpose. The session log and the spend ledger answer two
+    // questions about the same turns, and a deployment that made one durable
+    // and left the other in memory would re-grant its whole budget on every
+    // restart while the log that proves it was already spent survives.
     match std::env::var(REDIS_VAR) {
         Ok(url) => {
-            let store = RedisSessionStore::connect(url)
+            let store = RedisSessionStore::connect(&url)
                 .await
                 .with_context(|| format!("connecting to the Redis named by {REDIS_VAR}"))?;
-            tracing::info!(var = REDIS_VAR, "sessions are durable in Redis");
-            serve(Arc::new(store), plane, catalog, metrics_config, listener).await
+            let spend = RedisSpendLedger::connect(&url).await.with_context(|| {
+                format!("opening the spend ledger in the Redis named by {REDIS_VAR}")
+            })?;
+            tracing::info!(
+                var = REDIS_VAR,
+                "sessions and committed spend are durable in Redis"
+            );
+            serve(
+                Arc::new(store),
+                Arc::new(spend),
+                plane,
+                catalog,
+                metrics_config,
+                listener,
+            )
+            .await
         }
         Err(_) => {
             tracing::warn!(
                 var = REDIS_VAR,
-                "no Redis configured; sessions are in-memory and die with this process"
+                "no Redis configured; sessions and committed spend are in-memory and die \
+                 with this process"
             );
             serve(
                 Arc::new(MemoryStore::new()),
+                Arc::new(MemorySpendLedger::new()),
                 plane,
                 catalog,
                 metrics_config,
@@ -330,23 +414,28 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-/// Compose the engine and the three surfaces over whichever store was chosen.
+/// Compose the engine and the three surfaces over whichever backends were
+/// chosen.
 async fn serve<S: SessionStore>(
     store: Arc<S>,
+    spend: Arc<dyn SpendLedger>,
     plane: Arc<ControlPlane>,
     catalog: StaticFrontierCatalog,
     metrics_config: Arc<MetricsConfig>,
     listener: tokio::net::TcpListener,
 ) -> anyhow::Result<()> {
-    let engine = Arc::new(Engine::new(
-        Arc::clone(&store),
-        ByteTokenizer,
-        Arc::new(EchoLocalExecutor::new("local answer")),
-        catalog,
-        Arc::new(EchoFrontierClient::new("frontier answer")),
-        Arc::new(AffinityPolicy::new()),
-        EngineConfig::default(),
-    ));
+    let engine = Arc::new(
+        Engine::new(
+            Arc::clone(&store),
+            ByteTokenizer,
+            Arc::new(EchoLocalExecutor::new("local answer")),
+            catalog,
+            Arc::new(EchoFrontierClient::new("frontier answer")),
+            Arc::new(AffinityPolicy::new()),
+            EngineConfig::default(),
+        )
+        .with_spend_ledger(spend),
+    );
 
     // Three surfaces, one process and one log: the native transport, which
     // exposes sessions and the log itself; the Responses API, which lets an
@@ -372,12 +461,22 @@ mod tests {
     use roundhouse_server::ControlPlaneConfig;
 
     fn plane_with_policy(policy: serde_json::Value) -> ControlPlane {
-        // Through the config file rather than by building the lookup table, so
-        // the fixture exercises the same narrowing and validation a deployment
-        // does. The hash is a plausible-looking constant: this check never
-        // authenticates anything, it only reads the policies.
+        plane_with(policy, serde_json::Value::Null)
+    }
+
+    /// A one-key plane carrying a policy, a budget, or both.
+    ///
+    /// Through the config file rather than by building the lookup table, so
+    /// the fixture exercises the same narrowing and validation a deployment
+    /// does. The hash is a plausible-looking constant: this check never
+    /// authenticates anything, it only reads the policies and budgets.
+    fn plane_with(policy: serde_json::Value, budget: serde_json::Value) -> ControlPlane {
+        let mut project = serde_json::json!({ "id": "acme", "policy": policy });
+        if !budget.is_null() {
+            project["budget"] = budget;
+        }
         let json = serde_json::json!({
-            "projects": [{ "id": "acme", "policy": policy }],
+            "projects": [project],
             "users": [{ "id": "ada" }],
             "keys": [{ "project": "acme", "user": "ada", "key_sha256": "a".repeat(64) }],
         })
@@ -473,6 +572,35 @@ mod tests {
         }
     }
 
+    /// The echo stub at a real price.
+    ///
+    /// [`echo_catalog`] is free, and a free hosted model is admissible at a
+    /// ceiling of zero — so an exhausted budget would still have somewhere to
+    /// go and the budget half of the promise check would never fire. That is
+    /// the honest answer for the free stub and the wrong fixture for testing
+    /// the check, which is why the budget tests below quote this instead.
+    fn priced_catalog() -> StaticFrontierCatalog {
+        StaticFrontierCatalog::new(vec![FrontierModelSpec {
+            pricing: ProviderPricing {
+                input_per_mtok_usd: 3.0,
+                cached_input_per_mtok_usd: 0.3,
+                cache_write_per_mtok_usd: 3.75,
+                output_per_mtok_usd: 15.0,
+            },
+            ..echo_catalog().models()[0].clone()
+        }])
+    }
+
+    /// A degrade-mode budget with the valve off, spelled for `plane_with`.
+    fn strict_budget() -> serde_json::Value {
+        serde_json::json!({
+            "limit_usd": 10.0,
+            "window": "total",
+            "on_exhaustion": "degrade_to_local",
+            "overflow_when_local_saturated": false,
+        })
+    }
+
     #[test]
     fn a_cadence_with_no_local_fleet_to_fall_back_on_refuses_to_serve() {
         // The promise a cadence makes, checked against the fleet for the first
@@ -484,7 +612,7 @@ mod tests {
         let cadence = serde_json::json!({
             "frontier_cadence": { "max_frontier": 1, "per_turns": 10 }
         });
-        let error = refuse_cadences_with_nothing_to_serve(
+        let error = refuse_promises_of_a_local_fallback(
             &plane_with_policy(cadence.clone()),
             &reachable_candidates(&echo_catalog()),
         )
@@ -496,8 +624,18 @@ mod tests {
         );
         assert!(
             message.contains("spent window serves locally")
-                && message.contains("no local fleet to serve it"),
+                && message.contains("no local capacity to serve it"),
             "and it has to name the promise it is enforcing: {message}"
+        );
+        assert!(
+            message.contains("frontier_cadence"),
+            "and which of the two promises broke, since only one of them is in \
+             this key's file: {message}"
+        );
+        assert!(
+            !message.contains("overflow_when_local_saturated"),
+            "this key has no budget, so the budget promise must not be reported \
+             against it: {message}"
         );
 
         // Acceptance: the identical policy on a deployment that does quote a
@@ -506,26 +644,117 @@ mod tests {
         // about the cadence.
         let mut with_fleet = reachable_candidates(&echo_catalog());
         with_fleet.push(local_candidate());
-        refuse_cadences_with_nothing_to_serve(&plane_with_policy(cadence), &with_fleet)
+        refuse_promises_of_a_local_fallback(&plane_with_policy(cadence), &with_fleet)
             .expect("a spent window has somewhere to go when a local worker is quoted");
     }
 
     #[test]
-    fn a_policy_with_no_cadence_promises_nothing_about_a_spent_window() {
+    fn a_degrade_mode_budget_with_the_valve_off_and_no_local_fleet_refuses_to_serve() {
+        // Decision 9, and the same sentence the cadence makes one test up: an
+        // exhausted budget takes every priced target away, and with the valve
+        // off there is nothing but local left to serve the turn. In a
+        // deployment with no local capacity that is a promise nothing can
+        // keep, so it is refused at boot rather than discovered by a tenant
+        // whose turns start failing the day their budget runs out.
+        let error = refuse_promises_of_a_local_fallback(
+            &plane_with(serde_json::json!({}), strict_budget()),
+            &reachable_candidates(&priced_catalog()),
+        )
+        .expect_err("a valve-off budget with no local capacity behind it must stop the process");
+        let message = error.to_string();
+        assert!(
+            message.contains("project `acme`, user `ada`"),
+            "the refusal has to name the key an operator would go and fix: {message}"
+        );
+        assert!(
+            message.contains("overflow_when_local_saturated off")
+                && message.contains("exhausted budget serves locally"),
+            "and it has to name the field and the promise, not just the project: {message}"
+        );
+
+        // Acceptance: the identical budget on a deployment that quotes a local
+        // worker. Same key, same budget, and the check is satisfied — which is
+        // what makes the refusal above about the fleet rather than about
+        // budgets.
+        let mut with_fleet = reachable_candidates(&priced_catalog());
+        with_fleet.push(local_candidate());
+        refuse_promises_of_a_local_fallback(
+            &plane_with(serde_json::json!({}), strict_budget()),
+            &with_fleet,
+        )
+        .expect("an exhausted budget has somewhere to go when a local worker is quoted");
+    }
+
+    #[test]
+    fn the_two_exhaustion_settings_that_promise_nothing_local_boot_without_a_fleet() {
         // The control that keeps the check above from being "refuse every
-        // fleetless deployment": a policy that never rations never spends a
-        // window, so it has no spent-window behavior to make good on.
+        // budgeted fleetless deployment". Only one of the three exhaustion
+        // settings promises local service: `refuse` never made the promise,
+        // and the valve keeps it on frontier. Both must boot here, or turning
+        // a budget on would require a fleet nobody said they needed.
+        for budget in [
+            serde_json::json!({
+                "limit_usd": 10.0, "window": "total", "on_exhaustion": "refuse",
+            }),
+            serde_json::json!({
+                "limit_usd": 10.0,
+                "window": "monthly",
+                "on_exhaustion": "degrade_to_local",
+                "overflow_when_local_saturated": true,
+            }),
+        ] {
+            refuse_promises_of_a_local_fallback(
+                &plane_with(serde_json::json!({}), budget.clone()),
+                &reachable_candidates(&priced_catalog()),
+            )
+            .unwrap_or_else(|error| panic!("{budget} promises no local service: {error}"));
+        }
+    }
+
+    #[test]
+    fn a_configuration_that_spends_no_allowance_promises_nothing_about_one() {
+        // The other half of the same control: a policy that never rations and
+        // a project with no budget have no spent-allowance behavior to make
+        // good on, so a fleetless deployment serves them happily.
         for policy in [
             serde_json::json!({}),
             serde_json::json!({ "allow": ["echo/echo"] }),
             serde_json::json!({ "min_quality": 0.5 }),
         ] {
-            refuse_cadences_with_nothing_to_serve(
+            refuse_promises_of_a_local_fallback(
                 &plane_with_policy(policy.clone()),
                 &reachable_candidates(&echo_catalog()),
             )
-            .unwrap_or_else(|error| panic!("{policy} carries no cadence: {error}"));
+            .unwrap_or_else(|error| panic!("{policy} spends no allowance: {error}"));
         }
+    }
+
+    #[test]
+    fn a_key_that_breaks_both_promises_is_told_about_both_in_one_refusal() {
+        // The reason the two questions are one function rather than two
+        // lookalikes: a key that rations frontier traffic *and* budgets it has
+        // made the same promise twice, and being sent to fix one of them and
+        // then restarting into the other is two outages where there should be
+        // one message.
+        let error = refuse_promises_of_a_local_fallback(
+            &plane_with(
+                serde_json::json!({ "frontier_cadence": { "max_frontier": 1, "per_turns": 10 } }),
+                strict_budget(),
+            ),
+            &reachable_candidates(&priced_catalog()),
+        )
+        .expect_err("both promises are unkeepable here");
+        let message = error.to_string();
+        assert!(
+            message.contains("frontier_cadence")
+                && message.contains("overflow_when_local_saturated"),
+            "one refusal, both promises named: {message}"
+        );
+        assert_eq!(
+            message.matches("project `acme`, user `ada`").count(),
+            1,
+            "and the key named once rather than once per promise: {message}"
+        );
     }
 
     #[test]
@@ -533,8 +762,8 @@ mod tests {
         let reachable = reachable_candidates(&echo_catalog());
         refuse_policies_that_admit_nothing(&ControlPlane::Open, &reachable)
             .expect("open mode resolves to the unrestricted policy");
-        refuse_cadences_with_nothing_to_serve(&ControlPlane::Open, &reachable)
-            .expect("and the unrestricted policy carries no cadence");
+        refuse_promises_of_a_local_fallback(&ControlPlane::Open, &reachable)
+            .expect("and the unrestricted policy carries no cadence and no budget");
         // And the empty catalog is the deployment's problem, not this check's:
         // with nothing quoted there is nothing to disagree about, and the
         // routing layer's own `NoCandidates` is the accurate answer.

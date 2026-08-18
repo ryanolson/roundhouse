@@ -65,6 +65,7 @@ fn decision(chosen: Target) -> DecisionRecord {
             },
         ],
         turn_policy_digest: String::new(),
+        budget_state: Default::default(),
     }
 }
 

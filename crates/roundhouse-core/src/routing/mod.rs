@@ -36,7 +36,7 @@ pub use policy::{AffinityPolicy, EscalationPolicy};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::control::{FrontierHistory, TurnPolicy};
+use crate::control::{BudgetState, FrontierHistory, TurnBudget, TurnPolicy};
 use crate::ids::SessionId;
 
 /// Where a turn can be sent.
@@ -176,11 +176,188 @@ pub struct RoutingContext<'a> {
     /// [`FrontierCadence`](crate::control::FrontierCadence) is evaluated
     /// against. A projection of the log, borrowed from the session state.
     pub frontier_history: &'a FrontierHistory,
+    /// What the spend ledger granted this turn.
+    ///
+    /// Turn-resolved data like [`Self::frontier_history`] and deliberately not
+    /// admission-resolved like [`Self::turn_policy`]: a policy is fixed for the
+    /// session while a grant is opened between `quote` and `choose` on every
+    /// single turn and is stale by the next one. An unconfigured deployment
+    /// passes [`TurnBudget::Unlimited`], which is the value that makes the
+    /// budget axis a no-op rather than a ceiling that happens to be large.
+    pub budget: &'a TurnBudget,
 }
 
-impl RoutingContext<'_> {
+/// What the overflow valve appends to a rationale when it opens.
+///
+/// One string, because the fact is one fact however many policies can reach it,
+/// and because an operator grepping the audit trail for overspend should find
+/// every instance with one pattern.
+const OVERFLOW_NOTE: &str = "; budget exhausted and no local candidate could take the turn, so the frontier pool was re-admitted";
+
+/// The candidates one turn may be dispatched to, and the budget fact its
+/// decision has to record.
+///
+/// Never empty: an empty admissible set is a routing *failure* with a blame
+/// attached, so it leaves [`RoutingContext::admissible`] as an error rather
+/// than as an empty pool a caller has to remember to check.
+pub struct Admitted<'a> {
+    pool: Vec<&'a Candidate>,
+    budget_state: BudgetState,
+}
+
+impl<'a> Admitted<'a> {
+    pub fn pool(&self) -> &[&'a Candidate] {
+        &self.pool
+    }
+
+    /// The budget situation to record on this turn's decision — including
+    /// [`BudgetState::ExhaustedOverflow`], which is *produced* here and exists
+    /// nowhere upstream.
+    pub fn budget_state(&self) -> BudgetState {
+        self.budget_state
+    }
+
+    /// The admissible candidate with the highest quality prior.
+    ///
+    /// The escalation audit branch's question, answered here rather than there
+    /// because the pool's non-emptiness is this type's invariant: asked
+    /// outside, it comes back as an `Option` whose `None` arm is unreachable
+    /// and has to be given a wrong-but-plausible error anyway.
+    pub fn highest_quality(&self) -> &'a Candidate {
+        self.pool
+            .iter()
+            .copied()
+            .reduce(|best, candidate| {
+                if candidate.quality_prior > best.quality_prior {
+                    candidate
+                } else {
+                    best
+                }
+            })
+            .unwrap_or_else(|| unreachable!("an `Admitted` pool is never empty"))
+    }
+
+    /// `rationale`, with the valve's justification appended if it opened.
+    ///
+    /// Appended rather than woven in, so an ordinary decision's rationale is
+    /// byte-identical to the one a pre-budget deployment wrote — the M1
+    /// compatibility pin depends on exactly that.
+    pub fn annotate(&self, rationale: String) -> String {
+        match self.budget_state.overflowed() {
+            true => rationale + OVERFLOW_NOTE,
+            false => rationale,
+        }
+    }
+}
+
+impl<'a> RoutingContext<'a> {
     pub fn candidate_for(&self, target: &Target) -> Option<&Candidate> {
         self.candidates.iter().find(|c| &c.target == target)
+    }
+
+    /// **The one admissibility question the router asks**: may this turn be
+    /// dispatched to `candidate`?
+    ///
+    /// Three axes, two owners, and the split is the same one M2 named. The
+    /// allow filter and the quality floor are *reachability* — the same answer
+    /// on every turn of every session — and belong to
+    /// [`TurnPolicy::permits`](crate::control::TurnPolicy::permits). The
+    /// cadence and the budget are *this-turn* axes: a rationed model is
+    /// reachable next turn and a budget-excluded one is reachable next month,
+    /// which is why neither belongs in `permits` and why a candidate excluded
+    /// by either still belongs in `considered` with its counterfactual saving
+    /// intact.
+    ///
+    /// The conjunction lives here rather than inside `TurnPolicy` because the
+    /// budget is not a property of a policy — a policy is resolved once at
+    /// admission and a grant is opened between `quote` and `choose` on every
+    /// turn. Threading a `TurnBudget` into `TurnPolicy::admits` would make one
+    /// type answer for two clocks; this context is the thing that already holds
+    /// both.
+    pub fn admits(&self, candidate: &Candidate) -> bool {
+        self.admits_past_the_budget(candidate) && self.budget.admits(candidate)
+    }
+
+    /// The same question with the budget axis lifted — **the overflow valve's
+    /// question, and its only caller.**
+    ///
+    /// Named rather than spelled as [`Self::admits`] with a fabricated
+    /// [`TurnBudget::Unlimited`] handed in. A synthesized budget would be a
+    /// second answer to "what did the ledger grant this turn", and the M2
+    /// review blocked on exactly that shape — a fabricated argument standing in
+    /// for a question nobody had named. The valve relaxes precisely one axis,
+    /// and the name is what says which.
+    pub fn admits_past_the_budget(&self, candidate: &Candidate) -> bool {
+        self.turn_policy.admits(candidate, self.frontier_history)
+    }
+
+    /// The candidates this turn may be dispatched to, and — when there are
+    /// none — whose decision emptied the set.
+    ///
+    /// **One piece of code decides all three outcomes**, because they are three
+    /// answers to one question and a second implementation of any of them would
+    /// blame a different system for the same fleet. `max_load` is the calling
+    /// policy's own tuning: `None` means "do not exclude on load", which is what
+    /// the escalation audit branch passes, deliberately, since an audit is worth
+    /// reaching a busy worker for.
+    ///
+    /// **The order of the filters is the blame.** The turn policy runs first, so
+    /// an empty set at that point is a refusal *this deployment made about this
+    /// tenant* — [`RoutingError::PolicyRefused`], which a retry cannot fix and
+    /// only an operator widening a policy can. What survives it is filtered by
+    /// the budget and then by load, and an empty set at *that* point is a busy
+    /// fleet or a spent budget rather than a refused tenant.
+    ///
+    /// **The valve is the last step and it relaxes one axis.** When the budget
+    /// is exhausted, the project asked for the valve, and nothing survived — the
+    /// local pool was load-rejected, or there was no local candidate to begin
+    /// with — the *policy*-admitted candidates come back, budget aside. Load
+    /// still applies to them (frontier candidates report none, so in practice
+    /// it is the frontier pool that returns), and the allow filter, the quality
+    /// floor and the cadence all still bind, because they were applied before
+    /// the budget was and the valve never revisits them. The result is marked
+    /// [`BudgetState::ExhaustedOverflow`], which is the only place that variant
+    /// is produced.
+    pub fn admissible(&self, max_load: Option<f64>) -> Result<Admitted<'a>, RoutingError> {
+        let entitled: Vec<&'a Candidate> = self
+            .candidates
+            .iter()
+            .filter(|candidate| self.admits_past_the_budget(candidate))
+            .collect();
+        if entitled.is_empty() {
+            return Err(RoutingError::PolicyRefused);
+        }
+
+        let under_load = |candidate: &&Candidate| match (max_load, candidate.load) {
+            (Some(ceiling), Some(load)) => load <= ceiling,
+            _ => true,
+        };
+        let viable: Vec<&'a Candidate> = entitled
+            .iter()
+            .copied()
+            .filter(|candidate| self.budget.admits(candidate))
+            .filter(under_load)
+            .collect();
+        if !viable.is_empty() {
+            return Ok(Admitted {
+                pool: viable,
+                budget_state: self.budget.state(),
+            });
+        }
+
+        if self.budget.overflow_armed() {
+            let overflowed: Vec<&'a Candidate> = entitled.into_iter().filter(under_load).collect();
+            if !overflowed.is_empty() {
+                return Ok(Admitted {
+                    pool: overflowed,
+                    budget_state: BudgetState::ExhaustedOverflow,
+                });
+            }
+        }
+
+        Err(RoutingError::NoViableCandidate {
+            budget_state: self.budget.state(),
+        })
     }
 }
 
@@ -189,6 +366,15 @@ impl RoutingContext<'_> {
 pub struct Decision {
     pub target: Target,
     pub rationale: String,
+    /// The budget situation this choice was made under.
+    ///
+    /// Carried out of `choose` rather than read back off the
+    /// [`RoutingContext`] by the caller, because one of its four values is
+    /// *produced* here: only the admissibility resolution knows whether the
+    /// overflow valve had to open, and a caller re-deriving the state from the
+    /// grant it handed in would record every overflow as an ordinary
+    /// exhausted turn.
+    pub budget_state: BudgetState,
 }
 
 /// The persisted form of a decision, written into the session event log.
@@ -218,6 +404,21 @@ pub struct DecisionRecord {
     /// nothing; [`TurnPolicy::unrestricted`] has a real digest.
     #[serde(default)]
     pub turn_policy_digest: String,
+    /// The budget situation in force when this decision was made.
+    ///
+    /// Recorded because a project that stayed under budget by serving four
+    /// hundred turns on a 7B model has not had the same month as one that never
+    /// needed to, and because
+    /// [`ExhaustedOverflow`](BudgetState::ExhaustedOverflow) is the dashboard
+    /// number for "served on frontier past exhaustion because local was
+    /// saturated" — a fact that exists nowhere else in the log.
+    ///
+    /// Defaults to [`Unconstrained`](BudgetState::Unconstrained), which is the
+    /// correct reading of a log written before budgets existed rather than a
+    /// placeholder: those turns really were taken under no budget. Same
+    /// treatment, and same reason, as [`Self::turn_policy_digest`] above.
+    #[serde(default)]
+    pub budget_state: BudgetState,
 }
 
 /// Why no target was chosen.
@@ -251,8 +452,22 @@ pub enum RoutingError {
     /// would tell a client that widening a policy is the fix for an overloaded
     /// worker, and send an operator to read a `TurnPolicy` that is not the
     /// problem.
-    #[error("no candidate satisfied the routing policy's own constraints")]
-    NoViableCandidate,
+    ///
+    /// It carries the budget state because the two facts arrive together in the
+    /// one case an operator most needs both of: a project whose budget is spent
+    /// has had every frontier candidate excluded before load was ever
+    /// considered, so the local pool emptying under load is the *whole* of the
+    /// remaining fleet emptying. Blaming the fleet is still right — the pool
+    /// was emptied by load, not by the tenant's policy — but an operator told
+    /// only that goes tuning workers without noticing there was nothing to fall
+    /// back to. Every other state contributes nothing to the message, so the
+    /// ordinary busy-fleet error reads exactly as it did before budgets
+    /// existed.
+    #[error(
+        "no candidate satisfied the routing policy's own constraints{}",
+        .budget_state.saturation_note()
+    )]
+    NoViableCandidate { budget_state: BudgetState },
     #[error("policy failure: {0}")]
     Policy(#[from] anyhow::Error),
 }
@@ -377,5 +592,63 @@ mod tests {
         let round_tripped: DecisionRecord =
             serde_json::from_str(&serde_json::to_string(&digested).unwrap()).unwrap();
         assert_eq!(round_tripped, digested);
+    }
+
+    #[test]
+    fn an_overflow_dispatch_is_a_marked_fact_and_a_pre_m3_log_reads_unconstrained() {
+        // Both directions, because the field has to survive both. An overflow
+        // that did not round-trip would lose the one number that answers "how
+        // much did this project spend past its limit because its own fleet was
+        // full" — and a record written before budgets existed has to keep
+        // deserializing, or an upgrade takes the deployment's routing history
+        // with it.
+        let record = DecisionRecord {
+            chosen: Target::Frontier {
+                provider: "anthropic".into(),
+                model: "claude".into(),
+            },
+            rationale: "overflow".into(),
+            policy: "affinity".into(),
+            isl_tokens: 4_096,
+            expected_prefill_tokens: 4_096.0,
+            expected_cost_usd: 0.02,
+            considered: Vec::new(),
+            turn_policy_digest: "0123456789abcdef".into(),
+            budget_state: BudgetState::ExhaustedOverflow,
+        };
+        let encoded = serde_json::to_string(&record).unwrap();
+        assert!(
+            encoded.contains(r#""budget_state":"exhausted_overflow""#),
+            "the overspend has to be findable in the log by one grep: {encoded}"
+        );
+        assert_eq!(
+            serde_json::from_str::<DecisionRecord>(&encoded).unwrap(),
+            record
+        );
+
+        // Byte-for-byte what a `Routed` decision serialized to at M2 — with a
+        // policy digest, because that field already existed, and without a
+        // budget state, because this one did not.
+        let pre_m3 = r#"{
+            "chosen": {"kind":"local","worker_id":7,"dp_rank":0,"model":"llama"},
+            "rationale": "test",
+            "policy": "affinity",
+            "isl_tokens": 4096,
+            "expected_prefill_tokens": 512.0,
+            "expected_cost_usd": 0.0,
+            "considered": [],
+            "turn_policy_digest": "4ec325a715649c8e"
+        }"#;
+        let recovered: DecisionRecord = serde_json::from_str(pre_m3).unwrap();
+        assert_eq!(
+            recovered.budget_state,
+            BudgetState::Unconstrained,
+            "a turn taken before budgets existed was taken under no budget, \
+             which is a fact and not a missing value"
+        );
+        assert!(
+            !recovered.budget_state.overflowed(),
+            "and it certainly did not overflow one"
+        );
     }
 }

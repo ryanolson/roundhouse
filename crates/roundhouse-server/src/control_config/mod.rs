@@ -86,6 +86,7 @@
 //! [`HeaderMap`]: axum::http::HeaderMap
 
 pub mod auth;
+pub mod budget;
 pub mod config;
 
 use std::collections::{HashMap, HashSet};
@@ -95,10 +96,11 @@ use axum::http::HeaderMap;
 use axum::http::header::AUTHORIZATION;
 use sha2::{Digest, Sha256};
 
-use roundhouse_core::control::{Principal, TurnPolicy};
+use roundhouse_core::control::{BudgetTerms, Principal, TurnPolicy};
 use roundhouse_core::ids::SessionId;
 
 pub use auth::AuthError;
+pub use budget::{AllocationConfig, BudgetConfig, OnExhaustionConfig};
 pub use config::{
     ControlPlaneConfig, ControlPlaneError, KeyEntry, PolicyConfig, ProjectEntry, UserEntry,
 };
@@ -173,11 +175,13 @@ pub enum ControlPlane {
     Open,
     /// A key is required; `authenticate` looks up its hash.
     Configured {
-        /// `sha256(secret)` hex, to the membership it authenticates and the
-        /// effective [`TurnPolicy`] resolved for it at load time (its
-        /// project's policy narrowed by its own overrides — see
-        /// `ControlPlaneConfig::validate`, which builds this table).
-        turn_keys: HashMap<String, (Principal, Arc<TurnPolicy>)>,
+        /// `sha256(secret)` hex, to the complete [`Admission`] resolved for
+        /// it at load time: its membership, its effective [`TurnPolicy`]
+        /// (its project's policy narrowed by its own overrides), and its
+        /// effective budget terms (its project's budget paired with its own
+        /// allocation, or `None`) — see `ControlPlaneConfig::validate`, which
+        /// builds this table.
+        turn_keys: HashMap<String, Admission>,
         /// `sha256(secret)` hex, for keys with no membership to spend as.
         admin_keys: HashSet<String>,
     },
@@ -234,7 +238,7 @@ impl ControlPlane {
         }
     }
 
-    /// Every configured membership and the policy its key resolves to, in no
+    /// Every configured membership and everything its key resolves to, in no
     /// particular order.
     ///
     /// The one way to read the whole table, and it exists so that the sentence
@@ -248,18 +252,21 @@ impl ControlPlane {
     /// [`Self::Open`] yields nothing, and that is the accurate answer rather
     /// than a special case to handle: an open deployment has no configured
     /// memberships. Every caller so far wants to check something about *each
-    /// configured policy*, and "there are none" is exactly the right number of
+    /// configured key*, and "there are none" is exactly the right number of
     /// things to check.
-    pub fn configured_admissions(&self) -> impl Iterator<Item = (&Principal, &TurnPolicy)> {
+    ///
+    /// It yields the whole [`Admission`] rather than the
+    /// `(&Principal, &TurnPolicy)` pair it used to: the startup cross-check
+    /// now asks about a key's *budget* as well as its policy, and projecting
+    /// one field away here would have sent the composition root into
+    /// `Configured { turn_keys, .. }` for the other — reinstating the second
+    /// reader of the table's layout that this accessor exists to prevent.
+    pub fn configured_admissions(&self) -> impl Iterator<Item = &Admission> {
         let table = match self {
             ControlPlane::Open => None,
             ControlPlane::Configured { turn_keys, .. } => Some(turn_keys),
         };
-        table.into_iter().flat_map(|turn_keys| {
-            turn_keys
-                .values()
-                .map(|(principal, policy)| (principal, policy.as_ref()))
-        })
+        table.into_iter().flat_map(|turn_keys| turn_keys.values())
     }
 
     // -----------------------------------------------------------------------
@@ -422,11 +429,8 @@ impl ControlPlane {
                 if admin_keys.contains(&hash) {
                     return Ok(KeyScope::Admin);
                 }
-                if let Some((principal, policy)) = turn_keys.get(&hash) {
-                    return Ok(KeyScope::Turn(Admission {
-                        principal: principal.clone(),
-                        policy: Arc::clone(policy),
-                    }));
+                if let Some(admission) = turn_keys.get(&hash) {
+                    return Ok(KeyScope::Turn(admission.clone()));
                 }
                 Err(AuthError::UnknownKey)
             }
@@ -445,23 +449,39 @@ impl ControlPlane {
 pub struct Admission {
     pub principal: Principal,
     pub policy: Arc<TurnPolicy>,
+    /// This membership's fully resolved budget ceilings — its project's
+    /// [`Budget`](roundhouse_core::control::Budget) paired with its own
+    /// [`Allocation`](roundhouse_core::control::Allocation) — or `None` when
+    /// the project has no `"budget"` configured.
+    ///
+    /// `None` is what lets the engine skip the ledger entirely on the
+    /// open-mode and no-budget paths (decision 4): a `Some` here always
+    /// means a real ceiling somebody wrote down, never an infinite one
+    /// standing in for "no ceiling". Resolved once, here, alongside
+    /// `policy` — the same one-seam reasoning `Self::open` states for the
+    /// pair it already carries: two facts resolved from the same key must
+    /// travel together or a caller can read one without the other.
+    pub budget: Option<BudgetTerms>,
 }
 
 impl Admission {
     /// What an unconfigured deployment admits every request as: the one
-    /// built-in membership, under the policy that changes no routing decision.
+    /// built-in membership, under the policy that changes no routing decision
+    /// and with no budget to spend against.
     ///
     /// Named once rather than spelled at each site, and it is the value
     /// [`ControlPlane::Open`] itself resolves to — so this is the definition
-    /// of open mode's admission and not a convenience beside it. The two
-    /// halves have to travel together: an open deployment that paired the
+    /// of open mode's admission and not a convenience beside it. The three
+    /// fields have to travel together: an open deployment that paired the
     /// default principal with anything narrower than
-    /// [`TurnPolicy::unrestricted`] would re-route workloads that predate the
-    /// control plane, which is the one thing turning it on must not do.
+    /// [`TurnPolicy::unrestricted`] or with a real budget would re-route or
+    /// meter workloads that predate the control plane, which is the one
+    /// thing turning it on must not do.
     pub fn open() -> Self {
         Self {
             principal: Principal::default_open(),
             policy: Arc::new(TurnPolicy::unrestricted()),
+            budget: None,
         }
     }
 }
@@ -750,8 +770,13 @@ mod tests {
         let plane = ControlPlane::configured(config);
         let seen: Vec<_> = plane.configured_admissions().collect();
         assert_eq!(seen.len(), 1, "one turn key in the fixture");
-        assert_eq!(*seen[0].0, Principal::new("acme", "ada"));
-        assert_eq!(*seen[0].1, TurnPolicy::unrestricted());
+        assert_eq!(seen[0].principal, Principal::new("acme", "ada"));
+        assert_eq!(*seen[0].policy, TurnPolicy::unrestricted());
+        assert!(
+            seen[0].budget.is_none(),
+            "the fixture declares no `budget`, and absent means unlimited \
+             rather than a ceiling nobody wrote"
+        );
 
         assert_eq!(
             ControlPlane::Open.configured_admissions().count(),

@@ -24,14 +24,15 @@ pub mod session;
 pub mod store;
 
 pub use control::{
-    FrontierCadence, FrontierHistory, PolicyOverrides, Principal, PrincipalKey, ProjectId,
-    TargetFilter, TurnPolicy, UserId,
+    Allocation, Budget, BudgetState, BudgetTerms, BudgetWindow, Exhaustion, FrontierCadence,
+    FrontierHistory, Grant, GrantRequest, MemorySpendLedger, PolicyOverrides, Principal,
+    PrincipalKey, ProjectId, Settlement, SpendLedger, TargetFilter, TurnBudget, TurnPolicy, UserId,
 };
 pub use event::{Accounting, SessionEvent, SessionEventKind, SessionObserver, Usage};
 pub use ids::{ResponseId, SessionId, TurnId};
 pub use item::{Item, ItemContent, Role};
 pub use metrics::{MetricsConfig, MetricsFold, MetricsSnapshot, ServingMode};
-pub use session::{Session, SessionError};
+pub use session::{Session, SessionError, TerminalSettlement};
 pub use store::{Lease, SessionStore, StoreError};
 
 /// Milliseconds since the Unix epoch.

@@ -44,8 +44,11 @@
 //! `ROUNDHOUSE_REDIS_URL` is set (see `roundhouse-server`'s `main.rs`).
 
 mod scripts;
+pub mod spend;
 #[cfg(feature = "test-support")]
 pub mod test_support;
+
+pub use spend::RedisSpendLedger;
 
 use redis::aio::ConnectionManager;
 use redis::streams::StreamRangeReply;

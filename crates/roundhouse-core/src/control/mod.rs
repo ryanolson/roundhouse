@@ -39,16 +39,27 @@
 //! [`policy`], not this one: identity is a fact about a request and a
 //! [`TurnPolicy`] is a fact about configuration, and they are resolved
 //! together at admission precisely because they are two answers rather than
-//! one.
+//! one. What it may *spend* is a third answer on a third clock, and it gets
+//! two modules of its own: [`budget`] for the ceilings an operator writes down
+//! and [`spend`] for the durable counter they are checked against.
 
+pub mod budget;
 pub mod policy;
+pub mod spend;
 
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+pub use budget::{
+    Allocation, Budget, BudgetState, BudgetWindow, DEFAULT_WARN_AT, Exhaustion, TurnBudget,
+};
 pub use policy::{
     FilterError, FrontierCadence, FrontierHistory, PolicyOverrides, TargetFilter, TurnPolicy,
+};
+pub use spend::{
+    Balance, BalanceQuery, BudgetTerms, Grant, GrantRequest, MemorySpendLedger, Settled,
+    Settlement, SpendError, SpendLedger,
 };
 
 use crate::ids::string_id;

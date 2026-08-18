@@ -25,8 +25,12 @@ use std::sync::Arc;
 use serde::Deserialize;
 
 use roundhouse_core::control::{
-    FilterError, FrontierCadence, PolicyOverrides, Principal, TargetFilter, TurnPolicy,
+    Allocation, Budget, BudgetTerms, FilterError, FrontierCadence, PolicyOverrides, Principal,
+    TargetFilter, TurnPolicy,
 };
+
+use super::Admission;
+use super::budget::{AllocationConfig, BudgetConfig};
 
 /// One entry of the config's `"projects"` array.
 #[derive(Debug, Clone, Deserialize)]
@@ -43,6 +47,13 @@ pub struct ProjectEntry {
     /// control plane at all produces.
     #[serde(default)]
     pub policy: Option<PolicyConfig>,
+    /// This project's spending ceiling. Absent means unlimited: every key's
+    /// resolved [`Admission::budget`] is `None`, the engine skips the ledger
+    /// entirely, and routing is exactly what a pre-M3 deployment already
+    /// does — see [`roundhouse_core::control::budget`] on why unlimited is a
+    /// distinct value and not a budget with a very large limit.
+    #[serde(default)]
+    pub budget: Option<BudgetConfig>,
 }
 
 /// One entry of the config's `"users"` array.
@@ -64,6 +75,14 @@ pub struct KeyEntry {
     /// entries — see the module doc.
     #[serde(default)]
     pub overrides: Option<PolicyConfig>,
+    /// This key's ceiling on top of its project's budget. Absent means
+    /// [`Allocation::Pooled`] — no *second* ceiling, not no budget: the
+    /// project's own limit still binds. An `allocation` on a key whose
+    /// project has no `"budget"` is accepted and resolves to nothing —
+    /// decision 8 does not ask for it to be refused, unlike a widening
+    /// `overrides`.
+    #[serde(default)]
+    pub allocation: Option<AllocationConfig>,
 }
 
 /// The shape of a `"policy"` (project) or `"overrides"` (key) object: the
@@ -210,14 +229,16 @@ pub struct ControlPlaneConfig {
     /// `KeyScope::Admin` acts on the deployment, not from inside a project.
     #[serde(default)]
     pub admin_keys: Vec<String>,
-    /// The finished turn-key lookup table:  `key_sha256` to the membership it
-    /// authenticates and that key's fully-resolved [`TurnPolicy`] — its
-    /// project's policy narrowed by its own overrides.
+    /// The finished turn-key lookup table: `key_sha256` to the complete
+    /// [`Admission`] the key resolves to — its membership, its fully-resolved
+    /// [`TurnPolicy`] (its project's policy narrowed by its own overrides),
+    /// and its fully-resolved budget terms (its project's [`Budget`] paired
+    /// with its own [`Allocation`], or `None` when the project has none).
     ///
     /// Built once, by [`Self::validate`], and not by `serde`: resolving a
-    /// key's policy requires its project's policy to already exist and the
-    /// widening check to have already run, both of which only `validate` has
-    /// done by the time this is populated.
+    /// key's policy and budget requires its project's policy and budget to
+    /// already exist and the widening check to have already run, both of
+    /// which only `validate` has done by the time this is populated.
     ///
     /// The *finished* table rather than a side map keyed by hash that
     /// [`ControlPlane::configured`](super::ControlPlane::configured) then
@@ -226,9 +247,12 @@ pub struct ControlPlaneConfig {
     /// no path and no entry name to name — would be a silent
     /// [`TurnPolicy::unrestricted`], the most permissive value in the system,
     /// substituted for the narrowest. Building the table here means the
-    /// question cannot be asked twice, so it cannot be answered two ways.
+    /// question cannot be asked twice, so it cannot be answered two ways —
+    /// the same reasoning that makes `Admission` the table's value type
+    /// instead of a tuple `config` and `mod.rs` would each destructure their
+    /// own way.
     #[serde(skip)]
-    pub(super) turn_keys: HashMap<String, (Principal, Arc<TurnPolicy>)>,
+    pub(super) turn_keys: HashMap<String, Admission>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -337,6 +361,41 @@ pub enum ControlPlaneError {
         /// not part of the field name they are being told to go and fix.
         axes: String,
     },
+    #[error(
+        "control-plane config `{path}`: {entry}'s budget.limit_usd {limit_usd} is not positive \
+         -- a zero or negative limit would refuse every turn from boot, which nobody writes on \
+         purpose; write \"on_exhaustion\": \"refuse\" with a real limit for that"
+    )]
+    BudgetLimitNotPositive {
+        path: String,
+        entry: String,
+        limit_usd: f64,
+    },
+    #[error(
+        "control-plane config `{path}`: {entry}'s budget.warn_at {warn_at} is outside \
+         0.0..=1.0, exclusive of 0.0 -- a warning at 0.0 would fire before anything was spent"
+    )]
+    WarnAtOutOfRange {
+        path: String,
+        entry: String,
+        warn_at: f64,
+    },
+    #[error(
+        "control-plane config `{path}`: {entry}'s allocation.share.fraction {fraction} is \
+         outside 0.0..=1.0, exclusive of 0.0 -- a share of nothing is not a ceiling"
+    )]
+    ShareFractionOutOfRange {
+        path: String,
+        entry: String,
+        fraction: f64,
+    },
+    #[error(
+        "control-plane config `{path}`: {entry}'s budget sets \
+         \"overflow_when_local_saturated\" alongside \"on_exhaustion\": \"refuse\" -- overflow \
+         is a degrade-mode valve, meaningless once the project has decided to refuse a turn \
+         rather than degrade it"
+    )]
+    OverflowWithRefuse { path: String, entry: String },
 }
 
 /// `true` for `^[a-z0-9][a-z0-9_-]{0,63}$`.
@@ -403,6 +462,10 @@ impl ControlPlaneConfig {
         // re-parsing raw config data (and risking a second, differently-worded
         // judgment of the same glob).
         let mut project_policies: HashMap<&str, TurnPolicy> = HashMap::new();
+        // Every project's resolved budget, `None` meaning unlimited. Resolved
+        // here for the same reason the policy is: the keys loop below reads
+        // it once per key rather than re-judging the same `BudgetConfig`.
+        let mut project_budgets: HashMap<&str, Option<Budget>> = HashMap::new();
         for project in &self.projects {
             if !is_valid_slug(&project.id) {
                 return Err(ControlPlaneError::BadProjectSlug {
@@ -422,6 +485,12 @@ impl ControlPlaneConfig {
                 None => TurnPolicy::unrestricted(),
             };
             project_policies.insert(project.id.as_str(), policy);
+
+            let budget = match &project.budget {
+                Some(budget_config) => Some(budget_config.to_budget(path, &entry)?),
+                None => None,
+            };
+            project_budgets.insert(project.id.as_str(), budget);
         }
 
         let mut user_ids: HashSet<&str> = HashSet::new();
@@ -444,7 +513,7 @@ impl ControlPlaneConfig {
         // `keys` and `admin_keys`, nor appear twice within either.
         let mut hashes: HashSet<&str> = HashSet::new();
         // The finished table, assembled as each key is judged. See the field.
-        let mut turn_keys: HashMap<String, (Principal, Arc<TurnPolicy>)> = HashMap::new();
+        let mut turn_keys: HashMap<String, Admission> = HashMap::new();
         for key in &self.keys {
             if !project_ids.contains(key.project.as_str()) {
                 return Err(ControlPlaneError::UnknownProject {
@@ -494,12 +563,34 @@ impl ControlPlaneConfig {
                 }
                 None => PolicyOverrides::default(),
             };
+
+            // `project_ids.contains` above already proved this project
+            // exists, so it is in `project_budgets` too — both loops walk
+            // the same `self.projects`. `None` here is unlimited, not
+            // "unresolved" — see the field.
+            let project_budget = project_budgets
+                .get(key.project.as_str())
+                .expect("a project checked present above was resolved to a budget above");
+            let allocation = match &key.allocation {
+                Some(allocation_config) => Some(allocation_config.to_allocation(path, &key_entry)?),
+                None => None,
+            };
+            // An allocation only means something once a project has a budget
+            // to allocate — see `KeyEntry::allocation`'s doc for why an
+            // allocation with no project budget is accepted rather than
+            // refused.
+            let budget = project_budget.clone().map(|budget| BudgetTerms {
+                budget,
+                allocation: allocation.unwrap_or(Allocation::Pooled),
+            });
+
             turn_keys.insert(
                 key.key_sha256.clone(),
-                (
-                    Principal::new(key.project.clone(), key.user.clone()),
-                    Arc::new(project_policy.narrow(&overrides)),
-                ),
+                Admission {
+                    principal: Principal::new(key.project.clone(), key.user.clone()),
+                    policy: Arc::new(project_policy.narrow(&overrides)),
+                    budget,
+                },
             );
         }
 
@@ -674,6 +765,432 @@ mod tests {
             key.overrides.is_some(),
             "the example must demonstrate a key override"
         );
+
+        // Decision 8's config additions: a budgeted project with overflow
+        // spelled out explicitly, a capped key, and a share key. Reading
+        // these off the *resolved* `turn_keys` table (not the raw
+        // `AllocationConfig`) proves the whole seam -- parse, validate,
+        // resolve -- rather than just that the JSON shape parses.
+        assert!(
+            acme.budget.is_some(),
+            "the example must demonstrate a project budget"
+        );
+        assert_eq!(
+            acme.budget.as_ref().unwrap().overflow_when_local_saturated,
+            Some(true),
+            "the example spells the overflow valve out explicitly rather than \
+             relying on the default"
+        );
+
+        let ceilings: HashSet<_> = config
+            .turn_keys
+            .values()
+            .filter_map(|admission| admission.budget.as_ref())
+            .map(|terms| terms.member_ceiling_usd().map(|usd| usd.to_bits()))
+            .collect();
+        assert!(
+            ceilings.contains(&Some(100.0f64.to_bits())),
+            "the example must demonstrate a capped key resolving to its ceiling: {ceilings:?}"
+        );
+        assert!(
+            ceilings.contains(&Some(125.0f64.to_bits())),
+            "the example must demonstrate a share key resolving to its ceiling \
+             (25% of the $500 project limit): {ceilings:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Decision 8: budget on projects, allocation on keys
+    // -----------------------------------------------------------------------
+
+    /// The smallest JSON that carries a valid budget, with `limit_usd`
+    /// substitutable so the boundary tests below can push it out of range.
+    fn budget_json(limit_usd: impl std::fmt::Display) -> String {
+        format!(
+            r#"{{
+              "projects": [
+                {{
+                  "id": "acme",
+                  "budget": {{
+                    "limit_usd": {limit_usd},
+                    "window": "total",
+                    "on_exhaustion": "degrade_to_local"
+                  }}
+                }}
+              ],
+              "users": []
+            }}"#
+        )
+    }
+
+    #[test]
+    fn a_budget_with_nonpositive_limit_is_rejected() {
+        for limit_usd in ["0.0", "-5.0"] {
+            let error = ControlPlaneConfig::from_json(&budget_json(limit_usd), "test").unwrap_err();
+            match error {
+                ControlPlaneError::BudgetLimitNotPositive {
+                    entry,
+                    limit_usd: got,
+                    ..
+                } => {
+                    assert_eq!(entry, "project `acme`");
+                    assert_eq!(got, limit_usd.parse::<f64>().unwrap());
+                }
+                other => panic!("expected BudgetLimitNotPositive, got {other:?}"),
+            }
+        }
+
+        // Control: a real limit validates.
+        ControlPlaneConfig::from_json(&budget_json("1.0"), "test")
+            .expect("a positive limit is not refused");
+    }
+
+    #[test]
+    fn warn_at_outside_the_half_open_interval_is_rejected() {
+        let json = format!(
+            r#"{{
+              "projects": [
+                {{
+                  "id": "acme",
+                  "budget": {{
+                    "limit_usd": 10.0,
+                    "window": "total",
+                    "on_exhaustion": "degrade_to_local",
+                    "warn_at": {warn_at}
+                  }}
+                }}
+              ],
+              "users": []
+            }}"#,
+            warn_at = 0.0
+        );
+        let error = ControlPlaneConfig::from_json(&json, "test").unwrap_err();
+        match error {
+            ControlPlaneError::WarnAtOutOfRange { entry, warn_at, .. } => {
+                assert_eq!(entry, "project `acme`");
+                assert_eq!(warn_at, 0.0);
+            }
+            other => panic!("expected WarnAtOutOfRange, got {other:?}"),
+        }
+
+        let json = format!(
+            r#"{{
+              "projects": [
+                {{
+                  "id": "acme",
+                  "budget": {{
+                    "limit_usd": 10.0,
+                    "window": "total",
+                    "on_exhaustion": "degrade_to_local",
+                    "warn_at": {warn_at}
+                  }}
+                }}
+              ],
+              "users": []
+            }}"#,
+            warn_at = 1.1
+        );
+        let error = ControlPlaneConfig::from_json(&json, "test").unwrap_err();
+        assert!(matches!(error, ControlPlaneError::WarnAtOutOfRange { .. }));
+
+        // Control: 1.0 is the closed end of the interval and validates; an
+        // absent warn_at falls back to the shared default.
+        let json = r#"{
+          "projects": [
+            {
+              "id": "acme",
+              "budget": {
+                "limit_usd": 10.0,
+                "window": "total",
+                "on_exhaustion": "degrade_to_local",
+                "warn_at": 1.0
+              }
+            }
+          ],
+          "users": []
+        }"#;
+        ControlPlaneConfig::from_json(json, "test").expect("1.0 is exactly at the bound");
+        ControlPlaneConfig::from_json(&budget_json(10.0), "test")
+            .expect("an absent warn_at is not refused");
+    }
+
+    #[test]
+    fn a_share_fraction_outside_the_interval_is_rejected() {
+        let json = format!(
+            r#"{{
+              "projects": [
+                {{
+                  "id": "acme",
+                  "budget": {{
+                    "limit_usd": 100.0,
+                    "window": "total",
+                    "on_exhaustion": "degrade_to_local"
+                  }}
+                }}
+              ],
+              "users": [{{ "id": "ada" }}],
+              "keys": [{{
+                "project": "acme",
+                "user": "ada",
+                "key_sha256": "{TURN_HASH}",
+                "allocation": {{ "share": {{ "fraction": 0.0 }} }}
+              }}]
+            }}"#
+        );
+        let error = ControlPlaneConfig::from_json(&json, "test").unwrap_err();
+        match error {
+            ControlPlaneError::ShareFractionOutOfRange {
+                entry, fraction, ..
+            } => {
+                assert_eq!(entry, "key for project `acme`, user `ada`");
+                assert_eq!(fraction, 0.0);
+            }
+            other => panic!("expected ShareFractionOutOfRange, got {other:?}"),
+        }
+
+        // Control 1: 1.0 is the closed end of a single share's interval (a
+        // member may be allowed the whole project) and validates.
+        let json = format!(
+            r#"{{
+              "projects": [
+                {{
+                  "id": "acme",
+                  "budget": {{
+                    "limit_usd": 100.0,
+                    "window": "total",
+                    "on_exhaustion": "degrade_to_local"
+                  }}
+                }}
+              ],
+              "users": [{{ "id": "ada" }}],
+              "keys": [{{
+                "project": "acme",
+                "user": "ada",
+                "key_sha256": "{TURN_HASH}",
+                "allocation": {{ "share": {{ "fraction": 1.0 }} }}
+              }}]
+            }}"#
+        );
+        ControlPlaneConfig::from_json(&json, "test").expect("1.0 is exactly at the bound");
+
+        // Control 2: this rule is about one member's own fraction, not the
+        // sum across members -- two keys each within (0.0, 1.0] whose shares
+        // sum past 1.0 is the legitimate over-subscription decision 1 and
+        // decision 8 both describe, and is accepted (the project limit still
+        // binds both).
+        let json = format!(
+            r#"{{
+              "projects": [
+                {{
+                  "id": "acme",
+                  "budget": {{
+                    "limit_usd": 100.0,
+                    "window": "total",
+                    "on_exhaustion": "degrade_to_local"
+                  }}
+                }}
+              ],
+              "users": [{{ "id": "ada" }}, {{ "id": "bob" }}],
+              "keys": [
+                {{
+                  "project": "acme",
+                  "user": "ada",
+                  "key_sha256": "{TURN_HASH}",
+                  "allocation": {{ "share": {{ "fraction": 0.6 }} }}
+                }},
+                {{
+                  "project": "acme",
+                  "user": "bob",
+                  "key_sha256": "{SHARE_HASH}",
+                  "allocation": {{ "share": {{ "fraction": 0.6 }} }}
+                }}
+              ]
+            }}"#
+        );
+        ControlPlaneConfig::from_json(&json, "test")
+            .expect("0.6 + 0.6 over-subscribes the project, which is accepted");
+    }
+
+    #[test]
+    fn overflow_with_refuse_is_rejected_naming_the_project() {
+        let json = r#"{
+          "projects": [
+            {
+              "id": "acme",
+              "budget": {
+                "limit_usd": 10.0,
+                "window": "total",
+                "on_exhaustion": "refuse",
+                "overflow_when_local_saturated": true
+              }
+            }
+          ],
+          "users": []
+        }"#;
+        let error = ControlPlaneConfig::from_json(json, "test").unwrap_err();
+        let message = error.to_string();
+        match error {
+            ControlPlaneError::OverflowWithRefuse { entry, .. } => {
+                assert_eq!(entry, "project `acme`");
+            }
+            other => panic!("expected OverflowWithRefuse, got {other:?}"),
+        }
+        assert!(
+            message.contains("degrade-mode valve"),
+            "the refusal has to say why refuse and overflow do not mix: {message}"
+        );
+
+        // The same rule with the flag set to false: still meaningless under
+        // refuse, still rejected.
+        let json = r#"{
+          "projects": [
+            {
+              "id": "acme",
+              "budget": {
+                "limit_usd": 10.0,
+                "window": "total",
+                "on_exhaustion": "refuse",
+                "overflow_when_local_saturated": false
+              }
+            }
+          ],
+          "users": []
+        }"#;
+        assert!(matches!(
+            ControlPlaneConfig::from_json(json, "test").unwrap_err(),
+            ControlPlaneError::OverflowWithRefuse { .. }
+        ));
+
+        // Control: refuse with no overflow field at all validates.
+        let json = r#"{
+          "projects": [
+            {
+              "id": "acme",
+              "budget": {
+                "limit_usd": 10.0,
+                "window": "total",
+                "on_exhaustion": "refuse"
+              }
+            }
+          ],
+          "users": []
+        }"#;
+        ControlPlaneConfig::from_json(json, "test")
+            .expect("refuse with no overflow field is the ordinary spelling");
+    }
+
+    #[test]
+    fn an_absent_budget_resolves_to_unconstrained() {
+        // No `"budget"` anywhere in the fixture: every resolved admission
+        // carries `budget: None`.
+        let config = ControlPlaneConfig::from_json(sample_config(), "test").unwrap();
+        let admission = config
+            .turn_keys
+            .get(TURN_HASH)
+            .expect("the fixture's one turn key");
+        assert!(
+            admission.budget.is_none(),
+            "an absent project budget must resolve to no budget terms, not a \
+             very large one"
+        );
+
+        // M2-compat: adding `budget`/`allocation` to the config shapes must
+        // not move a single byte of what a config with neither already
+        // resolved to. Principal and policy are exactly what M2 produced.
+        assert_eq!(admission.principal, Principal::new("acme", "ada"));
+        assert_eq!(*admission.policy, TurnPolicy::unrestricted());
+    }
+
+    /// A second, unrelated well-formed hash, distinct from every fixture
+    /// hash: `a_capped_and_a_share_key_resolve_to_their_ceilings` needs two
+    /// keys under one project.
+    const SHARE_HASH: &str = "075a9ac6b0608cfb207cb2f2e21e41b8e9771815b4403e0de138d18a240e0624";
+
+    #[test]
+    fn a_capped_and_a_share_key_resolve_to_their_ceilings() {
+        let json = format!(
+            r#"{{
+              "projects": [
+                {{
+                  "id": "acme",
+                  "budget": {{
+                    "limit_usd": 100.0,
+                    "window": "total",
+                    "on_exhaustion": "degrade_to_local"
+                  }}
+                }}
+              ],
+              "users": [{{ "id": "cappy" }}, {{ "id": "sharey" }}],
+              "keys": [
+                {{
+                  "project": "acme",
+                  "user": "cappy",
+                  "key_sha256": "{TURN_HASH}",
+                  "allocation": {{ "capped": {{ "limit_usd": 30.0 }} }}
+                }},
+                {{
+                  "project": "acme",
+                  "user": "sharey",
+                  "key_sha256": "{SHARE_HASH}",
+                  "allocation": {{ "share": {{ "fraction": 0.25 }} }}
+                }}
+              ]
+            }}"#
+        );
+        let config = ControlPlaneConfig::from_json(&json, "test").unwrap();
+
+        let capped = config
+            .turn_keys
+            .get(TURN_HASH)
+            .expect("cappy's key")
+            .budget
+            .as_ref()
+            .expect("acme has a budget");
+        assert_eq!(capped.allocation, Allocation::Capped { limit_usd: 30.0 });
+        assert_eq!(capped.member_ceiling_usd(), Some(30.0));
+
+        let shared = config
+            .turn_keys
+            .get(SHARE_HASH)
+            .expect("sharey's key")
+            .budget
+            .as_ref()
+            .expect("acme has a budget");
+        assert_eq!(shared.allocation, Allocation::Share { fraction: 0.25 });
+        assert_eq!(
+            shared.member_ceiling_usd(),
+            Some(25.0),
+            "a quarter of the $100 project limit"
+        );
+
+        // Control: a key with no `allocation` on the same budgeted project
+        // resolves to `Pooled` -- a budget, but no second ceiling.
+        let pooled_json = format!(
+            r#"{{
+              "projects": [
+                {{
+                  "id": "acme",
+                  "budget": {{
+                    "limit_usd": 100.0,
+                    "window": "total",
+                    "on_exhaustion": "degrade_to_local"
+                  }}
+                }}
+              ],
+              "users": [{{ "id": "ada" }}],
+              "keys": [{{ "project": "acme", "user": "ada", "key_sha256": "{TURN_HASH}" }}]
+            }}"#
+        );
+        let config = ControlPlaneConfig::from_json(&pooled_json, "test").unwrap();
+        let pooled = config
+            .turn_keys
+            .get(TURN_HASH)
+            .unwrap()
+            .budget
+            .as_ref()
+            .unwrap();
+        assert_eq!(pooled.allocation, Allocation::Pooled);
+        assert_eq!(pooled.member_ceiling_usd(), None);
     }
 
     #[test]
@@ -685,12 +1202,12 @@ mod tests {
         let config = ControlPlaneConfig::from_json(sample_config(), "test").unwrap();
         assert_eq!(config.turn_keys.len(), config.keys.len());
         for key in &config.keys {
-            let (principal, _policy) = config
+            let admission = config
                 .turn_keys
                 .get(&key.key_sha256)
                 .unwrap_or_else(|| panic!("key `{}` reached no table entry", key.key_sha256));
             assert_eq!(
-                *principal,
+                admission.principal,
                 Principal::new(key.project.as_str(), key.user.as_str())
             );
         }

@@ -97,6 +97,7 @@ fn log(calls: &[Usage]) -> Vec<SessionEvent> {
                     expected_cost_usd: 0.0,
                     considered: vec![],
                     turn_policy_digest: String::new(),
+                    budget_state: Default::default(),
                 },
             },
         );

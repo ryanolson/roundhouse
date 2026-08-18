@@ -54,7 +54,7 @@
 
 use async_trait::async_trait;
 
-use crate::routing::{Candidate, Decision, RoutingContext, RoutingError, RoutingPolicy};
+use crate::routing::{Decision, RoutingContext, RoutingError, RoutingPolicy};
 
 /// Normalize a set of values to 0.0..=1.0 by min-max.
 ///
@@ -136,49 +136,6 @@ impl AffinityPolicy {
         self.max_load = Some(max_load);
         self
     }
-
-    /// Candidates this policy will score, under both the caller's
-    /// entitlements and the deployment's own tuning.
-    ///
-    /// **The order of the two filters is the blame.** The turn policy runs
-    /// first, so an empty set at that point is a refusal *this deployment made
-    /// about this tenant* — [`RoutingError::PolicyRefused`], which a retry
-    /// cannot fix and only an operator widening a policy can. What survives it
-    /// is then filtered by `max_load`, this policy instance's own tuning, and
-    /// an empty set at *that* point is a busy fleet —
-    /// [`RoutingError::NoViableCandidate`], which the next turn may well not
-    /// hit.
-    ///
-    /// The two are separate on purpose and neither subsumes the other: a
-    /// deployment can tune around a busy worker that a tenant is perfectly
-    /// entitled to, and a tenant's entitlements say nothing about load. One
-    /// combined filter would still route identically and would have exactly
-    /// one answer for why it routed nowhere — which is the answer that sends
-    /// half the readers to the wrong system.
-    fn admissible<'a>(
-        &self,
-        ctx: &'a RoutingContext<'_>,
-    ) -> Result<Vec<&'a Candidate>, RoutingError> {
-        let entitled: Vec<&Candidate> = ctx
-            .candidates
-            .iter()
-            .filter(|c| ctx.turn_policy.admits(c, ctx.frontier_history))
-            .collect();
-        if entitled.is_empty() {
-            return Err(RoutingError::PolicyRefused);
-        }
-        let viable: Vec<&Candidate> = entitled
-            .into_iter()
-            .filter(|c| match (self.max_load, c.load) {
-                (Some(ceiling), Some(load)) => load <= ceiling,
-                _ => true,
-            })
-            .collect();
-        if viable.is_empty() {
-            return Err(RoutingError::NoViableCandidate);
-        }
-        Ok(viable)
-    }
 }
 
 #[async_trait]
@@ -191,7 +148,12 @@ impl RoutingPolicy for AffinityPolicy {
         if ctx.candidates.is_empty() {
             return Err(RoutingError::NoCandidates);
         }
-        let pool = self.admissible(ctx)?;
+        // The admissibility resolution, the blame when it comes back empty, and
+        // the overflow valve are all one piece of code on the context — see
+        // `RoutingContext::admissible`. This policy contributes exactly one
+        // thing to it: `max_load`, its own tuning.
+        let admitted = ctx.admissible(self.max_load)?;
+        let pool = admitted.pool();
 
         let prefill = normalize(
             &pool
@@ -218,7 +180,8 @@ impl RoutingPolicy for AffinityPolicy {
         let hit_ratio = winner.cache_hit_ratio(ctx.isl_tokens);
         Ok(Decision {
             target: winner.target.clone(),
-            rationale: format!(
+            budget_state: admitted.budget_state(),
+            rationale: admitted.annotate(format!(
                 "score {:.4} over {} candidate(s); expected prefill {:.0} of {} tokens ({:.0}% cached), ${:.5}",
                 best_score,
                 pool.len(),
@@ -226,7 +189,7 @@ impl RoutingPolicy for AffinityPolicy {
                 ctx.isl_tokens,
                 hit_ratio * 100.0,
                 winner.expected_cost_usd,
-            ),
+            )),
         })
     }
 }
@@ -276,36 +239,29 @@ impl RoutingPolicy for EscalationPolicy {
 
         // The audit branch is the one place in the router that reaches past
         // what any scoring would pick, so it is the one place that could reach
-        // past what the caller is entitled to. Unfiltered, this `max_by` would
-        // escalate straight through a quality ceiling, an access filter or a
-        // spent frontier cadence — none of which it asks about — on every
-        // `audit_every`-th turn. The clamp is here rather than in
-        // `is_audit_turn` because it *is* still an audit turn: it escalates to
-        // the best admissible target, which is what "narrowing clamps the
-        // escalation rather than cancelling it" means.
+        // past what the caller is entitled to. Unfiltered, a `max_by` here
+        // would escalate straight through a quality ceiling, an access filter,
+        // a spent frontier cadence or an exhausted budget — none of which it
+        // asks about — on every `audit_every`-th turn. The clamp is here rather
+        // than in `is_audit_turn` because it *is* still an audit turn: it
+        // escalates to the best admissible target, which is what "narrowing
+        // clamps the escalation rather than cancelling it" means.
         //
-        // The turn policy is the only filter on this branch — it applies no
-        // `max_load`, deliberately, since an audit is worth reaching a busy
-        // worker for — so an empty set here has exactly one cause and is
-        // reported as it: `PolicyRefused`, never the fleet-shaped
-        // `NoViableCandidate`.
-        let best = ctx
-            .candidates
-            .iter()
-            .filter(|candidate| ctx.turn_policy.admits(candidate, ctx.frontier_history))
-            .max_by(|a, b| {
-                a.quality_prior
-                    .partial_cmp(&b.quality_prior)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .ok_or(RoutingError::PolicyRefused)?;
+        // `None` for `max_load`, deliberately: an audit is worth reaching a busy
+        // worker for. Everything else — the blame when the set empties, and the
+        // overflow valve — is the same code the ordinary branch runs, because
+        // whether a turn may be dispatched somewhere is not a question two
+        // policies get two answers to.
+        let admitted = ctx.admissible(None)?;
+        let best = admitted.highest_quality();
 
         Ok(Decision {
             target: best.target.clone(),
-            rationale: format!(
+            budget_state: admitted.budget_state(),
+            rationale: admitted.annotate(format!(
                 "audit turn (every {}); escalated to highest quality prior {:.2}",
                 self.audit_every, best.quality_prior
-            ),
+            )),
         })
     }
 }
@@ -313,9 +269,12 @@ impl RoutingPolicy for EscalationPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control::{FrontierCadence, FrontierHistory, TargetFilter, TurnPolicy};
+    use crate::control::{
+        BudgetState, Exhaustion, FrontierCadence, FrontierHistory, TargetFilter, TurnBudget,
+        TurnPolicy,
+    };
     use crate::ids::SessionId;
-    use crate::routing::{CacheLedger, Target};
+    use crate::routing::{CacheLedger, Candidate, Target};
 
     /// `load` is in booked prefill tokens, the unit a real fleet reports, so
     /// these numbers are on the same scale an operator would calibrate against.
@@ -336,6 +295,17 @@ mod tests {
     }
 
     fn frontier(prefill: f64, cost: f64) -> Candidate {
+        frontier_rated(prefill, cost, 0.95)
+    }
+
+    /// A hosted candidate whose quality prior is the thing under test.
+    ///
+    /// Needed because the fleet above is deliberately ordered — every local
+    /// worker priors at 0.6 and the hosted model at 0.95 — so no floor can
+    /// exclude the hosted half without excluding the local half first, and the
+    /// floor half of `overflow_never_relaxes_the_allow_filter_or_floor` would
+    /// otherwise be testing `PolicyRefused` instead of the valve.
+    fn frontier_rated(prefill: f64, cost: f64, quality_prior: f64) -> Candidate {
         Candidate {
             target: Target::Frontier {
                 provider: "anthropic".into(),
@@ -345,8 +315,19 @@ mod tests {
             matched_prefix_tokens: 0,
             expected_ttft_ms: 500.0,
             expected_cost_usd: cost,
-            quality_prior: 0.95,
+            quality_prior,
             load: None,
+        }
+    }
+
+    /// A budget with nothing left, and a project that asked for the valve.
+    fn exhausted(overflow: bool) -> TurnBudget {
+        TurnBudget::Granted {
+            ceiling_usd: 0.0,
+            state: BudgetState::Exhausted,
+            on_exhaustion: Exhaustion::DegradeToLocal {
+                overflow_when_local_saturated: overflow,
+            },
         }
     }
 
@@ -360,6 +341,7 @@ mod tests {
         ledger: CacheLedger,
         turn_policy: TurnPolicy,
         frontier_history: FrontierHistory,
+        budget: TurnBudget,
     }
 
     impl Fixture {
@@ -370,6 +352,7 @@ mod tests {
                 ledger: CacheLedger::new(),
                 turn_policy: TurnPolicy::unrestricted(),
                 frontier_history: FrontierHistory::default(),
+                budget: TurnBudget::Unlimited,
             }
         }
 
@@ -378,6 +361,11 @@ mod tests {
                 turn_policy,
                 ..Self::open()
             }
+        }
+
+        fn spending(mut self, budget: TurnBudget) -> Self {
+            self.budget = budget;
+            self
         }
 
         /// `true` for a routed turn that went to a hosted model.
@@ -408,6 +396,7 @@ mod tests {
                 ledger: &self.ledger,
                 turn_policy: &self.turn_policy,
                 frontier_history: &self.frontier_history,
+                budget: &self.budget,
             }
         }
     }
@@ -460,7 +449,7 @@ mod tests {
         assert!(
             matches!(
                 policy.choose(&fixture.ctx(&candidates, 1)).await,
-                Err(RoutingError::NoViableCandidate)
+                Err(RoutingError::NoViableCandidate { .. })
             ),
             "an overloaded fleet is not a policy refusal: the caller here is \
              under the unrestricted policy and could not have been refused by it"
@@ -521,6 +510,7 @@ mod tests {
                 Decision {
                     target: warm_local.clone(),
                     rationale: scored.into(),
+                    budget_state: BudgetState::Unconstrained,
                 },
             ),
             (
@@ -529,6 +519,7 @@ mod tests {
                 Decision {
                     target: warm_local.clone(),
                     rationale: scored.into(),
+                    budget_state: BudgetState::Unconstrained,
                 },
             ),
             (
@@ -537,6 +528,7 @@ mod tests {
                 Decision {
                     target: warm_local,
                     rationale: scored.into(),
+                    budget_state: BudgetState::Unconstrained,
                 },
             ),
             (
@@ -549,6 +541,7 @@ mod tests {
                     },
                     rationale: "audit turn (every 4); escalated to highest quality prior 0.95"
                         .into(),
+                    budget_state: BudgetState::Unconstrained,
                 },
             ),
         ] {
@@ -653,7 +646,7 @@ mod tests {
         let open = Fixture::open();
         assert!(matches!(
             tuned.choose(&open.ctx(&overloaded, 1)).await,
-            Err(RoutingError::NoViableCandidate)
+            Err(RoutingError::NoViableCandidate { .. })
         ));
 
         // The identical worker, well under any ceiling, refused by the tenant's
@@ -713,6 +706,255 @@ mod tests {
             decision.target.is_local(),
             "a spent window serves local: {}",
             decision.rationale
+        );
+    }
+
+    #[tokio::test]
+    async fn a_zero_grant_excludes_frontier_and_admits_local_with_no_special_case() {
+        // The whole of degrade-to-local, and the reason it needed no branch:
+        // local candidates are priced at zero dollars, so `expected_cost_usd <=
+        // ceiling` with a ceiling of zero excludes every hosted option and
+        // admits every local one through the same comparison every other
+        // candidate goes through.
+        //
+        // The candidate set is the one from `a_warm_frontier_beats_a_cold_local_worker`,
+        // chosen because the router *wants* the hosted model here: it is
+        // enormously warmer, and the local worker is cold and loaded. If the
+        // budget moves this decision, it is the budget that moved it.
+        let candidates = vec![local(1, 100_000.0, 20_000.0), frontier(200.0, 0.02)];
+        let policy = AffinityPolicy::new();
+
+        let spent = Fixture::open().spending(exhausted(true));
+        let decision = policy.choose(&spent.ctx(&candidates, 1)).await.unwrap();
+        assert!(
+            decision.target.is_local(),
+            "an exhausted budget must serve locally rather than fail or overspend: {}",
+            decision.rationale
+        );
+        assert_eq!(decision.budget_state, BudgetState::Exhausted);
+        assert!(
+            !decision.budget_state.overflowed(),
+            "the local pool served, so no valve opened"
+        );
+        assert!(
+            decision.rationale.contains("over 1 candidate(s)"),
+            "the hosted option left the scored pool through the ordinary \
+             predicate, not through a special case: {}",
+            decision.rationale
+        );
+
+        // The control: the identical set under no budget picks the hosted model.
+        let unlimited = choose(&policy, &candidates, 1).await;
+        assert!(!unlimited.target.is_local(), "{}", unlimited.rationale);
+        assert_eq!(unlimited.budget_state, BudgetState::Unconstrained);
+    }
+
+    #[tokio::test]
+    async fn overflow_readmits_frontier_only_when_local_is_load_rejected() {
+        // The probe for the escape valve. The budget is a ceiling on *choice*,
+        // not a tourniquet on service: when the pool it degraded to cannot take
+        // the turn either, the turn goes back to frontier and the overspend is
+        // marked rather than hidden.
+        let overloaded = vec![local(1, 100.0, 120_000.0), frontier(50_000.0, 5.0)];
+        let tuned = AffinityPolicy::new().with_max_load(50_000.0);
+        let spent = Fixture::open().spending(exhausted(true));
+
+        let decision = tuned.choose(&spent.ctx(&overloaded, 1)).await.unwrap();
+        assert!(
+            !decision.target.is_local(),
+            "every local candidate was load-rejected, so the valve had to open: {}",
+            decision.rationale
+        );
+        assert_eq!(
+            decision.budget_state,
+            BudgetState::ExhaustedOverflow,
+            "an overspend past the limit is a marked fact or it is a hidden one"
+        );
+        assert!(
+            decision.rationale.contains("local"),
+            "the rationale has to name local saturation, which is the only \
+             thing that justifies the overspend: {}",
+            decision.rationale
+        );
+
+        // The first control: the same budget over a fleet that can serve. The
+        // valve is for saturation, not for exhaustion.
+        let idle = vec![local(1, 100.0, 1_000.0), frontier(50_000.0, 5.0)];
+        let served = tuned.choose(&spent.ctx(&idle, 1)).await.unwrap();
+        assert!(served.target.is_local(), "{}", served.rationale);
+        assert_eq!(served.budget_state, BudgetState::Exhausted);
+
+        // The second: no local capacity at all is the same saturation. A
+        // deployment with no fleet has nowhere to degrade *to*, which is the
+        // case the startup check refuses to boot with the valve off.
+        let frontier_only = vec![frontier(50_000.0, 5.0)];
+        let overflowed = tuned.choose(&spent.ctx(&frontier_only, 1)).await.unwrap();
+        assert_eq!(overflowed.budget_state, BudgetState::ExhaustedOverflow);
+
+        // The third: with the valve off, the same saturated fleet fails.
+        let valve_off = Fixture::open().spending(exhausted(false));
+        assert!(matches!(
+            tuned.choose(&valve_off.ctx(&overloaded, 1)).await,
+            Err(RoutingError::NoViableCandidate { .. })
+        ));
+
+        // And the escalation policy's audit branch reaches the valve through
+        // the same code: overflow is a property of the turn, not of one
+        // policy's scoring.
+        let escalation = EscalationPolicy::new(AffinityPolicy::new().with_max_load(50_000.0), 4);
+        let audited = escalation
+            .choose(&spent.ctx(&frontier_only, 4))
+            .await
+            .unwrap();
+        assert_eq!(audited.budget_state, BudgetState::ExhaustedOverflow);
+
+        // Its control is subtler than the affinity one and worth pinning
+        // rather than leaving to be rediscovered: the audit branch passes no
+        // `max_load` on purpose, because an audit is worth reaching a busy
+        // worker for. A load-rejected local pool is therefore *not* saturated
+        // from where the audit stands, so the same overloaded fleet serves
+        // locally and no valve opens.
+        let tolerated = escalation.choose(&spent.ctx(&overloaded, 4)).await.unwrap();
+        assert!(tolerated.target.is_local(), "{}", tolerated.rationale);
+        assert_eq!(tolerated.budget_state, BudgetState::Exhausted);
+    }
+
+    #[tokio::test]
+    async fn overflow_never_relaxes_the_allow_filter_or_floor() {
+        // The valve relaxes exactly one axis. A tenant confined to `local/*`
+        // does not acquire a hosted model because its own workers filled up,
+        // and neither does one whose quality floor excluded that model — those
+        // are entitlements, and a saturated fleet is not an entitlement event.
+        let tuned = AffinityPolicy::new().with_max_load(50_000.0);
+        let overloaded = vec![local(1, 100.0, 120_000.0), frontier(50_000.0, 5.0)];
+
+        let local_only = Fixture::under(TurnPolicy {
+            allow: TargetFilter::parse(["local/*"]).unwrap(),
+            ..TurnPolicy::unrestricted()
+        })
+        .spending(exhausted(true));
+        assert!(
+            matches!(
+                tuned.choose(&local_only.ctx(&overloaded, 1)).await,
+                Err(RoutingError::NoViableCandidate { .. })
+            ),
+            "the valve re-admitted a target the tenant's filter had excluded"
+        );
+
+        // The floor, on a hosted model priced below it. The local worker is
+        // above the floor, so the set is not empty and this is genuinely the
+        // valve being asked to reach past a floor rather than a policy refusal.
+        let cheap_frontier = vec![
+            local(1, 100.0, 120_000.0),
+            frontier_rated(50_000.0, 5.0, 0.3),
+        ];
+        let floored = Fixture::under(TurnPolicy {
+            min_quality: 0.5,
+            ..TurnPolicy::unrestricted()
+        })
+        .spending(exhausted(true));
+        assert!(
+            matches!(
+                tuned.choose(&floored.ctx(&cheap_frontier, 1)).await,
+                Err(RoutingError::NoViableCandidate { .. })
+            ),
+            "the valve re-admitted a target below the tenant's quality floor"
+        );
+
+        // The control, and it is what makes both assertions about the *axis*
+        // rather than about the valve never firing: drop the floor and the same
+        // saturated fleet overflows onto the same hosted model.
+        let unfloored = Fixture::open().spending(exhausted(true));
+        let decision = tuned
+            .choose(&unfloored.ctx(&cheap_frontier, 1))
+            .await
+            .unwrap();
+        assert!(!decision.target.is_local());
+        assert_eq!(decision.budget_state, BudgetState::ExhaustedOverflow);
+    }
+
+    #[tokio::test]
+    async fn a_spent_cadence_is_not_bypassed_by_overflow() {
+        // The distinction the valve turns on: a cadence is *policy* — an
+        // operator's statement about how often this tenant may reach for a
+        // hosted model — and the valve is a *budget* device. A spent cadence
+        // therefore stands, and the turn fails fleet-shaped rather than
+        // spending a ration the tenant does not have.
+        let tuned = AffinityPolicy::new().with_max_load(50_000.0);
+        let overloaded = vec![local(1, 100.0, 120_000.0), frontier(50_000.0, 5.0)];
+        let cadence = TurnPolicy {
+            frontier_cadence: Some(FrontierCadence {
+                max_frontier: 1,
+                per_turns: 3,
+            }),
+            ..TurnPolicy::unrestricted()
+        };
+
+        let spent = Fixture::under(cadence.clone())
+            .spending(exhausted(true))
+            .having_routed(&[true]);
+        assert!(
+            matches!(
+                tuned.choose(&spent.ctx(&overloaded, 1)).await,
+                Err(RoutingError::NoViableCandidate { .. })
+            ),
+            "the valve spent a frontier ration the cadence had already used"
+        );
+
+        // The control: the identical fleet and budget with the window unspent
+        // does overflow, so the assertion above is about the cadence and not
+        // about the valve being broken.
+        let unspent = Fixture::under(cadence).spending(exhausted(true));
+        let decision = tuned.choose(&unspent.ctx(&overloaded, 1)).await.unwrap();
+        assert_eq!(decision.budget_state, BudgetState::ExhaustedOverflow);
+    }
+
+    #[tokio::test]
+    async fn exhausted_plus_saturated_with_overflow_off_blames_the_fleet_and_names_the_budget() {
+        // Two facts, one message. The blame is the fleet's — load emptied the
+        // local pool, and no tenant policy refused anything — but an operator
+        // told only that goes tuning workers without noticing that an exhausted
+        // budget had already excluded every hosted candidate that could have
+        // taken their place.
+        let overloaded = vec![local(1, 500.0, 120_000.0), frontier(4_000.0, 0.25)];
+        let tuned = AffinityPolicy::new().with_max_load(50_000.0);
+
+        let spent = Fixture::open().spending(exhausted(false));
+        let error = tuned
+            .choose(&spent.ctx(&overloaded, 1))
+            .await
+            .expect_err("a saturated pool with the valve off has nowhere to go");
+        assert!(
+            matches!(error, RoutingError::NoViableCandidate { .. }),
+            "the pool was emptied by load, not by the tenant's policy: {error}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("budget"),
+            "the coincidence of an exhausted budget has to be visible: {message}"
+        );
+
+        // The first control, and the one that makes the failure above about
+        // the *budget*: the identical fleet under no budget serves the turn on
+        // the hosted candidate. It was there all along; the exhausted budget is
+        // what removed it.
+        let open = Fixture::open();
+        let served = tuned.choose(&open.ctx(&overloaded, 1)).await.unwrap();
+        assert!(!served.target.is_local(), "{}", served.rationale);
+
+        // The second: a genuinely fleet-only failure — nothing hosted was
+        // quoted at all — still reads exactly as it did before budgets existed.
+        // The note is a fact about this deployment's budget, not decoration on
+        // every busy fleet.
+        let local_only = vec![local(1, 500.0, 120_000.0)];
+        let plain = tuned
+            .choose(&open.ctx(&local_only, 1))
+            .await
+            .expect_err("every worker is over the ceiling this policy was tuned with");
+        assert_eq!(
+            plain.to_string(),
+            "no candidate satisfied the routing policy's own constraints",
+            "an unbudgeted busy fleet must not grow a budget clause"
         );
     }
 

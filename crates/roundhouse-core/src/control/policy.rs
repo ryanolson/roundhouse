@@ -517,6 +517,38 @@ impl TurnPolicy {
         self.permits(candidate) && self.cadence_allows(candidate, history)
     }
 
+    /// What the dearest hosted candidate this policy admits *this turn* would
+    /// cost — the amount the spend ledger is asked to reserve.
+    ///
+    /// The dearest and not the one about to be chosen, because a grant has to
+    /// be a ceiling the choice is then made *under*. Reserving the chosen
+    /// candidate's price would be a rubber stamp applied after the decision it
+    /// was supposed to constrain, and every turn would be affordable by
+    /// construction.
+    ///
+    /// Hosted only, because a local candidate is priced at zero and asking for
+    /// zero more dollars is asking for nothing. Zero is therefore also the
+    /// honest answer for a turn with no hosted option at all — a local-only
+    /// key requests nothing and receives a ceiling that still admits every
+    /// local candidate through the same comparison.
+    ///
+    /// A fold over [`Self::admits`] rather than a second opinion about
+    /// admissibility: what the ledger reserves and what the router may then
+    /// spend it on have to be the same set, or the grant is a number about a
+    /// different question.
+    pub fn dearest_admissible_frontier_usd(
+        &self,
+        candidates: &[Candidate],
+        history: &FrontierHistory,
+    ) -> f64 {
+        candidates
+            .iter()
+            .filter(|candidate| !candidate.target.is_local())
+            .filter(|candidate| self.admits(candidate, history))
+            .map(|candidate| candidate.expected_cost_usd)
+            .fold(0.0, f64::max)
+    }
+
     /// Whether `candidate` survives a *fully spent* cadence window.
     ///
     /// The question a deployment has to answer before it boots, and the one
@@ -720,6 +752,85 @@ mod tests {
             });
         }
         history
+    }
+
+    /// The grant request is a fold over `admits`, so every axis that takes a
+    /// candidate away takes its price out of the request too.
+    ///
+    /// The failure this pins is a grant that is *too large*, which has no
+    /// visible symptom at all: it reserves budget for a model this turn could
+    /// never have been sent to, and every over-reservation is money another
+    /// concurrent session is refused. Both directions matter — asking for too
+    /// little would put a ceiling under a candidate the router is about to be
+    /// offered, and degrade a turn nobody meant to degrade.
+    #[test]
+    fn the_grant_request_is_the_dearest_hosted_candidate_the_policy_admits() {
+        let cheap = Candidate {
+            expected_cost_usd: 0.25,
+            ..candidate(frontier("anthropic", "claude"), 0.9)
+        };
+        let dear = Candidate {
+            expected_cost_usd: 4.0,
+            ..candidate(frontier("openai", "gpt-5"), 0.95)
+        };
+        let worker = candidate(local("llama"), 0.6);
+        let pool = [worker.clone(), cheap.clone(), dear.clone()];
+        let empty = FrontierHistory::default();
+
+        assert_eq!(
+            TurnPolicy::unrestricted().dearest_admissible_frontier_usd(&pool, &empty),
+            4.0,
+            "the ceiling has to cover the dearest option, or the router is \
+             offered a candidate the ledger never reserved for"
+        );
+
+        // Each axis in turn. A filter and a floor are reachability, so they
+        // remove a price permanently; a spent cadence removes it for this turn
+        // only — and the request is a this-turn number, so it goes either way.
+        let filtered = TurnPolicy {
+            allow: filter(&["anthropic/*", "local/*"]),
+            ..TurnPolicy::unrestricted()
+        };
+        assert_eq!(
+            filtered.dearest_admissible_frontier_usd(&pool, &empty),
+            0.25,
+            "a filtered-out model is not something this key can spend on"
+        );
+        let floored = TurnPolicy {
+            min_quality: 0.94,
+            ..TurnPolicy::unrestricted()
+        };
+        assert_eq!(floored.dearest_admissible_frontier_usd(&pool, &empty), 4.0);
+        let rationed = TurnPolicy {
+            frontier_cadence: Some(FrontierCadence {
+                max_frontier: 1,
+                per_turns: 3,
+            }),
+            ..TurnPolicy::unrestricted()
+        };
+        assert_eq!(
+            rationed.dearest_admissible_frontier_usd(&pool, &history(&[true])),
+            0.0,
+            "a spent ration leaves this turn nothing hosted to pay for"
+        );
+        assert_eq!(
+            rationed.dearest_admissible_frontier_usd(&pool, &empty),
+            4.0,
+            "the control: the same cadence with the window open reserves in full"
+        );
+
+        // Local is priced at zero and asking for zero more dollars is asking
+        // for nothing, so a local-only pool requests nothing — which still
+        // yields a ceiling every local candidate clears.
+        assert_eq!(
+            TurnPolicy::unrestricted().dearest_admissible_frontier_usd(&[worker], &empty),
+            0.0
+        );
+        assert_eq!(
+            TurnPolicy::unrestricted().dearest_admissible_frontier_usd(&[], &empty),
+            0.0,
+            "and an empty pool is a request for nothing rather than a panic"
+        );
     }
 
     #[test]

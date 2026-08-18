@@ -12,6 +12,7 @@
 //!
 //! Validation only — no fix is applied here.
 
+use roundhouse_core::control::BudgetState;
 use roundhouse_core::event::{Accounting, SessionEvent, SessionEventKind, Usage};
 use roundhouse_core::ids::{ResponseId, SessionId};
 use roundhouse_core::metrics::{MetricsFold, MetricsSnapshot, Scope};
@@ -108,6 +109,7 @@ fn one_frontier_call(usage: Usage) -> Vec<SessionEvent> {
                     expected_cost_usd: 0.0,
                     considered: Vec::new(),
                     turn_policy_digest: String::new(),
+                    budget_state: BudgetState::Unconstrained,
                 },
             },
         },

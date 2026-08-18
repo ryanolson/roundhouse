@@ -17,7 +17,7 @@
 //! for.
 #![allow(dead_code)]
 
-use roundhouse_core::control::Principal;
+use roundhouse_core::control::{BudgetState, Principal};
 use roundhouse_core::event::{Accounting, IncompleteReason, SessionEvent, SessionEventKind, Usage};
 use roundhouse_core::ids::{ResponseId, SessionId, TurnId};
 use roundhouse_core::item::Item;
@@ -163,6 +163,10 @@ pub fn every_event_kind() -> Vec<SessionEventKind> {
                     },
                 ],
                 turn_policy_digest: String::new(),
+                // Unconstrained: this fixture predates budgets and exists to
+                // prove persistence round-trips the whole vocabulary, not to
+                // exercise the budget axis — `spend_contract.rs` does that.
+                budget_state: BudgetState::Unconstrained,
             },
         },
         SessionEventKind::OutputTextDelta {
