@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::control::Principal;
+use crate::control::{FrontierHistory, Principal};
 use crate::event::{IncompleteReason, SessionEvent, SessionEventKind, SessionObserver, Usage};
 use crate::ids::{ResponseId, SessionId, TurnId};
 use crate::item::Item;
@@ -97,6 +97,18 @@ pub struct SessionState {
     /// because over-claiming warmth is the exact mispricing this fold exists
     /// to prevent.
     pending_routings: HashMap<ResponseId, PendingRouting>,
+    /// Which routed turns went to a hosted model, in log order.
+    ///
+    /// Folded at `Routed` and *not* at the terminal event, which is the
+    /// opposite of the rule `pending_routings` follows one field up, so the
+    /// difference is worth stating. The cache ledger asks "did the provider
+    /// process this prompt?", and a dispatch that failed on the way out is no
+    /// evidence of that. A cadence asks "how often did this session reach for
+    /// a hosted model?", and a dispatch that failed on the way out is exactly
+    /// that. Counting only successes would let a provider outage multiply the
+    /// frontier traffic of every session retrying through it, at the moment
+    /// the knob is most supposed to hold.
+    pub frontier_history: FrontierHistory,
     pub last_seq: u64,
 }
 
@@ -120,6 +132,7 @@ impl SessionState {
                 response_id,
                 decision,
             } => {
+                self.frontier_history.record(&decision.chosen);
                 // Held rather than recorded; see `pending_routings`.
                 self.pending_routings.insert(
                     response_id.clone(),
@@ -597,6 +610,7 @@ mod tests {
             expected_prefill_tokens: isl as f64,
             expected_cost_usd: 0.0,
             considered: Vec::<Candidate>::new(),
+            turn_policy_digest: String::new(),
         }
     }
 
@@ -861,6 +875,68 @@ mod tests {
         // The routing ledger is part of the projection, so the successor knows
         // worker 7 is warm without being told.
         assert!(successor.ledger().state_for(&target).is_some());
+    }
+
+    #[tokio::test]
+    async fn the_frontier_window_is_a_projection_a_successor_reconstructs() {
+        let store = Arc::new(MemoryStore::new());
+        let (sid, mut session) = new_session(store.clone(), "node-a").await;
+        let hosted = Target::Frontier {
+            provider: "anthropic".into(),
+            model: "claude".into(),
+        };
+        let own = Target::Local {
+            worker_id: 7,
+            dp_rank: 0,
+            model: "llama".into(),
+        };
+
+        for (turn, target) in [(1, &hosted), (2, &own), (3, &hosted)] {
+            let admission = session
+                .begin_turn(TurnId::new(format!("t{turn}")), vec![Item::user_text("q")])
+                .await
+                .unwrap();
+            let response_id = admission.response_id().clone();
+            session
+                .record_routing(&response_id, decision_for(target.clone(), 1_000))
+                .await
+                .unwrap();
+            // Turn 3's dispatch dies before the provider ever answers. It has
+            // still spent its ration: the window is folded from `Routed`.
+            if turn != 3 {
+                session
+                    .complete(&response_id, "a", Usage::default())
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let window = session.state().frontier_history.clone();
+        assert_eq!(window.frontier_in_last(3), 2);
+        assert_eq!(
+            window.frontier_in_last(1),
+            1,
+            "the last routed turn was the abandoned frontier dispatch, and it counts"
+        );
+        assert_eq!(
+            window.frontier_in_last(100),
+            2,
+            "a window longer than the session sees the whole session"
+        );
+
+        // Ownership moves. A cadence that a successor could not reconstruct
+        // would reset every time a node died, which is exactly when a session
+        // is retrying hardest.
+        drop(session);
+        store.expire_lease_now(&sid).await;
+        let successor = Session::open(store, sid, "node-b", TTL, CacheLedger::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            successor.state().frontier_history,
+            window,
+            "the window is derived from the log, so the successor derives the same one"
+        );
     }
 
     #[tokio::test]

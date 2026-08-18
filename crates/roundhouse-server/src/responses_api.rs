@@ -51,7 +51,7 @@ use tokio::task::JoinHandle;
 
 use roundhouse_core::context::Tokenizer;
 use roundhouse_core::control::Principal;
-use roundhouse_core::event::{SessionEvent, SessionEventKind};
+use roundhouse_core::event::{IncompleteReason, SessionEvent, SessionEventKind};
 use roundhouse_core::ids::{ResponseId, SessionId, TurnId};
 use roundhouse_core::item::Item;
 use roundhouse_core::store::SessionStore;
@@ -180,7 +180,11 @@ where
     // Before the body is even read: an unauthenticated request must cost this
     // process a hash lookup and nothing else, and must not be able to name a
     // session — which is what parsing the body would let it do.
-    let principal = state.plane.turn_principal(&headers)?;
+    //
+    // The admission rather than the principal alone: one lookup answers both
+    // who pays and what may be routed to, and the policy is fixed here for the
+    // whole turn rather than re-read during it.
+    let admission = state.plane.turn_admission(&headers)?;
     let request: ResponsesRequest = parse_body(&body)?;
     if !request.stream {
         return Err(ApiError::unprocessable(
@@ -201,7 +205,7 @@ where
 
     let claimed = canonicalize(&request.instructions, &request.input)?;
     let turn_id = turn_id_for(&claimed);
-    let (session_id, input) = state.bind(&principal, cache_key, claimed).await?;
+    let (session_id, input) = state.bind(&admission.principal, cache_key, claimed).await?;
 
     // Read before the spawn, for the reason `http` gives: an event appended
     // between this read and the start of the turn would fall outside the
@@ -216,10 +220,10 @@ where
         let engine = Arc::clone(&state.engine);
         let session_id = session_id.clone();
         let turn_id = turn_id.clone();
-        let principal = principal.clone();
+        let admission = admission.clone();
         async move {
             engine
-                .run_turn(&session_id, turn_id, input, &principal)
+                .run_turn(&session_id, turn_id, input, &admission)
                 .await
                 .map(|_| ())
                 .map_err(|error| error.to_string())
@@ -603,10 +607,37 @@ impl<S: SessionStore> ResponsesFollower<S> {
                 self.queued.push_back(completed_frame(response_id, usage));
                 Step::End
             }
+            // A refusal is not a truncated answer. This dialect has two
+            // terminal shapes for a response that produced none — `incomplete`
+            // means the model stopped short, `failed` means the request was
+            // not served — and a client that read `response.incomplete` for a
+            // policy refusal would report a model that ran out of room. The
+            // log's own vocabulary is finer than the wire's here, so this is
+            // the one place a reason is translated rather than forwarded, and
+            // the translation is one-to-one: every other reason is a real
+            // attempt that stopped.
+            SessionEventKind::ResponseIncomplete {
+                response_id,
+                reason: IncompleteReason::PolicyRefused,
+                // Nothing was dispatched, so there is nothing to report; and
+                // this dialect's `failed` frame has no place to put usage even
+                // when there is some. Bound by name so a field added here
+                // cannot be dropped without someone reading this line.
+                usage: _,
+            } => {
+                self.queued.push_back(failed_frame(
+                    Some(response_id),
+                    "no target this key may use was admissible for this turn",
+                ));
+                Step::End
+            }
             SessionEventKind::ResponseIncomplete {
                 response_id,
                 reason,
-                ..
+                // Deliberately not forwarded: `response.incomplete` carries no
+                // usage in this dialect, and the log is where the accounting
+                // for a truncated turn is read from.
+                usage: _,
             } => {
                 self.queued.push_back(incomplete_frame(response_id, reason));
                 Step::End

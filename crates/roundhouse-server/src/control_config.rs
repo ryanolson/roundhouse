@@ -44,6 +44,25 @@
 //! [`ControlPlane::contains`] asks whether an id is one it could have minted.
 //! Both surfaces mint through the first and check through the second, so an id
 //! this deployment hands out is always an id the same key can then use.
+//!
+//! **Policy resolution rides the same seam as identity, because they are
+//! resolved together.** A project entry's optional `"policy"` object becomes
+//! its [`TurnPolicy`]; a key entry's optional `"overrides"` narrows that
+//! policy via [`TurnPolicy::narrow`] — the *only* composition, so an override
+//! can shrink what a key may do and never grow it. Both readings share one
+//! [`PolicyConfig`] shape (the three axes `TurnPolicy` and `PolicyOverrides`
+//! already agree on); they differ only in what an absent axis means, decided
+//! by which `to_*` conversion is used. Two rules are enforced at the
+//! boundary, not clamped at runtime, because an operator-authored file that
+//! silently means less than it says is worse than one that fails to load: a
+//! malformed glob is rejected naming the entry it came from, and an override
+//! wider than its project's policy on any numeric axis is rejected naming
+//! both the project and the key — clamping that quietly instead is exactly
+//! [`TurnPolicy::narrow`]'s job at *runtime*, for the axes a config boundary
+//! cannot see coming (an MCP overlay, later). [`ControlPlane::turn_admission`]
+//! is where a request's key becomes both its [`Principal`] and its resolved
+//! `Arc<TurnPolicy>` in one lookup; [`ControlPlane::turn_principal`] is now a
+//! thin projection of it, kept for the surfaces that only need identity.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -56,7 +75,9 @@ use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use roundhouse_core::control::Principal;
+use roundhouse_core::control::{
+    FilterError, FrontierCadence, PolicyOverrides, Principal, TargetFilter, TurnPolicy,
+};
 use roundhouse_core::ids::SessionId;
 
 /// Path to a control-plane JSON file. Absent means [`ControlPlane::Open`].
@@ -76,6 +97,11 @@ pub struct ProjectEntry {
     /// when that milestone lands.
     #[serde(default)]
     pub name: Option<String>,
+    /// What this project's turns may do. Absent means
+    /// [`TurnPolicy::unrestricted`] — the same routing a deployment with no
+    /// control plane at all produces.
+    #[serde(default)]
+    pub policy: Option<PolicyConfig>,
 }
 
 /// One entry of the config's `"users"` array.
@@ -90,6 +116,125 @@ pub struct KeyEntry {
     pub project: String,
     pub user: String,
     pub key_sha256: String,
+    /// A narrowing overlay on the owning project's policy, applied via
+    /// [`TurnPolicy::narrow`]. Absent touches nothing — the key resolves to
+    /// its project's policy exactly. An axis that would *widen* the project's
+    /// policy is rejected at validation rather than clamped, naming both
+    /// entries — see the module doc.
+    #[serde(default)]
+    pub overrides: Option<PolicyConfig>,
+}
+
+/// The shape of a `"policy"` (project) or `"overrides"` (key) object: the
+/// three axes [`TurnPolicy`] and [`PolicyOverrides`] already agree on, read
+/// as raw config data so validation can name the entry it belongs to before
+/// any of it becomes a real [`TargetFilter`] or [`TurnPolicy`].
+///
+/// One shape serves both readings on purpose. They differ only in what an
+/// absent axis means — "unrestricted" for a project's policy,
+/// "leave alone" for a key's overrides — which is why that distinction is
+/// decided by which `to_*` conversion below is called, not by two parallel
+/// structs that would drift apart the first time a field is added to one and
+/// not the other.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PolicyConfig {
+    pub min_quality: Option<f64>,
+    /// Raw glob patterns, parsed (and thereby validated) by
+    /// [`Self::allow_filter`] rather than at `serde` time — deserializing
+    /// straight into a [`TargetFilter`] would fail with a bare parse error
+    /// naming no entry, which is exactly what the module doc says this
+    /// boundary must not do.
+    pub allow: Option<Vec<String>>,
+    pub frontier_cadence: Option<FrontierCadence>,
+}
+
+impl PolicyConfig {
+    /// Field-level sanity shared by both readings: a quality floor inside
+    /// `0.0..=1.0`, and a cadence that is a real window (`per_turns >= 1`)
+    /// promising no more frontier traffic than it has turns to grant
+    /// (`max_frontier <= per_turns`).
+    fn validate_shape(&self, path: &str, entry: &str) -> Result<(), ControlPlaneError> {
+        if let Some(min_quality) = self.min_quality
+            && !(0.0..=1.0).contains(&min_quality)
+        {
+            return Err(ControlPlaneError::MinQualityOutOfRange {
+                path: path.to_string(),
+                entry: entry.to_string(),
+                min_quality,
+            });
+        }
+        if let Some(cadence) = self.frontier_cadence {
+            if cadence.per_turns == 0 {
+                return Err(ControlPlaneError::CadencePerTurnsZero {
+                    path: path.to_string(),
+                    entry: entry.to_string(),
+                });
+            }
+            if cadence.max_frontier > cadence.per_turns {
+                return Err(ControlPlaneError::CadenceExceedsWindow {
+                    path: path.to_string(),
+                    entry: entry.to_string(),
+                    max_frontier: cadence.max_frontier,
+                    per_turns: cadence.per_turns,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Parse `allow`, if present, naming `entry` on a malformed pattern.
+    fn allow_filter(
+        &self,
+        path: &str,
+        entry: &str,
+    ) -> Result<Option<TargetFilter>, ControlPlaneError> {
+        self.allow
+            .as_ref()
+            .map(|patterns| {
+                TargetFilter::parse(patterns.iter().cloned()).map_err(|source| {
+                    ControlPlaneError::MalformedGlob {
+                        path: path.to_string(),
+                        entry: entry.to_string(),
+                        source,
+                    }
+                })
+            })
+            .transpose()
+    }
+
+    /// Read as a project's `"policy"`: an absent axis is unrestricted.
+    fn to_project_policy(&self, path: &str, entry: &str) -> Result<TurnPolicy, ControlPlaneError> {
+        self.validate_shape(path, entry)?;
+        Ok(TurnPolicy {
+            min_quality: self.min_quality.unwrap_or(0.0),
+            allow: self
+                .allow_filter(path, entry)?
+                .unwrap_or_else(TargetFilter::allow_all),
+            frontier_cadence: self.frontier_cadence,
+        })
+    }
+
+    /// Read as a key's `"overrides"`: an absent axis touches nothing.
+    fn to_overrides(&self, path: &str, entry: &str) -> Result<PolicyOverrides, ControlPlaneError> {
+        self.validate_shape(path, entry)?;
+        Ok(PolicyOverrides {
+            min_quality: self.min_quality,
+            allow: self.allow_filter(path, entry)?,
+            frontier_cadence: self.frontier_cadence,
+        })
+    }
+}
+
+/// `"project `{id}`"`, the label every project-policy error names.
+fn project_entry_label(id: &str) -> String {
+    format!("project `{id}`")
+}
+
+/// `"key for project `{project}`, user `{user}`"`, the label every
+/// key-overrides error names.
+fn key_entry_label(project: &str, user: &str) -> String {
+    format!("key for project `{project}`, user `{user}`")
 }
 
 /// What a deployment supplies at `ROUNDHOUSE_CONTROL_PLANE`.
@@ -107,6 +252,19 @@ pub struct ControlPlaneConfig {
     /// `KeyScope::Admin` acts on the deployment, not from inside a project.
     #[serde(default)]
     pub admin_keys: Vec<String>,
+    /// Each key's fully-resolved [`TurnPolicy`] — its project's policy
+    /// narrowed by its own overrides — keyed by `key_sha256`.
+    ///
+    /// Computed once, by [`Self::validate`], and not by `serde`: resolving a
+    /// key's policy requires its project's policy to already exist and the
+    /// widening check to have already run, both of which only `validate` has
+    /// done by the time this is populated. `#[serde(skip)]` rather than a
+    /// second pass over `keys` in [`ControlPlane::configured`] — the two
+    /// would otherwise be two places a malformed glob could be judged
+    /// differently, one of them silent (no path, no entry name) because it
+    /// would run after the boundary that names them.
+    #[serde(skip)]
+    key_effective_policies: HashMap<String, TurnPolicy>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -158,6 +316,49 @@ pub enum ControlPlaneError {
          `keys` and/or `admin_keys` -- one secret must resolve to exactly one scope"
     )]
     DuplicateHash { path: String, key_sha256: String },
+    #[error(
+        "control-plane config `{path}`: {entry}'s min_quality {min_quality} is outside \
+         0.0..=1.0"
+    )]
+    MinQualityOutOfRange {
+        path: String,
+        entry: String,
+        min_quality: f64,
+    },
+    #[error(
+        "control-plane config `{path}`: {entry}'s frontier_cadence.per_turns is 0 -- a window \
+         must be at least one turn wide"
+    )]
+    CadencePerTurnsZero { path: String, entry: String },
+    #[error(
+        "control-plane config `{path}`: {entry}'s frontier_cadence allows {max_frontier} \
+         frontier dispatch(es) in a window of {per_turns} turn(s) -- max_frontier must not \
+         exceed per_turns"
+    )]
+    CadenceExceedsWindow {
+        path: String,
+        entry: String,
+        max_frontier: u32,
+        per_turns: u32,
+    },
+    #[error("control-plane config `{path}`: {entry}'s allow pattern is malformed: {source}")]
+    MalformedGlob {
+        path: String,
+        entry: String,
+        #[source]
+        source: FilterError,
+    },
+    #[error(
+        "control-plane config `{path}`: {key_entry}'s overrides are wider than \
+         {project_entry}'s policy on {axes:?} -- an override may only narrow the policy of the \
+         project it belongs to"
+    )]
+    OverrideWiderThanProject {
+        path: String,
+        project_entry: String,
+        key_entry: String,
+        axes: Vec<&'static str>,
+    },
 }
 
 /// `true` for `^[a-z0-9][a-z0-9_-]{0,63}$`.
@@ -189,7 +390,7 @@ fn is_valid_sha256_hex(hash: &str) -> bool {
 
 impl ControlPlaneConfig {
     pub fn from_json(json: &str, path: &str) -> Result<Self, ControlPlaneError> {
-        let config: Self =
+        let mut config: Self =
             serde_json::from_str(json).map_err(|source| ControlPlaneError::Parse {
                 path: path.to_string(),
                 source,
@@ -215,8 +416,13 @@ impl ControlPlaneConfig {
     /// are checked before the ids are trusted as lookup keys, and a key's
     /// project/user references are checked before its hash, so a config with
     /// several problems reports the one closest to the top of the file.
-    fn validate(&self, path: &str) -> Result<(), ControlPlaneError> {
+    fn validate(&mut self, path: &str) -> Result<(), ControlPlaneError> {
         let mut project_ids: HashSet<&str> = HashSet::new();
+        // Every project's effective policy, resolved once here so the keys
+        // loop below can narrow against a real `TurnPolicy` rather than
+        // re-parsing raw config data (and risking a second, differently-worded
+        // judgment of the same glob).
+        let mut project_policies: HashMap<&str, TurnPolicy> = HashMap::new();
         for project in &self.projects {
             if !is_valid_slug(&project.id) {
                 return Err(ControlPlaneError::BadProjectSlug {
@@ -230,6 +436,12 @@ impl ControlPlaneConfig {
                     id: project.id.clone(),
                 });
             }
+            let entry = project_entry_label(&project.id);
+            let policy = match &project.policy {
+                Some(policy_config) => policy_config.to_project_policy(path, &entry)?,
+                None => TurnPolicy::unrestricted(),
+            };
+            project_policies.insert(project.id.as_str(), policy);
         }
 
         let mut user_ids: HashSet<&str> = HashSet::new();
@@ -251,6 +463,10 @@ impl ControlPlaneConfig {
         // One secret must resolve one way: a hash cannot be a member of both
         // `keys` and `admin_keys`, nor appear twice within either.
         let mut hashes: HashSet<&str> = HashSet::new();
+        // Every key's fully-resolved policy: its project's, narrowed by its
+        // own overrides. Built here rather than in `ControlPlane::configured`
+        // — see the field's doc comment.
+        let mut key_effective_policies: HashMap<String, TurnPolicy> = HashMap::new();
         for key in &self.keys {
             if !project_ids.contains(key.project.as_str()) {
                 return Err(ControlPlaneError::UnknownProject {
@@ -276,6 +492,32 @@ impl ControlPlaneConfig {
                     key_sha256: key.key_sha256.clone(),
                 });
             }
+
+            // `project_ids.contains` above already proved this project
+            // exists, so it is in `project_policies` too — both loops walk
+            // the same `self.projects`.
+            let project_policy = project_policies
+                .get(key.project.as_str())
+                .expect("a project checked present above was resolved to a policy above");
+            let key_entry = key_entry_label(&key.project, &key.user);
+            let overrides = match &key.overrides {
+                Some(overrides_config) => {
+                    let overrides = overrides_config.to_overrides(path, &key_entry)?;
+                    let widened = project_policy.widenings_of(&overrides);
+                    if !widened.is_empty() {
+                        return Err(ControlPlaneError::OverrideWiderThanProject {
+                            path: path.to_string(),
+                            project_entry: project_entry_label(&key.project),
+                            key_entry,
+                            axes: widened,
+                        });
+                    }
+                    overrides
+                }
+                None => PolicyOverrides::default(),
+            };
+            key_effective_policies
+                .insert(key.key_sha256.clone(), project_policy.narrow(&overrides));
         }
 
         for hash in &self.admin_keys {
@@ -293,6 +535,7 @@ impl ControlPlaneConfig {
             }
         }
 
+        self.key_effective_policies = key_effective_policies;
         Ok(())
     }
 }
@@ -357,8 +600,11 @@ pub enum ControlPlane {
     Open,
     /// A key is required; `resolve` looks up its hash.
     Configured {
-        /// `sha256(secret)` hex, to the membership it authenticates.
-        turn_keys: HashMap<String, Principal>,
+        /// `sha256(secret)` hex, to the membership it authenticates and the
+        /// effective [`TurnPolicy`] resolved for it at load time (its
+        /// project's policy narrowed by its own overrides — see
+        /// [`ControlPlaneConfig::validate`]).
+        turn_keys: HashMap<String, (Principal, Arc<TurnPolicy>)>,
         /// `sha256(secret)` hex, for keys with no membership to spend as.
         admin_keys: HashSet<String>,
     },
@@ -371,12 +617,28 @@ impl ControlPlane {
     /// `Vec`s exist only to be turned into these two lookup tables, and there
     /// is no second reader of the parsed form once resolution is wired.
     pub fn configured(config: ControlPlaneConfig) -> Self {
-        let turn_keys = config
-            .keys
+        let ControlPlaneConfig {
+            projects: _,
+            users: _,
+            keys,
+            admin_keys,
+            key_effective_policies,
+        } = config;
+        let turn_keys = keys
             .into_iter()
-            .map(|key| (key.key_sha256, Principal::new(key.project, key.user)))
+            .map(|key| {
+                // Always present: `validate` inserts an entry (the
+                // project's own policy, narrowed by nothing) for every key
+                // that reaches here, overridden or not.
+                let policy = key_effective_policies
+                    .get(&key.key_sha256)
+                    .cloned()
+                    .unwrap_or_else(TurnPolicy::unrestricted);
+                let principal = Principal::new(key.project, key.user);
+                (key.key_sha256, (principal, Arc::new(policy)))
+            })
             .collect();
-        let admin_keys = config.admin_keys.into_iter().collect();
+        let admin_keys = admin_keys.into_iter().collect();
         ControlPlane::Configured {
             turn_keys,
             admin_keys,
@@ -473,59 +735,98 @@ impl ControlPlane {
     /// The scope the request's `Authorization` header authenticates.
     ///
     /// The auth seam, and the only one: every surface that gates on a key comes
-    /// through here or through [`Self::turn_principal`] below, so the header
-    /// name, the ASCII rule and the error table are read out of one function
-    /// rather than re-derived per transport.
+    /// through here or through [`Self::turn_principal`] / [`Self::turn_admission`]
+    /// below, so the header name, the ASCII rule and the error table are read
+    /// out of one function rather than re-derived per transport.
     ///
     /// A header that is present but not ASCII is malformed rather than missing.
     /// Reporting it as missing would tell a client to add a key it already
     /// sent, which is the least actionable of the answers in the table.
     pub fn scope(&self, headers: &HeaderMap) -> Result<KeyScope, AuthError> {
-        let header = match headers.get(AUTHORIZATION) {
-            None => None,
-            Some(value) => Some(value.to_str().map_err(|_| AuthError::MalformedKey)?),
-        };
+        let header = self.header_str(headers)?;
         self.resolve(header)
     }
 
     /// The membership a turn-serving surface's caller spends as.
     ///
-    /// `wrong_key_kind` is decided here rather than in [`Self::resolve`],
-    /// because whether an admin key is the wrong key depends on what the route
-    /// wanted. Every turn surface wants exactly this answer, so there is one
-    /// place for them to disagree with instead of three.
-    ///
-    /// An admin key is refused rather than quietly given a principal of its
-    /// own: an admin acts on the deployment and has no membership to bill, and
-    /// the alternative — minting one — would put spend on a row no project
-    /// owns.
+    /// A thin projection of [`Self::turn_admission`] for the surfaces that
+    /// only need identity and have not yet been threaded through to consult a
+    /// policy — see that method for the shared logic, including why an admin
+    /// key is refused here rather than quietly given a principal of its own.
     pub fn turn_principal(&self, headers: &HeaderMap) -> Result<Principal, AuthError> {
-        match self.scope(headers)? {
-            KeyScope::Turn(principal) => Ok(principal),
-            KeyScope::Admin => Err(AuthError::WrongKeyKind),
+        self.turn_admission(headers)
+            .map(|admission| admission.principal)
+    }
+
+    /// The membership a turn-serving surface's caller spends as, together with
+    /// its resolved [`TurnPolicy`] — the admission seam decision 10 names.
+    ///
+    /// One lookup produces both, because both are resolved from the same key:
+    /// a second function reaching into `Configured { turn_keys, .. }` on its
+    /// own would be a second place that table's shape could be gotten wrong.
+    /// `WrongKeyKind` is decided here, not in [`Self::authenticate`], because
+    /// whether an admin key is the wrong key depends on what the route
+    /// wanted — an admin acts on the deployment and has no membership to bill,
+    /// and the alternative — minting one — would put spend on a row no
+    /// project owns.
+    ///
+    /// In [`Self::Open`] this always resolves to
+    /// [`Principal::default_open`] paired with [`TurnPolicy::unrestricted`],
+    /// regardless of the header: an unconfigured deployment authenticates
+    /// nothing, so there is no wrong answer a header could produce, and no
+    /// policy narrower than the one every pre-control-plane deployment already
+    /// routes under.
+    pub fn turn_admission(&self, headers: &HeaderMap) -> Result<Admission, AuthError> {
+        let header = self.header_str(headers)?;
+        match self.authenticate(header)? {
+            Authenticated::Turn(principal, policy) => Ok(Admission { principal, policy }),
+            Authenticated::Admin => Err(AuthError::WrongKeyKind),
         }
     }
 
-    /// Resolve a presented `Authorization` header value to the scope it
-    /// authenticates.
+    /// Read `headers`' `Authorization` value as UTF-8, or refuse it as
+    /// malformed. Shared by [`Self::scope`] and [`Self::turn_admission`] so
+    /// the ASCII rule is read out of one function rather than two.
+    fn header_str<'a>(&self, headers: &'a HeaderMap) -> Result<Option<&'a str>, AuthError> {
+        match headers.get(AUTHORIZATION) {
+            None => Ok(None),
+            Some(value) => value
+                .to_str()
+                .map(Some)
+                .map_err(|_| AuthError::MalformedKey),
+        }
+    }
+
+    /// [`Self::authenticate`], with the policy dropped — [`Self::scope`]'s
+    /// pure-function core, kept separate so the tests below can exercise
+    /// resolution as a function of a string without a [`HeaderMap`] to build.
+    fn resolve(&self, authorization_header: Option<&str>) -> Result<KeyScope, AuthError> {
+        match self.authenticate(authorization_header)? {
+            Authenticated::Turn(principal, _policy) => Ok(KeyScope::Turn(principal)),
+            Authenticated::Admin => Ok(KeyScope::Admin),
+        }
+    }
+
+    /// Resolve a presented `Authorization` header value to what it
+    /// authenticates: a membership and its resolved policy, or the admin
+    /// scope.
     ///
     /// The error table (decision 3) is: missing header -> `MissingKey`;
     /// present but not `Bearer rh_(turn|admin)_<43 chars>` -> `MalformedKey`;
     /// well-shaped but no record of its hash -> `UnknownKey`. `WrongKeyKind`
-    /// is not decided here — see [`Self::turn_principal`] — because this
+    /// is not decided here — see [`Self::turn_admission`] — because this
     /// function has no notion of which surface is asking.
     ///
-    /// Private, and takes the header value rather than the map, so that it can
-    /// be exercised as a pure function of a string by the tests below while
-    /// [`Self::scope`] remains the one way in.
-    ///
-    /// In [`Self::Open`] every request resolves to
-    /// [`Principal::default_open`] regardless of the header: an unconfigured
-    /// deployment authenticates nothing, so there is no wrong answer a header
-    /// could produce.
-    fn resolve(&self, authorization_header: Option<&str>) -> Result<KeyScope, AuthError> {
+    /// Private, and takes the header value rather than the map, for the same
+    /// reason [`Self::resolve`] does: [`Self::scope`] and
+    /// [`Self::turn_admission`] are the two public ways in, and both read the
+    /// header through [`Self::header_str`] first.
+    fn authenticate(&self, authorization_header: Option<&str>) -> Result<Authenticated, AuthError> {
         match self {
-            ControlPlane::Open => Ok(KeyScope::Turn(Principal::default_open())),
+            ControlPlane::Open => {
+                let open = Admission::open();
+                Ok(Authenticated::Turn(open.principal, open.policy))
+            }
             ControlPlane::Configured {
                 turn_keys,
                 admin_keys,
@@ -539,10 +840,10 @@ impl ControlPlane {
                 }
                 let hash = hex::encode(Sha256::digest(secret.as_bytes()));
                 if admin_keys.contains(&hash) {
-                    return Ok(KeyScope::Admin);
+                    return Ok(Authenticated::Admin);
                 }
-                if let Some(principal) = turn_keys.get(&hash) {
-                    return Ok(KeyScope::Turn(principal.clone()));
+                if let Some((principal, policy)) = turn_keys.get(&hash) {
+                    return Ok(Authenticated::Turn(principal.clone(), Arc::clone(policy)));
                 }
                 Err(AuthError::UnknownKey)
             }
@@ -550,11 +851,55 @@ impl ControlPlane {
     }
 }
 
+/// What a presented `Authorization` header authenticates, with the data each
+/// arm actually carries — the internal counterpart to [`KeyScope`], which
+/// [`ControlPlane::scope`] projects this down to for callers that only need
+/// the tenancy-shape guarantee "an admin key served a turn" is unrepresentable.
+/// [`ControlPlane::turn_admission`] keeps the policy this drops; [`KeyScope`]
+/// exists for the surfaces that predate that seam.
+enum Authenticated {
+    Turn(Principal, Arc<TurnPolicy>),
+    Admin,
+}
+
+/// A turn-serving caller, resolved once at admission: which membership, and
+/// what that membership's turns may do.
+///
+/// The pair decision 10 asks for, rather than two calls a caller could make
+/// out of order or against two different headers: [`ControlPlane::turn_admission`]
+/// is the one place that produces it, so "the principal from one key and the
+/// policy from another" is not a mistake this crate's callers can make.
+#[derive(Debug, Clone)]
+pub struct Admission {
+    pub principal: Principal,
+    pub policy: Arc<TurnPolicy>,
+}
+
+impl Admission {
+    /// What an unconfigured deployment admits every request as: the one
+    /// built-in membership, under the policy that changes no routing decision.
+    ///
+    /// Named once rather than spelled at each site, and it is the value
+    /// [`ControlPlane::Open`] itself resolves to — so this is the definition
+    /// of open mode's admission and not a convenience beside it. The two
+    /// halves have to travel together: an open deployment that paired the
+    /// default principal with anything narrower than
+    /// [`TurnPolicy::unrestricted`] would re-route workloads that predate the
+    /// control plane, which is the one thing turning it on must not do.
+    pub fn open() -> Self {
+        Self {
+            principal: Principal::default_open(),
+            policy: Arc::new(TurnPolicy::unrestricted()),
+        }
+    }
+}
+
 /// Why a request never reached a session: decision 3's error table, whole.
 ///
 /// All five rows, including the two no single function decides on its own —
-/// `WrongKeyKind` comes from [`ControlPlane::turn_principal`], which knows what
-/// the surface wanted, and `OutOfNamespace` from the surface that was handed a
+/// `WrongKeyKind` comes from [`ControlPlane::turn_admission`] (and its
+/// projection [`ControlPlane::turn_principal`]), which know what the surface
+/// wanted, and `OutOfNamespace` from the surface that was handed a
 /// session id. They live here anyway, because the table is the contract: a
 /// refusal spelled somewhere else is a refusal a client's error handling has
 /// never heard of.
@@ -910,5 +1255,285 @@ mod tests {
             .unwrap_or_else(|error| panic!("the shipped example must validate: {error}"));
         assert!(!config.projects.is_empty());
         assert!(!config.users.is_empty());
+
+        // Decision 9's two config additions, both present in the shipped
+        // example: a project policy, and a key override that narrows it. A
+        // widening override would have failed `load` above, so reaching this
+        // line already proves the override narrows -- these assertions pin
+        // down *that it is exercised at all*, not just that nothing widened.
+        let acme = config
+            .projects
+            .iter()
+            .find(|project| project.id == "acme")
+            .expect("the example's acme project");
+        assert!(
+            acme.policy.is_some(),
+            "the example must demonstrate a project policy"
+        );
+        let key = config
+            .keys
+            .first()
+            .expect("the example must ship at least one key");
+        assert!(
+            key.overrides.is_some(),
+            "the example must demonstrate a key override"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Decision 9: policy on project entries, overrides on key entries
+    // -----------------------------------------------------------------------
+
+    fn bearer_headers(secret: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            format!("Bearer {secret}").parse().expect("a valid value"),
+        );
+        headers
+    }
+
+    #[test]
+    fn a_min_quality_outside_the_unit_interval_is_rejected_naming_the_project() {
+        for min_quality in [-0.1, 1.1] {
+            let json = format!(
+                r#"{{
+                  "projects": [
+                    {{ "id": "acme", "policy": {{ "min_quality": {min_quality} }} }}
+                  ],
+                  "users": []
+                }}"#
+            );
+            let error = ControlPlaneConfig::from_json(&json, "test").unwrap_err();
+            match error {
+                ControlPlaneError::MinQualityOutOfRange {
+                    entry,
+                    min_quality: got,
+                    ..
+                } => {
+                    assert_eq!(entry, "project `acme`");
+                    assert_eq!(got, min_quality);
+                }
+                other => panic!("expected MinQualityOutOfRange, got {other:?}"),
+            }
+        }
+
+        // Control: the bounds themselves are inside the interval and validate.
+        let json = r#"{
+          "projects": [{ "id": "acme", "policy": { "min_quality": 0.0 } }],
+          "users": []
+        }"#;
+        ControlPlaneConfig::from_json(json, "test").expect("0.0 is inside 0.0..=1.0");
+        let json = r#"{
+          "projects": [{ "id": "acme", "policy": { "min_quality": 1.0 } }],
+          "users": []
+        }"#;
+        ControlPlaneConfig::from_json(json, "test").expect("1.0 is inside 0.0..=1.0");
+    }
+
+    #[test]
+    fn a_cadence_with_zero_per_turns_or_excess_max_frontier_is_rejected() {
+        let zero_window = r#"{
+          "projects": [
+            {
+              "id": "acme",
+              "policy": { "frontier_cadence": { "max_frontier": 0, "per_turns": 0 } }
+            }
+          ],
+          "users": []
+        }"#;
+        let error = ControlPlaneConfig::from_json(zero_window, "test").unwrap_err();
+        match error {
+            ControlPlaneError::CadencePerTurnsZero { entry, .. } => {
+                assert_eq!(entry, "project `acme`");
+            }
+            other => panic!("expected CadencePerTurnsZero, got {other:?}"),
+        }
+
+        let excess = r#"{
+          "projects": [
+            {
+              "id": "acme",
+              "policy": { "frontier_cadence": { "max_frontier": 5, "per_turns": 2 } }
+            }
+          ],
+          "users": []
+        }"#;
+        let error = ControlPlaneConfig::from_json(excess, "test").unwrap_err();
+        match error {
+            ControlPlaneError::CadenceExceedsWindow {
+                entry,
+                max_frontier,
+                per_turns,
+                ..
+            } => {
+                assert_eq!(entry, "project `acme`");
+                assert_eq!(max_frontier, 5);
+                assert_eq!(per_turns, 2);
+            }
+            other => panic!("expected CadenceExceedsWindow, got {other:?}"),
+        }
+
+        // Control: `max_frontier == per_turns` is the bound, not past it.
+        let boundary = r#"{
+          "projects": [
+            {
+              "id": "acme",
+              "policy": { "frontier_cadence": { "max_frontier": 3, "per_turns": 3 } }
+            }
+          ],
+          "users": []
+        }"#;
+        ControlPlaneConfig::from_json(boundary, "test")
+            .expect("max_frontier == per_turns is exactly at the bound");
+    }
+
+    #[test]
+    fn a_malformed_glob_is_rejected_naming_the_entry() {
+        let project_glob = r#"{
+          "projects": [{ "id": "acme", "policy": { "allow": ["anthropic/**"] } }],
+          "users": []
+        }"#;
+        let error = ControlPlaneConfig::from_json(project_glob, "test").unwrap_err();
+        match error {
+            ControlPlaneError::MalformedGlob { entry, .. } => {
+                assert_eq!(entry, "project `acme`");
+            }
+            other => panic!("expected MalformedGlob, got {other:?}"),
+        }
+
+        let key_glob = format!(
+            r#"{{
+              "projects": [{{ "id": "acme" }}],
+              "users": [{{ "id": "ada" }}],
+              "keys": [{{
+                "project": "acme",
+                "user": "ada",
+                "key_sha256": "{TURN_HASH}",
+                "overrides": {{ "allow": ["anthropic/{{a,b}}"] }}
+              }}]
+            }}"#
+        );
+        let error = ControlPlaneConfig::from_json(&key_glob, "test").unwrap_err();
+        match error {
+            ControlPlaneError::MalformedGlob { entry, .. } => {
+                assert_eq!(entry, "key for project `acme`, user `ada`");
+            }
+            other => panic!("expected MalformedGlob, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_override_wider_than_the_project_policy_is_rejected_naming_both() {
+        let json = format!(
+            r#"{{
+              "projects": [
+                {{ "id": "acme", "policy": {{ "min_quality": 0.7 }} }}
+              ],
+              "users": [{{ "id": "ada" }}],
+              "keys": [{{
+                "project": "acme",
+                "user": "ada",
+                "key_sha256": "{TURN_HASH}",
+                "overrides": {{ "min_quality": 0.3 }}
+              }}]
+            }}"#
+        );
+        let error = ControlPlaneConfig::from_json(&json, "test").unwrap_err();
+        match error {
+            ControlPlaneError::OverrideWiderThanProject {
+                project_entry,
+                key_entry,
+                axes,
+                ..
+            } => {
+                assert_eq!(project_entry, "project `acme`");
+                assert_eq!(key_entry, "key for project `acme`, user `ada`");
+                assert_eq!(axes, vec!["min_quality"]);
+            }
+            other => panic!("expected OverrideWiderThanProject, got {other:?}"),
+        }
+
+        // Control: an override that only tightens validates.
+        let json = format!(
+            r#"{{
+              "projects": [
+                {{ "id": "acme", "policy": {{ "min_quality": 0.5 }} }}
+              ],
+              "users": [{{ "id": "ada" }}],
+              "keys": [{{
+                "project": "acme",
+                "user": "ada",
+                "key_sha256": "{TURN_HASH}",
+                "overrides": {{ "min_quality": 0.8 }}
+              }}]
+            }}"#
+        );
+        ControlPlaneConfig::from_json(&json, "test")
+            .expect("an override that only raises the floor narrows and must validate");
+    }
+
+    #[test]
+    fn an_absent_policy_resolves_to_unrestricted_and_open_mode_always_does() {
+        // Configured mode, no `"policy"` and no `"overrides"` anywhere in the
+        // fixture: the key resolves to exactly `TurnPolicy::unrestricted()`.
+        let config = ControlPlaneConfig::from_json(sample_config(), "test").unwrap();
+        let plane = ControlPlane::configured(config);
+        let admission = plane
+            .turn_admission(&bearer_headers(TURN_SECRET))
+            .expect("a known turn key");
+        assert_eq!(*admission.policy, TurnPolicy::unrestricted());
+
+        // Open mode: unrestricted regardless of what the header says, since an
+        // unconfigured deployment authenticates nothing.
+        let open = ControlPlane::Open;
+        for headers in [HeaderMap::new(), bearer_headers("rh_turn_garbage")] {
+            let admission = open
+                .turn_admission(&headers)
+                .expect("Open mode never refuses");
+            assert_eq!(*admission.policy, TurnPolicy::unrestricted());
+        }
+    }
+
+    #[test]
+    fn a_key_with_overrides_resolves_to_the_narrowed_policy() {
+        let json = format!(
+            r#"{{
+              "projects": [
+                {{
+                  "id": "acme",
+                  "policy": {{
+                    "min_quality": 0.5,
+                    "frontier_cadence": {{ "max_frontier": 2, "per_turns": 10 }}
+                  }}
+                }}
+              ],
+              "users": [{{ "id": "ada" }}],
+              "keys": [{{
+                "project": "acme",
+                "user": "ada",
+                "key_sha256": "{TURN_HASH}",
+                "overrides": {{
+                  "min_quality": 0.8,
+                  "frontier_cadence": {{ "max_frontier": 1, "per_turns": 10 }}
+                }}
+              }}]
+            }}"#
+        );
+        let config = ControlPlaneConfig::from_json(&json, "test").unwrap();
+        let plane = ControlPlane::configured(config);
+        let admission = plane
+            .turn_admission(&bearer_headers(TURN_SECRET))
+            .expect("a known turn key");
+
+        assert_eq!(admission.principal, Principal::new("acme", "ada"));
+        assert_eq!(admission.policy.min_quality, 0.8);
+        assert_eq!(
+            admission.policy.frontier_cadence,
+            Some(FrontierCadence {
+                max_frontier: 1,
+                per_turns: 10
+            })
+        );
     }
 }

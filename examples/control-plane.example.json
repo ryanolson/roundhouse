@@ -9,11 +9,33 @@
     "they parse and validate as an example but authenticate nothing: if you point",
     "ROUNDHOUSE_CONTROL_PLANE at this file unmodified, every request resolves",
     "unknown_key.",
+    "A project's \"policy\" sets what its turns may do: min_quality (0.0 = no",
+    "floor), allow (glob patterns over a target's identity -- \"provider/model\"",
+    "for a hosted model, \"local/model\" for one of the fleet's own; absent or",
+    "\"*\" admits everything), and frontier_cadence (at most max_frontier hosted",
+    "dispatches in a trailing window of per_turns turns; when the window is",
+    "spent, hosted targets go inadmissible and the turn serves locally instead",
+    "of failing). Absent \"policy\" means unrestricted -- the same routing this",
+    "deployment would do with no control plane at all.",
+    "A key's \"overrides\" narrow its project's policy for that key alone, via",
+    "the same three axes. Narrowing only: an override that would raise the",
+    "admissible set on any axis -- a lower min_quality, a looser cadence -- is",
+    "rejected at load, naming both the key and the project it belongs to, rather",
+    "than silently clamped. Ada's key below tightens the floor from 0.5 to 0.8",
+    "and the cadence from 2-per-10 to 1-per-10; it could not loosen either.",
     "Point ROUNDHOUSE_CONTROL_PLANE at your copy."
   ],
 
   "projects": [
-    { "id": "acme", "name": "Acme Corp" }
+    {
+      "id": "acme",
+      "name": "Acme Corp",
+      "policy": {
+        "min_quality": 0.5,
+        "allow": ["anthropic/*", "local/*"],
+        "frontier_cadence": { "max_frontier": 2, "per_turns": 10 }
+      }
+    }
   ],
 
   "users": [
@@ -24,7 +46,11 @@
     {
       "project": "acme",
       "user": "ada",
-      "key_sha256": "bd7419bcfc5b931146425c95c682a5194d389c26329672f651fc2eefbd9d95c1"
+      "key_sha256": "bd7419bcfc5b931146425c95c682a5194d389c26329672f651fc2eefbd9d95c1",
+      "overrides": {
+        "min_quality": 0.8,
+        "frontier_cadence": { "max_frontier": 1, "per_turns": 10 }
+      }
     }
   ],
 

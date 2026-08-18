@@ -11,7 +11,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::StreamExt;
 use roundhouse_core::context::{ContextAssembler, Tokenizer};
-use roundhouse_core::control::Principal;
+use roundhouse_core::control::{FrontierHistory, TurnPolicy};
 use roundhouse_core::event::{Accounting, IncompleteReason, SessionObserver, Usage};
 use roundhouse_core::ids::{ResponseId, SessionId, TurnId};
 use roundhouse_core::item::Item;
@@ -28,6 +28,8 @@ use roundhouse_fleet::{
     FrontierStream, LocalFleet, LocalQuote, StaticFrontierCatalog,
 };
 use tokio::time::Instant;
+
+use crate::control_config::Admission;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -217,6 +219,39 @@ impl Failed {
             evidence,
         }
     }
+
+    /// How the log should name this failure when the response is terminated.
+    ///
+    /// Derived from the error rather than fixed at the construction site,
+    /// because the two callers above split on *when* the failure happened and
+    /// this splits on *what* failed — a policy refusal and a provider timeout
+    /// both arrive through [`Self::before_output`].
+    ///
+    /// Only the refusal is separated out, and only because it is the one
+    /// failure with no upstream in it at all: see
+    /// [`IncompleteReason::PolicyRefused`]. Everything else genuinely is an
+    /// attempt that did not come back, whatever stage it died at.
+    ///
+    /// Spelled out variant by variant rather than with a catch-all, because the
+    /// next thing to land here is a budget the turn could not pay — a refusal
+    /// this deployment made, not a provider failing — and a wildcard would file
+    /// it under `UpstreamError` without anyone having to decide.
+    fn incomplete_reason(&self) -> IncompleteReason {
+        match &self.error {
+            EngineError::Routing(RoutingError::NoViableCandidate) => {
+                IncompleteReason::PolicyRefused
+            }
+            // `NoCandidates` is deliberately not a refusal: nothing was quoted
+            // at all, which is a fleet and a catalog with nothing in them
+            // rather than a decision anyone made about this tenant.
+            EngineError::Routing(RoutingError::NoCandidates | RoutingError::Policy(_))
+            | EngineError::Session(_)
+            | EngineError::Fleet(_)
+            | EngineError::Frontier(_)
+            | EngineError::UnresolvableTarget(_)
+            | EngineError::TurnDeadline(_) => IncompleteReason::UpstreamError,
+        }
+    }
 }
 
 /// Outcome of one turn.
@@ -321,20 +356,31 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         ledger
     }
 
-    /// Run one turn to completion, charged to `principal`.
+    /// Run one turn to completion, charged to `admission`'s principal and
+    /// bounded by its policy.
     ///
-    /// The principal is a plain parameter rather than an `Option`: an
-    /// unconfigured deployment resolves every request to
-    /// [`Principal::default_open`], so "a turn nobody is paying for" is a state
-    /// no caller can construct. It reaches the log through the session-created
-    /// event below and nowhere else — the engine spends it, it does not store
-    /// it.
+    /// One [`Admission`] rather than a principal and a policy side by side:
+    /// they are resolved together from one key by
+    /// [`ControlPlane::turn_admission`](crate::control_config::ControlPlane::turn_admission),
+    /// and passing them separately would let a caller pair one tenant's
+    /// identity with another tenant's entitlements — a mistake with no
+    /// compile-time answer and, since both turns would still serve, no
+    /// runtime symptom either. It is also what keeps this signature at the
+    /// arity the M1 review set as the ceiling.
+    ///
+    /// Neither half is an `Option`: an unconfigured deployment resolves every
+    /// request to [`Admission::open`](crate::control_config::Admission::open),
+    /// so "a turn nobody is paying for" and "a turn under no policy" are
+    /// states no caller can construct. The principal reaches the log through
+    /// the session-created event below and nowhere else; the policy reaches it
+    /// as the digest on every [`DecisionRecord`]. The engine spends both, it
+    /// stores neither.
     pub async fn run_turn(
         &self,
         session_id: &SessionId,
         turn_id: TurnId,
         input: Vec<Item>,
-        principal: &Principal,
+        admission: &Admission,
     ) -> Result<TurnResult, EngineError> {
         // See `turn_gates`: within this node, one turn at a time per session.
         let gate = self.turn_gate(session_id);
@@ -368,13 +414,17 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         // which is what lets `by_principal` exist without a side table.
         if session.last_seq() == 0 {
             session
-                .record_created(self.policy.name(), principal)
+                .record_created(self.policy.name(), &admission.principal)
                 .await?;
         }
 
-        let admission = session.begin_turn(turn_id.clone(), input).await?;
-        let response_id = admission.response_id().clone();
-        if let TurnAdmission::Deduplicated(_) = admission {
+        // `started`, not `admission`: the caller's [`Admission`] is who may
+        // spend and on what, and this one is whether the log accepted the turn
+        // at all. Two unrelated questions that used to share a name because
+        // only one of them existed.
+        let started = session.begin_turn(turn_id.clone(), input).await?;
+        let response_id = started.response_id().clone();
+        if let TurnAdmission::Deduplicated(_) = started {
             // A retry of a completed turn. Replay rather than regenerate: the
             // client already paid for this answer, and the accounting it was
             // billed under is durable in the log, so report that rather than a
@@ -410,7 +460,9 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         // ticks before a live owner is declared dead.
         let _heartbeat = session.heartbeat(self.config.lease_ttl_ms / 3, self.config.lease_ttl_ms);
 
-        let outcome = self.dispatch(&mut session, &response_id).await;
+        let outcome = self
+            .dispatch(&mut session, &response_id, &admission.policy)
+            .await;
 
         // The one settle seam. Every admitted turn terminates its response and
         // hands back the lease, whichever way the body went: returning while
@@ -429,23 +481,26 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                     .map(|()| (text, usage, decision))
                     .map_err(EngineError::from)
             }
-            Err(Failed {
-                error,
-                partial,
-                evidence,
-            }) => {
+            Err(failed) => {
                 // Terminating a failed dispatch is what commits the partial for
                 // a successor to resume from, and what tells the cache ledger
                 // whether the prompt reached the provider. Best-effort: the
                 // usual reason this append fails is a lost lease, and the
                 // original error is the better diagnosis.
+                //
+                // A policy refusal terminates here too, rather than returning
+                // with the response left open: an open response would be
+                // re-admitted on the client's next retry and its input
+                // appended a second time, so "the turn was refused" would
+                // grow the conversation every time the client asked again.
+                let reason = failed.incomplete_reason();
+                let Failed {
+                    error,
+                    partial,
+                    evidence,
+                } = failed;
                 let _ = session
-                    .mark_incomplete(
-                        &response_id,
-                        partial,
-                        IncompleteReason::UpstreamError,
-                        evidence,
-                    )
+                    .mark_incomplete(&response_id, partial, reason, evidence)
                     .await;
                 Err(error)
             }
@@ -480,6 +535,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         &self,
         session: &mut Session<S>,
         response_id: &ResponseId,
+        turn_policy: &TurnPolicy,
     ) -> Result<Completed, Failed> {
         // One deadline for every model await in this turn, taken before any of
         // them: a provider that hangs after accepting the request settles the
@@ -490,7 +546,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         let deadline_at = Instant::now() + Duration::from_millis(self.config.turn_deadline_ms);
 
         let (mut stream, decision, isl_tokens) = self
-            .plan(session, response_id, deadline_at)
+            .plan(session, response_id, deadline_at, turn_policy)
             .await
             .map_err(Failed::before_output)?;
 
@@ -590,6 +646,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         session: &mut Session<S>,
         response_id: &ResponseId,
         deadline_at: Instant,
+        turn_policy: &TurnPolicy,
     ) -> Result<(FrontierStream, Decision, usize), EngineError> {
         // Rebuild the prompt from the committed log, so what we price is
         // exactly what a successor would reconstruct.
@@ -633,6 +690,40 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             self.config.expected_output_tokens as u64,
         ));
 
+        // --- drop what this principal could never use ------------------------
+        //
+        // The second half of the policy's reach into routing, and it exists for
+        // a different reason from the first. `TurnPolicy::admits` inside each
+        // `RoutingPolicy` is the *behavior* half: it decides what may be
+        // chosen. This is the *accounting* half: `considered` is what the
+        // dashboard's counterfactual is priced against — `best_frontier_alternative`
+        // reads exactly this list — so leaving an unreachable model in it would
+        // report a saving against a model no turn of this principal's could
+        // ever have been sent to. That is a cost win the deployment never made,
+        // and the one number the whole dashboard is judged by.
+        //
+        // Filtering only here would not do: a policy is free to reach past the
+        // scored pool (`EscalationPolicy`'s audit branch does), so the router
+        // has to be able to ask. Filtering only there would not do either, for
+        // the reason above. Both, therefore, through one predicate.
+        //
+        // The window it asks about is the *unspent* one, and that is the whole
+        // difference between the two calls. A cadence-rationed frontier model
+        // is not unreachable, it is not available this turn — so it stays in
+        // `considered` and the counterfactual against it is true, while
+        // `admits` at the routing site sees the session's real history and
+        // rations it. A model excluded by the filter or the quality floor is
+        // unreachable on every turn of this principal's, and goes.
+        let unspent = FrontierHistory::default();
+        let quoted = candidates.len();
+        candidates.retain(|candidate| turn_policy.admits(candidate, &unspent));
+        if candidates.is_empty() && quoted > 0 {
+            // Not `NoCandidates`: the fleet and the catalog answered, and it is
+            // this deployment's own policy that left nothing. Reporting the
+            // fleet as empty would send an operator to look at the workers.
+            return Err(RoutingError::NoViableCandidate.into());
+        }
+
         // --- choose --------------------------------------------------------
         let decision = self
             .bounded(
@@ -643,6 +734,12 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                     isl_tokens,
                     candidates: &candidates,
                     ledger: session.ledger(),
+                    turn_policy,
+                    // The turns before this one. `record_routing` below folds
+                    // this turn's own dispatch in afterwards, which is what
+                    // makes the window a trailing one rather than one that
+                    // counts the decision being taken.
+                    frontier_history: &session.state().frontier_history,
                 }),
             )
             .await?;
@@ -666,6 +763,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                     expected_prefill_tokens: chosen.expected_prefill_tokens,
                     expected_cost_usd: chosen.expected_cost_usd,
                     considered: candidates.clone(),
+                    turn_policy_digest: turn_policy.digest(),
                 },
             )
             .await?;

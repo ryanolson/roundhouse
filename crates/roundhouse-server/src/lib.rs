@@ -38,7 +38,7 @@ pub mod tokenizer;
 
 pub use catalog_config::{CatalogConfig, CatalogError};
 pub use control_config::{
-    AuthError, ControlPlane, ControlPlaneConfig, ControlPlaneError, KeyScope,
+    Admission, AuthError, ControlPlane, ControlPlaneConfig, ControlPlaneError, KeyScope,
 };
 pub use engine::{
     EchoLocalExecutor, Engine, EngineConfig, EngineError, LocalExecution, LocalExecutor, TurnResult,

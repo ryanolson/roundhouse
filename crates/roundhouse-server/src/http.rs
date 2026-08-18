@@ -353,8 +353,13 @@ where
     let session_id = SessionId::new(session_id);
     // Before the body, and before the store: a key that may not touch this
     // session must not learn whether it exists, and must not cost a round trip.
-    let principal = state.plane.turn_principal(&headers)?;
-    in_namespace(&state.plane, &principal, &session_id)?;
+    //
+    // The admission rather than the principal alone, because this route serves
+    // a turn: the same key lookup answers "who pays" and "what may be routed
+    // to", and resolving them once here is what makes the policy immutable for
+    // the whole turn rather than something re-read mid-dispatch.
+    let admission = state.plane.turn_admission(&headers)?;
+    in_namespace(&state.plane, &admission.principal, &session_id)?;
     let request: CreateResponseBody = parse_body(&body)?;
     let input = request
         .input
@@ -376,13 +381,13 @@ where
         let engine = Arc::clone(&state.engine);
         let session_id = session_id.clone();
         let turn_id = turn_id.clone();
-        let principal = principal.clone();
+        let admission = admission.clone();
         // Flattened to `Result<(), String>` at the spawn boundary: the stream
         // needs to know only that the turn failed and how that reads, so it
         // does not depend on the engine's result or error shape.
         async move {
             engine
-                .run_turn(&session_id, turn_id, input, &principal)
+                .run_turn(&session_id, turn_id, input, &admission)
                 .await
                 .map(|_| ())
                 .map_err(|error| error.to_string())

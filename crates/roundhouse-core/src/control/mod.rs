@@ -35,9 +35,21 @@
 //! they get a row of their own that no project can be confused with, and which
 //! a reader can see the size of.
 
+//! What a resolved caller may *do* with a turn is the sibling module
+//! [`policy`], not this one: identity is a fact about a request and a
+//! [`TurnPolicy`] is a fact about configuration, and they are resolved
+//! together at admission precisely because they are two answers rather than
+//! one.
+
+pub mod policy;
+
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+
+pub use policy::{
+    FilterError, FrontierCadence, FrontierHistory, PolicyOverrides, TargetFilter, TurnPolicy,
+};
 
 use crate::ids::string_id;
 

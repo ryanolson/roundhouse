@@ -136,14 +136,24 @@ impl AffinityPolicy {
         self
     }
 
-    fn admissible<'a>(&self, candidates: &'a [Candidate]) -> Vec<&'a Candidate> {
-        candidates
+    /// Candidates this policy will score, under both the deployment's own
+    /// constraints and the caller's.
+    ///
+    /// The two are separate on purpose: `min_quality` and `max_load` here are
+    /// operator tuning of *this* policy instance, while
+    /// [`TurnPolicy`](crate::control::TurnPolicy) is what the principal is
+    /// entitled to. Neither subsumes the other — a deployment can tune below a
+    /// tenant's floor, and a tenant cannot tune around a busy worker — so both
+    /// apply and the tighter of each pair wins by construction.
+    fn admissible<'a>(&self, ctx: &'a RoutingContext<'_>) -> Vec<&'a Candidate> {
+        ctx.candidates
             .iter()
             .filter(|c| c.quality_prior >= self.min_quality)
             .filter(|c| match (self.max_load, c.load) {
                 (Some(ceiling), Some(load)) => load <= ceiling,
                 _ => true,
             })
+            .filter(|c| ctx.turn_policy.admits(c, ctx.frontier_history))
             .collect()
     }
 }
@@ -158,7 +168,7 @@ impl RoutingPolicy for AffinityPolicy {
         if ctx.candidates.is_empty() {
             return Err(RoutingError::NoCandidates);
         }
-        let pool = self.admissible(ctx.candidates);
+        let pool = self.admissible(ctx);
         if pool.is_empty() {
             return Err(RoutingError::NoViableCandidate);
         }
@@ -244,15 +254,25 @@ impl RoutingPolicy for EscalationPolicy {
             return self.inner.choose(ctx).await;
         }
 
+        // The audit branch is the one place in the router that reaches past
+        // what any scoring would pick, so it is the one place that could reach
+        // past what the caller is entitled to. Unfiltered, this `max_by` would
+        // escalate straight through a quality ceiling, an access filter or a
+        // spent frontier cadence — none of which it asks about — on every
+        // `audit_every`-th turn. The clamp is here rather than in
+        // `is_audit_turn` because it *is* still an audit turn: it escalates to
+        // the best admissible target, which is what "narrowing clamps the
+        // escalation rather than cancelling it" means.
         let best = ctx
             .candidates
             .iter()
+            .filter(|candidate| ctx.turn_policy.admits(candidate, ctx.frontier_history))
             .max_by(|a, b| {
                 a.quality_prior
                     .partial_cmp(&b.quality_prior)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
-            .ok_or(RoutingError::NoCandidates)?;
+            .ok_or(RoutingError::NoViableCandidate)?;
 
         Ok(Decision {
             target: best.target.clone(),
@@ -267,6 +287,7 @@ impl RoutingPolicy for EscalationPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::{FrontierCadence, FrontierHistory, TargetFilter, TurnPolicy};
     use crate::ids::SessionId;
     use crate::routing::{CacheLedger, Target};
 
@@ -303,17 +324,71 @@ mod tests {
         }
     }
 
+    /// Everything a [`RoutingContext`] needs that is not the candidate set.
+    ///
+    /// A fixture rather than six arguments: the context borrows all of it, so
+    /// the alternative is every test owning six locals whose only job is to
+    /// outlive the borrow.
+    struct Fixture {
+        session_id: SessionId,
+        ledger: CacheLedger,
+        turn_policy: TurnPolicy,
+        frontier_history: FrontierHistory,
+    }
+
+    impl Fixture {
+        /// Open mode: the value every pre-tenancy deployment routes under.
+        fn open() -> Self {
+            Self {
+                session_id: SessionId::new("s"),
+                ledger: CacheLedger::new(),
+                turn_policy: TurnPolicy::unrestricted(),
+                frontier_history: FrontierHistory::default(),
+            }
+        }
+
+        fn under(turn_policy: TurnPolicy) -> Self {
+            Self {
+                turn_policy,
+                ..Self::open()
+            }
+        }
+
+        /// `true` for a routed turn that went to a hosted model.
+        fn having_routed(mut self, dispatches: &[bool]) -> Self {
+            for &to_frontier in dispatches {
+                self.frontier_history.record(&if to_frontier {
+                    Target::Frontier {
+                        provider: "anthropic".into(),
+                        model: "claude".into(),
+                    }
+                } else {
+                    Target::Local {
+                        worker_id: 1,
+                        dp_rank: 0,
+                        model: "llama".into(),
+                    }
+                });
+            }
+            self
+        }
+
+        fn ctx<'a>(&'a self, candidates: &'a [Candidate], turn: u64) -> RoutingContext<'a> {
+            RoutingContext {
+                session_id: &self.session_id,
+                turn_index: turn,
+                isl_tokens: 10_000,
+                candidates,
+                ledger: &self.ledger,
+                turn_policy: &self.turn_policy,
+                frontier_history: &self.frontier_history,
+            }
+        }
+    }
+
     async fn choose(policy: &dyn RoutingPolicy, candidates: &[Candidate], turn: u64) -> Decision {
-        let session_id = SessionId::new("s");
-        let ledger = CacheLedger::new();
-        let ctx = RoutingContext {
-            session_id: &session_id,
-            turn_index: turn,
-            isl_tokens: 10_000,
-            candidates,
-            ledger: &ledger,
-        };
-        policy.choose(&ctx).await.unwrap()
+        let fixture = Fixture::open();
+        policy.choose(&fixture.ctx(candidates, turn)).await.unwrap()
     }
 
     #[tokio::test]
@@ -352,17 +427,9 @@ mod tests {
     async fn no_admissible_candidate_is_an_error_not_a_bad_choice() {
         let candidates = vec![local(1, 500.0, 120_000.0)];
         let policy = AffinityPolicy::new().with_max_load(50_000.0);
-        let session_id = SessionId::new("s");
-        let ledger = CacheLedger::new();
-        let ctx = RoutingContext {
-            session_id: &session_id,
-            turn_index: 1,
-            isl_tokens: 1_000,
-            candidates: &candidates,
-            ledger: &ledger,
-        };
+        let fixture = Fixture::open();
         assert!(matches!(
-            policy.choose(&ctx).await,
+            policy.choose(&fixture.ctx(&candidates, 1)).await,
             Err(RoutingError::NoViableCandidate)
         ));
     }
@@ -380,6 +447,198 @@ mod tests {
         assert!(!choose(&policy, &candidates, 4).await.target.is_local());
         assert!(choose(&policy, &candidates, 5).await.target.is_local());
         assert!(!choose(&policy, &candidates, 8).await.target.is_local());
+    }
+
+    /// The candidate set every policy test below shares: two local workers of
+    /// differing warmth and one hosted model that is warmer still but paid.
+    fn mixed_fleet() -> Vec<Candidate> {
+        vec![
+            local(1, 9_000.0, 2_000.0),
+            local(2, 500.0, 2_000.0),
+            frontier(4_000.0, 0.25),
+        ]
+    }
+
+    #[tokio::test]
+    async fn an_unrestricted_policy_reproduces_m1_routing_byte_for_byte() {
+        // Captured from this tree at 5ca00a9 — the commit before per-principal
+        // policy existed — by running these two policies over `mixed_fleet()`
+        // and printing the `Decision`. Not recomputed from the format string:
+        // a pin that derives its expectation from the code under test pins
+        // nothing.
+        //
+        // This is the compatibility guarantee that lets an operator turn the
+        // control plane on without re-routing a single existing workload, and
+        // it is the reason `TurnPolicy::unrestricted` exists as a named value
+        // rather than as an `Option::None` handled at each call site.
+        let candidates = mixed_fleet();
+        let affinity = AffinityPolicy::new();
+        let escalation = EscalationPolicy::new(AffinityPolicy::new(), 4);
+        let warm_local = Target::Local {
+            worker_id: 2,
+            dp_rank: 0,
+            model: "llama".into(),
+        };
+        let scored = "score 0.0000 over 3 candidate(s); expected prefill 500 of 10000 tokens (95% cached), $0.00000";
+
+        for (label, decision, expected) in [
+            (
+                "affinity, ordinary turn",
+                choose(&affinity, &candidates, 1).await,
+                Decision {
+                    target: warm_local.clone(),
+                    rationale: scored.into(),
+                },
+            ),
+            (
+                "escalation, ordinary turn",
+                choose(&escalation, &candidates, 1).await,
+                Decision {
+                    target: warm_local.clone(),
+                    rationale: scored.into(),
+                },
+            ),
+            (
+                "affinity, audit-numbered turn",
+                choose(&affinity, &candidates, 4).await,
+                Decision {
+                    target: warm_local,
+                    rationale: scored.into(),
+                },
+            ),
+            (
+                "escalation, audit turn",
+                choose(&escalation, &candidates, 4).await,
+                Decision {
+                    target: Target::Frontier {
+                        provider: "anthropic".into(),
+                        model: "claude".into(),
+                    },
+                    rationale: "audit turn (every 4); escalated to highest quality prior 0.95"
+                        .into(),
+                },
+            ),
+        ] {
+            assert_eq!(decision, expected, "{label} must be byte-identical to M1");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_quality_floor_excludes_a_target_the_default_policy_would_pick() {
+        // Worker 2 is the warmest thing on the fleet and free, so the default
+        // policy picks it — `the_warmest_worker_wins_all_else_equal` is that
+        // same claim without a floor. A floor above the local prior has to
+        // exclude it outright rather than merely score it down.
+        let candidates = mixed_fleet();
+        let fixture = Fixture::under(TurnPolicy {
+            min_quality: 0.9,
+            ..TurnPolicy::unrestricted()
+        });
+
+        let decision = AffinityPolicy::new()
+            .choose(&fixture.ctx(&candidates, 1))
+            .await
+            .unwrap();
+        assert!(
+            !decision.target.is_local(),
+            "a 0.9 floor leaves only the hosted model: {}",
+            decision.rationale
+        );
+        assert_eq!(
+            choose(&AffinityPolicy::new(), &candidates, 1).await.target,
+            candidates[1].target,
+            "the control: with no floor the same set routes local"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_escalation_audit_turn_cannot_escalate_past_the_policy() {
+        // The audit branch takes `max_by(quality_prior)` over the whole
+        // candidate set, so it is the one place in the router that can reach a
+        // target no other path would. A principal restricted to its own fleet
+        // must get the best *admissible* target, not the best target.
+        let candidates = mixed_fleet();
+        let policy = EscalationPolicy::new(AffinityPolicy::new(), 4);
+        let fixture = Fixture::under(TurnPolicy {
+            allow: TargetFilter::parse(["local/*"]).unwrap(),
+            ..TurnPolicy::unrestricted()
+        });
+
+        let decision = policy.choose(&fixture.ctx(&candidates, 4)).await.unwrap();
+        assert!(
+            decision.target.is_local(),
+            "the audit clamped to the ceiling instead of escalating past it: {}",
+            decision.rationale
+        );
+        assert!(
+            !choose(&policy, &candidates, 4).await.target.is_local(),
+            "the control: the same audit turn does escalate when nothing forbids it"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_admissible_set_is_no_viable_candidate_not_local() {
+        // A filter that matches nothing routes every turn to a free local
+        // worker and looks exactly like a cost win, which is why it fails the
+        // turn instead. The startup cross-check against the catalog is what
+        // makes this rare; this is what makes it loud when it happens anyway.
+        let candidates = mixed_fleet();
+        let fixture = Fixture::under(TurnPolicy {
+            allow: TargetFilter::parse(["mistral/*"]).unwrap(),
+            ..TurnPolicy::unrestricted()
+        });
+
+        for policy in [
+            Box::new(AffinityPolicy::new()) as Box<dyn RoutingPolicy>,
+            Box::new(EscalationPolicy::new(AffinityPolicy::new(), 4)),
+        ] {
+            for turn in [1u64, 4u64] {
+                assert!(
+                    matches!(
+                        policy.choose(&fixture.ctx(&candidates, turn)).await,
+                        Err(RoutingError::NoViableCandidate)
+                    ),
+                    "{} turn {turn} degraded silently instead of failing",
+                    policy.name()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_cadence_serves_locally_rather_than_failing_the_turn() {
+        // The control for the test above, and the distinction decision 7 turns
+        // on: an empty admissible set is a misconfiguration and fails, while a
+        // spent cadence is the knob working — frontier goes inadmissible and
+        // local, still admissible, serves.
+        let candidates = mixed_fleet();
+        let cadence = TurnPolicy {
+            frontier_cadence: Some(FrontierCadence {
+                max_frontier: 1,
+                per_turns: 3,
+            }),
+            ..TurnPolicy::unrestricted()
+        };
+        let policy = EscalationPolicy::new(AffinityPolicy::new(), 4);
+
+        let fresh = Fixture::under(cadence.clone());
+        assert!(
+            !policy
+                .choose(&fresh.ctx(&candidates, 4))
+                .await
+                .unwrap()
+                .target
+                .is_local(),
+            "an unspent window still escalates"
+        );
+
+        let spent = Fixture::under(cadence).having_routed(&[true, false]);
+        let decision = policy.choose(&spent.ctx(&candidates, 4)).await.unwrap();
+        assert!(
+            decision.target.is_local(),
+            "a spent window serves local: {}",
+            decision.rationale
+        );
     }
 
     #[test]

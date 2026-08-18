@@ -415,6 +415,7 @@ mod tests {
                 expected_prefill_tokens: 10_000.0,
                 expected_cost_usd: 0.03,
                 considered: vec![],
+                turn_policy_digest: String::new(),
             },
         });
         // Failed before anything was sent: empty usage is the engine's way of
@@ -455,6 +456,7 @@ mod tests {
                 expected_prefill_tokens: 10_000.0,
                 expected_cost_usd: 0.03,
                 considered: vec![],
+                turn_policy_digest: String::new(),
             },
         });
         log.push(SessionEventKind::ResponseIncomplete {

@@ -64,6 +64,7 @@ fn decision(chosen: Target) -> DecisionRecord {
                 load: None,
             },
         ],
+        turn_policy_digest: String::new(),
     }
 }
 

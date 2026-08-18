@@ -23,7 +23,10 @@ pub mod routing;
 pub mod session;
 pub mod store;
 
-pub use control::{Principal, PrincipalKey, ProjectId, UserId};
+pub use control::{
+    FrontierCadence, FrontierHistory, PolicyOverrides, Principal, PrincipalKey, ProjectId,
+    TargetFilter, TurnPolicy, UserId,
+};
 pub use event::{Accounting, SessionEvent, SessionEventKind, SessionObserver, Usage};
 pub use ids::{ResponseId, SessionId, TurnId};
 pub use item::{Item, ItemContent, Role};

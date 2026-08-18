@@ -36,6 +36,7 @@ pub use policy::{AffinityPolicy, EscalationPolicy};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::control::{FrontierHistory, TurnPolicy};
 use crate::ids::SessionId;
 
 /// Where a turn can be sent.
@@ -65,6 +66,31 @@ impl Target {
 
     pub fn is_local(&self) -> bool {
         matches!(self, Target::Local { .. })
+    }
+
+    /// How a [`TargetFilter`](crate::control::TargetFilter) names this target:
+    /// `provider/model` for a hosted model, `local/model` for one of our own
+    /// workers.
+    ///
+    /// Deliberately not [`Self::ledger_key`], and the difference is the point.
+    /// A ledger key identifies a *cache*, so it names the worker; a policy
+    /// identity identifies a *capability*, and a filter that named a worker
+    /// would admit a turn on Monday and refuse the identical turn on Tuesday
+    /// because the fleet scheduled it elsewhere. `dp_rank` is absent for the
+    /// same reason it is absent there.
+    ///
+    /// One spelling for both halves of the fleet, so `local/*` and
+    /// `anthropic/*` are sentences in the same language and an operator does
+    /// not have to learn which side of the router they are configuring.
+    pub fn policy_identity(&self) -> String {
+        match self {
+            Target::Local {
+                model,
+                worker_id: _,
+                dp_rank: _,
+            } => format!("local/{model}"),
+            Target::Frontier { provider, model } => format!("{provider}/{model}"),
+        }
     }
 
     /// Stable key for ledger lookups.
@@ -136,6 +162,20 @@ pub struct RoutingContext<'a> {
     pub isl_tokens: usize,
     pub candidates: &'a [Candidate],
     pub ledger: &'a CacheLedger,
+    /// What this turn's principal is allowed to do, resolved once at admission
+    /// and immutable for the turn.
+    ///
+    /// Arrives as *data* rather than as a second `Arc<dyn RoutingPolicy>`: the
+    /// engine keeps exactly one policy object, and tenancy is a constraint on
+    /// what that policy may choose rather than a different way of choosing.
+    /// Every implementation consults it through
+    /// [`TurnPolicy::admits`](crate::control::TurnPolicy::admits) and none
+    /// re-derives it.
+    pub turn_policy: &'a TurnPolicy,
+    /// The session's frontier dispatches per routed turn, which is what
+    /// [`FrontierCadence`](crate::control::FrontierCadence) is evaluated
+    /// against. A projection of the log, borrowed from the session state.
+    pub frontier_history: &'a FrontierHistory,
 }
 
 impl RoutingContext<'_> {
@@ -164,6 +204,20 @@ pub struct DecisionRecord {
     pub expected_prefill_tokens: f64,
     pub expected_cost_usd: f64,
     pub considered: Vec<Candidate>,
+    /// Fingerprint of the [`TurnPolicy`] in force when this decision was made.
+    ///
+    /// The audit trail's answer to "under what constraints was this chosen?",
+    /// recorded on the decision itself so a policy change is visible on the
+    /// very next routing event with no side channel able to disagree with it.
+    ///
+    /// The empty string means a log written before per-principal policy
+    /// existed — the serde default, the same treatment
+    /// [`Usage::reasoning_tokens`](crate::event::Usage::reasoning_tokens)
+    /// gets, and for the same reason: history has to keep deserializing after
+    /// the type grows. It is not a policy that happens to fingerprint to
+    /// nothing; [`TurnPolicy::unrestricted`] has a real digest.
+    #[serde(default)]
+    pub turn_policy_digest: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -231,5 +285,70 @@ mod tests {
         };
         assert_eq!(a.ledger_key(), b.ledger_key());
         assert_ne!(a.ledger_key(), c.ledger_key());
+    }
+
+    #[test]
+    fn a_policy_identity_names_a_capability_and_a_ledger_key_names_a_cache() {
+        let worker_a = Target::Local {
+            worker_id: 1,
+            dp_rank: 0,
+            model: "llama".into(),
+        };
+        let worker_b = Target::Local {
+            worker_id: 2,
+            dp_rank: 3,
+            model: "llama".into(),
+        };
+        assert_eq!(worker_a.policy_identity(), "local/llama");
+        assert_eq!(
+            worker_a.policy_identity(),
+            worker_b.policy_identity(),
+            "which worker served the turn is not a policy question"
+        );
+        assert_ne!(
+            worker_a.ledger_key(),
+            worker_b.ledger_key(),
+            "the control: it is very much a cache question"
+        );
+        assert_eq!(
+            Target::Frontier {
+                provider: "anthropic".into(),
+                model: "claude-opus-4".into(),
+            }
+            .policy_identity(),
+            "anthropic/claude-opus-4"
+        );
+    }
+
+    #[test]
+    fn a_pre_m2_decision_record_reads_back_with_an_empty_policy_digest() {
+        // Byte-for-byte what a `Routed` decision serialized to before
+        // per-principal policy existed. Logs in this shape are still replayed
+        // after an upgrade, and a fold that refused to parse them would take
+        // the deployment's whole routing history with it.
+        let json = r#"{
+            "chosen": {"kind":"frontier","provider":"anthropic","model":"claude"},
+            "rationale": "test",
+            "policy": "affinity",
+            "isl_tokens": 4096,
+            "expected_prefill_tokens": 4096.0,
+            "expected_cost_usd": 0.02,
+            "considered": []
+        }"#;
+        let record: DecisionRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            record.turn_policy_digest, "",
+            "an absent digest is `pre-M2`, which is a fact and not a policy"
+        );
+
+        // And a record written today round-trips its digest, or replaying a
+        // log would report constraints that were never in force.
+        let digested = DecisionRecord {
+            turn_policy_digest: "0123456789abcdef".into(),
+            ..record
+        };
+        let round_tripped: DecisionRecord =
+            serde_json::from_str(&serde_json::to_string(&digested).unwrap()).unwrap();
+        assert_eq!(round_tripped, digested);
     }
 }

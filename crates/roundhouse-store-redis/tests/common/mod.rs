@@ -162,6 +162,7 @@ pub fn every_event_kind() -> Vec<SessionEventKind> {
                         load: None,
                     },
                 ],
+                turn_policy_digest: String::new(),
             },
         },
         SessionEventKind::OutputTextDelta {

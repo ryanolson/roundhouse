@@ -599,6 +599,7 @@ pub(super) mod tests {
                     expected_prefill_tokens: 0.0,
                     expected_cost_usd: 0.0,
                     considered,
+                    turn_policy_digest: String::new(),
                 },
             });
             self.push(SessionEventKind::ResponseCompleted { response_id, usage });

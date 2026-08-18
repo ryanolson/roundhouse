@@ -36,8 +36,11 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use roundhouse_core::context::ByteTokenizer;
+use roundhouse_core::control::FrontierHistory;
 use roundhouse_core::metrics::MetricsConfig;
-use roundhouse_core::routing::{AffinityPolicy, CacheModel, ProviderPricing};
+use roundhouse_core::routing::{
+    AffinityPolicy, CacheLedger, CacheModel, Candidate, ProviderPricing,
+};
 use roundhouse_core::store::{MemoryStore, SessionStore};
 use roundhouse_fleet::{
     EchoFrontierClient, FrontierModelSpec, StaticFrontierCatalog, WireProtocol,
@@ -72,6 +75,100 @@ const DEFAULT_ADDR: &str = "127.0.0.1:8080";
 
 /// Where sessions live, as a `redis://` URL. Absent means in-memory.
 const REDIS_VAR: &str = "ROUNDHOUSE_REDIS_URL";
+
+/// Prompt shape the startup cross-check quotes the catalog under.
+///
+/// Nominal, and it does not affect the answer: [`TurnPolicy::admits`] reads a
+/// candidate's target identity and its quality prior, and a quote's length
+/// moves neither. It is here so the check goes through the same quoting path
+/// the router does rather than assembling candidates by hand.
+const PROBE_ISL_TOKENS: u64 = 1_024;
+const PROBE_OSL_TOKENS: u64 = 256;
+
+/// Every target a turn of this process's could actually be routed to, priced
+/// the way the router prices them.
+///
+/// The catalog and nothing else, because [`serve`] wires no [`LocalFleet`]:
+/// this binary quotes no local candidate, so `local/<model>` names nothing it
+/// could send a turn to and a policy that named only local really would refuse
+/// every turn. A deployment that attaches a fleet adds its local model to this
+/// list at the same site it attaches the fleet — the two facts have to move
+/// together, or the check starts refusing configurations that would in fact
+/// serve.
+///
+/// [`LocalFleet`]: roundhouse_fleet::LocalFleet
+fn reachable_candidates(catalog: &StaticFrontierCatalog) -> Vec<Candidate> {
+    let mut ledger = CacheLedger::new();
+    catalog.apply_to_ledger(&mut ledger);
+    catalog.quote(
+        &ledger,
+        roundhouse_core::now_ms(),
+        PROBE_ISL_TOKENS,
+        PROBE_OSL_TOKENS,
+    )
+}
+
+/// Refuse to serve a key whose policy admits nothing this process can route to.
+///
+/// The catalog and the control plane are separate files, so neither loader can
+/// see the other: a `TargetFilter` cannot tell at parse time that its patterns
+/// name no model, and a quality floor cannot tell that it sits above every
+/// model in the catalog. Here both are loaded, which makes this the one place
+/// the question can be asked.
+///
+/// Asking it is the same load-or-die posture both loaders already take. A
+/// policy that admits nothing does not degrade — every turn it serves ends in
+/// `no_viable_candidate` — so starting anyway would turn one mistyped pattern
+/// into a tenant whose every request fails, discovered by the tenant.
+///
+/// Per key rather than per project, and that is not a shortcut: a key's
+/// effective policy is its project's narrowed by its own overrides, so a
+/// project whose filter is fine can still hold a key whose override intersects
+/// it down to nothing — and a turn arrives on a key.
+fn refuse_policies_that_admit_nothing(
+    plane: &ControlPlane,
+    reachable: &[Candidate],
+) -> anyhow::Result<()> {
+    let ControlPlane::Configured { turn_keys, .. } = plane else {
+        // Open mode resolves every request to the unrestricted policy, which
+        // admits whatever was quoted. There is nothing to disagree with.
+        return Ok(());
+    };
+    // The window a fresh session starts with, so a cadence is never what makes
+    // a policy look empty here: a rationed frontier model is one this key
+    // reaches on some turns, and refusing to boot over it would be refusing
+    // the knob working.
+    let unspent = FrontierHistory::default();
+    // Collected and sorted rather than reported on the first hit: `turn_keys`
+    // is a hash map, so a deployment with two bad entries would otherwise be
+    // told about a different one on each restart.
+    let mut refused: Vec<String> = turn_keys
+        .values()
+        .filter(|(_principal, policy)| {
+            !reachable
+                .iter()
+                .any(|candidate| policy.admits(candidate, &unspent))
+        })
+        .map(|(principal, policy)| {
+            format!(
+                "project `{}`, user `{}` (policy {})",
+                principal.project,
+                principal.user,
+                policy.digest()
+            )
+        })
+        .collect();
+    refused.sort();
+    if !refused.is_empty() {
+        anyhow::bail!(
+            "these control-plane keys admit none of the {} model(s) this deployment can route to, \
+             so every one of their turns would fail: {}",
+            reachable.len(),
+            refused.join("; ")
+        );
+    }
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -119,6 +216,11 @@ async fn main() -> anyhow::Result<()> {
              default/default membership, with no key and no session namespace"
         ),
     }
+
+    // Both files are loaded now, and only now can they be compared. See the
+    // function: neither loader can see the other, so a policy naming no model
+    // this deployment has is a mistake nothing before this point could catch.
+    refuse_policies_that_admit_nothing(&plane, &reachable_candidates(&catalog))?;
 
     let addr: SocketAddr = std::env::var(ADDR_VAR)
         .unwrap_or_else(|_| DEFAULT_ADDR.to_string())
@@ -196,4 +298,99 @@ async fn serve<S: SessionStore>(
         .merge(responses_api::responses_router(plane, engine, store));
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use roundhouse_server::ControlPlaneConfig;
+
+    fn plane_with_policy(policy: serde_json::Value) -> ControlPlane {
+        // Through the config file rather than by building the lookup table, so
+        // the fixture exercises the same narrowing and validation a deployment
+        // does. The hash is a plausible-looking constant: this check never
+        // authenticates anything, it only reads the policies.
+        let json = serde_json::json!({
+            "projects": [{ "id": "acme", "policy": policy }],
+            "users": [{ "id": "ada" }],
+            "keys": [{ "project": "acme", "user": "ada", "key_sha256": "a".repeat(64) }],
+        })
+        .to_string();
+        ControlPlane::configured(
+            ControlPlaneConfig::from_json(&json, "startup cross-check fixture")
+                .expect("the fixture config must validate"),
+        )
+    }
+
+    #[test]
+    fn a_policy_that_names_no_model_in_the_catalog_refuses_to_serve() {
+        let reachable = reachable_candidates(&echo_catalog());
+        assert_eq!(
+            reachable.len(),
+            1,
+            "the echo stub is the one thing this binary can route to"
+        );
+
+        // Probe: a filter that is well-formed, parses, and names nothing.
+        let error = refuse_policies_that_admit_nothing(
+            &plane_with_policy(serde_json::json!({ "allow": ["anthropic/*"] })),
+            &reachable,
+        )
+        .expect_err("a filter matching no catalog entry must stop the process");
+        let message = error.to_string();
+        assert!(
+            message.contains("project `acme`, user `ada`"),
+            "the refusal has to name the entry an operator would go and fix: {message}"
+        );
+
+        // Probe: the same failure through the other axis. A floor above every
+        // quality prior in the catalog leaves nothing admissible just as surely.
+        assert!(
+            refuse_policies_that_admit_nothing(
+                &plane_with_policy(serde_json::json!({ "min_quality": 0.9 })),
+                &reachable,
+            )
+            .is_err(),
+            "the echo stub's prior is 0.5, so a 0.9 floor admits nothing"
+        );
+
+        // Control: a filter that does name it, and one that names everything.
+        for policy in [
+            serde_json::json!({ "allow": ["echo/echo"] }),
+            serde_json::json!({ "allow": ["*"] }),
+            serde_json::json!({ "min_quality": 0.5 }),
+            serde_json::json!({}),
+        ] {
+            refuse_policies_that_admit_nothing(&plane_with_policy(policy.clone()), &reachable)
+                .unwrap_or_else(|error| panic!("{policy} admits the catalog: {error}"));
+        }
+    }
+
+    #[test]
+    fn a_cadence_is_never_what_makes_a_policy_look_empty_at_startup() {
+        // A rationed frontier model is one this key reaches on some turns, so
+        // booting must not refuse over it — the check asks about an unspent
+        // window for exactly this reason.
+        refuse_policies_that_admit_nothing(
+            &plane_with_policy(
+                serde_json::json!({ "frontier_cadence": { "max_frontier": 1, "per_turns": 10 } }),
+            ),
+            &reachable_candidates(&echo_catalog()),
+        )
+        .expect("a cadence rations a target, it does not remove it");
+    }
+
+    #[test]
+    fn an_open_deployment_has_no_policies_to_cross_check() {
+        refuse_policies_that_admit_nothing(
+            &ControlPlane::Open,
+            &reachable_candidates(&echo_catalog()),
+        )
+        .expect("open mode resolves to the unrestricted policy");
+        // And the empty catalog is the deployment's problem, not this check's:
+        // with nothing quoted there is nothing to disagree about, and the
+        // routing layer's own `NoCandidates` is the accurate answer.
+        refuse_policies_that_admit_nothing(&ControlPlane::Open, &[])
+            .expect("no catalog is not a policy mistake");
+    }
 }

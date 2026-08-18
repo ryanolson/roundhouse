@@ -317,8 +317,12 @@ pub(super) fn completed_frame(response_id: &ResponseId, usage: &Usage) -> Event 
 
 /// `response.incomplete`, which ends the stream.
 ///
-/// The reason is the log's own, not a translation: a client surfaces it verbatim
-/// to whoever is watching, and the log's vocabulary is the accurate one.
+/// The reason is the log's own: a client surfaces it verbatim to whoever is
+/// watching, and the log's vocabulary is the accurate one. The single reason
+/// that never reaches this function is
+/// [`IncompleteReason::PolicyRefused`] — a refusal is not a truncated answer,
+/// and its caller renders it as `response.failed` instead. That is the only
+/// translation on this surface, and it is spelled out at the call site.
 pub(super) fn incomplete_frame(response_id: &ResponseId, reason: &IncompleteReason) -> Event {
     frame(
         "response.incomplete",

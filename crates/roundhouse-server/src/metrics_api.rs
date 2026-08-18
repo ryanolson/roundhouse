@@ -222,6 +222,7 @@ mod tests {
                         expected_prefill_tokens: 10_000.0,
                         expected_cost_usd: 0.03,
                         considered: vec![],
+                        turn_policy_digest: String::new(),
                     },
                 },
             },

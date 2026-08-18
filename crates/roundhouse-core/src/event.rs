@@ -130,6 +130,20 @@ pub enum IncompleteReason {
     MaxOutputTokens,
     ClientCancelled,
     UpstreamError,
+    /// No target the turn's principal may use was admissible.
+    ///
+    /// Distinct from [`Self::UpstreamError`] because no upstream was contacted:
+    /// nothing was dispatched, there is no partial to resume from, and the
+    /// cache ledger learns nothing about any target. Calling it an upstream
+    /// error would blame a provider for a decision this deployment made, and
+    /// an operator reading the log would go looking at the wrong system.
+    ///
+    /// It is also the one terminal reason a retry cannot fix on its own: the
+    /// same turn under the same policy refuses again, and only an operator
+    /// widening the policy changes the answer. Surfaces that speak a dialect
+    /// with a separate "could not be served" terminal render it as that rather
+    /// than as a truncated answer — see `responses_api`.
+    PolicyRefused,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

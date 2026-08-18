@@ -107,6 +107,7 @@ fn one_frontier_call(usage: Usage) -> Vec<SessionEvent> {
                     expected_prefill_tokens: 1_000_000.0,
                     expected_cost_usd: 0.0,
                     considered: Vec::new(),
+                    turn_policy_digest: String::new(),
                 },
             },
         },
