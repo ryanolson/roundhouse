@@ -415,6 +415,66 @@ reads `decision.considered`, `fold.rs:264-274`). `payer`
 `BudgetCounts::AllFrontierSpend` (default) vs `ProjectPaidOnly` decides
 whether user-paid spend draws down the project budget.
 
+### Pass-through mode (a ruling for enterprise device login, verified against the pinned Codex source)
+
+The BYOK refusal above forbids *storing and re-presenting* OAuth tokens. It
+does not forbid **forwarding a credential inside the request the client
+itself made** — and for enterprises whose Codex access is ChatGPT device
+login, that pass-through is the transparent answer: `CredentialMode` gains a
+`PassThrough` arm under which roundhouse forwards a frontier turn verbatim —
+`Authorization` header included, held in-flight only, never persisted,
+redacted from every log and event — to the upstream endpoint, while locally
+routed turns never touch the credential at all, because roundhouse terminates
+the API rather than tunneling it. The seat pays for frontier turns; local
+turns are free; policy, budgets (as accounted seat-consumption), attribution,
+and steering all still work, because every request and every usage frame
+still passes through the one write path.
+
+Facts verified at the pinned rev `6344a65` that make this buildable as
+configuration, not protocol work:
+
+- Codex attaches its ChatGPT login bearer (and `ChatGPT-Account-ID`) to a
+  **custom** `model_providers.*` base_url unconditionally — the auth
+  resolution wraps whatever `CodexAuth` is active unless the provider
+  declares its own `env_key` (`model-provider/src/auth.rs:186-203`). Leave
+  `requires_openai_auth` unset: that keeps the plain bearer path and avoids
+  the Agent-Identity bootstrap, which would call `auth.openai.com` directly.
+- The wire shape is the **same Responses API** roundhouse already speaks —
+  only the base URL and headers differ by auth mode. The upstream target for
+  ChatGPT-authed traffic is `https://chatgpt.com/backend-api/codex` (whether
+  its SSE framing is byte-identical to the platform API is the one empirical
+  check left; this repo only proves the client sends the same request).
+- `[model_providers.*]` supports `http_headers` / `env_http_headers`, merged
+  before auth and untouched by it — so `X-Roundhouse-Key` (the ordinary
+  `rh_turn_` key) rides beside the pass-through `Authorization`, and M1's
+  principal resolution works unchanged from a second header. Do **not** name
+  the provider literally `"OpenAI"`: `is_openai()` matches the name and would
+  turn on the routing-hint header and remote compaction against us.
+- Codex already sends `session-id`, `thread-id`, and `x-codex-turn-metadata`
+  headers on every model request, and `session_id` doubles as
+  `prompt_cache_key` — per-session isolation and tracking on the wire side
+  need nothing new.
+- The one real gap: MCP handshake headers are static/env-sourced, so an MCP
+  connection cannot carry the codex session id natively. Correlating the MCP
+  channel to a conversation uses the init-tool trick: `init_session` returns
+  a minted id in its tool *output*, the client appends that output to its
+  conversation, and the next turn's resent history carries it into the log —
+  the session whose log holds the id is the session that made the call.
+
+The enterprise client config this implies, in full:
+
+```toml
+model_provider = "roundhouse"
+
+[model_providers.roundhouse]
+name = "Roundhouse"
+base_url = "https://roundhouse.internal.example.com/v1"
+wire_api = "responses"
+
+[model_providers.roundhouse.env_http_headers]
+"X-Roundhouse-Key" = "ROUNDHOUSE_API_KEY"
+```
+
 ---
 
 ## 4. Per-key policy, and how it reaches the router
