@@ -7,16 +7,21 @@
 //! touches this file, not one file per test binary. Each binary compiles its
 //! own copy via `mod common;`, and none uses every item, so the module opts out
 //! of dead-code analysis rather than sprinkling `allow`s per item.
+//!
+//! Split in two once a third suite needed the client side. **This file holds
+//! what stands behind the server** — catalog, fleet, frontier client, engine
+//! config — and [`codex`] holds what stands in front of it: the transport,
+//! auth, request and collector doubles that make a test *be* a Codex client.
+//! The two halves have no reason to change together, and the `use` line at the
+//! top of a suite now says which side of the wire it is exercising.
 #![allow(dead_code)]
+
+pub mod codex;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use axum::http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
-
-use codex_api::AuthProvider;
-use codex_protocol::models::{FunctionCallOutputPayload, ResponseItem};
 
 use roundhouse_core::routing::{CacheModel, ProviderPricing};
 use roundhouse_fleet::{
@@ -168,68 +173,5 @@ impl FrontierClient for ScriptedFrontierClient {
             reply.len() as u64,
             0,
         ))
-    }
-}
-
-/// A [`codex_api::AuthProvider`] that always sends the same bearer token.
-///
-/// Unused before M1, which is the first milestone that drives a real
-/// `codex_api::ResponsesClient` against an endpoint that checks auth at all —
-/// M0's oracle tests authenticate with `NoAuth` because the wire-shape facts
-/// they pin do not depend on it. Built here rather than in M1 so the harness
-/// convention (auth doubles live in `common`, next to the transport doubles)
-/// is set once.
-pub struct StaticToken {
-    token: String,
-}
-
-impl StaticToken {
-    pub fn new(token: impl Into<String>) -> Self {
-        Self {
-            token: token.into(),
-        }
-    }
-}
-
-impl AuthProvider for StaticToken {
-    fn add_auth_headers(&self, headers: &mut HeaderMap) {
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", self.token))
-                .expect("a token supplied by test code is a valid header value"),
-        );
-    }
-}
-
-/// A `function_call` item built from Codex's own type, never hand-written
-/// JSON — the same rationale as `codex_conformance.rs`'s `request()`: a field
-/// this struct adds or renames arrives here without anyone having transcribed
-/// it, which is the whole point of an oracle test.
-pub fn function_call_item(
-    name: &str,
-    namespace: Option<&str>,
-    call_id: &str,
-    arguments: &str,
-) -> ResponseItem {
-    ResponseItem::FunctionCall {
-        id: None,
-        name: name.to_string(),
-        namespace: namespace.map(str::to_string),
-        arguments: arguments.to_string(),
-        encrypted_function_args: None,
-        call_id: call_id.to_string(),
-        internal_chat_message_metadata_passthrough: None,
-    }
-}
-
-/// A `function_call_output` item carrying a plain-string result — the form
-/// `FunctionCallOutputPayload::from_text` produces, as opposed to the
-/// structured `content_items` array the same field can also hold.
-pub fn function_call_output_item(call_id: &str, output_text: &str) -> ResponseItem {
-    ResponseItem::FunctionCallOutput {
-        id: None,
-        call_id: call_id.to_string(),
-        output: FunctionCallOutputPayload::from_text(output_text.to_string()),
-        internal_chat_message_metadata_passthrough: None,
     }
 }

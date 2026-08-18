@@ -12,6 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::control::Principal;
 use crate::ids::{ResponseId, SessionId, TurnId};
 use crate::item::Item;
 use crate::routing::DecisionRecord;
@@ -134,8 +135,31 @@ pub enum IncompleteReason {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionEventKind {
+    /// The first fact in a session's log: which policy serves it and who pays.
+    ///
+    /// Emitted once, when the log is empty, by the one caller that already
+    /// holds the lease — so it is race-free and idempotent by construction, a
+    /// log being empty exactly once. Everything downstream that needs to know
+    /// whose turn this was reads it from here rather than from a side table: a
+    /// replay starts at seq 0, so every fold sees this before the first event
+    /// that costs money.
     SessionCreated {
         model_policy: String,
+        /// The membership this session was opened for.
+        ///
+        /// `None` in exactly one case, and it is not "unknown": a log written
+        /// before the control plane existed, when there was nobody to record.
+        /// Everything that writes this field writes a principal, so the absent
+        /// case can only ever mean "older than tenancy" — which is why the
+        /// fold gives it a marked row of its own instead of guessing a project
+        /// (see [`PrincipalKey`](crate::control::PrincipalKey)).
+        ///
+        /// Carries a serde default for the same reason
+        /// [`Usage::reasoning_tokens`] does: history has to keep deserializing
+        /// after the type grows, or an upgrade silently costs a deployment its
+        /// past.
+        #[serde(default)]
+        principal: Option<Principal>,
     },
     /// A turn was admitted. Carries the client's idempotency key.
     TurnStarted {
@@ -264,5 +288,41 @@ mod tests {
         };
         assert!(!delta.is_terminal());
         assert_eq!(delta.response_id(), Some(&ResponseId::new("r")));
+    }
+
+    #[test]
+    fn a_log_written_before_the_control_plane_deserializes_with_no_principal() {
+        // Byte-for-byte what `SessionCreated` serialized to before tenancy
+        // existed. Such logs are still being replayed after an upgrade, and a
+        // fold that refused to parse them would take the deployment's whole
+        // history with it.
+        let json = r#"{"type":"session_created","model_policy":"affinity"}"#;
+        let kind: SessionEventKind = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            kind,
+            SessionEventKind::SessionCreated {
+                model_policy: "affinity".into(),
+                principal: None,
+            },
+            "an absent principal is `None`, which the fold marks rather than guesses at"
+        );
+    }
+
+    #[test]
+    fn session_created_round_trips_its_principal() {
+        let kind = SessionEventKind::SessionCreated {
+            model_policy: "affinity".into(),
+            principal: Some(Principal::new("acme", "ada")),
+        };
+        let json = serde_json::to_string(&kind).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"session_created","model_policy":"affinity","principal":{"project":"acme","user":"ada"}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<SessionEventKind>(&json).unwrap(),
+            kind,
+            "attribution has to survive the round trip, or a replay reattributes the spend"
+        );
     }
 }

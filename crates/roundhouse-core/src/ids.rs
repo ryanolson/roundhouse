@@ -58,6 +58,11 @@ macro_rules! string_id {
     };
 }
 
+// Shared with `control`, which mints the same shape of newtype for the tenancy
+// ids. Exported rather than copied so "an id is a transparent string newtype
+// with a prefixed generator" stays one definition.
+pub(crate) use string_id;
+
 string_id!(SessionId, "sess", "Identifies one long-lived conversation.");
 string_id!(
     ResponseId,

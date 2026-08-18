@@ -14,6 +14,7 @@
 //! account.
 
 pub mod context;
+pub mod control;
 pub mod event;
 pub mod ids;
 pub mod item;
@@ -22,6 +23,7 @@ pub mod routing;
 pub mod session;
 pub mod store;
 
+pub use control::{KeyId, KeyScope, Principal, PrincipalKey, ProjectId, UserId};
 pub use event::{Accounting, SessionEvent, SessionEventKind, SessionObserver, Usage};
 pub use ids::{ResponseId, SessionId, TurnId};
 pub use item::{Item, ItemContent, Role};

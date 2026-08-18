@@ -43,7 +43,8 @@ use roundhouse_fleet::{
     EchoFrontierClient, FrontierModelSpec, StaticFrontierCatalog, WireProtocol,
 };
 use roundhouse_server::{
-    EchoLocalExecutor, Engine, EngineConfig, catalog_config, http, metrics_api, responses_api,
+    ControlPlane, EchoLocalExecutor, Engine, EngineConfig, catalog_config, control_config, http,
+    metrics_api, responses_api,
 };
 use roundhouse_store_redis::RedisSessionStore;
 use tracing_subscriber::EnvFilter;
@@ -100,6 +101,25 @@ async fn main() -> anyhow::Result<()> {
     };
     let metrics_config = Arc::new(metrics_config);
 
+    // Same posture as the catalog, and for a sharper reason: a control plane
+    // that was named but cannot be read stops the process, because starting
+    // anyway would serve every request as if no key were required — the exact
+    // failure the variable is set to prevent — and would do it silently, with
+    // every tenant's turns landing in one unnamespaced session space.
+    let plane = Arc::new(ControlPlane::from_env()?);
+    match &*plane {
+        ControlPlane::Configured { turn_keys, .. } => tracing::info!(
+            memberships = turn_keys.len(),
+            var = control_config::CONTROL_PLANE_VAR,
+            "control plane loaded; a key is required on every surface"
+        ),
+        ControlPlane::Open => tracing::warn!(
+            var = control_config::CONTROL_PLANE_VAR,
+            "no control plane configured; every request is served as the built-in \
+             default/default membership, with no key and no session namespace"
+        ),
+    }
+
     let addr: SocketAddr = std::env::var(ADDR_VAR)
         .unwrap_or_else(|_| DEFAULT_ADDR.to_string())
         .parse()?;
@@ -123,7 +143,7 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .with_context(|| format!("connecting to the Redis named by {REDIS_VAR}"))?;
             tracing::info!(var = REDIS_VAR, "sessions are durable in Redis");
-            serve(Arc::new(store), catalog, metrics_config, listener).await
+            serve(Arc::new(store), plane, catalog, metrics_config, listener).await
         }
         Err(_) => {
             tracing::warn!(
@@ -132,6 +152,7 @@ async fn main() -> anyhow::Result<()> {
             );
             serve(
                 Arc::new(MemoryStore::new()),
+                plane,
                 catalog,
                 metrics_config,
                 listener,
@@ -144,6 +165,7 @@ async fn main() -> anyhow::Result<()> {
 /// Compose the engine and the three surfaces over whichever store was chosen.
 async fn serve<S: SessionStore>(
     store: Arc<S>,
+    plane: Arc<ControlPlane>,
     catalog: StaticFrontierCatalog,
     metrics_config: Arc<MetricsConfig>,
     listener: tokio::net::TcpListener,
@@ -162,12 +184,16 @@ async fn serve<S: SessionStore>(
     // exposes sessions and the log itself; the Responses API, which lets an
     // agent written against OpenAI drive the same sessions unmodified; and the
     // metrics surface, which reports on both by folding the same log.
-    let app = http::router(Arc::clone(&engine), Arc::clone(&store))
-        .merge(metrics_api::metrics_router(
+    // One control plane behind all three, not one each: a key that pays for a
+    // turn on one surface and is unknown to another would be a deployment with
+    // two answers to the same question.
+    let app = http::router_under(Arc::clone(&plane), Arc::clone(&engine), Arc::clone(&store))
+        .merge(metrics_api::metrics_router_under(
+            Arc::clone(&plane),
             engine.metrics(),
             metrics_config,
         ))
-        .merge(responses_api::responses_router(engine, store));
+        .merge(responses_api::responses_router_under(plane, engine, store));
     axum::serve(listener, app).await?;
     Ok(())
 }

@@ -18,6 +18,7 @@
 use std::sync::Arc;
 
 use roundhouse_core::context::ByteTokenizer;
+use roundhouse_core::control::Principal;
 use roundhouse_core::ids::{SessionId, TurnId};
 use roundhouse_core::item::{Item, Role};
 use roundhouse_core::routing::{AffinityPolicy, CacheLedger};
@@ -68,6 +69,7 @@ async fn a_session_survives_the_process_that_created_it() {
                     &session_id,
                     TurnId::new(format!("turn-{turn}")),
                     vec![Item::user_text(format!("Step {turn}"))],
+                    &Principal::default_open(),
                 )
                 .await
                 .unwrap();
@@ -85,6 +87,7 @@ async fn a_session_survives_the_process_that_created_it() {
             &session_id,
             TurnId::new("turn-3"),
             vec![Item::user_text("Step 3")],
+            &Principal::default_open(),
         )
         .await
         .unwrap();
@@ -98,6 +101,7 @@ async fn a_session_survives_the_process_that_created_it() {
             &session_id,
             TurnId::new("turn-1"),
             vec![Item::user_text("Step 1")],
+            &Principal::default_open(),
         )
         .await
         .unwrap();

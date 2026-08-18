@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::control::Principal;
 use crate::event::{IncompleteReason, SessionEvent, SessionEventKind, SessionObserver, Usage};
 use crate::ids::{ResponseId, SessionId, TurnId};
 use crate::item::Item;
@@ -401,9 +402,24 @@ impl<S: SessionStore> Session<S> {
     }
 
     /// Record the session-created event. Safe to call once, at creation.
-    pub async fn record_created(&mut self, model_policy: &str) -> Result<(), SessionError> {
+    ///
+    /// Called where the log is still empty and this handle already holds the
+    /// lease, which is what makes "exactly once" a property of the log rather
+    /// than of anyone's care: a second caller would have to win the lease and
+    /// find `last_seq == 0`, and only one of those can be true at a time.
+    ///
+    /// The principal is taken by reference and not as an `Option`, so a
+    /// `SessionCreated` this method writes always names its payer. That is what
+    /// makes the absent case in the event unambiguous — it can only mean a log
+    /// older than tenancy, never "this deployment forgot".
+    pub async fn record_created(
+        &mut self,
+        model_policy: &str,
+        principal: &Principal,
+    ) -> Result<(), SessionError> {
         self.commit(vec![SessionEventKind::SessionCreated {
             model_policy: model_policy.to_string(),
+            principal: Some(principal.clone()),
         }])
         .await?;
         Ok(())
@@ -557,6 +573,7 @@ impl<S: SessionStore> Session<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::Principal;
     use crate::routing::{Candidate, Target};
     use crate::store::MemoryStore;
 
@@ -581,6 +598,29 @@ mod tests {
             expected_cost_usd: 0.0,
             considered: Vec::<Candidate>::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn record_created_commits_session_created_with_the_principal() {
+        let store = Arc::new(MemoryStore::new());
+        let (_, mut session) = new_session(store, "node-a").await;
+        let principal = Principal::new("acme", "ada");
+
+        session.record_created("affinity", &principal).await.unwrap();
+
+        let events = session.events_since(0, 10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].seq, 1,
+            "identity is the first fact in the log, so a replay learns it before any spend"
+        );
+        assert_eq!(
+            events[0].kind,
+            SessionEventKind::SessionCreated {
+                model_policy: "affinity".into(),
+                principal: Some(principal),
+            }
+        );
     }
 
     #[tokio::test]

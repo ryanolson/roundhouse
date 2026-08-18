@@ -11,6 +11,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::StreamExt;
 use roundhouse_core::context::{ContextAssembler, Tokenizer};
+use roundhouse_core::control::Principal;
 use roundhouse_core::event::{Accounting, IncompleteReason, SessionObserver, Usage};
 use roundhouse_core::ids::{ResponseId, SessionId, TurnId};
 use roundhouse_core::item::Item;
@@ -320,12 +321,20 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         ledger
     }
 
-    /// Run one turn to completion.
+    /// Run one turn to completion, charged to `principal`.
+    ///
+    /// The principal is a plain parameter rather than an `Option`: an
+    /// unconfigured deployment resolves every request to
+    /// [`Principal::default_open`], so "a turn nobody is paying for" is a state
+    /// no caller can construct. It reaches the log through the session-created
+    /// event below and nowhere else — the engine spends it, it does not store
+    /// it.
     pub async fn run_turn(
         &self,
         session_id: &SessionId,
         turn_id: TurnId,
         input: Vec<Item>,
+        principal: &Principal,
     ) -> Result<TurnResult, EngineError> {
         // See `turn_gates`: within this node, one turn at a time per session.
         let gate = self.turn_gate(session_id);
@@ -344,6 +353,24 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             Some(Arc::clone(&self.metrics) as Arc<dyn SessionObserver>),
         )
         .await?;
+
+        // Identity, written once, into an empty log. This is the only place in
+        // the system that can do it race-free and needs no flag to stay
+        // idempotent: the lease is already held, and a log is empty exactly
+        // once, so a second caller would have to win the lease *and* still find
+        // seq 0. Writing it at `create_session` instead would have to guess at
+        // a payer before any credential had been resolved, and writing it from
+        // the transport would need a lease the transport deliberately never
+        // takes.
+        //
+        // Because it lands at seq 1 and every replay starts at seq 0, a fold
+        // learns whose a session is before any event that can spend money —
+        // which is what lets `by_principal` exist without a side table.
+        if session.last_seq() == 0 {
+            session
+                .record_created(self.policy.name(), principal)
+                .await?;
+        }
 
         let admission = session.begin_turn(turn_id.clone(), input).await?;
         let response_id = admission.response_id().clone();

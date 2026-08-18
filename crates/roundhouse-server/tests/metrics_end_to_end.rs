@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use roundhouse_core::context::ByteTokenizer;
+use roundhouse_core::control::Principal;
 use roundhouse_core::ids::{SessionId, TurnId};
 use roundhouse_core::item::Item;
 use roundhouse_core::metrics::{
@@ -60,6 +61,7 @@ async fn run_turns(engine: &Engine<MemoryStore, ByteTokenizer>, session: &Sessio
                 session,
                 TurnId::new(format!("turn-{turn}")),
                 vec![Item::user_text(format!("question {turn}"))],
+                &Principal::default_open(),
             )
             .await
             .expect("the turn completed");
@@ -119,12 +121,20 @@ async fn a_retried_turn_is_not_counted_twice() {
     let turn = TurnId::new("the-same-turn");
     let input = vec![Item::user_text("only asked once")];
     engine
-        .run_turn(&session, turn.clone(), input.clone())
+        .run_turn(
+            &session,
+            turn.clone(),
+            input.clone(),
+            &Principal::default_open(),
+        )
         .await
         .unwrap();
     let after_first = snapshot(&engine);
 
-    let replay = engine.run_turn(&session, turn, input).await.unwrap();
+    let replay = engine
+        .run_turn(&session, turn, input, &Principal::default_open())
+        .await
+        .unwrap();
     assert!(replay.deduplicated, "the retry was served from the log");
 
     let after_retry = snapshot(&engine);
@@ -217,6 +227,7 @@ async fn a_restarted_node_recovers_a_sessions_history_exactly_once() {
             &session,
             TurnId::new("turn-after-restart"),
             vec![Item::user_text("carry on")],
+            &Principal::default_open(),
         )
         .await
         .unwrap();

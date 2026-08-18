@@ -20,12 +20,15 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::State;
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 
-use roundhouse_core::metrics::{MetricsConfig, MetricsRecorder};
+use roundhouse_core::control::{KeyScope, PrincipalKey};
+use roundhouse_core::metrics::{MetricsConfig, MetricsRecorder, MetricsSnapshot};
 use roundhouse_core::now_ms;
+
+use crate::control_config::{AuthError, ControlPlane};
 
 /// The dashboard, inlined at build time.
 ///
@@ -38,6 +41,8 @@ const DASHBOARD_HTML: &str = include_str!("dashboard.html");
 struct MetricsState {
     recorder: Arc<MetricsRecorder>,
     config: Arc<MetricsConfig>,
+    /// Who may read this document, and how much of it.
+    plane: Arc<ControlPlane>,
 }
 
 /// Mount the metrics endpoints.
@@ -47,10 +52,26 @@ struct MetricsState {
 /// concern: repricing history under a corrected rate card must not require
 /// touching the thing that serves traffic.
 pub fn metrics_router(recorder: Arc<MetricsRecorder>, config: Arc<MetricsConfig>) -> Router {
+    metrics_router_under(Arc::new(ControlPlane::Open), recorder, config)
+}
+
+/// The same endpoints, gated by a control plane.
+///
+/// See [`http::router_under`](crate::http::router_under) for why this is a
+/// second constructor rather than an `Option` on the first.
+pub fn metrics_router_under(
+    plane: Arc<ControlPlane>,
+    recorder: Arc<MetricsRecorder>,
+    config: Arc<MetricsConfig>,
+) -> Router {
     Router::new()
         .route("/v1/metrics", get(snapshot))
         .route("/v1/metrics/dashboard", get(dashboard))
-        .with_state(MetricsState { recorder, config })
+        .with_state(MetricsState {
+            recorder,
+            config,
+            plane,
+        })
 }
 
 /// `GET /v1/metrics`
@@ -60,9 +81,9 @@ pub fn metrics_router(recorder: Arc<MetricsRecorder>, config: Arc<MetricsConfig>
 /// and a dashboard that had to stitch several requests together could render a
 /// state that never existed — provider totals from one instant beside a savings
 /// figure from another.
-async fn snapshot(State(state): State<MetricsState>) -> Response {
-    let snapshot = state.recorder.snapshot(&state.config, now_ms());
-    match serde_json::to_vec(&snapshot) {
+async fn snapshot(State(state): State<MetricsState>, headers: HeaderMap) -> Result<Response, AuthError> {
+    let snapshot = scoped_snapshot(&state, &headers)?;
+    Ok(match serde_json::to_vec(&snapshot) {
         Ok(body) => (
             StatusCode::OK,
             [
@@ -86,10 +107,56 @@ async fn snapshot(State(state): State<MetricsState>) -> Response {
             .to_string(),
         )
             .into_response(),
+    })
+}
+
+/// The document this caller is entitled to.
+///
+/// Three answers, and the difference between them is the whole of decision 6.
+/// An unconfigured deployment has one tenant and no keys, so it reports
+/// everything to anyone — unchanged. A configured one answers an admin key
+/// with the deployment-wide document and a turn key with its own membership's
+/// rows and nothing else. There is no fourth case: a request with no key at
+/// all is refused before this is reached, because "how much did the fleet
+/// spend" is not a public question once there is more than one tenant to
+/// answer it about.
+///
+/// A turn key gets a *scoped* document rather than a filtered copy of the
+/// deployment's — see `MetricsSnapshot::build_for`, which scopes the session
+/// count, the turn count and the event window too. Filtering only the money
+/// would leave three fields quietly describing the neighbours.
+fn scoped_snapshot(
+    state: &MetricsState,
+    headers: &HeaderMap,
+) -> Result<MetricsSnapshot, AuthError> {
+    let at_ms = now_ms();
+    match &*state.plane {
+        ControlPlane::Open => Ok(state.recorder.snapshot(&state.config, at_ms)),
+        ControlPlane::Configured { .. } => {
+            let header = match headers.get(header::AUTHORIZATION) {
+                None => None,
+                Some(value) => Some(value.to_str().map_err(|_| AuthError::MalformedKey)?),
+            };
+            match state.plane.resolve(header)? {
+                KeyScope::Admin => Ok(state.recorder.snapshot(&state.config, at_ms)),
+                KeyScope::Turn(principal) => Ok(state.recorder.snapshot_for(
+                    &PrincipalKey::from(&principal),
+                    &state.config,
+                    at_ms,
+                )),
+            }
+        }
     }
 }
 
 /// `GET /v1/metrics/dashboard`
+///
+/// Deliberately ungated, in both modes. The page carries no numbers — it is a
+/// static asset that fetches [`snapshot`] from the browser — so gating it would
+/// buy nothing and cost the only way a human reaches this surface: a browser
+/// cannot be told to send a bearer header on a navigation. The data it renders
+/// is gated where the data is, one request later, and an unkeyed browser gets
+/// an empty dashboard rather than somebody else's.
 async fn dashboard() -> Response {
     (
         StatusCode::OK,

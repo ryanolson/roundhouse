@@ -41,6 +41,7 @@ use dynamo_mocker::common::protocols::{
 use dynamo_mocker::live::{LiveEngine, LiveEngineConfig};
 use dynamo_mocker::services::zmq_events::ZmqKvEventSink;
 use roundhouse_core::context::ContextAssembler;
+use roundhouse_core::control::Principal;
 use roundhouse_core::event::SessionEventKind;
 use roundhouse_core::ids::{SessionId, TurnId};
 use roundhouse_core::item::Item;
@@ -387,6 +388,7 @@ async fn a_warmed_worker_prices_a_repeat_turn_far_below_its_prompt_length() {
             &session_id,
             TurnId::new("t0"),
             vec![Item::user_text(long_opening_message())],
+            &Principal::default_open(),
         )
         .await
         .expect("the first turn must run");
@@ -433,6 +435,7 @@ async fn a_warmed_worker_prices_a_repeat_turn_far_below_its_prompt_length() {
             vec![Item::user_text(
                 "Given all of that, which region should we look at first?",
             )],
+            &Principal::default_open(),
         )
         .await
         .expect("the second turn must run");

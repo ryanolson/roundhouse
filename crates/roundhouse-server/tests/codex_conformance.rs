@@ -17,24 +17,19 @@
 //! a real chunked body, the client's real HTTP stack — are covered too.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use axum::Router;
-use axum::body::{Body, Bytes};
+use axum::body::Body;
+use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
-use axum::http::{HeaderMap, StatusCode};
-use futures::StreamExt;
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 use codex_api::{
-    ApiError, AuthProvider, Compression, Provider, ResponseEvent, ResponsesApiRequest,
-    ResponsesClient, ResponsesOptions, RetryConfig,
+    ApiError, Compression, Provider, ResponseEvent, ResponsesApiRequest, ResponsesClient,
+    ResponsesOptions,
 };
-use codex_client::{
-    HttpClientBuilder, HttpTransport, Request, ReqwestTransport, Response, StreamResponse,
-    TransportError,
-};
+use codex_client::{HttpClientBuilder, ReqwestTransport};
 use codex_protocol::models::{ContentItem, ResponseItem};
 use codex_utils_rustls_provider::ensure_rustls_crypto_provider;
 
@@ -48,16 +43,12 @@ use roundhouse_fleet::{EchoFrontierClient, StaticFrontierCatalog};
 use roundhouse_server::{EchoLocalExecutor, Engine, EngineConfig, responses_router};
 
 mod common;
+use common::codex::{EXCHANGE_TIMEOUT, NoAuth, RouterTransport, collect, request, user_message};
 use common::frontier_catalog;
 
 /// What the echo provider answers with, and therefore what a turn's assistant
 /// item contains.
 const ANSWER: &str = "frontier answer";
-
-/// Ceiling on a whole exchange. Generous, because it should never be reached: a
-/// stall is a transport bug and must fail with a message rather than hang the
-/// suite.
-const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ---------------------------------------------------------------------------
 // The service under test
@@ -90,164 +81,10 @@ fn surface_with(catalog: StaticFrontierCatalog) -> (Router, Arc<MemoryStore>) {
 // Codex's client, pointed at the router
 // ---------------------------------------------------------------------------
 
-/// Codex's [`HttpTransport`], backed by the router rather than by a socket.
-///
-/// Everything the client does above the socket — building the request, encoding
-/// the body, setting `Accept`, spawning the SSE reader — is unchanged; only the
-/// dispatch is a `tower` call.
-#[derive(Clone)]
-struct RouterTransport {
-    app: Router,
-}
-
-impl RouterTransport {
-    async fn dispatch(&self, request: Request) -> Result<axum::response::Response, TransportError> {
-        let prepared = request
-            .prepare_body_for_send()
-            .map_err(TransportError::Build)?;
-
-        let mut builder = axum::http::Request::builder()
-            .method(request.method.clone())
-            .uri(&request.url);
-        for (name, value) in prepared.headers.iter() {
-            builder = builder.header(name, value);
-        }
-        let request = builder
-            .body(Body::from(prepared.body_bytes()))
-            .map_err(|error| TransportError::Build(error.to_string()))?;
-
-        self.app
-            .clone()
-            .oneshot(request)
-            .await
-            .map_err(|error| TransportError::Network(error.to_string()))
-    }
-}
-
-impl HttpTransport for RouterTransport {
-    async fn execute(&self, request: Request) -> Result<Response, TransportError> {
-        let url = request.url.clone();
-        let response = self.dispatch(request).await?;
-        let status = response.status();
-        let headers = response.headers().clone();
-        let body = response
-            .into_body()
-            .collect()
-            .await
-            .map_err(|error| TransportError::Network(error.to_string()))?
-            .to_bytes();
-        if !status.is_success() {
-            return Err(http_error(status, url, headers, body));
-        }
-        Ok(Response {
-            status,
-            headers,
-            body,
-        })
-    }
-
-    async fn stream(&self, request: Request) -> Result<StreamResponse, TransportError> {
-        let url = request.url.clone();
-        let response = self.dispatch(request).await?;
-        let status = response.status();
-        let headers = response.headers().clone();
-        if !status.is_success() {
-            let body = response
-                .into_body()
-                .collect()
-                .await
-                .map_err(|error| TransportError::Network(error.to_string()))?
-                .to_bytes();
-            return Err(http_error(status, url, headers, body));
-        }
-        // Left as a stream rather than collected: a response that has not ended
-        // is the only kind this endpoint produces, and buffering it here would
-        // hide any ordering the client depends on.
-        let bytes = response
-            .into_body()
-            .into_data_stream()
-            .map(|chunk| chunk.map_err(|error| TransportError::Network(error.to_string())));
-        Ok(StreamResponse {
-            status,
-            headers,
-            bytes: Box::pin(bytes),
-        })
-    }
-}
-
-fn http_error(status: StatusCode, url: String, headers: HeaderMap, body: Bytes) -> TransportError {
-    TransportError::Http {
-        status,
-        url: Some(url),
-        headers: Some(headers),
-        body: String::from_utf8(body.to_vec()).ok(),
-    }
-}
-
-/// This surface authenticates nothing, so neither does the client.
-#[derive(Clone, Default)]
-struct NoAuth;
-
-impl AuthProvider for NoAuth {
-    fn add_auth_headers(&self, _headers: &mut HeaderMap) {}
-}
-
-/// A provider that retries nothing.
-///
-/// Retries would mask exactly what these tests are for: a request answered twice
-/// because the first answer was unreadable must fail here, not succeed slowly.
+/// This suite's provider: the shared retry-nothing builder, named for this
+/// surface so a client-side failure says which suite raised it.
 fn provider(base_url: &str) -> Provider {
-    Provider {
-        name: "roundhouse".to_string(),
-        base_url: base_url.to_string(),
-        query_params: None,
-        headers: HeaderMap::new(),
-        retry: RetryConfig {
-            max_attempts: 0,
-            base_delay: Duration::from_millis(1),
-            retry_429: false,
-            retry_5xx: false,
-            retry_transport: false,
-        },
-        stream_idle_timeout: EXCHANGE_TIMEOUT,
-    }
-}
-
-/// A request in the shape Codex sends, built from Codex's own type.
-///
-/// Serializing the client's struct rather than hand-writing JSON is what makes
-/// this a conformance test: a field it adds or renames arrives here without
-/// anyone having transcribed it.
-fn request(cache_key: &str, input: Vec<ResponseItem>) -> ResponsesApiRequest {
-    ResponsesApiRequest {
-        model: "roundhouse".to_string(),
-        instructions: "be brief".to_string(),
-        input,
-        tools: None,
-        tool_choice: "auto".to_string(),
-        parallel_tool_calls: false,
-        reasoning: None,
-        store: false,
-        stream: true,
-        stream_options: None,
-        include: Vec::new(),
-        service_tier: None,
-        prompt_cache_key: Some(cache_key.to_string()),
-        text: None,
-        client_metadata: None,
-    }
-}
-
-fn user_message(text: &str) -> ResponseItem {
-    ResponseItem::Message {
-        id: None,
-        role: "user".to_string(),
-        content: vec![ContentItem::InputText {
-            text: text.to_string(),
-        }],
-        phase: None,
-        internal_chat_message_metadata_passthrough: None,
-    }
+    common::codex::provider(base_url, "roundhouse")
 }
 
 fn assistant_message(text: &str) -> ResponseItem {
@@ -278,27 +115,6 @@ async fn drive(app: &Router, request: ResponsesApiRequest) -> Result<Vec<Respons
             .await?,
     )
     .await
-}
-
-/// Everything the client parsed, minus what it invented.
-///
-/// `RateLimits` is synthesized from response headers on every response, present
-/// or not, so it reports nothing about what this endpoint emitted. Filtering it
-/// keeps these assertions about the wire; that nothing *else* went out is what
-/// [`ordering_is_enforced_at_the_frame_level`] proves.
-async fn collect(mut stream: codex_api::ResponseStream) -> Result<Vec<ResponseEvent>, ApiError> {
-    tokio::time::timeout(EXCHANGE_TIMEOUT, async move {
-        let mut events = Vec::new();
-        while let Some(event) = stream.next().await {
-            match event? {
-                ResponseEvent::RateLimits(_) => {}
-                event => events.push(event),
-            }
-        }
-        Ok(events)
-    })
-    .await
-    .expect("the response stream stalled")
 }
 
 // ---------------------------------------------------------------------------

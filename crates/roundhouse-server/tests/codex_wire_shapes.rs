@@ -24,15 +24,13 @@
 //! roundhouse computes.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::http::{HeaderMap, StatusCode};
 use serde_json::{Value, json};
 
 use codex_api::{
-    ApiError, AuthProvider, Provider, ResponseEvent, ResponsesApiRequest, ResponsesClient,
-    ResponsesOptions, RetryConfig,
+    ApiError, Provider, ResponseEvent, ResponsesApiRequest, ResponsesClient, ResponsesOptions,
 };
 use codex_client::{HttpTransport, Request, Response, StreamResponse, TransportError};
 use codex_protocol::models::ResponseItem;
@@ -40,12 +38,7 @@ use codex_utils_rustls_provider::ensure_rustls_crypto_provider;
 use futures::StreamExt;
 
 mod common;
-use common::function_call_item;
-
-/// Ceiling on a whole exchange. A canned body never actually stalls, so
-/// reaching this is a bug in the fixture, not in Codex — but a bug that hangs
-/// the suite is worse than one that fails fast.
-const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
+use common::codex::{collect, function_call_item};
 
 // ---------------------------------------------------------------------------
 // A transport that plays back a fixed SSE body
@@ -81,59 +74,21 @@ impl HttpTransport for CannedTransport {
     }
 }
 
-/// This harness authenticates nothing; the facts under test are about parsing,
-/// not about auth.
-#[derive(Clone, Default)]
-struct NoAuth;
-
-impl AuthProvider for NoAuth {
-    fn add_auth_headers(&self, _headers: &mut HeaderMap) {}
-}
-
-/// A provider that retries nothing, deliberately duplicated from
-/// `codex_conformance.rs`'s rather than shared: M0's evidence is that
-/// conformance is untouched, and consolidating both into `common` is M1's
-/// job, when a third caller appears. Retries here would replay the identical
-/// canned body and double every event `drive` counts.
+/// This suite's provider: the shared retry-nothing builder — consolidated
+/// into `common::codex` now that a third caller exists, which is the move M0
+/// deferred to M1 rather than the duplication it left behind.
 fn provider() -> Provider {
-    Provider {
-        name: "roundhouse-wire-shapes".to_string(),
-        base_url: "http://canned.test/v1".to_string(),
-        query_params: None,
-        headers: HeaderMap::new(),
-        retry: RetryConfig {
-            max_attempts: 0,
-            base_delay: Duration::from_millis(1),
-            retry_429: false,
-            retry_5xx: false,
-            retry_transport: false,
-        },
-        stream_idle_timeout: EXCHANGE_TIMEOUT,
-    }
+    common::codex::provider("http://canned.test/v1", "roundhouse-wire-shapes")
 }
 
 /// A minimal well-formed request. Its content is inert — `CannedTransport`
 /// never inspects it — but it has to be a real `ResponsesApiRequest` for
 /// `stream_request` to encode, which is what makes the trip through the
-/// client's own request path rather than a bypass of it.
+/// client's own request path rather than a bypass of it. Only the session name
+/// is this suite's; the field list is the shared builder's, so a field Codex
+/// adds cannot arrive in one suite and not the other.
 fn request(input: Vec<ResponseItem>) -> ResponsesApiRequest {
-    ResponsesApiRequest {
-        model: "roundhouse".to_string(),
-        instructions: "be brief".to_string(),
-        input,
-        tools: None,
-        tool_choice: "auto".to_string(),
-        parallel_tool_calls: false,
-        reasoning: None,
-        store: false,
-        stream: true,
-        stream_options: None,
-        include: Vec::new(),
-        service_tier: None,
-        prompt_cache_key: Some("sess-wire-shapes".to_string()),
-        text: None,
-        client_metadata: None,
-    }
+    common::codex::request("sess-wire-shapes", input)
 }
 
 /// One SSE frame, in the `event: <name>\ndata: <json>\n\n` shape both
@@ -151,27 +106,23 @@ fn sse_body(frames: Vec<String>) -> Bytes {
 
 /// Drive one request through Codex's real client, against a canned body.
 ///
-/// `RateLimits` is filtered the same way `codex_conformance.rs`'s `collect()`
-/// filters it: `spawn_response_stream` synthesizes one from response headers
-/// on every call, present or not, so it reports nothing about the frames this
-/// fixture wrote and would only pad every event-count assertion below by one.
+/// The `RateLimits` filtering lives in `common::codex::collect`, for the
+/// reason stated there: `spawn_response_stream` synthesizes one from response
+/// headers on every call, present or not, so it reports nothing about the
+/// frames this fixture wrote and would only pad every event-count assertion
+/// below by one.
 async fn drive(body: Bytes, request: ResponsesApiRequest) -> Result<Vec<ResponseEvent>, ApiError> {
-    let client = ResponsesClient::new(CannedTransport { body }, provider(), Arc::new(NoAuth));
-    let mut stream = client
-        .stream_request(request, ResponsesOptions::default())
-        .await?;
-    tokio::time::timeout(EXCHANGE_TIMEOUT, async move {
-        let mut events = Vec::new();
-        while let Some(event) = stream.next().await {
-            match event? {
-                ResponseEvent::RateLimits(_) => {}
-                event => events.push(event),
-            }
-        }
-        Ok(events)
-    })
+    let client = ResponsesClient::new(
+        CannedTransport { body },
+        provider(),
+        Arc::new(common::codex::NoAuth),
+    );
+    collect(
+        client
+            .stream_request(request, ResponsesOptions::default())
+            .await?,
+    )
     .await
-    .expect("the response stream stalled")
 }
 
 fn usage_object(input_tokens: u64, output_tokens: u64) -> Value {

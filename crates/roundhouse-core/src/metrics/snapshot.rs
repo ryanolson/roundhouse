@@ -422,10 +422,35 @@ impl MetricsSnapshot {
     /// Separate from the fold on purpose: prices change, and a corrected rate
     /// card has to be able to reprice history without replaying it.
     pub fn build(fold: &MetricsFold, config: &MetricsConfig, generated_at_ms: u64) -> Self {
-        let frontier_shapes = fold.frontier_shapes();
+        Self::build_for(fold, None, config, generated_at_ms)
+    }
 
-        let mut models = Vec::with_capacity(fold.models.len());
-        for (key, counters) in &fold.models {
+    /// As [`Self::build`], for one principal's share of the same fold.
+    ///
+    /// `None` is the deployment-wide document an admin reads; `Some` is what a
+    /// turn key gets. Every field is scoped, not only the model rows: a
+    /// document whose money is filtered but whose session count, turn count and
+    /// event window still describe the deployment reads as correct and
+    /// discloses the size and activity of every other tenant. Those four are
+    /// the fields nobody thinks to check, which is exactly why they are named
+    /// here rather than left to the caller.
+    ///
+    /// One function rather than two, because the alternative is a second copy
+    /// of the pricing walk below that agrees with this one until the day it
+    /// does not — and the disagreement would be between what a tenant is billed
+    /// and what the deployment reports.
+    pub fn build_for(
+        fold: &MetricsFold,
+        scope: Option<&crate::control::PrincipalKey>,
+        config: &MetricsConfig,
+        generated_at_ms: u64,
+    ) -> Self {
+        let rows = fold.rows(scope);
+        let totals_for_scope = fold.totals_for(scope);
+        let frontier_shapes = crate::metrics::fold::frontier_shapes(rows);
+
+        let mut models = Vec::with_capacity(rows.len());
+        for (key, counters) in rows {
             let total_usage = counters.total_usage();
             let tokens = TokenBreakdown::from_usage(&total_usage);
             let coverage = Coverage {
@@ -512,8 +537,7 @@ impl MetricsSnapshot {
             frontier_spend_estimated_usd: totals.billed_estimated_usd,
             cache_savings_usd: totals.cache_savings_usd,
             routing_savings_usd: totals.shadow_usd,
-            routing_savings_at_decision_usd: fold
-                .models
+            routing_savings_at_decision_usd: rows
                 .values()
                 .map(|c| c.quoted_alternative_usd)
                 .sum(),
@@ -522,10 +546,10 @@ impl MetricsSnapshot {
 
         Self {
             generated_at_ms,
-            first_event_at_ms: fold.first_at_ms,
-            last_event_at_ms: fold.last_at_ms,
-            sessions: fold.sessions(),
-            turns: fold.turns(),
+            first_event_at_ms: totals_for_scope.first_at_ms,
+            last_event_at_ms: totals_for_scope.last_at_ms,
+            sessions: totals_for_scope.sessions,
+            turns: totals_for_scope.turns,
             calls: totals.calls,
             tokens: totals.tokens,
             savings,

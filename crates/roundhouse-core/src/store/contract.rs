@@ -23,6 +23,7 @@
 
 use async_trait::async_trait;
 
+use crate::control::Principal;
 use crate::event::{Accounting, SessionEvent, SessionEventKind, Usage};
 use crate::ids::{ResponseId, SessionId, TurnId};
 use crate::store::{Lease, MemoryStore, SessionStore, StoreError};
@@ -265,6 +266,7 @@ pub async fn appends_assign_contiguous_seqs_and_replay_is_gapless<S: SessionStor
             vec![
                 SessionEventKind::SessionCreated {
                     model_policy: "affinity".into(),
+                    principal: None,
                 },
                 text_event("one"),
             ],
@@ -299,6 +301,11 @@ pub async fn read_events_pages_oldest_first_and_reproduces_the_append<S: Session
     let kinds = [
         SessionEventKind::SessionCreated {
             model_policy: "affinity".into(),
+            // Populated rather than `None`: this is the round-trip case, and a
+            // backend that took an event apart field by field and quietly
+            // dropped the one carrying attribution would still pass with an
+            // empty principal here.
+            principal: Some(Principal::new("acme", "ada")),
         },
         SessionEventKind::TurnStarted {
             turn_id: TurnId::generate(),

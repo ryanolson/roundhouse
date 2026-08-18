@@ -17,6 +17,7 @@
 //! for.
 #![allow(dead_code)]
 
+use roundhouse_core::control::Principal;
 use roundhouse_core::event::{Accounting, IncompleteReason, SessionEvent, SessionEventKind, Usage};
 use roundhouse_core::ids::{ResponseId, SessionId, TurnId};
 use roundhouse_core::item::Item;
@@ -120,6 +121,10 @@ pub fn every_event_kind() -> Vec<SessionEventKind> {
     vec![
         SessionEventKind::SessionCreated {
             model_policy: "affinity".into(),
+            // Populated rather than `None`: this list exists to prove the
+            // backend reassembles what it took apart, and an empty principal
+            // would let a codec that dropped attribution round-trip cleanly.
+            principal: Some(Principal::new("acme", "ada")),
         },
         SessionEventKind::TurnStarted {
             turn_id: TurnId::generate(),
