@@ -45,7 +45,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::control::TurnPolicy;
 use crate::event::Usage;
 use crate::ids::ResponseId;
 use crate::item::Item;
@@ -73,6 +72,9 @@ pub enum Interjection {
 /// Everything a decision may see.
 ///
 /// A named struct rather than a tuple of arguments because M6 adds to it —
+/// the turn's `TurnPolicy` first among the additions, when an occupant exists
+/// to read it: a field supplied before anything consults it would be a claim
+/// ("a decision to steer is subject to the policy") that nothing enforces. —
 /// and because each field here answers a different question, which a reader
 /// should be able to see without opening the occupant.
 pub struct InterjectionContext<'a> {
@@ -80,10 +82,6 @@ pub struct InterjectionContext<'a> {
     /// the turn index, the frontier history, the steers still outstanding.
     /// Everything a trigger can compute without a model call is in here.
     pub state: &'a SessionState,
-    /// What this principal is allowed to do with the turn. A decision that
-    /// narrows routing may not widen past this, and a decision to steer is
-    /// still subject to it.
-    pub policy: &'a TurnPolicy,
     /// The response this turn has already opened.
     ///
     /// Load-bearing rather than incidental: the steer's call id is minted from
@@ -135,7 +133,6 @@ mod tests {
     #[tokio::test]
     async fn the_noop_interjector_is_the_production_default_and_decides_nothing() {
         let interjector = production_default();
-        let policy = TurnPolicy::unrestricted();
         let response_id = ResponseId::new("resp_1");
 
         let mut state = SessionState::default();
@@ -143,7 +140,6 @@ mod tests {
             interjector
                 .consider(&InterjectionContext {
                     state: &state,
-                    policy: &policy,
                     response_id: &response_id,
                 })
                 .await,
@@ -164,7 +160,6 @@ mod tests {
             interjector
                 .consider(&InterjectionContext {
                     state: &state,
-                    policy: &policy,
                     response_id: &response_id,
                 })
                 .await,

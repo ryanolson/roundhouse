@@ -454,6 +454,14 @@ async fn assert_never_forked(store: &MemoryStore, session: &str) {
     );
 }
 
+/// How many frames in a body carry a `function_call` item.
+fn frames_carrying_a_call(frames: &[Frame]) -> usize {
+    frames
+        .iter()
+        .filter(|frame| frame.payload["item"]["type"] == "function_call")
+        .count()
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1137,12 +1145,4 @@ async fn an_earlier_steer_is_not_replayed_into_a_later_response() {
         "the replay is the second response and nothing else: {replay:#?}"
     );
     assert_eq!(frames_carrying_a_call(&replay), 0);
-}
-
-/// How many frames in a body carry a `function_call` item.
-fn frames_carrying_a_call(frames: &[Frame]) -> usize {
-    frames
-        .iter()
-        .filter(|frame| frame.payload["item"]["type"] == "function_call")
-        .count()
 }

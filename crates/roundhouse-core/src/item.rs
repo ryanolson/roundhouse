@@ -85,7 +85,12 @@ pub struct Item {
     pub role: Role,
     pub content: ItemContent,
     /// Set on assistant items so `previous_response_id` can resolve to the
-    /// exact prefix a client is continuing from.
+    /// exact prefix a client is continuing from — and, since M4, the
+    /// provenance stamp on a server-emitted tool call. Client input always
+    /// canonicalizes with `None` and only the emission act
+    /// (`Session::complete_with_item`) sets it, so a stamped `ToolCall` in the
+    /// log means *we* emitted it and a client cannot forge one; `open_steers`
+    /// and the steering projection both key on exactly this distinction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_id: Option<ResponseId>,
 }

@@ -29,7 +29,7 @@ use roundhouse_core::routing::{
     CacheLedger, Candidate, Decision, DecisionRecord, RoutingContext, RoutingError, RoutingPolicy,
     Target,
 };
-use roundhouse_core::session::{LeaseHeartbeat, Session, SessionError, TurnAdmission};
+use roundhouse_core::session::{Session, SessionError, TurnAdmission};
 use roundhouse_core::store::SessionStore;
 use roundhouse_fleet::{
     FleetError, FleetQuery, FrontierChunk, FrontierClient, FrontierError, FrontierQuote,
@@ -630,57 +630,94 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             .interjector
             .consider(&InterjectionContext {
                 state: session.state(),
-                policy: admission.policy.as_ref(),
                 response_id: &response_id,
             })
             .await;
-        if let Interjection::Complete { item, usage } = interjection {
-            return self
-                .complete_steered(session, response_id, item, usage, admission, _heartbeat)
-                .await;
-        }
-
-        let outcome = self.dispatch(&mut session, &response_id, admission).await;
-
         // The one settle seam. Every admitted turn terminates its response and
         // hands back the lease, whichever way the body went: returning while
         // still holding the lease would lock the session out until the TTL
         // lapsed, and leaving the response open would strand every poller of
         // `is_terminal` and make the next retry duplicate this turn's input
         // forever rather than replay it.
-        let settled = match outcome {
-            Ok(Completed {
-                text,
-                usage,
-                decision,
-            }) => {
-                let committed = session.complete(&response_id, &text, usage.clone()).await;
+        //
+        // Two bodies, one tail. A steered turn and a dispatched one differ in
+        // what they commit and in nothing else, so they meet here as the same
+        // triple rather than as two functions that each have to remember to
+        // settle and release. That is what makes "every terminal event this
+        // engine writes goes through the one settle seam" a property of the
+        // control flow instead of a claim two call sites keep separately.
+        let settled = match interjection {
+            // Answered at the seam, never dispatched.
+            //
+            // **Completed, never incomplete.** Only a completion registers in
+            // the session's completed turns, so an incomplete steered turn
+            // would re-enter the seam on every retry and never settle — and
+            // `response.incomplete` reads as an error in the client rather
+            // than as a call to run.
+            //
+            // **Nothing is booked for the turn.** No `Routed` was recorded,
+            // because the seam is consulted before `plan`, so the fold's
+            // dispatch-to-terminal pairing finds nothing for this response and
+            // books no model row, and the cache ledger records no warm prefix.
+            // The `settle` below still runs, and that is deliberate rather
+            // than redundant: it prices this terminal event at zero (a
+            // settlement carrying no target owes nobody anything) and advances
+            // the ledger's per-session watermark, so the *next* turn's repair
+            // sees a settle that has already been applied instead of
+            // re-driving a turn that never took a grant.
+            //
+            // The text is empty and that is the honest report rather than a
+            // rendering of the call: the call reaches the client as a wire
+            // item, and a caller that concatenated `text` into a transcript
+            // must not find a tool call in it. The usage is the
+            // interjection's — reporting `Usage::default()` instead would make
+            // this deployment's own dashboard exceed what clients were told
+            // they spent, which is the one direction an accounting error must
+            // never run.
+            Interjection::Complete { item, usage } => {
+                let committed = session
+                    .complete_with_item(&response_id, item, usage.clone())
+                    .await;
                 committed
-                    .map(|()| (text, usage, decision))
+                    .map(|()| (String::new(), usage, None))
                     .map_err(EngineError::from)
             }
-            Err(failed) => {
-                // Terminating a failed dispatch is what commits the partial for
-                // a successor to resume from, and what tells the cache ledger
-                // whether the prompt reached the provider. Best-effort: the
-                // usual reason this append fails is a lost lease, and the
-                // original error is the better diagnosis.
-                //
-                // A policy refusal terminates here too, rather than returning
-                // with the response left open: an open response would be
-                // re-admitted on the client's next retry and its input
-                // appended a second time, so "the turn was refused" would
-                // grow the conversation every time the client asked again.
-                let reason = failed.incomplete_reason();
-                let Failed {
-                    error,
-                    partial,
-                    evidence,
-                } = failed;
-                let _ = session
-                    .mark_incomplete(&response_id, partial, reason, evidence)
-                    .await;
-                Err(error)
+            Interjection::Proceed => {
+                match self.dispatch(&mut session, &response_id, admission).await {
+                    Ok(Completed {
+                        text,
+                        usage,
+                        decision,
+                    }) => {
+                        let committed = session.complete(&response_id, &text, usage.clone()).await;
+                        committed
+                            .map(|()| (text, usage, Some(decision)))
+                            .map_err(EngineError::from)
+                    }
+                    Err(failed) => {
+                        // Terminating a failed dispatch is what commits the partial for
+                        // a successor to resume from, and what tells the cache ledger
+                        // whether the prompt reached the provider. Best-effort: the
+                        // usual reason this append fails is a lost lease, and the
+                        // original error is the better diagnosis.
+                        //
+                        // A policy refusal terminates here too, rather than returning
+                        // with the response left open: an open response would be
+                        // re-admitted on the client's next retry and its input
+                        // appended a second time, so "the turn was refused" would
+                        // grow the conversation every time the client asked again.
+                        let reason = failed.incomplete_reason();
+                        let Failed {
+                            error,
+                            partial,
+                            evidence,
+                        } = failed;
+                        let _ = session
+                            .mark_incomplete(&response_id, partial, reason, evidence)
+                            .await;
+                        Err(error)
+                    }
+                }
             }
         };
         // Money after the log, always: the settle is priced from the terminal
@@ -702,74 +739,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         Ok(TurnResult {
             response_id,
             text,
-            decision: Some(decision),
-            usage,
-            last_seq,
-            deduplicated: false,
-        })
-    }
-
-    /// Answer an admitted turn with `item` instead of running it, and settle.
-    ///
-    /// Split out of [`Engine::run_turn`] because it is a whole second way for a
-    /// turn to end and inlining it would put a second settle-and-release
-    /// sequence in the middle of the first. It takes the session and the
-    /// heartbeat *by value* for the same reason: this path ends the turn, and
-    /// owning both is what says so — the heartbeat stops renewing before the
-    /// lease is handed back, so no renewal can land after the release and
-    /// re-own a session this node has finished with.
-    ///
-    /// **Completed, never incomplete.** Only a completion registers in the
-    /// session's completed turns, so an incomplete steered turn would re-enter
-    /// the seam on every retry and never settle — and `response.incomplete`
-    /// reads as an error in the client rather than as a call to run.
-    ///
-    /// **Nothing is booked for the turn.** No `Routed` was recorded, because
-    /// the seam is consulted before `plan`, so the fold's dispatch-to-terminal
-    /// pairing finds nothing for this response and books no model row, and the
-    /// cache ledger records no warm prefix. `settle` still runs, and that is
-    /// deliberate rather than redundant: it prices this terminal event at zero
-    /// (a settlement carrying no target owes nobody anything) and advances the
-    /// ledger's per-session watermark, so the *next* turn's repair sees a
-    /// settle that has already been applied instead of re-driving a turn that
-    /// never took a grant. Every terminal event this engine writes goes through
-    /// the one settle seam; that is what keeps the seam's own claim true.
-    ///
-    /// The usage is the interjection's, reported to the client as this turn's
-    /// cost. Reporting `Usage::default()` instead would make this deployment's
-    /// own dashboard exceed what clients were told they spent, which is the one
-    /// direction an accounting error must never run.
-    async fn complete_steered(
-        &self,
-        mut session: Session<S>,
-        response_id: ResponseId,
-        item: Item,
-        usage: Usage,
-        admission: &Admission,
-        heartbeat: LeaseHeartbeat,
-    ) -> Result<TurnResult, EngineError> {
-        let committed = session
-            .complete_with_item(&response_id, item, usage.clone())
-            .await;
-        // Money after the log, always, and for the reason the dispatched path
-        // gives: the settle is priced from the terminal event's own usage, so
-        // it cannot run until that event exists.
-        let spend = self.settle(&session, admission).await;
-        let last_seq = session.last_seq();
-        drop(heartbeat);
-        let _ = session.release().await;
-
-        committed?;
-        spend?;
-        Ok(TurnResult {
-            response_id,
-            // A steered turn produced no assistant text, and this is the
-            // honest report of that rather than a rendering of the call: the
-            // call reaches the client as a wire item, and a caller of this
-            // function that concatenated `text` into a transcript must not
-            // find a tool call in it.
-            text: String::new(),
-            decision: None,
+            decision,
             usage,
             last_seq,
             deduplicated: false,
