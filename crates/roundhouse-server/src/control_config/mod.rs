@@ -88,6 +88,7 @@
 pub mod auth;
 pub mod budget;
 pub mod config;
+pub mod validate;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
@@ -98,6 +99,7 @@ use sha2::{Digest, Sha256};
 
 use roundhouse_core::control::{BudgetTerms, Principal, TurnPolicy};
 use roundhouse_core::ids::SessionId;
+use roundhouse_core::validate::ValidationTerms;
 
 use crate::dialect::ClientDialect;
 
@@ -106,6 +108,7 @@ pub use budget::{AllocationConfig, BudgetConfig, OnExhaustionConfig};
 pub use config::{
     ControlPlaneConfig, ControlPlaneError, KeyEntry, PolicyConfig, ProjectEntry, UserEntry,
 };
+pub use validate::{ArmSharesConfig, ValidateConfig};
 
 /// Path to a control-plane JSON file. Absent means [`ControlPlane::Open`].
 pub const CONTROL_PLANE_VAR: &str = "ROUNDHOUSE_CONTROL_PLANE";
@@ -204,6 +207,10 @@ pub enum ControlPlane {
         /// what does this deployment call the things its clients say back to
         /// it. See [`Self::client_dialect`].
         dialect: ClientDialect,
+        /// What this deployment hashes arm assignment against, resolved once
+        /// at load time. Read by the composition root on its way into
+        /// [`EngineConfig`](crate::EngineConfig) and by nothing else.
+        arm_salt: String,
     },
 }
 
@@ -225,11 +232,13 @@ impl ControlPlane {
             keys: _,
             admin_keys,
             mcp_namespace,
+            arm_salt,
             turn_keys,
         } = config;
         ControlPlane::Configured {
             turn_keys,
             admin_keys: admin_keys.into_iter().collect(),
+            arm_salt: arm_salt.unwrap_or_default(),
             // An absent name is the default one rather than an absence
             // carried forward: see [`ClientDialect::default`] on why there is
             // no honest `None` for a surface every client of which is a
@@ -434,6 +443,18 @@ impl ControlPlane {
     /// Deliberately not `Option`-returning: a `None` here would put a case on
     /// the wire projection whose only possible behavior is to emit a call that
     /// resolves against nothing.
+    /// What arm assignment is hashed against.
+    ///
+    /// Empty in [`Self::Open`], which is the accurate answer rather than a
+    /// placeholder: an open deployment enrols nothing, so nothing is ever
+    /// hashed against it.
+    pub fn arm_salt(&self) -> &str {
+        match self {
+            ControlPlane::Open => "",
+            ControlPlane::Configured { arm_salt, .. } => arm_salt,
+        }
+    }
+
     pub fn client_dialect(&self) -> &ClientDialect {
         match self {
             // Borrowed from a shared value rather than built per call: the
@@ -554,10 +575,13 @@ impl ControlPlane {
                 turn_keys,
                 admin_keys,
                 // Named and ignored rather than swept under a `..`: this arm
-                // decides who a key is, and the dialect decides how a call is
-                // spelled. A field added here that authentication does have to
-                // read should make this line stop compiling.
+                // decides who a key is; the dialect decides how a call is
+                // spelled and the salt decides which arm a session lands in,
+                // and neither bears on identity. A field added here that
+                // authentication does have to read should make this line stop
+                // compiling.
                 dialect: _,
+                arm_salt: _,
             } => {
                 let header = authorization_header.ok_or(AuthError::MissingKey)?;
                 let secret = header
@@ -619,6 +643,19 @@ pub struct Admission {
     /// pair it already carries: two facts resolved from the same key must
     /// travel together or a caller can read one without the other.
     pub budget: Option<BudgetTerms>,
+    /// Whether this membership's sessions are enrolled in the validate/steer
+    /// loop, and under what arms — or `None` for the shipped posture, which is
+    /// off.
+    ///
+    /// `None` is not "validate with default settings" and not "validate but do
+    /// nothing": it is *not enrolled*, and it costs a turn exactly nothing.
+    /// The engine reads it once, at session creation, to decide whether to
+    /// stamp an arm into `SessionCreated`; an unstamped session is one the
+    /// validator declines to be asked about, so a deployment that has not
+    /// turned the loop on pays for no trigger, no brief and no judge. Resolved
+    /// here beside the policy and the budget for the reason they are: three
+    /// facts read off one key must travel together.
+    pub validation: Option<ValidationTerms>,
 }
 
 impl Admission {
@@ -639,6 +676,11 @@ impl Admission {
             principal: Principal::default_open(),
             policy: Arc::new(TurnPolicy::unrestricted()),
             budget: None,
+            // An open deployment has no file to enable the experiment in, and
+            // enrolling its traffic anyway would meter and interrupt workloads
+            // that predate the control plane — the one thing turning it on
+            // must not do.
+            validation: None,
         }
     }
 }

@@ -1,0 +1,670 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! The validate/steer loop: deciding whether a turn is worth interrupting.
+//!
+//! This module is the occupant of the [`interject`](crate::interject) seam that
+//! milestone M6 exists to install. Everything it does is either pure or one
+//! network call:
+//!
+//! ```text
+//! turn admitted ── Trigger::evaluate(&SessionState)          pure, no I/O
+//!     │                    │
+//!     │ no fire            │ fires
+//!     ▼                    ▼
+//!  Proceed              arm (stamped in SessionCreated)
+//!  unchanged            ├─ Shadow  → judge runs, action discarded, all logged
+//!                       ├─ Placebo → no judge; sham intervention on hashed timing
+//!                       └─ Live    → judge → Verdict → map → action
+//! ```
+//!
+//! **The occupant decides and the engine writes.** Nothing here appends to a
+//! log: a [`Validator`] returns the facts it produced inside the
+//! [`Interjection`], and the session that holds the lease commits them. One
+//! writer is what makes an interjection's record atomic with the completion it
+//! justifies, which closes the window between a decision and its realization.
+//!
+//! **A judge that cannot be reached releases the turn.** There is no error arm
+//! anywhere on this path — not on the trait, not on the seam. The checker must
+//! never break the checked, so every failure here is a logged fact plus
+//! `Proceed`. What is *not* allowed is for the failure to be silent: a timed-out
+//! validator is marked, never free.
+//!
+//! ## The review budget, in two places on purpose
+//!
+//! The advisor-gate mechanism this borrows reserves a review *before* the await
+//! so concurrent work cannot overdraw, refunds a failed consult, and counts
+//! that failure against a separate cap so a down judge neither drains the
+//! budget nor hangs every turn. Here that splits across two owners, because
+//! the two questions have different truth sources:
+//!
+//! - **Per session**, how many reviews one conversation may buy, and how much
+//!   it must spend between them. That is a projection of the log —
+//!   [`TriggerConfig`] reads it out of [`SessionState`] — so it needs no
+//!   counter and survives a process restart exactly.
+//! - **Per node**, how many consults may be outstanding at once and how many
+//!   consecutive failures are tolerated. That is a fact about *concurrency*,
+//!   which no single session's log can see, so it is [`ReviewBudget`]: two
+//!   counters, reserved before the await, released on the way out.
+
+pub mod arm;
+pub mod brief;
+pub mod exchange;
+pub mod prompt;
+pub mod trigger;
+pub mod verdict;
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use async_trait::async_trait;
+
+use crate::control::{BudgetTerms, Principal};
+use crate::event::Usage;
+use crate::event::{ControlRecord, NotRunReason, SideCallAbandonReason, ValidationOutcome};
+use crate::ids::{SessionId, SideCallId, ValidationId};
+use crate::interject::{Interjection, InterjectionContext, Interjector};
+use crate::item::Item;
+use crate::routing::Target;
+
+pub use arm::{Arm, ArmShares, placebo_intervenes};
+pub use brief::{BriefConfig, BriefStep, Objective, ValidationBrief};
+pub use exchange::{Exchange, exchanges};
+pub use prompt::judge_system_prompt;
+pub use trigger::{
+    CostAnomaly, Evidence, NoProgressRepeat, PingPong, Signal, SignalFired, SignalKind,
+    ToolFailureStreak, Trigger, TriggerConfig, TriggerRecord, default_signals,
+};
+pub use verdict::{
+    ActionPolicy, Divergence, EscalationOverrides, SteerAction, SteerCapability, SteerChannel,
+    Verdict, VerdictParseError, map,
+};
+
+/// The tool an emitted steer names, in the log's neutral spelling.
+///
+/// The bare name, without a namespace: canonicalization ignores a namespace on
+/// the way in, so a namespaced resend and a flat one arrive as the same stored
+/// item and no dialect can fork a steered session. The namespace lives only in
+/// the wire projection.
+pub const STEER_TOOL: &str = "fetch_steer";
+
+/// The prefix every steer's `call_id` carries.
+///
+/// The id is minted from the turn's [`ResponseId`](crate::ids::ResponseId),
+/// which is what makes two concurrent steers unable to collide and a steer that
+/// no emitted call named impossible to fetch.
+pub const STEER_CALL_PREFIX: &str = "rhsteer_";
+
+/// What the judge answered, and what asking cost.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JudgeAnswer {
+    /// The judge's reply, exactly as it arrived.
+    ///
+    /// Unparsed on purpose: parsing is [`Verdict::parse`]'s job and it is
+    /// strict, so a client that pre-parsed would be a second, laxer parser in
+    /// the position that matters most.
+    pub raw: String,
+    pub usage: Usage,
+    /// Which model answered, so the money books under its own row.
+    pub target: Target,
+}
+
+/// Why a consult produced nothing usable.
+///
+/// Three arms because the log has three reasons and they must not be guessable
+/// from one another: an enum makes "abandoned against no target" — a phantom
+/// row on the dashboard — unrepresentable, where the earlier
+/// `{ target: Option<Target>, reason }` pair made it merely unlikely. Each arm
+/// maps to exactly one [`NotRunReason`], which is why the mapping in
+/// [`Validator::consult`] is a `match` with no defaulting.
+#[derive(Debug, Clone, PartialEq)]
+pub enum JudgeFailure {
+    /// The budget could not cover the check, so nothing was attempted.
+    ///
+    /// The rule the whole side call is subject to: never fail a turn because we
+    /// could not afford to check it. Nothing is booked, because nothing was
+    /// spent — the check is the thing that did not happen.
+    Unaffordable,
+    /// No judge could be dialled at all: none configured, or none admissible.
+    ///
+    /// Distinct from [`Self::Abandoned`] because nothing was attempted and
+    /// therefore nothing may be booked. Recording an abandoned call against a
+    /// target nobody dialled would put a phantom row on the dashboard.
+    Unavailable,
+    /// A call was made against `target` and produced nothing usable.
+    Abandoned {
+        target: Target,
+        reason: SideCallAbandonReason,
+    },
+}
+
+/// What one side call is made under, and for whom.
+///
+/// The three facts a judge implementation needs that are properties of *this
+/// turn* rather than of the deployment: which conversation it is checking,
+/// who pays for the check, and what ceiling that payer is under. They travel
+/// as one struct rather than as three arguments for the reason the server's
+/// admission does: resolved together from one turn, they must not be
+/// recombinable across two — one tenant's identity against another's ceiling
+/// has no compile-time answer and no runtime symptom either.
+///
+/// **What is deliberately absent is a deadline.** The checker's deadline is a
+/// bounded fraction of the turn's, which is deployment configuration the
+/// implementation already holds; passing it here would let one caller hand a
+/// judge a deadline longer than the turn it is checking.
+#[derive(Debug, Clone, Copy)]
+pub struct SideCall<'a> {
+    /// The conversation being checked, and the *only* input to the side call's
+    /// own cache key. See [`JudgeClient`] on why that key is
+    /// `{session_id}#validate` and not the conversation's own.
+    pub session_id: &'a SessionId,
+    pub principal: &'a Principal,
+    /// The payer's ceiling, or `None` when the membership has no budget.
+    ///
+    /// `None` is "no ledger to ask", exactly as it is on the server's
+    /// admission — never an unlimited budget, so an implementation cannot
+    /// confuse a deployment that meters nothing with one that granted a great
+    /// deal.
+    pub budget: Option<&'a BudgetTerms>,
+}
+
+/// The one network call this loop makes.
+///
+/// Narrow on purpose: it takes two prompts and the three facts about *this
+/// turn* that decide who the call is billed to and under what key, and answers
+/// with one string. Everything else about the fleet — quotes, credentials,
+/// rate cards, the deadline, the transport — stays on the far side of it and
+/// this module stays testable with a struct. The four isolations the side call
+/// needs (its own cache key, its own deadline, its own budget grant, and never
+/// the cache ledger) are properties of the implementation, and they are stated
+/// here because an implementor who does not know them will get all four wrong:
+///
+/// - **Its own cache key**, `{session_id}#validate`: distinct from the
+///   conversation's, or a judge prompt cools the hit the router just priced,
+///   yet stable across validations so the judge's own prefix warms and the
+///   marginal cost of checking falls with use.
+/// - **Its own deadline**, a bounded fraction of the turn's remaining budget.
+///   The checker must never break the checked.
+/// - **Its own budget question**, asked of the payer's own ledger. If the
+///   budget cannot cover the check, the check does not happen and the turn
+///   proceeds ([`JudgeFailure::Unaffordable`]) — never fail a turn because we
+///   could not afford to check it. Whether the implementation *reserves* the
+///   money or merely reads what is left is its business; what this trait
+///   requires is that the budget can refuse, and that refusing costs the turn
+///   nothing.
+/// - **Never the cache ledger.** A judge prompt is not a prefix of the
+///   conversation, and feeding it to the ledger would falsely warm that target
+///   for the next real turn.
+#[async_trait]
+pub trait JudgeClient: Send + Sync + 'static {
+    async fn consult(
+        &self,
+        side_call: &SideCall<'_>,
+        system_prompt: &str,
+        brief: &str,
+    ) -> Result<JudgeAnswer, JudgeFailure>;
+}
+
+/// How much review one node may have in flight, and how much failure it takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReviewLimits {
+    pub max_in_flight: u32,
+    /// Consecutive failures before this node stops asking.
+    ///
+    /// A circuit breaker, and the reason the failure counter is *separate* from
+    /// the reservation: a judge that is down refunds every reservation it takes,
+    /// so a single counter would show a node with all its capacity free
+    /// cheerfully timing out every turn.
+    pub max_consecutive_failures: u32,
+}
+
+impl Default for ReviewLimits {
+    fn default() -> Self {
+        Self {
+            max_in_flight: 8,
+            max_consecutive_failures: 3,
+        }
+    }
+}
+
+/// The node-local half of the review budget: two counters.
+#[derive(Debug)]
+pub struct ReviewBudget {
+    limits: ReviewLimits,
+    in_flight: AtomicU32,
+    consecutive_failures: AtomicU32,
+}
+
+impl ReviewBudget {
+    pub fn new(limits: ReviewLimits) -> Self {
+        Self {
+            limits,
+            in_flight: AtomicU32::new(0),
+            consecutive_failures: AtomicU32::new(0),
+        }
+    }
+
+    /// Take capacity for one consult, **before** the await.
+    ///
+    /// Compare-and-swap rather than fetch-add-then-check: the check-then-take
+    /// version admits every concurrent caller that read the count before any of
+    /// them wrote it, which is the overdraw this exists to prevent and which
+    /// only appears under the load that makes it expensive.
+    pub fn reserve(&self) -> Option<Reservation<'_>> {
+        if self.consecutive_failures.load(Ordering::Acquire) >= self.limits.max_consecutive_failures
+        {
+            return None;
+        }
+        let mut current = self.in_flight.load(Ordering::Acquire);
+        loop {
+            if current >= self.limits.max_in_flight {
+                return None;
+            }
+            match self.in_flight.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Reservation { budget: self }),
+                Err(seen) => current = seen,
+            }
+        }
+    }
+
+    pub fn in_flight(&self) -> u32 {
+        self.in_flight.load(Ordering::Acquire)
+    }
+
+    pub fn consecutive_failures(&self) -> u32 {
+        self.consecutive_failures.load(Ordering::Acquire)
+    }
+}
+
+/// One consult's capacity, released when this is dropped.
+///
+/// A guard rather than a matching `release()` call, because the release has to
+/// happen on every path out — including the one where the future is cancelled
+/// mid-await, which is exactly what a timeout does. A leaked reservation is a
+/// node that quietly stops validating and never says why.
+#[derive(Debug)]
+pub struct Reservation<'a> {
+    budget: &'a ReviewBudget,
+}
+
+impl Reservation<'_> {
+    /// The consult answered. Clears the failure streak.
+    pub fn succeeded(self) {
+        self.budget.consecutive_failures.store(0, Ordering::Release);
+    }
+
+    /// The consult did not answer. Counts against the separate failure cap.
+    ///
+    /// The reservation itself is refunded by the drop below — a failed consult
+    /// must not also cost capacity, or a slow judge would look like a busy one.
+    pub fn failed(self) {
+        self.budget
+            .consecutive_failures
+            .fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        self.budget.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// What *one membership* permits of the validate loop.
+///
+/// **The half of the configuration that is a tenancy decision**, and the reason
+/// it is separate from [`ValidatorConfig`]: how often to ask and how long to
+/// wait are properties of this node and its judge, while which arms a
+/// population splits into and how strong an intervention may be are properties
+/// of whose traffic is being experimented on. One project running Live with a
+/// tool-call channel and another observing in Shadow is the ordinary case, and
+/// it is unrepresentable if the occupant reads one global answer.
+///
+/// Resolved beside the policy and the budget, from the same key, and handed to
+/// the occupant on [`InterjectionContext`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidationTerms {
+    /// How this membership's population splits.
+    ///
+    /// Read once per *session*, by the engine, to stamp an arm — never by the
+    /// occupant, which reads the stamp. Both halves are here anyway because
+    /// they are one operator's one decision, and a share table living
+    /// somewhere else from the channel it applies to is two files to keep in
+    /// agreement.
+    pub shares: ArmShares,
+    /// Everything the action map needs beyond the verdict.
+    pub action: ActionPolicy,
+    /// The fraction of fired triggers the placebo arm intervenes on.
+    pub placebo_rate: f64,
+}
+
+impl Default for ValidationTerms {
+    /// Enrolled, observing, acting on nothing — the posture the whole loop
+    /// ships in. See [`ArmShares::shadow_only`] and [`ActionPolicy::default`].
+    fn default() -> Self {
+        Self {
+            shares: ArmShares::shadow_only(),
+            action: ActionPolicy::default(),
+            placebo_rate: DEFAULT_PLACEBO_RATE,
+        }
+    }
+}
+
+/// The placebo intervention rate a deployment that says nothing gets.
+///
+/// One fired trigger in four, which is enough to see a disruption effect
+/// without making the control arm a worse version of the live one. Calibration
+/// rather than measurement: matching the sham's rate to the live arm's observed
+/// rate is something a dashboard does across many sessions, not something one
+/// turn can know.
+pub const DEFAULT_PLACEBO_RATE: f64 = 0.25;
+
+/// What *this node* sets about the validate loop.
+///
+/// The deployment half: how often to ask, how much to show, how much review may
+/// be in flight, and what assignment hashes against. Nothing here is a tenancy
+/// decision — see [`ValidationTerms`] for the half that is.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ValidatorConfig {
+    pub trigger: TriggerConfig,
+    pub brief: BriefConfig,
+    pub review: ReviewLimits,
+    /// The salt placebo timing hashes against, which is the same
+    /// deployment-wide salt arm assignment uses.
+    ///
+    /// Stable: moving it re-randomizes the experiment, which is something an
+    /// operator does deliberately between studies and never in the middle of
+    /// one. See [`Arm::for_session`]. The engine holds the same value for the
+    /// assignment itself — two holders of one operator-written string, set at
+    /// the one composition site, because the two hashes happen on opposite
+    /// sides of the seam and neither can reach the other's configuration.
+    pub arm_salt: String,
+}
+
+/// The occupant of the interjection seam.
+///
+/// Owns the trigger, the arm's meaning, the review budget, the brief, the
+/// verdict parse and the action map — and returns events rather than writing
+/// them.
+pub struct Validator {
+    judge: Arc<dyn JudgeClient>,
+    trigger: Trigger,
+    budget: ReviewBudget,
+    config: ValidatorConfig,
+}
+
+impl Validator {
+    pub fn new(judge: Arc<dyn JudgeClient>, config: ValidatorConfig) -> Self {
+        Self {
+            judge,
+            trigger: Trigger::new(config.trigger, default_signals()),
+            budget: ReviewBudget::new(config.review),
+            config,
+        }
+    }
+
+    /// The same validator with a different signal set.
+    ///
+    /// The additive seam the trigger's trait exists for: a deployment adding
+    /// the prompt-stability signal, or an experiment removing one, changes the
+    /// list and touches no gate.
+    pub fn with_signals(mut self, signals: Vec<Box<dyn Signal>>) -> Self {
+        self.trigger = Trigger::new(self.config.trigger, signals);
+        self
+    }
+
+    pub fn config(&self) -> &ValidatorConfig {
+        &self.config
+    }
+
+    /// Everything after the trigger has fired.
+    async fn decide(
+        &self,
+        context: &InterjectionContext<'_>,
+        terms: &ValidationTerms,
+        fired: TriggerRecord,
+        arm: Arm,
+    ) -> Interjection {
+        let validation_id = ValidationId::generate();
+        let mut record = ControlRecord::default();
+
+        let (outcome, action) = if arm.consults_judge() {
+            self.consult(context, terms, &fired, &mut record).await
+        } else {
+            // The placebo arm: no judge, and an intervention whose *timing* is
+            // a hash rather than a draw — for the reason the arm itself is one.
+            // The action it takes is deliberately the weakest that is still an
+            // interruption, because the control has to isolate the disruption
+            // from the correction: a sham with a plausible-looking correction
+            // in it would be measuring a worse judge, not no judge.
+            let intervenes = placebo_intervenes(
+                context.response_id,
+                &self.config.arm_salt,
+                terms.placebo_rate,
+            );
+            (
+                ValidationOutcome::NotRun {
+                    reason: NotRunReason::PlaceboArm {
+                        intervened: intervenes,
+                    },
+                },
+                intervenes.then(|| SteerAction::Halt {
+                    reason: sham_directive(),
+                }),
+            )
+        };
+
+        let action = action.unwrap_or(SteerAction::Continue);
+        record.validation_decided(validation_id, fired, arm, outcome);
+
+        // The arm decides whether the action happens. A Shadow run has computed
+        // everything and logged everything, and does nothing — which is what
+        // makes it the control the whole instrumentation is built around.
+        if !arm.acts() {
+            return Interjection::Proceed { record };
+        }
+        match action {
+            // `Escalate` proceeds. The narrowing is not carried across the seam
+            // in a side channel: it is a fact in the log, folded into
+            // `SessionState::active_escalation`, so the turns it applies to read
+            // it from the same projection a replay would.
+            SteerAction::Continue | SteerAction::Escalate { .. } => {
+                Interjection::Proceed { record }
+            }
+            SteerAction::Steer { directive } => {
+                let call_id = format!("{STEER_CALL_PREFIX}{}", context.response_id);
+                // Minted once and stored in the item, never re-serialized, so
+                // the client's verbatim echo matches by construction.
+                let arguments = serde_json::json!({ "steer_id": call_id }).to_string();
+                Interjection::Complete {
+                    item: Item::tool_call(call_id, STEER_TOOL, arguments),
+                    usage: record.usage(),
+                    guidance: directive,
+                    record,
+                }
+            }
+            SteerAction::Halt { reason } => Interjection::Complete {
+                // Plain text, which ends the client's loop and hands control
+                // back to the human. Not a tool call, so no steer payload is
+                // deposited — there is nothing for an agent to fetch, and the
+                // engine's deposit is `None` for exactly this shape.
+                item: Item::assistant_text(reason.clone(), context.response_id.clone()),
+                usage: record.usage(),
+                guidance: reason,
+                record,
+            },
+        }
+    }
+
+    /// Ask the judge, book what it cost, and turn its answer into an action.
+    ///
+    /// Returns the outcome to record and the action to consider taking. Every
+    /// failure path here returns `None` for the action, which is the "release
+    /// the turn" rule spelled once.
+    async fn consult(
+        &self,
+        context: &InterjectionContext<'_>,
+        terms: &ValidationTerms,
+        fired: &TriggerRecord,
+        record: &mut ControlRecord,
+    ) -> (ValidationOutcome, Option<SteerAction>) {
+        // Before the await, always. See the module note on the two counters.
+        let Some(reservation) = self.budget.reserve() else {
+            return (
+                ValidationOutcome::NotRun {
+                    reason: NotRunReason::ReviewBudgetSpent,
+                },
+                None,
+            );
+        };
+
+        let brief = ValidationBrief::build(
+            &context.state.items,
+            context.objective.clone(),
+            fired.facts().map(str::to_string).collect(),
+            self.config.brief,
+        );
+        let answer = self
+            .judge
+            .consult(&context.side_call, judge_system_prompt(), &brief.render())
+            .await;
+
+        let answer = match answer {
+            Ok(answer) => {
+                reservation.succeeded();
+                answer
+            }
+            // Every arm here releases the turn, and the three differ only in
+            // what the log is told. Spelled as a `match` with no default: the
+            // failure vocabulary and the not-run vocabulary are the same size
+            // on purpose, and a new arm on either must be paired here rather
+            // than swept into whichever reason happened to be the fallback.
+            Err(JudgeFailure::Unaffordable) => {
+                // Neither counter moves, and that is the third state the two
+                // of them exist to express. A budget refusal is not evidence
+                // the judge answers (which would clear a real failure streak)
+                // and not evidence it is down (which would trip the breaker
+                // for every *other* tenant on this node); the reservation is
+                // simply given back by the drop.
+                drop(reservation);
+                return (
+                    ValidationOutcome::NotRun {
+                        reason: NotRunReason::BudgetRefused,
+                    },
+                    None,
+                );
+            }
+            Err(JudgeFailure::Unavailable) => {
+                reservation.failed();
+                // Nothing was attempted, so nothing is booked. An abandoned
+                // side call against a target nobody dialled would be a phantom
+                // row on the dashboard.
+                return (
+                    ValidationOutcome::NotRun {
+                        reason: NotRunReason::JudgeUnavailable,
+                    },
+                    None,
+                );
+            }
+            Err(JudgeFailure::Abandoned { target, reason }) => {
+                reservation.failed();
+                record.side_call_abandoned(SideCallId::generate(), target, reason);
+                return (
+                    ValidationOutcome::NotRun {
+                        reason: NotRunReason::JudgeFailed,
+                    },
+                    None,
+                );
+            }
+        };
+
+        // Booked before the answer is parsed, and that ordering is the point:
+        // the money was spent whatever the answer said, and a parse failure
+        // that also lost the cost would make a broken judge look free.
+        let side_call_id = SideCallId::generate();
+        record.side_call_completed(side_call_id.clone(), answer.target, answer.usage);
+
+        let verdict = match Verdict::parse(&answer.raw) {
+            Ok(verdict) => verdict,
+            Err(error) => {
+                tracing::warn!(%error, "judge answer did not parse; releasing the turn");
+                return (
+                    ValidationOutcome::NotRun {
+                        reason: NotRunReason::VerdictUnparseable,
+                    },
+                    None,
+                );
+            }
+        };
+        // Clamped against the turn's own ceiling before it is recorded, so the
+        // log holds the narrowing that will actually be in force rather than
+        // the one the map asked for. This is the occupant's read of
+        // `turn_policy`, and it is why the seam carries it: an escalation
+        // recorded at a floor the membership could never reach would make the
+        // audit trail describe a decision that did not happen.
+        let action = map(
+            &verdict,
+            fired,
+            &terms.action,
+            context.capability,
+            context.state.consecutive_interventions(),
+        )
+        .clamped_to(context.turn_policy);
+        (
+            ValidationOutcome::Judged {
+                side_call_id,
+                verdict,
+                action: action.clone(),
+            },
+            Some(action),
+        )
+    }
+}
+
+/// The placebo's interruption: an interruption and nothing else.
+///
+/// Deliberately content-free. The control has to isolate *being interrupted*
+/// from *being corrected*, so a sham carrying a plausible correction would be
+/// measuring a worse judge rather than no judge at all.
+fn sham_directive() -> String {
+    "Pausing here. Re-read the task and state what you believe the remaining \
+     work is before continuing."
+        .to_string()
+}
+
+#[async_trait]
+impl Interjector for Validator {
+    async fn consider(&self, context: &InterjectionContext<'_>) -> Interjection {
+        // A log with no arm stamp predates the experiment, and it is not
+        // enrolled in one. Assigning it here would work — the hash is
+        // deterministic — and would silently re-assign every historical session
+        // the day the salt moved, which is the exact hazard the stamp exists to
+        // prevent. Not enrolled is the honest reading and it costs nothing.
+        let Some(arm) = context.state.arm() else {
+            return Interjection::proceed();
+        };
+        // The second half of the same question, asked of the *membership*
+        // rather than of the log — and independent of the first on purpose.
+        // A session stamped under a project whose operator has since turned
+        // the loop off is not validated, which is what turning it off means;
+        // and a project that turned it on today does not retroactively enrol
+        // sessions created before the stamp existed, which is what keeps the
+        // arm comparison from being computed over a control group that was
+        // never eligible. Either absence releases the turn.
+        let Some(terms) = context.validation else {
+            return Interjection::proceed();
+        };
+        let Some(fired) = self.trigger.evaluate(context.state) else {
+            return Interjection::proceed();
+        };
+        self.decide(context, terms, fired, arm).await
+    }
+}
+
+#[cfg(test)]
+mod tests;

@@ -43,16 +43,18 @@ use roundhouse_core::context::ByteTokenizer;
 use roundhouse_core::control::{MemorySpendLedger, SpendLedger, TurnBudget};
 use roundhouse_core::metrics::MetricsConfig;
 use roundhouse_core::routing::{
-    AffinityPolicy, CacheLedger, CacheModel, Candidate, ProviderPricing,
+    AffinityPolicy, CacheLedger, CacheModel, Candidate, ProviderPricing, Target,
 };
 use roundhouse_core::store::{MemoryStore, SessionStore};
+use roundhouse_core::validate::{Validator, ValidatorConfig};
 use roundhouse_fleet::{
-    EchoFrontierClient, FrontierModelSpec, StaticFrontierCatalog, WireProtocol,
+    EchoFrontierClient, FrontierClient, FrontierModelSpec, StaticFrontierCatalog, WireProtocol,
 };
 use roundhouse_mcp::ControlStore;
 use roundhouse_server::{
     Admission, ControlPlane, ControlPlaneReads, Conversations, EchoLocalExecutor, Engine,
-    EngineConfig, catalog_config, control_config, http, mcp_api, metrics_api, responses_api,
+    EngineConfig, FleetJudge, JudgeConfig, catalog_config, control_config, http, mcp_api,
+    metrics_api, responses_api,
 };
 use roundhouse_store_redis::{RedisSessionStore, RedisSpendLedger};
 use tracing_subscriber::EnvFilter;
@@ -80,6 +82,20 @@ const DEFAULT_ADDR: &str = "127.0.0.1:8080";
 
 /// Where sessions live, as a `redis://` URL. Absent means in-memory.
 const REDIS_VAR: &str = "ROUNDHOUSE_REDIS_URL";
+
+/// Which catalog model the validate loop's judge runs on, as `provider/model`.
+///
+/// An environment variable rather than a control-plane field, and the split is
+/// the same one the two files already draw: *whether* a project's traffic is
+/// validated is a tenancy decision and lives with the tenants, while *which
+/// model does the judging* is a fact about what this deployment can reach and
+/// lives with the catalog. A deployment that moves its judge to a different
+/// provider edits the same variable it edits to change providers at all.
+///
+/// Absent means no judge, which is a deployment that cannot validate — and a
+/// config that enrolled a project anyway stops the boot. See
+/// [`unkeepable_promises`].
+const JUDGE_MODEL_VAR: &str = "ROUNDHOUSE_JUDGE_MODEL";
 
 /// Prompt shape the startup cross-check quotes the catalog under.
 ///
@@ -194,15 +210,42 @@ fn describe(admission: &Admission) -> String {
 /// What a [`FrontierCadence`] promises about a window it has spent.
 ///
 /// [`FrontierCadence`]: roundhouse_core::control::FrontierCadence
-const CADENCE_PROMISE: &str =
-    "its frontier_cadence promises that a spent window serves locally instead of failing";
+const CADENCE_PROMISE: &str = "its frontier_cadence promises that a spent window serves locally \
+     instead of failing, and this deployment has no local capacity to serve it";
 
 /// What a degrade-mode [`Budget`] with the overflow valve off promises about a
 /// limit it has spent.
 ///
 /// [`Budget`]: roundhouse_core::control::Budget
 const BUDGET_PROMISE: &str = "its budget degrades to local with overflow_when_local_saturated off, \
-     which promises that an exhausted budget serves locally instead of failing";
+     which promises that an exhausted budget serves locally instead of failing, and this \
+     deployment has no local capacity to serve it";
+
+/// What a project's `"validate"` block promises, and what keeping it needs.
+///
+/// [`ValidationTerms`]: roundhouse_server::ValidationTerms
+const VALIDATION_PROMISE: &str = "its validate block enrols this project's sessions in the validate/steer loop, which \
+     needs a judge -- and no reachable catalog model is named by ROUNDHOUSE_JUDGE_MODEL, so \
+     every validation would be skipped as unavailable and the arm comparison the enrolment \
+     exists to produce would be empty";
+
+/// The catalog entry the judge runs on, if this deployment named a reachable
+/// one.
+///
+/// Resolved against the catalog rather than trusted as written, for the reason
+/// the two cross-checks below exist: a variable naming a model this process
+/// cannot reach is a mistake nothing before this point could catch, and its
+/// symptom — every validation abandoned — is invisible from a client's side.
+fn judge_spec(catalog: &StaticFrontierCatalog) -> Option<FrontierModelSpec> {
+    let named = std::env::var(JUDGE_MODEL_VAR).ok()?;
+    let (provider, model) = named.split_once('/')?;
+    catalog
+        .spec_for(&Target::Frontier {
+            provider: provider.to_string(),
+            model: model.to_string(),
+        })
+        .cloned()
+}
 
 /// Every promise this key's configuration makes about a *spent* allowance that
 /// this deployment cannot keep.
@@ -231,8 +274,22 @@ const BUDGET_PROMISE: &str = "its budget degrades to local with overflow_when_lo
 ///
 /// [`TurnPolicy::admits_when_spent`]: roundhouse_core::control::TurnPolicy::admits_when_spent
 /// [`TurnPolicy::permits`]: roundhouse_core::control::TurnPolicy::permits
-fn unkeepable_promises(admission: &Admission, reachable: &[Candidate]) -> Vec<&'static str> {
+fn unkeepable_promises(
+    admission: &Admission,
+    reachable: &[Candidate],
+    judge: Option<&FrontierModelSpec>,
+) -> Vec<&'static str> {
     let mut broken = Vec::new();
+    // The third promise, and the one that is not about a *spent* allowance —
+    // it is here anyway because it is the same sentence in the same file with
+    // the same remedy shape: a config says something will happen, and this is
+    // the first moment anything can see whether it can. Splitting it into its
+    // own boot check would give an operator two lookalike refusals to tell
+    // apart, which is exactly what folding the cadence and the budget into one
+    // list already refused to do.
+    if admission.validation.is_some() && judge.is_none() {
+        broken.push(VALIDATION_PROMISE);
+    }
     if admission.policy.frontier_cadence.is_some()
         && !reachable
             .iter()
@@ -271,11 +328,12 @@ fn unkeepable_promises(admission: &Admission, reachable: &[Candidate]) -> Vec<&'
 fn refuse_promises_of_a_local_fallback(
     plane: &ControlPlane,
     reachable: &[Candidate],
+    judge: Option<&FrontierModelSpec>,
 ) -> anyhow::Result<()> {
     let mut refused: Vec<String> = plane
         .configured_admissions()
         .filter_map(|admission| {
-            let broken = unkeepable_promises(admission, reachable);
+            let broken = unkeepable_promises(admission, reachable, judge);
             (!broken.is_empty())
                 .then(|| format!("{} — {}", describe(admission), broken.join("; and ")))
         })
@@ -283,9 +341,8 @@ fn refuse_promises_of_a_local_fallback(
     refused.sort();
     if !refused.is_empty() {
         anyhow::bail!(
-            "these control-plane keys promise that a spent allowance serves locally; this \
-             deployment has no local capacity to serve it, so their turns would fail instead \
-             of degrading: {}",
+            "these control-plane keys promise this deployment something it cannot deliver, so \
+             their turns would fail or their configuration would silently do nothing: {}",
             refused.join(" | ")
         );
     }
@@ -348,8 +405,23 @@ async fn main() -> anyhow::Result<()> {
     // this deployment has — or promising a local fallback it does not have —
     // is a mistake nothing before this point could catch.
     let reachable = reachable_candidates(&catalog);
+    // Resolved before the cross-checks because one of them asks about it: a
+    // project enrolled in the validate loop on a deployment with no judge is a
+    // configuration that would load, serve, and quietly validate nothing.
+    let judge = judge_spec(&catalog);
+    match &judge {
+        Some(spec) => tracing::info!(
+            provider = %spec.provider,
+            model = %spec.model,
+            "validate/steer loop: judge resolved; enrolled projects will be checked"
+        ),
+        None => tracing::info!(
+            var = JUDGE_MODEL_VAR,
+            "validate/steer loop: no judge configured, so nothing is validated"
+        ),
+    }
     refuse_policies_that_admit_nothing(&plane, &reachable)?;
-    refuse_promises_of_a_local_fallback(&plane, &reachable)?;
+    refuse_promises_of_a_local_fallback(&plane, &reachable, judge.as_ref())?;
     // The third cross-check, and the one this deployment's *control surface*
     // needs: that surface answers entitlement questions by principal, and the
     // config lets two keys name one membership with different overrides. A
@@ -400,6 +472,7 @@ async fn main() -> anyhow::Result<()> {
                 Arc::new(spend),
                 plane,
                 catalog,
+                judge,
                 reachable,
                 metrics_config,
                 listener,
@@ -417,6 +490,7 @@ async fn main() -> anyhow::Result<()> {
                 Arc::new(MemorySpendLedger::new()),
                 plane,
                 catalog,
+                judge,
                 reachable,
                 metrics_config,
                 listener,
@@ -444,26 +518,62 @@ async fn serve<S: SessionStore>(
     spend: Arc<dyn SpendLedger>,
     plane: Arc<ControlPlane>,
     catalog: StaticFrontierCatalog,
+    judge: Option<FrontierModelSpec>,
     reachable: Vec<Candidate>,
     metrics_config: Arc<MetricsConfig>,
     listener: tokio::net::TcpListener,
 ) -> anyhow::Result<()> {
     let conversations = Arc::new(Conversations::new());
     let control = Arc::new(ControlStore::new());
+    let frontier: Arc<dyn FrontierClient> = Arc::new(EchoFrontierClient::new("frontier answer"));
+    let engine_config = EngineConfig {
+        // The salt reaches the engine and nowhere else: it is an input to the
+        // stamp written at session creation, and every later reader — the
+        // occupant, the fold, a replay — reads the *arm*, not the salt.
+        arm_salt: plane.arm_salt().to_string(),
+        ..EngineConfig::default()
+    };
 
-    let engine = Arc::new(
-        Engine::new(
-            Arc::clone(&store),
+    let mut engine = Engine::new(
+        Arc::clone(&store),
+        ByteTokenizer,
+        Arc::new(EchoLocalExecutor::new("local answer")),
+        catalog,
+        Arc::clone(&frontier),
+        Arc::new(AffinityPolicy::new()),
+        engine_config.clone(),
+    )
+    .with_spend_ledger(Arc::clone(&spend))
+    .with_control_store(Arc::clone(&control));
+
+    // The validator is installed only where there is a judge to install it
+    // around, and the boot check above has already refused the configuration
+    // where that absence would be a broken promise. A deployment with a judge
+    // and no enrolled project installs it too and it decides nothing: no
+    // session is stamped, so the occupant's first question answers "not
+    // enrolled" and no turn pays for a trigger.
+    if let Some(spec) = judge {
+        let fleet_judge = FleetJudge::new(
+            frontier,
+            spec,
             ByteTokenizer,
-            Arc::new(EchoLocalExecutor::new("local answer")),
-            catalog,
-            Arc::new(EchoFrontierClient::new("frontier answer")),
-            Arc::new(AffinityPolicy::new()),
-            EngineConfig::default(),
+            engine_config.turn_deadline_ms,
+            JudgeConfig::default(),
         )
-        .with_spend_ledger(Arc::clone(&spend))
-        .with_control_store(Arc::clone(&control)),
-    );
+        .with_spend_ledger(Arc::clone(&spend));
+        engine = engine.with_interjector(Arc::new(Validator::new(
+            Arc::new(fleet_judge),
+            // The trigger, the brief and the action defaults; the per-project
+            // half — channel, arms, placebo rate — travels on the admission
+            // instead, because it is a tenancy decision and this is not the
+            // file tenancy is written in.
+            ValidatorConfig {
+                arm_salt: plane.arm_salt().to_string(),
+                ..ValidatorConfig::default()
+            },
+        )));
+    }
+    let engine = Arc::new(engine);
 
     // Four surfaces, one process and one log: the native transport, which
     // exposes sessions and the log itself; the Responses API, which lets an
@@ -667,6 +777,7 @@ mod tests {
         let error = refuse_promises_of_a_local_fallback(
             &plane_with_policy(cadence.clone()),
             &reachable_candidates(&echo_catalog()),
+            None,
         )
         .expect_err("a cadence with no local capacity behind it must stop the process");
         let message = error.to_string();
@@ -696,7 +807,7 @@ mod tests {
         // about the cadence.
         let mut with_fleet = reachable_candidates(&echo_catalog());
         with_fleet.push(local_candidate());
-        refuse_promises_of_a_local_fallback(&plane_with_policy(cadence), &with_fleet)
+        refuse_promises_of_a_local_fallback(&plane_with_policy(cadence), &with_fleet, None)
             .expect("a spent window has somewhere to go when a local worker is quoted");
     }
 
@@ -711,6 +822,7 @@ mod tests {
         let error = refuse_promises_of_a_local_fallback(
             &plane_with(serde_json::json!({}), strict_budget()),
             &reachable_candidates(&priced_catalog()),
+            None,
         )
         .expect_err("a valve-off budget with no local capacity behind it must stop the process");
         let message = error.to_string();
@@ -733,6 +845,7 @@ mod tests {
         refuse_promises_of_a_local_fallback(
             &plane_with(serde_json::json!({}), strict_budget()),
             &with_fleet,
+            None,
         )
         .expect("an exhausted budget has somewhere to go when a local worker is quoted");
     }
@@ -758,6 +871,7 @@ mod tests {
             refuse_promises_of_a_local_fallback(
                 &plane_with(serde_json::json!({}), budget.clone()),
                 &reachable_candidates(&priced_catalog()),
+                None,
             )
             .unwrap_or_else(|error| panic!("{budget} promises no local service: {error}"));
         }
@@ -776,6 +890,7 @@ mod tests {
             refuse_promises_of_a_local_fallback(
                 &plane_with_policy(policy.clone()),
                 &reachable_candidates(&echo_catalog()),
+                None,
             )
             .unwrap_or_else(|error| panic!("{policy} spends no allowance: {error}"));
         }
@@ -794,6 +909,7 @@ mod tests {
                 strict_budget(),
             ),
             &reachable_candidates(&priced_catalog()),
+            None,
         )
         .expect_err("both promises are unkeepable here");
         let message = error.to_string();
@@ -809,12 +925,65 @@ mod tests {
         );
     }
 
+    /// A one-key plane whose project enrols in the validate loop.
+    fn plane_that_validates() -> ControlPlane {
+        let json = serde_json::json!({
+            "projects": [{ "id": "acme", "validate": { "enabled": true } }],
+            "users": [{ "id": "ada" }],
+            "keys": [{ "project": "acme", "user": "ada", "key_sha256": "a".repeat(64) }],
+        })
+        .to_string();
+        ControlPlane::configured(
+            ControlPlaneConfig::from_json(&json, "startup cross-check fixture")
+                .expect("the fixture config must validate"),
+        )
+    }
+
+    #[test]
+    fn a_project_enrolled_in_the_validate_loop_with_no_judge_refuses_to_serve() {
+        let reachable = reachable_candidates(&echo_catalog());
+
+        // Probe: the config says these sessions will be checked, and this
+        // deployment has nothing to check them with. Serving anyway would stamp
+        // arms, fire triggers, and record `NotRun { JudgeUnavailable }` on every
+        // one of them — an experiment that loads, runs, and produces an empty
+        // comparison, discovered whenever somebody finally reads the dashboard.
+        let error = refuse_promises_of_a_local_fallback(&plane_that_validates(), &reachable, None)
+            .expect_err("an enrolled project with no judge must stop the process");
+        let message = error.to_string();
+        assert!(
+            message.contains("project `acme`, user `ada`"),
+            "the refusal has to name the key an operator would go and fix: {message}"
+        );
+        assert!(
+            message.contains("ROUNDHOUSE_JUDGE_MODEL"),
+            "and the variable that fixes it, since the remedy is not in the \
+             control-plane file the rest of this key lives in: {message}"
+        );
+
+        // Control 1: the identical config on a deployment that *has* a judge
+        // serves. The refusal is about the missing judge and not about the
+        // `validate` block existing.
+        let judge = echo_catalog().models()[0].clone();
+        refuse_promises_of_a_local_fallback(&plane_that_validates(), &reachable, Some(&judge))
+            .expect("an enrolled project with a judge behind it is servable");
+
+        // Control 2: a project that never enrolled is asked nothing, so a
+        // deployment with no judge is unaffected by this check.
+        refuse_promises_of_a_local_fallback(
+            &plane_with_policy(serde_json::json!({})),
+            &reachable,
+            None,
+        )
+        .expect("a key that makes no validation promise has none to break");
+    }
+
     #[test]
     fn an_open_deployment_has_no_policies_to_cross_check() {
         let reachable = reachable_candidates(&echo_catalog());
         refuse_policies_that_admit_nothing(&ControlPlane::Open, &reachable)
             .expect("open mode resolves to the unrestricted policy");
-        refuse_promises_of_a_local_fallback(&ControlPlane::Open, &reachable)
+        refuse_promises_of_a_local_fallback(&ControlPlane::Open, &reachable, None)
             .expect("and the unrestricted policy carries no cadence and no budget");
         // And the empty catalog is the deployment's problem, not this check's:
         // with nothing quoted there is nothing to disagree about, and the

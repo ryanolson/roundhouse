@@ -155,6 +155,27 @@ impl Item {
     pub fn render(&self) -> String {
         format!("<|{}|>{}", self.role.as_str(), self.content.render())
     }
+
+    /// What this item says to a human reader, and nothing else.
+    ///
+    /// Empty for everything that is not plain text, which is the whole
+    /// distinction from [`Self::render`]: `render` produces the *prompt*
+    /// encoding — role prefix, `<tool_call>` tags — and a caller that
+    /// concatenated that into a transcript a person or an agent reads would
+    /// find scaffolding in it, or worse, a tool call it might act on.
+    ///
+    /// Its caller is the interjection seam's completion: outcome C commits
+    /// guidance text and outcome B commits a synthetic call, and the turn's
+    /// reported text is the guidance for one and nothing for the other. A
+    /// `match` at that site would work today and would answer wrongly the day
+    /// a third completion shape is added, because the *default* it would have
+    /// to pick is the unsafe one.
+    pub fn spoken_text(&self) -> &str {
+        match &self.content {
+            ItemContent::Text { text } => text,
+            ItemContent::ToolCall { .. } | ItemContent::ToolResult { .. } => "",
+        }
+    }
 }
 
 #[cfg(test)]

@@ -65,8 +65,9 @@ use serde::{Deserialize, Serialize};
 use crate::control::PrincipalKey;
 use crate::event::{SessionEvent, SessionObserver};
 use crate::routing::Target;
+use crate::validate::Arm;
 
-pub use fold::{MetricsFold, Scope};
+pub use fold::{MetricsFold, Scope, SideCallTally, ValidationTally};
 pub use pricing::{
     Correlary, DEFAULT_CAPABILITY_BAND, IncoherentCorrelary, PricedBasis, ReferenceModel,
     ShadowPricing, TokenShape,
@@ -186,6 +187,32 @@ impl MetricsRecorder {
     ) -> MetricsSnapshot {
         let fold = self.fold.read().unwrap_or_else(|e| e.into_inner());
         MetricsSnapshot::build(&fold, Scope::Principal(scope), config, generated_at_ms)
+    }
+
+    /// What one arm of the validate experiment decided, and how often it acted.
+    ///
+    /// **Not on [`MetricsSnapshot`], and that is the deliberate half.** The
+    /// snapshot is the money document — tokens, rate cards, savings — and the
+    /// arm comparison is a *control* figure whose honest presentation is three
+    /// numbers side by side (spend measured, tokens-after-intervention against
+    /// the arm-matched control, prevented waste estimated), never a single
+    /// "validation saved you $X" folded into a total. Until a surface exists
+    /// that reports them that way, the fold answers directly, so the arm
+    /// comparison is readable from the same projection the log builds rather
+    /// than from a counter beside it.
+    pub fn validation_tally(&self, scope: Scope<'_>, arm: Arm) -> ValidationTally {
+        let fold = self.fold.read().unwrap_or_else(|e| e.into_inner());
+        fold.validation_tally(scope, arm)
+    }
+
+    /// Side calls booked and side calls abandoned, in one scope.
+    ///
+    /// The discarded-work half of the same question: a check that produced
+    /// nothing still happened, and a deployment that could not see the
+    /// abandoned count would read a broken judge as a free one.
+    pub fn side_call_tally(&self, scope: Scope<'_>) -> SideCallTally {
+        let fold = self.fold.read().unwrap_or_else(|e| e.into_inner());
+        fold.side_call_tally(scope)
     }
 }
 

@@ -369,12 +369,16 @@ impl ControlStore {
 
     /// The standing intent for a session.
     ///
-    /// `pub(crate)` because M6's brief is its only real consumer and it lives
-    /// in another crate: exporting the reader now would be a public API with
-    /// nothing behind it, and the M6 change that needs it is the change that
-    /// should widen it. This crate's own tests are what keep the write half
-    /// honest in the meantime.
-    pub(crate) fn intent(&self, session: &SessionId) -> Option<IntentRecord> {
+    /// Public as of M6, which is the change its own doc said should widen it:
+    /// the engine reads this at the interjection seam and hands it to the
+    /// validator as [`Objective::Declared`], where a stated goal turns the
+    /// judge's question from "infer the goal, then judge drift against your
+    /// inference" into "here is the goal, name the divergence". Until there
+    /// was a reader in another crate this was `pub(crate)`, because a public
+    /// API with nothing behind it is a promise nothing keeps.
+    ///
+    /// [`Objective::Declared`]: roundhouse_core::validate::Objective::Declared
+    pub fn intent(&self, session: &SessionId) -> Option<IntentRecord> {
         self.lock().intents.get(session).cloned()
     }
 

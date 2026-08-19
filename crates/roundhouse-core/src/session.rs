@@ -14,14 +14,27 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::control::{FrontierHistory, Principal};
-use crate::event::{IncompleteReason, SessionEvent, SessionEventKind, SessionObserver, Usage};
+use crate::event::{
+    ControlRecord, IncompleteReason, NotRunReason, SessionEvent, SessionEventKind, SessionObserver,
+    Usage, ValidationOutcome,
+};
 use crate::ids::{ResponseId, SessionId, TurnId};
 use crate::item::{Item, ItemContent};
 use crate::routing::{CacheLedger, DecisionRecord, ProviderPricing, Target};
 use crate::store::{Lease, SessionStore, StoreError};
+use crate::validate::{Arm, EscalationOverrides, SteerAction};
 
 /// How many events to pull per replay batch.
 const REPLAY_BATCH: usize = 1024;
+
+/// How many turns of billing the cost-anomaly signal compares against.
+///
+/// A window rather than the whole history, and small on purpose: the question
+/// is "is this turn unlike *this session's recent work*", and a session's early
+/// turns are frequently a different kind of work from its later ones. Sixteen
+/// `u64`s is also strictly less state than one conversation item, which is what
+/// makes keeping it in the projection cheaper than deriving it on demand.
+const TURN_TOKEN_WINDOW: usize = 16;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
@@ -209,6 +222,82 @@ pub struct SessionState {
     /// `explain_last_route` in `roundhouse-mcp`, the audit trail as a tool.
     last_decision: Option<DecisionRecord>,
     pub last_seq: u64,
+
+    // ---- The validate loop's projections. -------------------------------
+    //
+    // Every one of these is a fold of the log and never a counter kept beside
+    // it. That is the same rule `FrontierHistory` follows and it is load-bearing
+    // for the same reason twice over: a successor process that replays a log has
+    // to arrive at the trigger's answer, *and* the arm comparison is only
+    // meaningful if a replay of a session reaches the decision the original
+    // process reached. A second writer anywhere here would make "fold equals
+    // log" false exactly where the experiment reads.
+    /// Which arm of the validate experiment this session belongs to.
+    ///
+    /// `None` for a log written before the experiment: not enrolled, which the
+    /// occupant reads as "do not validate". See
+    /// [`SessionEventKind::SessionCreated`]'s `arm`.
+    pub(crate) arm: Option<Arm>,
+    /// Billable tokens this session's turns have reported since the last
+    /// validation, or since it opened.
+    ///
+    /// The self-scaling half of the trigger: a validator budgeted as a fraction
+    /// of spend-since-last-check needs no per-workload cadence to tune.
+    ///
+    /// Side-call tokens are deliberately absent. They are this deployment's own
+    /// spend, not the conversation's, and counting them would let the act of
+    /// checking bring the next check forward.
+    pub(crate) tokens_since_last_validation: u64,
+    /// When the last validation was decided, on the log's own clock.
+    pub(crate) last_validation_at_ms: Option<u64>,
+    /// The timestamp of the most recent event, whatever kind it was.
+    ///
+    /// What makes the cooldown computable without a clock argument: the turn
+    /// being decided has already committed its `TurnStarted`, so this is
+    /// "now" as the log understands it — and a replay reads the same value the
+    /// original process did, which a wall clock would not.
+    pub(crate) last_event_at_ms: u64,
+    /// Turns in a row that this deployment interrupted.
+    ///
+    /// Counted at the terminal event and reset there, so it means "trailing
+    /// interrupted turns" rather than "interruptions ever". A turn the
+    /// validator let through resets it, which is what stops the cap from
+    /// disabling validation for the rest of a long session.
+    pub(crate) consecutive_interventions: u32,
+    /// Validations this session has bought.
+    pub(crate) validations_run: u32,
+    /// The turn index at which a client's input last closed an open steer.
+    ///
+    /// The hysteresis rule's evidence. By the time the interjection seam runs,
+    /// the turn's input is already committed, so `open_steers` has *already*
+    /// been cleared by the fulfilling result — asking "is a steer open" would
+    /// answer no on exactly the turn the rule is about. Recording the turn it
+    /// closed on is what makes the question answerable at all.
+    pub(crate) steer_fulfilled_on_turn: Option<u64>,
+    /// Billable tokens per terminated turn, oldest first, bounded to
+    /// [`TURN_TOKEN_WINDOW`].
+    pub(crate) turn_tokens: Vec<u64>,
+    /// A narrowing the validate loop asked for, and how many turns of it are
+    /// left.
+    ///
+    /// Held in the projection rather than handed across the interjection seam
+    /// in a side channel, because it outlives the turn that decided it: the
+    /// turns it applies to read it from the same fold a replay would build.
+    escalation: Option<ActiveEscalation>,
+    /// Whether the turn currently in flight was interrupted by the validator.
+    ///
+    /// Set when the decision is committed and consumed at the terminal event,
+    /// which is the one place every turn passes through exactly once.
+    turn_intervened: bool,
+}
+
+/// A narrowing the validate loop asked for, with its remaining life.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ActiveEscalation {
+    pub overrides: EscalationOverrides,
+    /// Turns still to be served under it, counting from and including the turn
+    /// the escalation was decided on.
+    pub turns_remaining: u32,
 }
 
 impl SessionState {
@@ -218,6 +307,11 @@ impl SessionState {
     /// fail to update derived state.
     fn apply(&mut self, event: &SessionEvent) {
         self.last_seq = event.seq;
+        // Above the match, and from every kind rather than only the ones that
+        // cost money: this is the clock the cooldown is measured on, and a
+        // session whose last event was an error an hour ago has been quiet for
+        // an hour.
+        self.last_event_at_ms = event.at_ms;
         match &event.kind {
             SessionEventKind::ItemAppended { item } => {
                 // The conversation itself is untouched by steering: an emitted
@@ -248,7 +342,15 @@ impl SessionState {
                         // an agent runs its own tools between our turns, and
                         // closing on any of those would report a steer
                         // fulfilled that nobody answered.
-                        self.open_steers.remove(call_id);
+                        if self.open_steers.remove(call_id).is_some() {
+                            // Which turn closed it, for the trigger's
+                            // hysteresis. The removal above is what the
+                            // question is really about, and asking `is a steer
+                            // open` at the seam would answer `no` on exactly
+                            // this turn — the input is committed before the
+                            // seam runs.
+                            self.steer_fulfilled_on_turn = Some(self.turn_index);
+                        }
                     }
                     ItemContent::Text { .. } => {}
                 }
@@ -330,12 +432,144 @@ impl SessionState {
                         );
                     }
                 }
+
+                // The validate loop's per-turn bookkeeping, all of it here
+                // because the terminal event is the one place every turn passes
+                // through exactly once — whether it dispatched, was steered, or
+                // was refused.
+                self.tokens_since_last_validation = self
+                    .tokens_since_last_validation
+                    .saturating_add(usage.total());
+                self.turn_tokens.push(usage.total());
+                if self.turn_tokens.len() > TURN_TOKEN_WINDOW {
+                    self.turn_tokens.remove(0);
+                }
+                // Trailing interrupted turns, so a turn the validator let
+                // through resets the count. Counting interruptions forever
+                // would disable validation for the rest of any long session
+                // that was ever interrupted twice.
+                if self.turn_intervened {
+                    self.consecutive_interventions =
+                        self.consecutive_interventions.saturating_add(1);
+                } else {
+                    self.consecutive_interventions = 0;
+                }
+                self.turn_intervened = false;
+                self.escalation = self.escalation.and_then(|escalation| {
+                    escalation
+                        .turns_remaining
+                        .checked_sub(1)
+                        .filter(|remaining| *remaining > 0)
+                        .map(|turns_remaining| ActiveEscalation {
+                            turns_remaining,
+                            ..escalation
+                        })
+                });
             }
-            SessionEventKind::SessionCreated { .. }
+            SessionEventKind::ValidationDecided { arm, outcome, .. } => {
+                self.validations_run = self.validations_run.saturating_add(1);
+                self.last_validation_at_ms = Some(event.at_ms);
+                // The budget the gate spends. Reset here rather than at the
+                // side call, because what the gate measures is conversation
+                // spend between checks and a check is not conversation.
+                self.tokens_since_last_validation = 0;
+
+                // Only an arm that *acts* has intervened. A Shadow run computed
+                // everything and did nothing, and counting it would make the
+                // observe-only arm suppress its own future observations —
+                // which would quietly destroy the control the experiment leans
+                // on.
+                let action = match outcome {
+                    ValidationOutcome::Judged { action, .. } => Some(action.clone()),
+                    ValidationOutcome::NotRun {
+                        reason: NotRunReason::PlaceboArm { intervened: true },
+                    } => Some(SteerAction::Halt {
+                        reason: String::new(),
+                    }),
+                    ValidationOutcome::NotRun { .. } => None,
+                };
+                if arm.acts()
+                    && let Some(action) = action
+                {
+                    self.turn_intervened |= action.intervenes();
+                    if let SteerAction::Escalate { turns, overrides } = action
+                        && turns > 0
+                    {
+                        self.escalation = Some(ActiveEscalation {
+                            overrides,
+                            turns_remaining: turns,
+                        });
+                    }
+                }
+            }
+            SessionEventKind::SessionCreated { arm, .. } => self.arm = *arm,
+            // Money facts, folded by the metrics layer and not here. This
+            // projection answers "what may this session do next", and what a
+            // side call billed does not bear on that — the *decision* beside it
+            // does, and that is the arm above.
+            SessionEventKind::SideCallCompleted { .. }
+            | SessionEventKind::SideCallAbandoned { .. }
             | SessionEventKind::OutputTextDelta { .. }
             | SessionEventKind::TurnDeduplicated { .. }
             | SessionEventKind::Error { .. } => {}
         }
+    }
+
+    /// Which arm of the validate experiment this session is in, if any.
+    pub fn arm(&self) -> Option<Arm> {
+        self.arm
+    }
+
+    /// Billable tokens reported since the last validation, or since the log
+    /// opened.
+    pub fn tokens_since_last_validation(&self) -> u64 {
+        self.tokens_since_last_validation
+    }
+
+    /// When the last validation was decided, on the log's own clock.
+    pub fn last_validation_at_ms(&self) -> Option<u64> {
+        self.last_validation_at_ms
+    }
+
+    /// The timestamp of the most recent event in the log.
+    pub fn last_event_at_ms(&self) -> u64 {
+        self.last_event_at_ms
+    }
+
+    /// Turns in a row this deployment interrupted.
+    pub fn consecutive_interventions(&self) -> u32 {
+        self.consecutive_interventions
+    }
+
+    /// Validations this session has bought.
+    pub fn validations_run(&self) -> u32 {
+        self.validations_run
+    }
+
+    /// Whether the input already committed for the turn in flight closed a
+    /// steer this deployment emitted.
+    ///
+    /// The trigger's hysteresis rule, and the reason it is a question about a
+    /// *turn index* rather than about `open_steers`: the fulfilling result is
+    /// committed with the turn's input, before the interjection seam runs, so
+    /// the steer is already closed by the time anybody asks.
+    pub fn this_turn_fulfilled_a_steer(&self) -> bool {
+        self.steer_fulfilled_on_turn == Some(self.turn_index)
+    }
+
+    /// Billable tokens per terminated turn, oldest first.
+    pub fn recent_turn_tokens(&self) -> &[u64] {
+        &self.turn_tokens
+    }
+
+    /// The narrowing a validation asked for, if one is still in force.
+    ///
+    /// Read by the engine on every turn while it lasts. Returning the overrides
+    /// rather than the record is the same choice the MCP overlay makes: the
+    /// caller wants `ceiling.narrow(&overrides)` and handing it the record
+    /// would invite a second place that decides what an escalation means.
+    pub fn active_escalation(&self) -> Option<EscalationOverrides> {
+        self.escalation.map(|escalation| escalation.overrides)
     }
 
     pub fn completed_response_for(&self, turn_id: &TurnId) -> Option<&ResponseId> {
@@ -632,14 +866,23 @@ impl<S: SessionStore> Session<S> {
     /// `SessionCreated` this method writes always names its payer. That is what
     /// makes the absent case in the event unambiguous — it can only mean a log
     /// older than tenancy, never "this deployment forgot".
+    /// `arm` is an `Option` and not a value with a default, and the difference
+    /// is the same one the principal draws: absent means *not enrolled in the
+    /// experiment*, which is a real and correct state for a deployment that has
+    /// not installed the validator. A default arm would enrol every such
+    /// session in a study nobody is running, and the arm comparison would be
+    /// computed against a control group made of sessions that were never
+    /// eligible.
     pub async fn record_created(
         &mut self,
         model_policy: &str,
         principal: &Principal,
+        arm: Option<Arm>,
     ) -> Result<(), SessionError> {
         self.commit(vec![SessionEventKind::SessionCreated {
             model_policy: model_policy.to_string(),
             principal: Some(principal.clone()),
+            arm,
         }])
         .await?;
         Ok(())
@@ -730,6 +973,7 @@ impl<S: SessionStore> Session<S> {
             response_id,
             Item::assistant_text(text, response_id.clone()),
             usage,
+            ControlRecord::default(),
         )
         .await
     }
@@ -772,24 +1016,50 @@ impl<S: SessionStore> Session<S> {
     /// [`interject`](crate::interject) for why the decision is taken before the
     /// turn is planned, which is what makes that pairing absent rather than
     /// merely unused.
+    /// **`record` goes in the same batch, and ahead of the item.** The facts an
+    /// interjector produced are the *reason* this completion exists; committed
+    /// afterwards, a crash between them would leave a steered turn in the log
+    /// with no record of what decided it, and the arm comparison would count
+    /// the intervention against no validation. Ahead of the item rather than
+    /// behind it because the log then reads in causal order — the decision, and
+    /// then what it produced.
     pub async fn complete_with_item(
         &mut self,
         response_id: &ResponseId,
         item: Item,
         usage: Usage,
+        record: ControlRecord,
     ) -> Result<(), SessionError> {
         let item = Item {
             response_id: Some(response_id.clone()),
             ..item
         };
-        self.commit(vec![
-            SessionEventKind::ItemAppended { item },
-            SessionEventKind::ResponseCompleted {
-                response_id: response_id.clone(),
-                usage,
-            },
-        ])
-        .await?;
+        let mut kinds = record.into_kinds();
+        kinds.push(SessionEventKind::ItemAppended { item });
+        kinds.push(SessionEventKind::ResponseCompleted {
+            response_id: response_id.clone(),
+            usage,
+        });
+        self.commit(kinds).await?;
+        Ok(())
+    }
+
+    /// Commit facts an interjector produced for a turn that then proceeds.
+    ///
+    /// The `Proceed` half of the same contract [`Self::complete_with_item`]
+    /// serves for `Complete`. There is no atomicity to buy here — nothing else
+    /// is being committed alongside — but there is still exactly one writer,
+    /// and this is how an occupant reaches it.
+    ///
+    /// An empty record commits nothing rather than an empty batch: the
+    /// production default interjects on no turn, and a store round trip per
+    /// turn to say so would be a cost paid by every deployment that never
+    /// enables validation.
+    pub async fn record_control(&mut self, record: ControlRecord) -> Result<(), SessionError> {
+        if record.is_empty() {
+            return Ok(());
+        }
+        self.commit(record.into_kinds()).await?;
         Ok(())
     }
 

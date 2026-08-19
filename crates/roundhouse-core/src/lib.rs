@@ -23,19 +23,28 @@ pub mod metrics;
 pub mod routing;
 pub mod session;
 pub mod store;
+pub mod validate;
 
 pub use control::{
     Allocation, Budget, BudgetState, BudgetTerms, BudgetWindow, Exhaustion, FrontierCadence,
     FrontierHistory, Grant, GrantRequest, MemorySpendLedger, PolicyOverrides, Principal,
     PrincipalKey, ProjectId, Settlement, SpendLedger, TargetFilter, TurnBudget, TurnPolicy, UserId,
 };
-pub use event::{Accounting, SessionEvent, SessionEventKind, SessionObserver, Usage};
-pub use ids::{ResponseId, SessionId, TurnId};
+pub use event::{
+    Accounting, ControlRecord, NotRunReason, SessionEvent, SessionEventKind, SessionObserver,
+    SideCallAbandonReason, SideCallPurpose, Usage, ValidationOutcome,
+};
+pub use ids::{ResponseId, SessionId, SideCallId, TurnId, ValidationId};
 pub use interject::{Interjection, InterjectionContext, Interjector};
 pub use item::{Item, ItemContent, Role};
 pub use metrics::{MetricsConfig, MetricsFold, MetricsSnapshot, ServingMode};
-pub use session::{Session, SessionError, TerminalSettlement};
+pub use session::{ActiveEscalation, Session, SessionError, TerminalSettlement};
 pub use store::{Lease, SessionStore, StoreError};
+pub use validate::{
+    ActionPolicy, Arm, ArmShares, JudgeAnswer, JudgeClient, JudgeFailure, Objective, SideCall,
+    SteerAction, SteerCapability, SteerChannel, TriggerConfig, TriggerRecord, ValidationTerms,
+    Validator, ValidatorConfig, Verdict,
+};
 
 /// Milliseconds since the Unix epoch.
 ///

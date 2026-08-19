@@ -24,11 +24,13 @@
 use std::sync::Arc;
 
 use roundhouse_core::context::Tokenizer;
-use roundhouse_core::control::Principal;
+use roundhouse_core::control::{PolicyOverrides, Principal};
 use roundhouse_core::ids::SessionId;
 use roundhouse_core::item::{Item, ItemContent};
 use roundhouse_core::now_ms;
+use roundhouse_core::session::SessionState;
 use roundhouse_core::store::SessionStore;
+use roundhouse_core::validate::{Arm, Objective};
 use roundhouse_mcp::{ControlStore, SteerRecord};
 
 use crate::control_config::Admission;
@@ -91,27 +93,104 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
     /// in turns that happened to succeed. An overlay is a narrowing, so the cost
     /// of spending one early is that routing widens back to the deployment's
     /// ceiling and never past it.
+    /// **Two narrowings, one composition, and they arrive from opposite
+    /// directions.** The overlay is what the *agent* asked for and is spent as
+    /// it is applied; the escalation is what a *validation* decided and lasts
+    /// for the turns it named. Both are [`PolicyOverrides`] and both compose
+    /// through [`TurnPolicy::narrow`], which is total and can only shrink — so
+    /// "neither an agent nor a judge can widen what a key may do" is a property
+    /// of the operator rather than a rule two callers are trusted to remember,
+    /// and the order they compose in cannot change the result.
+    ///
+    /// The escalation is read from [`SessionState::active_escalation`], which
+    /// is folded from the `ValidationDecided` in the log. It crosses no side
+    /// channel: the turns it applies to read it from the same projection a
+    /// replay builds, so a successor picking this session up mid-escalation
+    /// narrows exactly as this process would have.
+    ///
+    /// [`PolicyOverrides`]: roundhouse_core::control::PolicyOverrides
+    /// [`TurnPolicy::narrow`]: roundhouse_core::control::TurnPolicy::narrow
+    /// [`SessionState::active_escalation`]: roundhouse_core::session::SessionState::active_escalation
     pub(super) fn narrowed_admission(
         &self,
         session_id: &SessionId,
+        state: &SessionState,
         admission: &Admission,
     ) -> Admission {
-        let Some(overrides) = self
+        let overlay = self
             .control
             .as_ref()
-            .and_then(|control| control.consume_overlay(session_id))
-        else {
+            .and_then(|control| control.consume_overlay(session_id));
+        let escalation = state.active_escalation().map(PolicyOverrides::from);
+        if overlay.is_none() && escalation.is_none() {
             return admission.clone();
-        };
+        }
+        let mut policy = admission.policy.as_ref().clone();
+        for overrides in [escalation, overlay].into_iter().flatten() {
+            policy = policy.narrow(&overrides);
+        }
         Admission {
             principal: admission.principal.clone(),
-            policy: Arc::new(admission.policy.narrow(&overrides)),
+            policy: Arc::new(policy),
             // Untouched, and deliberately: the two axes an agent may move are
             // the two the overlay carries, and a budget is not one of them.
             // Narrowing a ceiling an admin wrote would be an agent editing its
-            // own project's money, and widening it needs no comment.
+            // own project's money, and widening it needs no comment. An
+            // escalation is the same: it raises a quality floor, which is a
+            // routing question, and says nothing about what may be spent.
             budget: admission.budget.clone(),
+            // Copied through for the same reason: which experiment a session is
+            // in was decided when the session was created, and no per-turn
+            // narrowing may move it.
+            validation: admission.validation.clone(),
         }
+    }
+
+    /// The arm this session is enrolled in, if its membership enrolled it.
+    ///
+    /// Called once per session, where the log is empty, and its answer is
+    /// *stamped* rather than recomputed — see
+    /// [`Arm::for_session`](roundhouse_core::validate::Arm::for_session). A
+    /// deployment that edits its salt therefore re-buckets the sessions it has
+    /// not yet created and none of the ones it has, which is what keeps an arm
+    /// comparison from being computed across a boundary nobody recorded.
+    ///
+    /// `None` for a membership with no `validate` block, and that is the
+    /// shipped answer: an unstamped session is not enrolled, the validator
+    /// declines to be asked about it, and the turn costs no trigger and no
+    /// judge. Guessing an arm here instead would enrol every deployment that
+    /// merely upgraded.
+    pub(super) fn arm_for(&self, session_id: &SessionId, admission: &Admission) -> Option<Arm> {
+        admission
+            .validation
+            .as_ref()
+            .map(|terms| Arm::for_session(session_id, &self.config.arm_salt, terms.shares))
+    }
+
+    /// What the agent says it is trying to do, best answer first.
+    ///
+    /// **The declared goal is the better one and the log cannot hold it.** An
+    /// agent states its objective through the MCP surface, which writes into
+    /// the node-local control store; a stated goal turns the judge's question
+    /// from "infer the goal, then judge drift against your inference" into
+    /// "here is the goal, name the divergence", and the difference is the
+    /// whole reason `declare_intent` has a write half.
+    ///
+    /// The fallback is [`Objective::from_items`], which every session has. A
+    /// declaration lost to a restart therefore degrades to the last user
+    /// message rather than to nothing — the same bounded loss every other read
+    /// of this store takes, and for the same reason it is acceptable: what is
+    /// lost is precision in a brief, never a routing decision.
+    pub(super) fn objective(&self, session_id: &SessionId, state: &SessionState) -> Objective {
+        self.control
+            .as_ref()
+            .and_then(|control| control.intent(session_id))
+            .map(|intent| Objective::Declared {
+                goal: intent.goal,
+                plan_steps: intent.plan_steps,
+                done_when: intent.done_when,
+            })
+            .unwrap_or_else(|| Objective::from_items(&state.items))
     }
 
     /// Commit the corrective payload behind a steer this turn just emitted.

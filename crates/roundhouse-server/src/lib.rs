@@ -44,6 +44,7 @@ pub mod conversations;
 pub mod dialect;
 pub mod engine;
 pub mod http;
+pub mod judge;
 pub mod mcp_api;
 pub mod metrics_api;
 pub mod responses_api;
@@ -52,7 +53,7 @@ pub mod tokenizer;
 pub use catalog_config::{CatalogConfig, CatalogError};
 pub use control_config::{
     Admission, AuthError, ControlPlane, ControlPlaneConfig, ControlPlaneError, KeyScope,
-    MembershipError,
+    MembershipError, ValidateConfig,
 };
 pub use conversations::Conversations;
 pub use dialect::{ClientDialect, DEFAULT_MCP_NAMESPACE};
@@ -60,6 +61,7 @@ pub use engine::{
     EchoLocalExecutor, Engine, EngineConfig, EngineError, LocalExecution, LocalExecutor, TurnResult,
 };
 pub use http::router;
+pub use judge::{FleetJudge, JudgeConfig};
 pub use mcp_api::{ControlPlaneReads, describe_ambiguous_memberships, mcp_router};
 pub use metrics_api::metrics_router;
 pub use responses_api::responses_router;

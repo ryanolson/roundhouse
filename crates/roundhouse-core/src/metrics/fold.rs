@@ -28,11 +28,14 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 
 use crate::control::PrincipalKey;
-use crate::event::{Accounting, SessionEvent, SessionEventKind, Usage};
+use crate::event::{
+    Accounting, NotRunReason, SessionEvent, SessionEventKind, Usage, ValidationOutcome,
+};
 use crate::ids::{ResponseId, SessionId, TurnId};
 use crate::metrics::pricing::TokenShape;
 use crate::metrics::{ModelKey, ServingMode};
 use crate::routing::DecisionRecord;
+use crate::validate::Arm;
 
 /// Raw counters for one [`ModelKey`], before any rate card is applied.
 ///
@@ -61,6 +64,25 @@ pub(super) struct Counters {
     /// Summed over locally-served turns: the cheapest frontier option the
     /// router had quoted at the moment it chose local.
     pub(super) quoted_alternative_usd: f64,
+    /// How many of [`Self::calls`] this deployment made for its own purposes.
+    ///
+    /// A *subset* of `calls`, not an addition to it: the tokens are in the
+    /// usage totals above, because money is money whoever asked for it, and the
+    /// dashboard's grand total must stay the sum of its rows. What this adds is
+    /// the ability to say which part of a row a client asked for — a judge that
+    /// happens to be the same model a conversation used would otherwise be
+    /// indistinguishable from the conversation.
+    pub(super) side_calls: u64,
+    /// Side calls that produced nothing and cost an unknown amount.
+    ///
+    /// **Deliberately not folded as a zero-token call.** A zero-token call is
+    /// indistinguishable from a free one, and the whole reason
+    /// [`SideCallAbandoned`](crate::event::SessionEventKind::SideCallAbandoned)
+    /// is its own kind is that the vocabulary is free to avoid an ambiguity the
+    /// terminal-event vocabulary was not. Counted here so an unaccounted call
+    /// is *marked*: a validator that times out on every turn shows up as a
+    /// number, not as a dashboard that looks its best when its judge is down.
+    pub(super) abandoned_side_calls: u64,
 }
 
 impl Counters {
@@ -85,7 +107,52 @@ impl Counters {
         self.reported_usage.add(&other.reported_usage);
         self.estimated_usage.add(&other.estimated_usage);
         self.quoted_alternative_usd += other.quoted_alternative_usd;
+        self.side_calls += other.side_calls;
+        self.abandoned_side_calls += other.abandoned_side_calls;
     }
+}
+
+/// What one arm's validations came to, for one scope.
+///
+/// A separate accumulator from [`Counters`], and the separation is the plan's
+/// rule made structural: money facts and control facts must not merge. A Shadow
+/// run spends real money on a judge and takes no action, and a row that summed
+/// the two could not tell it from a Live run that spent the same money and
+/// changed the trajectory — which is the one comparison the whole
+/// instrumentation exists to make.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ValidationTally {
+    /// Validations decided, whatever came of them.
+    pub decided: u64,
+    /// Validations that reached a verdict.
+    pub judged: u64,
+    /// Validations that asked nobody — a spent budget, an unreachable judge, an
+    /// unparseable answer, an arm that consults nobody.
+    pub not_run: u64,
+    /// Validations whose action was actually taken.
+    ///
+    /// Zero for the Shadow arm by construction, which is what makes "the arm
+    /// judged and released unchanged" checkable from the fold rather than only
+    /// from the engine.
+    pub intervened: u64,
+}
+
+impl ValidationTally {
+    fn absorb(&mut self, other: &ValidationTally) {
+        self.decided += other.decided;
+        self.judged += other.judged;
+        self.not_run += other.not_run;
+        self.intervened += other.intervened;
+    }
+}
+
+/// Side calls made and abandoned, for one scope.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SideCallTally {
+    /// Calls that answered and were booked.
+    pub completed: u64,
+    /// Calls that produced nothing and cost an unknown amount.
+    pub abandoned: u64,
 }
 
 /// A dispatch waiting for its response to terminate.
@@ -182,6 +249,15 @@ pub struct MetricsFold {
     /// deployment's uptime, and would disclose when anyone else was last
     /// active.
     window_of_principal: BTreeMap<PrincipalKey, (u64, u64)>,
+    /// Validations folded per principal and per arm.
+    ///
+    /// The control accumulator, and deliberately beside [`Self::by_principal`]
+    /// rather than inside it. Everything in `by_principal` is money and is
+    /// keyed by the model that billed it; a validation bills nothing and is
+    /// *about* an arm. Folding the two together would need a model key for a
+    /// decision, and the only honest one — the judge's — would attribute the
+    /// arm comparison to whichever model happened to be answering.
+    validations: BTreeMap<PrincipalKey, BTreeMap<Arm, ValidationTally>>,
 }
 
 /// The volume figures a snapshot carries that are not per-model.
@@ -344,6 +420,62 @@ impl MetricsFold {
                     pending.best_frontier_alternative_usd,
                 );
             }
+            // Money this deployment spent on its own behalf, booked under the
+            // model that billed it and **never paired with a `Routed`**. There
+            // is no dispatch to pair with — the seam that makes side calls sits
+            // before `plan` — so the pending map is untouched: a side call must
+            // not settle some other response's dispatch, and its own row must
+            // not wait for a terminal event that will never come.
+            SessionEventKind::SideCallCompleted { target, usage, .. } => {
+                let counters = self
+                    .by_principal
+                    .entry(payer)
+                    .or_default()
+                    .entry(ModelKey::from_target(target))
+                    .or_default();
+                settle(counters, usage, None);
+                counters.side_calls += 1;
+            }
+            // Marked, not booked. What it billed upstream is the one thing this
+            // deployment does not know, and a zero-token call would read as a
+            // free one.
+            SessionEventKind::SideCallAbandoned { target, .. } => {
+                self.by_principal
+                    .entry(payer)
+                    .or_default()
+                    .entry(ModelKey::from_target(target))
+                    .or_default()
+                    .abandoned_side_calls += 1;
+            }
+            SessionEventKind::ValidationDecided { arm, outcome, .. } => {
+                let tally = self
+                    .validations
+                    .entry(payer)
+                    .or_default()
+                    .entry(*arm)
+                    .or_default();
+                tally.decided += 1;
+                match outcome {
+                    ValidationOutcome::Judged { action, .. } => {
+                        tally.judged += 1;
+                        // The arm decides whether the action happened, which is
+                        // why both are on the event. A Shadow run computes an
+                        // action and takes none, and a fold that read only the
+                        // action would report the control arm intervening.
+                        if arm.acts() && action.intervenes() {
+                            tally.intervened += 1;
+                        }
+                    }
+                    ValidationOutcome::NotRun { reason } => {
+                        tally.not_run += 1;
+                        if let NotRunReason::PlaceboArm { intervened: true } = reason
+                            && arm.acts()
+                        {
+                            tally.intervened += 1;
+                        }
+                    }
+                }
+            }
             SessionEventKind::SessionCreated { .. }
             | SessionEventKind::ItemAppended { .. }
             | SessionEventKind::OutputTextDelta { .. }
@@ -432,6 +564,46 @@ impl MetricsFold {
         merged
     }
 
+    /// What one arm's validations came to, in one scope.
+    ///
+    /// Scoped through the same [`Scope`] the money view uses, so a tenant's
+    /// report cannot read the deployment's arm counts by forgetting to narrow.
+    pub fn validation_tally(&self, scope: Scope<'_>, arm: Arm) -> ValidationTally {
+        let mut total = ValidationTally::default();
+        match scope {
+            Scope::Deployment => {
+                for arms in self.validations.values() {
+                    if let Some(tally) = arms.get(&arm) {
+                        total.absorb(tally);
+                    }
+                }
+            }
+            Scope::Principal(key) => {
+                if let Some(tally) = self.validations.get(key).and_then(|arms| arms.get(&arm)) {
+                    total.absorb(tally);
+                }
+            }
+        }
+        total
+    }
+
+    /// Side calls made and abandoned, in one scope.
+    ///
+    /// Summed across model rows, because the question ("how much of this bill
+    /// did the deployment order for itself, and how much of it went nowhere") is
+    /// not a per-model one — the judge may move between models without the
+    /// answer changing.
+    pub fn side_call_tally(&self, scope: Scope<'_>) -> SideCallTally {
+        let view = self.view(scope);
+        view.rows
+            .values()
+            .fold(SideCallTally::default(), |mut tally, counters| {
+                tally.completed += counters.side_calls;
+                tally.abandoned += counters.abandoned_side_calls;
+                tally
+            })
+    }
+
     /// Turns admitted across the deployment.
     pub fn turns(&self) -> u64 {
         self.turns_of_principal.values().sum()
@@ -499,6 +671,7 @@ pub(super) mod tests {
     use crate::control::Principal;
     use crate::event::{Accounting, IncompleteReason};
     use crate::routing::{Candidate, Target};
+    use crate::validate::SteerAction;
 
     // The fixtures live here, with the fold they build logs for, and are
     // re-used by the snapshot-level tests one module up. Two builders would be
@@ -617,11 +790,61 @@ pub(super) mod tests {
             self.push(SessionEventKind::SessionCreated {
                 model_policy: "affinity".into(),
                 principal,
+                arm: None,
+            })
+        }
+
+        /// A call this deployment made for itself. `None` usage means it was
+        /// abandoned.
+        pub(crate) fn side_call(&mut self, target: Target, usage: Option<Usage>) -> &mut Self {
+            let side_call_id = crate::ids::SideCallId::new(format!("sc_{}", self.events.len()));
+            match usage {
+                Some(usage) => self.push(SessionEventKind::SideCallCompleted {
+                    side_call_id,
+                    purpose: crate::event::SideCallPurpose::Validate,
+                    target,
+                    usage,
+                }),
+                None => self.push(SessionEventKind::SideCallAbandoned {
+                    side_call_id,
+                    purpose: crate::event::SideCallPurpose::Validate,
+                    target,
+                    reason: crate::event::SideCallAbandonReason::DeadlineExceeded,
+                }),
+            }
+        }
+
+        pub(crate) fn validation(&mut self, arm: Arm, outcome: ValidationOutcome) -> &mut Self {
+            self.push(SessionEventKind::ValidationDecided {
+                validation_id: crate::ids::ValidationId::new(format!("val_{}", self.events.len())),
+                trigger: crate::validate::TriggerRecord::new(3, 30_000, Vec::new()),
+                arm,
+                outcome,
             })
         }
 
         pub(crate) fn events(&self) -> &[SessionEvent] {
             &self.events
+        }
+    }
+
+    /// A judged outcome carrying `action`, with the verdict fixed.
+    ///
+    /// The verdict is not what these tests are about — the arm is — so it is
+    /// one shape here rather than a parameter at every call site.
+    pub(crate) fn judged(action: SteerAction) -> ValidationOutcome {
+        ValidationOutcome::Judged {
+            side_call_id: crate::ids::SideCallId::new("sc_j"),
+            verdict: crate::validate::Verdict {
+                on_track: false,
+                confidence: 0.7,
+                divergence: Some(crate::validate::Divergence {
+                    at_step: 2,
+                    description: "the failing test has not been opened".into(),
+                }),
+                missing_context: None,
+            },
+            action,
         }
     }
 
@@ -828,6 +1051,205 @@ pub(super) mod tests {
         );
         assert_eq!(merged.estimated_usage.output_tokens, 200);
         assert!((merged.quoted_alternative_usd - 0.05).abs() < 1e-12);
+        assert_eq!(
+            (merged.side_calls, merged.abandoned_side_calls),
+            (0, 0),
+            "neither tenant made one; the fields are here so the *next* field \
+             added to `Counters` fails this test rather than the dashboard"
+        );
+
+        // And the same merge with side calls on both sides, so the two new
+        // fields are proven to survive it rather than merely proven to be zero.
+        let mut judged = LogBuilder::new("s3");
+        judged.created(Some(principal("acme", "cy")));
+        judged.side_call(
+            frontier("anthropic", "claude"),
+            Some(usage(4_000, 0, 40, 0)),
+        );
+        judged.side_call(frontier("anthropic", "claude"), None);
+        fold.extend(judged.events());
+        let claude_row = &fold.deployment_rows()[&claude()];
+        assert_eq!(
+            (claude_row.side_calls, claude_row.abandoned_side_calls),
+            (1, 1)
+        );
+    }
+
+    /// A side call is money, and it books like money — under the model that
+    /// billed it, with no dispatch to pair with.
+    #[test]
+    fn a_side_call_books_under_its_own_model_row_and_pairs_with_no_dispatch() {
+        let ada = principal("acme", "ada");
+        let mut log = LogBuilder::new("acme/ada/main");
+        log.created(Some(ada.clone()));
+        // One ordinary turn served locally, then a judge consulted about it.
+        log.turn("r1", local("llama"), vec![], usage(10_000, 0, 500, 0));
+        log.side_call(
+            frontier("anthropic", "claude"),
+            Some(usage(4_000, 0, 40, 0)),
+        );
+
+        let mut fold = MetricsFold::new();
+        fold.extend(log.events());
+
+        let key = PrincipalKey::from(&ada);
+        let rows = fold.by_principal.get(&key).expect("the tenant has rows");
+        let judge = &rows[&claude()];
+        assert_eq!(judge.calls, 1, "the judge's call is a call");
+        assert_eq!(judge.side_calls, 1, "and it is one of ours");
+        assert_eq!(judge.reported_usage.input_tokens, 4_000);
+        let worker = &rows[&ModelKey {
+            mode: ServingMode::Local,
+            provider: crate::metrics::LOCAL_PROVIDER.into(),
+            model: "llama".into(),
+        }];
+        assert_eq!(
+            (worker.calls, worker.side_calls),
+            (1, 0),
+            "the turn's own row is untouched: a side call must not settle a \
+             dispatch it had nothing to do with"
+        );
+
+        // The dashboard total is still the sum of its rows, exactly once.
+        assert_eq!(
+            fold.deployment_rows()
+                .values()
+                .map(|row| row.total_usage().total())
+                .sum::<u64>(),
+            10_500 + 4_040
+        );
+        assert_eq!(
+            fold.pending_dispatches(),
+            0,
+            "and nothing is left waiting: a side call opens no pending dispatch, \
+             so its row does not hang on a terminal event that never comes"
+        );
+        assert_eq!(
+            fold.side_call_tally(Scope::Principal(&key)),
+            SideCallTally {
+                completed: 1,
+                abandoned: 0
+            }
+        );
+    }
+
+    /// The ambiguity this vocabulary is free to avoid, avoided.
+    #[test]
+    fn an_abandoned_side_call_is_distinct_from_one_that_billed_nothing() {
+        let ada = principal("acme", "ada");
+        let mut log = LogBuilder::new("acme/ada/main");
+        log.created(Some(ada.clone()));
+        // A judge that answered and genuinely billed nothing — a cached or
+        // free tier — and a judge that timed out. The old vocabulary would have
+        // written both as a zero-usage completion and the `consumed` heuristic
+        // would have had to guess between them.
+        log.side_call(frontier("anthropic", "claude"), Some(usage(0, 0, 0, 0)));
+        log.side_call(frontier("anthropic", "claude"), None);
+
+        let mut fold = MetricsFold::new();
+        fold.extend(log.events());
+
+        let key = PrincipalKey::from(&ada);
+        let row = &fold.by_principal[&key][&claude()];
+        assert_eq!(
+            (row.calls, row.side_calls, row.abandoned_side_calls),
+            (1, 1, 1),
+            "one call happened and billed nothing; one is unaccounted. A single \
+             counter would report two free calls, and a dashboard looks its best \
+             exactly when its judge is down"
+        );
+        assert_eq!(
+            fold.side_call_tally(Scope::Principal(&key)),
+            SideCallTally {
+                completed: 1,
+                abandoned: 1
+            }
+        );
+        assert_eq!(
+            fold.side_call_tally(Scope::Deployment),
+            fold.side_call_tally(Scope::Principal(&key)),
+            "the sole tenant's tally is the deployment's, as the money rows are"
+        );
+    }
+
+    /// The comparison the whole design exists to make, at the fold.
+    #[test]
+    fn a_shadow_run_is_distinguishable_from_a_live_one() {
+        let escalate = SteerAction::Escalate {
+            turns: 3,
+            overrides: crate::validate::EscalationOverrides { min_quality: 0.8 },
+        };
+        let ada = principal("acme", "ada");
+        let mut log = LogBuilder::new("acme/ada/main");
+        log.created(Some(ada.clone()));
+        // Two sessions' worth of decisions in one log, which is what a fold
+        // sees anyway: identical verdicts and identical actions, differing only
+        // in the arm.
+        log.validation(Arm::Shadow, judged(escalate.clone()));
+        log.validation(Arm::Live, judged(escalate));
+        log.validation(
+            Arm::Placebo,
+            ValidationOutcome::NotRun {
+                reason: NotRunReason::PlaceboArm { intervened: true },
+            },
+        );
+        log.validation(
+            Arm::Live,
+            ValidationOutcome::NotRun {
+                reason: NotRunReason::JudgeFailed,
+            },
+        );
+
+        let mut fold = MetricsFold::new();
+        fold.extend(log.events());
+        let key = PrincipalKey::from(&ada);
+
+        assert_eq!(
+            fold.validation_tally(Scope::Principal(&key), Arm::Shadow),
+            ValidationTally {
+                decided: 1,
+                judged: 1,
+                not_run: 0,
+                intervened: 0,
+            },
+            "the observe-only arm computed an action and took none -- which is \
+             what makes it the control"
+        );
+        assert_eq!(
+            fold.validation_tally(Scope::Principal(&key), Arm::Live),
+            ValidationTally {
+                decided: 2,
+                judged: 1,
+                not_run: 1,
+                intervened: 1,
+            },
+            "the same verdict, acted on; and a failed consult that is a decision \
+             too, marked rather than absent"
+        );
+        assert_eq!(
+            fold.validation_tally(Scope::Principal(&key), Arm::Placebo),
+            ValidationTally {
+                decided: 1,
+                judged: 0,
+                not_run: 1,
+                intervened: 1,
+            },
+            "an intervention with no verdict behind it, which is the whole of the \
+             placebo"
+        );
+
+        // Control facts stay out of the money rows: nothing above dispatched or
+        // billed anything.
+        assert!(fold.deployment_rows().is_empty());
+        // And a tenant with no validations reads as none rather than as a
+        // lookup failure.
+        assert_eq!(
+            fold.validation_tally(
+                Scope::Principal(&PrincipalKey::from(&principal("other", "bo"))),
+                Arm::Live
+            ),
+            ValidationTally::default()
+        );
     }
 
     #[test]

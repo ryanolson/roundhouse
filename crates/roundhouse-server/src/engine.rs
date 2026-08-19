@@ -40,6 +40,7 @@ use roundhouse_core::routing::{
 };
 use roundhouse_core::session::{Session, SessionError, TurnAdmission};
 use roundhouse_core::store::SessionStore;
+use roundhouse_core::validate::{SideCall, SteerCapability};
 use roundhouse_fleet::{
     FleetError, FleetQuery, FrontierChunk, FrontierClient, FrontierError, FrontierQuote,
     FrontierStream, LocalFleet, LocalQuote, StaticFrontierCatalog,
@@ -190,6 +191,18 @@ pub struct EngineConfig {
     /// indefinitely, and the session would never fail over to anyone able to
     /// make progress. The deadline is what makes the heartbeat safe.
     pub turn_deadline_ms: u64,
+    /// What arm assignment is hashed against, deployment-wide.
+    ///
+    /// Configuration and stable: moving it re-randomizes the experiment, which
+    /// is something an operator does deliberately between studies and never in
+    /// the middle of one. It reaches the log only as the *arm it produced* —
+    /// stamped once into `SessionCreated` and never recomputed — so editing it
+    /// changes which arm the next new session lands in and no historical one.
+    ///
+    /// Empty by default, which is a salt like any other rather than "no
+    /// experiment": a deployment with no membership enrolled stamps no arm
+    /// whatever this says.
+    pub arm_salt: String,
 }
 
 impl Default for EngineConfig {
@@ -204,6 +217,7 @@ impl Default for EngineConfig {
             local_base_ttft_ms: 60.0,
             expected_output_tokens: 256,
             turn_deadline_ms: 120_000,
+            arm_salt: String::new(),
         }
     }
 }
@@ -598,7 +612,11 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         // which is what lets `by_principal` exist without a side table.
         if session.last_seq() == 0 {
             session
-                .record_created(self.policy.name(), &admission.principal)
+                .record_created(
+                    self.policy.name(),
+                    &admission.principal,
+                    self.arm_for(session_id, admission),
+                )
                 .await?;
         }
 
@@ -665,6 +683,33 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             .consider(&InterjectionContext {
                 state: session.state(),
                 response_id: &response_id,
+                turn_policy: &admission.policy,
+                // What the agent declared through the MCP surface, and the
+                // log's own fallback where it declared nothing. See
+                // [`Self::objective`].
+                objective: self.objective(session_id, session.state()),
+                // Not yet detected. `Absent` is the honest value while nothing
+                // reads the request's tool list: under `SteerChannel::Auto` it
+                // degrades a correction to plain guidance, which is the safe
+                // direction, and the production default interjects on nothing
+                // regardless. Detection belongs at the wire layer against the
+                // tool list a request declared, which is §7's milestone.
+                capability: &SteerCapability::Absent,
+                // Who a check is billed to, and under what key. Not the
+                // candidate list, and never a price: an occupant may be told
+                // there is no room for a check and never what the turn it is
+                // checking would have cost.
+                side_call: SideCall {
+                    session_id,
+                    principal: &admission.principal,
+                    budget: admission.budget.as_ref(),
+                },
+                // What this membership permits of the loop, resolved from the
+                // same key the policy and the budget were. `None` is a
+                // membership that is not enrolled, and it releases the turn as
+                // surely as an unstamped session does — see
+                // `Validator::consider`, which asks both.
+                validation: admission.validation.as_ref(),
             })
             .await;
         // The one settle seam. Every admitted turn terminates its response and
@@ -700,21 +745,41 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             // sees a settle that has already been applied instead of
             // re-driving a turn that never took a grant.
             //
-            // The text is empty and that is the honest report rather than a
-            // rendering of the call: the call reaches the client as a wire
-            // item, and a caller that concatenated `text` into a transcript
-            // must not find a tool call in it. The usage is the
-            // interjection's — reporting `Usage::default()` instead would make
-            // this deployment's own dashboard exceed what clients were told
-            // they spent, which is the one direction an accounting error must
-            // never run.
+            // **The dashboard total equals the sum of its rows exactly once,
+            // and this is the site that makes it true.** A steered turn books
+            // no model row for itself, and the judge's side call — committed
+            // in `record`, one line down — books once under the judge's own
+            // row. Two rows for one turn would double-count the check; none
+            // would report a turn that genuinely cost money as free. Without
+            // this comment the absence reads as a missing `record_routing`,
+            // which is exactly the "fix" that would break it.
+            //
+            // **The text is what the item says, and for a call that is
+            // nothing.** A caller that concatenated `text` into a transcript
+            // must not find a tool call in it — the call reaches a client as a
+            // wire item, not as prose — but a halt's item *is* prose, and it is
+            // the whole point of the halt: the guidance that ends the agent's
+            // loop and hands control back to a human. Returning the empty
+            // string for both would leave the degrade path with its correction
+            // in the log and nothing on the wire. See
+            // [`Item::spoken_text`](roundhouse_core::item::Item::spoken_text).
+            //
+            // The usage is the interjection's — reporting `Usage::default()`
+            // instead would make this deployment's own dashboard exceed what
+            // clients were told they spent, which is the one direction an
+            // accounting error must never run.
             Interjection::Complete {
                 item,
                 usage,
                 guidance,
+                record,
             } => {
+                // The record goes in the same append batch as the item and the
+                // completion. A decision and its realization committed
+                // separately leave a window in which a steered turn exists with
+                // nothing in the log saying what decided it.
                 let committed = session
-                    .complete_with_item(&response_id, item.clone(), usage.clone())
+                    .complete_with_item(&response_id, item.clone(), usage.clone(), record)
                     .await;
                 committed
                     .map(|()| {
@@ -722,11 +787,21 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                         // [`Self::deposit_steer`] on why that ordering is the
                         // load-bearing half.
                         self.deposit_steer(session_id, &admission.principal, &item, guidance);
-                        (String::new(), usage, None)
+                        (item.spoken_text().to_string(), usage, None)
                     })
                     .map_err(EngineError::from)
             }
-            Interjection::Proceed => {
+            Interjection::Proceed { record } => {
+                // Whatever deciding *not* to interject cost, before anything
+                // else in this arm: a judge that was consulted and said carry
+                // on, or one that could not be reached, is a fact about this
+                // turn either way. Committed rather than dropped, because a
+                // validator that released the turn and left no trace is
+                // indistinguishable from one that never ran — and an empty
+                // record, which is what the production default returns, commits
+                // nothing at all.
+                session.record_control(record).await?;
+
                 // The agent's own narrowing, spent here and applied for the
                 // rest of this turn.
                 //
@@ -748,7 +823,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                 // reads the principal and the budget, and `narrow` touches
                 // neither — a budget is an admin's ceiling and not an axis an
                 // agent may move.
-                let admission = &self.narrowed_admission(session_id, admission);
+                let admission = &self.narrowed_admission(session_id, session.state(), admission);
                 match self.dispatch(&mut session, &response_id, admission).await {
                     Ok(Completed {
                         text,

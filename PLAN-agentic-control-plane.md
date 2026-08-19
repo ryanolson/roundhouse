@@ -669,9 +669,19 @@ no new transport. Four isolations, each load-bearing:
 
 A lease lost mid-side-call fails the subsequent commit exactly like the
 existing mid-dispatch failure path — the turn settles incomplete and
-retryable; the side-call's cost, if reported, is still booked. (New exposure
-the review named: this seam turns a zero-latency window into a network round
-trip. Handled by the same failure vocabulary, tested explicitly.)
+retryable, and nothing the fenced owner decided reaches the log, the side
+call's own cost included. `SideCallCompleted` and `ValidationDecided` are one
+`ControlRecord`, written as a single atomic append (the log has one writer,
+and there is no way to be half the writer), so a lease lost between the judge
+answering and that commit takes the cost with it exactly as a lease lost
+between a dispatch's model call and *its* commit already took the dispatch's
+cost — the new seam inherits the old failure's shape rather than earning a
+narrower one. A judge answer that never reaches the log is not spent twice:
+the client's retry is what re-attempts it, in the same way a dropped dispatch
+is retried rather than double-booked. (New exposure the review named: this
+seam turns a zero-latency window into a network round trip. Handled by the
+same failure vocabulary, tested explicitly, including the case where the
+judge answered before the fence landed.)
 
 ### What the judge sees, and what it may say
 

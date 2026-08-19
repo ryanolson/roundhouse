@@ -31,6 +31,9 @@ use roundhouse_core::control::{
 
 use super::Admission;
 use super::budget::{AllocationConfig, BudgetConfig};
+use roundhouse_core::validate::ValidationTerms;
+
+use super::validate::ValidateConfig;
 
 /// One entry of the config's `"projects"` array.
 #[derive(Debug, Clone, Deserialize)]
@@ -54,6 +57,17 @@ pub struct ProjectEntry {
     /// distinct value and not a budget with a very large limit.
     #[serde(default)]
     pub budget: Option<BudgetConfig>,
+    /// Whether this project's sessions are enrolled in the validate/steer
+    /// loop, and how. Absent means off — see [`ValidateConfig`], and note that
+    /// off is the *shipped* posture rather than a fallback: a deployment that
+    /// upgrades validates nothing until a project says otherwise.
+    ///
+    /// On the project and not on a key, unlike `overrides` and `allocation`:
+    /// an arm is the unit of a comparison, and two keys of one project running
+    /// different arm splits would put two experiments inside one project's
+    /// numbers.
+    #[serde(default)]
+    pub validate: Option<ValidateConfig>,
 }
 
 /// One entry of the config's `"users"` array.
@@ -247,6 +261,22 @@ pub struct ControlPlaneConfig {
     /// same question in one place.
     #[serde(default)]
     pub mcp_namespace: Option<String>,
+    /// What arm assignment is hashed against, deployment-wide.
+    ///
+    /// Here rather than in an environment variable for the same reason
+    /// `mcp_namespace` is: it is a deployment-wide name whose value decides how
+    /// something an operator wrote down is interpreted, and it belongs in the
+    /// file the rest of that is written in. Absent is the empty salt, which is
+    /// a salt like any other rather than "no experiment" — a deployment with no
+    /// project enrolled stamps no arm whatever this says.
+    ///
+    /// **Moving it is a study boundary.** The arm it produces is stamped into
+    /// `SessionCreated` and never recomputed, so an edit re-buckets sessions
+    /// created afterwards and none created before. That is the intended
+    /// behavior and the reason the stamp exists; what it is not is a way to
+    /// re-randomize a study already in flight.
+    #[serde(default)]
+    pub arm_salt: Option<String>,
     /// The finished turn-key lookup table: `key_sha256` to the complete
     /// [`Admission`] the key resolves to — its membership, its fully-resolved
     /// [`TurnPolicy`] (its project's policy narrowed by its own overrides),
@@ -424,6 +454,33 @@ pub enum ControlPlaneError {
         fraction: f64,
     },
     #[error(
+        "control-plane config `{path}`: {entry}'s validate.arms weights are all zero -- a share \
+         table that shares nothing has no honest reading, and the tempting fallback (everything \
+         in one arm) is exactly the silent mis-assignment the arms exist to prevent; give at \
+         least one arm a weight, or leave `validate` out"
+    )]
+    ArmSharesEmpty { path: String, entry: String },
+    #[error(
+        "control-plane config `{path}`: {entry}'s validate.placebo_rate {placebo_rate} is \
+         outside 0.0..=1.0 -- it is the fraction of fired triggers the sham arm interrupts on, \
+         and a fraction outside that range is a control that is not one"
+    )]
+    PlaceboRateOutOfRange {
+        path: String,
+        entry: String,
+        placebo_rate: f64,
+    },
+    #[error(
+        "control-plane config `{path}`: {entry}'s validate.escalation_floor {escalation_floor} \
+         is outside 0.0..=1.0 -- it is a quality prior, on the same scale every model in the \
+         catalog is scored on"
+    )]
+    EscalationFloorOutOfRange {
+        path: String,
+        entry: String,
+        escalation_floor: f64,
+    },
+    #[error(
         "control-plane config `{path}`: {entry}'s budget sets \
          \"overflow_when_local_saturated\" alongside \"on_exhaustion\": \"refuse\" -- overflow \
          is a degrade-mode valve, meaningless once the project has decided to refuse a turn \
@@ -500,6 +557,12 @@ impl ControlPlaneConfig {
         // here for the same reason the policy is: the keys loop below reads
         // it once per key rather than re-judging the same `BudgetConfig`.
         let mut project_budgets: HashMap<&str, Option<Budget>> = HashMap::new();
+        // And every project's resolved validate terms, `None` meaning the loop
+        // is off for it — resolved here for the same reason the two above are,
+        // and refused here for a sharper one: a broken share table has to stop
+        // the boot on the day it is written, not on the day somebody flips
+        // `enabled`.
+        let mut project_validation: HashMap<&str, Option<ValidationTerms>> = HashMap::new();
         for project in &self.projects {
             if !is_valid_slug(&project.id) {
                 return Err(ControlPlaneError::BadProjectSlug {
@@ -525,6 +588,12 @@ impl ControlPlaneConfig {
                 None => None,
             };
             project_budgets.insert(project.id.as_str(), budget);
+
+            let validation = match &project.validate {
+                Some(validate_config) => validate_config.to_terms(path, &entry)?,
+                None => None,
+            };
+            project_validation.insert(project.id.as_str(), validation);
         }
 
         let mut user_ids: HashSet<&str> = HashSet::new();
@@ -618,12 +687,20 @@ impl ControlPlaneConfig {
                 allocation: allocation.unwrap_or(Allocation::Pooled),
             });
 
+            // Copied down from the project unchanged: an arm is the unit of a
+            // comparison, so every key of one project is in one experiment.
+            let validation = project_validation
+                .get(key.project.as_str())
+                .expect("a project checked present above was resolved to validate terms above")
+                .clone();
+
             turn_keys.insert(
                 key.key_sha256.clone(),
                 Admission {
                     principal: Principal::new(key.project.clone(), key.user.clone()),
                     policy: Arc::new(project_policy.narrow(&overrides)),
                     budget,
+                    validation,
                 },
             );
         }

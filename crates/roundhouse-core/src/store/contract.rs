@@ -267,6 +267,7 @@ pub async fn appends_assign_contiguous_seqs_and_replay_is_gapless<S: SessionStor
                 SessionEventKind::SessionCreated {
                     model_policy: "affinity".into(),
                     principal: None,
+                    arm: None,
                 },
                 text_event("one"),
             ],
@@ -306,6 +307,10 @@ pub async fn read_events_pages_oldest_first_and_reproduces_the_append<S: Session
             // dropped the one carrying attribution would still pass with an
             // empty principal here.
             principal: Some(Principal::new("acme", "ada")),
+            // Populated for the same reason, one widening later: an arm stamp
+            // that a backend dropped would put every replayed session back in
+            // the unenrolled state and silently empty the experiment.
+            arm: Some(crate::validate::Arm::Shadow),
         },
         SessionEventKind::TurnStarted {
             turn_id: TurnId::generate(),

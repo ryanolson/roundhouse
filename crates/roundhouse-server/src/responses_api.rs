@@ -402,6 +402,21 @@ enum Step {
     End,
 }
 
+/// An item this response emitted, in the two shapes a response can emit one.
+///
+/// An enum rather than two predicates because the choice is exclusive and the
+/// exclusivity is load-bearing: an item is a call or a message, never both, and
+/// a stream that projected it twice would hand a client one answer in two
+/// shapes. Named here rather than in [`wire`] because what it decides is which
+/// frames to build, not how to build them.
+enum Emitted<'a> {
+    /// A synthetic tool call — the steered turn's outcome B.
+    Call(EmittedCall<'a>),
+    /// Assistant text committed whole, with no deltas behind it — the halted
+    /// turn's outcome C.
+    Message(&'a str),
+}
+
 /// Streams one turn as a Responses API response.
 ///
 /// The turn runs in a task this follower never aborts, for the reason
@@ -539,15 +554,24 @@ impl<S: SessionStore> ResponsesFollower<S> {
             }
             // Claimed exactly when there is something to project, asked
             // through the one predicate `project` renders from. See
-            // [`Self::emitted_call`].
-            SessionEventKind::ItemAppended { item } => self.emitted_call(item).is_some(),
+            // [`Self::emitted`].
+            SessionEventKind::ItemAppended { item } => self.emitted(item).is_some(),
+            // The validate loop's three kinds belong to no response — they
+            // answer `None` from `response_id()` — so no stream claims them.
+            // That is what keeps this deployment's own bookkeeping off a
+            // client's wire: a side call is money nobody asked us to spend and
+            // a verdict is a decision, and neither is an answer to the turn
+            // being streamed.
             SessionEventKind::SessionCreated { .. }
             | SessionEventKind::Routed { .. }
+            | SessionEventKind::SideCallCompleted { .. }
+            | SessionEventKind::SideCallAbandoned { .. }
+            | SessionEventKind::ValidationDecided { .. }
             | SessionEventKind::Error { .. } => false,
         }
     }
 
-    /// The tool call `item` carries, if *this response* emitted it.
+    /// What *this response* emitted as an item, if this entry is one.
     ///
     /// One predicate rather than a condition in [`Self::concerns`] and a
     /// matching one in [`Self::project`]. The first draft had both, and the
@@ -557,39 +581,51 @@ impl<S: SessionStore> ResponsesFollower<S> {
     /// makes "claimed" and "projected" the same answer by construction —
     /// there is no entry this stream claims and then silently drops.
     ///
-    /// The narrowing is two questions, and returning the call's parts is what
-    /// makes both structural rather than remembered:
+    /// **Provenance is the question both arms ask**, and it is a real choice
+    /// rather than a formality: a replay re-reads the whole log, so every item
+    /// this session ever emitted passes through here, and only this response's
+    /// may go out. An item a client sent never has a stamp at all, because
+    /// canonicalization sets `None` on everything on the input path.
     ///
-    /// - **Content.** Only a `ToolCall` has a `call_id`, a `name` and
-    ///   `arguments` to render, so a widened predicate would not compile. It
-    ///   matters because an assistant text item is *already* on the wire
-    ///   through the delta path: forwarding it here would emit a second
-    ///   `response.output_item.done` for the same message, and a client reads
-    ///   that as the answer arriving twice.
-    /// - **Provenance.** The frame's item id is minted from the response that
-    ///   emitted the call, so an item with no stamp has no id to be given —
-    ///   and an item a client sent never has one, because canonicalization
-    ///   sets `None` on everything on the input path. The equality is the half
-    ///   that is a real choice: a replay re-reads the whole log, so every call
-    ///   this session ever emitted passes through here, and only the one this
-    ///   response emitted may go out.
-    fn emitted_call<'a>(&'a self, item: &'a Item) -> Option<EmittedCall<'a>> {
-        let ItemContent::ToolCall {
-            call_id,
-            name,
-            arguments,
-        } = &item.content
-        else {
-            return None;
-        };
+    /// The two arms then differ in what else they have to be sure of:
+    ///
+    /// - **A call** needs nothing more. Only a `ToolCall` has a `call_id`, a
+    ///   `name` and `arguments` to render, so the frame builders would not
+    ///   compile against anything else.
+    /// - **A message** needs `item_open` to be false, and that is the whole of
+    ///   the narrowing. An ordinary dispatched turn puts its answer on the wire
+    ///   through the delta path and *then* commits the same text as an item, so
+    ///   claiming it here too would emit a second
+    ///   `response.output_item.done` for one message — the answer arriving
+    ///   twice. `item_open` is true exactly when a delta has already announced
+    ///   that item, so the only message this arm ever claims is one no delta
+    ///   preceded: the validate loop's halt (outcome C), whose guidance text is
+    ///   committed whole and never streamed. Before this arm existed a halted
+    ///   turn streamed `created` then `completed` with no text at all — the
+    ///   correction sat in the log and the agent, whose loop the halt is meant
+    ///   to end, was handed an empty answer.
+    fn emitted<'a>(&'a self, item: &'a Item) -> Option<Emitted<'a>> {
         let response_id = item.response_id.as_ref()?;
-        (self.response_id.as_ref() == Some(response_id)).then_some(EmittedCall {
-            dialect: &self.dialect,
-            response_id,
-            call_id,
-            name,
-            arguments,
-        })
+        if self.response_id.as_ref() != Some(response_id) {
+            return None;
+        }
+        match &item.content {
+            ItemContent::ToolCall {
+                call_id,
+                name,
+                arguments,
+            } => Some(Emitted::Call(EmittedCall {
+                dialect: &self.dialect,
+                response_id,
+                call_id,
+                name,
+                arguments,
+            })),
+            ItemContent::Text { text } if !self.item_open && !text.is_empty() => {
+                Some(Emitted::Message(text))
+            }
+            ItemContent::Text { .. } | ItemContent::ToolResult { .. } => None,
+        }
     }
 
     /// Queue what one log entry becomes on the wire.
@@ -684,19 +720,32 @@ impl<S: SessionStore> ResponsesFollower<S> {
             // the four-frame sequence four frames rather than five with an
             // empty message on the end.
             SessionEventKind::ItemAppended { item } => {
-                if let Some(call) = self.emitted_call(item) {
-                    // Built before either is queued, because `call` borrows
-                    // this follower and the queue needs it back mutably. The
-                    // pair is built together for a second reason too: a client
-                    // announced one call and handed another has no way to
-                    // reconcile them.
-                    let frames = [tool_call_added_frame(&call), tool_call_done_frame(&call)];
-                    self.queued.extend(frames);
-                }
+                // Built before either is queued, because the borrow is on this
+                // follower and the queue needs it back mutably. Each pair is
+                // built together for a second reason too: a client announced
+                // one item and handed another has no way to reconcile them.
+                let frames = match self.emitted(item) {
+                    Some(Emitted::Call(call)) => {
+                        Some([tool_call_added_frame(&call), tool_call_done_frame(&call)])
+                    }
+                    // A halt: guidance committed whole, with no deltas behind
+                    // it. `item_open` stays false — it tracks the *streamed*
+                    // message, whose `done` the completion below emits — so
+                    // the completion adds only its own frame and the sequence
+                    // is the same four a steered turn is.
+                    Some(Emitted::Message(text)) => {
+                        Some([item_added_frame(), item_done_frame(text)])
+                    }
+                    None => None,
+                };
+                self.queued.extend(frames.into_iter().flatten());
                 Step::Continue
             }
             SessionEventKind::SessionCreated { .. }
             | SessionEventKind::Routed { .. }
+            | SessionEventKind::SideCallCompleted { .. }
+            | SessionEventKind::SideCallAbandoned { .. }
+            | SessionEventKind::ValidationDecided { .. }
             | SessionEventKind::Error { .. } => Step::Continue,
         }
     }

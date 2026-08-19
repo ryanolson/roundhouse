@@ -74,6 +74,16 @@ string_id!(
     "turn",
     "Client-supplied idempotency key for a single turn.\n\nRe-sending a turn after a reconnect must not produce a second response, so\nthe session replays the existing outcome when it sees a `TurnId` it has\nalready completed."
 );
+string_id!(
+    SideCallId,
+    "sc",
+    "Identifies one model call this deployment made for its own purposes.\n\nA side call is not a turn: no client asked for it, it emits no conversation\nitem, and it never appears on the wire. It has an id of its own precisely so\nits money can be booked and joined to the decision that caused it without\nborrowing a [`ResponseId`], which would make the side call look like part of\nthe response a client is streaming."
+);
+string_id!(
+    ValidationId,
+    "val",
+    "Identifies one consultation of the validate/steer loop.\n\nSeparate from [`SideCallId`] because a validation may run *without* a side\ncall — a spent budget, an arm that consults nobody — and a side call may\nexist whose verdict was unusable. One id per question asked, one per model\ncall made, and the join between them is a field rather than an assumption."
+);
 
 #[cfg(test)]
 mod tests {

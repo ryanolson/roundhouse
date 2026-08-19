@@ -48,7 +48,7 @@ use codex_utils_rustls_provider::ensure_rustls_crypto_provider;
 
 use roundhouse_core::context::ByteTokenizer;
 use roundhouse_core::control::{MemorySpendLedger, Principal, SpendLedger};
-use roundhouse_core::event::{Accounting, SessionEventKind, Usage};
+use roundhouse_core::event::{Accounting, ControlRecord, SessionEventKind, Usage};
 use roundhouse_core::ids::SessionId;
 use roundhouse_core::interject::{Interjection, InterjectionContext, Interjector};
 use roundhouse_core::item::{Item, ItemContent};
@@ -245,7 +245,7 @@ impl Interjector for TestInterjector {
             .pop_front()
             .unwrap_or(Plan::Proceed);
         match plan {
-            Plan::Proceed => Interjection::Proceed,
+            Plan::Proceed => Interjection::proceed(),
             Plan::Steer => {
                 let call_id = format!("rhsteer_{}", context.response_id);
                 Interjection::Complete {
@@ -264,6 +264,9 @@ impl Interjector for TestInterjector {
                     // The payload, which never reaches the wire: the client is
                     // handed the call, and the correction is fetched separately.
                     guidance: STEER_GUIDANCE.to_string(),
+                    // Empty: this double stands in for the interjector, not for
+                    // the validate loop behind it.
+                    record: ControlRecord::default(),
                 }
             }
         }

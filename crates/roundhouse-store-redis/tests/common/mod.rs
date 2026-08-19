@@ -18,11 +18,18 @@
 #![allow(dead_code)]
 
 use roundhouse_core::control::{BudgetState, Principal};
-use roundhouse_core::event::{Accounting, IncompleteReason, SessionEvent, SessionEventKind, Usage};
-use roundhouse_core::ids::{ResponseId, SessionId, TurnId};
+use roundhouse_core::event::{
+    Accounting, IncompleteReason, SessionEvent, SessionEventKind, SideCallAbandonReason,
+    SideCallPurpose, Usage, ValidationOutcome,
+};
+use roundhouse_core::ids::{ResponseId, SessionId, SideCallId, TurnId, ValidationId};
 use roundhouse_core::item::Item;
 use roundhouse_core::routing::{Candidate, DecisionRecord, Target};
 use roundhouse_core::store::SessionStore;
+use roundhouse_core::validate::{
+    Arm, Divergence, EscalationOverrides, SignalFired, SignalKind, SteerAction, TriggerRecord,
+    Verdict,
+};
 use roundhouse_store_redis::RedisSessionStore;
 use roundhouse_store_redis::test_support;
 
@@ -118,6 +125,10 @@ pub fn every_event_kind() -> Vec<SessionEventKind> {
         provider: "anthropic".into(),
         model: "claude-sonnet-5".into(),
     };
+    let judge = Target::Frontier {
+        provider: "openai".into(),
+        model: "gpt-5-mini".into(),
+    };
     vec![
         SessionEventKind::SessionCreated {
             model_policy: "affinity".into(),
@@ -125,6 +136,10 @@ pub fn every_event_kind() -> Vec<SessionEventKind> {
             // backend reassembles what it took apart, and an empty principal
             // would let a codec that dropped attribution round-trip cleanly.
             principal: Some(Principal::new("acme", "ada")),
+            // Populated for the same reason: a backend that dropped the arm
+            // stamp would put every replayed session back in the unenrolled
+            // state and silently empty the experiment.
+            arm: Some(Arm::Shadow),
         },
         SessionEventKind::TurnStarted {
             turn_id: TurnId::generate(),
@@ -199,6 +214,52 @@ pub fn every_event_kind() -> Vec<SessionEventKind> {
             turn_id: TurnId::generate(),
             response_id,
         },
+        SessionEventKind::SideCallCompleted {
+            side_call_id: SideCallId::generate(),
+            purpose: SideCallPurpose::Validate,
+            target: judge.clone(),
+            usage: Usage {
+                input_tokens: 4_000,
+                output_tokens: 40,
+                ..Usage::default()
+            },
+        },
+        SessionEventKind::SideCallAbandoned {
+            side_call_id: SideCallId::generate(),
+            purpose: SideCallPurpose::Validate,
+            target: judge,
+            reason: SideCallAbandonReason::DeadlineExceeded,
+        },
+        SessionEventKind::ValidationDecided {
+            validation_id: ValidationId::generate(),
+            trigger: TriggerRecord::new(
+                4,
+                30_000,
+                vec![SignalFired {
+                    kind: SignalKind::NoProgressRepeat,
+                    fact: "the call `pytest` has produced identical output 4 times".into(),
+                }],
+            ),
+            arm: Arm::Live,
+            // Judged rather than `NotRun`: the richer of the two arms, so a
+            // codec that flattened the verdict or the action fails here.
+            outcome: ValidationOutcome::Judged {
+                side_call_id: SideCallId::generate(),
+                verdict: Verdict {
+                    on_track: false,
+                    confidence: 0.75,
+                    divergence: Some(Divergence {
+                        at_step: 3,
+                        description: "never opened the failing import".into(),
+                    }),
+                    missing_context: None,
+                },
+                action: SteerAction::Escalate {
+                    turns: 3,
+                    overrides: EscalationOverrides { min_quality: 0.8 },
+                },
+            },
+        },
         SessionEventKind::Error {
             message: "boom".into(),
         },
@@ -211,7 +272,7 @@ pub fn every_event_kind() -> Vec<SessionEventKind> {
 /// rather than a hopeful one.
 pub fn assert_covers_every_variant(kinds: &[SessionEventKind]) {
     use SessionEventKind as K;
-    let mut covered = [false; 9];
+    let mut covered = [false; 12];
     for kind in kinds {
         covered[match kind {
             K::SessionCreated { .. } => 0,
@@ -223,6 +284,9 @@ pub fn assert_covers_every_variant(kinds: &[SessionEventKind]) {
             K::ResponseIncomplete { .. } => 6,
             K::TurnDeduplicated { .. } => 7,
             K::Error { .. } => 8,
+            K::SideCallCompleted { .. } => 9,
+            K::SideCallAbandoned { .. } => 10,
+            K::ValidationDecided { .. } => 11,
         }] = true;
     }
     assert!(

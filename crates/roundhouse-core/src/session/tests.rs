@@ -70,7 +70,7 @@ async fn record_created_commits_session_created_with_the_principal() {
     let principal = Principal::new("acme", "ada");
 
     session
-        .record_created("affinity", &principal)
+        .record_created("affinity", &principal, None)
         .await
         .unwrap();
 
@@ -83,6 +83,7 @@ async fn record_created_commits_session_created_with_the_principal() {
     assert_eq!(
         events[0].kind,
         SessionEventKind::SessionCreated {
+            arm: None,
             model_policy: "affinity".into(),
             principal: Some(principal),
         }
@@ -504,7 +505,7 @@ async fn a_reader_projects_a_session_without_taking_the_lease_the_writer_holds()
     let store = Arc::new(MemoryStore::new());
     let (sid, mut session) = new_session(Arc::clone(&store), "writer").await;
     session
-        .record_created("affinity", &Principal::new("acme", "ada"))
+        .record_created("affinity", &Principal::new("acme", "ada"), None)
         .await
         .unwrap();
     let started = session
@@ -522,6 +523,7 @@ async fn a_reader_projects_a_session_without_taking_the_lease_the_writer_holds()
             &response_id,
             Item::tool_call(STEER_CALL_ID, STEER_NAME, STEER_ARGS),
             Usage::default(),
+            ControlRecord::default(),
         )
         .await
         .unwrap();
@@ -819,7 +821,12 @@ async fn complete_with_item_appends_the_item_and_completes_in_one_batch() {
     store.forget_batches();
 
     session
-        .complete_with_item(&response_id, steer_call(), Usage::default())
+        .complete_with_item(
+            &response_id,
+            steer_call(),
+            Usage::default(),
+            ControlRecord::default(),
+        )
         .await
         .unwrap();
 
@@ -875,7 +882,12 @@ async fn the_appended_item_carries_the_response_stamp_and_renders_as_a_tool_call
         .unwrap();
     let response_id = admission.response_id().clone();
     session
-        .complete_with_item(&response_id, steer_call(), Usage::default())
+        .complete_with_item(
+            &response_id,
+            steer_call(),
+            Usage::default(),
+            ControlRecord::default(),
+        )
         .await
         .unwrap();
 
@@ -938,7 +950,12 @@ async fn complete_with_item_registers_the_turn_for_dedup_like_complete_does() {
         ..Usage::default()
     };
     session
-        .complete_with_item(&response_id, steer_call(), billed.clone())
+        .complete_with_item(
+            &response_id,
+            steer_call(),
+            billed.clone(),
+            ControlRecord::default(),
+        )
         .await
         .unwrap();
 
@@ -984,7 +1001,12 @@ async fn a_server_emitted_tool_call_opens_a_steer_and_the_matching_result_closes
         .unwrap();
     let response_id = admission.response_id().clone();
     session
-        .complete_with_item(&response_id, steer_call(), Usage::default())
+        .complete_with_item(
+            &response_id,
+            steer_call(),
+            Usage::default(),
+            ControlRecord::default(),
+        )
         .await
         .unwrap();
 
@@ -1047,7 +1069,12 @@ async fn an_unrelated_tool_result_leaves_the_steer_open() {
         .unwrap();
     let response_id = admission.response_id().clone();
     session
-        .complete_with_item(&response_id, steer_call(), Usage::default())
+        .complete_with_item(
+            &response_id,
+            steer_call(),
+            Usage::default(),
+            ControlRecord::default(),
+        )
         .await
         .unwrap();
 
@@ -1090,4 +1117,251 @@ async fn a_client_sent_tool_call_in_input_opens_no_steer() {
          client could open one by sending a tool call, and M6's \
          open-steer exclusion would be a knob the client turns"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The validate loop's projections, folded from a real log
+// ---------------------------------------------------------------------------
+
+/// Everything the trigger reads, driven through a session rather than set by
+/// hand.
+///
+/// The trigger's own tests fabricate a [`SessionState`] on purpose — a test
+/// about the gate should fail for the gate's reasons — but that leaves the fold
+/// that *produces* those fields untested, which is where the whole design's one
+/// rule lives: every one of them is a projection of the log and never a counter
+/// kept beside it. This is that fold's test.
+#[tokio::test]
+async fn the_trigger_reads_projections_of_the_log_and_not_counters_beside_it() {
+    let store = Arc::new(MemoryStore::new());
+    let (sid, mut session) = new_session(Arc::clone(&store), "node-a").await;
+    session
+        .record_created("affinity", &Principal::new("acme", "ada"), Some(Arm::Live))
+        .await
+        .unwrap();
+    assert_eq!(session.state().arm(), Some(Arm::Live));
+
+    // Two ordinary turns, so there is spend to measure and a trailing
+    // distribution to compare against.
+    for (n, tokens) in [(1u64, 1_000u64), (2, 3_000)] {
+        let admitted = session
+            .begin_turn(TurnId::new(format!("t{n}")), vec![Item::user_text("go")])
+            .await
+            .unwrap();
+        let response_id = admitted.response_id().clone();
+        session
+            .complete(
+                &response_id,
+                "done",
+                Usage {
+                    input_tokens: tokens,
+                    output_tokens: 0,
+                    ..Usage::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(session.state().tokens_since_last_validation(), 4_000);
+    assert_eq!(session.state().recent_turn_tokens(), &[1_000, 3_000]);
+    assert_eq!(session.state().validations_run(), 0);
+    assert_eq!(session.state().last_validation_at_ms(), None);
+    assert_eq!(session.state().consecutive_interventions(), 0);
+    assert_eq!(session.state().active_escalation(), None);
+
+    // A third turn, this one escalated: the decision is committed before
+    // dispatch, exactly as the interjection seam commits it.
+    let admitted = session
+        .begin_turn(TurnId::new("t3"), vec![Item::user_text("still going")])
+        .await
+        .unwrap();
+    let response_id = admitted.response_id().clone();
+    let mut record = ControlRecord::default();
+    record.side_call_completed(
+        crate::ids::SideCallId::new("sc_1"),
+        Target::Frontier {
+            provider: "anthropic".into(),
+            model: "claude".into(),
+        },
+        Usage {
+            input_tokens: 4_000,
+            output_tokens: 40,
+            ..Usage::default()
+        },
+    );
+    record.validation_decided(
+        crate::ids::ValidationId::new("val_1"),
+        crate::validate::TriggerRecord::new(3, 4_000, Vec::new()),
+        Arm::Live,
+        crate::event::ValidationOutcome::Judged {
+            side_call_id: crate::ids::SideCallId::new("sc_1"),
+            verdict: crate::validate::Verdict {
+                on_track: false,
+                confidence: 0.8,
+                divergence: Some(crate::validate::Divergence {
+                    at_step: 1,
+                    description: "never opened the failing import".into(),
+                }),
+                missing_context: None,
+            },
+            action: SteerAction::Escalate {
+                turns: 2,
+                overrides: EscalationOverrides { min_quality: 0.9 },
+            },
+        },
+    );
+    let ledger_before = format!("{:?}", session.ledger());
+    session.record_control(record).await.unwrap();
+
+    assert_eq!(session.state().validations_run(), 1);
+    assert!(session.state().last_validation_at_ms().is_some());
+    assert_eq!(
+        session.state().tokens_since_last_validation(),
+        0,
+        "the gate's budget resets at the decision, not at the next turn"
+    );
+    assert_eq!(
+        session.state().active_escalation(),
+        Some(EscalationOverrides { min_quality: 0.9 }),
+        "the narrowing outlives the turn that decided it, and it does so as a \
+         fold of the log rather than as a value handed across the seam"
+    );
+    assert_eq!(
+        format!("{:?}", session.ledger()),
+        ledger_before,
+        "and a side call reaches the cache ledger not at all: a judge prompt is \
+         not a prefix of the conversation, and warming that target would \
+         mis-price the next real turn"
+    );
+
+    // The turn then terminates. Intervening turns are counted at the terminal
+    // event, which is the one place every turn passes through exactly once.
+    session
+        .record_routing(
+            &response_id,
+            decision_for(
+                Target::Local {
+                    worker_id: 7,
+                    dp_rank: 0,
+                    model: "llama".into(),
+                },
+                100,
+            ),
+        )
+        .await
+        .unwrap();
+    session
+        .complete(
+            &response_id,
+            "done",
+            Usage {
+                input_tokens: 100,
+                ..Usage::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(session.state().consecutive_interventions(), 1);
+    assert_eq!(
+        session.state().active_escalation(),
+        Some(EscalationOverrides { min_quality: 0.9 }),
+        "two turns were asked for, and one has been served"
+    );
+    assert_eq!(session.state().tokens_since_last_validation(), 100);
+
+    // A fourth turn, uninterrupted: the count resets and the escalation runs
+    // out. A count that only ever grew would disable validation for the rest of
+    // any long session that was interrupted twice.
+    let admitted = session
+        .begin_turn(TurnId::new("t4"), vec![Item::user_text("carry on")])
+        .await
+        .unwrap();
+    let response_id = admitted.response_id().clone();
+    session
+        .complete(&response_id, "done", Usage::default())
+        .await
+        .unwrap();
+    assert_eq!(session.state().consecutive_interventions(), 0);
+    assert_eq!(session.state().active_escalation(), None);
+
+    // And the whole projection is reproduced by a replay, which is the property
+    // every one of these fields exists in the fold to have.
+    let replayed = SessionState::project(store.as_ref(), &sid, CacheLedger::new(), None)
+        .await
+        .unwrap();
+    assert_eq!(replayed.arm(), Some(Arm::Live));
+    assert_eq!(replayed.validations_run(), 1);
+    assert_eq!(replayed.consecutive_interventions(), 0);
+    assert_eq!(replayed.active_escalation(), None);
+    assert_eq!(
+        replayed.recent_turn_tokens(),
+        session.state().recent_turn_tokens()
+    );
+    assert_eq!(
+        replayed.tokens_since_last_validation(),
+        session.state().tokens_since_last_validation()
+    );
+    assert_eq!(
+        replayed.last_event_at_ms(),
+        session.state().last_event_at_ms()
+    );
+}
+
+/// The hysteresis rule's evidence, folded from the turn that carries it.
+#[tokio::test]
+async fn the_turn_whose_input_answers_a_steer_is_the_one_that_says_so() {
+    let store = Arc::new(MemoryStore::new());
+    let (_, mut session) = new_session(store, "node-a").await;
+
+    // A steered turn: the call is emitted and the steer is open.
+    let admitted = session
+        .begin_turn(TurnId::new("t1"), vec![Item::user_text("go")])
+        .await
+        .unwrap();
+    let response_id = admitted.response_id().clone();
+    session
+        .complete_with_item(
+            &response_id,
+            steer_call(),
+            Usage::default(),
+            ControlRecord::default(),
+        )
+        .await
+        .unwrap();
+    assert!(!session.state().this_turn_fulfilled_a_steer());
+
+    // The next turn resends the call and appends its output. By the time the
+    // interjection seam runs, the input is already committed and `open_steers`
+    // is already empty — which is exactly why the question is about a turn
+    // index and not about whether a steer is open.
+    session
+        .begin_turn(
+            TurnId::new("t2"),
+            vec![steer_call(), tool_result(STEER_CALL_ID, "re-read the task")],
+        )
+        .await
+        .unwrap();
+    assert!(session.state().open_steer_ids().is_empty());
+    assert!(
+        session.state().this_turn_fulfilled_a_steer(),
+        "the turn that answers a correction looks, to every signal, exactly \
+         like the turn that provoked it; without this the steer re-triggers \
+         the validation that emitted it, forever"
+    );
+
+    // The control: the turn after it does not.
+    let admitted = session
+        .begin_turn(TurnId::new("t3"), vec![Item::user_text("carry on")])
+        .await
+        .unwrap();
+    assert!(
+        !session.state().this_turn_fulfilled_a_steer(),
+        "a steer fulfilled two turns ago must not disable validation for the \
+         rest of the session"
+    );
+    let response_id = admitted.response_id().clone();
+    session
+        .complete(&response_id, "done", Usage::default())
+        .await
+        .unwrap();
 }

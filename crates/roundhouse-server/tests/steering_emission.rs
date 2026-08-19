@@ -52,7 +52,7 @@ use roundhouse_core::control::{
     Balance, BalanceQuery, Grant, GrantRequest, MemorySpendLedger, Settled, Settlement, SpendError,
     SpendLedger,
 };
-use roundhouse_core::event::{Accounting, SessionEventKind, Usage};
+use roundhouse_core::event::{Accounting, ControlRecord, SessionEventKind, Usage};
 use roundhouse_core::ids::{ResponseId, SessionId};
 use roundhouse_core::interject::{Interjection, InterjectionContext, Interjector};
 use roundhouse_core::item::{Item, ItemContent, Role};
@@ -92,6 +92,11 @@ const NAMESPACE: &str = "mcp__roundhouse";
 enum Plan {
     /// Answer the turn with a synthetic call instead of running it.
     Steer,
+    /// Answer the turn with plain guidance and no call — the degrade path, and
+    /// M6's outcome C. Named here because it is the *other* completion shape
+    /// the seam admits, and this file is where completion shapes are pinned to
+    /// frames.
+    Halt,
     /// Leave the turn alone, exactly as the production default does.
     Proceed,
 }
@@ -130,6 +135,14 @@ fn mint(response_id: &ResponseId) -> Steer {
 /// Distinctive on purpose: an assertion that this text reached an agent through
 /// `fetch_steer` and never through the wire is an assertion about a literal.
 const STEER_GUIDANCE: &str = "you are editing a file the task did not name; go back to the parser";
+
+/// What a halt says.
+///
+/// Distinctive on purpose, for the same reason [`STEER_GUIDANCE`] is: an
+/// assertion that this text reached the client *through the conversation* is an
+/// assertion about a literal.
+const HALT_GUIDANCE: &str =
+    "Stopping here: the last four steps repeated without progress. Re-read the task.";
 
 /// What the interjection reports the turn cost.
 ///
@@ -199,7 +212,24 @@ impl Interjector for TestInterjector {
             .pop_front()
             .unwrap_or(Plan::Proceed);
         match plan {
-            Plan::Proceed => Interjection::Proceed,
+            Plan::Proceed => Interjection::proceed(),
+            Plan::Halt => Interjection::Complete {
+                // Assistant text, with no response stamp: the stamp is
+                // `complete_with_item`'s to put on, exactly as it is for a
+                // call. Nothing is deposited for a halt, because there is no
+                // call an agent could fetch by — the engine's deposit already
+                // answers `None` for this shape.
+                item: Item {
+                    role: Role::Assistant,
+                    content: ItemContent::Text {
+                        text: HALT_GUIDANCE.to_string(),
+                    },
+                    response_id: None,
+                },
+                usage: steer_usage(),
+                guidance: HALT_GUIDANCE.to_string(),
+                record: ControlRecord::default(),
+            },
             Plan::Steer => {
                 let steer = mint(context.response_id);
                 self.steers
@@ -216,6 +246,11 @@ impl Interjector for TestInterjector {
                     ),
                     usage: steer_usage(),
                     guidance: steer.guidance,
+                    // Empty: this double stands in for the interjector, not for
+                    // the validate loop behind it, and a steer with no
+                    // validation behind it is exactly what M4's assertions are
+                    // about.
+                    record: ControlRecord::default(),
                 }
             }
         }
@@ -906,6 +941,78 @@ async fn an_assistant_text_item_is_not_forwarded_twice() {
         frames[3].payload["item"]["type"], "message",
         "and it is the message, not a call: {:?}",
         frames[3].payload
+    );
+}
+
+/// The degrade path reaches the client as an answer, not as silence.
+///
+/// Outcome C is what happens when the correction cannot be a tool call — no MCP
+/// registered, or a membership whose channel forbids one — and it is named
+/// honestly in the plan: Codex ends its loop on a message with no tool call, so
+/// a halt *hands control back to the human*. That only works if the human is
+/// handed something. Before this projection existed a halted turn streamed
+/// `created` then `completed` with no text at all: the guidance sat in the log
+/// and the agent saw an empty answer, which is the most complete failure in the
+/// design and the most silent from the deployment's side.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_halted_turn_carries_its_guidance_as_the_answer() {
+    let halting = rig([Plan::Halt]);
+
+    let frames = drive_frames(
+        &halting,
+        request("sess-halted", vec![user_message("hello")]),
+    )
+    .await;
+    assert_eq!(
+        kinds(&frames),
+        STEERED_FRAMES,
+        "four frames, the same four a steered turn is: a halt streams no deltas, \
+         so the item is announced and finished in one pair rather than opened by \
+         a first delta"
+    );
+    assert_eq!(
+        frames[2].payload["item"]["type"], "message",
+        "and the item is a message, not a call — there is nothing here for a \
+         client to dispatch: {:?}",
+        frames[2].payload
+    );
+    assert_eq!(
+        frames_carrying_a_call(&frames),
+        0,
+        "a halt emits no call, so no client may be handed one to run"
+    );
+
+    // The text itself, which is the whole point.
+    let done = &frames[2].payload["item"]["content"][0]["text"];
+    assert_eq!(done, HALT_GUIDANCE);
+
+    // And Codex's own parser sees a message it will surface, rather than the
+    // `Other` an unrecognized shape silently becomes. A fresh rig, because the
+    // script above is spent: a second turn on the same one would proceed, and
+    // this assertion would then be about an ordinary answer.
+    let parsed = rig([Plan::Halt]);
+    let events = drive(
+        &parsed,
+        request("sess-halted-parsed", vec![user_message("hello")]),
+    )
+    .await
+    .expect("a halted turn is a completed turn, not a failure");
+    let done: Vec<&ResponseItem> = events
+        .iter()
+        .filter_map(|event| match event {
+            ResponseEvent::OutputItemDone(item) => Some(item),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(done.len(), 1);
+    assert!(
+        matches!(done[0], ResponseItem::Message { role, content, .. }
+            if role == "assistant"
+                && content
+                    .iter()
+                    .any(|part| matches!(part, ContentItem::OutputText { text } if text == HALT_GUIDANCE))),
+        "the guidance has to arrive as an assistant message: got {:?}",
+        done[0]
     );
 }
 
