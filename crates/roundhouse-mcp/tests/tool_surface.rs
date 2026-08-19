@@ -98,7 +98,12 @@ fn the_tool_list_is_stable_and_golden_pinned() {
     let canonical = serde_json::to_string(&list).expect("the tool list serializes");
     assert_eq!(
         hex_digest(&canonical),
-        "dd507c3c00a18ac09ac66082545d0d3dd6039a56ccc79dfc57cf32f6845b4a23",
+        // Moved once since M5 shipped, deliberately and for one reason: two
+        // descriptions said things the deployment does not do. `status` was
+        // advertised as costing nothing when every call replayed the session
+        // log, and `init_session` was advertised as performing a correlation
+        // whose read side does not land until M7.
+        "d0b5d081c87295ad3362d71f19f7111e6ccf79bd62ee5c81d5e351e33911f94a",
         "the published tool list changed; see this test's comment before editing the literal"
     );
 
@@ -531,6 +536,326 @@ async fn asking_for_auto_releases_a_preference_the_agent_set_itself() {
     assert!(store.overlay(&adas_session()).is_none());
 }
 
+/// A [`ControlReads`] whose admissibility read stands in for a turn starting on
+/// another thread, in the gap between an overlay tool's read and its write.
+struct RacingReads {
+    inner: FakeDeployment,
+    store: Arc<ControlStore>,
+    armed: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl roundhouse_mcp::reads::ControlReads for RacingReads {
+    async fn resolve_session(
+        &self,
+        principal: &Principal,
+        conversation: Option<&str>,
+    ) -> Result<SessionId, roundhouse_mcp::SurfaceError> {
+        self.inner.resolve_session(principal, conversation).await
+    }
+
+    async fn ceiling_policy(
+        &self,
+        principal: &Principal,
+    ) -> Result<TurnPolicy, roundhouse_mcp::SurfaceError> {
+        self.inner.ceiling_policy(principal).await
+    }
+
+    async fn admissible_targets(
+        &self,
+        principal: &Principal,
+        policy: &TurnPolicy,
+    ) -> Result<Vec<roundhouse_core::routing::Target>, roundhouse_mcp::SurfaceError> {
+        if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            // The engine's turn start, landing inside the surface's await.
+            self.store.consume_overlay(&adas_session());
+        }
+        self.inner.admissible_targets(principal, policy).await
+    }
+
+    async fn balance(
+        &self,
+        principal: &Principal,
+    ) -> Result<Option<roundhouse_core::control::Balance>, roundhouse_mcp::SurfaceError> {
+        self.inner.balance(principal).await
+    }
+
+    async fn session_facts(
+        &self,
+        session: &SessionId,
+    ) -> Result<SessionFacts, roundhouse_mcp::SurfaceError> {
+        self.inner.session_facts(session).await
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.inner.now_ms()
+    }
+}
+
+#[tokio::test]
+async fn a_turn_that_spends_an_axis_during_an_overlay_write_does_not_get_it_back() {
+    // The overlay entry has two writers: this surface, and the engine at every
+    // turn start. An overlay tool has to decide whether the ask leaves anything
+    // routable, and that decision is an `await` — so a writer that read the
+    // whole overlay before it and wrote the whole overlay after it publishes a
+    // picture of a moment that has passed. Here the moment that passes is the
+    // one in which a turn spends this session's last ration of `local`.
+    let store = Arc::new(ControlStore::new());
+    let reads = Arc::new(RacingReads {
+        inner: FakeDeployment::default(),
+        store: Arc::clone(&store),
+        armed: std::sync::atomic::AtomicBool::new(false),
+    });
+    let surface = ControlPlaneSurface::new(Arc::clone(&reads), Arc::clone(&store));
+
+    let first = served(
+        &call(
+            &surface,
+            &ada(),
+            "prefer",
+            json!({"mode": "local", "scope": "turn", "reason": "one cheap turn"}),
+        )
+        .await,
+    );
+    assert_eq!(first["overlay"]["mode_turns_remaining"], json!(1));
+
+    // The engine's turn start, scheduled inside the next tool call's await.
+    reads.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    let answer = served(
+        &call(
+            &surface,
+            &ada(),
+            "set_quality_floor",
+            json!({"floor": 0.5, "turns": 3, "reason": "this one is subtle"}),
+        )
+        .await,
+    );
+
+    let after = store
+        .overlay(&adas_session())
+        .expect("the floor axis is installed");
+    assert!(
+        after.mode.is_none(),
+        "the turn that spent the mode axis had it handed back: {:?}",
+        after.mode
+    );
+    assert!(
+        answer["overlay"]["mode"].is_null(),
+        "and the agent is told it still holds a preference it already spent: {answer}"
+    );
+
+    // The control: the axis this call was actually about did land, so the
+    // absence above is one axis untouched and not a write that failed.
+    assert_eq!(answer["overlay"]["quality_floor"], json!(0.5));
+    assert_eq!(answer["overlay"]["floor_turns_remaining"], json!(3));
+    assert_eq!(
+        after.floor.as_ref().map(|floor| floor.ask),
+        Some(0.5),
+        "and the engine reads the same floor out of the store"
+    );
+}
+
+#[tokio::test]
+async fn an_unhonorable_ask_writes_nothing_and_leaves_the_session_as_it_was() {
+    // The second rung of `install`, pinned at the store rather than only in the
+    // answer — it is the whole of the fallback now that the third rung is gone,
+    // and what "the session keeps the overlay it had" means once a write is per
+    // axis is that no write happens at all.
+    let (surface, store) = FakeDeployment::local_only().surface();
+    served(
+        &call(
+            &surface,
+            &ada(),
+            "prefer",
+            json!({"mode": "local", "scope": "session", "turns": 4, "reason": "bulk edits"}),
+        )
+        .await,
+    );
+    let before = store.overlay(&adas_session()).expect("a standing overlay");
+
+    let refused = served(
+        &call(
+            &surface,
+            &ada(),
+            "set_quality_floor",
+            json!({"floor": 0.99, "turns": 2, "reason": "only the best"}),
+        )
+        .await,
+    );
+    assert_eq!(refused["narrowed"], json!(true));
+    assert_eq!(
+        store.overlay(&adas_session()),
+        Some(before),
+        "an ask that would empty the admissible set leaves the store untouched, \
+         axis and turn count included"
+    );
+    assert_eq!(refused["overlay"]["mode"], json!("local"));
+    assert!(
+        refused["overlay"]["quality_floor"].is_null(),
+        "and the agent is not told it holds a floor that was never stored: {refused}"
+    );
+}
+
+/// A [`ControlReads`] with a movable log: a cursor the surface can check and a
+/// projection that changes when it moves.
+struct MemoProbeReads {
+    inner: FakeDeployment,
+    logs: std::sync::Mutex<std::collections::HashMap<SessionId, (u64, SessionFacts)>>,
+    projections: std::sync::atomic::AtomicUsize,
+}
+
+impl MemoProbeReads {
+    fn advance(&self, session: &SessionId, facts: SessionFacts) {
+        let mut logs = self.logs.lock().unwrap();
+        let entry = logs.entry(session.clone()).or_insert((0, facts.clone()));
+        entry.0 += 1;
+        entry.1 = facts;
+    }
+
+    fn projections(&self) -> usize {
+        self.projections.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl roundhouse_mcp::reads::ControlReads for MemoProbeReads {
+    async fn resolve_session(
+        &self,
+        principal: &Principal,
+        conversation: Option<&str>,
+    ) -> Result<SessionId, roundhouse_mcp::SurfaceError> {
+        self.inner.resolve_session(principal, conversation).await
+    }
+
+    async fn ceiling_policy(
+        &self,
+        principal: &Principal,
+    ) -> Result<TurnPolicy, roundhouse_mcp::SurfaceError> {
+        self.inner.ceiling_policy(principal).await
+    }
+
+    async fn admissible_targets(
+        &self,
+        principal: &Principal,
+        policy: &TurnPolicy,
+    ) -> Result<Vec<roundhouse_core::routing::Target>, roundhouse_mcp::SurfaceError> {
+        self.inner.admissible_targets(principal, policy).await
+    }
+
+    async fn balance(
+        &self,
+        principal: &Principal,
+    ) -> Result<Option<roundhouse_core::control::Balance>, roundhouse_mcp::SurfaceError> {
+        self.inner.balance(principal).await
+    }
+
+    async fn session_facts(
+        &self,
+        session: &SessionId,
+    ) -> Result<SessionFacts, roundhouse_mcp::SurfaceError> {
+        self.projections
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(self
+            .logs
+            .lock()
+            .unwrap()
+            .get(session)
+            .map(|(_, facts)| facts.clone())
+            .unwrap_or_default())
+    }
+
+    async fn session_cursor(
+        &self,
+        session: &SessionId,
+    ) -> Result<Option<u64>, roundhouse_mcp::SurfaceError> {
+        Ok(Some(
+            self.logs
+                .lock()
+                .unwrap()
+                .get(session)
+                .map(|(cursor, _)| *cursor)
+                .unwrap_or(0),
+        ))
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.inner.now_ms()
+    }
+}
+
+async fn facts_with(steer: &str) -> SessionFacts {
+    SessionFacts {
+        open_steers: vec![steer.to_string()],
+        last_decision: Some(decision().await),
+    }
+}
+
+#[tokio::test]
+async fn a_repeat_status_between_turns_reads_the_cursor_rather_than_the_whole_log() {
+    // `status` and `explain_last_route` are called from a model's context, and
+    // on a real deployment each answer is a replay of the whole session log —
+    // a store round trip per batch plus a clone of every item and every routing
+    // decision. Nothing rate-limits either tool, so the cost is bounded here or
+    // it is not bounded at all.
+    let mut sessions = std::collections::HashMap::new();
+    sessions.insert(ada(), adas_session());
+    let bobs_session = SessionId::new("other/bob/sess_1");
+    sessions.insert(bob(), bobs_session.clone());
+
+    let reads = Arc::new(MemoProbeReads {
+        inner: FakeDeployment {
+            sessions,
+            ..FakeDeployment::default()
+        },
+        logs: std::sync::Mutex::new(std::collections::HashMap::new()),
+        projections: std::sync::atomic::AtomicUsize::new(0),
+    });
+    reads.advance(&adas_session(), facts_with("fc_1").await);
+    reads.advance(&bobs_session, facts_with("fc_bob").await);
+    let surface = ControlPlaneSurface::new(Arc::clone(&reads), Arc::new(ControlStore::new()));
+
+    let first = served(&call(&surface, &ada(), "status", json!({})).await);
+    assert_eq!(first["open_steers"], json!(["fc_1"]));
+    assert_eq!(reads.projections(), 1);
+
+    let repeat = served(&call(&surface, &ada(), "status", json!({})).await);
+    assert_eq!(
+        reads.projections(),
+        1,
+        "a second status with no turn in between replayed the log again"
+    );
+    assert_eq!(repeat["open_steers"], json!(["fc_1"]));
+
+    // The other tool that pays the same cost shares the same answer.
+    let explained = served(&call(&surface, &ada(), "explain_last_route", json!({})).await);
+    assert_eq!(explained["chosen"], json!("anthropic/claude-opus-4"));
+    assert_eq!(reads.projections(), 1);
+
+    // A different conversation is a different memo, not a hit: a cache keyed on
+    // the cursor alone would answer bob with ada's steers.
+    let bobs = served(&call(&surface, &bob(), "status", json!({})).await);
+    assert_eq!(bobs["open_steers"], json!(["fc_bob"]));
+    assert_eq!(reads.projections(), 2);
+    assert_eq!(
+        served(&call(&surface, &ada(), "status", json!({})).await)["open_steers"],
+        json!(["fc_1"]),
+        "and ada's memo survived bob's call rather than being overwritten by it"
+    );
+    assert_eq!(reads.projections(), 2);
+
+    // The control that keeps every assertion above from being a study of a
+    // frozen cache: a turn moves the log, and the next call sees it.
+    reads.advance(&adas_session(), facts_with("fc_2").await);
+    let after_turn = served(&call(&surface, &ada(), "status", json!({})).await);
+    assert_eq!(
+        after_turn["open_steers"],
+        json!(["fc_2"]),
+        "a memo that outlived the turn it was taken before would report a steer \
+         that has already been answered"
+    );
+    assert_eq!(reads.projections(), 3);
+}
+
 // ---------------------------------------------------------------------------
 // Steers
 // ---------------------------------------------------------------------------
@@ -847,7 +1172,7 @@ async fn status_reports_names_not_prices() {
     // is quoting its own context back at it.
     let facts = SessionFacts {
         open_steers: vec!["fc_1".into()],
-        last_decision: Some(decision()),
+        last_decision: Some(decision().await),
     };
     let (surface, _store) = FakeDeployment::default()
         .with_facts(&adas_session(), facts)
@@ -926,9 +1251,22 @@ async fn a_deployment_that_meters_nothing_reports_no_budget_rather_than_a_zero()
 
 #[tokio::test]
 async fn explain_last_route_reports_the_decision_without_its_prices() {
+    // **The rationale under test is one a real `AffinityPolicy::choose` wrote.**
+    // It used to be the literal `"cheapest warm option"`, and that made the
+    // no-prices assertion below tautological twice over: a hand-written string
+    // contains a price only if the author put one there, and no deployment ever
+    // writes that string. What a deployment does write — the affinity policy's
+    // own account of the turn, copied verbatim by `engine.rs` into
+    // `DecisionRecord::rationale` and verbatim again by `plane.rs` into this
+    // tool's answer — used to carry the winning candidate's `expected_cost_usd`
+    // formatted in. See [`common::decision`].
+    //
+    // The fixture is arranged so the router picks a *priced* target: a fleet
+    // where the free local worker always wins produces `$0.00000`, and an
+    // assertion about `7.77` would then hold for a producer that prints prices.
     let facts = SessionFacts {
         open_steers: Vec::new(),
-        last_decision: Some(decision()),
+        last_decision: Some(decision().await),
     };
     let (surface, _store) = FakeDeployment::default()
         .with_facts(&adas_session(), facts)
@@ -936,9 +1274,15 @@ async fn explain_last_route_reports_the_decision_without_its_prices() {
 
     let outcome = call(&surface, &ada(), "explain_last_route", json!({})).await;
     let answer = served(&outcome);
-    assert_eq!(answer["chosen"], json!("local/llama-3.1-8b"));
-    assert_eq!(answer["rationale"], json!("cheapest warm option"));
-    assert_eq!(answer["routing_policy"], json!("cost-aware"));
+    assert_eq!(answer["chosen"], json!("anthropic/claude-opus-4"));
+    assert_eq!(
+        answer["rationale"],
+        json!("score 0.5000 over 3 candidate(s); expected prefill 200 of 1200 tokens (83% cached)"),
+        "the policy's own account of the turn, republished verbatim -- and \
+         pinned as a literal so that a term added back to the producer's format \
+         string fails here and not only in the negative assertion below"
+    );
+    assert_eq!(answer["routing_policy"], json!("affinity"));
     assert_eq!(answer["budget_state"], json!("warned"));
     assert_eq!(
         answer["turn_policy_digest"],
@@ -1019,8 +1363,8 @@ async fn init_session_returns_the_binding_id_in_its_output_text() {
     // The second half: the id resolves back to the session that minted it, and
     // the projection finds it in a conversation the client resent.
     let binding = store
-        .binding(&roundhouse_mcp::BindingId::new(id))
-        .expect("this node minted it");
+        .binding(&ada(), &adas_session(), &roundhouse_mcp::BindingId::new(id))
+        .expect("this node minted it, for this caller");
     assert_eq!(binding.session, adas_session());
     assert_eq!(binding.principal, ada());
 
@@ -1046,6 +1390,48 @@ async fn init_session_returns_the_binding_id_in_its_output_text() {
             "an ordinary turn"
         )])
         .is_none()
+    );
+}
+
+#[tokio::test]
+async fn init_session_called_in_a_loop_answers_with_one_id_and_writes_once() {
+    // One of the eight tools is a *write*, and nothing rate-limits a model that
+    // calls a tool in a loop. Answering with the binding already recorded for
+    // this conversation is what makes the loop free: the store cannot grow, and
+    // a client that called the tool twice appends the same token twice rather
+    // than two tokens a later reader has to adjudicate between.
+    let (surface, store) = FakeDeployment::default().surface();
+
+    let first = call(&surface, &ada(), "init_session", json!({})).await;
+    for _ in 0..4 {
+        let again = call(&surface, &ada(), "init_session", json!({})).await;
+        assert_eq!(
+            first.text(),
+            again.text(),
+            "a second init_session minted a second id for one conversation"
+        );
+    }
+
+    let id = served(&first)["session_binding_id"]
+        .as_str()
+        .expect("an id")
+        .to_string();
+    let both = vec![
+        roundhouse_core::item::Item::user_text(id.clone()),
+        roundhouse_core::item::Item::user_text(id.clone()),
+    ];
+    assert_eq!(
+        roundhouse_mcp::binding_ids_in_items(&both)
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        1,
+        "and a conversation that carries the answer twice carries one id"
+    );
+    assert!(
+        store
+            .binding(&ada(), &adas_session(), &roundhouse_mcp::BindingId::new(id))
+            .is_some()
     );
 }
 

@@ -180,10 +180,13 @@ impl SessionOverlay {
 
     /// Spend one turn of every axis, dropping the ones that run out.
     ///
-    /// Called once per turn by the engine, at the same seam the admission
-    /// policy is resolved — so the turn that consumes an overlay is the turn
-    /// routed under it, and the `turn_policy_digest` on that turn's decision is
-    /// the observable an operator checks the overlay against.
+    /// Called once per *routed* turn by the engine, at the same seam the
+    /// admission policy is resolved — so the turn that consumes an overlay is
+    /// the turn routed under it, and the `turn_policy_digest` on that turn's
+    /// decision is the observable an operator checks the overlay against. A
+    /// turn the engine's interjection seam answers instead of routing spends
+    /// nothing: it writes no decision, so there would be nothing to check the
+    /// spend against.
     pub fn consume(&mut self) {
         fn spend<T>(axis: &mut Option<TimedOverlay<T>>) {
             let expired = match axis {

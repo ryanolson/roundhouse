@@ -67,19 +67,29 @@ pub fn adas_session() -> SessionId {
     SessionId::new("acme/ada/sess_1")
 }
 
-/// One catalog row: what a target is, how good it is, and what it costs.
+/// One catalog row: what a target is, how good it is, what it costs, and how
+/// warm it is.
 #[derive(Debug, Clone)]
 pub struct CatalogRow {
     pub target: Target,
     pub quality_prior: f64,
     pub price_usd: f64,
+    /// Cache-adjusted prefill, the axis [`AffinityPolicy`] weights highest.
+    ///
+    /// Here rather than fixed at one value for every row because [`decision`]
+    /// runs the *real* router over these candidates, and a fleet where every row
+    /// is equally warm makes cost the only tiebreak — which hands every turn to
+    /// the free local worker and produces a rationale carrying `$0.00000`. A
+    /// no-prices assertion against that string would pass for a policy that
+    /// prints prices, which is the tautology this fixture exists to avoid.
+    pub prefill_tokens: f64,
 }
 
 impl CatalogRow {
     fn candidate(&self) -> Candidate {
         Candidate {
             target: self.target.clone(),
-            expected_prefill_tokens: 1_000.0,
+            expected_prefill_tokens: self.prefill_tokens,
             matched_prefix_tokens: 0,
             expected_ttft_ms: 100.0,
             expected_cost_usd: self.price_usd,
@@ -90,22 +100,29 @@ impl CatalogRow {
 }
 
 /// The mixed fleet most tests run against.
+///
+/// The hosted Anthropic row is warm and the other two are cold, which is what
+/// makes the real router pick a *priced* target — see
+/// [`CatalogRow::prefill_tokens`].
 pub fn mixed_fleet() -> Vec<CatalogRow> {
     vec![
         CatalogRow {
             target: local("llama-3.1-8b"),
             quality_prior: 0.6,
             price_usd: LOCAL_PRICE_USD,
+            prefill_tokens: 1_000.0,
         },
         CatalogRow {
             target: frontier("anthropic", "claude-opus-4"),
             quality_prior: 0.95,
             price_usd: CLAUDE_PRICE_USD,
+            prefill_tokens: 200.0,
         },
         CatalogRow {
             target: frontier("openai", "gpt-5"),
             quality_prior: 0.9,
             price_usd: GPT_PRICE_USD,
+            prefill_tokens: 1_000.0,
         },
     ]
 }
@@ -116,6 +133,7 @@ pub fn local_only_fleet() -> Vec<CatalogRow> {
         target: local("llama-3.1-8b"),
         quality_prior: 0.6,
         price_usd: LOCAL_PRICE_USD,
+        prefill_tokens: 1_000.0,
     }]
 }
 
@@ -258,6 +276,7 @@ pub struct CountingReads<R> {
     pub admissible_targets_calls: AtomicUsize,
     pub balance_calls: AtomicUsize,
     pub session_facts_calls: AtomicUsize,
+    pub session_cursor_calls: AtomicUsize,
 }
 
 impl<R> CountingReads<R> {
@@ -269,6 +288,7 @@ impl<R> CountingReads<R> {
             admissible_targets_calls: AtomicUsize::new(0),
             balance_calls: AtomicUsize::new(0),
             session_facts_calls: AtomicUsize::new(0),
+            session_cursor_calls: AtomicUsize::new(0),
         }
     }
 
@@ -281,6 +301,7 @@ impl<R> CountingReads<R> {
             + self.admissible_targets_calls.load(Ordering::SeqCst)
             + self.balance_calls.load(Ordering::SeqCst)
             + self.session_facts_calls.load(Ordering::SeqCst)
+            + self.session_cursor_calls.load(Ordering::SeqCst)
     }
 }
 
@@ -319,24 +340,76 @@ impl<R: ControlReads> ControlReads for CountingReads<R> {
         self.inner.session_facts(session).await
     }
 
+    /// Forwarded rather than left to the trait's default, or the wrapper would
+    /// silently answer "no cheap cursor" for an inner that has one and turn
+    /// every memo assertion made through it into a study of the wrapper.
+    async fn session_cursor(&self, session: &SessionId) -> Result<Option<u64>, SurfaceError> {
+        self.session_cursor_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.session_cursor(session).await
+    }
+
     fn now_ms(&self) -> u64 {
         self.inner.now_ms()
     }
 }
 
-/// A routing decision with every field a `explain_last_route` renders — and the
-/// two it must not.
-pub fn decision() -> DecisionRecord {
+/// How many tokens the fixture turn's prompt is.
+const FIXTURE_ISL_TOKENS: usize = 1_200;
+
+/// A routing decision with every field `explain_last_route` renders — and the
+/// two it must not — **as a real routing policy produced it**.
+///
+/// The rationale is not a literal. `AffinityPolicy` is the policy this
+/// deployment wires (`main.rs`), `engine.rs` copies `Decision::rationale` into
+/// `DecisionRecord::rationale` verbatim, and `plane.rs` copies that into
+/// `RouteExplanation` verbatim — so a hand-written rationale here tests the two
+/// copies and nothing else. It certainly cannot test the no-prices rule: a
+/// literal chosen by the test author contains a price only if the author put one
+/// there, which makes the assertion true by construction and blind to a
+/// *producer* that formats one in. Running the real policy is what makes the
+/// guard a statement about the string a deployment actually writes.
+///
+/// `budget_state` is the one field set by hand. The router answers
+/// `Unconstrained` for an unmetered turn, and the rendering under test is the
+/// mapping from the enum to its wire spelling — which a fixture stuck on the
+/// default value would exercise for exactly one of four arms.
+pub async fn decision() -> DecisionRecord {
+    use roundhouse_core::control::{FrontierHistory, TurnBudget};
+    use roundhouse_core::routing::{AffinityPolicy, CacheLedger, RoutingContext, RoutingPolicy};
+
     let considered: Vec<Candidate> = mixed_fleet().iter().map(CatalogRow::candidate).collect();
+    let policy = AffinityPolicy::new();
+    let ceiling = TurnPolicy::unrestricted();
+    let ledger = CacheLedger::new();
+    let history = FrontierHistory::default();
+    let budget = TurnBudget::Unlimited;
+    let chosen = policy
+        .choose(&RoutingContext {
+            session_id: &adas_session(),
+            turn_index: 1,
+            isl_tokens: FIXTURE_ISL_TOKENS,
+            candidates: &considered,
+            ledger: &ledger,
+            turn_policy: &ceiling,
+            frontier_history: &history,
+            budget: &budget,
+        })
+        .await
+        .expect("a three-candidate fleet under an unrestricted policy routes");
+    let winner = considered
+        .iter()
+        .find(|candidate| candidate.target == chosen.target)
+        .expect("the router chooses from the set it was handed");
+
     DecisionRecord {
-        chosen: local("llama-3.1-8b"),
-        rationale: "cheapest warm option".into(),
-        policy: "cost-aware".into(),
-        isl_tokens: 1_200,
-        expected_prefill_tokens: 1_000.0,
-        expected_cost_usd: LOCAL_PRICE_USD,
+        chosen: chosen.target.clone(),
+        rationale: chosen.rationale,
+        policy: policy.name().to_string(),
+        isl_tokens: FIXTURE_ISL_TOKENS as u64,
+        expected_prefill_tokens: winner.expected_prefill_tokens,
+        expected_cost_usd: winner.expected_cost_usd,
         considered,
-        turn_policy_digest: TurnPolicy::unrestricted().digest(),
+        turn_policy_digest: ceiling.digest(),
         budget_state: BudgetState::Warned,
         rate_card: None,
     }

@@ -178,16 +178,31 @@ impl RoutingPolicy for AffinityPolicy {
 
         let winner = pool[best_index];
         let hit_ratio = winner.cache_hit_ratio(ctx.isl_tokens);
+        // **No price in this string, and that is a rule about where prices may
+        // travel rather than a formatting preference.** A rationale is not a
+        // private note: `engine.rs` copies it into `DecisionRecord::rationale`
+        // verbatim and the MCP surface's `explain_last_route` copies *that* into
+        // a tool result verbatim, so every term here lands in the calling
+        // model's own context. A per-turn dollar figure there lets an agent
+        // price the whole fleet by alternating `prefer local` / `prefer
+        // frontier` with `explain_last_route` — the family-bias leak
+        // `StatusResponse`'s "names, never prices" rule exists to prevent — and
+        // it argues with a component that cannot check whether the agent is
+        // quoting its own context back at it.
+        //
+        // Nothing that legitimately needs the number loses it: the winner's
+        // `expected_cost_usd` is a structured field on the same
+        // `DecisionRecord`, beside `rate_card`, where the metrics fold and an
+        // operator's dashboard read it and a tool result does not.
         Ok(admitted.decide(
             winner.target.clone(),
             format!(
-                "score {:.4} over {} candidate(s); expected prefill {:.0} of {} tokens ({:.0}% cached), ${:.5}",
+                "score {:.4} over {} candidate(s); expected prefill {:.0} of {} tokens ({:.0}% cached)",
                 best_score,
                 pool.len(),
                 winner.expected_prefill_tokens,
                 ctx.isl_tokens,
                 hit_ratio * 100.0,
-                winner.expected_cost_usd,
             ),
         ))
     }
@@ -499,6 +514,16 @@ mod tests {
         // control plane on without re-routing a single existing workload, and
         // it is the reason `TurnPolicy::unrestricted` exists as a named value
         // rather than as an `Option::None` handled at each call site.
+        //
+        // **The literal moved once, and only by deletion.** The captured string
+        // ended `, $0.00000`; the trailing cost term is gone because a rationale
+        // is republished into a model's own context by `explain_last_route` and
+        // must carry no per-model price (see `AffinityPolicy::choose`). What the
+        // pin is for is unaffected — the *target* each policy picks and the
+        // score it picked it on are byte-identical to M1, which is what "no
+        // existing workload is re-routed" means. A term added back here would be
+        // a price leak and not a formatting change, which is why this literal is
+        // still a literal.
         let candidates = mixed_fleet();
         let affinity = AffinityPolicy::new();
         let escalation = EscalationPolicy::new(AffinityPolicy::new(), 4);
@@ -507,7 +532,8 @@ mod tests {
             dp_rank: 0,
             model: "llama".into(),
         };
-        let scored = "score 0.0000 over 3 candidate(s); expected prefill 500 of 10000 tokens (95% cached), $0.00000";
+        let scored =
+            "score 0.0000 over 3 candidate(s); expected prefill 500 of 10000 tokens (95% cached)";
 
         for (label, decision, expected) in [
             (

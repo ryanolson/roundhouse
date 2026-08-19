@@ -92,6 +92,28 @@ impl Conversations {
 
     /// Rebind `key` to a fresh session, because the client's history disagreed
     /// with the log.
+    ///
+    /// # What a fork costs the control plane, stated rather than hidden
+    ///
+    /// `ControlStore`'s four families — overlay, intent, steer payload, session
+    /// binding — are keyed by the `SessionId` this rebinds *away from*, and
+    /// nothing migrates them. The visible consequence is one: an agent that
+    /// asked for `scope=session` narrowing, on a client that then edited its own
+    /// history mid-session, silently stops being narrowed — the engine asks the
+    /// post-fork id for an overlay and finds none. The trigger is specific and
+    /// worth naming, because it is not "a fork happens": a fork happens when a
+    /// *client rewrites history it already sent*, which is a compaction or a
+    /// user editing a message, not an ordinary turn.
+    ///
+    /// Not migrated on purpose. Carrying an overlay across a fork means a
+    /// narrowing surviving a history rewrite that the agent which asked for it
+    /// may no longer be running, and deciding that is a decision about what an
+    /// overlay's identity *is* — which belongs to the milestone that gives it a
+    /// durable one (M8), not to a rebind hook reaching across two crates. What
+    /// holds in the meantime is a bound rather than a fix: the orphaned records
+    /// are collected by `ControlStore`'s retention sweep like any other aged
+    /// state, so a forking client leaks for a day and not for the process's
+    /// life.
     pub fn fork(&self, principal: &Principal, key: &str) -> SessionId {
         let mut inner = self.lock();
         let generation = inner.generations.entry(key.to_string()).or_insert(0);

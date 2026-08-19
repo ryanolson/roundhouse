@@ -334,8 +334,22 @@ impl ControlPlane {
                 // for a while, and refusing that would make rotation an outage.
                 // What cannot be resolved is two keys that mean different
                 // things.
+                //
+                // **Meaning, through [`TurnPolicy::admits_the_same_as`], and
+                // not [`TurnPolicy::digest`].** A digest fingerprints how a
+                // policy was *written* — which is what makes it the right
+                // thing to stamp on a `DecisionRecord` and the wrong thing to
+                // compare two keys by. A key that inherits its project's
+                // `allow` and a key that restates the same filter as its own
+                // override admit exactly the same targets and fingerprint
+                // differently, because the restatement intersects into a
+                // second identical layer; comparing digests turned that
+                // rotation into a boot failure whose message ("different
+                // policies or budgets") was not merely unhelpful but untrue.
+                // The budget stays a structural comparison: it is a pair of
+                // numbers with one spelling.
                 for other in found {
-                    if other.policy.digest() != first.policy.digest()
+                    if !other.policy.admits_the_same_as(&first.policy)
                         || other.budget != first.budget
                     {
                         return Err(MembershipError::Ambiguous(principal.clone()));

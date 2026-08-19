@@ -197,20 +197,48 @@ impl ServerHandler for RoundhouseMcp {
     }
 }
 
+/// Which `Host` headers the `/mcp` route answers to.
+///
+/// `rmcp` ships a loopback-only allowlist as its DNS-rebinding guard, aimed at
+/// MCP servers running on a developer's laptop. Whether that guard is the right
+/// one is not this crate's question — it depends on whether the deployment
+/// requires a credential — so the answer arrives as an argument rather than as a
+/// decision taken here. See [`mcp_service`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostGuard {
+    /// `rmcp`'s default: `localhost`, `127.0.0.1`, `::1`, on any port.
+    Loopback,
+    /// Every `Host`, because something else is doing the work.
+    AnyHost,
+}
+
 /// The `/mcp` route: a `tower` service the server mounts beside its other three
 /// routers.
 ///
-/// `allowed_hosts` is cleared. The default list is loopback-only, a DNS
-/// rebinding guard aimed at MCP servers running on a developer's laptop; this
-/// one is a deployment behind whatever hostname an operator gave it, and the
-/// guard would refuse every real request. What replaces it is the bearer key,
-/// which a rebinding attack cannot supply — the browser it hijacks does not
-/// have one.
+/// **`hosts` is a security decision and it follows the deployment's mode.**
+/// [`HostGuard::AnyHost`] clears `allowed_hosts`, which is right for a
+/// deployment that requires a bearer key: it is served behind whatever hostname
+/// an operator gave it — the loopback list would refuse every real request — and
+/// what replaces the guard is the key, which a rebinding attack cannot supply
+/// because the browser it hijacks does not have one.
+///
+/// A deployment that requires *no* key has nothing to replace it with, so it
+/// passes [`HostGuard::Loopback`] and keeps rmcp's default. That is not
+/// belt-and-braces: an unconfigured deployment is a process on 127.0.0.1 with
+/// eight tools that read its posture and write overlays against the developer's
+/// live conversation, and it is exactly the deployment the guard was written
+/// for. `allowed_origins` cannot stand in for it either — under rebinding the
+/// browser believes it is same-origin, so the `Origin` check never fires and the
+/// `Host` header is the only one still telling the truth.
 pub fn mcp_service(
     surface: Arc<dyn ControlSurface>,
+    hosts: HostGuard,
 ) -> StreamableHttpService<RoundhouseMcp, NeverSessionManager> {
     let handler = RoundhouseMcp::new(surface);
-    let mut config = StreamableHttpServerConfig::default().disable_allowed_hosts();
+    let mut config = match hosts {
+        HostGuard::Loopback => StreamableHttpServerConfig::default(),
+        HostGuard::AnyHost => StreamableHttpServerConfig::default().disable_allowed_hosts(),
+    };
     // No sessions, no `Mcp-Session-Id`, and therefore `GET /mcp` -> 405.
     config.legacy_session_mode = false;
     // One JSON response per POST rather than an SSE frame carrying one message:

@@ -56,11 +56,18 @@
 //!   (`codex-rs/core/src/mcp/registry.rs:440-444`).
 //!
 //! The first is what makes the endpoint speak to Codex at all; the second is
-//! what makes [`init_session`](ControlSurface::init_session)'s correlation trick
-//! work, since the minted id reaches a session log only by riding the client's
-//! own resent history. M9's real-binary end-to-end is the test that closes both;
-//! until it is green this block is the honest statement of what we have not
-//! proven.
+//! what will make [`init_session`](ControlSurface::init_session)'s correlation
+//! trick work, since the minted id reaches a session log only by riding the
+//! client's own resent history. M9's real-binary end-to-end is the test that
+//! closes both; until it is green this block is the honest statement of what we
+//! have not proven.
+//!
+//! Note the tense. M5 ships the *write* half of that trick — an id minted,
+//! recorded and returned in a form a client keeps — and nothing in the
+//! deployment resolves a session from a binding yet. The read side is M7's, per
+//! the plan's §3, and both agent-facing sentences about it
+//! ([`tools::descriptors`] and [`surface::InitSessionResponse::note`]) are
+//! written to say what is recorded rather than what is correlated.
 
 pub mod overlay;
 pub mod reads;
@@ -75,7 +82,8 @@ pub use overlay::{ModeNarrowing, OverlayScope, PreferMode, SessionOverlay, Timed
 pub use plane::ControlPlaneSurface;
 pub use reads::{ControlReads, SessionFacts};
 pub use store::{
-    BindingId, ControlStore, IntentRecord, SessionBinding, SteerRecord, binding_in_items,
+    BindingId, ControlStore, IntentRecord, SessionBinding, SteerRecord, binding_ids_in_items,
+    binding_in_items,
 };
 pub use surface::{ControlSurface, SurfaceError, ToolOutcome};
 pub use tools::{TOOL_NAMES, ToolCall, ToolDescriptor, descriptors, dispatch};

@@ -316,13 +316,24 @@ pub struct OverlayResponse {
 /// therefore runs the other way. The minted id goes out in this tool's *output*,
 /// the client appends that output to its conversation as an ordinary item, and
 /// the next turn's resent history carries it into the session log — where
-/// [`binding_in_items`](crate::store::binding_in_items) finds it. The session
-/// whose log holds the id is the session that made the call, provable from the
-/// log alone.
+/// [`ControlStore::binding_in_log`](crate::store::ControlStore::binding_in_log)
+/// can find it and check that the binding is the caller's own.
 ///
-/// [`Self::note`] is what makes that work: the client must be told, in the
-/// output it is about to append, that the id identifies this session. Without
-/// it a summarizing client drops the id as noise and the join never happens.
+/// # What M5 does, and what it does not
+///
+/// M5 ships the write half: an id is minted, recorded against
+/// `(principal, session)`, and returned in a form a client will keep. Nothing
+/// in the deployment *reads* it back — `mcp_api::resolve_session` answers from
+/// the client's `prompt_cache_key` and from the node's conversation table, and
+/// never from a binding. The read side is M7's, per the plan's §3. Both this
+/// type's [`Self::note`] and the tool description are written to match: they
+/// ask the client to keep the token and say what keeping it makes possible,
+/// and neither claims a correlation is being performed on this turn.
+///
+/// [`Self::note`] is what makes the future join possible at all: the client
+/// must be told, in the output it is about to append, that the id identifies
+/// this session. Without it a summarizing client drops the id as noise and
+/// there is nothing in the log for M7 to find.
 #[derive(Debug, Clone, Serialize)]
 pub struct InitSessionResponse {
     pub session_binding_id: String,
@@ -375,6 +386,18 @@ pub struct OutcomeResponse {
 pub struct RouteExplanation {
     pub conversation: String,
     pub chosen: String,
+    /// The routing policy's own account of the turn, republished byte for byte.
+    ///
+    /// **The one field on this type whose no-prices rule the type cannot
+    /// enforce.** Every other field is either a name or a fingerprint this
+    /// crate builds; this one is a string a `RoutingPolicy` in
+    /// `roundhouse-core` wrote, carried here through two verbatim copies
+    /// (`engine.rs` into `DecisionRecord::rationale`, `plane.rs` into this
+    /// field). A scrub here would be the wrong place to put the rule — it would
+    /// have to guess which digits are a price — so the rule lives at the
+    /// producer, and `AffinityPolicy::choose` says so where it formats this
+    /// string. A policy that formats a per-model dollar figure into a rationale
+    /// puts one in a model's context, whatever this type promises.
     pub rationale: String,
     /// The name of the deployment's routing policy — how the choice was made,
     /// as distinct from what it was allowed to choose from.

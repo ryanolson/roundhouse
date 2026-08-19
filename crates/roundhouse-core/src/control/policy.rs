@@ -255,6 +255,55 @@ impl TargetFilter {
         layers.sort();
         layers.join(";")
     }
+
+    /// The redundancy-free spelling, for asking whether two filters *mean* the
+    /// same thing.
+    ///
+    /// **Deliberately not [`Self::canonical`], and the difference is the whole
+    /// point.** `canonical` is the digest's input: it answers "how was this
+    /// policy written", which is exactly right for a fingerprint stamped on a
+    /// `DecisionRecord` — an operator who edits a file wants the audit trail to
+    /// show that they did — and exactly wrong for deciding whether two keys
+    /// disagree. It also carries a golden pin and a `DIGEST_VERSION`, so
+    /// teaching it to dedupe would renumber every policy in every log to fix a
+    /// comparison it is not the one making.
+    ///
+    /// Three redundancies are removed, and each is a theorem about
+    /// [`Self::matches`] rather than a guess about operator intent:
+    ///
+    /// - **A repeated pattern inside a layer.** A layer is a disjunction, so
+    ///   `any` over it is unmoved by a duplicate.
+    /// - **A repeated layer.** Layers conjoin, so a second copy of a layer
+    ///   admits exactly what the first already did. This is the one that turns
+    ///   a key restating its project's `allow` — the shape of a secret rotation
+    ///   where the operator writes down the policy already in force — into two
+    ///   identical layers where the inheriting key has one.
+    /// - **A layer naming `*`.** `*` crosses `/` (see [`Self::parse`]'s
+    ///   rejection list, which is why `**` is not a dialect here), so such a
+    ///   layer admits every `policy_identity` and constrains nothing.
+    ///
+    /// Nothing else is folded. Two patterns where one subsumes the other —
+    /// `local/*` and `local/llama` in one layer — are left alone: deciding that
+    /// needs glob subsumption, and a comparison that is *conservative* errs
+    /// toward reporting an ambiguity an operator can resolve by hand, which is
+    /// the safe direction for a check whose failure mode is a wrong answer
+    /// about what a key may do.
+    fn comparison_form(&self) -> Vec<Vec<String>> {
+        let mut layers: Vec<Vec<String>> = self
+            .layers
+            .iter()
+            .filter(|layer| !layer.iter().any(|pattern| pattern == "*"))
+            .map(|layer| {
+                let mut patterns = layer.clone();
+                patterns.sort();
+                patterns.dedup();
+                patterns
+            })
+            .collect();
+        layers.sort();
+        layers.dedup();
+        layers
+    }
 }
 
 impl fmt::Display for TargetFilter {
@@ -666,6 +715,41 @@ impl TurnPolicy {
         // line beside a decision, not a signature. 64 bits is far past the
         // point where two policies in one deployment collide.
         hex::encode(&full[..8])
+    }
+
+    /// Whether `other` admits exactly the turns this policy does, however
+    /// either of them was spelled.
+    ///
+    /// **The question [`Self::digest`] is not the answer to.** A digest
+    /// fingerprints a *spelling* — that is its job on a `DecisionRecord`, where
+    /// an operator who rewrote a policy should see the audit trail change — so
+    /// comparing two digests asks "were these written the same way", and two
+    /// keys can spell one entitlement two ways: a key inheriting its project's
+    /// `allow` and a key restating it as an override intersect to one layer and
+    /// to two identical layers respectively. Comparing digests reports that as
+    /// a disagreement, which turns a secret rotation into a boot failure. The
+    /// caller is
+    /// [`ControlPlane::membership`](../../../roundhouse_server/control_config/enum.ControlPlane.html),
+    /// and the failure it must not produce is refusing to say what a key may do
+    /// when both keys say the same thing.
+    ///
+    /// Conservative on every axis it cannot prove: the floor is compared by its
+    /// bits (the same fold `digest` applies, so `-0.0` and `0.0` are one
+    /// policy), the cadence structurally, and the filter through
+    /// [`TargetFilter::comparison_form`], which removes only redundancies that
+    /// are theorems about [`TargetFilter::matches`]. Anything subtler reads as
+    /// disagreement, and disagreement is the arm an operator can fix by hand.
+    pub fn admits_the_same_as(&self, other: &Self) -> bool {
+        let floor = |policy: &Self| {
+            if policy.min_quality == 0.0 {
+                0.0f64.to_bits()
+            } else {
+                policy.min_quality.to_bits()
+            }
+        };
+        floor(self) == floor(other)
+            && self.frontier_cadence == other.frontier_cadence
+            && self.allow.comparison_form() == other.allow.comparison_form()
     }
 
     /// Axes on which `overrides` is *wider* than this policy — the ones a
@@ -1368,6 +1452,97 @@ mod tests {
         assert!(
             TurnPolicy::unrestricted().digest().len() == 16,
             "a quarter of the hash, hex-encoded"
+        );
+    }
+
+    #[test]
+    fn two_spellings_of_one_entitlement_compare_equal_while_still_fingerprinting_apart() {
+        // The two questions kept separate, in one test because keeping them
+        // separate is the whole claim. A digest answers "was this written the
+        // same way" and is stamped on every `DecisionRecord`; `admits_the_same_as`
+        // answers "may these two keys do the same things" and is what
+        // `ControlPlane::membership` compares before refusing to say what a
+        // membership may do. Conflating them made a secret rotation — where an
+        // operator copies the policy already in force onto the new key — read as
+        // two keys with different entitlements and stopped the boot.
+
+        // A project's filter, and a key that restates it: `narrow` appends a
+        // layer, so the restatement is two identical layers where the inheriting
+        // key has one.
+        let inherited = TurnPolicy {
+            allow: filter(&["local/*"]),
+            ..TurnPolicy::unrestricted()
+        };
+        let restated = inherited.narrow(&PolicyOverrides {
+            allow: Some(filter(&["local/*"])),
+            ..PolicyOverrides::default()
+        });
+        assert!(
+            inherited.admits_the_same_as(&restated),
+            "a layer conjoined with itself admits exactly what it admitted"
+        );
+        // The control that makes the assertion above about *meaning*: the two
+        // still fingerprint apart, because they were written differently and the
+        // audit trail is entitled to say so. A comparison implemented by
+        // teaching `canonical` to dedupe would have renumbered every policy in
+        // every existing log.
+        assert_ne!(inherited.digest(), restated.digest());
+        assert_eq!(
+            inherited.digest(),
+            "96cd6326af5e364b",
+            "pinned so that the tempting shortcut fails here: teaching \
+             `canonical` to dedupe would make the two spellings above compare \
+             equal *and* renumber this filter in every log that already carries \
+             it. See `the_digest_of_two_known_policies_is_pinned_to_a_literal` \
+             on what a moved fingerprint costs"
+        );
+
+        // A layer naming `*` constrains nothing, so a key that spells out "may
+        // reach everything" agrees with a project that narrowed nothing.
+        assert!(TurnPolicy::unrestricted().admits_the_same_as(&TurnPolicy {
+            allow: filter(&["*"]),
+            ..TurnPolicy::unrestricted()
+        }));
+
+        // The controls: policies that really differ, on each axis, must not
+        // compare equal — or the check would be satisfied by returning `true`.
+        for different in [
+            TurnPolicy {
+                allow: filter(&["local/*"]),
+                ..TurnPolicy::unrestricted()
+            },
+            TurnPolicy {
+                min_quality: 0.9,
+                ..TurnPolicy::unrestricted()
+            },
+            TurnPolicy {
+                frontier_cadence: Some(FrontierCadence {
+                    max_frontier: 1,
+                    per_turns: 4,
+                }),
+                ..TurnPolicy::unrestricted()
+            },
+        ] {
+            assert!(
+                !TurnPolicy::unrestricted().admits_the_same_as(&different),
+                "{different:?} admits a different set from the unrestricted policy"
+            );
+        }
+
+        // And nothing subtler is folded: subsumption inside a layer is left
+        // alone, so a comparison that cannot prove agreement reports
+        // disagreement — the arm an operator can fix by hand.
+        assert!(
+            !TurnPolicy {
+                allow: filter(&["local/*"]),
+                ..TurnPolicy::unrestricted()
+            }
+            .admits_the_same_as(&TurnPolicy {
+                allow: filter(&["local/*", "local/llama"]),
+                ..TurnPolicy::unrestricted()
+            }),
+            "conservative on anything it would have to reason about globs to \
+             decide"
         );
     }
 }

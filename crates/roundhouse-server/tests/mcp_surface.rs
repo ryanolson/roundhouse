@@ -84,14 +84,23 @@ const STEER_GUIDANCE: &str = "you are editing a file the task did not name; go b
 /// Ceiling on anything this suite waits for.
 const PATIENCE: Duration = Duration::from_secs(10);
 
-/// The `Host` a request arrives with.
+/// The `Host` a request to a *configured* deployment arrives with.
 ///
-/// Deliberately not a loopback name: the transport ships with a loopback-only
-/// rebinding guard aimed at MCP servers on a developer's laptop, this
-/// deployment turns it off because it is served behind whatever hostname an
-/// operator gave it, and a fixture that used `localhost` would pass whether or
+/// Deliberately not a loopback name: a configured deployment is served behind
+/// whatever hostname an operator gave it and turns the transport's loopback-only
+/// rebinding guard off, so a fixture that used `localhost` would pass whether or
 /// not that had been done.
 const HOST_HEADER: &str = "roundhouse.internal.example.com";
+
+/// The `Host` a request to an *open* deployment arrives with.
+///
+/// An unconfigured deployment has no bearer key to stand in for the guard, so it
+/// keeps rmcp's loopback allowlist and is reachable only as the laptop process
+/// it is — see [`open_mode_refuses_a_tools_call_from_a_host_it_does_not_serve`].
+const LOOPBACK_HOST: &str = "127.0.0.1";
+
+/// A `Host` a rebound DNS name would arrive as.
+const REBOUND_HOST: &str = "evil.example.com";
 
 // ---------------------------------------------------------------------------
 // Keys and the control plane that declares them
@@ -301,6 +310,15 @@ struct Rig {
     /// The one control store, shared with the engine. Held so a test can look
     /// at what the surface wrote without going back through the wire.
     control: Arc<ControlStore>,
+    /// A `Host` this deployment answers to, given its mode.
+    ///
+    /// Carried on the rig rather than fixed as one constant because the
+    /// transport's rebinding guard now follows the control plane: a configured
+    /// deployment serves any host and relies on the key, an open one serves only
+    /// loopback because it has no key to rely on. A single constant would have
+    /// made every open-mode assertion below a statement about whichever of the
+    /// two the constant happened to name.
+    host: &'static str,
 }
 
 async fn rig(plane: Arc<ControlPlane>) -> Rig {
@@ -330,6 +348,10 @@ async fn build(
     script: impl IntoIterator<Item = Plan>,
 ) -> Rig {
     ensure_rustls_crypto_provider();
+    let host = match plane.as_ref() {
+        ControlPlane::Open => LOOPBACK_HOST,
+        ControlPlane::Configured { .. } => HOST_HEADER,
+    };
     let store = Arc::new(MemoryStore::new());
     let control = Arc::new(ControlStore::new());
     let conversations = Arc::new(Conversations::new());
@@ -375,6 +397,7 @@ async fn build(
         app,
         store,
         control,
+        host,
     }
 }
 
@@ -425,6 +448,7 @@ impl Conversation {
         body["input"] = Value::Array(self.history.clone());
         let (status, text) = post(
             &rig.app,
+            rig.host,
             "/v1/responses",
             Some(&self.secret),
             &body.to_string(),
@@ -476,6 +500,7 @@ fn completed_items(sse: &str) -> Vec<Value> {
 async fn tools_call(rig: &Rig, secret: Option<&str>, tool: &str, arguments: Value) -> Value {
     let (status, text) = post(
         &rig.app,
+        rig.host,
         "/mcp",
         secret,
         &json!({
@@ -540,13 +565,14 @@ fn refused(reply: &Value) -> String {
 /// One POST, body drained to a string.
 async fn post(
     app: &Router,
+    host: &str,
     uri: &str,
     secret: Option<&str>,
     body: &str,
     content_type: &str,
 ) -> (StatusCode, String) {
     let (status, _headers, text) =
-        post_with_extra_headers(app, uri, secret, body, content_type, &[]).await;
+        post_with_extra_headers(app, host, uri, secret, body, content_type, &[]).await;
     (status, text)
 }
 
@@ -556,6 +582,7 @@ async fn post(
 /// framing rather than a tool's own JSON-RPC reply.
 async fn post_with_extra_headers(
     app: &Router,
+    host: &str,
     uri: &str,
     secret: Option<&str>,
     body: &str,
@@ -569,24 +596,26 @@ async fn post_with_extra_headers(
         // Every HTTP/1.1 client sends one, and the streamable-HTTP transport's
         // DNS-rebinding guard refuses a request that does not — a `tower`
         // oneshot has to supply what a socket would have.
-        .header(HOST, HOST_HEADER)
+        .header(HOST, host)
         // Both, because the transport requires a client to accept either
         // framing even when this deployment only ever answers in one of them.
         .header(ACCEPT, "application/json, text/event-stream");
     if let Some(secret) = secret {
         builder = builder.header(AUTHORIZATION, format!("Bearer {secret}"));
     }
+    let mut request = builder.body(Body::from(body.to_string())).expect("request");
+    // `insert` rather than the builder's `header`, which appends. A caller that
+    // names a header this fixture already set means to *replace* it — the
+    // rebinding probes name `Host` — and an appended second value would be
+    // silently ignored by a reader that takes the first, which is how a probe
+    // for a guard ends up proving nothing.
     for (name, value) in extra_headers {
-        builder = builder.header(
+        request.headers_mut().insert(
             name.clone(),
             HeaderValue::from_str(value).expect("a header value fixture"),
         );
     }
-    let response = app
-        .clone()
-        .oneshot(builder.body(Body::from(body.to_string())).expect("request"))
-        .await
-        .expect("call");
+    let response = app.clone().oneshot(request).await.expect("call");
     let status = response.status();
     let headers = response.headers().clone();
     let bytes = response
@@ -675,6 +704,7 @@ const TOOL_NAMES: [&str; 8] = [
 async fn tools_list(rig: &Rig, secret: Option<&str>) -> (StatusCode, String) {
     post(
         &rig.app,
+        rig.host,
         "/mcp",
         secret,
         &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }).to_string(),
@@ -738,7 +768,7 @@ async fn a_get_on_the_mcp_endpoint_is_405() {
                 .method("GET")
                 .uri("/mcp")
                 .header(ACCEPT, "text/event-stream")
-                .header(HOST, HOST_HEADER)
+                .header(HOST, rig.host)
                 .header(AUTHORIZATION, format!("Bearer {}", key("ada")))
                 .body(Body::empty())
                 .expect("request"),
@@ -776,6 +806,7 @@ async fn the_mcp_transport_issues_no_session_id_and_requires_none() {
 
     let (status, headers, text) = post_with_extra_headers(
         &rig.app,
+        rig.host,
         "/mcp",
         Some(&key("ada")),
         &json!({
@@ -801,6 +832,7 @@ async fn the_mcp_transport_issues_no_session_id_and_requires_none() {
     // "not required" for a transport that never issues one to begin with.
     let (status_with_bogus, headers_with_bogus, text_with_bogus) = post_with_extra_headers(
         &rig.app,
+        rig.host,
         "/mcp",
         Some(&key("ada")),
         &json!({
@@ -1029,6 +1061,110 @@ async fn an_expired_scope_restores_the_admission_policy() {
     );
 }
 
+#[tokio::test]
+async fn a_steered_turn_does_not_spend_the_agents_ration() {
+    // "One turn, one ration" is a claim about *routed* turns, and the doc on
+    // `Engine::narrowed_admission` says why in the strongest available form:
+    // consuming where the turn's policy is fixed makes "the turn routed under
+    // the overlay" and "the turn that spent it" the same turn by construction.
+    // A steered turn is the case where that construction has nothing to hold
+    // onto — the interjection seam answers the turn before `plan` runs, so no
+    // `Routed` event, no `DecisionRecord` and no `turn_policy_digest` are
+    // written at all. Spending the ration there charges the agent for a turn
+    // that produced nothing to check the charge against, and `status` had
+    // already promised the digest it reported would be "the same string the
+    // next `DecisionRecord` will carry".
+    let rig = steering_rig(control_plane(), [Plan::Proceed, Plan::Steer, Plan::Proceed]).await;
+    let session = "acme/ada/main";
+    let mut agent = Conversation::new(&key("ada"), "main");
+
+    agent.say(&rig, "start the parser").await;
+    let asked = served(
+        &tools_call(
+            &rig,
+            Some(&key("ada")),
+            "prefer",
+            json!({
+                "mode": "local",
+                "scope": "turn",
+                "reason": "just the next one",
+                "conversation": "main",
+            }),
+        )
+        .await,
+    );
+
+    // The steered turn. It commits a synthetic call and answers the client
+    // without ever reaching the router.
+    agent.say(&rig, "keep editing whatever").await;
+    let call_id = emitted_call_id(&rig.store, session).await;
+    assert_eq!(
+        decisions(&rig.store, session).await.len(),
+        1,
+        "the premise: the steer really did answer at the seam, so this turn \
+         wrote no decision the ration could be checked against"
+    );
+
+    // And the surface still holds the overlay, because nothing routed under it.
+    let mid = served(
+        &tools_call(
+            &rig,
+            Some(&key("ada")),
+            "status",
+            json!({ "conversation": "main" }),
+        )
+        .await,
+    );
+    assert!(
+        !mid["overlay"].is_null(),
+        "a turn that never asked the router what it may do cannot have spent a \
+         turn's worth of asking: {mid}"
+    );
+    assert_eq!(
+        mid["policy_digest"], asked["policy_digest"],
+        "and the digest the tool keeps promising is still the one it promised \
+         before the steer"
+    );
+
+    // The client answers the call, exactly as Codex does, and the next turn
+    // routes — under the overlay, which is what the agent asked for and has not
+    // yet had.
+    agent.append(as_value(function_call_output_item(&call_id, "{}")));
+    agent.say(&rig, "back to the parser, then").await;
+
+    let routed = decisions(&rig.store, session).await;
+    let routes: Vec<String> = routed
+        .iter()
+        .map(|decision| decision.chosen.policy_identity())
+        .collect();
+    assert_eq!(
+        routes,
+        vec!["anthropic/claude", "local/local"],
+        "the ration was spent by the turn that was routed under it, and by no \
+         other"
+    );
+    assert_eq!(
+        asked["policy_digest"], routed[1].turn_policy_digest,
+        "which is the promise `status` and `prefer` both make: the digest \
+         reported is the digest the next `DecisionRecord` carries"
+    );
+
+    // And it is a ration still, not a subscription: the turn after the routed
+    // one is back at the ceiling.
+    agent.say(&rig, "and the turn after that").await;
+    let after = decisions(&rig.store, session).await;
+    assert_eq!(after.len(), 3);
+    assert_eq!(
+        after[2].chosen.policy_identity(),
+        "anthropic/claude",
+        "moving the consume must not have made the overlay outlive its scope"
+    );
+    assert_eq!(
+        after[0].turn_policy_digest, after[2].turn_policy_digest,
+        "and what it returns to is the admission policy itself"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The surface does not queue behind the turn
 // ---------------------------------------------------------------------------
@@ -1063,12 +1199,14 @@ async fn an_mcp_call_during_a_running_turn_does_not_take_the_session_gate() {
     held_history.push(as_value(user_message("and keep going")));
     let held = tokio::spawn({
         let app = rig.app.clone();
+        let host = rig.host;
         let secret = key("ada");
         async move {
             let mut body = request_value("main");
             body["input"] = Value::Array(held_history);
             post(
                 &app,
+                host,
                 "/v1/responses",
                 Some(&secret),
                 &body.to_string(),
@@ -1273,13 +1411,26 @@ async fn init_session_joins_the_mcp_channel_to_the_wire_session() {
     );
 
     // And the join answers the question it exists for: which wire session made
-    // that MCP call?
+    // that MCP call? Asked with the caller's own `(principal, session)`, which
+    // is what makes a token *pasted* into a log inert rather than authoritative
+    // — the resolver refuses to answer for anyone but the pair that minted it.
+    let ada = Principal::new("acme", "ada");
     let binding = rig
         .control
-        .binding(&found)
-        .expect("this node minted it, so this node can resolve it");
+        .binding(&ada, &SessionId::new(session), &found)
+        .expect("this node minted it for this caller, so this node can resolve it");
     assert_eq!(binding.session, SessionId::new(session));
-    assert_eq!(binding.principal, Principal::new("acme", "ada"));
+    assert_eq!(binding.principal, ada);
+    assert!(
+        rig.control
+            .binding(
+                &Principal::new("acme", "bob"),
+                &SessionId::new(session),
+                &found
+            )
+            .is_none(),
+        "and it answers nobody else, however they came by the token"
+    );
 
     // The control: a *different* conversation of the same key holds nothing, so
     // the join names one session rather than every session this key has.
@@ -1351,4 +1502,123 @@ async fn open_mode_serves_the_mcp_surface_under_the_default_principal() {
     let denial =
         refused(&tools_call(&rig, None, "fetch_steer", json!({ "steer_id": "fc_nope" })).await);
     assert!(denial.contains("fc_nope"), "{denial}");
+}
+
+#[tokio::test]
+async fn open_mode_refuses_a_tools_call_from_a_host_it_does_not_serve() {
+    // The DNS-rebinding guard rmcp ships exists for exactly this deployment: a
+    // process on 127.0.0.1:8080 with no key, which is what the shipped binary is
+    // whenever `ROUNDHOUSE_CONTROL_PLANE` is unset. A page in the developer's
+    // browser cannot read a loopback response cross-origin, so the attack is to
+    // point a hostname it *does* control at 127.0.0.1 and re-resolve it — the
+    // browser then believes it is same-origin, sends no `Authorization`, and the
+    // only header that still tells the truth is `Host`.
+    //
+    // The tools are not read-only: `prefer` and `set_quality_floor` write
+    // overlays against the developer's live conversation, and `status` reports
+    // the admissible fleet and the budget position. `allowed_origins` cannot
+    // stand in — under rebinding the `Origin` is the attacker's own page and
+    // reads as same-origin — so the host allowlist is the only check that fires.
+    let open = rig(ControlPlane::open()).await;
+    let mut agent = Conversation::new("unused", "main");
+    agent.say(&open, "start").await;
+
+    let (status, _headers, text) = post_with_extra_headers(
+        &open.app,
+        open.host,
+        "/mcp",
+        None,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "status", "arguments": {} },
+        })
+        .to_string(),
+        "application/json",
+        &[(HOST, REBOUND_HOST)],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "an open deployment has no bearer key standing in for the loopback \
+         guard, so a request from a host it does not serve must not reach a \
+         tool: {text}"
+    );
+    assert!(
+        !text.contains("admissible_targets"),
+        "and it must not answer with the deployment's own posture on the way \
+         out: {text}"
+    );
+
+    // The control, and the reason the assertion above is about the *host*: the
+    // identical request from loopback is served, with no key, exactly as
+    // `open_mode_serves_the_mcp_surface_under_the_default_principal` requires.
+    let (served_status, _, served_text) = post_with_extra_headers(
+        &open.app,
+        open.host,
+        "/mcp",
+        None,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "status", "arguments": {} },
+        })
+        .to_string(),
+        "application/json",
+        &[],
+    )
+    .await;
+    assert_eq!(served_status, StatusCode::OK, "{served_text}");
+
+    // The other control: a *configured* deployment does clear the allowlist,
+    // because it is served behind whatever hostname an operator gave it and the
+    // key is what a rebound page cannot supply. The same attacker host with a
+    // real key is served; without one it is refused by the key check rather than
+    // by the host check, which is what makes the key the replacement rather than
+    // an addition.
+    let keyed = rig(control_plane()).await;
+    let mut ada = Conversation::new(&key("ada"), "main");
+    ada.say(&keyed, "start").await;
+    let (keyed_status, _, keyed_text) = post_with_extra_headers(
+        &keyed.app,
+        REBOUND_HOST,
+        "/mcp",
+        Some(&key("ada")),
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "status", "arguments": {} },
+        })
+        .to_string(),
+        "application/json",
+        &[],
+    )
+    .await;
+    assert_eq!(
+        keyed_status,
+        StatusCode::OK,
+        "a configured deployment answers to any hostname an operator put in \
+         front of it: {keyed_text}"
+    );
+    let (unkeyed_status, _, _) = post_with_extra_headers(
+        &keyed.app,
+        REBOUND_HOST,
+        "/mcp",
+        None,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "status", "arguments": {} },
+        })
+        .to_string(),
+        "application/json",
+        &[],
+    )
+    .await;
+    assert_eq!(unkeyed_status, StatusCode::UNAUTHORIZED);
 }

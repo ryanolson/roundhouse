@@ -733,8 +733,14 @@ async fn open_mode_routing_is_byte_identical_to_m1() {
 /// `roundhouse-core`'s own `an_unrestricted_policy_reproduces_m1_routing_byte_for_byte`
 /// pins one layer down, where the expectations were captured against the tree
 /// before any M2 code existed.
+///
+/// Moved once since it was captured, by deletion only: the trailing `, $0.00000`
+/// is gone because a rationale is republished verbatim into a model's own
+/// context by `explain_last_route`, and a per-model price must not travel that
+/// way. The quantity the pin is about — which target, on what score — is
+/// unchanged.
 const M1_RATIONALE: &str =
-    "score 0.0000 over 2 candidate(s); expected prefill 31 of 31 tokens (0% cached), $0.00000";
+    "score 0.0000 over 2 candidate(s); expected prefill 31 of 31 tokens (0% cached)";
 
 /// A filter and a cadence are different kinds of narrowing, and the difference
 /// is which failure they are allowed to produce.

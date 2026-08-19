@@ -100,7 +100,10 @@ pub fn descriptors() -> Vec<ToolDescriptor> {
     vec![
         ToolDescriptor {
             name: "status",
-            description: "What this key may be routed to right now: the effective policy fingerprint, the admissible model names, budget remaining, and any steer awaiting an answer. Costs nothing and changes nothing.",
+            // Not "costs nothing": answering this reads the conversation's log,
+            // and a description that told a model the call was free would be
+            // inviting the loop the surface then has to absorb.
+            description: "What this key may be routed to right now: the effective policy fingerprint, the admissible model names, budget remaining, and any steer awaiting an answer. Changes nothing; it reads this conversation's log to answer, so it is cheap between turns and not free in a loop.",
             input_schema: json!({
                 "type": "object",
                 "properties": { "conversation": conversation_property() },
@@ -109,7 +112,13 @@ pub fn descriptors() -> Vec<ToolDescriptor> {
         },
         ToolDescriptor {
             name: "init_session",
-            description: "Mint an id identifying this conversation to roundhouse. Call it once at the start of a session and keep the output in the conversation: roundhouse correlates this tool connection to your conversation by seeing that id in the history you resend.",
+            // States what M5 does — mint, record, and ask the client to keep
+            // the token — and stops there. The read side that turns a kept
+            // token into a resolved conversation is M7's (see
+            // `ControlStore::binding_in_log`), and a description written in the
+            // present tense about it would have every agent's context asserting
+            // a correlation this deployment does not perform.
+            description: "Mint an id identifying this conversation to roundhouse, which records it. Call it once at the start of a session and keep the output in the conversation, unsummarized: the id travelling back in the history you resend is what lets a later turn be matched to this conversation.",
             input_schema: json!({
                 "type": "object",
                 "properties": { "conversation": conversation_property() },

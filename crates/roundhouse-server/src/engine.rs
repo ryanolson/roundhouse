@@ -396,9 +396,13 @@ pub struct Engine<S: SessionStore, T: Tokenizer + Clone> {
     /// engine reads.
     ///
     /// Two directions, one store, and they are the two halves of the same
-    /// conversation: an agent's overlay is *consumed* here at the start of every
-    /// turn, and a steer's corrective payload is *deposited* here after the log
-    /// commit that emitted its call. Sharing one `Arc` with the surface is not
+    /// conversation: an agent's overlay is *consumed* here on every turn this
+    /// engine goes on to route — not on a turn the interjection seam answers,
+    /// which routes nowhere and so has no decision to spend a ration against
+    /// (see [`Engine::narrowed_admission`]) — and a steer's corrective payload
+    /// is *deposited* here after the log commit that emitted its call. The two
+    /// exclusions are one turn: a steered turn deposits and does not consume.
+    /// Sharing one `Arc` with the surface is not
     /// an optimization — a surface holding its own copy would install overlays
     /// no turn reads and hold payloads no agent can fetch, and both failures are
     /// silent from every side.
@@ -632,14 +636,6 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             });
         }
 
-        // The agent's own narrowing, spent here and applied for the rest of this
-        // turn. Everything below reads `admission` — the interjection seam, the
-        // grant, the router, the settle — and from here that name means the
-        // key's entitlements narrowed by whatever the agent asked for, which is
-        // the only composition an overlay ever gets. See
-        // [`Self::narrowed_admission`].
-        let admission = &self.narrowed_admission(session_id, admission);
-
         // Held across dispatch *and* settle. A model call outlives the lease TTL
         // routinely, and without renewal every one of those turns would be
         // fenced at commit and throw away an answer already paid for; the
@@ -731,6 +727,28 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                     .map_err(EngineError::from)
             }
             Interjection::Proceed => {
+                // The agent's own narrowing, spent here and applied for the
+                // rest of this turn.
+                //
+                // **Inside this arm, not above the seam.** Consuming before the
+                // interjection was the position that made the `Complete` arm
+                // above spend a ration for a turn that never reached `plan` —
+                // no `Routed`, no `DecisionRecord`, no `turn_policy_digest`, so
+                // nothing in the audit trail the charge could be checked
+                // against, and `status`'s promise that the digest it reports is
+                // the one the next decision carries silently false for every
+                // steered turn. Here the claim on
+                // [`Self::narrowed_admission`] is not just preserved but
+                // finally true: this is still before `plan`, so the turn routed
+                // under the overlay is the turn that spent it *by
+                // construction*, and now every turn that spends one is a turn
+                // that routed.
+                //
+                // Nothing below the seam needed the narrowed value. `settle`
+                // reads the principal and the budget, and `narrow` touches
+                // neither — a budget is an admin's ceiling and not an axis an
+                // agent may move.
+                let admission = &self.narrowed_admission(session_id, admission);
                 match self.dispatch(&mut session, &response_id, admission).await {
                     Ok(Completed {
                         text,

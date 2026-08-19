@@ -93,7 +93,41 @@ pub trait ControlReads: Send + Sync + 'static {
     async fn balance(&self, principal: &Principal) -> Result<Option<Balance>, SurfaceError>;
 
     /// What `session`'s log projects to.
+    ///
+    /// The expensive read on this trait: on a real deployment it is a replay of
+    /// the whole log. [`Self::session_cursor`] is what lets the surface skip it.
     async fn session_facts(&self, session: &SessionId) -> Result<SessionFacts, SurfaceError>;
+
+    /// Where `session`'s log ends, if that can be answered without replaying it.
+    ///
+    /// A projection of a log that has not advanced cannot have changed, so this
+    /// is the whole freshness check behind the surface's memo of
+    /// [`Self::session_facts`] — see `ControlPlaneSurface::session_facts` for
+    /// why a memo is needed at all (`status` and `explain_last_route` are
+    /// called from a model's context, and a model can call a tool in a loop).
+    ///
+    /// The default answers `None`, meaning "not cheaply" — and a `None` makes
+    /// the surface project on every call, which is exactly what every caller
+    /// paid before the memo existed. It is a default rather than a required
+    /// method because a cheap cursor is a property of the *store* behind an
+    /// implementation and not of the seam: an implementation over a durable
+    /// session store has one, and a test double may not care to have one.
+    ///
+    /// `roundhouse-server`'s `ControlPlaneReads` overrides this over the
+    /// `SessionStore::last_seq` that `resolve_session` already calls on every
+    /// session-scoped tool call, so on the shipped deployment a repeat `status`
+    /// or `explain_last_route` between turns is one cursor read rather than a
+    /// full log replay. The default here stays `None` for implementations —
+    /// test doubles among them — whose store cannot answer the cursor cheaply.
+    ///
+    /// A cursor must be *monotone per session and moved by every append*. A
+    /// value that repeats across two different log states would serve a stale
+    /// projection, which is a worse failure than the cost this exists to avoid:
+    /// answer `None` rather than something approximate.
+    async fn session_cursor(&self, session: &SessionId) -> Result<Option<u64>, SurfaceError> {
+        let _ = session;
+        Ok(None)
+    }
 
     /// Wall-clock milliseconds, as the deployment tells the time.
     ///

@@ -20,7 +20,8 @@
 //! is a retry loop bolted to the one surface that must stay cheap. `narrowed:
 //! true` plus the resulting admissible list tells it exactly what it got.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
@@ -29,7 +30,7 @@ use roundhouse_core::ids::SessionId;
 use roundhouse_core::routing::Target;
 
 use crate::overlay::{ModeNarrowing, OverlayScope, PreferMode, SessionOverlay, TimedOverlay};
-use crate::reads::ControlReads;
+use crate::reads::{ControlReads, SessionFacts};
 use crate::store::{ControlStore, IntentRecord};
 use crate::surface::*;
 
@@ -43,9 +44,25 @@ const CLAMPED_TO_CEILING: &str =
 const WOULD_LEAVE_NOTHING: &str =
     "no model this key may use satisfies that request, so your routing was left as it was";
 
+/// How many sessions' projections the surface remembers at once.
+///
+/// A cap and not a policy: see [`ControlPlaneSurface::session_facts`].
+const MEMO_CAPACITY: usize = 256;
+
+/// A projection, and the log cursor it was taken at.
+struct MemoisedFacts {
+    cursor: u64,
+    facts: SessionFacts,
+}
+
 pub struct ControlPlaneSurface<R: ControlReads> {
     reads: Arc<R>,
     store: Arc<ControlStore>,
+    /// The last projection taken of each session, keyed by the cursor it was
+    /// taken at. Node-local and owned outright by this surface, unlike
+    /// [`ControlStore`], because it is a cache of a *read* and not a fact
+    /// anything else in the deployment is entitled to see.
+    memo: Mutex<HashMap<SessionId, MemoisedFacts>>,
 }
 
 impl<R: ControlReads> ControlPlaneSurface<R> {
@@ -54,7 +71,75 @@ impl<R: ControlReads> ControlPlaneSurface<R> {
     /// its own copy would be a second control plane that agreed with the first
     /// only by luck.
     pub fn new(reads: Arc<R>, store: Arc<ControlStore>) -> Self {
-        Self { reads, store }
+        Self {
+            reads,
+            store,
+            memo: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// What `session`'s log projects to, re-projecting only when it has moved.
+    ///
+    /// **`status` and `explain_last_route` are called from a model's context,
+    /// and a projection is a replay of the whole log.** On the server that is
+    /// a store round trip per batch of events plus a clone of every item and of
+    /// every routing decision — the cost the neighbouring seam doc refuses on
+    /// principle, and the one `fetch_steer` was specifically hardened against.
+    /// Nothing stops an agent calling either tool in a loop, so the cost has to
+    /// be bounded here rather than trusted not to be paid.
+    ///
+    /// The bound is a cursor comparison: a log that has not advanced cannot
+    /// have changed what it projects to, so the memo is exact rather than
+    /// merely fresh-ish, and a turn landing between two calls invalidates it by
+    /// construction. A deployment that cannot answer
+    /// [`ControlReads::session_cursor`] cheaply says so and pays the projection
+    /// every call, which is what every caller paid before the memo existed.
+    ///
+    /// Eviction is a wholesale drop rather than a recency order. A memo is a
+    /// cache: losing it costs one projection per session and nothing else, so
+    /// maintaining an LRU here would be machinery whose failure mode is worse
+    /// than the thing it optimizes.
+    async fn session_facts(&self, session: &SessionId) -> Result<SessionFacts, SurfaceError> {
+        let Some(cursor) = self.reads.session_cursor(session).await? else {
+            return self.reads.session_facts(session).await;
+        };
+        if let Some(remembered) = self.remembered(session, cursor) {
+            return Ok(remembered);
+        }
+        let facts = self.reads.session_facts(session).await?;
+        self.remember(session, cursor, &facts);
+        Ok(facts)
+    }
+
+    /// The projection held for `session` at `cursor`, if it is that one.
+    fn remembered(&self, session: &SessionId, cursor: u64) -> Option<SessionFacts> {
+        self.lock_memo()
+            .get(session)
+            .filter(|memo| memo.cursor == cursor)
+            .map(|memo| memo.facts.clone())
+    }
+
+    fn remember(&self, session: &SessionId, cursor: u64, facts: &SessionFacts) {
+        let mut memo = self.lock_memo();
+        if memo.len() >= MEMO_CAPACITY && !memo.contains_key(session) {
+            memo.clear();
+        }
+        memo.insert(
+            session.clone(),
+            MemoisedFacts {
+                cursor,
+                facts: facts.clone(),
+            },
+        );
+    }
+
+    /// The memo's lock. Poisoned means a handler panicked mid-insert; the
+    /// recovered guard is a cache that may be one entry stale, which is the
+    /// same thing an eviction is.
+    fn lock_memo(&self) -> std::sync::MutexGuard<'_, HashMap<SessionId, MemoisedFacts>> {
+        self.memo
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Whether `overlay` leaves this principal anything to be routed to.
@@ -80,31 +165,54 @@ impl<R: ControlReads> ControlPlaneSurface<R> {
             .is_empty())
     }
 
-    /// Store `proposed` if it leaves something routable, and say what happened.
+    /// Move one axis if the result leaves something routable, and say what
+    /// happened.
     ///
-    /// The fallback chain is total and self-healing: proposed, else what the
-    /// session already had, else nothing at all. The last rung exists because a
-    /// catalog is a file an operator edits — an overlay installed against
-    /// yesterday's models can be left admitting none of today's, and a session
-    /// pinned to an overlay it can no longer satisfy would fail every remaining
-    /// turn at a seam the agent cannot reach.
+    /// Two rungs and no third: the ask, else the session exactly as it is. An
+    /// earlier version had a third — reset to the empty overlay — against the
+    /// case of a catalog an operator edited out from under a live overlay. That
+    /// rung could not be entered. Every overlay in the store was written by this
+    /// function against the same catalog, `consume_overlay` only ever drops axes
+    /// (which widens), and both the ceiling and the catalog are fixed for the
+    /// process's lifetime — so an overlay that was routable when it was written
+    /// is still routable now, and the second rung always answers.
+    ///
+    /// **Stated plainly, then: the "leaves something routable" guarantee is
+    /// enforced at write time only, and it holds because the catalog outlives
+    /// every overlay written against it.** M8 is where that stops being true —
+    /// a durable overlay survives the restart that reloads the catalog — and
+    /// the place to re-derive is the seam that can see the empty set, which is
+    /// the engine's own admission path, not a rung here that fires only for a
+    /// session that happens to call an overlay tool again.
+    ///
+    /// The admissibility question is asked outside the store's lock and the
+    /// write is taken inside it, which is safe in one direction only and that
+    /// is the direction it runs: a concurrent turn can only *drop* axes, so an
+    /// ask judged routable against a sibling axis that has since expired is
+    /// judged against a policy at least as strict as the one that lands. The
+    /// converse — refusing a write that would now have been fine — is the error
+    /// this trade makes, and it errs toward leaving the agent's routing alone.
     async fn install(
         &self,
         principal: &Principal,
         session: &SessionId,
         ceiling: &TurnPolicy,
-        current: SessionOverlay,
-        proposed: SessionOverlay,
+        current: &SessionOverlay,
+        axis: OverlayAxis,
     ) -> Result<(SessionOverlay, bool), SurfaceError> {
-        let (settled, clamped) = if self.leaves_a_target(principal, ceiling, &proposed).await? {
-            (proposed, false)
-        } else if self.leaves_a_target(principal, ceiling, &current).await? {
-            (current, true)
-        } else {
-            (SessionOverlay::default(), true)
+        let proposed = axis.applied_to(current.clone());
+        if !self.leaves_a_target(principal, ceiling, &proposed).await? {
+            // Nothing is written at all — not even the axis's own value — which
+            // is what "the session keeps the overlay it had" has to mean once
+            // the write is per axis.
+            return Ok((self.store.overlay(session).unwrap_or_default(), true));
+        }
+        let now_ms = self.reads.now_ms();
+        let settled = match axis {
+            OverlayAxis::Mode(mode) => self.store.set_mode_axis(session, mode, now_ms),
+            OverlayAxis::Floor(floor) => self.store.set_floor_axis(session, floor, now_ms),
         };
-        self.store.set_overlay(session, settled.clone());
-        Ok((settled, clamped))
+        Ok((settled, false))
     }
 
     /// The answer both overlay writers give, built from the settled overlay.
@@ -137,6 +245,31 @@ impl<R: ControlReads> ControlPlaneSurface<R> {
         self.reads
             .resolve_session(principal, conversation.as_deref())
             .await
+    }
+}
+
+/// Which single axis of an overlay a write moves.
+///
+/// The unit of an overlay write is one axis and not one snapshot, because the
+/// engine is mutating the same entry from another thread — see
+/// [`ControlStore::set_mode_axis`]. Spelling that as a type rather than as a
+/// convention means an overlay writer cannot accidentally carry a sibling axis
+/// it read a moment ago back into the store.
+#[derive(Debug, Clone)]
+enum OverlayAxis {
+    Mode(Option<TimedOverlay<ModeNarrowing>>),
+    Floor(Option<TimedOverlay<f64>>),
+}
+
+impl OverlayAxis {
+    /// `base` with this axis replaced — the overlay the admissibility question
+    /// is asked about, never the one that is written.
+    fn applied_to(&self, mut base: SessionOverlay) -> SessionOverlay {
+        match self {
+            OverlayAxis::Mode(mode) => base.mode = mode.clone(),
+            OverlayAxis::Floor(floor) => base.floor = floor.clone(),
+        }
+        base
     }
 }
 
@@ -223,7 +356,7 @@ impl<R: ControlReads> ControlSurface for ControlPlaneSurface<R> {
         let effective = overlay.apply_to(&ceiling);
         let targets = self.reads.admissible_targets(principal, &effective).await?;
         let balance = self.reads.balance(principal).await?;
-        let facts = self.reads.session_facts(&session).await?;
+        let facts = self.session_facts(&session).await?;
 
         ToolOutcome::ok(&StatusResponse {
             conversation: session.to_string(),
@@ -247,12 +380,18 @@ impl<R: ControlReads> ControlSurface for ControlPlaneSurface<R> {
         ToolOutcome::ok(&InitSessionResponse {
             session_binding_id: id.to_string(),
             conversation: session.to_string(),
-            // The sentence that makes the correlation work. It is addressed to
-            // the client, is the reason the id survives into the next turn's
-            // resent history, and is deliberately an instruction rather than a
-            // description — a client summarizing its own history keeps what it
-            // was told to keep.
-            note: "This id identifies this conversation to roundhouse. Keep this tool output in the conversation and do not summarize it away; roundhouse recognizes this conversation by seeing the id in the history you resend.",
+            // The sentence that makes the correlation *possible*. It is
+            // addressed to the client, it is the reason the id survives into
+            // the next turn's resent history, and it is deliberately an
+            // instruction rather than a description — a client summarizing its
+            // own history keeps what it was told to keep.
+            //
+            // What it must not say is that the correlation is happening. It is
+            // not: nothing in this deployment resolves a session from a binding
+            // yet (see `ControlStore::binding_in_log`, whose read side is M7),
+            // and a note promising a mechanism the deployment does not run is
+            // the one lie an agent has no way to catch.
+            note: "This id identifies this conversation to roundhouse, which has recorded it. Keep this tool output in the conversation and do not summarize it away: the id travelling back in the history you resend is what lets a later turn be matched to this conversation.",
         })
     }
 
@@ -305,31 +444,34 @@ impl<R: ControlReads> ControlSurface for ControlPlaneSurface<R> {
 
         // `auto` is a release, not an ask: it drops the mode axis and can never
         // be narrowed, because there is nothing in it to clamp.
-        let mut proposed = current.clone();
-        let mut unhonorable = None;
-        if request.mode == PreferMode::Auto {
-            proposed.mode = None;
+        let asked = if request.mode == PreferMode::Auto {
+            Some(OverlayAxis::Mode(None))
         } else {
-            match ModeNarrowing::resolve(request.mode, &ceiling_targets) {
-                Some(ask) => {
-                    proposed.mode = Some(TimedOverlay {
-                        ask,
-                        remaining_turns,
-                        reason,
-                    });
-                }
-                None => unhonorable = Some(WOULD_LEAVE_NOTHING),
-            }
-        }
+            ModeNarrowing::resolve(request.mode, &ceiling_targets).map(|ask| {
+                OverlayAxis::Mode(Some(TimedOverlay {
+                    ask,
+                    remaining_turns,
+                    reason,
+                }))
+            })
+        };
 
-        let (settled, clamped) = self
-            .install(principal, &session, &ceiling, current, proposed)
-            .await?;
-        let because = unhonorable.or(if clamped {
-            Some(WOULD_LEAVE_NOTHING)
-        } else {
-            None
-        });
+        // An unhonorable ask writes nothing at all, which is the same answer
+        // `install` gives an ask that would empty the set — and it has to read
+        // the store rather than echo `current`, because a turn may have spent
+        // an axis since.
+        let (settled, because) = match asked {
+            None => (
+                self.store.overlay(&session).unwrap_or_default(),
+                Some(WOULD_LEAVE_NOTHING),
+            ),
+            Some(axis) => {
+                let (settled, clamped) = self
+                    .install(principal, &session, &ceiling, &current, axis)
+                    .await?;
+                (settled, clamped.then_some(WOULD_LEAVE_NOTHING))
+            }
+        };
         let response = self
             .overlay_response(principal, &session, &ceiling, &settled, because)
             .await?;
@@ -356,19 +498,20 @@ impl<R: ControlReads> ControlSurface for ControlPlaneSurface<R> {
         let ceiling = self.reads.ceiling_policy(principal).await?;
         let current = self.store.overlay(&session).unwrap_or_default();
 
-        let mut proposed = current.clone();
-        proposed.floor = Some(TimedOverlay {
+        let axis = OverlayAxis::Floor(Some(TimedOverlay {
             ask: request.floor,
             remaining_turns,
             reason,
-        });
+        }));
         // Asked for below the ceiling's own floor. `narrow` already clamps it,
         // so nothing unsafe happens either way; the report is what stops the
         // agent believing it moved something.
-        let widened = !ceiling.widenings_of(&proposed.overrides()).is_empty();
+        let widened = !ceiling
+            .widenings_of(&axis.applied_to(current.clone()).overrides())
+            .is_empty();
 
         let (settled, clamped) = self
-            .install(principal, &session, &ceiling, current, proposed)
+            .install(principal, &session, &ceiling, &current, axis)
             .await?;
         let because = if clamped {
             Some(WOULD_LEAVE_NOTHING)
@@ -424,7 +567,7 @@ impl<R: ControlReads> ControlSurface for ControlPlaneSurface<R> {
         request: ExplainLastRouteRequest,
     ) -> Result<ToolOutcome, SurfaceError> {
         let session = self.session_of(principal, &request.conversation).await?;
-        let facts = self.reads.session_facts(&session).await?;
+        let facts = self.session_facts(&session).await?;
         let decision = facts
             .last_decision
             .ok_or_else(|| SurfaceError::NotRoutedYet(session.to_string()))?;

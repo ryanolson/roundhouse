@@ -49,13 +49,28 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
 
     /// This turn's admission, narrowed by whatever the agent asked for.
     ///
-    /// **The one place an overlay reaches routing**, and it is here — at the
-    /// start of an admitted turn, beside the admission the key resolved to —
-    /// rather than inside `plan`, because an overlay is *spent* as well as
-    /// applied: one turn, one ration. Consuming it where the policy for the turn
-    /// is fixed makes "the turn routed under the overlay" and "the turn that
-    /// spent it" the same turn by construction, and the digest on that turn's
-    /// [`DecisionRecord`] is the observable an operator checks it against.
+    /// **The one place an overlay reaches routing**, and it is called from one
+    /// place: the `Interjection::Proceed` arm of `run_turn`, after the
+    /// interjection seam has answered and before `plan`. Not inside `plan`,
+    /// because an overlay is *spent* as well as applied — one turn, one ration —
+    /// and consuming it where the policy for the turn is fixed makes "the turn
+    /// routed under the overlay" and "the turn that spent it" the same turn by
+    /// construction, with the digest on that turn's [`DecisionRecord`] as the
+    /// observable an operator checks it against.
+    ///
+    /// And not *above* the seam, which is where it used to be. A steered turn
+    /// is answered by [`Interjection::Complete`] and never reaches `plan`, so it
+    /// writes no `Routed` event, no [`DecisionRecord`] and no
+    /// `turn_policy_digest`: consuming before the seam charged the agent a
+    /// ration for a turn with nothing in the audit trail to check the charge
+    /// against, and made `status`'s promise — that the digest it reports is the
+    /// string the next `DecisionRecord` will carry — false for exactly those
+    /// turns. Moving the call into the arm costs nothing else, because a
+    /// narrowing changes only the policy: the principal and the budget the
+    /// settle reads are copied through untouched.
+    ///
+    /// [`Interjection::Complete`]: roundhouse_core::interject::Interjection::Complete
+    /// [`DecisionRecord`]: roundhouse_core::routing::DecisionRecord
     ///
     /// Composed the only way an overlay is ever composed:
     /// [`TurnPolicy::narrow`], which is total and can only shrink the admissible

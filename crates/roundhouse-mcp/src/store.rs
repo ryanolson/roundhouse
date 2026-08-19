@@ -33,6 +33,37 @@
 //! would be three places to remember to lock, three to expire and three to
 //! migrate.
 //!
+//! # Expiry is one sweep, and it is what bounds the whole store
+//!
+//! Every family is keyed by something a *session* owns, and a node serves
+//! unboundedly many sessions over its life — so without expiry the four maps
+//! only ever grow, and [`ControlSurface::init_session`](crate::ControlSurface::init_session)
+//! in particular is a write a model can call in a loop. [`RETENTION_MS`] is
+//! therefore enforced by a sweep that runs on the writes that carry a clock,
+//! against the timestamp each record already stores. One retention for four
+//! families rather than four is the other half of what "one store" bought: a
+//! per-family lifecycle is M8's business, where a key's records get a
+//! reconciliation view to be tuned against.
+//!
+//! The sweep is rate-limited by `SWEEP_INTERVAL_MS` rather than run on every
+//! write. A sweep is `O(n)` over four maps and an insert is `O(1)`; running one
+//! per insert would make the cost of holding state quadratic in the number of
+//! writes, and what this needs is a *bound*, not a deadline.
+//!
+//! # A leak the sweep bounds rather than closes
+//!
+//! `Conversations::fork` rebinds a client's cache key to a fresh `SessionId`
+//! when the client's resent history disagrees with the log — a client editing
+//! its own history mid-session. Every family here is keyed by the *pre-fork*
+//! id, so the agent's standing narrowing silently stops applying (the engine
+//! asks for the new id and finds nothing) and the old records are orphaned.
+//! Nothing migrates them: a cross-crate rebind hook would put this crate's four
+//! maps into the server's conversation table, and the widening it would cause —
+//! `scope=session` narrowing surviving a history rewrite — is a decision for
+//! the milestone that gives overlays a durable identity of their own (M8), not
+//! a hook bolted on here. What M5 guarantees instead is that the orphan is
+//! bounded: the sweep collects it like any other aged record.
+//!
 //! # The log is the truth; this is a projection
 //!
 //! A steer payload is deposited *after* the log commit that emitted its call —
@@ -50,8 +81,27 @@ use roundhouse_core::control::Principal;
 use roundhouse_core::ids::SessionId;
 use roundhouse_core::item::{Item, ItemContent};
 
-use crate::overlay::SessionOverlay;
+use crate::overlay::{ModeNarrowing, SessionOverlay, TimedOverlay};
 use crate::surface::{SteerOutcome, SurfaceError};
+
+/// How long a record outlives the write that made it.
+///
+/// One day, and the same day for all four families. The number is chosen from
+/// the consequence of getting it wrong in each direction rather than from a
+/// measurement: too short and a steer is swept while the turn that was told to
+/// fetch it is still running, which is `fetch_steer` refusing a correction the
+/// log says was emitted; too long and a node's state is bounded by how many
+/// conversations it has *ever* served. A day sits far above any single agent
+/// turn and far below a node's uptime. It is deliberately not tunable — a knob
+/// here would be a per-family lifecycle in disguise, which is M8's.
+pub const RETENTION_MS: u64 = 24 * 60 * 60 * 1_000;
+
+/// How often the sweep is allowed to run.
+///
+/// See the module note: the sweep bounds the store, and running one per insert
+/// would make holding state quadratic in the number of writes for no bound the
+/// minute-granular version does not already give.
+const SWEEP_INTERVAL_MS: u64 = 60_000;
 
 /// The prefix every minted session-binding id carries.
 ///
@@ -123,6 +173,19 @@ pub struct IntentRecord {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SteerRecord {
     pub steer_id: String,
+    /// Which conversation the steer was emitted in.
+    ///
+    /// Written now and compared in M7, deliberately in that order. `fetch_steer`
+    /// is scoped by *principal* today — [`Self::principal`] is the only field
+    /// [`ControlStore::steer_for`] filters on — so a steer emitted in one of a
+    /// key's conversations is fetchable from another of the same key's. That is
+    /// the weaker of the two scopings and it is the one M5 can defend: the
+    /// tool takes a `steer_id` and no conversation, so narrowing to a
+    /// conversation needs the caller's session resolved at the seam, which is
+    /// the same read the binding join is waiting on (see
+    /// [`ControlStore::binding_in_log`]). Recording the session now is what
+    /// makes that a comparison rather than a migration: a steer deposited today
+    /// already knows which conversation it belongs to.
     pub session: SessionId,
     /// Who the steer belongs to. Compared against the caller on every fetch:
     /// the id travels through a model's context, and a context is a place ids
@@ -147,10 +210,47 @@ pub struct ControlStore {
 
 #[derive(Debug, Default)]
 struct Inner {
-    overlays: HashMap<SessionId, SessionOverlay>,
+    overlays: HashMap<SessionId, OverlayEntry>,
     intents: HashMap<SessionId, IntentRecord>,
     steers: HashMap<String, SteerRecord>,
     bindings: HashMap<BindingId, SessionBinding>,
+    /// The wall clock the next sweep is due at. Zero, so the first write of a
+    /// process's life sweeps and the interval is measured from there.
+    next_sweep_at_ms: u64,
+}
+
+/// An overlay together with the clock reading that installed it.
+///
+/// The stamp is here rather than on [`SessionOverlay`] because it is a fact
+/// about *this store's* copy and not about what the agent asked for: an overlay
+/// crossing the seam into the engine is a narrowing, and a narrowing carrying a
+/// node's local clock would be one more thing two nodes could disagree about.
+#[derive(Debug, Clone)]
+struct OverlayEntry {
+    overlay: SessionOverlay,
+    written_at_ms: u64,
+}
+
+impl Inner {
+    /// Drop every record older than [`RETENTION_MS`], at most once per
+    /// [`SWEEP_INTERVAL_MS`].
+    ///
+    /// Called with the clock of the write that is about to happen, so the
+    /// record being written is never the one collected.
+    fn sweep(&mut self, now_ms: u64) {
+        if now_ms < self.next_sweep_at_ms {
+            return;
+        }
+        self.next_sweep_at_ms = now_ms.saturating_add(SWEEP_INTERVAL_MS);
+        let cutoff = now_ms.saturating_sub(RETENTION_MS);
+        self.overlays
+            .retain(|_, entry| entry.written_at_ms >= cutoff);
+        self.intents
+            .retain(|_, intent| intent.declared_at_ms >= cutoff);
+        self.steers.retain(|_, steer| steer.emitted_at_ms >= cutoff);
+        self.bindings
+            .retain(|_, binding| binding.minted_at_ms >= cutoff);
+    }
 }
 
 impl ControlStore {
@@ -165,21 +265,76 @@ impl ControlStore {
     /// expire it — a chatty agent calling `status` three times a turn would
     /// otherwise burn a three-turn preference before its first turn ran.
     pub fn overlay(&self, session: &SessionId) -> Option<SessionOverlay> {
-        self.lock().overlays.get(session).cloned()
+        self.lock()
+            .overlays
+            .get(session)
+            .map(|entry| entry.overlay.clone())
     }
 
-    /// Install the overlay `session` will be routed under.
+    /// Install the mode axis, leaving every other axis exactly as it is.
     ///
-    /// An empty overlay is stored as an absence rather than as a record with
-    /// two `None`s, so "this session has an overlay" is one question with one
-    /// answer.
-    pub fn set_overlay(&self, session: &SessionId, overlay: SessionOverlay) {
+    /// **Per axis, and inside one lock, because the alternative loses a turn's
+    /// ration.** The surface has to decide whether an ask leaves anything
+    /// routable, and that decision is an `await` — so a whole-snapshot write
+    /// would read the overlay, go away, and write back a picture of a moment
+    /// that has passed. The engine consumes the same entry at the start of
+    /// every turn it goes on to route:
+    /// an interleaving in which a turn spends this session's last ration inside
+    /// that gap gets the spent axis handed back with its count intact, and two
+    /// overlay tool calls in flight at once each drop the other's axis.
+    /// Read-modify-write of one axis under one lock is what makes both
+    /// unrepresentable rather than unlikely.
+    ///
+    /// Returns the overlay in force *after* the write, which is what the
+    /// answering tool renders: what the agent is told it has must be what a
+    /// later reader finds, and the two are the same thing only if one of them
+    /// is read back.
+    pub fn set_mode_axis(
+        &self,
+        session: &SessionId,
+        mode: Option<TimedOverlay<ModeNarrowing>>,
+        now_ms: u64,
+    ) -> SessionOverlay {
+        self.mutate_axis(session, now_ms, |overlay| overlay.mode = mode)
+    }
+
+    /// Install the quality-floor axis, leaving every other axis as it is.
+    ///
+    /// See [`Self::set_mode_axis`] for why an axis and not a snapshot.
+    pub fn set_floor_axis(
+        &self,
+        session: &SessionId,
+        floor: Option<TimedOverlay<f64>>,
+        now_ms: u64,
+    ) -> SessionOverlay {
+        self.mutate_axis(session, now_ms, |overlay| overlay.floor = floor)
+    }
+
+    /// One axis moved under one lock, and the resulting overlay.
+    fn mutate_axis(
+        &self,
+        session: &SessionId,
+        now_ms: u64,
+        apply: impl FnOnce(&mut SessionOverlay),
+    ) -> SessionOverlay {
         let mut inner = self.lock();
-        if overlay.is_empty() {
+        inner.sweep(now_ms);
+        let entry = inner
+            .overlays
+            .entry(session.clone())
+            .or_insert(OverlayEntry {
+                overlay: SessionOverlay::default(),
+                written_at_ms: now_ms,
+            });
+        apply(&mut entry.overlay);
+        entry.written_at_ms = now_ms;
+        let settled = entry.overlay.clone();
+        if settled.is_empty() {
+            // Stored as an absence rather than as a record with two `None`s, so
+            // "this session has an overlay" is one question with one answer.
             inner.overlays.remove(session);
-        } else {
-            inner.overlays.insert(session.clone(), overlay);
         }
+        settled
     }
 
     /// The narrowing this turn is routed under, spending one turn of it.
@@ -194,12 +349,12 @@ impl ControlStore {
         session: &SessionId,
     ) -> Option<roundhouse_core::control::PolicyOverrides> {
         let mut inner = self.lock();
-        let overlay = inner.overlays.get_mut(session)?;
+        let entry = inner.overlays.get_mut(session)?;
         // Read before spending: the turn about to run is routed under the
         // ration it is spending, not under what is left after it.
-        let overrides = overlay.overrides();
-        overlay.consume();
-        if overlay.is_empty() {
+        let overrides = entry.overlay.overrides();
+        entry.overlay.consume();
+        if entry.overlay.is_empty() {
             inner.overlays.remove(session);
         }
         Some(overrides)
@@ -207,7 +362,9 @@ impl ControlStore {
 
     /// Record what the agent says it is doing. Replaces any earlier statement.
     pub fn set_intent(&self, session: &SessionId, intent: IntentRecord) {
-        self.lock().intents.insert(session.clone(), intent);
+        let mut inner = self.lock();
+        inner.sweep(intent.declared_at_ms);
+        inner.intents.insert(session.clone(), intent);
     }
 
     /// The standing intent for a session.
@@ -226,7 +383,9 @@ impl ControlStore {
     /// The engine's interjection seam is the only honest caller. See the module
     /// note on why the ordering is log-first.
     pub fn deposit_steer(&self, record: SteerRecord) {
-        self.lock().steers.insert(record.steer_id.clone(), record);
+        let mut inner = self.lock();
+        inner.sweep(record.emitted_at_ms);
+        inner.steers.insert(record.steer_id.clone(), record);
     }
 
     /// Read a steer this principal owns.
@@ -271,15 +430,37 @@ impl ControlStore {
         Ok(record.clone())
     }
 
-    /// Mint a binding id for `session` and record what it stands for.
+    /// The binding id for `(principal, session)`, minting one if it has none.
+    ///
+    /// **Idempotent, because the one write behind it is model-callable.**
+    /// `init_session` is a tool, an agent can call a tool in a loop, and a
+    /// version of this that minted unconditionally turned that loop into
+    /// unbounded growth of a map with no key the loop could collide on. Its
+    /// answer is also a better one: a conversation has *one* id, so a client
+    /// that called the tool twice appends the same token twice rather than two
+    /// tokens whose ordering a later reader has to adjudicate.
+    ///
+    /// The lookup is a scan rather than a second map keyed by owner. Two maps
+    /// are two things to keep in step and two to sweep, and this scan runs once
+    /// per `init_session` — once per conversation in the intended use — over a
+    /// map the sweep keeps bounded.
     pub fn bind_session(
         &self,
         principal: &Principal,
         session: &SessionId,
         now_ms: u64,
     ) -> BindingId {
+        let mut inner = self.lock();
+        inner.sweep(now_ms);
+        if let Some((id, _)) = inner
+            .bindings
+            .iter()
+            .find(|(_, binding)| &binding.principal == principal && &binding.session == session)
+        {
+            return id.clone();
+        }
         let id = BindingId::generate();
-        self.lock().bindings.insert(
+        inner.bindings.insert(
             id.clone(),
             SessionBinding {
                 principal: principal.clone(),
@@ -290,9 +471,59 @@ impl ControlStore {
         id
     }
 
-    /// What a binding id stands for, if this node minted it.
-    pub fn binding(&self, id: &BindingId) -> Option<SessionBinding> {
-        self.lock().bindings.get(id).cloned()
+    /// What a binding id stands for, when it stands for *this* caller's
+    /// conversation.
+    ///
+    /// **The tenancy check is the whole of the method.** A binding id is a
+    /// token that travels through a model's context, and a context is where
+    /// text of unknown authorship arrives: an issue body, a summarized web
+    /// page, another agent's transcript. Resolving whatever id turned up and
+    /// answering with its record would make a pasted token authoritative over
+    /// the log it was pasted into. Matching on both halves of the record — the
+    /// principal *and* the session the caller already holds — is what makes a
+    /// foreign id inert rather than merely unlikely to be useful.
+    pub fn binding(
+        &self,
+        principal: &Principal,
+        session: &SessionId,
+        id: &BindingId,
+    ) -> Option<SessionBinding> {
+        self.lock()
+            .bindings
+            .get(id)
+            .filter(|binding| &binding.principal == principal && &binding.session == session)
+            .cloned()
+    }
+
+    /// The binding this caller's own conversation proves, out of its items.
+    ///
+    /// The join [`binding_in_items`] only scans for: every `rhb_…` token in log
+    /// order is tried, and the first that resolves *for this caller* wins.
+    /// Trying them all rather than only the first is what stops a token pasted
+    /// ahead of the agent's own from denying the join as well as failing it.
+    ///
+    /// **This is the read side of the correlation trick, and in M5 it has no
+    /// production caller.** `mcp_api::resolve_session` answers "which
+    /// conversation is this?" from the client's `prompt_cache_key` and from
+    /// `Conversations::latest`, never from a binding — which is why the tool
+    /// that mints an id is honest about recording it rather than about using
+    /// it. M7 is where the read lands, per the plan's §3: it is the milestone
+    /// that gives a request an identity resolved from the log rather than from
+    /// a header the client cannot set.
+    pub fn binding_in_log(
+        &self,
+        principal: &Principal,
+        session: &SessionId,
+        items: &[Item],
+    ) -> Option<SessionBinding> {
+        let inner = self.lock();
+        binding_ids_in_items(items).into_iter().find_map(|id| {
+            inner
+                .bindings
+                .get(&id)
+                .filter(|binding| &binding.principal == principal && &binding.session == session)
+                .cloned()
+        })
     }
 
     /// The lock, in one place.
@@ -309,43 +540,57 @@ impl ControlStore {
     }
 }
 
-/// Find a session-binding id in a session's conversation items.
+/// Every session-binding id a conversation's items mention, in log order.
 ///
-/// **The correlation trick's second half.** `init_session` mints an id and
-/// returns it in its tool output; the client appends that output to its
-/// conversation; the next turn resends the history, and the id lands in the
-/// session log as an ordinary item. This is what reads it back out — so the
-/// question "which wire session made that MCP call?" is answered from the log
-/// and from nothing else.
+/// **A lexical scan, and nothing more.** `init_session` mints an id and returns
+/// it in its tool output; the client appends that output to its conversation;
+/// the next turn resends the history, and the id lands in the session log as an
+/// ordinary item. This finds the tokens — it does not decide what they mean.
+/// Every item in a log is text of *some* provenance, and the ones an agent
+/// pastes in from an issue body or a summarized page are as scannable as the
+/// ones this deployment wrote. Turning a token into a binding is
+/// [`ControlStore::binding_in_log`]'s job, and the tenancy check it applies is
+/// the reason this function may safely be as credulous as it is.
 ///
 /// Scans the rendered text of every item rather than only tool results, because
 /// which item kind the output arrives as is the client's decision and not ours:
 /// Codex appends it as a tool result, another client may fold it into a user
 /// turn or a summary, and a scan that guessed wrong would find nothing while
 /// looking like it worked.
-///
-/// Returns the **first** id in log order. A conversation holding two is a
-/// client that called `init_session` twice, and the first is the one whose
-/// binding the earlier turns were made under.
-pub fn binding_in_items(items: &[Item]) -> Option<BindingId> {
-    items.iter().find_map(|item| {
-        let text = match &item.content {
-            ItemContent::Text { text } => text.clone(),
-            other => other.render(),
-        };
-        binding_in_text(&text)
-    })
+pub fn binding_ids_in_items(items: &[Item]) -> Vec<BindingId> {
+    items
+        .iter()
+        .flat_map(|item| {
+            let text = match &item.content {
+                ItemContent::Text { text } => text.clone(),
+                other => other.render(),
+            };
+            binding_ids_in_text(&text)
+        })
+        .collect()
 }
 
-/// The first `rhb_…` token in `text`, if there is one.
+/// The first id a conversation mentions, whoever it belongs to.
+///
+/// Kept as the cheap "did the id reach the log at all?" question — which is
+/// what the end-to-end test of the correlation trick asks, and what an operator
+/// debugging a client that summarizes too hard wants. It resolves nothing: see
+/// [`ControlStore::binding_in_log`] for the join that applies the tenancy
+/// check, and [`binding_ids_in_items`] for why the distinction matters.
+pub fn binding_in_items(items: &[Item]) -> Option<BindingId> {
+    binding_ids_in_items(items).into_iter().next()
+}
+
+/// Every `rhb_…` token in `text`, in order.
 ///
 /// A hand-rolled scan rather than a regex, for the reason the policy filter is
 /// hand-rolled: the token shape is fixed by [`BindingId::generate`] — the
 /// prefix followed by exactly 32 lowercase hex digits — and a scan that
 /// accepted anything looser would match a truncated id a client summarized, and
 /// resolve to a binding that is not the one minted.
-fn binding_in_text(text: &str) -> Option<BindingId> {
+fn binding_ids_in_text(text: &str) -> Vec<BindingId> {
     const HEX_LEN: usize = 32;
+    let mut found = Vec::new();
     let mut rest = text;
     while let Some(at) = rest.find(BINDING_PREFIX) {
         let after = &rest[at + BINDING_PREFIX.len()..];
@@ -358,14 +603,17 @@ fn binding_in_text(text: &str) -> Option<BindingId> {
             .take_while(|c| c.is_ascii_digit() || matches!(c, 'a'..='f'))
             .collect();
         if digits.len() >= HEX_LEN {
-            return Some(BindingId::new(format!(
+            found.push(BindingId::new(format!(
                 "{BINDING_PREFIX}{}",
                 &digits[..HEX_LEN]
             )));
         }
+        // Past the prefix only: a hex run holds no `r`, so no id can hide
+        // inside another's tail, and advancing past the whole token would skip
+        // a second prefix that overlapped a rejected one.
         rest = &rest[at + BINDING_PREFIX.len()..];
     }
-    None
+    found
 }
 
 #[cfg(test)]
@@ -454,8 +702,9 @@ mod tests {
     #[test]
     fn reading_an_overlay_does_not_spend_it_and_consuming_it_does() {
         let store = ControlStore::new();
-        let overlay = SessionOverlay {
-            mode: Some(TimedOverlay {
+        store.set_mode_axis(
+            &session(),
+            Some(TimedOverlay {
                 ask: ModeNarrowing {
                     mode: PreferMode::Local,
                     allow: None,
@@ -463,9 +712,8 @@ mod tests {
                 remaining_turns: Some(1),
                 reason: "cheap".into(),
             }),
-            floor: None,
-        };
-        store.set_overlay(&session(), overlay);
+            1,
+        );
 
         for _ in 0..3 {
             assert!(
@@ -482,6 +730,50 @@ mod tests {
             store.consume_overlay(&session()).is_none(),
             "and a spent overlay is an absence, not a record of zeroes"
         );
+    }
+
+    #[test]
+    fn writing_one_axis_leaves_the_other_exactly_as_it_was() {
+        // The other half of why a write is per axis rather than per snapshot:
+        // two overlay tool calls in flight at once each read the same overlay,
+        // and a snapshot writer would have each of them publish a picture
+        // missing the other's axis. Here the two writes are sequential, which
+        // is the case a snapshot writer *also* gets wrong the moment anything
+        // ran between them.
+        let store = ControlStore::new();
+        store.set_mode_axis(
+            &session(),
+            Some(TimedOverlay {
+                ask: ModeNarrowing {
+                    mode: PreferMode::Local,
+                    allow: None,
+                },
+                remaining_turns: Some(3),
+                reason: "bulk edits".into(),
+            }),
+            1,
+        );
+        let both = store.set_floor_axis(
+            &session(),
+            Some(TimedOverlay {
+                ask: 0.9,
+                remaining_turns: Some(2),
+                reason: "this one is subtle".into(),
+            }),
+            2,
+        );
+        assert_eq!(both.mode.as_ref().unwrap().remaining_turns, Some(3));
+        assert_eq!(both.floor.as_ref().unwrap().ask, 0.9);
+
+        // Releasing an axis releases that axis. `prefer auto` must not take a
+        // quality floor with it.
+        let released = store.set_mode_axis(&session(), None, 3);
+        assert!(released.mode.is_none());
+        assert_eq!(released.floor.as_ref().unwrap().ask, 0.9);
+
+        // And the last axis leaving is an absence, not a record of two `None`s.
+        assert!(store.set_floor_axis(&session(), None, 4).is_empty());
+        assert!(store.overlay(&session()).is_none());
     }
 
     #[test]
@@ -507,10 +799,148 @@ mod tests {
     }
 
     #[test]
+    fn a_binding_id_pasted_into_another_tenants_log_resolves_to_nothing() {
+        // The token travels through a model's context, and a context is where
+        // text of unknown authorship arrives — an issue body, a summarized
+        // page. Mallory's id, placed at the head of Ada's conversation, must
+        // not answer the question "which conversation is this?" for Ada.
+        let store = ControlStore::new();
+        let mallory = Principal::new("evil", "mal");
+        let mallorys_session = SessionId::new("evil/mal/main");
+        let mallorys_id = store.bind_session(&mallory, &mallorys_session, 1);
+        let adas_id = store.bind_session(&principal(), &session(), 2);
+
+        let adas_log = vec![
+            Item::user_text(format!("the issue body said: {mallorys_id}")),
+            Item::user_text(format!("and my own id is {adas_id}")),
+        ];
+        let resolved = store
+            .binding_in_log(&principal(), &session(), &adas_log)
+            .expect("ada's own binding is still found behind the pasted one");
+        assert_eq!(resolved.principal, principal());
+        assert_eq!(resolved.session, session());
+        assert!(
+            store
+                .binding(&principal(), &session(), &mallorys_id)
+                .is_none(),
+            "and the pasted id resolves to nothing when asked for directly"
+        );
+
+        // The controls: the scan itself still sees both tokens — the check is a
+        // tenancy check and not a blinder — and Mallory reads her own binding.
+        assert_eq!(
+            binding_ids_in_items(&adas_log),
+            vec![mallorys_id.clone(), adas_id],
+        );
+        assert!(
+            store
+                .binding(&mallory, &mallorys_session, &mallorys_id)
+                .is_some()
+        );
+        // And a log holding *only* a foreign id proves nothing rather than
+        // proving somebody else's conversation.
+        assert!(
+            store
+                .binding_in_log(
+                    &principal(),
+                    &session(),
+                    &[Item::user_text(mallorys_id.to_string())]
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn an_aged_record_is_swept_by_a_later_write_and_a_fresh_one_is_not() {
+        // The store's own module doc names expiry as the requirement one shared
+        // store buys; without it every family grows for the process's life, and
+        // `init_session` is a write a model can call in a loop.
+        const DAY_MS: u64 = 86_400_000;
+        let store = ControlStore::new();
+        let old_id = store.bind_session(&principal(), &session(), 0);
+        store.set_intent(
+            &session(),
+            IntentRecord {
+                goal: "ship the parser".into(),
+                plan_steps: Vec::new(),
+                done_when: "cargo test is green".into(),
+                declared_at_ms: 0,
+            },
+        );
+        let mut old_steer = steer("fc_old", principal());
+        old_steer.emitted_at_ms = 0;
+        store.deposit_steer(old_steer);
+        store.set_mode_axis(
+            &session(),
+            Some(TimedOverlay {
+                ask: ModeNarrowing {
+                    mode: PreferMode::Local,
+                    allow: None,
+                },
+                remaining_turns: None,
+                reason: "cheap".into(),
+            }),
+            0,
+        );
+
+        // A month later, one write of any family sweeps all four.
+        let mut fresh_steer = steer("fc_new", principal());
+        fresh_steer.emitted_at_ms = 30 * DAY_MS;
+        store.deposit_steer(fresh_steer);
+
+        assert!(store.steer_for(&principal(), "fc_old").is_err());
+        assert!(store.intent(&session()).is_none());
+        assert!(store.overlay(&session()).is_none());
+        assert!(store.binding(&principal(), &session(), &old_id).is_none());
+
+        // The control: the record the sweeping write itself carried is not the
+        // one collected, and neither is anything written after it.
+        assert!(store.steer_for(&principal(), "fc_new").is_ok());
+        let fresh_id = store.bind_session(&principal(), &session(), 30 * DAY_MS);
+        assert!(store.binding(&principal(), &session(), &fresh_id).is_some());
+    }
+
+    #[test]
+    fn init_session_called_twice_answers_with_one_binding() {
+        // `init_session` is a tool, and a model can call a tool in a loop. A
+        // mint per call is that loop turned into unbounded growth of a map with
+        // no key the loop collides on.
+        let store = ControlStore::new();
+        let first = store.bind_session(&principal(), &session(), 1);
+        let second = store.bind_session(&principal(), &session(), 2);
+        assert_eq!(
+            first, second,
+            "one conversation has one id, however many times the tool is called"
+        );
+        assert_eq!(
+            store.binding(&principal(), &session(), &first).unwrap(),
+            SessionBinding {
+                principal: principal(),
+                session: session(),
+                minted_at_ms: 1,
+            },
+            "and the record is the one the first call wrote, timestamp included"
+        );
+
+        // The controls: another conversation of the same key, and another key
+        // on the same conversation id, each get their own.
+        let other_session = store.bind_session(&principal(), &SessionId::new("acme/ada/sess_2"), 3);
+        assert_ne!(other_session, first);
+        let other_key = store.bind_session(&Principal::new("acme", "bob"), &session(), 4);
+        assert_ne!(other_key, first);
+    }
+
+    #[test]
     fn a_binding_id_is_found_in_whatever_item_kind_the_client_appended_it_as() {
         let store = ControlStore::new();
         let id = store.bind_session(&principal(), &session(), 7);
-        assert_eq!(store.binding(&id).unwrap().session, session());
+        assert_eq!(
+            store
+                .binding(&principal(), &session(), &id)
+                .unwrap()
+                .session,
+            session()
+        );
 
         // Codex appends a tool output as a `ToolResult`. Another client may
         // fold it into text. Both have to join.
@@ -523,6 +953,12 @@ mod tests {
             response_id: None,
         }];
         assert_eq!(binding_in_items(&as_result), Some(id.clone()));
+        assert_eq!(
+            store
+                .binding_in_log(&principal(), &session(), &as_result)
+                .map(|binding| binding.session),
+            Some(session())
+        );
 
         let as_text = vec![Item::user_text(format!("earlier I got {id} from the tool"))];
         assert_eq!(binding_in_items(&as_text), Some(id.clone()));
@@ -538,12 +974,14 @@ mod tests {
         let interrupted = format!("{BINDING_PREFIX}A{}", &id.as_str()[BINDING_PREFIX.len()..]);
         assert_eq!(binding_in_items(&[Item::user_text(interrupted)]), None);
 
-        // And the first id wins when a client called the tool twice.
-        let second = store.bind_session(&principal(), &session(), 8);
+        // Two ids in one conversation is no longer a client that called the
+        // tool twice — that answers with one id — but a client that carried
+        // somebody else's token in. The scan reports both, in log order.
+        let elsewhere = store.bind_session(&Principal::new("evil", "mal"), &session(), 8);
         let both = vec![
-            Item::assistant_text(id.to_string(), ResponseId::new("resp_1")),
-            Item::assistant_text(second.to_string(), ResponseId::new("resp_2")),
+            Item::assistant_text(elsewhere.to_string(), ResponseId::new("resp_1")),
+            Item::assistant_text(id.to_string(), ResponseId::new("resp_2")),
         ];
-        assert_eq!(binding_in_items(&both), Some(id));
+        assert_eq!(binding_ids_in_items(&both), vec![elsewhere, id]);
     }
 }
