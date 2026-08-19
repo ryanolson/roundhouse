@@ -3,12 +3,21 @@
 
 //! Turn execution.
 //!
-//! The money half lives in [`spend`]: what a turn may reserve, what it is
-//! charged, and how a settle lost to a crash is put right. It is one module
-//! down rather than one screen down because it answers to a different clock —
-//! a durable counter two processes race for, rather than a model call under a
-//! deadline — and because everything in it has to be as true for a successor
-//! replaying a log as for the process that wrote it.
+//! Two halves live one module down, each because it answers to a different
+//! store than the log this file is about.
+//!
+//! [`spend`] is the money: what a turn may reserve, what it is charged, and how
+//! a settle lost to a crash is put right. It answers to a durable counter two
+//! processes race for rather than to a model call under a deadline, and
+//! everything in it has to be as true for a successor replaying a log as for the
+//! process that wrote it.
+//!
+//! [`control`] is the agent's own half of the conversation: the overlay it asked
+//! for, spent at the start of this turn, and the corrective payload a steered
+//! turn deposits for it to fetch. It answers to node-local process state that
+//! does not survive a restart — which is safe only because every write in it is
+//! a *narrowing* or a projection of something the log already holds, and losing
+//! either degrades to the deployment's own ceiling rather than past it.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -35,10 +44,12 @@ use roundhouse_fleet::{
     FleetError, FleetQuery, FrontierChunk, FrontierClient, FrontierError, FrontierQuote,
     FrontierStream, LocalFleet, LocalQuote, StaticFrontierCatalog,
 };
+use roundhouse_mcp::ControlStore;
 use tokio::time::Instant;
 
 use crate::control_config::Admission;
 
+mod control;
 mod spend;
 
 #[derive(Debug, thiserror::Error)]
@@ -381,6 +392,24 @@ pub struct Engine<S: SessionStore, T: Tokenizer + Clone> {
     /// installed through [`Engine::with_interjector`]; the seam's position in
     /// [`Engine::run_turn`] and its two answers are fixed here.
     interjector: Arc<dyn Interjector>,
+    /// The node-local control-plane state the MCP surface writes and this
+    /// engine reads.
+    ///
+    /// Two directions, one store, and they are the two halves of the same
+    /// conversation: an agent's overlay is *consumed* here at the start of every
+    /// turn, and a steer's corrective payload is *deposited* here after the log
+    /// commit that emitted its call. Sharing one `Arc` with the surface is not
+    /// an optimization — a surface holding its own copy would install overlays
+    /// no turn reads and hold payloads no agent can fetch, and both failures are
+    /// silent from every side.
+    ///
+    /// `None` for a deployment that mounts no control surface, which is a
+    /// deployment with nothing to consume and nobody to deposit for. It is an
+    /// `Option` rather than an always-present empty store because the difference
+    /// is observable in exactly one place — a steered turn whose payload has
+    /// nowhere to go — and that is worth a distinct state rather than a silent
+    /// write into a map no reader holds.
+    control: Option<Arc<ControlStore>>,
     /// One gate per session, held for the whole of [`Engine::run_turn`].
     ///
     /// This gate serializes turns inside one engine before they contend for the
@@ -413,6 +442,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             metrics: Arc::new(MetricsRecorder::new()),
             spend: Arc::new(MemorySpendLedger::new()),
             interjector: roundhouse_core::interject::production_default(),
+            control: None,
             turn_gates: Mutex::new(HashMap::new()),
         }
     }
@@ -602,6 +632,14 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             });
         }
 
+        // The agent's own narrowing, spent here and applied for the rest of this
+        // turn. Everything below reads `admission` — the interjection seam, the
+        // grant, the router, the settle — and from here that name means the
+        // key's entitlements narrowed by whatever the agent asked for, which is
+        // the only composition an overlay ever gets. See
+        // [`Self::narrowed_admission`].
+        let admission = &self.narrowed_admission(session_id, admission);
+
         // Held across dispatch *and* settle. A model call outlives the lease TTL
         // routinely, and without renewal every one of those turns would be
         // fenced at commit and throw away an answer already paid for; the
@@ -674,12 +712,22 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             // this deployment's own dashboard exceed what clients were told
             // they spent, which is the one direction an accounting error must
             // never run.
-            Interjection::Complete { item, usage } => {
+            Interjection::Complete {
+                item,
+                usage,
+                guidance,
+            } => {
                 let committed = session
-                    .complete_with_item(&response_id, item, usage.clone())
+                    .complete_with_item(&response_id, item.clone(), usage.clone())
                     .await;
                 committed
-                    .map(|()| (String::new(), usage, None))
+                    .map(|()| {
+                        // Only once the log holds the call. See
+                        // [`Self::deposit_steer`] on why that ordering is the
+                        // load-bearing half.
+                        self.deposit_steer(session_id, &admission.principal, &item, guidance);
+                        (String::new(), usage, None)
+                    })
                     .map_err(EngineError::from)
             }
             Interjection::Proceed => {

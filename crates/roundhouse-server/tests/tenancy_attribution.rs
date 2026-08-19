@@ -45,8 +45,8 @@ use roundhouse_core::routing::{AffinityPolicy, ProviderPricing};
 use roundhouse_core::store::{MemoryStore, SessionStore};
 use roundhouse_fleet::EchoFrontierClient;
 use roundhouse_server::{
-    ControlPlane, ControlPlaneConfig, EchoLocalExecutor, Engine, EngineConfig, http, metrics_api,
-    responses_api,
+    ControlPlane, ControlPlaneConfig, Conversations, EchoLocalExecutor, Engine, EngineConfig, http,
+    metrics_api, responses_api,
 };
 
 mod common;
@@ -190,6 +190,7 @@ fn deployment(plane: Arc<ControlPlane>) -> Deployment {
             plane,
             engine,
             Arc::clone(&store),
+            Arc::new(Conversations::new()),
         ));
     Deployment {
         app,

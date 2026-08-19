@@ -298,6 +298,77 @@ impl ControlPlane {
         table.into_iter().flat_map(|turn_keys| turn_keys.values())
     }
 
+    /// The one admission this principal's turns are made under.
+    ///
+    /// **The one place identity is resolved backwards**, and the only caller
+    /// that needs it is the MCP control surface: every other surface resolves a
+    /// *secret* to an [`Admission`] through [`Self::turn_admission`], but a tool
+    /// handler is handed a [`Principal`] the transport already resolved, and it
+    /// asks entitlement questions — what may this key be routed to, what is left
+    /// to spend — about *that*.
+    ///
+    /// The config keys entitlements by secret and permits two keys to name one
+    /// membership with different `overrides`, so the backwards question has no
+    /// answer where they disagree. It is refused rather than resolved: picking
+    /// either would answer an agent about a policy its own key does not have,
+    /// which is a wrong answer that looks exactly like a right one.
+    /// [`ambiguous_memberships`](Self::ambiguous_memberships) asks the same
+    /// question at boot, so an operator learns it from a startup refusal rather
+    /// than from a tenant.
+    ///
+    /// [`Self::Open`] resolves to [`Admission::open`] for every principal, which
+    /// is the same value it admits every *request* as — one definition of what
+    /// an unconfigured deployment allows, not two.
+    pub fn membership(&self, principal: &Principal) -> Result<Admission, MembershipError> {
+        match self {
+            ControlPlane::Open => Ok(Admission::open()),
+            ControlPlane::Configured { .. } => {
+                let mut found = self
+                    .configured_admissions()
+                    .filter(|admission| &admission.principal == principal);
+                let first = found
+                    .next()
+                    .ok_or_else(|| MembershipError::Unknown(principal.clone()))?;
+                // Two keys naming one membership are fine as long as they mean
+                // the same thing — an operator rotating a secret has two rows
+                // for a while, and refusing that would make rotation an outage.
+                // What cannot be resolved is two keys that mean different
+                // things.
+                for other in found {
+                    if other.policy.digest() != first.policy.digest()
+                        || other.budget != first.budget
+                    {
+                        return Err(MembershipError::Ambiguous(principal.clone()));
+                    }
+                }
+                Ok(first.clone())
+            }
+        }
+    }
+
+    /// Every membership whose keys disagree about what it may do.
+    ///
+    /// The boot-time half of [`Self::membership`], collected rather than
+    /// reported on the first hit for the reason the other startup cross-checks
+    /// are: the table is a hash map, so a deployment with two bad memberships
+    /// would otherwise be told about a different one on each restart.
+    pub fn ambiguous_memberships(&self) -> Vec<Principal> {
+        let mut ambiguous: Vec<Principal> = self
+            .configured_admissions()
+            .map(|admission| admission.principal.clone())
+            .filter(|principal| {
+                matches!(
+                    self.membership(principal),
+                    Err(MembershipError::Ambiguous(_))
+                )
+            })
+            .collect();
+        ambiguous
+            .sort_by_key(|principal| (principal.project.to_string(), principal.user.to_string()));
+        ambiguous.dedup();
+        ambiguous
+    }
+
     // -----------------------------------------------------------------------
     // The namespace convention
     // -----------------------------------------------------------------------
@@ -492,6 +563,22 @@ impl ControlPlane {
             }
         }
     }
+}
+
+/// Why a [`Principal`] does not resolve to one set of entitlements.
+///
+/// Both arms are errors and neither has a default, which is the whole point:
+/// the caller is a tool handler about to tell an agent what its key may do, and
+/// there is no honest thing to say when the deployment does not know.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MembershipError {
+    #[error("no configured key names the membership `{0}`")]
+    Unknown(Principal),
+    #[error(
+        "the membership `{0}` is named by two keys with different entitlements, so there is no \
+         single policy or budget to report for it"
+    )]
+    Ambiguous(Principal),
 }
 
 /// A turn-serving caller, resolved once at admission: which membership, and

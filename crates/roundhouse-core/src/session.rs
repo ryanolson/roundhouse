@@ -193,6 +193,21 @@ pub struct SessionState {
     /// projection added later against an older log is a projection nobody has
     /// replayed.
     pub(crate) open_steers: HashMap<String, u64>,
+    /// The most recent routing decision, whether or not its response has
+    /// terminated.
+    ///
+    /// A different question from [`Self::pending_routings`] one field up, which
+    /// is why it is a different field rather than a read of that one.
+    /// `pending_routings` asks *what evidence is still outstanding* and is
+    /// emptied at the terminal event; this asks *where did the last turn go*,
+    /// which is exactly as true after the turn ends as during it. Deriving one
+    /// from the other would answer "this session has never been routed" for
+    /// every session between turns.
+    ///
+    /// The whole record rather than the target: its consumer renders the
+    /// rationale, the policy digest and the budget state as well — see
+    /// `explain_last_route` in `roundhouse-mcp`, the audit trail as a tool.
+    last_decision: Option<DecisionRecord>,
     pub last_seq: u64,
 }
 
@@ -250,6 +265,7 @@ impl SessionState {
                 decision,
             } => {
                 self.frontier_history.record(&decision.chosen);
+                self.last_decision = Some(decision.clone());
                 // Held rather than recorded; see `pending_routings`.
                 self.pending_routings.insert(
                     response_id.clone(),
@@ -345,6 +361,69 @@ impl SessionState {
             .get(turn_id)
             .map(|completed| &completed.usage)
     }
+
+    /// Where the most recent routed turn went, and why.
+    ///
+    /// `None` for a session whose first turn has not been routed — a session
+    /// that has only ever been steered has no routing decision, which is the
+    /// accurate answer rather than an empty one.
+    pub fn last_decision(&self) -> Option<&DecisionRecord> {
+        self.last_decision.as_ref()
+    }
+
+    /// `call_id`s of steers this deployment emitted that no turn has answered.
+    ///
+    /// Sorted, so two reads of one projection are two identical answers: the
+    /// underlying map has no order, and this is rendered into an agent's
+    /// context by `status`, where a list that reshuffled between calls is a
+    /// list an agent reads as having changed.
+    ///
+    /// The accessor rather than the field: [`Self::open_steers`] stays private
+    /// because it is a fold this module owns, and its two consumers — M5's
+    /// `status` tool and M6's trigger — both want the ids and neither wants the
+    /// timestamps.
+    pub fn open_steer_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.open_steers.keys().cloned().collect();
+        ids.sort();
+        ids
+    }
+
+    /// Rebuild a session's projection from its log, **taking no lease**.
+    ///
+    /// The read-only half of [`Session::open_observed`], which calls it: a
+    /// reader that took the lease would evict the engine it is watching, and
+    /// that rule is why the MCP control surface projects a session through here
+    /// rather than opening one. One replay loop and one fold serve both, so a
+    /// question answered for a reader and the same question answered for the
+    /// engine cannot come back with two answers.
+    pub async fn project<S: SessionStore>(
+        store: &S,
+        session_id: &SessionId,
+        ledger: CacheLedger,
+        observer: Option<&Arc<dyn SessionObserver>>,
+    ) -> Result<Self, SessionError> {
+        let mut state = SessionState {
+            ledger,
+            ..Default::default()
+        };
+        // Replay in batches so a long session does not need the whole log
+        // resident at once.
+        let mut cursor = 0u64;
+        loop {
+            let batch = store.read_events(session_id, cursor, REPLAY_BATCH).await?;
+            if batch.is_empty() {
+                break;
+            }
+            for event in &batch {
+                state.apply(event);
+            }
+            if let Some(observer) = observer {
+                observer.observe(&batch);
+            }
+            cursor = batch.last().map_or(cursor, |event| event.seq);
+        }
+        Ok(state)
+    }
 }
 
 /// A running lease renewal, alive for exactly as long as this handle is.
@@ -411,27 +490,10 @@ impl<S: SessionStore> Session<S> {
             .await?
             .ok_or_else(|| SessionError::NotOwner(session_id.clone()))?;
 
-        let mut state = SessionState {
-            ledger,
-            ..Default::default()
-        };
-
-        // Replay in batches so a long session does not need the whole log
-        // resident at once.
-        let mut cursor = 0u64;
-        loop {
-            let batch = store.read_events(&session_id, cursor, REPLAY_BATCH).await?;
-            if batch.is_empty() {
-                break;
-            }
-            for event in &batch {
-                state.apply(event);
-            }
-            if let Some(observer) = &observer {
-                observer.observe(&batch);
-            }
-            cursor = batch.last().map_or(cursor, |event| event.seq);
-        }
+        // The same replay a lease-free reader performs, so the two cannot
+        // diverge; the lease above is the only thing this adds to it.
+        let state =
+            SessionState::project(store.as_ref(), &session_id, ledger, observer.as_ref()).await?;
 
         Ok(Self {
             store,

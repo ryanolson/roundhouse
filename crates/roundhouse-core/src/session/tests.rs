@@ -495,6 +495,93 @@ async fn the_frontier_window_is_a_projection_a_successor_reconstructs() {
 }
 
 #[tokio::test]
+async fn a_reader_projects_a_session_without_taking_the_lease_the_writer_holds() {
+    // The rule the MCP control surface rests on: a reader that took the lease
+    // would evict the engine it is reporting on. `project` is that read, and it
+    // is the *same* fold `open` runs — one replay loop, so a question answered
+    // for a reader and the same question answered for the engine cannot come
+    // back with two answers.
+    let store = Arc::new(MemoryStore::new());
+    let (sid, mut session) = new_session(Arc::clone(&store), "writer").await;
+    session
+        .record_created("affinity", &Principal::new("acme", "ada"))
+        .await
+        .unwrap();
+    let started = session
+        .begin_turn(TurnId::new("t1"), vec![Item::user_text("hello")])
+        .await
+        .unwrap();
+    let response_id = started.response_id().clone();
+    session
+        .record_routing(&response_id, decision_for(local_target(), 100))
+        .await
+        .unwrap();
+    // An emitted call, so the projection has a steer to report as open.
+    session
+        .complete_with_item(
+            &response_id,
+            Item::tool_call(STEER_CALL_ID, STEER_NAME, STEER_ARGS),
+            Usage::default(),
+        )
+        .await
+        .unwrap();
+
+    let projected = SessionState::project(store.as_ref(), &sid, CacheLedger::new(), None)
+        .await
+        .expect("a projection needs no lease");
+    assert_eq!(projected.open_steer_ids(), vec![STEER_CALL_ID.to_string()]);
+    assert_eq!(
+        projected
+            .last_decision()
+            .expect("the turn was routed")
+            .chosen,
+        local_target(),
+        "and the last decision survives its response terminating -- which is \
+         the whole difference between this and `pending_routings`"
+    );
+
+    // The control that makes the claim about the *lease*: the writer still
+    // holds it and can still write, which a reader that had taken it would
+    // have made impossible.
+    session
+        .begin_turn(TurnId::new("t2"), vec![Item::user_text("again")])
+        .await
+        .expect("the reader must not have displaced the writer");
+
+    // And the projection agrees with what the engine's own replay reconstructs.
+    let reopened = Session::open(
+        Arc::clone(&store),
+        sid.clone(),
+        "writer",
+        TTL,
+        CacheLedger::new(),
+    )
+    .await
+    .unwrap();
+    let reprojected = SessionState::project(store.as_ref(), &sid, CacheLedger::new(), None)
+        .await
+        .unwrap();
+    assert_eq!(reopened.state().items.len(), reprojected.items.len());
+    assert_eq!(
+        reopened.state().open_steer_ids(),
+        reprojected.open_steer_ids()
+    );
+    assert_eq!(
+        reopened.state().last_decision().map(|d| d.chosen.clone()),
+        reprojected.last_decision().map(|d| d.chosen.clone())
+    );
+}
+
+/// The worker a routed test turn lands on.
+fn local_target() -> Target {
+    Target::Local {
+        worker_id: 1,
+        dp_rank: 0,
+        model: "llama".into(),
+    }
+}
+
+#[tokio::test]
 async fn a_displaced_owner_cannot_keep_writing() {
     let store = Arc::new(MemoryStore::new());
     let (sid, mut displaced) = new_session(store.clone(), "node-a").await;

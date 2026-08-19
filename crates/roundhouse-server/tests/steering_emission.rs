@@ -62,7 +62,8 @@ use roundhouse_core::routing::AffinityPolicy;
 use roundhouse_core::store::{MemoryStore, SessionStore};
 use roundhouse_fleet::EchoFrontierClient;
 use roundhouse_server::{
-    ControlPlane, ControlPlaneConfig, EchoLocalExecutor, Engine, EngineConfig, responses_router,
+    ControlPlane, ControlPlaneConfig, Conversations, EchoLocalExecutor, Engine, EngineConfig,
+    responses_router,
 };
 
 mod common;
@@ -104,6 +105,10 @@ enum Plan {
 struct Steer {
     call_id: String,
     arguments: String,
+    /// The correction itself, which the engine deposits into the control store
+    /// for `fetch_steer` to serve. Never on the wire and never in the log: what
+    /// the client is handed is the call, and the payload is fetched separately.
+    guidance: String,
 }
 
 /// The steer this response would carry.
@@ -113,8 +118,18 @@ struct Steer {
 fn mint(response_id: &ResponseId) -> Steer {
     let call_id = format!("rhsteer_{response_id}");
     let arguments = serde_json::json!({ "steer_id": call_id }).to_string();
-    Steer { call_id, arguments }
+    Steer {
+        call_id,
+        arguments,
+        guidance: STEER_GUIDANCE.to_string(),
+    }
 }
+
+/// What the correction says.
+///
+/// Distinctive on purpose: an assertion that this text reached an agent through
+/// `fetch_steer` and never through the wire is an assertion about a literal.
+const STEER_GUIDANCE: &str = "you are editing a file the task did not name; go back to the parser";
 
 /// What the interjection reports the turn cost.
 ///
@@ -200,6 +215,7 @@ impl Interjector for TestInterjector {
                         steer.arguments.as_str(),
                     ),
                     usage: steer_usage(),
+                    guidance: steer.guidance,
                 }
             }
         }
@@ -303,7 +319,12 @@ fn build(
         .with_interjector(Arc::clone(&interjector) as Arc<dyn Interjector>),
     );
     Rig {
-        app: responses_router(plane, Arc::clone(&engine), Arc::clone(&store)),
+        app: responses_router(
+            plane,
+            Arc::clone(&engine),
+            Arc::clone(&store),
+            Arc::new(Conversations::new()),
+        ),
         store,
         interjector,
         engine,

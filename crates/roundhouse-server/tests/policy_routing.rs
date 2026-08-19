@@ -51,8 +51,8 @@ use roundhouse_fleet::{
     EchoFrontierClient, FrontierModelSpec, StaticFrontierCatalog, WireProtocol,
 };
 use roundhouse_server::{
-    ControlPlane, ControlPlaneConfig, EchoLocalExecutor, Engine, EngineConfig, http, metrics_api,
-    responses_api,
+    ControlPlane, ControlPlaneConfig, Conversations, EchoLocalExecutor, Engine, EngineConfig, http,
+    metrics_api, responses_api,
 };
 
 mod common;
@@ -235,6 +235,7 @@ async fn deployment(
             plane,
             engine,
             Arc::clone(&store),
+            Arc::new(Conversations::new()),
         ));
     Deployment {
         app,

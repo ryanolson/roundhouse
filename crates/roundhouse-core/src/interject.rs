@@ -66,7 +66,28 @@ pub enum Interjection {
     /// client as this turn's usage. Reporting an empty usage instead would
     /// make the deployment's own dashboard exceed what clients were told they
     /// spent, which is the one direction an accounting error must never run.
-    Complete { item: Item, usage: Usage },
+    ///
+    /// `guidance` is the correction itself — the text the agent will read when
+    /// it calls `fetch_steer` with the id `item` names. It travels beside the
+    /// item rather than inside it because the two go to different places: the
+    /// item goes into the log and onto the wire, where an agent's client
+    /// dispatches it, and the guidance goes into the control store, where the
+    /// MCP surface reads it back. That split is what makes the correction cost
+    /// nothing in the turn that emits it and lets it be fetched byte-identically
+    /// afterwards.
+    ///
+    /// Required rather than optional. Every completion this seam produces is a
+    /// steer, and a steer whose payload nothing can serve is a synthetic call
+    /// the agent dutifully dispatches and gets an error back from — the failure
+    /// mode is silent from the deployment's side and total from the agent's.
+    /// The id is *not* repeated here: the engine reads it off `item`, so the
+    /// call an agent fetches by and the call its client resends are one string
+    /// written once.
+    Complete {
+        item: Item,
+        usage: Usage,
+        guidance: String,
+    },
 }
 
 /// Everything a decision may see.

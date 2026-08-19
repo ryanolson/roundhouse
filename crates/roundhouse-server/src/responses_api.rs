@@ -33,9 +33,9 @@
 //! client, it drops what it does not recognize, and the terminal event closes
 //! the body before anything could follow it anyway.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::convert::Infallible;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Bytes;
@@ -57,6 +57,7 @@ use roundhouse_core::item::{Item, ItemContent};
 use roundhouse_core::store::SessionStore;
 
 use crate::control_config::ControlPlane;
+use crate::conversations::Conversations;
 use crate::dialect::ClientDialect;
 use crate::engine::Engine;
 use crate::http::{ApiError, LogTail, POLL_INTERVAL, READ_BATCH, parse_body, store_error};
@@ -78,26 +79,13 @@ struct Compat<S: SessionStore, T: Tokenizer + Clone> {
     store: Arc<S>,
     /// Who may drive this surface, and under what session namespace.
     plane: Arc<ControlPlane>,
-    /// How many times each *namespaced* cache key's history has failed the
-    /// prefix check.
+    /// Which session this node binds a client's cache key to.
     ///
-    /// Keyed by the whole namespaced string — `{project}/{user}/{cache_key}`
-    /// where there is a namespace, the bare cache key where there is not —
-    /// rather than by the cache key the client sent. Two tenants both naming a
-    /// conversation `main` own separate logs, and a shared fork counter would
-    /// let an edited history in one of them cold-start the other: the second
-    /// tenant's next request would compute a session id at a generation it
-    /// never forked to, find it empty, and lose its warm prefix. One string
-    /// rather than a `(Principal, key)` tuple because the same string is the
-    /// session id's stem, so the counter and the id cannot be keyed on
-    /// different things.
-    ///
-    /// Node-local, like the turn gates in [`Engine`] and for the same reason:
-    /// this is process state standing in for a durable mapping the Redis store
-    /// will own. Until then a client that reconnects to a different node keeps
-    /// its cache key and loses only its generation, which re-derives on the
-    /// first request that disagrees with the log.
-    generations: Arc<Mutex<HashMap<String, u32>>>,
+    /// Shared with the MCP control surface rather than owned here, which is why
+    /// it is a constructor argument: an agent that narrows the routing of
+    /// conversation `main` and a turn that then arrives on `main` have to reach
+    /// one session id, generation and all. See [`Conversations`].
+    conversations: Arc<Conversations>,
 }
 
 impl<S: SessionStore, T: Tokenizer + Clone> Clone for Compat<S, T> {
@@ -106,7 +94,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Clone for Compat<S, T> {
             engine: Arc::clone(&self.engine),
             store: Arc::clone(&self.store),
             plane: Arc::clone(&self.plane),
-            generations: Arc::clone(&self.generations),
+            conversations: Arc::clone(&self.conversations),
         }
     }
 }
@@ -117,10 +105,16 @@ impl<S: SessionStore, T: Tokenizer + Clone> Clone for Compat<S, T> {
 /// it: the two speak different vocabularies over the same log, and merging them
 /// into one `Router` is the composition root's decision to make. One
 /// constructor with a required plane, for the reason given there.
+///
+/// `conversations` is required for the same reason the plane is, and it is
+/// supplied rather than minted here because the MCP surface reads the same
+/// table: a router that made its own would be a second answer to "which session
+/// is `main`?", and the two would agree only until a client edited its history.
 pub fn responses_router<S, T>(
     plane: Arc<ControlPlane>,
     engine: Arc<Engine<S, T>>,
     store: Arc<S>,
+    conversations: Arc<Conversations>,
 ) -> Router
 where
     S: SessionStore,
@@ -132,7 +126,7 @@ where
             engine,
             store,
             plane,
-            generations: Arc::new(Mutex::new(HashMap::new())),
+            conversations,
         })
 }
 
@@ -273,9 +267,9 @@ impl<S: SessionStore, T: Tokenizer + Clone> Compat<S, T> {
         claimed: Vec<Item>,
     ) -> Result<(SessionId, Vec<Item>), ApiError> {
         // Computed once and used for both the fork counter and the session id,
-        // so the two cannot key on different strings. See `generations`.
+        // so the two cannot key on different strings. See [`Conversations`].
         let key = self.namespaced_key(principal, cache_key);
-        let session_id = bound_session(&key, self.generation(&key));
+        let session_id = self.conversations.bind(principal, &key);
         self.create(&session_id).await?;
         if let Some(delta) = suffix_after(&self.stored_items(&session_id).await?, &claimed) {
             return Ok((session_id, delta));
@@ -293,7 +287,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Compat<S, T> {
         // next turn is priced cold. That is the conservative direction — a
         // ledger that claimed a warm prefix for a conversation that just
         // changed shape would be claiming a cache hit nobody can serve.
-        let session_id = bound_session(&key, self.next_generation(&key));
+        let session_id = self.conversations.fork(principal, &key);
         self.create(&session_id).await?;
         Ok((session_id, claimed))
     }
@@ -314,28 +308,6 @@ impl<S: SessionStore, T: Tokenizer + Clone> Compat<S, T> {
     /// the rule is at the config boundary rather than here.
     fn namespaced_key(&self, principal: &Principal, cache_key: &str) -> String {
         self.plane.qualify(principal, cache_key)
-    }
-
-    /// The generation this namespaced key is currently bound to.
-    ///
-    /// Read on every request, not just after a fork: a rebound key stays
-    /// rebound, and starting each request from generation zero would compare
-    /// every later turn against the history the client already abandoned and
-    /// fork again, one dead session per turn.
-    fn generation(&self, key: &str) -> u32 {
-        self.generations
-            .lock()
-            .expect("generation map poisoned")
-            .get(key)
-            .copied()
-            .unwrap_or(0)
-    }
-
-    fn next_generation(&self, key: &str) -> u32 {
-        let mut generations = self.generations.lock().expect("generation map poisoned");
-        let generation = generations.entry(key.to_string()).or_insert(0);
-        *generation += 1;
-        *generation
     }
 
     async fn create(&self, session_id: &SessionId) -> Result<(), ApiError> {
@@ -368,18 +340,6 @@ impl<S: SessionStore, T: Tokenizer + Clone> Compat<S, T> {
             }));
         }
         Ok(items)
-    }
-}
-
-/// This node's session id for a namespaced cache key at a given generation.
-///
-/// Generation zero is the key verbatim, so a session survives a process
-/// restart that loses the generation map: the common case is a conversation
-/// that never forked, and it re-binds to the same log.
-fn bound_session(key: &str, generation: u32) -> SessionId {
-    match generation {
-        0 => SessionId::new(key),
-        n => SessionId::new(format!("{key}#g{n}")),
     }
 }
 

@@ -27,6 +27,12 @@
 //! adds no state either: a client's resent conversation is checked against the
 //! log as a prefix rather than remembered alongside it.
 //!
+//! [`mcp_api`] is the fourth, and the only one an *agent* rather than a client
+//! drives: it mounts the control tools in [`roundhouse_mcp`] behind the same key
+//! resolution as the rest, so a model can read what it is being routed to and
+//! ask to be routed to less. It adds no state of its own either — its writes go
+//! to a node-local control store the engine reads at the start of every turn.
+//!
 //! [`metrics_api`] reports on all of it. Token counts, dollars, and the savings
 //! figure are folded out of the same log as everything else — see
 //! [`roundhouse_core::metrics`] — so the dashboard cannot disagree with the
@@ -34,9 +40,11 @@
 
 pub mod catalog_config;
 pub mod control_config;
+pub mod conversations;
 pub mod dialect;
 pub mod engine;
 pub mod http;
+pub mod mcp_api;
 pub mod metrics_api;
 pub mod responses_api;
 pub mod tokenizer;
@@ -44,12 +52,15 @@ pub mod tokenizer;
 pub use catalog_config::{CatalogConfig, CatalogError};
 pub use control_config::{
     Admission, AuthError, ControlPlane, ControlPlaneConfig, ControlPlaneError, KeyScope,
+    MembershipError,
 };
+pub use conversations::Conversations;
 pub use dialect::{ClientDialect, DEFAULT_MCP_NAMESPACE};
 pub use engine::{
     EchoLocalExecutor, Engine, EngineConfig, EngineError, LocalExecution, LocalExecutor, TurnResult,
 };
 pub use http::router;
+pub use mcp_api::{ControlPlaneReads, describe_ambiguous_memberships, mcp_router};
 pub use metrics_api::metrics_router;
 pub use responses_api::responses_router;
 pub use tokenizer::HfTokenizer;

@@ -49,9 +49,10 @@ use roundhouse_core::store::{MemoryStore, SessionStore};
 use roundhouse_fleet::{
     EchoFrontierClient, FrontierModelSpec, StaticFrontierCatalog, WireProtocol,
 };
+use roundhouse_mcp::ControlStore;
 use roundhouse_server::{
-    Admission, ControlPlane, EchoLocalExecutor, Engine, EngineConfig, catalog_config,
-    control_config, http, metrics_api, responses_api,
+    Admission, ControlPlane, ControlPlaneReads, Conversations, EchoLocalExecutor, Engine,
+    EngineConfig, catalog_config, control_config, http, mcp_api, metrics_api, responses_api,
 };
 use roundhouse_store_redis::{RedisSessionStore, RedisSpendLedger};
 use tracing_subscriber::EnvFilter;
@@ -349,6 +350,15 @@ async fn main() -> anyhow::Result<()> {
     let reachable = reachable_candidates(&catalog);
     refuse_policies_that_admit_nothing(&plane, &reachable)?;
     refuse_promises_of_a_local_fallback(&plane, &reachable)?;
+    // The third cross-check, and the one this deployment's *control surface*
+    // needs: that surface answers entitlement questions by principal, and the
+    // config lets two keys name one membership with different overrides. A
+    // deployment where they disagree would tell an agent about a policy its own
+    // key does not have — so it is refused here, where an operator reads it,
+    // rather than discovered by a tenant. See `ControlPlane::membership`.
+    if let Some(refusal) = mcp_api::describe_ambiguous_memberships(&plane) {
+        anyhow::bail!(refusal);
+    }
 
     let addr: SocketAddr = std::env::var(ADDR_VAR)
         .unwrap_or_else(|_| DEFAULT_ADDR.to_string())
@@ -390,6 +400,7 @@ async fn main() -> anyhow::Result<()> {
                 Arc::new(spend),
                 plane,
                 catalog,
+                reachable,
                 metrics_config,
                 listener,
             )
@@ -406,6 +417,7 @@ async fn main() -> anyhow::Result<()> {
                 Arc::new(MemorySpendLedger::new()),
                 plane,
                 catalog,
+                reachable,
                 metrics_config,
                 listener,
             )
@@ -414,16 +426,31 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-/// Compose the engine and the three surfaces over whichever backends were
+/// Compose the engine and the four surfaces over whichever backends were
 /// chosen.
+///
+/// **The one composition site**, and two of its values are shared rather than
+/// minted per router on purpose. [`Conversations`] is the node's answer to
+/// "which session is the conversation the client calls `main`?", and the
+/// Responses surface and the control surface both ask it — two tables would
+/// agree only until a client edited its own history. [`ControlStore`] is the
+/// node's control-plane state, and the engine and the control surface hold
+/// opposite ends of it: the surface writes an agent's overlay and the engine
+/// spends it at the start of the next turn, the engine deposits a steer's
+/// payload and the surface serves it to `fetch_steer`.
+#[allow(clippy::too_many_arguments)]
 async fn serve<S: SessionStore>(
     store: Arc<S>,
     spend: Arc<dyn SpendLedger>,
     plane: Arc<ControlPlane>,
     catalog: StaticFrontierCatalog,
+    reachable: Vec<Candidate>,
     metrics_config: Arc<MetricsConfig>,
     listener: tokio::net::TcpListener,
 ) -> anyhow::Result<()> {
+    let conversations = Arc::new(Conversations::new());
+    let control = Arc::new(ControlStore::new());
+
     let engine = Arc::new(
         Engine::new(
             Arc::clone(&store),
@@ -434,14 +461,18 @@ async fn serve<S: SessionStore>(
             Arc::new(AffinityPolicy::new()),
             EngineConfig::default(),
         )
-        .with_spend_ledger(spend),
+        .with_spend_ledger(Arc::clone(&spend))
+        .with_control_store(Arc::clone(&control)),
     );
 
-    // Three surfaces, one process and one log: the native transport, which
+    // Four surfaces, one process and one log: the native transport, which
     // exposes sessions and the log itself; the Responses API, which lets an
-    // agent written against OpenAI drive the same sessions unmodified; and the
-    // metrics surface, which reports on both by folding the same log.
-    // One control plane behind all three, not one each: a key that pays for a
+    // agent written against OpenAI drive the same sessions unmodified; the
+    // metrics surface, which reports on both by folding the same log; and the
+    // MCP control surface, which is the only one an agent rather than a client
+    // drives — it reads what the others did and lets the model ask to be routed
+    // to less than its key allows.
+    // One control plane behind all four, not one each: a key that pays for a
     // turn on one surface and is unknown to another would be a deployment with
     // two answers to the same question.
     let app = http::router(Arc::clone(&plane), Arc::clone(&engine), Arc::clone(&store))
@@ -450,7 +481,28 @@ async fn serve<S: SessionStore>(
             engine.metrics(),
             metrics_config,
         ))
-        .merge(responses_api::responses_router(plane, engine, store));
+        .merge(mcp_api::mcp_router(
+            Arc::clone(&plane),
+            Arc::new(ControlPlaneReads::new(
+                Arc::clone(&plane),
+                Arc::clone(&store),
+                spend,
+                Arc::clone(&conversations),
+                // The same list the startup cross-checks above are built on, and
+                // it is right for the same reason: this binary attaches no
+                // fleet, so the catalog is everything a turn of its could be
+                // routed to. A deployment that attaches one adds its local model
+                // here at the same site — see `reachable_candidates`.
+                reachable,
+            )),
+            control,
+        ))
+        .merge(responses_api::responses_router(
+            plane,
+            engine,
+            store,
+            conversations,
+        ));
     axum::serve(listener, app).await?;
     Ok(())
 }

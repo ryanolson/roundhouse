@@ -6,6 +6,7 @@ resolver = "3"
 members = [
     "crates/roundhouse-core",
     "crates/roundhouse-fleet",
+    "crates/roundhouse-mcp",
     "crates/roundhouse-store-redis",
     "crates/roundhouse-server",
 ]
@@ -18,6 +19,7 @@ license = "Apache-2.0"
 [workspace.dependencies]
 roundhouse-core = { path = "crates/roundhouse-core" }
 roundhouse-fleet = { path = "crates/roundhouse-fleet" }
+roundhouse-mcp = { path = "crates/roundhouse-mcp" }
 roundhouse-store-redis = { path = "crates/roundhouse-store-redis" }
 
 # Dynamo crates, pinned to an upstream commit of ai-dynamo/dynamo.

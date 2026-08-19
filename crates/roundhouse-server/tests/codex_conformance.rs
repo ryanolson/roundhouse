@@ -40,7 +40,9 @@ use roundhouse_core::item::{Item, ItemContent, Role};
 use roundhouse_core::routing::AffinityPolicy;
 use roundhouse_core::store::{MemoryStore, SessionStore};
 use roundhouse_fleet::{EchoFrontierClient, StaticFrontierCatalog};
-use roundhouse_server::{ControlPlane, EchoLocalExecutor, Engine, EngineConfig, responses_router};
+use roundhouse_server::{
+    ControlPlane, Conversations, EchoLocalExecutor, Engine, EngineConfig, responses_router,
+};
 
 mod common;
 use common::codex::{NoAuth, RouterTransport, collect, frames, request, user_message};
@@ -75,7 +77,12 @@ fn surface_with(catalog: StaticFrontierCatalog) -> (Router, Arc<MemoryStore>) {
         EngineConfig::default(),
     ));
     (
-        responses_router(ControlPlane::open(), engine, Arc::clone(&store)),
+        responses_router(
+            ControlPlane::open(),
+            engine,
+            Arc::clone(&store),
+            Arc::new(Conversations::new()),
+        ),
         store,
     )
 }

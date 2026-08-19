@@ -70,8 +70,8 @@ use roundhouse_fleet::{
     FrontierQuote, FrontierStream, StaticFrontierCatalog, WireProtocol,
 };
 use roundhouse_server::{
-    ControlPlane, ControlPlaneConfig, EchoLocalExecutor, Engine, EngineConfig, http, metrics_api,
-    responses_api,
+    ControlPlane, ControlPlaneConfig, Conversations, EchoLocalExecutor, Engine, EngineConfig, http,
+    metrics_api, responses_api,
 };
 
 mod common;
@@ -379,6 +379,7 @@ fn surfaces(
             Arc::clone(plane),
             Arc::clone(engine),
             Arc::clone(store),
+            Arc::new(Conversations::new()),
         ))
 }
 
