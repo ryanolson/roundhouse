@@ -9,6 +9,22 @@ Project-specific practice. The architecture itself is documented in `README.md`
 and in module-level docs; this file is about *how we work*, not what the code
 does.
 
+## Every test run is bounded
+
+Run `cargo test` / `cargo nextest` under a coreutils timeout, always:
+`timeout 900 cargo test --workspace` for the full suite, ~`timeout 300` for a
+targeted one. A PreToolUse hook (`.claude/hooks/cargo-test-timeout.sh`)
+enforces this mechanically.
+
+The reason is not slow tests — it is that a hung test hangs the entire cargo
+run, silently. The sessions most likely to hang one are exactly the sessions
+this repo runs on purpose: adversarial reviews that *mutate timeout and
+deadline code* to prove a guard test is load-bearing. Break a timeout path and
+its guard does not go red — it waits forever. A bounded run converts "stalled
+for hours" into "exit 124 in minutes"; on 124, suspect the newest test or the
+mutation you just applied, and re-run the suspect binary with
+`--test-threads=1 --nocapture` under a short timeout to name the hang.
+
 ## Validating a claim
 
 **Write the test first, then rule, then fix.** This applies to review findings,
