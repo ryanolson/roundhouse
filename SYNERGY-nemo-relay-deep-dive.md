@@ -272,7 +272,7 @@ Relay's policy is **middleware placement**, not a policy language. Five hook poi
 | **4** | **Emit `LlmOptimizationSummary`/`Contribution`** | `nemo-relay-types` `codec::optimization::*` | **S** | The savings story becomes a standard machine-readable object. Near-exact field parity. |
 | **5** | **Consume `AgentHints` as a routing input** | header `x-nemo-relay-adaptive-agent-hints` | **S** to read | `osl` (predicted output length) directly improves the `expected_output_tokens` that sizes the budget grant — a known honest limitation of M3. |
 | **6** | **Delegate PII to `nemo-relay-pii-redaction`** | crate (drags core — weigh) | **M** | Judge-brief redaction (PLAN §10 risk 5) without writing detectors. |
-| **7** | **Import ACG stability as an M6 trigger signal** | port the stability analysis (redis version conflict blocks the crate's storage backend) | **M** | A no-model-call trigger orthogonal to the four planned — strengthens the conjunction. |
+| **7** | **Import ACG stability as an M6 trigger signal** | port the stability analysis (the redis version conflict this row cited is resolved as of 2026-08-19 — roundhouse runs 1.2.4 — but the crate still drags `nemo-relay` core, so the port-not-crate call stands) | **M** | A no-model-call trigger orthogonal to the four planned — strengthens the conjunction. |
 
 ### D.2 Relay → Roundhouse (the reverse direction)
 
@@ -300,7 +300,7 @@ Relay's policy is **middleware placement**, not a policy language. Five hook poi
 
 **E5 — Two routers.** Switchyard's `backend_id` decision and roundhouse's cache-adjusted choice both stamping `model_routing` contributions with baselines: the dashboards will not agree.
 
-**E6 — Version/dependency frictions.** toolchain 1.96.1 ✅ identical; edition 2024 ✅; `uuid =1.18.1` ✅ identical; axum 0.8 ✅; reqwest root stores differ ⚠️ (native-roots vs webpki); `sha2` 0.11 vs 0.10 ⚠️ duplicate; **`redis` 1.1 vs 0.27 ❌ hard conflict** (blocks `nemo-relay-adaptive/redis-backend`); OpenSSL banned on both sides ✅; `nemo-relay` core is heavy (OTel ×3, tonic, object_store, libloading) — **`nemo-relay-types` is the only cheap import**.
+**E6 — Version/dependency frictions.** toolchain 1.96.1 ✅ identical; edition 2024 ✅; `uuid =1.18.1` ✅ identical; axum 0.8 ✅; reqwest root stores differ ⚠️ (native-roots vs webpki); `sha2` 0.11 vs 0.10 ⚠️ duplicate; **`redis` 1.1 vs 0.27 ❌ hard conflict** (blocks `nemo-relay-adaptive/redis-backend`) *[resolved after this snapshot: roundhouse moved to redis 1.2.4 on 2026-08-19 (commit `8578e8c`), which unifies with Relay's `^1.1`; the ceiling below latest 1.x is Dynamo's exact `tokio = "=1.48.0"` pin, recorded in the workspace manifest — see the ruling's addendum]*; OpenSSL banned on both sides ✅; `nemo-relay` core is heavy (OTel ×3, tonic, object_store, libloading) — **`nemo-relay-types` is the only cheap import**.
 
 **E7 — Roadmap collision, from Relay's own docs.** Routing is moving *out* of Relay toward Switchyard ("replaced by a Switchyard-owned native plugin"); cache/scheduling optimization is moving *into* `nemo-relay-adaptive` ("performance-aware scheduling, hints, and cache behavior"). Roundhouse's routing collides less with Relay over time and more with Switchyard; its cache economics collide more with adaptive. `prompt_token_estimate: None` is a placeholder someone intends to fill.
 

@@ -95,13 +95,19 @@ crossing it looked cheap and is not.
   client speaks to does not exist on Switchyard main. It is a client to
   a server that is not there.
 - **`nemo-relay` core as a dependency is disproportionate.** It drags
-  OTel ×3, tonic, libloading, object_store — and `redis 1.1` against our
-  `0.27`, a hard conflict. `nemo-relay-types` is the only cheap import:
-  bitflags, chrono, serde, typed-builder, and a `uuid` pin identical to
-  ours. **The dependency rule is: `nemo-relay-types`, nothing else.**
-- **`nemo-relay-adaptive`'s Redis backend is blocked** by the same
-  version conflict. Where we want an adaptive idea (ACG stability,
-  below), we port the analysis, not the crate.
+  OTel ×3, tonic, libloading, object_store. The redis version conflict
+  the deep dive listed beside those is gone — our store runs redis 1.2.4
+  since S1's upgrade, which unifies with Relay's `^1.1` — but the ruling
+  never rested on it: weight, not versions, is why
+  `nemo-relay-types` is the only cheap import (bitflags, chrono, serde,
+  typed-builder, and a `uuid` pin identical to ours). **The dependency
+  rule is: `nemo-relay-types`, nothing else.**
+- **`nemo-relay-adaptive` is ported, never adopted** — and no longer
+  because of redis: since the 1.2.4 upgrade its Redis backend would
+  resolve against our tree. What still rules it out is that the crate
+  drags `nemo-relay` core, which the dependency rule forbids. Where we
+  want an adaptive idea (ACG stability, below), we port the analysis,
+  not the crate.
 
 ## The plan
 
@@ -137,11 +143,12 @@ Small edits that stop the tree from misleading its next reader:
   than reconstructed at dashboard time; and `observe_only` as a routing
   rollout mode — which the addendum confirms *nobody* ships, so it is
   ours to invent, not to copy.
-- **Upgrade `redis` from 0.27 to current 1.x.** The 0.27 pin dates to the
-  repo's first commit and nothing external holds it there — `cargo tree -i
-  redis` shows `roundhouse-store-redis` as the sole consumer; the Dynamo
-  crates never touch redis. So the E6 "hard conflict" with Relay was
-  one-sided all along. The store's API surface is ten items, all four
+- **Upgrade `redis` from 0.27 to current 1.x** (done — landed at 1.2.4,
+  commit `8578e8c`, proven against a live Redis 7). The 0.27 pin dated to
+  the repo's first commit and nothing external held it there — `cargo
+  tree -i redis` showed `roundhouse-store-redis` as the sole consumer;
+  the Dynamo crates never touch redis. So the E6 "hard conflict" with
+  Relay was one-sided all along. The store's API surface is ten items, all four
   cargo features we enable exist unchanged by name in 1.x, our `Value`
   matches already carry fallthrough arms past the `non_exhaustive` change,
   and we implement no `FromRedisValue` and match no `ErrorKind`s — the two
