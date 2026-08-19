@@ -69,7 +69,10 @@ serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2.0.17"
-tokio = { version = "=1.48.0", features = ["full"] }
+# Caret, resolving to 1.48.0 today: the pinned Dynamo rev's `dynamo-mocker`
+# pins tokio exactly, and an exact pin here would just restate that constraint
+# where nobody can see whose it is. When Dynamo relaxes, this floats.
+tokio = { version = "1.48", features = ["full"] }
 tokio-stream = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
@@ -83,7 +86,15 @@ reqwest = { version = "0.12.24", default-features = false, features = [
     "http2",
     "charset",
 ] }
-redis = { version = "0.27", default-features = false, features = [
+# 1.2, not latest: redis 1.3.0+ carries a target-gated `tokio ^1.51`
+# requirement (wasm support) that the resolver unifies workspace-wide, and the
+# pinned Dynamo rev's `dynamo-mocker` pins `tokio = "=1.48.0"` exactly — as
+# does Dynamo main today. The day Dynamo's tokio pin reaches 1.51, this moves
+# to the newest 1.x in a one-line change; until then 1.2.4 is the newest that
+# resolves, and it already carries the 1.0 line's fixes (default async
+# timeouts, the ConnectionManager retry fix, the TCP-deadlock fix, idempotent
+# stream producers).
+redis = { version = "1.2", default-features = false, features = [
     "tokio-rustls-comp",
     "streams",
     "script",

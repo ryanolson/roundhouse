@@ -145,13 +145,18 @@ Small edits that stop the tree from misleading its next reader:
   cargo features we enable exist unchanged by name in 1.x, our `Value`
   matches already carry fallthrough arms past the `non_exhaustive` change,
   and we implement no `FromRedisValue` and match no `ErrorKind`s — the two
-  real 1.0 breaking areas. Target **latest 1.x** (1.6 as of 2026-08), not
-  Relay's 1.1: cargo unifies any two 1.x requirements, so latest dissolves
-  the conflict *and* stops trailing a storage driver by two years. The
-  behavioral deltas run in our favor (default async timeouts, the
-  `ConnectionManager` retry fix, a TCP-deadlock fix, reconnect-attempt
-  limits). Lands as its own small commit whose proof is the full
-  build+test pass — after M5 releases the manifests it is mid-edit on.
+  real 1.0 breaking areas. Landed at **1.2.4**, not the 1.6 this step
+  first targeted: redis 1.3.0+ carries a target-gated `tokio ^1.51`
+  requirement the resolver unifies workspace-wide, and the pinned Dynamo
+  rev's `dynamo-mocker` pins `tokio = "=1.48.0"` exactly — as does Dynamo
+  main today — so 1.2.4 is the newest that resolves. Any 1.x dissolves
+  the Relay conflict (cargo unifies 1.x requirements), and 1.2.4 already
+  carries the deltas that run in our favor (default async timeouts, the
+  `ConnectionManager` retry fix, the TCP-deadlock fix, idempotent stream
+  producers). The manifest names the unlock: when Dynamo's tokio pin
+  reaches 1.51, redis moves to newest 1.x in a one-line change. Landed as
+  its own commit, proven by the full workspace build plus the env-gated
+  contract suites run against a live Redis 7.
 
 - **Copy the pricing-catalog schema ideas** into `ROUNDHOUSE_CATALOG`'s
   next revision: tiered rate schedules, aliases, and above all
@@ -378,13 +383,19 @@ ever sits in a roundhouse path, session correlation is already
 Dynamo-vocabulary-compatible for free. No action now; noted for S3's
 topology work.
 
-**The redis pin (E6, revisited).** Our `redis 0.27` is scaffold
+**The redis pin (E6, revisited).** Our `redis 0.27` was scaffold
 inertia, not a constraint: sole consumer is `roundhouse-store-redis`,
 the Dynamo crates never touch redis, and the migration surface is ten
 API items that all survive into 1.x (features unchanged by name, our
 `Value` matches already non-exhaustive-safe, no `FromRedisValue` impls,
-no `ErrorKind` matching). Relay's 1.1 is itself five minors behind.
-The upgrade targets latest 1.x as its own build+test-proven commit
-(S1), which deletes the one hard dependency conflict in E6 — after
-which the honest statement is that nothing in the dependency graph
-separates the two projects except choices.
+no `ErrorKind` matching — the store compiled against 1.x with zero
+source changes). Relay's 1.1 is itself five minors behind. The upgrade
+landed at **1.2.4** rather than latest: redis 1.3.0+ demands
+`tokio ^1.51` on a target-gated edge the resolver unifies everywhere,
+and the pinned Dynamo rev's `dynamo-mocker` — like Dynamo main today —
+pins `tokio = "=1.48.0"` exactly. The manifest records the unlock (a
+Dynamo tokio bump frees the one-line move to newest). Any 1.x unifies
+with Relay's `^1.1`, so E6's one hard dependency conflict is deleted —
+the honest statement is now that nothing in the dependency graph
+separates the two projects except choices, plus one tokio pin that is
+Dynamo's to relax.
