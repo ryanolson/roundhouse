@@ -222,7 +222,7 @@ impl RoutingPolicy for AffinityPolicy {
 /// latch whose outage arm deliberately holds the streak rather than clearing
 /// it — an unreachable judge is not evidence the cheap tier is fine. Adopting
 /// the prompt without the crate is scheduled synergy work
-/// (`SYNERGY-nemo-relay.md` §S5); until then `audit_every` stays, knowing it
+/// (`agent-docs/synergies/nemo-relay.md` §S5); until then `audit_every` stays, knowing it
 /// benchmarks below boundary-triggered review on weak executors.
 pub struct EscalationPolicy {
     inner: AffinityPolicy,

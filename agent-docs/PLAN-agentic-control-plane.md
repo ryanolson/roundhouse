@@ -444,7 +444,7 @@ configuration, not protocol work:
   at `c37b551`), directly contradicting this ruling, which was read from
   rev `6344a65`. One read is stale or the flag changed meaning; resolving
   it against current codex source in device-login mode is M7's first
-  verification item (see `SYNERGY-nemo-relay.md` §S1).
+  verification item (see `agent-docs/synergies/nemo-relay.md` §S1).
 - The wire shape is the **same Responses API** roundhouse already speaks —
   only the base URL and headers differ by auth mode. The upstream target for
   ChatGPT-authed traffic is `https://chatgpt.com/backend-api/codex` (whether

@@ -6,7 +6,7 @@ SPDX-License-Identifier: Apache-2.0
 # NeMo Relay ↔ Roundhouse: the synergy ruling
 
 > **Status: direction.** This is the synthesis of
-> `SYNERGY-nemo-relay-deep-dive.md` into a plan. The deep dive is the
+> `../research/nemo-relay-deep-dive.md` into a plan. The deep dive is the
 > evidence base — every claim relied on below carries a file:line there —
 > and this document is the ruling: what roundhouse adopts, what it emits,
 > what it contributes back, and what it deliberately does not do. Where

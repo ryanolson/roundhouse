@@ -9,7 +9,7 @@ SPDX-License-Identifier: Apache-2.0
 > `c37b551` (workspace 0.8.0) against this tree as it stands (M0–M5),
 > produced to answer "what are we reinventing, and how do these NVIDIA
 > projects mesh?". The ruling that synthesizes this into direction is
-> `SYNERGY-nemo-relay.md`, which this document exists to justify. Every
+> `../synergies/nemo-relay.md`, which this document exists to justify. Every
 > code claim carries a file:line into one of the two trees.
 
 Source: `/workspace/nvidia/nemo-relay` @ `c37b551`, workspace version **0.8.0**, edition 2024, `rust-toolchain.toml:5` → **1.96.1**. Roundhouse read at `/home/user/roundhouse` (README.md, PLAN-agentic-control-plane.md §1–7, plus the tree as it stands: `control/`, `interject.rs`, `roundhouse-mcp` exist; `validate/` and real frontier clients do not).

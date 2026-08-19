@@ -33,9 +33,11 @@ is never allowed to claim one without measuring the others.
 
 Plans, synergy rulings, deep-dive evidence, and design records go in
 `agent-docs/` — see its README for the evidence-vs-ruling pairing and the
-dated-addendum discipline. `README.md` and module docs describe the code
-as it is; `agent-docs/` records where it is going and why. A new plan or
-deep dive that lands at the repo root is in the wrong place.
+dated-addendum discipline. Deep-dive evidence goes in
+`agent-docs/research/`, synergy rulings in `agent-docs/synergies/`, and
+plans at the `agent-docs/` root. `README.md` and module docs describe the
+code as it is; `agent-docs/` records where it is going and why. A new
+plan or deep dive that lands at the repo root is in the wrong place.
 
 ## Synergy dependencies are watched, not just pinned
 
