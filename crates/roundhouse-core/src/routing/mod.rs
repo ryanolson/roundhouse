@@ -21,11 +21,15 @@
 //! Costing happens in `roundhouse-fleet`, which owns the transports. This
 //! module owns the vocabulary and the choice.
 //!
-//! [`RoutingPolicy`] is the seam that keeps Switchyard optional. Its
-//! `Algorithm` trait is a good fit — the algorithm emits `Step::CallLlm` with a
-//! semantic target and the *host* executes it — but `libsy::State` is in-memory
-//! with no pluggable persistence, which collides with surviving process death.
-//! Keeping libsy behind this trait means our session core never depends on it.
+//! [`RoutingPolicy`] is the seam that keeps Switchyard optional. Switchyard
+//! here means the `NVIDIA-NeMo/Switchyard` library (`switchyard-libsy`), not
+//! NeMo Relay's deprecated `crates/switchyard` HTTP client. Its `Algorithm`
+//! trait is a good fit — the algorithm emits `Step::CallModel` with a semantic
+//! target and the *host* executes it — but `libsy::State` is in-memory with no
+//! pluggable persistence (re-verified at main `47babb1`, 2026-08-19), which
+//! collides with surviving process death. Keeping libsy behind this trait also
+//! absorbs its pre-alpha churn: `Algorithm::route`'s return type and the
+//! `Step`/`Driver` vocabulary each changed shape during one week of 2026-08.
 
 pub mod ledger;
 pub mod policy;

@@ -196,11 +196,19 @@ impl RoutingPolicy for AffinityPolicy {
 /// Serve most turns from the cheaper pool, but hand every `audit_every`-th turn
 /// to the highest-quality target available.
 ///
-/// This is the shape Switchyard's escalation router implements, reproduced
-/// natively so the behavior is available without the dependency. The periodic
-/// audit is the cheap approximation; the richer version latches to the strong
-/// target on a confirmed streak of trouble, which needs a quality signal we do
-/// not yet collect.
+/// This is the shape Switchyard's escalation router implements (in
+/// `NVIDIA-NeMo/Switchyard`, as `EscalationClassifier` — not in NeMo Relay's
+/// deprecated client crate of the same name), reproduced natively so the
+/// behavior is available without the dependency. The periodic audit is the
+/// cheap approximation; the richer version latches to the strong target on a
+/// confirmed streak of trouble. The quality signal that variant needs is no
+/// longer uncollected so much as unadopted: Switchyard publishes its judge
+/// prompt (`prompts/escalation/prompt.md`, Apache-2.0) and a two-confirmation
+/// latch whose outage arm deliberately holds the streak rather than clearing
+/// it — an unreachable judge is not evidence the cheap tier is fine. Adopting
+/// the prompt without the crate is scheduled synergy work
+/// (`SYNERGY-nemo-relay.md` §S5); until then `audit_every` stays, knowing it
+/// benchmarks below boundary-triggered review on weak executors.
 pub struct EscalationPolicy {
     inner: AffinityPolicy,
     audit_every: u64,

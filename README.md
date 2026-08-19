@@ -233,12 +233,16 @@ price is zero — so the demo demonstrates the token breakdown, not the savings.
 
 ## Switchyard
 
-Kept behind our own `RoutingPolicy` trait rather than wired in directly.
-Switchyard's `Algorithm` trait is a good fit — the algorithm emits
-`Step::CallLlm` with a semantic target and the *host* executes it — but
-`libsy::State` is in-memory with no pluggable persistence, which collides with
-the requirement to survive process death. Behind the trait, it is an option
-rather than a dependency.
+Kept behind our own `RoutingPolicy` trait rather than wired in directly. This
+means the `NVIDIA-NeMo/Switchyard` library (`switchyard-libsy`); NeMo Relay's
+`crates/switchyard` is a deprecated HTTP client for a decision service that
+Switchyard's main branch no longer serves. Switchyard's `Algorithm` trait is a
+good fit — the algorithm emits `Step::CallModel` with a semantic target and the
+*host* executes it — but `libsy::State` is in-memory with no pluggable
+persistence, which collides with the requirement to survive process death, and
+the library is self-described pre-alpha whose core vocabulary changed shape
+three times in one week of 2026-08. Behind the trait, it is an option rather
+than a dependency.
 
 ## Build and test
 
