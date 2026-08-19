@@ -9,6 +9,62 @@ Project-specific practice. The architecture itself is documented in `README.md`
 and in module-level docs; this file is about *how we work*, not what the code
 does.
 
+## What the product is
+
+One sentence, so every design call can be checked against it: **agentic
+coding agents (Codex, Claude Code) transparently hook up to roundhouse
+and, through it, take advantage of NeMo Relay and Switchyard — routing to
+local models served by Dynamo and to frontier-lab models via their public
+endpoints, co-optimizing function, cost, and time to solution.**
+
+Every word is load-bearing. *Transparently*: the agent's own stack is not
+modified — pass-through auth, prefix admission of resent history, and the
+MCP surface are what make hooking up invisible. *Through it*: roundhouse
+owns the turn (the durable log, policy, budgets, routing, steering);
+Relay owns the harness; Switchyard contributes routing ideas and judge
+prompts; Dynamo owns the metal. *Co-optimizing all three*: a router that
+optimizes cost alone ships worse answers, one that optimizes quality
+alone is a thin proxy to a frontier lab, and one that ignores latency
+loses the agent loop — which is why routing decisions carry quality
+priors, exact prices, and TTFT together, and why the savings dashboard
+is never allowed to claim one without measuring the others.
+
+## Where documents live
+
+Plans, synergy rulings, deep-dive evidence, and design records go in
+`agent-docs/` — see its README for the evidence-vs-ruling pairing and the
+dated-addendum discipline. `README.md` and module docs describe the code
+as it is; `agent-docs/` records where it is going and why. A new plan or
+deep dive that lands at the repo root is in the wrong place.
+
+## Synergy dependencies are watched, not just pinned
+
+Some dependencies are not mere libraries but the other half of the
+product: **NeMo Relay** (the harness we interoperate with), **Switchyard**
+(routing algorithms and judge prompts we adopt ideas from), **Dynamo**
+(the serving plane, including its pinned crates and their transitive
+pins), the **codex** crates (our wire-conformance oracle), and **redis**
+(the store under the session log). For these, upgrading or adding is
+never just bumping a version:
+
+- **Read what changed upstream before it lands.** Diff the release notes
+  or the tree between the old and new pin. These projects move fast and
+  break vocabulary — Switchyard changed its core API three times in one
+  week of 2026-08.
+- **Map each change into the product.** The question is not "does it
+  compile" but "does this change how an agent hooks up, what a turn
+  costs, where a route can go, or what a document here claims" — and the
+  answer goes into `agent-docs/` as a dated addendum to the affected
+  ruling, the way the Switchyard-main and redis-1.2.4 addenda were done.
+- **Re-verify pinned-source claims before milestones that rely on
+  them.** A ruling read from one revision (e.g. `requires_openai_auth`
+  from codex `6344a65`) is stale the day the pin moves; the milestone
+  that depends on it re-reads first.
+- **Record the unlock condition when a constraint blocks the newest
+  version**, in the manifest next to the pin — the way the redis 1.2.4
+  pin names Dynamo's `tokio = "=1.48.0"` as exactly what frees it. A
+  ceiling nobody wrote down becomes a mystery nobody lifts.
+
 ## Every test run is bounded
 
 Run `cargo test` / `cargo nextest` under a coreutils timeout, always:
