@@ -17,7 +17,7 @@
 use roundhouse_core::event::{Accounting, SessionEvent, SessionEventKind, Usage};
 use roundhouse_core::ids::{ResponseId, SessionId, TurnId};
 use roundhouse_core::metrics::pricing::{ReferenceModel, ShadowPricing};
-use roundhouse_core::metrics::{MetricsConfig, MetricsFold, MetricsSnapshot};
+use roundhouse_core::metrics::{MetricsConfig, MetricsFold, MetricsSnapshot, Scope};
 use roundhouse_core::routing::{DecisionRecord, ProviderPricing, Target};
 
 const HOSTED: ProviderPricing = ProviderPricing {
@@ -96,6 +96,9 @@ fn log(calls: &[Usage]) -> Vec<SessionEvent> {
                     expected_prefill_tokens: 0.0,
                     expected_cost_usd: 0.0,
                     considered: vec![],
+                    turn_policy_digest: String::new(),
+                    budget_state: Default::default(),
+                    rate_card: None,
                 },
             },
         );
@@ -113,7 +116,7 @@ fn log(calls: &[Usage]) -> Vec<SessionEvent> {
 fn snapshot_of(calls: &[Usage]) -> MetricsSnapshot {
     let mut fold = MetricsFold::new();
     fold.extend(log(calls).iter());
-    MetricsSnapshot::build(&fold, &config(), 9_999)
+    MetricsSnapshot::build(&fold, Scope::Deployment, &config(), 9_999)
 }
 
 /// Everything a consumer of the snapshot can observe about the hosted row and

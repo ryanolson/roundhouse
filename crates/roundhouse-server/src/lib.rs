@@ -5,14 +5,18 @@
 //! execution meet.
 //!
 //! One turn is: claim the session, replay it into a context assembler, admit
-//! the turn, price every target, choose, record the choice, execute, and settle.
-//! Each of those steps lives in a lower layer; this module only sequences them.
+//! the turn, price every target, reserve what may be spent, choose, record the
+//! choice, execute, and settle — the log first, then the money. Each of those
+//! steps lives in a lower layer; this module only sequences them.
 //!
-//! The sequencing itself carries two guarantees worth stating. The routing
+//! The sequencing itself carries three guarantees worth stating. The routing
 //! decision is written to the log *before* execution starts, so the audit trail
-//! records what was chosen even when execution then fails. And a booked local
-//! reservation is always settled, including on the error path, because a leaked
-//! reservation silently inflates the router's view of a worker forever.
+//! records what was chosen even when execution then fails. The spend ledger is
+//! written *after* the terminal event, so what a project is charged is priced
+//! from what the log actually holds rather than from what a turn intended. And
+//! a booked local reservation is always settled, including on the error path,
+//! because a leaked reservation silently inflates the router's view of a worker
+//! forever.
 //!
 //! [`http`] puts a transport in front of that sequence without joining it: it
 //! streams turns by tailing the same log the engine writes to, so the wire
@@ -23,23 +27,42 @@
 //! adds no state either: a client's resent conversation is checked against the
 //! log as a prefix rather than remembered alongside it.
 //!
+//! [`mcp_api`] is the fourth, and the only one an *agent* rather than a client
+//! drives: it mounts the control tools in [`roundhouse_mcp`] behind the same key
+//! resolution as the rest, so a model can read what it is being routed to and
+//! ask to be routed to less. It adds no state of its own either — its writes go
+//! to a node-local control store the engine reads at the start of every turn.
+//!
 //! [`metrics_api`] reports on all of it. Token counts, dollars, and the savings
 //! figure are folded out of the same log as everything else — see
 //! [`roundhouse_core::metrics`] — so the dashboard cannot disagree with the
 //! audit trail it summarizes.
 
 pub mod catalog_config;
+pub mod control_config;
+pub mod conversations;
+pub mod dialect;
 pub mod engine;
 pub mod http;
+pub mod judge;
+pub mod mcp_api;
 pub mod metrics_api;
 pub mod responses_api;
 pub mod tokenizer;
 
 pub use catalog_config::{CatalogConfig, CatalogError};
+pub use control_config::{
+    Admission, AuthError, ControlPlane, ControlPlaneConfig, ControlPlaneError, KeyScope,
+    MembershipError, ValidateConfig,
+};
+pub use conversations::Conversations;
+pub use dialect::{ClientDialect, DEFAULT_MCP_NAMESPACE};
 pub use engine::{
     EchoLocalExecutor, Engine, EngineConfig, EngineError, LocalExecution, LocalExecutor, TurnResult,
 };
 pub use http::router;
+pub use judge::{FleetJudge, JudgeConfig};
+pub use mcp_api::{ControlPlaneReads, describe_ambiguous_memberships, mcp_router};
 pub use metrics_api::metrics_router;
 pub use responses_api::responses_router;
 pub use tokenizer::HfTokenizer;

@@ -33,7 +33,9 @@ use roundhouse_fleet::{
     EchoFrontierClient, FleetError, FrontierClient, FrontierError, FrontierQuote, FrontierStream,
     LocalFleet,
 };
-use roundhouse_server::{EchoLocalExecutor, Engine, EngineConfig, LocalExecution, LocalExecutor};
+use roundhouse_server::{
+    Admission, EchoLocalExecutor, Engine, EngineConfig, LocalExecution, LocalExecutor,
+};
 
 mod common;
 use common::{BLOCK_SIZE, LOCAL_MODEL, config, embedded_fleet, frontier_catalog};
@@ -75,6 +77,7 @@ async fn client_bytes_stay_flat_while_context_grows() {
                 &session_id,
                 TurnId::new(format!("turn-{turn}")),
                 vec![Item::user_text(message)],
+                &Admission::open(),
             )
             .await
             .unwrap();
@@ -127,6 +130,7 @@ async fn a_warmed_frontier_target_wins_a_turn_it_would_otherwise_lose() {
             &session_id,
             TurnId::new("t0"),
             vec![Item::user_text("open the task")],
+            &Admission::open(),
         )
         .await
         .unwrap();
@@ -140,6 +144,7 @@ async fn a_warmed_frontier_target_wins_a_turn_it_would_otherwise_lose() {
             &session_id,
             TurnId::new("t1"),
             vec![Item::user_text("continue")],
+            &Admission::open(),
         )
         .await
         .unwrap();
@@ -186,6 +191,7 @@ async fn a_successor_resumes_a_killed_session_without_gaps() {
                 &session_id,
                 TurnId::new(format!("t{turn}")),
                 vec![Item::user_text(format!("question {turn}"))],
+                &Admission::open(),
             )
             .await
             .unwrap();
@@ -228,6 +234,7 @@ async fn a_successor_resumes_a_killed_session_without_gaps() {
             &session_id,
             TurnId::new("t3"),
             vec![Item::user_text("question 3")],
+            &Admission::open(),
         )
         .await
         .unwrap();
@@ -262,6 +269,7 @@ async fn a_retried_turn_replays_instead_of_regenerating() {
             &session_id,
             TurnId::new("same-turn"),
             vec![Item::user_text("hello")],
+            &Admission::open(),
         )
         .await
         .unwrap();
@@ -273,6 +281,7 @@ async fn a_retried_turn_replays_instead_of_regenerating() {
             &session_id,
             TurnId::new("same-turn"),
             vec![Item::user_text("hello")],
+            &Admission::open(),
         )
         .await
         .unwrap();
@@ -342,6 +351,7 @@ async fn a_failed_turn_terminates_its_response_and_frees_the_session() {
             &session_id,
             TurnId::new("t0"),
             vec![Item::user_text("hello")],
+            &Admission::open(),
         )
         .await;
     assert!(failed.is_err(), "the provider failed, so the turn must too");
@@ -384,6 +394,7 @@ async fn a_failed_turn_terminates_its_response_and_frees_the_session() {
             &session_id,
             TurnId::new("t0"),
             vec![Item::user_text("hello")],
+            &Admission::open(),
         )
         .await
         .expect("the same turn id must be runnable again after a failure");
@@ -426,6 +437,7 @@ async fn a_local_worker_wins_and_its_reservation_settles() {
             &session_id,
             TurnId::new("t0"),
             vec![Item::user_text("a question for the local model")],
+            &Admission::open(),
         )
         .await
         .unwrap();
@@ -505,6 +517,7 @@ async fn the_worker_receives_exactly_the_tokens_the_router_was_quoted_on() {
                 vec![Item::user_text(format!(
                     "question {turn} for the local model"
                 ))],
+                &Admission::open(),
             )
             .await
             .unwrap();

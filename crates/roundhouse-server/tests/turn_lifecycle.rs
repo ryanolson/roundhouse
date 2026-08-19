@@ -35,7 +35,7 @@ use roundhouse_fleet::{
     FrontierQuote, FrontierStream, LocalFleet,
 };
 use roundhouse_server::{
-    EchoLocalExecutor, Engine, EngineConfig, EngineError, LocalExecution, LocalExecutor,
+    Admission, EchoLocalExecutor, Engine, EngineConfig, EngineError, LocalExecution, LocalExecutor,
 };
 use tokio::sync::mpsc;
 
@@ -136,6 +136,7 @@ async fn a_turn_longer_than_the_lease_ttl_still_commits() {
             &session_id,
             TurnId::new("t0"),
             vec![Item::user_text("a question worth waiting for")],
+            &Admission::open(),
         )
         .await
         .expect("a turn longer than the TTL must not be fenced at its own commit");
@@ -188,6 +189,7 @@ async fn a_fenced_owner_cannot_commit_after_takeover() {
                     &session_id,
                     TurnId::new("t0"),
                     vec![Item::user_text("a question the owner will not finish")],
+                    &Admission::open(),
                 )
                 .await
         }
@@ -280,6 +282,7 @@ async fn a_hung_dispatch_settles_at_the_deadline() {
             &session_id,
             TurnId::new("t0"),
             vec![Item::user_text("a question nothing answers")],
+            &Admission::open(),
         )
         .await
         .expect_err("a turn that produces nothing must not succeed");
@@ -322,6 +325,7 @@ async fn a_hung_dispatch_settles_at_the_deadline() {
             &session_id,
             TurnId::new("t0"),
             vec![Item::user_text("a question nothing answers")],
+            &Admission::open(),
         )
         .await
         .expect("the same turn id must be runnable again after a deadline");
@@ -360,6 +364,7 @@ async fn concurrent_turns_on_one_session_serialize_rather_than_interleave() {
                             &session_id,
                             TurnId::new(format!("t{turn}")),
                             vec![Item::user_text(format!("question {turn}"))],
+                            &Admission::open(),
                         )
                         .await
                 }
@@ -470,6 +475,7 @@ async fn deltas_are_durable_before_the_response_completes() {
                     &session_id,
                     TurnId::new("t0"),
                     vec![Item::user_text("stream it")],
+                    &Admission::open(),
                 )
                 .await
         }
@@ -557,6 +563,7 @@ async fn a_mid_stream_failure_commits_the_partial() {
                     &session_id,
                     TurnId::new("t0"),
                     vec![Item::user_text("stream it")],
+                    &Admission::open(),
                 )
                 .await
         }

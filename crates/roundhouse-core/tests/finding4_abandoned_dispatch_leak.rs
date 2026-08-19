@@ -64,6 +64,11 @@ fn decision(chosen: Target) -> DecisionRecord {
                 load: None,
             },
         ],
+        turn_policy_digest: String::new(),
+        budget_state: Default::default(),
+        // The subject is the cache ledger's evidence rule, which no price
+        // enters into: a dispatch is warm or cold whatever it cost.
+        rate_card: None,
     }
 }
 

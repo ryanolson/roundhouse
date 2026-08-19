@@ -1,0 +1,42 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "roundhouse-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+roundhouse-core = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+
+# The `http` types the transport reads a resolved `Principal` out of. Already in
+# the tree via `axum`/`reqwest`; declared here so the dependency is deliberate
+# rather than an accident of somebody else's graph -- the same argument the
+# workspace makes for `hex` and `sha2`.
+http = "1"
+
+# The official MCP SDK, pinned like the `codex-*` deps and behind one adapter
+# file (`transport.rs`). `default-features = false` drops `macros` and `base64`;
+# the three features requested are the server handler, the streamable-HTTP
+# server, and the `tower` Service impl the existing axum router mounts it with.
+#
+# The gate this had to pass, from the plan: rustls only (the Dynamo `deny.toml`
+# rule) and no second `axum` against the `=0.8.4` pin. It brings no TLS stack at
+# all and reaches axum not at all -- its server is a `tower_service::Service` --
+# so both hold, and `cargo tree` is the exit criterion that keeps them holding.
+rmcp = { version = "3.1.3", default-features = false, features = [
+    "server",
+    "transport-streamable-http-server",
+    "tower",
+] }
+
+[dev-dependencies]
+sha2 = { workspace = true }
+tokio = { workspace = true }

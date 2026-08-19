@@ -45,11 +45,13 @@ use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 
 use roundhouse_core::context::Tokenizer;
+use roundhouse_core::control::Principal;
 use roundhouse_core::event::{SessionEvent, SessionEventKind};
 use roundhouse_core::ids::{ResponseId, SessionId, TurnId};
 use roundhouse_core::item::{Item, Role};
 use roundhouse_core::store::{SessionStore, StoreError};
 
+use crate::control_config::{AuthError, ControlPlane};
 use crate::engine::Engine;
 
 /// How long to wait before re-reading a log that had nothing new.
@@ -75,6 +77,8 @@ const SETTLE_GRACE: Duration = Duration::from_millis(500);
 struct Transport<S: SessionStore, T: Tokenizer + Clone> {
     engine: Arc<Engine<S, T>>,
     store: Arc<S>,
+    /// Who may drive these routes, and under what session namespace.
+    plane: Arc<ControlPlane>,
 }
 
 impl<S: SessionStore, T: Tokenizer + Clone> Clone for Transport<S, T> {
@@ -82,16 +86,24 @@ impl<S: SessionStore, T: Tokenizer + Clone> Clone for Transport<S, T> {
         Self {
             engine: Arc::clone(&self.engine),
             store: Arc::clone(&self.store),
+            plane: Arc::clone(&self.plane),
         }
     }
 }
 
-/// The transport's routes.
+/// The transport's routes, gated by a control plane.
+///
+/// One constructor, and the plane is required rather than defaulted: who may
+/// drive these routes is not a detail a call site should be able to leave out,
+/// and an unconfigured deployment says so by passing
+/// [`ControlPlane::open`](crate::control_config::ControlPlane::open). A
+/// convenience overload that supplied `Open` for you was one grep away from
+/// looking like the *normal* way to mount this.
 ///
 /// The store is passed alongside the engine rather than borrowed out of it: the
 /// streaming endpoints only read, and reading through the engine would suggest
 /// a coupling to turn execution that deliberately does not exist.
-pub fn router<S, T>(engine: Arc<Engine<S, T>>, store: Arc<S>) -> Router
+pub fn router<S, T>(plane: Arc<ControlPlane>, engine: Arc<Engine<S, T>>, store: Arc<S>) -> Router
 where
     S: SessionStore,
     T: Tokenizer + Clone + Send + Sync + 'static,
@@ -106,7 +118,11 @@ where
             "/v1/sessions/{session_id}/events",
             get(session_events::<S, T>),
         )
-        .with_state(Transport { engine, store })
+        .with_state(Transport {
+            engine,
+            store,
+            plane,
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -202,6 +218,46 @@ impl ApiError {
     }
 }
 
+/// The auth vocabulary, in this transport's error shape.
+///
+/// One body shape for every pre-stream refusal, whether it came from the key
+/// or from the request: a client parsing `{"error": {"code", "message"}}` for
+/// one must not need a second parser for the other.
+impl From<AuthError> for ApiError {
+    fn from(error: AuthError) -> Self {
+        Self {
+            status: error.status(),
+            code: error.code(),
+            message: error.to_string(),
+        }
+    }
+}
+
+/// Refuse a session id outside the caller's namespace, in this transport's
+/// error shape.
+///
+/// The decision itself is [`ControlPlane::contains`] — one function pair mints
+/// and checks the convention, and this is only the half that turns a `false`
+/// into the refusal a client reads. In [`ControlPlane::Open`] there is no
+/// namespace and every id passes, which is what keeps an unconfigured
+/// deployment's client-supplied ids working unchanged. In a configured one
+/// this is the whole of a session route's authorization: session ids are the
+/// only thing these transports take as input, and they stream the raw log —
+/// items, routing decisions, prices — for whichever one they are given.
+pub(crate) fn in_namespace(
+    plane: &ControlPlane,
+    principal: &Principal,
+    session_id: &SessionId,
+) -> Result<(), ApiError> {
+    if plane.contains(principal, session_id) {
+        return Ok(());
+    }
+    Err(AuthError::OutOfNamespace {
+        prefix: principal.namespace_prefix(),
+    }
+    .into())
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let body = json!({ "error": { "code": self.code, "message": self.message } });
@@ -238,19 +294,35 @@ pub(crate) fn parse_body<B: serde::de::DeserializeOwned>(body: &Bytes) -> Result
 /// creation, and a client that retried cannot tell those apart from a 201.
 async fn create_session<S, T>(
     State(state): State<Transport<S, T>>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError>
 where
     S: SessionStore,
     T: Tokenizer + Clone + Send + Sync + 'static,
 {
+    let principal = state.plane.turn_principal(&headers)?;
     let request: CreateSessionBody = if body.is_empty() {
         CreateSessionBody::default()
     } else {
         parse_body(&body)?
     };
 
-    let session_id = request.session_id.unwrap_or_else(SessionId::generate);
+    // A minted id is namespaced, not just a checked one, and it is minted by
+    // the same pair that checks: an id this endpoint handed back that the
+    // caller's own key could not then use on `/v1/sessions/{id}/responses`
+    // would be a session created and immediately unreachable.
+    let session_id = match request.session_id {
+        Some(supplied) => {
+            in_namespace(&state.plane, &principal, &supplied)?;
+            supplied
+        }
+        None => SessionId::new(
+            state
+                .plane
+                .qualify(&principal, SessionId::generate().as_str()),
+        ),
+    };
     let created = state
         .engine
         .create_session(&session_id)
@@ -271,6 +343,7 @@ where
 async fn create_response<S, T>(
     State(state): State<Transport<S, T>>,
     Path(session_id): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError>
 where
@@ -278,6 +351,15 @@ where
     T: Tokenizer + Clone + Send + Sync + 'static,
 {
     let session_id = SessionId::new(session_id);
+    // Before the body, and before the store: a key that may not touch this
+    // session must not learn whether it exists, and must not cost a round trip.
+    //
+    // The admission rather than the principal alone, because this route serves
+    // a turn: the same key lookup answers "who pays" and "what may be routed
+    // to", and resolving them once here is what makes the policy immutable for
+    // the whole turn rather than something re-read mid-dispatch.
+    let admission = state.plane.turn_admission(&headers)?;
+    in_namespace(&state.plane, &admission.principal, &session_id)?;
     let request: CreateResponseBody = parse_body(&body)?;
     let input = request
         .input
@@ -299,12 +381,13 @@ where
         let engine = Arc::clone(&state.engine);
         let session_id = session_id.clone();
         let turn_id = turn_id.clone();
+        let admission = admission.clone();
         // Flattened to `Result<(), String>` at the spawn boundary: the stream
         // needs to know only that the turn failed and how that reads, so it
         // does not depend on the engine's result or error shape.
         async move {
             engine
-                .run_turn(&session_id, turn_id, input)
+                .run_turn(&session_id, turn_id, input, &admission)
                 .await
                 .map(|_| ())
                 .map_err(|error| error.to_string())
@@ -337,6 +420,10 @@ where
     T: Tokenizer + Clone + Send + Sync + 'static,
 {
     let session_id = SessionId::new(session_id);
+    // This endpoint streams the raw log — items, routing decisions, prices —
+    // so the namespace check is the whole of its authorization.
+    let principal = state.plane.turn_principal(&headers)?;
+    in_namespace(&state.plane, &principal, &session_id)?;
     let cursor = resume_cursor(&params, &headers)?;
 
     // Existence probe. A stream opened on a session that does not exist would

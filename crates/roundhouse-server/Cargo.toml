@@ -19,6 +19,10 @@ path = "src/main.rs"
 [dependencies]
 roundhouse-core = { workspace = true }
 roundhouse-fleet = { workspace = true }
+# The MCP control surface. The dependency runs one way only -- `roundhouse-mcp`
+# knows nothing of this crate, and supplies the seams (`ControlReads`) this one
+# implements. See `src/mcp_api.rs`.
+roundhouse-mcp = { workspace = true }
 roundhouse-store-redis = { workspace = true }
 
 anyhow = { workspace = true }
@@ -26,8 +30,10 @@ async-trait = { workspace = true }
 axum = { workspace = true }
 tokenizers = { workspace = true }
 futures = { workspace = true }
+hex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }

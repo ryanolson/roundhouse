@@ -31,7 +31,7 @@ use roundhouse_core::ids::SessionId;
 use roundhouse_core::routing::AffinityPolicy;
 use roundhouse_core::store::{MemoryStore, SessionStore};
 use roundhouse_fleet::{EchoFrontierClient, StaticFrontierCatalog};
-use roundhouse_server::{EchoLocalExecutor, Engine, EngineConfig, router};
+use roundhouse_server::{ControlPlane, EchoLocalExecutor, Engine, EngineConfig, router};
 
 mod common;
 use common::frontier_catalog;
@@ -62,7 +62,10 @@ fn transport_with(catalog: StaticFrontierCatalog) -> (Router, Arc<MemoryStore>) 
         Arc::new(AffinityPolicy::new()),
         EngineConfig::default(),
     ));
-    (router(engine, Arc::clone(&store)), store)
+    (
+        router(ControlPlane::open(), engine, Arc::clone(&store)),
+        store,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -281,11 +284,19 @@ async fn a_turn_streams_its_events_in_order() {
     let frames = SseReader::new(response.into_body()).drain().await;
     let names: Vec<&str> = frames.iter().map(SseFrame::name).collect();
 
-    assert_eq!(names.first(), Some(&"turn_started"));
+    // A session's log opens with its identity and closes with the turn's
+    // terminal event. `session_created` is named here rather than the check
+    // being relaxed to "some event first": it is written into an empty log at
+    // seq 1, ahead of anything that can spend money, and that ordering is what
+    // lets the metrics fold attribute a turn without a side table. A stream
+    // that began at `turn_started` would mean the identity was written late,
+    // or not at all.
+    assert_eq!(names.first(), Some(&"session_created"));
     assert_eq!(names.last(), Some(&"response_completed"));
     assert_ordered(
         &names,
         &[
+            "session_created",
             "turn_started",
             "item_appended",
             "routed",

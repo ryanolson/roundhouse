@@ -23,7 +23,7 @@ use roundhouse_core::item::{Item, Role};
 use roundhouse_core::routing::{AffinityPolicy, CacheLedger};
 use roundhouse_core::session::Session;
 use roundhouse_fleet::EchoFrontierClient;
-use roundhouse_server::{EchoLocalExecutor, Engine, EngineConfig};
+use roundhouse_server::{Admission, EchoLocalExecutor, Engine, EngineConfig};
 use roundhouse_store_redis::RedisSessionStore;
 use roundhouse_store_redis::test_support::connect_from_env;
 
@@ -68,6 +68,7 @@ async fn a_session_survives_the_process_that_created_it() {
                     &session_id,
                     TurnId::new(format!("turn-{turn}")),
                     vec![Item::user_text(format!("Step {turn}"))],
+                    &Admission::open(),
                 )
                 .await
                 .unwrap();
@@ -85,6 +86,7 @@ async fn a_session_survives_the_process_that_created_it() {
             &session_id,
             TurnId::new("turn-3"),
             vec![Item::user_text("Step 3")],
+            &Admission::open(),
         )
         .await
         .unwrap();
@@ -98,6 +100,7 @@ async fn a_session_survives_the_process_that_created_it() {
             &session_id,
             TurnId::new("turn-1"),
             vec![Item::user_text("Step 1")],
+            &Admission::open(),
         )
         .await
         .unwrap();

@@ -11,7 +11,10 @@
 //! Two properties of this API decide everything else here. A client re-sends the
 //! *whole* conversation on every turn — `previous_response_id` is a websocket
 //! feature, so an HTTP client has nowhere to keep a cursor — and it names the
-//! conversation with `prompt_cache_key`, which is its own session id. Against an
+//! conversation with `prompt_cache_key`, which is its own session id. (A
+//! configured deployment resolves that name inside the caller's namespace
+//! rather than taking it verbatim — see [`Compat::namespaced_key`] — because a
+//! name the client chooses is a name two clients can choose.) Against an
 //! append-only log the resent history is not input: it is a claim about what the
 //! session already contains. The handler checks that claim as a prefix and
 //! admits only the suffix, which is what keeps one client session on one
@@ -30,13 +33,14 @@
 //! client, it drops what it does not recognize, and the terminal event closes
 //! the body before anything could follow it anyway.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::convert::Infallible;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -46,18 +50,23 @@ use serde_json::Value;
 use tokio::task::JoinHandle;
 
 use roundhouse_core::context::Tokenizer;
-use roundhouse_core::event::{SessionEvent, SessionEventKind};
+use roundhouse_core::control::Principal;
+use roundhouse_core::event::{IncompleteReason, SessionEvent, SessionEventKind};
 use roundhouse_core::ids::{ResponseId, SessionId, TurnId};
-use roundhouse_core::item::Item;
+use roundhouse_core::item::{Item, ItemContent};
 use roundhouse_core::store::SessionStore;
 
+use crate::control_config::ControlPlane;
+use crate::conversations::Conversations;
+use crate::dialect::ClientDialect;
 use crate::engine::Engine;
 use crate::http::{ApiError, LogTail, POLL_INTERVAL, READ_BATCH, parse_body, store_error};
 
 mod wire;
 use wire::{
-    canonicalize, completed_frame, created_frame, delta_frame, failed_frame, incomplete_frame,
-    item_added_frame, item_done_frame, turn_id_for,
+    EmittedCall, canonicalize, completed_frame, created_frame, delta_frame, failed_frame,
+    incomplete_frame, item_added_frame, item_done_frame, tool_call_added_frame,
+    tool_call_done_frame, turn_id_for,
 };
 
 /// Engine and store handles, plus this node's cache-key bindings.
@@ -68,14 +77,15 @@ use wire::{
 struct Compat<S: SessionStore, T: Tokenizer + Clone> {
     engine: Arc<Engine<S, T>>,
     store: Arc<S>,
-    /// How many times each cache key's history has failed the prefix check.
+    /// Who may drive this surface, and under what session namespace.
+    plane: Arc<ControlPlane>,
+    /// Which session this node binds a client's cache key to.
     ///
-    /// Node-local, like the turn gates in [`Engine`] and for the same reason:
-    /// this is process state standing in for a durable mapping the Redis store
-    /// will own. Until then a client that reconnects to a different node keeps
-    /// its cache key and loses only its generation, which re-derives on the
-    /// first request that disagrees with the log.
-    generations: Arc<Mutex<HashMap<String, u32>>>,
+    /// Shared with the MCP control surface rather than owned here, which is why
+    /// it is a constructor argument: an agent that narrows the routing of
+    /// conversation `main` and a turn that then arrives on `main` have to reach
+    /// one session id, generation and all. See [`Conversations`].
+    conversations: Arc<Conversations>,
 }
 
 impl<S: SessionStore, T: Tokenizer + Clone> Clone for Compat<S, T> {
@@ -83,17 +93,29 @@ impl<S: SessionStore, T: Tokenizer + Clone> Clone for Compat<S, T> {
         Self {
             engine: Arc::clone(&self.engine),
             store: Arc::clone(&self.store),
-            generations: Arc::clone(&self.generations),
+            plane: Arc::clone(&self.plane),
+            conversations: Arc::clone(&self.conversations),
         }
     }
 }
 
-/// The compatibility surface's routes.
+/// The compatibility surface's route, gated by a control plane.
 ///
 /// Separate from [`http::router`](crate::http::router) rather than folded into
 /// it: the two speak different vocabularies over the same log, and merging them
-/// into one `Router` is the composition root's decision to make.
-pub fn responses_router<S, T>(engine: Arc<Engine<S, T>>, store: Arc<S>) -> Router
+/// into one `Router` is the composition root's decision to make. One
+/// constructor with a required plane, for the reason given there.
+///
+/// `conversations` is required for the same reason the plane is, and it is
+/// supplied rather than minted here because the MCP surface reads the same
+/// table: a router that made its own would be a second answer to "which session
+/// is `main`?", and the two would agree only until a client edited its history.
+pub fn responses_router<S, T>(
+    plane: Arc<ControlPlane>,
+    engine: Arc<Engine<S, T>>,
+    store: Arc<S>,
+    conversations: Arc<Conversations>,
+) -> Router
 where
     S: SessionStore,
     T: Tokenizer + Clone + Send + Sync + 'static,
@@ -103,7 +125,8 @@ where
         .with_state(Compat {
             engine,
             store,
-            generations: Arc::new(Mutex::new(HashMap::new())),
+            plane,
+            conversations,
         })
 }
 
@@ -143,12 +166,21 @@ struct ResponsesRequest {
 /// no round trip and creates no session.
 async fn create_response<S, T>(
     State(state): State<Compat<S, T>>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError>
 where
     S: SessionStore,
     T: Tokenizer + Clone + Send + Sync + 'static,
 {
+    // Before the body is even read: an unauthenticated request must cost this
+    // process a hash lookup and nothing else, and must not be able to name a
+    // session — which is what parsing the body would let it do.
+    //
+    // The admission rather than the principal alone: one lookup answers both
+    // who pays and what may be routed to, and the policy is fixed here for the
+    // whole turn rather than re-read during it.
+    let admission = state.plane.turn_admission(&headers)?;
     let request: ResponsesRequest = parse_body(&body)?;
     if !request.stream {
         return Err(ApiError::unprocessable(
@@ -169,7 +201,7 @@ where
 
     let claimed = canonicalize(&request.instructions, &request.input)?;
     let turn_id = turn_id_for(&claimed);
-    let (session_id, input) = state.bind(cache_key, claimed).await?;
+    let (session_id, input) = state.bind(&admission.principal, cache_key, claimed).await?;
 
     // Read before the spawn, for the reason `http` gives: an event appended
     // between this read and the start of the turn would fall outside the
@@ -184,9 +216,10 @@ where
         let engine = Arc::clone(&state.engine);
         let session_id = session_id.clone();
         let turn_id = turn_id.clone();
+        let admission = admission.clone();
         async move {
             engine
-                .run_turn(&session_id, turn_id, input)
+                .run_turn(&session_id, turn_id, input, &admission)
                 .await
                 .map(|_| ())
                 .map_err(|error| error.to_string())
@@ -201,6 +234,10 @@ where
         queued: VecDeque::new(),
         item_open: false,
         text: String::new(),
+        // Read once and carried, rather than consulted per frame: a
+        // reconfiguration must not be able to change a namespace half way
+        // through a response the client is still reading.
+        dialect: state.plane.client_dialect().clone(),
         phase: Phase::Tailing,
     };
 
@@ -225,10 +262,14 @@ impl<S: SessionStore, T: Tokenizer + Clone> Compat<S, T> {
     /// engine's per-session gate keeps the log itself consistent regardless.
     async fn bind(
         &self,
+        principal: &Principal,
         cache_key: &str,
         claimed: Vec<Item>,
     ) -> Result<(SessionId, Vec<Item>), ApiError> {
-        let session_id = self.bound_session(cache_key, self.generation(cache_key));
+        // Computed once and used for both the fork counter and the session id,
+        // so the two cannot key on different strings. See [`Conversations`].
+        let key = self.namespaced_key(principal, cache_key);
+        let session_id = self.conversations.bind(principal, &key);
         self.create(&session_id).await?;
         if let Some(delta) = suffix_after(&self.stored_items(&session_id).await?, &claimed) {
             return Ok((session_id, delta));
@@ -246,43 +287,27 @@ impl<S: SessionStore, T: Tokenizer + Clone> Compat<S, T> {
         // next turn is priced cold. That is the conservative direction — a
         // ledger that claimed a warm prefix for a conversation that just
         // changed shape would be claiming a cache hit nobody can serve.
-        let session_id = self.bound_session(cache_key, self.next_generation(cache_key));
+        let session_id = self.conversations.fork(principal, &key);
         self.create(&session_id).await?;
         Ok((session_id, claimed))
     }
 
-    /// This node's session id for a cache key at a given generation.
+    /// The client's cache key inside its caller's namespace.
     ///
-    /// Generation zero is the cache key verbatim, so a session survives a
-    /// process restart that loses the generation map: the common case is a
-    /// conversation that never forked, and it re-binds to the same log.
-    fn bound_session(&self, cache_key: &str, generation: u32) -> SessionId {
-        match generation {
-            0 => SessionId::new(cache_key),
-            n => SessionId::new(format!("{cache_key}#g{n}")),
-        }
-    }
-
-    /// The generation this cache key is currently bound to.
+    /// A cache key is chosen by the client and nothing stops two of them
+    /// choosing `main`. Before namespacing, both got the session called `main`:
+    /// one log, one lease, one warm prefix, and each tenant's conversation
+    /// visible in the other's prompt.
     ///
-    /// Read on every request, not just after a fork: a rebound key stays
-    /// rebound, and starting each request from generation zero would compare
-    /// every later turn against the history the client already abandoned and
-    /// fork again, one dead session per turn.
-    fn generation(&self, cache_key: &str) -> u32 {
-        self.generations
-            .lock()
-            .expect("generation map poisoned")
-            .get(cache_key)
-            .copied()
-            .unwrap_or(0)
-    }
-
-    fn next_generation(&self, cache_key: &str) -> u32 {
-        let mut generations = self.generations.lock().expect("generation map poisoned");
-        let generation = generations.entry(cache_key.to_string()).or_insert(0);
-        *generation += 1;
-        *generation
+    /// Deferred to [`ControlPlane::qualify`] rather than spelled here, because
+    /// the id this mints is the id the native surface's namespace check will
+    /// later be asked about: minting and checking are one function pair, and
+    /// two spellings of the convention is how a namespace stops being one. The
+    /// prefix it produces is unambiguous because a project or user id may not
+    /// contain `/` — the config's slug rule is what buys that, and it is why
+    /// the rule is at the config boundary rather than here.
+    fn namespaced_key(&self, principal: &Principal, cache_key: &str) -> String {
+        self.plane.qualify(principal, cache_key)
     }
 
     async fn create(&self, session_id: &SessionId) -> Result<(), ApiError> {
@@ -377,6 +402,21 @@ enum Step {
     End,
 }
 
+/// An item this response emitted, in the two shapes a response can emit one.
+///
+/// An enum rather than two predicates because the choice is exclusive and the
+/// exclusivity is load-bearing: an item is a call or a message, never both, and
+/// a stream that projected it twice would hand a client one answer in two
+/// shapes. Named here rather than in [`wire`] because what it decides is which
+/// frames to build, not how to build them.
+enum Emitted<'a> {
+    /// A synthetic tool call — the steered turn's outcome B.
+    Call(EmittedCall<'a>),
+    /// Assistant text committed whole, with no deltas behind it — the halted
+    /// turn's outcome C.
+    Message(&'a str),
+}
+
 /// Streams one turn as a Responses API response.
 ///
 /// The turn runs in a task this follower never aborts, for the reason
@@ -399,6 +439,9 @@ struct ResponsesFollower<S: SessionStore> {
     item_open: bool,
     /// Deltas so far, which `response.output_item.done` repeats in full.
     text: String,
+    /// How an emitted tool call is spelled for this client, fixed for the life
+    /// of the response. See [`ClientDialect`].
+    dialect: ClientDialect,
     phase: Phase,
 }
 
@@ -509,10 +552,79 @@ impl<S: SessionStore> ResponsesFollower<S> {
             | SessionEventKind::ResponseIncomplete { response_id, .. } => {
                 self.response_id.as_ref() == Some(response_id)
             }
+            // Claimed exactly when there is something to project, asked
+            // through the one predicate `project` renders from. See
+            // [`Self::emitted`].
+            SessionEventKind::ItemAppended { item } => self.emitted(item).is_some(),
+            // The validate loop's three kinds belong to no response — they
+            // answer `None` from `response_id()` — so no stream claims them.
+            // That is what keeps this deployment's own bookkeeping off a
+            // client's wire: a side call is money nobody asked us to spend and
+            // a verdict is a decision, and neither is an answer to the turn
+            // being streamed.
             SessionEventKind::SessionCreated { .. }
-            | SessionEventKind::ItemAppended { .. }
             | SessionEventKind::Routed { .. }
+            | SessionEventKind::SideCallCompleted { .. }
+            | SessionEventKind::SideCallAbandoned { .. }
+            | SessionEventKind::ValidationDecided { .. }
             | SessionEventKind::Error { .. } => false,
+        }
+    }
+
+    /// What *this response* emitted as an item, if this entry is one.
+    ///
+    /// One predicate rather than a condition in [`Self::concerns`] and a
+    /// matching one in [`Self::project`]. The first draft had both, and the
+    /// duplication was not merely untidy: with the narrowing written twice,
+    /// neither copy was load-bearing on its own, so a test that removed one
+    /// stayed green and the narrowness claim was unfalsifiable. Asking once
+    /// makes "claimed" and "projected" the same answer by construction —
+    /// there is no entry this stream claims and then silently drops.
+    ///
+    /// **Provenance is the question both arms ask**, and it is a real choice
+    /// rather than a formality: a replay re-reads the whole log, so every item
+    /// this session ever emitted passes through here, and only this response's
+    /// may go out. An item a client sent never has a stamp at all, because
+    /// canonicalization sets `None` on everything on the input path.
+    ///
+    /// The two arms then differ in what else they have to be sure of:
+    ///
+    /// - **A call** needs nothing more. Only a `ToolCall` has a `call_id`, a
+    ///   `name` and `arguments` to render, so the frame builders would not
+    ///   compile against anything else.
+    /// - **A message** needs `item_open` to be false, and that is the whole of
+    ///   the narrowing. An ordinary dispatched turn puts its answer on the wire
+    ///   through the delta path and *then* commits the same text as an item, so
+    ///   claiming it here too would emit a second
+    ///   `response.output_item.done` for one message — the answer arriving
+    ///   twice. `item_open` is true exactly when a delta has already announced
+    ///   that item, so the only message this arm ever claims is one no delta
+    ///   preceded: the validate loop's halt (outcome C), whose guidance text is
+    ///   committed whole and never streamed. Before this arm existed a halted
+    ///   turn streamed `created` then `completed` with no text at all — the
+    ///   correction sat in the log and the agent, whose loop the halt is meant
+    ///   to end, was handed an empty answer.
+    fn emitted<'a>(&'a self, item: &'a Item) -> Option<Emitted<'a>> {
+        let response_id = item.response_id.as_ref()?;
+        if self.response_id.as_ref() != Some(response_id) {
+            return None;
+        }
+        match &item.content {
+            ItemContent::ToolCall {
+                call_id,
+                name,
+                arguments,
+            } => Some(Emitted::Call(EmittedCall {
+                dialect: &self.dialect,
+                response_id,
+                call_id,
+                name,
+                arguments,
+            })),
+            ItemContent::Text { text } if !self.item_open && !text.is_empty() => {
+                Some(Emitted::Message(text))
+            }
+            ItemContent::Text { .. } | ItemContent::ToolResult { .. } => None,
         }
     }
 
@@ -548,17 +660,92 @@ impl<S: SessionStore> ResponsesFollower<S> {
                 self.queued.push_back(completed_frame(response_id, usage));
                 Step::End
             }
+            // A refusal is not a truncated answer. This dialect has two
+            // terminal shapes for a response that produced none — `incomplete`
+            // means the model stopped short, `failed` means the request was
+            // not served — and a client that read `response.incomplete` for a
+            // refusal would report a model that ran out of room. The log's own
+            // vocabulary is finer than the wire's here, so this is the one
+            // place a reason is translated rather than forwarded.
+            //
+            // Two reasons land on `failed`, and they are the two under which
+            // nothing was dispatched at all. They keep separate messages
+            // because the remedies are opposite: a policy refusal is answered
+            // by an operator widening a policy and never by retrying, and a
+            // budget refusal is answered by an admin raising a limit — or by
+            // waiting for the window to roll — after which the identical
+            // request succeeds. Every remaining reason really is an attempt
+            // that stopped, and forwards unchanged.
+            SessionEventKind::ResponseIncomplete {
+                response_id,
+                reason:
+                    reason @ (IncompleteReason::PolicyRefused | IncompleteReason::BudgetExhausted),
+                // Nothing was dispatched, so there is nothing to report; and
+                // this dialect's `failed` frame has no place to put usage even
+                // when there is some. Bound by name so a field added here
+                // cannot be dropped without someone reading this line.
+                usage: _,
+            } => {
+                let message = match reason {
+                    IncompleteReason::BudgetExhausted => {
+                        "this project's budget is spent and it is configured to refuse rather \
+                         than serve locally"
+                    }
+                    _ => "no target this key may use was admissible for this turn",
+                };
+                self.queued
+                    .push_back(failed_frame(Some(response_id), message));
+                Step::End
+            }
             SessionEventKind::ResponseIncomplete {
                 response_id,
                 reason,
-                ..
+                // Deliberately not forwarded: `response.incomplete` carries no
+                // usage in this dialect, and the log is where the accounting
+                // for a truncated turn is read from.
+                usage: _,
             } => {
                 self.queued.push_back(incomplete_frame(response_id, reason));
                 Step::End
             }
+            // A tool call this response emitted, which `concerns` has already
+            // narrowed to exactly that. Two frames, both carrying the whole
+            // item: the client dispatches off the `done`, and no argument
+            // deltas go out at all because the pinned parser traces and drops
+            // them — so anything not in these two frames is not on the wire.
+            //
+            // `item_open` is deliberately untouched. It tracks the *message*
+            // item, whose `done` the completion below emits; a steered turn
+            // produces no deltas and so leaves it false, which is what makes
+            // the four-frame sequence four frames rather than five with an
+            // empty message on the end.
+            SessionEventKind::ItemAppended { item } => {
+                // Built before either is queued, because the borrow is on this
+                // follower and the queue needs it back mutably. Each pair is
+                // built together for a second reason too: a client announced
+                // one item and handed another has no way to reconcile them.
+                let frames = match self.emitted(item) {
+                    Some(Emitted::Call(call)) => {
+                        Some([tool_call_added_frame(&call), tool_call_done_frame(&call)])
+                    }
+                    // A halt: guidance committed whole, with no deltas behind
+                    // it. `item_open` stays false — it tracks the *streamed*
+                    // message, whose `done` the completion below emits — so
+                    // the completion adds only its own frame and the sequence
+                    // is the same four a steered turn is.
+                    Some(Emitted::Message(text)) => {
+                        Some([item_added_frame(), item_done_frame(text)])
+                    }
+                    None => None,
+                };
+                self.queued.extend(frames.into_iter().flatten());
+                Step::Continue
+            }
             SessionEventKind::SessionCreated { .. }
-            | SessionEventKind::ItemAppended { .. }
             | SessionEventKind::Routed { .. }
+            | SessionEventKind::SideCallCompleted { .. }
+            | SessionEventKind::SideCallAbandoned { .. }
+            | SessionEventKind::ValidationDecided { .. }
             | SessionEventKind::Error { .. } => Step::Continue,
         }
     }
@@ -596,7 +783,7 @@ impl<S: SessionStore> ResponsesFollower<S> {
 
 #[cfg(test)]
 mod tests {
-    use roundhouse_core::item::{ItemContent, Role};
+    use roundhouse_core::item::Role;
 
     use super::*;
 

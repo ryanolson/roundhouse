@@ -6,6 +6,7 @@ resolver = "3"
 members = [
     "crates/roundhouse-core",
     "crates/roundhouse-fleet",
+    "crates/roundhouse-mcp",
     "crates/roundhouse-store-redis",
     "crates/roundhouse-server",
 ]
@@ -18,6 +19,7 @@ license = "Apache-2.0"
 [workspace.dependencies]
 roundhouse-core = { path = "crates/roundhouse-core" }
 roundhouse-fleet = { path = "crates/roundhouse-fleet" }
+roundhouse-mcp = { path = "crates/roundhouse-mcp" }
 roundhouse-store-redis = { path = "crates/roundhouse-store-redis" }
 
 # Dynamo crates, pinned to an upstream commit of ai-dynamo/dynamo.
@@ -55,10 +57,22 @@ anyhow = "1"
 async-trait = "0.1"
 axum = { version = "=0.8.4", features = ["macros", "ws"] }
 futures = "0.3"
+# Control-plane key hashing (`roundhouse-server/src/control_config.rs`). Both
+# already resolve in the tree transitively (via `redis`/`reqwest`'s TLS
+# stacks), so declaring them directly adds no new crate to the build, only a
+# name the control plane can depend on deliberately rather than by accident of
+# some other crate's graph. SHA-256 rather than a slow KDF: the rationale is
+# recorded in `control_config.rs`, not here, because that is where a future
+# reader would otherwise "fix" it.
+hex = "0.4"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
+sha2 = "0.10"
 thiserror = "2.0.17"
-tokio = { version = "=1.48.0", features = ["full"] }
+# Caret, resolving to 1.48.0 today: the pinned Dynamo rev's `dynamo-mocker`
+# pins tokio exactly, and an exact pin here would just restate that constraint
+# where nobody can see whose it is. When Dynamo relaxes, this floats.
+tokio = { version = "1.48", features = ["full"] }
 tokio-stream = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
@@ -72,11 +86,30 @@ reqwest = { version = "0.12.24", default-features = false, features = [
     "http2",
     "charset",
 ] }
-redis = { version = "0.27", default-features = false, features = [
+# 1.2, not latest: redis 1.3.0+ carries a target-gated `tokio ^1.51`
+# requirement (wasm support) that the resolver unifies workspace-wide, and the
+# pinned Dynamo rev's `dynamo-mocker` pins `tokio = "=1.48.0"` exactly — as
+# does Dynamo main today. The day Dynamo's tokio pin reaches 1.51, this moves
+# to the newest 1.x in a one-line change; until then 1.2.4 is the newest that
+# resolves, and it already carries the 1.0 line's fixes (default async
+# timeouts, the ConnectionManager retry fix, the TCP-deadlock fix, idempotent
+# stream producers).
+redis = { version = "1.2", default-features = false, features = [
     "tokio-rustls-comp",
     "streams",
     "script",
     "connection-manager",
+] }
+# Tests only (`roundhouse-store-redis` dev-dependency): an embedded Lua 5.4, so
+# the spend ledger's Lua prelude can be *executed* against the same table of
+# calendar cases the Rust port is executed against. Without it the two ports
+# only agree where a live Redis is reachable, which is exactly where the suite
+# is ignore-gated. `vendored` builds Lua from the bundled C source rather than
+# linking a system liblua: no OpenSSL, no pkg-config, and the same answer on
+# every machine that has a C compiler.
+mlua = { version = "0.12", default-features = false, features = [
+    "lua54",
+    "vendored",
 ] }
 
 # `zmq` is pulled in transitively by `dynamo-kv-router/standalone-selection`.

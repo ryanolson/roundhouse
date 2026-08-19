@@ -13,14 +13,28 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::event::{IncompleteReason, SessionEvent, SessionEventKind, SessionObserver, Usage};
+use crate::control::{FrontierHistory, Principal};
+use crate::event::{
+    ControlRecord, IncompleteReason, NotRunReason, PlaceboTiming, SessionEvent, SessionEventKind,
+    SessionObserver, Usage, ValidationOutcome,
+};
 use crate::ids::{ResponseId, SessionId, TurnId};
-use crate::item::Item;
-use crate::routing::{CacheLedger, DecisionRecord, Target};
+use crate::item::{Item, ItemContent};
+use crate::routing::{CacheLedger, DecisionRecord, ProviderPricing, Target};
 use crate::store::{Lease, SessionStore, StoreError};
+use crate::validate::{Arm, EscalationOverrides, SteerAction};
 
 /// How many events to pull per replay batch.
 const REPLAY_BATCH: usize = 1024;
+
+/// How many turns of billing the cost-anomaly signal compares against.
+///
+/// A window rather than the whole history, and small on purpose: the question
+/// is "is this turn unlike *this session's recent work*", and a session's early
+/// turns are frequently a different kind of work from its later ones. Sixteen
+/// `u64`s is also strictly less state than one conversation item, which is what
+/// makes keeping it in the projection cheaper than deriving it on demand.
+const TURN_TOKEN_WINDOW: usize = 16;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
@@ -61,10 +75,58 @@ struct CompletedTurn {
     usage: Usage,
 }
 
-/// Where a dispatch went and how much prompt it carried.
+/// Where a dispatch went, how much prompt it carried, and at what price.
 struct PendingRouting {
     target: Target,
     isl_tokens: u64,
+    /// The rate card the decision recorded. See
+    /// [`DecisionRecord::rate_card`] for why a settle reads the log's card and
+    /// never a live one.
+    rate_card: Option<ProviderPricing>,
+}
+
+/// A response that terminated, and everything needed to charge it for.
+///
+/// The spend ledger's view of a turn, projected from the log rather than
+/// handed across from whatever produced it: the repair that re-drives a lost
+/// settle has only the log to work from, so if the live settle read its inputs
+/// from anywhere else the two would be settling from two different accounts of
+/// the same turn.
+///
+/// **The price is one of those inputs**, which it was not at first. A settle
+/// priced against the running process's catalog is priced against a file an
+/// operator edits, so the two moments really could see different numbers — and
+/// a repair against a catalog that had *dropped* the model could see no number
+/// at all, which failed the settle, which failed every turn of the session
+/// after it. [`Self::rate_card`] is that hole closed at the seam it was open
+/// at: the card travels in the log beside the target it prices.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TerminalSettlement {
+    pub response_id: ResponseId,
+    /// The log sequence number of the terminal event, and half of the
+    /// idempotency key a settle is applied under.
+    pub seq: u64,
+    /// Where the turn was dispatched.
+    ///
+    /// `None` for a response that terminated before any routing decision was
+    /// recorded — a refusal, or a failure while pricing the options. That turn
+    /// reached no provider and so owes nobody anything, which makes the
+    /// absence a fact rather than a missing value.
+    pub target: Option<Target>,
+    /// The rate card that was in force when the turn was routed, as its
+    /// decision recorded it — the price half of "projected from the log rather
+    /// than handed across from whatever produced it".
+    ///
+    /// Carried beside the target rather than folded into it, because the two
+    /// absences mean different things and a settle has to tell them apart: no
+    /// target is a turn that reached nobody and owes nothing, while a frontier
+    /// target with no card is a turn routed before the card was recorded, which
+    /// no process alive can price. See [`DecisionRecord::rate_card`].
+    pub rate_card: Option<ProviderPricing>,
+    /// What the terminal event reported, estimate or measurement alike. An
+    /// estimate is what a provider that reported nothing gets charged on, and
+    /// it is charged exactly as a measurement would be.
+    pub usage: Usage,
 }
 
 /// State derived from the event log.
@@ -96,7 +158,168 @@ pub struct SessionState {
     /// because over-claiming warmth is the exact mispricing this fold exists
     /// to prevent.
     pending_routings: HashMap<ResponseId, PendingRouting>,
+    /// Which routed turns went to a hosted model, in log order.
+    ///
+    /// Folded at `Routed` and *not* at the terminal event, which is the
+    /// opposite of the rule `pending_routings` follows one field up, so the
+    /// difference is worth stating. The cache ledger asks "did the provider
+    /// process this prompt?", and a dispatch that failed on the way out is no
+    /// evidence of that. A cadence asks "how often did this session reach for
+    /// a hosted model?", and a dispatch that failed on the way out is exactly
+    /// that. Counting only successes would let a provider outage multiply the
+    /// frontier traffic of every session retrying through it, at the moment
+    /// the knob is most supposed to hold.
+    pub frontier_history: FrontierHistory,
+    /// The most recent response to terminate, priced-ready.
+    ///
+    /// **One entry rather than a list, and that is a claim about the log
+    /// rather than a convenience.** A session's turns are serialized — the
+    /// engine gates them per session within a process and the store's lease
+    /// fences them across processes — and every turn applies its spend before
+    /// the next is admitted. So whenever a session is opened, at most one
+    /// terminal event can still be unsettled, and it is the last one. Keeping
+    /// the whole history here would be an unbounded second copy of the log,
+    /// held to support a repair that can only ever concern its final entry.
+    ///
+    /// `None` until a response terminates, which is also the honest answer for
+    /// a session whose only turns are still open.
+    last_settlement: Option<TerminalSettlement>,
+    /// Steers this deployment emitted that no client has answered yet, keyed
+    /// by `call_id` and valued by the log timestamp of the `ItemAppended` that
+    /// opened each one.
+    ///
+    /// The timestamp is what makes fulfilment latency derivable from the
+    /// projection and the log alone — the closing item's own `at_ms` minus
+    /// this one — without a second table to keep in step with the first.
+    ///
+    /// Filled by an `ItemAppended` whose item is a `ToolCall` *bearing a
+    /// response id*, and cleared by an `ItemAppended` whose item is a
+    /// `ToolResult` naming the same call. Provenance rather than shape is what
+    /// selects the opening item: everything on the input path canonicalizes
+    /// with no response id, so a client cannot open a steer by sending a tool
+    /// call. One writer, one event kind, no second source of truth.
+    ///
+    /// `pub(crate)` rather than `pub` because its consumer is M6's trigger —
+    /// the open-steer exclusion that stops a steer re-triggering the
+    /// validation that emitted it. It ships with M4 anyway because it is a
+    /// fact about M4's items: the events that fill it are emitted here, and a
+    /// projection added later against an older log is a projection nobody has
+    /// replayed.
+    pub(crate) open_steers: HashMap<String, u64>,
+    /// The most recent routing decision, whether or not its response has
+    /// terminated.
+    ///
+    /// A different question from [`Self::pending_routings`] one field up, which
+    /// is why it is a different field rather than a read of that one.
+    /// `pending_routings` asks *what evidence is still outstanding* and is
+    /// emptied at the terminal event; this asks *where did the last turn go*,
+    /// which is exactly as true after the turn ends as during it. Deriving one
+    /// from the other would answer "this session has never been routed" for
+    /// every session between turns.
+    ///
+    /// The whole record rather than the target: its consumer renders the
+    /// rationale, the policy digest and the budget state as well — see
+    /// `explain_last_route` in `roundhouse-mcp`, the audit trail as a tool.
+    last_decision: Option<DecisionRecord>,
     pub last_seq: u64,
+
+    // ---- The validate loop's projections. -------------------------------
+    //
+    // Every one of these is a fold of the log and never a counter kept beside
+    // it. That is the same rule `FrontierHistory` follows and it is load-bearing
+    // for the same reason twice over: a successor process that replays a log has
+    // to arrive at the trigger's answer, *and* the arm comparison is only
+    // meaningful if a replay of a session reaches the decision the original
+    // process reached. A second writer anywhere here would make "fold equals
+    // log" false exactly where the experiment reads.
+    /// Which arm of the validate experiment this session belongs to.
+    ///
+    /// `None` for a log written before the experiment: not enrolled, which the
+    /// occupant reads as "do not validate". See
+    /// [`SessionEventKind::SessionCreated`]'s `arm`.
+    pub(crate) arm: Option<Arm>,
+    /// Billable tokens this session's turns have reported since the last
+    /// validation, or since it opened.
+    ///
+    /// The self-scaling half of the trigger: a validator budgeted as a fraction
+    /// of spend-since-last-check needs no per-workload cadence to tune.
+    ///
+    /// Side-call tokens are deliberately absent. They are this deployment's own
+    /// spend, not the conversation's, and counting them would let the act of
+    /// checking bring the next check forward. Held structurally rather than by
+    /// care: only a turn that recorded a
+    /// [`Routed`](SessionEventKind::Routed) folds its usage in here, and a
+    /// completing interjection records none — which is what keeps the judge's
+    /// own billing out even though it arrives on an ordinary
+    /// `ResponseCompleted`.
+    ///
+    /// Reset when a validation is *bought* and not merely decided: a check that
+    /// reached no judge leaves the evidence standing, so a session whose judge
+    /// was down validates as soon as it is back rather than having to earn the
+    /// budget again.
+    pub(crate) tokens_since_last_validation: u64,
+    /// When the last validation was decided, on the log's own clock.
+    pub(crate) last_validation_at_ms: Option<u64>,
+    /// The timestamp of the most recent event, whatever kind it was.
+    ///
+    /// What makes the cooldown computable without a clock argument: the turn
+    /// being decided has already committed its `TurnStarted`, so this is
+    /// "now" as the log understands it — and a replay reads the same value the
+    /// original process did, which a wall clock would not.
+    pub(crate) last_event_at_ms: u64,
+    /// Turns in a row that this deployment interrupted.
+    ///
+    /// Counted at the terminal event and reset there, so it means "trailing
+    /// interrupted turns" rather than "interruptions ever". A turn the
+    /// validator let through resets it, which is what stops the cap from
+    /// disabling validation for the rest of a long session.
+    pub(crate) consecutive_interventions: u32,
+    /// Validations this session has bought.
+    ///
+    /// Bought, not decided: a judged outcome and the placebo arm's own
+    /// non-consultation count, and the five ways a validation can reach no
+    /// judge do not. This is the session's lifetime allowance and the counter
+    /// only grows, so charging a judge outage to it would close the trigger's
+    /// gate for good on a session that never got a check.
+    pub(crate) validations_run: u32,
+    /// The turn index at which a client's input last closed an open steer.
+    ///
+    /// The hysteresis rule's evidence. By the time the interjection seam runs,
+    /// the turn's input is already committed, so `open_steers` has *already*
+    /// been cleared by the fulfilling result — asking "is a steer open" would
+    /// answer no on exactly the turn the rule is about. Recording the turn it
+    /// closed on is what makes the question answerable at all.
+    pub(crate) steer_fulfilled_on_turn: Option<u64>,
+    /// Billable tokens per *dispatched* terminated turn, oldest first, bounded
+    /// to [`TURN_TOKEN_WINDOW`].
+    ///
+    /// The trailing distribution the cost-anomaly signal compares each turn
+    /// against, which is why only dispatched turns are in it: a completing
+    /// interjection's usage is the judge's own side call, and a side call in
+    /// this window makes the next ordinary turn look cheap by comparison and
+    /// the next check correspondingly less likely.
+    pub(crate) turn_tokens: Vec<u64>,
+    /// A narrowing the validate loop asked for, and how many turns of it are
+    /// left.
+    ///
+    /// Held in the projection rather than handed across the interjection seam
+    /// in a side channel, because it outlives the turn that decided it: the
+    /// turns it applies to read it from the same fold a replay would build.
+    escalation: Option<ActiveEscalation>,
+    /// Whether the turn currently in flight was interrupted by the validator.
+    ///
+    /// Set when the decision is committed and consumed at the terminal event,
+    /// which is the one place every turn passes through exactly once.
+    turn_intervened: bool,
+}
+
+/// A narrowing the validate loop asked for, with its remaining life.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ActiveEscalation {
+    pub overrides: EscalationOverrides,
+    /// Turns still to be served under it, counting from and including the turn
+    /// the escalation was decided on.
+    pub turns_remaining: u32,
 }
 
 impl SessionState {
@@ -106,8 +329,54 @@ impl SessionState {
     /// fail to update derived state.
     fn apply(&mut self, event: &SessionEvent) {
         self.last_seq = event.seq;
+        // Above the match, and from every kind rather than only the ones that
+        // cost money: this is the clock the cooldown is measured on, and a
+        // session whose last event was an error an hour ago has been quiet for
+        // an hour.
+        self.last_event_at_ms = event.at_ms;
         match &event.kind {
-            SessionEventKind::ItemAppended { item } => self.items.push(item.clone()),
+            SessionEventKind::ItemAppended { item } => {
+                // The conversation itself is untouched by steering: an emitted
+                // tool call is an ordinary item arriving on the ordinary path,
+                // which is the whole reason this kind was reused rather than a
+                // second item-carrying kind added. A second kind would have
+                // given this fold, the wire layer's stored-items projection and
+                // the context assembler two sources for one conversation, and
+                // the first site to forget the second kind forks every steered
+                // session.
+                self.items.push(item.clone());
+                // The projection beside it, folded from the same event. See
+                // `open_steers`.
+                match &item.content {
+                    ItemContent::ToolCall { call_id, .. } => {
+                        // Provenance, not shape. An item on the input path
+                        // canonicalizes with no response id, so this arm is
+                        // unreachable for anything a client sent — including
+                        // the client's own verbatim resend of the very call it
+                        // is about to answer, which must not re-open the steer
+                        // its output closes.
+                        if item.response_id.is_some() {
+                            self.open_steers.insert(call_id.clone(), event.at_ms);
+                        }
+                    }
+                    ItemContent::ToolResult { call_id, .. } => {
+                        // Keyed on the call id and not on "a result arrived":
+                        // an agent runs its own tools between our turns, and
+                        // closing on any of those would report a steer
+                        // fulfilled that nobody answered.
+                        if self.open_steers.remove(call_id).is_some() {
+                            // Which turn closed it, for the trigger's
+                            // hysteresis. The removal above is what the
+                            // question is really about, and asking `is a steer
+                            // open` at the seam would answer `no` on exactly
+                            // this turn — the input is committed before the
+                            // seam runs.
+                            self.steer_fulfilled_on_turn = Some(self.turn_index);
+                        }
+                    }
+                    ItemContent::Text { .. } => {}
+                }
+            }
             SessionEventKind::TurnStarted {
                 turn_id,
                 response_id,
@@ -119,12 +388,15 @@ impl SessionState {
                 response_id,
                 decision,
             } => {
+                self.frontier_history.record(&decision.chosen);
+                self.last_decision = Some(decision.clone());
                 // Held rather than recorded; see `pending_routings`.
                 self.pending_routings.insert(
                     response_id.clone(),
                     PendingRouting {
                         target: decision.chosen.clone(),
                         isl_tokens: decision.isl_tokens,
+                        rate_card: decision.rate_card,
                     },
                 );
             }
@@ -136,7 +408,13 @@ impl SessionState {
                 // provider stopped holding the prompt, which is what the TTL
                 // runs from — and only under the evidence rule documented on
                 // `pending_routings`.
-                if let Some(routing) = self.pending_routings.remove(response_id) {
+                let routing = self.pending_routings.remove(response_id);
+                // Whether this response ever reached a provider, which is the
+                // same question `last_settlement` keys "owes nobody anything"
+                // on one block down. The validate loop's two token projections
+                // read it too — see below.
+                let dispatched = routing.is_some();
+                if let Some(routing) = &routing {
                     let processed =
                         matches!(event.kind, SessionEventKind::ResponseCompleted { .. })
                             || usage.input_tokens > 0;
@@ -145,6 +423,21 @@ impl SessionState {
                             .record(&routing.target, event.at_ms, routing.isl_tokens);
                     }
                 }
+
+                // The spend ledger's view of the same event, and note that it
+                // is folded under *no* evidence rule: the cache ledger asks
+                // whether a provider processed the prompt, while a settlement
+                // asks what the log says this turn is to be charged. A
+                // dispatch that never reached anyone is priced at zero by
+                // carrying no target, not by being left out — leaving it out
+                // would strand its hold for a whole TTL.
+                self.last_settlement = Some(TerminalSettlement {
+                    response_id: response_id.clone(),
+                    seq: event.seq,
+                    rate_card: routing.as_ref().and_then(|routing| routing.rate_card),
+                    target: routing.map(|routing| routing.target),
+                    usage: usage.clone(),
+                });
 
                 // A turn is only settled once its response terminates, which is
                 // what makes a re-sent turn after a mid-generation crash
@@ -166,12 +459,202 @@ impl SessionState {
                         );
                     }
                 }
+
+                // The validate loop's per-turn bookkeeping, all of it here
+                // because the terminal event is the one place every turn passes
+                // through exactly once — whether it dispatched, was steered, or
+                // was refused.
+
+                // **Only a turn that dispatched bills the conversation.** A
+                // completing interjection's usage is the *judge's* side call —
+                // `complete_with_item` says so, and it is the honest number to
+                // report to a client — but both fields below are about what the
+                // conversation spent. Feeding them the check's own cost lets
+                // the act of checking bring the next check forward, which is
+                // exactly what `tokens_since_last_validation` documents itself
+                // as not doing, and puts a side call into the trailing
+                // distribution the cost-anomaly signal compares ordinary turns
+                // against. `dispatched` is the same evidence the settlement
+                // above keys on: no `Routed`, no provider, nothing the
+                // conversation was billed for.
+                if dispatched {
+                    self.tokens_since_last_validation = self
+                        .tokens_since_last_validation
+                        .saturating_add(usage.total());
+                    self.turn_tokens.push(usage.total());
+                    if self.turn_tokens.len() > TURN_TOKEN_WINDOW {
+                        self.turn_tokens.remove(0);
+                    }
+                }
+                // Trailing interrupted turns, so a turn the validator let
+                // through resets the count. Counting interruptions forever
+                // would disable validation for the rest of any long session
+                // that was ever interrupted twice.
+                if self.turn_intervened {
+                    self.consecutive_interventions =
+                        self.consecutive_interventions.saturating_add(1);
+                } else {
+                    self.consecutive_interventions = 0;
+                }
+                self.turn_intervened = false;
+                self.escalation = self.escalation.and_then(|escalation| {
+                    escalation
+                        .turns_remaining
+                        .checked_sub(1)
+                        .filter(|remaining| *remaining > 0)
+                        .map(|turns_remaining| ActiveEscalation {
+                            turns_remaining,
+                            ..escalation
+                        })
+                });
             }
-            SessionEventKind::SessionCreated { .. }
+            SessionEventKind::ValidationDecided { arm, outcome, .. } => {
+                // **The cooldown is spent by every decision; the cap and the
+                // budget are spent only by a decision that bought something.**
+                //
+                // The cooldown is what stops a session with an open gate
+                // re-dialling a judge that is down on every single turn, so it
+                // has to run whatever the outcome was — a failure is precisely
+                // the case it exists for.
+                //
+                // The other two are the session's *allowance*, and the five
+                // failure reasons bought none of it: no verdict, no action, and
+                // for three of them not even a side call. Charging them would
+                // let a judge outage close `validations_run`'s gate for good
+                // after `max_validations_per_session` turns — permanently,
+                // since the counter only grows — and each no-op would discard
+                // the accumulated token evidence too, so nothing would be left
+                // to fund a check once the judge came back. A session must
+                // validate when the budget returns; that is the whole reason
+                // the gate is a projection of spend rather than a countdown.
+                //
+                // The placebo arm charges: it consults nobody by design, not by
+                // failure, and it is the control the live arm is compared
+                // against. A control that validated far more often than the arm
+                // it controls for is not a control.
+                let bought = match outcome {
+                    ValidationOutcome::Judged { .. } => true,
+                    ValidationOutcome::NotRun {
+                        reason: NotRunReason::PlaceboArm { .. },
+                    } => true,
+                    ValidationOutcome::NotRun {
+                        reason:
+                            NotRunReason::BudgetRefused
+                            | NotRunReason::ReviewBudgetSpent
+                            | NotRunReason::JudgeUnavailable
+                            | NotRunReason::JudgeFailed
+                            | NotRunReason::VerdictUnparseable,
+                    } => false,
+                };
+                self.last_validation_at_ms = Some(event.at_ms);
+                if bought {
+                    self.validations_run = self.validations_run.saturating_add(1);
+                    // The budget the gate spends. Reset here rather than at the
+                    // side call, because what the gate measures is conversation
+                    // spend between checks and a check is not conversation.
+                    self.tokens_since_last_validation = 0;
+                }
+
+                // Only an arm that *acts* has intervened. A Shadow run computed
+                // everything and did nothing, and counting it would make the
+                // observe-only arm suppress its own future observations —
+                // which would quietly destroy the control the experiment leans
+                // on.
+                let action = match outcome {
+                    ValidationOutcome::Judged { action, .. } => Some(action.clone()),
+                    ValidationOutcome::NotRun {
+                        reason:
+                            NotRunReason::PlaceboArm {
+                                timing: PlaceboTiming::Intervened,
+                            },
+                    } => Some(SteerAction::Halt {
+                        reason: String::new(),
+                    }),
+                    ValidationOutcome::NotRun { .. } => None,
+                };
+                if arm.acts()
+                    && let Some(action) = action
+                {
+                    self.turn_intervened |= action.intervenes();
+                    if let SteerAction::Escalate { turns, overrides } = action
+                        && turns > 0
+                    {
+                        self.escalation = Some(ActiveEscalation {
+                            overrides,
+                            turns_remaining: turns,
+                        });
+                    }
+                }
+            }
+            SessionEventKind::SessionCreated { arm, .. } => self.arm = *arm,
+            // Money facts, folded by the metrics layer and not here. This
+            // projection answers "what may this session do next", and what a
+            // side call billed does not bear on that — the *decision* beside it
+            // does, and that is the arm above.
+            SessionEventKind::SideCallCompleted { .. }
+            | SessionEventKind::SideCallAbandoned { .. }
             | SessionEventKind::OutputTextDelta { .. }
             | SessionEventKind::TurnDeduplicated { .. }
             | SessionEventKind::Error { .. } => {}
         }
+    }
+
+    /// Which arm of the validate experiment this session is in, if any.
+    pub fn arm(&self) -> Option<Arm> {
+        self.arm
+    }
+
+    /// Billable tokens reported since the last validation, or since the log
+    /// opened.
+    pub fn tokens_since_last_validation(&self) -> u64 {
+        self.tokens_since_last_validation
+    }
+
+    /// When the last validation was decided, on the log's own clock.
+    pub fn last_validation_at_ms(&self) -> Option<u64> {
+        self.last_validation_at_ms
+    }
+
+    /// The timestamp of the most recent event in the log.
+    pub fn last_event_at_ms(&self) -> u64 {
+        self.last_event_at_ms
+    }
+
+    /// Turns in a row this deployment interrupted.
+    pub fn consecutive_interventions(&self) -> u32 {
+        self.consecutive_interventions
+    }
+
+    /// Validations this session has bought.
+    pub fn validations_run(&self) -> u32 {
+        self.validations_run
+    }
+
+    /// Whether the input already committed for the turn in flight closed a
+    /// steer this deployment emitted.
+    ///
+    /// The trigger's hysteresis rule, and the reason it is a question about a
+    /// *turn index* rather than about `open_steers`: the fulfilling result is
+    /// committed with the turn's input, before the interjection seam runs, so
+    /// the steer is already closed by the time anybody asks.
+    pub fn this_turn_fulfilled_a_steer(&self) -> bool {
+        self.steer_fulfilled_on_turn == Some(self.turn_index)
+    }
+
+    /// Billable tokens per dispatched terminated turn, oldest first. See
+    /// [`Self::turn_tokens`] on why a completing interjection is not one.
+    pub fn recent_turn_tokens(&self) -> &[u64] {
+        &self.turn_tokens
+    }
+
+    /// The narrowing a validation asked for, if one is still in force.
+    ///
+    /// Read by the engine on every turn while it lasts. Returning the overrides
+    /// rather than the record is the same choice the MCP overlay makes: the
+    /// caller wants `ceiling.narrow(&overrides)` and handing it the record
+    /// would invite a second place that decides what an escalation means.
+    pub fn active_escalation(&self) -> Option<EscalationOverrides> {
+        self.escalation.map(|escalation| escalation.overrides)
     }
 
     pub fn completed_response_for(&self, turn_id: &TurnId) -> Option<&ResponseId> {
@@ -180,11 +663,85 @@ impl SessionState {
             .map(|completed| &completed.response_id)
     }
 
+    /// The most recent response to terminate, and what it is to be charged
+    /// for.
+    ///
+    /// The one input the spend ledger's settle takes, both when this turn
+    /// commits its own terminal event and when a successor replays a log whose
+    /// last settle was lost to a crash. See [`Self::last_settlement`] on why
+    /// one entry is enough for both.
+    pub fn last_settlement(&self) -> Option<&TerminalSettlement> {
+        self.last_settlement.as_ref()
+    }
+
     /// Usage reported when `turn_id` completed, for replaying it verbatim.
     pub fn completed_usage_for(&self, turn_id: &TurnId) -> Option<&Usage> {
         self.completed_turns
             .get(turn_id)
             .map(|completed| &completed.usage)
+    }
+
+    /// Where the most recent routed turn went, and why.
+    ///
+    /// `None` for a session whose first turn has not been routed — a session
+    /// that has only ever been steered has no routing decision, which is the
+    /// accurate answer rather than an empty one.
+    pub fn last_decision(&self) -> Option<&DecisionRecord> {
+        self.last_decision.as_ref()
+    }
+
+    /// `call_id`s of steers this deployment emitted that no turn has answered.
+    ///
+    /// Sorted, so two reads of one projection are two identical answers: the
+    /// underlying map has no order, and this is rendered into an agent's
+    /// context by `status`, where a list that reshuffled between calls is a
+    /// list an agent reads as having changed.
+    ///
+    /// The accessor rather than the field: [`Self::open_steers`] stays private
+    /// because it is a fold this module owns, and its two consumers — M5's
+    /// `status` tool and M6's trigger — both want the ids and neither wants the
+    /// timestamps.
+    pub fn open_steer_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.open_steers.keys().cloned().collect();
+        ids.sort();
+        ids
+    }
+
+    /// Rebuild a session's projection from its log, **taking no lease**.
+    ///
+    /// The read-only half of [`Session::open_observed`], which calls it: a
+    /// reader that took the lease would evict the engine it is watching, and
+    /// that rule is why the MCP control surface projects a session through here
+    /// rather than opening one. One replay loop and one fold serve both, so a
+    /// question answered for a reader and the same question answered for the
+    /// engine cannot come back with two answers.
+    pub async fn project<S: SessionStore>(
+        store: &S,
+        session_id: &SessionId,
+        ledger: CacheLedger,
+        observer: Option<&Arc<dyn SessionObserver>>,
+    ) -> Result<Self, SessionError> {
+        let mut state = SessionState {
+            ledger,
+            ..Default::default()
+        };
+        // Replay in batches so a long session does not need the whole log
+        // resident at once.
+        let mut cursor = 0u64;
+        loop {
+            let batch = store.read_events(session_id, cursor, REPLAY_BATCH).await?;
+            if batch.is_empty() {
+                break;
+            }
+            for event in &batch {
+                state.apply(event);
+            }
+            if let Some(observer) = observer {
+                observer.observe(&batch);
+            }
+            cursor = batch.last().map_or(cursor, |event| event.seq);
+        }
+        Ok(state)
     }
 }
 
@@ -252,27 +809,10 @@ impl<S: SessionStore> Session<S> {
             .await?
             .ok_or_else(|| SessionError::NotOwner(session_id.clone()))?;
 
-        let mut state = SessionState {
-            ledger,
-            ..Default::default()
-        };
-
-        // Replay in batches so a long session does not need the whole log
-        // resident at once.
-        let mut cursor = 0u64;
-        loop {
-            let batch = store.read_events(&session_id, cursor, REPLAY_BATCH).await?;
-            if batch.is_empty() {
-                break;
-            }
-            for event in &batch {
-                state.apply(event);
-            }
-            if let Some(observer) = &observer {
-                observer.observe(&batch);
-            }
-            cursor = batch.last().map_or(cursor, |event| event.seq);
-        }
+        // The same replay a lease-free reader performs, so the two cannot
+        // diverge; the lease above is the only thing this adds to it.
+        let state =
+            SessionState::project(store.as_ref(), &session_id, ledger, observer.as_ref()).await?;
 
         Ok(Self {
             store,
@@ -401,9 +941,33 @@ impl<S: SessionStore> Session<S> {
     }
 
     /// Record the session-created event. Safe to call once, at creation.
-    pub async fn record_created(&mut self, model_policy: &str) -> Result<(), SessionError> {
+    ///
+    /// Called where the log is still empty and this handle already holds the
+    /// lease, which is what makes "exactly once" a property of the log rather
+    /// than of anyone's care: a second caller would have to win the lease and
+    /// find `last_seq == 0`, and only one of those can be true at a time.
+    ///
+    /// The principal is taken by reference and not as an `Option`, so a
+    /// `SessionCreated` this method writes always names its payer. That is what
+    /// makes the absent case in the event unambiguous — it can only mean a log
+    /// older than tenancy, never "this deployment forgot".
+    /// `arm` is an `Option` and not a value with a default, and the difference
+    /// is the same one the principal draws: absent means *not enrolled in the
+    /// experiment*, which is a real and correct state for a deployment that has
+    /// not installed the validator. A default arm would enrol every such
+    /// session in a study nobody is running, and the arm comparison would be
+    /// computed against a control group made of sessions that were never
+    /// eligible.
+    pub async fn record_created(
+        &mut self,
+        model_policy: &str,
+        principal: &Principal,
+        arm: Option<Arm>,
+    ) -> Result<(), SessionError> {
         self.commit(vec![SessionEventKind::SessionCreated {
             model_policy: model_policy.to_string(),
+            principal: Some(principal.clone()),
+            arm,
         }])
         .await?;
         Ok(())
@@ -478,22 +1042,109 @@ impl<S: SessionStore> Session<S> {
     }
 
     /// Close a response successfully, committing the assistant item.
+    ///
+    /// The dispatched turn's spelling of [`Session::complete_with_item`], and
+    /// expressed in terms of it rather than beside it: the atomicity rule — the
+    /// produced item and the terminal event in one append batch — is a property
+    /// of *completing*, not of completing with a particular shape of item, and
+    /// stating it twice is how the two spellings drift apart.
     pub async fn complete(
         &mut self,
         response_id: &ResponseId,
         text: impl Into<String>,
         usage: Usage,
     ) -> Result<(), SessionError> {
-        self.commit(vec![
-            SessionEventKind::ItemAppended {
-                item: Item::assistant_text(text, response_id.clone()),
-            },
-            SessionEventKind::ResponseCompleted {
-                response_id: response_id.clone(),
-                usage,
-            },
-        ])
-        .await?;
+        self.complete_with_item(
+            response_id,
+            Item::assistant_text(text, response_id.clone()),
+            usage,
+            ControlRecord::default(),
+        )
+        .await
+    }
+
+    /// Close a response successfully, committing `item` as what it produced.
+    ///
+    /// The one way a response completes. [`Session::complete`] is this method
+    /// with the item fixed to assistant text, which is the shape every
+    /// dispatched turn produces; a steered turn passes its synthetic tool call
+    /// instead. Both spellings commit the same two events in the same batch
+    /// because they are the same method, rather than because two methods agree.
+    ///
+    /// **The response id is stamped here rather than read off the item.** That
+    /// is what makes a committed item bearing a response id mean "this response
+    /// emitted it": everything on the input path arrives through
+    /// [`Session::begin_turn`] carrying none, and this is the only method that
+    /// puts one on anything at all. A caller that had to supply the stamp
+    /// itself could forget it, and a forgotten stamp is an emitted call that no
+    /// projection can tell from a client's own.
+    ///
+    /// **One append batch, never two.** The item and the completion are a
+    /// decision and its realization. Committed separately, a process that died
+    /// between them would leave a session holding an emitted tool call whose
+    /// turn never completed: the retry would not deduplicate, the same call
+    /// would be emitted a second time, and the client would hold two calls with
+    /// one id. The store numbers a batch contiguously within one call, so the
+    /// window does not exist rather than being narrow — the same property
+    /// [`Session::begin_turn`] admits a turn and its input under.
+    ///
+    /// **Nothing here records a [`SessionEventKind::Routed`]**, and for the
+    /// steered caller that absence is the point rather than an omission: the
+    /// usage passed is whatever produced the interjection, and the turn itself
+    /// dispatched nothing. A turn that reaches its completion with no routing
+    /// of its own is priced at nothing by every projection that pairs a
+    /// dispatch with its terminal event — the metrics fold books no model row
+    /// for it and the cache ledger records no warm prefix — while the client is
+    /// still told what its turn genuinely cost. (A dispatched turn recorded its
+    /// own `Routed` before it got here, so the same absence costs it nothing.)
+    /// See
+    /// [`interject`](crate::interject) for why the decision is taken before the
+    /// turn is planned, which is what makes that pairing absent rather than
+    /// merely unused.
+    /// **`record` goes in the same batch, and ahead of the item.** The facts an
+    /// interjector produced are the *reason* this completion exists; committed
+    /// afterwards, a crash between them would leave a steered turn in the log
+    /// with no record of what decided it, and the arm comparison would count
+    /// the intervention against no validation. Ahead of the item rather than
+    /// behind it because the log then reads in causal order — the decision, and
+    /// then what it produced.
+    pub async fn complete_with_item(
+        &mut self,
+        response_id: &ResponseId,
+        item: Item,
+        usage: Usage,
+        record: ControlRecord,
+    ) -> Result<(), SessionError> {
+        let item = Item {
+            response_id: Some(response_id.clone()),
+            ..item
+        };
+        let mut kinds = record.into_kinds();
+        kinds.push(SessionEventKind::ItemAppended { item });
+        kinds.push(SessionEventKind::ResponseCompleted {
+            response_id: response_id.clone(),
+            usage,
+        });
+        self.commit(kinds).await?;
+        Ok(())
+    }
+
+    /// Commit facts an interjector produced for a turn that then proceeds.
+    ///
+    /// The `Proceed` half of the same contract [`Self::complete_with_item`]
+    /// serves for `Complete`. There is no atomicity to buy here — nothing else
+    /// is being committed alongside — but there is still exactly one writer,
+    /// and this is how an occupant reaches it.
+    ///
+    /// An empty record commits nothing rather than an empty batch: the
+    /// production default interjects on no turn, and a store round trip per
+    /// turn to say so would be a cost paid by every deployment that never
+    /// enables validation.
+    pub async fn record_control(&mut self, record: ControlRecord) -> Result<(), SessionError> {
+        if record.is_empty() {
+            return Ok(());
+        }
+        self.commit(record.into_kinds()).await?;
         Ok(())
     }
 
@@ -555,372 +1206,4 @@ impl<S: SessionStore> Session<S> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::routing::{Candidate, Target};
-    use crate::store::MemoryStore;
-
-    const TTL: u64 = 30_000;
-
-    async fn new_session(store: Arc<MemoryStore>, node: &str) -> (SessionId, Session<MemoryStore>) {
-        let sid = SessionId::generate();
-        store.create_session(&sid, "affinity").await.unwrap();
-        let session = Session::open(store, sid.clone(), node, TTL, CacheLedger::new())
-            .await
-            .unwrap();
-        (sid, session)
-    }
-
-    fn decision_for(target: Target, isl: u64) -> DecisionRecord {
-        DecisionRecord {
-            chosen: target,
-            rationale: "test".into(),
-            policy: "affinity".into(),
-            isl_tokens: isl,
-            expected_prefill_tokens: isl as f64,
-            expected_cost_usd: 0.0,
-            considered: Vec::<Candidate>::new(),
-        }
-    }
-
-    #[tokio::test]
-    async fn a_turn_appends_items_and_advances_the_turn_index() {
-        let store = Arc::new(MemoryStore::new());
-        let (_, mut session) = new_session(store, "node-a").await;
-        assert_eq!(session.turn_index(), 0);
-
-        let admission = session
-            .begin_turn(TurnId::new("t1"), vec![Item::user_text("hello")])
-            .await
-            .unwrap();
-        assert!(matches!(admission, TurnAdmission::Started(_)));
-        assert_eq!(session.turn_index(), 1);
-        assert_eq!(session.state().items.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn replaying_a_completed_turn_id_does_not_generate_twice() {
-        let store = Arc::new(MemoryStore::new());
-        let (_, mut session) = new_session(store, "node-a").await;
-
-        let first = session
-            .begin_turn(TurnId::new("t1"), vec![Item::user_text("hello")])
-            .await
-            .unwrap();
-        let response_id = first.response_id().clone();
-        session
-            .complete(&response_id, "hi there", Usage::default())
-            .await
-            .unwrap();
-
-        let retry = session
-            .begin_turn(TurnId::new("t1"), vec![Item::user_text("hello")])
-            .await
-            .unwrap();
-        assert_eq!(retry, TurnAdmission::Deduplicated(response_id));
-        // The retry must not have appended the user item a second time.
-        assert_eq!(
-            session
-                .state()
-                .items
-                .iter()
-                .filter(|item| item.render().contains("hello"))
-                .count(),
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn an_interrupted_turn_is_retryable_rather_than_deduplicated() {
-        let store = Arc::new(MemoryStore::new());
-        let (_, mut session) = new_session(store, "node-a").await;
-
-        let admission = session
-            .begin_turn(TurnId::new("t1"), vec![Item::user_text("hello")])
-            .await
-            .unwrap();
-        let response_id = admission.response_id().clone();
-        session
-            .mark_incomplete(
-                &response_id,
-                "partial",
-                IncompleteReason::OwnerLost,
-                Usage::default(),
-            )
-            .await
-            .unwrap();
-
-        // The turn never completed, so re-sending it must start fresh.
-        let retry = session
-            .begin_turn(TurnId::new("t1"), vec![Item::user_text("hello")])
-            .await
-            .unwrap();
-        assert!(matches!(retry, TurnAdmission::Started(_)));
-        assert_ne!(retry.response_id(), &response_id);
-    }
-
-    #[tokio::test]
-    async fn a_dispatch_that_never_terminates_leaves_the_target_cold() {
-        let store = Arc::new(MemoryStore::new());
-        let (_, mut session) = new_session(store, "node-a").await;
-
-        let admission = session
-            .begin_turn(TurnId::new("t1"), vec![Item::user_text("hello")])
-            .await
-            .unwrap();
-        let target = Target::Frontier {
-            provider: "anthropic".into(),
-            model: "claude".into(),
-        };
-        session
-            .record_routing(admission.response_id(), decision_for(target.clone(), 8_192))
-            .await
-            .unwrap();
-
-        // The process died before the response terminated, so nothing is known
-        // about what the provider saw. Claiming a warm prefix here would price
-        // the retry against a cache that may not exist.
-        assert!(session.ledger().state_for(&target).is_none());
-    }
-
-    #[tokio::test]
-    async fn an_incomplete_response_records_its_dispatch_at_the_terminal_event() {
-        let store = Arc::new(MemoryStore::new());
-        let (_, mut session) = new_session(store, "node-a").await;
-
-        let admission = session
-            .begin_turn(TurnId::new("t1"), vec![Item::user_text("hello")])
-            .await
-            .unwrap();
-        let response_id = admission.response_id().clone();
-        let target = Target::Frontier {
-            provider: "anthropic".into(),
-            model: "claude".into(),
-        };
-        let checkpoint = session.last_seq();
-        session
-            .record_routing(&response_id, decision_for(target.clone(), 8_192))
-            .await
-            .unwrap();
-        session
-            .mark_incomplete(
-                &response_id,
-                "partial",
-                IncompleteReason::UpstreamError,
-                Usage {
-                    input_tokens: 8_192,
-                    cached_input_tokens: 0,
-                    output_tokens: 3,
-                    reasoning_tokens: 0,
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-
-        // Billed input is the proof the prompt was prefilled: the prefix is
-        // warm even though the response never completed.
-        let state = session
-            .ledger()
-            .state_for(&target)
-            .expect("an incomplete with billed input is ledger evidence");
-        assert_eq!(state.last_prefix_tokens, 8_192);
-
-        let terminal = session
-            .events_since(checkpoint, 100)
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|event| event.is_terminal())
-            .expect("the response terminated");
-        assert_eq!(
-            state.last_call_at_ms, terminal.at_ms,
-            "the TTL runs from when the provider stopped holding the prompt"
-        );
-    }
-
-    #[tokio::test]
-    async fn an_incomplete_response_with_no_billed_input_leaves_the_target_cold() {
-        let store = Arc::new(MemoryStore::new());
-        let (_, mut session) = new_session(store, "node-a").await;
-
-        let admission = session
-            .begin_turn(TurnId::new("t1"), vec![Item::user_text("hello")])
-            .await
-            .unwrap();
-        let response_id = admission.response_id().clone();
-        let target = Target::Frontier {
-            provider: "anthropic".into(),
-            model: "claude".into(),
-        };
-        session
-            .record_routing(&response_id, decision_for(target.clone(), 8_192))
-            .await
-            .unwrap();
-        // The engine terminates a dispatch that failed before anything was
-        // sent with exactly this shape: incomplete, empty usage.
-        session
-            .mark_incomplete(
-                &response_id,
-                "",
-                IncompleteReason::UpstreamError,
-                Usage::default(),
-            )
-            .await
-            .unwrap();
-
-        // No billed input, no evidence the provider ever saw the prompt --
-        // claiming a warm prefix here is precisely the phantom the ledger fold
-        // must not produce.
-        assert!(session.ledger().state_for(&target).is_none());
-    }
-
-    #[tokio::test]
-    async fn a_successor_node_reconstructs_identical_state_from_the_log() {
-        let store = Arc::new(MemoryStore::new());
-        let (sid, mut session) = new_session(store.clone(), "node-a").await;
-
-        let admission = session
-            .begin_turn(TurnId::new("t1"), vec![Item::user_text("first question")])
-            .await
-            .unwrap();
-        let response_id = admission.response_id().clone();
-        let target = Target::Local {
-            worker_id: 7,
-            dp_rank: 0,
-            model: "llama".into(),
-        };
-        session
-            .record_routing(&response_id, decision_for(target.clone(), 4_096))
-            .await
-            .unwrap();
-        session
-            .append_output(&response_id, "part one ")
-            .await
-            .unwrap();
-        session
-            .complete(&response_id, "part one and two", Usage::default())
-            .await
-            .unwrap();
-
-        // Owner dies; a second node takes over.
-        let seq_before = session.last_seq();
-        let items_before = session.state().items.clone();
-        drop(session);
-        store.expire_lease_now(&sid).await;
-
-        let successor = Session::open(store, sid, "node-b", TTL, CacheLedger::new())
-            .await
-            .unwrap();
-        assert_eq!(successor.last_seq(), seq_before);
-        assert_eq!(successor.state().items, items_before);
-        assert_eq!(successor.turn_index(), 1);
-        // The routing ledger is part of the projection, so the successor knows
-        // worker 7 is warm without being told.
-        assert!(successor.ledger().state_for(&target).is_some());
-    }
-
-    #[tokio::test]
-    async fn a_displaced_owner_cannot_keep_writing() {
-        let store = Arc::new(MemoryStore::new());
-        let (sid, mut displaced) = new_session(store.clone(), "node-a").await;
-
-        store.expire_lease_now(&sid).await;
-        let _successor = Session::open(store, sid, "node-b", TTL, CacheLedger::new())
-            .await
-            .unwrap();
-
-        let result = displaced
-            .begin_turn(TurnId::new("t1"), vec![Item::user_text("hello")])
-            .await;
-        assert!(matches!(
-            result,
-            Err(SessionError::Store(StoreError::LeaseLost { .. }))
-        ));
-    }
-
-    #[tokio::test]
-    async fn a_heartbeat_keeps_a_writer_alive_past_its_lease_ttl() {
-        let store = Arc::new(MemoryStore::new());
-        let sid = SessionId::generate();
-        store.create_session(&sid, "affinity").await.unwrap();
-        let mut session = Session::open(store, sid, "node-a", 200, CacheLedger::new())
-            .await
-            .unwrap();
-
-        let _heartbeat = session.heartbeat(60, 200);
-        // Longer than the TTL. Unrenewed, the append below is fenced and
-        // whatever produced it is thrown away.
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        session
-            .begin_turn(TurnId::new("t1"), vec![Item::user_text("hello")])
-            .await
-            .expect("a renewed lease is still the single writer");
-    }
-
-    #[tokio::test]
-    async fn a_heartbeat_stops_at_takeover_instead_of_stealing_the_session_back() {
-        let store = Arc::new(MemoryStore::new());
-        let sid = SessionId::generate();
-        store.create_session(&sid, "affinity").await.unwrap();
-        let mut displaced = Session::open(
-            store.clone(),
-            sid.clone(),
-            "node-a",
-            200,
-            CacheLedger::new(),
-        )
-        .await
-        .unwrap();
-        let _heartbeat = displaced.heartbeat(60, 200);
-
-        store.expire_lease_now(&sid).await;
-        let mut successor = Session::open(store, sid, "node-b", TTL, CacheLedger::new())
-            .await
-            .unwrap();
-
-        // Several renewal ticks. A heartbeat that treated a lost lease as
-        // something to re-acquire would put two writers on one log here.
-        tokio::time::sleep(Duration::from_millis(300)).await;
-
-        successor
-            .begin_turn(TurnId::new("t1"), vec![Item::user_text("hello")])
-            .await
-            .expect("the successor is the owner and stays the owner");
-        assert!(matches!(
-            displaced
-                .begin_turn(TurnId::new("t2"), vec![Item::user_text("hello")])
-                .await,
-            Err(SessionError::Store(StoreError::LeaseLost { .. }))
-        ));
-    }
-
-    #[tokio::test]
-    async fn resumption_from_a_sequence_number_is_gapless() {
-        let store = Arc::new(MemoryStore::new());
-        let (_, mut session) = new_session(store, "node-a").await;
-
-        let admission = session
-            .begin_turn(TurnId::new("t1"), vec![Item::user_text("q")])
-            .await
-            .unwrap();
-        let response_id = admission.response_id().clone();
-        let checkpoint = session.last_seq();
-
-        for chunk in ["a", "b", "c"] {
-            session.append_output(&response_id, chunk).await.unwrap();
-        }
-
-        let replayed = session.events_since(checkpoint, 100).await.unwrap();
-        assert_eq!(replayed.len(), 3);
-        assert_eq!(
-            replayed.iter().map(|e| e.seq).collect::<Vec<_>>(),
-            vec![checkpoint + 1, checkpoint + 2, checkpoint + 3]
-        );
-
-        // Projecting to one response drops the session-level events.
-        let scoped = session.response_events(&response_id, 0, 100).await.unwrap();
-        assert!(scoped.iter().all(|e| e.response_id() == Some(&response_id)));
-    }
-}
+mod tests;

@@ -62,10 +62,12 @@ use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
 
+use crate::control::PrincipalKey;
 use crate::event::{SessionEvent, SessionObserver};
 use crate::routing::Target;
+use crate::validate::Arm;
 
-pub use fold::MetricsFold;
+pub use fold::{MetricsFold, Scope, SideCallTally, ValidationTally};
 pub use pricing::{
     Correlary, DEFAULT_CAPABILITY_BAND, IncoherentCorrelary, PricedBasis, ReferenceModel,
     ShadowPricing, TokenShape,
@@ -166,7 +168,51 @@ impl MetricsRecorder {
 
     pub fn snapshot(&self, config: &MetricsConfig, generated_at_ms: u64) -> MetricsSnapshot {
         let fold = self.fold.read().unwrap_or_else(|e| e.into_inner());
-        MetricsSnapshot::build(&fold, config, generated_at_ms)
+        MetricsSnapshot::build(&fold, Scope::Deployment, config, generated_at_ms)
+    }
+
+    /// The same report, restricted to one principal's share of the same fold.
+    ///
+    /// What a turn key is answered with. A separate method rather than a
+    /// [`Scope`] argument on [`Self::snapshot`] so that "this document is
+    /// somebody's only" is a decision named at the call site, in the surface
+    /// that serves it. The two are one function underneath — the scope seam is
+    /// [`MetricsSnapshot::build`] — so there is no second pricing walk for
+    /// these two entry points to disagree over.
+    pub fn snapshot_for(
+        &self,
+        scope: &PrincipalKey,
+        config: &MetricsConfig,
+        generated_at_ms: u64,
+    ) -> MetricsSnapshot {
+        let fold = self.fold.read().unwrap_or_else(|e| e.into_inner());
+        MetricsSnapshot::build(&fold, Scope::Principal(scope), config, generated_at_ms)
+    }
+
+    /// What one arm of the validate experiment decided, and how often it acted.
+    ///
+    /// **Not on [`MetricsSnapshot`], and that is the deliberate half.** The
+    /// snapshot is the money document — tokens, rate cards, savings — and the
+    /// arm comparison is a *control* figure whose honest presentation is three
+    /// numbers side by side (spend measured, tokens-after-intervention against
+    /// the arm-matched control, prevented waste estimated), never a single
+    /// "validation saved you $X" folded into a total. Until a surface exists
+    /// that reports them that way, the fold answers directly, so the arm
+    /// comparison is readable from the same projection the log builds rather
+    /// than from a counter beside it.
+    pub fn validation_tally(&self, scope: Scope<'_>, arm: Arm) -> ValidationTally {
+        let fold = self.fold.read().unwrap_or_else(|e| e.into_inner());
+        fold.validation_tally(scope, arm)
+    }
+
+    /// Side calls booked and side calls abandoned, in one scope.
+    ///
+    /// The discarded-work half of the same question: a check that produced
+    /// nothing still happened, and a deployment that could not see the
+    /// abandoned count would read a broken judge as a free one.
+    pub fn side_call_tally(&self, scope: Scope<'_>) -> SideCallTally {
+        let fold = self.fold.read().unwrap_or_else(|e| e.into_inner());
+        fold.side_call_tally(scope)
     }
 }
 
@@ -179,9 +225,15 @@ impl SessionObserver for MetricsRecorder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::{Accounting, IncompleteReason, SessionEvent, SessionEventKind, Usage};
-    use crate::ids::{ResponseId, SessionId, TurnId};
-    use crate::routing::{Candidate, DecisionRecord, ProviderPricing};
+    // The log fixtures live with the fold they build logs for; see
+    // `fold::tests`. One builder means one clock, so a test that compares a
+    // window across two logs is asserting about the fold rather than about two
+    // fixtures that happened to agree.
+    use crate::control::PrincipalKey;
+    use crate::event::{Accounting, IncompleteReason, SessionEventKind, Usage};
+    use crate::ids::{ResponseId, TurnId};
+    use crate::metrics::fold::tests::{LogBuilder, candidate, frontier, local, principal, usage};
+    use crate::routing::{DecisionRecord, ProviderPricing};
 
     const HOSTED: ProviderPricing = ProviderPricing {
         input_per_mtok_usd: 3.0,
@@ -189,107 +241,6 @@ mod tests {
         cache_write_per_mtok_usd: 3.75,
         output_per_mtok_usd: 15.0,
     };
-
-    fn local(model: &str) -> Target {
-        Target::Local {
-            worker_id: 7,
-            dp_rank: 0,
-            model: model.into(),
-        }
-    }
-
-    fn frontier(provider: &str, model: &str) -> Target {
-        Target::Frontier {
-            provider: provider.into(),
-            model: model.into(),
-        }
-    }
-
-    fn candidate(target: Target, cost: f64) -> Candidate {
-        Candidate {
-            target,
-            expected_prefill_tokens: 0.0,
-            matched_prefix_tokens: 0,
-            expected_ttft_ms: 0.0,
-            expected_cost_usd: cost,
-            quality_prior: 0.6,
-            load: None,
-        }
-    }
-
-    fn usage(input: u64, cached: u64, output: u64, reasoning: u64) -> Usage {
-        Usage {
-            input_tokens: input,
-            cached_input_tokens: cached,
-            output_tokens: output,
-            reasoning_tokens: reasoning,
-            accounting: Accounting::Reported,
-        }
-    }
-
-    /// A minimal session log: one turn routed to `target` and completed.
-    ///
-    /// Built by hand rather than by driving the engine so the fold can be
-    /// tested against logs the engine cannot currently produce — a provider
-    /// that reported nothing, a dispatch that died before sending.
-    struct LogBuilder {
-        session: SessionId,
-        events: Vec<SessionEvent>,
-        at_ms: u64,
-    }
-
-    impl LogBuilder {
-        fn new(session: &str) -> Self {
-            Self {
-                session: SessionId::new(session),
-                events: Vec::new(),
-                at_ms: 1_000,
-            }
-        }
-
-        fn push(&mut self, kind: SessionEventKind) -> &mut Self {
-            self.at_ms += 10;
-            self.events.push(SessionEvent {
-                seq: self.events.len() as u64 + 1,
-                session_id: self.session.clone(),
-                at_ms: self.at_ms,
-                kind,
-            });
-            self
-        }
-
-        fn turn(
-            &mut self,
-            response: &str,
-            target: Target,
-            considered: Vec<Candidate>,
-            usage: Usage,
-        ) -> &mut Self {
-            let response_id = ResponseId::new(response);
-            self.push(SessionEventKind::TurnStarted {
-                turn_id: TurnId::new(format!("turn-{response}")),
-                response_id: response_id.clone(),
-            });
-            self.push(SessionEventKind::Routed {
-                response_id: response_id.clone(),
-                decision: DecisionRecord {
-                    chosen: target,
-                    rationale: "test".into(),
-                    policy: "test".into(),
-                    isl_tokens: usage.input_tokens,
-                    expected_prefill_tokens: 0.0,
-                    expected_cost_usd: 0.0,
-                    considered,
-                },
-            });
-            self.push(SessionEventKind::ResponseCompleted { response_id, usage });
-            self
-        }
-
-        fn events(&self) -> &[SessionEvent] {
-            &self.events
-        }
-    }
 
     fn config() -> MetricsConfig {
         MetricsConfig::new(
@@ -305,7 +256,7 @@ mod tests {
     }
 
     fn snapshot(fold: &MetricsFold) -> MetricsSnapshot {
-        MetricsSnapshot::build(fold, &config(), 9_999)
+        MetricsSnapshot::build(fold, Scope::Deployment, &config(), 9_999)
     }
 
     #[test]
@@ -491,6 +442,9 @@ mod tests {
                 expected_prefill_tokens: 10_000.0,
                 expected_cost_usd: 0.03,
                 considered: vec![],
+                turn_policy_digest: String::new(),
+                budget_state: Default::default(),
+                rate_card: None,
             },
         });
         // Failed before anything was sent: empty usage is the engine's way of
@@ -531,6 +485,9 @@ mod tests {
                 expected_prefill_tokens: 10_000.0,
                 expected_cost_usd: 0.03,
                 considered: vec![],
+                turn_policy_digest: String::new(),
+                budget_state: Default::default(),
+                rate_card: None,
             },
         });
         log.push(SessionEventKind::ResponseIncomplete {
@@ -591,5 +548,95 @@ mod tests {
             snapshot.tokens.total, 1_900,
             "reasoning is part of output, not an addition to it"
         );
+    }
+
+    /// A scoped report must be scoped in *every* field, not only in its rows.
+    ///
+    /// The failure this pins is the quiet one: a document whose money is
+    /// filtered to one principal but whose session count, turn count and event
+    /// window are still deployment-wide reads as correct, and discloses the
+    /// size and activity window of every other tenant to anyone holding a turn
+    /// key. Filtering the rows is the easy half.
+    #[test]
+    fn a_scoped_snapshot_is_scoped_in_every_field_not_only_its_rows() {
+        let acme = principal("acme", "ada");
+        let globex = principal("globex", "bob");
+
+        let mut mine = LogBuilder::new("acme/ada/main");
+        mine.created(Some(acme.clone())).turn(
+            "r1",
+            frontier("anthropic", "claude"),
+            vec![],
+            usage(1_000, 0, 100, 0),
+        );
+        let mut theirs = LogBuilder::new("globex/bob/main");
+        theirs
+            .created(Some(globex.clone()))
+            .turn(
+                "r2",
+                frontier("anthropic", "claude"),
+                vec![],
+                usage(2_000, 0, 200, 0),
+            )
+            .turn(
+                "r3",
+                frontier("anthropic", "claude"),
+                vec![],
+                usage(4_000, 0, 400, 0),
+            );
+        // A log from before the control plane: it must not be silently added to
+        // anyone's row, and it must not vanish from the deployment's.
+        let mut legacy = LogBuilder::new("legacy");
+        legacy.turn(
+            "r4",
+            frontier("anthropic", "claude"),
+            vec![],
+            usage(8_000, 0, 800, 0),
+        );
+
+        let mut fold = MetricsFold::new();
+        fold.extend(mine.events());
+        fold.extend(theirs.events());
+        fold.extend(legacy.events());
+
+        let config = config();
+        let deployment = MetricsSnapshot::build(&fold, Scope::Deployment, &config, 9_999);
+        let scoped = MetricsSnapshot::build(
+            &fold,
+            Scope::Principal(&PrincipalKey::from(&acme)),
+            &config,
+            9_999,
+        );
+
+        assert_eq!(deployment.sessions, 3);
+        assert_eq!(deployment.turns, 4);
+        assert_eq!(scoped.sessions, 1, "one principal, one session");
+        assert_eq!(scoped.turns, 1);
+        assert_eq!(scoped.calls, 1);
+        assert_eq!(scoped.tokens.input, 1_000);
+
+        // The window is the caller's own traffic, not the deployment's. Read
+        // off the fixture rather than restated, so a change to the builder's
+        // clock cannot make this pass by coincidence.
+        let mine_first = mine.events().first().expect("the log is non-empty").at_ms;
+        let mine_last = mine.events().last().expect("the log is non-empty").at_ms;
+        assert_eq!(scoped.first_event_at_ms, Some(mine_first));
+        assert_eq!(scoped.last_event_at_ms, Some(mine_last));
+        assert!(
+            deployment.last_event_at_ms > scoped.last_event_at_ms,
+            "the fixture must actually distinguish the two windows"
+        );
+
+        // The scoped documents adding up to the deployment's was asserted here
+        // and no longer is, deliberately. It was a real claim while two folds
+        // were accumulated side by side; now the deployment's rows, turns and
+        // sessions are *summed out of* the per-principal ones on the way out
+        // (see `MetricsFold::view`), so the assertion reduces to `x == x`. The
+        // property is now held by construction, and a test that cannot fail is
+        // worse than no test: it reads as coverage.
+        //
+        // The half that is still a claim is above — a scoped document that
+        // filtered its rows but not its window, session count or turn count.
+        // That one can regress, so that one stays.
     }
 }

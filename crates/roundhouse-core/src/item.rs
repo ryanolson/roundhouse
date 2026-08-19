@@ -85,7 +85,12 @@ pub struct Item {
     pub role: Role,
     pub content: ItemContent,
     /// Set on assistant items so `previous_response_id` can resolve to the
-    /// exact prefix a client is continuing from.
+    /// exact prefix a client is continuing from — and, since M4, the
+    /// provenance stamp on a server-emitted tool call. Client input always
+    /// canonicalizes with `None` and only the emission act
+    /// (`Session::complete_with_item`) sets it, so a stamped `ToolCall` in the
+    /// log means *we* emitted it and a client cannot forge one; `open_steers`
+    /// and the steering projection both key on exactly this distinction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_id: Option<ResponseId>,
 }
@@ -115,9 +120,61 @@ impl Item {
         }
     }
 
+    /// A tool call, with no provenance.
+    ///
+    /// `response_id` is deliberately `None`, and it is the constructor's whole
+    /// point: a call built here is just a call. Only
+    /// [`Session::complete_with_item`](crate::session::Session::complete_with_item)
+    /// stamps a response onto one, which is what lets a stamped `ToolCall` in
+    /// the log mean "this deployment emitted it" rather than "somebody set a
+    /// field". The input path cannot produce a stamp — the wire layer's
+    /// canonicalization sets `None` on everything a client sends — so the
+    /// provenance marker is not something a client can forge.
+    ///
+    /// The name is the bare one. A namespace belongs to a client dialect and
+    /// lives in the wire projection: canonicalization ignores it on the way
+    /// in, so a namespaced resend and a flat one arrive as this same item, and
+    /// the log keeps one spelling per tool.
+    pub fn tool_call(
+        call_id: impl Into<String>,
+        name: impl Into<String>,
+        arguments: impl Into<String>,
+    ) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: ItemContent::ToolCall {
+                call_id: call_id.into(),
+                name: name.into(),
+                arguments: arguments.into(),
+            },
+            response_id: None,
+        }
+    }
+
     /// Deterministic prompt rendering for a single item.
     pub fn render(&self) -> String {
         format!("<|{}|>{}", self.role.as_str(), self.content.render())
+    }
+
+    /// What this item says to a human reader, and nothing else.
+    ///
+    /// Empty for everything that is not plain text, which is the whole
+    /// distinction from [`Self::render`]: `render` produces the *prompt*
+    /// encoding — role prefix, `<tool_call>` tags — and a caller that
+    /// concatenated that into a transcript a person or an agent reads would
+    /// find scaffolding in it, or worse, a tool call it might act on.
+    ///
+    /// Its caller is the interjection seam's completion: outcome C commits
+    /// guidance text and outcome B commits a synthetic call, and the turn's
+    /// reported text is the guidance for one and nothing for the other. A
+    /// `match` at that site would work today and would answer wrongly the day
+    /// a third completion shape is added, because the *default* it would have
+    /// to pick is the unsafe one.
+    pub fn spoken_text(&self) -> &str {
+        match &self.content {
+            ItemContent::Text { text } => text,
+            ItemContent::ToolCall { .. } | ItemContent::ToolResult { .. } => "",
+        }
     }
 }
 

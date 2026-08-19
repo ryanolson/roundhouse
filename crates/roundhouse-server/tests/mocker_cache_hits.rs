@@ -51,7 +51,9 @@ use roundhouse_fleet::{
     EchoFrontierClient, EmbeddedFleet, FleetError, FleetQuery, KvRouterConfig, LocalFleet,
     SelectionServiceBuilder, StaticFrontierCatalog, WorkerRegistration,
 };
-use roundhouse_server::{Engine, EngineConfig, HfTokenizer, LocalExecution, LocalExecutor};
+use roundhouse_server::{
+    Admission, Engine, EngineConfig, HfTokenizer, LocalExecution, LocalExecutor,
+};
 
 /// One block size for the whole stack. The engine's block pool, the worker
 /// registration, the indexer, and the token buffer must agree on it: the
@@ -387,6 +389,7 @@ async fn a_warmed_worker_prices_a_repeat_turn_far_below_its_prompt_length() {
             &session_id,
             TurnId::new("t0"),
             vec![Item::user_text(long_opening_message())],
+            &Admission::open(),
         )
         .await
         .expect("the first turn must run");
@@ -433,6 +436,7 @@ async fn a_warmed_worker_prices_a_repeat_turn_far_below_its_prompt_length() {
             vec![Item::user_text(
                 "Given all of that, which region should we look at first?",
             )],
+            &Admission::open(),
         )
         .await
         .expect("the second turn must run");

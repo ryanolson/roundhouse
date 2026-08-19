@@ -20,12 +20,15 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::State;
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 
-use roundhouse_core::metrics::{MetricsConfig, MetricsRecorder};
+use roundhouse_core::control::PrincipalKey;
+use roundhouse_core::metrics::{MetricsConfig, MetricsRecorder, MetricsSnapshot};
 use roundhouse_core::now_ms;
+
+use crate::control_config::{AuthError, ControlPlane, KeyScope};
 
 /// The dashboard, inlined at build time.
 ///
@@ -38,19 +41,32 @@ const DASHBOARD_HTML: &str = include_str!("dashboard.html");
 struct MetricsState {
     recorder: Arc<MetricsRecorder>,
     config: Arc<MetricsConfig>,
+    /// Who may read this document, and how much of it.
+    plane: Arc<ControlPlane>,
 }
 
-/// Mount the metrics endpoints.
+/// Mount the metrics endpoints, gated by a control plane.
 ///
 /// `config` carries the rate card and the declared correlaries. It is passed
 /// here rather than read from the engine because pricing is a reporting
 /// concern: repricing history under a corrected rate card must not require
 /// touching the thing that serves traffic.
-pub fn metrics_router(recorder: Arc<MetricsRecorder>, config: Arc<MetricsConfig>) -> Router {
+///
+/// One constructor with a required plane, for the reason
+/// [`http::router`](crate::http::router) gives.
+pub fn metrics_router(
+    plane: Arc<ControlPlane>,
+    recorder: Arc<MetricsRecorder>,
+    config: Arc<MetricsConfig>,
+) -> Router {
     Router::new()
         .route("/v1/metrics", get(snapshot))
         .route("/v1/metrics/dashboard", get(dashboard))
-        .with_state(MetricsState { recorder, config })
+        .with_state(MetricsState {
+            recorder,
+            config,
+            plane,
+        })
 }
 
 /// `GET /v1/metrics`
@@ -60,9 +76,12 @@ pub fn metrics_router(recorder: Arc<MetricsRecorder>, config: Arc<MetricsConfig>
 /// and a dashboard that had to stitch several requests together could render a
 /// state that never existed — provider totals from one instant beside a savings
 /// figure from another.
-async fn snapshot(State(state): State<MetricsState>) -> Response {
-    let snapshot = state.recorder.snapshot(&state.config, now_ms());
-    match serde_json::to_vec(&snapshot) {
+async fn snapshot(
+    State(state): State<MetricsState>,
+    headers: HeaderMap,
+) -> Result<Response, AuthError> {
+    let snapshot = scoped_snapshot(&state, &headers)?;
+    Ok(match serde_json::to_vec(&snapshot) {
         Ok(body) => (
             StatusCode::OK,
             [
@@ -86,10 +105,68 @@ async fn snapshot(State(state): State<MetricsState>) -> Response {
             .to_string(),
         )
             .into_response(),
+    })
+}
+
+/// The document this caller is entitled to.
+///
+/// Three answers, and the difference between them is the whole of decision 6.
+/// An unconfigured deployment has one tenant and no keys, so it reports
+/// everything to anyone — unchanged. A configured one answers an admin key
+/// with the deployment-wide document and a turn key with its own membership's
+/// rows and nothing else. There is no fourth case: a request with no key at
+/// all is refused before this is reached, because "how much did the fleet
+/// spend" is not a public question once there is more than one tenant to
+/// answer it about.
+///
+/// A turn key gets a *scoped* document rather than a filtered copy of the
+/// deployment's — see `MetricsSnapshot::build`, which scopes the session count,
+/// the turn count and the event window too. Filtering only the money would
+/// leave three fields quietly describing the neighbours.
+fn scoped_snapshot(
+    state: &MetricsState,
+    headers: &HeaderMap,
+) -> Result<MetricsSnapshot, AuthError> {
+    let at_ms = now_ms();
+    match &*state.plane {
+        // Short-circuited rather than resolved and scoped to the one principal
+        // `Open` would hand back, and the difference matters on exactly one
+        // deployment: an upgraded one. Every session logged before the control
+        // plane existed folds under `PrincipalKey::Unattributed`, and
+        // `default/default` is a different key — so scoping here would drop the
+        // whole of an existing deployment's history from its own dashboard the
+        // first time it ran this binary. Reporting everything to everyone is
+        // also simply what `Open` means: one tenant, no keys, nothing to
+        // withhold from whom.
+        ControlPlane::Open => Ok(state.recorder.snapshot(&state.config, at_ms)),
+        ControlPlane::Configured { .. } => match state.plane.scope(headers)? {
+            KeyScope::Admin => Ok(state.recorder.snapshot(&state.config, at_ms)),
+            // The admission's policy is not consulted here and is not meant to
+            // be: what a key may *route to* has no bearing on what it may
+            // *read about itself*.
+            KeyScope::Turn(admission) => Ok(state.recorder.snapshot_for(
+                &PrincipalKey::from(&admission.principal),
+                &state.config,
+                at_ms,
+            )),
+        },
     }
 }
 
 /// `GET /v1/metrics/dashboard`
+///
+/// Deliberately ungated, in both modes. The page carries no numbers — it is a
+/// static asset that fetches [`snapshot`] from the browser — so gating it would
+/// buy nothing and cost the only way a human reaches this surface: a browser
+/// cannot be told to send a bearer header on a navigation. The data it renders
+/// is gated where the data is, one request later.
+///
+/// What that means today, stated plainly because the page cannot say it for
+/// itself: in `Configured` mode a browser navigating here sends no key, so the
+/// fetch is refused and the page renders its own error — "cannot reach
+/// /v1/metrics -- HTTP 401" — rather than an empty or a partial dashboard. That
+/// is honest but not usable; giving the page somewhere to put a key is a later
+/// milestone's work, not an oversight in this one.
 async fn dashboard() -> Response {
     (
         StatusCode::OK,
@@ -104,6 +181,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
+    use roundhouse_core::control::BudgetState;
     use roundhouse_core::event::{SessionEvent, SessionEventKind, Usage};
     use roundhouse_core::ids::{ResponseId, SessionId};
     use roundhouse_core::metrics::{ReferenceModel, ShadowPricing};
@@ -148,6 +226,9 @@ mod tests {
                         expected_prefill_tokens: 10_000.0,
                         expected_cost_usd: 0.03,
                         considered: vec![],
+                        turn_policy_digest: String::new(),
+                        budget_state: BudgetState::Unconstrained,
+                        rate_card: None,
                     },
                 },
             },
@@ -171,7 +252,7 @@ mod tests {
     }
 
     async fn get(path: &str) -> (StatusCode, String, String) {
-        let app = metrics_router(recorder_with_one_call(), config());
+        let app = metrics_router(ControlPlane::open(), recorder_with_one_call(), config());
         let response = app
             .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
             .await
