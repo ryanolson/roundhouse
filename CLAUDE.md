@@ -180,6 +180,12 @@ ruling into `agent-docs/`. Workflow stage briefs carry the design rulings
 resolved in advance — an implementation agent re-litigating a settled
 decision mid-stage is the failure mode the briefs exist to prevent.
 
+**Each major milestone or phase ships as its own PR**, on a branch cut
+from the then-current `main` and named for the phase. A milestone PR
+carries the implementation, its thermo-nuclear review fixes, and the
+documents the phase produced — one reviewable unit per rung, not one
+mega-branch accreting forever.
+
 ## Cost and pricing data
 
 Rate cards never go in source — `roundhouse-fleet/src/frontier.rs` states the
