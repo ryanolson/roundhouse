@@ -445,6 +445,14 @@ configuration, not protocol work:
   rev `6344a65`. One read is stale or the flag changed meaning; resolving
   it against current codex source in device-login mode is M7's first
   verification item (see `agent-docs/synergies/nemo-relay.md` §S1).
+  *[2026-08-19, round 2: Switchyard's launcher supplies the reconciling
+  hypothesis — it sets the flag conditionally per route: `true` when
+  forwarding the caller's own OpenAI login, `false` + `env_key` otherwise
+  (`switchyard/cli/launchers/codex_cli_launcher.py:79-102` @ `5341f71`). If
+  the flag is a route property rather than a client-version fact, both prior
+  readings were correct for their own configurations. M7's first item now
+  tests that hypothesis in both configurations rather than adjudicating a
+  contradiction — see `agent-docs/synergies/ecosystem-round-2.md`.]*
 - The wire shape is the **same Responses API** roundhouse already speaks —
   only the base URL and headers differ by auth mode. The upstream target for
   ChatGPT-authed traffic is `https://chatgpt.com/backend-api/codex` (whether

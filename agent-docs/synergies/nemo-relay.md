@@ -406,3 +406,19 @@ with Relay's `^1.1`, so E6's one hard dependency conflict is deleted —
 the honest statement is now that nothing in the dependency graph
 separates the two projects except choices, plus one tokio pin that is
 Dynamo's to relax.
+
+---
+
+## Addendum (2026-08-19, round 2): extended by `ecosystem-round-2.md`
+
+A second synergy round — Relay and Switchyard re-read at `ca08901`/`5341f71`
+under a stronger use-heavily/dedup directive, plus vllm-project/agentic-api
+and the Kubernetes Gateway API inference extension — is ruled in
+`ecosystem-round-2.md`, which extends this document and wins where they
+disagree. Its principal deltas to this ruling: the dependency rule widens
+from "`nemo-relay-types`, nothing else" to also admit `switchyard-protocol`
+(rev-pinned, as the correlation front door); the `requires_openai_auth`
+contradiction dissolves into a route-property hypothesis M7 tests
+(Switchyard's launcher sets it conditionally on auth mode); and a
+version-identity rule binds every pre-1.0 adoption to a git rev, never a
+version or tag.

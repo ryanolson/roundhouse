@@ -1,0 +1,400 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
+> **Status: evidence base.** Produced 2026-08-19 against vllm-project/agentic-api @ d59d4b4 (fetched 2026-08-19; shallow clone, history from 2026-07-09), with the
+> roundhouse tree read for comparison. The ruling that synthesizes this into
+> direction is `../synergies/ecosystem-round-2.md`, which this document exists to justify.
+> An independent fact-checker re-derived the highest-stakes claims from the
+> pinned trees; its verdicts and any corrections are appended. Per
+> `agent-docs/README.md`, this snapshot gains dated bracketed notes when the
+> world moves - never silent rewrites.
+
+# Deep dive: `vllm-project/agentic-api`
+
+**Evidence document.** Target tree: `/workspace/nvidia/agentic-api` @ `d59d4b4` ("feat: Support Codex CLI remote compaction V2 (#183)"), fetched 2026-08-19. Comparison tree: `/home/user/roundhouse` @ `c168de8` + uncommitted M6 review-fix diff. Every claim below carries a `file:line` into one of those two trees, or a URL. Where I could not confirm a claim, I say so rather than inferring.
+
+**One caveat on the clone up front, because it bounds several maturity claims:** `/workspace/nvidia/agentic-api/.git/shallow` exists and the earliest reachable commit is `7e852ab` (2026-07-09, PR #88). GitHub reports the repo was created `2026-03-23T12:48:34Z`. So the ~50 commits visible locally are the last six weeks of a five-month project; PRs #1–#66 are not in this clone. Cadence and contributor counts below are stated for that window only.
+
+---
+
+## 0. What it is — one page
+
+`agentic-api` is a **Rust gateway that adds server-held conversation state and server-side tool execution in front of a single stateless vLLM endpoint**. Its README states the thesis in one line: *"The stateful, agentic API layer for [vLLM](https://github.com/vllm-project/vllm), written in Rust 🦀"* (`README.md:15`), and the diagram beneath it shows the exact topology: Client → Agentic API (state hydration / server-side tools / SQLite persistence) → vLLM core (`README.md:24-46`).
+
+It is **all three things at once** — a spec-follower (it implements OpenAI's Responses API and Anthropic's Messages API rather than defining a protocol), a server (`agentic-server`, an axum binary), and a library (`agentic-server-core`, published to crates.io as a framework-agnostic crate). The library is the load-bearing piece: 23,162 lines of `src/`, 16,069 lines of `tests/`, and `[lib] name = "agentic_core"` (`crates/agentic-server-core/Cargo.toml:10-11`).
+
+**The product-owner's impression — "very promising with a strong Rust library" — is substantially correct on the code and substantially overstated on two specific README claims.** The code is real, dense, well-tested (697 test functions, cassette-replay harness), multi-vendor-governed, and published. But: `agentic-praxis`, one of the three advertised crates, is a 6-line placeholder (`crates/agentic-praxis/src/lib.rs:1-6`); "Background execution" (`README.md:60`) has **zero implementation anywhere in `crates/`**; and "validated against the Open Responses compatibility suite" (`README.md:61`) has no suite, no harness, and no CI job in the tree.
+
+**What it deliberately does not do is exactly roundhouse's territory.** `Config` holds one upstream — `pub llm_api_base: String` (`crates/agentic-server-core/src/config.rs:79`). There is no model catalog, no candidate set, no routing, no cache-affinity, no cost, no budget, no policy, no metrics export. The ROADMAP says so on purpose: *"Treat model aliasing and routing as deployment concerns that may live at the standalone server or gateway edge; they are not part of tool execution semantics"* (`ROADMAP.md`, Near-Term Focus), and issue [#159](https://github.com/vllm-project/agentic-api/issues/159) explicitly assigns cache-aware routing to **llm-d**, not to itself.
+
+The single sharpest structural fact for the dedup question: **agentic-api and roundhouse both own a stateful Responses surface for Codex, and they own it with opposite continuation contracts.** agentic-api holds history server-side and the client sends `previous_response_id` + new input only (`ROADMAP.md` §1). Roundhouse holds history server-side and the client **re-sends the whole transcript**, which roundhouse admits as a prefix against a `prompt_cache_key`-named session (`crates/roundhouse-server/src/responses_api.rs:159`, `:190-201`). Roundhouse's `ResponsesRequest` does not read `previous_response_id` at all (`crates/roundhouse-server/src/responses_api.rs:137-161`).
+
+---
+
+## 1. WHAT IT IS
+
+### 1.1 Scope and ambition
+
+The ROADMAP is unambiguous about the layer boundary:
+
+> *"`agentic-api` … is the stateful agentic API layer for vLLM core. It is optimized for vLLM core and implemented in Rust. Its job is to own stateful agentic APIs, including Responses, Messages, and Interactions, and to orchestrate server-side tool execution for tool calls generated by vLLM core."* (`ROADMAP.md`, opening)
+
+Five numbered project goals: (1) Responses API hydration, (2) Codex support through Responses, (3) server-side tool execution with an explicit gateway/client/provider ownership model, (4) Messages API, (5) Interactions API — *"the higher-level agentic workflow surface once the Responses and Messages foundations are solid"*. Explicit non-goals: reimplementing tokenization or chat templates, building a plugin platform, moving inference responsibilities out of vLLM core (`ROADMAP.md`, Non-Goals For Now).
+
+It is **not** a specification project. `TERMINOLOGY.md:6-8` makes the follower stance normative: *"OpenAI documentation is the primary terminology source. Project-specific terms are included only where this repository adds a distinct implementation concept, such as rehydration or tool normalization."* The Rust types are a Rust rendering of OpenAI's Responses wire shapes, not an independent schema.
+
+### 1.2 Governance
+
+- GitHub org **`vllm-project`** — the vLLM project's own org, not a vendor org. Repo description: *"Stateful API logic for agentic applications using vLLM"*; license Apache-2.0; `archived: false`; default branch `main` (GitHub API `repos/vllm-project/agentic-api`).
+- **Multi-vendor CODEOWNERS**, 8 maintainers: `@bbrowning @franciscojavierarceo @jiahuei @leseb @maralbahari @noobHappylife @qandrew @tjtanaa` (`.github/CODEOWNERS:3`). ADR-01's decider list names their affiliations — Red Hat, DaoCloud, EmbeddedLLM, Meta (`docs/adr/ADR-01_core.md`, header and §1.1). This is *not* single-vendor.
+- Decisions are recorded as ADRs with community-vote provenance, and **at least one has been reversed**: ADR-01 §1.1 records *"Language: Python … Red Hat, DaoCloud, and EmbeddedLLM all voted Python. Meta advocated for Rust … but was willing to defer"*, and D3 is marked **Decided**. ADR-03 then records: *"ADR-01 decided on Python as the project language. PR #23 transitioned the project to Rust, superseding ADR-01's language decision (D3)"* (`docs/adr/ADR-03_gateway_integration.md`, Context). `AGENTS.md:9-12`: *"Python gateway code has been removed as part of the migration plan."*
+- Contribution requires DCO sign-off and PR-template Summary/Test Plan (`CONTRIBUTING.md`, Pull Requests).
+- **No SPDX headers in any Rust file** — `grep -rl SPDX --include=*.rs crates/` returns 0. Roundhouse stamps every file (`crates/roundhouse-core/src/item.rs:1-2`). Upstreaming roundhouse code means dropping the NVIDIA SPDX header convention or negotiating it.
+
+### 1.3 Maturity signals
+
+| Signal | Value | Evidence |
+|---|---|---|
+| Stars / forks / open issues | 72 / 27 / 42 | GitHub API `repos/vllm-project/agentic-api` |
+| Created / last push | 2026-03-23 / 2026-08-19 | same |
+| Releases | `v0.1.0`, `v0.2.0`, `v0.3.0` | `git tag`; workspace `version = "0.3.0"` (`Cargo.toml:6`) |
+| crates.io | `agentic-server-core` 0.1.0 (2026-07-10) → 0.3.0 (2026-08-14), **81 downloads total**; `agentic-server` **62 downloads**; publisher `franciscojavierarceo` | crates.io API for both crates |
+| Commits in visible window | 50, 2026-07-09 → 2026-08-19 (33 in July, 17 in Aug) | `git log` (shallow) |
+| Contributors in window | 8: Arceo 22, Maral 11, Ashwin Giridharan 7, Hao Shan 3, Hari Panjwani 3, Tan Jia Huei 2, TJian 1, noobHappylife 1 | `git shortlog -sne` |
+| Tests | **697** `#[test]`/`#[tokio::test]`; 16,069 lines of integration tests; cassette-replay harness with recorder scripts | `grep -c`; `crates/agentic-server-core/tests/cassettes/` (recorders `record_*.sh`, `record_cassette.py`) |
+| CI | `rust.yml` (build/test/clippy `-D warnings`/fmt + `kubeconform` manifest validation), `pre-commit.yml`, `container.yml`, `prepare-release-pr.yml`, `release-crates.yml` (maintainer-permission-gated publish) | `.github/workflows/` |
+| Docs | MkDocs site: 3 ADRs, 6 design docs, deploy guides (container, kubernetes, GitHub OIDC), `TERMINOLOGY.md` (16.9 KB, normative) | `docs/`, `mkdocs.yaml` |
+| Lint posture | `unsafe_code = "forbid"`; clippy `all = deny`, `pedantic = warn` workspace-wide | `Cargo.toml:11-17` |
+
+**Counter-signals in the same table:** only 143 total crates.io downloads across both crates is "published but not yet consumed by anyone"; `dependabot.yml` covers **only `package-ecosystem: docker`**, not `cargo` (`.github/dependabot.yml:3-7`); and there is no `rust-toolchain.toml` — CI installs `stable` (`.github/workflows/rust.yml`, `toolchain: stable`), with the MSRV claim living only in `clippy.toml` (`msrv = "1.85"`).
+
+### 1.4 Where the Rust lives, and how heavy it is
+
+```
+crates/
+├── agentic-server-core/   lib name = agentic_core   23,162 src + 16,069 test lines   PUBLISHED
+├── agentic-server/        axum binary                3,656 src lines                  PUBLISHED
+└── agentic-praxis/        Praxis gateway adapter     6 lines, publish = false         PLACEHOLDER
+```
+
+`crates/agentic-praxis/src/lib.rs` is, in full:
+
+```rust
+// Placeholder for the Praxis gateway adapter.
+//
+// This crate will provide HttpFilter implementations, one per
+// agentic_core public function, composed into a Praxis filter chain
+// with branch support for tool-call looping. See ADR-03 for the
+// integration model.
+```
+
+`crates/agentic-praxis/Cargo.toml:9` — `publish = false`.
+
+**`agentic-server-core` module map** (largest first): `executor/accumulator.rs` 1,846 · `executor/gateway.rs` 1,072 · `types/io/output.rs` 1,070 · `storage/schema.rs` 1,053 · `executor/function_sse.rs` 1,015 · `tool/codex.rs` 932 · `executor/engine.rs` 849 · `types/request_response.rs` 796 · `tool/mcp/handler.rs` 783 · `executor/messages_stream.rs` 697 · `tool/registry.rs` 665 · `executor/compaction.rs` 617 · `storage/pool.rs` 616.
+
+**Public API surface** (`crates/agentic-server-core/src/lib.rs:1-34`): ten public modules (`config, error, events, executor, proxy, readiness, storage, tool, types, utils`) plus a flat re-export of ~70 protocol types and ~15 storage/tool types. `executor/mod.rs:20-31` re-exports the pipeline as composable functions: `execute`, `create_conversation`, `rehydrate_conversation`, `call_inference`, `persist_response`, `persist_turn`, `compact_response`, `run_messages_loop`, `run_messages_stream`. This decomposition is deliberate — ADR-03 D1: *"Core orchestration logic is a Rust library crate … that exposes each loop step as a public function — plain Rust, no gateway-specific API"*.
+
+**Dependency weight.** `Cargo.lock` = **404 packages** (roundhouse: 600). Core deps: `axum 0.8` (dev only in core), `reqwest 0.12` **and** `reqwest 0.13.4` (aliased `rmcp-reqwest`), `rmcp 1.8`, `sqlx 0.8` (`runtime-tokio-rustls, any, migrate, sqlite, postgres`), `tokio`, `serde`, `chrono`, `uuid v7`, `indexmap`, `either`, `thiserror`, `url`, `tracing` (`Cargo.toml:19-46`, `crates/agentic-server-core/Cargo.toml:13-44`).
+
+**Toolchain**: `edition = "2024"`, `resolver = "3"` (`Cargo.toml:3-6`) — the same edition roundhouse uses (`Cargo.toml:16`). Roundhouse pins `1.96.1` (`rust-toolchain.toml`); agentic-api does not pin.
+
+---
+
+## 2. THE API MODEL
+
+### 2.1 Wire protocol: OpenAI Responses + Anthropic Messages, both borrowed, neither invented
+
+Routes, in full (`crates/agentic-server/src/app.rs:247-254`):
+
+| Route | Method | Notes |
+|---|---|---|
+| `/health`, `/ready` | GET | public (outside the OIDC layer) |
+| `/v1/conversations` | POST | create only; `store=true` required (`handler/http/conversations.rs:19-21`) |
+| `/v1/models` | GET | proxied from vLLM (`handler/http/models.rs`) |
+| `/v1/messages` | POST | Anthropic Messages |
+| `/v1/messages/count_tokens` | POST | Anthropic |
+| `/v1/responses` | POST **and** GET | GET is the **WebSocket** upgrade (`responses_ws_with_auth`) |
+| `/v1/responses/compact` | POST | non-OpenAI extension |
+
+**Absent, and each absence is load-bearing:**
+- No `GET /v1/responses/{id}` retrieve, no `DELETE`, no `POST …/cancel`. Grepping `crates/agentic-server/src/` for a response-id path parameter returns nothing.
+- **No stream resumption.** `starting_after` and `Last-Event-ID` appear nowhere in `crates/` — the only `sequence_number` is an outbound counter minted per stream (`executor/gateway_accumulator.rs:23,44,69-72`), reset to 0 on every request. Roundhouse's `/v1/responses` supports resumption off the log via `starting_after` / `Last-Event-ID` (`crates/roundhouse-server/src/http.rs:457-460`).
+- **No background execution.** `README.md:60` and `docs/index.md:33` both advertise *"Background execution — fire-and-forget requests that continue processing server-side"*. `grep -rni background --include=*.rs crates/` returns **zero hits**.
+
+### 2.2 Statefulness — genuinely server-held, with two continuation keys
+
+Yes, stateful, and it is the project's raison d'être (`ROADMAP.md` §1). Two mutually exclusive continuation keys, rejected if both are supplied:
+
+```rust
+if ctx.original_request.conversation_id.is_some() && ctx.original_request.previous_response_id.is_some() {
+    return Err(ExecutorError::InvalidRequest(
+        "provide only one of conversation_id or previous_response_id".into(),
+    ));
+}
+```
+(`crates/agentic-server-core/src/executor/rehydrate.rs:44-48`)
+
+**Storage** is three relational tables (`crates/agentic-server-core/migrations/0001_initial.sql`), matching ADR-02's accepted design:
+
+```sql
+conversations(id PK, created_at)
+items(id PK, data TEXT, created_at, conversation_id FK→conversations ON DELETE CASCADE, seq)
+responses(id PK, conversation_id FK, previous_response_id FK→responses, history_item_ids TEXT, metadata TEXT, created_at)
+```
+`0002_add_placeholders.sql` adds unused `tenant_id` and `raw_tokens` columns to all three; `0003_index_conversation_sequence.sql` replaces the plain index with `UNIQUE (conversation_id, seq)`. Backends: SQLite (default, zero-config) and PostgreSQL, through `sqlx::Any` (`crates/agentic-server-core/src/storage/backend.rs`, `pool.rs`). ADR-02 D1: *"Use an ordered item-ID checkpoint for hot-path rehydration"* — `Response.history_item_ids` is a JSON array of item ids, so no chain-walking on the read path.
+
+**Concurrency control is asymmetric, and the asymmetry is real:**
+- **`conversation_id` path** — pessimistic row lock plus optimistic version. `conversation::lock_in_tx` issues `SELECT id FROM conversations WHERE id = $1 FOR UPDATE` on Postgres and a no-op `UPDATE … SET created_at = created_at` on SQLite (`storage/models/conversation.rs:77-89`); then `persist_if_version` compares the captured `ConversationVersion` (`Empty` | `LastSequence(i64)`, `storage/types/conversation.rs:8-13`) against the live last `seq` and returns `StorageError::ConversationConflict` on mismatch (`storage/conversation.rs:183-199`), surfaced as `ExecutorError::ConversationLocked` (`executor/modes/conversation.rs:124-136`). This is commit `80e3095` "fix: reject stale conversation turns (#162)".
+- **`previous_response_id` path** — **no version check at all**. `rehydrate.rs` leaves `conversation_version = None` for that path, and the test `previous_response_rehydration_has_no_conversation_version` asserts it (`executor/rehydrate.rs:211-224`); persistence goes through the unversioned `persist_with_conversation_id` (`executor/modes/response.rs:84-94`). Two concurrent turns off one `previous_response_id` both succeed and fork the chain. (Arguably correct per OpenAI semantics — branching off a response id is legal there — but it is a materially weaker guarantee than roundhouse's fenced single-writer `Lease`, `crates/roundhouse-core/src/store.rs:83-120`.)
+
+**Compaction** is a real, non-OpenAI-standard extension: `POST /v1/responses/compact`, plus automatic `context_management: [{type, compact_threshold}]` re-evaluated *before every inference round* including post-tool rounds (`types/request_response.rs:183-189`; `docs/design/core-public-api.md`, "Responses compaction extension"). Codex CLI's remote-compaction V2 is supported through a payload-free `InputItem::CompactionTrigger` marker (`types/io/input.rs:216-220`) — that is HEAD, PR #183. Summaries are stored as a public `compaction` item and rendered to the upstream as retained user messages + an assistant summary, because *"vLLM does not accept the public `compaction` item type"*.
+
+### 2.3 Tool calls, MCP, streaming, framing
+
+- **Tool ownership** is the framework's core: `ToolType::is_gateway_owned()` returns `!matches!(self, Function | Custom | CodexNamespace)` (`tool/registry.rs:53-55`). Gateway-owned = `Mcp | WebSearch | FileSearch | CodeInterpreter`; of those **only `web_search` ships an executor**, backed by You.com via `YOU_API_KEY` / `YOU_API_BASE_URL` (`tool/web_search.rs:17-18,180-215`). *"A gateway-owned type with no handler is preserved, not executed"* (`docs/design/tool-framework.md`, Principle 4).
+- **MCP is client-side**: `rmcp 1.8` with `client`, `transport-child-process`, `transport-streamable-http-client-reqwest` (`crates/agentic-server-core/Cargo.toml:26-32`); the gateway *connects out* to MCP servers, discovers with `tools/list`, and executes `tools/call` (`tool/mcp/client.rs:10-22`). `McpToolParam` carries `server_label, server_url, connector_id, headers, authorization, allowed_tools, require_approval` (`types/tools/params.rs:148-171`) — `require_approval` is parsed but the approval path is open work (issue #145).
+- **Streaming**: SSE with a typed event vocabulary (`events/types.rs` — `SSEEventType` covering response lifecycle, output-item lifecycle, text, function-call args, custom-tool input, reasoning, file/web/MCP tool events), each frame stamped with a monotonic `sequence_number` (`gateway_accumulator.rs:44,69-72`) and OpenAI-compatible named `event:` headers (commit `62a6c39`, PR #167).
+- **WebSocket**: a real second transport at `GET /v1/responses` (`handler/websocket/responses.rs:30-56`); requests arriving during an active stream are queued and processed in order (`:65-67`). Roundhouse's README states its WebSocket and gRPC transports are **not yet implemented**.
+- **Tool-loop bound**: `const MAX_GATEWAY_TOOL_ROUNDS: usize = 10` (`executor/engine.rs:38`); exceeding it yields `status: "incomplete"`, not an error (`executor/gateway.rs:51-53,75-77`).
+
+### 2.4 Vocabulary map — agentic-api ↔ roundhouse, field by field
+
+**Request** (`agentic-api crates/agentic-server-core/src/types/request_response.rs:15-39` ↔ `roundhouse crates/roundhouse-server/src/responses_api.rs:147-161`):
+
+| agentic-api `RequestPayload` | roundhouse `ResponsesRequest` | Note |
+|---|---|---|
+| `model: String` | *(accepted and ignored)* | roundhouse chooses the target by routing policy, not by requested model (`responses_api.rs:137-145`) |
+| `input: ResponsesInput` (Text \| Items) | `input: Vec<Value>` | roundhouse keeps raw JSON so an unsupported item can be *named* in the refusal |
+| `instructions: Option<String>` | `instructions: String` | roundhouse sends it whole every turn |
+| `previous_response_id: Option<String>` | **absent** | roundhouse's whole continuation contract differs — see §2.5 |
+| `conversation_id: Option<String>` | **absent** (session named by `prompt_cache_key`) | |
+| — | `prompt_cache_key: String` (**required**) | *"`prompt_cache_key` is required: it names the session"* (`responses_api.rs:190-201`) |
+| `tools`, `tool_choice`, `parallel_tool_calls` | accepted and ignored | roundhouse runs no tool loop in v1; PLAN §7's `tools: Vec<Value>` for dialect detection is **not yet in the tree** (grep: only the doc comment at `:139`) |
+| `stream: bool` (default false) | `stream: bool` (**must be true**) | roundhouse rejects non-streaming with 422 (`responses_api.rs:186-190`) |
+| `store: bool` (default **true**) | ignored | agentic-api uses it to choose executor vs raw proxy (`handler/http/responses.rs:56-66`) |
+| `cache_salt: Option<String>` | — | forwarded verbatim to vLLM (`request_response.rs:36,76,171`) |
+| `context_management: Option<Vec<ContextManagement>>` | — | executor-only, never forwarded upstream |
+| `temperature/top_p/max_output_tokens/truncation/metadata/include` | ignored | |
+
+**Items.** agentic-api splits `InputItem` (8 variants: `Message, FunctionCall, FunctionCallOutput, CustomToolCall, CustomToolCallOutput, Reasoning, Compaction, CompactionTrigger`, plus `Unknown`, `types/io/input.rs:198-223`) from `OutputItem` (8: `Message, FunctionCall, CustomToolCall, WebSearchCall, McpCall, McpListTools, Reasoning, Compaction`, `types/io/output.rs:729-748`). Roundhouse has **one** canonical `Item { role: Role, content: ItemContent, response_id: Option<ResponseId> }` with `ItemContent ∈ {Text, ToolCall, ToolResult}` (`crates/roundhouse-core/src/item.rs:41-92`), provider-neutral by design: *"Both the local Dynamo path and the frontier path render *from* this; neither renders *to* it"* (`item.rs:5-9`).
+
+Mapping is lossy in one direction and free in the other:
+
+| agentic-api | roundhouse | Fidelity |
+|---|---|---|
+| `InputItem::Message{role,content}` | `Item{role, ItemContent::Text}` | free for text; image/file content parts have no roundhouse variant (`item.rs:39-42` notes they "slot in as further variants") |
+| `FunctionCall{call_id,name,arguments}` | `ItemContent::ToolCall{call_id,name,arguments}` | **1:1** |
+| `FunctionCallOutput{call_id,output}` | `ItemContent::ToolResult{call_id,output}` | **1:1** |
+| `Reasoning` | *no variant* | roundhouse would drop or flatten reasoning items |
+| `CustomToolCall` (raw text `input`, not JSON) | *no variant* | Codex freeform tools have no canonical home |
+| `Compaction`/`CompactionTrigger` | *no variant* | |
+| namespace on a call | **deliberately not stored** — `dialect.rs:12-24` | roundhouse stores the bare name and renders the namespace on the way out |
+
+**Usage.** agentic-api `ResponseUsage{input_tokens, output_tokens, total_tokens, input_tokens_details.cached_tokens, output_tokens_details.reasoning_tokens}` (`executor/engine.rs:41-56`) maps 1:1 onto roundhouse `Usage{input_tokens, cached_input_tokens, output_tokens, reasoning_tokens}` (`crates/roundhouse-core/src/event.rs:30-56`) — same nesting semantics (components, not addends). Roundhouse adds `accounting: Reported | Estimated` (`event.rs:57-77`), which agentic-api has no analogue for.
+
+### 2.5 The one contract that does not map
+
+agentic-api: **client sends deltas, server rehydrates.** Roundhouse: **client re-sends everything, server admits the prefix.** `Compat::bind` resolves a `prompt_cache_key` to a session and returns "the part of `claimed` that session does not have yet" (`crates/roundhouse-server/src/responses_api.rs:252-260`); a client editing its own history forks a `#g{n}` generation (`crates/roundhouse-server/src/conversations.rs:21-25`).
+
+Both are legitimate readings of "the server owns the turn", and **they are not composable in one request path** — a client cannot both omit history and send it. This is the single most important fact for the dedup decision.
+
+---
+
+## 3. RELATION TO vLLM ITSELF
+
+**It fronts a vLLM engine, and exactly one of them.** `Config { llm_api_base: String, openai_api_key, llm_ready_timeout_s, llm_ready_interval_s, skip_llm_ready_check, db_url, postgres, sqlite }` (`config.rs:78-89`). Every upstream call derives its URL from that one base (`executor/request.rs:77`, `executor/upstream.rs:40,69`). `GET /v1/models` is a proxy of the upstream's list (`handler/http/models.rs`), and `/ready` probes the upstream `/health` (`readiness.rs:61-110`).
+
+**Engine-agnostic in principle, vLLM-shaped in practice.** ADR-01 §3: *"'vLLM Server' represents any Responses API-compatible upstream, doesn't have to literally be vLLM."* But the tool framework's Principle 2 is *"vLLM is function-only. Every tool type normalizes to `type: \"function\"` before inference. Permanent constraint."* (`docs/design/tool-framework.md`), enforced by `UpstreamTool` being a single-variant enum: `pub enum UpstreamTool { Function(FunctionTool) }` (`types/request_response.rs:83-87`). An upstream with native built-in tools cannot be addressed.
+
+**No routing, scheduling, or caching of its own.** Confirmed negatively: `grep -rni "prefix.cache|kv.cache|session.affinit|load.balanc|scheduler"` over `crates/` returns only the string "routing" used for `axum::routing` imports, log-line labels ("routing HTTP responses request", `handler/http/responses.rs:76`), and the tool *registry* lookup ("Routing by registry, not heuristics"). `cache_salt` is threaded through untouched — request → upstream, no decision taken on it (`request_response.rs:36,76,171`, test `request_payload_forwards_cache_salt_upstream` at `:345-356`).
+
+**Where they say cache-awareness belongs.** ROADMAP, Longer-Term Direction: *"Cached prefix continuation and other latency optimizations where vLLM core owns rendering, tokenization, and KV-cache execution"* and *"Coordination with vLLM core and llm-d where token identity, prefix routing, and renderer boundaries matter."* Issue [#159](https://github.com/vllm-project/agentic-api/issues/159) *"[Claude Code - Stage 4] Normalize Messages session identity for cache-aware routing"* proposes normalizing `x-claude-code-session-id` / `X-Session-ID` into one tenant-scoped internal `session_id`, with the explicit division: **agentic-api normalizes the header, llm-d uses it for routing and retention, vLLM receives it as typed metadata**; and the explicit prohibition *"Do not derive session identity from `cache_control`, message content, prompt hashes, or request IDs."*
+
+Two dormant hooks worth flagging: the unused `raw_tokens TEXT` columns on `items` and `responses` (`migrations/0002_add_placeholders.sql:5,8` — zero readers/writers in `crates/`), which is where token-identity work would land; and ADR-01 Open Question #4, a proposed *"vLLM Agentic Protocol"* for structured gateway↔engine communication "like KVConnectors".
+
+**Zero overlap with roundhouse's `SelectionService`/`CacheLedger`.** Roundhouse embeds Dynamo's `SelectionService` in-process, queries by block/sequence hashes rather than token ids, and uses the `select`/`reserve` split to price local against frontier without booking (`README.md`, "Why embed the selection service"). agentic-api has none of that machinery and, per #159, does not intend to.
+
+---
+
+## 4. AGENT-FACING FEATURES — overlap table vs roundhouse M0–M6
+
+Legend, matching the nemo-relay deep dive: **DUP** = roundhouse is reinventing something agentic-api ships · **COMP** = meshes cleanly, different layer · **DISJ** = no contact · **CONFL** = two sources of truth if both run in one path.
+
+| # | Roundhouse (M0–M6, shipped) | agentic-api @ d59d4b4 | Verdict | Note |
+|---|---|---|---|---|
+| 1 | Append-only per-session event log with monotonic `seq`; conversation items and routing ledger are *projections* of it (`crates/roundhouse-core/src/event.rs:5-11`) | Normalized 3-table row store; items are rows, not events; `history_item_ids` is the checkpoint (ADR-02 D1/D2; `migrations/0001_initial.sql`) | **CONFL** | Two incompatible truths about "what happened in a turn". agentic-api cannot answer "replay the log" and roundhouse cannot answer "fetch item by id" cheaply. Both cannot be authoritative in one path. |
+| 2 | Fenced single-writer `Lease` across processes (`crates/roundhouse-core/src/store.rs:83-120`) | `SELECT … FOR UPDATE` + optimistic `ConversationVersion`, **conversation path only** (`storage/conversation.rs:183-199`; `models/conversation.rs:77-89`) | **DUP** (roundhouse stronger) | agentic-api's `previous_response_id` path is unversioned (`executor/modes/response.rs:84-94`). Roundhouse's lease also fences a *crashed* owner; a Postgres row lock releases on disconnect. |
+| 3 | Prefix admission of re-sent history against `prompt_cache_key` (`responses_api.rs:252-260`) | Delta upload via `previous_response_id`/`conversation_id`; **server rehydrates** (`executor/rehydrate.rs:26-62`) | **CONFL** | Opposite continuation contracts. See §2.5. |
+| 4 | Canonical provider-neutral `Item` (`crates/roundhouse-core/src/item.rs`) | OpenAI-shaped `InputItem`/`OutputItem` pair, stored as JSON in `items.data` | **COMP-with-friction** | agentic-api's types are richer (reasoning, custom-tool, compaction, images); roundhouse's are neutral. Neither is a superset. |
+| 5 | Codex MCP namespace handling: log the bare name, render `{namespace,name}` on the way out (`crates/roundhouse-server/src/dialect.rs:12-32,52-62`) | `CodexNamespaceHandler`: flatten to `agentic_ns__{ns}__{member}`, cap at 64 chars with a 16-hex FNV tail, restore via a request-scoped `NamespaceMap`, reject collisions (`tool/codex.rs:17-18,31-42,120-150`) | **DUP** (agentic-api more complete) | agentic-api additionally handles the ≤64-char upstream limit and namespaced `tool_choice`; roundhouse handles only the emission direction because it runs no tool loop. |
+| 6 | Synthetic tool-call steering: server *emits* a tool call the client must run, stamped with provenance so a client cannot forge one (`crates/roundhouse-core/src/item.rs:81-92`, `session.rs` `open_steers`) | **none.** The loop only *classifies* calls the model made: `LoopDecision::{Continue, Done, RequiresClientAction, Incomplete}` (`executor/gateway.rs:42-54`) | **DISJ** | agentic-api can hide a call or hand one back. It has no notion of *injecting* one. Roundhouse's M4 is genuinely novel here. |
+| 7 | Gateway-owned vs client-owned tool split | Same concept, shipped and named: gateway / client / provider ownership (`tool/registry.rs:53-55`, `ROADMAP.md` §3, `README.md` Tool Ownership table) | **COMP** | Roundhouse's steer *is* a gateway-owned tool by their taxonomy — except roundhouse's runs on the *client*, which their model has no slot for. |
+| 8 | MCP **server** — 8 tools: `status, init_session, declare_intent, prefer, set_quality_floor, fetch_steer, report_outcome, explain_last_route` (`crates/roundhouse-mcp/src/tools.rs:47,102-226`) | MCP **client** only (`rmcp 1.8` with `client` feature, `tool/mcp/client.rs`) | **COMP** | Perfectly dual. agentic-api could consume roundhouse's control plane as a remote MCP server today, no code change on either side — see §5.4. |
+| 9 | TurnPolicy / narrow-only overlays / budgets / spend ledger / degrade-to-local | **none.** `grep -rni "usd\|price\|budget"` finds only tool-loop round budgets (`executor/gateway.rs:26,61-64`) and doc-comment uses of "cost" | **DISJ** | Roundhouse's exclusive territory, confirmed. |
+| 10 | Cache-adjusted cross-provider routing (`SelectionService`, `CacheLedger`, `FrontierQuote`) | **none**; explicitly delegated to llm-d (issue #159) and named a deployment concern (`ROADMAP.md` Near-Term Focus) | **DISJ / COMP** | The clean seam. agentic-api *wants* someone else to own this. |
+| 11 | Metrics fold + `/v1/metrics` + `/v1/metrics/dashboard` | **none.** `grep -rni "prometheus\|opentelemetry\|metrics"` over `crates/` returns **zero hits**; ROADMAP lists observability as longer-term | **DISJ — roundhouse ahead** | A concrete contribution opportunity. |
+| 12 | Validate/steer loop with a frontier judge, Live/Shadow/Placebo arms (M6) | **none.** `grep -rni "steer\|judge\|interject\|guardrail"` returns only `allowPrivilegeEscalation` in a k8s test | **DISJ** | |
+| 13 | Streaming SSE + resumption (`starting_after` / `Last-Event-ID`, `http.rs:457-460`) | SSE with per-stream `sequence_number`, **no resumption** (`gateway_accumulator.rs:23,69-72`) | **COMP — roundhouse ahead** | agentic-api's log-free store cannot support resumption; roundhouse's can and does. |
+| 14 | WebSocket transport | **shipped** (`handler/websocket/responses.rs`), + Codex `supports_websockets = true` config (`README.md`) | **COMP — agentic-api ahead** | Roundhouse README: WebSocket "not yet implemented". |
+| 15 | Anthropic Messages surface | **shipped**: `/v1/messages` + `/v1/messages/count_tokens` with a native gateway tool loop (`executor/messages_loop.rs`, `messages_stream.rs`, `types/messages/tool_seam.rs`) | **COMP — agentic-api far ahead** | Roundhouse PLAN §7 explicitly calls the `Flat` dialect branch *"future-proofing for a Messages surface, not a claim that Claude Code traffic exists in v1"*. |
+| 16 | Context compaction | **shipped**: `/v1/responses/compact`, `context_management` auto-compaction, Codex remote-compaction V2 (`executor/compaction.rs`, `types/io/input.rs:216-220`) | **DISJ — agentic-api ahead** | Roundhouse has no compaction concept. |
+| 17 | Pass-through auth for Codex device login (ruled in PLAN §3, M7) | `extract_bearer(headers, config_key)` forwards the client bearer upstream, falling back to `OPENAI_API_KEY` (`handler/common.rs:77-85`, `handler/http/responses.rs:30-32`) | **DUP-in-shape, weaker** | agentic-api has no per-principal credential store, no payer stamping, no secret-scan invariant. |
+| 18 | Auth / identity | OIDC bearer with JWKS cache, 9 algorithms, cooldown/coalescing, strips `Authorization` before forwarding, conditionally strips `x-api-key` (`crates/agentic-server/src/auth.rs:22-40,352-372`) | **COMP — agentic-api ahead on OIDC** | 1,126 lines + a 1,098-line test file. Roundhouse's M7/M8 auth is opaque-key based; the two solve adjacent halves. |
+| 19 | Codex conformance oracle via pinned `codex-*` crates | Cassette replay of *real* OpenAI and vLLM traffic, with recorder scripts (`tests/cassettes/record_*.sh`) | **COMP** | Different evidence classes: roundhouse parses with Codex's own types; agentic-api replays captured bytes. Both are stronger than hand-written fixtures. |
+| 20 | Kubernetes deployment | `deploy/kubernetes/` kustomize (Deployment, Service, PDB, NetworkPolicy, ServiceAccount, ConfigMap, Secret example) validated by `kubeconform` in CI (`.github/workflows/rust.yml`, `crates/agentic-server/tests/kubernetes_manifests_test.rs`) | **DISJ — agentic-api ahead** | Roundhouse has no deploy manifests in-tree. |
+
+---
+
+## 5. SYNERGY SEAMS — both directions
+
+### 5.1 them→us: could roundhouse SPEAK agentic-api as a client dialect?
+
+**There is nothing to speak.** agentic-api does not define a dialect — it implements OpenAI Responses and Anthropic Messages, both of which roundhouse already targets or plans to. The concrete deltas a roundhouse "agentic-api dialect" would mean are three server *extensions*, not a protocol:
+
+1. `POST /v1/responses/compact` + `context_management` + `InputItem::CompactionTrigger` (`types/request_response.rs:183-214`, `types/io/input.rs:216-220`).
+2. `cache_salt` pass-through (`request_response.rs:36`).
+3. The `agentic_ns__` namespace flattening on the *upstream* leg (`tool/codex.rs:17`).
+
+Roundhouse's `ClientDialect` enum was built for exactly this kind of addition — one variant today, deliberately an enum so *"the day it lands the compiler names every site that has to decide"* (`crates/roundhouse-server/src/dialect.rs:44-62`). Adding `ClientDialect::AgenticApiResponses` is mechanically cheap. **Whether it is worth anything depends on a decision this evidence cannot make**: roundhouse's continuation contract (client re-sends everything) and agentic-api's (client sends deltas) are mutually exclusive on one request path (§2.5).
+
+### 5.2 them→us: could its Rust library replace or harden our wire layer?
+
+**Technically yes for the types; blocked today on three build facts.**
+
+What it would give roundhouse, and it is not small: a battle-tested `ResponseAccumulator` (1,846 lines) that turns vLLM's and OpenAI's differing SSE dialects into one `ResponsePayload` (`events/types.rs` notes it covers *"both the OpenAI and vLLM wire formats (e.g. `response.done` vs `response.completed`)"*), a complete `OutputItem`/`InputItem` type set including reasoning and custom tools, and the namespace flattening roundhouse only half-implements.
+
+**Blocker 1 — OpenSSL.** `crates/agentic-server-core/Cargo.toml:24` requests `reqwest = { features = ["default-tls", "stream"] }`, i.e. native-tls → OpenSSL. Roundhouse's manifest says, in a comment that is a policy statement: *"# rustls only -- the Dynamo `deny.toml` bans OpenSSL and we match it"* (`crates/roundhouse-server/../Cargo.toml:81-89`, `default-features = false`, `rustls-tls`). Cargo features are additive across the graph, so depending on `agentic-server-core` would turn `default-tls` on for the whole workspace. This is a hard, specific incompatibility with a stated NVIDIA-side policy — and it is a one-line upstream fix (make the TLS backend a feature) that would be a clean first contribution.
+
+**Blocker 2 — two `reqwest` majors.** `/workspace/nvidia/agentic-api/Cargo.lock` contains `reqwest 0.12.28` **and** `reqwest 0.13.4` (`Cargo.lock:2218-2219, 2262-2263`), because `rmcp 1.8` needs 0.13 while their own code uses 0.12 (`Cargo.toml:33-34`). Roundhouse's lock has one (`0.12.28`). Adopting the crate imports a second HTTP client and a second connection-pool/TLS configuration into roundhouse's binary.
+
+**Blocker 3 — `rmcp` major skew.** agentic-api pins `rmcp 1.8` (`Cargo.lock:2326-2327`); roundhouse pins `rmcp 3.1.3` (`crates/roundhouse-mcp/Cargo.toml:34`). Both would link. Two MCP protocol implementations in one process is a correctness hazard worth avoiding.
+
+Version skew that is *not* a blocker: `axum` 0.8.9 vs roundhouse's `=0.8.4` (semver-compatible; roundhouse's `=` pin would need relaxing), `tokio` 1.52.3 vs 1.48.0 (roundhouse's floor is Dynamo's `=1.48.0` pin — see its Cargo.toml comment — so *this* is a real constraint if agentic-api's code needs ≥1.51), edition 2024 on both sides.
+
+**Cheapest useful version of this seam:** vendor or copy the SSE normalizer (`events/normalize.rs`, 188 lines, `events/types.rs`, 403 lines) rather than take the crate. It has no reqwest, no sqlx, no rmcp in its dependency cone.
+
+### 5.3 them→us: could roundhouse front a vLLM deployment through it, as a second local plane beside Dynamo?
+
+**Yes, and this is the strongest and lowest-risk seam in either direction — but only in the "stateless" configuration.**
+
+Roundhouse's `roundhouse-fleet` already models two target classes (`local.rs` = Dynamo, `frontier.rs` = hosted). A third — "vLLM via agentic-api" — would slot in as another local target. The mechanics work because agentic-api has a **raw-proxy escape hatch**: when a request is `store=false`, carries no continuation id, no compaction, and only ordinary `function` tools, it is byte-forwarded to vLLM untouched (`handler/http/responses.rs:56-83`, `should_execute` computation). Roundhouse, which owns the state and re-sends full history, would always take that branch — so agentic-api's storage and its conflicting continuation model **never engage**.
+
+What roundhouse would gain by pointing at agentic-api rather than raw vLLM: server-side `web_search` and MCP tool execution, Messages-protocol serving, compaction, and OIDC — while keeping its own log, routing, budget, and steering. What it costs: one extra network hop and one extra SSE decode/re-encode (`gateway_accumulator.rs`), and a second process to operate.
+
+**Caveat requiring verification before this is ruled on:** agentic-api's *readiness* and *model listing* both assume a single upstream (`readiness.rs:87-110`, `handler/http/models.rs`). Fronting an N-worker Dynamo fleet through one agentic-api instance collapses roundhouse's per-worker visibility. The natural shape is one agentic-api per vLLM *deployment*, not one in front of the fleet.
+
+### 5.4 us→them: could our log/replay/accounting be a backend for its sessions?
+
+**Two seams, one of which needs no code at all.**
+
+**(a) MCP, today, zero changes.** agentic-api is an MCP *client* with streamable-HTTP transport (`tool/mcp/client.rs:17`, `StreamableHttpClientTransport`), and roundhouse ships an MCP *server* with 8 control tools over `/mcp` (`crates/roundhouse-mcp/src/tools.rs:47`). A Codex session running against agentic-api could declare roundhouse's `/mcp` as an `mcp` tool with `server_url` + `authorization` (`types/tools/params.rs:148-161`) and get `status`, `declare_intent`, `prefer`, `set_quality_floor`, `explain_last_route` — **without either project depending on the other**. This is the single cheapest demonstrable integration available and it needs a config file, not a PR.
+
+**(b) A storage backend, which needs an upstream change.** agentic-api's storage is *not* trait-abstracted despite ADR-03 D3 promising *"Response store … implemented natively in Rust"* with "trait-based backends". `ConversationStore` and `ResponseStore` are concrete structs wrapping `Option<Arc<DbPool>>` (`storage/conversation.rs:14-30`, `storage/response.rs`), and `storage/backend.rs` (87 lines) classifies *URLs*, not backends. Making the store a trait so a roundhouse-backed implementation could satisfy it is a genuine upstream contribution — and it is arguably already owed by their own ADR.
+
+Note the impedance: roundhouse's log is per-session append-only events; agentic-api's store is item-addressed by uuid7 with `history_item_ids` checkpoints. A roundhouse-backed `ResponseStore` would have to synthesize item ids and maintain the checkpoint arrays as a projection. That is possible (roundhouse already treats items as a projection of the log) but is real work, not a shim.
+
+### 5.5 us→them: what we would contribute upstream
+
+Ranked by ratio of their-gap to our-effort:
+
+1. **rustls/native-tls as a feature on `agentic-server-core`.** One-line manifest change; unblocks any NVIDIA consumer bound by Dynamo's `deny.toml`. Trivially reviewable.
+2. **Observability.** They have literally none (`grep`: zero prometheus/otel hits) and ROADMAP lists it as longer-term. Roundhouse's metrics fold and per-turn accounting vocabulary (`Accounting::{Reported,Estimated}`, `event.rs:57-77`) is directly transplantable and is a named gap.
+3. **Stream resumption.** Their SSE already carries a monotonic `sequence_number` per stream (`gateway_accumulator.rs:69-72`) — the wire half exists; the durable half does not. Roundhouse's `starting_after`/`Last-Event-ID` design is the missing piece and is exactly the kind of thing their store cannot do today.
+4. **Version-checked persistence on the `previous_response_id` path**, closing the asymmetry in §2.2 — small, testable, and their own `#162` established the pattern on the sibling path.
+5. **The trait-ification of the store** (§5.4b), which their ADR-03 D3 already claims.
+6. **Codex conformance-by-parsing.** Roundhouse pins `codex-api`/`codex-protocol` and parses with Codex's own types; agentic-api replays recorded bytes. Contributing the parser-level oracle would catch shape drift their cassettes cannot.
+
+---
+
+## 6. RISKS
+
+**R1 — API stability. 0.x, three releases in six weeks, and `#[non_exhaustive]` used unevenly.** Workspace at `0.3.0` (`Cargo.toml:6`), tags v0.1.0/v0.2.0/v0.3.0 all within the visible window. `ResponsesTool` and `SSEEventType` are `#[non_exhaustive]` (`types/tools/params.rs:77`, `events/types.rs`) but `RequestPayload`, `ResponsePayload`, `InputItem`, `OutputItem` are not — so any added field or variant is a breaking change for a downstream that constructs them. Any roundhouse dependency should pin exactly and expect churn.
+
+**R2 — the OpenSSL/`reqwest`/`rmcp` triple** (§5.2). This is the most concrete adoption blocker and it is verifiable today from the two `Cargo.lock`s.
+
+**R3 — Praxis coupling is asserted, not built.** ADR-03 designates `praxis-proxy/praxis` (a third-party gateway, referenced as [Praxis #354](https://github.com/praxis-proxy/praxis/issues/354) in `docs/design/core-public-api.md:4`) as *"the primary gateway for agentic-api"* and structures the entire crate layering around it (D2, D4). The adapter crate is 6 lines. **The layering exists; the coupling does not.** That is good news for a Switchyard-shaped alternative — the seam is a set of plain public functions with no gateway-specific API (ADR-03 D1) — but it also means ADR-03's Layer 3 is unvalidated by any real gateway.
+
+**R4 — Two README claims not evidenced in the tree.** "Background execution" (`README.md:60`, `docs/index.md:33`) has zero implementation. "Validated against the Open Responses compatibility suite" (`README.md:61`, `docs/index.md:29`) has no vendored suite, no harness, and no CI job — the string appears only in those two prose files. Both *may* be true out-of-tree (a suite run manually, background execution in a branch), but neither is demonstrable from `d59d4b4`. Flagging them is the honest reading of "verify the impression in both directions".
+
+**R5 — Feature-completeness gaps against the Responses spec they follow.** No retrieve/delete/cancel, no `starting_after`, no background. A client SDK that calls `client.responses.retrieve(id)` fails. This matters directly if roundhouse ever considers agentic-api a drop-in Responses server.
+
+**R6 — Spec drift on OpenAI's side is a live, visible cost.** `ResponsesTool::WebSearch` already carries four wire spellings — `web_search_preview`, `web_search`, `web_search_preview_2025_03_11`, `web_search_2025_08_26` (`types/tools/params.rs:85-90`) — and `TERMINOLOGY.md:6-8` binds the project's vocabulary to OpenAI's docs. They inherit OpenAI's versioning churn by construction; so would anyone depending on their types.
+
+**R7 — Bus factor and cadence.** 22 of 50 visible commits by one author. Multi-vendor CODEOWNERS mitigates the governance risk but not the throughput risk. crates.io downloads (81 + 62) say nobody outside the project consumes the library yet, so API stability has never been pressure-tested by a real downstream.
+
+**R8 — Direction can flip.** The Python→Rust reversal (ADR-01 D3 "Decided" → superseded by PR #23) is a documented instance of a settled decision being overturned. It is also, in fairness, evidence the project self-corrects in public. But it means "agentic-api is Rust" is a community consensus, not a guarantee.
+
+**R9 — Surface area to inherit.** 23k lines of `agentic-server-core`, with a 1,846-line accumulator and a 1,072-line gateway loop. Adopting it is not a small dependency; hardening our wire layer with it means owning a review burden.
+
+**R10 — Not single-vendor, which cuts both ways.** Contributions land only by consensus of 8 maintainers across at least four organizations. Roundhouse cannot unilaterally steer this project. That is a governance strength for the ecosystem and a scheduling risk for any roundhouse milestone that depends on an upstream merge.
+
+**R11 — Licensing is clean.** Apache-2.0 at root (`LICENSE`), Apache-2.0 in every crate manifest, DCO sign-off required (`CONTRIBUTING.md`). No CLA, no copyleft, no field-of-use restriction found. Compatible with roundhouse's Apache-2.0. Only friction: they use no SPDX file headers and roundhouse uses NVIDIA SPDX headers on every file (§1.2).
+
+**R12 — Supply chain.** `dependabot.yml` watches Docker only, not Cargo (`.github/dependabot.yml:3-7`). No `deny.toml`, no `cargo-audit` job in `.github/workflows/`. Roundhouse inherits that posture if it depends on the crate.
+
+---
+
+## 7. OPEN QUESTIONS THE SYNTHESIS MUST DECIDE
+
+1. **Which continuation contract wins?** Delta-upload (`previous_response_id`) and full-resend-with-prefix-admission (`prompt_cache_key`) cannot both be authoritative in one request path (§2.5). Options appear to be: (a) roundhouse fronts agentic-api in its stateless/proxy branch and the question never arises (§5.3); (b) roundhouse adds `previous_response_id` as a second continuation key over its own log; (c) they stay separate products for separate deployments. This is the load-bearing decision and no amount of further code-reading settles it.
+
+2. **Is "roundhouse in front, agentic-api behind vLLM" the intended topology, or is it a two-gateway stack nobody wants to operate?** The proxy-branch analysis (§5.3) says it *works*; whether two Rust gateways plus Dynamo plus vLLM is a shippable product shape is a product call. Note the SSE double-re-encode cost, the same objection the nemo-relay ruling raised against chaining (row 21 of that table).
+
+3. **Do we contribute routing/cost/observability upstream, or keep them as roundhouse's differentiation?** agentic-api has explicitly disclaimed routing (ROADMAP; issue #159 → llm-d) and has no observability at all. That is either a gift (a named upstream gap we can fill, per the "used heavily / deduped" directive) or the last thing that makes roundhouse a distinct product. Cannot be decided from evidence.
+
+4. **Praxis or Switchyard as the gateway for ADR-03's Layer 3?** ADR-03 D4 names Praxis and the adapter is a stub. Switchyard is a Rust proxy that already translates OpenAI Chat / Anthropic Messages / OpenAI Responses (`/workspace/nvidia/switchyard/README.md:6-19`) and already launches Claude Code and Codex through itself. There is **no mention of Praxis anywhere in the Switchyard tree** and none of Switchyard in agentic-api. Whether NVIDIA proposes `agentic-switchyard` alongside `agentic-praxis` is a real, actionable upstream move — but it is a strategy question, not a fact I can resolve.
+
+5. **Does the roundhouse MCP surface get exercised through agentic-api as the cheap first proof (§5.4a)?** It needs no code from either side. If the answer is yes, it is the fastest possible demonstration of the "used heavily wherever they make sense" directive and should probably precede any dependency discussion.
+
+6. **What is our answer to the Anthropic Messages surface?** agentic-api has shipped it with a native tool loop; roundhouse's PLAN §7 calls its own Messages support "future-proofing, not a claim that Claude Code traffic exists in v1". If Claude Code is a target client, this is a build-vs-adopt decision with a clear incumbent.
+
+7. **Do we take the store-trait contribution (§5.4b) as our entry point into the project?** It is owed by their own ADR-03 D3, it is the seam a roundhouse-backed session store would need, and it is a credible first substantial PR. But it commits us to their item-addressed model as the interface shape.
+
+8. **Unverified, and worth one focused follow-up:** whether the Open Responses compatibility suite is actually run out-of-tree (R4), and what `agentic-server-core` 0.3.0's *actual* semver policy is — the release workflow (`release-crates.yml`) gates on maintainer permission but records no compatibility promise.
+
+
+---
+
+## Appendix: independent verification (2026-08-19)
+
+**[CONFIRMED]** agentic-praxis crate is a 6-line placeholder file with `publish = false`, providing no HttpFilter implementation (crates/agentic-praxis/src/lib.rs:1-6; Cargo.toml:9)
+
+Read /workspace/nvidia/agentic-api/crates/agentic-praxis/src/lib.rs verbatim: exactly 6 lines, all comments, no code. `wc -l` = 6. Cargo.toml contains `publish = false` (line 8 in the file, not exactly line 9 but present).
+
+**[CONFIRMED]** README advertises 'Background execution: fire-and-forget requests that continue processing server-side' (README.md:60) but `grep -rni background --include=*.rs crates/` returns zero hits
+
+README.md line 60 reads '🏃 Background execution: fire-and-forget requests that keep processing server-side' (near-verbatim, minor paraphrase of 'continue'/'keep'). grep -rni 'background' --include=*.rs across crates/ returned 0 matches.
+
+**[CONFIRMED]** Config has a single upstream field `pub llm_api_base: String` with no model catalog/routing fields (config.rs:78-89)
+
+Read config.rs: `pub struct Config { pub llm_api_base: String, pub openai_api_key: Option<String>, pub llm_ready_timeout_s: f64, pub llm_ready_interval_s: f64, pub skip_llm_ready_check: bool, pub db_url: Option<String>, pub postgres: PostgresConfig, pub sqlite: SqliteConfig }` — exactly one upstream URL field, no catalog/routing fields.
+
+**[CONFIRMED]** Roundhouse's `ResponsesRequest` does not read `previous_response_id` or `conversation_id` at all — the continuation contracts are structurally incompatible (responses_api.rs:137-161)
+
+Read struct ResponsesRequest in roundhouse crates/roundhouse-server/src/responses_api.rs: fields are `instructions: String`, `input: Vec<Value>`, `stream: bool`, `prompt_cache_key: Option<String>` only. No previous_response_id/conversation_id field anywhere in the struct or file section shown.
+
+**[CONFIRMED]** roundhouse's `prompt_cache_key` is functionally required (empty/missing -> 422) and non-streaming requests are rejected with 422 (responses_api.rs:186-201)
+
+Code shows `if !request.stream { return Err(ApiError::unprocessable(...)) }` and `request.prompt_cache_key.as_deref().filter(|key| !key.is_empty()).ok_or_else(|| ApiError::unprocessable("`prompt_cache_key` is required..."))`. ApiError::unprocessable sets StatusCode::UNPROCESSABLE_ENTITY (422) per http.rs:204-206. Note: the report's vocabulary table labels the type `prompt_cache_key: String (required)` when the Rust type is actually `Option<String>` validated as required at runtime — a harmless simplification, not an error of substance.
+
+**[CONFIRMED]** agentic-api's Cargo.lock contains two reqwest majors (0.12.28 and 0.13.4) and pins rmcp 1.8, vs roundhouse's single reqwest 0.12.28 and rmcp 3.1.3, making this a real dependency-skew blocker for adopting the crate
+
+agentic-api Cargo.lock lines 2218-2220 show reqwest 0.12.28 and lines 2262-2264 show reqwest 0.13.4 (two separate lockfile entries); lines 2326-2328 show rmcp 1.8.0. roundhouse Cargo.lock lines 4136-4138 show only reqwest 0.12.28. roundhouse-mcp/Cargo.toml:34 pins rmcp = "3.1.3". Also confirmed agentic-api's rmcp Cargo.toml features are client-only ("client", "reqwest", "transport-child-process", "transport-streamable-http-client-reqwest") with zero rmcp::server/ServerHandler hits in crates/, supporting the client-vs-server duality claim in row 8/§5.4a.
+
+**[CONFIRMED]** Dependency-graph weight: agentic-api Cargo.lock has 404 packages, roundhouse has 600
+
+`grep -c "^name = " Cargo.lock` gives exactly 404 for /workspace/nvidia/agentic-api/Cargo.lock and exactly 600 for /home/user/roundhouse/Cargo.lock.
+
+**[CONFIRMED]** roundhouse's MCP server exposes exactly 8 tools named status, init_session, declare_intent, prefer, set_quality_floor, fetch_steer, report_outcome, explain_last_route (tools.rs:47,102-226)
+
+roundhouse-mcp/src/tools.rs defines `pub const TOOL_NAMES: [&str; 8] = ["status","init_session","declare_intent","prefer","set_quality_floor","fetch_steer","report_outcome","explain_last_route"]` and the descriptors() function lists them at the cited line numbers (name literal at line 102 for "status" matches exactly).
+
+**[CONFIRMED]** No SPDX headers anywhere in agentic-api's Rust files, while roundhouse stamps every file (item.rs:1-2)
+
+`grep -rl SPDX --include=*.rs crates/` on agentic-api returned 0 files. roundhouse item.rs lines 1-2 contain 'SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION...' and 'SPDX-License-Identifier: Apache-2.0'.
+
+### Checker's confidence statement
+
+I selected the 9 claims most likely to sink a synergy ruling if wrong: two 'X does not exist' negatives (Praxis placeholder, missing background execution), one architecture/stateless-boundary claim (Config's single llm_api_base field, which underpins the entire 'no routing/no catalog' section), one protocol-mechanics/API-shape claim (roundhouse's ResponsesRequest lacking previous_response_id, which the document calls its single sharpest structural fact), one required-field/status-code mechanics claim (prompt_cache_key + 422), two dependency-weight/blocker claims (dual reqwest majors + rmcp 1.8 vs 3.1.3, and the 404-vs-600 package counts), one public-API-surface claim (roundhouse's 8 MCP tools, load-bearing for the 'zero-code synergy' recommendation), and one licensing/governance-hygiene claim (SPDX headers). Every one of the nine checked out exactly as stated, down to specific line numbers, byte-for-byte struct definitions, and grep counts — I did not find a single misstatement, mislabeled line number, or fabricated negative in this sample. That is an unusually clean hit rate and gives me reasonably high confidence in the document's overall care, but it is a sample of ~9 out of roughly 150+ discrete file:line claims in the full document, concentrated on claims I judged highest-stakes rather than a random sample. I did not verify: the ADR-01/ADR-03 governance-reversal narrative and CODEOWNERS/maintainer-affiliation claims (would require reading prose docs and cross-referencing GitHub org data I can't independently pull here), the GitHub API-sourced maturity table (stars/forks/downloads/commit-cadence numbers — inherently unverifiable from a static clone), the large executor/gateway line-count table in section 1.4, the detailed tool-registry/MCP-namespace-flattening mechanics in tool/codex.rs, the Anthropic Messages surface claims, the WebSocket handler claims, or any of the twelve R1-R12 risk narratives beyond what the spot checks above incidentally touch. Those remain unverified opinions-as-yet, not confirmed facts, though the pattern of exactness in the checked claims is a reasonable (not certain) basis to extend provisional trust to the rest of the file:line-cited technical claims in the document, with the GitHub-API-sourced and prose-narrative claims (governance history, download counts, star counts) meriting the most independent skepticism since they are not re-derivable from the tree alone.
