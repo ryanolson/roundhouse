@@ -445,6 +445,8 @@ mod tests {
                 turn_policy_digest: String::new(),
                 budget_state: Default::default(),
                 rate_card: None,
+                payer: Default::default(),
+                withheld_providers: Vec::new(),
             },
         });
         // Failed before anything was sent: empty usage is the engine's way of
@@ -488,6 +490,8 @@ mod tests {
                 turn_policy_digest: String::new(),
                 budget_state: Default::default(),
                 rate_card: None,
+                payer: Default::default(),
+                withheld_providers: Vec::new(),
             },
         });
         log.push(SessionEventKind::ResponseIncomplete {

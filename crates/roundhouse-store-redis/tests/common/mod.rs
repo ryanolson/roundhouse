@@ -186,6 +186,12 @@ pub fn every_event_kind() -> Vec<SessionEventKind> {
                 // own workers: local capacity is billed in prefill tokens, so
                 // the absence is what a local decision correctly records.
                 rate_card: None,
+                // Same reading on both credential fields: a local dispatch is
+                // deployment-paid because local capacity is ours, and nothing
+                // was withheld from a fixture whose deployment configures no
+                // credential tier at all.
+                payer: Default::default(),
+                withheld_providers: Vec::new(),
             },
         },
         SessionEventKind::OutputTextDelta {

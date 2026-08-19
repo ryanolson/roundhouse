@@ -426,6 +426,8 @@ mod tests {
             turn_policy_digest: "4ec325a715649c8e".into(),
             budget_state: Default::default(),
             rate_card: None,
+            payer: Default::default(),
+            withheld_providers: Vec::new(),
         };
 
         let items = vec![

@@ -42,8 +42,17 @@
 //! one. What it may *spend* is a third answer on a third clock, and it gets
 //! two modules of its own: [`budget`] for the ceilings an operator writes down
 //! and [`spend`] for the durable counter they are checked against.
+//!
+//! What it may spend it *on* is a fourth answer, and it is the one that decides
+//! the other three's units: [`credential`] holds the keys a turn authenticates
+//! with, which providers are therefore reachable at all, and the handle that
+//! renders as a fingerprint everywhere but the one seam that reveals it.
+//! [`payer`] holds whose money that was — and the rule that stops roundhouse
+//! naming a price it did not pay.
 
 pub mod budget;
+pub mod credential;
+pub mod payer;
 pub mod policy;
 pub mod spend;
 
@@ -54,6 +63,12 @@ use serde::{Deserialize, Serialize};
 pub use budget::{
     Allocation, Budget, BudgetState, BudgetWindow, DEFAULT_WARN_AT, Exhaustion, TurnBudget,
 };
+pub use credential::{
+    CredentialError, CredentialKind, CredentialMode, CredentialRef, ForwardedCredential,
+    OauthEvidence, PresentedCredential, ProviderAccess, Reachable, Secret, TurnCredential,
+    TurnCredentials,
+};
+pub use payer::{BudgetCounts, Payer, SettledSpend};
 pub use policy::{
     FilterError, FrontierCadence, FrontierHistory, PolicyOverrides, TargetFilter, TurnPolicy,
 };

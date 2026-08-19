@@ -69,6 +69,8 @@ fn decision(chosen: Target) -> DecisionRecord {
         // The subject is the cache ledger's evidence rule, which no price
         // enters into: a dispatch is warm or cold whatever it cost.
         rate_card: None,
+        payer: Default::default(),
+        withheld_providers: Vec::new(),
     }
 }
 

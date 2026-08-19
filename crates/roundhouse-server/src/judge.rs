@@ -80,7 +80,9 @@ use async_trait::async_trait;
 use futures::StreamExt;
 
 use roundhouse_core::context::Tokenizer;
-use roundhouse_core::control::{BudgetTerms, GrantRequest, Settlement, SpendLedger};
+use roundhouse_core::control::{
+    BudgetTerms, GrantRequest, Settlement, SpendLedger, TurnCredential,
+};
 use roundhouse_core::event::{Accounting, SideCallAbandonReason, Usage};
 use roundhouse_core::ids::{ResponseId, SessionId};
 use roundhouse_core::now_ms;
@@ -449,7 +451,18 @@ impl<T: Tokenizer + Clone> FleetJudge<T> {
         JudgeFailure::Abandoned {
             target: self.target(),
             reason: match error {
-                FrontierError::UnknownProvider(_) => SideCallAbandonReason::Unreachable,
+                // A provider nobody could reach, and a credential that never
+                // resolved, are the same answer to the operator: nothing was
+                // asked. Grouped rather than given a fourth reason because
+                // `Refused` means the provider answered, and a client that
+                // declined to send an unauthenticated request has no answer to
+                // report.
+                // A dialect the client cannot serialize joins them: it is a
+                // deployment mistake, and like the other two it means the
+                // request was never sent.
+                FrontierError::UnknownProvider(_)
+                | FrontierError::Credential(_)
+                | FrontierError::UnsupportedDialect { .. } => SideCallAbandonReason::Unreachable,
                 FrontierError::Upstream(_) => SideCallAbandonReason::Refused,
             },
         }
@@ -525,6 +538,23 @@ impl<T: Tokenizer + Clone> FleetJudge<T> {
             // cool the hit the router priced for the next real turn.
             prompt_cache_key: format!("{}{VALIDATE_CACHE_SUFFIX}", side_call.session_id),
             expected_output_tokens: Some(self.config.expected_output_tokens),
+            // **Deliberately unresolved, and this is the honest state rather
+            // than an oversight.** A side call is deployment work — it is not a
+            // tenant's turn and must never spend a member's key — so the only
+            // tier it may draw on is the deployment's own. That tier is
+            // resolved inside `ControlPlaneConfig::validate` and folded into
+            // each `Admission`; handing it to a judge as well would be a second
+            // reader of the same keys, held for the life of the process, and
+            // deciding where that reader lives is a design question this
+            // milestone did not need to answer: no named M7 test turns on it.
+            //
+            // What that costs is bounded and loud. A deployment that composes a
+            // real provider client *and* enrols a project in the validate loop
+            // gets every validation abandoned as `Unreachable`, with the
+            // credential layer's own message and code — never an
+            // unauthenticated request, and never a silently skipped check. The
+            // gap is a missing feature, not a fail-open.
+            credential: TurnCredential::Absent,
         };
 
         let stream = match tokio::time::timeout_at(deadline, self.client.execute(&quote)).await {
@@ -572,6 +602,18 @@ mod tests {
                 Some(FrontierError::UnknownProvider(name)) => {
                     Err(FrontierError::UnknownProvider(name.clone()))
                 }
+                Some(FrontierError::Credential(error)) => {
+                    Err(FrontierError::Credential(error.clone()))
+                }
+                Some(FrontierError::UnsupportedDialect {
+                    expected,
+                    got,
+                    target,
+                }) => Err(FrontierError::UnsupportedDialect {
+                    expected,
+                    got,
+                    target: target.clone(),
+                }),
                 None => Ok(FrontierChunk::whole_response(
                     r#"{"on_track":true,"confidence":0.9,"divergence":null,"missing_context":null}"#
                         .to_string(),

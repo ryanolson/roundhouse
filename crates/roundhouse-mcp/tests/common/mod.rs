@@ -412,5 +412,7 @@ pub async fn decision() -> DecisionRecord {
         turn_policy_digest: ceiling.digest(),
         budget_state: BudgetState::Warned,
         rate_card: None,
+        payer: Default::default(),
+        withheld_providers: Vec::new(),
     }
 }

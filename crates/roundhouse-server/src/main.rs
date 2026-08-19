@@ -48,7 +48,8 @@ use roundhouse_core::routing::{
 use roundhouse_core::store::{MemoryStore, SessionStore};
 use roundhouse_core::validate::{Validator, ValidatorConfig};
 use roundhouse_fleet::{
-    EchoFrontierClient, FrontierClient, FrontierModelSpec, StaticFrontierCatalog, WireProtocol,
+    DEFAULT_API_BASE, DEFAULT_PASS_THROUGH_BASE, EchoFrontierClient, FrontierClient,
+    FrontierModelSpec, OpenAiResponsesClient, StaticFrontierCatalog, WireProtocol,
 };
 use roundhouse_mcp::ControlStore;
 use roundhouse_server::{
@@ -96,6 +97,75 @@ const REDIS_VAR: &str = "ROUNDHOUSE_REDIS_URL";
 /// config that enrolled a project anyway stops the boot. See
 /// [`unkeepable_promises`].
 const JUDGE_MODEL_VAR: &str = "ROUNDHOUSE_JUDGE_MODEL";
+
+/// Which real provider transport this deployment dispatches through.
+///
+/// Absent means the offline echo stub, which is what every test and every
+/// pre-M7 deployment gets — a real client is opted into, never defaulted to,
+/// because composing one changes where a turn's tokens actually go. The one
+/// value today is `openai_responses`; a second transport adds a value here
+/// rather than a second variable.
+const FRONTIER_UPSTREAM_VAR: &str = "ROUNDHOUSE_FRONTIER_UPSTREAM";
+
+/// Where a stored key authenticates, overriding the published endpoint.
+///
+/// Separate from the pass-through base below because the two auth modes address
+/// genuinely different origins — stage 0's ruling, and the reason
+/// `OpenAiResponsesClient` takes two. A deployment behind one egress proxy
+/// points both at it.
+const OPENAI_API_BASE_VAR: &str = "ROUNDHOUSE_OPENAI_API_BASE";
+
+/// Where a forwarded ChatGPT device login authenticates, overriding the
+/// endpoint the pass-through stanza implies.
+const OPENAI_PASS_THROUGH_BASE_VAR: &str = "ROUNDHOUSE_OPENAI_PASS_THROUGH_BASE";
+
+/// The transport a turn is dispatched through, as this deployment configured it.
+///
+/// Load-or-die on a *named* transport, the same posture the catalog and the
+/// control plane take: a deployment that asked for a real upstream and got the
+/// echo stub would report a full dashboard of turns that never left the
+/// process. An unrecognised name is refused rather than falling back, for the
+/// same reason.
+fn frontier_client() -> anyhow::Result<Arc<dyn FrontierClient>> {
+    let named = match std::env::var(FRONTIER_UPSTREAM_VAR) {
+        Ok(named) if !named.trim().is_empty() => named.trim().to_string(),
+        _ => {
+            tracing::warn!(
+                var = FRONTIER_UPSTREAM_VAR,
+                "no frontier upstream configured; serving the offline echo stub, which \
+                 reaches no provider and bills nothing"
+            );
+            return Ok(Arc::new(EchoFrontierClient::new("frontier answer")));
+        }
+    };
+    let base = |var: &str, default: &str| {
+        std::env::var(var)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| default.to_string())
+    };
+    match named.as_str() {
+        "openai_responses" => {
+            let api_base = base(OPENAI_API_BASE_VAR, DEFAULT_API_BASE);
+            let pass_through_base = base(OPENAI_PASS_THROUGH_BASE_VAR, DEFAULT_PASS_THROUGH_BASE);
+            // The bases are logged and the credentials are not, which is the
+            // whole of what an operator needs to see here: which origin this
+            // process will talk to. A URL is configuration; a key is not.
+            tracing::info!(
+                %api_base,
+                %pass_through_base,
+                "dispatching frontier turns over the OpenAI Responses wire"
+            );
+            Ok(Arc::new(OpenAiResponsesClient::with_bases(
+                api_base,
+                pass_through_base,
+            )?))
+        }
+        other => anyhow::bail!(
+            "{FRONTIER_UPSTREAM_VAR} names `{other}`, which is not a transport this build has;              the supported value is `openai_responses`, and leaving the variable unset serves              the offline echo stub"
+        ),
+    }
+}
 
 /// Prompt shape the startup cross-check quotes the catalog under.
 ///
@@ -221,6 +291,15 @@ const BUDGET_PROMISE: &str = "its budget degrades to local with overflow_when_lo
      which promises that an exhausted budget serves locally instead of failing, and this \
      deployment has no local capacity to serve it";
 
+/// What a `UserOnly` or pass-through credential mode promises about a member
+/// who has attached nothing.
+///
+/// [`CredentialMode`]: roundhouse_core::control::CredentialMode
+const CREDENTIAL_PROMISE: &str = "its credential mode reaches no hosted provider on this \
+     deployment -- either every provider its keys name is one this process cannot route to, or \
+     its mode leaves it with no key at all -- which promises that an unreachable provider serves \
+     locally instead of failing, and this deployment has no local capacity to serve it";
+
 /// What a project's `"validate"` block promises, and what keeping it needs.
 ///
 /// [`ValidationTerms`]: roundhouse_server::ValidationTerms
@@ -280,6 +359,26 @@ fn unkeepable_promises(
     judge: Option<&FrontierModelSpec>,
 ) -> Vec<&'static str> {
     let mut broken = Vec::new();
+    // The credential half, and it is here rather than at the config boundary
+    // for the reason the other three are: `config.rs` refuses a *variable this
+    // process does not have* -- an unset `env_var` stops the boot naming the
+    // variable, which is the loud half and needs no catalog. What it cannot see
+    // is whether the providers a key can authenticate to are providers this
+    // deployment can route to at all, because that is the catalog's half, and
+    // the two files cannot see each other. Only here are both loaded.
+    //
+    // Asked through the same `reachable` the router will apply at runtime
+    // rather than a restatement of it, exactly as the cadence and budget halves
+    // are.
+    if admission
+        .credentials
+        .reachable(reachable.to_vec())
+        .candidates
+        .is_empty()
+        && !reachable.is_empty()
+    {
+        broken.push(CREDENTIAL_PROMISE);
+    }
     // The third promise, and the one that is not about a *spent* allowance —
     // it is here anyway because it is the same sentence in the same file with
     // the same remedy shape: a config says something will happen, and this is
@@ -525,7 +624,7 @@ async fn serve<S: SessionStore>(
 ) -> anyhow::Result<()> {
     let conversations = Arc::new(Conversations::new());
     let control = Arc::new(ControlStore::new());
-    let frontier: Arc<dyn FrontierClient> = Arc::new(EchoFrontierClient::new("frontier answer"));
+    let frontier = frontier_client()?;
     let engine_config = EngineConfig {
         // The salt reaches the engine and nowhere else: it is an input to the
         // stamp written at session creation, and every later reader — the
@@ -848,6 +947,76 @@ mod tests {
             None,
         )
         .expect("an exhausted budget has somewhere to go when a local worker is quoted");
+    }
+
+    /// A one-key plane whose project declares a credential arrangement.
+    ///
+    /// Through the config file for the reason [`plane_with`] is: the mode, the
+    /// tiers and the mutual-exclusion check are all inside `validate`, and a
+    /// fixture that assembled an `Admission` by hand would be checking a
+    /// promise no operator could write.
+    fn plane_with_credentials(credentials: serde_json::Value) -> ControlPlane {
+        let json = serde_json::json!({
+            "projects": [{ "id": "acme", "credentials": credentials }],
+            "users": [{ "id": "ada" }],
+            "keys": [{ "project": "acme", "user": "ada", "key_sha256": "a".repeat(64) }],
+        })
+        .to_string();
+        ControlPlane::configured(
+            ControlPlaneConfig::from_json(&json, "credential cross-check fixture")
+                .expect("the fixture config must validate"),
+        )
+    }
+
+    #[test]
+    fn a_credential_mode_that_reaches_no_provider_refuses_to_serve_without_a_fleet() {
+        // The credential half of the same promise, and the one only this file
+        // can ask: `config.rs` refuses an environment variable this process
+        // does not *have*, which needs no catalog. Whether the providers a key
+        // can authenticate to are providers this deployment can route to is the
+        // catalog's half, and the two files cannot see each other.
+        //
+        // PROBE: `user_only` with no member key anywhere. Every hosted
+        // candidate goes, and a fleetless deployment has nothing to degrade to,
+        // so every turn of that key's would fail.
+        let error = refuse_promises_of_a_local_fallback(
+            &plane_with_credentials(serde_json::json!({ "mode": "user_only" })),
+            &reachable_candidates(&priced_catalog()),
+            None,
+        )
+        .expect_err("a mode that reaches nothing has nowhere to degrade to");
+        let message = error.to_string();
+        assert!(
+            message.contains("project `acme`, user `ada`"),
+            "the refusal has to name the key an operator would go and fix: {message}"
+        );
+        assert!(
+            message.contains("credential mode reaches no hosted provider"),
+            "and it has to name the promise: {message}"
+        );
+
+        // Acceptance: the identical arrangement on a deployment that quotes a
+        // local worker. Degrading to local is what the mode promises, and here
+        // there is a local worker to degrade to -- which is what makes the
+        // refusal above about the fleet rather than about `user_only`.
+        let mut with_fleet = reachable_candidates(&priced_catalog());
+        with_fleet.push(local_candidate());
+        refuse_promises_of_a_local_fallback(
+            &plane_with_credentials(serde_json::json!({ "mode": "user_only" })),
+            &with_fleet,
+            None,
+        )
+        .expect("a member with no key degrades to local when there is a local worker");
+
+        // CONTROL, and the one that keeps this check from refusing every
+        // deployment: a project that declares no credentials at all is not
+        // gating on them, so nothing is withheld and nothing is promised.
+        refuse_promises_of_a_local_fallback(
+            &plane_with(serde_json::json!({}), serde_json::Value::Null),
+            &reachable_candidates(&priced_catalog()),
+            None,
+        )
+        .expect("a file that says nothing about credentials promises nothing about them");
     }
 
     #[test]

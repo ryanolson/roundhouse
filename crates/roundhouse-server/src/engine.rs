@@ -27,7 +27,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::StreamExt;
 use roundhouse_core::context::{ContextAssembler, Tokenizer};
-use roundhouse_core::control::{MemorySpendLedger, SpendError, SpendLedger, TurnPolicy};
+use roundhouse_core::control::{
+    CredentialError, MemorySpendLedger, SpendError, SpendLedger, TurnPolicy,
+};
 use roundhouse_core::event::{Accounting, IncompleteReason, SessionObserver, Usage};
 use roundhouse_core::ids::{ResponseId, SessionId, SideCallId, TurnId};
 use roundhouse_core::interject::{Interjection, InterjectionContext, Interjector};
@@ -1122,6 +1124,47 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             return Err(RoutingError::PolicyRefused.into());
         }
 
+        // --- drop what this principal holds no credential for ----------------
+        //
+        // **Here, and not in the connect branch**, which is where a first draft
+        // put it. The review caught that placement as too late twice over, and
+        // both halves are visible in the twenty lines below this one: `payer`
+        // is stamped on the `DecisionRecord` that `record_routing` is about to
+        // write, and `considered` — the list `best_frontier_alternative` prices
+        // a local turn's saving against (`metrics/fold.rs`) — is this filtered
+        // set. A provider left in because nobody had a key for it would become
+        // the counterfactual every local turn is credited against: a dashboard
+        // number invented out of a missing credential.
+        //
+        // Deliberately *not* the same question the policy filter above asks. A
+        // cadence- or budget-excluded model is reachable next turn, so its
+        // counterfactual is true and it stays in `considered`. A provider this
+        // principal cannot authenticate to is unreachable on every turn, and
+        // pricing against it is a claim about money that could never have been
+        // spent.
+        //
+        // Local candidates always survive, which is why a missing credential
+        // *degrades* rather than failing — the same shape as budget exhaustion,
+        // a served turn plus a marker rather than a 500.
+        let reached = admission.credentials.reachable(candidates);
+        let withheld_providers = reached.withheld_providers;
+        let candidates = reached.candidates;
+        if candidates.is_empty() && quoted > 0 {
+            // Every option went for want of a credential and there is no local
+            // capacity to degrade to. Its own error rather than `PolicyRefused`
+            // for the reason that one is not `NoCandidates`: the remedy is a
+            // variable an operator has not set, and blaming the policy would
+            // send them to the wrong file. The boot check
+            // (`unkeepable_promises`) refuses the configuration that makes this
+            // reachable, so arriving here means a credential went missing after
+            // the process started.
+            return Err(EngineError::Frontier(FrontierError::Credential(
+                CredentialError::NoCredential {
+                    provider: withheld_providers.join(", "),
+                },
+            )));
+        }
+
         // --- reserve what this turn may spend --------------------------------
         //
         // Between the quotes and the choice, which is the only place it can
@@ -1173,6 +1216,17 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             .cloned()
             .ok_or_else(|| EngineError::UnresolvableTarget(decision.target.clone()))?;
 
+        // The credential and the payer for what was actually chosen, resolved
+        // once and read twice — by the decision below and by the dispatch after
+        // it. `None` is not a state to fall back from: `reachable` above has
+        // already made an unreachable target unchoosable, so a `None` here is a
+        // caller that skipped the filter, and defaulting the payer would book
+        // somebody else's spend under the deployment's name.
+        let access = admission
+            .credentials
+            .access_for(&decision.target)
+            .ok_or_else(|| EngineError::UnresolvableTarget(decision.target.clone()))?;
+
         // Recorded before execution: a decision that led to a failure is still
         // part of the audit trail.
         session
@@ -1217,6 +1271,21 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                         .frontier_catalog
                         .spec_for(&decision.target)
                         .map(|spec| spec.pricing),
+                    // Whose credential this dispatch spends, and what the
+                    // credential filter took out. Both are decided above, in
+                    // the same pass that filtered the candidate set — which is
+                    // the whole argument for that placement: a payer resolved
+                    // in the connect branch is resolved after the record it
+                    // belongs on has been written, and a settle would then have
+                    // to guess.
+                    payer: access.payer,
+                    // Empty on every ordinary turn, and skipped on the wire
+                    // when it is, so a pre-M7 log's decisions stay
+                    // byte-identical. Non-empty, it is the only place in the
+                    // log that a project whose credential variable was never
+                    // set is distinguishable from one that simply prefers its
+                    // own workers.
+                    withheld_providers,
                 },
             )
             .await?;
@@ -1259,6 +1328,15 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                     // would defeat the hit we just routed on.
                     prompt_cache_key: session.session_id().to_string(),
                     expected_output_tokens: Some(self.config.expected_output_tokens),
+                    // The credential travels here for the same reason the
+                    // dialect above does: this is the only argument `execute`
+                    // receives, and the engine holds one client for every
+                    // provider. It is the *same* resolution the payer on the
+                    // decision came from, read out of one `access_for` above —
+                    // two calls could resolve two tiers if a key were attached
+                    // between them, and the log would then name a payer the
+                    // request did not use.
+                    credential: access.credential.clone(),
                 };
                 self.bounded(deadline_at, self.frontier_client.execute(&quote))
                     .await?

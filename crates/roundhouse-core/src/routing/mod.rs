@@ -40,7 +40,7 @@ pub use policy::{AffinityPolicy, EscalationPolicy};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::control::{BudgetState, FrontierHistory, TurnBudget, TurnPolicy};
+use crate::control::{BudgetState, FrontierHistory, Payer, TurnBudget, TurnPolicy};
 use crate::ids::SessionId;
 
 /// Where a turn can be sent.
@@ -473,6 +473,34 @@ pub struct DecisionRecord {
     /// `roundhouse-server`'s engine — rather than a turn anyone can fix now.
     #[serde(default)]
     pub rate_card: Option<ProviderPricing>,
+    /// Whose credential this dispatch spends.
+    ///
+    /// Decided where the credential resolves — before `choose()`, at the same
+    /// seam the candidate set is filtered — because a fact decided there and
+    /// read again at settle time has to travel in the log, or the process that
+    /// ran the turn and the successor that replays it can reach two different
+    /// answers about who was billed.
+    ///
+    /// Defaults to [`Payer::Deployment`], which is the correct reading of a
+    /// pre-M7 log rather than a placeholder: those turns really were paid for
+    /// with the deployment's own key. Same treatment, and same reason, as
+    /// [`Self::budget_state`].
+    #[serde(default)]
+    pub payer: Payer,
+    /// Providers quoted for this turn and dropped for want of a credential.
+    ///
+    /// **The marker on a credential degrade**, and the reason it is recorded
+    /// rather than inferred: a project whose credential variable was never set
+    /// serves every turn locally and looks, in every other field of this
+    /// record, exactly like a project that simply prefers its own workers. That
+    /// is the silent failure this milestone's auth ruling found on the client
+    /// side, and it is not one worth reproducing on ours.
+    ///
+    /// Empty on every ordinary turn and skipped on the wire when it is, so a
+    /// deployment that has never configured a credential writes the same
+    /// decision bytes it wrote before this field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub withheld_providers: Vec<String>,
 }
 
 /// Why no target was chosen.
@@ -675,11 +703,17 @@ mod tests {
                 cache_write_per_mtok_usd: 3.75,
                 output_per_mtok_usd: 15.0,
             }),
+            payer: Payer::User,
+            withheld_providers: vec!["openai".into()],
         };
         let encoded = serde_json::to_string(&record).unwrap();
         assert!(
             encoded.contains(r#""budget_state":"exhausted_overflow""#),
             "the overspend has to be findable in the log by one grep: {encoded}"
+        );
+        assert!(
+            encoded.contains(r#""payer":"user""#),
+            "and so does whose credential paid for it: {encoded}"
         );
         assert_eq!(
             serde_json::from_str::<DecisionRecord>(&encoded).unwrap(),
@@ -717,6 +751,31 @@ mod tests {
             "and it recorded no rate card, because there was no field to record \
              one in -- which is why a repair reports such a settle as drift \
              rather than pricing it at zero"
+        );
+        assert_eq!(
+            recovered.payer,
+            Payer::Deployment,
+            "a turn taken before BYOK existed really was paid for with the \
+             deployment's own key, which is a fact and not a missing value"
+        );
+        assert!(
+            recovered.withheld_providers.is_empty(),
+            "and nothing was withheld from it, because there was nothing to \
+             withhold on"
+        );
+
+        // The credential marker is skipped when empty, so a deployment that
+        // never configures one keeps writing exactly the bytes it wrote before
+        // this field existed.
+        let ordinary = DecisionRecord {
+            payer: Payer::Deployment,
+            withheld_providers: Vec::new(),
+            ..record
+        };
+        let encoded = serde_json::to_string(&ordinary).unwrap();
+        assert!(
+            !encoded.contains("withheld_providers"),
+            "an empty marker is absent from the wire, not present and empty: {encoded}"
         );
     }
 }

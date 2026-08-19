@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::control::{FrontierHistory, Principal};
+use crate::control::{FrontierHistory, Payer, Principal};
 use crate::event::{
     ControlRecord, IncompleteReason, NotRunReason, PlaceboTiming, SessionEvent, SessionEventKind,
     SessionObserver, Usage, ValidationOutcome,
@@ -83,6 +83,10 @@ struct PendingRouting {
     /// [`DecisionRecord::rate_card`] for why a settle reads the log's card and
     /// never a live one.
     rate_card: Option<ProviderPricing>,
+    /// Whose credential the decision resolved. Held here for exactly the
+    /// reason the card is: what a turn draws depends on it, and a repair
+    /// driven from the log alone has to reach the same answer.
+    payer: Payer,
 }
 
 /// A response that terminated, and everything needed to charge it for.
@@ -123,6 +127,21 @@ pub struct TerminalSettlement {
     /// target with no card is a turn routed before the card was recorded, which
     /// no process alive can price. See [`DecisionRecord::rate_card`].
     pub rate_card: Option<ProviderPricing>,
+    /// Whose credential paid, as the decision recorded it.
+    ///
+    /// Beside the card for the same reason the card is here rather than in the
+    /// running process's configuration: what the project's ledger draws is
+    /// `BudgetCounts::drawn_usd(payer, spend)`, and a repair driven from the
+    /// log alone must reach the same number as the live settle it replaced. A
+    /// payer re-derived from whichever credential the process happens to hold
+    /// *now* would differ from the one that actually paid the moment a member
+    /// attached or removed a key.
+    ///
+    /// [`Payer::Deployment`] for a response that recorded no decision, which is
+    /// literally true: a turn that reached no provider spent nobody's
+    /// credential, and a settle prices it at zero on the target rather than on
+    /// this field.
+    pub payer: Payer,
     /// What the terminal event reported, estimate or measurement alike. An
     /// estimate is what a provider that reported nothing gets charged on, and
     /// it is charged exactly as a measurement would be.
@@ -397,6 +416,7 @@ impl SessionState {
                         target: decision.chosen.clone(),
                         isl_tokens: decision.isl_tokens,
                         rate_card: decision.rate_card,
+                        payer: decision.payer,
                     },
                 );
             }
@@ -435,6 +455,10 @@ impl SessionState {
                     response_id: response_id.clone(),
                     seq: event.seq,
                     rate_card: routing.as_ref().and_then(|routing| routing.rate_card),
+                    payer: routing
+                        .as_ref()
+                        .map(|routing| routing.payer)
+                        .unwrap_or_default(),
                     target: routing.map(|routing| routing.target),
                     usage: usage.clone(),
                 });

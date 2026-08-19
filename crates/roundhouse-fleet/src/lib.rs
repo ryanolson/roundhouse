@@ -18,6 +18,7 @@
 
 pub mod frontier;
 pub mod local;
+pub mod openai_responses;
 pub mod usage;
 
 pub use frontier::{
@@ -27,6 +28,7 @@ pub use frontier::{
 pub use local::{
     EmbeddedFleet, FleetError, FleetQuery, LocalFleet, LocalQuote, Reservation, WorkerRegistration,
 };
+pub use openai_responses::{DEFAULT_API_BASE, DEFAULT_PASS_THROUGH_BASE, OpenAiResponsesClient};
 pub use usage::WireProtocol;
 
 /// Re-exported so callers can configure and own the embedded service without

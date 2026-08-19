@@ -229,6 +229,8 @@ mod tests {
                         turn_policy_digest: String::new(),
                         budget_state: BudgetState::Unconstrained,
                         rate_card: None,
+                        payer: Default::default(),
+                        withheld_providers: Vec::new(),
                     },
                 },
             },

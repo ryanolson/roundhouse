@@ -18,7 +18,7 @@
 //! [`DecisionRecord::rate_card`](roundhouse_core::routing::DecisionRecord::rate_card).
 
 use roundhouse_core::context::Tokenizer;
-use roundhouse_core::control::{GrantRequest, Settlement, TurnBudget};
+use roundhouse_core::control::{GrantRequest, SettledSpend, Settlement, TurnBudget};
 use roundhouse_core::ids::ResponseId;
 use roundhouse_core::now_ms;
 use roundhouse_core::routing::{Candidate, Target};
@@ -132,12 +132,51 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                 session_id: session.session_id().clone(),
                 seq: settlement.seq,
                 response_id: settlement.response_id.clone(),
-                actual_usd: settled_cost_usd(settlement)?,
+                // The two credential axes meet here and only here — see
+                // [`BudgetCounts::drawn_usd`], which is the one place `payer`
+                // and the accounting-honesty rule are applied, so two callers
+                // cannot apply them in two orders.
+                actual_usd: admission
+                    .budget_counts
+                    .drawn_usd(settlement.payer, self.settled_spend(admission, settlement)?),
                 window: terms.budget.window,
                 now_ms: now_ms(),
             })
             .await?;
         Ok(())
+    }
+
+    /// What this turn cost, and whether roundhouse may name the number.
+    ///
+    /// **The forwarded half is read from the admission, not from the log**, and
+    /// that is a deliberate exception to this module's "a settle reads the log
+    /// and nothing else" rule — so it is written down rather than left to be
+    /// discovered. Whether a project forwards its callers' credentials is
+    /// *configuration*, exactly like the `window` and the `terms` two lines
+    /// above, which this function already reads from the same `Admission`. The
+    /// alternative was a fourth field on every `DecisionRecord` recording
+    /// something derivable from the project's own mode.
+    ///
+    /// What it costs is bounded and shared with the fields beside it: a project
+    /// switched from pass-through to a stored key between a turn and its repair
+    /// would have that turn re-priced under the new mode. The same is already
+    /// true of a project whose budget window changed, and the reconciliation
+    /// view is where such a difference becomes visible.
+    fn settled_spend(
+        &self,
+        admission: &Admission,
+        settlement: &TerminalSettlement,
+    ) -> Result<SettledSpend, EngineError> {
+        let usd = settled_cost_usd(settlement)?;
+        Ok(match admission.credentials.is_forwarding() {
+            // A seat is a subscription, not a metered rate card. The catalog's
+            // per-token price describes what *roundhouse* would have paid on
+            // its own key, which is a counterfactual and not a bill — see
+            // `SettledSpend`. The tokens still land in the fold, which is the
+            // honest half.
+            true => SettledSpend::AccountedNotBilled,
+            false => SettledSpend::Billed { usd },
+        })
     }
 
     /// The same settle, driven on a log this process did not write — and
@@ -212,6 +251,7 @@ pub(super) fn settled_cost_usd(settlement: &TerminalSettlement) -> Result<f64, E
 #[cfg(test)]
 mod tests {
     use super::*;
+    use roundhouse_core::control::Payer;
     use roundhouse_core::event::{Accounting, Usage};
     use roundhouse_core::ids::ResponseId;
     use roundhouse_core::routing::ProviderPricing;
@@ -246,6 +286,10 @@ mod tests {
             seq: 7,
             target,
             rate_card,
+            // This function's subject is the *price*, which is a question about
+            // the card and the target. Who paid is the axis `BudgetCounts`
+            // reads, one seam out, and it is asserted there.
+            payer: Payer::Deployment,
             usage: one_mtok_out(),
         }
     }
