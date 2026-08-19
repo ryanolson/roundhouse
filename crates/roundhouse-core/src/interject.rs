@@ -184,8 +184,11 @@ pub struct InterjectionContext<'a> {
     /// applied with [`TurnPolicy::narrow`], which is total and can only shrink,
     /// so "the validator cannot escalate past the ceiling" is a property of the
     /// composition operator rather than a rule an occupant is trusted to
-    /// remember. Read here so the *recorded* action is the one that will
-    /// actually be in force.
+    /// remember. Read here so the *recorded* action is the one this membership
+    /// permits — not, and it cannot be, the one this turn's pool can serve:
+    /// that needs the candidate list, which is the one thing this context
+    /// deliberately withholds, so the engine applies the second clamp where the
+    /// quotes are.
     pub turn_policy: &'a TurnPolicy,
     /// What the agent said it is trying to do.
     ///
@@ -278,8 +281,11 @@ mod tests {
         let session_id = SessionId::new("acme/ada/main");
         let principal = Principal::new("acme", "ada");
 
+        let side_call_id = crate::ids::SideCallId::new("sc_1");
         let side_call = SideCall {
             session_id: &session_id,
+            id: &side_call_id,
+            at_seq: 1,
             principal: &principal,
             budget: None,
         };

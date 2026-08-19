@@ -422,15 +422,43 @@ pub enum NotRunReason {
     VerdictUnparseable,
     /// This arm consults nobody, by design.
     PlaceboArm {
-        /// Whether the sham intervention fired on this turn.
+        /// What the sham's deterministic timing came to on this turn.
         ///
         /// On the reason rather than beside the outcome, because there is no
         /// verdict here for an action to have been derived *from*: what the
         /// placebo arm did is a property of its timing, and its timing is what
         /// this variant is about. The control the whole experiment leans on is
         /// unreadable without it.
-        intervened: bool,
+        timing: PlaceboTiming,
     },
+}
+
+/// What the placebo arm's timing came to on one turn.
+///
+/// **Three states rather than a boolean, because "nothing happened" has two
+/// meanings here and the arm comparison needs them apart.** A turn the coin did
+/// not select was never in the sham's exposed group at all; a turn it selected
+/// and the channel refused to act on *was* — the exposure is real, only the
+/// disruption is missing. A boolean forced those together, and the fold reading
+/// it would either understate the control arm's exposure or report an
+/// interruption on a turn nothing interrupted. Neither reading is one an
+/// operator could correct after the fact, because the log would no longer carry
+/// the difference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaceboTiming {
+    /// The timing did not select this turn. An ordinary turn.
+    Quiet,
+    /// The timing selected this turn and the sham interruption was taken.
+    Intervened,
+    /// The timing selected this turn and the channel does not act, so nothing
+    /// was altered.
+    ///
+    /// [`SteerChannel::Off`](crate::validate::SteerChannel::Off) is the shipped
+    /// default and it means observe — for every arm, not only for the one that
+    /// routes through the action map. The measurement survives the refusal
+    /// because the measurement is what `Off` still permits.
+    Withheld,
 }
 
 /// Facts an interjector produced for the engine to commit.
@@ -747,7 +775,9 @@ mod tests {
                 trigger: TriggerRecord::new(4, 30_000, Vec::new()),
                 arm: Arm::Shadow,
                 outcome: ValidationOutcome::NotRun {
-                    reason: NotRunReason::PlaceboArm { intervened: true },
+                    reason: NotRunReason::PlaceboArm {
+                        timing: PlaceboTiming::Intervened,
+                    },
                 },
             },
         ];

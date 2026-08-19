@@ -387,10 +387,6 @@ impl Trigger {
         Self { config, signals }
     }
 
-    pub fn config(&self) -> &TriggerConfig {
-        &self.config
-    }
-
     /// Whether this turn is worth asking about, and what fired.
     ///
     /// **Pure, and takes no clock.** The cooldown is measured against

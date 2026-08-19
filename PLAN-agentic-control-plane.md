@@ -707,12 +707,17 @@ struct Verdict {
 }       // no suggested_action field exists — by construction
 ```
 
-The directive the agent eventually sees is roundhouse's rendering of the
-structured verdict, never the judge's prose passed through: a judge whose free
-text reaches the agent verbatim is a judge that can be prompt-injected into
-escalating. (The brief itself renders transcript content compactly and
-hashed where possible for the same reason — §10 keeps this on the risk
-register rather than calling it solved.)
+The directive the agent eventually sees is built from roundhouse's own
+vocabulary alone — fixed sentences, `at_step` as a number, and the trigger's
+computed `SignalFired` facts. `divergence.description` is **not** among them,
+not quoted and not summarized: it is a model's free text about a transcript
+that is attacker-influenceable by construction, and a `Halt`'s text is
+committed into the conversation permanently, so a sentence that lands there
+prefixes every later turn. The description is recorded whole in
+`ValidationDecided`, for the operator reading the log and for calibration.
+(The brief renders transcript content compacted, hashed and line-prefixed as
+quotation for the same reason — §10 keeps this on the risk register rather
+than calling it solved.)
 
 ### The action map — weakest intervention first, evidence-ordered
 
@@ -728,9 +733,15 @@ register rather than calling it solved.)
   shortening trajectories). Clamped through the ceiling like every other
   narrowing.
 - **Steer { directive }** (outcome B) requires policy `ToolCall|Auto` **and**
-  detected capability **and** a zero consecutive-intervention count — injected
-  guidance is the weakest, most oscillation-prone action in the literature
-  and the protocol-heavy path is the last resort on purpose.
+  detected capability **and** a consecutive-intervention count inside
+  `steer_after_interventions`. That knob defaults to `0`, which makes outcome B
+  **unreachable out of the box**: escalation above claims every zero-count turn
+  on any channel that is not `Off`, so the steer branch only ever sees counts of
+  one or more and a cap of zero admits none of them. Deliberate — injected
+  guidance is the weakest, most oscillation-prone action in the literature and
+  the protocol-heavy path is the last resort on purpose. Opting in is one
+  number: `steer_after_interventions: 1` makes an already-interrupted session
+  eligible.
 - **Halt { reason }** (outcome C) completes the turn with plain guidance text
   — named honestly: Codex ends its loop on a message with no tool call, so
   this *hands control back to the human*. It is the degrade path when the MCP
@@ -1059,11 +1070,15 @@ narrowings, never membership state).
    `committed_usd` is global. Per-node reporting or a fold-merge endpoint —
    decide before multi-node, alongside the README's existing per-process
    metrics caveat.
-5. **Judge prompt-injection.** The brief renders transcript content compacted
-   and hashed, the verdict is structured with no action field, directives are
-   roundhouse-rendered, and interventions are capped — but adversarial content
-   in the transcript influencing `on_track` is not *solved*, only bounded.
-   The Shadow arm is also the measurement instrument here.
+5. **Judge prompt-injection.** The brief renders transcript content compacted,
+   hashed, and line-prefixed as quotation — every line, so nothing from the
+   transcript can begin a line of the brief and forge one of its sections; the
+   verdict is structured with no action field; directives carry roundhouse's
+   vocabulary only, never the judge's prose; and interventions are capped. But
+   adversarial content in the transcript influencing `on_track` is not
+   *solved*, only bounded: a well-written instruction inside a quotation is
+   still an instruction the judge can read. The Shadow arm is also the
+   measurement instrument here.
 6. **Does the Intervention Paradox reproduce for coding agents?** Unknown and
    deployment-specific by its own mechanism. Hence: default off, Shadow first,
    arms in the log, and the default flips only on arm evidence.

@@ -29,7 +29,7 @@ use futures::StreamExt;
 use roundhouse_core::context::{ContextAssembler, Tokenizer};
 use roundhouse_core::control::{MemorySpendLedger, SpendError, SpendLedger, TurnPolicy};
 use roundhouse_core::event::{Accounting, IncompleteReason, SessionObserver, Usage};
-use roundhouse_core::ids::{ResponseId, SessionId, TurnId};
+use roundhouse_core::ids::{ResponseId, SessionId, SideCallId, TurnId};
 use roundhouse_core::interject::{Interjection, InterjectionContext, Interjector};
 use roundhouse_core::item::Item;
 use roundhouse_core::metrics::MetricsRecorder;
@@ -51,7 +51,7 @@ use tokio::time::Instant;
 use crate::control_config::Admission;
 
 mod control;
-mod spend;
+pub(crate) mod spend;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -678,6 +678,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         // *before* `dispatch`, which is what makes the accounting below true
         // rather than merely tidy — nothing has been priced, no `Routed`
         // exists, and no grant has been opened.
+        let side_call_id = SideCallId::generate();
         let interjection = self
             .interjector
             .consider(&InterjectionContext {
@@ -695,12 +696,25 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                 // regardless. Detection belongs at the wire layer against the
                 // tool list a request declared, which is §7's milestone.
                 capability: &SteerCapability::Absent,
-                // Who a check is billed to, and under what key. Not the
-                // candidate list, and never a price: an occupant may be told
-                // there is no room for a check and never what the turn it is
-                // checking would have cost.
+                // Who a check is billed to, under what key, and by what name.
+                // Not the candidate list, and never a price: an occupant may be
+                // told there is no room for a check and never what the turn it
+                // is checking would have cost.
+                //
+                // The id is minted here, before anyone knows whether a check
+                // will happen, because the money question is asked before the
+                // call and a hold has to be keyed by something. One id per
+                // turn, spent or not, is the cheapest possible way to make the
+                // ledger row and the log row name one string — and a turn that
+                // never checks simply never uses it.
                 side_call: SideCall {
                     session_id,
+                    id: &side_call_id,
+                    // The log position this turn is being checked at: after its
+                    // own `TurnStarted` and before anything the check can
+                    // cause, so it rises with every turn and a replay computes
+                    // the same number. It is the settle's idempotency key.
+                    at_seq: session.last_seq(),
                     principal: &admission.principal,
                     budget: admission.budget.as_ref(),
                 },
@@ -823,7 +837,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                 // reads the principal and the budget, and `narrow` touches
                 // neither — a budget is an admin's ceiling and not an axis an
                 // agent may move.
-                let admission = &self.narrowed_admission(session_id, session.state(), admission);
+                let admission = &self.narrowed_admission(session_id, admission);
                 match self.dispatch(&mut session, &response_id, admission).await {
                     Ok(Completed {
                         text,
@@ -1013,7 +1027,6 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         deadline_at: Instant,
         admission: &Admission,
     ) -> Result<(FrontierStream, Decision, usize), EngineError> {
-        let turn_policy: &TurnPolicy = &admission.policy;
         // Rebuild the prompt from the committed log, so what we price is
         // exactly what a successor would reconstruct.
         let assembler = ContextAssembler::rehydrate(
@@ -1055,6 +1068,26 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             isl_tokens as u64,
             self.config.expected_output_tokens as u64,
         ));
+
+        // --- apply the judge's escalation, as far as the pool allows ---------
+        //
+        // Here rather than beside the overlay in `narrowed_admission`, and the
+        // reason is the line above it: the escalation's floor has to be clamped
+        // to what the quoted candidates can reach, and nothing upstream of this
+        // point has quoted anything. The escalation itself crosses no side
+        // channel — it is read from `SessionState::active_escalation`, folded
+        // from the `ValidationDecided` in the log, so a successor picking this
+        // session up mid-escalation narrows exactly as this process would have.
+        //
+        // See `escalate_within_reach`: an overlay may refuse a turn because the
+        // agent asked for it, and an escalation may not, because nobody did.
+        let escalated = control::escalate_within_reach(
+            admission,
+            session.state().active_escalation(),
+            &candidates,
+        );
+        let admission = &escalated.admission;
+        let turn_policy: &TurnPolicy = &admission.policy;
 
         // --- drop what this principal could never use ------------------------
         //
@@ -1147,7 +1180,16 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                 response_id,
                 DecisionRecord {
                     chosen: decision.target.clone(),
-                    rationale: decision.rationale.clone(),
+                    // Appended rather than woven in, exactly as the overflow
+                    // valve's note is: an ordinary decision's rationale stays
+                    // byte-identical to the one a deployment without the
+                    // validate loop writes, and the one turn in a session where
+                    // the floor served was not the floor asked for says so
+                    // where an operator reads it.
+                    rationale: match escalated.clamped {
+                        true => decision.rationale.clone() + control::ESCALATION_CLAMPED_NOTE,
+                        false => decision.rationale.clone(),
+                    },
                     policy: self.policy.name().to_string(),
                     isl_tokens: isl_tokens as u64,
                     expected_prefill_tokens: chosen.expected_prefill_tokens,

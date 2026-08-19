@@ -552,6 +552,37 @@ impl TurnPolicy {
         candidate.quality_prior >= self.min_quality && self.allow.matches(&candidate.target)
     }
 
+    /// The highest [`Candidate::quality_prior`] this policy still permits, or
+    /// `None` when it permits none of them.
+    ///
+    /// **The ceiling a best-effort narrowing is clamped to.** Every other
+    /// narrowing in this system is an ask somebody made and may be refused on:
+    /// an `allow` filter that matches nothing empties the pool and fails the
+    /// turn, and that is the operator's configured intent. The validator's
+    /// escalation is the one narrowing *nobody asked for* — this deployment
+    /// invented it, on a turn a client is already waiting for — so it must
+    /// never be the reason a turn fails. Clamping its floor to this value turns
+    /// "raise the bar past every candidate" into "take the best candidate there
+    /// is", which is what escalating meant in the first place.
+    ///
+    /// [`Self::permits`] and not [`Self::admits`], matching the engine's own
+    /// pre-`choose` filter: a cadence-rationed model is not unreachable, it is
+    /// unavailable *this* turn, and a ceiling computed against a spent ration
+    /// would collapse an escalation for the rest of a session because one turn
+    /// had used its frontier allowance.
+    ///
+    /// `None` rather than `0.0` for a pool this policy permits nothing from,
+    /// because those are opposite answers: no candidate at all is a refusal the
+    /// caller has to leave standing, and a floor of zero is one every candidate
+    /// meets.
+    pub fn reachable_quality_ceiling(&self, candidates: &[Candidate]) -> Option<f64> {
+        candidates
+            .iter()
+            .filter(|candidate| self.permits(candidate))
+            .map(|candidate| candidate.quality_prior)
+            .reduce(f64::max)
+    }
+
     /// Whether `candidate` is one this principal may be routed to *on this
     /// turn*, given what the session has already spent.
     ///
@@ -1215,6 +1246,56 @@ mod tests {
                 .to_string(),
             "(anthropic/*|local/*) & local/*"
         );
+    }
+
+    #[test]
+    fn the_reachable_ceiling_is_the_best_a_policy_permits_and_none_when_it_permits_nothing() {
+        let policy = TurnPolicy {
+            min_quality: 0.5,
+            allow: filter(&["anthropic/*", "local/*"]),
+            frontier_cadence: Some(FrontierCadence {
+                max_frontier: 1,
+                per_turns: 3,
+            }),
+        };
+        let hosted = candidate(frontier("anthropic", "claude"), 0.95);
+        let own = candidate(local("llama"), 0.6);
+        let excluded = candidate(frontier("openai", "gpt-5"), 0.99);
+        let too_cheap = candidate(local("tiny"), 0.1);
+
+        assert_eq!(
+            policy.reachable_quality_ceiling(&[
+                own.clone(),
+                hosted.clone(),
+                excluded.clone(),
+                too_cheap.clone()
+            ]),
+            Some(0.95),
+            "the best of what is permitted, and the 0.99 the filter excludes is \
+             not a candidate an escalation could ever be clamped onto"
+        );
+        // The cadence is deliberately not consulted: a spent ration makes a
+        // model unavailable this turn, not unreachable for the session, and a
+        // ceiling that fell when the window filled would silently un-escalate.
+        assert_eq!(
+            policy.reachable_quality_ceiling(std::slice::from_ref(&hosted)),
+            Some(0.95)
+        );
+        assert_eq!(
+            policy.reachable_quality_ceiling(std::slice::from_ref(&own)),
+            Some(0.6),
+            "a modest pool has a modest ceiling, which is the whole point: the \
+             clamp lands here rather than emptying the set"
+        );
+
+        // The refusal that must stay a refusal. `None` and `Some(0.0)` are
+        // opposite answers, and a caller that read one as the other would route
+        // a turn its key admits nowhere.
+        assert_eq!(
+            policy.reachable_quality_ceiling(&[excluded, too_cheap]),
+            None
+        );
+        assert_eq!(policy.reachable_quality_ceiling(&[]), None);
     }
 
     #[test]

@@ -24,13 +24,14 @@
 use std::sync::Arc;
 
 use roundhouse_core::context::Tokenizer;
-use roundhouse_core::control::{PolicyOverrides, Principal};
+use roundhouse_core::control::{PolicyOverrides, Principal, TurnPolicy};
 use roundhouse_core::ids::SessionId;
 use roundhouse_core::item::{Item, ItemContent};
 use roundhouse_core::now_ms;
+use roundhouse_core::routing::Candidate;
 use roundhouse_core::session::SessionState;
 use roundhouse_core::store::SessionStore;
-use roundhouse_core::validate::{Arm, Objective};
+use roundhouse_core::validate::{Arm, EscalationOverrides, Objective};
 use roundhouse_mcp::{ControlStore, SteerRecord};
 
 use crate::control_config::Admission;
@@ -93,57 +94,34 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
     /// in turns that happened to succeed. An overlay is a narrowing, so the cost
     /// of spending one early is that routing widens back to the deployment's
     /// ceiling and never past it.
-    /// **Two narrowings, one composition, and they arrive from opposite
-    /// directions.** The overlay is what the *agent* asked for and is spent as
-    /// it is applied; the escalation is what a *validation* decided and lasts
-    /// for the turns it named. Both are [`PolicyOverrides`] and both compose
-    /// through [`TurnPolicy::narrow`], which is total and can only shrink — so
-    /// "neither an agent nor a judge can widen what a key may do" is a property
-    /// of the operator rather than a rule two callers are trusted to remember,
-    /// and the order they compose in cannot change the result.
     ///
-    /// The escalation is read from [`SessionState::active_escalation`], which
-    /// is folded from the `ValidationDecided` in the log. It crosses no side
-    /// channel: the turns it applies to read it from the same projection a
-    /// replay builds, so a successor picking this session up mid-escalation
-    /// narrows exactly as this process would have.
+    /// **The judge's escalation is the other narrowing, and it is deliberately
+    /// not composed here.** Both are [`PolicyOverrides`] and both compose
+    /// through [`TurnPolicy::narrow`], so "neither an agent nor a judge can
+    /// widen what a key may do" is a property of the operator either way. What
+    /// separates them is what happens when a narrowing empties the candidate
+    /// set: an overlay is an *ask* — the agent made it, and a refusal is the
+    /// answer to a question it asked — while an escalation is an ask nobody
+    /// made, so it may not refuse. Deciding that needs the quoted pool, which
+    /// exists one layer down, so the escalation is applied by
+    /// [`escalate_within_reach`] inside `plan` and this function composes the
+    /// overlay alone. See [`Escalated`] for what the split buys.
     ///
     /// [`PolicyOverrides`]: roundhouse_core::control::PolicyOverrides
     /// [`TurnPolicy::narrow`]: roundhouse_core::control::TurnPolicy::narrow
-    /// [`SessionState::active_escalation`]: roundhouse_core::session::SessionState::active_escalation
     pub(super) fn narrowed_admission(
         &self,
         session_id: &SessionId,
-        state: &SessionState,
         admission: &Admission,
     ) -> Admission {
-        let overlay = self
+        let Some(overlay) = self
             .control
             .as_ref()
-            .and_then(|control| control.consume_overlay(session_id));
-        let escalation = state.active_escalation().map(PolicyOverrides::from);
-        if overlay.is_none() && escalation.is_none() {
+            .and_then(|control| control.consume_overlay(session_id))
+        else {
             return admission.clone();
-        }
-        let mut policy = admission.policy.as_ref().clone();
-        for overrides in [escalation, overlay].into_iter().flatten() {
-            policy = policy.narrow(&overrides);
-        }
-        Admission {
-            principal: admission.principal.clone(),
-            policy: Arc::new(policy),
-            // Untouched, and deliberately: the two axes an agent may move are
-            // the two the overlay carries, and a budget is not one of them.
-            // Narrowing a ceiling an admin wrote would be an agent editing its
-            // own project's money, and widening it needs no comment. An
-            // escalation is the same: it raises a quality floor, which is a
-            // routing question, and says nothing about what may be spent.
-            budget: admission.budget.clone(),
-            // Copied through for the same reason: which experiment a session is
-            // in was decided when the session was created, and no per-turn
-            // narrowing may move it.
-            validation: admission.validation.clone(),
-        }
+        };
+        admission.with_policy(admission.policy.narrow(&overlay))
     }
 
     /// The arm this session is enrolled in, if its membership enrolled it.
@@ -217,6 +195,96 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         {
             control.deposit_steer(record);
         }
+    }
+}
+
+/// What the audit trail is told when an escalation asked for more than the pool
+/// could reach.
+///
+/// One string, for the reason [`OVERFLOW_NOTE`] is one: the fact is one fact,
+/// and an operator asking "why did my escalation not do what the floor says"
+/// should find every instance with a single pattern. No number in it, and
+/// nothing about money — the floor is on the [`DecisionRecord`]'s digest and the
+/// candidate it selected is in `considered`, so the note says what happened and
+/// the record says what it happened to.
+///
+/// [`OVERFLOW_NOTE`]: roundhouse_core::routing
+/// [`DecisionRecord`]: roundhouse_core::routing::DecisionRecord
+pub(super) const ESCALATION_CLAMPED_NOTE: &str = "; the validator's quality floor was above every candidate this key admits, so it selected the best of them rather than refusing the turn";
+
+/// This turn's admission with the judge's escalation applied as far as the
+/// quoted pool allows.
+///
+/// **An escalation is best-effort narrowing, and that is the whole type.** It
+/// is the one narrowing in the system that nobody asked for: an operator's
+/// policy and an agent's overlay are both asks, and an ask that admits nothing
+/// is answered honestly with [`RoutingError::PolicyRefused`]. A floor this
+/// deployment invented has no such standing — "the checker must never break the
+/// checked" is stated three times across the validate tree, and an escalation
+/// that empties the candidate set breaks it for `escalation_turns` turns
+/// running, on exactly the deployment whose pool is too modest to meet a
+/// shipped default. So the floor is clamped to
+/// [`TurnPolicy::reachable_quality_ceiling`] and the escalation *selects* the
+/// strongest admissible candidate instead of refusing.
+///
+/// [`RoutingError::PolicyRefused`]: roundhouse_core::routing::RoutingError::PolicyRefused
+/// [`TurnPolicy::reachable_quality_ceiling`]: roundhouse_core::control::TurnPolicy::reachable_quality_ceiling
+pub(super) struct Escalated {
+    /// What routing runs under: the admission, with the composed floor.
+    pub(super) admission: Admission,
+    /// `true` when the floor served is not the floor the judge asked for.
+    ///
+    /// Carried out rather than re-derived at the recording site, because the
+    /// only other way to spot it is to run the composition a second time — and
+    /// two places computing "was this clamped" is how the audit trail starts
+    /// disagreeing with the routing it describes.
+    pub(super) clamped: bool,
+}
+
+/// Compose the escalation onto `admission`, then clamp it into reach.
+///
+/// A free function with no `&self`, for the reason [`steer_for_completion`] is
+/// one: what a floor composes to is separable from the engine that quoted the
+/// pool, and separating them is what makes the degenerate cases — an empty
+/// pool, a floor already met, a floor nothing can meet — checkable without an
+/// engine to build.
+///
+/// **The order is composition, then reachability, and it cannot be the other
+/// way.** `admission.policy` already carries the membership's own floor and any
+/// overlay the agent spent this turn, composed by
+/// [`TurnPolicy::narrow`](roundhouse_core::control::TurnPolicy::narrow)'s
+/// `max`. The clamp is applied last, to the result, and against what *that*
+/// policy permits — so an overlay that admits nothing still refuses, which is
+/// the agent's own ask answered, while the escalation can only ever move the
+/// floor within a set the base admission had already agreed to.
+///
+/// The `None` ceiling is the case worth naming: a policy that permits none of
+/// the quoted candidates has nothing to clamp onto, so the composed floor is
+/// left exactly as it was and the refusal below falls out of the membership's
+/// policy — where an operator can find it — rather than being papered over
+/// here.
+pub(super) fn escalate_within_reach(
+    admission: &Admission,
+    escalation: Option<EscalationOverrides>,
+    candidates: &[Candidate],
+) -> Escalated {
+    let Some(escalation) = escalation else {
+        return Escalated {
+            admission: admission.clone(),
+            clamped: false,
+        };
+    };
+    let asked = admission.policy.narrow(&PolicyOverrides::from(escalation));
+    let floor = match admission.policy.reachable_quality_ceiling(candidates) {
+        Some(ceiling) => asked.min_quality.min(ceiling),
+        None => asked.min_quality,
+    };
+    Escalated {
+        clamped: floor < asked.min_quality,
+        admission: admission.with_policy(TurnPolicy {
+            min_quality: floor,
+            ..asked
+        }),
     }
 }
 
@@ -300,5 +368,93 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    /// A quoted candidate at `quality_prior`, with the axes the clamp does not
+    /// read left at zero.
+    fn candidate(name: &str, quality_prior: f64) -> Candidate {
+        Candidate {
+            target: roundhouse_core::routing::Target::Frontier {
+                provider: name.into(),
+                model: name.into(),
+            },
+            expected_prefill_tokens: 0.0,
+            matched_prefix_tokens: 0,
+            expected_ttft_ms: 0.0,
+            expected_cost_usd: 0.0,
+            quality_prior,
+            load: None,
+        }
+    }
+
+    fn admission(min_quality: f64) -> Admission {
+        Admission::open().with_policy(TurnPolicy {
+            min_quality,
+            ..TurnPolicy::unrestricted()
+        })
+    }
+
+    fn escalation(min_quality: f64) -> Option<EscalationOverrides> {
+        Some(EscalationOverrides { min_quality })
+    }
+
+    #[test]
+    fn an_escalation_narrows_as_far_as_the_pool_reaches_and_never_past_it() {
+        let modest = candidate("modest", 0.6);
+        let flagship = candidate("flagship", 0.95);
+
+        // The probe: a floor above everything quoted. Clamped to the best
+        // candidate, so the escalation *selects* rather than empties — the
+        // checker must never break the checked.
+        let out_of_reach = escalate_within_reach(
+            &admission(0.0),
+            escalation(0.8),
+            std::slice::from_ref(&modest),
+        );
+        assert_eq!(out_of_reach.admission.policy.min_quality, 0.6);
+        assert!(out_of_reach.clamped);
+        assert!(
+            out_of_reach.admission.policy.permits(&modest),
+            "the clamped floor has to leave a candidate standing, or the clamp \
+             bought nothing"
+        );
+
+        // The control that makes the probe about reachability rather than about
+        // escalations being ignored: the identical floor over a pool that can
+        // meet it is applied in full, and says nothing about a clamp.
+        let in_reach = escalate_within_reach(
+            &admission(0.0),
+            escalation(0.8),
+            &[modest.clone(), flagship.clone()],
+        );
+        assert_eq!(in_reach.admission.policy.min_quality, 0.8);
+        assert!(!in_reach.clamped);
+        assert!(!in_reach.admission.policy.permits(&modest));
+
+        // A floor *below* the membership's own is not a narrowing, so `narrow`
+        // discards it — and the clamp must not then read the discarded value as
+        // something it lowered.
+        let widening = escalate_within_reach(
+            &admission(0.9),
+            escalation(0.5),
+            std::slice::from_ref(&flagship),
+        );
+        assert_eq!(widening.admission.policy.min_quality, 0.9);
+        assert!(!widening.clamped);
+
+        // The refusal that stays a refusal: the base policy permits none of the
+        // quoted candidates, so there is no ceiling to clamp onto and the
+        // composed floor is left exactly where the membership put it. `plan`
+        // then reports `PolicyRefused` against the operator's own policy, which
+        // is where an operator can act on it.
+        let nothing_admitted = escalate_within_reach(&admission(0.99), escalation(0.8), &[modest]);
+        assert_eq!(nothing_admitted.admission.policy.min_quality, 0.99);
+        assert!(!nothing_admitted.clamped);
+
+        // And a turn with no escalation in force is handed back untouched,
+        // which is every turn of every deployment that has not enabled the loop.
+        let unescalated = escalate_within_reach(&admission(0.3), None, &[flagship]);
+        assert_eq!(unescalated.admission.policy.min_quality, 0.3);
+        assert!(!unescalated.clamped);
     }
 }

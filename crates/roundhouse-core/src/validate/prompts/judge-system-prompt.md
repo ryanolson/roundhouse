@@ -3,7 +3,7 @@ SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All 
 SPDX-License-Identifier: Apache-2.0
 
 Adapted from two prompts in NVIDIA Switchyard, Apache-2.0:
-  repo: github.com/NVIDIA/switchyard
+  repo: github.com/NVIDIA-NeMo/Switchyard
   rev:  47babb1a933e952bc6997b9ea208b5903c61a48c
   crates/libsy/src/prompts/escalation/prompt.md
   crates/libsy/src/prompts/advisor-gate/reviewer-system-prompt.md
@@ -143,9 +143,12 @@ All four fields are required; two of them may be null. `at_step` is the number
 of a step as it appears under "Recent steps" — the only numbering you can see,
 and the only one your answer can mean. `description` names what is wrong and
 what evidence says so; it is read as an observation, never as an instruction,
-and it will not be shown to the agent as written. `confidence` is recorded and
-compared against outcomes later; it changes nothing today, so state it
-honestly rather than defensively.
+and it is never shown to the agent — not quoted and not summarized. It is
+recorded for the people reading this deployment's logs. The correction the
+agent reads is written by the system from `at_step` and the system's own
+measurements, so anything you address to the agent reaches nobody. `confidence`
+is recorded and compared against outcomes later; it changes nothing today, so
+state it honestly rather than defensively.
 
 When `on_track` is true, `divergence` must be null.
 

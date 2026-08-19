@@ -29,7 +29,8 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::control::PrincipalKey;
 use crate::event::{
-    Accounting, NotRunReason, SessionEvent, SessionEventKind, Usage, ValidationOutcome,
+    Accounting, NotRunReason, PlaceboTiming, SessionEvent, SessionEventKind, Usage,
+    ValidationOutcome,
 };
 use crate::ids::{ResponseId, SessionId, TurnId};
 use crate::metrics::pricing::TokenShape;
@@ -468,7 +469,14 @@ impl MetricsFold {
                     }
                     ValidationOutcome::NotRun { reason } => {
                         tally.not_run += 1;
-                        if let NotRunReason::PlaceboArm { intervened: true } = reason
+                        // `Withheld` is exposure without disruption — the
+                        // timing fired and the channel refused to act — so it
+                        // is a decided, not-run validation like any other and
+                        // never an intervention. Counting it would report this
+                        // deployment interrupting turns it left alone.
+                        if let NotRunReason::PlaceboArm {
+                            timing: PlaceboTiming::Intervened,
+                        } = reason
                             && arm.acts()
                         {
                             tally.intervened += 1;
@@ -1190,7 +1198,9 @@ pub(super) mod tests {
         log.validation(
             Arm::Placebo,
             ValidationOutcome::NotRun {
-                reason: NotRunReason::PlaceboArm { intervened: true },
+                reason: NotRunReason::PlaceboArm {
+                    timing: PlaceboTiming::Intervened,
+                },
             },
         );
         log.validation(

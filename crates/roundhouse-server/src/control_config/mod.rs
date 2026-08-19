@@ -683,6 +683,29 @@ impl Admission {
             validation: None,
         }
     }
+
+    /// The same admission under a narrowed policy.
+    ///
+    /// **The one shape a per-turn narrowing may take**, and the reason it is a
+    /// method rather than a struct literal at each site: the other three fields
+    /// are copied through, and a caller assembling this by hand is a caller who
+    /// could quietly move one of them. A budget is not an axis a narrowing may
+    /// touch — an agent editing its own project's ceiling is the failure, and
+    /// widening it needs no argument — and which experiment arm a session is in
+    /// was decided when the session was created, so no per-turn narrowing may
+    /// move it either.
+    ///
+    /// Takes an owned [`TurnPolicy`] because every caller has just computed
+    /// one; the `Arc` is minted here so the narrowed policy is shared by the
+    /// turn rather than cloned again at each read.
+    pub fn with_policy(&self, policy: TurnPolicy) -> Self {
+        Self {
+            principal: self.principal.clone(),
+            policy: Arc::new(policy),
+            budget: self.budget.clone(),
+            validation: self.validation.clone(),
+        }
+    }
 }
 
 /// Secret/hash pairs and the fixture config that declares them.

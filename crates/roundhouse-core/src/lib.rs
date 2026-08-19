@@ -31,8 +31,8 @@ pub use control::{
     PrincipalKey, ProjectId, Settlement, SpendLedger, TargetFilter, TurnBudget, TurnPolicy, UserId,
 };
 pub use event::{
-    Accounting, ControlRecord, NotRunReason, SessionEvent, SessionEventKind, SessionObserver,
-    SideCallAbandonReason, SideCallPurpose, Usage, ValidationOutcome,
+    Accounting, ControlRecord, NotRunReason, PlaceboTiming, SessionEvent, SessionEventKind,
+    SessionObserver, SideCallAbandonReason, SideCallPurpose, Usage, ValidationOutcome,
 };
 pub use ids::{ResponseId, SessionId, SideCallId, TurnId, ValidationId};
 pub use interject::{Interjection, InterjectionContext, Interjector};

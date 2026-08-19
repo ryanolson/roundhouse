@@ -46,6 +46,14 @@
 //!   consecutive failures are tolerated. That is a fact about *concurrency*,
 //!   which no single session's log can see, so it is [`ReviewBudget`]: two
 //!   counters, reserved before the await, released on the way out.
+//!
+//! The failure counter is a breaker and not a fuse: once tripped it re-arms
+//! after a quiet period and admits one probe, whose answer either clears the
+//! streak or starts the cooldown again. The quiet period is measured on the
+//! log's own timestamps like everything else here — see
+//! [`ReviewBudget::reserve`] — because a node whose validator switched itself
+//! off for good after three transient timeouts is indistinguishable, from
+//! outside, from one where somebody turned the loop off.
 
 pub mod arm;
 pub mod brief;
@@ -55,13 +63,15 @@ pub mod trigger;
 pub mod verdict;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use async_trait::async_trait;
 
 use crate::control::{BudgetTerms, Principal};
 use crate::event::Usage;
-use crate::event::{ControlRecord, NotRunReason, SideCallAbandonReason, ValidationOutcome};
+use crate::event::{
+    ControlRecord, NotRunReason, PlaceboTiming, SideCallAbandonReason, ValidationOutcome,
+};
 use crate::ids::{SessionId, SideCallId, ValidationId};
 use crate::interject::{Interjection, InterjectionContext, Interjector};
 use crate::item::Item;
@@ -140,13 +150,14 @@ pub enum JudgeFailure {
 
 /// What one side call is made under, and for whom.
 ///
-/// The three facts a judge implementation needs that are properties of *this
-/// turn* rather than of the deployment: which conversation it is checking,
-/// who pays for the check, and what ceiling that payer is under. They travel
-/// as one struct rather than as three arguments for the reason the server's
-/// admission does: resolved together from one turn, they must not be
-/// recombinable across two — one tenant's identity against another's ceiling
-/// has no compile-time answer and no runtime symptom either.
+/// The facts a judge implementation needs that are properties of *this turn*
+/// rather than of the deployment: which conversation it is checking, what the
+/// check is called, where in that conversation's log it is being made, who pays
+/// for it, and what ceiling that payer is under. They travel as one struct
+/// rather than as five arguments for the reason the server's admission does:
+/// resolved together from one turn, they must not be recombinable across two —
+/// one tenant's identity against another's ceiling has no compile-time answer
+/// and no runtime symptom either.
 ///
 /// **What is deliberately absent is a deadline.** The checker's deadline is a
 /// bounded fraction of the turn's, which is deployment configuration the
@@ -158,6 +169,26 @@ pub struct SideCall<'a> {
     /// own cache key. See [`JudgeClient`] on why that key is
     /// `{session_id}#validate` and not the conversation's own.
     pub session_id: &'a SessionId,
+    /// What this check is called, minted before it is made.
+    ///
+    /// **Before, so that one string names the check everywhere it appears.**
+    /// The log books `SideCallCompleted` or `SideCallAbandoned` under it and a
+    /// metered deployment holds the check's money under it, so an operator
+    /// reconciling committed spend against the log joins on a field rather than
+    /// on an assumption. Minted by the caller rather than returned by the judge
+    /// because the money question is asked *first* — a hold has to be keyed
+    /// before there is an answer to key it by.
+    pub id: &'a SideCallId,
+    /// Where in the checked session's log this check is being made.
+    ///
+    /// The turn's own position, read after its `TurnStarted` and before
+    /// anything a check could cause — so it rises with every turn of the
+    /// session and is the same number a replay would compute. That makes it the
+    /// idempotency key a settle needs: a ledger keyed on `(session, seq)`
+    /// requires one that only goes up, and a wall clock or a process-local
+    /// counter would either regress across nodes or reset on restart, silently
+    /// dropping a settle in both cases.
+    pub at_seq: u64,
     pub principal: &'a Principal,
     /// The payer's ceiling, or `None` when the membership has no budget.
     ///
@@ -188,10 +219,12 @@ pub struct SideCall<'a> {
 /// - **Its own budget question**, asked of the payer's own ledger. If the
 ///   budget cannot cover the check, the check does not happen and the turn
 ///   proceeds ([`JudgeFailure::Unaffordable`]) — never fail a turn because we
-///   could not afford to check it. Whether the implementation *reserves* the
-///   money or merely reads what is left is its business; what this trait
-///   requires is that the budget can refuse, and that refusing costs the turn
-///   nothing.
+///   could not afford to check it. What the trait requires is that the budget
+///   can refuse, that refusing costs the turn nothing, and that what a check
+///   spends reaches the ledger afterwards: a budget that is only ever *read*
+///   answers the same way on the first check and the thousandth, so it is not
+///   a ceiling. [`SideCall::id`] and [`SideCall::at_seq`] are what an
+///   implementation keys the hold and its settle by.
 /// - **Never the cache ledger.** A judge prompt is not a prefix of the
 ///   conversation, and feeding it to the ledger would falsely warm that target
 ///   for the next real turn.
@@ -216,6 +249,18 @@ pub struct ReviewLimits {
     /// so a single counter would show a node with all its capacity free
     /// cheerfully timing out every turn.
     pub max_consecutive_failures: u32,
+    /// How quiet a tripped breaker must be before it admits one probe.
+    ///
+    /// The half that makes it a breaker rather than a kill switch. Only a
+    /// [`Reservation::succeeded`] clears the streak, and the only way to a
+    /// reservation is [`ReviewBudget::reserve`] — so without a re-arm the
+    /// tripped counter blocks the one call that could clear it, and three
+    /// transient failures end validation on this node for the life of the
+    /// process. A cooldown rather than an immediate retry because the failure
+    /// this guards against is a judge that is *down*: probing it every turn
+    /// would pay a full deadline per turn to learn what the counter already
+    /// says.
+    pub breaker_cooldown_ms: u64,
 }
 
 impl Default for ReviewLimits {
@@ -223,16 +268,25 @@ impl Default for ReviewLimits {
         Self {
             max_in_flight: 8,
             max_consecutive_failures: 3,
+            breaker_cooldown_ms: 60_000,
         }
     }
 }
 
-/// The node-local half of the review budget: two counters.
+/// The node-local half of the review budget: two counters and a re-arm clock.
 #[derive(Debug)]
 pub struct ReviewBudget {
     limits: ReviewLimits,
     in_flight: AtomicU32,
     consecutive_failures: AtomicU32,
+    /// The log timestamp the breaker's cooldown runs from.
+    ///
+    /// Written by a failure, and moved forward by each probe the breaker
+    /// admits so that two callers arriving in one cooldown window cannot both
+    /// take one — a half-open breaker that admitted every concurrent caller
+    /// would be no breaker at all for exactly the deployment that has enough
+    /// traffic to need one.
+    cooldown_from_ms: AtomicU64,
 }
 
 impl ReviewBudget {
@@ -241,6 +295,7 @@ impl ReviewBudget {
             limits,
             in_flight: AtomicU32::new(0),
             consecutive_failures: AtomicU32::new(0),
+            cooldown_from_ms: AtomicU64::new(0),
         }
     }
 
@@ -250,10 +305,36 @@ impl ReviewBudget {
     /// version admits every concurrent caller that read the count before any of
     /// them wrote it, which is the overdraw this exists to prevent and which
     /// only appears under the load that makes it expensive.
-    pub fn reserve(&self) -> Option<Reservation<'_>> {
+    ///
+    /// **`now_ms` is the log's clock, never the wall's.** The caller passes
+    /// [`SessionState::last_event_at_ms`](crate::session::SessionState::last_event_at_ms)
+    /// — the timestamp the store stamped on the turn already being decided —
+    /// for the same reason [`Trigger::evaluate`] takes no clock: a replay must
+    /// reach the decision the original process reached, and a breaker consulting
+    /// `Instant::now()` inside the fold would make "was this session validated"
+    /// depend on when anybody asked. The counters themselves are node-local and
+    /// deliberately outside the fold; what has to be replay-stable is the
+    /// *answer this call gives*, and a monotonic log timestamp gives it.
+    pub fn reserve(&self, now_ms: u64) -> Option<Reservation<'_>> {
         if self.consecutive_failures.load(Ordering::Acquire) >= self.limits.max_consecutive_failures
         {
-            return None;
+            // Half-open: after a quiet period, exactly one probe gets through.
+            // Its `succeeded()` clears the streak and its `failed()` leaves the
+            // breaker tripped and the cooldown running again from that failure.
+            let since = self.cooldown_from_ms.load(Ordering::Acquire);
+            if now_ms.saturating_sub(since) < self.limits.breaker_cooldown_ms {
+                return None;
+            }
+            // Claiming the probe is the same compare-and-swap discipline the
+            // capacity below uses, and for the same reason: whoever loses the
+            // race waits out another cooldown rather than joining the winner.
+            if self
+                .cooldown_from_ms
+                .compare_exchange(since, now_ms, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return None;
+            }
         }
         let mut current = self.in_flight.load(Ordering::Acquire);
         loop {
@@ -266,7 +347,12 @@ impl ReviewBudget {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return Some(Reservation { budget: self }),
+                Ok(_) => {
+                    return Some(Reservation {
+                        budget: self,
+                        at_ms: now_ms,
+                    });
+                }
                 Err(seen) => current = seen,
             }
         }
@@ -290,6 +376,9 @@ impl ReviewBudget {
 #[derive(Debug)]
 pub struct Reservation<'a> {
     budget: &'a ReviewBudget,
+    /// The log time this reservation was taken at, carried so a failure dates
+    /// itself rather than reading a clock the fold cannot reproduce.
+    at_ms: u64,
 }
 
 impl Reservation<'_> {
@@ -302,10 +391,18 @@ impl Reservation<'_> {
     ///
     /// The reservation itself is refunded by the drop below — a failed consult
     /// must not also cost capacity, or a slow judge would look like a busy one.
+    ///
+    /// The cooldown is dated from *this* failure rather than from the one that
+    /// tripped the breaker, so a judge that keeps failing keeps the breaker
+    /// open: a window anchored to the first failure would expire while the
+    /// judge was still down and re-admit a probe every turn thereafter.
     pub fn failed(self) {
         self.budget
             .consecutive_failures
             .fetch_add(1, Ordering::AcqRel);
+        self.budget
+            .cooldown_from_ms
+            .store(self.at_ms, Ordering::Release);
     }
 }
 
@@ -418,10 +515,6 @@ impl Validator {
         self
     }
 
-    pub fn config(&self) -> &ValidatorConfig {
-        &self.config
-    }
-
     /// Everything after the trigger has fired.
     async fn decide(
         &self,
@@ -442,18 +535,33 @@ impl Validator {
             // interruption, because the control has to isolate the disruption
             // from the correction: a sham with a plausible-looking correction
             // in it would be measuring a worse judge, not no judge.
-            let intervenes = placebo_intervenes(
+            let selected = placebo_intervenes(
                 context.response_id,
                 &self.config.arm_salt,
                 terms.placebo_rate,
             );
+            // **The channel gates the sham exactly as it gates the real thing.**
+            // The Live arm's action goes through `map`, which collapses to
+            // `Continue` under `Off`; the placebo's never did, so `Off` — the
+            // shipped default, documented as "never interject" — was the one
+            // configuration where the control arm interrupted turns the treated
+            // arm left alone. That is worse than an unmeasured experiment: it
+            // is a deployment that installed a validator to observe and got a
+            // sham halt on live traffic instead.
+            //
+            // Withheld rather than quiet, because the timing did fire. The
+            // marker is what the fold compares; the disruption is what `Off`
+            // forbids, and only one of those is the measurement.
+            let timing = match (selected, terms.action.channel) {
+                (false, _) => PlaceboTiming::Quiet,
+                (true, SteerChannel::Off) => PlaceboTiming::Withheld,
+                (true, _) => PlaceboTiming::Intervened,
+            };
             (
                 ValidationOutcome::NotRun {
-                    reason: NotRunReason::PlaceboArm {
-                        intervened: intervenes,
-                    },
+                    reason: NotRunReason::PlaceboArm { timing },
                 },
-                intervenes.then(|| SteerAction::Halt {
+                matches!(timing, PlaceboTiming::Intervened).then(|| SteerAction::Halt {
                     reason: sham_directive(),
                 }),
             )
@@ -514,7 +622,10 @@ impl Validator {
         record: &mut ControlRecord,
     ) -> (ValidationOutcome, Option<SteerAction>) {
         // Before the await, always. See the module note on the two counters.
-        let Some(reservation) = self.budget.reserve() else {
+        // The clock is the log's — the turn being decided has already committed
+        // its `TurnStarted`, so this is "now" as the log understands it, and a
+        // replay reads the same value the original process did.
+        let Some(reservation) = self.budget.reserve(context.state.last_event_at_ms()) else {
             return (
                 ValidationOutcome::NotRun {
                     reason: NotRunReason::ReviewBudgetSpent,
@@ -573,7 +684,7 @@ impl Validator {
             }
             Err(JudgeFailure::Abandoned { target, reason }) => {
                 reservation.failed();
-                record.side_call_abandoned(SideCallId::generate(), target, reason);
+                record.side_call_abandoned(context.side_call.id.clone(), target, reason);
                 return (
                     ValidationOutcome::NotRun {
                         reason: NotRunReason::JudgeFailed,
@@ -586,7 +697,12 @@ impl Validator {
         // Booked before the answer is parsed, and that ordering is the point:
         // the money was spent whatever the answer said, and a parse failure
         // that also lost the cost would make a broken judge look free.
-        let side_call_id = SideCallId::generate();
+        //
+        // Under the id the *caller* minted, not a fresh one. The judge held
+        // this check's money under that string before the call was made, so
+        // booking it under another would leave a ledger row and a log row for
+        // one call that nothing can join.
+        let side_call_id = context.side_call.id.clone();
         record.side_call_completed(side_call_id.clone(), answer.target, answer.usage);
 
         let verdict = match Verdict::parse(&answer.raw) {
@@ -602,11 +718,15 @@ impl Validator {
             }
         };
         // Clamped against the turn's own ceiling before it is recorded, so the
-        // log holds the narrowing that will actually be in force rather than
-        // the one the map asked for. This is the occupant's read of
+        // log holds the narrowing the membership's policy leaves standing
+        // rather than the one the map asked for. This is the occupant's read of
         // `turn_policy`, and it is why the seam carries it: an escalation
-        // recorded at a floor the membership could never reach would make the
-        // audit trail describe a decision that did not happen.
+        // recorded at a floor the membership forbids would make the audit trail
+        // describe a decision that did not happen. What it deliberately cannot
+        // clamp against is the quoted pool — this seam has no candidate list, by
+        // the contract in `interject` — so the engine clamps a second time when
+        // it applies the escalation, and records that on the turn's own
+        // decision. See `SteerAction::clamped_to`.
         let action = map(
             &verdict,
             fired,

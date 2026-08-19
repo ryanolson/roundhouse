@@ -31,21 +31,23 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use roundhouse_core::context::ByteTokenizer;
-use roundhouse_core::control::MemorySpendLedger;
+use roundhouse_core::control::{MemorySpendLedger, TargetFilter, TurnPolicy};
 use roundhouse_core::event::{Accounting, SessionEventKind, SideCallAbandonReason, Usage};
 use roundhouse_core::ids::{SessionId, TurnId};
 use roundhouse_core::interject::Interjector;
 use roundhouse_core::item::{Item, ItemContent};
 use roundhouse_core::metrics::{MetricsConfig, Scope, ShadowPricing};
 use roundhouse_core::now_ms;
-use roundhouse_core::routing::{AffinityPolicy, CacheLedger, Target};
+use roundhouse_core::routing::{AffinityPolicy, CacheLedger, DecisionRecord, RoutingError, Target};
 use roundhouse_core::session::{Session, SessionState};
 use roundhouse_core::store::{MemoryStore, SessionStore, StoreError};
 use roundhouse_core::validate::{
     ActionPolicy, Arm, ArmShares, Evidence, JudgeAnswer, JudgeClient, JudgeFailure, SideCall,
     Signal, SignalKind, SteerChannel, TriggerConfig, ValidationTerms, Validator, ValidatorConfig,
 };
-use roundhouse_fleet::{EchoFrontierClient, FrontierClient, FrontierModelSpec};
+use roundhouse_fleet::{
+    EchoFrontierClient, FrontierClient, FrontierModelSpec, StaticFrontierCatalog,
+};
 use roundhouse_mcp::{ControlStore, IntentRecord};
 use roundhouse_server::{Admission, EchoLocalExecutor, Engine, EngineConfig, EngineError};
 
@@ -280,12 +282,54 @@ impl Rig {
     }
 }
 
+/// A catalog of one model per `(name, quality_prior)` pair.
+///
+/// Priced identically to the shared fixture's single model, so the only axis
+/// that varies between two entries is the one an escalation moves. Provider and
+/// model share the name, which is what lets [`frontier`] name a target in one
+/// word at the assertion site.
+fn catalog_of(models: &[(&str, f64)]) -> StaticFrontierCatalog {
+    StaticFrontierCatalog::new(
+        models
+            .iter()
+            .map(|(name, quality_prior)| FrontierModelSpec {
+                provider: (*name).into(),
+                model: (*name).into(),
+                quality_prior: *quality_prior,
+                ..frontier_catalog().models()[0].clone()
+            })
+            .collect(),
+    )
+}
+
+/// The target [`catalog_of`] gives the model it named `name`.
+fn frontier(name: &str) -> Target {
+    Target::Frontier {
+        provider: name.into(),
+        model: name.into(),
+    }
+}
+
 /// A deployment with the validator installed over `judge`.
 fn rig(judge: Arc<ScriptedJudge>) -> Rig {
     rig_with(judge, Arc::new(EchoFrontierClient::new(ANSWER)))
 }
 
 fn rig_with(judge: Arc<ScriptedJudge>, frontier: Arc<dyn FrontierClient>) -> Rig {
+    rig_with_catalog(judge, frontier, frontier_catalog())
+}
+
+/// The same deployment over a caller-chosen catalog.
+///
+/// The escalation tests are the reason it is parameterized: what an escalation
+/// does depends entirely on what the pool it narrows can reach, so a fixture
+/// that could only ever quote the shared 0.95 model could not tell "the floor
+/// selected the strongest candidate" from "the floor happened to be met".
+fn rig_with_catalog(
+    judge: Arc<ScriptedJudge>,
+    frontier: Arc<dyn FrontierClient>,
+    catalog: StaticFrontierCatalog,
+) -> Rig {
     let store = Arc::new(MemoryStore::new());
     let control = Arc::new(ControlStore::new());
     let validator = Validator::new(
@@ -302,7 +346,7 @@ fn rig_with(judge: Arc<ScriptedJudge>, frontier: Arc<dyn FrontierClient>) -> Rig
             Arc::clone(&store),
             ByteTokenizer,
             Arc::new(EchoLocalExecutor::new("local answer")),
-            frontier_catalog(),
+            catalog,
             frontier,
             Arc::new(AffinityPolicy::new()),
             EngineConfig {
@@ -471,6 +515,24 @@ fn validations(kinds: &[SessionEventKind]) -> usize {
         .iter()
         .filter(|kind| matches!(kind, SessionEventKind::ValidationDecided { .. }))
         .count()
+}
+
+/// Every routing decision the log holds, in dispatch order.
+///
+/// The escalation probes read the decision rather than counting `Routed`
+/// events, because what an escalation does is choose differently — the target,
+/// the considered set and the policy digest are the three places that shows.
+async fn decisions(store: &MemoryStore, session_id: &SessionId) -> Vec<DecisionRecord> {
+    store
+        .read_events(session_id, 0, 4096)
+        .await
+        .expect("the session exists")
+        .into_iter()
+        .filter_map(|event| match event.kind {
+            SessionEventKind::Routed { decision, .. } => Some(decision),
+            _ => None,
+        })
+        .collect()
 }
 
 fn routings(kinds: &[SessionEventKind]) -> usize {
@@ -952,6 +1014,160 @@ async fn the_shadow_arm_judges_and_releases_unchanged() {
          and it must do so through the log rather than a side channel: \
          {live_digests:?}"
     );
+}
+
+/// **The checker must never break the checked, and this is the sharp case.**
+///
+/// An escalation raises a quality floor. Nothing about the verdict that
+/// produced it knows what this membership's pool can reach, so a shipped floor
+/// of 0.8 over a deployment whose only model priors at 0.6 asks for something
+/// that does not exist — and a narrowing that empties the candidate set fails
+/// the turn with `PolicyRefused` for as many turns as the escalation lasts.
+/// That is the validator breaking the conversation it was installed to protect,
+/// on the deployment least able to absorb it.
+///
+/// So an escalation is *best-effort narrowing*: it selects the strongest
+/// candidate the membership already admits, and the floor it asked for is
+/// clamped to what the pool can reach.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_escalation_above_the_whole_pool_selects_its_best_rather_than_refusing() {
+    let judge = ScriptedJudge::always(OFF_TRACK);
+    // Every candidate below the shipped escalation floor of 0.8.
+    let probe = rig_with_catalog(
+        Arc::clone(&judge),
+        Arc::new(EchoFrontierClient::new(ANSWER)),
+        catalog_of(&[("modest", 0.6)]),
+    );
+    let session_id = SessionId::new("acme/ada/floor-out-of-reach");
+    let results = drive(
+        &probe,
+        &session_id,
+        &enrolled(Arm::Live, tool_call_channel()),
+        2,
+    )
+    .await;
+    for (turn, result) in results.iter().enumerate() {
+        result.as_ref().unwrap_or_else(|error| {
+            panic!(
+                "an escalation must never be the reason a turn fails: turn \
+                 {turn} came back {error}"
+            )
+        });
+    }
+
+    // Turn 0 is unvalidated; turn 1 is the one the judge escalated on, and
+    // `ActiveEscalation` counts from the turn it was decided on.
+    assert_eq!(judge.asked(), 1, "turn 1 is the validated one");
+    let decided = decisions(&probe.store, &session_id).await;
+    assert_eq!(
+        decided.len(),
+        2,
+        "both turns reached a provider: {:?}",
+        decided.iter().map(|d| &d.chosen).collect::<Vec<_>>()
+    );
+    assert_eq!(decided[1].chosen, frontier("modest"));
+
+    // The other half, and what keeps the clamp from being "drop the
+    // escalation": the narrowing still reached routing. A dropped escalation
+    // would leave the second turn's policy byte-identical to the first's.
+    assert_ne!(
+        decided[1].turn_policy_digest, decided[0].turn_policy_digest,
+        "the escalation was clamped into reach, not discarded"
+    );
+    assert!(
+        decided[1].rationale.contains("quality floor"),
+        "an operator reading the audit trail has to be able to see that the \
+         floor served was not the floor asked for: {:?}",
+        decided[1].rationale
+    );
+}
+
+/// The control that makes the clamp a *clamp* rather than a widening.
+///
+/// The identical verdict, the identical floor, over a pool that can meet it:
+/// the escalation must select the strong candidate and drop the weak one from
+/// the considered set, exactly as an unclamped narrowing would — and must say
+/// nothing about having been clamped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_escalation_the_pool_can_meet_narrows_to_the_floor_it_asked_for() {
+    let judge = ScriptedJudge::always(OFF_TRACK);
+    let probe = rig_with_catalog(
+        Arc::clone(&judge),
+        Arc::new(EchoFrontierClient::new(ANSWER)),
+        catalog_of(&[("modest", 0.6), ("flagship", 0.95)]),
+    );
+    let session_id = SessionId::new("acme/ada/floor-in-reach");
+    for result in drive(
+        &probe,
+        &session_id,
+        &enrolled(Arm::Live, tool_call_channel()),
+        2,
+    )
+    .await
+    {
+        result.expect("a reachable floor changes where a turn goes, not whether");
+    }
+
+    let decided = decisions(&probe.store, &session_id).await;
+    assert_eq!(decided.len(), 2);
+    assert_eq!(
+        decided[1].chosen,
+        frontier("flagship"),
+        "0.8 admits only the flagship, and that is the whole point of escalating"
+    );
+    assert_eq!(
+        decided[1]
+            .considered
+            .iter()
+            .map(|candidate| candidate.target.clone())
+            .collect::<Vec<_>>(),
+        vec![frontier("flagship")],
+        "the modest model is unreachable this turn, so the counterfactual must \
+         not be priced against it"
+    );
+    assert!(
+        !decided[1].rationale.contains("quality floor"),
+        "nothing was clamped, so nothing may claim it was: {:?}",
+        decided[1].rationale
+    );
+}
+
+/// And the refusal that is still a refusal.
+///
+/// The clamp exists so that a floor *this deployment invented* cannot fail a
+/// turn. A floor an operator wrote is the opposite: an empty candidate set
+/// under the membership's own policy is the configured intent, and rescuing it
+/// would route traffic to a model the key says it may never reach.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_floor_the_membership_itself_wrote_still_refuses() {
+    let judge = ScriptedJudge::always(OFF_TRACK);
+    let probe = rig_with_catalog(
+        Arc::clone(&judge),
+        Arc::new(EchoFrontierClient::new(ANSWER)),
+        catalog_of(&[("modest", 0.6)]),
+    );
+    let session_id = SessionId::new("acme/ada/operator-refusal");
+    let admission = Admission {
+        policy: Arc::new(TurnPolicy {
+            min_quality: 0.9,
+            allow: TargetFilter::allow_all(),
+            frontier_cadence: None,
+        }),
+        ..enrolled(Arm::Live, tool_call_channel())
+    };
+    for (turn, result) in drive(&probe, &session_id, &admission, 2)
+        .await
+        .into_iter()
+        .enumerate()
+    {
+        assert!(
+            matches!(
+                result,
+                Err(EngineError::Routing(RoutingError::PolicyRefused))
+            ),
+            "turn {turn} must be refused by the membership's own floor: {result:?}"
+        );
+    }
 }
 
 /// The judge is shown what the agent said it was doing, not what we guessed.

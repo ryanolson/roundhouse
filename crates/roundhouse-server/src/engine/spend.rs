@@ -36,7 +36,7 @@ use crate::engine::{Engine, EngineError};
 /// spent twice. Much longer and a dead process's reservation would strand its
 /// project's money for the difference. There is no sweeper: the next call to
 /// touch the project is what expires it.
-pub(super) const GRANT_TTL_SLACK_MS: u64 = 30_000;
+pub(crate) const GRANT_TTL_SLACK_MS: u64 = 30_000;
 
 impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
     /// Reserve what this turn may spend, or discover there is nothing to

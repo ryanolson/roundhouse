@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use crate::control::{FrontierHistory, Principal};
 use crate::event::{
-    ControlRecord, IncompleteReason, NotRunReason, SessionEvent, SessionEventKind, SessionObserver,
-    Usage, ValidationOutcome,
+    ControlRecord, IncompleteReason, NotRunReason, PlaceboTiming, SessionEvent, SessionEventKind,
+    SessionObserver, Usage, ValidationOutcome,
 };
 use crate::ids::{ResponseId, SessionId, TurnId};
 use crate::item::{Item, ItemContent};
@@ -246,7 +246,17 @@ pub struct SessionState {
     ///
     /// Side-call tokens are deliberately absent. They are this deployment's own
     /// spend, not the conversation's, and counting them would let the act of
-    /// checking bring the next check forward.
+    /// checking bring the next check forward. Held structurally rather than by
+    /// care: only a turn that recorded a
+    /// [`Routed`](SessionEventKind::Routed) folds its usage in here, and a
+    /// completing interjection records none — which is what keeps the judge's
+    /// own billing out even though it arrives on an ordinary
+    /// `ResponseCompleted`.
+    ///
+    /// Reset when a validation is *bought* and not merely decided: a check that
+    /// reached no judge leaves the evidence standing, so a session whose judge
+    /// was down validates as soon as it is back rather than having to earn the
+    /// budget again.
     pub(crate) tokens_since_last_validation: u64,
     /// When the last validation was decided, on the log's own clock.
     pub(crate) last_validation_at_ms: Option<u64>,
@@ -265,6 +275,12 @@ pub struct SessionState {
     /// disabling validation for the rest of a long session.
     pub(crate) consecutive_interventions: u32,
     /// Validations this session has bought.
+    ///
+    /// Bought, not decided: a judged outcome and the placebo arm's own
+    /// non-consultation count, and the five ways a validation can reach no
+    /// judge do not. This is the session's lifetime allowance and the counter
+    /// only grows, so charging a judge outage to it would close the trigger's
+    /// gate for good on a session that never got a check.
     pub(crate) validations_run: u32,
     /// The turn index at which a client's input last closed an open steer.
     ///
@@ -274,8 +290,14 @@ pub struct SessionState {
     /// answer no on exactly the turn the rule is about. Recording the turn it
     /// closed on is what makes the question answerable at all.
     pub(crate) steer_fulfilled_on_turn: Option<u64>,
-    /// Billable tokens per terminated turn, oldest first, bounded to
-    /// [`TURN_TOKEN_WINDOW`].
+    /// Billable tokens per *dispatched* terminated turn, oldest first, bounded
+    /// to [`TURN_TOKEN_WINDOW`].
+    ///
+    /// The trailing distribution the cost-anomaly signal compares each turn
+    /// against, which is why only dispatched turns are in it: a completing
+    /// interjection's usage is the judge's own side call, and a side call in
+    /// this window makes the next ordinary turn look cheap by comparison and
+    /// the next check correspondingly less likely.
     pub(crate) turn_tokens: Vec<u64>,
     /// A narrowing the validate loop asked for, and how many turns of it are
     /// left.
@@ -387,6 +409,11 @@ impl SessionState {
                 // runs from — and only under the evidence rule documented on
                 // `pending_routings`.
                 let routing = self.pending_routings.remove(response_id);
+                // Whether this response ever reached a provider, which is the
+                // same question `last_settlement` keys "owes nobody anything"
+                // on one block down. The validate loop's two token projections
+                // read it too — see below.
+                let dispatched = routing.is_some();
                 if let Some(routing) = &routing {
                     let processed =
                         matches!(event.kind, SessionEventKind::ResponseCompleted { .. })
@@ -437,12 +464,27 @@ impl SessionState {
                 // because the terminal event is the one place every turn passes
                 // through exactly once — whether it dispatched, was steered, or
                 // was refused.
-                self.tokens_since_last_validation = self
-                    .tokens_since_last_validation
-                    .saturating_add(usage.total());
-                self.turn_tokens.push(usage.total());
-                if self.turn_tokens.len() > TURN_TOKEN_WINDOW {
-                    self.turn_tokens.remove(0);
+
+                // **Only a turn that dispatched bills the conversation.** A
+                // completing interjection's usage is the *judge's* side call —
+                // `complete_with_item` says so, and it is the honest number to
+                // report to a client — but both fields below are about what the
+                // conversation spent. Feeding them the check's own cost lets
+                // the act of checking bring the next check forward, which is
+                // exactly what `tokens_since_last_validation` documents itself
+                // as not doing, and puts a side call into the trailing
+                // distribution the cost-anomaly signal compares ordinary turns
+                // against. `dispatched` is the same evidence the settlement
+                // above keys on: no `Routed`, no provider, nothing the
+                // conversation was billed for.
+                if dispatched {
+                    self.tokens_since_last_validation = self
+                        .tokens_since_last_validation
+                        .saturating_add(usage.total());
+                    self.turn_tokens.push(usage.total());
+                    if self.turn_tokens.len() > TURN_TOKEN_WINDOW {
+                        self.turn_tokens.remove(0);
+                    }
                 }
                 // Trailing interrupted turns, so a turn the validator let
                 // through resets the count. Counting interruptions forever
@@ -467,12 +509,51 @@ impl SessionState {
                 });
             }
             SessionEventKind::ValidationDecided { arm, outcome, .. } => {
-                self.validations_run = self.validations_run.saturating_add(1);
+                // **The cooldown is spent by every decision; the cap and the
+                // budget are spent only by a decision that bought something.**
+                //
+                // The cooldown is what stops a session with an open gate
+                // re-dialling a judge that is down on every single turn, so it
+                // has to run whatever the outcome was — a failure is precisely
+                // the case it exists for.
+                //
+                // The other two are the session's *allowance*, and the five
+                // failure reasons bought none of it: no verdict, no action, and
+                // for three of them not even a side call. Charging them would
+                // let a judge outage close `validations_run`'s gate for good
+                // after `max_validations_per_session` turns — permanently,
+                // since the counter only grows — and each no-op would discard
+                // the accumulated token evidence too, so nothing would be left
+                // to fund a check once the judge came back. A session must
+                // validate when the budget returns; that is the whole reason
+                // the gate is a projection of spend rather than a countdown.
+                //
+                // The placebo arm charges: it consults nobody by design, not by
+                // failure, and it is the control the live arm is compared
+                // against. A control that validated far more often than the arm
+                // it controls for is not a control.
+                let bought = match outcome {
+                    ValidationOutcome::Judged { .. } => true,
+                    ValidationOutcome::NotRun {
+                        reason: NotRunReason::PlaceboArm { .. },
+                    } => true,
+                    ValidationOutcome::NotRun {
+                        reason:
+                            NotRunReason::BudgetRefused
+                            | NotRunReason::ReviewBudgetSpent
+                            | NotRunReason::JudgeUnavailable
+                            | NotRunReason::JudgeFailed
+                            | NotRunReason::VerdictUnparseable,
+                    } => false,
+                };
                 self.last_validation_at_ms = Some(event.at_ms);
-                // The budget the gate spends. Reset here rather than at the
-                // side call, because what the gate measures is conversation
-                // spend between checks and a check is not conversation.
-                self.tokens_since_last_validation = 0;
+                if bought {
+                    self.validations_run = self.validations_run.saturating_add(1);
+                    // The budget the gate spends. Reset here rather than at the
+                    // side call, because what the gate measures is conversation
+                    // spend between checks and a check is not conversation.
+                    self.tokens_since_last_validation = 0;
+                }
 
                 // Only an arm that *acts* has intervened. A Shadow run computed
                 // everything and did nothing, and counting it would make the
@@ -482,7 +563,10 @@ impl SessionState {
                 let action = match outcome {
                     ValidationOutcome::Judged { action, .. } => Some(action.clone()),
                     ValidationOutcome::NotRun {
-                        reason: NotRunReason::PlaceboArm { intervened: true },
+                        reason:
+                            NotRunReason::PlaceboArm {
+                                timing: PlaceboTiming::Intervened,
+                            },
                     } => Some(SteerAction::Halt {
                         reason: String::new(),
                     }),
@@ -557,7 +641,8 @@ impl SessionState {
         self.steer_fulfilled_on_turn == Some(self.turn_index)
     }
 
-    /// Billable tokens per terminated turn, oldest first.
+    /// Billable tokens per dispatched terminated turn, oldest first. See
+    /// [`Self::turn_tokens`] on why a completing interjection is not one.
     pub fn recent_turn_tokens(&self) -> &[u64] {
         &self.turn_tokens
     }

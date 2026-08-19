@@ -1123,6 +1123,58 @@ async fn a_client_sent_tool_call_in_input_opens_no_steer() {
 // The validate loop's projections, folded from a real log
 // ---------------------------------------------------------------------------
 
+/// One ordinary dispatched turn, start to finish, billing `tokens`.
+///
+/// Every step the engine takes for a turn that reaches a provider, including
+/// the `Routed` — which is what separates a conversation turn from a completing
+/// interjection in every projection that pairs a dispatch with its terminal
+/// event. Returns what the turn billed, so a caller asserts against the number
+/// it asked for rather than restating it.
+async fn routed_turn(session: &mut Session<MemoryStore>, turn: &str, tokens: u64) -> u64 {
+    let admitted = session
+        .begin_turn(TurnId::new(turn), vec![Item::user_text("go")])
+        .await
+        .unwrap();
+    let response_id = admitted.response_id().clone();
+    session
+        .record_routing(
+            &response_id,
+            decision_for(
+                Target::Local {
+                    worker_id: 7,
+                    dp_rank: 0,
+                    model: "llama".into(),
+                },
+                tokens,
+            ),
+        )
+        .await
+        .unwrap();
+    let usage = Usage {
+        input_tokens: tokens,
+        ..Usage::default()
+    };
+    let billed = usage.total();
+    session.complete(&response_id, "done", usage).await.unwrap();
+    billed
+}
+
+/// A judged validation that acted on nothing — the cheapest outcome that still
+/// reached a judge, so a test about *being charged* is not also a test about
+/// what the action did.
+fn judged_continue() -> crate::event::ValidationOutcome {
+    crate::event::ValidationOutcome::Judged {
+        side_call_id: crate::ids::SideCallId::new("sc_judged"),
+        verdict: crate::validate::Verdict {
+            on_track: true,
+            confidence: 0.9,
+            divergence: None,
+            missing_context: None,
+        },
+        action: SteerAction::Continue,
+    }
+}
+
 /// Everything the trigger reads, driven through a session rather than set by
 /// hand.
 ///
@@ -1142,25 +1194,11 @@ async fn the_trigger_reads_projections_of_the_log_and_not_counters_beside_it() {
     assert_eq!(session.state().arm(), Some(Arm::Live));
 
     // Two ordinary turns, so there is spend to measure and a trailing
-    // distribution to compare against.
+    // distribution to compare against. Dispatched, `Routed` and all: what these
+    // two projections measure is conversation spend, and a turn with no routing
+    // is a turn that reached no provider.
     for (n, tokens) in [(1u64, 1_000u64), (2, 3_000)] {
-        let admitted = session
-            .begin_turn(TurnId::new(format!("t{n}")), vec![Item::user_text("go")])
-            .await
-            .unwrap();
-        let response_id = admitted.response_id().clone();
-        session
-            .complete(
-                &response_id,
-                "done",
-                Usage {
-                    input_tokens: tokens,
-                    output_tokens: 0,
-                    ..Usage::default()
-                },
-            )
-            .await
-            .unwrap();
+        routed_turn(&mut session, &format!("t{n}"), tokens).await;
     }
     assert_eq!(session.state().tokens_since_last_validation(), 4_000);
     assert_eq!(session.state().recent_turn_tokens(), &[1_000, 3_000]);
@@ -1272,15 +1310,7 @@ async fn the_trigger_reads_projections_of_the_log_and_not_counters_beside_it() {
     // A fourth turn, uninterrupted: the count resets and the escalation runs
     // out. A count that only ever grew would disable validation for the rest of
     // any long session that was interrupted twice.
-    let admitted = session
-        .begin_turn(TurnId::new("t4"), vec![Item::user_text("carry on")])
-        .await
-        .unwrap();
-    let response_id = admitted.response_id().clone();
-    session
-        .complete(&response_id, "done", Usage::default())
-        .await
-        .unwrap();
+    routed_turn(&mut session, "t4", 0).await;
     assert_eq!(session.state().consecutive_interventions(), 0);
     assert_eq!(session.state().active_escalation(), None);
 
@@ -1364,4 +1394,169 @@ async fn the_turn_whose_input_answers_a_steer_is_the_one_that_says_so() {
         .complete(&response_id, "done", Usage::default())
         .await
         .unwrap();
+}
+
+/// A judge outage must not spend the session's lifetime allowance.
+///
+/// `validations_run` is documented as "validations this session has bought",
+/// and the trigger closes its gate for good once it reaches
+/// `max_validations_per_session`. A validation that reached no judge bought
+/// nothing: it produced no verdict, took no action, and cost no side call. What
+/// it legitimately spends is the *cooldown* — that is what stops a failing
+/// judge being re-dialled on every turn — and nothing else.
+#[tokio::test]
+async fn a_validation_that_reached_no_judge_spends_the_cooldown_and_nothing_else() {
+    let store = Arc::new(MemoryStore::new());
+    let (_, mut session) = new_session(store, "node-a").await;
+    session
+        .record_created("affinity", &Principal::new("acme", "ada"), Some(Arm::Live))
+        .await
+        .unwrap();
+    let evidence = routed_turn(&mut session, "t1", 5_000).await;
+    assert_eq!(session.state().tokens_since_last_validation(), evidence);
+
+    // The judge could not be dialled at all — the exact shape `Validator`
+    // records when a consult finds no admissible judge.
+    let mut record = ControlRecord::default();
+    record.validation_decided(
+        crate::ids::ValidationId::new("val_1"),
+        crate::validate::TriggerRecord::new(2, evidence, Vec::new()),
+        Arm::Live,
+        crate::event::ValidationOutcome::NotRun {
+            reason: NotRunReason::JudgeUnavailable,
+        },
+    );
+    session.record_control(record).await.unwrap();
+
+    assert_eq!(
+        session.state().validations_run(),
+        0,
+        "a check that never happened is not a check this session bought; a \
+         judge outage would otherwise burn the whole lifetime allowance of \
+         every session that fired a trigger while it lasted"
+    );
+    assert_eq!(
+        session.state().tokens_since_last_validation(),
+        evidence,
+        "and the evidence that would have funded a check survives the outage, \
+         so the session validates as soon as the judge is back rather than \
+         having to earn the budget again"
+    );
+    assert!(
+        session.state().last_validation_at_ms().is_some(),
+        "the cooldown *is* spent, and it is the only thing that is: without it \
+         a session with an open gate re-dials a down judge every single turn"
+    );
+
+    // The control: the same session, the same shape of event, and an outcome
+    // that did reach a judge. This is what the session bought, and it is
+    // charged for it.
+    let more = routed_turn(&mut session, "t2", 7_000).await;
+    let evidence = evidence + more;
+    assert_eq!(
+        session.state().tokens_since_last_validation(),
+        evidence,
+        "the outage did not reset the gate, so the next turn's spend adds to \
+         what was already there"
+    );
+    let mut record = ControlRecord::default();
+    record.validation_decided(
+        crate::ids::ValidationId::new("val_2"),
+        crate::validate::TriggerRecord::new(3, evidence, Vec::new()),
+        Arm::Live,
+        judged_continue(),
+    );
+    session.record_control(record).await.unwrap();
+    assert_eq!(session.state().validations_run(), 1);
+    assert_eq!(
+        session.state().tokens_since_last_validation(),
+        0,
+        "the gate's budget resets for a check that happened"
+    );
+}
+
+/// The tokens a check cost must not bring the next check forward.
+///
+/// A steered or halted turn completes with the *side call's* billing — the
+/// judge's own prompt and answer — because that is genuinely what the turn cost
+/// and the client is told so. What it is not is conversation spend, and both
+/// projections it would otherwise land in are about conversation spend:
+/// `tokens_since_last_validation` is the budget the trigger's gate opens on,
+/// and `recent_turn_tokens` is the trailing distribution the cost-anomaly
+/// signal compares each turn against. A check that fed either would be a
+/// validator triggering on the cost of validating.
+#[tokio::test]
+async fn a_completing_interjections_own_tokens_reach_neither_trigger_projection() {
+    let store = Arc::new(MemoryStore::new());
+    let (_, mut session) = new_session(store, "node-a").await;
+    session
+        .record_created("affinity", &Principal::new("acme", "ada"), Some(Arm::Live))
+        .await
+        .unwrap();
+
+    // One ordinary dispatched turn, so both projections have something in them
+    // that a check could later be confused with.
+    let conversation = routed_turn(&mut session, "t1", 1_000).await;
+    assert_eq!(session.state().tokens_since_last_validation(), conversation);
+    assert_eq!(session.state().recent_turn_tokens(), &[conversation]);
+
+    // A steered turn: no `Routed`, and the usage on the terminal event is the
+    // judge's side call, exactly as `Validator::decide` hands it over.
+    let admitted = session
+        .begin_turn(TurnId::new("t2"), vec![Item::user_text("still going")])
+        .await
+        .unwrap();
+    let response_id = admitted.response_id().clone();
+    let judge_usage = Usage {
+        input_tokens: 4_000,
+        output_tokens: 40,
+        ..Usage::default()
+    };
+    let mut record = ControlRecord::default();
+    record.side_call_completed(
+        crate::ids::SideCallId::new("sc_1"),
+        Target::Frontier {
+            provider: "anthropic".into(),
+            model: "claude".into(),
+        },
+        judge_usage.clone(),
+    );
+    record.validation_decided(
+        crate::ids::ValidationId::new("val_1"),
+        crate::validate::TriggerRecord::new(2, conversation, Vec::new()),
+        Arm::Live,
+        judged_continue(),
+    );
+    session
+        .complete_with_item(&response_id, steer_call(), judge_usage, record)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        session.state().tokens_since_last_validation(),
+        0,
+        "counting the check's own tokens here would let the act of checking \
+         bring the next check forward, which is the one thing this field's own \
+         doc says it must not do"
+    );
+    assert_eq!(
+        session.state().recent_turn_tokens(),
+        &[conversation],
+        "and the trailing distribution the cost-anomaly signal compares against \
+         is a distribution of *conversation* turns: a side call in it makes the \
+         next ordinary turn look cheap and the next check less likely"
+    );
+
+    // The control: an ordinary dispatched turn on the same session does feed
+    // both, so the assertions above are about the interjection and not about a
+    // fold that has stopped counting.
+    let conversation_again = routed_turn(&mut session, "t3", 2_000).await;
+    assert_eq!(
+        session.state().tokens_since_last_validation(),
+        conversation_again
+    );
+    assert_eq!(
+        session.state().recent_turn_tokens(),
+        &[conversation, conversation_again]
+    );
 }

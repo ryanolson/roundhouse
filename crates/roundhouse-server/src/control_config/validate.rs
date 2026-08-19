@@ -64,7 +64,12 @@ pub struct ValidateConfig {
     pub escalation_floor: f64,
     /// How many subsequent turns that floor applies for.
     pub escalation_turns: u32,
-    /// How many consecutive intervening validations may precede a `Steer`.
+    /// How many consecutive intervening validations a `Steer` may follow.
+    ///
+    /// `0`, the default, means the synthetic-call path is off: escalation
+    /// claims the uninterrupted turn, so a cap of zero admits nothing after it.
+    /// Set `1` or more to turn outcome B on. See
+    /// [`ActionPolicy::steer_after_interventions`].
     pub steer_after_interventions: u32,
 }
 
