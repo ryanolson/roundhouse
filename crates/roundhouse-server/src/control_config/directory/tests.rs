@@ -361,6 +361,90 @@ fn an_archived_projects_key_refuses_project_archived() {
     ));
 }
 
+/// The direct archived-key refusal inside `compile`'s key loop, isolated from
+/// its neighbour a few lines above: the unconditional exclusion of an
+/// *admin-owned* archived project from `merged.projects`.
+///
+/// Ordinarily the two agree by construction — an admin-created project that
+/// gets archived is excluded from `merged.projects` regardless of whether the
+/// direct `archived.contains(...)` check also fires, which is why
+/// `an_archived_projects_key_refuses_project_archived` cannot tell the two
+/// apart: remove the direct check there and the key still gets refused, via
+/// `merged.validate`'s `UnknownProject`, because its project is genuinely
+/// gone from `merged.projects` either way.
+///
+/// They come apart for a project id the *file* also declares: `merged =
+/// file.clone()` seeds `merged.projects` from the file first, and nothing
+/// ever removes a file-declared entry from it. A hand-built, records-owned
+/// `acme` row — an id no real archive request could ever reach, since the
+/// file owns it and `ArchiveProject` refuses a file-owned id — therefore
+/// stays present in `merged.projects` no matter what its own
+/// `archived_at_ms` says. With the direct check gone, nothing else refuses
+/// the key: `merged.validate` finds `acme` right there and admits it.
+#[test]
+fn the_direct_archived_key_refusal_is_not_the_projects_exclusion_in_disguise() {
+    let minted = mint_key(KeyKind::Turn).expect("the system CSPRNG answers");
+    let mut records = DirectoryRecords {
+        projects: vec![ProjectRecord {
+            entry: project("acme"),
+            provenance: Provenance::Admin,
+            created_at_ms: Some(0),
+            archived_at_ms: Some(500),
+        }],
+        users: vec![UserRecord {
+            entry: user("bo"),
+            provenance: Provenance::Admin,
+            created_at_ms: Some(0),
+        }],
+        memberships: vec![MembershipRecord {
+            project: "acme".into(),
+            user: "bo".into(),
+            role: Some(MembershipRole::Member),
+            allocation: None,
+            overrides: None,
+            provenance: Provenance::Admin,
+            created_at_ms: Some(0),
+        }],
+        keys: vec![ApiKeyRecord {
+            id: key_id(&minted.key_sha256),
+            key_sha256: minted.key_sha256.clone(),
+            display_tail: Some(minted.display_tail.clone()),
+            scope: KeyRecordScope::Turn {
+                project: "acme".into(),
+                user: "bo".into(),
+            },
+            provenance: Provenance::Admin,
+            created_at_ms: Some(0),
+            revoked_at_ms: None,
+        }],
+    };
+
+    let plane = compile(&file(), PATH, &checks(), &records).expect(
+        "`acme` is in `merged.projects` either way, and `bo`'s policy admits `reachable()`",
+    );
+    assert_eq!(
+        plane.scope(&bearer_headers(&minted.secret)).err(),
+        Some(AuthError::ProjectArchived),
+        "the direct check must fire even though `acme` is never absent from \
+         `merged.projects` here -- there is no `UnknownProject` fallback to \
+         lean on"
+    );
+
+    // CONTROL: the same membership and key, over a records table that makes
+    // no claim about `acme` at all -- so the refusal above tracks the
+    // archived flag on the hand-built row and not some artifact of feeding
+    // `compile` a row the real API could never produce. (Un-archiving the
+    // same row instead would re-push it into `merged.projects` alongside the
+    // file's own `acme` and fail on `DuplicateProject`, which is a fact about
+    // this fixture rather than about the check under test.)
+    records.projects.clear();
+    let plane = compile(&file(), PATH, &checks(), &records).expect("still compiles");
+    assert_eq!(
+        principal_of(plane.scope(&bearer_headers(&minted.secret))),
+        Some(Principal::new("acme", "bo"))
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Ownership
 // ---------------------------------------------------------------------------
@@ -472,6 +556,103 @@ fn a_config_owned_entity_refuses_mutation() {
     assert_eq!(
         principal_of(resolve(&directory, TURN_SECRET, 1_000)),
         Some(Principal::new("acme", "ada"))
+    );
+}
+
+/// `PatchProject`'s ownership check, isolated from the coincidence that lets
+/// [`a_config_owned_entity_refuses_mutation`] catch its removal today.
+///
+/// `acme` never has a row in `records.projects` — `CreateProject` refuses a
+/// config-owned id before one could ever be inserted, see `refuse_taken` — so
+/// `PatchProject`'s fallback `UnknownProject` lookup happens to redden the same
+/// way a missing `self.refuse_config_project(&id)?` call would (a 404 rather
+/// than the intended 409). That is a fact about the *current* shape of the
+/// records table, not about the ownership check, and it would stop holding the
+/// day something else legitimately puts an admin-owned row under a config id.
+/// Calling `mutate` directly, on a hand-built records table that *does* hold
+/// such a row, proves the ownership check runs before that row is ever
+/// consulted, rather than merely being one of two paths to the same refusal.
+#[test]
+fn patch_project_refuses_ownership_before_it_ever_looks_at_the_records_table() {
+    let directory = solo(0);
+    let mut records = DirectoryRecords {
+        projects: vec![
+            // A row that could not exist through the real API — nothing may
+            // `CreateProject` under an id the file owns — built here so the
+            // check under test cannot lean on that row's absence.
+            ProjectRecord {
+                entry: project("acme"),
+                provenance: Provenance::Admin,
+                created_at_ms: Some(0),
+                archived_at_ms: None,
+            },
+            ProjectRecord {
+                entry: project("widgets"),
+                provenance: Provenance::Admin,
+                created_at_ms: Some(0),
+                archived_at_ms: None,
+            },
+        ],
+        ..DirectoryRecords::default()
+    };
+    let managed = directory.managed().expect("a managed directory");
+
+    let error = managed
+        .mutate(
+            &mut records,
+            DirectoryMutation::PatchProject {
+                id: "acme".into(),
+                patch: ProjectPatch {
+                    name: Some("Renamed".into()),
+                    ..ProjectPatch::default()
+                },
+            },
+            1_000,
+        )
+        .expect_err("the file owns `acme` regardless of what the records table holds");
+    assert!(
+        matches!(error, DirectoryError::ConfigOwned { .. }),
+        "expected a config-owned refusal, got {error:?}"
+    );
+    assert_eq!(
+        records
+            .projects
+            .iter()
+            .find(|record| record.id() == "acme")
+            .expect("the hand-built row")
+            .entry
+            .name,
+        None,
+        "a refused patch must not have written anything"
+    );
+
+    // CONTROL: the identically-shaped row under an id the file does not own is
+    // exactly as patchable as `a_config_owned_entity_refuses_mutation`'s
+    // control already shows through the real API — so the refusal above is
+    // about ownership and not an artifact of feeding `mutate` a hand-built
+    // table.
+    managed
+        .mutate(
+            &mut records,
+            DirectoryMutation::PatchProject {
+                id: "widgets".into(),
+                patch: ProjectPatch {
+                    name: Some("Renamed".into()),
+                    ..ProjectPatch::default()
+                },
+            },
+            1_000,
+        )
+        .expect("an admin-owned row is the API's to patch");
+    assert_eq!(
+        records
+            .projects
+            .iter()
+            .find(|record| record.id() == "widgets")
+            .expect("the hand-built row")
+            .entry
+            .name,
+        Some("Renamed".to_string())
     );
 }
 
@@ -916,6 +1097,79 @@ fn deleting_a_membership_revokes_its_minted_keys() {
             .count(),
         2,
         "both of that membership's keys, and no others"
+    );
+}
+
+/// The cascade in [`DirectoryMutation::DeleteMembership`], isolated from
+/// `compile`'s own `Inconsistent` invariant.
+///
+/// Without the cascade, [`deleting_a_membership_revokes_its_minted_keys`]
+/// still reddens — but through a different mechanism than the one it names: the
+/// membership row is removed by `mutate` regardless, and the *next* `compile`
+/// then refuses to describe a live key naming a membership no record has,
+/// failing the whole `apply` with `DirectoryError::Inconsistent` rather than
+/// leaving an orphaned, still-admitting key. That is a real safety net — worth
+/// knowing about — but it means the wrapper test's `.expect(...)` panics before
+/// its own assertions run, which is a different failure than the one it is
+/// meant to demonstrate, and would stop catching the cascade's removal at all
+/// if that invariant were ever loosened. Calling `mutate` directly checks the
+/// cascade's own effect on `records.keys` before `compile` gets anywhere near
+/// it.
+#[test]
+fn delete_membership_s_cascade_revokes_keys_inside_mutate_before_any_compile_runs() {
+    let directory = solo(0);
+    let key_sha256 = "b".repeat(64);
+    let mut records = DirectoryRecords {
+        memberships: vec![MembershipRecord {
+            project: "widgets".into(),
+            user: "bo".into(),
+            role: Some(MembershipRole::Member),
+            allocation: None,
+            overrides: None,
+            provenance: Provenance::Admin,
+            created_at_ms: Some(0),
+        }],
+        keys: vec![ApiKeyRecord {
+            id: key_id(&key_sha256),
+            key_sha256: key_sha256.clone(),
+            display_tail: Some("bbbb".into()),
+            scope: KeyRecordScope::Turn {
+                project: "widgets".into(),
+                user: "bo".into(),
+            },
+            provenance: Provenance::Admin,
+            created_at_ms: Some(0),
+            revoked_at_ms: None,
+        }],
+        ..DirectoryRecords::default()
+    };
+
+    directory
+        .managed()
+        .expect("a managed directory")
+        .mutate(
+            &mut records,
+            DirectoryMutation::DeleteMembership {
+                project: "widgets".into(),
+                user: "bo".into(),
+            },
+            2_000,
+        )
+        .expect("deleting a membership neither half declares");
+
+    assert!(
+        !records
+            .memberships
+            .iter()
+            .any(|membership| membership.names("widgets", "bo")),
+        "the edge itself must be gone"
+    );
+    assert_eq!(
+        records.keys[0].revoked_at_ms,
+        Some(2_000),
+        "the cascade has to revoke the key inside `mutate`, before `compile` \
+         ever runs and could fail loudly (or stop failing loudly) instead: {:?}",
+        records.keys[0]
     );
 }
 

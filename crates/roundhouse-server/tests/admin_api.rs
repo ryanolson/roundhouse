@@ -256,6 +256,107 @@ async fn plain() -> Rig {
     rig(Arc::new(MemorySpendLedger::new())).await
 }
 
+/// A project that forwards its members' subscription seats rather than
+/// billing through this deployment's own rate card -- what R5's `seat_tokens`
+/// column exists to make visible.
+///
+/// Kept out of [`file`], which every other test in this module shares, so
+/// this fixture's presence does not change what `GET /v1/admin/projects` or
+/// `GET /v1/admin/keys` return elsewhere. No `"budget"` on the project:
+/// forwarded traffic bills nothing this deployment may name, so there is no
+/// ceiling to give it.
+fn pass_through_file() -> roundhouse_server::ControlPlaneConfig {
+    control_plane(
+        json!({
+            "projects": [
+                { "id": "forwarding", "credentials": { "mode": "pass_through" } },
+            ],
+            "users": [{ "id": "faye" }],
+            "keys": [
+                { "project": "forwarding", "user": "faye", "key_sha256": sha256_hex(&key("faye")) },
+            ],
+            "admin_keys": [sha256_hex(&root())],
+        }),
+        "admin-api pass-through fixture",
+    )
+}
+
+/// A deployment shaped for one test, `seat_tokens_are_visible_at_both_the_project_and_the_member_level`.
+///
+/// [`rig`] is deliberately frontier-only (see the module doc) — routing is
+/// then arithmetic rather than a race, which is what the money-column tests
+/// need. That is also why it is the wrong fixture here: a forwarding project's
+/// turn with nothing captured to forward is exactly the shape
+/// `mcp_surface.rs`'s pass-through tests degrade to local for, and `rig` has
+/// no local to degrade to — the turn would fail at dispatch rather than
+/// complete, and an incomplete turn measures no tokens at all. This rig adds a
+/// real local worker via [`common::embedded_fleet`] so a plain, header-free
+/// `turn()` completes the way it does in `mcp_surface.rs`, and still books as
+/// [`Billing::AccountedNotBilled`](roundhouse_core::control::Billing::AccountedNotBilled)
+/// — that reads off the project's *mode*, never off whether a credential was
+/// presented (see `payer.rs`'s `Billing::of`).
+async fn pass_through_rig() -> Rig {
+    ensure_rustls_crypto_provider();
+    let directory = Arc::new(
+        ControlDirectory::new(
+            pass_through_file(),
+            "ROUNDHOUSE_CONTROL_PLANE",
+            Arc::new(MemoryDirectoryStore::new()),
+            CrossChecks::new(reachable(), None),
+            now_ms(),
+        )
+        .expect("the file alone compiles, since it is what a boot would have loaded"),
+    );
+    let store = Arc::new(MemoryStore::new());
+    let ledger: Arc<dyn SpendLedger> = Arc::new(MemorySpendLedger::new());
+    let engine = Arc::new(
+        Engine::new(
+            Arc::clone(&store),
+            ByteTokenizer,
+            Arc::new(EchoLocalExecutor::new("local answer")),
+            catalog(),
+            Arc::new(EchoFrontierClient::new(FRONTIER_ANSWER)),
+            Arc::new(AffinityPolicy::new().with_weights(Weights {
+                prefill: 1.0,
+                cost: 0.0,
+                ttft: 0.25,
+            })),
+            EngineConfig {
+                expected_output_tokens: EXPECTED_OUTPUT_TOKENS,
+                block_size: common::BLOCK_SIZE,
+                local_model: common::LOCAL_MODEL.to_string(),
+                ..Default::default()
+            },
+        )
+        .with_fleet(common::embedded_fleet().await)
+        .with_spend_ledger(Arc::clone(&ledger)),
+    );
+    let metrics_config = metrics_config();
+    let app = admin_api::admin_router(
+        Arc::clone(&directory),
+        ledger,
+        engine.metrics(),
+        Arc::clone(&metrics_config),
+    )
+    .merge(http::router(
+        Arc::clone(&directory),
+        Arc::clone(&engine),
+        Arc::clone(&store),
+    ))
+    .merge(metrics_api::metrics_router(
+        Arc::clone(&directory),
+        engine.metrics(),
+        metrics_config,
+    ))
+    .merge(responses_api::responses_router(
+        Arc::clone(&directory),
+        engine,
+        store,
+        Arc::new(Conversations::new()),
+    ));
+    Rig { app, directory }
+}
+
 // ---------------------------------------------------------------------------
 // Driving it
 // ---------------------------------------------------------------------------
@@ -588,9 +689,27 @@ async fn the_budget_view_reports_committed_and_measured_separately() {
     // spending since it started. A view that summed them would be quoting a
     // number with no referent, and a view that reported only one would be
     // hiding the disagreement this endpoint exists to surface.
-    let rig = plain().await;
+    //
+    // Two turns, the first eaten by `SwallowsOneSettle` -- so committed and
+    // measured genuinely disagree here rather than only in principle. A
+    // fixture where every turn settles leaves them equal, which makes
+    // `drift_usd`'s own assertion below pass under a sign flip: `committed -
+    // measured` and `measured - committed` are both zero when the two figures
+    // match, so this broadest shape test would never catch that mutation.
+    // `drift_goes_negative_and_stays_visible_when_a_settle_is_lost` stays the
+    // primary, dedicated guard for the lost-settle behavior itself; this only
+    // needs *some* real drift to make its own sign-sensitive assertion mean
+    // something.
+    let ledger = Arc::new(SwallowsOneSettle::default());
+    let rig = rig(Arc::clone(&ledger) as Arc<dyn SpendLedger>).await;
     let secret = budgeted_member(&rig.app, "globex", "bob").await;
     turn(&rig.app, &secret, "globex/bob/main").await;
+    turn(&rig.app, &secret, "globex/bob/second").await;
+    assert!(
+        ledger.swallowed(),
+        "the double must have eaten exactly one settle, or this fixture is \
+         back to zero drift and every assertion below passes vacuously"
+    );
 
     let view = read(&rig.app, "/v1/admin/projects/globex/budget").await;
 
@@ -615,10 +734,15 @@ async fn the_budget_view_reports_committed_and_measured_separately() {
 
     let committed = view["committed_usd"].as_f64().expect("a ledger figure");
     let measured = view["measured_usd"].as_f64().expect("a folded figure");
-    assert_usd(committed, ACTUAL_TURN_USD, "the ledger's committed spend");
-    assert!(
-        measured > 0.0,
-        "the fold measured nothing for a turn that reached a priced provider: {view}"
+    assert_usd(
+        committed,
+        ACTUAL_TURN_USD,
+        "the ledger's committed spend — only the second turn settled",
+    );
+    assert_usd(
+        measured,
+        2.0 * ACTUAL_TURN_USD,
+        "the fold measures both turns, the swallowed one included",
     );
 
     // Independently correct: the folded figure is the same number the metrics
@@ -698,6 +822,53 @@ async fn the_budget_view_reports_committed_and_measured_separately() {
     // always read it — zero here, because nothing in this fixture forwards a
     // subscription seat.
     assert_eq!(view["seat_tokens"]["total"], 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn seat_tokens_are_visible_at_both_the_project_and_the_member_level() {
+    // R5's dollar-free column, isolated. Every other test in this file drives
+    // `file()`'s `acme`/`ada`, which bills through this deployment's own rate
+    // card, so `seat_tokens.total` is legitimately `0` in every one of them —
+    // and a mutation that zeroed the field, at either the project or the
+    // member row, changed nothing any of those assertions checked.
+    //
+    // What this fixture does NOT cover: `faye`'s turn presents no forwarded
+    // credential and degrades to local (mirroring `mcp_surface.rs`'s own
+    // pass-through fixture, whose `seat/cleo` does the same for the same
+    // reason — resolving a real forwarded credential runs through the
+    // read-denied `credential.rs`, and this milestone's fixtures do not
+    // exercise that path end to end). `Billing::of` reads the project's
+    // *mode* rather than whether a credential arrived, so the billing
+    // classification under test (`AccountedNotBilled`, landing in
+    // `counters.seat`) is exercised correctly either way — but this test
+    // cannot and does not distinguish "pass-through traffic is
+    // counted-not-priced" from "local traffic is counted-not-priced", since
+    // local traffic carries no dollars regardless of the project's mode.
+    let rig = pass_through_rig().await;
+    turn(&rig.app, &key("faye"), "forwarding/faye/main").await;
+
+    let view = read(&rig.app, "/v1/admin/projects/forwarding/budget").await;
+    let project_seat_tokens = view["seat_tokens"]["total"]
+        .as_u64()
+        .expect("a token count");
+    assert!(
+        project_seat_tokens > 0,
+        "a turn under a forwarding project spends no dollars this deployment \
+         may name, but it moves real tokens, and the project row is where an \
+         operator looks first: {view}"
+    );
+
+    let member = &view["members"][0];
+    assert_eq!(member["user"], "faye");
+    let member_seat_tokens = member["seat_tokens"]["total"]
+        .as_u64()
+        .expect("a token count");
+    assert!(member_seat_tokens > 0, "{view}");
+    assert_eq!(
+        member_seat_tokens, project_seat_tokens,
+        "one member, one turn — the project's total is exactly hers, so a \
+         mutation zeroing either level independently has to show up here: {view}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

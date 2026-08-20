@@ -1248,6 +1248,16 @@ mod tests {
         for header in [
             "not a bearer header",
             "Bearer rh_turn_tooshort",
+            // The admin prefix shares `has_valid_key_shape`'s length/charset
+            // check with the turn prefix above rather than a branch of its
+            // own, so this looked exercised by proxy -- until the M8 refute
+            // found a mutation that special-cased `rh_admin_` ahead of the
+            // shared check and nothing here caught it. Malformed admin secrets
+            // are vanishingly unlikely to matter in practice (the SHA256 of a
+            // guessed string still has to collide with a minted key's hash),
+            // but the two prefixes sharing one function is exactly the reason
+            // a divergence between them is worth asserting on directly.
+            "Bearer rh_admin_tooshort",
             "Bearer rh_something_else",
         ] {
             assert_eq!(
@@ -1256,6 +1266,33 @@ mod tests {
                 "`{header}`"
             );
         }
+    }
+
+    #[test]
+    fn has_valid_key_shape_treats_the_turn_and_admin_prefixes_alike() {
+        // Direct on the function itself, rather than through `resolved`'s
+        // header parsing: the two prefixes fall through to one shared
+        // length/charset check (see the function), and this is the test that
+        // would catch either arm growing a special case the other lacks.
+        for tag in ["rh_turn_", "rh_admin_"] {
+            assert!(
+                !has_valid_key_shape(&format!("{tag}tooshort")),
+                "{tag}: shorter than a real tail must be refused"
+            );
+            assert!(
+                !has_valid_key_shape(&format!("{tag}{}", "!".repeat(KEY_TAIL_LEN))),
+                "{tag}: the right length in a charset no minted key ever uses"
+            );
+            assert!(
+                !has_valid_key_shape(&format!("{tag}{}", "a".repeat(KEY_TAIL_LEN + 1))),
+                "{tag}: one digit too many"
+            );
+        }
+        assert!(
+            !has_valid_key_shape("rh_something_else_entirely"),
+            "neither prefix"
+        );
+        assert!(!has_valid_key_shape(""), "empty");
     }
 
     #[test]

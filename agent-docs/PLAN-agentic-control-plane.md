@@ -1243,3 +1243,120 @@ Several paper claims were read from abstracts/summaries because the research
 environment could not fetch full texts; they are used here for design shape,
 not for their point estimates, and the arm instrumentation exists precisely so
 roundhouse measures its own numbers rather than importing anyone else's.
+
+## Addendum (2026-08-20): M8 rulings — the admin plane as built
+
+Recorded at M8 implementation time. Where this addendum and the sections
+above disagree, the addendum wins.
+
+**Where the directory landed, and why not where §8 said.** §8's table put
+`ControlDirectory` in core with a Redis impl in `roundhouse-store-redis`.
+M1–M7 practice already diverged (KeyScope sits beside the resolver in the
+server crate), and `control/mod.rs`'s own placement note — "a key record
+... arrives with the admin plane, and it will arrive next to the resolver
+too, not here" — is the later, argued ruling. M8 honors it:
+`ControlDirectory`, its records, and its memory-backed store live in
+`roundhouse-server::control_config::directory`. The store seam is
+`load / commit(expected_version, records) / version` rather than §8's
+implied mutation-apply, because validation must run between read and
+write — the compile step judges the merged view, so the store cannot be
+the thing that applies a mutation. The Redis impl is deferred with its
+unlock condition in the module doc: when durable admin state or
+multi-node arrives, either the records move to core (with a dated
+amendment of the placement note) or the impl lands in the server crate
+via its own redis handle — decided then. (`ControlStore` was not
+available as a name: `roundhouse_mcp::ControlStore` holds the MCP overlay
+maps, whose own durability remains deferred to the same unlock.)
+
+**Configuration before CRUD, resolved.** The two paths cannot disagree
+because admin-created entities are expressed in the same config
+vocabulary the file uses and compiled by the same
+`ControlPlaneConfig::validate` — "writing the same state the file
+expresses", literally. Every entity carries provenance
+(`Config` | `Admin`); one owner per entity; mutating a Config-owned
+entity is refused `409 config_owned` naming `ROUNDHOUSE_CONTROL_PLANE`;
+creates colliding with a Config identity are refused the same way, which
+also means a key cannot be minted under a config-declared membership —
+the file owns that edge. Every mutation re-runs the boot cross-checks
+(now one callable list, `CrossChecks::refuse`, moved verbatim out of
+`main.rs`) against catalog and fleet, so a runtime-minted key is exactly
+as validated as a boot-loaded one. One honest consequence: the
+admits-nothing check walks turn keys, so an unservable policy is accepted
+at project-create and refused at the first mint — nothing can be harmed
+while no key exists, and the refusal still lands before any admission.
+Admin-created state is process-lifetime until the durable store lands —
+the file stays the only restart-stable truth, which is why bootstrap is
+file-only: in Open mode the admin surface refuses everything with
+`403 admin_requires_control_plane`, and the first admin key hash always
+enters through the file. API lockout is impossible on two branches:
+config-owned admin keys are unrevocable via the API, and a file with no
+admin keys never had an authenticated admin to lock out.
+
+**Revocation is a snapshot bound, not a row delete.** Admission resolves
+against an immutable compiled plane snapshot served by
+`ControlDirectory::plane(now_ms)`; writes recompile and swap immediately
+(same node), and a stale view refreshes once `admission_cache_ttl_ms`
+(config field, default 30s; 0 means every call re-checks) has elapsed and
+the store version moved. Revoked keys and archived projects compile to
+named refusals — `401 revoked_key`, `403 project_archived` — in the one
+auth table, consulted ahead of `unknown_key`, so an operator can tell
+theft from typo and history from absence. Archive is terminal in v1; the
+un-archive that would reopen the question of what its keys resume meaning
+is deferred with the audit trail.
+
+**The surfaces take a `PlaneSource`, not a plane.** The ripple that makes
+every router re-resolve per request shipped as a one-method trait
+(`plane(now_ms) -> Arc<ControlPlane>`) with the five composition seams
+generic over it. `ControlDirectory` is the live impl and the only one a
+production build can name; `ControlPlane` serves as its own fixed source
+strictly behind the `test-support` feature, so pre-M8 test fixtures stay
+valid while a bare plane at a production call site is a missing-impl
+compile error rather than a silent loss of revocation propagation. That
+fence — not convenience — is why the shim shape was rejected and the
+trait shape ruled in.
+
+**The reconciliation view's arithmetic, sharpened by a proven hazard.**
+During M8's understanding pass a probe proved that a `balance()` read
+carrying the wrong `BudgetWindow` permanently destroys committed spend
+(the window roll in `settle_time` zeroes the account on a Total→Monthly
+mismatch; Monthly→Total silently reinterprets a month as a lifetime).
+Two rulings follow. The view calls `balance` only with the membership's
+`BudgetTerms` taken verbatim from the compiled admission — never
+constructed fresh. And `PATCH` of a project's budget window is refused
+(`400 window_change_unsupported`) naming that mechanism; a window
+migration is a deliberate future design, not a field edit.
+The view itself: `committed_usd`, `held_usd`, `measured_usd`,
+`seat_tokens`, `drift_usd` — separate fields, no total anywhere,
+`drift_usd = committed − measured`, negative on a lost settle and never
+clamped. Every dollar column carries a basis stamp, and there are four
+bases, not two: `ledger` (windowed committed), `unenforced` (a budgetless
+membership the engine never grants against — nulls, never `0.0`),
+`no_keys` (a membership with no admission at all, which is not the same
+claim), and `archived` (committed null while measured stays real, because
+spend history outliving the project is the reason archiving is not
+deletion). `seat_tokens` is the dollar-free column that keeps a
+pass-through project from reading as under-billed; structural drift is
+disclosed rather than merged — under `ProjectPaidOnly`, user-paid spend
+appears in measured and never in committed, a label rather than a bug
+until the fold learns to read `DecisionRecord.payer` (deferred, named).
+Two more honesty notes the implementation surfaced: measured dollars are
+priced from the live rate card at snapshot time, so a catalog whose
+prices disagree with what turns were settled at reads as drift — a
+configuration mismatch wearing drift's clothes; and the fold is
+process-local, so a restart legitimately sends drift positive until the
+log is re-folded. Both are why the columns carry their basis instead of
+asking the reader to trust a bare number.
+
+**Credential CRUD did not ship, loudly.** `POST /v1/admin/credentials`
+refuses OAuth-shaped input with `400 oauth_credentials_unsupported` (the
+plan's own refusal, now HTTP-reachable) and everything else with
+`501 credential_crud_not_available` naming the config-file mechanism that
+remains authoritative. The sealed store (XChaCha20-Poly1305 under
+`ROUNDHOUSE_CONTROL_KEY`) stays deferred; its unlock is the durable
+directory store above.
+
+**Still deferred, by name** (unchanged from §10.8, restated so M8 is not
+read as having quietly delivered them): admin audit trail (admin writes
+are unattributed — `KeyScope::Admin` deliberately carries no identity),
+key rotation, per-key rate limiting, pagination, rate-card editing,
+MCP-overlay durability, un-archive.
