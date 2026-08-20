@@ -48,7 +48,6 @@ use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{Request, StatusCode};
 use futures::StreamExt;
 use http_body_util::BodyExt;
-use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 
 use codex_utils_rustls_provider::ensure_rustls_crypto_provider;
@@ -76,7 +75,7 @@ use roundhouse_server::{
 
 mod common;
 use common::codex::{request, user_message};
-use common::{BLOCK_SIZE, LOCAL_MODEL, MINUTE, embedded_fleet, path_segment};
+use common::{BLOCK_SIZE, LOCAL_MODEL, MINUTE, embedded_fleet, key, path_segment, sha256_hex};
 
 /// What each executor answers with, so a target is legible in the answer as
 /// well as in the log.
@@ -161,20 +160,8 @@ fn catalog_priced_at(output_per_mtok_usd: f64) -> StaticFrontierCatalog {
 }
 
 // ---------------------------------------------------------------------------
-// Keys and the control plane that declares them
+// The control plane that authenticates `common::key`
 // ---------------------------------------------------------------------------
-
-/// A well-shaped secret with `tag` legible inside it, padded to the 43 base62
-/// characters the key format requires — the same fixture rule the policy and
-/// tenancy suites use, and for the same reason: a hand-counted literal fails as
-/// `malformed_key` for a reason no assertion names.
-fn key(tag: &str) -> String {
-    format!("rh_turn_{tag:A<43}")
-}
-
-fn sha256_hex(secret: &str) -> String {
-    hex::encode(Sha256::digest(secret.as_bytes()))
-}
 
 /// A project budget, spelled the way an operator writes one.
 fn budget(on_exhaustion: &str, overflow: Option<bool>) -> serde_json::Value {

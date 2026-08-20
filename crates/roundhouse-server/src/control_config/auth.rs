@@ -4,8 +4,8 @@
 //! Decision 3's refusal table, and how it reaches a client.
 //!
 //! The narrowest of the three files [`control_config`](super) splits into, and
-//! deliberately so: this holds the *vocabulary* of a refusal — the five rows,
-//! their machine-readable codes, their statuses, and the body shape — and none
+//! deliberately so: this holds the *vocabulary* of a refusal — every row, its
+//! machine-readable code, its status, and the body shape — and none
 //! of the logic that decides which row applies. That decision is
 //! [`ControlPlane::scope`](super::ControlPlane::scope) and its two callers in
 //! [`mod.rs`](super), which is where a reader looking for "why was I refused"
@@ -18,13 +18,20 @@ use serde_json::json;
 
 /// Why a request never reached a session: decision 3's error table, whole.
 ///
-/// All five rows, including the two no single function decides on its own —
+/// Every row, including the ones no single function decides on its own —
 /// `WrongKeyKind` comes from [`ControlPlane::turn_admission`] (and its
 /// projection [`ControlPlane::turn_principal`]), which know what the surface
-/// wanted, and `OutOfNamespace` from the surface that was handed a
-/// session id. They live here anyway, because the table is the contract: a
-/// refusal spelled somewhere else is a refusal a client's error handling has
-/// never heard of.
+/// wanted, `OutOfNamespace` from the surface that was handed a session id, and
+/// `AdminRequiresControlPlane` from the admin router, which refuses on the
+/// deployment's *mode* before any header is read. They live here anyway,
+/// because the table is the contract: a refusal spelled somewhere else is a
+/// refusal a client's error handling has never heard of.
+///
+/// The admin plane added three rows rather than reusing `UnknownKey` for its
+/// two tombstones, and that is the point of the tombstones — see
+/// [`Self::RevokedKey`]. A parallel table beside this one would have been the
+/// other way to spell them, and it is the way that leaves a client parsing two
+/// vocabularies for the same question.
 ///
 /// `Clone` but not `Copy`: `OutOfNamespace` carries the prefix that would have
 /// worked, which is the only actionable part of that answer.
@@ -51,6 +58,57 @@ pub enum AuthError {
     /// existence oracle over other tenants' sessions.
     #[error("a session id must begin with `{prefix}` for this key")]
     OutOfNamespace { prefix: String },
+    /// A key the admin plane minted and then tombstoned.
+    ///
+    /// **Distinct from `UnknownKey`, and the distinction is the whole point of
+    /// keeping a revoked key's hash instead of deleting the row.** An operator
+    /// who revoked a leaked key wants to know that the thief is still trying it;
+    /// an operator whose deploy script pasted the wrong secret wants to know
+    /// that nothing here has ever heard of it. One code for both answers makes
+    /// theft and typo indistinguishable in a log, which is exactly the moment
+    /// somebody needs to tell them apart.
+    ///
+    /// Disclosing that the key *did* exist costs nothing: a secret is 32 CSPRNG
+    /// bytes, so a caller holding one holds it because it was issued to them or
+    /// leaked to them, never because they guessed. 401 rather than 403 because
+    /// the credential is no longer a credential — re-presenting it will never
+    /// work, and a client's retry logic should treat it as it treats an unknown
+    /// key.
+    #[error("this key has been revoked")]
+    RevokedKey,
+    /// A live key whose project is archived.
+    ///
+    /// 403 rather than 401: the key is intact and would authenticate, and it is
+    /// the *project* that has been closed. Told apart from
+    /// [`Self::RevokedKey`] because the remedies are opposite — un-archive the
+    /// project, or move the member to a live one — and because a fleet of keys
+    /// going dark at once reads very differently from one key going dark.
+    ///
+    /// Archived and not deleted, so this row exists at all: a project's spend
+    /// history outlives the project, and a deployment that dropped the row would
+    /// answer `unknown_key` for a membership its own ledger still has numbers
+    /// for.
+    #[error("this key's project has been archived")]
+    ProjectArchived,
+    /// An admin route on a deployment that configured no control plane.
+    ///
+    /// **The bootstrap root of trust is the file and there is no second one.**
+    /// In [`ControlPlane::Open`](super::ControlPlane::Open) every request
+    /// resolves to the built-in membership with no key at all, so an admin
+    /// surface that served open mode would be an unauthenticated writer of the
+    /// deployment's own tenancy — reachable by anything that can reach the port.
+    /// Refused mode-first, before any header is read, which is why this row
+    /// carries no key vocabulary: there is no key it could be about.
+    ///
+    /// 403 rather than 404: the route exists and the deployment is misconfigured
+    /// for it, and an operator who gets "not found" goes looking for a typo in a
+    /// path that was right.
+    #[error(
+        "the admin plane is only served on a deployment with a control plane; set \
+         ROUNDHOUSE_CONTROL_PLANE, which is the only root of trust an admin key can be \
+         issued from"
+    )]
+    AdminRequiresControlPlane,
 }
 
 impl AuthError {
@@ -63,15 +121,22 @@ impl AuthError {
             AuthError::UnknownKey => "unknown_key",
             AuthError::WrongKeyKind => "wrong_key_kind",
             AuthError::OutOfNamespace { .. } => "session_out_of_namespace",
+            AuthError::RevokedKey => "revoked_key",
+            AuthError::ProjectArchived => "project_archived",
+            AuthError::AdminRequiresControlPlane => "admin_requires_control_plane",
         }
     }
 
     pub fn status(&self) -> StatusCode {
         match self {
-            AuthError::MissingKey | AuthError::MalformedKey | AuthError::UnknownKey => {
-                StatusCode::UNAUTHORIZED
-            }
-            AuthError::WrongKeyKind | AuthError::OutOfNamespace { .. } => StatusCode::FORBIDDEN,
+            AuthError::MissingKey
+            | AuthError::MalformedKey
+            | AuthError::UnknownKey
+            | AuthError::RevokedKey => StatusCode::UNAUTHORIZED,
+            AuthError::WrongKeyKind
+            | AuthError::OutOfNamespace { .. }
+            | AuthError::ProjectArchived
+            | AuthError::AdminRequiresControlPlane => StatusCode::FORBIDDEN,
         }
     }
 }
@@ -124,6 +189,21 @@ mod tests {
                     prefix: "acme/ada/".into(),
                 },
                 "session_out_of_namespace",
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                AuthError::RevokedKey,
+                "revoked_key",
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                AuthError::ProjectArchived,
+                "project_archived",
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                AuthError::AdminRequiresControlPlane,
+                "admin_requires_control_plane",
                 StatusCode::FORBIDDEN,
             ),
         ];

@@ -40,7 +40,6 @@ use axum::body::Body;
 use axum::http::StatusCode;
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 
 use codex_api::{ApiError, ResponseEvent, ResponsesApiRequest, ResponsesClient, ResponsesOptions};
@@ -71,7 +70,7 @@ use common::codex::{
     Frame, NoAuth, RouterTransport, StaticToken, collect, frames, function_call_item,
     function_call_output_item, reasoning_item, request, user_message,
 };
-use common::frontier_catalog;
+use common::{frontier_catalog, sha256_hex};
 
 /// What the echo provider answers an *ordinary* turn with.
 const ANSWER: &str = "frontier answer";
@@ -382,7 +381,7 @@ fn budgeted_rig(script: impl IntoIterator<Item = Plan>) -> (Rig, Arc<GrantCounti
         "users": [{ "id": "ada" }],
         "keys": [{
             "project": "acme", "user": "ada",
-            "key_sha256": format!("{:x}", Sha256::digest(secret.as_bytes())),
+            "key_sha256": sha256_hex(secret),
         }],
     })
     .to_string();

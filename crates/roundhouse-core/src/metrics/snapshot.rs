@@ -491,7 +491,8 @@ impl MetricsSnapshot {
     /// card has to be able to reprice history without replaying it.
     ///
     /// [`Scope::Deployment`] is the document an admin reads;
-    /// [`Scope::Principal`] is what a turn key gets. Every field is scoped, not
+    /// [`Scope::Principal`] is what a turn key gets; [`Scope::Project`] is the
+    /// measured half of one project's reconciliation. Every field is scoped, not
     /// only the model rows: a document whose money is filtered but whose
     /// session count, turn count and event window still describe the deployment
     /// reads as correct and discloses the size and activity of every other

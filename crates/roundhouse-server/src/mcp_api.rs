@@ -53,7 +53,7 @@ use roundhouse_mcp::surface::SurfaceError;
 use roundhouse_mcp::transport::HostGuard;
 use roundhouse_mcp::{ControlPlaneSurface, ControlStore};
 
-use crate::control_config::{AuthError, ControlPlane, KeyScope};
+use crate::control_config::{AuthError, ControlPlane, KeyScope, PlaneSource};
 use crate::conversations::Conversations;
 use crate::http::ApiError;
 
@@ -64,7 +64,17 @@ use crate::http::ApiError;
 /// table — because a second copy of any of them would be a control surface that
 /// reports on a deployment adjacent to the one serving turns.
 pub struct ControlPlaneReads<S: SessionStore> {
-    plane: Arc<ControlPlane>,
+    /// A [`PlaneSource`] rather than a compiled plane, for the reason every
+    /// other surface holds one: an agent whose key was revoked mid-session must
+    /// stop being told what it may route to, and a copy captured at mount time
+    /// would answer for the life of the process.
+    ///
+    /// Re-asked per read rather than once per tool call, because this trait has
+    /// no request scope to hang a snapshot on and each method is an independent
+    /// question. The two reads inside one tool call can therefore straddle a
+    /// write — the answer is then simply the newer of two compiled planes,
+    /// which is what a second tool call a millisecond later would have said.
+    planes: Arc<dyn PlaneSource>,
     store: Arc<S>,
     spend: Arc<dyn SpendLedger>,
     conversations: Arc<Conversations>,
@@ -84,15 +94,15 @@ pub struct ControlPlaneReads<S: SessionStore> {
 }
 
 impl<S: SessionStore> ControlPlaneReads<S> {
-    pub fn new(
-        plane: Arc<ControlPlane>,
+    pub fn new<P: PlaneSource>(
+        planes: Arc<P>,
         store: Arc<S>,
         spend: Arc<dyn SpendLedger>,
         conversations: Arc<Conversations>,
         reachable: Vec<Candidate>,
     ) -> Self {
         Self {
-            plane,
+            planes,
             store,
             spend,
             conversations,
@@ -110,9 +120,14 @@ impl<S: SessionStore> ControlPlaneReads<S> {
     /// is a file an operator has to go and edit. The startup cross-check is what
     /// makes the second arm unreachable in a deployment that booted.
     fn membership(&self, principal: &Principal) -> Result<crate::Admission, SurfaceError> {
-        self.plane
+        self.plane()
             .membership(principal)
             .map_err(|error| SurfaceError::Internal(error.to_string()))
+    }
+
+    /// This node's current compiled plane. See [`Self::planes`].
+    fn plane(&self) -> Arc<ControlPlane> {
+        self.planes.plane(self.now_ms())
     }
 }
 
@@ -139,7 +154,7 @@ impl<S: SessionStore> ControlReads for ControlPlaneReads<S> {
         // one.
         let session = self
             .conversations
-            .resolve(&self.plane.qualify(principal, named));
+            .resolve(&self.plane().qualify(principal, named));
         // Existence is the whole of the check, and it is enough because the name
         // was qualified into *this* caller's namespace first: a conversation
         // that resolves to nothing either never existed or belongs to another
@@ -286,11 +301,19 @@ impl<S: SessionStore> ControlReads for ControlPlaneReads<S> {
 /// methods with the same status even if the transport underneath is swapped for
 /// the hand-rolled handler. The behavior a test pins is therefore a property of
 /// this deployment rather than of whichever library is behind the route.
-pub fn mcp_router<R: ControlReads>(
-    plane: Arc<ControlPlane>,
+///
+/// Generic over the source and stored as `Arc<dyn PlaneSource>`, rather than
+/// taking the trait object directly. `Arc<ControlPlane>` and
+/// `Arc<ControlDirectory>` are both accepted and both unsize at the call site;
+/// a parameter typed `Arc<dyn PlaneSource>` would not accept either through the
+/// `Arc::clone(&plane)` a caller naturally writes, because the clone's own
+/// return type is inferred before any coercion could apply.
+pub fn mcp_router<R: ControlReads, P: PlaneSource>(
+    planes: Arc<P>,
     reads: Arc<R>,
     store: Arc<ControlStore>,
 ) -> Router {
+    let planes: Arc<dyn PlaneSource> = planes;
     let surface = Arc::new(ControlPlaneSurface::new(reads, store));
     // The rebinding guard follows the mode, because what the guard is standing
     // in for differs by mode. A configured deployment is served behind whatever
@@ -303,7 +326,14 @@ pub fn mcp_router<R: ControlReads>(
     // and the overlay writes against the developer's live conversation, with no
     // credential. `allowed_origins` is not an alternative — under rebinding the
     // browser believes it is same-origin.
-    let hosts = match plane.as_ref() {
+    //
+    // Resolved once here and never per request, and that is a claim rather than
+    // an optimization: the mode is a property of the *deployment* — a directory
+    // over a file always compiles to `Configured`, one without a file is fixed at
+    // `Open`, and a fixed source cannot move at all — so no admin write and no
+    // refresh can change it. A guard re-derived per request would suggest
+    // otherwise.
+    let hosts = match planes.plane(now_ms()).as_ref() {
         ControlPlane::Open => HostGuard::Loopback,
         ControlPlane::Configured { .. } => HostGuard::AnyHost,
     };
@@ -312,7 +342,7 @@ pub fn mcp_router<R: ControlReads>(
             "/mcp",
             post_service(roundhouse_mcp::transport::mcp_service(surface, hosts)),
         )
-        .layer(axum::middleware::from_fn_with_state(plane, auth_layer))
+        .layer(axum::middleware::from_fn_with_state(planes, auth_layer))
 }
 
 /// Resolve the caller's key and put the principal where the transport reads it.
@@ -324,11 +354,11 @@ pub fn mcp_router<R: ControlReads>(
 /// resolves every request to [`Principal::default_open`], so an unconfigured
 /// deployment serves this surface exactly as it serves its turns.
 async fn auth_layer(
-    State(plane): State<Arc<ControlPlane>>,
+    State(planes): State<Arc<dyn PlaneSource>>,
     mut request: Request,
     next: Next,
 ) -> Response {
-    let principal = match plane.scope(request.headers()) {
+    let principal = match planes.plane(now_ms()).scope(request.headers()) {
         Ok(KeyScope::Turn(admission)) => admission.principal,
         Ok(KeyScope::Admin) => return ApiError::from(AuthError::WrongKeyKind).into_response(),
         Err(error) => return ApiError::from(error).into_response(),

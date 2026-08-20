@@ -29,11 +29,57 @@ use roundhouse_fleet::{
     FrontierStream, KvRouterConfig, SelectionServiceBuilder, StaticFrontierCatalog, WireProtocol,
     WorkerRegistration,
 };
-use roundhouse_server::EngineConfig;
+use roundhouse_server::{ControlPlaneConfig, EngineConfig};
+use sha2::{Digest, Sha256};
 
 pub const BLOCK_SIZE: u32 = 16;
 pub const LOCAL_MODEL: &str = "local";
 pub const MINUTE: u64 = 60_000;
+
+// ---------------------------------------------------------------------------
+// Keys, and the config that declares them
+// ---------------------------------------------------------------------------
+
+/// A well-shaped turn secret with `tag` legible inside it.
+///
+/// Padded to the 43 base62 characters
+/// [`has_valid_key_shape`](roundhouse_server::has_valid_key_shape) requires,
+/// because a hand-counted literal fails as `malformed_key` for a reason no
+/// assertion names — and the tag is inside the secret so a failure message says
+/// *which* key was refused rather than showing forty-three identical letters.
+///
+/// Here rather than once per suite: six binaries had their own copy of this and
+/// of the two functions below, which meant the fixture rule and the deployment's
+/// real key format were six independent restatements of one fact.
+pub fn key(tag: &str) -> String {
+    format!("rh_turn_{tag:A<43}")
+}
+
+/// The same, wearing the admin prefix.
+pub fn admin_key(tag: &str) -> String {
+    format!("rh_admin_{tag:A<43}")
+}
+
+/// What a control-plane file carries in place of a secret.
+///
+/// Computed from the secret rather than transcribed, so a fixture cannot drift
+/// into declaring a hash nothing hashes to — which parses perfectly and
+/// authenticates nothing.
+pub fn sha256_hex(secret: &str) -> String {
+    hex::encode(Sha256::digest(secret.as_bytes()))
+}
+
+/// A validated config from the JSON an operator would have written.
+///
+/// Through [`ControlPlaneConfig::from_json`] rather than by assembling the
+/// lookup tables, because the file *is* the format: the pairing of a project's
+/// budget with a key's allocation, the narrowing of a policy by an override and
+/// the credential tiers all happen inside `validate`, and a fixture that
+/// bypassed it would be testing terms no deployment could be given.
+pub fn control_plane(json: serde_json::Value, label: &str) -> ControlPlaneConfig {
+    ControlPlaneConfig::from_json(&json.to_string(), label)
+        .unwrap_or_else(|error| panic!("the {label} config must validate: {error}"))
+}
 
 /// A namespaced session id as one path segment.
 ///

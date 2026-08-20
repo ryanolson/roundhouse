@@ -33,11 +33,18 @@
 //! ask to be routed to less. It adds no state of its own either — its writes go
 //! to a node-local control store the engine reads at the start of every turn.
 //!
+//! [`admin_api`] is the fifth, and the only one that *writes*: it is the
+//! surface an operator creates projects, members and keys through, and the
+//! reason the other four hold a [`ControlDirectory`] rather than a compiled
+//! [`ControlPlane`] — a key revoked there has to stop working on all of them,
+//! which it cannot do if each captured its own plane at mount time.
+//!
 //! [`metrics_api`] reports on all of it. Token counts, dollars, and the savings
 //! figure are folded out of the same log as everything else — see
 //! [`roundhouse_core::metrics`] — so the dashboard cannot disagree with the
 //! audit trail it summarizes.
 
+pub mod admin_api;
 pub mod catalog_config;
 pub mod control_config;
 pub mod conversations;
@@ -50,10 +57,12 @@ pub mod metrics_api;
 pub mod responses_api;
 pub mod tokenizer;
 
+pub use admin_api::admin_router;
 pub use catalog_config::{CatalogConfig, CatalogError};
 pub use control_config::{
-    Admission, AuthError, ControlPlane, ControlPlaneConfig, ControlPlaneError, KeyScope,
-    MembershipError, ValidateConfig,
+    Admission, AuthError, ControlDirectory, ControlPlane, ControlPlaneConfig, ControlPlaneError,
+    CrossChecks, DirectoryError, DirectoryMutation, DirectoryStore, DirectoryView, KeyScope,
+    MembershipError, MemoryDirectoryStore, PlaneSource, ValidateConfig, has_valid_key_shape,
 };
 pub use conversations::Conversations;
 pub use dialect::{ClientDialect, DEFAULT_MCP_NAMESPACE};

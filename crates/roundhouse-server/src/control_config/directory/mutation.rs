@@ -1,0 +1,246 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! What the admin plane can change, and every way a change is refused.
+//!
+//! The vocabulary of a *write* and of a *refused write*, kept apart from the
+//! records they act on for the reason [`records`](super::records) is kept apart
+//! from the directory: these two enums are read as tables — one arm per route,
+//! one variant per HTTP outcome — and a table is only readable while it is the
+//! whole of what a reader is looking at.
+
+use serde::Deserialize;
+
+use roundhouse_core::control::BudgetWindow;
+
+use super::super::budget::{AllocationConfig, BudgetConfig};
+use super::super::config::{ControlPlaneError, PolicyConfig, ProjectEntry, UserEntry};
+use super::super::credentials::CredentialsConfig;
+use super::super::crosscheck::CrossCheckRefusal;
+use super::super::validate::ValidateConfig;
+use super::super::{MintError, MintedKey};
+use super::records::{EntityKind, MembershipRole};
+use super::store::StoreFailure;
+
+// ---------------------------------------------------------------------------
+// Mutations
+// ---------------------------------------------------------------------------
+
+/// The axes a project `PATCH` may move.
+///
+/// **Absent means "leave alone", and there is no spelling for "remove this
+/// block".** That is a deliberate gap rather than an unfinished one: removing a
+/// budget widens a ceiling to unlimited and removing a credentials block
+/// un-gates a project, and both of those read like a field an operator forgot
+/// to include. Widening by omission is the shape of mistake a partial-update
+/// API is worst at making visible, so in M8 it is only expressible in the file,
+/// where the whole document is in front of whoever edits it.
+///
+/// `deny_unknown_fields`, and the project's own `id` is therefore *not*
+/// accepted: it is in the path, and a body that carried a second one would have
+/// to decide what a disagreement between them means. Strict rather than lenient
+/// because the failure this shape is worst at showing is a misspelled field
+/// name — which reads, silently, as "leave that alone".
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProjectPatch {
+    pub name: Option<String>,
+    pub policy: Option<PolicyConfig>,
+    pub budget: Option<BudgetConfig>,
+    pub validate: Option<ValidateConfig>,
+    pub credentials: Option<CredentialsConfig>,
+}
+
+/// The identity half of a minted key: everything about it that outlives the
+/// secret.
+///
+/// Carried by [`DirectoryMutation::MintTurnKey`] and
+/// [`DirectoryMutation::MintAdminKey`] rather than the [`MintedKey`] itself, so
+/// the mutation vocabulary — the thing a durable store would one day
+/// serialize — has no field a plaintext could reach.
+#[derive(Debug, Clone)]
+pub struct KeyFingerprint {
+    pub key_sha256: String,
+    pub display_tail: String,
+}
+
+impl From<&MintedKey> for KeyFingerprint {
+    fn from(minted: &MintedKey) -> Self {
+        Self {
+            key_sha256: minted.key_sha256.clone(),
+            display_tail: minted.display_tail.clone(),
+        }
+    }
+}
+
+/// Everything the admin plane can change.
+///
+/// One enum rather than a method per route, because provenance and identity are
+/// checked the same way for all of them and the check belongs in one `match`
+/// where the compiler can see a new arm was added to it.
+#[derive(Debug, Clone)]
+pub enum DirectoryMutation {
+    CreateProject {
+        entry: ProjectEntry,
+    },
+    PatchProject {
+        id: String,
+        patch: ProjectPatch,
+    },
+    /// `DELETE /v1/admin/projects/{id}` — archive, never delete. See
+    /// [`ProjectRecord::archived_at_ms`].
+    ArchiveProject {
+        id: String,
+    },
+    CreateUser {
+        entry: UserEntry,
+    },
+    UpsertMembership {
+        project: String,
+        user: String,
+        role: MembershipRole,
+        allocation: Option<AllocationConfig>,
+        overrides: Option<PolicyConfig>,
+    },
+    /// Removes the edge and revokes every key minted under it. See
+    /// [`ControlDirectory::apply`] on why the cascade is not optional.
+    DeleteMembership {
+        project: String,
+        user: String,
+    },
+    MintTurnKey {
+        project: String,
+        user: String,
+        key: KeyFingerprint,
+    },
+    MintAdminKey {
+        key: KeyFingerprint,
+    },
+    RevokeKey {
+        id: String,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Refusals
+// ---------------------------------------------------------------------------
+
+/// Why a directory read or write did not happen.
+///
+/// **One variant per outcome, named for the outcome's cause**, rather than a
+/// single `Refused { code, message }`. The surface that turns these into HTTP
+/// writes a `match`, and a `match` is checked: a variant added here without a
+/// status is a compile error rather than a route that answers 500 for a
+/// perfectly ordinary 409.
+#[derive(Debug, thiserror::Error)]
+pub enum DirectoryError {
+    #[error(
+        "{kind} `{id}` is declared in ROUNDHOUSE_CONTROL_PLANE, which owns it -- edit the file \
+         and restart. An API change that shadowed the file would be undone by the next restart, \
+         silently"
+    )]
+    ConfigOwned { kind: EntityKind, id: String },
+    #[error("{kind} `{id}` already exists, so creating it here would give one identity two owners")]
+    IdentityCollision { kind: EntityKind, id: String },
+    #[error(
+        "project `{id}` is archived, and archiving is final in this milestone -- its spend \
+         history keeps the id, so nothing else may be created under it"
+    )]
+    ProjectIsArchived { id: String },
+    /// A write against a directory with no writable half.
+    ///
+    /// The only *reachable* state it describes is a deployment that configured
+    /// no control plane, which is exactly what
+    /// [`AuthError::AdminRequiresControlPlane`] says — and the admin router says
+    /// it first, on the mode, before any handler runs. This is what stops a
+    /// future caller that forgets that gate from writing into a deployment that
+    /// has no root of trust to have authorized the write.
+    ///
+    /// A fixed directory over a *configured* plane would also land here, and the
+    /// message would then name the wrong remedy. Nothing constructs that
+    /// arrangement outside a test fixture, and no fixture mounts the admin
+    /// router over one; a route that made it reachable would need a message of
+    /// its own rather than this one.
+    ///
+    /// [`AuthError::AdminRequiresControlPlane`]: super::super::AuthError::AdminRequiresControlPlane
+    #[error(
+        "this deployment configured no control plane, so there is no root of trust an admin \
+         key could have been issued from and nothing here to administer -- set \
+         ROUNDHOUSE_CONTROL_PLANE"
+    )]
+    NoAdminPlane,
+    #[error("no project `{id}`")]
+    UnknownProject { id: String },
+    #[error("no user `{id}`")]
+    UnknownUser { id: String },
+    #[error("no membership for user `{user}` in project `{project}`")]
+    UnknownMembership { project: String, user: String },
+    #[error("no key `{id}`")]
+    UnknownKey { id: String },
+    #[error(
+        "project `{project}`'s budget window is `{from:?}` and this change would make it \
+         `{to:?}`, which is refused: committed spend is counted *within* a window, so moving one \
+         either zeroes what the project has already spent this period or reinterprets a total as \
+         a month. Neither is a change an API can make honestly. Create a project on the window \
+         you want, or edit ROUNDHOUSE_CONTROL_PLANE and restart, where the reset is at least \
+         visible"
+    )]
+    WindowChangeUnsupported {
+        project: String,
+        from: BudgetWindow,
+        to: BudgetWindow,
+    },
+    /// The merged config did not compile.
+    ///
+    /// The same boundary, and the same words, a boot failure would have used —
+    /// which is the point of compiling admin state through it.
+    #[error("this change would not load as a control plane: {0}")]
+    Invalid(#[source] ControlPlaneError),
+    /// The merged config compiled but the deployment could not serve it.
+    #[error("this change would not start this deployment ({check}): {detail}")]
+    CrossCheckRefused { check: &'static str, detail: String },
+    /// The *process* is missing something the config names.
+    ///
+    /// Split out of [`Self::Invalid`] because the remedy is somewhere else
+    /// entirely: an unset environment variable is not a bad request, and
+    /// answering 422 would send an operator to re-read a `PATCH` body that was
+    /// correct. It is reported as a server fault naming the variable, because
+    /// that is what it is.
+    #[error("this deployment is missing something its control plane names: {0}")]
+    EnvironmentIncomplete(#[source] ControlPlaneError),
+    #[error(transparent)]
+    Store(#[from] StoreFailure),
+    #[error(transparent)]
+    Mint(#[from] MintError),
+    /// A record referenced something that should have been impossible to
+    /// remove.
+    ///
+    /// Never a caller's fault: every route that could orphan a row cascades
+    /// instead. Reported rather than repaired, because the repair — dropping the
+    /// key — would turn a revocation this deployment cannot explain into an
+    /// `unknown_key` nobody investigates.
+    #[error("internal inconsistency in the control directory: {detail}")]
+    Inconsistent { detail: String },
+}
+
+impl From<CrossCheckRefusal> for DirectoryError {
+    fn from(refusal: CrossCheckRefusal) -> Self {
+        DirectoryError::CrossCheckRefused {
+            check: refusal.check,
+            detail: refusal.detail,
+        }
+    }
+}
+
+impl From<ControlPlaneError> for DirectoryError {
+    /// Sorted into the two that read completely differently to whoever is
+    /// holding the failed request. See [`DirectoryError::EnvironmentIncomplete`].
+    fn from(error: ControlPlaneError) -> Self {
+        match error {
+            ControlPlaneError::CredentialEnvVarUnset { .. } => {
+                DirectoryError::EnvironmentIncomplete(error)
+            }
+            other => DirectoryError::Invalid(other),
+        }
+    }
+}

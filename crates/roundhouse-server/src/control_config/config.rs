@@ -304,6 +304,26 @@ pub struct ControlPlaneConfig {
     /// it may reach them through its `mode`; it does not restate them.
     #[serde(default)]
     pub credentials: Option<CredentialsConfig>,
+    /// How long a node may keep serving a compiled plane before it re-reads the
+    /// admin directory, in milliseconds. Absent means
+    /// [`DEFAULT_ADMISSION_CACHE_TTL_MS`].
+    ///
+    /// **This is the staleness bound on a revocation, and it is the only one.**
+    /// The node that performs a write swaps its own snapshot immediately, so a
+    /// key revoked here stops working here on the next request. Every *other*
+    /// node is serving a snapshot compiled before the write, and this is how
+    /// long it may go on doing so — see
+    /// [`ControlDirectory::plane`](super::directory::ControlDirectory::plane).
+    /// An operator revoking a leaked key is choosing this number, so it is
+    /// written in the same file the keys are.
+    ///
+    /// `0` is legal and means "re-read on every request", which is the honest
+    /// spelling of a deployment that would rather pay a store read per
+    /// admission than leave a revoked key working for a second. It is not a
+    /// disabled-cache sentinel: the refresh still only recompiles when the
+    /// store's version has actually moved.
+    #[serde(default)]
+    pub admission_cache_ttl_ms: Option<u64>,
     /// The finished turn-key lookup table: `key_sha256` to the complete
     /// [`Admission`] the key resolves to — its membership, its fully-resolved
     /// [`TurnPolicy`] (its project's policy narrowed by its own overrides),
@@ -558,6 +578,18 @@ pub enum ControlPlaneError {
     },
 }
 
+/// How long a compiled plane is served before the directory is re-read, where
+/// the file names no other number.
+///
+/// Thirty seconds because it is the bound on how long a *revoked* key keeps
+/// working on a node that did not perform the revocation, and that is the
+/// number an operator is really choosing. Long enough that an admin surface
+/// under load is not a read amplifier on the store; short enough that "revoke
+/// the leaked key" is an action with a visible end. A deployment that wants
+/// either extreme writes `admission_cache_ttl_ms` rather than arguing with this
+/// constant.
+pub const DEFAULT_ADMISSION_CACHE_TTL_MS: u64 = 30_000;
+
 /// `true` for `^[a-z0-9][a-z0-9_-]{0,63}$`.
 ///
 /// Hand-rolled rather than the `regex` crate: the alphabet is three ASCII
@@ -615,7 +647,15 @@ impl ControlPlaneConfig {
     /// are checked before the ids are trusted as lookup keys, and a key's
     /// project/user references are checked before its hash, so a config with
     /// several problems reports the one closest to the top of the file.
-    fn validate(&mut self, path: &str) -> Result<(), ControlPlaneError> {
+    ///
+    /// `pub(super)` rather than private since the admin plane: the directory
+    /// merges the file's entries with the ones an operator created over the API
+    /// into one config of this same shape and compiles it *here*, so a
+    /// runtime-minted key is judged by the same boundary as a boot-loaded one.
+    /// A second compiler for admin-created entities is the one thing that would
+    /// let the two halves of the control plane disagree — see
+    /// [`ControlDirectory`](super::directory::ControlDirectory).
+    pub(super) fn validate(&mut self, path: &str) -> Result<(), ControlPlaneError> {
         let mut project_ids: HashSet<&str> = HashSet::new();
         // Every project's effective policy, resolved once here so the keys
         // loop below can narrow against a real `TurnPolicy` rather than

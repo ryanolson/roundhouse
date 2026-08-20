@@ -27,7 +27,6 @@ use axum::body::Body;
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
-use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 
 use codex_api::{
@@ -51,7 +50,7 @@ use roundhouse_server::{
 
 mod common;
 use common::codex::{NoAuth, RouterTransport, StaticToken, collect, request, user_message};
-use common::{frontier_catalog, path_segment};
+use common::{frontier_catalog, path_segment, sha256_hex};
 
 /// What the echo provider answers with, and therefore what every turn here
 /// contains.
@@ -84,10 +83,6 @@ fn admin_key() -> String {
 
 fn unknown_key() -> String {
     secret("turn", "nobody")
-}
-
-fn sha256_hex(secret: &str) -> String {
-    hex::encode(Sha256::digest(secret.as_bytes()))
 }
 
 fn acme() -> Principal {

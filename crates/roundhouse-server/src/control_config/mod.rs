@@ -89,6 +89,8 @@ pub mod auth;
 pub mod budget;
 pub mod config;
 pub mod credentials;
+pub mod crosscheck;
+pub mod directory;
 pub mod validate;
 
 use std::collections::{HashMap, HashSet};
@@ -109,13 +111,51 @@ use crate::dialect::ClientDialect;
 pub use auth::AuthError;
 pub use budget::{AllocationConfig, BudgetConfig, OnExhaustionConfig};
 pub use config::{
-    ControlPlaneConfig, ControlPlaneError, KeyEntry, PolicyConfig, ProjectEntry, UserEntry,
+    ControlPlaneConfig, ControlPlaneError, DEFAULT_ADMISSION_CACHE_TTL_MS, KeyEntry, PolicyConfig,
+    ProjectEntry, UserEntry,
 };
 pub use credentials::{CredentialsConfig, ProviderCredentialConfig};
+pub use crosscheck::{CrossCheckRefusal, CrossChecks};
+pub use directory::{
+    ApiKeyRecord, ControlDirectory, DirectoryError, DirectoryMutation, DirectoryRecords,
+    DirectoryStore, DirectoryView, EntityKind, KeyFingerprint, KeyRecordScope, MembershipRecord,
+    MembershipRole, MemoryDirectoryStore, PlaneSource, ProjectPatch, ProjectRecord, Provenance,
+    StoreFailure, UserRecord,
+};
 pub use validate::{ArmSharesConfig, ValidateConfig};
 
 /// Path to a control-plane JSON file. Absent means [`ControlPlane::Open`].
 pub const CONTROL_PLANE_VAR: &str = "ROUNDHOUSE_CONTROL_PLANE";
+
+/// The validated config named by [`CONTROL_PLANE_VAR`] and the path it came
+/// from, or `None` when the variable is unset.
+///
+/// A variable that *is* set but names an unreadable or malformed file stops the
+/// process, mirroring `catalog_config::from_env`: starting anyway would serve
+/// every request as if no key were required, which is the exact failure a
+/// deployment sets this variable to prevent.
+///
+/// The *config* rather than a finished [`ControlPlane`], which is what this
+/// used to hand back. Since the admin plane the file is only half of what a
+/// deployment authenticates against — see
+/// [`ControlDirectory`](directory::ControlDirectory), which merges it with what
+/// an operator created over the API and compiles the two together. Returning a
+/// compiled plane here would have made the file's half look like the whole, and
+/// the composition root would have had to take it apart again.
+///
+/// The path travels with the config because every refusal names it: a `PATCH`
+/// refused because it collides with a file-declared project has to say which
+/// file, and by then the variable has long been read.
+pub fn config_from_env() -> Result<Option<(ControlPlaneConfig, String)>, ControlPlaneError> {
+    match std::env::var(CONTROL_PLANE_VAR) {
+        Ok(path) if !path.trim().is_empty() => {
+            let path = path.trim().to_string();
+            let config = ControlPlaneConfig::load(&path)?;
+            Ok(Some((config, path)))
+        }
+        _ => Ok(None),
+    }
+}
 
 /// The header a client may present its roundhouse turn key in, beside
 /// `Authorization`.
@@ -149,13 +189,172 @@ static OPEN_DIALECT: LazyLock<ClientDialect> = LazyLock::new(ClientDialect::defa
 /// about what an operator *wrote in a file*. They look alike and are checked at
 /// opposite ends of the system, which is the whole reason the two are separate
 /// files.
-fn has_valid_key_shape(secret: &str) -> bool {
+///
+/// `pub` since the admin plane, for one reason: the milestone test that mints a
+/// key asserts the secret against *this* predicate. A test that re-spelled the
+/// prefix and the length would pass while the deployment refused its own freshly
+/// issued key — which is precisely the drift that keeping [`mint_key`] beside
+/// this function exists to prevent, reintroduced in the one place that was
+/// supposed to catch it.
+pub fn has_valid_key_shape(secret: &str) -> bool {
     let tail = secret
         .strip_prefix("rh_turn_")
         .or_else(|| secret.strip_prefix("rh_admin_"));
     match tail {
-        Some(tail) => tail.len() == 43 && tail.chars().all(|c| c.is_ascii_alphanumeric()),
+        Some(tail) => tail.len() == KEY_TAIL_LEN && tail.chars().all(|c| c.is_ascii_alphanumeric()),
         None => false,
+    }
+}
+
+/// How many base62 digits a minted secret's tail carries.
+///
+/// Not a taste: 32 bytes is 256 bits, and 62^43 is 2^256.03 — the smallest
+/// digit count that can render every 256-bit value. 42 digits would truncate
+/// the entropy this file's opening paragraph claims, and 44 would pad every
+/// secret with a digit that is always the same.
+const KEY_TAIL_LEN: usize = 43;
+
+/// The digits a minted secret's tail is spelled in.
+///
+/// Base62 rather than base64 because [`has_valid_key_shape`] is the gate every
+/// presented secret passes, and it asks for `is_ascii_alphanumeric` — a `+`, a
+/// `/` or a `=` would be refused by the deployment that issued it. Base62 also
+/// survives a round trip through a URL, a shell, and an environment variable
+/// without an encoding step nobody would remember to reverse.
+const BASE62_DIGITS: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+/// Which prefix a minted secret wears, and therefore what a [`KeyScope`] match
+/// may trust structurally about it.
+///
+/// An enum rather than a `&str` prefix the caller supplies: the prefix is half
+/// of what the resolver reads, and a mint site free to invent one could issue a
+/// secret this deployment refuses on sight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyKind {
+    /// `rh_turn_` — pays for turns as one membership.
+    Turn,
+    /// `rh_admin_` — reads and writes the control plane itself.
+    Admin,
+}
+
+impl KeyKind {
+    pub fn prefix(self) -> &'static str {
+        match self {
+            KeyKind::Turn => "rh_turn_",
+            KeyKind::Admin => "rh_admin_",
+        }
+    }
+}
+
+/// The system CSPRNG was unavailable, so nothing was minted.
+///
+/// Surfaced rather than `expect`ed. On Linux this means the kernel could not
+/// give the process randomness, which is not a state a control plane should
+/// paper over by panicking inside a request handler — and the honest answer to
+/// the caller is a 500 naming the cause, not a key drawn from something else.
+#[derive(Debug, thiserror::Error)]
+#[error("the system CSPRNG is unavailable, so no key could be minted: {source}")]
+pub struct MintError {
+    #[source]
+    source: getrandom::Error,
+}
+
+/// A secret, and the two facts about it that outlive it.
+///
+/// **The plaintext leaves this struct exactly once.** Nothing that gets stored
+/// carries it — see
+/// [`ApiKeyRecord`](directory::ApiKeyRecord), which has no field it could go
+/// in — so "returned once and never again" is a property of the types rather
+/// than of a handler remembering not to log it.
+#[derive(Debug)]
+pub struct MintedKey {
+    /// The secret as the operator will paste it. Held by value on the way to
+    /// one response body and dropped with it.
+    pub secret: String,
+    /// `sha256(secret)`, hex — the lookup key, and the only form of the secret
+    /// this deployment keeps.
+    pub key_sha256: String,
+    /// The last four characters of the secret.
+    ///
+    /// Enough for an operator to match a row in a list against the value in
+    /// their secret manager, and far too little to reconstruct: four base62
+    /// characters is ~24 bits of a 256-bit secret, so a table of every possible
+    /// tail is 62^4 rows and identifies nothing.
+    pub display_tail: String,
+}
+
+/// Mint a secret of `kind`: 32 CSPRNG bytes, base62, behind its role prefix.
+///
+/// Beside [`has_valid_key_shape`] on purpose — the function that *makes* a
+/// secret and the function that *judges* one must agree on the alphabet and the
+/// length, and the way they stay agreed is by being read together. A mint that
+/// drifted would issue keys its own resolver refuses with `malformed_key`,
+/// which reads to an operator like a paste error in the one place there was
+/// none.
+pub fn mint_key(kind: KeyKind) -> Result<MintedKey, MintError> {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).map_err(|source| MintError { source })?;
+    let secret = format!("{}{}", kind.prefix(), base62(bytes));
+    let key_sha256 = hex::encode(Sha256::digest(secret.as_bytes()));
+    // Safe to slice: the tail is base62, so every one of its bytes is one
+    // ASCII character and the boundary is a character boundary.
+    let display_tail = secret[secret.len() - 4..].to_string();
+    Ok(MintedKey {
+        secret,
+        key_sha256,
+        display_tail,
+    })
+}
+
+/// A 256-bit big-endian value as exactly [`KEY_TAIL_LEN`] base62 digits.
+///
+/// Long division by 62 over the byte array rather than a big-integer
+/// dependency, which would be a crate in the graph for forty lines of
+/// schoolbook arithmetic. Digits are filled from the least significant end, so
+/// a value below `62^42` is left-padded with the zero digit rather than coming
+/// out one character short — which would be a secret this deployment's own
+/// shape check refuses, on roughly one mint in sixty-two.
+fn base62(bytes: [u8; 32]) -> String {
+    let mut value = bytes;
+    let mut digits = [0u8; KEY_TAIL_LEN];
+    for digit in digits.iter_mut().rev() {
+        let mut remainder = 0u32;
+        for byte in value.iter_mut() {
+            // `remainder` is below 62, so this stays well inside a `u32`.
+            let accumulated = (remainder << 8) | u32::from(*byte);
+            *byte = (accumulated / 62) as u8;
+            remainder = accumulated % 62;
+        }
+        *digit = BASE62_DIGITS[remainder as usize];
+    }
+    debug_assert!(
+        value.iter().all(|byte| *byte == 0),
+        "62^43 exceeds 2^256, so 43 digits must consume the whole value"
+    );
+    String::from_utf8(digits.to_vec()).expect("every base62 digit is ASCII")
+}
+
+/// Why a hash that this deployment does recognize nevertheless resolves to
+/// nothing.
+///
+/// The tombstone vocabulary, and the reason revocation deletes no row: a hash
+/// with a reason attached is what lets [`AuthError::RevokedKey`] and
+/// [`AuthError::ProjectArchived`] be told apart from `unknown_key` — and from
+/// each other, which matters because their remedies are opposite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyRefusal {
+    /// The key itself was revoked.
+    Revoked,
+    /// The key is intact; its project is archived.
+    ProjectArchived,
+}
+
+impl From<KeyRefusal> for AuthError {
+    fn from(refusal: KeyRefusal) -> Self {
+        match refusal {
+            KeyRefusal::Revoked => AuthError::RevokedKey,
+            KeyRefusal::ProjectArchived => AuthError::ProjectArchived,
+        }
     }
 }
 
@@ -267,6 +466,24 @@ pub enum ControlPlane {
         turn_keys: HashMap<String, Admission>,
         /// `sha256(secret)` hex, for keys with no membership to spend as.
         admin_keys: HashSet<String>,
+        /// `sha256(secret)` hex, for keys this deployment recognizes and
+        /// refuses: the admin plane's tombstones, compiled in beside the live
+        /// tables.
+        ///
+        /// **Here rather than in a check the admin surface runs**, because a
+        /// revoked key is presented to the *turn* surfaces, which is the whole
+        /// point of revoking it. A tombstone held anywhere but inside the one
+        /// auth seam would leave the key working everywhere the admin plane
+        /// does not look — which is everywhere that matters.
+        ///
+        /// Empty on a deployment that has never revoked anything, and empty on
+        /// every deployment that predates the admin plane, so the lookup below
+        /// is a miss on an empty map and the resolution path is what it was.
+        ///
+        /// A hash can never be in both this and one of the tables above: the
+        /// compiler refuses a duplicate hash across `keys` and `admin_keys`,
+        /// and a tombstoned key is left out of the config it compiles from.
+        refusals: HashMap<String, KeyRefusal>,
         /// How this deployment's synthetic tool calls are spelled on the
         /// wire, resolved once at load time from the file's optional
         /// `"mcp_namespace"`.
@@ -296,6 +513,23 @@ impl ControlPlane {
     /// miss, and therefore no default for a missed lookup to fall back to —
     /// see [`ControlPlaneConfig::turn_keys`](config::ControlPlaneConfig).
     pub fn configured(config: ControlPlaneConfig) -> Self {
+        Self::configured_with_refusals(config, HashMap::new())
+    }
+
+    /// The same runtime resolver, plus the hashes it must refuse *by name*.
+    ///
+    /// The entry point the admin plane compiles through — see
+    /// [`ControlDirectory`](directory::ControlDirectory). Separate from
+    /// [`Self::configured`] rather than an extra argument on it, because a
+    /// deployment with no admin plane has no tombstones and should not have to
+    /// pass an empty map to say so; and separate rather than a
+    /// `with_refusals(self)` builder, because a builder would compile in
+    /// [`Self::Open`] too, where it could only be a no-op that reads like a
+    /// guarantee.
+    pub fn configured_with_refusals(
+        config: ControlPlaneConfig,
+        refusals: HashMap<String, KeyRefusal>,
+    ) -> Self {
         let ControlPlaneConfig {
             projects: _,
             users: _,
@@ -309,11 +543,17 @@ impl ControlPlane {
             // for the life of the process and reachable by anything that can
             // see the plane.
             credentials: _,
+            // Named and ignored for a different reason: this is a *clock*
+            // setting, and a compiled plane has no clock. How long one of these
+            // may be served before the directory recompiles is the directory's
+            // question, and it reads the field itself.
+            admission_cache_ttl_ms: _,
             turn_keys,
         } = config;
         ControlPlane::Configured {
             turn_keys,
             admin_keys: admin_keys.into_iter().collect(),
+            refusals,
             arm_salt: arm_salt.unwrap_or_default(),
             // An absent name is the default one rather than an absence
             // carried forward: see [`ClientDialect::default`] on why there is
@@ -334,22 +574,6 @@ impl ControlPlane {
     /// fixtures and call sites that want it.
     pub fn open() -> Arc<Self> {
         Arc::new(ControlPlane::Open)
-    }
-
-    /// The control plane named by [`CONTROL_PLANE_VAR`], or [`Self::Open`] if
-    /// the variable is unset.
-    ///
-    /// A variable that *is* set but names an unreadable or malformed file
-    /// stops the process, mirroring `catalog_config::from_env`: starting
-    /// anyway would serve every request as if no key were required, which is
-    /// the exact failure a deployment sets this variable to prevent.
-    pub fn from_env() -> Result<Self, ControlPlaneError> {
-        match std::env::var(CONTROL_PLANE_VAR) {
-            Ok(path) if !path.trim().is_empty() => {
-                ControlPlaneConfig::load(path.trim()).map(Self::configured)
-            }
-            _ => Ok(Self::Open),
-        }
     }
 
     /// Every configured membership and everything its key resolves to, in no
@@ -724,6 +948,12 @@ impl ControlPlane {
             ControlPlane::Configured {
                 turn_keys,
                 admin_keys,
+                // `refusals` is the field that stopped this line compiling, and
+                // it is read below rather than ignored here: a tombstone *is*
+                // an identity answer — "this deployment knows this secret and
+                // will not honour it" — which is precisely the kind of field
+                // the comment this replaces was written to catch.
+                refusals,
                 // Named and ignored rather than swept under a `..`: this arm
                 // decides who a key is; the dialect decides how a call is
                 // spelled and the salt decides which arm a session lands in,
@@ -743,6 +973,15 @@ impl ControlPlane {
                 }
                 if let Some(admission) = turn_keys.get(&hash) {
                     return Ok(KeyScope::Turn(admission.clone()));
+                }
+                // Before `UnknownKey`, and that ordering is the row's whole
+                // value: a revoked key that fell through to `unknown_key` would
+                // be indistinguishable in a log from a typo, at exactly the
+                // moment somebody is trying to work out whether a leaked secret
+                // is still being tried. The two tables cannot both hold one
+                // hash — see the field.
+                if let Some(refusal) = refusals.get(&hash) {
+                    return Err((*refusal).into());
                 }
                 Err(AuthError::UnknownKey)
             }

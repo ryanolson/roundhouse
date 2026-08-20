@@ -1,0 +1,1166 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! What an operator created over the API, and how it composes with the file.
+//!
+//! # Config before CRUD, and one compiler
+//!
+//! A deployment has two ways to say who may spend what: the
+//! `ROUNDHOUSE_CONTROL_PLANE` file, and — from this milestone — `POST
+//! /v1/admin/...`. The obvious failure is that they disagree, and the obvious
+//! defence (reconcile them at read time) is the wrong one: reconciliation is a
+//! rule somebody has to write down, and every rule of that shape has a case it
+//! gets wrong quietly.
+//!
+//! What is done instead is that **admin-created entities are expressed in the
+//! same vocabulary the file is** — [`ProjectEntry`], [`UserEntry`],
+//! [`KeyEntry`] — and the two halves are concatenated into one
+//! [`ControlPlaneConfig`] and compiled by
+//! [`ControlPlaneConfig::validate`], the boundary that has judged every
+//! boot-loaded key since M2. A runtime-minted key is therefore not *similar
+//! to* a configured one, it is one. There is no second compiler for the two to
+//! drift apart in, and a policy an operator could not write in the file is a
+//! policy they cannot `POST` either.
+//!
+//! # One owner per entity
+//!
+//! Provenance is not decoration. Every row is owned either by the file
+//! ([`Provenance::Config`]) or by the API ([`Provenance::Admin`]), and:
+//!
+//! - the API may **create** entities that *reference* file-owned ones — a
+//!   membership in a configured project, a user in a configured deployment;
+//! - the API may **never mutate** a file-owned entity. Every such attempt is
+//!   refused naming `ROUNDHOUSE_CONTROL_PLANE`, because the remedy is to edit
+//!   the file, and a surface that quietly shadowed the file would make the next
+//!   restart a silent rollback;
+//! - an API create whose identity collides with a file-owned one — a project
+//!   id, a user id, a key hash, a `(project, user)` membership pair — is
+//!   refused for the same reason: two owners is exactly the state the rule
+//!   exists to prevent.
+//!
+//! It follows that the *store* below holds admin-created rows only. File-owned
+//! rows are projected from the file itself, on every read, by
+//! [`ControlDirectory::view`] — so a file edited between restarts is
+//! authoritative on the next boot rather than fighting a stale copy of itself
+//! in a database.
+//!
+//! It also follows that **API lockout is impossible**, and the argument is worth
+//! stating exactly rather than loosely. A file-declared admin key cannot be
+//! revoked here, so a deployment whose file declares one always retains it. A
+//! deployment whose file declares *none* is not the exception it looks like:
+//! `admin_keys` is optional, such a file loads, and `ControlPlane::scope` can
+//! then never yield `KeyScope::Admin` — so there is no admin plane to reach,
+//! nothing to mint the first API-owned admin key with, and no lockout to
+//! suffer. Either way no "refuse to revoke the last key" special case is
+//! needed, and adding one would be guarding a state no sequence of calls
+//! reaches.
+//!
+//! # Revocation, staleness, and the two clocks
+//!
+//! Revocation is a tombstone and never a delete: the row keeps its hash and
+//! gains a `revoked_at_ms`, and the compiled plane refuses that hash by name —
+//! `revoked_key`, not `unknown_key`. See [`AuthError::RevokedKey`] for why the
+//! distinction is the point of keeping the row.
+//!
+//! A write recompiles and swaps this node's snapshot immediately, so on the
+//! node that performed it a revocation is effective on the next request. Any
+//! *other* node is serving a snapshot compiled before the write, and
+//! [`ControlDirectory::plane`] bounds how long it may: after
+//! `admission_cache_ttl_ms` it re-reads the store's version, and recompiles if
+//! it moved. That bound is written in the same file the keys are, because it is
+//! the operator's choice of how long a leaked key survives its own revocation.
+//!
+//! # What is deferred, and what would unblock it
+//!
+//! [`MemoryDirectoryStore`] is the only backing store in this milestone, which
+//! means admin-created tenancy dies with the process and a two-node deployment
+//! has two directories that never converge. That is honest for M8, whose admin
+//! plane is a single-node surface, and it is exactly the shape of the M2 choice
+//! between [`MemoryStore`](roundhouse_core::store::MemoryStore) and Redis.
+//!
+//! **The unlock condition, so the next person does not have to re-derive it:**
+//! a durable store is wanted the moment admin-created tenancy has to outlive a
+//! restart or be seen by a second node. Two placements are available and the
+//! choice is not obvious, which is why it is being deferred rather than guessed
+//! at:
+//!
+//! - the records move into `roundhouse-core` beside the session and spend
+//!   contracts, and `roundhouse-store-redis` implements
+//!   [`DirectoryStore`] the way it implements the other two. That contradicts
+//!   `core/src/control/mod.rs`'s standing note that a key record "will arrive
+//!   next to the resolver, not here", so it needs a dated amendment of that
+//!   note rather than a quiet move;
+//! - or the implementation lands in this crate, over the Redis handle
+//!   `main.rs` already opens, and the records stay where the resolver is.
+//!
+//! Either way the records need `Serialize`/`Deserialize`, which today they have
+//! only half of: the config entries they wrap derive `Deserialize` because a
+//! file is read and never written. Adding the other half is the first
+//! mechanical step, and it is small; the placement is the decision.
+//!
+//! [`AuthError::RevokedKey`]: super::AuthError::RevokedKey
+
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, RwLock};
+
+use super::config::{ControlPlaneConfig, DEFAULT_ADMISSION_CACHE_TTL_MS, KeyEntry};
+use super::crosscheck::CrossChecks;
+use super::{ControlPlane, KeyKind, KeyRefusal, MintedKey, mint_key};
+
+pub mod mutation;
+pub mod records;
+pub mod store;
+
+pub use mutation::{DirectoryError, DirectoryMutation, KeyFingerprint, ProjectPatch};
+pub use records::{
+    ApiKeyRecord, DirectoryRecords, DirectoryView, EntityKind, KeyRecordScope, MembershipRecord,
+    MembershipRole, ProjectRecord, Provenance, UserRecord, key_id,
+};
+pub use store::{DirectoryStore, MemoryDirectoryStore, StoreFailure, VersionedRecords};
+
+// ---------------------------------------------------------------------------
+// Where a surface gets its plane
+// ---------------------------------------------------------------------------
+
+/// Where a surface gets its compiled plane, once per request.
+///
+/// **The one seam between "who may do this" and "when was that decided".** Every
+/// router takes an `Arc<dyn PlaneSource>` and asks it at the top of each
+/// handler, rather than capturing an [`Arc<ControlPlane>`] at mount time. That
+/// is the whole mechanism by which a key revoked over the admin plane stops
+/// serving turns: a plane is a value compiled at one instant, and a router
+/// holding one would go on honouring it for the life of the process.
+///
+/// A trait rather than the concrete [`ControlDirectory`] because there is a
+/// second, deliberately weaker implementation — see the one on [`ControlPlane`]
+/// itself, which is compiled only under the `test-support` feature. Keeping the
+/// weak one behind a feature is what makes "this call site silently lost
+/// revocation" a build error in production rather than a property nobody
+/// notices: a bare plane handed to a router in `main.rs` does not compile.
+pub trait PlaneSource: Send + Sync + 'static {
+    /// The plane this request is judged against.
+    ///
+    /// `now_ms` is the caller's clock rather than one read inside, for the
+    /// reason every other seam in this crate takes it: a staleness bound that
+    /// cannot be moved from a test is a staleness bound nothing pins.
+    fn plane(&self, now_ms: u64) -> Arc<ControlPlane>;
+}
+
+impl PlaneSource for ControlDirectory {
+    /// The live implementation, and production's only one.
+    fn plane(&self, now_ms: u64) -> Arc<ControlPlane> {
+        ControlDirectory::plane(self, now_ms)
+    }
+}
+
+/// A plane that is its own source, and therefore never changes.
+///
+/// **Test support only, and the feature gate is the point.** This answers the
+/// same value at every instant, so a surface mounted over it can never see a
+/// revocation, a new project, or a raised limit — which is exactly what every
+/// integration suite written before the admin plane means by "the control plane
+/// of this deployment", and exactly what a production composition root must not
+/// be able to reach for by accident. Compiled under `test-support`, which the
+/// crate turns on for its own dev builds and for nothing else, so a `main.rs`
+/// that passed a bare plane fails to compile rather than quietly serving a
+/// snapshot forever.
+///
+/// A deployment that genuinely has nothing to administer — no
+/// `ROUNDHOUSE_CONTROL_PLANE`, so no root of trust and no admin plane — is not
+/// this: it gets [`ControlDirectory::open`], which is a real directory and
+/// answers the admin surface's mode question as itself.
+///
+/// It also clones the whole plane per request, which is a second reason it does
+/// not belong in a shipped binary and a non-reason in a fixture: the trait hands
+/// back an owned `Arc` because the live implementation mints a fresh one on
+/// refresh, and a value that is its own source has nothing to hand back but a
+/// copy.
+#[cfg(feature = "test-support")]
+impl PlaneSource for ControlPlane {
+    fn plane(&self, _now_ms: u64) -> Arc<ControlPlane> {
+        Arc::new(self.clone())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// What the file owns
+// ---------------------------------------------------------------------------
+
+/// The identities `ROUNDHOUSE_CONTROL_PLANE` declares.
+///
+/// Resolved once, at construction: the file is read at boot and cannot change
+/// under a running process, so re-deriving this per write would be work with no
+/// question attached. It is what every provenance check is asked.
+#[derive(Debug, Default)]
+struct ConfigIdentities {
+    projects: HashSet<String>,
+    users: HashSet<String>,
+    /// `(project, user)` for every membership the file's `keys` array implies.
+    memberships: HashSet<(String, String)>,
+    /// Every hash the file declares, turn and admin alike.
+    hashes: HashSet<String>,
+}
+
+impl ConfigIdentities {
+    fn of(config: &ControlPlaneConfig) -> Self {
+        Self {
+            projects: config
+                .projects
+                .iter()
+                .map(|project| project.id.clone())
+                .collect(),
+            users: config.users.iter().map(|user| user.id.clone()).collect(),
+            memberships: config
+                .keys
+                .iter()
+                .map(|key| (key.project.clone(), key.user.clone()))
+                .collect(),
+            hashes: config
+                .keys
+                .iter()
+                .map(|key| key.key_sha256.clone())
+                .chain(config.admin_keys.iter().cloned())
+                .collect(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The directory
+// ---------------------------------------------------------------------------
+
+/// One node's compiled answer, and what it was compiled from.
+struct Compiled {
+    version: u64,
+    records: Arc<DirectoryRecords>,
+    plane: Arc<ControlPlane>,
+    /// When this node last confirmed its snapshot against the store — not when
+    /// it last recompiled. A confirmed-unchanged snapshot is as fresh as a
+    /// rebuilt one, and treating it otherwise would recompile a quiet
+    /// deployment once per TTL forever.
+    refreshed_at_ms: u64,
+}
+
+/// The file, the API's records, and the compiled plane the two produce.
+///
+/// **Not named `ControlStore`.** [`roundhouse_mcp::ControlStore`] already
+/// exists, holds a completely different thing (an agent's per-session overlay),
+/// and is composed into the same process a few lines from where this is —
+/// two types of that name in one composition root is a confusion nobody
+/// deserves.
+///
+/// In this crate rather than in `roundhouse-core`, honoring the standing note
+/// in `core/src/control/mod.rs`: a key record is a fact about *credentials*,
+/// core deliberately knows nothing about credentials, and the record belongs
+/// next to the resolver that turns a secret into an identity. That resolver is
+/// [`ControlPlane`], one module up.
+///
+/// **Every surface holds one of these rather than an [`Arc<ControlPlane>`]**,
+/// including the surfaces of a deployment that has no admin plane at all. A
+/// plane is a value compiled once; a revocation has to reach the *turn*
+/// surfaces, which is the entire point of revoking a key, and it can only do
+/// that if what a handler resolves against is a directory it re-asks per
+/// request. Two wirings — planes here, a directory there — would be a
+/// deployment where a revoked key kept serving on whichever surface had not
+/// been converted.
+pub struct ControlDirectory {
+    backing: Backing,
+}
+
+/// Whether this directory has anything to administer.
+///
+/// The split exists because [`ControlPlane::Open`] is a real deployment: it has
+/// no file, so there is no root of trust an admin key could have been issued
+/// from (see [`AuthError::AdminRequiresControlPlane`]), nothing for a store to
+/// hold, and no compile to run. Rather than making the composition root wire
+/// two shapes, an open deployment gets a directory whose answer never changes.
+///
+/// [`AuthError::AdminRequiresControlPlane`]: super::AuthError::AdminRequiresControlPlane
+enum Backing {
+    /// A plane nothing here can change.
+    Fixed(Arc<ControlPlane>),
+    /// A file, a store, and the snapshot the two compile to.
+    ///
+    /// Boxed so the enum stays pointer-sized: a fixed directory is one `Arc` and
+    /// a managed one is a whole config, a store handle and two locks. Every
+    /// surface holds this behind an `Arc` already, so the extra indirection is
+    /// one that no request path can notice.
+    Managed(Box<Managed>),
+}
+
+/// The managed half: what [`ControlDirectory`]'s doc describes.
+struct Managed {
+    /// The file's entries, kept whole so a merge is a clone-and-extend rather
+    /// than a reconstruction. Its `turn_keys` table is rebuilt by every
+    /// compile and is never read from this copy.
+    file: ControlPlaneConfig,
+    /// What a compile failure names. The path from `ROUNDHOUSE_CONTROL_PLANE`
+    /// on a real deployment, so a refused `PATCH` and a refused boot point at
+    /// the same document.
+    path: String,
+    config: ConfigIdentities,
+    store: Arc<dyn DirectoryStore>,
+    checks: CrossChecks,
+    ttl_ms: u64,
+    current: RwLock<Compiled>,
+    /// Held across read-validate-commit, so a single node never races itself.
+    ///
+    /// With this, [`StoreFailure::Concurrent`] can only be another *node*, which
+    /// is what makes it a meaningful answer rather than a lock this process
+    /// forgot to take.
+    write: Mutex<()>,
+}
+
+impl ControlDirectory {
+    /// Compile the file and whatever the store already holds.
+    ///
+    /// Fails if the two together do not compile — which, on a fresh
+    /// [`MemoryDirectoryStore`], can only mean the file itself does not, and
+    /// that has already stopped the boot by the time this is called.
+    pub fn new(
+        file: ControlPlaneConfig,
+        path: impl Into<String>,
+        store: Arc<dyn DirectoryStore>,
+        checks: CrossChecks,
+        now_ms: u64,
+    ) -> Result<Self, DirectoryError> {
+        Ok(Self {
+            backing: Backing::Managed(Box::new(Managed::new(file, path, store, checks, now_ms)?)),
+        })
+    }
+
+    /// A directory over a plane nothing can change.
+    ///
+    /// **Two callers, and the second is why this is `pub`.** The composition
+    /// root builds one for a deployment that set no `ROUNDHOUSE_CONTROL_PLANE`
+    /// — see [`Backing`]. Every integration suite that is *not* about the admin
+    /// plane builds one too, and the alternative there is worse than verbose:
+    /// a managed directory needs [`CrossChecks`], which means each of those
+    /// suites would have to quote a candidate list, and their fixtures would
+    /// then start failing `refuse_policies_that_admit_nothing` over policies
+    /// that were never the subject of the test. A fixed directory keeps a suite
+    /// in exactly the checks it was written against.
+    pub fn fixed(plane: ControlPlane) -> Arc<Self> {
+        Arc::new(Self {
+            backing: Backing::Fixed(Arc::new(plane)),
+        })
+    }
+
+    /// The directory an unconfigured deployment runs on: [`ControlPlane::Open`]
+    /// and no admin plane.
+    pub fn open() -> Arc<Self> {
+        Self::fixed(ControlPlane::Open)
+    }
+
+    /// The plane every surface authenticates against, refreshed if it is due.
+    ///
+    /// See [`Managed::plane`] for the refresh rule. A fixed directory answers
+    /// the one plane it was built with, and the clock is ignored rather than
+    /// consulted: there is nothing behind it that could have moved.
+    pub fn plane(&self, now_ms: u64) -> Arc<ControlPlane> {
+        match &self.backing {
+            Backing::Fixed(plane) => Arc::clone(plane),
+            Backing::Managed(managed) => managed.plane(now_ms),
+        }
+    }
+
+    /// Every entity this deployment has, whoever owns it.
+    ///
+    /// Empty for a fixed directory, which is the accurate answer and not a
+    /// placeholder: nothing can reach this on an open deployment, because the
+    /// admin surface refuses that mode before any route runs.
+    pub fn view(&self, now_ms: u64) -> DirectoryView {
+        match &self.backing {
+            Backing::Fixed(_) => DirectoryView {
+                projects: Vec::new(),
+                users: Vec::new(),
+                memberships: Vec::new(),
+                keys: Vec::new(),
+            },
+            Backing::Managed(managed) => managed.view(now_ms),
+        }
+    }
+
+    /// Apply one change: validate it, compile the whole control plane it would
+    /// produce, and only then write. See [`Managed::apply`].
+    pub fn apply(
+        &self,
+        mutation: DirectoryMutation,
+        now_ms: u64,
+    ) -> Result<Arc<DirectoryRecords>, DirectoryError> {
+        self.managed()?.apply(mutation, now_ms)
+    }
+
+    /// Mint a turn key for one membership and record it in one write.
+    pub fn mint_turn_key(
+        &self,
+        project: &str,
+        user: &str,
+        now_ms: u64,
+    ) -> Result<MintedKey, DirectoryError> {
+        self.managed()?.mint_turn_key(project, user, now_ms)
+    }
+
+    /// Mint an admin key. See [`Managed::mint_turn_key`] on why this is one call.
+    pub fn mint_admin_key(&self, now_ms: u64) -> Result<MintedKey, DirectoryError> {
+        self.managed()?.mint_admin_key(now_ms)
+    }
+
+    /// The version this node last compiled, or `0` for a directory with nothing
+    /// behind it to version.
+    pub fn version(&self, now_ms: u64) -> u64 {
+        match &self.backing {
+            Backing::Fixed(_) => 0,
+            Backing::Managed(managed) => managed.version(now_ms),
+        }
+    }
+
+    /// The writable half, or the refusal that says there is none.
+    ///
+    /// **Defence in depth rather than a path.** The admin router refuses
+    /// [`ControlPlane::Open`] on its own mode check before any handler runs, so
+    /// no request reaches a write on a fixed directory; this is what stops a
+    /// future caller that forgets the gate from writing into a deployment that
+    /// has no admin plane, and it answers with the same row that gate does.
+    fn managed(&self) -> Result<&Managed, DirectoryError> {
+        match &self.backing {
+            Backing::Fixed(_) => Err(DirectoryError::NoAdminPlane),
+            Backing::Managed(managed) => Ok(managed),
+        }
+    }
+}
+
+impl Managed {
+    fn new(
+        file: ControlPlaneConfig,
+        path: impl Into<String>,
+        store: Arc<dyn DirectoryStore>,
+        checks: CrossChecks,
+        now_ms: u64,
+    ) -> Result<Self, DirectoryError> {
+        let path = path.into();
+        let config = ConfigIdentities::of(&file);
+        let ttl_ms = file
+            .admission_cache_ttl_ms
+            .unwrap_or(DEFAULT_ADMISSION_CACHE_TTL_MS);
+        let loaded = store.load()?;
+        let plane = compile(&file, &path, &checks, &loaded.records)?;
+        Ok(Self {
+            file,
+            path,
+            config,
+            store,
+            checks,
+            ttl_ms,
+            current: RwLock::new(Compiled {
+                version: loaded.version,
+                records: Arc::new(loaded.records),
+                plane,
+                refreshed_at_ms: now_ms,
+            }),
+            write: Mutex::new(()),
+        })
+    }
+
+    /// The plane every surface authenticates against, refreshed if it is due.
+    ///
+    /// **Two conditions, and both are load-bearing.** The TTL alone would
+    /// recompile a quiet deployment forever; the version alone would make every
+    /// admission a store read. Together they cost one cheap version read per
+    /// TTL when nothing is happening, and recompile exactly when something has.
+    ///
+    /// The elapsed test is `>=` rather than `>` so that a TTL of zero means what
+    /// an operator writing zero means — refresh on every call — rather than
+    /// "refresh on every call after the first millisecond".
+    ///
+    /// **A refresh that fails keeps serving the last good plane**, and says so
+    /// in the log. The alternative is a node that stops authenticating anything
+    /// because the store blinked or because a variable moved out of the
+    /// environment, which converts a degraded control plane into an outage. What
+    /// it costs is that a revocation does not propagate while the failure lasts
+    /// — which is why it is a warning and not a debug line.
+    ///
+    /// A failed refresh still stamps `refreshed_at_ms`, so the next attempt is
+    /// one TTL away rather than one request away. That is a deliberate backoff
+    /// and not an oversight: the two ways a refresh fails here are a store
+    /// outage and a config the environment can no longer satisfy, and both are
+    /// failures that *last*. Retrying per request would recompile the whole
+    /// control plane on every admission for the duration — turning a degraded
+    /// directory into a CPU incident precisely when the store is already
+    /// unwell. The price is that a revocation made during the failure can take
+    /// up to two TTLs instead of one.
+    ///
+    /// The recompile happens **under the write lock**, which briefly stalls
+    /// concurrent admissions. That is the cheaper side of the trade: compiling
+    /// outside the lock would have every request that arrived during a refresh
+    /// compile its own copy of the same plane, so the busier the node, the more
+    /// work one revocation would cost it.
+    fn plane(&self, now_ms: u64) -> Arc<ControlPlane> {
+        {
+            let current = self.read_current();
+            if now_ms.saturating_sub(current.refreshed_at_ms) < self.ttl_ms {
+                return Arc::clone(&current.plane);
+            }
+        }
+        let version = match self.store.version() {
+            Ok(version) => version,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "the control directory could not be re-read; serving the last compiled \
+                     control plane, so a revocation made elsewhere is not yet in force here"
+                );
+                return Arc::clone(&self.read_current().plane);
+            }
+        };
+        let mut current = self.write_current();
+        current.refreshed_at_ms = now_ms;
+        if version == current.version {
+            return Arc::clone(&current.plane);
+        }
+        match self.store.load() {
+            Ok(loaded) => match self.compile(&loaded.records) {
+                Ok(plane) => {
+                    current.version = loaded.version;
+                    current.records = Arc::new(loaded.records);
+                    current.plane = plane;
+                }
+                Err(error) => tracing::warn!(
+                    %error,
+                    "the control directory changed but the new state does not compile on this \
+                     node; serving the last compiled control plane"
+                ),
+            },
+            Err(error) => tracing::warn!(
+                %error,
+                "the control directory's version moved but its records could not be read; \
+                 serving the last compiled control plane"
+            ),
+        }
+        Arc::clone(&current.plane)
+    }
+
+    /// Every entity this deployment has, whoever owns it.
+    ///
+    /// File-owned rows are projected here rather than copied into the store —
+    /// see the module doc — which is also why this is the only way to list
+    /// them: [`ControlPlane::configured`] discards the config's entries as it
+    /// builds its lookup tables, so the compiled plane cannot answer "what
+    /// projects are there" at all.
+    ///
+    /// Refreshed through [`Self::plane`], so a list is exactly as stale as an
+    /// admission taken at the same instant — a `GET` that read straight from
+    /// the store would show an operator rows this node is not yet
+    /// authenticating against, which is a worse kind of wrong than being one
+    /// TTL behind.
+    ///
+    /// The rows are taken in one read, and a concurrent write may land between
+    /// the refresh and that read: the answer is then simply the newer of two
+    /// consistent snapshots. What cannot happen is a view assembled from two.
+    fn view(&self, now_ms: u64) -> DirectoryView {
+        let _ = self.plane(now_ms);
+        let records = Arc::clone(&self.read_current().records);
+        let mut view = DirectoryView {
+            projects: self
+                .file
+                .projects
+                .iter()
+                .map(|entry| ProjectRecord {
+                    entry: entry.clone(),
+                    provenance: Provenance::Config,
+                    created_at_ms: None,
+                    archived_at_ms: None,
+                })
+                .collect(),
+            users: self
+                .file
+                .users
+                .iter()
+                .map(|entry| UserRecord {
+                    entry: entry.clone(),
+                    provenance: Provenance::Config,
+                    created_at_ms: None,
+                })
+                .collect(),
+            memberships: Vec::new(),
+            keys: Vec::new(),
+        };
+        // The file's memberships are implied by its keys, so two keys for one
+        // person in one project are one membership — deduped here rather than
+        // listed twice, which is what an operator rotating a secret would
+        // otherwise see.
+        let mut seen: HashSet<(&str, &str)> = HashSet::new();
+        for key in &self.file.keys {
+            if seen.insert((key.project.as_str(), key.user.as_str())) {
+                view.memberships.push(MembershipRecord {
+                    project: key.project.clone(),
+                    user: key.user.clone(),
+                    role: None,
+                    allocation: None,
+                    overrides: None,
+                    provenance: Provenance::Config,
+                    created_at_ms: None,
+                });
+            }
+            view.keys.push(ApiKeyRecord {
+                id: key_id(&key.key_sha256),
+                key_sha256: key.key_sha256.clone(),
+                display_tail: None,
+                scope: KeyRecordScope::Turn {
+                    project: key.project.clone(),
+                    user: key.user.clone(),
+                },
+                provenance: Provenance::Config,
+                created_at_ms: None,
+                revoked_at_ms: None,
+            });
+        }
+        for hash in &self.file.admin_keys {
+            view.keys.push(ApiKeyRecord {
+                id: key_id(hash),
+                key_sha256: hash.clone(),
+                display_tail: None,
+                scope: KeyRecordScope::Admin,
+                provenance: Provenance::Config,
+                created_at_ms: None,
+                revoked_at_ms: None,
+            });
+        }
+        view.projects.extend(records.projects.iter().cloned());
+        view.users.extend(records.users.iter().cloned());
+        view.memberships.extend(records.memberships.iter().cloned());
+        view.keys.extend(records.keys.iter().cloned());
+        view
+    }
+
+    /// Apply one change: validate it, compile the whole control plane it would
+    /// produce, and only then write.
+    ///
+    /// **In that order, always.** A store that took the write first would let
+    /// an operator persist a configuration this deployment refuses to start
+    /// under, and the symptom would be a process that will not come back up
+    /// after the next restart — the failure furthest in time from its cause.
+    ///
+    /// The cascade in [`DirectoryMutation::DeleteMembership`] is part of this
+    /// and not a convenience: a key whose membership is gone has no policy, no
+    /// budget and no principal to resolve to, so leaving it live would be a
+    /// secret that authenticates as nothing. It is *revoked* rather than
+    /// deleted, so the operator who removed the member can still see that the
+    /// key existed and stopped working, which is the question they will have.
+    fn apply(
+        &self,
+        mutation: DirectoryMutation,
+        now_ms: u64,
+    ) -> Result<Arc<DirectoryRecords>, DirectoryError> {
+        let _write = self.write.lock().unwrap_or_else(|error| error.into_inner());
+        let loaded = self.store.load()?;
+        let mut next = loaded.records.clone();
+        self.mutate(&mut next, mutation, now_ms)?;
+        let plane = self.compile(&next)?;
+        let version = self.store.commit(loaded.version, next.clone())?;
+        let records = Arc::new(next);
+        *self.write_current() = Compiled {
+            version,
+            records: Arc::clone(&records),
+            plane,
+            refreshed_at_ms: now_ms,
+        };
+        Ok(records)
+    }
+
+    /// Mint a turn key for one membership and record it in one write.
+    ///
+    /// The secret is returned and nothing keeps it. Minting and applying are
+    /// one call rather than two so a caller cannot hand a secret to an operator
+    /// and then fail to store its hash — which is a key that works nowhere and
+    /// looks, from the operator's side, exactly like one that works.
+    fn mint_turn_key(
+        &self,
+        project: &str,
+        user: &str,
+        now_ms: u64,
+    ) -> Result<MintedKey, DirectoryError> {
+        let minted = mint_key(KeyKind::Turn)?;
+        self.apply(
+            DirectoryMutation::MintTurnKey {
+                project: project.to_string(),
+                user: user.to_string(),
+                key: KeyFingerprint::from(&minted),
+            },
+            now_ms,
+        )?;
+        Ok(minted)
+    }
+
+    /// Mint an admin key. See [`Self::mint_turn_key`] on why this is one call.
+    fn mint_admin_key(&self, now_ms: u64) -> Result<MintedKey, DirectoryError> {
+        let minted = mint_key(KeyKind::Admin)?;
+        self.apply(
+            DirectoryMutation::MintAdminKey {
+                key: KeyFingerprint::from(&minted),
+            },
+            now_ms,
+        )?;
+        Ok(minted)
+    }
+
+    /// The version this node last compiled. Observability, and the seam the
+    /// staleness tests read.
+    fn version(&self, now_ms: u64) -> u64 {
+        let _ = self.plane(now_ms);
+        self.read_current().version
+    }
+
+    // -----------------------------------------------------------------------
+    // The compile
+    // -----------------------------------------------------------------------
+
+    /// The file's entries plus the API's, judged by the one compiler, with the
+    /// tombstones compiled in beside the live tables.
+    ///
+    /// Every key is built *from its membership* here rather than carrying a
+    /// copy of that membership's entitlements in its own record. That is what
+    /// makes two keys of one membership impossible to disagree — an
+    /// `UpsertMembership` re-stamps all of them at the next compile, because
+    /// there was never a second copy to update.
+    fn compile(&self, records: &DirectoryRecords) -> Result<Arc<ControlPlane>, DirectoryError> {
+        compile(&self.file, &self.path, &self.checks, records)
+    }
+
+    // -----------------------------------------------------------------------
+    // The mutations
+    // -----------------------------------------------------------------------
+
+    /// Apply one mutation to a copy of the records, refusing anything the
+    /// ownership rules forbid.
+    ///
+    /// Pure, and separate from the compile that follows it, because the two
+    /// answer different questions: this one asks "may this caller do this",
+    /// which is about provenance and identity, and the compile asks "would the
+    /// result serve", which is about policy and the catalog. Answering both in
+    /// one pass is how a 409 comes to be reported as a 422.
+    fn mutate(
+        &self,
+        records: &mut DirectoryRecords,
+        mutation: DirectoryMutation,
+        now_ms: u64,
+    ) -> Result<(), DirectoryError> {
+        match mutation {
+            DirectoryMutation::CreateProject { entry } => {
+                self.refuse_taken(records, EntityKind::Project, &entry.id)?;
+                records.projects.push(ProjectRecord {
+                    entry,
+                    provenance: Provenance::Admin,
+                    created_at_ms: Some(now_ms),
+                    archived_at_ms: None,
+                });
+            }
+            DirectoryMutation::PatchProject { id, patch } => {
+                self.refuse_config_project(&id)?;
+                let project = records
+                    .project(&id)
+                    .ok_or_else(|| DirectoryError::UnknownProject { id: id.clone() })?;
+                if project.is_archived() {
+                    return Err(DirectoryError::ProjectIsArchived { id });
+                }
+                // Asked before anything is written, because the answer is about
+                // the *transition* and there is nothing to compare against once
+                // the new budget is in place.
+                if let (Some(current), Some(next)) = (&project.entry.budget, &patch.budget)
+                    && current.window != next.window
+                {
+                    return Err(DirectoryError::WindowChangeUnsupported {
+                        project: id,
+                        from: current.window,
+                        to: next.window,
+                    });
+                }
+                let project = records
+                    .project_mut(&id)
+                    .expect("the project was found immutably a few lines above");
+                if let Some(name) = patch.name {
+                    project.entry.name = Some(name);
+                }
+                if let Some(policy) = patch.policy {
+                    project.entry.policy = Some(policy);
+                }
+                if let Some(budget) = patch.budget {
+                    project.entry.budget = Some(budget);
+                }
+                if let Some(validate) = patch.validate {
+                    project.entry.validate = Some(validate);
+                }
+                if let Some(credentials) = patch.credentials {
+                    project.entry.credentials = Some(credentials);
+                }
+            }
+            DirectoryMutation::ArchiveProject { id } => {
+                self.refuse_config_project(&id)?;
+                let project = records
+                    .project_mut(&id)
+                    .ok_or_else(|| DirectoryError::UnknownProject { id: id.clone() })?;
+                if project.is_archived() {
+                    return Err(DirectoryError::ProjectIsArchived { id });
+                }
+                project.archived_at_ms = Some(now_ms);
+            }
+            DirectoryMutation::CreateUser { entry } => {
+                self.refuse_taken(records, EntityKind::User, &entry.id)?;
+                records.users.push(UserRecord {
+                    entry,
+                    provenance: Provenance::Admin,
+                    created_at_ms: Some(now_ms),
+                });
+            }
+            DirectoryMutation::UpsertMembership {
+                project,
+                user,
+                role,
+                allocation,
+                overrides,
+            } => {
+                self.refuse_absent_project(records, &project)?;
+                self.refuse_absent_user(records, &user)?;
+                self.refuse_config_membership(&project, &user)?;
+                match records
+                    .memberships
+                    .iter_mut()
+                    .find(|membership| membership.names(&project, &user))
+                {
+                    Some(existing) => {
+                        existing.role = Some(role);
+                        existing.allocation = allocation;
+                        existing.overrides = overrides;
+                    }
+                    None => records.memberships.push(MembershipRecord {
+                        project,
+                        user,
+                        role: Some(role),
+                        allocation,
+                        overrides,
+                        provenance: Provenance::Admin,
+                        created_at_ms: Some(now_ms),
+                    }),
+                }
+            }
+            DirectoryMutation::DeleteMembership { project, user } => {
+                self.refuse_config_membership(&project, &user)?;
+                if records.membership(&project, &user).is_none() {
+                    return Err(DirectoryError::UnknownMembership { project, user });
+                }
+                records
+                    .memberships
+                    .retain(|membership| !membership.names(&project, &user));
+                // The cascade. See `apply`: a key whose membership is gone
+                // resolves to nothing, and a tombstone is the only answer that
+                // stays explicable afterwards.
+                for key in &mut records.keys {
+                    let mints_this_membership = matches!(
+                        &key.scope,
+                        KeyRecordScope::Turn { project: p, user: u } if *p == project && *u == user
+                    );
+                    if mints_this_membership && !key.is_revoked() {
+                        key.revoked_at_ms = Some(now_ms);
+                    }
+                }
+            }
+            DirectoryMutation::MintTurnKey { project, user, key } => {
+                self.refuse_config_membership(&project, &user)?;
+                self.refuse_archived(records, &project)?;
+                if records.membership(&project, &user).is_none() {
+                    return Err(DirectoryError::UnknownMembership { project, user });
+                }
+                self.refuse_taken_hash(records, &key.key_sha256)?;
+                records.keys.push(ApiKeyRecord {
+                    id: key_id(&key.key_sha256),
+                    key_sha256: key.key_sha256,
+                    display_tail: Some(key.display_tail),
+                    scope: KeyRecordScope::Turn { project, user },
+                    provenance: Provenance::Admin,
+                    created_at_ms: Some(now_ms),
+                    revoked_at_ms: None,
+                });
+            }
+            DirectoryMutation::MintAdminKey { key } => {
+                self.refuse_taken_hash(records, &key.key_sha256)?;
+                records.keys.push(ApiKeyRecord {
+                    id: key_id(&key.key_sha256),
+                    key_sha256: key.key_sha256,
+                    display_tail: Some(key.display_tail),
+                    scope: KeyRecordScope::Admin,
+                    provenance: Provenance::Admin,
+                    created_at_ms: Some(now_ms),
+                    revoked_at_ms: None,
+                });
+            }
+            DirectoryMutation::RevokeKey { id } => {
+                // A file-declared key is refused here, and that refusal is what
+                // makes locking this deployment out of its own admin plane
+                // impossible: the root of trust it booted with is not something
+                // this API can remove. No "refuse to revoke the last key" rule
+                // is needed, because there is no sequence of calls that reaches
+                // the state such a rule would guard.
+                if self.config.hashes.iter().any(|hash| key_id(hash) == id) {
+                    return Err(DirectoryError::ConfigOwned {
+                        kind: EntityKind::Key,
+                        id,
+                    });
+                }
+                let key = records
+                    .keys
+                    .iter_mut()
+                    .find(|key| key.id == id)
+                    .ok_or_else(|| DirectoryError::UnknownKey { id: id.clone() })?;
+                // Idempotent: a second `DELETE` of a revoked key is the same
+                // request arriving twice, and answering 404 or 409 to it would
+                // make a retry after a dropped response look like a bug.
+                if !key.is_revoked() {
+                    key.revoked_at_ms = Some(now_ms);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // The ownership rules, spelled once each
+    // -----------------------------------------------------------------------
+
+    /// Refuse a create whose identity is already somebody's.
+    ///
+    /// The file is checked first on purpose: an id the file owns must report
+    /// `ConfigOwned` — which names the file and the remedy — rather than a bare
+    /// collision, which would send an operator looking for an API row that does
+    /// not exist.
+    fn refuse_taken(
+        &self,
+        records: &DirectoryRecords,
+        kind: EntityKind,
+        id: &str,
+    ) -> Result<(), DirectoryError> {
+        let owned_by_file = match kind {
+            EntityKind::Project => self.config.projects.contains(id),
+            EntityKind::User => self.config.users.contains(id),
+            _ => false,
+        };
+        if owned_by_file {
+            return Err(DirectoryError::ConfigOwned {
+                kind,
+                id: id.to_string(),
+            });
+        }
+        let taken = match kind {
+            // An archived project still holds its id — see
+            // `ProjectRecord::archived_at_ms` — so this deliberately does not
+            // skip archived rows. Re-creating a project under a closed
+            // project's id would join two tenants' spend histories under one
+            // name.
+            EntityKind::Project => records.project(id).is_some(),
+            EntityKind::User => records.user(id).is_some(),
+            _ => false,
+        };
+        if taken {
+            return Err(DirectoryError::IdentityCollision {
+                kind,
+                id: id.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn refuse_taken_hash(
+        &self,
+        records: &DirectoryRecords,
+        key_sha256: &str,
+    ) -> Result<(), DirectoryError> {
+        // Vanishingly unlikely and checked anyway: the compiler would refuse a
+        // duplicate hash with a message about a *file* an operator did not
+        // write the second key in, and this is the one place that can say what
+        // actually happened.
+        if self.config.hashes.contains(key_sha256) || records.holds_hash(key_sha256) {
+            return Err(DirectoryError::IdentityCollision {
+                kind: EntityKind::Key,
+                id: key_id(key_sha256),
+            });
+        }
+        Ok(())
+    }
+
+    fn refuse_config_project(&self, id: &str) -> Result<(), DirectoryError> {
+        if self.config.projects.contains(id) {
+            return Err(DirectoryError::ConfigOwned {
+                kind: EntityKind::Project,
+                id: id.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Refuse a change to a membership the file declares.
+    ///
+    /// Minting a key under one counts as a change, and that is the sharp case:
+    /// the file decides who may authenticate as that membership and with what
+    /// entitlements, and a key added here would be a second answer to the first
+    /// question that the next restart silently discards.
+    fn refuse_config_membership(&self, project: &str, user: &str) -> Result<(), DirectoryError> {
+        if self
+            .config
+            .memberships
+            .contains(&(project.to_string(), user.to_string()))
+        {
+            return Err(DirectoryError::ConfigOwned {
+                kind: EntityKind::Membership,
+                id: format!("{project}/{user}"),
+            });
+        }
+        Ok(())
+    }
+
+    /// Refuse a reference to a project neither half declares.
+    ///
+    /// A configured project is a perfectly good target — the API may *create*
+    /// entities referencing what the file owns, it just may not edit it.
+    fn refuse_absent_project(
+        &self,
+        records: &DirectoryRecords,
+        id: &str,
+    ) -> Result<(), DirectoryError> {
+        if self.config.projects.contains(id) {
+            return Ok(());
+        }
+        match records.project(id) {
+            None => Err(DirectoryError::UnknownProject { id: id.to_string() }),
+            Some(project) if project.is_archived() => {
+                Err(DirectoryError::ProjectIsArchived { id: id.to_string() })
+            }
+            Some(_) => Ok(()),
+        }
+    }
+
+    fn refuse_archived(&self, records: &DirectoryRecords, id: &str) -> Result<(), DirectoryError> {
+        match records.project(id) {
+            Some(project) if project.is_archived() => {
+                Err(DirectoryError::ProjectIsArchived { id: id.to_string() })
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn refuse_absent_user(
+        &self,
+        records: &DirectoryRecords,
+        id: &str,
+    ) -> Result<(), DirectoryError> {
+        if self.config.users.contains(id) || records.user(id).is_some() {
+            return Ok(());
+        }
+        Err(DirectoryError::UnknownUser { id: id.to_string() })
+    }
+
+    // -----------------------------------------------------------------------
+
+    fn read_current(&self) -> std::sync::RwLockReadGuard<'_, Compiled> {
+        self.current
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn write_current(&self) -> std::sync::RwLockWriteGuard<'_, Compiled> {
+        self.current
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+}
+
+/// See [`ControlDirectory::compile`].
+///
+/// A free function rather than only a method so that [`ControlDirectory::new`]
+/// can compile *before* it constructs. The method-only shape needed a
+/// placeholder in the field it was about to fill, and the only available
+/// placeholder was [`ControlPlane::Open`] — a value that means "no key is
+/// required anywhere", parked for a few instructions inside the type whose
+/// whole job is to require one.
+fn compile(
+    file: &ControlPlaneConfig,
+    path: &str,
+    checks: &CrossChecks,
+    records: &DirectoryRecords,
+) -> Result<Arc<ControlPlane>, DirectoryError> {
+    let mut merged = file.clone();
+    let archived: HashSet<&str> = records
+        .projects
+        .iter()
+        .filter(|project| project.is_archived())
+        .map(ProjectRecord::id)
+        .collect();
+
+    for project in &records.projects {
+        // An archived project is left out of the compiled config entirely,
+        // rather than compiled and then filtered: leaving it in would need
+        // every reader of a project — the policy cross-check, the ambiguity
+        // check, the router — to remember that some projects do not count.
+        if !project.is_archived() {
+            merged.projects.push(project.entry.clone());
+        }
+    }
+    merged
+        .users
+        .extend(records.users.iter().map(|user| user.entry.clone()));
+
+    let mut refusals: HashMap<String, KeyRefusal> = HashMap::new();
+    for key in &records.keys {
+        if key.is_revoked() {
+            refusals.insert(key.key_sha256.clone(), KeyRefusal::Revoked);
+            continue;
+        }
+        match &key.scope {
+            KeyRecordScope::Admin => merged.admin_keys.push(key.key_sha256.clone()),
+            KeyRecordScope::Turn { project, user } => {
+                // Refused by its own row rather than by its membership's
+                // absence: `project_archived` and `revoked_key` are told
+                // apart because their remedies are opposite, and a key that
+                // simply vanished from the table would be `unknown_key`,
+                // which is neither.
+                if archived.contains(project.as_str()) {
+                    refusals.insert(key.key_sha256.clone(), KeyRefusal::ProjectArchived);
+                    continue;
+                }
+                let membership = records.membership(project, user).ok_or_else(|| {
+                    DirectoryError::Inconsistent {
+                        detail: format!(
+                            "key `{}` is minted under a membership (`{project}`, `{user}`) \
+                             that no record names, and every route that removes a membership \
+                             revokes its keys",
+                            key.id
+                        ),
+                    }
+                })?;
+                merged.keys.push(KeyEntry {
+                    project: project.clone(),
+                    user: user.clone(),
+                    key_sha256: key.key_sha256.clone(),
+                    // Read off the membership on every compile. A copy on
+                    // the key record would be the second place a
+                    // membership's entitlements lived, and the first
+                    // `UpsertMembership` after a second key was minted
+                    // would leave the two disagreeing — which
+                    // `ControlPlane::membership` refuses to describe at all.
+                    overrides: membership.overrides.clone(),
+                    allocation: membership.allocation.clone(),
+                    // No per-key credentials: M8 has no credential CRUD, so
+                    // a member's own provider keys stay a thing only the
+                    // file can say. See the milestone's R9.
+                    credentials: None,
+                });
+            }
+        }
+    }
+
+    merged.validate(path)?;
+    let plane = ControlPlane::configured_with_refusals(merged, refusals);
+    checks.refuse(&plane)?;
+    Ok(Arc::new(plane))
+}
+
+#[cfg(test)]
+mod tests;

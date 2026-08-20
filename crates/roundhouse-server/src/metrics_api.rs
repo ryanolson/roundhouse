@@ -28,7 +28,7 @@ use roundhouse_core::control::PrincipalKey;
 use roundhouse_core::metrics::{MetricsConfig, MetricsRecorder, MetricsSnapshot};
 use roundhouse_core::now_ms;
 
-use crate::control_config::{AuthError, ControlPlane, KeyScope};
+use crate::control_config::{AuthError, ControlPlane, KeyScope, PlaneSource};
 
 /// The dashboard, inlined at build time.
 ///
@@ -42,7 +42,11 @@ struct MetricsState {
     recorder: Arc<MetricsRecorder>,
     config: Arc<MetricsConfig>,
     /// Who may read this document, and how much of it.
-    plane: Arc<ControlPlane>,
+    ///
+    /// A [`PlaneSource`] rather than the compiled plane, for the reason the turn
+    /// surfaces hold one: a revoked key must stop reading a tenant's spend at
+    /// the same moment it stops being able to spend it.
+    planes: Arc<dyn PlaneSource>,
 }
 
 /// Mount the metrics endpoints, gated by a control plane.
@@ -54,18 +58,26 @@ struct MetricsState {
 ///
 /// One constructor with a required plane, for the reason
 /// [`http::router`](crate::http::router) gives.
-pub fn metrics_router(
-    plane: Arc<ControlPlane>,
+///
+/// Generic over the source and stored as `Arc<dyn PlaneSource>`, rather than
+/// taking the trait object directly. `Arc<ControlPlane>` and
+/// `Arc<ControlDirectory>` are both accepted and both unsize at the call site;
+/// a parameter typed `Arc<dyn PlaneSource>` would not accept either through the
+/// `Arc::clone(&plane)` a caller naturally writes, because the clone's own
+/// return type is inferred before any coercion could apply.
+pub fn metrics_router<P: PlaneSource>(
+    planes: Arc<P>,
     recorder: Arc<MetricsRecorder>,
     config: Arc<MetricsConfig>,
 ) -> Router {
+    let planes: Arc<dyn PlaneSource> = planes;
     Router::new()
         .route("/v1/metrics", get(snapshot))
         .route("/v1/metrics/dashboard", get(dashboard))
         .with_state(MetricsState {
             recorder,
             config,
-            plane,
+            planes,
         })
 }
 
@@ -128,7 +140,11 @@ fn scoped_snapshot(
     headers: &HeaderMap,
 ) -> Result<MetricsSnapshot, AuthError> {
     let at_ms = now_ms();
-    match &*state.plane {
+    // One snapshot, taken at the same instant the document is stamped with:
+    // the mode branch below and the key resolution inside it have to be two
+    // questions about one compiled plane.
+    let plane = state.planes.plane(at_ms);
+    match &*plane {
         // Short-circuited rather than resolved and scoped to the one principal
         // `Open` would hand back, and the difference matters on exactly one
         // deployment: an upgraded one. Every session logged before the control
@@ -139,7 +155,7 @@ fn scoped_snapshot(
         // also simply what `Open` means: one tenant, no keys, nothing to
         // withhold from whom.
         ControlPlane::Open => Ok(state.recorder.snapshot(&state.config, at_ms)),
-        ControlPlane::Configured { .. } => match state.plane.scope(headers)? {
+        ControlPlane::Configured { .. } => match plane.scope(headers)? {
             KeyScope::Admin => Ok(state.recorder.snapshot(&state.config, at_ms)),
             // The admission's policy is not consulted here and is not meant to
             // be: what a key may *route to* has no bearing on what it may

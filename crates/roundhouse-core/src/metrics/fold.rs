@@ -27,7 +27,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 
-use crate::control::{Billing, PrincipalKey};
+use crate::control::{Billing, PrincipalKey, ProjectId};
 use crate::event::{
     Accounting, NotRunReason, PlaceboTiming, SessionEvent, SessionEventKind, Usage,
     ValidationOutcome,
@@ -259,6 +259,45 @@ struct Pending {
 pub enum Scope<'a> {
     Deployment,
     Principal(&'a PrincipalKey),
+    /// Every attributed principal of one project, summed in one pass.
+    ///
+    /// **A scope rather than a loop over [`Self::Principal`] at the call site**,
+    /// and the difference is not performance. A caller that summed one
+    /// `Principal` view per *configured* member would report a project's
+    /// measured spend as the spend of the members it can currently see — so a
+    /// key deleted last week, or a user removed from the project this morning,
+    /// would take their traffic out of the project's own reconciliation while
+    /// leaving it in the deployment's. The fold knows who actually spent; the
+    /// config knows who is currently allowed to. Asking the fold is the only
+    /// way to get an answer that still adds up.
+    ///
+    /// [`PrincipalKey::Unattributed`] belongs to no project and is never
+    /// collected here, which is what keeps a project's measured column from
+    /// absorbing every log written before the control plane existed.
+    Project(&'a ProjectId),
+}
+
+impl Scope<'_> {
+    /// Whether a fold row keyed by `key` belongs in this scope.
+    ///
+    /// The one predicate the three arms share, so "which rows are mine" is
+    /// decided once rather than restated by every accumulator that walks
+    /// [`MetricsFold::by_principal`]. A second spelling is how a project's
+    /// tokens and a project's turns come to be summed over two different sets
+    /// of principals.
+    fn collects(&self, key: &PrincipalKey) -> bool {
+        match self {
+            Scope::Deployment => true,
+            Scope::Principal(scope) => key == *scope,
+            // Matched on the `Attributed` arm rather than tested with a
+            // projection that could return a project for the other one:
+            // unattributed usage has no project, and any answer that gave it
+            // one would silently bill somebody for it.
+            Scope::Project(project) => {
+                matches!(key, PrincipalKey::Attributed { project: owner, .. } if owner == *project)
+            }
+        }
+    }
 }
 
 /// Folds session events into token aggregates.
@@ -619,12 +658,48 @@ impl MetricsFold {
     pub(super) fn view(&self, scope: Scope<'_>) -> ScopeView<'_> {
         match scope {
             Scope::Deployment => ScopeView {
-                rows: Cow::Owned(self.deployment_rows()),
+                rows: Cow::Owned(self.summed_rows(scope)),
                 totals: ScopeTotals {
+                    // Counted rather than filtered: every session is in this
+                    // scope, and `Scope::collects` would agree at the cost of a
+                    // hash lookup per session per dashboard poll.
                     sessions: self.watermarks.len(),
                     turns: self.turns_of_principal.values().sum(),
                     first_at_ms: self.window_of_principal.values().map(|(f, _)| *f).min(),
                     last_at_ms: self.window_of_principal.values().map(|(_, l)| *l).max(),
+                },
+            },
+            // Every figure filtered through the *same* predicate the rows were,
+            // which is the arm's one real hazard: a project whose tokens came
+            // from two members and whose window came from one would report a
+            // per-second rate over an interval the traffic did not happen in,
+            // and nothing about the number would look wrong.
+            Scope::Project(_) => ScopeView {
+                rows: Cow::Owned(self.summed_rows(scope)),
+                totals: ScopeTotals {
+                    sessions: self
+                        .watermarks
+                        .keys()
+                        .filter(|session| scope.collects(&self.principal_for(session)))
+                        .count(),
+                    turns: self
+                        .turns_of_principal
+                        .iter()
+                        .filter(|(key, _)| scope.collects(key))
+                        .map(|(_, turns)| *turns)
+                        .sum(),
+                    first_at_ms: self
+                        .window_of_principal
+                        .iter()
+                        .filter(|(key, _)| scope.collects(key))
+                        .map(|(_, (first, _))| *first)
+                        .min(),
+                    last_at_ms: self
+                        .window_of_principal
+                        .iter()
+                        .filter(|(key, _)| scope.collects(key))
+                        .map(|(_, (_, last))| *last)
+                        .max(),
                 },
             },
             Scope::Principal(key) => {
@@ -653,11 +728,20 @@ impl MetricsFold {
         }
     }
 
-    /// Every principal's rows added together, which is what the deployment's
-    /// row for a model *is*. See [`Counters::absorb`].
-    fn deployment_rows(&self) -> BTreeMap<ModelKey, Counters> {
+    /// Every collected principal's rows added together, which is what a
+    /// deployment's — or a project's — row for a model *is*. See
+    /// [`Counters::absorb`].
+    ///
+    /// One pass over the one accumulator, filtered by the scope. Not one
+    /// [`Scope::Principal`] view per member summed by the caller: that would
+    /// make a project's total a function of who the *config* still lists, and
+    /// the whole reason to fold is that the log knows who actually spent.
+    fn summed_rows(&self, scope: Scope<'_>) -> BTreeMap<ModelKey, Counters> {
         let mut merged: BTreeMap<ModelKey, Counters> = BTreeMap::new();
-        for rows in self.by_principal.values() {
+        for (owner, rows) in &self.by_principal {
+            if !scope.collects(owner) {
+                continue;
+            }
             for (key, counters) in rows {
                 merged.entry(key.clone()).or_default().absorb(counters);
             }
@@ -669,20 +753,18 @@ impl MetricsFold {
     ///
     /// Scoped through the same [`Scope`] the money view uses, so a tenant's
     /// report cannot read the deployment's arm counts by forgetting to narrow.
+    /// One filtered walk rather than an arm per scope: the direct map lookup a
+    /// single principal used to get was O(1) against a table with one entry per
+    /// principal, and it was also a second place the answer to "whose rows are
+    /// these" was decided.
     pub fn validation_tally(&self, scope: Scope<'_>, arm: Arm) -> ValidationTally {
         let mut total = ValidationTally::default();
-        match scope {
-            Scope::Deployment => {
-                for arms in self.validations.values() {
-                    if let Some(tally) = arms.get(&arm) {
-                        total.absorb(tally);
-                    }
-                }
+        for (owner, arms) in &self.validations {
+            if !scope.collects(owner) {
+                continue;
             }
-            Scope::Principal(key) => {
-                if let Some(tally) = self.validations.get(key).and_then(|arms| arms.get(&arm)) {
-                    total.absorb(tally);
-                }
+            if let Some(tally) = arms.get(&arm) {
+                total.absorb(tally);
             }
         }
         total
@@ -1133,7 +1215,9 @@ pub(super) mod tests {
         // excluded. This is `Counters::absorb` merging two principals' rows for
         // one model, which is the only way a deployment row is ever produced.
         assert_eq!(
-            fold.deployment_rows()[&key].reported_usage().input_tokens,
+            fold.summed_rows(Scope::Deployment)[&key]
+                .reported_usage()
+                .input_tokens,
             8_000
         );
         assert_eq!(
@@ -1143,6 +1227,20 @@ pub(super) mod tests {
                 PrincipalKey::Unattributed,
             ],
             "the marked row is a row a reader can see the size of, not a silent remainder"
+        );
+
+        // **"never into a project", asked of a project scope.** Everything above
+        // this line reads `by_principal` and the deployment total, which is what
+        // this test could ask before project scoping existed — and it left the
+        // name writing a cheque the body did not cash: widening
+        // `Scope::collects` to sweep the marked row into every project passes
+        // every assertion above and fails only here.
+        assert_eq!(
+            fold.view(Scope::Project(&ProjectId::from("acme"))).rows[&key]
+                .reported_usage()
+                .input_tokens,
+            1_000,
+            "a project's own scope must not absorb usage nobody can be charged for"
         );
     }
 
@@ -1185,7 +1283,7 @@ pub(super) mod tests {
             provider: crate::metrics::LOCAL_PROVIDER.into(),
             model: "llama".into(),
         };
-        let merged = &fold.deployment_rows()[&key];
+        let merged = &fold.summed_rows(Scope::Deployment)[&key];
         assert_eq!(merged.calls, 2);
         assert_eq!(merged.estimated_calls, 1, "one of the two was unreported");
         assert_eq!(merged.reported_usage().input_tokens, 10_000);
@@ -1217,7 +1315,7 @@ pub(super) mod tests {
         );
         judged.side_call(frontier("anthropic", "claude"), None);
         fold.extend(judged.events());
-        let claude_row = &fold.deployment_rows()[&claude()];
+        let claude_row = &fold.summed_rows(Scope::Deployment)[&claude()];
         assert_eq!(
             (claude_row.side_calls, claude_row.abandoned_side_calls),
             (1, 1)
@@ -1261,7 +1359,7 @@ pub(super) mod tests {
 
         // The dashboard total is still the sum of its rows, exactly once.
         assert_eq!(
-            fold.deployment_rows()
+            fold.summed_rows(Scope::Deployment)
                 .values()
                 .map(|row| row.total_usage().total())
                 .sum::<u64>(),
@@ -1391,7 +1489,7 @@ pub(super) mod tests {
 
         // Control facts stay out of the money rows: nothing above dispatched or
         // billed anything.
-        assert!(fold.deployment_rows().is_empty());
+        assert!(fold.summed_rows(Scope::Deployment).is_empty());
         // And a tenant with no validations reads as none rather than as a
         // lookup failure.
         assert_eq!(
@@ -1433,5 +1531,204 @@ pub(super) mod tests {
              or a replay doubles what a project is billed"
         );
         assert_eq!(fold.turns(), turns);
+    }
+
+    /// A project's rows are exactly the sum of its own principals' rows.
+    ///
+    /// The property the admin plane's `measured_usd` column rests on, and the
+    /// two ways it can be wrong point opposite directions: collect too little
+    /// and a project reads as under-spent against a ledger that saw everything;
+    /// collect too much and one tenant's reconciliation reports another's
+    /// traffic. So the assertion is an equality against the accumulator itself
+    /// rather than a bound — over-collection fails it just as loudly as
+    /// under-collection.
+    #[test]
+    fn a_project_view_sums_exactly_its_own_principals_rows() {
+        let ada = principal("acme", "ada");
+        let bob = principal("acme", "bob");
+        let eve = principal("globex", "eve");
+
+        let mut mine = LogBuilder::new("acme/ada/main");
+        mine.created(Some(ada.clone()));
+        mine.turn(
+            "r1",
+            frontier("anthropic", "claude"),
+            vec![],
+            usage(1_000, 0, 100, 0),
+        );
+        let mut colleague = LogBuilder::new("acme/bob/main");
+        colleague.created(Some(bob.clone()));
+        colleague.turn(
+            "r2",
+            frontier("anthropic", "claude"),
+            vec![],
+            usage(2_000, 0, 200, 0),
+        );
+        let mut neighbour = LogBuilder::new("globex/eve/main");
+        neighbour.created(Some(eve.clone()));
+        neighbour.turn(
+            "r3",
+            frontier("anthropic", "claude"),
+            vec![],
+            usage(9_000, 0, 900, 0),
+        );
+        // And a log from before the control plane, which belongs to nobody.
+        let mut legacy = LogBuilder::new("legacy");
+        legacy.turn(
+            "r4",
+            frontier("anthropic", "claude"),
+            vec![],
+            usage(5_000, 0, 500, 0),
+        );
+
+        let mut fold = MetricsFold::new();
+        for log in [&mine, &colleague, &neighbour, &legacy] {
+            fold.extend(log.events());
+        }
+
+        let acme = ProjectId::from("acme");
+        let view = fold.view(Scope::Project(&acme));
+        let key = claude();
+        assert_eq!(
+            view.rows[&key].reported_usage().input_tokens,
+            3_000,
+            "ada's 1,000 and bob's 2,000, and nothing else"
+        );
+
+        // Stated a second way, against the accumulator rather than against a
+        // number written out by hand: whatever `by_principal` holds for the two
+        // acme rows is what the project view must equal. A fixture whose
+        // arithmetic drifted would still be checked.
+        let summed: u64 = [&ada, &bob]
+            .into_iter()
+            .map(|principal| {
+                fold.by_principal[&PrincipalKey::from(principal)][&key]
+                    .reported_usage()
+                    .input_tokens
+            })
+            .sum();
+        assert_eq!(view.rows[&key].reported_usage().input_tokens, summed);
+
+        // The two exclusions, named: the neighbouring project, and the row that
+        // belongs to no project at all. Without the second, every project's
+        // reconciliation would absorb every log written before the control
+        // plane existed — into whichever project happened to be asking.
+        assert_eq!(
+            fold.view(Scope::Project(&ProjectId::from("globex"))).rows[&key]
+                .reported_usage()
+                .input_tokens,
+            9_000
+        );
+        let deployment = fold.view(Scope::Deployment);
+        assert_eq!(
+            deployment.rows[&key].reported_usage().input_tokens,
+            17_000,
+            "the deployment still sees all four, unattributed included"
+        );
+        assert!(
+            fold.view(Scope::Project(&ProjectId::from("nobody")))
+                .rows
+                .is_empty(),
+            "a project that has never served a turn has no rows, which is an \
+             answer rather than a lookup failure"
+        );
+    }
+
+    /// A project collects a principal its config no longer names.
+    ///
+    /// The fold has no notion of configuration — that is the point. Nothing in
+    /// this test deletes a key, because nothing in this crate could: what it
+    /// pins is that the *only* thing deciding whether a row is collected is the
+    /// project stamped in the log, so a member whose key was revoked this
+    /// morning still appears in the project's measured column. A view that
+    /// filtered by anything else would let tidying up tenancy silently move
+    /// money out of a project's reconciliation and into the drift.
+    #[test]
+    fn a_project_view_collects_a_principal_the_config_no_longer_names() {
+        let departed = principal("acme", "sam");
+        let mut log = LogBuilder::new("acme/sam/main");
+        log.created(Some(departed.clone()));
+        log.turn(
+            "r1",
+            frontier("anthropic", "claude"),
+            vec![],
+            usage(4_000, 0, 400, 0),
+        );
+
+        let mut fold = MetricsFold::new();
+        fold.extend(log.events());
+
+        let acme = ProjectId::from("acme");
+        let view = fold.view(Scope::Project(&acme));
+        assert_eq!(
+            view.rows[&claude()].reported_usage().input_tokens,
+            4_000,
+            "the log says acme paid for it, and the log is the record"
+        );
+        assert_eq!(view.totals.turns, 1);
+        assert_eq!(view.totals.sessions, 1);
+    }
+
+    /// Every figure on a project view is filtered by the same predicate.
+    ///
+    /// The failure this pins is the quiet one: a project whose tokens came from
+    /// two members and whose *window* came from one reports a per-second rate
+    /// over an interval its traffic did not happen in, and the number looks
+    /// perfectly plausible. Sessions, turns and both window ends are asserted
+    /// together for that reason.
+    #[test]
+    fn a_project_views_sessions_turns_and_window_cover_every_member() {
+        let ada = principal("acme", "ada");
+        let bob = principal("acme", "bob");
+        let eve = principal("globex", "eve");
+
+        let mut early = LogBuilder::new("acme/ada/main");
+        early.created(Some(ada.clone()));
+        early.turn("r1", local("llama"), vec![], usage(100, 0, 10, 0));
+
+        // Later in wall-clock time than ada's log: the builder starts every log
+        // at the same clock, so bob's is advanced by hand to make "the project's
+        // window is the union of its members'" a claim with two distinct ends.
+        let mut late = LogBuilder::new("acme/bob/main");
+        late.at_ms = 500_000;
+        late.created(Some(bob.clone()));
+        late.turn("r2", local("llama"), vec![], usage(100, 0, 10, 0));
+
+        let mut neighbour = LogBuilder::new("globex/eve/main");
+        neighbour.at_ms = 900_000;
+        neighbour.created(Some(eve.clone()));
+        neighbour.turn("r3", local("llama"), vec![], usage(100, 0, 10, 0));
+
+        let mut fold = MetricsFold::new();
+        for log in [&early, &late, &neighbour] {
+            fold.extend(log.events());
+        }
+
+        let view = fold.view(Scope::Project(&ProjectId::from("acme")));
+        assert_eq!(view.totals.sessions, 2, "ada's and bob's, not eve's");
+        assert_eq!(view.totals.turns, 2);
+        assert_eq!(
+            view.totals.first_at_ms,
+            fold.view(Scope::Principal(&PrincipalKey::from(&ada)))
+                .totals
+                .first_at_ms,
+            "the project's window opens with its earliest member's"
+        );
+        assert_eq!(
+            view.totals.last_at_ms,
+            fold.view(Scope::Principal(&PrincipalKey::from(&bob)))
+                .totals
+                .last_at_ms,
+            "and closes with its latest member's, not with the first member's"
+        );
+        assert!(
+            view.totals.last_at_ms
+                < fold
+                    .view(Scope::Principal(&PrincipalKey::from(&eve)))
+                    .totals
+                    .last_at_ms,
+            "and never reaches the neighbouring project's, which would disclose \
+             when another tenant was last active"
+        );
     }
 }
