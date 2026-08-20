@@ -277,16 +277,41 @@ async fn an_upstream_that_echoes_the_forwarded_credential_is_redacted_before_any
     assert!(message.contains("401"), "{message}");
     assert!(message.contains("invalid token"), "{message}");
 
-    // CONTROL: the same upstream on the stored-key route. There is no forwarded
-    // credential to redact, and the deployment's own key is echoed -- which is
-    // a real disclosure, but a different one, and pretending this test covers
-    // it would be worse than saying so. What it does prove is that the
-    // redaction above is driven by the *forwarded* credential rather than by a
-    // blanket scrub that would also hide the upstream's meaning.
-    let Err(stored_error) = client.execute(&quote(stored())).await else {
+    // CONTROL: the redaction takes out the credential and not the upstream's
+    // meaning. A blanket scrub of the body would satisfy every assertion above
+    // and leave an operator with an error that says only that something was
+    // removed.
+    assert!(!message.contains("[REDACTED][REDACTED]"), "{message}");
+    // The stored-key route on the same upstream is the twin below: both arms
+    // are scrubbed, because the credential itself is what knows how.
+}
+
+#[tokio::test]
+async fn an_upstream_that_echoes_a_stored_key_is_redacted_before_anyone_reads_it() {
+    let (base, _) = Upstream::spawn(Behaviour::EchoTheCredential).await;
+    let client = OpenAiResponsesClient::with_bases(&base, &base).unwrap();
+
+    // PROBE: the twin of the forwarded case, and the arm this client's own
+    // redaction originally skipped. A provider that rejects a key quotes it
+    // back; on the stored route that key is the deployment's or a member's, and
+    // it leaves `execute` inside `FrontierError::Upstream` — which becomes
+    // `EngineError::Frontier`, then `error.to_string()`, then the failed frame
+    // a client reads. A forwarded seat and a stored key are different secrets
+    // belonging to different people; neither is a thing an upstream's own words
+    // may carry back out.
+    let Err(error) = client.execute(&quote(stored())).await else {
         panic!("a 401 is an error")
     };
-    assert!(stored_error.to_string().contains("invalid token"));
+    let message = error.to_string();
+    assert!(
+        !message.contains(STORED_KEY),
+        "the upstream echoed the stored key and it survived to the caller: {message}"
+    );
+    assert!(message.contains("[REDACTED]"), "{message}");
+    // And the diagnosis survives, so the scrub is of the credential rather than
+    // of the error.
+    assert!(message.contains("401"), "{message}");
+    assert!(message.contains("invalid token"), "{message}");
 }
 
 #[tokio::test]

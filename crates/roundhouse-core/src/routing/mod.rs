@@ -40,7 +40,7 @@ pub use policy::{AffinityPolicy, EscalationPolicy};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::control::{BudgetState, FrontierHistory, Payer, TurnBudget, TurnPolicy};
+use crate::control::{Billing, BudgetState, FrontierHistory, Payer, TurnBudget, TurnPolicy};
 use crate::ids::SessionId;
 
 /// Where a turn can be sent.
@@ -487,6 +487,26 @@ pub struct DecisionRecord {
     /// [`Self::budget_state`].
     #[serde(default)]
     pub payer: Payer,
+    /// Whether roundhouse may put a price on this dispatch at all.
+    ///
+    /// Beside [`Self::payer`] because it is the same kind of fact decided at
+    /// the same moment — where the credential resolves, before `choose()` — and
+    /// it is here for the sharper version of the same reason. Who paid and
+    /// whether there is a bill to name are two questions, and answering the
+    /// second one downstream meant answering it twice: the settle asked the
+    /// *live* admission whether the project forwards, while the metrics fold
+    /// asked nobody and priced every hosted row from the rate card. An operator
+    /// switching one project between a stored key and pass-through was enough
+    /// to make the ledger and the dashboard report different money for the same
+    /// turn. Recorded here, there is one answer and both read it.
+    ///
+    /// Defaults to [`Billing::Billed`], which is the correct reading of a
+    /// pre-M7 log rather than a placeholder: pass-through did not exist, so
+    /// those turns were all billable. Same treatment, and same reason, as
+    /// [`Self::payer`] — and the same one-way door, since a log written with
+    /// this field is read by an older process as a decision without it.
+    #[serde(default)]
+    pub billing: Billing,
     /// Providers quoted for this turn and dropped for want of a credential.
     ///
     /// **The marker on a credential degrade**, and the reason it is recorded
@@ -704,6 +724,7 @@ mod tests {
                 output_per_mtok_usd: 15.0,
             }),
             payer: Payer::User,
+            billing: Billing::AccountedNotBilled,
             withheld_providers: vec!["openai".into()],
         };
         let encoded = serde_json::to_string(&record).unwrap();
@@ -714,6 +735,11 @@ mod tests {
         assert!(
             encoded.contains(r#""payer":"user""#),
             "and so does whose credential paid for it: {encoded}"
+        );
+        assert!(
+            encoded.contains(r#""billing":"accounted_not_billed""#),
+            "and whether there is a bill to name at all, which is the fact the \
+             settle and the dashboard both read: {encoded}"
         );
         assert_eq!(
             serde_json::from_str::<DecisionRecord>(&encoded).unwrap(),
@@ -757,6 +783,13 @@ mod tests {
             Payer::Deployment,
             "a turn taken before BYOK existed really was paid for with the \
              deployment's own key, which is a fact and not a missing value"
+        );
+        assert_eq!(
+            recovered.billing,
+            Billing::Billed,
+            "and pass-through did not exist, so it was billable -- the serde \
+             default is the correct reading of that log rather than a \
+             placeholder"
         );
         assert!(
             recovered.withheld_providers.is_empty(),

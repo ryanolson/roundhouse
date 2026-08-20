@@ -413,6 +413,7 @@ pub async fn decision() -> DecisionRecord {
         budget_state: BudgetState::Warned,
         rate_card: None,
         payer: Default::default(),
+        billing: Default::default(),
         withheld_providers: Vec::new(),
     }
 }

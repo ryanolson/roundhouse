@@ -640,6 +640,17 @@ that the API does not have, so a hard refresh loses nothing.
     return tr;
   }
 
+  // Tokens on a row that a rate card of ours applies to. A row can serve
+  // tokens and bill nothing for a good reason now, and the two reasons need
+  // telling apart: a missing rate card is a mistake, a forwarded seat is not.
+  function priceable(row) {
+    return row.tokens.total - ((row.seat_tokens && row.seat_tokens.total) || 0);
+  }
+
+  function seatTotal(data) {
+    return (data.seat_tokens && data.seat_tokens.total) || 0;
+  }
+
   function renderAlerts(data) {
     const host = $("alerts");
     host.textContent = "";
@@ -663,12 +674,22 @@ that the API does not have, so a hard refresh loses nothing.
         no correlary</strong>, so ${unpriced.length === 1 ? "its" : "their"} traffic contributes
         nothing to the savings figure. See the correlary table below.`);
     }
+    // Priceable tokens only. A row whose traffic was all forwarded seats bills
+    // nothing *correctly*, and telling an operator to go and fix a rate card
+    // for it would send them after a file that is not the explanation.
     const freeHosted = data.models.filter(
-      (m) => m.mode === "frontier" && m.tokens.total > 0 && m.billed_usd === 0);
+      (m) => m.mode === "frontier" && priceable(m) > 0 && m.billed_usd === 0);
     if (freeHosted.length) {
       notes.push(`<strong>${freeHosted.length} hosted model${freeHosted.length === 1 ? "" : "s"}
         served tokens at no cost</strong>, which almost always means a missing rate card
         rather than a free provider: ${esc(freeHosted.map((m) => m.provider + "/" + m.model).join(", "))}.`);
+    }
+    if (seatTotal(data) > 0) {
+      notes.push(`<strong>${tokens(seatTotal(data))} tokens were served through forwarded
+        subscription seats</strong> and carry no price: roundhouse holds no rate card for a
+        seat, so the catalog's per-token figure would describe what <em>it</em> would have
+        paid on its own key rather than what anyone was billed. Those tokens are inside
+        every count on this page and inside none of the money.`);
     }
 
     for (const note of notes) {
@@ -702,11 +723,15 @@ that the API does not have, so a hard refresh loses nothing.
     const measuredShare = spend.frontier_spend_usd > 0
       ? spend.frontier_spend_measured_usd / spend.frontier_spend_usd
       : 1;
-    $("kpi-spend-note").textContent = spend.frontier_spend_usd === 0
+    const seatNote = seatTotal(data) > 0
+      ? ` · ${tokens(seatTotal(data))} tokens on forwarded seats, unpriced`
+      : "";
+    $("kpi-spend-note").textContent = (spend.frontier_spend_usd === 0
       ? "nothing billed yet"
       : measuredShare >= 0.9995
         ? "measured"
-        : `${pct(measuredShare)} measured · ${usd(spend.frontier_spend_estimated_usd)} estimated`;
+        : `${pct(measuredShare)} measured · ${usd(spend.frontier_spend_estimated_usd)} estimated`)
+      + seatNote;
     $("kpi-tokens").textContent = tokens(data.tokens.total);
     $("kpi-calls").textContent =
       `${nf.format(data.calls)} calls · ${nf.format(data.turns)} turns · ${nf.format(data.sessions)} sessions`;

@@ -70,6 +70,7 @@ fn decision(chosen: Target) -> DecisionRecord {
         // enters into: a dispatch is warm or cold whatever it cost.
         rate_card: None,
         payer: Default::default(),
+        billing: Default::default(),
         withheld_providers: Vec::new(),
     }
 }

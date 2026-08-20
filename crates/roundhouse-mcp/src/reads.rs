@@ -69,7 +69,17 @@ pub trait ControlReads: Send + Sync + 'static {
     /// overlay: project profile composed with the membership's overrides.
     async fn ceiling_policy(&self, principal: &Principal) -> Result<TurnPolicy, SurfaceError>;
 
-    /// Every target in the deployment's catalog that `policy` admits.
+    /// Every target in the deployment's catalog a turn of `principal`'s under
+    /// `policy` could actually be routed to.
+    ///
+    /// **Both gates, because the router applies both.** `policy` says what this
+    /// key may reach and the principal's credentials say what it can
+    /// authenticate to; a target that fails either is a target the next turn
+    /// will not be given. Answering with only the policy half is what makes
+    /// `status` promise a hosted model to a member holding no key for it, and
+    /// what lets the overlay guard admit a narrowing onto a provider the turn
+    /// then refuses — two answers to one question, disagreeing invisibly.
+    /// `principal` is a parameter for that reason and not for logging.
     ///
     /// A catalog read and a policy filter, not a quote: this must never reach
     /// the fleet, because `status` is called from a model's context and a tool

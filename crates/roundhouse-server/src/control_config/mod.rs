@@ -159,6 +159,29 @@ fn has_valid_key_shape(secret: &str) -> bool {
     }
 }
 
+/// Whether a header value carries one of *roundhouse's own* secrets rather
+/// than somebody else's credential.
+///
+/// **The second half of the forwarding gate, and the half that cannot be
+/// inferred from a header name.** Where a turn key arrived says which stanza a
+/// client is speaking; it does not say what the client put in `Authorization`,
+/// and the documented BYOK stanza puts the same `rh_turn_…` value in both
+/// places. A capture gated on the header alone therefore forwards roundhouse's
+/// own turn key to a frontier provider on the happy path — and an
+/// `rh_admin_…` beside a turn key would go the same way. Neither is a
+/// credential any upstream has any business seeing.
+///
+/// Every whitespace-separated token is checked rather than just the value after
+/// a `Bearer ` strip, so the scheme a client chose — `Bearer`, `bearer`, none
+/// at all — cannot decide whether the key leaves the process. What that costs
+/// is a third-party credential containing a token shaped exactly like one of
+/// ours, which is refused rather than forwarded; that direction degrades the
+/// turn to local with a marker, which is the direction this module already errs
+/// in (see [`header_value`]).
+fn carries_a_roundhouse_secret(value: &str) -> bool {
+    value.split_whitespace().any(has_valid_key_shape)
+}
+
 /// A turn key as the request presented it.
 ///
 /// The pair travels together because the second half is only meaningful beside
@@ -597,13 +620,29 @@ impl ControlPlane {
     /// [`TURN_KEY_HEADER`] — that is exactly the configuration in which
     /// `Authorization` is somebody else's, and the two stanzas are
     /// distinguishable by nothing else.
+    ///
+    /// **The header is a necessary condition and not a sufficient one**, and
+    /// the difference is a real client's doing rather than a hypothetical's:
+    /// PLAN §3's BYOK stanza sends the same `rh_turn_…` value in `env_key` *and*
+    /// in `env_http_headers`, so "the key arrived in the dedicated header" is
+    /// true of a request whose `Authorization` is also roundhouse's own key.
+    /// The value is therefore checked as well as the header —
+    /// [`carries_a_roundhouse_secret`] — and a capture that would forward one
+    /// of this deployment's own secrets is refused. The turn is still admitted;
+    /// what it loses is the hosted half of its pool, which degrades to local
+    /// with a marker like any other unreachable provider.
     pub fn turn_admission(&self, headers: &HeaderMap) -> Result<Admission, AuthError> {
         let presented = self.presented_key(headers)?;
         let forwardable = presented.as_ref().is_some_and(|key| key.dedicated_header);
         match self.authenticate(presented.map(|key| key.secret))? {
             KeyScope::Turn(admission) => Ok(admission.with_forwarded(
                 forwardable
-                    .then(|| PresentedCredential::captured(|name| header_value(headers, name)))
+                    .then(|| {
+                        PresentedCredential::captured(|name| {
+                            header_value(headers, name)
+                                .filter(|value| !carries_a_roundhouse_secret(value))
+                        })
+                    })
                     .flatten(),
             )),
             KeyScope::Admin => Err(AuthError::WrongKeyKind),
@@ -1051,6 +1090,109 @@ mod tests {
             Err(AuthError::WrongKeyKind),
             "an admin has no membership to bill, and minting one would put spend \
              on a row no project owns"
+        );
+    }
+
+    /// A one-project plane whose turns forward the caller's own credential.
+    ///
+    /// Pass-through is the only mode in which a capture is read at all — a
+    /// stored resolution drops it on the floor — so it is the only fixture that
+    /// can observe what the edge decided to forward.
+    fn pass_through_plane() -> ControlPlane {
+        let json = format!(
+            r#"{{
+              "projects": [{{ "id": "acme", "credentials": {{ "mode": "pass_through" }} }}],
+              "users": [{{ "id": "ada" }}],
+              "keys": [{{ "project": "acme", "user": "ada", "key_sha256": "{TURN_HASH}" }}],
+              "admin_keys": ["{ADMIN_HASH}"]
+            }}"#
+        );
+        ControlPlane::configured(
+            ControlPlaneConfig::from_json(&json, "pass-through capture fixture")
+                .expect("the fixture config must validate"),
+        )
+    }
+
+    /// The turn key in its own header, and whatever the client put in
+    /// `Authorization` beside it — the shape both documented stanzas produce.
+    fn both_headers(dedicated: &str, authorization: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            TURN_KEY_HEADER,
+            dedicated.parse().expect("a valid header value"),
+        );
+        headers.insert(
+            AUTHORIZATION,
+            authorization.parse().expect("a valid header value"),
+        );
+        headers
+    }
+
+    /// What this request would forward to `openai` as its `Authorization`, if
+    /// anything.
+    ///
+    /// Read through `access` rather than off a field, because that is the seam
+    /// a provider client reads: a value this returns is a value that would go
+    /// on an upstream request.
+    fn forwarded_authorization(plane: &ControlPlane, headers: &HeaderMap) -> Option<String> {
+        let admission = plane.turn_admission(headers).expect("a known turn key");
+        let access = admission.credentials.access("openai")?;
+        let forwarded = access.credential.forwarded()?;
+        forwarded
+            .headers()
+            .find(|(name, _)| *name == "authorization")
+            .map(|(_, value)| value.to_string())
+    }
+
+    #[test]
+    fn roundhouses_own_secret_is_never_the_credential_that_gets_forwarded() {
+        let plane = pass_through_plane();
+
+        // PROBE: the pair of headers the *documented* BYOK stanza sends. PLAN
+        // §3 puts the same `rh_turn_…` value in `env_key` and in
+        // `env_http_headers`, so a capture gated only on "the turn key arrived
+        // in the dedicated header" takes roundhouse's own turn key off
+        // `Authorization` and forwards it to a frontier provider — on the happy
+        // path, on every turn.
+        for authorization in [
+            format!("Bearer {TURN_SECRET}"),
+            // Bare, because codex copies an environment variable's value into a
+            // header verbatim and a client may do the same into `Authorization`.
+            TURN_SECRET.to_string(),
+            // Lowercase scheme: a client's spelling of `Bearer` must not decide
+            // whether roundhouse's key leaves the process.
+            format!("bearer {TURN_SECRET}"),
+            // And the sharpest one: the deployment's *admin* key, which spends
+            // nothing and administers everything.
+            format!("Bearer {ADMIN_SECRET}"),
+        ] {
+            assert_eq!(
+                forwarded_authorization(&plane, &both_headers(TURN_SECRET, &authorization)),
+                None,
+                "`{authorization}` is roundhouse's own secret and must never reach an upstream"
+            );
+        }
+
+        // And the turn is still served as the membership the key names: the
+        // refusal is about what is forwarded, not about who is admitted. What
+        // the caller loses is the hosted half of its pool, which degrades to
+        // local with a marker — the same shape as a member who attached no key.
+        let admission = plane
+            .turn_admission(&both_headers(
+                TURN_SECRET,
+                &format!("Bearer {ADMIN_SECRET}"),
+            ))
+            .expect("the dedicated header still authenticates the turn key");
+        assert_eq!(admission.principal, Principal::new("acme", "ada"));
+        assert!(!admission.credentials.reaches("openai"));
+
+        // CONTROL, and it is what keeps the rule above from being "forward
+        // nothing": a genuine third-party bearer beside the dedicated header is
+        // exactly the pass-through stanza, and it still forwards.
+        let seat = "Bearer eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJhZGEifQ.a-real-seat-token";
+        assert_eq!(
+            forwarded_authorization(&plane, &both_headers(TURN_SECRET, seat)),
+            Some(seat.to_string()),
         );
     }
 

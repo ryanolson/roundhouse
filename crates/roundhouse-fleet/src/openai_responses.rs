@@ -35,21 +35,27 @@
 //!    deployments behind an ordinary rewriting proxy.
 //! 2. **Forwarded headers come from an explicit per-provider allowlist**
 //!    (`backend.rs:179-211`), enforced here by construction: the client can
-//!    only ask a [`ForwardedCredential`] for its headers, and the only way to
-//!    build one is through the allowlist — see
+//!    only ask a
+//!    [`ForwardedCredential`](roundhouse_core::control::ForwardedCredential) for
+//!    its headers, and the only way to build one is through the allowlist — see
 //!    [`roundhouse_core::control::PresentedCredential::for_provider`].
 //! 3. **An upstream's error body is redacted of any echoed credential**
 //!    (`backend.rs:214-240`) before it is returned, logged, or becomes an event
-//!    payload. A provider that rejects a bearer commonly quotes it back.
+//!    payload. A provider that rejects a bearer commonly quotes it back — and
+//!    it quotes a stored API key back just as readily, which is why the
+//!    redaction is asked of [`TurnCredential`] rather than of the forwarded
+//!    half: a `Route` carries the whole credential, so there is no arm the
+//!    scrub can be reached without.
 //! 4. **Forwarding is mutually exclusive with a stored key** (`config.rs:873-877`).
 //!    Here that is a property of the type — [`TurnCredential`] has one arm, not
 //!    a pair of optional fields — decided at the control plane, not here.
 //!
 //! **What is never logged.** No line in this file renders a credential.
-//! `Secret` and `ForwardedCredential` both redact in `Debug`, which covers the
-//! accidental `?` on a quote; what the two seams named `reveal` and `headers`
+//! `Secret` and the forwarded credential both redact in `Debug`, which covers
+//! the accidental `?` on a quote; what the two seams named `reveal` and `headers`
 //! return is put on a request and nowhere else. Every upstream error body goes
-//! through [`ForwardedCredential::redact`] first.
+//! through [`TurnCredential::redact`] first — every arm of it, the stored key
+//! as well as the forwarded seat.
 
 mod stream;
 
@@ -59,7 +65,7 @@ use futures::stream::BoxStream;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Value, json};
 
-use roundhouse_core::control::{ForwardedCredential, TurnCredential};
+use roundhouse_core::control::TurnCredential;
 use roundhouse_core::routing::Target;
 
 use crate::frontier::{FrontierClient, FrontierError, FrontierQuote, FrontierStream};
@@ -200,7 +206,7 @@ impl OpenAiResponsesClient {
                     client: &self.direct,
                     base: &self.api_base,
                     headers,
-                    forwarded: None,
+                    credential,
                 })
             }
             TurnCredential::Forwarded(forwarded) => {
@@ -227,7 +233,7 @@ impl OpenAiResponsesClient {
                     client: &self.forwarding,
                     base: &self.pass_through_base,
                     headers,
-                    forwarded: Some(forwarded),
+                    credential,
                 })
             }
             // The loud refusal, spelled once in `require_api_key` so this
@@ -245,9 +251,17 @@ struct Route<'a> {
     client: &'a reqwest::Client,
     base: &'a str,
     headers: HeaderMap,
-    /// Present on the pass-through route, and held past the request for one
-    /// job: redacting the credential back out of whatever the upstream says.
-    forwarded: Option<&'a ForwardedCredential>,
+    /// The whole credential, held past the request for one job: redacting it
+    /// back out of whatever the upstream says.
+    ///
+    /// **The whole credential and not the forwarded half.** This field used to
+    /// be an `Option<&ForwardedCredential>`, which is `None` on the stored-key
+    /// route — so the redaction below ran against nothing there, and a provider
+    /// that quoted a deployment's own key back in a 401 body handed it to the
+    /// caller verbatim. Carrying the credential itself makes the redaction path
+    /// unreachable with a credential it does not scrub, because there is no
+    /// arm [`TurnCredential::redact`] does not cover.
+    credential: &'a TurnCredential,
 }
 
 #[async_trait]
@@ -288,35 +302,35 @@ impl FrontierClient for OpenAiResponsesClient {
             let body = response.text().await.unwrap_or_default();
             return Err(FrontierError::Upstream(format!(
                 "the upstream answered {status}: {}",
-                redacted(route.forwarded, body)
+                route.credential.redact(body)
             )));
         }
 
         Ok(decode(
             Box::pin(response.bytes_stream()),
-            route.forwarded.cloned(),
+            route.credential.clone(),
         ))
     }
 }
 
 /// A byte stream from the upstream, as [`FrontierChunk`]s.
 ///
-/// Takes an owned `Option<ForwardedCredential>` rather than a borrow because
-/// the stream outlives this call: it is handed to the engine, which reads it
-/// against a deadline. That is the same clone the redaction needs anyway, and
-/// it is one more live copy of the caller's credential for the length of one
-/// turn — the cost of being able to redact an error that arrives mid-stream.
+/// Takes an owned [`TurnCredential`] rather than a borrow because the stream
+/// outlives this call: it is handed to the engine, which reads it against a
+/// deadline. That is the same clone the redaction needs anyway, and it is one
+/// more live copy of the turn's credential for the length of one turn — the
+/// cost of being able to redact an error that arrives mid-stream.
 fn decode(
     mut bytes: BoxStream<'static, reqwest::Result<bytes::Bytes>>,
-    forwarded: Option<ForwardedCredential>,
+    credential: TurnCredential,
 ) -> FrontierStream {
     let state = (SseDecoder::default(), false);
     futures::stream::unfold(
-        (bytes_state(&mut bytes), state, forwarded),
-        |(mut bytes, (mut decoder, mut stopped), forwarded)| async move {
+        (bytes_state(&mut bytes), state, credential),
+        |(mut bytes, (mut decoder, mut stopped), credential)| async move {
             loop {
                 if let Some(chunk) = decoder.next_chunk() {
-                    return Some((Ok(chunk), (bytes, (decoder, stopped), forwarded)));
+                    return Some((Ok(chunk), (bytes, (decoder, stopped), credential)));
                 }
                 if stopped || decoder.finished() {
                     return None;
@@ -332,8 +346,8 @@ fn decode(
                     // Stop after the error: a decoder that has refused its
                     // input has no business being fed more of it.
                     return Some((
-                        Err(redact_error(forwarded.as_ref(), error)),
-                        (bytes, (decoder, true), forwarded),
+                        Err(redact_error(&credential, error)),
+                        (bytes, (decoder, true), credential),
                     ));
                 }
             }
@@ -355,20 +369,13 @@ fn bytes_state(
 /// The same error with any echoed credential removed.
 ///
 /// Every error leaving this module goes through here or through
-/// [`redacted`]. Only the [`FrontierError::Upstream`] arm can carry an
-/// upstream's words; the others are this client's own sentences and have
-/// nothing to scrub.
-fn redact_error(forwarded: Option<&ForwardedCredential>, error: FrontierError) -> FrontierError {
+/// [`TurnCredential::redact`] directly. Only the [`FrontierError::Upstream`]
+/// arm can carry an upstream's words; the others are this client's own
+/// sentences and have nothing to scrub.
+fn redact_error(credential: &TurnCredential, error: FrontierError) -> FrontierError {
     match error {
-        FrontierError::Upstream(message) => FrontierError::Upstream(redacted(forwarded, message)),
+        FrontierError::Upstream(message) => FrontierError::Upstream(credential.redact(message)),
         other => other,
-    }
-}
-
-fn redacted(forwarded: Option<&ForwardedCredential>, body: String) -> String {
-    match forwarded {
-        Some(forwarded) => forwarded.redact(body),
-        None => body,
     }
 }
 
@@ -484,7 +491,11 @@ mod tests {
             byok.base, "https://api.example.test/v1",
             "trailing slash trimmed"
         );
-        assert!(byok.forwarded.is_none());
+        assert!(
+            matches!(byok.credential, TurnCredential::Stored(_)),
+            "the route carries the whole credential, so the redaction path \
+             cannot be reached with one it does not scrub"
+        );
         assert_eq!(
             byok.headers[reqwest::header::AUTHORIZATION],
             "Bearer sk-proj-ZZZZ"
@@ -507,7 +518,7 @@ mod tests {
         );
         let seat = client.route(&forwarded, "openai").unwrap();
         assert_eq!(seat.base, "https://seat.example.test");
-        assert!(seat.forwarded.is_some());
+        assert!(matches!(seat.credential, TurnCredential::Forwarded(_)));
         assert_eq!(seat.headers[reqwest::header::AUTHORIZATION], bearer);
         assert_eq!(seat.headers["chatgpt-account-id"], "acct-777");
         // The two routes are different `reqwest::Client`s, so a forwarded

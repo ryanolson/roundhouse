@@ -16,13 +16,22 @@
 //! every path that turns a settled turn into a ledger draw goes through
 //! [`BudgetCounts::drawn_usd`].
 //!
+//! The rule is *decided* once, as [`Billing`], where the credential resolves and
+//! before the turn runs — and it is written into the log there, beside
+//! [`Payer`]. Everything downstream reads that recorded answer: the settle, the
+//! repair a successor drives from the log alone, and the metrics fold behind the
+//! dashboard. Two of those three used to answer the question for themselves —
+//! the settle from the live admission and the dashboard not at all — and an
+//! operator editing one line of the control plane was enough to make the ledger
+//! and the dashboard report different money for the same turn.
+//!
 //! This is the same discipline `spend.rs` states for `NaN`: the failure mode
 //! worth engineering against is not a missing number, it is a *confident wrong*
 //! one.
 
 use serde::{Deserialize, Serialize};
 
-use super::credential::TurnCredential;
+use super::credential::TurnCredentials;
 
 /// Whose money a turn's dispatch spends.
 ///
@@ -117,18 +126,97 @@ pub enum SettledSpend {
     AccountedNotBilled,
 }
 
-impl SettledSpend {
-    /// What may be claimed for a turn that the rate card prices at `usd`.
+/// Whether roundhouse may put a price on a turn at all.
+///
+/// [`SettledSpend`] without the number, which is exactly the half that is
+/// knowable *before* the turn runs — and therefore the half that belongs in the
+/// log. Recorded on the
+/// [`DecisionRecord`](crate::routing::DecisionRecord) beside [`Payer`], for the
+/// same reason: a fact decided where the credential resolves and read again at
+/// settle time has to travel in the log, or the process that ran the turn, the
+/// successor that repairs it and the dashboard that reports it can reach three
+/// different answers.
+///
+/// One decision with one spelling. `SettledSpend::of(credential, usd)` used to
+/// be a second, and the engine's settle a third, asked of the *live* admission
+/// rather than of the turn: a project switched between a stored key and
+/// pass-through re-priced every turn a successor repaired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Billing {
+    /// A rate card roundhouse holds applied, so the catalog's price is a bill.
     ///
-    /// The credential decides, because the credential is what says whose rate
-    /// card applied. A forwarded seat has none — the catalog's per-token price
-    /// describes what *roundhouse* would have paid on its own key, which is a
-    /// counterfactual and not a bill.
-    pub fn of(credential: &TurnCredential, usd: f64) -> Self {
-        match credential.is_forwarded() {
-            true => SettledSpend::AccountedNotBilled,
-            false => SettledSpend::Billed { usd },
+    /// The default, and the correct reading of a log written before this field
+    /// existed rather than a placeholder: pass-through did not exist then, so
+    /// every one of those turns really was billable. Same treatment, and same
+    /// reason, as [`Payer::Deployment`].
+    #[default]
+    Billed,
+    /// Tokens roundhouse measured under a seat it holds no rate card for.
+    ///
+    /// A pass-through turn. The tokens are real and are counted; the dollars
+    /// are a subscription's and are not roundhouse's to name.
+    AccountedNotBilled,
+}
+
+impl Billing {
+    /// The rule, applied where the credential resolves.
+    ///
+    /// **The admission's mode decides, not the one dispatch's credential**, and
+    /// the difference shows on a locally-served turn of a pass-through project.
+    /// That turn touches no credential at all — [`TurnCredential::Absent`] —
+    /// but the hosted call it displaced would have been billed to the caller's
+    /// seat, so crediting this deployment with having saved that money is the
+    /// same invented number in the other direction. One question, asked of the
+    /// project: *is any of this roundhouse's money?*
+    ///
+    /// [`TurnCredentials::is_forwarding`] is the whole of it, and it is
+    /// deliberately true whether or not a credential was presented: a turn under
+    /// a pass-through project is a pass-through turn even when it degraded to
+    /// local for want of one.
+    pub fn of(credentials: &TurnCredentials) -> Self {
+        match credentials.is_forwarding() {
+            true => Billing::AccountedNotBilled,
+            false => Billing::Billed,
         }
+    }
+
+    /// What a turn the rate card prices at `usd` may be settled for.
+    ///
+    /// The one place a recorded [`Billing`] becomes a [`SettledSpend`], so the
+    /// two types cannot come to disagree about which arm a turn is in.
+    pub fn settled(self, usd: f64) -> SettledSpend {
+        match self {
+            Billing::Billed => SettledSpend::Billed { usd },
+            Billing::AccountedNotBilled => SettledSpend::AccountedNotBilled,
+        }
+    }
+
+    /// Whether this turn's money is roundhouse's to name.
+    ///
+    /// One predicate for the two questions that turn on it, because they are
+    /// one question: what a ledger may draw, and what a *saving* may be claimed
+    /// against. A counterfactual is only a saving if the money it stands in for
+    /// would have been ours.
+    ///
+    /// **It is also the boot-knowable half of "is this budget inert?".** A
+    /// project that forwards its callers' seats bills nothing for its turns, so
+    /// a dollar budget over them never commits: it can neither exhaust nor
+    /// warn, and every figure it produces stays zero however much traffic the
+    /// project serves. What such a budget still does is bound each turn
+    /// *individually* — the grant is opened before the choice and a candidate
+    /// dearer than the ceiling is inadmissible — so the setting is not ignored,
+    /// it is a per-turn price cap that never accumulates. An operator who wrote
+    /// "$200 a month" wrote something else.
+    ///
+    /// That is not the *whole* of the question, which is why it is a predicate
+    /// here rather than a boot refusal: a project enrolled in the validate loop
+    /// pays for its judge on the deployment's own transport — `TurnCredential::Absent`,
+    /// never a forwarded seat — and that spend does commit against the same
+    /// budget. So a pass-through project **with** a `validate` block has a live
+    /// ceiling, and only one without is provably inert.
+    pub fn is_billable(self) -> bool {
+        matches!(self, Billing::Billed)
     }
 }
 
@@ -250,32 +338,99 @@ mod tests {
             );
         }
 
-        // Which arm applies is the credential's answer and nobody else's.
-        let stored = TurnCredential::Stored(Secret::api_key("sk-live-AAAA").unwrap());
+        // Which arm applies is the admission's answer and nobody else's, and it
+        // is decided once — before the turn runs — as a `Billing`.
+        let stored = TurnCredentials::configured(
+            crate::control::CredentialMode::PreferUser,
+            [(
+                "openai".to_string(),
+                Secret::api_key("sk-live-AAAA").unwrap(),
+            )]
+            .into_iter()
+            .collect(),
+            Default::default(),
+            Default::default(),
+        )
+        .expect("an ordinary stored key");
+        assert_eq!(Billing::of(&stored), Billing::Billed);
         assert_eq!(
-            SettledSpend::of(&stored, 4.0),
+            Billing::of(&stored).settled(4.0),
             SettledSpend::Billed { usd: 4.0 }
         );
-        let forwarded = TurnCredential::Forwarded(
-            crate::control::PresentedCredential::captured(|name| match name {
-                "authorization" => Some("Bearer eyJhbGciOiJub25lIn0.e30.seat".to_string()),
-                _ => None,
-            })
-            .expect("a bearer was presented")
-            .for_provider("openai")
-            .expect("openai has an allowlist row"),
-        );
+
+        let forwarding =
+            TurnCredentials::forwarding(crate::control::PresentedCredential::captured(|name| {
+                match name {
+                    "authorization" => Some("Bearer eyJhbGciOiJub25lIn0.e30.seat".to_string()),
+                    _ => None,
+                }
+            }));
         assert_eq!(
-            SettledSpend::of(&forwarded, 4.0),
+            Billing::of(&forwarding).settled(4.0),
             SettledSpend::AccountedNotBilled,
             "the catalog price of a forwarded turn is a counterfactual, not a bill"
         );
-        // The control that keeps the rule about *forwarding* rather than about
-        // absence: a turn with no credential resolved is still a billed shape,
-        // and it fails loudly at the client instead of quietly here.
+        // And the same project on a turn where no seat arrived at all: still
+        // pass-through, still unpriceable. The alternative reading -- deciding
+        // per dispatch, off `TurnCredential::is_forwarded` -- would price the
+        // local turn that degrade produces as if this deployment had chosen to
+        // save the seat's money.
         assert_eq!(
-            SettledSpend::of(&TurnCredential::Absent, 4.0),
+            Billing::of(&TurnCredentials::forwarding(None)),
+            Billing::AccountedNotBilled
+        );
+
+        // The control that keeps the rule about *forwarding* rather than about
+        // absence: an ungated deployment resolves no credential either, and its
+        // turns are billed exactly as they were before M7.
+        assert_eq!(
+            Billing::of(&TurnCredentials::unrestricted()).settled(4.0),
             SettledSpend::Billed { usd: 4.0 }
+        );
+    }
+
+    /// What a dollar budget over pass-through traffic can and cannot do.
+    ///
+    /// The combination is accepted by the configuration boundary and reads like
+    /// a monthly ceiling. It is not one: nothing a pass-through turn settles
+    /// ever commits, so the ledger's total stays at zero and the exhaustion arm
+    /// an operator chose is unreachable. Pinned here rather than left as prose,
+    /// because "this setting quietly means something else" is the shape of
+    /// finding worth a test.
+    #[tokio::test]
+    async fn a_dollar_budget_over_forwarded_traffic_can_never_commit() {
+        let seat = TurnCredentials::forwarding(None);
+        assert!(
+            !Billing::of(&seat).is_billable(),
+            "a project whose turns are all seat-forwarded has an inert ceiling"
+        );
+
+        // The ledger says the same thing, over as many turns as anyone cares to
+        // serve: `AccountedNotBilled` draws nothing under either `BudgetCounts`,
+        // so the committed total a warn threshold and an exhaustion arm both
+        // read never moves.
+        for counts in [
+            BudgetCounts::AllFrontierSpend,
+            BudgetCounts::ProjectPaidOnly,
+        ] {
+            assert_eq!(
+                committed_after_a_user_paid_turn(counts, Billing::of(&seat).settled(4.0)).await,
+                0.0
+            );
+        }
+
+        // CONTROL: the same budget on a project that bills is a real ceiling.
+        assert!(
+            Billing::of(&TurnCredentials::unrestricted()).is_billable(),
+            "the check must be about the mode, not about budgets generally"
+        );
+        assert_eq!(
+            committed_after_a_user_paid_turn(
+                BudgetCounts::AllFrontierSpend,
+                Billing::of(&TurnCredentials::unrestricted()).settled(4.0)
+            )
+            .await,
+            4.0
         );
     }
 }

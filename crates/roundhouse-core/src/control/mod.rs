@@ -68,7 +68,7 @@ pub use credential::{
     OauthEvidence, PresentedCredential, ProviderAccess, Reachable, Secret, TurnCredential,
     TurnCredentials,
 };
-pub use payer::{BudgetCounts, Payer, SettledSpend};
+pub use payer::{Billing, BudgetCounts, Payer, SettledSpend};
 pub use policy::{
     FilterError, FrontierCadence, FrontierHistory, PolicyOverrides, TargetFilter, TurnPolicy,
 };

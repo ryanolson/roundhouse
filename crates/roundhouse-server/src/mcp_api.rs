@@ -189,18 +189,51 @@ impl<S: SessionStore> ControlReads for ControlPlaneReads<S> {
 
     async fn admissible_targets(
         &self,
-        _principal: &Principal,
+        principal: &Principal,
         policy: &TurnPolicy,
     ) -> Result<Vec<Target>, SurfaceError> {
+        // **Two predicates, because the engine applies two.** The policy says
+        // what this key may be routed to and the credential says what it can
+        // authenticate to, and a turn needs both. Asking only the first — which
+        // is what this read did before M7's credential filter existed
+        // downstream — makes `status` name a hosted target to a member who
+        // holds no key for it, and lets `prefer`'s guard wave a narrowing onto
+        // that provider through to a turn the router then withholds it from.
+        // Two answers to one question, and the disagreement is invisible from
+        // either side.
+        let credentials = self.membership(principal)?.credentials;
+
         // `permits` and deliberately not `admits`: this asks what a turn of this
         // key's could *ever* be routed to, and a cadence-rationed model is one
         // it reaches on some turns. The same distinction the startup
         // cross-check draws, asked through the same predicate.
-        Ok(self
+        let permitted: Vec<Candidate> = self
             .reachable
             .iter()
             .filter(|candidate| policy.permits(candidate))
-            .map(|candidate| candidate.target.clone())
+            .cloned()
+            .collect();
+
+        // **A forwarding project is answered optimistically, and that is not
+        // the same laxity the filter above refuses.** A member under
+        // `user_only` who has attached nothing is unreachable as a fact about
+        // the *file*: no request will supply the key, so naming the provider is
+        // a promise every turn breaks. A pass-through project's credential is a
+        // fact about one *request*, and an MCP call is not that request — the
+        // configured resolution has presented nothing yet, so asking `reaches`
+        // here would tell every forwarding agent it can reach nothing hosted on
+        // a deployment where each of its turns can. The boot check exempts
+        // forwarding for exactly this reason; see `main::unkeepable_promises`.
+        // A turn that then arrives with no seat degrades to local with
+        // `withheld_providers` naming the provider, which is where that answer
+        // is corrected.
+        let reached = match credentials.is_forwarding() {
+            true => permitted,
+            false => credentials.reachable(permitted).candidates,
+        };
+        Ok(reached
+            .into_iter()
+            .map(|candidate| candidate.target)
             .collect())
     }
 

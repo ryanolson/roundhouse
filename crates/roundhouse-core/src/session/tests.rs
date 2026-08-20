@@ -61,6 +61,7 @@ fn decision_for(target: Target, isl: u64) -> DecisionRecord {
         turn_policy_digest: String::new(),
         budget_state: Default::default(),
         payer: Default::default(),
+        billing: Default::default(),
         withheld_providers: Vec::new(),
     }
 }

@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::control::{FrontierHistory, Payer, Principal};
+use crate::control::{Billing, FrontierHistory, Payer, Principal};
 use crate::event::{
     ControlRecord, IncompleteReason, NotRunReason, PlaceboTiming, SessionEvent, SessionEventKind,
     SessionObserver, Usage, ValidationOutcome,
@@ -87,6 +87,11 @@ struct PendingRouting {
     /// reason the card is: what a turn draws depends on it, and a repair
     /// driven from the log alone has to reach the same answer.
     payer: Payer,
+    /// Whether the decision said this turn was roundhouse's money to price.
+    /// Held for the same reason as the two above, and see
+    /// [`DecisionRecord::billing`] for what asking the live configuration
+    /// instead used to cost.
+    billing: Billing,
 }
 
 /// A response that terminated, and everything needed to charge it for.
@@ -142,6 +147,20 @@ pub struct TerminalSettlement {
     /// credential, and a settle prices it at zero on the target rather than on
     /// this field.
     pub payer: Payer,
+    /// Whether roundhouse may name this turn's price, as the decision recorded
+    /// it.
+    ///
+    /// **The half of the settle that used to be read from the running
+    /// process's configuration**, and the one exception this projection made to
+    /// its own rule. It is closed: a project switched between a stored key and
+    /// pass-through no longer re-prices the turns a successor repairs, and the
+    /// dashboard reading the same log reaches the same answer by construction
+    /// rather than by both being written correctly.
+    ///
+    /// [`Billing::Billed`] for a response that recorded no decision — the same
+    /// reading as [`Self::payer`], and equally harmless, since such a turn is
+    /// priced at zero on its absent target.
+    pub billing: Billing,
     /// What the terminal event reported, estimate or measurement alike. An
     /// estimate is what a provider that reported nothing gets charged on, and
     /// it is charged exactly as a measurement would be.
@@ -417,6 +436,7 @@ impl SessionState {
                         isl_tokens: decision.isl_tokens,
                         rate_card: decision.rate_card,
                         payer: decision.payer,
+                        billing: decision.billing,
                     },
                 );
             }
@@ -458,6 +478,10 @@ impl SessionState {
                     payer: routing
                         .as_ref()
                         .map(|routing| routing.payer)
+                        .unwrap_or_default(),
+                    billing: routing
+                        .as_ref()
+                        .map(|routing| routing.billing)
                         .unwrap_or_default(),
                     target: routing.map(|routing| routing.target),
                     usage: usage.clone(),

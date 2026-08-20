@@ -27,7 +27,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 
-use crate::control::PrincipalKey;
+use crate::control::{Billing, PrincipalKey};
 use crate::event::{
     Accounting, NotRunReason, PlaceboTiming, SessionEvent, SessionEventKind, Usage,
     ValidationOutcome,
@@ -37,6 +37,46 @@ use crate::metrics::pricing::TokenShape;
 use crate::metrics::{ModelKey, ServingMode};
 use crate::routing::DecisionRecord;
 use crate::validate::Arm;
+
+/// Tokens for one grouping, split by whether the provider counted them.
+///
+/// Kept apart rather than summed, and this is the whole point: pricing is
+/// linear in tokens, so two accumulators can be priced independently at no
+/// cost, while one accumulator makes the split unrecoverable the instant the
+/// first estimated call lands. Merging first and reporting a call-weighted
+/// coverage ratio afterwards does not substitute — a 50%-of-calls ratio is
+/// consistent with 95% or 5% of the dollars being measured, because calls
+/// differ in size by orders of magnitude.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(super) struct Counted {
+    /// Tokens the provider itself counted.
+    pub(super) reported: Usage,
+    /// Tokens Roundhouse counted because the provider did not.
+    pub(super) estimated: Usage,
+}
+
+impl Counted {
+    /// Book one settled call's usage under its own provenance.
+    fn add(&mut self, usage: &Usage) {
+        match usage.accounting {
+            Accounting::Reported => self.reported.add(usage),
+            Accounting::Estimated => self.estimated.add(usage),
+        }
+    }
+
+    fn absorb(&mut self, other: &Counted) {
+        self.reported.add(&other.reported);
+        self.estimated.add(&other.estimated);
+    }
+
+    /// Both provenances together, for the figures that are about volume rather
+    /// than confidence.
+    pub(super) fn total(&self) -> Usage {
+        let mut total = self.reported.clone();
+        total.add(&self.estimated);
+        total
+    }
+}
 
 /// Raw counters for one [`ModelKey`], before any rate card is applied.
 ///
@@ -48,22 +88,40 @@ use crate::validate::Arm;
 pub(super) struct Counters {
     pub(super) calls: u64,
     /// Calls whose usage the provider never reported. See [`Accounting`].
-    pub(super) estimated_calls: u64,
-    /// Tokens the provider itself counted.
-    pub(super) reported_usage: Usage,
-    /// Tokens Roundhouse counted because the provider did not.
     ///
-    /// Kept apart from `reported_usage` rather than summed into it, and this is
-    /// the whole point: pricing is linear in tokens, so two accumulators can be
-    /// priced independently at no cost, while one accumulator makes the split
-    /// unrecoverable the instant the first estimated call lands. Merging first
-    /// and reporting a call-weighted coverage ratio afterwards does not
-    /// substitute — a 50%-of-calls ratio is consistent with 95% or 5% of the
-    /// dollars being measured, because calls differ in size by orders of
-    /// magnitude.
-    pub(super) estimated_usage: Usage,
+    /// Across both pots below: coverage is a question about the *provider's*
+    /// accounting, which is orthogonal to whose money paid for it.
+    pub(super) estimated_calls: u64,
+    /// Tokens roundhouse may put its rate card against.
+    pub(super) billed: Counted,
+    /// Tokens measured under a subscription seat, which have no price.
+    ///
+    /// **Separate from [`Self::billed`] rather than distinguished at read
+    /// time**, because the two are added into the same row and the row is what
+    /// the dashboard prices: a deployment serving one BYOK project and one
+    /// pass-through project on the same model has one row for both, and a
+    /// single pot would make the seat's tokens indistinguishable from the ones
+    /// a rate card applies to. Priced, they become a bill nobody issued — see
+    /// [`SettledSpend`](crate::control::SettledSpend), whose rule the ledger has
+    /// kept since M3 and this projection had not.
+    ///
+    /// A *local* dispatch of a pass-through project lands here too, and that is
+    /// deliberate rather than incidental: it bills nothing either way, but what
+    /// it displaced was a hosted call the caller's seat would have paid for, so
+    /// shadow-pricing it into routing savings credits this deployment with
+    /// money it was never going to spend. See
+    /// [`Billing::of`](crate::control::Billing::of).
+    pub(super) seat: Counted,
     /// Summed over locally-served turns: the cheapest frontier option the
     /// router had quoted at the moment it chose local.
+    ///
+    /// Only over turns whose decision recorded [`Billing::Billed`]. The figure
+    /// is a *saving*, and a saving is money this deployment would otherwise
+    /// have spent; the hosted option a pass-through session passed over would
+    /// have been billed to the caller's seat, so counting it here credits
+    /// roundhouse with somebody else's economy.
+    ///
+    /// [`Billing::Billed`]: crate::control::Billing::Billed
     pub(super) quoted_alternative_usd: f64,
     /// How many of [`Self::calls`] this deployment made for its own purposes.
     ///
@@ -87,11 +145,29 @@ pub(super) struct Counters {
 }
 
 impl Counters {
-    /// Both provenances together, for the figures that are about volume rather
-    /// than confidence.
+    /// Every token this row measured, whoever paid for it.
+    ///
+    /// The volume answer, and it stays whole: a seat's tokens are as real as a
+    /// keyed turn's, so they belong in the token breakdown, in coverage, and in
+    /// the traffic shape a correlary is inferred from. It is only the *dollars*
+    /// that have to know the difference.
     pub(super) fn total_usage(&self) -> Usage {
-        let mut total = self.reported_usage.clone();
-        total.add(&self.estimated_usage);
+        let mut total = self.billed.total();
+        total.add(&self.seat.total());
+        total
+    }
+
+    /// Tokens the provider counted, across both pots.
+    pub(super) fn reported_usage(&self) -> Usage {
+        let mut total = self.billed.reported.clone();
+        total.add(&self.seat.reported);
+        total
+    }
+
+    /// Tokens Roundhouse counted in a silent provider's place, across both.
+    pub(super) fn estimated_usage(&self) -> Usage {
+        let mut total = self.billed.estimated.clone();
+        total.add(&self.seat.estimated);
         total
     }
 
@@ -105,8 +181,8 @@ impl Counters {
     pub(super) fn absorb(&mut self, other: &Counters) {
         self.calls += other.calls;
         self.estimated_calls += other.estimated_calls;
-        self.reported_usage.add(&other.reported_usage);
-        self.estimated_usage.add(&other.estimated_usage);
+        self.billed.absorb(&other.billed);
+        self.seat.absorb(&other.seat);
         self.quoted_alternative_usd += other.quoted_alternative_usd;
         self.side_calls += other.side_calls;
         self.abandoned_side_calls += other.abandoned_side_calls;
@@ -162,6 +238,15 @@ struct Pending {
     /// `None` when the chosen target was itself a frontier model, or when no
     /// frontier was quoted at all.
     best_frontier_alternative_usd: Option<f64>,
+    /// Whether roundhouse may price what this dispatch consumes, as the
+    /// decision recorded it.
+    ///
+    /// Read off the `Routed` event and carried to the terminal event, because
+    /// that is where tokens arrive and the two events are the two halves of one
+    /// turn. Read from anywhere else it would be a second answer to a question
+    /// the log has already answered — the same argument the rate card travels
+    /// in the log under.
+    billing: Billing,
 }
 
 /// Whose numbers a report is about.
@@ -384,6 +469,7 @@ impl MetricsFold {
                     Pending {
                         key: ModelKey::from_target(&decision.chosen),
                         best_frontier_alternative_usd: best_frontier_alternative(decision),
+                        billing: decision.billing,
                     },
                 );
             }
@@ -419,6 +505,7 @@ impl MetricsFold {
                         .or_default(),
                     usage,
                     pending.best_frontier_alternative_usd,
+                    pending.billing,
                 );
             }
             // Money this deployment spent on its own behalf, booked under the
@@ -434,7 +521,13 @@ impl MetricsFold {
                     .or_default()
                     .entry(ModelKey::from_target(target))
                     .or_default();
-                settle(counters, usage, None);
+                // Booked as billed, whatever the checked project's credential
+                // mode is, and that is a claim about the judge rather than a
+                // default: a side call authenticates on this deployment's own
+                // transport with `TurnCredential::Absent` — it never forwards a
+                // caller's seat — so the money is roundhouse's and the rate card
+                // is the right one to price it with.
+                settle(counters, usage, None, Billing::Billed);
                 counters.side_calls += 1;
             }
             // Marked, not booked. What it billed upstream is the one thing this
@@ -641,16 +734,26 @@ impl MetricsFold {
 /// booking a call means, and keeping it named and in one piece is what makes
 /// [`Counters::absorb`] — the merge that has to stay in step with it — obviously
 /// its counterpart rather than a second, unrelated list of fields.
-fn settle(counters: &mut Counters, usage: &Usage, best_frontier_alternative_usd: Option<f64>) {
+fn settle(
+    counters: &mut Counters,
+    usage: &Usage,
+    best_frontier_alternative_usd: Option<f64>,
+    billing: Billing,
+) {
     counters.calls += 1;
-    match usage.accounting {
-        Accounting::Reported => counters.reported_usage.add(usage),
-        Accounting::Estimated => {
-            counters.estimated_calls += 1;
-            counters.estimated_usage.add(usage);
-        }
+    if usage.accounting == Accounting::Estimated {
+        counters.estimated_calls += 1;
     }
-    if let Some(alternative) = best_frontier_alternative_usd {
+    // The one branch that decides which pot a call's tokens land in, so the
+    // billed/accounted rule is applied here and nowhere else in this module.
+    match billing {
+        Billing::Billed => counters.billed.add(usage),
+        Billing::AccountedNotBilled => counters.seat.add(usage),
+    }
+    // A counterfactual is a saving only if the money it stands in for would
+    // have been ours — the same predicate the pot above turns on, asked of the
+    // road not taken.
+    if let Some(alternative) = best_frontier_alternative_usd.filter(|_| billing.is_billable()) {
         counters.quoted_alternative_usd += alternative;
     }
 }
@@ -765,6 +868,39 @@ pub(super) mod tests {
             considered: Vec<Candidate>,
             usage: Usage,
         ) -> &mut Self {
+            self.turn_billed(Billing::Billed, response, target, considered, usage)
+        }
+
+        /// The same turn, on a project that forwards its caller's seat.
+        ///
+        /// A separate method rather than a parameter on `turn`, so every
+        /// fixture that predates pass-through keeps saying what it said: those
+        /// logs are billed logs, and a defaulted argument would make that a
+        /// coincidence rather than a statement.
+        pub(crate) fn seat_turn(
+            &mut self,
+            response: &str,
+            target: Target,
+            considered: Vec<Candidate>,
+            usage: Usage,
+        ) -> &mut Self {
+            self.turn_billed(
+                Billing::AccountedNotBilled,
+                response,
+                target,
+                considered,
+                usage,
+            )
+        }
+
+        fn turn_billed(
+            &mut self,
+            billing: Billing,
+            response: &str,
+            target: Target,
+            considered: Vec<Candidate>,
+            usage: Usage,
+        ) -> &mut Self {
             let response_id = ResponseId::new(response);
             self.push(SessionEventKind::TurnStarted {
                 turn_id: TurnId::new(format!("turn-{response}")),
@@ -784,6 +920,7 @@ pub(super) mod tests {
                     budget_state: Default::default(),
                     rate_card: None,
                     payer: Default::default(),
+                    billing,
                     withheld_providers: Vec::new(),
                 },
             });
@@ -981,7 +1118,8 @@ pub(super) mod tests {
             .get(&PrincipalKey::from(&principal("acme", "ada")))
             .expect("the attributed session has a row");
         assert_eq!(
-            acme[&key].reported_usage.input_tokens, 1_000,
+            acme[&key].reported_usage().input_tokens,
+            1_000,
             "a project is charged for its own turns and no others"
         );
 
@@ -989,13 +1127,13 @@ pub(super) mod tests {
             .by_principal
             .get(&PrincipalKey::Unattributed)
             .expect("pre-control-plane usage is marked, not dropped");
-        assert_eq!(unattributed[&key].reported_usage.input_tokens, 7_000);
+        assert_eq!(unattributed[&key].reported_usage().input_tokens, 7_000);
 
         // The deployment total still sees both: marked is not the same as
         // excluded. This is `Counters::absorb` merging two principals' rows for
         // one model, which is the only way a deployment row is ever produced.
         assert_eq!(
-            fold.deployment_rows()[&key].reported_usage.input_tokens,
+            fold.deployment_rows()[&key].reported_usage().input_tokens,
             8_000
         );
         assert_eq!(
@@ -1050,16 +1188,17 @@ pub(super) mod tests {
         let merged = &fold.deployment_rows()[&key];
         assert_eq!(merged.calls, 2);
         assert_eq!(merged.estimated_calls, 1, "one of the two was unreported");
-        assert_eq!(merged.reported_usage.input_tokens, 10_000);
-        assert_eq!(merged.reported_usage.cached_input_tokens, 8_000);
-        assert_eq!(merged.reported_usage.output_tokens, 500);
-        assert_eq!(merged.reported_usage.reasoning_tokens, 40);
+        assert_eq!(merged.reported_usage().input_tokens, 10_000);
+        assert_eq!(merged.reported_usage().cached_input_tokens, 8_000);
+        assert_eq!(merged.reported_usage().output_tokens, 500);
+        assert_eq!(merged.reported_usage().reasoning_tokens, 40);
         assert_eq!(
-            merged.estimated_usage.input_tokens, 3_000,
+            merged.estimated_usage().input_tokens,
+            3_000,
             "the provenance split has to survive the merge, or a deployment \
              reports as measured what a tenant reports as estimated"
         );
-        assert_eq!(merged.estimated_usage.output_tokens, 200);
+        assert_eq!(merged.estimated_usage().output_tokens, 200);
         assert!((merged.quoted_alternative_usd - 0.05).abs() < 1e-12);
         assert_eq!(
             (merged.side_calls, merged.abandoned_side_calls),
@@ -1107,7 +1246,7 @@ pub(super) mod tests {
         let judge = &rows[&claude()];
         assert_eq!(judge.calls, 1, "the judge's call is a call");
         assert_eq!(judge.side_calls, 1, "and it is one of ours");
-        assert_eq!(judge.reported_usage.input_tokens, 4_000);
+        assert_eq!(judge.reported_usage().input_tokens, 4_000);
         let worker = &rows[&ModelKey {
             mode: ServingMode::Local,
             provider: crate::metrics::LOCAL_PROVIDER.into(),

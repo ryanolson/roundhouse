@@ -40,13 +40,14 @@ use roundhouse_core::context::ByteTokenizer;
 use roundhouse_core::control::{MemorySpendLedger, Payer, SpendLedger};
 use roundhouse_core::event::{SessionEvent, SessionEventKind};
 use roundhouse_core::ids::SessionId;
-use roundhouse_core::metrics::{MetricsConfig, ShadowPricing};
+use roundhouse_core::metrics::MetricsConfig;
 use roundhouse_core::routing::policy::Weights;
 use roundhouse_core::routing::{AffinityPolicy, CacheModel, DecisionRecord, ProviderPricing};
 use roundhouse_core::store::{MemoryStore, SessionStore};
 use roundhouse_fleet::{
     EchoFrontierClient, FrontierModelSpec, StaticFrontierCatalog, WireProtocol,
 };
+use roundhouse_mcp::{ControlStore, ModeNarrowing, PreferMode, TimedOverlay};
 use roundhouse_server::{
     ControlPlane, ControlPlaneConfig, Conversations, EchoLocalExecutor, Engine, EngineConfig, http,
     metrics_api, responses_api,
@@ -137,6 +138,12 @@ fn key(tag: &str) -> String {
     format!("rh_turn_{tag:A<43}")
 }
 
+/// This deployment's admin key — a real secret of roundhouse's own, and the
+/// one a client is most likely to be holding beside a turn key.
+fn admin_key() -> String {
+    format!("rh_admin_{:A<43}", "ADMIN")
+}
+
 fn sha256_hex(secret: &str) -> String {
     hex::encode(Sha256::digest(secret.as_bytes()))
 }
@@ -170,8 +177,12 @@ fn control_plane_json() -> String {
                 "budget": budget(),
                 "credentials": { "mode": "prefer_user", "budget_counts": "project_paid_only" }
             },
-            // Forwards the caller's own credential and stores nothing.
-            { "id": "seat", "credentials": { "mode": "pass_through" } },
+            // Forwards the caller's own credential and stores nothing. It
+            // carries a budget like every other metered project here, which is
+            // a claim in its own right: what a dollar ceiling does over traffic
+            // roundhouse is never billed for is a question an operator can
+            // write and this suite therefore has to answer.
+            { "id": "seat", "budget": budget(), "credentials": { "mode": "pass_through" } },
         ],
         "users": [{ "id": "ada" }, { "id": "bob" }],
         "keys": [
@@ -185,6 +196,36 @@ fn control_plane_json() -> String {
                 "credentials": { "providers": { "openai": { "env_var": USER_VAR } } }
             },
             { "project": "seat", "user": "bob", "key_sha256": sha256_hex(&key("seat")) },
+        ],
+        // Declared so a client can present one, which is the point: an admin
+        // key is a secret of roundhouse's own, and the capture must refuse it
+        // for the same reason it refuses a turn key.
+        "admin_keys": [sha256_hex(&admin_key())],
+    })
+    .to_string()
+}
+
+/// The same two projects with their credential modes exchanged.
+///
+/// What a successor process boots with after an operator has edited the file —
+/// an ordinary edit, and the only arrangement in which the live configuration
+/// and the log disagree about whether a turn was billable. Same key digests and
+/// same ids, so the sessions the first process wrote resolve to the same
+/// memberships here.
+fn swapped_plane_json() -> String {
+    serde_json::json!({
+        "credentials": { "providers": { "openai": { "env_var": DEPLOYMENT_VAR } } },
+        "projects": [
+            { "id": "byok", "budget": budget(), "credentials": { "mode": "pass_through" } },
+            { "id": "seat", "budget": budget(), "credentials": { "mode": "prefer_user" } },
+        ],
+        "users": [{ "id": "ada" }, { "id": "bob" }],
+        "keys": [
+            { "project": "byok", "user": "ada", "key_sha256": sha256_hex(&key("byok")) },
+            {
+                "project": "seat", "user": "bob", "key_sha256": sha256_hex(&key("seat")),
+                "credentials": { "providers": { "openai": { "env_var": USER_VAR } } }
+            },
         ],
     })
     .to_string()
@@ -211,12 +252,29 @@ struct Rig {
     store: Arc<MemoryStore>,
     ledger: Arc<MemorySpendLedger>,
     engine: Arc<Engine<MemoryStore, ByteTokenizer>>,
+    /// The node-local store an agent's overlay lands in, shared with the engine
+    /// exactly as the composition root shares it. Written directly here rather
+    /// than through the MCP surface: what this suite has claims about is what a
+    /// *narrowing* does to the credential filter, and the tool call that
+    /// installs one is the subject of its own suite.
+    control: Arc<ControlStore>,
 }
 
 async fn rig(plane: Arc<ControlPlane>) -> Rig {
+    rig_over(plane, None).await
+}
+
+/// The same deployment, optionally over a log some other process wrote.
+///
+/// A successor: same sessions, fresh ledger, and a control plane an operator
+/// may have edited in between. That is the one arrangement in which the engine
+/// settles a turn it did not run, so it is the only place a settle that reads
+/// the *live* configuration can be told apart from one that reads the log.
+async fn rig_over(plane: Arc<ControlPlane>, over: Option<Arc<MemoryStore>>) -> Rig {
     ensure_rustls_crypto_provider();
-    let store = Arc::new(MemoryStore::new());
+    let store = over.unwrap_or_else(|| Arc::new(MemoryStore::new()));
     let ledger = Arc::new(MemorySpendLedger::new());
+    let control = Arc::new(ControlStore::new());
     let engine = Arc::new(
         Engine::new(
             Arc::clone(&store),
@@ -241,9 +299,15 @@ async fn rig(plane: Arc<ControlPlane>) -> Rig {
             },
         )
         .with_spend_ledger(Arc::clone(&ledger) as Arc<dyn SpendLedger>)
+        .with_control_store(Arc::clone(&control))
         .with_fleet(embedded_fleet().await),
     );
-    let metrics_config = Arc::new(MetricsConfig::new(ShadowPricing::new(Vec::new())));
+    // Priced off the same catalog the engine routes against, and that is
+    // load-bearing rather than tidy: with an empty rate card every hosted row
+    // costs zero dollars, so a dashboard that invented a bill for a seat turn
+    // and one that refused to would look identical here. The catalog's card is
+    // what makes "this turn was priced" an observable claim.
+    let metrics_config = Arc::new(MetricsConfig::new(catalog().shadow_pricing()));
     let app = http::router(Arc::clone(&plane), Arc::clone(&engine), Arc::clone(&store))
         .merge(metrics_api::metrics_router(
             Arc::clone(&plane),
@@ -261,6 +325,7 @@ async fn rig(plane: Arc<ControlPlane>) -> Rig {
         store,
         ledger,
         engine,
+        control,
     }
 }
 
@@ -272,10 +337,18 @@ async fn rig(plane: Arc<ControlPlane>) -> Rig {
 #[derive(Clone, Copy)]
 enum Present {
     /// The BYOK stanza: `Authorization: Bearer rh_turn_…`.
-    InAuthorization,
+    AuthorizationOnly,
     /// The pass-through stanza: the turn key in `X-Roundhouse-Key`, and
     /// `Authorization` carrying the caller's own ChatGPT bearer.
-    InRoundhouseHeaderWithASeat,
+    DedicatedHeaderWithASeat,
+    /// The BYOK stanza **as PLAN §3 writes it**: one `rh_turn_…` value, sent in
+    /// `env_key` and in `env_http_headers` both, so the dedicated header and
+    /// `Authorization` carry the same roundhouse secret.
+    BothHeaders,
+    /// The dedicated header beside an `Authorization` carrying this
+    /// deployment's *admin* key — the sharpest thing a client could put there,
+    /// and one it has every reason to be holding.
+    DedicatedHeaderWithAnAdminKey,
 }
 
 async fn post(
@@ -290,13 +363,19 @@ async fn post(
         .uri(uri)
         .header(CONTENT_TYPE, "application/json");
     builder = match present {
-        Present::InAuthorization => builder.header(AUTHORIZATION, format!("Bearer {secret}")),
-        Present::InRoundhouseHeaderWithASeat => builder
+        Present::AuthorizationOnly => builder.header(AUTHORIZATION, format!("Bearer {secret}")),
+        Present::DedicatedHeaderWithASeat => builder
             // Bare, exactly as codex's `env_http_headers` copies an environment
             // variable's value through.
             .header("x-roundhouse-key", secret)
             .header(AUTHORIZATION, SEAT_BEARER)
             .header("chatgpt-account-id", SEAT_ACCOUNT),
+        Present::BothHeaders => builder
+            .header("x-roundhouse-key", secret)
+            .header(AUTHORIZATION, format!("Bearer {secret}")),
+        Present::DedicatedHeaderWithAnAdminKey => builder
+            .header("x-roundhouse-key", secret)
+            .header(AUTHORIZATION, format!("Bearer {}", admin_key())),
     };
     let response = app
         .clone()
@@ -411,7 +490,7 @@ async fn a_principal_without_a_credential_for_a_provider_never_sees_it_in_candid
     one_turn(
         &rig,
         &key("fallback"),
-        Present::InAuthorization,
+        Present::AuthorizationOnly,
         "fallback/ada/s1",
     )
     .await;
@@ -464,7 +543,7 @@ async fn a_config_that_says_nothing_about_credentials_routes_exactly_as_it_did_b
     one_turn(
         &ungated,
         &key("legacy"),
-        Present::InAuthorization,
+        Present::AuthorizationOnly,
         "legacy/ada/s1",
     )
     .await;
@@ -501,7 +580,7 @@ async fn a_config_that_says_nothing_about_credentials_routes_exactly_as_it_did_b
     one_turn(
         &gated,
         &key("legacy"),
-        Present::InAuthorization,
+        Present::AuthorizationOnly,
         "legacy/ada/s2",
     )
     .await;
@@ -618,7 +697,7 @@ async fn user_paid_spend_draws_the_project_budget_under_all_frontier_spend() {
 async fn committed_after_one_hosted_turn(project: &str, tag: &str) -> f64 {
     let rig = rig(control_plane()).await;
     let session_id = format!("{project}/ada/s1");
-    one_turn(&rig, &key(tag), Present::InAuthorization, &session_id).await;
+    one_turn(&rig, &key(tag), Present::AuthorizationOnly, &session_id).await;
 
     let decision = decision(&rig.store, &session_id).await;
     assert!(
@@ -626,9 +705,14 @@ async fn committed_after_one_hosted_turn(project: &str, tag: &str) -> f64 {
         "this fixture's claim is about a *hosted* turn: {decision:?}"
     );
 
+    committed(&rig, project, "ada").await
+}
+
+/// What a membership's ledger says it has spent.
+async fn committed(rig: &Rig, project: &str, user: &str) -> f64 {
     rig.ledger
         .balance(roundhouse_core::control::BalanceQuery {
-            principal: roundhouse_core::control::Principal::new(project, "ada"),
+            principal: roundhouse_core::control::Principal::new(project, user),
             terms: roundhouse_core::control::BudgetTerms {
                 budget: roundhouse_core::control::Budget {
                     limit_usd: LIMIT_USD,
@@ -653,7 +737,13 @@ async fn a_quote_never_carries_a_secret_across_a_whole_turn() {
     // of one quote redacts" but "no secret this deployment holds appears
     // anywhere in the events a full turn produced".
     let rig = rig(control_plane()).await;
-    one_turn(&rig, &key("byok"), Present::InAuthorization, "byok/ada/s1").await;
+    one_turn(
+        &rig,
+        &key("byok"),
+        Present::AuthorizationOnly,
+        "byok/ada/s1",
+    )
+    .await;
 
     let shown = everything_the_log_shows(&rig.store, "byok/ada/s1").await;
     for (whose, secret) in [
@@ -685,7 +775,7 @@ async fn a_pass_through_turns_authorization_never_appears_in_any_event_or_debug_
     one_turn(
         &rig,
         &key("seat"),
-        Present::InRoundhouseHeaderWithASeat,
+        Present::DedicatedHeaderWithASeat,
         "seat/bob/s1",
     )
     .await;
@@ -738,7 +828,7 @@ async fn a_pass_through_turn_with_no_seat_degrades_to_local_rather_than_going_an
         &rig.app,
         "/v1/sessions",
         &key("seat"),
-        Present::InAuthorization,
+        Present::AuthorizationOnly,
         &serde_json::json!({ "session_id": "seat/bob/s2" }).to_string(),
     )
     .await;
@@ -746,7 +836,7 @@ async fn a_pass_through_turn_with_no_seat_degrades_to_local_rather_than_going_an
     turn(
         &rig.app,
         &key("seat"),
-        Present::InAuthorization,
+        Present::AuthorizationOnly,
         "seat/bob/s2",
         "t1",
     )
@@ -795,7 +885,7 @@ async fn a_locally_routed_turn_under_pass_through_never_touches_the_credential()
     one_turn(
         &rig,
         &key("seat"),
-        Present::InRoundhouseHeaderWithASeat,
+        Present::DedicatedHeaderWithASeat,
         "seat/bob/s3",
     )
     .await;
@@ -936,7 +1026,13 @@ async fn a_key_may_not_decide_who_pays_for_its_own_turns() {
 #[tokio::test]
 async fn the_payer_stamp_survives_to_the_fold_and_the_dashboard_row() {
     let rig = rig(control_plane()).await;
-    one_turn(&rig, &key("byok"), Present::InAuthorization, "byok/ada/s1").await;
+    one_turn(
+        &rig,
+        &key("byok"),
+        Present::AuthorizationOnly,
+        "byok/ada/s1",
+    )
+    .await;
 
     // PROBE: a replay of the log -- the same path a successor process takes --
     // reaches the same payer. This is what makes `payer` a fact about the turn
@@ -1013,10 +1109,10 @@ async fn a_turn_key_is_accepted_from_either_header_and_only_one_licenses_forward
     // membership -- which is what lets one deployment serve both client
     // stanzas.
     for (label, present, session) in [
-        ("Authorization", Present::InAuthorization, "seat/bob/h1"),
+        ("Authorization", Present::AuthorizationOnly, "seat/bob/h1"),
         (
             "X-Roundhouse-Key",
-            Present::InRoundhouseHeaderWithASeat,
+            Present::DedicatedHeaderWithASeat,
             "seat/bob/h2",
         ),
     ] {
@@ -1049,15 +1145,447 @@ async fn roundhouses_own_turn_key_is_never_the_credential_that_gets_forwarded() 
     let rig = rig(control_plane()).await;
     let engine_is_alive = Arc::strong_count(&rig.engine) > 0;
     assert!(engine_is_alive);
-    one_turn(&rig, &key("seat"), Present::InAuthorization, "seat/bob/s4").await;
+    one_turn(
+        &rig,
+        &key("seat"),
+        Present::AuthorizationOnly,
+        "seat/bob/s4",
+    )
+    .await;
 
-    let decision = decision(&rig.store, "seat/bob/s4").await;
+    let in_authorization = decision(&rig.store, "seat/bob/s4").await;
     assert_eq!(
-        decision.chosen.policy_identity(),
+        in_authorization.chosen.policy_identity(),
         "local/local",
         "a turn key in `Authorization` is roundhouse's own and is not forwardable; \
          a hosted decision here would mean it had been forwarded"
     );
     let shown = everything_the_log_shows(&rig.store, "seat/bob/s4").await;
     assert!(!shown.contains(&key("seat")), "{shown}");
+
+    // And the case the header rule alone does not cover, which is the
+    // *documented* one: PLAN §3's BYOK stanza sends the same `rh_turn_…` value
+    // in `env_key` and in `env_http_headers`, so the dedicated header arrives
+    // beside an `Authorization` that is also roundhouse's own key. Gated on the
+    // header alone, that request forwards it. Gated on the value too, there is
+    // nothing to forward, `openai` is unreachable, and the turn degrades to
+    // local exactly as a pass-through turn with no seat does.
+    for (label, present, session) in [
+        (
+            "the PLAN's own BYOK stanza",
+            Present::BothHeaders,
+            "seat/bob/s5",
+        ),
+        (
+            "an admin key beside the turn key",
+            Present::DedicatedHeaderWithAnAdminKey,
+            "seat/bob/s6",
+        ),
+    ] {
+        one_turn(&rig, &key("seat"), present, session).await;
+        let routed = decision(&rig.store, session).await;
+        assert_eq!(
+            routed.chosen.policy_identity(),
+            "local/local",
+            "{label}: a hosted decision here means one of roundhouse's own \
+             secrets was captured and forwarded upstream"
+        );
+        let shown = everything_the_log_shows(&rig.store, session).await;
+        assert!(!shown.contains(&key("seat")), "{label}: {shown}");
+        assert!(!shown.contains(&admin_key()), "{label}: {shown}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// What the dashboard may put a price on
+// ---------------------------------------------------------------------------
+
+/// The accounting-honesty rule, at the surface that publishes the number.
+///
+/// The ledger has kept it since M3 — a forwarded seat is `AccountedNotBilled`
+/// and draws nothing — and the metrics path is the half nobody wired: it prices
+/// every hosted row off the rate card, whoever paid. So a pass-through
+/// deployment reads a dollar figure for traffic it was never billed for, on the
+/// one surface it shows to people who are not its operators.
+#[tokio::test]
+async fn the_dashboard_never_prices_a_seat_forwarded_turn() {
+    let rig = rig(control_plane()).await;
+    one_turn(
+        &rig,
+        &key("seat"),
+        Present::DedicatedHeaderWithASeat,
+        "seat/bob/m1",
+    )
+    .await;
+
+    let (status, body) = get(&rig.app, "/v1/metrics", &key("seat")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let doc: serde_json::Value = serde_json::from_str(&body).expect("a snapshot");
+
+    // CONTROL first, because every assertion below is worthless if the turn did
+    // not actually go to a hosted provider on the strength of the forwarded
+    // seat: a local turn is free on every code path there is.
+    assert_eq!(
+        doc["models"][0]["provider"],
+        serde_json::json!("openai"),
+        "the seat made a hosted provider reachable: {body}"
+    );
+    let tokens = doc["tokens"]["total"].as_u64().expect("a token total");
+    assert!(tokens > 0, "the turn measured tokens: {body}");
+
+    // PROBE: those tokens are real and the dollars are not. Roundhouse holds no
+    // rate card for a subscription seat, so the catalog's per-token price
+    // describes what *it* would have paid on its own key — a counterfactual,
+    // not a bill.
+    assert_eq!(
+        doc["savings"]["frontier_spend_usd"]
+            .as_f64()
+            .expect("a spend figure"),
+        0.0,
+        "a seat-forwarded turn was priced at the rate card: {body}"
+    );
+    assert_eq!(
+        doc["models"][0]["billed_usd"]
+            .as_f64()
+            .expect("a row price"),
+        0.0,
+        "and the row it merges out of says the same: {body}"
+    );
+
+    // And the tokens are published as what they are: a count with no price
+    // beside it. Reporting them nowhere would leave a pass-through deployment
+    // unable to see the traffic it is carrying, which is the other half of
+    // being honest about a seat.
+    assert_eq!(
+        doc["seat_tokens"]["total"].as_u64().expect("a seat total"),
+        tokens,
+        "every token of this turn was a seat's: {body}"
+    );
+    assert_eq!(
+        doc["models"][0]["seat_tokens"]["total"]
+            .as_u64()
+            .expect("a row seat total"),
+        tokens,
+        "and the row carries its own share: {body}"
+    );
+}
+
+/// The control for the test above: an ordinary keyed turn still prices.
+///
+/// Without it, "the dashboard reports no dollars" is satisfied by a dashboard
+/// that reports no dollars at all — which is the regression the honesty rule
+/// would otherwise invite.
+#[tokio::test]
+async fn a_turn_on_a_key_this_deployment_holds_still_prices_at_the_rate_card() {
+    let rig = rig(control_plane()).await;
+    one_turn(
+        &rig,
+        &key("byok"),
+        Present::AuthorizationOnly,
+        "byok/ada/m1",
+    )
+    .await;
+
+    let (status, body) = get(&rig.app, "/v1/metrics", &key("byok")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let doc: serde_json::Value = serde_json::from_str(&body).expect("a snapshot");
+    assert_eq!(
+        doc["savings"]["frontier_spend_usd"]
+            .as_f64()
+            .expect("a spend figure"),
+        TURN_USD,
+        "a member's own API key is a rate card roundhouse can read: {body}"
+    );
+    assert_eq!(
+        doc["seat_tokens"]["total"].as_u64().expect("a seat total"),
+        0,
+        "and nothing here was a seat's: {body}"
+    );
+}
+
+/// A dollar budget on a pass-through project meters nothing, however much
+/// traffic it serves.
+///
+/// Not a bug being fixed — the ledger is right to refuse a price it never paid
+/// — but the semantics an operator gets from writing `"budget"` beside
+/// `"mode": "pass_through"`, pinned so that "this setting quietly means
+/// something else" is a claim with a test behind it rather than a paragraph.
+/// The ceiling still bounds each turn (see `Engine::open_grant`); what it never
+/// does is accumulate, so its exhaustion arm and its warn threshold cannot
+/// fire.
+#[tokio::test]
+async fn a_dollar_budget_over_a_forwarded_seat_never_commits() {
+    let rig = rig(control_plane()).await;
+    create_session(
+        &rig.app,
+        &key("seat"),
+        Present::DedicatedHeaderWithASeat,
+        "seat/bob/b1",
+    )
+    .await;
+    for turn_id in ["t1", "t2", "t3"] {
+        turn(
+            &rig.app,
+            &key("seat"),
+            Present::DedicatedHeaderWithASeat,
+            "seat/bob/b1",
+            turn_id,
+        )
+        .await;
+    }
+    assert_eq!(
+        decision(&rig.store, "seat/bob/b1")
+            .await
+            .chosen
+            .policy_identity(),
+        "openai/flagship",
+        "three hosted turns, or this says nothing about hosted traffic"
+    );
+    assert_eq!(
+        committed(&rig, "seat", "bob").await,
+        0.0,
+        "three turns that would have cost ${} each on a key of ours, and the \
+         project's meter has not moved -- because none of it was ours to bill",
+        TURN_USD * 3.0
+    );
+
+    // CONTROL: the same budget on a project that pays with a stored key does
+    // accumulate, so the flatline above is the credential mode and not a ledger
+    // that has stopped counting.
+    assert_eq!(
+        committed_after_one_hosted_turn("byok", "byok").await,
+        TURN_USD
+    );
+}
+
+/// The ledger and the dashboard read one recorded fact, so they cannot
+/// disagree about whether a turn was billed.
+///
+/// Two spellings of the billed/accounted rule is one spelling too many. The
+/// engine's settle asked the *live* admission whether the project forwards,
+/// while the dashboard asked nothing at all and priced every hosted row — so
+/// the two answers were free to differ, and an operator editing one line of the
+/// control plane made them differ. Both now read the decision the log recorded.
+///
+/// Driven through the repair seam because that is the only moment the engine
+/// settles a turn it did not run: same log, fresh ledger, a control plane
+/// edited in between. Re-sending the completed turn deduplicates, so nothing is
+/// routed and the repair is the only thing that can move the number.
+#[tokio::test]
+async fn a_settle_and_the_dashboard_price_the_same_turn_the_same_way() {
+    with_env();
+    let swapped = || {
+        Arc::new(ControlPlane::configured(
+            ControlPlaneConfig::from_json(&swapped_plane_json(), "swapped-mode fixture")
+                .expect("the successor's file must validate"),
+        ))
+    };
+
+    // ---- a turn billed on a stored key, repaired after the project was
+    // ---- switched to pass-through.
+    let first = rig(control_plane()).await;
+    one_turn(
+        &first,
+        &key("byok"),
+        Present::AuthorizationOnly,
+        "byok/ada/s9",
+    )
+    .await;
+    assert_eq!(
+        committed(&first, "byok", "ada").await,
+        TURN_USD,
+        "the live settle billed the member's own key"
+    );
+
+    let successor = rig_over(swapped(), Some(Arc::clone(&first.store))).await;
+    assert_eq!(
+        committed(&successor, "byok", "ada").await,
+        0.0,
+        "the successor starts believing nothing was ever spent"
+    );
+    turn(
+        &successor.app,
+        &key("byok"),
+        Present::AuthorizationOnly,
+        "byok/ada/s9",
+        "t1",
+    )
+    .await;
+    let (status, body) = get(&successor.app, "/v1/metrics", &key("byok")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let doc: serde_json::Value = serde_json::from_str(&body).expect("a snapshot");
+    let dashboard = doc["savings"]["frontier_spend_usd"]
+        .as_f64()
+        .expect("a spend figure");
+    assert_eq!(
+        committed(&successor, "byok", "ada").await,
+        dashboard,
+        "the repaired settle and the dashboard read the same turn: {body}"
+    );
+    assert_eq!(
+        dashboard, TURN_USD,
+        "and the fact they read is the one the log recorded, not the mode the \
+         project happens to carry today: {body}"
+    );
+
+    // ---- and the mirror: a seat turn repaired after the project was switched
+    // ---- to a stored key must stay accounted-and-not-billed.
+    let first = rig(control_plane()).await;
+    one_turn(
+        &first,
+        &key("seat"),
+        Present::DedicatedHeaderWithASeat,
+        "seat/bob/s9",
+    )
+    .await;
+    assert_eq!(
+        committed(&first, "seat", "bob").await,
+        0.0,
+        "a forwarded seat draws nothing, which is the rule this mirror is about"
+    );
+
+    let successor = rig_over(swapped(), Some(Arc::clone(&first.store))).await;
+    turn(
+        &successor.app,
+        &key("seat"),
+        Present::AuthorizationOnly,
+        "seat/bob/s9",
+        "t1",
+    )
+    .await;
+    let (status, body) = get(&successor.app, "/v1/metrics", &key("seat")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let doc: serde_json::Value = serde_json::from_str(&body).expect("a snapshot");
+    let dashboard = doc["savings"]["frontier_spend_usd"]
+        .as_f64()
+        .expect("a spend figure");
+    assert_eq!(
+        committed(&successor, "seat", "bob").await,
+        dashboard,
+        "the two agree in this direction too: {body}"
+    );
+    assert_eq!(
+        dashboard, 0.0,
+        "a seat roundhouse held no card for stays unpriced however the project \
+         is configured afterwards: {body}"
+    );
+}
+
+/// A narrowing installed mid-session can empty the credential-reachable set on
+/// a deployment whose boot check passed.
+///
+/// The boot check asks its question of a *project's* policy, which is the only
+/// policy that exists before any session does. An overlay is a second
+/// narrowing, composed a turn at a time, and it can take the local half of the
+/// pool away from a pass-through session whose caller has not presented a seat
+/// — leaving the credential filter with nothing to keep.
+#[tokio::test]
+async fn an_overlay_can_narrow_a_session_onto_providers_it_holds_no_credential_for() {
+    let narrowed = rig(control_plane()).await;
+    let session_id = "seat/bob/o1";
+    // No seat presented: the turn key arrives in `Authorization`, so nothing is
+    // forwardable and every hosted provider is unreachable this turn.
+    create_session(
+        &narrowed.app,
+        &key("seat"),
+        Present::AuthorizationOnly,
+        session_id,
+    )
+    .await;
+
+    // The agent asks for frontier. Honorable against the ceiling — the project's
+    // policy allows both hosted models — and it is what takes local out of the
+    // pool before the credential filter runs.
+    narrowed.control.set_mode_axis(
+        &SessionId::new(session_id),
+        Some(TimedOverlay {
+            ask: ModeNarrowing {
+                mode: PreferMode::Frontier,
+                allow: Some(
+                    roundhouse_core::control::TargetFilter::parse([
+                        "openai/flagship",
+                        "anthropic/flagship",
+                    ])
+                    .expect("two ordinary patterns"),
+                ),
+            },
+            remaining_turns: None,
+            reason: "the agent asked for a hosted model".into(),
+        }),
+        roundhouse_core::now_ms(),
+    );
+
+    let body = serde_json::json!({
+        "turn_id": "t1",
+        "input": [{ "role": "user", "text": "how many tokens did that turn bill?" }],
+    })
+    .to_string();
+    let (status, text) = post(
+        &narrowed.app,
+        &format!("/v1/sessions/{}/responses", path_segment(session_id)),
+        &key("seat"),
+        Present::AuthorizationOnly,
+        &body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    // PROBE: the branch the engine used to describe as unreachable after boot.
+    // Nothing went missing here — the deployment's configuration is exactly
+    // what it booted with, and the narrowing that emptied the pool was composed
+    // this turn.
+    assert!(
+        text.contains("event: response_incomplete"),
+        "an overlay onto unreachable providers must terminate the turn rather \
+         than dispatch it anonymously: {text}"
+    );
+    assert!(
+        text.contains("no credential resolved for provider"),
+        "and the reason names the credential axis, not the policy: {text}"
+    );
+
+    // CONTROL: the same overlay on the same project *with* a seat presented
+    // serves, so the failure above is the missing credential and not the
+    // narrowing itself.
+    let served = rig(control_plane()).await;
+    let session_id = "seat/bob/o2";
+    create_session(
+        &served.app,
+        &key("seat"),
+        Present::DedicatedHeaderWithASeat,
+        session_id,
+    )
+    .await;
+    served.control.set_mode_axis(
+        &SessionId::new(session_id),
+        Some(TimedOverlay {
+            ask: ModeNarrowing {
+                mode: PreferMode::Frontier,
+                allow: Some(
+                    roundhouse_core::control::TargetFilter::parse([
+                        "openai/flagship",
+                        "anthropic/flagship",
+                    ])
+                    .expect("two ordinary patterns"),
+                ),
+            },
+            remaining_turns: None,
+            reason: "the agent asked for a hosted model".into(),
+        }),
+        roundhouse_core::now_ms(),
+    );
+    turn(
+        &served.app,
+        &key("seat"),
+        Present::DedicatedHeaderWithASeat,
+        session_id,
+        "t1",
+    )
+    .await;
+    assert_eq!(
+        decision(&served.store, session_id)
+            .await
+            .chosen
+            .policy_identity(),
+        "openai/flagship"
+    );
 }

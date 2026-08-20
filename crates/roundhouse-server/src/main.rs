@@ -291,8 +291,13 @@ const BUDGET_PROMISE: &str = "its budget degrades to local with overflow_when_lo
      which promises that an exhausted budget serves locally instead of failing, and this \
      deployment has no local capacity to serve it";
 
-/// What a `UserOnly` or pass-through credential mode promises about a member
-/// who has attached nothing.
+/// What a *stored*-key credential mode promises about a member who has
+/// attached nothing.
+///
+/// Stored only, and pass-through is exempt for a reason written out at the
+/// check: a mode that reads a tier the file leaves empty is unreachable as a
+/// structural fact this boot can see, while a mode whose credential arrives on
+/// the request is unreachable only until a request arrives.
 ///
 /// [`CredentialMode`]: roundhouse_core::control::CredentialMode
 const CREDENTIAL_PROMISE: &str = "its credential mode reaches no hosted provider on this \
@@ -370,22 +375,55 @@ fn unkeepable_promises(
     // Asked through the same `reachable` the router will apply at runtime
     // rather than a restatement of it, exactly as the cadence and budget halves
     // are.
-    if admission
-        .credentials
-        .reachable(reachable.to_vec())
-        .candidates
-        .is_empty()
+    //
+    // **Of stored modes only, because pass-through's answer is not a
+    // boot-knowable one.** A stored mode names tiers a file either fills or
+    // does not, so "this key reaches nothing" is a fact about the file and this
+    // is the first and last moment anything can see it. A forwarding mode holds
+    // no key at all: the credential is the caller's and arrives on the request,
+    // so `Resolution::Forwarding { presented: None }` is what *every*
+    // pass-through admission looks like before any request exists. Asked here,
+    // it reads as "reaches nothing" and refuses every pass-through project on
+    // every deployment — the mode this milestone exists for, undeployable, with
+    // the boot check as the only thing stopping it.
+    //
+    // What is boot-knowable for pass-through is whether there is any hosted
+    // provider a forwarded credential *could* cover, and a non-empty catalog is
+    // that question already answered — the same `!reachable.is_empty()` guard
+    // this check already carries. The per-request half is asked per request, by
+    // the same filter, and a turn whose caller presented nothing degrades to
+    // local with `withheld_providers` naming the provider.
+    if !admission.credentials.is_forwarding()
+        && admission
+            .credentials
+            .reachable(reachable.to_vec())
+            .candidates
+            .is_empty()
         && !reachable.is_empty()
     {
         broken.push(CREDENTIAL_PROMISE);
     }
-    // The third promise, and the one that is not about a *spent* allowance —
-    // it is here anyway because it is the same sentence in the same file with
-    // the same remedy shape: a config says something will happen, and this is
-    // the first moment anything can see whether it can. Splitting it into its
-    // own boot check would give an operator two lookalike refusals to tell
-    // apart, which is exactly what folding the cadence and the budget into one
-    // list already refused to do.
+    // The promise that is not about a *spent* allowance — it is in this list
+    // anyway because it is the same sentence with the same remedy shape: a
+    // config says something will happen, and this is the first moment the
+    // *catalog* can be compared against it. Splitting it into its own boot
+    // check would give an operator two lookalike refusals to tell apart, which
+    // is exactly what folding the cadence and the budget into one list already
+    // refused to do.
+    //
+    // **What is checked is that a judge resolves, and that is all.** Whether
+    // the side call it makes can *authenticate* is not asked here and is
+    // deliberately not a boot promise: `FleetJudge` resolves no credential of
+    // its own — see `judge.rs`, where `TurnCredential::Absent` is written out
+    // as the honest state rather than an oversight — so on a deployment
+    // composing a real provider client the checks are refused at dispatch. That
+    // is a **runtime fail-open**, and it is the M6 interject contract holding
+    // rather than a gap this check should close: an unreachable judge abandons
+    // its side call as `Unreachable` and the turn it was checking proceeds
+    // unchanged, because the checker never breaks the checked. Refusing to boot
+    // over it would take a deployment down for a check that costs it nothing.
+    // See `tests/validate_loop.rs`:
+    // `a_judge_that_cannot_authenticate_abandons_its_check_and_the_turn_proceeds`.
     if admission.validation.is_some() && judge.is_none() {
         broken.push(VALIDATION_PROMISE);
     }
@@ -1017,6 +1055,51 @@ mod tests {
             None,
         )
         .expect("a file that says nothing about credentials promises nothing about them");
+    }
+
+    #[test]
+    fn a_pass_through_project_boots_because_its_credential_arrives_with_the_turn() {
+        // The other half of the credential check, and the half that decides
+        // whether the marquee BYOK arm is deployable at all.
+        //
+        // PROBE: `pass_through`, no local worker, a catalog with hosted
+        // providers in it — the ordinary shape of a pass-through deployment.
+        // Reachability under this mode is a fact about *one request*: the
+        // credential is the caller's, and at boot no caller exists, so the
+        // configured resolution says "nothing presented" and every provider
+        // reads as unreachable. Asked the same question the other modes are
+        // asked, that answer refuses every pass-through project on every
+        // deployment and the process never reaches `axum::serve`.
+        refuse_promises_of_a_local_fallback(
+            &plane_with_credentials(serde_json::json!({ "mode": "pass_through" })),
+            &reachable_candidates(&priced_catalog()),
+            None,
+        )
+        .expect("a forwarded credential arrives with the turn, not with the boot");
+
+        // And the same project on a deployment that quotes a local worker too,
+        // which must not start refusing for some *other* reason.
+        let mut with_fleet = reachable_candidates(&priced_catalog());
+        with_fleet.push(local_candidate());
+        refuse_promises_of_a_local_fallback(
+            &plane_with_credentials(serde_json::json!({ "mode": "pass_through" })),
+            &with_fleet,
+            None,
+        )
+        .expect("and a fleet beside it changes nothing about the answer");
+
+        // CONTROL, and the reason this is an exemption rather than a weakening:
+        // `user_only` with no member key anywhere is a *structural* fact a boot
+        // can see — no request will ever supply the missing key, because the
+        // mode reads a tier the file leaves empty — and it is still refused.
+        // An exemption that covered both would trade one undeployable arm for
+        // a silent one.
+        refuse_promises_of_a_local_fallback(
+            &plane_with_credentials(serde_json::json!({ "mode": "user_only" })),
+            &reachable_candidates(&priced_catalog()),
+            None,
+        )
+        .expect_err("a mode whose key is missing from the file is still refused");
     }
 
     #[test]

@@ -28,7 +28,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use roundhouse_core::context::{ContextAssembler, Tokenizer};
 use roundhouse_core::control::{
-    CredentialError, MemorySpendLedger, SpendError, SpendLedger, TurnPolicy,
+    Billing, CredentialError, MemorySpendLedger, SpendError, SpendLedger, TurnPolicy,
 };
 use roundhouse_core::event::{Accounting, IncompleteReason, SessionObserver, Usage};
 use roundhouse_core::ids::{ResponseId, SessionId, SideCallId, TurnId};
@@ -1150,14 +1150,38 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         let withheld_providers = reached.withheld_providers;
         let candidates = reached.candidates;
         if candidates.is_empty() && quoted > 0 {
-            // Every option went for want of a credential and there is no local
-            // capacity to degrade to. Its own error rather than `PolicyRefused`
-            // for the reason that one is not `NoCandidates`: the remedy is a
-            // variable an operator has not set, and blaming the policy would
-            // send them to the wrong file. The boot check
-            // (`unkeepable_promises`) refuses the configuration that makes this
-            // reachable, so arriving here means a credential went missing after
-            // the process started.
+            // Every option went for want of a credential and nothing local
+            // survived to degrade to. Its own error rather than
+            // `PolicyRefused`, for the reason that one is not `NoCandidates`:
+            // the remedy is a credential, and blaming the policy would send an
+            // operator to the wrong file.
+            //
+            // **Reachable on a deployment that booted clean, and the boot check
+            // does not say otherwise.** `unkeepable_promises` asks its question
+            // of a project's *configured* policy against the catalog quoted at
+            // startup — the only policy, and the only fleet, that exist before
+            // any session does. Getting here needs two things at once, and each
+            // has a runtime cause that check cannot see:
+            //
+            // - *no hosted candidate the credentials reach* — a pass-through
+            //   project whose caller presented no seat on this request, a
+            //   member who has not attached a key, or a credential that went
+            //   missing mid-process; and
+            // - *no local candidate left to degrade to* — an overlay or an
+            //   escalation narrowing this session onto hosted targets (both
+            //   compose a second `TurnPolicy`, a turn at a time, above the
+            //   filter that runs here), or a fleet with no worker to quote at
+            //   this moment.
+            //
+            // The overlay case is the ordinary one: an agent asks for frontier
+            // on a session whose seat is absent, and the pool it asked for is
+            // the pool it cannot authenticate to.
+            //
+            // Degrading is therefore not available — there is nothing left in
+            // the pool — and terminating with the credential's own reason is
+            // the loudest honest answer. Whenever local capacity *does* survive
+            // both filters the turn serves locally instead, and the marker on
+            // the decision is what says a provider was withheld.
             return Err(EngineError::Frontier(FrontierError::Credential(
                 CredentialError::NoCredential {
                     provider: withheld_providers.join(", "),
@@ -1279,6 +1303,16 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                     // belongs on has been written, and a settle would then have
                     // to guess.
                     payer: access.payer,
+                    // And whether any of it is roundhouse's money to price,
+                    // decided here for the same reason and from the same
+                    // resolution. Asked of the *admission* rather than of
+                    // `access.credential`, which is the one place the two
+                    // differ: a local dispatch under a pass-through project
+                    // touches no credential, but the hosted call it displaced
+                    // would have been the caller's seat to pay for, so a saving
+                    // credited against it is the same invented number the seat
+                    // turn's price is. See `Billing::of`.
+                    billing: Billing::of(&admission.credentials),
                     // Empty on every ordinary turn, and skipped on the wire
                     // when it is, so a pre-M7 log's decisions stay
                     // byte-identical. Non-empty, it is the only place in the

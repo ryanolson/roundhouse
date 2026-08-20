@@ -191,6 +191,7 @@ pub fn every_event_kind() -> Vec<SessionEventKind> {
                 // was withheld from a fixture whose deployment configures no
                 // credential tier at all.
                 payer: Default::default(),
+                billing: Default::default(),
                 withheld_providers: Vec::new(),
             },
         },

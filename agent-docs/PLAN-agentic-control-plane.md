@@ -538,6 +538,17 @@ Enterprise device login — the `PassThrough` arm:
 ```toml
 model_provider = "roundhouse"
 
+# The prerequisite `requires_openai_auth = true` brings with it, and the reason
+# it is in this stanza and not the BYOK one: under that flag codex fetches its
+# model catalog from `GET {base_url}/models` with the forwarded credential,
+# before the first turn. Roundhouse serves no `/v1/models` today, so the
+# catalog is pinned to a local file and the remote fetch is skipped — the same
+# move Switchyard's launcher makes (`codex_cli_launcher.py:92-93`). Serving
+# `/v1/models` on the same base URL is the other half of the either/or and
+# retires this line; with neither, the client's first action against this route
+# is a request nothing answers.
+model_catalog_json = "/etc/roundhouse/codex-model-catalog.json"
+
 [model_providers.roundhouse]
 # Not "OpenAI": is_openai() matches this exact name and would turn on the
 # routing-hint header and remote compaction v2 against us.

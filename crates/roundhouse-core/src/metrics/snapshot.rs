@@ -142,8 +142,16 @@ pub enum ModelAccounting {
     Local {
         /// What this traffic would have cost on its correlary. Zero when the
         /// correlary is [`Correlary::Unpriced`].
+        ///
+        /// Over the priceable share of the row only — see `seat_tokens` on the
+        /// hosted arm. A pass-through project's local turn
+        /// displaced a hosted call its caller's seat would have paid for, and
+        /// crediting this deployment with having saved that money is the same
+        /// invented figure as billing it for the seat's tokens.
         shadow_usd: f64,
         correlary: Correlary,
+        /// Tokens this row served for a project whose money is a seat's.
+        seat_tokens: TokenBreakdown,
     },
     /// Issued to an external endpoint: bills real money.
     Frontier {
@@ -157,7 +165,23 @@ pub enum ModelAccounting {
         billed_estimated_usd: f64,
         /// The discount the provider's own cache applied. Wholly measured: an
         /// unreported call carries no cache reads to guess at.
+        ///
+        /// Over the priceable share only, for the reason every other dollar
+        /// here is: a discount on a seat's bill was applied to a bill this
+        /// deployment never saw.
         cache_savings_usd: f64,
+        /// Tokens measured under a forwarded subscription seat.
+        ///
+        /// **A count and never a dollar**, which is the whole of the honesty
+        /// rule at this surface: roundhouse holds no rate card for a seat, so
+        /// the catalog's per-token price describes what *it* would have paid on
+        /// its own key — a counterfactual, not a bill. They are inside this
+        /// row's `tokens` and inside its `coverage`, because they were really
+        /// served and really counted; they are outside every figure above.
+        ///
+        /// Zero on a deployment with no pass-through project, which is what
+        /// keeps every pre-M7 row reading exactly as it did.
+        seat_tokens: TokenBreakdown,
     },
 }
 
@@ -233,6 +257,19 @@ impl ModelMetrics {
             ModelAccounting::Frontier { .. } => None,
         }
     }
+
+    /// Tokens in this row that no rate card of ours applies to.
+    ///
+    /// On both arms, unlike every dollar accessor above, because the question
+    /// it answers is the same on both: how much of this row is a seat's? A
+    /// reader comparing `tokens` with the money beside it needs one number to
+    /// explain the gap, not one per serving mode.
+    pub fn seat_tokens(&self) -> TokenBreakdown {
+        match self.accounting {
+            ModelAccounting::Local { seat_tokens, .. }
+            | ModelAccounting::Frontier { seat_tokens, .. } => seat_tokens,
+        }
+    }
 }
 
 /// The volume and money of a set of rows.
@@ -250,6 +287,12 @@ impl ModelMetrics {
 pub struct Rollup {
     pub calls: u64,
     pub tokens: TokenBreakdown,
+    /// The share of `tokens` that is a forwarded seat's and carries no price.
+    ///
+    /// A token field among money fields, deliberately: an aggregate whose
+    /// dollars are smaller than its tokens imply is exactly the shape a reader
+    /// mistakes for a bargain, and this is the number that explains it.
+    pub seat_tokens: TokenBreakdown,
     pub coverage: Coverage,
     pub billed_usd: f64,
     pub billed_measured_usd: f64,
@@ -263,6 +306,7 @@ impl Rollup {
     fn absorb(&mut self, row: &ModelMetrics) {
         self.calls += row.calls;
         self.tokens.add(&row.tokens);
+        self.seat_tokens.add(&row.seat_tokens());
         self.coverage.add(&row.coverage);
         self.billed_usd += row.billed_usd();
         self.billed_measured_usd += row.billed_measured_usd();
@@ -306,6 +350,14 @@ pub struct Savings {
     /// Not labelled "measured" as a whole, which it was and which was wrong.
     /// A provider that reports no usage still bills, and the tokens standing in
     /// for its silence are ours, not its.
+    ///
+    /// **Over the traffic roundhouse holds a rate card for, and not over a
+    /// forwarded seat's.** A pass-through turn is measured in
+    /// [`MetricsSnapshot::seat_tokens`] and priced nowhere: the seat is a
+    /// subscription, and the catalog's per-token figure describes what this
+    /// deployment would have paid on its own key. Reporting that as spend was
+    /// this document's version of the bill the ledger has always refused to
+    /// issue.
     pub frontier_spend_usd: f64,
     /// The part of `frontier_spend_usd` priced from provider-reported counts.
     pub frontier_spend_measured_usd: f64,
@@ -321,6 +373,11 @@ pub struct Savings {
     pub cache_savings_usd: f64,
     /// Estimated. What local traffic would have cost on its correlary — a call
     /// that never happened, priced against a model chosen by [`pricing`].
+    ///
+    /// A *saving*, so it counts only the local turns whose hosted alternative
+    /// would have been this deployment's money. A pass-through project's local
+    /// turn passed over a call its caller's seat would have paid for, and there
+    /// is no sense in which roundhouse saved that.
     pub routing_savings_usd: f64,
     /// Estimated, independently. The same quantity as `routing_savings_usd`
     /// but taken from the router's own quotes at decision time rather than
@@ -353,6 +410,17 @@ pub struct MetricsSnapshot {
     /// Dispatches that reached a provider and were accounted for.
     pub calls: u64,
     pub tokens: TokenBreakdown,
+    /// The share of `tokens` served under a forwarded subscription seat.
+    ///
+    /// **Beside `tokens` and outside `savings`, which is the point.** Every
+    /// figure in [`Savings`] is dollars, and a seat has none this deployment
+    /// may name; reporting these tokens as money would be the invented bill the
+    /// whole accounting rule exists to refuse, and reporting them nowhere would
+    /// leave a deployment unable to see the traffic it is carrying. So they are
+    /// published as what they are: a count, with no price attached.
+    ///
+    /// Zero for every deployment with no pass-through project.
+    pub seat_tokens: TokenBreakdown,
     pub savings: Savings,
     pub coverage: Coverage,
     /// Share of *calls* the provider accounted for.
@@ -453,9 +521,19 @@ impl MetricsSnapshot {
                 calls: counters.calls,
                 reported_calls: counters.calls.saturating_sub(counters.estimated_calls),
                 estimated_calls: counters.estimated_calls,
-                reported_tokens: counters.reported_usage.total(),
-                estimated_tokens: counters.estimated_usage.total(),
+                // Across both pots: coverage asks whether the *provider*
+                // counted a turn, which is a different axis from whose money
+                // paid for it. A seat turn the provider reported is reported.
+                reported_tokens: counters.reported_usage().total(),
+                estimated_tokens: counters.estimated_usage().total(),
             };
+
+            // Everything below prices this and never `total_usage`: the seat's
+            // share of a row is measured and unpriceable, and the one place
+            // that rule can be kept for good is the value the rate card is
+            // handed. See `Counters::seat`.
+            let priceable = counters.billed.total();
+            let seat_tokens = TokenBreakdown::from_usage(&counters.seat.total());
 
             let accounting = match key.mode {
                 ServingMode::Frontier => {
@@ -469,8 +547,9 @@ impl MetricsSnapshot {
                     // `price` is linear in tokens, and is the only way the two
                     // parts can be reported apart afterwards.
                     let billed = Billed {
-                        measured: rate.map_or(0.0, |r| r.pricing.price(&counters.reported_usage)),
-                        estimated: rate.map_or(0.0, |r| r.pricing.price(&counters.estimated_usage)),
+                        measured: rate.map_or(0.0, |r| r.pricing.price(&counters.billed.reported)),
+                        estimated: rate
+                            .map_or(0.0, |r| r.pricing.price(&counters.billed.estimated)),
                     };
                     // Wholly measured: an unreported call carries
                     // `cached_input_tokens: 0`, so it contributes nothing here
@@ -480,10 +559,17 @@ impl MetricsSnapshot {
                         billed_measured_usd: billed.measured,
                         billed_estimated_usd: billed.estimated,
                         cache_savings_usd: rate
-                            .map_or(0.0, |r| r.pricing.cache_savings(&total_usage)),
+                            .map_or(0.0, |r| r.pricing.cache_savings(&priceable)),
+                        seat_tokens,
                     }
                 }
                 ServingMode::Local => {
+                    // The correlary is inferred from the *whole* row's shape and
+                    // priced over the priceable part of it. Two different
+                    // questions: which hosted model this traffic resembles is
+                    // answered by the traffic, all of it, while what it would
+                    // have saved is answered only for the turns whose
+                    // alternative would have been this deployment's money.
                     let shape = TokenShape::from_rollup(&total_usage, counters.calls);
                     let correlary = config.pricing.resolve(
                         &key.model,
@@ -492,8 +578,9 @@ impl MetricsSnapshot {
                         &frontier_shapes,
                     );
                     ModelAccounting::Local {
-                        shadow_usd: correlary.shadow_cost_usd(&total_usage),
+                        shadow_usd: correlary.shadow_cost_usd(&priceable),
                         correlary,
+                        seat_tokens,
                     }
                 }
             };
@@ -545,6 +632,7 @@ impl MetricsSnapshot {
             turns: view.totals.turns,
             calls: totals.calls,
             tokens: totals.tokens,
+            seat_tokens: totals.seat_tokens,
             savings,
             coverage_fraction: totals.coverage.reported_fraction(),
             coverage_token_fraction: totals.coverage.reported_token_fraction(),

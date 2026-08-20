@@ -205,10 +205,14 @@ impl ForwardedCredential {
     /// and it closes a real hole rather than a theoretical one: an upstream
     /// that rejects a bearer commonly quotes it back in the error body ("invalid
     /// token: eyJ…"), and that body is what a client sees, what a log line
-    /// carries, and what an event payload would hold. Every path an upstream
-    /// error takes out of a provider client goes through here first, so the
-    /// credential cannot re-enter the system through the one door that is not
-    /// the request.
+    /// carries, and what an event payload would hold.
+    ///
+    /// Reached through [`TurnCredential::redact`](super::secret::TurnCredential::redact)
+    /// rather than called directly, which is what makes "every path an upstream
+    /// error takes out of a provider client goes through a redaction" true of
+    /// *all three* arms rather than of this one. A client holding an
+    /// `Option<&ForwardedCredential>` had a `None` on the stored-key route and
+    /// scrubbed nothing there.
     ///
     /// Substring replacement rather than a parse, because the body is the
     /// upstream's and may be anything — JSON, HTML, a proxy's plain text. What
@@ -225,7 +229,10 @@ impl ForwardedCredential {
 /// What an echoed credential is replaced with. Spelled loudly so a reader of a
 /// redacted error knows something was taken out rather than wondering what an
 /// empty string meant.
-const REDACTED: &str = "[REDACTED]";
+///
+/// Shared with [`super::secret`], which scrubs the stored arm: one marker, so
+/// an operator greps for one string whichever credential a turn used.
+pub(super) const REDACTED: &str = "[REDACTED]";
 
 #[cfg(test)]
 mod tests {

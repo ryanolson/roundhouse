@@ -32,7 +32,7 @@ use serde::{Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
 use super::CredentialError;
-use super::forwarded::ForwardedCredential;
+use super::forwarded::{ForwardedCredential, REDACTED};
 
 /// Domain separator for [`Secret::fingerprint`].
 ///
@@ -300,6 +300,41 @@ impl TurnCredential {
     pub fn is_forwarded(&self) -> bool {
         matches!(self, TurnCredential::Forwarded(_))
     }
+
+    /// Remove this turn's own credential from an upstream's own words.
+    ///
+    /// **On the credential rather than on the client, because the client is
+    /// where the arm gets lost.** The first version of this lived in the OpenAI
+    /// client and took an `Option<&ForwardedCredential>` — which is `None` on
+    /// the stored-key route, so a provider that quoted a *deployment's* key back
+    /// in a 401 body ("invalid token: sk-proj-…") had it survive verbatim into
+    /// [`Self::Stored`]'s error, out through the engine, and into the frame a
+    /// client reads. The forwarded arm was scrubbed and the stored arm was not,
+    /// and nothing in the shape of the code said so.
+    ///
+    /// Asking the credential closes that by construction: there is no
+    /// credential a caller can hold that this does not cover, so the three arms
+    /// are a `match` the compiler checks rather than an `Option` a caller can
+    /// be handed the empty half of.
+    ///
+    /// - [`Self::Stored`] — the resolved key, through the one seam that yields
+    ///   plaintext. Substring replacement for the reason
+    ///   [`ForwardedCredential::redact`] is: the body is the upstream's and may
+    ///   be JSON, HTML, or a proxy's plain text, and a body that happens to
+    ///   contain the key for some other reason is redacted too, which is the
+    ///   harmless direction.
+    /// - [`Self::Forwarded`] — the caller's own headers, already narrowed to
+    ///   this provider's allowlist.
+    /// - [`Self::Absent`] — nothing was sent, so nothing can have been echoed.
+    ///   Identity, and not a hole: an absent credential is refused before a
+    ///   socket is opened.
+    pub fn redact(&self, body: String) -> String {
+        match self {
+            TurnCredential::Absent => body,
+            TurnCredential::Stored(secret) => body.replace(secret.reveal(), REDACTED),
+            TurnCredential::Forwarded(forwarded) => forwarded.redact(body),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -456,5 +491,40 @@ mod tests {
             Secret::api_key(FORWARDED_BEARER).unwrap_err().code(),
             "oauth_credentials_unsupported"
         );
+    }
+
+    #[test]
+    fn every_arm_scrubs_its_own_credential_out_of_an_upstreams_words() {
+        // PROBE: the shape a real 401 takes — the upstream quotes the
+        // credential back. Both arms that *have* one must take it out, and the
+        // stored arm is the one an earlier `Option<&ForwardedCredential>`
+        // spelling left uncovered: it was `None` on that route, so a
+        // deployment's own key travelled out of the client verbatim.
+        let stored = TurnCredential::Stored(Secret::api_key(PLAINTEXT).unwrap());
+        let forwarded = TurnCredential::Forwarded(forwarded_credential());
+        for (arm, credential, secret) in [
+            ("stored", &stored, PLAINTEXT),
+            ("forwarded", &forwarded, FORWARDED_BEARER),
+        ] {
+            let echoed = format!(r#"{{"error":{{"message":"invalid token: {secret}"}}}}"#);
+            let redacted = credential.redact(echoed);
+            assert!(!redacted.contains(secret), "{arm}: {redacted}");
+            assert!(redacted.contains("[REDACTED]"), "{arm}: {redacted}");
+            // What the upstream actually said survives, or the redaction has
+            // eaten the diagnosis along with the credential.
+            assert!(redacted.contains("invalid token"), "{arm}: {redacted}");
+        }
+
+        // CONTROL: a body that echoed nothing comes back unchanged, on every
+        // arm — including `Absent`, where nothing was ever sent and there is
+        // therefore nothing an upstream could have quoted.
+        let clean = r#"{"error":{"message":"model overloaded"}}"#.to_string();
+        for (arm, credential) in [
+            ("stored", &stored),
+            ("forwarded", &forwarded),
+            ("absent", &TurnCredential::Absent),
+        ] {
+            assert_eq!(credential.redact(clean.clone()), clean, "{arm}");
+        }
     }
 }
