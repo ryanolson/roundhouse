@@ -237,3 +237,53 @@ a target class and a header vocabulary rather than as rivals. The moat was
 never the wire format; it is the turn, priced exactly, under policy, with an
 audit trail — and after this round, that claim carries four pinned trees of
 evidence instead of an assertion.
+
+---
+
+## Addendum (2026-08-20): Router.com, and the narrowing of "only ours"
+
+This document was produced 2026-08-19. **Ramp launched Router.com the same
+day** — a commercial OpenAI-compatible routing gateway, run internally at Ramp
+for three years at ~2.75 trillion tokens/month, free through 2026, with NVIDIA
+NeMo Switchyard's stage router live in it. The evidence is
+`../research/router-com-deep-dive.md` (second-hand: egress to every primary
+host was blocked, confidence marked per claim); the ruling is
+`router-com-commercial-overlap.md`. Where that ruling and this document
+disagree, that one wins.
+
+**The dedup verdict above survives, narrowed.** The seven-item claim — "nobody
+in this survey owns the turn: the durable log under a fenced lease, prefix
+admission, per-principal policy and budgets, exact per-turn pricing across local
+and frontier, steering, and the arm-instrumented judge" — loses two items.
+**Ramp** ships them — Router.com together with its companion AI Token Spend
+Management, the half it actually sells: **per-principal policy and budgets**
+(limits by team, project, and key) and **per-request cost attribution across
+providers**, the frontier half of the fourth item.
+Read the claim as five items from here: the durable log under a fenced lease,
+prefix admission, local-and-frontier on one comparison axis, steering, and the
+arm-instrumented judge. Budgets and cross-provider pricing are table stakes now,
+not differentiators.
+
+**The method defect matters more than the correction.** This round read four
+*trees* and concluded a market position. Router.com was invisible to it because
+repository surveys see published source, and a three-year-old internal product
+publishes none. Future rounds read shipped products alongside trees.
+
+**Three things here are re-weighted rather than reversed:**
+
+- The `ToolSignals` port (§"What 'use heavily' resolves to", item 3) was
+  scheduled into the validate seam only. Ramp measured Switchyard's stage router
+  — the same signal family, consumed by the *router* instead of a judge — at 58%
+  cost and 33% runtime against single-model controls. The port feeds both
+  consumers. This is the highest-value item in the new ruling.
+- The Switchyard contribution track gains a production adopter downstream, which
+  raises the value of every item on it and confirms this document's
+  version-identity rule: a production adopter is evidence about which rev is
+  real.
+- **The Messages-surface ruling is now conditional.** "Roundhouse does not build
+  a native Anthropic Messages tool loop" was decided against open-source
+  neighbors. Switchyard preserves Anthropic API compatibility and ships a Claude
+  Code launcher; whether Router.com exposes `/v1/messages` was not established
+  and is the highest-value unknown in the deep dive's §8. If it does, this
+  ruling hands the largest coding-agent client to a competitor and must be
+  re-argued.
