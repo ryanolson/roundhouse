@@ -109,6 +109,21 @@ impl WireProtocol {
         }
     }
 
+    /// How a configuration file spells this dialect.
+    ///
+    /// The same string `serde` writes, pinned by
+    /// [`protocol_names_are_what_a_config_file_would_write`](wire_names) so the
+    /// two cannot drift. It exists because an error message that has to name a
+    /// dialect should name it the way the operator wrote it — `{:?}` would say
+    /// `OpenAiResponses`, which appears in no file anyone can go and edit.
+    pub fn wire_name(&self) -> &'static str {
+        match self {
+            WireProtocol::OpenAiChatCompletions => "openai_chat_completions",
+            WireProtocol::OpenAiResponses => "openai_responses",
+            WireProtocol::AnthropicMessages => "anthropic_messages",
+        }
+    }
+
     /// Whether a call on this dialect can report usage before the stream ends.
     ///
     /// [`WireProtocol::AnthropicMessages`] can, on `message_start`, which is
@@ -249,6 +264,12 @@ mod wire_names {
             assert_eq!(
                 serde_json::from_str::<WireProtocol>(&json).unwrap(),
                 protocol
+            );
+            assert_eq!(
+                protocol.wire_name(),
+                expected,
+                "an error naming a dialect must name it the way the file spells \
+                 it, or it points an operator at a word that is in no file"
             );
         }
     }

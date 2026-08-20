@@ -26,9 +26,11 @@ pub mod store;
 pub mod validate;
 
 pub use control::{
-    Allocation, Budget, BudgetState, BudgetTerms, BudgetWindow, Exhaustion, FrontierCadence,
-    FrontierHistory, Grant, GrantRequest, MemorySpendLedger, PolicyOverrides, Principal,
-    PrincipalKey, ProjectId, Settlement, SpendLedger, TargetFilter, TurnBudget, TurnPolicy, UserId,
+    Allocation, Budget, BudgetCounts, BudgetState, BudgetTerms, BudgetWindow, CredentialError,
+    CredentialKind, CredentialMode, CredentialRef, Exhaustion, FrontierCadence, FrontierHistory,
+    Grant, GrantRequest, MemorySpendLedger, Payer, PolicyOverrides, Principal, PrincipalKey,
+    ProjectId, ProviderAccess, Reachable, Secret, SettledSpend, Settlement, SpendLedger,
+    TargetFilter, TurnBudget, TurnCredential, TurnCredentials, TurnPolicy, UserId,
 };
 pub use event::{
     Accounting, ControlRecord, NotRunReason, PlaceboTiming, SessionEvent, SessionEventKind,

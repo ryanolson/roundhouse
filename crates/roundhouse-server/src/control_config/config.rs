@@ -24,13 +24,15 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 
+use roundhouse_core::control::credential::access::ProviderKeys;
 use roundhouse_core::control::{
-    Allocation, Budget, BudgetTerms, FilterError, FrontierCadence, PolicyOverrides, Principal,
-    TargetFilter, TurnPolicy,
+    Allocation, Budget, BudgetCounts, BudgetTerms, CredentialError, CredentialMode, FilterError,
+    FrontierCadence, PolicyOverrides, Principal, TargetFilter, TurnCredentials, TurnPolicy,
 };
 
 use super::Admission;
 use super::budget::{AllocationConfig, BudgetConfig};
+use super::credentials::CredentialsConfig;
 use roundhouse_core::validate::ValidationTerms;
 
 use super::validate::ValidateConfig;
@@ -68,6 +70,15 @@ pub struct ProjectEntry {
     /// numbers.
     #[serde(default)]
     pub validate: Option<ValidateConfig>,
+    /// Whose provider keys this project's turns authenticate with, and whether
+    /// a member's own key draws the project's budget. Absent means the
+    /// deployment's own keys under the default mode — which, on a deployment
+    /// that declares none either, is
+    /// [`TurnCredentials::unrestricted`](roundhouse_core::control::TurnCredentials::unrestricted):
+    /// every quoted provider stays in the candidate set and the transport
+    /// authenticates itself, exactly as a pre-M7 deployment routes.
+    #[serde(default)]
+    pub credentials: Option<CredentialsConfig>,
 }
 
 /// One entry of the config's `"users"` array.
@@ -97,6 +108,13 @@ pub struct KeyEntry {
     /// `overrides`.
     #[serde(default)]
     pub allocation: Option<AllocationConfig>,
+    /// This member's own provider keys — the `user` tier
+    /// [`CredentialMode`] resolves against. `"mode"` and `"budget_counts"` are
+    /// refused here rather than ignored: both decide who pays, and a member who
+    /// could set either could spend somebody else's key or exempt their own
+    /// turns from the ceiling they are meant to draw.
+    #[serde(default)]
+    pub credentials: Option<CredentialsConfig>,
 }
 
 /// The shape of a `"policy"` (project) or `"overrides"` (key) object: the
@@ -277,6 +295,15 @@ pub struct ControlPlaneConfig {
     /// re-randomize a study already in flight.
     #[serde(default)]
     pub arm_salt: Option<String>,
+    /// The deployment's own provider keys: the tier every mode but `UserOnly`
+    /// falls back to, and the one a project that declares nothing of its own
+    /// runs on.
+    ///
+    /// At the top level rather than repeated per project because that is what
+    /// it is — one set of keys this process holds. A project selects *whether*
+    /// it may reach them through its `mode`; it does not restate them.
+    #[serde(default)]
+    pub credentials: Option<CredentialsConfig>,
     /// The finished turn-key lookup table: `key_sha256` to the complete
     /// [`Admission`] the key resolves to — its membership, its fully-resolved
     /// [`TurnPolicy`] (its project's policy narrowed by its own overrides),
@@ -487,6 +514,48 @@ pub enum ControlPlaneError {
          rather than degrade it"
     )]
     OverflowWithRefuse { path: String, entry: String },
+    #[error(
+        "control-plane config `{path}`: {entry}'s credentials for provider `{provider}` are \
+         refused: {source}"
+    )]
+    Credential {
+        path: String,
+        entry: String,
+        provider: String,
+        #[source]
+        source: CredentialError,
+    },
+    #[error(
+        "control-plane config `{path}`: {entry}'s credentials for provider `{provider}` name the \
+         environment variable `{var}`, which is not set in this process -- the file names the \
+         variable a secret lives in and never carries the secret itself, so an unset variable is \
+         a credential this deployment does not have. Every turn of that key's would lose \
+         `{provider}` from its candidate set and quietly route elsewhere; set the variable, or \
+         take the entry out"
+    )]
+    CredentialEnvVarUnset {
+        path: String,
+        entry: String,
+        provider: String,
+        var: String,
+    },
+    #[error(
+        "control-plane config `{path}`: {entry} sets `credentials.{field}`, which only a project \
+         may set -- it decides who pays, and a tier that could set it for itself could spend \
+         somebody else's key or exempt its own turns from the ceiling they draw"
+    )]
+    CredentialFieldNotAllowedHere {
+        path: String,
+        entry: String,
+        field: &'static str,
+    },
+    #[error("control-plane config `{path}`: {entry} is refused: {source}")]
+    CredentialResolution {
+        path: String,
+        entry: String,
+        #[source]
+        source: CredentialError,
+    },
 }
 
 /// `true` for `^[a-z0-9][a-z0-9_-]{0,63}$`.
@@ -563,6 +632,27 @@ impl ControlPlaneConfig {
         // the boot on the day it is written, not on the day somebody flips
         // `enabled`.
         let mut project_validation: HashMap<&str, Option<ValidationTerms>> = HashMap::new();
+        // The deployment's own keys, resolved once: every project's resolution
+        // reads them, and reading the environment per project would let one
+        // variable be judged twice and -- if it changed underneath us -- judged
+        // two ways.
+        let deployment_keys = match &self.credentials {
+            Some(credentials) => credentials.to_tier(path, "the deployment")?,
+            None => ProviderKeys::new(),
+        };
+        // Every project's credential resolution: its mode, its budget axis, and
+        // its own keys. Resolved here for the reason the three above are --
+        // once per project rather than once per key -- and refused here for the
+        // sharper one: an environment variable this process does not have has
+        // to stop the boot on the day it is written down, not on the day a
+        // tenant's turn quietly loses a provider.
+        let mut project_credentials: HashMap<&str, (CredentialMode, BudgetCounts, ProviderKeys)> =
+            HashMap::new();
+        // Which projects wrote a `"credentials"` block at all, which is a
+        // different question from what it resolved to: a project may declare
+        // the block, name no provider, and mean it -- see the `declared` branch
+        // in the keys loop below.
+        let mut project_declares_credentials: HashSet<&str> = HashSet::new();
         for project in &self.projects {
             if !is_valid_slug(&project.id) {
                 return Err(ControlPlaneError::BadProjectSlug {
@@ -594,6 +684,19 @@ impl ControlPlaneConfig {
                 None => None,
             };
             project_validation.insert(project.id.as_str(), validation);
+
+            if project.credentials.is_some() {
+                project_declares_credentials.insert(project.id.as_str());
+            }
+            let credentials = match &project.credentials {
+                Some(credentials) => credentials.to_project(path, &entry)?,
+                None => (
+                    CredentialMode::default(),
+                    BudgetCounts::default(),
+                    ProviderKeys::new(),
+                ),
+            };
+            project_credentials.insert(project.id.as_str(), credentials);
         }
 
         let mut user_ids: HashSet<&str> = HashSet::new();
@@ -694,6 +797,52 @@ impl ControlPlaneConfig {
                 .expect("a project checked present above was resolved to validate terms above")
                 .clone();
 
+            // `project_ids.contains` above already proved this project exists,
+            // so it is in `project_credentials` too -- both loops walk the same
+            // `self.projects`.
+            let (mode, budget_counts, project_keys) = project_credentials
+                .get(key.project.as_str())
+                .expect("a project checked present above was resolved to credentials above");
+            let user_keys = match &key.credentials {
+                Some(credentials) => credentials.to_tier(path, &key_entry)?,
+                None => ProviderKeys::new(),
+            };
+            // **A file that says nothing about credentials is not gating on
+            // them.** Without this line, every deployment that upgrades into M7
+            // resolves to a `Stored` resolution with three empty tiers, which
+            // reaches no provider, which withholds every hosted candidate — so
+            // turning the milestone on would silently re-route every existing
+            // M1–M6 workload to local capacity it may not even have. That is
+            // the one thing a new milestone must not do, and it is the same
+            // rule `Admission::open` states for the unconfigured deployment,
+            // extended to the configured one that simply has not written this
+            // block. Declaring the block *anywhere* — deployment, project or
+            // key — turns the gate on for that key.
+            let declared = self.credentials.is_some()
+                || project_declares_credentials.contains(key.project.as_str())
+                || key.credentials.is_some();
+            // Through `configured` and never through a caller-side branch on
+            // the mode: it is the one entry point that runs the
+            // pass-through/stored mutual-exclusion check, and a branch here
+            // would skip it for exactly the configuration it exists to refuse.
+            // The `declared` branch above is not that branch — it selects
+            // between gating and not gating, and the un-gated arm has no tiers
+            // for the check to be about.
+            let credentials = match declared {
+                false => TurnCredentials::unrestricted(),
+                true => TurnCredentials::configured(
+                    *mode,
+                    deployment_keys.clone(),
+                    project_keys.clone(),
+                    user_keys,
+                )
+                .map_err(|source| ControlPlaneError::CredentialResolution {
+                    path: path.to_string(),
+                    entry: key_entry.clone(),
+                    source,
+                })?,
+            };
+
             turn_keys.insert(
                 key.key_sha256.clone(),
                 Admission {
@@ -701,6 +850,8 @@ impl ControlPlaneConfig {
                     policy: Arc::new(project_policy.narrow(&overrides)),
                     budget,
                     validation,
+                    credentials,
+                    budget_counts: *budget_counts,
                 },
             );
         }

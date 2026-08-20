@@ -153,6 +153,18 @@ reported 2k-token turn is 50% coverage by calls and 1% by tokens, and it is the
 token figure that tracks the money. Both are reported;
 `coverage_token_fraction` is the one to quote next to a dollar.
 
+There is a fourth quantity and it is deliberately not one of the three, because
+it is not money: `seat_tokens`, the traffic served through a **forwarded
+subscription seat**. Roundhouse holds no rate card for a seat, so the catalog's
+per-token price would describe what *it* would have paid on its own key — a
+counterfactual, not a bill — and the spend ledger has refused to draw against
+one since budgets existed. The dashboard now refuses the same way: a
+pass-through turn is counted in every token figure on the page and priced in
+none of them, and the seat's share is published as a count so a deployment can
+still see the traffic it is carrying. The turn's decision records which it is,
+so the ledger, a successor process repairing a lost settle, and the dashboard
+all read one recorded fact rather than three re-derivations of it.
+
 Only the third needs an argument. A local worker bills nothing, so its saving is
 the difference against a call that never happened — which means naming a hosted
 model it stands in for. That stand-in is a model's **correlary**, chosen by

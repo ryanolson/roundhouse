@@ -138,7 +138,7 @@ is not more correct, only slower.
 |---|---|
 | **Opus** (`claude-opus-5`) | Load-bearing reasoning: judging whether an invariant actually holds, designing a type that makes an invalid state unrepresentable, tracing a lifecycle across modules, deciding whether a finding is real. Anything where being wrong is expensive and the answer is not lookup-shaped. |
 | **Sonnet** (`claude-sonnet-5`) | Bounded work with a checkable answer: "does anything call this function", "does this parse", mechanical refactors, running a suite and reporting what failed, writing a test for a behavior someone has already characterized. |
-| **Fable** (`claude-fable-5`) | High-volume shallow passes where a wrong answer is cheap and immediately visible — bulk extraction, formatting sweeps, first-pass triage that something else verifies. |
+| **Fable** (`claude-fable-5`) | The orchestrator, never the workhorse: planning milestones, authoring the workflow scripts and the design rulings their stage briefs carry, synthesizing across reports into the documents in `agent-docs/`, running the thermo-nuclear review cadence, gating and committing. Fable does not implement milestones or conduct deep research itself — it decides what Opus and Sonnet do and rules on what they return. |
 
 Two rules that matter more than the table:
 
@@ -148,6 +148,43 @@ Two rules that matter more than the table:
 - **Escalate on ambiguity, not on stakes.** If the step has one checkable
   answer, a smaller model gets it right and gets it right faster. Reach for
   Opus when the step requires judgment that could reasonably go either way.
+
+## The ultracode cadence
+
+Milestones and reviews run as dynamic workflows, and the shape that carried
+M0–M6 is the default until something beats it:
+
+1. **Implementation workflow** — Opus core (the invariant-carrying code and
+   its tests), then Opus wiring (cross-module joins, engine seams,
+   integration tests), then Sonnet churn (mechanical fixture updates, full
+   workspace verification), then Sonnet refute (adversarial, by mutation —
+   never by reading alone), then Sonnet fix (rule each finding test-first,
+   close it). Stages are sequential: the box has four cores and one cargo
+   build lock, so parallel cargo-heavy stages just fight.
+2. **Commit** — Fable gates independently (fmt, targeted suites, tree
+   hygiene) and writes the commit.
+3. **Thermo-nuclear review workflow** — two Opus reviewers on different
+   lenses, primed with what the milestone's own refute stage already covered
+   so they hunt what it missed; Sonnet triage; one Sonnet refuter per
+   finding ruling valid/partially-valid/invalid test-first.
+4. **Fix workflow** — Opus fix stages split by file-cluster so they never
+   race, then an independent Sonnet mutation-verifier that re-breaks every
+   fix and watches its guard go red.
+5. **Commit and push** — again Fable's, with the findings ruled in the
+   message.
+
+Research rounds follow the same split: Opus dives over rev-pinned clones,
+one Sonnet fact-checker per dive re-deriving the highest-stakes claims
+(negatives most of all), and Fable writing the evidence documents and the
+ruling into `agent-docs/`. Workflow stage briefs carry the design rulings
+resolved in advance — an implementation agent re-litigating a settled
+decision mid-stage is the failure mode the briefs exist to prevent.
+
+**Each major milestone or phase ships as its own PR**, on a branch cut
+from the then-current `main` and named for the phase. A milestone PR
+carries the implementation, its thermo-nuclear review fixes, and the
+documents the phase produced — one reviewable unit per rung, not one
+mega-branch accreting forever.
 
 ## Cost and pricing data
 

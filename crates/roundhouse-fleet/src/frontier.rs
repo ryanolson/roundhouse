@@ -16,6 +16,7 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 
+use roundhouse_core::control::{CredentialError, TurnCredential};
 use roundhouse_core::metrics::{ReferenceModel, ShadowPricing};
 use roundhouse_core::routing::{CacheLedger, CacheModel, Candidate, ProviderPricing, Target};
 
@@ -240,6 +241,30 @@ pub struct FrontierQuote {
     /// cache node, so it must not vary turn to turn.
     pub prompt_cache_key: String,
     pub expected_output_tokens: Option<u32>,
+    /// What this request authenticates with.
+    ///
+    /// **Carried here for the same reason [`Self::wire_protocol`] is, and the
+    /// argument is the stronger one of the two.** This is the only argument
+    /// [`FrontierClient::execute`] receives, and the engine deliberately holds
+    /// exactly one `Arc<dyn FrontierClient>` for a catalog of providers whose
+    /// transports have nothing in common — a client per user would be
+    /// connection-pool machinery asked to hold a secret, which is a worse place
+    /// for one than a value that lives as long as the turn. So the credential
+    /// arrives in the quote or the client cannot authenticate at all, exactly
+    /// as the dialect arrives here or the usage obligation cannot be
+    /// discharged.
+    ///
+    /// It is a [`TurnCredential`] and not a string, so `Debug` on this struct —
+    /// which is what a `tracing` field on a dispatch renders — yields a
+    /// fingerprint. The plaintext is reachable only through
+    /// [`TurnCredential::require_api_key`], inside `execute`.
+    ///
+    /// There is deliberately no default. Every construction site has to say
+    /// which credential it resolved, because a site that forgot would otherwise
+    /// get [`TurnCredential::Absent`] silently — and an unauthenticated request
+    /// nobody meant to send is precisely the failure mode M7's auth ruling
+    /// found on the client side.
+    pub credential: TurnCredential,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -248,6 +273,36 @@ pub enum FrontierError {
     UnknownProvider(String),
     #[error("provider call failed: {0}")]
     Upstream(String),
+    /// No credential, or the wrong shape of one.
+    ///
+    /// Its own arm rather than an [`Self::Upstream`] string, because nothing
+    /// reached an upstream: a client that cannot authenticate must refuse
+    /// locally instead of sending the request and letting the provider decide,
+    /// which is a fail-open on a request path and — per the M7 auth ruling —
+    /// the exact silent failure a misconfigured pass-through route produces.
+    /// Transparent so the credential layer's code and message survive to the
+    /// client unchanged.
+    #[error(transparent)]
+    Credential(#[from] CredentialError),
+    /// A client was handed a quote in a dialect it does not speak.
+    ///
+    /// Its own arm for the same reason [`Self::Credential`] is: nothing reached
+    /// an upstream. A client holds one transport and one serialization, and the
+    /// engine holds one `Arc<dyn FrontierClient>` for the whole catalog — so a
+    /// catalog entry whose `wire_protocol` does not match the client a
+    /// deployment composed is a configuration mistake, and sending the request
+    /// anyway in the hope that the upstream is forgiving is a fail-open with a
+    /// mis-serialized body attached. Names both halves because the remedy is to
+    /// change one of them.
+    #[error(
+        "this client speaks `{expected}` and the catalog asked it for `{got}` on `{target}`; \
+         refusing to send a request in a dialect it cannot serialize"
+    )]
+    UnsupportedDialect {
+        expected: &'static str,
+        got: &'static str,
+        target: String,
+    },
 }
 
 /// Executes a turn against a hosted provider.
@@ -293,6 +348,7 @@ impl FrontierClient for EchoFrontierClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use roundhouse_core::control::Secret;
 
     const MINUTE: u64 = 60_000;
 
@@ -358,20 +414,93 @@ mod tests {
         assert_eq!(outside.expected_prefill_tokens, 50_000.0);
     }
 
+    /// A plaintext with no substring in common with any fingerprint, marker or
+    /// field name in the quote, so a scan that finds it found the real thing.
+    const LIVE_KEY: &str = "sk-live-ZZZQQQ0000-do-not-log-me";
+
+    fn quote_with(credential: TurnCredential) -> FrontierQuote {
+        FrontierQuote {
+            target: Target::Frontier {
+                provider: "anthropic".into(),
+                model: "claude".into(),
+            },
+            wire_protocol: WireProtocol::AnthropicMessages,
+            prompt: "some prompt".into(),
+            prompt_cache_key: "sess_x".into(),
+            expected_output_tokens: None,
+            credential,
+        }
+    }
+
+    #[test]
+    fn a_quote_never_carries_a_secret() {
+        let secret = Secret::api_key(LIVE_KEY).expect("an ordinary API key");
+        let fingerprint = secret.fingerprint().to_string();
+        let quote = quote_with(TurnCredential::Stored(secret));
+
+        // PROBE. The two ways a quote reaches a log: a `tracing` field on the
+        // dispatch, which is `Debug`, and any serialization of the credential
+        // it carries. Neither may contain the key.
+        for (surface, rendered) in [
+            ("Debug of the whole quote", format!("{quote:?}")),
+            ("Debug of the credential", format!("{:?}", quote.credential)),
+            (
+                "serde_json of the credential",
+                serde_json::to_string(&quote.credential).unwrap(),
+            ),
+        ] {
+            assert!(
+                !rendered.contains(LIVE_KEY),
+                "{surface} disclosed the key: {rendered}"
+            );
+            assert!(
+                rendered.contains(&fingerprint),
+                "{surface} must still identify the key by fingerprint: {rendered}"
+            );
+        }
+
+        // CONTROL, and it is what makes the assertions above about *rendering*
+        // rather than about the quote having lost the key: the one named seam
+        // a client's `execute` calls does return it.
+        assert_eq!(
+            quote.credential.require_api_key("anthropic").unwrap(),
+            LIVE_KEY
+        );
+
+        // The two arms that carry nothing to disclose still say which they are,
+        // because a client has to tell "nobody resolved a key" from "the key
+        // travels in the client's own headers" and must refuse on both.
+        assert_eq!(
+            format!("{:?}", quote_with(TurnCredential::Absent).credential),
+            "Absent"
+        );
+        let forwarded =
+            roundhouse_core::control::PresentedCredential::captured(|name| match name {
+                "authorization" => Some("Bearer eyJhbGciOiJub25lIn0.e30.seat".to_string()),
+                _ => None,
+            })
+            .expect("a bearer was presented")
+            .for_provider("openai")
+            .expect("openai has an allowlist row");
+        let quote = quote_with(TurnCredential::Forwarded(forwarded));
+        assert!(quote.credential.is_forwarded());
+        // A forwarded credential carries the caller's own bearer, so the
+        // no-secret promise has to hold for it too -- and it holds through a
+        // different mechanism from the stored arm's, which is why both are
+        // asserted rather than one standing in for the other.
+        for rendered in [
+            format!("{quote:?}"),
+            serde_json::to_string(&quote.credential).unwrap(),
+        ] {
+            assert!(!rendered.contains("seat"), "{rendered}");
+        }
+    }
+
     #[tokio::test]
     async fn the_echo_client_reports_usage() {
         let client = EchoFrontierClient::new("hello");
         let stream = client
-            .execute(&FrontierQuote {
-                target: Target::Frontier {
-                    provider: "anthropic".into(),
-                    model: "claude".into(),
-                },
-                wire_protocol: WireProtocol::AnthropicMessages,
-                prompt: "some prompt".into(),
-                prompt_cache_key: "sess_x".into(),
-                expected_output_tokens: None,
-            })
+            .execute(&quote_with(TurnCredential::Absent))
             .await
             .unwrap();
         let chunks: Vec<_> = stream.map(|chunk| chunk.unwrap()).collect().await;

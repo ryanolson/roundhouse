@@ -44,6 +44,14 @@
 //!
 //! A single total would hide that distinction, so the snapshot reports all
 //! three and lets the reader decide which claim to make.
+//!
+//! There is a fourth quantity and it is deliberately **not** money:
+//! [`MetricsSnapshot::seat_tokens`], the traffic served under a forwarded
+//! subscription seat. Roundhouse holds no rate card for a seat, so the honest
+//! report is the token count with no dollar beside it — the same rule
+//! [`SettledSpend`](crate::control::SettledSpend) states at the ledger, kept
+//! here by [`Billing`](crate::control::Billing) travelling in the log and by
+//! this projection pricing only what it marks as billable.
 
 //! ## Layout
 //!
@@ -445,6 +453,9 @@ mod tests {
                 turn_policy_digest: String::new(),
                 budget_state: Default::default(),
                 rate_card: None,
+                payer: Default::default(),
+                billing: Default::default(),
+                withheld_providers: Vec::new(),
             },
         });
         // Failed before anything was sent: empty usage is the engine's way of
@@ -488,6 +499,9 @@ mod tests {
                 turn_policy_digest: String::new(),
                 budget_state: Default::default(),
                 rate_card: None,
+                payer: Default::default(),
+                billing: Default::default(),
+                withheld_providers: Vec::new(),
             },
         });
         log.push(SessionEventKind::ResponseIncomplete {
@@ -638,5 +652,140 @@ mod tests {
         // The half that is still a claim is above — a scoped document that
         // filtered its rows but not its window, session count or turn count.
         // That one can regress, so that one stays.
+    }
+
+    /// A forwarded seat is counted in tokens and priced at nothing — in the
+    /// same row as a keyed turn on the same model.
+    ///
+    /// The mixed deployment is the sharp case, and it is why the split lives in
+    /// the fold rather than in a filter over rows. One BYOK project and one
+    /// pass-through project reaching the same hosted model produce **one** row,
+    /// so a reader of that row cannot tell the two apart — and pricing all of
+    /// it invents a bill for the half roundhouse holds no rate card for. Which
+    /// is exactly what the ledger has refused to do since M3.
+    #[test]
+    fn a_seat_forwarded_turn_is_counted_in_tokens_and_priced_at_nothing() {
+        let mut log = LogBuilder::new("s1");
+        // Billed: a key this deployment holds.
+        log.turn(
+            "r1",
+            frontier("anthropic", "claude"),
+            vec![],
+            usage(10_000, 0, 1_000, 0),
+        );
+        // Accounted, not billed: the caller's own subscription seat, forwarded.
+        log.seat_turn(
+            "r2",
+            frontier("anthropic", "claude"),
+            vec![],
+            usage(20_000, 0, 2_000, 0),
+        );
+
+        let mut fold = MetricsFold::new();
+        fold.extend(log.events());
+        let mixed = snapshot(&fold);
+
+        assert_eq!(
+            mixed.models.len(),
+            1,
+            "one model is one row whoever paid for it; the split has to survive \
+             inside the row"
+        );
+        let row = &mixed.models[0];
+        assert_eq!(row.tokens.total, 33_000, "every token is counted");
+        assert_eq!(
+            row.seat_tokens().total,
+            22_000,
+            "and the seat's share is visible rather than merely excluded"
+        );
+
+        // PROBE: only the keyed turn is priced. 10k uncached input at the write
+        // rate plus 1k output, and nothing at all for the 22k tokens a
+        // subscription paid for.
+        let keyed = 10_000.0 * 3.75e-6 + 1_000.0 * 15.0e-6;
+        assert!(
+            (row.billed_usd() - keyed).abs() < 1e-12,
+            "{} is not {keyed}",
+            row.billed_usd()
+        );
+        assert!((mixed.savings.frontier_spend_usd - keyed).abs() < 1e-12);
+        assert_eq!(
+            mixed.seat_tokens.total, 22_000,
+            "the headline reports the traffic it declined to price"
+        );
+
+        // CONTROL: the identical log with both turns on a key prices both, so
+        // the assertion above is about the seat and not about the rate card
+        // having gone missing.
+        let mut both = LogBuilder::new("s2");
+        both.turn(
+            "r1",
+            frontier("anthropic", "claude"),
+            vec![],
+            usage(10_000, 0, 1_000, 0),
+        );
+        both.turn(
+            "r2",
+            frontier("anthropic", "claude"),
+            vec![],
+            usage(20_000, 0, 2_000, 0),
+        );
+        let mut all_billed_fold = MetricsFold::new();
+        all_billed_fold.extend(both.events());
+        let all_billed = snapshot(&all_billed_fold);
+        let expected = 30_000.0 * 3.75e-6 + 3_000.0 * 15.0e-6;
+        assert!((all_billed.savings.frontier_spend_usd - expected).abs() < 1e-12);
+        assert_eq!(all_billed.seat_tokens.total, 0);
+    }
+
+    /// A local turn a seat would have paid for is not a saving this deployment
+    /// made.
+    ///
+    /// The other direction of the same rule, and the easier one to get wrong
+    /// because nothing about it looks like a bill: the counterfactual
+    /// `routing_savings_usd` reports is *money not spent*, and the hosted call a
+    /// pass-through session passed over would have been charged to the caller's
+    /// subscription. Crediting roundhouse with it is the same invented figure as
+    /// pricing the seat's tokens, spelled as a saving instead of a cost.
+    #[test]
+    fn routing_savings_never_credit_a_local_turn_a_seat_would_have_paid_for() {
+        let mut log = LogBuilder::new("s1");
+        log.seat_turn(
+            "r1",
+            local("llama"),
+            vec![candidate(frontier("anthropic", "claude"), 0.05)],
+            usage(100_000, 0, 1_000, 0),
+        );
+
+        let mut fold = MetricsFold::new();
+        fold.extend(log.events());
+        let seat = snapshot(&fold);
+
+        assert_eq!(seat.tokens.total, 101_000, "the tokens are still real");
+        assert_eq!(
+            seat.savings.routing_savings_usd, 0.0,
+            "a correlary price over a seat's traffic is a saving nobody made"
+        );
+        assert_eq!(
+            seat.savings.routing_savings_at_decision_usd, 0.0,
+            "and the router's own quote for the same road not taken says so too"
+        );
+        assert_eq!(seat.savings.total_usd, 0.0);
+
+        // CONTROL: the identical turn on a project that pays with a key it
+        // brought is a saving, and both estimates report it.
+        let mut billed = LogBuilder::new("s2");
+        billed.turn(
+            "r1",
+            local("llama"),
+            vec![candidate(frontier("anthropic", "claude"), 0.05)],
+            usage(100_000, 0, 1_000, 0),
+        );
+        let mut billed_fold = MetricsFold::new();
+        billed_fold.extend(billed.events());
+        let paid = snapshot(&billed_fold);
+        let shadow = 100_000.0 * 3.75e-6 + 1_000.0 * 15.0e-6;
+        assert!((paid.savings.routing_savings_usd - shadow).abs() < 1e-12);
+        assert!((paid.savings.routing_savings_at_decision_usd - 0.05).abs() < 1e-12);
     }
 }

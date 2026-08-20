@@ -31,7 +31,7 @@
 //! M5 builds the tool that reads a steer; M6 builds the thing that writes one.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -997,6 +997,181 @@ async fn an_overlay_cannot_widen_what_the_key_may_do() {
             "and both turns still serve"
         );
     }
+}
+
+/// A member's own provider key, and the variable it lives in.
+///
+/// A credential resolves at *boot*, from a variable named in the file, so a
+/// suite with a credential-gated fixture has to have one set.
+/// `std::env::set_var` is unsound beside a concurrent `std::env::var` and
+/// `cargo test` runs these on many threads, so the write happens inside one
+/// [`LazyLock`] initializer — the same discipline `credential_gating.rs` runs
+/// under, and for the same reason.
+const MEMBER_KEY_VAR: &str = "ROUNDHOUSE_TEST_MCP_MEMBER_KEY";
+const MEMBER_KEY: &str = "sk-ant-api03-MCPSURFACE0000-the-member-pays";
+
+static ENV: LazyLock<()> = LazyLock::new(|| {
+    // SAFETY: this closure runs exactly once and `LazyLock` blocks every other
+    // thread inside `force` until it returns. Every read of this variable in
+    // this binary is downstream of the `force` in `credential_gated_plane`, and
+    // nothing unsets or rewrites it afterwards.
+    unsafe {
+        std::env::set_var(MEMBER_KEY_VAR, MEMBER_KEY);
+    }
+});
+
+/// One project that gates on credentials, and one that forwards the caller's.
+///
+/// `byok/ada` has attached a key for the catalog's one hosted provider and
+/// `byok/bob` has not — the same project, the same policy, the same catalog,
+/// and the only difference between the two memberships is a credential. That is
+/// what makes an assertion about what each is *told* an assertion about the
+/// credential gate rather than about policy.
+///
+/// `seat/cleo` forwards: it holds no key and never will, because its credential
+/// arrives with a turn. What the surface should say about it is the opposite of
+/// what it says about `bob`, which is why it is in the same fixture.
+fn credential_gated_plane() -> Arc<ControlPlane> {
+    LazyLock::force(&ENV);
+    let json = json!({
+        "projects": [
+            { "id": "byok", "credentials": { "mode": "user_only" } },
+            { "id": "seat", "credentials": { "mode": "pass_through" } },
+        ],
+        "users": [{ "id": "ada" }, { "id": "bob" }, { "id": "cleo" }],
+        "keys": [
+            {
+                "project": "byok", "user": "ada", "key_sha256": sha256_hex(&key("ada")),
+                "credentials": { "providers": { "anthropic": { "env_var": MEMBER_KEY_VAR } } },
+            },
+            { "project": "byok", "user": "bob", "key_sha256": sha256_hex(&key("bob")) },
+            { "project": "seat", "user": "cleo", "key_sha256": sha256_hex(&key("cleo")) },
+        ],
+    })
+    .to_string();
+    Arc::new(ControlPlane::configured(
+        ControlPlaneConfig::from_json(&json, "mcp-surface credential fixture")
+            .expect("the fixture config must validate"),
+    ))
+}
+
+/// What `status` says this key's turns could be routed to.
+async fn admissible(rig: &Rig, secret: &str) -> Value {
+    served(&tools_call(rig, Some(secret), "status", json!({})).await)["admissible_targets"].clone()
+}
+
+/// A `prefer frontier` ask, which is the overlay that needs a hosted target to
+/// be honorable at all.
+async fn prefer_frontier(rig: &Rig, secret: &str) -> Value {
+    served(
+        &tools_call(
+            rig,
+            Some(secret),
+            "prefer",
+            json!({
+                "mode": "frontier",
+                "scope": "session",
+                "reason": "this looks hard",
+                "conversation": "main",
+            }),
+        )
+        .await,
+    )
+}
+
+#[tokio::test]
+async fn status_and_the_overlay_guard_withhold_a_target_the_key_cannot_authenticate_to() {
+    // The engine gained a credential filter in M7 and this read never saw it,
+    // so the control surface answered a strictly wider question than the router
+    // does: `status` named a hosted target to a member holding no key for it,
+    // and `prefer`'s guard waved a narrowing onto that provider through to a
+    // turn the router would then withhold it from.
+    let rig = rig(credential_gated_plane()).await;
+
+    // A turn each, so `status` has a conversation to resolve — and so the
+    // router's own answer is on the record beside the surface's.
+    let mut with_key = Conversation::new(&key("ada"), "main");
+    with_key.say(&rig, "start").await;
+    let mut without_key = Conversation::new(&key("bob"), "main");
+    without_key.say(&rig, "start").await;
+
+    // PROBE: `bob` holds no key for `anthropic`, so no turn of his can ever be
+    // routed there. Naming it is a promise the next turn breaks.
+    assert_eq!(
+        admissible(&rig, &key("bob")).await,
+        json!(["local/local"]),
+        "a member with no credential is told what the router would actually give them"
+    );
+
+    // CONTROL: the same project, the same policy, the same catalog. The only
+    // difference is a key, so the omission above is the credential's doing.
+    assert_eq!(
+        admissible(&rig, &key("ada")).await,
+        json!(["anthropic/claude", "local/local"]),
+    );
+
+    // And the router agrees with both, which is the point of intersecting the
+    // same two predicates it does.
+    assert_eq!(
+        decisions(&rig.store, "byok/bob/main").await[0]
+            .chosen
+            .policy_identity(),
+        "local/local",
+    );
+    assert_eq!(
+        decisions(&rig.store, "byok/ada/main").await[0]
+            .chosen
+            .policy_identity(),
+        "anthropic/claude",
+    );
+
+    // PROBE: the overlay guard reads the same answer. `prefer frontier` on a
+    // key that can authenticate to nothing hosted is an ask that would leave
+    // the session with nothing routable, so it is reported rather than applied
+    // — never refused, and never honored into a turn that then fails.
+    let over_ask = prefer_frontier(&rig, &key("bob")).await;
+    assert_eq!(over_ask["narrowed"], json!(true), "{over_ask}");
+    assert!(
+        over_ask["narrowed_because"].is_string(),
+        "an agent that is told `narrowed` without being told why has to guess: {over_ask}"
+    );
+    assert_eq!(
+        over_ask["admissible_targets"],
+        json!(["local/local"]),
+        "and the session is left routable: {over_ask}"
+    );
+
+    // CONTROL: `ada`'s identical ask is honored in full.
+    let honored = prefer_frontier(&rig, &key("ada")).await;
+    assert_eq!(honored["narrowed"], json!(false), "{honored}");
+    assert_eq!(honored["admissible_targets"], json!(["anthropic/claude"]));
+}
+
+#[tokio::test]
+async fn a_pass_through_key_is_shown_the_hosted_target_its_next_turn_may_still_present_a_seat_for()
+{
+    // The one place the surface and the boot check both answer optimistically,
+    // and it is the same argument in both: a forwarding project's credential is
+    // a property of a *request*, and an MCP call is not the turn. Answering
+    // `reaches` here would tell every pass-through agent it can reach nothing
+    // hosted — on a deployment where every one of its turns can — because the
+    // configured resolution has presented nothing yet.
+    let rig = rig(credential_gated_plane()).await;
+    let mut agent = Conversation::new(&key("cleo"), "main");
+    agent.say(&rig, "start").await;
+
+    assert_eq!(
+        admissible(&rig, &key("cleo")).await,
+        json!(["anthropic/claude", "local/local"]),
+        "a forwarding project is shown what a turn carrying a seat could reach"
+    );
+
+    // And this really is the optimistic answer rather than an ungated one: the
+    // turn above presented no seat, so the router withheld the provider. The
+    // two disagree here on purpose, and the marker is what says so.
+    let decision = &decisions(&rig.store, "seat/cleo/main").await[0];
+    assert_eq!(decision.chosen.policy_identity(), "local/local");
+    assert_eq!(decision.withheld_providers, vec!["anthropic".to_string()]);
 }
 
 #[tokio::test]

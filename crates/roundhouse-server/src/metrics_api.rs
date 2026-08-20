@@ -229,6 +229,9 @@ mod tests {
                         turn_policy_digest: String::new(),
                         budget_state: BudgetState::Unconstrained,
                         rate_card: None,
+                        payer: Default::default(),
+                        billing: Default::default(),
+                        withheld_providers: Vec::new(),
                     },
                 },
             },
@@ -301,6 +304,7 @@ mod tests {
             "calls",
             "tokens",
             "coverage",
+            "seat_tokens",
             "billed_usd",
             "shadow_usd",
             "models",
@@ -319,11 +323,20 @@ mod tests {
             );
         }
 
+        // The seat count is published beside the money and never as money —
+        // zero here, because this fixture forwards nobody's subscription, and
+        // present rather than absent so a dashboard can always read it.
+        assert_eq!(json["seat_tokens"]["total"], 0);
+
         // And a model row still flattens its accounting: `mode` beside only
         // the money that applies to it.
         let row = &json["models"][0];
         assert_eq!(row["mode"], "frontier");
         assert!(row.get("billed_usd").is_some());
+        assert_eq!(
+            row["seat_tokens"]["total"], 0,
+            "a hosted row carries its unpriceable share, even when it has none"
+        );
         assert!(
             row.get("shadow_usd").is_none(),
             "a hosted row must not carry a shadow price, not even a zero one"

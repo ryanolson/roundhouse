@@ -19,6 +19,7 @@
 use std::sync::Mutex;
 
 use async_trait::async_trait;
+use roundhouse_core::control::TurnCredential;
 use roundhouse_core::routing::{CacheLedger, CacheModel, ProviderPricing, Target};
 use roundhouse_fleet::{
     FrontierChunk, FrontierClient, FrontierError, FrontierModelSpec, FrontierQuote, FrontierStream,
@@ -63,6 +64,11 @@ fn quote_as_the_engine_builds_it(catalog: &StaticFrontierCatalog) -> FrontierQuo
         prompt: "how many tokens did that turn bill?".into(),
         prompt_cache_key: "sess_finding1".into(),
         expected_output_tokens: Some(512),
+        // This test is about the dialect the quote carries, not about
+        // authentication: the stub below never contacts a provider, so there is
+        // nothing to authenticate to. `Absent` is the honest value, and a real
+        // client handed it refuses rather than sending the request.
+        credential: TurnCredential::Absent,
     }
 }
 

@@ -99,6 +99,9 @@ fn log(calls: &[Usage]) -> Vec<SessionEvent> {
                     turn_policy_digest: String::new(),
                     budget_state: Default::default(),
                     rate_card: None,
+                    payer: Default::default(),
+                    billing: Default::default(),
+                    withheld_providers: Vec::new(),
                 },
             },
         );

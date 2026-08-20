@@ -18,6 +18,10 @@ dynamo-tokens = { workspace = true }
 
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+# `reqwest::Response::bytes_stream` yields `bytes::Bytes`, which the SSE decoder
+# in `openai_responses` names in its own signature. Declared rather than reached
+# through `reqwest::`: a re-export is not a stability promise.
+bytes = "1"
 futures = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
@@ -28,4 +32,10 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+# The mock upstream the provider client is tested against. A hand-rolled axum
+# server rather than a mocking crate, matching how the rest of this workspace
+# stands in for an HTTP dependency -- and it is what lets a test assert the
+# exact headers that *arrived*, which is the whole question a forwarding client
+# has to answer.
+axum = { workspace = true }
 tokio = { workspace = true }

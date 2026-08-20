@@ -190,6 +190,7 @@ fn a_model_row_cannot_contradict_its_own_serving_mode() {
             local_model: "llama".into(),
             reason: "nothing comparable".into(),
         },
+        seat_tokens: Default::default(),
     };
     let row = roundhouse_core::metrics::ModelMetrics {
         provider: "dynamo".into(),
@@ -217,6 +218,7 @@ fn a_model_row_cannot_contradict_its_own_serving_mode() {
             billed_measured_usd: 3.0,
             billed_estimated_usd: 1.0,
             cache_savings_usd: 0.5,
+            seat_tokens: Default::default(),
         },
     };
     assert_eq!(hosted.mode(), ServingMode::Frontier);

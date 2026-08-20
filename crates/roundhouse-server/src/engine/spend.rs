@@ -10,15 +10,23 @@
 //! whether or not the process that opened the grant survived to close it.
 //!
 //! **The one rule this module exists to keep: a settle reads the log and
-//! nothing else.** What a turn is charged is a fact about the turn — its usage
-//! and the rate card that was in force when it was routed — and both travel in
-//! the session's own log, so the process that ran the turn and a successor
+//! nothing else.** What a turn is charged is a fact about the turn — its usage,
+//! the rate card that was in force when it was routed, who paid, and whether
+//! any of it was roundhouse's money to price — and all four travel in the
+//! session's own log, so the process that ran the turn and a successor
 //! replaying its log arrive at the same number by construction rather than by
-//! both consulting a catalog file that may have been edited in between. See
-//! [`DecisionRecord::rate_card`](roundhouse_core::routing::DecisionRecord::rate_card).
+//! both consulting files that may have been edited in between. See
+//! [`DecisionRecord::rate_card`](roundhouse_core::routing::DecisionRecord::rate_card)
+//! and [`DecisionRecord::billing`](roundhouse_core::routing::DecisionRecord::billing).
+//!
+//! The rule has no exception now, and it had one until recently: the
+//! billed-or-accounted half was read from the live `Admission`, which made a
+//! repaired settle disagree with the settle it replaced the moment a project's
+//! credential mode was edited — and left the dashboard, which reads only the
+//! log, unable to agree with either.
 
 use roundhouse_core::context::Tokenizer;
-use roundhouse_core::control::{GrantRequest, Settlement, TurnBudget};
+use roundhouse_core::control::{GrantRequest, SettledSpend, Settlement, TurnBudget};
 use roundhouse_core::ids::ResponseId;
 use roundhouse_core::now_ms;
 use roundhouse_core::routing::{Candidate, Target};
@@ -62,6 +70,23 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
     /// and the failure terminates it with a reason a client can read. The
     /// repair below runs before any of that exists and therefore cannot fail a
     /// turn at all — see [`Engine::repair_settle`].
+    ///
+    /// **A budget over pass-through traffic is not the ceiling it looks like,
+    /// and this is the seam where the difference shows.** A grant is opened for
+    /// every budgeted turn, whatever the credential mode, and the ceiling it
+    /// returns bounds *this* turn: a candidate dearer than what the ledger
+    /// granted is inadmissible, so an operator's dollar figure does change
+    /// routing. What it never does on a forwarded seat is accumulate — the
+    /// settle commits [`SettledSpend::AccountedNotBilled`], the committed total
+    /// stays at zero, and the exhaustion arm and the warn threshold are
+    /// therefore unreachable. The setting reads as "this project may spend $200"
+    /// and behaves as "no single turn of this project may be quoted above $200".
+    /// See [`Billing::is_billable`] for the boot-knowable form of
+    /// that, and for the one path that still commits on such a project: a
+    /// `validate` block's judge authenticates on this deployment's own
+    /// transport and its spend is real.
+    ///
+    /// [`Billing::is_billable`]: roundhouse_core::control::Billing::is_billable
     pub(super) async fn open_grant(
         &self,
         session: &Session<S>,
@@ -132,12 +157,44 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                 session_id: session.session_id().clone(),
                 seq: settlement.seq,
                 response_id: settlement.response_id.clone(),
-                actual_usd: settled_cost_usd(settlement)?,
+                // The two credential axes meet here and only here — see
+                // [`BudgetCounts::drawn_usd`], which is the one place `payer`
+                // and the accounting-honesty rule are applied, so two callers
+                // cannot apply them in two orders.
+                actual_usd: admission
+                    .budget_counts
+                    .drawn_usd(settlement.payer, self.settled_spend(settlement)?),
                 window: terms.budget.window,
                 now_ms: now_ms(),
             })
             .await?;
         Ok(())
+    }
+
+    /// What this turn cost, and whether roundhouse may name the number.
+    ///
+    /// **Both halves come out of the log, and the exception this function used
+    /// to carry is gone.** It read the forwarded half from the live
+    /// `Admission` on the argument that a project's credential mode is
+    /// configuration like the `window` beside it. That argument was wrong in a
+    /// way the window's is not: a `DecisionRecord` already records the payer
+    /// resolved from that mode, so the mode's consequence for *this turn* was
+    /// half in the log and half in a file an operator edits. A project switched
+    /// between a stored key and pass-through therefore re-priced every turn a
+    /// successor repaired — and the metrics fold, reading the same log, had no
+    /// way to agree with either answer.
+    ///
+    /// [`DecisionRecord::billing`] is that fact, written where the credential
+    /// resolves and read here. One decision, one source, and the dashboard
+    /// reads it too.
+    ///
+    /// [`DecisionRecord::billing`]: roundhouse_core::routing::DecisionRecord::billing
+    fn settled_spend(&self, settlement: &TerminalSettlement) -> Result<SettledSpend, EngineError> {
+        // A seat is a subscription, not a metered rate card: the catalog's
+        // per-token price describes what *roundhouse* would have paid on its
+        // own key, which is a counterfactual and not a bill. The tokens still
+        // land in the fold, which is the honest half.
+        Ok(settlement.billing.settled(settled_cost_usd(settlement)?))
     }
 
     /// The same settle, driven on a log this process did not write — and
@@ -212,6 +269,7 @@ pub(super) fn settled_cost_usd(settlement: &TerminalSettlement) -> Result<f64, E
 #[cfg(test)]
 mod tests {
     use super::*;
+    use roundhouse_core::control::{Billing, Payer};
     use roundhouse_core::event::{Accounting, Usage};
     use roundhouse_core::ids::ResponseId;
     use roundhouse_core::routing::ProviderPricing;
@@ -246,6 +304,12 @@ mod tests {
             seq: 7,
             target,
             rate_card,
+            // This function's subject is the *price*, which is a question about
+            // the card and the target. Who paid is the axis `BudgetCounts`
+            // reads, one seam out, and it is asserted there — as is whether the
+            // price may be claimed at all, which `Billing` decides.
+            payer: Payer::Deployment,
+            billing: Billing::Billed,
             usage: one_mtok_out(),
         }
     }

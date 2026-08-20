@@ -115,6 +115,9 @@ fn one_frontier_call(usage: Usage) -> Vec<SessionEvent> {
                     // finding is about. What a settle would charge is the
                     // decision's own card and a separate question.
                     rate_card: None,
+                    payer: Default::default(),
+                    billing: Default::default(),
+                    withheld_providers: Vec::new(),
                 },
             },
         },

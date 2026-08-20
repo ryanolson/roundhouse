@@ -46,10 +46,15 @@ use roundhouse_core::validate::{
     Signal, SignalKind, SteerChannel, TriggerConfig, ValidationTerms, Validator, ValidatorConfig,
 };
 use roundhouse_fleet::{
-    EchoFrontierClient, FrontierClient, FrontierModelSpec, StaticFrontierCatalog,
+    EchoFrontierClient, FrontierClient, FrontierModelSpec, OpenAiResponsesClient,
+    StaticFrontierCatalog,
 };
 use roundhouse_mcp::{ControlStore, IntentRecord};
-use roundhouse_server::{Admission, EchoLocalExecutor, Engine, EngineConfig, EngineError};
+use roundhouse_server::{
+    Admission, EchoLocalExecutor, Engine, EngineConfig, EngineError, FleetJudge, JudgeConfig,
+};
+
+use codex_utils_rustls_provider::ensure_rustls_crypto_provider;
 
 mod common;
 use common::{MINUTE, frontier_catalog};
@@ -330,10 +335,28 @@ fn rig_with_catalog(
     frontier: Arc<dyn FrontierClient>,
     catalog: StaticFrontierCatalog,
 ) -> Rig {
+    rig_over_judge(
+        Arc::clone(&judge) as Arc<dyn JudgeClient>,
+        frontier,
+        catalog,
+    )
+}
+
+/// The same deployment over any judge, scripted or real.
+///
+/// Split out for the one test whose subject *is* the real judge: what a
+/// [`FleetJudge`] does when its dispatch cannot authenticate is a fact about
+/// the fleet path, and a scripted double would be asserting the answer the test
+/// wrote down.
+fn rig_over_judge(
+    judge: Arc<dyn JudgeClient>,
+    frontier: Arc<dyn FrontierClient>,
+    catalog: StaticFrontierCatalog,
+) -> Rig {
     let store = Arc::new(MemoryStore::new());
     let control = Arc::new(ControlStore::new());
     let validator = Validator::new(
-        Arc::clone(&judge) as Arc<dyn JudgeClient>,
+        judge,
         ValidatorConfig {
             trigger: open_trigger(),
             arm_salt: "m6-fixture".into(),
@@ -896,6 +919,106 @@ async fn a_validator_timeout_releases_the_turn_unchanged_and_is_marked_not_free(
     // books a completion and no abandonment.
     let answered = rig(ScriptedJudge::always(ON_TRACK));
     let answered_id = SessionId::new("acme/ada/answered");
+    for result in drive(&answered, &answered_id, &admission, 2).await {
+        result.expect("answers");
+    }
+    let tally = answered.engine.metrics().side_call_tally(Scope::Deployment);
+    assert_eq!((tally.completed, tally.abandoned), (1, 0));
+}
+
+/// The judge the boot check *cannot* ask about: one that resolves, and then
+/// cannot authenticate.
+///
+/// [`judge_spec`] speaks Anthropic, which a Responses client refuses on the
+/// dialect before it ever reaches the credential. This one speaks the dialect
+/// the client serializes, so the refusal under test is the credential's.
+fn openai_dialect_judge_spec() -> FrontierModelSpec {
+    FrontierModelSpec {
+        wire_protocol: roundhouse_fleet::WireProtocol::OpenAiResponses,
+        ..judge_spec()
+    }
+}
+
+/// What the boot promise check does **not** cover, and what happens instead.
+///
+/// `unkeepable_promises` asks one question about the judge — does
+/// `ROUNDHOUSE_JUDGE_MODEL` name a model in this deployment's catalog — and
+/// deliberately asks nothing about whether the side call can *authenticate*.
+/// [`FleetJudge`] resolves no credential of its own (`judge.rs`: the deployment
+/// tier is a second reader of the same keys, and which process holds it is a
+/// design question M7 did not answer), so on a deployment composing a real
+/// provider client every check is refused before a socket opens.
+///
+/// That is a **runtime fail-open**, not a boot failure, and it is the M6
+/// interject contract holding: the checker never breaks the checked. This test
+/// is what makes that sentence true rather than asserted, and it is the
+/// evidence behind the comment at the boot check that used to claim the check
+/// could see whether an enrolled project's validations would happen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_judge_that_cannot_authenticate_abandons_its_check_and_the_turn_proceeds() {
+    ensure_rustls_crypto_provider();
+    // A real `FleetJudge` over a real provider client. No socket is opened and
+    // none is needed: an absent credential is refused before one is.
+    let judge = FleetJudge::new(
+        Arc::new(OpenAiResponsesClient::new().expect("a client builds")) as Arc<dyn FrontierClient>,
+        openai_dialect_judge_spec(),
+        ByteTokenizer,
+        EngineConfig::default().turn_deadline_ms,
+        JudgeConfig::default(),
+    );
+    let probe = rig_over_judge(
+        Arc::new(judge),
+        Arc::new(EchoFrontierClient::new(ANSWER)),
+        frontier_catalog(),
+    );
+    let session_id = SessionId::new("acme/ada/unauthenticated-judge");
+    let admission = enrolled(Arm::Live, tool_call_channel());
+
+    // PROBE: the turns run. A judge that cannot authenticate must not be able
+    // to fail the turn it was asked about — which is exactly why its
+    // reachability is not a boot promise: there is no turn for it to break.
+    for result in drive(&probe, &session_id, &admission, 2).await {
+        assert!(
+            result.is_ok(),
+            "a judge that could not authenticate failed the turn it was checking: {result:?}"
+        );
+    }
+
+    // And it is *loud*: the check is abandoned as unreachable, which is the
+    // same answer an operator gets for a provider nobody could reach. Never a
+    // silently skipped check, and never an unauthenticated request.
+    let kinds = events(&probe.store, &session_id).await;
+    assert!(
+        kinds.iter().any(|kind| matches!(
+            kind,
+            SessionEventKind::SideCallAbandoned {
+                reason: SideCallAbandonReason::Unreachable,
+                ..
+            }
+        )),
+        "the abandonment has to be in the log, or the fail-open is a silent one: {kinds:?}"
+    );
+    let tally = probe.engine.metrics().side_call_tally(Scope::Deployment);
+    assert_eq!((tally.completed, tally.abandoned), (0, 1));
+
+    // Unchanged: byte-for-byte the conversation an unvalidated deployment
+    // produces. "The turn proceeds" is a claim about what the client got, not
+    // just about a `Result` being `Ok`.
+    let control = unvalidated_rig();
+    let control_id = SessionId::new("acme/ada/unauthenticated-judge-control");
+    for result in drive(&control, &control_id, &Admission::open(), 2).await {
+        result.expect("the control answers");
+    }
+    assert_eq!(
+        conversation(&probe.store, &session_id).await,
+        conversation(&control.store, &control_id).await,
+    );
+
+    // CONTROL: the identical fixture over a judge that *can* answer completes
+    // its check, so the abandonment above is the credential's doing and not the
+    // enrolment's.
+    let answered = rig(ScriptedJudge::always(ON_TRACK));
+    let answered_id = SessionId::new("acme/ada/authenticated-judge");
     for result in drive(&answered, &answered_id, &admission, 2).await {
         result.expect("answers");
     }

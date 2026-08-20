@@ -430,29 +430,72 @@ turns are free; policy, budgets (as accounted seat-consumption), attribution,
 and steering all still work, because every request and every usage frame
 still passes through the one write path.
 
-Facts verified at the pinned rev `6344a65` that make this buildable as
-configuration, not protocol work:
+Facts verified against codex `3b45c29` (2026-08-19, device-login mode, both
+configurations traced end to end) that make this buildable as configuration,
+not protocol work:
 
-- Codex attaches its ChatGPT login bearer (and `ChatGPT-Account-ID`) to a
-  **custom** `model_providers.*` base_url unconditionally — the auth
-  resolution wraps whatever `CodexAuth` is active unless the provider
-  declares its own `env_key` (`model-provider/src/auth.rs:186-203`). Leave
-  `requires_openai_auth` unset: that keeps the plain bearer path and avoids
-  the Agent-Identity bootstrap, which would call `auth.openai.com` directly.
-  **Caveat:** NeMo Relay ships `requires_openai_auth = true` in the same
-  position against `codex-cli ≥ 0.143.0` (`crates/cli/src/agents/codex/launch.rs:199-206`
-  at `c37b551`), directly contradicting this ruling, which was read from
-  rev `6344a65`. One read is stale or the flag changed meaning; resolving
-  it against current codex source in device-login mode is M7's first
-  verification item (see `agent-docs/synergies/nemo-relay.md` §S1).
-  *[2026-08-19, round 2: Switchyard's launcher supplies the reconciling
-  hypothesis — it sets the flag conditionally per route: `true` when
+- `requires_openai_auth` is a **route property**, and it is load-bearing. It
+  decides whether the caller's own first-party Codex credential attaches to
+  *this* provider route at all; its default is `false`
+  (`model-provider-info/src/lib.rs:138-143`). Set `true` — with no `env_key`,
+  `experimental_bearer_token`, `auth` command, or `aws` — and codex forwards
+  the active ChatGPT device login to the configured custom `base_url`:
+  `Authorization: Bearer <access token>`, `ChatGPT-Account-ID`, and
+  `X-OpenAI-Fedramp` for fedramp accounts (`model-provider/src/auth.rs:197-219`,
+  `304-320`; `bearer_auth_provider.rs:32-46`). Leave it unset and codex
+  attaches **nothing** — `resolve_provider_auth` short-circuits to the
+  unauthenticated provider even when a valid login exists
+  (`auth.rs:205-207`) — and the TUI never offers the login screen for that
+  provider (`tui/src/lib.rs:1909-1917`). Codex's own probe/control pair
+  proves it: `custom_provider_does_not_inherit_ambient_auth_headers`
+  (`auth.rs:476-494`) asserts an empty header map against
+  `openai_provider_preserves_ambient_auth_headers` (`auth.rs:558-576`) with
+  the same ambient credential and only the flag differing. A custom
+  `base_url` is honoured under either setting;
+  `https://chatgpt.com/backend-api/codex` is only the *default* when
+  `base_url` is unset (`model-provider-info/src/lib.rs:289-303`). `env_key`
+  beats the forwarded login — `bearer_auth_for_provider` runs first
+  (`auth.rs:201-203`) — and `validate()` does not reject the pair
+  (`model-provider-info/src/lib.rs:190-256`), so the two must never both
+  appear: that is codex enforcing natively the mutual exclusion Switchyard
+  states in config (`crates/switchyard-server/src/config.rs:249-254` @
+  `5341f71`). The Agent-Identity bootstrap that once argued for leaving the
+  flag unset is no longer on this path: it sits behind
+  `Feature::UseAgentIdentity`, under development and off by default
+  (`features/src/lib.rs:1529-1533`, reached via
+  `model-provider/src/provider.rs:285-291` and
+  `core/src/session/session.rs:1328-1332`), and when it does run and fails it
+  degrades to the ChatGPT bearer rather than erroring (`auth.rs:256-278`) —
+  we pin `use_agent_identity = false` regardless, because an agent assertion
+  is not a credential roundhouse may forward on a user's behalf. Two of the
+  three failure modes are **silent**, which is why this stanza is documented
+  rather than inferred: the flag unset means roundhouse sees an anonymous
+  request with no client-side error, and the flag `true` without a login
+  yields the same on non-interactive paths (`auth.rs:215-218`). Only a named
+  `env_key` that is unset fails loudly (`model-provider-info/src/lib.rs:329-345`).
+  A `401` from roundhouse buys exactly one auth-recovery attempt plus one
+  retry (`core/src/client.rs:2235-2296`), which is the behaviour we want from
+  a missing pass-through credential.
+  *[History — recorded so nobody re-litigates it. The original ruling here
+  was read from rev `6344a65` and said the bearer attached to a custom
+  `base_url` **unconditionally** absent `env_key`, and therefore prescribed
+  leaving `requires_openai_auth` unset. NeMo Relay shipped
+  `requires_openai_auth = true` in the same position
+  (`crates/cli/src/agents/codex/launch.rs:199-205` @ `ca08901`), a flat
+  contradiction. 2026-08-19, round 2: Switchyard's launcher supplied the
+  reconciling hypothesis — the flag set conditionally per route, `true` when
   forwarding the caller's own OpenAI login, `false` + `env_key` otherwise
-  (`switchyard/cli/launchers/codex_cli_launcher.py:79-102` @ `5341f71`). If
-  the flag is a route property rather than a client-version fact, both prior
-  readings were correct for their own configurations. M7's first item now
-  tests that hypothesis in both configurations rather than adjudicating a
-  contradiction — see `agent-docs/synergies/ecosystem-round-2.md`.]*
+  (`switchyard/cli/launchers/codex_cli_launcher.py:79-91` @ `5341f71`).
+  2026-08-19, M7 stage 0: the hypothesis is **confirmed** and the original
+  ruling **refuted** against codex `3b45c29`. Relay was right for its
+  configuration; our stanza was wrong and would have forwarded nothing at
+  all. Switchyard pays the cost of the same branch in the other direction —
+  its non-forwarding route must inject a dummy `OPENAI_API_KEY="switchyard"`
+  (`codex_cli_launcher.py:97-102`) precisely because
+  `requires_openai_auth = false` sends no bearer. Whether `auth.rs:205-207`
+  post-dates `6344a65` or was simply missed cannot be settled here — the
+  pinned clone is a single-commit snapshot with no history — so the fact is
+  restated against `3b45c29` rather than re-pinned to the old rev.]*
 - The wire shape is the **same Responses API** roundhouse already speaks —
   only the base URL and headers differ by auth mode. The upstream target for
   ChatGPT-authed traffic is `https://chatgpt.com/backend-api/codex` (whether
@@ -468,6 +511,16 @@ configuration, not protocol work:
   headers on every model request, and `session_id` doubles as
   `prompt_cache_key` — per-session isolation and tracking on the wire side
   need nothing new.
+- Under `requires_openai_auth = true` codex also fetches the model catalog
+  from the provider: `GET {base_url}/models`, carrying the forwarded
+  credential (`model-provider/src/models_endpoint.rs:39, 86-109`, selected at
+  `model-provider/src/provider.rs:418-435`). Roundhouse must serve
+  `/v1/models` on the same base URL, or the deployment must pin
+  `model_catalog_json` to an absolute path (`config/src/config_toml.rs:355`)
+  and skip the remote fetch — which is what Switchyard's launcher does
+  (`codex_cli_launcher.py:92-93`). This is not optional polish: without one
+  of the two, the client's first action against a pass-through route is a
+  catalog request roundhouse does not answer.
 - The one real gap: MCP handshake headers are static/env-sourced, so an MCP
   connection cannot carry the codex session id natively. Correlating the MCP
   channel to a conversation uses the init-tool trick: `init_session` returns
@@ -475,7 +528,55 @@ configuration, not protocol work:
   conversation, and the next turn's resent history carries it into the log —
   the session whose log holds the id is the session that made the call.
 
-The enterprise client config this implies, in full:
+The ruling makes this a **pair** of client configs, selected by route exactly
+as Switchyard selects it from `caller_auth_kind`. Never set `env_key`
+alongside `requires_openai_auth = true`: the key wins silently and
+pass-through stops working with no error anywhere.
+
+Enterprise device login — the `PassThrough` arm:
+
+```toml
+model_provider = "roundhouse"
+
+# The prerequisite `requires_openai_auth = true` brings with it, and the reason
+# it is in this stanza and not the BYOK one: under that flag codex fetches its
+# model catalog from `GET {base_url}/models` with the forwarded credential,
+# before the first turn. Roundhouse serves no `/v1/models` today, so the
+# catalog is pinned to a local file and the remote fetch is skipped — the same
+# move Switchyard's launcher makes (`codex_cli_launcher.py:92-93`). Serving
+# `/v1/models` on the same base URL is the other half of the either/or and
+# retires this line; with neither, the client's first action against this route
+# is a request nothing answers.
+model_catalog_json = "/etc/roundhouse/codex-model-catalog.json"
+
+[model_providers.roundhouse]
+# Not "OpenAI": is_openai() matches this exact name and would turn on the
+# routing-hint header and remote compaction v2 against us.
+name = "Roundhouse"
+base_url = "https://roundhouse.internal.example.com/v1"
+wire_api = "responses"
+# The load-bearing line: forward this client's own ChatGPT login. Omitted or
+# false, codex attaches no credential at all and never prompts to log in.
+requires_openai_auth = true
+# env_key / experimental_bearer_token / auth / aws deliberately absent: each
+# resolves first and would replace the forwarded login with a stored secret.
+supports_websockets = false
+
+[model_providers.roundhouse.env_http_headers]
+# Rides beside the forwarded Authorization; this is what M1's principal
+# resolution reads. The Authorization is the user's, held in-flight only.
+"X-Roundhouse-Key" = "ROUNDHOUSE_API_KEY"
+
+[features]
+# Pinned off, not merely left at its default: enabled, Authorization becomes
+# an Agent-Identity assertion bootstrapped against auth.openai.com instead of
+# the user's ChatGPT bearer.
+use_agent_identity = false
+```
+
+The API-key alternative, for seats with no login to forward — the ordinary
+BYOK path, where nothing is forwarded upstream and `payer` comes from the
+stored credential:
 
 ```toml
 model_provider = "roundhouse"
@@ -484,8 +585,16 @@ model_provider = "roundhouse"
 name = "Roundhouse"
 base_url = "https://roundhouse.internal.example.com/v1"
 wire_api = "responses"
+# Stated explicitly because it is a route decision, not an omission.
+requires_openai_auth = false
+# Resolved before any first-party auth; unset at request time is a hard error
+# naming the variable — the one loud failure of the three configurations.
+env_key = "ROUNDHOUSE_API_KEY"
+supports_websockets = false
 
 [model_providers.roundhouse.env_http_headers]
+# Same variable, second header, so principal resolution reads one header name
+# across both routes and nothing downstream branches on the stanza in use.
 "X-Roundhouse-Key" = "ROUNDHOUSE_API_KEY"
 ```
 
