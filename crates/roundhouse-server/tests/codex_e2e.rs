@@ -67,7 +67,17 @@
 //! is pinned on disk (so the client's models manager has no network path at
 //! all), no `auth.json` is ever written, and the child's environment is cleared
 //! before it is built — so a login the developer happens to hold cannot leak
-//! into a request. Nothing here reaches beyond loopback.
+//! into a request. Nothing here reaches beyond loopback. The "cannot leak"
+//! half of that claim is enforced by
+//! `the_childs_environment_carries_only_the_allowlisted_keys_and_no_ambient_credential`
+//! below, on the constructed [`std::process::Command`] itself — added in
+//! stage 5 after stage 4's refute (Finding B) found that no assertion on the
+//! wire could see the negative: a leaked `OPENAI_API_KEY` left every
+//! steering-test assertion green, because `RoundhouseKey`'s `env_key`
+//! resolves ahead of any ambient login and the leaked variable was simply
+//! never consulted. A guard that checks only what arrived can never catch an
+//! extra credential that was available but happened not to be picked; this
+//! one checks what was available at all.
 //!
 //! # Version vigilance
 //!
@@ -75,19 +85,32 @@
 //! printed on every run and a mismatch prints a WARNING rather than failing:
 //! the suite is evidence about a *binary*, and a green run against an unread
 //! version is exactly the silent change of meaning CLAUDE.md's vigilance rule
-//! exists to catch. Two 0.146.0-specific facts are load-bearing and would move:
-//! `CODEX_HOME` must not be under the system temp dir (release builds refuse to
-//! create the arg0 helper symlinks there), and `request_max_retries` /
-//! `stream_max_retries` are **provider-scoped** keys — the top-level spelling is
-//! rejected by `--strict-config`, which this harness passes on purpose so that
-//! drift is loud.
+//! exists to catch. One 0.146.0-specific fact is load-bearing and would move:
+//! `request_max_retries` / `stream_max_retries` are **provider-scoped** keys —
+//! the top-level spelling is rejected by `--strict-config`, which this harness
+//! passes on purpose so that drift is loud.
+//!
+//! `CODEX_HOME` still lives under `target/` rather than the system temp dir,
+//! but — corrected here after stage 4's refute found the original framing
+//! overstated (Finding A) — that is precaution, not a measured fact. The
+//! arg0-symlink refusal it guards against, if it exists at 0.146.0, sits on
+//! the sandboxed-shell-exec path (`codex-linux-sandbox`); this harness's
+//! `sandbox_mode = "read-only"` posture, with no `exec_command` ever
+//! dispatched, does not reach it. Direct retest confirms this on this box:
+//! pointing `CODEX_HOME` and the workdir at `/tmp` produced two full green
+//! runs, including the whole three-run steering suite with its usage-evidence
+//! block. Kept under `target/` regardless, because "the refusal path is never
+//! reached here" is a narrower and cheaper-to-attribute claim than "release
+//! builds refuse it" — the latter is not something this suite exercises or
+//! proves, in either direction, and no test here should be read as asserting
+//! it.
 //!
 //! One environmental note so nobody debugs it from scratch: codex's first user
 //! message embeds `<current_date>`, which is stable within a run but would
 //! change across local midnight — a suite straddling it would see the item
 //! change and the session fork.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -364,12 +387,15 @@ impl Rig {
     async fn start(label: &str) -> Self {
         ensure_rustls_crypto_provider();
 
-        // Under `target/`, never under the system temp dir: release builds of
-        // 0.146.0 refuse to create their arg0 helper symlinks there — including
-        // `codex-linux-sandbox` — and then fall back to a binary whose basename
-        // does not dispatch to the sandbox helper. Nothing here runs a shell
-        // command, so the fallback would probably work; "probably" is the part
-        // that would make a failing run impossible to attribute.
+        // Under `target/`, not the system temp dir — precaution, not a
+        // measured fact (module doc, "Version vigilance": stage 4's refute
+        // mutation 13 pointed this at `/tmp` and got two full green runs).
+        // The arg0-symlink refusal this guards against, if it exists at
+        // 0.146.0, sits on the sandboxed-shell-exec path; this harness's
+        // read-only posture with no `exec_command` ever dispatched does not
+        // reach it. Kept here anyway because "never reached on this box, this
+        // run" is a narrower claim than "release builds refuse it", and the
+        // narrower one is the one this suite can actually stand behind.
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/codex-e2e")
             .join(format!("{label}-{}", uuid::Uuid::new_v4()));
@@ -703,57 +729,14 @@ impl Rig {
 
     async fn spawn(&self, subcommand: &[&str], prompt: &str) -> CodexRun {
         let last_message = self.root.join(format!("last-{}.txt", uuid::Uuid::new_v4()));
-        let mut command = tokio::process::Command::new(&self.binary);
-        command.args(subcommand);
-        command.args([
-            "--json",
-            // Unknown config keys become hard errors rather than silent
-            // no-ops. Verified to pass against the generated config, and kept
-            // on purpose: this suite exists to notice client drift, and a knob
-            // that quietly stopped applying is exactly the drift it would
-            // otherwise miss.
-            "--strict-config",
-            "--skip-git-repo-check",
-            "-o",
-        ]);
-        command.arg(&last_message);
-        command.args([
-            "-c",
-            "sandbox_mode=\"read-only\"",
-            // Provider-scoped, not top level: at 0.146.0 the bare
-            // `request_max_retries` is not a config field and `--strict-config`
-            // rejects it. Zero so a server bug fails once, loudly, instead of
-            // three times with the first failure scrolled away.
-            "-c",
-            "model_providers.roundhouse.request_max_retries=0",
-            "-c",
-            "model_providers.roundhouse.stream_max_retries=0",
-        ]);
-        command.arg(prompt);
-
-        // Cleared and rebuilt, not inherited: an `OPENAI_API_KEY` or a ChatGPT
-        // login in the developer's environment would make the client
-        // authenticate as itself against our base_url, and the test would pass
-        // while exercising a path it never meant to.
-        // The working directory rather than `-C`: `exec resume` has no `--cd`
-        // flag at all, and `--last` filters recorded sessions *by cwd*, so the
-        // resumed process has to stand where the first one stood. Setting it on
-        // both keeps one spelling instead of a flag on one path and a chdir on
-        // the other.
-        command.current_dir(self.root.join("wd"));
-        command.env_clear();
-        command.env("PATH", std::env::var("PATH").unwrap_or_default());
-        command.env("HOME", &self.root);
-        command.env("CODEX_HOME", self.root.join("home"));
-        command.env(DEFAULT_KEY_ENV, &self.secret);
-        command.env("RUST_LOG", "info");
-        // Without this the child blocks reading stdin — the first probe of this
-        // idiom hung for a full minute printing "Reading additional input from
-        // stdin...", which under a bounded suite reads as "the newest test
-        // hangs" and points at the wrong thing entirely.
-        command.stdin(Stdio::null());
-        command.stdout(Stdio::piped());
-        command.stderr(Stdio::piped());
+        let mut command = build_child_command(
+            &self.binary,
+            subcommand,
+            prompt,
+            &self.root,
+            &self.secret,
+            &last_message,
+        );
 
         let output = tokio::time::timeout(CHILD_DEADLINE, command.output())
             .await
@@ -800,6 +783,91 @@ impl Rig {
     }
 }
 
+/// Build the exact `codex` child command `Rig::spawn` runs, without running it.
+///
+/// Pulled out of `spawn` as its own function — rather than left inline — so
+/// the "nothing leaks" half of the module doc's "No network is needed"
+/// paragraph has a guard that does not require spawning a process. Stage 4's
+/// refute (mutation 14) showed why the wire-level assertions cannot be that
+/// guard: leaking `OPENAI_API_KEY` into the child left every steering-test
+/// assertion green, because `RoundhouseKey`'s `env_key` resolves ahead of any
+/// ambient login and the leaked variable was simply never consulted for this
+/// auth kind. A check on what *arrived* structurally cannot see a credential
+/// that was merely *available*; a check on construction can, via
+/// `Command::get_envs()` on the object this function returns before anyone
+/// calls `.output()` on it.
+///
+/// One function used by both the real harness and its own test, rather than a
+/// second copy that mirrors it: a copy is a fixture that can drift from what
+/// actually spawns, which is exactly the gap this function closes.
+fn build_child_command(
+    binary: &str,
+    subcommand: &[&str],
+    prompt: &str,
+    root: &std::path::Path,
+    secret: &str,
+    last_message: &std::path::Path,
+) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(binary);
+    command.args(subcommand);
+    command.args([
+        "--json",
+        // Unknown config keys become hard errors rather than silent no-ops.
+        // Verified to pass against the generated config, and kept on purpose:
+        // this suite exists to notice client drift, and a knob that quietly
+        // stopped applying is exactly the drift it would otherwise miss.
+        "--strict-config",
+        "--skip-git-repo-check",
+        "-o",
+    ]);
+    command.arg(last_message);
+    command.args([
+        "-c",
+        "sandbox_mode=\"read-only\"",
+        // Provider-scoped, not top level: at 0.146.0 the bare
+        // `request_max_retries` is not a config field and `--strict-config`
+        // rejects it. Zero so a server bug fails once, loudly, instead of
+        // three times with the first failure scrolled away.
+        "-c",
+        "model_providers.roundhouse.request_max_retries=0",
+        "-c",
+        "model_providers.roundhouse.stream_max_retries=0",
+    ]);
+    command.arg(prompt);
+
+    // The working directory rather than `-C`: `exec resume` has no `--cd`
+    // flag at all, and `--last` filters recorded sessions *by cwd*, so the
+    // resumed process has to stand where the first one stood. Setting it on
+    // both keeps one spelling instead of a flag on one path and a chdir on
+    // the other.
+    command.current_dir(root.join("wd"));
+
+    // Cleared and rebuilt from an explicit allowlist, not inherited: an
+    // `OPENAI_API_KEY` or a ChatGPT login in the developer's environment would
+    // make the client authenticate as itself against our base_url, and the
+    // test would pass while exercising a path it never meant to. The
+    // allowlist below is the one
+    // `the_childs_environment_carries_only_the_allowlisted_keys_and_no_ambient_credential`
+    // checks against — change one without the other and that test is the one
+    // that goes red.
+    command.env_clear();
+    command.env("PATH", std::env::var("PATH").unwrap_or_default());
+    command.env("HOME", root);
+    command.env("CODEX_HOME", root.join("home"));
+    command.env(DEFAULT_KEY_ENV, secret);
+    command.env("RUST_LOG", "info");
+
+    // Without this the child blocks reading stdin — the first probe of this
+    // idiom hung for a full minute printing "Reading additional input from
+    // stdin...", which under a bounded suite reads as "the newest test hangs"
+    // and points at the wrong thing entirely.
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+
+    command
+}
+
 /// Every target this deployment can route to, priced the way the router prices
 /// them.
 ///
@@ -831,6 +899,78 @@ fn codex_version(binary: &str) -> String {
             )
         });
     String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// Finding B, stage 4's refute (mutation 14): nothing on the wire can prove
+/// the child's environment carries only what this harness allows, because a
+/// leaked credential the auth kind never consults looks, from the wire,
+/// identical to one that was never there — every steering-test header
+/// assertion stayed green with `OPENAI_API_KEY` leaked in, since
+/// `RoundhouseKey`'s `env_key` resolves ahead of any ambient login.
+///
+/// This is the guard that can actually see it: on the constructed
+/// [`tokio::process::Command`] itself, via `Command::get_envs()`, before
+/// anything is spawned. No real `codex` binary, no `--include-ignored`, no
+/// `ROUNDHOUSE_TEST_CODEX_BIN` — this runs on every `--features e2e-codex`
+/// compile.
+///
+/// Re-applying stage 4's mutation 14 against [`build_child_command`] (adding
+/// an extra `command.env("OPENAI_API_KEY", "sk-test")` beside the allowlist)
+/// turns this red on the key-set assertion below; reverting turns it green
+/// again. That red/green pair is the evidence stage 5's report cites for this
+/// finding.
+#[test]
+fn the_childs_environment_carries_only_the_allowlisted_keys_and_no_ambient_credential() {
+    let root = std::path::PathBuf::from("/does/not/need/to/exist");
+    let last_message = root.join("last.txt");
+    let command = build_child_command(
+        "codex",
+        &["exec"],
+        "prompt",
+        &root,
+        "rh_turn_test-secret",
+        &last_message,
+    );
+
+    let envs: BTreeMap<String, Option<String>> = command
+        .as_std()
+        .get_envs()
+        .map(|(key, value)| {
+            (
+                key.to_string_lossy().into_owned(),
+                value.map(|value| value.to_string_lossy().into_owned()),
+            )
+        })
+        .collect();
+
+    // Exactly these five, named exactly this way — not "at least", because a
+    // missing entry (say, a dropped `CODEX_HOME`) is exactly as dangerous a
+    // drift as an extra one, and `==` on the key set catches both directions.
+    let allowed: BTreeSet<&str> = ["PATH", "HOME", "CODEX_HOME", DEFAULT_KEY_ENV, "RUST_LOG"]
+        .into_iter()
+        .collect();
+    let actual: BTreeSet<&str> = envs.keys().map(String::as_str).collect();
+    assert_eq!(
+        actual, allowed,
+        "the child's constructed environment must carry exactly the allowlist, got: {envs:?}"
+    );
+
+    // Named explicitly, on top of the `==` above, because this is the exact
+    // property stage 4's mutation broke: `env_clear()` followed by an
+    // ambient-credential leak is a *sixth* key, which the set check above
+    // already catches — naming the specific suspects here is what makes a
+    // future reviewer's intent legible without re-deriving it from a diff.
+    for suspect in [
+        "OPENAI_API_KEY",
+        "CODEX_API_KEY",
+        "CHATGPT_ACCOUNT_ID",
+        "OPENAI_BASE_URL",
+    ] {
+        assert!(
+            !envs.contains_key(suspect),
+            "an ambient credential leaked into the child's environment: {suspect}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
