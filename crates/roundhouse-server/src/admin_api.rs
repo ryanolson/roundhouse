@@ -162,6 +162,28 @@ pub fn admin_router(
 /// which no plane source can do, so the admin plane is the seam where the
 /// abstraction the other four share would buy nothing and hide the one
 /// capability that matters.
+///
+/// # Accepted: the plane this layer authorized against is not the plane a
+/// handler reads
+///
+/// This layer resolves `directory.plane(now_ms())` once, to decide 403 or
+/// pass. Every handler behind it then independently calls
+/// `state.directory.view(now_ms())` or `.apply(...)` for its own work, which
+/// resolves the directory again. Between those two resolutions is a window —
+/// microseconds wide — in which a concurrent admin write (another admin
+/// revoking the very key this request authenticated with, say) could land, so
+/// a request can in principle be authorized against one snapshot and executed
+/// against another.
+///
+/// Ruled accepted rather than fixed: exploiting it needs a second admin
+/// issuing a same-instant revocation against this one's key, which has no
+/// realistic attacker model here. If this is ever worth closing, the shape
+/// is to resolve the plane once *here* and thread it to the handler through
+/// request extensions, so a handler cannot reach for the directory
+/// independently — the same defense-in-depth [`ControlDirectory`]'s own
+/// write path already applies one layer down, where a mutation holds a
+/// single lock across its own read-validate-commit rather than resolving the
+/// directory twice.
 async fn admin_auth_layer(
     State(directory): State<Arc<ControlDirectory>>,
     request: Request,
@@ -344,6 +366,12 @@ struct ListDto<T> {
 /// spelling of a project is the first step towards a policy an operator can
 /// write in one place and not the other, which is the whole thing R1 exists to
 /// prevent.
+///
+/// Which is also where the `422` on a misspelled field comes from: the entry is
+/// `deny_unknown_fields`, so this route inherits the file's strictness rather
+/// than restating it. It needs that more than the file does — nothing here
+/// reads a project back (see [`ProjectDto`]), so a silently dropped
+/// `credential` would never surface anywhere at all.
 async fn create_project(
     State(state): State<AdminState>,
     body: Bytes,
@@ -399,6 +427,10 @@ async fn get_project(
 /// The patch recompiles and re-validates the whole control plane before it is
 /// written, so a change that would stop this deployment starting is refused here
 /// rather than discovered at the next restart.
+///
+/// An axis sent as an explicit `null` is refused too, naming the axis — an
+/// absent field is "leave alone" and there is no spelling for "remove this
+/// block", so a `null` has no honest reading left. See [`ProjectPatch`].
 async fn patch_project(
     State(state): State<AdminState>,
     Path(project): Path<String>,
@@ -698,20 +730,53 @@ fn credential_crud_unavailable() -> ApiError {
     )
 }
 
-/// Whether a body is asking to store an OAuth credential.
+/// The three field names only an OAuth payload has, in both spellings a client
+/// library produces.
 ///
-/// The `kind` tag if it carries one, and otherwise the three field names that
+/// Both, rather than one and a normalization step, because the set is the whole
+/// rule: a reader deciding whether a body will be refused should be able to
+/// read the answer rather than simulate a transformation.
+const OAUTH_FIELDS: [&str; 6] = [
+    "refresh_token",
+    "refreshToken",
+    "id_token",
+    "idToken",
+    "client_id",
+    "clientId",
+];
+
+/// Whether a body is asking to store an OAuth credential, at any depth.
+///
+/// The `kind` tag if any object carries one, and otherwise the field names that
 /// only an OAuth payload has. Shape rather than tag alone, because the body a
 /// caller actually sends is whatever their client library serialized, and a
 /// refusal that only recognised `{"kind":"oauth"}` would answer 501 — "not yet"
 /// — to the one request whose answer is "not like this".
+///
+/// **Recursive, and that follows from the same sentence.** A credentials block
+/// in this deployment's own vocabulary nests per provider, so a caller who read
+/// that format and tried to hand over a refresh token writes
+/// `{"providers": {"anthropic": {"refresh_token": …}}}` — a top-level-keys-only
+/// check answers "not yet" to it, which is the wrong half of the two refusals.
+/// Arrays are walked for the same reason: a client that batches its credentials
+/// is describing the same thing one level out.
+///
+/// The recursion is bounded by `serde_json`'s own parse depth limit, which the
+/// body has already survived by the time this runs — there is no depth here a
+/// request could choose.
 fn is_oauth_shaped(body: &Value) -> bool {
-    if body.get("kind").and_then(Value::as_str) == Some("oauth") {
-        return true;
+    match body {
+        Value::Object(fields) => {
+            if fields.get("kind").and_then(Value::as_str) == Some("oauth") {
+                return true;
+            }
+            fields.iter().any(|(name, value)| {
+                OAUTH_FIELDS.contains(&name.as_str()) || is_oauth_shaped(value)
+            })
+        }
+        Value::Array(items) => items.iter().any(is_oauth_shaped),
+        _ => false,
     }
-    ["refresh_token", "id_token", "client_id"]
-        .iter()
-        .any(|field| body.get(field).is_some())
 }
 
 // ---------------------------------------------------------------------------

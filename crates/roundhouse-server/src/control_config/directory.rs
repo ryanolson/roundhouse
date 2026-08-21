@@ -98,12 +98,31 @@
 //! file is read and never written. Adding the other half is the first
 //! mechanical step, and it is small; the placement is the decision.
 //!
+//! One more constraint the placement decision inherits, not yet written down
+//! anywhere else: [`DirectoryStore`] today is a synchronous trait, called
+//! under `current`'s write lock alongside a full `compile()` (see
+//! [`Managed::compiled`]'s refresh path) — fine when `load()` is
+//! [`MemoryDirectoryStore`]'s in-memory clone, a real stall once it is a
+//! network round-trip to Redis. A durable store needs two changes together,
+//! not one: `DirectoryStore` becomes an async trait, *and* the refresh path
+//! stops compiling under the write guard — compile into a fresh value first,
+//! then swap it in under a lock held only long enough to publish it. Landing
+//! the trait change without the lock-span change would durable-back the store
+//! and then hold every concurrent admission behind one Redis round-trip on
+//! every TTL-driven refresh.
+//!
 //! [`AuthError::RevokedKey`]: super::AuthError::RevokedKey
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 
-use super::config::{ControlPlaneConfig, DEFAULT_ADMISSION_CACHE_TTL_MS, KeyEntry};
+use roundhouse_core::control::BudgetTerms;
+
+use super::budget::budget_terms;
+use super::config::{
+    ControlPlaneConfig, DEFAULT_ADMISSION_CACHE_TTL_MS, KeyEntry, key_entry_label,
+    project_entry_label,
+};
 use super::crosscheck::CrossChecks;
 use super::{ControlPlane, KeyKind, KeyRefusal, MintedKey, mint_key};
 
@@ -354,7 +373,7 @@ impl ControlDirectory {
 
     /// The plane every surface authenticates against, refreshed if it is due.
     ///
-    /// See [`Managed::plane`] for the refresh rule. A fixed directory answers
+    /// See [`Managed::compiled`] for the refresh rule. A fixed directory answers
     /// the one plane it was built with, and the clock is ignored rather than
     /// consulted: there is nothing behind it that could have moved.
     pub fn plane(&self, now_ms: u64) -> Arc<ControlPlane> {
@@ -370,15 +389,67 @@ impl ControlDirectory {
     /// placeholder: nothing can reach this on an open deployment, because the
     /// admin surface refuses that mode before any route runs.
     pub fn view(&self, now_ms: u64) -> DirectoryView {
+        self.snapshot(now_ms).1
+    }
+
+    /// The compiled plane and the entity listing, **at one version**.
+    ///
+    /// For the caller that needs both and has to explain what it read: the
+    /// reconciliation view lists a project's memberships out of the listing and
+    /// resolves each one's admission out of the plane, and taking those from two
+    /// calls means taking them from two lock acquisitions. A write landing
+    /// between them leaves a document whose members are a version ahead of the
+    /// plane their admissions were resolved against — a member with a live key
+    /// reported as having no admission at all, which that view spells as a row
+    /// with no figures. Both halves leave through one guard here, so the answer
+    /// is one version's answer, whichever version that turns out to be.
+    ///
+    /// Freshness is deliberately *not* the promise: a snapshot taken just before
+    /// a write describes the state before it, and that is a correct answer to
+    /// "what was true when this request arrived". What cannot happen is a
+    /// document assembled from two of them.
+    pub fn snapshot(&self, now_ms: u64) -> (Arc<ControlPlane>, DirectoryView) {
         match &self.backing {
-            Backing::Fixed(_) => DirectoryView {
-                projects: Vec::new(),
-                users: Vec::new(),
-                memberships: Vec::new(),
-                keys: Vec::new(),
-            },
-            Backing::Managed(managed) => managed.view(now_ms),
+            Backing::Fixed(plane) => (
+                Arc::clone(plane),
+                DirectoryView {
+                    projects: Vec::new(),
+                    users: Vec::new(),
+                    memberships: Vec::new(),
+                    keys: Vec::new(),
+                },
+            ),
+            Backing::Managed(managed) => managed.snapshot(now_ms),
         }
+    }
+
+    /// The [`BudgetTerms`] a membership's admission carries, derived from the
+    /// rows rather than taken off a live key.
+    ///
+    /// **For the membership whose keys have all been revoked**, which is the one
+    /// case where the two differ: its spend is still in the ledger and still
+    /// binds its project's ceiling, but there is no admission left to read terms
+    /// from. Terms invented at the reporting end would be a second authority
+    /// over the window a balance is read under — and since a balance read rolls
+    /// a lapsed window, the reporting end is exactly where that mistake hands a
+    /// month's committed spend back. So they are derived here, through the same
+    /// [`budget_terms`] pairing [`ControlPlaneConfig::validate`] runs for a live
+    /// key, over the same project block and the same membership allocation the
+    /// next compile would read: the same bytes the admission carried before the
+    /// key was revoked.
+    ///
+    /// `Ok(None)` means the project has no budget — there was never a ledger
+    /// position — and not that the terms could not be worked out.
+    ///
+    /// A fixed directory is refused rather than answered `None`, for the reason
+    /// [`Self::managed`] gives: `None` would render as "this project has no
+    /// budget", which is a claim about a deployment this call cannot see.
+    pub fn membership_terms(
+        &self,
+        project: &ProjectRecord,
+        membership: &MembershipRecord,
+    ) -> Result<Option<BudgetTerms>, DirectoryError> {
+        self.managed()?.membership_terms(project, membership)
     }
 
     /// Apply one change: validate it, compile the whole control plane it would
@@ -462,7 +533,16 @@ impl Managed {
         })
     }
 
-    /// The plane every surface authenticates against, refreshed if it is due.
+    /// The compiled plane and the records it was compiled from, refreshed if it
+    /// is due — **and taken together**.
+    ///
+    /// The pair rather than either half alone, because the pairing is where a
+    /// caller that needs both can go wrong: two calls take two locks, and
+    /// nothing stops a write landing between them. Every return below hands back
+    /// both fields out of the guard it is already holding, so no caller can
+    /// assemble an answer from two versions even by accident. See
+    /// [`ControlDirectory::snapshot`] for what that costs a reader who wanted
+    /// the newest state instead.
     ///
     /// **Two conditions, and both are load-bearing.** The TTL alone would
     /// recompile a quiet deployment forever; the version alone would make every
@@ -495,11 +575,11 @@ impl Managed {
     /// outside the lock would have every request that arrived during a refresh
     /// compile its own copy of the same plane, so the busier the node, the more
     /// work one revocation would cost it.
-    fn plane(&self, now_ms: u64) -> Arc<ControlPlane> {
+    fn compiled(&self, now_ms: u64) -> (Arc<ControlPlane>, Arc<DirectoryRecords>) {
         {
             let current = self.read_current();
             if now_ms.saturating_sub(current.refreshed_at_ms) < self.ttl_ms {
-                return Arc::clone(&current.plane);
+                return taken(&current);
             }
         }
         let version = match self.store.version() {
@@ -510,13 +590,13 @@ impl Managed {
                     "the control directory could not be re-read; serving the last compiled \
                      control plane, so a revocation made elsewhere is not yet in force here"
                 );
-                return Arc::clone(&self.read_current().plane);
+                return taken(&self.read_current());
             }
         };
         let mut current = self.write_current();
         current.refreshed_at_ms = now_ms;
         if version == current.version {
-            return Arc::clone(&current.plane);
+            return taken(&current);
         }
         match self.store.load() {
             Ok(loaded) => match self.compile(&loaded.records) {
@@ -537,7 +617,13 @@ impl Managed {
                  serving the last compiled control plane"
             ),
         }
-        Arc::clone(&current.plane)
+        taken(&current)
+    }
+
+    /// The plane alone, for the surfaces that only authenticate. See
+    /// [`Self::compiled`].
+    fn plane(&self, now_ms: u64) -> Arc<ControlPlane> {
+        self.compiled(now_ms).0
     }
 
     /// Every entity this deployment has, whoever owns it.
@@ -548,18 +634,27 @@ impl Managed {
     /// builds its lookup tables, so the compiled plane cannot answer "what
     /// projects are there" at all.
     ///
-    /// Refreshed through [`Self::plane`], so a list is exactly as stale as an
+    /// Refreshed through [`Self::compiled`], so a list is exactly as stale as an
     /// admission taken at the same instant — a `GET` that read straight from
     /// the store would show an operator rows this node is not yet
     /// authenticating against, which is a worse kind of wrong than being one
     /// TTL behind.
     ///
-    /// The rows are taken in one read, and a concurrent write may land between
-    /// the refresh and that read: the answer is then simply the newer of two
-    /// consistent snapshots. What cannot happen is a view assembled from two.
-    fn view(&self, now_ms: u64) -> DirectoryView {
-        let _ = self.plane(now_ms);
-        let records = Arc::clone(&self.read_current().records);
+    /// The plane comes back beside it because it is the *same* compile, not a
+    /// second one taken at the same instant: a caller that reads both — see
+    /// [`ControlDirectory::snapshot`] — must not be able to get them from two
+    /// versions, and the only way to promise that is to hand them over together.
+    fn snapshot(&self, now_ms: u64) -> (Arc<ControlPlane>, DirectoryView) {
+        let (plane, records) = self.compiled(now_ms);
+        (plane, self.listing(&records))
+    }
+
+    /// The file's rows merged with the store's, for records already taken.
+    ///
+    /// Separate from [`Self::snapshot`] so the projection cannot reach for the
+    /// lock a second time: it is handed the records it is to project, and has no
+    /// way to read a newer set halfway through building a listing out of them.
+    fn listing(&self, records: &DirectoryRecords) -> DirectoryView {
         let mut view = DirectoryView {
             projects: self
                 .file
@@ -704,6 +799,36 @@ impl Managed {
         Ok(minted)
     }
 
+    /// See [`ControlDirectory::membership_terms`].
+    ///
+    /// Both halves go through the resolvers the compiler uses — and name the
+    /// entry the way it names it — so a project block that would refuse a boot
+    /// refuses here with the same sentence rather than with a second wording of
+    /// the same complaint.
+    fn membership_terms(
+        &self,
+        project: &ProjectRecord,
+        membership: &MembershipRecord,
+    ) -> Result<Option<BudgetTerms>, DirectoryError> {
+        let budget = project
+            .entry
+            .budget
+            .as_ref()
+            .map(|budget| budget.to_budget(&self.path, &project_entry_label(project.id())))
+            .transpose()?;
+        let allocation = membership
+            .allocation
+            .as_ref()
+            .map(|allocation| {
+                allocation.to_allocation(
+                    &self.path,
+                    &key_entry_label(&membership.project, &membership.user),
+                )
+            })
+            .transpose()?;
+        Ok(budget_terms(budget, allocation))
+    }
+
     /// The version this node last compiled. Observability, and the seam the
     /// staleness tests read.
     fn version(&self, now_ms: u64) -> u64 {
@@ -763,11 +888,20 @@ impl Managed {
                 if project.is_archived() {
                     return Err(DirectoryError::ProjectIsArchived { id });
                 }
+                // After the three questions above, which are all "may this
+                // project be patched at all" and are answered the same way
+                // whatever the body said. Before the window guard, because a
+                // nulled `budget` has no window to compare.
+                if let Some(axis) = patch.explicit_null_axis() {
+                    return Err(DirectoryError::NullPatchUnsupported { project: id, axis });
+                }
                 // Asked before anything is written, because the answer is about
                 // the *transition* and there is nothing to compare against once
                 // the new budget is in place.
-                if let (Some(current), Some(next)) = (&project.entry.budget, &patch.budget)
-                    && current.window != next.window
+                if let (Some(current), Some(next)) = (
+                    &project.entry.budget,
+                    patch.budget.as_ref().and_then(Option::as_ref),
+                ) && current.window != next.window
                 {
                     return Err(DirectoryError::WindowChangeUnsupported {
                         project: id,
@@ -778,19 +912,22 @@ impl Managed {
                 let project = records
                     .project_mut(&id)
                     .expect("the project was found immutably a few lines above");
-                if let Some(name) = patch.name {
+                // `Some(Some(value))` is the only arm that writes: `None` is an
+                // absent field, and `Some(None)` was refused above rather than
+                // reaching here — see [`ProjectPatch`].
+                if let Some(Some(name)) = patch.name {
                     project.entry.name = Some(name);
                 }
-                if let Some(policy) = patch.policy {
+                if let Some(Some(policy)) = patch.policy {
                     project.entry.policy = Some(policy);
                 }
-                if let Some(budget) = patch.budget {
+                if let Some(Some(budget)) = patch.budget {
                     project.entry.budget = Some(budget);
                 }
-                if let Some(validate) = patch.validate {
+                if let Some(Some(validate)) = patch.validate {
                     project.entry.validate = Some(validate);
                 }
-                if let Some(credentials) = patch.credentials {
+                if let Some(Some(credentials)) = patch.credentials {
                     project.entry.credentials = Some(credentials);
                 }
             }
@@ -1070,6 +1207,16 @@ impl Managed {
             .write()
             .unwrap_or_else(|error| error.into_inner())
     }
+}
+
+/// Both halves of one compiled answer, out of the guard the caller is holding.
+///
+/// A free function taking `&Compiled` rather than a method on [`Managed`], so
+/// that it is spelled the same at every return in [`Managed::compiled`] and
+/// cannot be written as anything but a read of one already-held guard — which is
+/// the whole property that function exists to have.
+fn taken(current: &Compiled) -> (Arc<ControlPlane>, Arc<DirectoryRecords>) {
+    (Arc::clone(&current.plane), Arc::clone(&current.records))
 }
 
 /// See [`ControlDirectory::compile`].

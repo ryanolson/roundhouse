@@ -322,6 +322,22 @@ async fn main() -> anyhow::Result<()> {
     // `MemoryDirectoryStore` is this milestone's only backing store, so
     // admin-created tenancy dies with the process; the unlock condition for a
     // durable one is written at `ControlDirectory`.
+    //
+    // Captured before `file` moves into the match below: it is what decides,
+    // once the Redis branch is chosen further down, whether this deployment's
+    // durability is actually one thing or secretly two — see the warning
+    // there. A `None` file means [`ControlDirectory::open`] below, which has
+    // no admin plane at all, so nothing about it can be mismatched with
+    // anything.
+    //
+    // Named for what it reads (a file was configured), not for the store
+    // that follows from it, because those are two facts today only because
+    // `MemoryDirectoryStore` is this branch's *only* store. The day a
+    // durable `DirectoryStore` lands and the `Some` arm below picks between
+    // stores, this flag has to move with it — to whichever branch is still
+    // memory-backed — or the warning below keeps firing after the gap it
+    // describes is closed.
+    let control_plane_file_configured = file.is_some();
     let directory = match file {
         Some((file, path)) => Arc::new(
             ControlDirectory::new(
@@ -388,6 +404,27 @@ async fn main() -> anyhow::Result<()> {
                 var = REDIS_VAR,
                 "sessions and committed spend are durable in Redis"
             );
+            // Durable is not one property this deployment has, it is two, and
+            // this milestone only ever gives Redis one of them. Say so loudly
+            // rather than let an operator infer "durable" from the variable
+            // name and be wrong about the half that matters when a project
+            // gets archived and recreated.
+            if control_plane_file_configured {
+                tracing::warn!(
+                    var = control_config::CONTROL_PLANE_VAR,
+                    "sessions and committed spend just became durable in Redis, but \
+                     admin-created tenancy -- every project, user and turn key an \
+                     operator creates or archives through the admin plane -- still \
+                     lives only in memory and does not survive this process's \
+                     restart. Concretely: an archived project's tombstone is what \
+                     keeps its id retired (see ProjectRecord::archived_at_ms); lose \
+                     it on restart and the ordinary admin API will let that id be \
+                     recreated as if it were new, silently joining the new tenant \
+                     to the old one's spend history in the ledger that DID survive. \
+                     The fix is a durable DirectoryStore, not yet built -- see \
+                     ControlDirectory's own deferral note for the unlock condition"
+                );
+            }
             serve(
                 Arc::new(store),
                 Arc::new(spend),

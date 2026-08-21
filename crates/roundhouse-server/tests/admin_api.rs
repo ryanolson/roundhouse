@@ -520,6 +520,38 @@ async fn turn(app: &Router, secret: &str, session: &str) {
     );
 }
 
+/// One turn on the native surface, under a caller-chosen `turn_id`, so more
+/// than one turn can be driven through the same session. Asserted to have
+/// completed.
+///
+/// Session creation is idempotent (`POST /v1/sessions` adopting an id that
+/// already exists is a successful retry), so this is safe to call more than
+/// once for the same `session`.
+async fn turn_with_id(app: &Router, secret: &str, session: &str, turn_id: &str) {
+    let (status, text) = send(
+        app,
+        "POST",
+        "/v1/sessions",
+        Some(secret),
+        Some(json!({ "session_id": session })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "creating `{session}`: {text}");
+    let (status, body) = send(
+        app,
+        "POST",
+        &format!("/v1/sessions/{}/responses", path_segment(session)),
+        Some(secret),
+        Some(json!({ "turn_id": turn_id, "input": [{ "role": "user", "text": "hello" }] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the turn `{turn_id}`: {body}");
+    assert!(
+        body.contains("event: response_completed"),
+        "the turn `{turn_id}` did not complete: {body}"
+    );
+}
+
 fn keys_of(value: &Value) -> Vec<String> {
     let mut keys: Vec<String> = value
         .as_object()
@@ -916,6 +948,96 @@ async fn drift_goes_negative_and_stays_visible_when_a_settle_is_lost() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_archived_project_id_stays_refused_without_a_restart() {
+    // The control for the ignored test below: within one process's lifetime,
+    // `refuse_taken` really does keep an archived id retired, exactly as
+    // `ProjectRecord::archived_at_ms` documents. This is what proves the
+    // ignored test's failure is about the directory losing its tombstone on
+    // restart, and not about `refuse_taken` being broken in general.
+    let rig = plain().await;
+    let secret = budgeted_member(&rig.app, "shutco", "walt").await;
+    turn(&rig.app, &secret, "shutco/walt/main").await;
+    admin(&rig.app, "DELETE", "/v1/admin/projects/shutco", None).await;
+
+    let (status, code) = refused(
+        &rig.app,
+        "POST",
+        "/v1/admin/projects",
+        Some(json!({ "id": "shutco" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        code, "identity_collision",
+        "the archived row is still in the same store, so its id is still taken"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "R8: MemoryDirectoryStore is reconstructed fresh and unconditionally on every boot \
+            (main.rs ~341-353), independent of whether the session store and spend ledger are \
+            Redis-backed and durable (~396-427). An archived project's tombstone -- the row \
+            `refuse_taken` reads to keep a closed id retired, see `ProjectRecord::archived_at_ms` \
+            -- lives only in that store, so it is erased on restart while a durable ledger's rows \
+            for the same (project, user) survive untouched. The ordinary admin API then lets the \
+            id be re-created as if it were new, and the ledger silently hands the new tenant the \
+            old one's committed spend, with no field anywhere in the budget view saying so. Ship \
+            the honest signal (a loud boot warning when Redis is durable and the directory is not, \
+            main.rs ~396-427) rather than papering over the gap; the real fix, and this test's \
+            unlock condition, is a durable DirectoryStore replacing MemoryDirectoryStore -- see \
+            ControlDirectory's own module-doc deferral note for the placement decision it is \
+            waiting on. This is the one evidence test that stays #[ignore]'d rather than closed by \
+            a fix in this milestone: it goes green the day that store lands, with no change to the \
+            test itself."]
+async fn recreating_an_archived_project_after_a_restart_inherits_its_spend() {
+    // Stands in for a durable, Redis-backed spend ledger: nothing about this
+    // test depends on `MemorySpendLedger` being in-memory, only on it being the
+    // one thing that survives the "restart" below unwiped -- which is exactly
+    // what a real deployment's Redis-backed ledger would do while its directory
+    // (M8's only backing store is `MemoryDirectoryStore`) does not.
+    let ledger: Arc<dyn SpendLedger> = Arc::new(MemorySpendLedger::new());
+
+    // Boot 1: a real tenant spends real money and is then closed down.
+    let rig1 = rig(Arc::clone(&ledger)).await;
+    let secret = budgeted_member(&rig1.app, "shutco", "walt").await;
+    turn(&rig1.app, &secret, "shutco/walt/main").await;
+    let before = read(&rig1.app, "/v1/admin/projects/shutco/budget").await;
+    assert_usd(
+        before["committed_usd"].as_f64().expect("a ledger figure"),
+        ACTUAL_TURN_USD,
+        "spend really landed against `shutco` before the restart",
+    );
+    admin(&rig1.app, "DELETE", "/v1/admin/projects/shutco", None).await;
+
+    // Boot 2: a fresh `ControlDirectory` over a fresh `MemoryDirectoryStore` --
+    // what `main.rs` builds on every boot regardless of `ROUNDHOUSE_REDIS_URL`
+    // -- but the same `ledger`, standing in for the durable backend that a real
+    // restart would not have wiped.
+    let rig2 = rig(Arc::clone(&ledger)).await;
+
+    // A different tenant, through the ordinary admin API, happens to choose the
+    // same project id. Nothing refuses it: the tombstone that would have was
+    // only ever in the store this boot never inherited.
+    budgeted_member(&rig2.app, "shutco", "walt").await;
+
+    let after = read(&rig2.app, "/v1/admin/projects/shutco/budget").await;
+    assert_eq!(
+        keys_of(&after),
+        keys_of(&before),
+        "the document has no field that could tell an operator this project's \
+         history is not its own: {after}"
+    );
+    assert_usd(
+        after["committed_usd"].as_f64().expect("a ledger figure"),
+        0.0,
+        "a project created moments ago, that has run no turn in this process, \
+         must start at zero committed spend -- it must not inherit the archived \
+         tenant's history just because the durable ledger's row for \
+         (project, user) was never cleared: {after}",
+    );
+}
+
 /// A ledger that loses exactly one settlement and reports success.
 ///
 /// Everything else is forwarded, so the project's grants, its later settles and
@@ -1211,6 +1333,111 @@ async fn an_oauth_shaped_credential_is_refused_with_a_reason() {
     );
 }
 
+/// The refusal is decided on shape at any depth and in either spelling, which
+/// is what its own stated reason -- "whatever their client library serialized"
+/// -- actually commits it to. A top-level-keys-only check answered 501 ("not
+/// yet") to both of these, which is the wrong one of the two refusals: the
+/// caller is not waiting on a feature, they are being told this deployment will
+/// never hold a credential with a lifecycle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_oauth_shaped_credential_still_gets_the_oauth_refusal_camelcase_and_nested() {
+    let rig = plain().await;
+
+    for (label, body) in [
+        // camelCase: the check's own stated rationale is "whatever their
+        // client library serialized" (admin_api.rs doc comment on
+        // `is_oauth_shaped`), and a JS/TS OAuth client serializes exactly
+        // this. No nesting or analogy needed -- this falsifies the
+        // function's stated design intent directly.
+        (
+            "camelCase refreshToken",
+            json!({ "refreshToken": "rt_abc" }),
+        ),
+        // Nested one level under "providers", mirroring the exact nesting
+        // CredentialsConfig documents for a real per-provider credential
+        // block (see `mcp_surface.rs:1028`:
+        // `{"providers": {"anthropic": {"env_var": ...}}}`). A caller who
+        // read that shape and tried to hand over a refresh token instead of
+        // an env var name would write exactly this body.
+        (
+            "nested under providers",
+            json!({ "providers": { "anthropic": { "refresh_token": "rt_abc" } } }),
+        ),
+    ] {
+        let (status, code) = refused(&rig.app, "POST", "/v1/admin/credentials", Some(body)).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{label}: an OAuth-shaped body must be refused on its own terms, not filed under \
+             \"not yet\""
+        );
+        assert_eq!(code, "oauth_credentials_unsupported", "{label}");
+    }
+}
+
+/// The controls that stop the test above being tautological: bodies that are
+/// genuinely *not* OAuth-shaped at any depth or in any casing must keep
+/// answering 501. A walk that widened until everything matched would pass every
+/// assertion above and fail every one here, which is the only way to tell the
+/// two apart from outside.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_non_oauth_credential_still_gets_the_ordinary_501_nested_or_camelcase() {
+    let rig = plain().await;
+
+    for (label, body) in [
+        (
+            "nested ordinary provider credential",
+            json!({ "providers": { "anthropic": { "api_key": "sk-x" } } }),
+        ),
+        ("camelCase ordinary field", json!({ "apiKey": "sk-x" })),
+        ("empty body", json!({})),
+    ] {
+        let (status, code) = refused(&rig.app, "POST", "/v1/admin/credentials", Some(body)).await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{label}");
+        assert_eq!(code, "credential_crud_not_available", "{label}");
+    }
+}
+
+/// The array limb, and the discriminating pair that keeps the walk honest.
+///
+/// A client that batches its credentials is describing the same thing one
+/// level out, so an array is walked rather than dismissed as
+/// "not a credential object" -- but only the *contents* decide the answer. If
+/// the walk answered 400 to any array at all it would pass the first assertion
+/// here and fail the second, which is why both are in one test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_array_body_is_judged_by_what_is_in_it() {
+    let rig = plain().await;
+    let (status, code) = refused(
+        &rig.app,
+        "POST",
+        "/v1/admin/credentials",
+        Some(json!([{ "refresh_token": "rt_abc" }])),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "wrapping a refresh token in an array does not make it a credential this \
+         deployment could hold"
+    );
+    assert_eq!(code, "oauth_credentials_unsupported");
+
+    let (status, code) = refused(
+        &rig.app,
+        "POST",
+        "/v1/admin/credentials",
+        Some(json!([{ "api_key": "sk-x" }])),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_IMPLEMENTED,
+        "and an array of ordinary credentials is still the ordinary refusal"
+    );
+    assert_eq!(code, "credential_crud_not_available");
+}
+
 // ---------------------------------------------------------------------------
 // What the view says when there is nothing to say
 // ---------------------------------------------------------------------------
@@ -1324,6 +1551,336 @@ async fn a_keyless_membership_is_reported_as_having_no_keys_rather_than_unenforc
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_revoked_only_key_still_reports_its_committed_spend() {
+    // R1. The membership below spends real money on a real key, and only then
+    // has that key revoked. The ledger does not forget: the balance the engine
+    // charged against `globex`'s ceiling is unaffected by a key's lifecycle,
+    // and a live hold would still bind the project's limit too. But
+    // `budget_view` resolves a row's basis by asking `plane.membership()` for
+    // an *admission*, and a revoked key has no admission -- which is
+    // indistinguishable there from a membership that was never issued one at
+    // all. Reported as `no_keys` with every dollar blanked, this row discarded
+    // a balance the system still had rather than declining to guess at one it
+    // didn't; it now reports `revoked_keys` with the real figures, read under
+    // terms derived from the directory through the compiler's own pairing.
+    let rig = plain().await;
+    let id = tenancy(
+        &rig.app,
+        json!({
+            "id": "globex",
+            "budget": {
+                "limit_usd": LIMIT_USD,
+                "window": "total",
+                "on_exhaustion": "degrade_to_local",
+                "overflow_when_local_saturated": true,
+            },
+        }),
+        "bob",
+        None,
+    )
+    .await;
+    let minted = admin(
+        &rig.app,
+        "POST",
+        &format!("/v1/admin/projects/{id}/members/bob/keys"),
+        None,
+    )
+    .await;
+    let secret = minted["secret"]
+        .as_str()
+        .expect("a minted secret")
+        .to_string();
+    let key_id = minted["id"].as_str().expect("an id").to_string();
+
+    turn(&rig.app, &secret, "globex/bob/main").await;
+
+    // The spend is real before the key is touched: the same assertion the
+    // no-drift tests make, so a failure below cannot be "the turn never
+    // settled" wearing this finding's name.
+    let mid_flight = read(&rig.app, &format!("/v1/admin/projects/{id}/budget")).await;
+    assert_usd(
+        mid_flight["committed_usd"]
+            .as_f64()
+            .expect("the ledger charged this turn before the key was revoked"),
+        ACTUAL_TURN_USD,
+        "committed spend before revocation",
+    );
+
+    admin(
+        &rig.app,
+        "DELETE",
+        &format!("/v1/admin/keys/{key_id}"),
+        None,
+    )
+    .await;
+
+    let view = read(&rig.app, &format!("/v1/admin/projects/{id}/budget")).await;
+    let member = &view["members"][0];
+    assert_eq!(member["user"], "bob");
+    assert_eq!(
+        member["committed"]["basis"], "revoked_keys",
+        "bob spent {ACTUAL_TURN_USD} before his only key was revoked -- the \
+         ledger still holds that against him, which `no_keys` denies and \
+         `ledger` alone would not admit: {member}"
+    );
+    assert_usd(
+        member["member_committed_usd"]
+            .as_f64()
+            .expect("the ledger's committed balance for this principal is still real"),
+        ACTUAL_TURN_USD,
+        "bob's committed spend after his key was revoked",
+    );
+
+    // **The assertion this test exists for.** A figure is only worth reporting
+    // if it was read under the terms the engine spent under: `balance` rolls a
+    // lapsed window over, so terms assembled for the occasion -- a monthly
+    // window where the project declared a total one -- would not merely
+    // mislabel this row, it would zero the project's committed spend on the way
+    // past. Comparing the stamp to the one taken *before* the revocation is
+    // what catches that: same window, same instant it began, therefore the same
+    // `BudgetTerms`.
+    assert_eq!(
+        member["committed"]["window"], mid_flight["committed"]["window"],
+        "the derived terms must carry the project's own window, or reading a \
+         balance under them rolls it: {member} vs {mid_flight}"
+    );
+    assert_eq!(
+        member["committed"]["window_start_ms"], mid_flight["committed"]["window_start_ms"],
+        "and the same window start: {member} vs {mid_flight}"
+    );
+
+    // Same story at the project level: `globex` has no other member, so the
+    // project row inherits whatever basis `bob`'s row produced.
+    assert_eq!(
+        view["committed"]["basis"], "revoked_keys",
+        "the project's own ceiling is still bound by bob's committed spend: {view}"
+    );
+    assert_usd(
+        view["committed_usd"]
+            .as_f64()
+            .expect("the project-level committed figure survives the revocation"),
+        ACTUAL_TURN_USD,
+        "the project's committed spend after its only key was revoked",
+    );
+    assert_eq!(
+        view["committed"]["window"], mid_flight["committed"]["window"],
+        "{view} vs {mid_flight}"
+    );
+    assert_eq!(
+        view["committed"]["window_start_ms"], mid_flight["committed"]["window_start_ms"],
+        "{view} vs {mid_flight}"
+    );
+    // Held dollars are reported for the same reason the committed ones are: the
+    // column exists and the ledger has an answer for it.
+    assert!(
+        view["held_usd"].as_f64().is_some(),
+        "a real position has a real hold figure, even when it is zero: {view}"
+    );
+
+    // The control this finding depends on -- a membership that never had a key
+    // at all must still report `no_keys` -- is
+    // `a_keyless_membership_is_reported_as_having_no_keys_rather_than_unenforced`
+    // just above, which stays live and passing: it is what proves this test is
+    // about the view discarding real information rather than about the two
+    // cases legitimately looking alike.
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_revoked_key_on_an_unbudgeted_project_is_unenforced_and_not_revoked_keys() {
+    // The boundary of R1's remedy. `revoked_keys` promises real dollars read
+    // from the ledger, and an unbudgeted project has no ledger position at all
+    // -- the engine never called it. So a revoked key here changes nothing about
+    // why the figure is absent: nobody was counting this member's spend before
+    // the revocation and nobody is counting it after, which is what `unenforced`
+    // says and what makes it the honest label rather than `revoked_keys` with a
+    // `null` under it (or `no_keys`, which would deny the spending outright).
+    let rig = plain().await;
+    let id = tenancy(&rig.app, json!({ "id": "openhanded" }), "bob", None).await;
+    let minted = admin(
+        &rig.app,
+        "POST",
+        &format!("/v1/admin/projects/{id}/members/bob/keys"),
+        None,
+    )
+    .await;
+    let secret = minted["secret"].as_str().expect("a secret").to_string();
+    let key_id = minted["id"].as_str().expect("an id").to_string();
+    turn(&rig.app, &secret, "openhanded/bob/main").await;
+    admin(
+        &rig.app,
+        "DELETE",
+        &format!("/v1/admin/keys/{key_id}"),
+        None,
+    )
+    .await;
+
+    let view = read(&rig.app, &format!("/v1/admin/projects/{id}/budget")).await;
+    let member = &view["members"][0];
+    assert_eq!(
+        member["committed"]["basis"], "unenforced",
+        "there is no position a revoked key could have left behind on a project \
+         with no budget: {view}"
+    );
+    assert!(member["member_committed_usd"].is_null(), "{member}");
+    assert_eq!(view["committed"]["basis"], "unenforced", "{view}");
+    assert!(view["committed_usd"].is_null(), "{view}");
+    // And the fold still measured the money that was spent, which is the whole
+    // reason `unenforced` is a warning rather than a shrug.
+    assert!(
+        view["measured_usd"].as_f64().expect("a folded figure") > 0.0,
+        "{view}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_live_key_is_what_the_projects_own_row_is_stamped_from() {
+    // The project's basis is not simply the first member row's. `revoked_keys`
+    // says "nobody can spend against this position any more", which is exactly
+    // false of a project that still has a live key somewhere -- and the member
+    // whose key was revoked is listed first here, so a first-row-wins rule would
+    // stamp the whole project with it. The figures are the same either way (they
+    // are project-wide), which is what makes the label the only thing at stake
+    // and the only thing worth testing.
+    let rig = plain().await;
+    let id = tenancy(
+        &rig.app,
+        json!({
+            "id": "globex",
+            "budget": {
+                "limit_usd": LIMIT_USD,
+                "window": "total",
+                "on_exhaustion": "degrade_to_local",
+                "overflow_when_local_saturated": true,
+            },
+        }),
+        "bob",
+        None,
+    )
+    .await;
+    let minted = admin(
+        &rig.app,
+        "POST",
+        &format!("/v1/admin/projects/{id}/members/bob/keys"),
+        None,
+    )
+    .await;
+    let secret = minted["secret"].as_str().expect("a secret").to_string();
+    let key_id = minted["id"].as_str().expect("an id").to_string();
+    turn(&rig.app, &secret, "globex/bob/main").await;
+    admin(
+        &rig.app,
+        "DELETE",
+        &format!("/v1/admin/keys/{key_id}"),
+        None,
+    )
+    .await;
+
+    // cleo joins after bob and keeps her key, so the members list is
+    // [revoked, live] and the project's own row has to prefer the second.
+    admin(
+        &rig.app,
+        "POST",
+        "/v1/admin/users",
+        Some(json!({ "id": "cleo" })),
+    )
+    .await;
+    admin(
+        &rig.app,
+        "PUT",
+        &format!("/v1/admin/projects/{id}/members/cleo"),
+        Some(json!({ "role": "member" })),
+    )
+    .await;
+    admin(
+        &rig.app,
+        "POST",
+        &format!("/v1/admin/projects/{id}/members/cleo/keys"),
+        None,
+    )
+    .await;
+
+    let view = read(&rig.app, &format!("/v1/admin/projects/{id}/budget")).await;
+    assert_eq!(view["members"][0]["user"], "bob", "{view}");
+    assert_eq!(view["members"][0]["committed"]["basis"], "revoked_keys");
+    assert_eq!(view["members"][1]["user"], "cleo", "{view}");
+    assert_eq!(view["members"][1]["committed"]["basis"], "ledger");
+    assert_eq!(
+        view["committed"]["basis"], "ledger",
+        "one live key means this project's ceiling is still being enforced \
+         against something, whatever happened to bob's: {view}"
+    );
+    // Bob's spend is still in the project figure -- it is the same account --
+    // which is what makes the label the whole of the difference.
+    assert_usd(
+        view["committed_usd"].as_f64().expect("a ledger figure"),
+        ACTUAL_TURN_USD,
+        "the project's committed spend still includes bob's turn",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_revoked_only_membership_still_counts_toward_the_share_sum() {
+    // The other half of R1's remedy, and the reason the derived terms carry the
+    // *membership's* allocation rather than a bare project budget. A share is an
+    // arrangement between members -- what the sum is for is showing an operator
+    // how the project's limit has been promised out -- and dropping a member
+    // from it the moment their key is revoked would silently re-report the
+    // arrangement as something nobody agreed to, while their spend goes on
+    // binding the same limit.
+    let rig = plain().await;
+    let id = tenancy(
+        &rig.app,
+        json!({
+            "id": "globex",
+            "budget": {
+                "limit_usd": LIMIT_USD,
+                "window": "total",
+                "on_exhaustion": "degrade_to_local",
+                "overflow_when_local_saturated": true,
+            },
+        }),
+        "bob",
+        Some(json!({ "share": { "fraction": 0.7 } })),
+    )
+    .await;
+    let minted = admin(
+        &rig.app,
+        "POST",
+        &format!("/v1/admin/projects/{id}/members/bob/keys"),
+        None,
+    )
+    .await;
+    let key_id = minted["id"].as_str().expect("an id").to_string();
+    admin(
+        &rig.app,
+        "DELETE",
+        &format!("/v1/admin/keys/{key_id}"),
+        None,
+    )
+    .await;
+
+    let view = read(&rig.app, &format!("/v1/admin/projects/{id}/budget")).await;
+    let member = &view["members"][0];
+    assert_eq!(member["committed"]["basis"], "revoked_keys", "{view}");
+    assert!(
+        (member["allocation_share"].as_f64().expect("a share") - 0.7).abs() < EPSILON,
+        "{view}"
+    );
+    assert!(
+        (view["allocation_share_sum"].as_f64().expect("a sum") - 0.7).abs() < EPSILON,
+        "a revoked member is still allocated 70% of this project's limit: {view}"
+    );
+    // And their own ceiling is still the share of the project limit, which is
+    // what makes the sum readable as an arrangement rather than a number
+    // floating free of anything.
+    assert_usd(
+        member["member_remaining_usd"].as_f64().expect("a ceiling"),
+        LIMIT_USD * 0.7,
+        "an unspent share is the whole of it, key or no key",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn member_allocation_share_sum_is_reported_not_refused() {
     // Shares are allowed to sum past 1.0 and this view says so rather than
     // objecting. The project's own limit binds regardless, so over-subscription
@@ -1433,6 +1990,310 @@ async fn an_unknown_project_is_a_404_and_never_a_document_of_zeros() {
     let (status, code) = refused(&rig.app, "GET", "/v1/admin/keys/key_nosuch", None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(code, "key_not_found");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_axis_patched_to_an_explicit_null_is_refused_naming_the_axis() {
+    // The one JSON spelling that reads like an attempt at removal, and there is
+    // nothing honest to do with it: an absent field means "leave alone", and
+    // this milestone has no spelling for "remove this block" -- removing a
+    // budget widens a ceiling to unlimited. A 200 that changed nothing would
+    // tell an operator their clear worked.
+    let rig = plain().await;
+    tenancy(
+        &rig.app,
+        json!({
+            "id": "globex",
+            "budget": { "limit_usd": LIMIT_USD, "window": "total", "on_exhaustion": "refuse" },
+        }),
+        "bob",
+        None,
+    )
+    .await;
+
+    for axis in ["name", "policy", "budget", "validate", "credentials"] {
+        let (status, code) = refused(
+            &rig.app,
+            "PATCH",
+            "/v1/admin/projects/globex",
+            Some(json!({ axis: Value::Null })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "`{axis}`: null");
+        assert_eq!(code, "null_patch_unsupported", "`{axis}`: null");
+
+        let (_, text) = send(
+            &rig.app,
+            "PATCH",
+            "/v1/admin/projects/globex",
+            Some(&root()),
+            Some(json!({ axis: Value::Null })),
+        )
+        .await;
+        assert!(
+            text.contains(axis),
+            "a caller who nulled one field of five must not have to guess which one \
+             the refusal is about: {text}"
+        );
+    }
+
+    // Nothing was cleared on the way through, which is the failure the refusal
+    // exists to prevent -- `budgeted` is the one axis this API reads back.
+    let project = read(&rig.app, "/v1/admin/projects/globex").await;
+    assert_eq!(project["budgeted"], true, "{project}");
+
+    // The control: an *absent* axis is still "leave alone", answered 200. If
+    // this had turned into a refusal too, the fix would have replaced a silent
+    // no-op with a surface nobody can patch.
+    let patched = admin(
+        &rig.app,
+        "PATCH",
+        "/v1/admin/projects/globex",
+        Some(json!({ "name": "Globex Corp" })),
+    )
+    .await;
+    assert_eq!(patched["name"], "Globex Corp");
+    assert_eq!(
+        patched["budgeted"], true,
+        "a budget nobody mentioned is a budget nobody touched: {patched}"
+    );
+}
+
+/// Every refusal this surface can answer, hit once each and asserted on both
+/// halves of the answer.
+///
+/// The gap this closes is the one the codes themselves are for: a client
+/// branches on `error.code`, so a code that no test ever produces is a string
+/// nobody has checked against the status it travels with. Four of these
+/// (`user_not_found`, `membership_not_found`, `project_is_archived`,
+/// `invalid_control_plane`) had no test at any layer.
+///
+/// A table for the eight that share one deployment, and three blocks for the
+/// three that cannot: two need a key in a particular state, and one needs a
+/// deployment with no control plane at all. A table with a setup discriminator
+/// in it would be harder to read than the three blocks it absorbed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_refusal_code_this_surface_answers_is_produced_at_least_once() {
+    let rig = plain().await;
+    tenancy(
+        &rig.app,
+        json!({
+            "id": "globex",
+            "budget": { "limit_usd": LIMIT_USD, "window": "total", "on_exhaustion": "refuse" },
+        }),
+        "bob",
+        None,
+    )
+    .await;
+    // A second project that gets archived, so `project_is_archived` is reached
+    // on a project this API owns -- `acme` would answer `config_owned` first,
+    // which is a different row of this same table.
+    let archived_key = budgeted_member(&rig.app, "gone", "gus").await;
+    admin(&rig.app, "DELETE", "/v1/admin/projects/gone", None).await;
+
+    for (code, status, method, uri, body) in [
+        (
+            "project_not_found",
+            StatusCode::NOT_FOUND,
+            "GET",
+            "/v1/admin/projects/nosuch",
+            None,
+        ),
+        (
+            "user_not_found",
+            StatusCode::NOT_FOUND,
+            "PUT",
+            "/v1/admin/projects/globex/members/ghost",
+            Some(json!({ "role": "member" })),
+        ),
+        (
+            "membership_not_found",
+            StatusCode::NOT_FOUND,
+            "DELETE",
+            "/v1/admin/projects/globex/members/ghost",
+            None,
+        ),
+        (
+            "key_not_found",
+            StatusCode::NOT_FOUND,
+            "GET",
+            "/v1/admin/keys/key_nosuch",
+            None,
+        ),
+        (
+            "config_owned",
+            StatusCode::CONFLICT,
+            "PATCH",
+            "/v1/admin/projects/acme",
+            Some(json!({ "name": "Renamed" })),
+        ),
+        (
+            "identity_collision",
+            StatusCode::CONFLICT,
+            "POST",
+            "/v1/admin/projects",
+            Some(json!({ "id": "globex" })),
+        ),
+        (
+            "project_is_archived",
+            StatusCode::CONFLICT,
+            "PATCH",
+            "/v1/admin/projects/gone",
+            Some(json!({ "name": "Back From The Dead" })),
+        ),
+        (
+            "window_change_unsupported",
+            StatusCode::BAD_REQUEST,
+            "PATCH",
+            "/v1/admin/projects/globex",
+            Some(json!({
+                "budget": { "limit_usd": LIMIT_USD, "window": "monthly", "on_exhaustion": "refuse" }
+            })),
+        ),
+        (
+            "null_patch_unsupported",
+            StatusCode::BAD_REQUEST,
+            "PATCH",
+            "/v1/admin/projects/globex",
+            Some(json!({ "budget": Value::Null })),
+        ),
+        (
+            // A body the *compiler* refuses, reported in the compiler's own
+            // words -- the same sentence a boot failure would have printed.
+            "invalid_control_plane",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "PATCH",
+            "/v1/admin/projects/globex",
+            Some(json!({ "policy": { "min_quality": 2.0 } })),
+        ),
+        (
+            "oauth_credentials_unsupported",
+            StatusCode::BAD_REQUEST,
+            "POST",
+            "/v1/admin/credentials",
+            Some(json!({ "kind": "oauth" })),
+        ),
+        (
+            "credential_crud_not_available",
+            StatusCode::NOT_IMPLEMENTED,
+            "POST",
+            "/v1/admin/credentials",
+            Some(json!({ "provider": "anthropic" })),
+        ),
+    ] {
+        let (answered_status, answered_code) = refused(&rig.app, method, uri, body).await;
+        assert_eq!(answered_code, code, "{method} {uri}");
+        assert_eq!(answered_status, status, "{method} {uri} -> {code}");
+    }
+
+    // `project_archived`: a live turn key whose project closed under it. 403 on
+    // this surface as on every other, because the key is refused before the
+    // route is reached.
+    let (status, project_archived) = refused_as(
+        &rig.app,
+        "GET",
+        "/v1/admin/projects",
+        Some(archived_key),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(project_archived, "project_archived");
+
+    // `revoked_key`: an admin key this API minted and then tombstoned.
+    let minted = admin(&rig.app, "POST", "/v1/admin/keys", None).await;
+    let secret = minted["secret"].as_str().expect("a secret").to_string();
+    admin(
+        &rig.app,
+        "DELETE",
+        &format!("/v1/admin/keys/{}", minted["id"].as_str().expect("an id")),
+        None,
+    )
+    .await;
+    let (status, code) =
+        refused_as(&rig.app, "GET", "/v1/admin/projects", Some(secret), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(code, "revoked_key");
+
+    // `admin_requires_control_plane`: a deployment with no root of trust an
+    // admin key could have been issued from, which needs its own router.
+    let open = admin_api::admin_router(
+        ControlDirectory::open(),
+        Arc::new(MemorySpendLedger::new()),
+        Arc::new(roundhouse_core::metrics::MetricsRecorder::new()),
+        metrics_config(),
+    );
+    let (status, code) = refused_as(&open, "GET", "/v1/admin/projects", Some(root()), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(code, "admin_requires_control_plane");
+
+    // The near-collision, asserted on the two strings this test just pulled off
+    // the wire rather than on two literals: `project_is_archived` (409, a
+    // mutation this API refuses to make) and `project_archived` (403, a key
+    // whose project closed) differ by one infix and mean opposite things to
+    // whoever is holding the refusal. Comparing real answers is what makes a
+    // rename that converged them break here instead of passing quietly.
+    let (_, project_is_archived) = refused(
+        &rig.app,
+        "PATCH",
+        "/v1/admin/projects/gone",
+        Some(json!({ "name": "Back From The Dead" })),
+    )
+    .await;
+    assert_ne!(project_is_archived, project_archived);
+    assert!(
+        !project_is_archived.starts_with(&project_archived)
+            && !project_archived.starts_with(&project_is_archived),
+        "one code being a prefix of the other is how a client's `starts_with` \
+         dispatch quietly handles the wrong refusal: `{project_is_archived}` vs \
+         `{project_archived}`"
+    );
+}
+
+/// The create body *is* a `"projects"` entry, so the strictness the file gained
+/// is the strictness this route gained -- there is no second spelling of a
+/// project for the two to disagree in. It matters here more than in the file:
+/// nothing reads a project back afterwards (see `ProjectDto` and every admin
+/// route, none of which echoes `policy`, `validate`, `credentials` or a budget
+/// limit), so a dropped field would never surface anywhere at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_misspelled_field_on_project_create_is_refused_not_silently_dropped() {
+    let rig = plain().await;
+    let (status, text) = send(
+        &rig.app,
+        "POST",
+        "/v1/admin/projects",
+        Some(&root()),
+        Some(json!({ "id": "typo-co", "credential": { "mode": "pass_through" } })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a field this API never reads must stop the create at 422, the same way a malformed \
+         request body does -- not silently drop the field and answer 201: got {status}: {text}"
+    );
+}
+
+/// Control for the test above: the correctly spelled field creates the project
+/// as normal, proving the refusal is about the typo and not about some
+/// unrelated fixture problem.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_correctly_spelled_field_on_project_create_still_succeeds() {
+    let rig = plain().await;
+    let (status, text) = send(
+        &rig.app,
+        "POST",
+        "/v1/admin/projects",
+        Some(&root()),
+        Some(json!({ "id": "spelled-co", "credentials": { "mode": "pass_through" } })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "the real field name is enough: {text}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1770,5 +2631,197 @@ async fn a_directory_write_reaches_every_surface_and_not_just_the_admin_one() {
             .expect("a figure")
             > 0.0,
         "the new member's own turn is visible on the metrics surface: {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// R3: PATCHing a budget onto a previously-unbudgeted project
+// ---------------------------------------------------------------------------
+//
+// `Engine::settle` (`engine/spend.rs`) used to gate on `admission.budget`
+// read live off the *current* directory rather than off anything the log
+// records: `let Some(terms) = &admission.budget else { return Ok(()) };`.
+// That is a correct reading of "is there an account to talk to", which is why
+// the line is still there and why
+// `the_view_reports_null_not_zero_for_an_unbudgeted_project` above still
+// holds. It was never a correct reading of "was *this turn* budgeted", and
+// the two diverge the moment a turn that ran under `None` is re-read under a
+// `Some` a later admin write installed: the directory's own window-change
+// guard (`control_config/directory/mutation.rs`, `if let (Some(current),
+// Some(next)) = (&project.entry.budget, &patch.budget)`) only compares two
+// *existing* budgets, so a `PATCH` that turns budgeting on for the first time
+// is invisible to it.
+//
+// `Engine::repair_settle` runs on every `run_turn`, before the new turn is
+// even admitted, and replays the session's *last* terminal event through
+// `Engine::settle` under whatever `Admission` this call resolved --
+// unconditionally. A turn that ran while the project had no budget was never
+// settled (the ledger was never called), so it has no watermark in the spend
+// ledger's per-session map. The first turn served *after* the `PATCH`
+// therefore found that pre-budget terminal event unsettled, charged it
+// against the newly opened window, and only then ran its own turn and settled
+// that too -- so one genuinely-budgeted turn paid for two.
+//
+// The fix is `DecisionRecord::budget_draw`: whether a budget was in force is
+// recorded on the decision, so the settle asks the log rather than the plane
+// and a `None -> Some` PATCH governs only the turns decided after it.
+
+/// A turn that ran before a project had any budget must not be absorbed into
+/// the ledger the first time a later, genuinely-budgeted turn on the same
+/// session drives a repair.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r3_a_turn_predating_a_project_s_budget_is_not_absorbed_when_the_budget_is_patched_on() {
+    let rig = plain().await;
+    let secret = {
+        tenancy(&rig.app, json!({ "id": "openhanded" }), "bob", None).await;
+        let minted = admin(
+            &rig.app,
+            "POST",
+            "/v1/admin/projects/openhanded/members/bob/keys",
+            None,
+        )
+        .await;
+        minted["secret"].as_str().expect("a secret").to_string()
+    };
+    let session = "openhanded/bob/main";
+
+    // `t0` runs while the project has no budget at all: no grant, no settle,
+    // nothing for the ledger to hold an opinion about.
+    turn_with_id(&rig.app, &secret, session, "t0").await;
+    let before = read(&rig.app, "/v1/admin/projects/openhanded/budget").await;
+    assert!(
+        before["committed_usd"].is_null(),
+        "the ledger must not have been touched by an unbudgeted turn, or \
+         nothing below is about the patch: {before}"
+    );
+
+    // An admin turns budgeting on. `None -> Some`, which the window-change
+    // guard's `(Some, Some)` pattern does not match.
+    admin(
+        &rig.app,
+        "PATCH",
+        "/v1/admin/projects/openhanded",
+        Some(json!({
+            "budget": { "limit_usd": LIMIT_USD, "window": "total", "on_exhaustion": "refuse" },
+        })),
+    )
+    .await;
+
+    // Isolate the mechanism before running any new turn at all: re-send `t0`
+    // under its own turn id. `Session::begin_turn` deduplicates it, so this
+    // opens no grant and drives no settle of its own
+    // (`a_deduplicated_retry_opens_no_second_grant`, `budget_routing.rs`) --
+    // every `run_turn` still calls `Session::open_observed` and
+    // `repair_settle` before the dedup check runs, though, so any *dollars*
+    // appearing here can only be `repair_settle` re-pricing a terminal event
+    // that predates the budget entirely, not any turn actually being served.
+    //
+    // Zero rather than `null`: the project has a budget now, so the view has
+    // a real account to read and reports the position it finds. What the
+    // assertion is about is the figure, and the figure is what the defect
+    // moved.
+    turn_with_id(&rig.app, &secret, session, "t0").await;
+    let mid = read(&rig.app, "/v1/admin/projects/openhanded/budget").await;
+    assert_usd(
+        mid["committed_usd"]
+            .as_f64()
+            .expect("the project is budgeted now, so the view reports a figure"),
+        0.0,
+        "a dedup of `t0` served no turn and opened no grant, so nothing may \
+         have been charged against the window the PATCH just opened",
+    );
+    // And the honest signal that the fold saw a turn the ledger did not.
+    // Before the fix this column read a clean `0.0` at exactly this point --
+    // the ledger had wrongly absorbed `t0`'s $0.2 and the fold had rightly
+    // measured it, so the two agreed by coincidence and the one column built
+    // to surface ledger-versus-log drift showed none. A project that served
+    // turns before it was budgeted is *supposed* to look like this.
+    assert_usd(
+        mid["drift_usd"].as_f64().expect("a drift figure"),
+        -ACTUAL_TURN_USD,
+        "the fold still measures `t0` and the ledger rightly does not, which \
+         is drift with a cause rather than an accounting error",
+    );
+
+    // One more turn on the *same* session -- the ordinary, user-visible path:
+    // `run_turn` replays the log, `repair_settle` runs before `t1` is
+    // admitted, and then `t1` itself settles.
+    turn_with_id(&rig.app, &secret, session, "t1").await;
+
+    let after = read(&rig.app, "/v1/admin/projects/openhanded/budget").await;
+    let committed = after["committed_usd"]
+        .as_f64()
+        .expect("the project is budgeted now, so the view reports a figure");
+    assert_usd(
+        committed,
+        ACTUAL_TURN_USD,
+        "only `t1` ever ran under a budget -- `t0` predates it entirely and \
+         must not be repaired into the window the patch just opened",
+    );
+}
+
+/// The control: the same two-turns-one-session-with-a-PATCH-in-between shape,
+/// but the budget is `Some` from before `t0` and the `PATCH` changes only the
+/// limit (`Some -> Some`, which the window-change guard does compare). Both
+/// turns were genuinely budgeted throughout, so `2 * ACTUAL_TURN_USD` is the
+/// *correct* total here -- which is what proves the harness above is not
+/// tautological. A ledger that always charges whatever the log's turns cost,
+/// with no regard for whether a budget existed when each one ran, would
+/// report this same `2 * ACTUAL_TURN_USD` in both this test and the ignored
+/// one above -- right here, because both turns really were budgeted, and
+/// wrong there, because `t0` never was. Only the ignored test's own
+/// dedup-isolation step (no new turn served, ledger still moves) tells the
+/// two apart; this control rules out `turn_with_id`, the `PATCH` machinery,
+/// and the admin view's arithmetic as the source of that difference.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r3_control_a_budget_raised_mid_session_still_settles_every_turn_it_covered() {
+    let rig = plain().await;
+    let secret = {
+        tenancy(
+            &rig.app,
+            json!({
+                "id": "metered",
+                "budget": { "limit_usd": LIMIT_USD, "window": "total", "on_exhaustion": "refuse" },
+            }),
+            "bob",
+            None,
+        )
+        .await;
+        let minted = admin(
+            &rig.app,
+            "POST",
+            "/v1/admin/projects/metered/members/bob/keys",
+            None,
+        )
+        .await;
+        minted["secret"].as_str().expect("a secret").to_string()
+    };
+    let session = "metered/bob/main";
+
+    turn_with_id(&rig.app, &secret, session, "t0").await;
+
+    // `Some -> Some`: the window is unchanged, only the limit moves, so the
+    // guard admits it -- this is the axis PATCH is meant to move.
+    admin(
+        &rig.app,
+        "PATCH",
+        "/v1/admin/projects/metered",
+        Some(json!({
+            "budget": { "limit_usd": LIMIT_USD * 2.0, "window": "total", "on_exhaustion": "refuse" },
+        })),
+    )
+    .await;
+
+    turn_with_id(&rig.app, &secret, session, "t1").await;
+
+    let view = read(&rig.app, "/v1/admin/projects/metered/budget").await;
+    assert_usd(
+        view["committed_usd"]
+            .as_f64()
+            .expect("a budgeted project reports a committed figure"),
+        2.0 * ACTUAL_TURN_USD,
+        "both t0 and t1 ran under a real budget throughout, so both belong in \
+         committed_usd -- unlike the ignored case above, there is no turn \
+         here that predates budgeting",
     );
 }

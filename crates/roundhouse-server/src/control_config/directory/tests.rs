@@ -10,7 +10,7 @@
 //! busy machine and passes on a quiet one.
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use roundhouse_core::control::{Allocation, BudgetWindow, Principal};
 use roundhouse_core::routing::{Candidate, Target};
@@ -459,7 +459,7 @@ fn a_config_owned_entity_refuses_mutation() {
             DirectoryMutation::PatchProject {
                 id: "acme".into(),
                 patch: ProjectPatch {
-                    name: Some("Renamed".into()),
+                    name: Some(Some("Renamed".into())),
                     ..ProjectPatch::default()
                 },
             },
@@ -603,7 +603,7 @@ fn patch_project_refuses_ownership_before_it_ever_looks_at_the_records_table() {
             DirectoryMutation::PatchProject {
                 id: "acme".into(),
                 patch: ProjectPatch {
-                    name: Some("Renamed".into()),
+                    name: Some(Some("Renamed".into())),
                     ..ProjectPatch::default()
                 },
             },
@@ -637,7 +637,7 @@ fn patch_project_refuses_ownership_before_it_ever_looks_at_the_records_table() {
             DirectoryMutation::PatchProject {
                 id: "widgets".into(),
                 patch: ProjectPatch {
-                    name: Some("Renamed".into()),
+                    name: Some(Some("Renamed".into())),
                     ..ProjectPatch::default()
                 },
             },
@@ -884,13 +884,13 @@ fn a_window_change_is_refused_naming_the_mechanism() {
             DirectoryMutation::PatchProject {
                 id: "widgets".into(),
                 patch: ProjectPatch {
-                    budget: Some(BudgetConfig {
+                    budget: Some(Some(BudgetConfig {
                         limit_usd: 10.0,
                         window: BudgetWindow::Monthly,
                         on_exhaustion: OnExhaustionConfig::Refuse,
                         overflow_when_local_saturated: None,
                         warn_at: None,
-                    }),
+                    })),
                     ..ProjectPatch::default()
                 },
             },
@@ -920,13 +920,13 @@ fn a_window_change_is_refused_naming_the_mechanism() {
             DirectoryMutation::PatchProject {
                 id: "widgets".into(),
                 patch: ProjectPatch {
-                    budget: Some(BudgetConfig {
+                    budget: Some(Some(BudgetConfig {
                         limit_usd: 25.0,
                         window: BudgetWindow::Total,
                         on_exhaustion: OnExhaustionConfig::Refuse,
                         overflow_when_local_saturated: None,
                         warn_at: Some(0.5),
-                    }),
+                    })),
                     ..ProjectPatch::default()
                 },
             },
@@ -941,6 +941,230 @@ fn a_window_change_is_refused_naming_the_mechanism() {
         .and_then(|project| project.entry.budget.as_ref())
         .expect("the project still has a budget");
     assert_eq!(budget.limit_usd, 25.0);
+}
+
+/// CONTROL for [`explicit_json_null_on_a_populated_budget_is_refused`]: an
+/// *absent* `budget` field on the wire is `ProjectPatch::default()`'s `None`,
+/// and leaving a populated budget alone when the caller never mentioned it is
+/// exactly the "absent means leave alone" contract the type documents. It has
+/// to keep passing unchanged through the R7 fix — the double-`Option` seam is
+/// wrong if it needed touching, because an absent field never reaches the
+/// deserializer at all.
+#[test]
+fn omitting_the_budget_field_leaves_a_populated_budget_alone() {
+    let directory = solo(0);
+    directory
+        .apply(
+            DirectoryMutation::CreateProject {
+                entry: ProjectEntry {
+                    budget: Some(BudgetConfig {
+                        limit_usd: 10.0,
+                        window: BudgetWindow::Total,
+                        on_exhaustion: OnExhaustionConfig::Refuse,
+                        overflow_when_local_saturated: None,
+                        warn_at: None,
+                    }),
+                    ..project("widgets")
+                },
+            },
+            1_000,
+        )
+        .unwrap();
+
+    // What a `PATCH .../widgets` body of `{"name": "Widgets Inc"}` parses to:
+    // `budget` is never mentioned on the wire.
+    let patch: ProjectPatch =
+        serde_json::from_str(r#"{"name": "Widgets Inc"}"#).expect("valid patch body");
+    assert!(patch.budget.is_none(), "budget was never on the wire");
+
+    directory
+        .apply(
+            DirectoryMutation::PatchProject {
+                id: "widgets".into(),
+                patch,
+            },
+            2_000,
+        )
+        .expect("touching only `name` is an ordinary edit");
+    let view = directory.view(2_000);
+    let budget = view
+        .projects
+        .iter()
+        .find(|project| project.id() == "widgets")
+        .and_then(|project| project.entry.budget.as_ref())
+        .expect("an untouched budget is still there");
+    assert_eq!(budget.limit_usd, 10.0);
+}
+
+/// R7: an explicit JSON `null` is a refusal, not a silent no-op.
+///
+/// [`ProjectPatch`]'s doc says omission has no spelling for "remove this
+/// block" — that is the documented, deliberate half. The undocumented half was
+/// what an *explicit* `null` did: a plain `Option<T>` collapsed it into the
+/// same `None` an absent field produces, so `{"budget": null}` — the one JSON
+/// spelling that reads like an attempt at removal — took the "leave alone"
+/// branch and answered success, with the fact that the caller wrote anything
+/// already destroyed before `mutate` ran.
+///
+/// Both halves are asserted here, because closing only the second would leave
+/// a `mutate` that guesses: the seam has to preserve the distinction before
+/// anything can act on it.
+#[test]
+fn explicit_json_null_on_a_populated_budget_is_refused() {
+    let directory = solo(0);
+    directory
+        .apply(
+            DirectoryMutation::CreateProject {
+                entry: ProjectEntry {
+                    budget: Some(BudgetConfig {
+                        limit_usd: 10.0,
+                        window: BudgetWindow::Total,
+                        on_exhaustion: OnExhaustionConfig::Refuse,
+                        overflow_when_local_saturated: None,
+                        warn_at: None,
+                    }),
+                    ..project("widgets")
+                },
+            },
+            1_000,
+        )
+        .unwrap();
+
+    // Exactly what a `PATCH .../widgets` body of `{"budget": null}` parses
+    // to: the caller wrote the word `null` on the wire, not nothing.
+    let patch: ProjectPatch =
+        serde_json::from_str(r#"{"budget": null}"#).expect("valid patch body");
+    // The mechanism half: deserialization keeps the distinction the outer
+    // `Option` exists for. Without this, `mutate` could only guess -- which is
+    // why the assertion below cannot be satisfied by changing `mutate` alone.
+    assert!(
+        matches!(patch.budget, Some(None)),
+        "the field was on the wire (outer Some) and its value was null (inner None)"
+    );
+    assert_eq!(
+        patch.explicit_null_axis(),
+        Some("budget"),
+        "and the axis names itself, so the refusal can too"
+    );
+
+    // The behavior half: a caller who explicitly nulled a populated budget is
+    // told so, rather than getting an unremarked success.
+    let error = directory
+        .apply(
+            DirectoryMutation::PatchProject {
+                id: "widgets".into(),
+                patch,
+            },
+            2_000,
+        )
+        .expect_err("an explicit `null` on a populated budget is refused");
+    assert!(
+        matches!(
+            error,
+            DirectoryError::NullPatchUnsupported { axis: "budget", .. }
+        ),
+        "{error:?}"
+    );
+    assert!(
+        error.to_string().contains("budget"),
+        "the refusal has to name the axis, or a caller who nulled one field of \
+         five has to guess which: {error}"
+    );
+
+    // And nothing was written on the way to the refusal: `apply` validates
+    // before it commits, so a refused patch leaves the budget exactly as it
+    // was.
+    let view = directory.view(2_000);
+    let budget = view
+        .projects
+        .iter()
+        .find(|project| project.id() == "widgets")
+        .and_then(|project| project.entry.budget.as_ref())
+        .expect("the refused patch removed nothing");
+    assert_eq!(budget.limit_usd, 10.0);
+}
+
+/// The mirror: every axis, refused by name, and an absent axis left alone in
+/// the same breath.
+///
+/// One test rather than five because the point is that the five behave
+/// identically -- `mutate` reads them through one accessor, and a fix that
+/// covered `budget` alone (the axis the finding was written against) would
+/// leave `credentials` -- the one whose removal silently un-gates a project --
+/// still taking the "leave alone" branch.
+#[test]
+fn an_explicit_null_is_refused_on_every_axis_and_an_absent_one_is_not() {
+    let directory = solo(0);
+    directory
+        .apply(
+            DirectoryMutation::CreateProject {
+                entry: ProjectEntry {
+                    budget: Some(BudgetConfig {
+                        limit_usd: 10.0,
+                        window: BudgetWindow::Total,
+                        on_exhaustion: OnExhaustionConfig::Refuse,
+                        overflow_when_local_saturated: None,
+                        warn_at: None,
+                    }),
+                    ..project("widgets")
+                },
+            },
+            1_000,
+        )
+        .unwrap();
+
+    for axis in ["name", "policy", "budget", "validate", "credentials"] {
+        let body = format!(r#"{{"{axis}": null}}"#);
+        let patch: ProjectPatch = serde_json::from_str(&body).expect("valid patch body");
+        assert_eq!(patch.explicit_null_axis(), Some(axis), "{body}");
+        let error = directory
+            .apply(
+                DirectoryMutation::PatchProject {
+                    id: "widgets".into(),
+                    patch,
+                },
+                2_000,
+            )
+            .expect_err(&format!("`{body}` must be refused"));
+        match error {
+            DirectoryError::NullPatchUnsupported { axis: named, .. } => {
+                assert_eq!(named, axis, "{body}");
+            }
+            other => panic!("`{body}` was refused for the wrong reason: {other:?}"),
+        }
+    }
+
+    // The other half, in the same test so the two cannot drift: a body that
+    // never mentions `budget` leaves it exactly as it was, which is the
+    // contract this type documents and the fix must not have touched.
+    let patch: ProjectPatch =
+        serde_json::from_str(r#"{"name": "Widgets Inc"}"#).expect("valid patch body");
+    assert!(patch.explicit_null_axis().is_none(), "nothing was nulled");
+    directory
+        .apply(
+            DirectoryMutation::PatchProject {
+                id: "widgets".into(),
+                patch,
+            },
+            3_000,
+        )
+        .expect("touching only `name` is an ordinary edit");
+    let view = directory.view(3_000);
+    let project = view
+        .projects
+        .iter()
+        .find(|project| project.id() == "widgets")
+        .expect("the project is still there");
+    assert_eq!(project.entry.name.as_deref(), Some("Widgets Inc"));
+    assert_eq!(
+        project
+            .entry
+            .budget
+            .as_ref()
+            .expect("an unmentioned budget is untouched")
+            .limit_usd,
+        10.0
+    );
 }
 
 /// A key minted at runtime is judged by the cross-checks a boot would apply.
@@ -1018,10 +1242,10 @@ fn a_mutation_that_admits_no_model_is_refused() {
             DirectoryMutation::PatchProject {
                 id: "wide".into(),
                 patch: ProjectPatch {
-                    policy: Some(PolicyConfig {
+                    policy: Some(Some(PolicyConfig {
                         allow: Some(vec!["echo/*".into()]),
                         ..PolicyConfig::default()
-                    }),
+                    })),
                     ..ProjectPatch::default()
                 },
             },
@@ -1318,6 +1542,263 @@ fn the_view_lists_both_halves_and_marks_which_is_which() {
         configured
             .iter()
             .any(|key| key.scope == KeyRecordScope::Admin)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// One snapshot, or two versions (R2)
+// ---------------------------------------------------------------------------
+
+/// A store that lets another node's write land *between* two reads.
+///
+/// The defect R2 names needs a write to arrive after a directory has read its
+/// plane and before it reads its records. Arranging that with a second thread
+/// would be a test that passes on a busy machine and fails on a quiet one, so it
+/// is arranged here instead: a directory past its TTL reaches for its store once
+/// per refresh, which makes "how many times did this call refresh" observable,
+/// and makes the store the one place the other node's write can be timed
+/// exactly. The first read answers the version this was built with; the second
+/// hands over the records the other node wrote, one version on.
+///
+/// [`DirectoryStore::version`] is the injection point because every refresh asks
+/// it first, whether or not it goes on to load. A caller that refreshes once per
+/// snapshot therefore never sees the second answer at all; one that refreshes
+/// twice sees both, and that is exactly the pair-from-two-versions this is here
+/// to catch.
+struct WriteBetweenReads {
+    state: Mutex<(DirectoryRecords, u64)>,
+    /// What the other node wrote, handed over on the second read.
+    pending: Mutex<Option<DirectoryRecords>>,
+    reads: Mutex<u64>,
+}
+
+impl WriteBetweenReads {
+    fn new(before: DirectoryRecords, after: DirectoryRecords) -> Self {
+        Self {
+            state: Mutex::new((before, 1)),
+            pending: Mutex::new(Some(after)),
+            reads: Mutex::new(0),
+        }
+    }
+
+    fn locked(&self) -> std::sync::MutexGuard<'_, (DirectoryRecords, u64)> {
+        self.state.lock().unwrap_or_else(|error| error.into_inner())
+    }
+}
+
+impl DirectoryStore for WriteBetweenReads {
+    fn load(&self) -> Result<VersionedRecords, StoreFailure> {
+        let state = self.locked();
+        Ok(VersionedRecords {
+            records: state.0.clone(),
+            version: state.1,
+        })
+    }
+
+    fn commit(
+        &self,
+        expected_version: u64,
+        records: DirectoryRecords,
+    ) -> Result<u64, StoreFailure> {
+        let mut state = self.locked();
+        if state.1 != expected_version {
+            return Err(StoreFailure::Concurrent {
+                expected: expected_version,
+                found: state.1,
+            });
+        }
+        state.0 = records;
+        state.1 += 1;
+        Ok(state.1)
+    }
+
+    fn version(&self) -> Result<u64, StoreFailure> {
+        let mut reads = self.reads.lock().unwrap_or_else(|error| error.into_inner());
+        *reads += 1;
+        if *reads == 2
+            && let Some(after) = self
+                .pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+        {
+            let mut state = self.locked();
+            state.0 = after;
+            state.1 += 1;
+        }
+        Ok(self.locked().1)
+    }
+}
+
+/// The records `widgets`/`bo` stand at before and after their turn key is
+/// minted.
+///
+/// Produced by the ordinary mutations on a throwaway node rather than
+/// hand-built, so the pair [`WriteBetweenReads`] hands out is exactly what a
+/// real write on another node would have committed — a fixture that assembled
+/// the "after" records itself could differ from one in the way that made the
+/// test pass.
+fn staged_mint() -> (DirectoryRecords, DirectoryRecords) {
+    let staged = solo(0);
+    tenancy(&staged, "widgets", "bo", 0);
+    // `apply` hands back the records it wrote. The upsert is repeated rather
+    // than reached for through a listing because a listing is a projection, and
+    // what a store holds is records.
+    let before = staged
+        .apply(
+            DirectoryMutation::UpsertMembership {
+                project: "widgets".into(),
+                user: "bo".into(),
+                role: MembershipRole::Member,
+                allocation: None,
+                overrides: None,
+            },
+            0,
+        )
+        .expect("an upsert of the membership that is already there");
+    let minted = mint_key(KeyKind::Turn).expect("the process has an RNG");
+    let after = staged
+        .apply(
+            DirectoryMutation::MintTurnKey {
+                project: "widgets".into(),
+                user: "bo".into(),
+                key: KeyFingerprint::from(&minted),
+            },
+            0,
+        )
+        .expect("a fresh hash under an existing membership");
+    ((*before).clone(), (*after).clone())
+}
+
+/// Whether a listing says bo holds a live, unrevoked turn key.
+fn lists_bos_live_key(view: &DirectoryView) -> bool {
+    view.keys.iter().any(|key| {
+        key.revoked_at_ms.is_none()
+            && key.scope
+                == KeyRecordScope::Turn {
+                    project: "widgets".into(),
+                    user: "bo".into(),
+                }
+    })
+}
+
+/// The property: the two halves of one snapshot describe one version.
+///
+/// **Coherence, not freshness.** A snapshot taken just before a write describes
+/// the state before it, and that is a correct answer — a check that demanded the
+/// newest state would fail a correct implementation that happened to read one
+/// instant early. So this is gated on what the listing itself reports: if the
+/// listing says bo holds a live turn key, the plane beside it must resolve an
+/// admission for him. One response must never say both "has a key" and "has no
+/// admission" about the same membership.
+fn assert_coherent(plane: &ControlPlane, view: &DirectoryView, when: &str) {
+    if !lists_bos_live_key(view) {
+        return;
+    }
+    assert!(
+        plane.membership(&Principal::new("widgets", "bo")).is_ok(),
+        "{when}: the listing says bo holds a live turn key and the plane handed \
+         over beside it has no admission for him — one response, two versions"
+    );
+}
+
+/// R2 (thermo-nuclear review, M8): `budget_view` read its plane and its listing
+/// through two independent calls, each taking `Managed`'s `current` under its
+/// own lock acquisition — and the old `Managed::view` was two more internally
+/// (`let _ = self.plane(now_ms);` followed by a separate `read_current()`).
+/// Nothing spanned any of it, so a write landing mid-render left the two answers
+/// describing different directory versions: a member whose key the listing shows
+/// as live, resolving against a plane that has no admission for them, which this
+/// view spells as a row with no figures at all.
+///
+/// The handler's own comment claimed the opposite ("One snapshot for the whole
+/// document"), which is why the remedy is a single
+/// [`ControlDirectory::snapshot`] that hands both halves out of one guard rather
+/// than a comment saying to be careful.
+///
+/// Reproduced at the seam the two reads share rather than over HTTP, and with
+/// the other node's write timed by the store — see [`WriteBetweenReads`] — so
+/// that the failure is deterministic instead of a race the test hopes to lose.
+#[test]
+fn budget_view_s_plane_and_view_must_describe_the_same_version() {
+    let (before, after) = staged_mint();
+    let store = Arc::new(WriteBetweenReads::new(before, after));
+    // TTL zero, because a directory inside its TTL never reaches for the store
+    // at all: with a live cache both reads answer from the same `Compiled` by
+    // luck rather than by design, and this test would pass on the defect.
+    let directory = ControlDirectory::new(file_with_ttl(0), PATH, store, checks(), 0)
+        .expect("the file alone compiles, since it is what a boot would have loaded");
+
+    // The other node's write lands during this call if — and only if — it
+    // refreshes twice. One refresh, and this snapshot is coherently the older
+    // version; two, and its listing is a version ahead of its plane.
+    let (plane, view) = directory.snapshot(0);
+    assert_coherent(
+        &plane,
+        &view,
+        "the snapshot rendered while another node's write landed",
+    );
+
+    // And the write really did land, seen coherently by the next snapshot.
+    // Without this the test would also pass on a directory that had simply
+    // stopped refreshing — which is coherent, and useless.
+    let (plane, view) = directory.snapshot(0);
+    assert_coherent(&plane, &view, "the snapshot after that write");
+    assert!(
+        lists_bos_live_key(&view),
+        "sanity: the staged write is meant to have landed by now, or the \
+         assertion above never had a version mismatch to catch"
+    );
+}
+
+/// CONTROL for the test above, same coherence check, minus the race: the mint
+/// happens before the snapshot, so there is one unmoving version to read. It
+/// must pass — and the live-key assertion is what stops it passing vacuously,
+/// which is what proves the coherence check is capable of firing at all.
+#[test]
+fn plane_and_view_agree_when_nothing_writes_between_them() {
+    let directory = solo(0);
+    tenancy(&directory, "widgets", "bo", 0);
+    directory.mint_turn_key("widgets", "bo", 0).unwrap();
+
+    let version_before = directory.version(0);
+    let (plane, view) = directory.snapshot(0);
+    assert_eq!(
+        version_before,
+        directory.version(0),
+        "sanity: nothing writes across the snapshot in this control"
+    );
+    assert!(
+        lists_bos_live_key(&view),
+        "the control is only a control if the coherence check has a live key to \
+         be about"
+    );
+    assert_coherent(&plane, &view, "control: one version, read once");
+}
+
+/// CONTROL: a membership that genuinely has no key must still read `Unknown`.
+/// The fix for R2 is a shared snapshot, not a `plane()` that stops reporting
+/// absent admissions — this pins that a member nobody ever minted a key for is
+/// still, correctly, unresolvable.
+#[test]
+fn a_membership_with_no_key_at_all_is_still_unknown_to_the_plane() {
+    let directory = solo(0);
+    tenancy(&directory, "widgets", "bo", 0);
+    let principal = Principal::new("widgets", "bo");
+
+    let (plane, view) = directory.snapshot(0);
+    assert!(
+        view.memberships
+            .iter()
+            .any(|membership| membership.names("widgets", "bo")),
+        "the membership exists without ever having a key"
+    );
+    assert!(
+        matches!(
+            plane.membership(&principal),
+            Err(super::super::MembershipError::Unknown(_))
+        ),
+        "control: genuinely no key means genuinely no admission"
     );
 }
 

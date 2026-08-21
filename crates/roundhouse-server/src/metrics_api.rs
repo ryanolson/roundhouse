@@ -247,6 +247,7 @@ mod tests {
                         rate_card: None,
                         payer: Default::default(),
                         billing: Default::default(),
+                        budget_draw: None,
                         withheld_providers: Vec::new(),
                     },
                 },

@@ -47,7 +47,8 @@ fn card() -> ProviderPricing {
 
 /// A decision priced the way the engine prices one: a card for a hosted
 /// target, none for a local worker, which bills capacity rather than
-/// dollars.
+/// dollars. Budgeted, so the projection below has a basis to carry rather
+/// than an absence that would be true whatever it did.
 fn decision_for(target: Target, isl: u64) -> DecisionRecord {
     DecisionRecord {
         rate_card: (!target.is_local()).then(card),
@@ -62,6 +63,7 @@ fn decision_for(target: Target, isl: u64) -> DecisionRecord {
         budget_state: Default::default(),
         payer: Default::default(),
         billing: Default::default(),
+        budget_draw: Some(BudgetCounts::AllFrontierSpend),
         withheld_providers: Vec::new(),
     }
 }
@@ -226,6 +228,13 @@ async fn the_settlement_projection_names_the_last_terminal_event_and_where_it_we
         "the seq is the terminal event's own, which is what makes the \
          settle idempotent across a replay that assigns the same numbers"
     );
+    assert_eq!(
+        settlement.budget_draw,
+        Some(BudgetCounts::AllFrontierSpend),
+        "and the basis the turn draws its project's budget on travels with \
+         it too: read from the live plane instead, a settle would apply \
+         whichever basis an admin had switched to since"
+    );
 
     // A response that terminated without ever routing carries no target,
     // and that is what prices it at zero: it reached no provider.
@@ -259,6 +268,12 @@ async fn the_settlement_projection_names_the_last_terminal_event_and_where_it_we
         "and there is no card, because there was nothing to price -- which \
          is a different absence from a hosted turn whose card the log never \
          recorded"
+    );
+    assert_eq!(
+        settlement.budget_draw, None,
+        "nor any basis to draw a budget on, because no decision was \
+         recorded to carry one -- which is why the settle that releases \
+         this turn's hold draws zero rather than skipping"
     );
 
     // And a successor that replays this log arrives at the same answer,

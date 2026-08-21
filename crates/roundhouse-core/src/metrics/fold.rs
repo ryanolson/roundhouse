@@ -1003,6 +1003,7 @@ pub(super) mod tests {
                     rate_card: None,
                     payer: Default::default(),
                     billing,
+                    budget_draw: None,
                     withheld_providers: Vec::new(),
                 },
             });

@@ -192,6 +192,7 @@ pub fn every_event_kind() -> Vec<SessionEventKind> {
                 // credential tier at all.
                 payer: Default::default(),
                 billing: Default::default(),
+                budget_draw: None,
                 withheld_providers: Vec::new(),
             },
         },

@@ -6,21 +6,31 @@
 //!
 //! Its own module rather than a section of [`super`], because it is the one read
 //! on the admin plane and it has a whole vocabulary the CRUD routes do not
-//! share — a stamp per column, four reasons a dollar figure may be absent, and
+//! share — a stamp per column, four named reasons a committed figure is not a
+//! plain ledger figure (three of them absences and one of them not), and
 //! a rule about which terms a balance may be read under that is load-bearing
 //! enough to have its own paragraph. The routes next door are about *changing*
 //! tenancy; this is about not lying while describing it.
 //!
 //! # The one rule everything else follows from
 //!
-//! **Nothing here constructs [`BudgetTerms`].** Every balance is read under the
-//! terms the membership's own [`Admission`](crate::Admission) carries, because
-//! [`SpendLedger::balance`] is not a pure read: it rolls the account's window
-//! over if the window it was given has lapsed. A sweep with the wrong
-//! [`BudgetWindow`] would therefore zero a project's committed spend
-//! permanently — a reporting endpoint quietly handing a month's budget back.
-//! Where no admission exists there is no figure, and the row says which of the
-//! four reasons applies rather than reporting a zero.
+//! **Nothing here constructs [`BudgetTerms`].** [`SpendLedger::balance`] is not
+//! a pure read: it rolls the account's window over if the window it was given
+//! has lapsed. A sweep with the wrong [`BudgetWindow`] would therefore zero a
+//! project's committed spend permanently — a reporting endpoint quietly handing
+//! a month's budget back.
+//!
+//! So a balance is read under one of exactly two sets of terms, and this module
+//! authors neither. Ordinarily they are the ones the membership's own
+//! [`Admission`](crate::Admission) carries. For a membership whose keys have all
+//! been revoked there is no admission left to carry any — and its spend is still
+//! in the ledger, still binding the project's ceiling — so the terms come from
+//! [`ControlDirectory::membership_terms`](crate::control_config::ControlDirectory::membership_terms),
+//! which pairs the project block with the membership's allocation through the
+//! same function the compiler pairs them with for a live key. Same bytes, same
+//! window, no second authority. Where neither source has terms there is no
+//! figure, and the row says which of the reasons applies rather than reporting a
+//! zero.
 
 use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Response};
@@ -34,7 +44,7 @@ use roundhouse_core::metrics::TokenBreakdown;
 use roundhouse_core::now_ms;
 
 use super::{AdminState, find_project};
-use crate::control_config::MembershipError;
+use crate::control_config::{ApiKeyRecord, DirectoryView, KeyRecordScope, MembershipError};
 use crate::http::ApiError;
 
 /// Where a dollar figure came from, and over what period.
@@ -46,10 +56,15 @@ use crate::http::ApiError;
 /// started* — and a reader who does not know that will read their difference as
 /// an accounting error. So the difference is published, and so is the reason it
 /// is not one.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct Stamp {
-    /// `ledger`, `process-fold`, `unenforced`, `no_keys` or `archived`. The last
-    /// three are why the dollars beside them are `null`.
+    /// `ledger`, `process-fold`, `revoked_keys`, `unenforced`, `no_keys` or
+    /// `archived`.
+    ///
+    /// The last three are why the dollars beside them are `null`.
+    /// `revoked_keys` is not one of them: it carries a real figure, read from
+    /// the ledger over a real window, and says that the membership it belongs to
+    /// can no longer spend against it. See [`Basis`].
     basis: &'static str,
     /// `total`, `monthly` or `lifetime`.
     window: &'static str,
@@ -61,8 +76,24 @@ struct Stamp {
 impl Stamp {
     /// The ledger's stamp: a real window, with the instant it began.
     fn ledger(window: BudgetWindow, window_start_ms: u64) -> Self {
+        Self::figure("ledger", window, window_start_ms)
+    }
+
+    /// The ledger's stamp for a membership with no live key left.
+    ///
+    /// The same account, the same terms, the same window as [`Self::ledger`] —
+    /// the figure is not a different kind of number and must not be labelled as
+    /// though it were. What the label adds is the fact the row would otherwise
+    /// lose: nobody can spend against this position any more. See
+    /// [`Basis::RevokedKeys`].
+    fn revoked_keys(window: BudgetWindow, window_start_ms: u64) -> Self {
+        Self::figure(Basis::RevokedKeys.as_str(), window, window_start_ms)
+    }
+
+    /// A stamp with dollars behind it, whatever the label says about whose.
+    fn figure(basis: &'static str, window: BudgetWindow, window_start_ms: u64) -> Self {
         Self {
-            basis: "ledger",
+            basis,
             window: match window {
                 BudgetWindow::Total => "total",
                 BudgetWindow::Monthly => "monthly",
@@ -97,21 +128,32 @@ impl Stamp {
     }
 }
 
-/// Why a row has no committed spend to report.
+/// Why a row's committed column reads the way it does.
 ///
-/// Three answers and not one, because an operator's next action differs for each
-/// and `null` alone tells them nothing. **Never `0.0` for any of them:** a
-/// project that has spent nothing and a project nothing is counting look
+/// Three of these are reasons there is no figure at all, and they are three
+/// answers rather than one because an operator's next action differs for each
+/// and `null` alone tells them nothing. **Never `0.0` for any of those three:**
+/// a project that has spent nothing and a project nothing is counting look
 /// identical as a zero, and the second one is the state somebody needs to fix.
+///
+/// [`Self::RevokedKeys`] is the fourth and is not one of them — it labels a row
+/// that *does* carry dollars. It is here rather than beside `ledger` as a bare
+/// string because it exists for the same reason the other three do: it is the
+/// answer to "why does this row not say `ledger`", and the whole point of this
+/// enum is that every such answer is a named one.
 enum Basis {
     /// No budget is configured, so the engine never calls the ledger for this
     /// membership and there is no position to read.
     Unenforced,
-    /// The membership exists and has no key, so it has no admission — and
-    /// therefore no [`BudgetTerms`] to read a balance under, and no turn it could
-    /// have spent anything on. Distinct from [`Self::Unenforced`], which means
-    /// the opposite thing: there, spending is happening and nothing is counting
-    /// it.
+    /// The membership exists and has *never* had a key, so it has no admission —
+    /// and therefore no [`BudgetTerms`] to read a balance under, and no turn it
+    /// could have spent anything on. Distinct from [`Self::Unenforced`], which
+    /// means the opposite thing: there, spending is happening and nothing is
+    /// counting it.
+    ///
+    /// Never-had-a-key and no-longer-has-one are the same absence in the
+    /// compiled plane and completely different facts to an operator, which is
+    /// what [`Self::RevokedKeys`] exists to separate.
     NoKeys,
     /// The project is archived. Its keys are refused and it is left out of the
     /// compiled plane entirely, so there is no admission to take terms from — but
@@ -119,6 +161,22 @@ enum Basis {
     /// deletion, so the measured column is still real. A row with `measured_usd`
     /// and no `committed_usd` looks wrong and is not.
     Archived,
+    /// Every key this membership had has been revoked, and the ledger still
+    /// holds what it spent before that.
+    ///
+    /// **The one basis with dollars behind it that is not `ledger`.** A revoked
+    /// hash is gone from the compiled plane's admissions, so this membership
+    /// resolves to nothing there — exactly like [`Self::NoKeys`] — while the
+    /// ledger goes on counting its committed spend against the project's ceiling
+    /// and any hold it left open goes on binding it. Reporting `no_keys` for it
+    /// would blank a figure this deployment still has, and blank it in the one
+    /// view whose purpose is that its numbers are not invented; reporting
+    /// `ledger` would hide that nobody can spend against the position any more,
+    /// which is the operator's actual question when the row stops moving.
+    ///
+    /// The terms are derived from the directory's own rows rather than from an
+    /// admission — see the module doc — and every dollar figure here is real.
+    RevokedKeys,
 }
 
 impl Basis {
@@ -127,6 +185,7 @@ impl Basis {
             Basis::Unenforced => "unenforced",
             Basis::NoKeys => "no_keys",
             Basis::Archived => "archived",
+            Basis::RevokedKeys => "revoked_keys",
         }
     }
 }
@@ -141,11 +200,22 @@ impl Basis {
 /// anyway. What *is* published is their difference, which does have a referent.
 ///
 /// `drift_usd` is `committed - measured`, unclamped in both directions. Negative
-/// means the fold saw spend the ledger did not — a settle that failed and was
-/// logged as a warning, a process restarted between the dispatch and the
-/// settle — and that is precisely the number somebody is looking for when they
-/// come to this endpoint. Clamping it at zero, or "repairing" it here, would
-/// hide the only evidence of the failure it exists to surface.
+/// means the fold saw spend the ledger did not, for one of three causes, two of
+/// them real problems and one of them not:
+///
+/// - a settle that failed and was logged as a warning;
+/// - a process restarted between the dispatch and the settle;
+/// - **or, ordinarily and by design, nothing wrong at all:** the engine always
+///   writes a turn's terminal usage event to the log *before* it settles the
+///   ledger (see the engine's own "money after the log, always" rule), so any
+///   turn currently between those two steps has already been measured but not
+///   yet committed. `held_usd` is the discriminator — it is nonzero for
+///   exactly the turns in that window, so a reader can tell "still settling"
+///   from "actually lost" by checking whether anything is held before
+///   escalating.
+///
+/// Clamping it at zero, or "repairing" it here, would hide the only evidence
+/// of the two genuine failures this number exists to surface.
 ///
 /// `seat_tokens` is the dollar-free column: traffic served under a forwarded
 /// subscription seat is measured in tokens and priced nowhere, because the seat
@@ -155,8 +225,11 @@ impl Basis {
 #[derive(Debug, Serialize)]
 struct BudgetViewDto {
     project: String,
-    /// Realized spend in the current budget window, from the ledger, `null`
-    /// whenever `committed.basis` is not `ledger`.
+    /// Realized spend in the current budget window, from the ledger.
+    ///
+    /// `null` exactly when `committed.basis` is one of the three that say there
+    /// is no position to read — `unenforced`, `no_keys`, `archived`. A
+    /// `revoked_keys` stamp carries a real figure: see [`Basis::RevokedKeys`].
     committed_usd: Option<f64>,
     /// Reserved and not yet settled, across every live hold in the project.
     /// `null` under the same condition `committed_usd` is.
@@ -206,16 +279,80 @@ struct MemberBudgetDto {
     allocation_share: Option<f64>,
 }
 
+/// How one row's committed figure is going to be produced.
+///
+/// Decided before any ledger call, so that the two arms which *have* terms read
+/// their balance and stamp their window in one place rather than two. The second
+/// copy of that code is where the next hand-built [`BudgetTerms`] would appear,
+/// and the module doc's first rule is that there is not one.
+enum Position {
+    /// Terms to read a balance under, and whether they came from a live
+    /// admission (`ledger`) or were derived for a membership whose keys are all
+    /// revoked (`revoked_keys`). The figures are equally real either way; the
+    /// flag decides the label, and which row the project inherits its own from.
+    Figure { terms: BudgetTerms, live: bool },
+    /// No figure, and which of the reasons applies. See [`Basis`].
+    Absent(Basis),
+}
+
+/// Whether this membership has keys and every one of them is revoked.
+///
+/// Asked of the listing rather than of the plane, because the plane cannot
+/// answer it: a revoked hash is not in the admissions table and neither is a
+/// hash that was never minted, so "no admission" is where the two cases become
+/// one. The rows keep the tombstone — revocation is never a delete — which is
+/// what makes the distinction recoverable at all.
+///
+/// Both halves of the condition matter. Some key: a membership with none has
+/// never spent and there is nothing to report. All revoked: a membership with a
+/// live key resolves to an admission and never reaches this question, so the
+/// mixed case can only be a listing and a plane describing two different
+/// versions — which [`ControlDirectory::snapshot`](crate::control_config::ControlDirectory::snapshot)
+/// exists to prevent, and which this deliberately does not paper over.
+fn keys_all_revoked(view: &DirectoryView, project: &str, user: &str) -> bool {
+    let minted: Vec<&ApiKeyRecord> = view
+        .keys
+        .iter()
+        .filter(|key| {
+            matches!(
+                &key.scope,
+                KeyRecordScope::Turn { project: p, user: u } if p == project && u == user
+            )
+        })
+        .collect();
+    !minted.is_empty() && minted.iter().all(|key| key.is_revoked())
+}
+
+/// **Cost, written down so a future change to it is a decision and not a
+/// surprise:** this issues one [`SpendLedger::balance`] call per budgeted
+/// membership inside the loop below, so one `GET` performs N ledger
+/// round-trips, linear in the project's member count — and `balance` is not
+/// free the way a read normally is, since it rolls a lapsed window over (see
+/// the module doc), so this is N *mutating* round-trips, not N cache hits.
+/// Every figure produced is still correct: the rollovers are idempotent and
+/// order-independent (see `project_committed`'s own comment below), so this
+/// is a cost, not a defect. M8 has no pagination or rate limiting on the admin
+/// surface by design, so nothing here bounds N today.
+///
+/// A single project-scoped ledger read — one round-trip regardless of member
+/// count — is deferred rather than built: it needs a new [`SpendLedger`]
+/// method, coverage in its contract suite so the Rust and Redis-Lua
+/// implementations are held to the same answer, and the Lua script itself.
+/// That is real work for a milestone with no reported latency complaint
+/// against this endpoint yet, not a one-line hoist — the per-member loop
+/// still has to run for the member rows regardless, so a project-scoped call
+/// would sit *beside* it rather than replace it.
 pub(super) async fn budget_view(
     State(state): State<AdminState>,
     Path(project): Path<String>,
 ) -> Result<Response, ApiError> {
     let at_ms = now_ms();
-    // One snapshot for the whole document: the memberships listed and the terms
-    // their balances are read under have to come from one compiled plane, or a
-    // write landing mid-render would produce a view assembled from two.
-    let plane = state.directory.plane(at_ms);
-    let view = state.directory.view(at_ms);
+    // One snapshot for the whole document, and one call because that is the only
+    // way to have one: the memberships listed and the terms their balances are
+    // read under have to come from one compiled plane, and two calls would be two
+    // lock acquisitions with a write free to land between them — a member with a
+    // live key resolving to no admission, reported here as a row with no figures.
+    let (plane, view) = state.directory.snapshot(at_ms);
     let record = find_project(&view, &project)?;
     let archived = record.is_archived();
 
@@ -234,7 +371,15 @@ pub(super) async fn budget_view(
     // the `member_*` fields vary with the allocation. So every member of a
     // budgeted project reads the same two numbers here, and reading them from
     // the first is not a choice about which member is representative.
-    let mut project_committed: Option<(f64, f64, Stamp)> = None;
+    //
+    // The fourth element is whether that row's terms came from a live
+    // admission, and it is what breaks the tie for the *label*: a row read under
+    // a live key outranks one read for a revoked-only membership, because the
+    // project's ceiling is being enforced against something as long as one key
+    // is live. `revoked_keys` reaches the project row only when no key in the
+    // project does — which is the state that would otherwise report `no_keys`
+    // over a ledger holding money.
+    let mut project_committed: Option<(f64, f64, Stamp, bool)> = None;
     let mut unenforced_seen = false;
 
     for membership in view
@@ -256,12 +401,14 @@ pub(super) async fn budget_view(
         // whichever of them the hash map yielded first.
         //
         // Asked once, because the two things read off it — is there an admission
-        // at all, and does it carry a budget — are the two answers this row's
-        // basis is chosen between.
+        // at all, and does it carry a budget — are what this row's basis is
+        // chosen between.
         let admission = match plane.membership(&principal) {
             Ok(admission) => Some(admission),
-            // No key names this membership, so it has no admission — and has
-            // therefore never spent anything either, since a turn needs a key.
+            // No *live* key names this membership. That is not the same as
+            // never having had one, and the difference is money: a revoked key
+            // leaves no admission behind and leaves its spend in the ledger.
+            // Which of the two this is is settled below, off the rows.
             Err(MembershipError::Unknown(_)) => None,
             // Unreachable on a deployment that booted — the cross-check refuses
             // it at startup and again after every admin write — and reported
@@ -279,37 +426,67 @@ pub(super) async fn budget_view(
         // The archived arm is first because an archived project's memberships
         // resolve to nothing too, and `no_keys` would be the wrong reason for
         // the right `null`.
-        let (committed, remaining, stamp, share) = match (archived, admission) {
-            (true, _) => (None, None, Stamp::absent(Basis::Archived.as_str()), None),
-            (false, None) => (None, None, Stamp::absent(Basis::NoKeys.as_str()), None),
+        let position = match (archived, admission) {
+            (true, _) => Position::Absent(Basis::Archived),
             (false, Some(admission)) => match admission.budget {
-                None => {
-                    unenforced_seen = true;
-                    (None, None, Stamp::absent(Basis::Unenforced.as_str()), None)
-                }
-                Some(terms) => {
-                    let share = match terms.allocation {
-                        Allocation::Share { fraction } => Some(fraction),
-                        _ => None,
-                    };
-                    let balance =
-                        read_balance(state.spend.as_ref(), &principal, &terms, at_ms).await?;
-                    let stamp = Stamp::ledger(terms.budget.window, window_start_ms(&terms, at_ms));
-                    if project_committed.is_none() {
-                        project_committed = Some((
-                            dollars(balance.committed_usd),
-                            dollars(balance.held_usd),
-                            Stamp::ledger(terms.budget.window, window_start_ms(&terms, at_ms)),
-                        ));
-                    }
-                    (
-                        Some(dollars(balance.member_committed_usd)),
-                        balance.member_remaining_usd.map(dollars),
-                        stamp,
-                        share,
-                    )
-                }
+                None => Position::Absent(Basis::Unenforced),
+                Some(terms) => Position::Figure { terms, live: true },
             },
+            // No admission, which is two facts wearing one shape: a membership
+            // nobody ever minted a key for, and one whose keys have all been
+            // revoked *after* it spent money. Only the rows can tell them apart
+            // — the compiled plane has forgotten the second — and getting it
+            // wrong blanks a balance the ledger is still enforcing.
+            (false, None) => match keys_all_revoked(&view, &project, &membership.user) {
+                false => Position::Absent(Basis::NoKeys),
+                true => match state.directory.membership_terms(record, membership)? {
+                    Some(terms) => Position::Figure { terms, live: false },
+                    // The project has no budget, so nothing ever counted this
+                    // membership's spend and there is no position a revoked key
+                    // could have left behind. `unenforced` is the honest reason
+                    // for the absent figure; `revoked_keys` is kept for the row
+                    // that actually carries dollars.
+                    None => Position::Absent(Basis::Unenforced),
+                },
+            },
+        };
+
+        let (committed, remaining, stamp, share) = match position {
+            Position::Absent(basis) => {
+                unenforced_seen |= matches!(basis, Basis::Unenforced);
+                (None, None, Stamp::absent(basis.as_str()), None)
+            }
+            Position::Figure { terms, live } => {
+                let share = match terms.allocation {
+                    Allocation::Share { fraction } => Some(fraction),
+                    _ => None,
+                };
+                let balance = read_balance(state.spend.as_ref(), &principal, &terms, at_ms).await?;
+                let window_start_ms = window_start_ms(&terms, at_ms);
+                let stamp = match live {
+                    true => Stamp::ledger(terms.budget.window, window_start_ms),
+                    false => Stamp::revoked_keys(terms.budget.window, window_start_ms),
+                };
+                // First row wins, except that a live row displaces a
+                // revoked-only one — see `project_committed`'s declaration.
+                if project_committed
+                    .as_ref()
+                    .is_none_or(|(.., from_live)| live && !from_live)
+                {
+                    project_committed = Some((
+                        dollars(balance.committed_usd),
+                        dollars(balance.held_usd),
+                        stamp.clone(),
+                        live,
+                    ));
+                }
+                (
+                    Some(dollars(balance.member_committed_usd)),
+                    balance.member_remaining_usd.map(dollars),
+                    stamp,
+                    share,
+                )
+            }
         };
         if let Some(fraction) = share {
             shares.push(fraction);
@@ -330,7 +507,7 @@ pub(super) async fn budget_view(
 
     let measured_usd = dollars(project_measured.savings.frontier_spend_usd);
     let (committed_usd, held_usd, committed) = match project_committed {
-        Some((committed, held, stamp)) => (Some(committed), Some(held), stamp),
+        Some((committed, held, stamp, _)) => (Some(committed), Some(held), stamp),
         // The project's own basis follows from its members': archived first,
         // then "somebody is spending and nothing counts it", then "nobody can
         // spend at all". Ordered so the most actionable answer wins where a
@@ -355,14 +532,23 @@ pub(super) async fn budget_view(
     .into_response())
 }
 
-/// One membership's position, under the terms its own admission carries.
+/// One membership's position, under terms this module did not write.
 ///
-/// **Verbatim, and this is the sharp edge of the whole view.**
-/// [`SpendLedger::balance`] is not a pure read: it rolls the window over if the
-/// account's stored window has lapsed. Handing it terms assembled here rather
-/// than the ones the engine spends under would let a sweep with the wrong
-/// [`BudgetWindow`] roll a project's window and zero its committed spend
-/// permanently — a reporting endpoint silently handing a month's budget back.
+/// **This is the sharp edge of the whole view.** [`SpendLedger::balance`] is not
+/// a pure read: it rolls the window over if the account's stored window has
+/// lapsed. Handing it terms assembled here rather than the ones the engine
+/// spends under would let a sweep with the wrong [`BudgetWindow`] roll a
+/// project's window and zero its committed spend permanently — a reporting
+/// endpoint silently handing a month's budget back.
+///
+/// So `terms` is either the membership's own admission's, verbatim, or — for a
+/// membership whose keys are all revoked, which has no admission left — the
+/// pairing of its project's budget block with its allocation that
+/// [`ControlDirectory::membership_terms`](crate::control_config::ControlDirectory::membership_terms)
+/// derives through the compiler's own function. The second is not a relaxation
+/// of the rule: it is the same bytes the first would have carried, produced by
+/// the same code, which is exactly why deriving them is safe and assembling them
+/// here would not be.
 async fn read_balance(
     spend: &dyn SpendLedger,
     principal: &Principal,

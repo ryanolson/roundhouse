@@ -531,6 +531,9 @@ impl ControlPlane {
         refusals: HashMap<String, KeyRefusal>,
     ) -> Self {
         let ControlPlaneConfig {
+            // Named and ignored because it is prose: the file's own explanation
+            // of itself, which nothing in a compiled plane has a use for.
+            comment: _,
             projects: _,
             users: _,
             keys: _,

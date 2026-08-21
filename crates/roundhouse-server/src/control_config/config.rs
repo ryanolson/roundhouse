@@ -17,6 +17,25 @@
 //! `validate` builds the finished lookup table, and
 //! [`ControlPlane::configured`](super::ControlPlane::configured) takes it
 //! whole. See that field for why it is built here and not there.
+//!
+//! # The file shares the API's strictness
+//!
+//! Every shape below is `deny_unknown_fields`, top-level document included, so
+//! a stray or misspelled key in `ROUNDHOUSE_CONTROL_PLANE` is a **boot
+//! refusal** rather than a line quietly dropped. That is deliberately the same
+//! answer the admin plane gives a misspelled `POST` body, and for the same
+//! reason: a file that silently means less than it says is worse than one that
+//! fails to load, because the difference between `credentials` and `credential`
+//! is an ungated project nobody can see from the outside. The cost is real and
+//! accepted — a config written for a newer roundhouse will not boot an older
+//! one — and it is the cheaper of the two failures, because it happens at
+//! start-up in front of whoever made the change.
+//!
+//! JSON has no comments, so prose has exactly one home:
+//! [`ControlPlaneConfig::comment`] at the document root. A `$comment` written
+//! beside a project, a user or a key is refused like any other stray field —
+//! a carve-out narrow enough to be worth naming here, because that refusal is
+//! otherwise indistinguishable from a typo.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -26,19 +45,26 @@ use serde::Deserialize;
 
 use roundhouse_core::control::credential::access::ProviderKeys;
 use roundhouse_core::control::{
-    Allocation, Budget, BudgetCounts, BudgetTerms, CredentialError, CredentialMode, FilterError,
-    FrontierCadence, PolicyOverrides, Principal, TargetFilter, TurnCredentials, TurnPolicy,
+    Budget, BudgetCounts, CredentialError, CredentialMode, FilterError, FrontierCadence,
+    PolicyOverrides, Principal, TargetFilter, TurnCredentials, TurnPolicy,
 };
 
 use super::Admission;
-use super::budget::{AllocationConfig, BudgetConfig};
+use super::budget::{AllocationConfig, BudgetConfig, budget_terms};
 use super::credentials::CredentialsConfig;
 use roundhouse_core::validate::ValidationTerms;
 
 use super::validate::ValidateConfig;
 
 /// One entry of the config's `"projects"` array.
+///
+/// `deny_unknown_fields` because every optional axis below *widens* when it is
+/// absent: `credential` for `credentials` is an ungated project, `policy` lost
+/// to a typo is unrestricted routing, and a dropped `budget` is unlimited
+/// spend. None of those is visible from any read surface afterwards, so the
+/// only place the mistake can be caught is the load that made it.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectEntry {
     pub id: String,
     /// A human label. Accepted and validated, read by nothing yet — consumed by
@@ -82,13 +108,27 @@ pub struct ProjectEntry {
 }
 
 /// One entry of the config's `"users"` array.
+///
+/// One field today, and `deny_unknown_fields` is worth more here than on a
+/// wide struct rather than less: everything an operator might reasonably write
+/// beside `id` — a display name, a team, an email — is a field this shape does
+/// not have, and accepting them silently would let a whole vocabulary
+/// accumulate in a file that reads none of it.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UserEntry {
     pub id: String,
 }
 
 /// One entry of the config's `"keys"` array: a turn key's membership and hash.
+///
+/// `deny_unknown_fields` for [`ProjectEntry`]'s reason, sharpened: `override`
+/// for `overrides` drops a *narrowing* overlay, so the key silently resolves to
+/// its project's whole policy — the widest reading of the entry, produced by
+/// the one kind of mistake nothing downstream can distinguish from an operator
+/// who meant it.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct KeyEntry {
     pub project: String,
     pub user: String,
@@ -235,13 +275,19 @@ impl PolicyConfig {
 }
 
 /// `"project `{id}`"`, the label every project-policy error names.
-fn project_entry_label(id: &str) -> String {
+///
+/// `pub(super)` since the admin plane: the directory derives a membership's
+/// budget terms from the same project block this compiler reads, through the
+/// same resolvers, and a refusal from either has to name the entry the same way
+/// or the two halves of one control plane describe one project two ways.
+pub(super) fn project_entry_label(id: &str) -> String {
     format!("project `{id}`")
 }
 
 /// `"key for project `{project}`, user `{user}`"`, the label every
-/// key-overrides error names.
-fn key_entry_label(project: &str, user: &str) -> String {
+/// key-overrides error names. `pub(super)` for the reason
+/// [`project_entry_label`] is.
+pub(super) fn key_entry_label(project: &str, user: &str) -> String {
     format!("key for project `{project}`, user `{user}`")
 }
 
@@ -251,8 +297,26 @@ fn key_entry_label(project: &str, user: &str) -> String {
 /// The format is the deserialized shape, on purpose: a hand-maintained schema
 /// document would drift from what `serde` actually accepts, and this way it
 /// cannot.
+///
+/// `deny_unknown_fields` on the document as well as on every entry inside it,
+/// because the top level is where the widening typos are worst: `admin_key` for
+/// `admin_keys` is a deployment with no root of trust for its admin plane, and
+/// `credential` for `credentials` is a process holding no provider keys at all.
+/// Both would start, and both would look like a configuration problem
+/// somewhere else entirely.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ControlPlaneConfig {
+    /// Prose, read by nothing.
+    ///
+    /// JSON has no comments, and the shipped example leads with a `$comment`
+    /// array that explains the whole format — which parsed only because unknown
+    /// fields used to be dropped in silence. Declared now that they are
+    /// refused, so the one escape hatch this document has is a field the format
+    /// admits rather than a hole it happens to leave open. Any *other* stray
+    /// key is still a boot refusal, which is the point.
+    #[serde(default, rename = "$comment")]
+    pub comment: Option<serde_json::Value>,
     pub projects: Vec<ProjectEntry>,
     pub users: Vec<UserEntry>,
     #[serde(default)]
@@ -825,10 +889,12 @@ impl ControlPlaneConfig {
             // to allocate — see `KeyEntry::allocation`'s doc for why an
             // allocation with no project budget is accepted rather than
             // refused.
-            let budget = project_budget.clone().map(|budget| BudgetTerms {
-                budget,
-                allocation: allocation.unwrap_or(Allocation::Pooled),
-            });
+            //
+            // Through `budget_terms` rather than built here, so that this is the
+            // only *pairing* of a project budget with a member allocation in the
+            // process — see that function on why a second one would eventually
+            // roll somebody's budget window.
+            let budget = budget_terms(project_budget.clone(), allocation);
 
             // Copied down from the project unchanged: an arm is the unit of a
             // comparison, so every key of one project is in one experiment.

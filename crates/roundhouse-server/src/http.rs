@@ -298,11 +298,15 @@ impl ApiError {
 /// an ordinary `409`. Adding a catch-all would delete the only thing enforcing
 /// that.
 ///
-/// The codes are checked against [`AuthError`]'s table by hand and deliberately
-/// do not overlap it: `project_is_archived` here is a *mutation* refused at 409,
-/// while `project_archived` there is a live key whose project closed, at 403.
-/// One code carrying two statuses is exactly what a client's error handling
-/// cannot recover from, and no test spans both types.
+/// The codes deliberately do not overlap [`AuthError`]'s table:
+/// `project_is_archived` here is a *mutation* refused at 409, while
+/// `project_archived` there is a live key whose project closed, at 403. One
+/// code carrying two statuses is exactly what a client's error handling cannot
+/// recover from — which is why the near-miss is no longer checked by hand:
+/// `admin_api.rs`'s `every_refusal_code_this_surface_answers_is_produced_at_least_once`
+/// pulls both strings off the wire in one test and asserts they are neither
+/// equal nor a prefix of one another, so a rename that converged them fails
+/// there instead of shipping.
 impl From<DirectoryError> for ApiError {
     fn from(error: DirectoryError) -> Self {
         let message = error.to_string();
@@ -326,6 +330,13 @@ impl From<DirectoryError> for ApiError {
             // change this API refuses to make at all. See the variant.
             DirectoryError::WindowChangeUnsupported { .. } => {
                 ApiError::bad_request("window_change_unsupported", message)
+            }
+            // 400 for the same reason, and the axis travels in the message
+            // rather than in the code: a client that branched on
+            // `null_patch_unsupported_budget` would need a new branch per axis,
+            // and the remedy is identical for all five.
+            DirectoryError::NullPatchUnsupported { .. } => {
+                ApiError::bad_request("null_patch_unsupported", message)
             }
             DirectoryError::Invalid(_) => {
                 ApiError::unprocessable_named("invalid_control_plane", message)

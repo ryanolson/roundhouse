@@ -9,7 +9,7 @@
 //! one variant per HTTP outcome — and a table is only readable while it is the
 //! whole of what a reader is looking at.
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 use roundhouse_core::control::BudgetWindow;
 
@@ -36,6 +36,18 @@ use super::store::StoreFailure;
 /// API is worst at making visible, so in M8 it is only expressible in the file,
 /// where the whole document is in front of whoever edits it.
 ///
+/// **Which is why every axis is `Option<Option<T>>`.** A plain `Option<T>`
+/// collapses an absent field and an explicit JSON `null` into one `None` at
+/// deserialization time, so the gap above became a silent one: `{"budget":
+/// null}` — the only JSON spelling that reads like an attempt at removal — took
+/// the "leave alone" branch and answered 200, having thrown away the fact that
+/// the caller wrote anything at all. The outer `Option` is "was this field on
+/// the wire", the inner one is "was it `null`", and
+/// [`Self::explicit_null_axis`] is what turns the second into a refusal that
+/// names the axis. Refusing loudly is the choice here because both alternatives
+/// are silent: a no-op 200 tells an operator their clear worked, and an actual
+/// clear performs the widening this type exists to keep out of the API.
+///
 /// `deny_unknown_fields`, and the project's own `id` is therefore *not*
 /// accepted: it is in the path, and a body that carried a second one would have
 /// to decide what a disagreement between them means. Strict rather than lenient
@@ -44,11 +56,55 @@ use super::store::StoreFailure;
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProjectPatch {
-    pub name: Option<String>,
-    pub policy: Option<PolicyConfig>,
-    pub budget: Option<BudgetConfig>,
-    pub validate: Option<ValidateConfig>,
-    pub credentials: Option<CredentialsConfig>,
+    #[serde(default, deserialize_with = "keep_explicit_null")]
+    pub name: Option<Option<String>>,
+    #[serde(default, deserialize_with = "keep_explicit_null")]
+    pub policy: Option<Option<PolicyConfig>>,
+    #[serde(default, deserialize_with = "keep_explicit_null")]
+    pub budget: Option<Option<BudgetConfig>>,
+    #[serde(default, deserialize_with = "keep_explicit_null")]
+    pub validate: Option<Option<ValidateConfig>>,
+    #[serde(default, deserialize_with = "keep_explicit_null")]
+    pub credentials: Option<Option<CredentialsConfig>>,
+}
+
+/// The seam that keeps "the caller wrote `null`" alive past deserialization.
+///
+/// `serde` only calls a field's `deserialize_with` when the field is *present*,
+/// so wrapping whatever it read in `Some` is the whole trick: a missing field
+/// never reaches here and stays at the `Default` `None`.
+fn keep_explicit_null<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+impl ProjectPatch {
+    /// The name of the first axis the caller sent as an explicit JSON `null`.
+    ///
+    /// Field order, which is what makes it deterministic: a body that nulls two
+    /// axes is refused naming the same one every time, on every deployment, and
+    /// an operator who corrects it hits the other. Naming all of them at once
+    /// would be kinder and is not a shape this error carries; naming whichever
+    /// the JSON object happened to list first would make one request refuse two
+    /// different ways.
+    pub fn explicit_null_axis(&self) -> Option<&'static str> {
+        [
+            ("name", nulled(&self.name)),
+            ("policy", nulled(&self.policy)),
+            ("budget", nulled(&self.budget)),
+            ("validate", nulled(&self.validate)),
+            ("credentials", nulled(&self.credentials)),
+        ]
+        .into_iter()
+        .find_map(|(axis, is_null)| is_null.then_some(axis))
+    }
+}
+
+fn nulled<T>(axis: &Option<Option<T>>) -> bool {
+    matches!(axis, Some(None))
 }
 
 /// The identity half of a minted key: everything about it that outlives the
@@ -190,6 +246,21 @@ pub enum DirectoryError {
         from: BudgetWindow,
         to: BudgetWindow,
     },
+    /// A `PATCH` axis sent as an explicit JSON `null`.
+    ///
+    /// Refused rather than read as "leave alone" — which is what an *absent*
+    /// field means — or as "remove this block", which M8 has no spelling for at
+    /// all. See [`ProjectPatch`]: a caller who wrote `null` has said something
+    /// about the axis, and both available readings of it are silent ones.
+    #[error(
+        "project `{project}`'s `{axis}` was sent as an explicit `null`, which is not a change \
+         this API can make. An absent field means leave it alone, and there is no spelling for \
+         removing a block: removing a budget widens a ceiling to unlimited and removing a \
+         credentials block un-gates a project, so both are edits only ROUNDHOUSE_CONTROL_PLANE \
+         can make, where the whole document is in front of whoever makes them. Omit `{axis}` to \
+         leave it unchanged"
+    )]
+    NullPatchUnsupported { project: String, axis: &'static str },
     /// The merged config did not compile.
     ///
     /// The same boundary, and the same words, a boot failure would have used —
