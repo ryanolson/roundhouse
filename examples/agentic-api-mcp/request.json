@@ -1,0 +1,23 @@
+{
+  "model": "Qwen/Qwen3.6-35B-A3B",
+  "stream": true,
+  "store": false,
+  "parallel_tool_calls": true,
+  "input": "Ask roundhouse what it is routing me to.",
+  "tools": [
+    {
+      "type": "mcp",
+      "server_label": "roundhouse",
+      "server_url": "http://127.0.0.1:8090/mcp",
+      "authorization": "rh_turn_compatAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "allowed_tools": [
+        "status",
+        "declare_intent",
+        "prefer",
+        "set_quality_floor",
+        "explain_last_route"
+      ],
+      "require_approval": "never"
+    }
+  ]
+}
