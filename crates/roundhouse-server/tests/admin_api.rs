@@ -21,8 +21,8 @@
 //! is also the only way to get a key that may be minted at all (a membership the
 //! file declares is owned by the file, and minting under it is refused 409).
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use axum::Router;
@@ -40,7 +40,7 @@ use roundhouse_core::control::{
     Balance, BalanceQuery, Grant, GrantRequest, MemorySpendLedger, Settled, Settlement, SpendError,
     SpendLedger,
 };
-use roundhouse_core::metrics::{MetricsConfig, ReferenceModel, ShadowPricing};
+use roundhouse_core::metrics::{MetricsConfig, MetricsRecorder, ReferenceModel, ShadowPricing};
 use roundhouse_core::now_ms;
 use roundhouse_core::routing::{
     AffinityPolicy, CacheModel, Candidate, ProviderPricing, Target, policy::Weights,
@@ -50,9 +50,12 @@ use roundhouse_fleet::{
     EchoFrontierClient, FrontierModelSpec, StaticFrontierCatalog, WireProtocol,
 };
 use roundhouse_server::control_config::crosscheck::CrossChecks;
+use roundhouse_server::control_config::directory::{
+    DirectoryRecords, StoreFailure, VersionedRecords,
+};
 use roundhouse_server::{
-    ControlDirectory, Conversations, EchoLocalExecutor, Engine, EngineConfig, MemoryDirectoryStore,
-    admin_api, has_valid_key_shape, http, metrics_api, responses_api,
+    ControlDirectory, Conversations, DirectoryStore, EchoLocalExecutor, Engine, EngineConfig,
+    MemoryDirectoryStore, admin_api, has_valid_key_shape, http, metrics_api, responses_api,
 };
 
 mod common;
@@ -710,6 +713,322 @@ async fn revoking_a_key_stops_it_within_one_cache_ttl() {
     assert!(
         listed["revoked_at_ms"].is_number(),
         "a revoked key keeps its row: {listed}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// R2, over the wire: budget_view's plane and view must be one call
+// ---------------------------------------------------------------------------
+
+/// A directory store whose `version()` answers land a staged write at an
+/// exact call count from an armed instant, rather than at whichever call
+/// happens to be second ever.
+///
+/// `WriteBetweenReads` in the directory suite
+/// (`control_config/directory/tests.rs`) proves `ControlDirectory::snapshot`
+/// itself is atomic against this failure mode, by timing a write on the
+/// store's second `version()` call, ever. That pins the *primitive* -- it
+/// never reaches `budget_view`, because that guard drives `snapshot`
+/// directly and has no seam at which to watch what happens if a caller
+/// stopped using it. Nothing in this suite routes through the handler with a
+/// write timed to land between two independent reads either, which is why a
+/// regression from its one `state.directory.snapshot(at_ms)` back to two
+/// separate `state.directory.plane(at_ms)` / `.view(at_ms)` calls would
+/// compile and pass every test here today.
+///
+/// Timing the write on "the Nth `version()` call ever" does not survive
+/// contact with the HTTP boundary: `admin_auth_layer` reads the plane once,
+/// ahead of every handler on this router (see its own doc comment), so a
+/// fixed call count burns unpredictably on setup traffic before the request
+/// under test ever fires. `arm` resets the count the instant the test is
+/// ready, so the write lands `land_at` reads later regardless of how many
+/// earlier requests this store has already answered.
+struct ArmedStore {
+    state: Mutex<(DirectoryRecords, u64)>,
+    /// What the write installs, taken once the countdown reaches zero.
+    pending: Mutex<Option<DirectoryRecords>>,
+    /// `(reads since armed, the read count the write lands on)` -- `None`
+    /// while unarmed, so the setup calls that build `before`/`after` on a
+    /// throwaway router never touch this store at all, and this store's own
+    /// setup can never trip it early either.
+    countdown: Mutex<Option<(u64, u64)>>,
+}
+
+impl ArmedStore {
+    fn new(before: DirectoryRecords) -> Self {
+        Self {
+            state: Mutex::new((before, 1)),
+            pending: Mutex::new(None),
+            countdown: Mutex::new(None),
+        }
+    }
+
+    fn locked(&self) -> std::sync::MutexGuard<'_, (DirectoryRecords, u64)> {
+        self.state.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// Stage `after` to land on the `land_at`-th `version()` call from this
+    /// point on.
+    fn arm(&self, after: DirectoryRecords, land_at: u64) {
+        *self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(after);
+        *self
+            .countdown
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some((0, land_at));
+    }
+
+    /// How many `version()` calls have landed since the last `arm`, `0` if
+    /// never armed.
+    ///
+    /// What pins the read-count arithmetic in the test below to reality
+    /// rather than to a guess: without this, a request that produced *no*
+    /// `version()` calls at all -- because `arm` was never reached, or
+    /// `admin_auth_layer` stopped reading the plane, or the router changed
+    /// shape -- would satisfy "bob's row is absent" exactly as well as the
+    /// request this test means to exercise, and the guard would enforce
+    /// nothing while still going green.
+    fn reads_since_armed(&self) -> u64 {
+        self.countdown
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .map(|(count, _)| count)
+            .unwrap_or(0)
+    }
+}
+
+impl DirectoryStore for ArmedStore {
+    fn load(&self) -> Result<VersionedRecords, StoreFailure> {
+        let state = self.locked();
+        Ok(VersionedRecords {
+            records: state.0.clone(),
+            version: state.1,
+        })
+    }
+
+    fn commit(
+        &self,
+        expected_version: u64,
+        records: DirectoryRecords,
+    ) -> Result<u64, StoreFailure> {
+        let mut state = self.locked();
+        if state.1 != expected_version {
+            return Err(StoreFailure::Concurrent {
+                expected: expected_version,
+                found: state.1,
+            });
+        }
+        state.0 = records;
+        state.1 += 1;
+        Ok(state.1)
+    }
+
+    fn version(&self) -> Result<u64, StoreFailure> {
+        let mut countdown = self
+            .countdown
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some((count, land_at)) = countdown.as_mut() {
+            *count += 1;
+            if *count == *land_at {
+                let taken = self
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .take();
+                if let Some(after) = taken {
+                    let mut state = self.locked();
+                    state.0 = after;
+                    state.1 += 1;
+                }
+            }
+        }
+        Ok(self.locked().1)
+    }
+}
+
+/// R2 (thermo-nuclear review, M8), reproduced at the HTTP boundary: nothing
+/// else in this suite drives the real router with a write timed to land
+/// between `budget_view`'s plane read and its listing read, so a regression
+/// from its one `state.directory.snapshot(at_ms)` back to two independent
+/// `plane(at_ms)` / `view(at_ms)` calls would compile and pass everything
+/// else here.
+///
+/// The fixture is built so the coherent answers and the incoherent one are
+/// all visibly different in the response body, not merely internally
+/// inconsistent in a way an HTTP test has no handle on. `before` is a
+/// project and a user with no membership between them at all; `after` adds
+/// the membership *and* its live turn key in one staged write, the way a
+/// real mint produces both together. A coherent read of `before` therefore
+/// omits bob's row entirely -- the membership does not exist yet. A coherent
+/// read of `after` resolves his admission and reports a real basis
+/// (`unenforced`, since this project has no budget) -- never `no_keys`,
+/// which this module reserves for a membership with no *live* admission. The
+/// only way to see bob's row **and** `no_keys` together is a plane that has
+/// not heard about him yet paired with a listing that has -- exactly the
+/// split [`ArmedStore`] is armed to produce.
+///
+/// **Reach:** this pins the call order the R2 regression actually had --
+/// `plane(at_ms)` before `view(at_ms)`. A handler regressed to the opposite
+/// order would iterate a listing that is still `before` (no row for bob at
+/// all) and would pass this guard green; that direction is not covered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn budget_view_over_http_reads_plane_and_view_from_one_version() {
+    ensure_rustls_crypto_provider();
+
+    // `before`/`after`, staged on a throwaway router over a plain store --
+    // exactly what a real project, member and mint produce, rather than
+    // hand-built records that could differ from one in the way that makes
+    // this test pass for the wrong reason.
+    let seed_store = Arc::new(MemoryDirectoryStore::new());
+    let seed_directory = Arc::new(
+        ControlDirectory::new(
+            control_plane(
+                json!({ "projects": [], "users": [], "admin_keys": [sha256_hex(&root())] }),
+                "R2 http-guard seed",
+            ),
+            "ROUNDHOUSE_CONTROL_PLANE",
+            Arc::clone(&seed_store) as Arc<dyn DirectoryStore>,
+            CrossChecks::new(reachable(), None),
+            now_ms(),
+        )
+        .expect("admin_keys alone compiles"),
+    );
+    let seed_app = admin_api::admin_router(
+        Arc::clone(&seed_directory),
+        Arc::new(MemorySpendLedger::new()) as Arc<dyn SpendLedger>,
+        Arc::new(MetricsRecorder::new()),
+        metrics_config(),
+    );
+    admin(
+        &seed_app,
+        "POST",
+        "/v1/admin/projects",
+        Some(json!({ "id": "widgets" })),
+    )
+    .await;
+    admin(
+        &seed_app,
+        "POST",
+        "/v1/admin/users",
+        Some(json!({ "id": "bob" })),
+    )
+    .await;
+    let before = seed_store
+        .load()
+        .expect("the seed store answers its own writes")
+        .records;
+    admin(
+        &seed_app,
+        "PUT",
+        "/v1/admin/projects/widgets/members/bob",
+        Some(json!({ "role": "member" })),
+    )
+    .await;
+    admin(
+        &seed_app,
+        "POST",
+        "/v1/admin/projects/widgets/members/bob/keys",
+        None,
+    )
+    .await;
+    let after = seed_store
+        .load()
+        .expect("the seed store answers its own writes")
+        .records;
+
+    // The router under test, over the armed double. `admission_cache_ttl_ms:
+    // 0` so every `plane`/`view` call re-asks the store instead of answering
+    // from a cache that would hide the whole race.
+    let armed = Arc::new(ArmedStore::new(before));
+    let directory = Arc::new(
+        ControlDirectory::new(
+            control_plane(
+                json!({
+                    "projects": [], "users": [],
+                    "admin_keys": [sha256_hex(&root())],
+                    "admission_cache_ttl_ms": 0,
+                }),
+                "R2 http-guard target",
+            ),
+            "ROUNDHOUSE_CONTROL_PLANE",
+            Arc::clone(&armed) as Arc<dyn DirectoryStore>,
+            CrossChecks::new(reachable(), None),
+            now_ms(),
+        )
+        .expect("admin_keys alone compiles"),
+    );
+    let app = admin_api::admin_router(
+        Arc::clone(&directory),
+        Arc::new(MemorySpendLedger::new()) as Arc<dyn SpendLedger>,
+        Arc::new(MetricsRecorder::new()),
+        metrics_config(),
+    );
+
+    // `admin_auth_layer` reads the plane once, ahead of any handler, which
+    // consumes call 1 before the request under test even reaches
+    // `budget_view`. A handler that still calls `snapshot` once consumes
+    // call 2 and never reaches the landing point -- this whole request
+    // answers from `before`, which has no membership for bob at all. A
+    // handler regressed to call `plane` then `view` separately consumes
+    // calls 2 and 3, and the write lands between them: `plane` (call 2)
+    // still answers `before`, `view` (call 3) answers `after`.
+    armed.arm(after, 3);
+
+    let view = read(&app, "/v1/admin/projects/widgets/budget").await;
+    let members = view["members"]
+        .as_array()
+        .expect("a budget view always has a members array");
+    assert!(
+        members.iter().all(|member| member["user"] != "bob"),
+        "bob's membership does not exist in the `before` records this \
+         request's plane read is pinned to, and the only route to a row for \
+         him needs the fresher `after` listing paired with a plane that has \
+         caught up to it -- a row for him here means the response mixed a \
+         stale plane with a fresh listing: {view}"
+    );
+
+    // The assertion above is only a guard if this specific request really
+    // produced the two reads the `land_at(3)` arithmetic assumes -- one in
+    // `admin_auth_layer`, one in the handler's own call into the directory.
+    // A count of anything else means the landing point no longer sits where
+    // the comment above claims, and the assertion just passed without a
+    // version mismatch in front of it to catch.
+    assert_eq!(
+        armed.reads_since_armed(),
+        2,
+        "expected exactly two directory reads for this request (auth, then \
+         the handler) -- got a different count, so `arm(.., 3)` is no longer \
+         pinned between a regressed handler's two calls and the assertion \
+         above proves nothing"
+    );
+
+    // And the write really did land, seen coherently once a request's own
+    // reads carry the count the rest of the way: this second GET's auth read
+    // is the third since arming, so the swap fires *inside* that one
+    // `compiled()` call and both halves of `current` move together. Bob's
+    // key is live in `after`, so a plane that has caught up resolves a real
+    // admission -- `unenforced`, since this project carries no budget --
+    // never `no_keys`. Without this the test would also pass on a fixture
+    // whose `after` never gave bob a working key at all.
+    let landed = read(&app, "/v1/admin/projects/widgets/budget").await;
+    let bob = landed["members"]
+        .as_array()
+        .and_then(|members| members.iter().find(|member| member["user"] == "bob"))
+        .unwrap_or_else(|| {
+            panic!(
+                "sanity: the staged write is meant to have landed by now, or \
+                 the assertion above never had a version mismatch to catch: \
+                 {landed}"
+            )
+        });
+    assert_eq!(
+        bob["committed"]["basis"], "unenforced",
+        "bob's key is live in the landed `after` records and this project \
+         carries no budget -- a coherent read must resolve his admission, \
+         not report `no_keys`: {landed}"
     );
 }
 
