@@ -14,9 +14,15 @@
 //! auth, request and collector doubles that make a test *be* a Codex client.
 //! The two halves have no reason to change together, and the `use` line at the
 //! top of a suite now says which side of the wire it is exercising.
+//!
+//! [`validate`] is the third of those axes rather than a fourth pile in this
+//! file: it holds the judge and signal doubles that turn the validate/steer
+//! loop on, which neither stands behind the server nor in front of it — it
+//! occupies a seam inside it.
 #![allow(dead_code)]
 
 pub mod codex;
+pub mod validate;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

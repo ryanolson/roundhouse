@@ -291,6 +291,17 @@ impl<S: SessionStore> ControlReads for ControlPlaneReads<S> {
     }
 }
 
+/// The path this router mounts the control surface at.
+///
+/// A constant because two unrelated things have to agree on it and only one of
+/// them is in this file: the route below, and the `url` in the
+/// `[mcp_servers.roundhouse]` stanza [`crate::codex_launch`] generates for a
+/// client. A literal in each would be one edit away from a deployment whose
+/// generated config points a real agent at a path this router does not serve —
+/// which surfaces as a startup timeout in the agent, with nothing on our side
+/// logging a miss.
+pub const MCP_MOUNT_PATH: &str = "/mcp";
+
 /// The `/mcp` route, gated by the same bearer-key resolution as the turn
 /// surfaces.
 ///
@@ -339,7 +350,7 @@ pub fn mcp_router<R: ControlReads, P: PlaneSource>(
     };
     Router::new()
         .route(
-            "/mcp",
+            MCP_MOUNT_PATH,
             post_service(roundhouse_mcp::transport::mcp_service(surface, hosts)),
         )
         .layer(axum::middleware::from_fn_with_state(planes, auth_layer))

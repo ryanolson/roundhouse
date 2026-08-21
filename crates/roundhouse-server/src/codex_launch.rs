@@ -1,0 +1,654 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! What an operator hands a Codex client so that client hooks up to this
+//! deployment without being modified.
+//!
+//! Two files come out of here: the `config.toml` a client reads out of its
+//! `CODEX_HOME`, and the model catalog that `config.toml` points at. Nothing
+//! else about the client changes — no wrapper, no patched binary, no forked
+//! provider — which is the whole of "transparently" in the product sentence.
+//!
+//! **Which topology this is.** The *Direct* one — an agent pointed straight at
+//! roundhouse — and it is the reference by ruling rather than by default.
+//! `agent-docs/synergies/ecosystem-round-2.md`'s launch-surface dedup found
+//! three implementations of one surface (Relay's Rust launchers, Switchyard's
+//! Python launcher, this) and kept Direct as the reference with roundhouse
+//! generating its own minimal config, because the one test M9 exists for — a
+//! real codex binary executing our synthetic tool call — cannot be delegated
+//! to a launcher we do not own. Relay's CLI stays the supported instrumented
+//! front end for the *chained* topology; Switchyard's launcher is reference
+//! and evidence — its `caller_auth_kind` conditional is exactly what
+//! [`CodexAuthKind`] mirrors — and not a blessed front end.
+//!
+//! **Two lines here look like belt-and-braces and are not.** Both are facts
+//! about `codex-cli 0.146.0` that a later client could change, and deleting
+//! either re-opens a failure that is silent in the dangerous direction:
+//!
+//! - `env_key` is written *beside* `requires_openai_auth = false`, never
+//!   instead of it. At 0.146.0 the flag being `false` suppresses nothing — it
+//!   does not gate what the auth manager resolves — so a provider with neither
+//!   an `env_key` nor the flag sends whatever ambient credential happens to sit
+//!   in the client's `CODEX_HOME` to *our* `base_url`. The flag says what this
+//!   deployment is; `env_key` is what makes the resolution deterministic.
+//! - `model_catalog_json` is written under **both** auth kinds, not only the
+//!   forwarding one. The `GET {base_url}/models` fetch is gated on the ambient
+//!   auth mode in `CODEX_HOME` rather than on `requires_openai_auth`
+//!   (`models-manager/src/manager.rs:413-417`,
+//!   `model-provider/src/models_endpoint.rs:67-72` @ `e363b08`), so a
+//!   bring-your-own-key client can fetch too. A pinned catalog does not
+//!   short-circuit that request — it swaps in a static manager, so there is no
+//!   network path at all — which is why it is the answer for both rather than
+//!   a `/v1/models` route roundhouse would have to serve.
+//!
+//! **Why this lives in the server crate.** The stanza needs three things at
+//! once: the address this deployment is bound to, the turn-key header name
+//! ([`TURN_KEY_HEADER`]) and the MCP mount path
+//! ([`MCP_MOUNT_PATH`]). This crate is the only
+//! place that already knows all three. `control_config` is the wrong half of
+//! the same crate — it *reads* the file an operator wrote, and this *writes*
+//! the file a client will read; putting a TOML emitter beside
+//! `ControlPlaneConfig::validate` would invite reading the two as a round trip,
+//! which they are not.
+//!
+//! **Why the TOML is hand-templated rather than serialized from a struct.**
+//! Every stanza below carries a comment saying what it costs to get wrong, and
+//! those comments are the reason a generated config is worth reading at all.
+//! `toml::Serializer` would drop all of them and reorder the tables into
+//! whatever the struct declaration happened to be. `toml` is still a
+//! dependency, used for the two jobs a template cannot do safely: quoting a
+//! free string, and parsing the result back in the tests below so a
+//! hand-written template cannot ship syntactically broken.
+//!
+//! **The secret is never in the file.** Both auth kinds name an *environment
+//! variable*; the turn key travels in the client's environment at launch. A
+//! generator that took the secret would put a `rh_turn_…` into a file that
+//! ends up in a dotfile repo, and nothing downstream could tell that copy from
+//! a live one.
+//!
+//! Verified against `codex-cli 0.146.0` by
+//! `crates/roundhouse-server/tests/codex_e2e.rs`, which writes these two files
+//! into a hermetic `CODEX_HOME` and drives the real binary against a real
+//! roundhouse.
+
+use std::path::Path;
+
+use crate::control_config::TURN_KEY_HEADER;
+use crate::dialect::DEFAULT_MCP_NAMESPACE;
+use crate::mcp_api::MCP_MOUNT_PATH;
+
+/// The environment variable a generated config names by default.
+pub const DEFAULT_KEY_ENV: &str = "ROUNDHOUSE_API_KEY";
+
+/// The model slug a generated config names by default.
+///
+/// **Deliberately not a real OpenAI slug, and that is a safety property rather
+/// than a naming preference.** `/v1/responses` accepts `model` and ignores it —
+/// v1 chooses its target by routing policy — so the slug is free on our side.
+/// On the client's side it is not: naming a real slug can resolve metadata with
+/// `use_responses_lite: true`, which puts `ResponseItem::AdditionalTools` into
+/// `input`, and that is an item type this surface refuses with a 422.
+pub const DEFAULT_MODEL_SLUG: &str = "roundhouse-local";
+
+/// The provider table key, which is also the value of `model_provider`.
+///
+/// One constant for both because they are the same identifier in two places:
+/// codex resolves `model_provider` as a key into `[model_providers.*]`, and a
+/// pair that disagreed would fail at startup with a message about an unknown
+/// provider rather than about a typo.
+const PROVIDER_KEY: &str = "roundhouse";
+
+/// The prefix codex puts in front of an MCP server's table key to build the
+/// tool namespace it dispatches on (`mcp__{key}`).
+///
+/// Here rather than in [`crate::dialect`] because it is a fact about the
+/// *client*: this crate's [`DEFAULT_MCP_NAMESPACE`] is the whole namespace, and
+/// the server table key is what has to be written so codex reconstructs it. The
+/// unit test below pins the two together, which is the only place the
+/// reconstruction is checkable without a running agent.
+const MCP_NAMESPACE_PREFIX: &str = "mcp__";
+
+/// How many tokens the generated catalog claims the model's context window is.
+///
+/// A stated number rather than `null`, because the client accumulates the usage
+/// roundhouse reports into a session total and compares it against this — so a
+/// deployment reading the §10.2 usage evidence needs to know what the client
+/// was measuring against. Matches the figure 0.146.0's own fallback metadata
+/// uses, so pinning the catalog does not silently change the client's
+/// compaction arithmetic relative to an unpinned run.
+pub const CONTEXT_WINDOW_TOKENS: u64 = 272_000;
+
+/// How the client authenticates to roundhouse.
+///
+/// Two kinds because there are two deployments, not because there is a
+/// preference: a client that has its own roundhouse key, and a client whose
+/// user is logged into ChatGPT and whose login roundhouse forwards upstream.
+/// The difference is one flag and one line, and getting it wrong is silent in
+/// the dangerous direction — see the variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexAuthKind {
+    /// The client holds a roundhouse turn key and nothing else.
+    ///
+    /// `requires_openai_auth = false` **with** `env_key`. Never without: at
+    /// 0.146.0 the flag does not gate what the auth manager resolves, so a
+    /// provider with neither an `env_key` nor the flag sends whatever ambient
+    /// credential happens to sit in the client's `CODEX_HOME` to *our*
+    /// `base_url`. `env_key` is what makes the resolution deterministic.
+    RoundhouseKey,
+    /// The client's ChatGPT login is forwarded upstream by roundhouse.
+    ///
+    /// `requires_openai_auth = true` and **no** `env_key`, so `Authorization`
+    /// carries the client's own bearer. Roundhouse's key then has to arrive
+    /// somewhere else, which is what `env_http_headers` is for — see
+    /// [`TURN_KEY_HEADER`].
+    ForwardedOpenAiLogin,
+}
+
+/// Everything a generated launch config depends on.
+///
+/// Plain fields with a constructor that fills the two defaults, rather than a
+/// builder: there are five inputs, two of them have one sensible value, and a
+/// builder would make the two that must never be defaulted — the address and
+/// the catalog path — look optional.
+#[derive(Debug, Clone)]
+pub struct CodexLaunch {
+    /// Where this deployment serves the Responses API, including the `/v1`
+    /// suffix — exactly what goes into `base_url`.
+    pub base_url: String,
+    /// The environment variable the client's turn key arrives in.
+    pub key_env: String,
+    /// How the client authenticates. See [`CodexAuthKind`].
+    pub auth: CodexAuthKind,
+    /// The slug written into `model`. See [`DEFAULT_MODEL_SLUG`].
+    pub model: String,
+    /// Where [`Self::model_catalog_json`]'s output will be written, as the
+    /// client will see it.
+    ///
+    /// Absolute, because codex resolves a relative `model_catalog_json` against
+    /// the directory the config was loaded from — which is correct and
+    /// impossible to check from here, so the unambiguous form is the one this
+    /// type asks for.
+    pub model_catalog_path: String,
+}
+
+impl CodexLaunch {
+    /// A bring-your-own-key launch against `base_url`, with the defaults.
+    pub fn new(base_url: impl Into<String>, model_catalog_path: &Path) -> Self {
+        Self {
+            base_url: base_url.into(),
+            key_env: DEFAULT_KEY_ENV.to_string(),
+            auth: CodexAuthKind::RoundhouseKey,
+            model: DEFAULT_MODEL_SLUG.to_string(),
+            model_catalog_path: model_catalog_path.display().to_string(),
+        }
+    }
+
+    /// The same, forwarding the client's own ChatGPT login upstream.
+    pub fn forwarding_openai_login(mut self) -> Self {
+        self.auth = CodexAuthKind::ForwardedOpenAiLogin;
+        self
+    }
+
+    /// Name a different environment variable for the turn key.
+    pub fn with_key_env(mut self, key_env: impl Into<String>) -> Self {
+        self.key_env = key_env.into();
+        self
+    }
+
+    /// Name a different model slug. See [`DEFAULT_MODEL_SLUG`] first.
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = model.into();
+        self
+    }
+
+    /// Where the client's MCP registration should point.
+    pub fn mcp_url(&self) -> String {
+        mcp_endpoint(&self.base_url)
+    }
+
+    /// The `config.toml` a client reads out of its `CODEX_HOME`.
+    pub fn config_toml(&self) -> String {
+        let model = quote(&self.model);
+        let provider = quote(PROVIDER_KEY);
+        let catalog = quote(&self.model_catalog_path);
+        let base_url = quote(&self.base_url);
+        let key_env = quote(&self.key_env);
+        let header = quote(TURN_KEY_HEADER);
+        let mcp_url = quote(&self.mcp_url());
+        let server_key = mcp_server_key();
+
+        // `requires_openai_auth` and `env_key` move together, which is why they
+        // are formatted as one block rather than two lines with an `if` around
+        // the second: the invalid combination is `true` beside an `env_key`,
+        // where codex resolves the env key first and the forwarded login is
+        // silently never used.
+        let auth = match self.auth {
+            CodexAuthKind::RoundhouseKey => format!(
+                "# This client holds its own roundhouse key. `env_key` is what makes the\n\
+                 # credential resolution deterministic: without it, codex 0.146.0 attaches\n\
+                 # whatever ambient login sits in CODEX_HOME to this base_url.\n\
+                 requires_openai_auth = false\n\
+                 env_key = {key_env}\n"
+            ),
+            CodexAuthKind::ForwardedOpenAiLogin => concat!(
+                "# This client's own ChatGPT login rides `Authorization` and roundhouse\n",
+                "# forwards it upstream. No `env_key` here, deliberately: codex resolves an\n",
+                "# env key ahead of the login, so one would disable the forwarding this\n",
+                "# stanza exists for -- silently, since both produce a valid request.\n",
+                "requires_openai_auth = true\n",
+            )
+            .to_string(),
+        };
+
+        format!(
+            "# Generated by roundhouse (`roundhouse_server::codex_launch`). Everything here\n\
+             # is what makes an unmodified Codex drive roundhouse: the provider it posts to,\n\
+             # the header its turn key rides in, and the MCP surface it dispatches roundhouse's\n\
+             # own tool calls back to. No secret is in this file -- the key travels in the\n\
+             # environment variable named below.\n\
+             \n\
+             # Accepted and ignored by roundhouse: /v1/responses chooses its target by routing\n\
+             # policy, not by requested model. It still matters on this side -- a real OpenAI\n\
+             # slug resolves metadata that puts item types roundhouse refuses into the request.\n\
+             model = {model}\n\
+             model_provider = {provider}\n\
+             # Pinned rather than fetched. With a catalog on disk the client uses a static\n\
+             # models manager with no network path at all; without one it may issue\n\
+             # `GET {{base_url}}/models` -- gated at 0.146.0 on the ambient auth mode in\n\
+             # CODEX_HOME rather than on `requires_openai_auth`, so it applies to both kinds\n\
+             # of stanza and not only to the forwarded one.\n\
+             model_catalog_json = {catalog}\n\
+             \n\
+             [model_providers.{PROVIDER_KEY}]\n\
+             # Never \"OpenAI\": codex matches this *name* (not the table key) to decide\n\
+             # whether to attach its routing-hint header, use remote compaction, and zstd-\n\
+             # compress the request body. Roundhouse serves none of the three.\n\
+             name = \"Roundhouse\"\n\
+             base_url = {base_url}\n\
+             wire_api = \"responses\"\n\
+             # Roundhouse serves SSE over POST and no websocket upgrade.\n\
+             supports_websockets = false\n\
+             {auth}\
+             \n\
+             # Roundhouse's own turn key, in a header of its own. Required for the forwarded\n\
+             # login (where `Authorization` belongs to the upstream) and harmless beside a\n\
+             # roundhouse key, where both headers carry the same secret and the surface\n\
+             # captures neither.\n\
+             [model_providers.{PROVIDER_KEY}.env_http_headers]\n\
+             {header} = {key_env}\n\
+             \n\
+             # The control surface. The table key is load-bearing: codex builds the tool\n\
+             # namespace as `{MCP_NAMESPACE_PREFIX}<key>`, and roundhouse emits its synthetic calls under\n\
+             # `{DEFAULT_MCP_NAMESPACE}` -- a different key here makes every steer resolve\n\
+             # against nothing and come back to the model as an unsupported call.\n\
+             [mcp_servers.{server_key}]\n\
+             url = {mcp_url}\n\
+             bearer_token_env_var = {key_env}\n\
+             # Roundhouse's own tools run without asking the operator first, and that is a\n\
+             # property of what they do rather than a convenience. `fetch_steer` reads back the\n\
+             # correction this same deployment just emitted; the writing tools only ever narrow\n\
+             # what the caller's own key already allows, never widen it. Left at the default,\n\
+             # codex 0.146.0 treats an unannotated tool as needing approval, and under\n\
+             # `approval_policy = never` -- which `codex exec` forces -- an approval nobody\n\
+             # can be asked for resolves to *cancelled*: the agent is handed a cancellation\n\
+             # notice in place of the steer, and roundhouse's correction never arrives.\n\
+             default_tools_approval_mode = \"approve\"\n\
+             \n\
+             [features]\n\
+             # Agent identity is an OpenAI-backend credential mode; roundhouse authenticates\n\
+             # by turn key and would see a credential it has no use for.\n\
+             use_agent_identity = false\n"
+        )
+    }
+
+    /// The model catalog `config.toml` points at.
+    ///
+    /// Written against the schema of the binary that reads it, not of the
+    /// codex crates this workspace pins for wire conformance: the two are not
+    /// ancestors of each other and `ModelInfo` differs between them. Unknown
+    /// keys are ignored by the reader and missing required ones are a hard
+    /// config-load error, so over-specifying is the safe direction.
+    pub fn model_catalog_json(&self) -> String {
+        let entry = serde_json::json!({
+            "slug": self.model,
+            "display_name": "Roundhouse",
+            "description": "Routed by roundhouse: the target is chosen per turn, not by this slug.",
+            "supported_reasoning_levels": [],
+            // Decides which shell tool the client advertises. `shell_command` is
+            // the plain-string form; the alternative (`unified_exec`) advertises
+            // a different pair of tools. Stated rather than defaulted because a
+            // catalog that omits it does not load at all.
+            "shell_type": "shell_command",
+            "visibility": "list",
+            "supported_in_api": true,
+            "priority": 1,
+            "upgrade": null,
+            "base_instructions": "You are running against roundhouse, which routes each turn to \
+                                  the model it judges best for the work. Answer the task.",
+            "model_messages": null,
+            "default_reasoning_summary": "auto",
+            "support_verbosity": false,
+            "default_verbosity": null,
+            "apply_patch_tool_type": null,
+            "truncation_policy": { "mode": "bytes", "limit": 10_000 },
+            "supports_parallel_tool_calls": false,
+            "supports_image_detail_original": false,
+            "context_window": CONTEXT_WINDOW_TOKENS,
+            // Left off on purpose: roundhouse reports the *judge's* usage on a
+            // steered turn, and a compaction limit would make the client rewrite
+            // its own history off the back of a number that describes a side
+            // call. See the plan's §10.2.
+            "auto_compact_token_limit": null,
+            "effective_context_window_percent": 95,
+            "experimental_supported_tools": [],
+        });
+        serde_json::to_string_pretty(&serde_json::json!({ "models": [entry] }))
+            .expect("a catalog built from literals encodes")
+    }
+}
+
+/// The MCP endpoint that belongs to a Responses `base_url`.
+///
+/// A named function with its own tests because the two URLs are *not* one
+/// string with a suffix: `base_url` ends in the API version and the MCP route
+/// is mounted beside it, at the deployment root. Getting it wrong produces a
+/// client that starts, times out reaching its MCP server, and then runs turns
+/// perfectly — with every steer silently unresolvable.
+fn mcp_endpoint(base_url: &str) -> String {
+    let root = base_url.trim_end_matches('/');
+    let root = root.strip_suffix("/v1").unwrap_or(root);
+    format!("{}{MCP_MOUNT_PATH}", root.trim_end_matches('/'))
+}
+
+/// The `[mcp_servers.*]` table key codex must see to rebuild
+/// [`DEFAULT_MCP_NAMESPACE`].
+///
+/// Derived rather than written, so renaming the namespace renames the table key
+/// in the same edit. The `expect` is unreachable for any namespace the
+/// constant can hold and is a louder failure than emitting a config whose steer
+/// calls resolve against nothing.
+fn mcp_server_key() -> &'static str {
+    DEFAULT_MCP_NAMESPACE
+        .strip_prefix(MCP_NAMESPACE_PREFIX)
+        .expect("the MCP namespace is `mcp__` plus the server's config table key")
+}
+
+/// One free string, quoted the way TOML wants it.
+///
+/// Through `toml` rather than `format!("\"{s}\"")` because a path or a base URL
+/// can contain a quote or a backslash, and a template that produced a broken
+/// file would fail inside the *client*, where the error names a line number in
+/// a file nobody wrote by hand.
+fn quote(value: &str) -> String {
+    toml::Value::String(value.to_string()).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn launch() -> CodexLaunch {
+        CodexLaunch::new(
+            "http://127.0.0.1:8080/v1",
+            &PathBuf::from("/srv/roundhouse/models.json"),
+        )
+    }
+
+    fn parsed(launch: &CodexLaunch) -> toml::Value {
+        launch
+            .config_toml()
+            .parse::<toml::Value>()
+            .unwrap_or_else(|error| {
+                panic!(
+                    "the generated config must be TOML: {error}\n{}",
+                    launch.config_toml()
+                )
+            })
+    }
+
+    /// The generated file is TOML, and every value survives the round trip.
+    ///
+    /// The parse is the half a hand-written template can break; the value
+    /// checks are the half a template can get syntactically right and
+    /// semantically wrong — a stanza under the wrong table parses perfectly.
+    #[test]
+    fn the_generated_config_parses_back_to_the_values_it_was_built_from() {
+        let launch = launch();
+        let config = parsed(&launch);
+        assert_eq!(config["model"].as_str(), Some(DEFAULT_MODEL_SLUG));
+        assert_eq!(config["model_provider"].as_str(), Some(PROVIDER_KEY));
+        assert_eq!(
+            config["model_catalog_json"].as_str(),
+            Some("/srv/roundhouse/models.json")
+        );
+        let provider = &config["model_providers"][PROVIDER_KEY];
+        assert_eq!(
+            provider["base_url"].as_str(),
+            Some("http://127.0.0.1:8080/v1")
+        );
+        assert_eq!(provider["wire_api"].as_str(), Some("responses"));
+        assert_eq!(provider["supports_websockets"].as_bool(), Some(false));
+        assert_eq!(
+            config["features"]["use_agent_identity"].as_bool(),
+            Some(false)
+        );
+    }
+
+    /// One environment variable, named by all three places that need it.
+    ///
+    /// The failure this catches is a config where the provider authenticates
+    /// and the MCP surface does not: the client starts, runs turns, and only
+    /// the steer path is dead.
+    #[test]
+    fn every_credential_reference_names_the_same_one_env_var() {
+        let launch = launch().with_key_env("MY_KEY");
+        let config = parsed(&launch);
+        let provider = &config["model_providers"][PROVIDER_KEY];
+        assert_eq!(provider["env_key"].as_str(), Some("MY_KEY"));
+        assert_eq!(
+            provider["env_http_headers"][TURN_KEY_HEADER].as_str(),
+            Some("MY_KEY")
+        );
+        assert_eq!(
+            config["mcp_servers"][mcp_server_key()]["bearer_token_env_var"].as_str(),
+            Some("MY_KEY")
+        );
+    }
+
+    /// The forwarded-login stanza never carries an `env_key`.
+    ///
+    /// Codex resolves an env key ahead of the login, so the pair is not a
+    /// belt-and-braces config: it is forwarding switched off, with every
+    /// request still valid.
+    #[test]
+    fn a_forwarded_login_stanza_carries_no_env_key_beside_the_flag() {
+        let forwarding = launch().forwarding_openai_login();
+        let config = parsed(&forwarding);
+        let provider = &config["model_providers"][PROVIDER_KEY];
+        assert_eq!(provider["requires_openai_auth"].as_bool(), Some(true));
+        assert!(
+            provider.get("env_key").is_none(),
+            "an env_key beside requires_openai_auth = true silently disables forwarding: {provider}"
+        );
+        // The roundhouse key still has to arrive, and this is the only door
+        // left once `Authorization` belongs to the upstream.
+        assert_eq!(
+            provider["env_http_headers"][TURN_KEY_HEADER].as_str(),
+            Some(DEFAULT_KEY_ENV)
+        );
+        // The bring-your-own-key stanza is the control: same file, opposite pair.
+        let byok = parsed(&launch());
+        let byok = &byok["model_providers"][PROVIDER_KEY];
+        assert_eq!(byok["requires_openai_auth"].as_bool(), Some(false));
+        assert_eq!(byok["env_key"].as_str(), Some(DEFAULT_KEY_ENV));
+    }
+
+    /// The provider name is not `OpenAI`, and the check the client makes is on
+    /// this field rather than on the table key.
+    #[test]
+    fn the_provider_name_is_not_openai() {
+        let config = parsed(&launch());
+        let name = config["model_providers"][PROVIDER_KEY]["name"]
+            .as_str()
+            .expect("the provider is named");
+        assert_ne!(
+            name.to_ascii_lowercase(),
+            "openai",
+            "an `OpenAI` provider name turns on the routing hint header, remote compaction \
+             and zstd request compression, none of which roundhouse serves"
+        );
+    }
+
+    /// The MCP table key is exactly what codex needs to rebuild the namespace
+    /// roundhouse emits its steers under.
+    #[test]
+    fn the_mcp_table_key_rebuilds_the_namespace_roundhouse_emits() {
+        let config = parsed(&launch());
+        let key = config["mcp_servers"]
+            .as_table()
+            .expect("the MCP servers table exists")
+            .keys()
+            .next()
+            .expect("exactly one MCP server is registered")
+            .clone();
+        assert_eq!(
+            format!("{MCP_NAMESPACE_PREFIX}{key}"),
+            DEFAULT_MCP_NAMESPACE
+        );
+    }
+
+    /// The client is told to run roundhouse's own tools without asking.
+    ///
+    /// Not a convenience knob: `codex exec` forces `approval_policy = never`,
+    /// and at 0.146.0 an unannotated MCP tool under that policy is *cancelled*
+    /// rather than run. Without this line every steer comes back to the agent
+    /// as a cancellation notice -- the correction is never read, and nothing in
+    /// the turn says so.
+    #[test]
+    fn the_client_is_told_to_trust_the_deployments_own_control_tools() {
+        let config = parsed(&launch());
+        assert_eq!(
+            config["mcp_servers"][mcp_server_key()]["default_tools_approval_mode"].as_str(),
+            Some("approve")
+        );
+    }
+
+    /// The MCP url is the deployment root plus the mount path, not the API
+    /// base plus a suffix.
+    #[test]
+    fn the_mcp_url_is_the_deployment_root_and_the_mount_path() {
+        assert_eq!(
+            mcp_endpoint("http://127.0.0.1:8080/v1"),
+            "http://127.0.0.1:8080/mcp"
+        );
+        // A trailing slash is what a copy-pasted address usually carries.
+        assert_eq!(
+            mcp_endpoint("http://127.0.0.1:8080/v1/"),
+            "http://127.0.0.1:8080/mcp"
+        );
+        // A base that names no version still gets one well-formed answer
+        // rather than a silently doubled path.
+        assert_eq!(
+            mcp_endpoint("https://rh.example.com"),
+            "https://rh.example.com/mcp"
+        );
+        assert_eq!(
+            mcp_endpoint("https://rh.example.com/"),
+            "https://rh.example.com/mcp"
+        );
+        // And the generated file agrees with the function.
+        let config = parsed(&launch());
+        assert_eq!(
+            config["mcp_servers"][mcp_server_key()]["url"].as_str(),
+            Some("http://127.0.0.1:8080/mcp")
+        );
+    }
+
+    /// The catalog is a non-empty `{"models":[…]}` carrying every key 0.146.0
+    /// requires.
+    ///
+    /// Listed rather than spot-checked because the reader's failure mode is
+    /// all-or-nothing: a missing required key is an `InvalidData` config-load
+    /// error naming the file, and every test downstream then fails for a
+    /// reason that reads like a harness bug.
+    #[test]
+    fn the_catalog_carries_every_key_the_client_requires() {
+        let catalog: serde_json::Value =
+            serde_json::from_str(&launch().model_catalog_json()).expect("the catalog is JSON");
+        let models = catalog["models"].as_array().expect("a models array");
+        assert_eq!(models.len(), 1, "an empty catalog is a hard load error");
+        let entry = &models[0];
+        for key in [
+            "slug",
+            "display_name",
+            "supported_reasoning_levels",
+            "shell_type",
+            "visibility",
+            "supported_in_api",
+            "priority",
+            "base_instructions",
+            "support_verbosity",
+            "truncation_policy",
+            "supports_parallel_tool_calls",
+            "experimental_supported_tools",
+        ] {
+            assert!(
+                entry.get(key).is_some(),
+                "the catalog entry must carry `{key}`"
+            );
+            assert!(
+                !entry[key].is_null(),
+                "`{key}` has no serde default in the reader, so null is not the same as present"
+            );
+        }
+        assert_eq!(entry["slug"].as_str(), Some(DEFAULT_MODEL_SLUG));
+        assert_eq!(entry["shell_type"].as_str(), Some("shell_command"));
+        assert_eq!(
+            entry["context_window"].as_u64(),
+            Some(CONTEXT_WINDOW_TOKENS)
+        );
+        assert!(
+            entry["auto_compact_token_limit"].is_null(),
+            "a compaction limit would let a judge's reported usage rewrite the client's history"
+        );
+    }
+
+    /// The catalog names the slug the config names.
+    ///
+    /// Two files, one identifier: a client whose catalog does not carry the
+    /// configured slug falls back to invented metadata and reports it as an
+    /// `error` item on stdout, which is the one shape a harness assertion
+    /// cannot tell from a real failure.
+    #[test]
+    fn the_catalog_and_the_config_name_one_slug() {
+        let launch = launch().with_model("roundhouse-e2e");
+        let config = parsed(&launch);
+        let catalog: serde_json::Value =
+            serde_json::from_str(&launch.model_catalog_json()).expect("the catalog is JSON");
+        assert_eq!(config["model"].as_str(), Some("roundhouse-e2e"));
+        assert_eq!(
+            catalog["models"][0]["slug"].as_str(),
+            Some("roundhouse-e2e")
+        );
+    }
+
+    /// No secret is in either generated file.
+    ///
+    /// Structural, not incidental: [`CodexLaunch`] has no field a secret could
+    /// be put in. This asserts the property anyway, because the field that
+    /// would break it is exactly the one a future "make it easier to launch"
+    /// change adds.
+    #[test]
+    fn neither_generated_file_can_carry_a_key() {
+        let launch = launch();
+        for text in [launch.config_toml(), launch.model_catalog_json()] {
+            assert!(
+                !text.contains("rh_turn_") && !text.contains("rh_admin_"),
+                "a generated file must name the env var, never the secret:\n{text}"
+            );
+        }
+        // The env var *name* is what is there instead.
+        assert!(launch.config_toml().contains(DEFAULT_KEY_ENV));
+    }
+}
