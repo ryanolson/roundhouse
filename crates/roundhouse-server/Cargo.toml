@@ -30,6 +30,7 @@ async-trait = { workspace = true }
 axum = { workspace = true }
 tokenizers = { workspace = true }
 futures = { workspace = true }
+getrandom = { workspace = true }
 hex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -41,7 +42,24 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 
+[features]
+# Compiles the `PlaneSource` impl on `ControlPlane` itself -- a plane that is its
+# own source and therefore never sees a revocation. Every integration suite
+# written before the admin plane mounts its routers over a fixed plane and means
+# exactly that; a shipped binary must never be able to, because the whole point
+# of the directory is that a router re-resolves per request.
+#
+# A feature rather than `cfg(test)` because integration tests build the library
+# without `cfg(test)`; the self-dev-dependency below turns it on for exactly
+# those builds and nothing else, which is the same mechanism (and the same
+# reasoning) `roundhouse-store-redis` uses for its `LeaseControl` hook.
+test-support = []
+
 [dev-dependencies]
+# `test-support` is the fixed-plane `PlaneSource` above: it exists so the six
+# pre-M8 integration binaries keep mounting the routers with the planes they
+# already build, and it does not compile into `cargo build`.
+roundhouse-server = { path = ".", features = ["test-support"] }
 # The end-to-end cache-hit proof drives a real mock engine that publishes KV
 # events into the embedded selection service. See tests/mocker_cache_hits.rs.
 dynamo-mocker = { workspace = true }

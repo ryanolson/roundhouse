@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::control::{Billing, FrontierHistory, Payer, Principal};
+use crate::control::{Billing, BudgetCounts, FrontierHistory, Payer, Principal};
 use crate::event::{
     ControlRecord, IncompleteReason, NotRunReason, PlaceboTiming, SessionEvent, SessionEventKind,
     SessionObserver, Usage, ValidationOutcome,
@@ -92,6 +92,11 @@ struct PendingRouting {
     /// [`DecisionRecord::billing`] for what asking the live configuration
     /// instead used to cost.
     billing: Billing,
+    /// Whether the decision was taken under a budget, and on what basis its
+    /// spend draws one. Held for the same reason as the three above — see
+    /// [`DecisionRecord::budget_draw`], the last live read a settle used to
+    /// make.
+    budget_draw: Option<BudgetCounts>,
 }
 
 /// A response that terminated, and everything needed to charge it for.
@@ -161,6 +166,22 @@ pub struct TerminalSettlement {
     /// reading as [`Self::payer`], and equally harmless, since such a turn is
     /// priced at zero on its absent target.
     pub billing: Billing,
+    /// Whether a budget was in force when this turn was decided and, if so, on
+    /// what basis its spend draws — as the decision recorded it.
+    ///
+    /// The last of the settle's inputs to move in here, and the one that closes
+    /// the rule this projection is written to keep. What a turn is charged
+    /// stops being a question anyone can answer by reading the control plane:
+    /// a turn decided before its project had a budget draws nothing however the
+    /// plane reads now, and a member-paid turn draws what the basis in force
+    /// *then* says rather than what an admin has since switched it to. See
+    /// [`DecisionRecord::budget_draw`].
+    ///
+    /// `None` for a response that recorded no decision, which is the same
+    /// reading as [`Self::payer`] and harmless for the same reason: such a turn
+    /// is priced at zero on its absent target, and settling it at zero is what
+    /// releases the hold its grant took out.
+    pub budget_draw: Option<BudgetCounts>,
     /// What the terminal event reported, estimate or measurement alike. An
     /// estimate is what a provider that reported nothing gets charged on, and
     /// it is charged exactly as a measurement would be.
@@ -437,6 +458,7 @@ impl SessionState {
                         rate_card: decision.rate_card,
                         payer: decision.payer,
                         billing: decision.billing,
+                        budget_draw: decision.budget_draw,
                     },
                 );
             }
@@ -483,6 +505,7 @@ impl SessionState {
                         .as_ref()
                         .map(|routing| routing.billing)
                         .unwrap_or_default(),
+                    budget_draw: routing.as_ref().and_then(|routing| routing.budget_draw),
                     target: routing.map(|routing| routing.target),
                     usage: usage.clone(),
                 });

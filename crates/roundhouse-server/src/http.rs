@@ -49,9 +49,10 @@ use roundhouse_core::control::Principal;
 use roundhouse_core::event::{SessionEvent, SessionEventKind};
 use roundhouse_core::ids::{ResponseId, SessionId, TurnId};
 use roundhouse_core::item::{Item, Role};
+use roundhouse_core::now_ms;
 use roundhouse_core::store::{SessionStore, StoreError};
 
-use crate::control_config::{AuthError, ControlPlane};
+use crate::control_config::{AuthError, ControlPlane, DirectoryError, PlaneSource, StoreFailure};
 use crate::engine::Engine;
 
 /// How long to wait before re-reading a log that had nothing new.
@@ -78,7 +79,13 @@ struct Transport<S: SessionStore, T: Tokenizer + Clone> {
     engine: Arc<Engine<S, T>>,
     store: Arc<S>,
     /// Who may drive these routes, and under what session namespace.
-    plane: Arc<ControlPlane>,
+    ///
+    /// A [`PlaneSource`] rather than the compiled plane, and every handler asks
+    /// it again: a key revoked over the admin plane has to stop working *here*,
+    /// which is where it was being used. A router holding one `Arc<ControlPlane>`
+    /// for its lifetime would keep serving turns under a table compiled before
+    /// the revocation, for as long as the process ran.
+    planes: Arc<dyn PlaneSource>,
 }
 
 impl<S: SessionStore, T: Tokenizer + Clone> Clone for Transport<S, T> {
@@ -86,28 +93,37 @@ impl<S: SessionStore, T: Tokenizer + Clone> Clone for Transport<S, T> {
         Self {
             engine: Arc::clone(&self.engine),
             store: Arc::clone(&self.store),
-            plane: Arc::clone(&self.plane),
+            planes: Arc::clone(&self.planes),
         }
     }
 }
 
 /// The transport's routes, gated by a control plane.
 ///
-/// One constructor, and the plane is required rather than defaulted: who may
-/// drive these routes is not a detail a call site should be able to leave out,
-/// and an unconfigured deployment says so by passing
-/// [`ControlPlane::open`](crate::control_config::ControlPlane::open). A
+/// One constructor, and the plane source is required rather than defaulted: who
+/// may drive these routes is not a detail a call site should be able to leave
+/// out, and an unconfigured deployment says so by passing
+/// [`ControlDirectory::open`](crate::control_config::ControlDirectory::open). A
 /// convenience overload that supplied `Open` for you was one grep away from
 /// looking like the *normal* way to mount this.
 ///
 /// The store is passed alongside the engine rather than borrowed out of it: the
 /// streaming endpoints only read, and reading through the engine would suggest
 /// a coupling to turn execution that deliberately does not exist.
-pub fn router<S, T>(plane: Arc<ControlPlane>, engine: Arc<Engine<S, T>>, store: Arc<S>) -> Router
+///
+/// Generic over the source and stored as `Arc<dyn PlaneSource>`, rather than
+/// taking the trait object directly. `Arc<ControlPlane>` and
+/// `Arc<ControlDirectory>` are both accepted and both unsize at the call site;
+/// a parameter typed `Arc<dyn PlaneSource>` would not accept either through the
+/// `Arc::clone(&plane)` a caller naturally writes, because the clone's own
+/// return type is inferred before any coercion could apply.
+pub fn router<S, T, P>(planes: Arc<P>, engine: Arc<Engine<S, T>>, store: Arc<S>) -> Router
 where
     S: SessionStore,
     T: Tokenizer + Clone + Send + Sync + 'static,
+    P: PlaneSource,
 {
+    let planes: Arc<dyn PlaneSource> = planes;
     Router::new()
         .route("/v1/sessions", post(create_session::<S, T>))
         .route(
@@ -121,7 +137,7 @@ where
         .with_state(Transport {
             engine,
             store,
-            plane,
+            planes,
         })
 }
 
@@ -193,7 +209,7 @@ pub(crate) struct ApiError {
 }
 
 impl ApiError {
-    fn not_found(session_id: &SessionId) -> Self {
+    fn session_not_found(session_id: &SessionId) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
             code: "session_not_found",
@@ -209,11 +225,147 @@ impl ApiError {
         }
     }
 
+    /// A 422 that names *which* rule refused, rather than the shared
+    /// `invalid_request`.
+    ///
+    /// The admin plane needs it: a mutation can be refused by the config
+    /// compiler or by any of three deployment cross-checks, and an operator
+    /// reading a refusal has to know which one to go and satisfy. See
+    /// [`CrossCheckRefusal::check`](crate::control_config::CrossCheckRefusal).
+    pub(crate) fn unprocessable_named(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn bad_request(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            code,
+            message: message.into(),
+        }
+    }
+
+    /// A 404 for something other than a session.
+    ///
+    /// Named rather than `session_not_found` with a different message: the
+    /// admin plane's 404s are about projects, users, memberships and keys, and
+    /// a client's error handling should be able to tell those apart from a
+    /// session that is not there.
+    pub(crate) fn not_found(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            code,
+            message: message.into(),
+        }
+    }
+
+    /// A 409: the request was well-formed and the state says no.
+    pub(crate) fn conflict(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code,
+            message: message.into(),
+        }
+    }
+
+    /// A 501: this build does not have the feature, and no request body would
+    /// change that.
+    pub(crate) fn not_implemented(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_IMPLEMENTED,
+            code,
+            message: message.into(),
+        }
+    }
+
     pub(crate) fn internal(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code,
             message: message.into(),
+        }
+    }
+}
+
+/// The directory's refusals, in this transport's error shape.
+///
+/// **Exhaustive on purpose — no `_` arm.** [`DirectoryError`] is written as a
+/// table with one variant per outcome precisely so that a variant added without
+/// a status is a compile error here rather than a route that answers `500` for
+/// an ordinary `409`. Adding a catch-all would delete the only thing enforcing
+/// that.
+///
+/// The codes deliberately do not overlap [`AuthError`]'s table:
+/// `project_is_archived` here is a *mutation* refused at 409, while
+/// `project_archived` there is a live key whose project closed, at 403. One
+/// code carrying two statuses is exactly what a client's error handling cannot
+/// recover from — which is why the near-miss is no longer checked by hand:
+/// `admin_api.rs`'s `every_refusal_code_this_surface_answers_is_produced_at_least_once`
+/// pulls both strings off the wire in one test and asserts they are neither
+/// equal nor a prefix of one another, so a rename that converged them fails
+/// there instead of shipping.
+impl From<DirectoryError> for ApiError {
+    fn from(error: DirectoryError) -> Self {
+        let message = error.to_string();
+        match error {
+            DirectoryError::ConfigOwned { .. } => ApiError::conflict("config_owned", message),
+            DirectoryError::IdentityCollision { .. } => {
+                ApiError::conflict("identity_collision", message)
+            }
+            DirectoryError::ProjectIsArchived { .. } => {
+                ApiError::conflict("project_is_archived", message)
+            }
+            DirectoryError::UnknownProject { .. } => {
+                ApiError::not_found("project_not_found", message)
+            }
+            DirectoryError::UnknownUser { .. } => ApiError::not_found("user_not_found", message),
+            DirectoryError::UnknownMembership { .. } => {
+                ApiError::not_found("membership_not_found", message)
+            }
+            DirectoryError::UnknownKey { .. } => ApiError::not_found("key_not_found", message),
+            // 400 rather than 422: the body is not unprocessable, it is a
+            // change this API refuses to make at all. See the variant.
+            DirectoryError::WindowChangeUnsupported { .. } => {
+                ApiError::bad_request("window_change_unsupported", message)
+            }
+            // 400 for the same reason, and the axis travels in the message
+            // rather than in the code: a client that branched on
+            // `null_patch_unsupported_budget` would need a new branch per axis,
+            // and the remedy is identical for all five.
+            DirectoryError::NullPatchUnsupported { .. } => {
+                ApiError::bad_request("null_patch_unsupported", message)
+            }
+            DirectoryError::Invalid(_) => {
+                ApiError::unprocessable_named("invalid_control_plane", message)
+            }
+            // The check's own name as the code, so the sentence in the boot log
+            // and the code on the wire name the same rule.
+            DirectoryError::CrossCheckRefused { check, .. } => {
+                ApiError::unprocessable_named(check, message)
+            }
+            // A fault of the process, not of the request — the remedy is an
+            // environment variable, and answering 422 would send an operator to
+            // re-read a body that was correct.
+            DirectoryError::EnvironmentIncomplete(_) => {
+                ApiError::internal("environment_incomplete", message)
+            }
+            DirectoryError::Store(StoreFailure::Concurrent { .. }) => {
+                ApiError::conflict("directory_changed", message)
+            }
+            DirectoryError::Store(StoreFailure::Unavailable(_)) => {
+                ApiError::internal("directory_unavailable", message)
+            }
+            DirectoryError::Mint(_) => ApiError::internal("key_mint_failed", message),
+            DirectoryError::Inconsistent { .. } => {
+                ApiError::internal("directory_inconsistent", message)
+            }
+            // Through the refusal table rather than with a message of its own:
+            // this is the same answer the admin router's mode gate gives, and
+            // two wordings of one refusal is one to recognise as the other.
+            DirectoryError::NoAdminPlane => AuthError::AdminRequiresControlPlane.into(),
         }
     }
 }
@@ -268,7 +420,7 @@ impl IntoResponse for ApiError {
 /// Classify a store failure raised before streaming began.
 pub(crate) fn store_error(session_id: &SessionId, error: StoreError) -> ApiError {
     match error {
-        StoreError::SessionNotFound(_) => ApiError::not_found(session_id),
+        StoreError::SessionNotFound(_) => ApiError::session_not_found(session_id),
         other => ApiError::internal("store_error", other.to_string()),
     }
 }
@@ -301,7 +453,12 @@ where
     S: SessionStore,
     T: Tokenizer + Clone + Send + Sync + 'static,
 {
-    let principal = state.plane.turn_principal(&headers)?;
+    // The snapshot, once, at the top of the handler: every question this
+    // request asks about tenancy has to be answered by one compiled plane, or a
+    // session could be minted inside a namespace the very next check no longer
+    // recognises.
+    let plane = state.planes.plane(now_ms());
+    let principal = plane.turn_principal(&headers)?;
     let request: CreateSessionBody = if body.is_empty() {
         CreateSessionBody::default()
     } else {
@@ -314,14 +471,10 @@ where
     // would be a session created and immediately unreachable.
     let session_id = match request.session_id {
         Some(supplied) => {
-            in_namespace(&state.plane, &principal, &supplied)?;
+            in_namespace(&plane, &principal, &supplied)?;
             supplied
         }
-        None => SessionId::new(
-            state
-                .plane
-                .qualify(&principal, SessionId::generate().as_str()),
-        ),
+        None => SessionId::new(plane.qualify(&principal, SessionId::generate().as_str())),
     };
     let created = state
         .engine
@@ -358,8 +511,9 @@ where
     // a turn: the same key lookup answers "who pays" and "what may be routed
     // to", and resolving them once here is what makes the policy immutable for
     // the whole turn rather than something re-read mid-dispatch.
-    let admission = state.plane.turn_admission(&headers)?;
-    in_namespace(&state.plane, &admission.principal, &session_id)?;
+    let plane = state.planes.plane(now_ms());
+    let admission = plane.turn_admission(&headers)?;
+    in_namespace(&plane, &admission.principal, &session_id)?;
     let request: CreateResponseBody = parse_body(&body)?;
     let input = request
         .input
@@ -422,8 +576,9 @@ where
     let session_id = SessionId::new(session_id);
     // This endpoint streams the raw log — items, routing decisions, prices —
     // so the namespace check is the whole of its authorization.
-    let principal = state.plane.turn_principal(&headers)?;
-    in_namespace(&state.plane, &principal, &session_id)?;
+    let plane = state.planes.plane(now_ms());
+    let principal = plane.turn_principal(&headers)?;
+    in_namespace(&plane, &principal, &session_id)?;
     let cursor = resume_cursor(&params, &headers)?;
 
     // Existence probe. A stream opened on a session that does not exist would

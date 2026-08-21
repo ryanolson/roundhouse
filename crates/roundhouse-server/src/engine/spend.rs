@@ -11,19 +11,26 @@
 //!
 //! **The one rule this module exists to keep: a settle reads the log and
 //! nothing else.** What a turn is charged is a fact about the turn — its usage,
-//! the rate card that was in force when it was routed, who paid, and whether
-//! any of it was roundhouse's money to price — and all four travel in the
-//! session's own log, so the process that ran the turn and a successor
-//! replaying its log arrive at the same number by construction rather than by
-//! both consulting files that may have been edited in between. See
-//! [`DecisionRecord::rate_card`](roundhouse_core::routing::DecisionRecord::rate_card)
-//! and [`DecisionRecord::billing`](roundhouse_core::routing::DecisionRecord::billing).
+//! the rate card that was in force when it was routed, who paid, whether any of
+//! it was roundhouse's money to price, and whether a budget was in force to
+//! charge it against at all — and all five travel in the session's own log, so
+//! the process that ran the turn and a successor replaying its log arrive at the
+//! same number by construction rather than by both consulting files that may
+//! have been edited in between. See
+//! [`DecisionRecord::rate_card`](roundhouse_core::routing::DecisionRecord::rate_card),
+//! [`DecisionRecord::billing`](roundhouse_core::routing::DecisionRecord::billing)
+//! and
+//! [`DecisionRecord::budget_draw`](roundhouse_core::routing::DecisionRecord::budget_draw).
 //!
-//! The rule has no exception now, and it had one until recently: the
+//! The rule has no exception now, and it had two until recently. The
 //! billed-or-accounted half was read from the live `Admission`, which made a
 //! repaired settle disagree with the settle it replaced the moment a project's
 //! credential mode was edited — and left the dashboard, which reads only the
-//! log, unable to agree with either.
+//! log, unable to agree with either. The budget itself was read there too,
+//! which was worse in kind rather than in degree: a project handed a budget it
+//! had never had absorbed the turns that predated the change, because the
+//! successor asked the plane in front of it whether they had been budgeted and
+//! was told yes about turns that were over.
 
 use roundhouse_core::context::Tokenizer;
 use roundhouse_core::control::{GrantRequest, SettledSpend, Settlement, TurnBudget};
@@ -140,6 +147,15 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
     /// stop a hung *provider* from holding a lease open, and the ledger is this
     /// deployment's own store — the same reasoning that keeps the session
     /// store's appends out from under it.
+    ///
+    /// **What the live admission still decides is where a charge lands, never
+    /// what it is.** The account and the window come from the project's current
+    /// terms, because an account is a thing that exists now and a window is a
+    /// period that is open now; the dollars come from the log alone. The
+    /// early return below is that distinction and not the old one: an
+    /// unbudgeted project has no account to talk to, which is the whole of the
+    /// open-mode cost promise, while whether *this turn* is charged is
+    /// [`TerminalSettlement::budget_draw`]'s answer and no longer this line's.
     pub(super) async fn settle(
         &self,
         session: &Session<S>,
@@ -157,13 +173,26 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                 session_id: session.session_id().clone(),
                 seq: settlement.seq,
                 response_id: settlement.response_id.clone(),
-                // The two credential axes meet here and only here — see
-                // [`BudgetCounts::drawn_usd`], which is the one place `payer`
-                // and the accounting-honesty rule are applied, so two callers
-                // cannot apply them in two orders.
-                actual_usd: admission
-                    .budget_counts
-                    .drawn_usd(settlement.payer, self.settled_spend(settlement)?),
+                actual_usd: match settlement.budget_draw {
+                    // The log says this turn was decided when the project had
+                    // no budget. It owes this window nothing — the window did
+                    // not exist when the turn ran — and the settle still runs
+                    // rather than returning, because a settle is also what
+                    // releases a hold, and a turn that reached no provider
+                    // reaches this arm with a grant outstanding.
+                    None => 0.0,
+                    // The two credential axes meet here and only here — see
+                    // [`BudgetCounts::drawn_usd`], which is the one place
+                    // `payer` and the accounting-honesty rule are applied, so
+                    // two callers cannot apply them in two orders. The basis
+                    // comes off the log beside the payer it is applied to: read
+                    // from the live admission, it moved a finished turn's
+                    // charge the moment an admin switched the project between
+                    // the two bases.
+                    Some(counts) => {
+                        counts.drawn_usd(settlement.payer, self.settled_spend(settlement)?)
+                    }
+                },
                 window: terms.budget.window,
                 now_ms: now_ms(),
             })
@@ -269,7 +298,7 @@ pub(super) fn settled_cost_usd(settlement: &TerminalSettlement) -> Result<f64, E
 #[cfg(test)]
 mod tests {
     use super::*;
-    use roundhouse_core::control::{Billing, Payer};
+    use roundhouse_core::control::{Billing, BudgetCounts, Payer};
     use roundhouse_core::event::{Accounting, Usage};
     use roundhouse_core::ids::ResponseId;
     use roundhouse_core::routing::ProviderPricing;
@@ -307,9 +336,11 @@ mod tests {
             // This function's subject is the *price*, which is a question about
             // the card and the target. Who paid is the axis `BudgetCounts`
             // reads, one seam out, and it is asserted there — as is whether the
-            // price may be claimed at all, which `Billing` decides.
+            // price may be claimed at all, which `Billing` decides, and whether
+            // any budget draws on it at all, which `budget_draw` decides.
             payer: Payer::Deployment,
             billing: Billing::Billed,
+            budget_draw: Some(BudgetCounts::AllFrontierSpend),
             usage: one_mtok_out(),
         }
     }
@@ -370,5 +401,339 @@ mod tests {
             settled_cost_usd(&settlement(Some(hosted()), None)),
             Err(EngineError::UnpricedSettlement(target)) if target == hosted()
         ));
+    }
+}
+
+/// R3 and R4 (M8 thermo-nuclear review): **the live `Admission` cannot move
+/// what a finished turn is charged**, which are two findings and one guard.
+///
+/// The module doc above once claimed a settle was priced from four
+/// log-derived inputs and "nothing else" while `Engine::settle` read two
+/// more off the caller's `Admission`: whether a budget existed at all (R3),
+/// and which [`BudgetCounts`](roundhouse_core::control::BudgetCounts) basis
+/// the draw applied (R4). Both fed `Settlement::actual_usd` exactly where
+/// `payer` and `billing` used to before this module closed that hole for
+/// them.
+///
+/// R3 was reachable through the admin plane the day it was found — a
+/// `None -> Some` budget PATCH, and the next repair absorbed a turn that
+/// predated the budget — and its end-to-end proof lives in
+/// `tests/admin_api.rs`. R4 was latent, because nothing could make
+/// `budget_counts` vary between two settles of one turn while it came from
+/// file config alone; it goes live the day a stored user-tier credential is
+/// editable through admin-plane CRUD.
+///
+/// The tests below hold both closed at this seam, where an `Admission`
+/// handed to `settle()` twice with different contents is indistinguishable
+/// from one `Admission` an operator edited in between. Each varies only the
+/// live admission and asserts the charge does not move, and each has a live
+/// control that varies the *log* and asserts it does — because a guard that
+/// only proved the charge is insensitive to the admission would also pass on
+/// a settle that had stopped reading anything at all.
+#[cfg(test)]
+mod the_live_admission_cannot_move_a_finished_turns_charge {
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+
+    use roundhouse_core::context::ByteTokenizer;
+    use roundhouse_core::control::{
+        Allocation, Balance, BalanceQuery, Billing, Budget, BudgetCounts, BudgetTerms,
+        BudgetWindow, DEFAULT_WARN_AT, Exhaustion, Grant, Payer, Principal, Settled, SpendError,
+        SpendLedger, TurnCredentials, TurnPolicy,
+    };
+    use roundhouse_core::event::{Accounting, Usage};
+    use roundhouse_core::ids::{SessionId, TurnId};
+    use roundhouse_core::item::Item;
+    use roundhouse_core::routing::{AffinityPolicy, CacheLedger, DecisionRecord, ProviderPricing};
+    use roundhouse_core::store::MemoryStore;
+    use roundhouse_fleet::{EchoFrontierClient, StaticFrontierCatalog};
+
+    use crate::engine::{EchoLocalExecutor, EngineConfig};
+
+    use super::*;
+
+    /// Records what `settle()` sends rather than modeling a real ledger's
+    /// state. A real ledger's idempotency-by-`(session, seq)` would hide the
+    /// second call's amount behind `applied: false` — which is exactly the
+    /// "drift nobody can see" this defect is about, not a property to model
+    /// away in the harness that is supposed to surface it.
+    #[derive(Default)]
+    struct RecordingLedger {
+        actual_usd_seen: Mutex<Vec<f64>>,
+    }
+
+    #[async_trait]
+    impl SpendLedger for RecordingLedger {
+        async fn open_grant(&self, _request: GrantRequest) -> Result<Grant, SpendError> {
+            unreachable!("R4 exercises settle(), which never opens a grant")
+        }
+
+        async fn settle_grant(&self, settlement: Settlement) -> Result<Settled, SpendError> {
+            self.actual_usd_seen
+                .lock()
+                .unwrap()
+                .push(settlement.actual_usd);
+            Ok(Settled {
+                applied: true,
+                released_usd: 0.0,
+                committed_usd: settlement.actual_usd,
+            })
+        }
+
+        async fn balance(&self, _query: BalanceQuery) -> Result<Balance, SpendError> {
+            unreachable!("R4 exercises settle(), which never reads a balance")
+        }
+    }
+
+    fn frontier_card() -> ProviderPricing {
+        ProviderPricing {
+            input_per_mtok_usd: 0.0,
+            cached_input_per_mtok_usd: 0.0,
+            cache_write_per_mtok_usd: 0.0,
+            output_per_mtok_usd: 12.0,
+        }
+    }
+
+    /// A million output tokens against [`frontier_card`], so the settled
+    /// price reads back as the rate that produced it: $12.00 flat.
+    fn frontier_usage() -> Usage {
+        Usage {
+            input_tokens: 0,
+            cached_input_tokens: 0,
+            output_tokens: 1_000_000,
+            reasoning_tokens: 0,
+            accounting: Accounting::Reported,
+        }
+    }
+
+    fn budgeted_admission(budget_counts: BudgetCounts) -> Admission {
+        Admission {
+            principal: Principal::new("acme", "ada"),
+            policy: Arc::new(TurnPolicy::unrestricted()),
+            budget: Some(BudgetTerms {
+                budget: Budget {
+                    limit_usd: 1_000.0,
+                    window: BudgetWindow::Total,
+                    on_exhaustion: Exhaustion::degrade_with_overflow(),
+                    warn_at: DEFAULT_WARN_AT,
+                },
+                allocation: Allocation::Pooled,
+            }),
+            validation: None,
+            credentials: TurnCredentials::unrestricted(),
+            budget_counts,
+        }
+    }
+
+    fn engine_over(spend: Arc<dyn SpendLedger>) -> Engine<MemoryStore, ByteTokenizer> {
+        Engine::new(
+            Arc::new(MemoryStore::new()),
+            ByteTokenizer,
+            Arc::new(EchoLocalExecutor::new("local")),
+            StaticFrontierCatalog::new(vec![]),
+            Arc::new(EchoFrontierClient::new("frontier")),
+            Arc::new(AffinityPolicy::new()),
+            EngineConfig::default(),
+        )
+        .with_spend_ledger(spend)
+    }
+
+    /// One logged turn, billed to a member's own credential
+    /// (`Payer::User`) and priced by [`frontier_card`] — a
+    /// `TerminalSettlement` whose five documented inputs (usage, rate_card,
+    /// payer, billing, budget_draw) are fixed the instant this function
+    /// returns. Nothing below mutates the log again; every call to `settle()`
+    /// against this session reads the identical settlement.
+    ///
+    /// `logged` is the whole subject: it is the budget situation *the log
+    /// records*, which the tests below vary independently of the live
+    /// admission's, because the two agreeing is exactly what a settle must
+    /// not depend on.
+    async fn session_with_one_user_paid_turn(logged: Option<BudgetCounts>) -> Session<MemoryStore> {
+        let store = Arc::new(MemoryStore::new());
+        let session_id = SessionId::generate();
+        store.create_session(&session_id, "affinity").await.unwrap();
+        let mut session = Session::open(store, session_id, "node-a", 30_000, CacheLedger::new())
+            .await
+            .unwrap();
+
+        session
+            .record_created("affinity", &Principal::new("acme", "ada"), None)
+            .await
+            .unwrap();
+        let admission = session
+            .begin_turn(TurnId::new("t1"), vec![Item::user_text("hi")])
+            .await
+            .unwrap();
+        let response_id = admission.response_id().clone();
+
+        session
+            .record_routing(
+                &response_id,
+                DecisionRecord {
+                    chosen: Target::Frontier {
+                        provider: "anthropic".into(),
+                        model: "claude".into(),
+                    },
+                    rationale: "test".into(),
+                    policy: "affinity".into(),
+                    isl_tokens: 100,
+                    expected_prefill_tokens: 100.0,
+                    expected_cost_usd: 0.0,
+                    considered: Vec::new(),
+                    turn_policy_digest: String::new(),
+                    budget_state: Default::default(),
+                    rate_card: Some(frontier_card()),
+                    // The axis `BudgetCounts::ProjectPaidOnly` reads: a
+                    // member's own credential, not the project's.
+                    payer: Payer::User,
+                    billing: Billing::Billed,
+                    budget_draw: logged,
+                    withheld_providers: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        session
+            .complete(&response_id, "hi", frontier_usage())
+            .await
+            .unwrap();
+
+        session
+    }
+
+    /// Every `actual_usd` one settle of that session sent the ledger, under a
+    /// log that says `logged` and a live admission that says `live`.
+    ///
+    /// A `Vec` rather than the one figure, because "how many times the ledger
+    /// was called" is half of what these tests assert: a settle that draws
+    /// nothing and a settle that never happened commit the same dollars and
+    /// differ in whether the turn's hold is released.
+    async fn settled_usd(logged: Option<BudgetCounts>, live: BudgetCounts) -> Vec<f64> {
+        let session = session_with_one_user_paid_turn(logged).await;
+        let ledger = Arc::new(RecordingLedger::default());
+        engine_over(ledger.clone())
+            .settle(&session, &budgeted_admission(live))
+            .await
+            .unwrap();
+        ledger.actual_usd_seen.lock().unwrap().clone()
+    }
+
+    /// **R4's guard.** One identical logged `TerminalSettlement`, settled
+    /// twice under live admissions that disagree about `budget_counts`,
+    /// commits the same dollars both times — because the basis the draw is
+    /// applied on comes off the log, where the turn recorded it, and the
+    /// caller's `Admission` has no say in it.
+    ///
+    /// This is the assertion that used to fail: `AllFrontierSpend` drew the
+    /// full $12.00 the log prices and `ProjectPaidOnly` drew $0.00 for the
+    /// same finished turn, because `payer: Payer::User` zeroes it under that
+    /// arm. Its partner below is what stops it passing vacuously.
+    #[tokio::test]
+    async fn a_settle_does_not_move_with_the_live_admissions_budget_counts() {
+        let under_all = settled_usd(
+            Some(BudgetCounts::AllFrontierSpend),
+            BudgetCounts::AllFrontierSpend,
+        )
+        .await;
+        let under_project_paid = settled_usd(
+            Some(BudgetCounts::AllFrontierSpend),
+            BudgetCounts::ProjectPaidOnly,
+        )
+        .await;
+        assert_eq!(
+            under_all, under_project_paid,
+            "one logged TerminalSettlement settled twice: actual_usd must not \
+             move with admission.budget_counts, which is a fact about the \
+             plane in front of this process and not about the turn"
+        );
+        assert_eq!(
+            under_all,
+            vec![12.0],
+            "and the figure is the one the log's own basis produces: \
+             user-paid frontier spend draws in full under AllFrontierSpend"
+        );
+    }
+
+    /// **The partner that keeps the guard above honest.** Same turn, same
+    /// live admission, one thing different: the log says the project drew on
+    /// `ProjectPaidOnly` when this turn ran, so the member's own credential
+    /// draws nothing — and the live `AllFrontierSpend` admission does not
+    /// override it.
+    ///
+    /// Without this, a settle that had stopped reading the basis at all —
+    /// hard-coding `AllFrontierSpend`, say — would satisfy the test above
+    /// perfectly. The pair together say the number moves with the log and
+    /// with nothing else.
+    #[tokio::test]
+    async fn a_settle_draws_on_the_basis_the_log_recorded() {
+        assert_eq!(
+            settled_usd(
+                Some(BudgetCounts::ProjectPaidOnly),
+                BudgetCounts::AllFrontierSpend,
+            )
+            .await,
+            vec![0.0],
+            "the log recorded a project that does not meter its members' own \
+             keys, so this turn draws nothing however the live plane reads now"
+        );
+    }
+
+    /// **R3's guard at this seam**, where its end-to-end proof in
+    /// `tests/admin_api.rs` shows the same thing through the admin plane: a
+    /// turn the log records as having run under no budget draws nothing from
+    /// the budget a project acquired afterwards.
+    ///
+    /// The call still reaches the ledger, and that is the second assertion
+    /// rather than an accident. A settle is also what releases the hold a
+    /// grant took out, and a turn that terminated before recording any
+    /// decision arrives here with exactly this absent basis — skipping it
+    /// would strand that turn's reservation for a whole grant TTL.
+    #[tokio::test]
+    async fn a_turn_logged_under_no_budget_draws_nothing_from_one_added_later() {
+        assert_eq!(
+            settled_usd(None, BudgetCounts::AllFrontierSpend).await,
+            vec![0.0],
+            "the budget was not there when the turn ran, so the turn owes \
+             this window nothing -- and the ledger was still called once, \
+             which is what releases a hold"
+        );
+    }
+
+    /// **The harness control.** Same log, same admission, two settles — only
+    /// the recording ledger differs. If this went red, every mismatch above
+    /// would be something about the fixture (nondeterministic pricing,
+    /// mutable session state, ledger flakiness) rather than about the inputs
+    /// the tests vary on purpose.
+    #[tokio::test]
+    async fn control_identical_settlement_agrees_under_one_fixed_budget_counts() {
+        let session = session_with_one_user_paid_turn(Some(BudgetCounts::AllFrontierSpend)).await;
+        let admission = budgeted_admission(BudgetCounts::AllFrontierSpend);
+
+        let ledger_a = Arc::new(RecordingLedger::default());
+        engine_over(ledger_a.clone())
+            .settle(&session, &admission)
+            .await
+            .unwrap();
+
+        let ledger_b = Arc::new(RecordingLedger::default());
+        engine_over(ledger_b.clone())
+            .settle(&session, &admission)
+            .await
+            .unwrap();
+
+        let committed_a = ledger_a.actual_usd_seen.lock().unwrap()[0];
+        let committed_b = ledger_b.actual_usd_seen.lock().unwrap()[0];
+        assert_eq!(
+            committed_a, committed_b,
+            "one fixed budget_counts must settle one logged turn the same \
+             way twice"
+        );
+        assert_eq!(
+            committed_a, 12.0,
+            "user-paid frontier spend under AllFrontierSpend draws the full \
+             logged price"
+        );
     }
 }

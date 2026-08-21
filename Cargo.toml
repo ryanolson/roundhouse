@@ -57,6 +57,14 @@ anyhow = "1"
 async-trait = "0.1"
 axum = { version = "=0.8.4", features = ["macros", "ws"] }
 futures = "0.3"
+# Minting a control-plane key (`roundhouse-server/src/control_config.rs`): 32
+# bytes straight from the system CSPRNG. `getrandom` rather than `rand`
+# because that is the whole requirement -- there is no distribution to sample,
+# no seeding story, and no reproducibility question, so a generator framework
+# would be three layers over one syscall. Already in the tree transitively (it
+# is what `uuid`'s v4 and the TLS stacks draw from), so this adds a name the
+# control plane depends on deliberately rather than a crate.
+getrandom = "0.3"
 # Control-plane key hashing (`roundhouse-server/src/control_config.rs`). Both
 # already resolve in the tree transitively (via `redis`/`reqwest`'s TLS
 # stacks), so declaring them directly adds no new crate to the build, only a

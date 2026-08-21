@@ -41,7 +41,6 @@ use axum::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HOST};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 
 use codex_utils_rustls_provider::ensure_rustls_crypto_provider;
@@ -68,7 +67,7 @@ use roundhouse_server::{
 
 mod common;
 use common::codex::{function_call_output_item, request, user_message};
-use common::{BLOCK_SIZE, LOCAL_MODEL, MINUTE, embedded_fleet};
+use common::{BLOCK_SIZE, LOCAL_MODEL, MINUTE, admin_key, embedded_fleet, key, sha256_hex};
 
 /// What each executor answers with, so a target is legible in the answer as
 /// well as in the log.
@@ -103,24 +102,8 @@ const LOOPBACK_HOST: &str = "127.0.0.1";
 const REBOUND_HOST: &str = "evil.example.com";
 
 // ---------------------------------------------------------------------------
-// Keys and the control plane that declares them
+// The control plane that authenticates `common::key`/`common::admin_key`
 // ---------------------------------------------------------------------------
-
-/// A well-shaped secret with `tag` legible inside it, padded to the 43 base62
-/// characters the key format requires — the same fixture rule the tenancy and
-/// policy suites use, and for the same reason: a hand-counted literal fails as
-/// `malformed_key` for a reason no assertion names.
-fn key(tag: &str) -> String {
-    format!("rh_turn_{tag:A<43}")
-}
-
-fn admin_key(tag: &str) -> String {
-    format!("rh_admin_{tag:A<43}")
-}
-
-fn sha256_hex(secret: &str) -> String {
-    hex::encode(Sha256::digest(secret.as_bytes()))
-}
 
 /// `acme/ada` may be routed anywhere; `ourown/bob` may only be routed locally.
 ///

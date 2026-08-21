@@ -378,7 +378,13 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
 ///
 /// [`BudgetWindow::Total`] has no boundary, so it reports the epoch and never
 /// resets.
-fn window_start_ms(window: BudgetWindow, now_ms: u64) -> u64 {
+///
+/// `pub` since the admin plane: the reconciliation view stamps every committed
+/// figure with the window it covers, and deriving that boundary a second time
+/// there would be a second calendar for the two to disagree over — a report
+/// claiming a month that started a day away from the month the ledger actually
+/// rolled.
+pub fn window_start_ms(window: BudgetWindow, now_ms: u64) -> u64 {
     match window {
         BudgetWindow::Total => 0,
         BudgetWindow::Monthly => month_start_ms(now_ms),

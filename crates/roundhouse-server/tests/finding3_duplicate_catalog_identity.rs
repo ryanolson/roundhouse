@@ -117,6 +117,7 @@ fn one_frontier_call(usage: Usage) -> Vec<SessionEvent> {
                     rate_card: None,
                     payer: Default::default(),
                     billing: Default::default(),
+                    budget_draw: None,
                     withheld_providers: Vec::new(),
                 },
             },

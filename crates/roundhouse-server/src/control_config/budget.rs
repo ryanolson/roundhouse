@@ -23,9 +23,39 @@
 
 use serde::Deserialize;
 
-use roundhouse_core::control::{Allocation, Budget, BudgetWindow, DEFAULT_WARN_AT, Exhaustion};
+use roundhouse_core::control::{
+    Allocation, Budget, BudgetTerms, BudgetWindow, DEFAULT_WARN_AT, Exhaustion,
+};
 
 use super::config::ControlPlaneError;
+
+/// Pair a project's resolved budget with one membership's resolved allocation.
+///
+/// **The one place [`BudgetTerms`] is built from a configured pair, and the
+/// reason it is a function at all.** A balance is not a pure read:
+/// [`balance`](roundhouse_core::control::SpendLedger::balance) rolls an
+/// account's window over when the terms it is handed say the stored one has
+/// lapsed. Two spellings of "this membership's terms" is therefore two ways to
+/// roll a project's window, and the second one is always written by whoever
+/// needed terms somewhere the compiler had not already produced them — a
+/// reporting path, handing a month's committed spend back by accident. So the
+/// compiler that admits a key and the admin view that describes a membership
+/// whose keys are all revoked call this same function, and neither assembles the
+/// struct itself.
+///
+/// The `None` allocation defaulting to [`Allocation::Pooled`] is the substance
+/// here: pooled is *no second ceiling*, not no budget, and getting that backwards
+/// is the difference between a member who may draw the project's whole limit and
+/// one who may draw nothing.
+pub(super) fn budget_terms(
+    project_budget: Option<Budget>,
+    allocation: Option<Allocation>,
+) -> Option<BudgetTerms> {
+    project_budget.map(|budget| BudgetTerms {
+        budget,
+        allocation: allocation.unwrap_or(Allocation::Pooled),
+    })
+}
 
 /// Whether `value` fails the "must be a positive number of dollars" rule that
 /// every ceiling in this file is judged by.

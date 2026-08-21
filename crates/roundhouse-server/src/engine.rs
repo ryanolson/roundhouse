@@ -1313,6 +1313,15 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                     // credited against it is the same invented number the seat
                     // turn's price is. See `Billing::of`.
                     billing: Billing::of(&admission.credentials),
+                    // And whether a budget was in force at all, taken from the
+                    // same admission the grant was opened against a few lines
+                    // up — so "a grant was opened for this turn" and "this turn
+                    // is charged" are one fact recorded once, rather than two
+                    // reads of a plane that an admin may edit in between. A
+                    // project that gains a budget after this turn is over does
+                    // not retroactively acquire one here, which is exactly what
+                    // a settle driven off the live plane used to believe.
+                    budget_draw: admission.budget.as_ref().map(|_| admission.budget_counts),
                     // Empty on every ordinary turn, and skipped on the wire
                     // when it is, so a pre-M7 log's decisions stay
                     // byte-identical. Non-empty, it is the only place in the

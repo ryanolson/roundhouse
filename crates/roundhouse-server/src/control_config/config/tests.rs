@@ -2,6 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+// Named here rather than reached for through `super::*`: the validator resolves
+// an allocation through `budget_terms` and no longer mentions the type itself,
+// and a test that borrowed its parent's imports would go on compiling only
+// until the production file stopped needing them.
+use roundhouse_core::control::Allocation;
+
 use crate::control_config::fixtures::{TURN_HASH, sample_config};
 
 #[test]
@@ -804,6 +810,149 @@ fn a_misspelled_field_inside_frontier_cadence_is_refused_rather_than_ignored() {
       "users": []
     }"#;
     ControlPlaneConfig::from_json(clean, "test").expect("the two real fields are enough");
+}
+
+#[test]
+fn a_misspelled_top_level_field_on_a_project_is_refused_rather_than_ignored() {
+    let json = r#"{
+      "projects": [
+        { "id": "acme", "credential": { "mode": "pass_through" } }
+      ],
+      "users": []
+    }"#;
+    let error = ControlPlaneConfig::from_json(json, "test").unwrap_err();
+    assert!(
+        matches!(error, ControlPlaneError::Parse { .. }),
+        "a field nobody reads must stop the load, the same way it does one level down inside \
+         `frontier_cadence`: {error:?}"
+    );
+    assert!(
+        error.to_string().contains("credential"),
+        "and name the line to delete: {error}"
+    );
+}
+
+/// Control for the test above: the same entry, correctly spelled, loads.
+/// Proves the refusal is about the missing field name and not about some
+/// unrelated malformed-JSON accident in the fixture.
+#[test]
+fn the_correctly_spelled_project_credentials_field_still_loads() {
+    let json = r#"{
+      "projects": [
+        { "id": "acme", "credentials": { "mode": "pass_through" } }
+      ],
+      "users": []
+    }"#;
+    ControlPlaneConfig::from_json(json, "test").expect("the real field name is enough");
+}
+
+#[test]
+fn a_misspelled_top_level_field_on_a_user_is_refused_rather_than_ignored() {
+    let json = r#"{
+      "projects": [],
+      "users": [
+        { "id": "ada", "nmae": "Ada" }
+      ]
+    }"#;
+    let error = ControlPlaneConfig::from_json(json, "test").unwrap_err();
+    assert!(
+        matches!(error, ControlPlaneError::Parse { .. }),
+        "a field nobody reads must stop the load: {error:?}"
+    );
+    assert!(
+        error.to_string().contains("nmae"),
+        "and name the line to delete: {error}"
+    );
+}
+
+/// Control for the test above: the same entry with no stray field loads.
+#[test]
+fn a_plain_user_entry_still_loads() {
+    let json = r#"{
+      "projects": [],
+      "users": [
+        { "id": "ada" }
+      ]
+    }"#;
+    ControlPlaneConfig::from_json(json, "test").expect("a bare id is a complete user entry");
+}
+
+/// The third entry type, found by the R6 audit rather than named by it, and
+/// the one whose typo widens the most: `override` for `overrides` drops a
+/// *narrowing* overlay, so the key resolves to its project's whole policy —
+/// which is indistinguishable, everywhere downstream, from an operator who
+/// wrote no overlay at all.
+#[test]
+fn a_misspelled_top_level_field_on_a_key_is_refused_rather_than_ignored() {
+    let json = format!(
+        r#"{{
+          "projects": [{{ "id": "acme" }}],
+          "users": [{{ "id": "ada" }}],
+          "keys": [{{
+            "project": "acme",
+            "user": "ada",
+            "key_sha256": "{TURN_HASH}",
+            "override": {{ "min_quality": 0.9 }}
+          }}]
+        }}"#
+    );
+    let error = ControlPlaneConfig::from_json(&json, "test").unwrap_err();
+    assert!(
+        matches!(error, ControlPlaneError::Parse { .. }),
+        "a narrowing overlay lost to a typo is the widest reading of the entry: {error:?}"
+    );
+    assert!(
+        error.to_string().contains("override"),
+        "and name the line to correct: {error}"
+    );
+
+    // Control: the same entry with the real field name loads, so the refusal
+    // above is about the spelling and not about overlays being unwelcome here.
+    let spelled = format!(
+        r#"{{
+          "projects": [{{ "id": "acme" }}],
+          "users": [{{ "id": "ada" }}],
+          "keys": [{{
+            "project": "acme",
+            "user": "ada",
+            "key_sha256": "{TURN_HASH}",
+            "overrides": {{ "min_quality": 0.9 }}
+          }}]
+        }}"#
+    );
+    ControlPlaneConfig::from_json(&spelled, "test").expect("the real field name is enough");
+}
+
+/// The document itself, not an entry inside it — where the widening typos are
+/// worst, because `admin_key` for `admin_keys` is a deployment whose admin
+/// plane has no root of trust and which starts anyway.
+#[test]
+fn a_misspelled_top_level_field_on_the_document_is_refused_rather_than_ignored() {
+    let json = format!(
+        r#"{{
+          "projects": [],
+          "users": [],
+          "admin_key": ["{TURN_HASH}"]
+        }}"#
+    );
+    let error = ControlPlaneConfig::from_json(&json, "test").unwrap_err();
+    assert!(
+        matches!(error, ControlPlaneError::Parse { .. }),
+        "a deployment with no admin key must not start believing it has one: {error:?}"
+    );
+    assert!(
+        error.to_string().contains("admin_key"),
+        "and name the line to correct: {error}"
+    );
+
+    let spelled = format!(
+        r#"{{
+          "projects": [],
+          "users": [],
+          "admin_keys": ["{TURN_HASH}"]
+        }}"#
+    );
+    ControlPlaneConfig::from_json(&spelled, "test").expect("the real field name is enough");
 }
 
 #[test]

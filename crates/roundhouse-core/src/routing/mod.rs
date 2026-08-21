@@ -40,7 +40,9 @@ pub use policy::{AffinityPolicy, EscalationPolicy};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::control::{Billing, BudgetState, FrontierHistory, Payer, TurnBudget, TurnPolicy};
+use crate::control::{
+    Billing, BudgetCounts, BudgetState, FrontierHistory, Payer, TurnBudget, TurnPolicy,
+};
 use crate::ids::SessionId;
 
 /// Where a turn can be sent.
@@ -507,6 +509,34 @@ pub struct DecisionRecord {
     /// this field is read by an older process as a decision without it.
     #[serde(default)]
     pub billing: Billing,
+    /// What this turn draws from the project's budget, and `None` when there
+    /// was no budget for it to draw from.
+    ///
+    /// **The last two live inputs a settle used to read off the running
+    /// process's configuration**, and they are one field because a flag beside
+    /// a basis would allow a state that is a lie: "not budgeted, and drawn on
+    /// the project-paid-only basis" describes nothing. Same argument
+    /// [`BudgetState`] makes one field up, and the same remedy — a variant
+    /// that names its own precondition.
+    ///
+    /// Both halves were reachable from the live `Admission` and neither was in
+    /// the log, which made two things possible that the module's own rule
+    /// forbids. A project switched from no budget to a budget re-priced every
+    /// turn that predated the switch, because a successor's repair asked the
+    /// *current* plane whether the turn had been budgeted and was told yes. And
+    /// a project switched between the two [`BudgetCounts`] bases moved what a
+    /// member-paid turn drew, after the turn was over. Recorded here, the
+    /// answer to both is a fact about the turn, decided where the grant is
+    /// opened and read again where it is settled.
+    ///
+    /// Defaults to `None`, which is the correct reading of a log written
+    /// before this field existed *and* the direction a default has to fail in:
+    /// an old event reads as unbudgeted and is therefore never charged into a
+    /// window it did not run in. Same treatment as [`Self::billing`] above, and
+    /// skipped on the wire when absent so an unbudgeted deployment writes the
+    /// bytes it wrote before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_draw: Option<BudgetCounts>,
     /// Providers quoted for this turn and dropped for want of a credential.
     ///
     /// **The marker on a credential degrade**, and the reason it is recorded
@@ -725,6 +755,7 @@ mod tests {
             }),
             payer: Payer::User,
             billing: Billing::AccountedNotBilled,
+            budget_draw: Some(BudgetCounts::ProjectPaidOnly),
             withheld_providers: vec!["openai".into()],
         };
         let encoded = serde_json::to_string(&record).unwrap();
@@ -740,6 +771,12 @@ mod tests {
             encoded.contains(r#""billing":"accounted_not_billed""#),
             "and whether there is a bill to name at all, which is the fact the \
              settle and the dashboard both read: {encoded}"
+        );
+        assert!(
+            encoded.contains(r#""budget_draw":"project_paid_only""#),
+            "and on what basis the turn drew the project's budget, without \
+             which a settle has to ask a plane an admin may have edited since: \
+             {encoded}"
         );
         assert_eq!(
             serde_json::from_str::<DecisionRecord>(&encoded).unwrap(),
@@ -796,12 +833,20 @@ mod tests {
             "and nothing was withheld from it, because there was nothing to \
              withhold on"
         );
+        assert_eq!(
+            recovered.budget_draw, None,
+            "and it drew no budget, which is the one default that has to fail \
+             in a particular direction: a turn from before this field existed \
+             must read as unbudgeted, or a project handed a budget today would \
+             absorb every turn it ran yesterday"
+        );
 
-        // The credential marker is skipped when empty, so a deployment that
-        // never configures one keeps writing exactly the bytes it wrote before
-        // this field existed.
+        // The credential marker is skipped when empty, and so is an unbudgeted
+        // turn's absent basis, so a deployment that configures neither keeps
+        // writing exactly the bytes it wrote before the two fields existed.
         let ordinary = DecisionRecord {
             payer: Payer::Deployment,
+            budget_draw: None,
             withheld_providers: Vec::new(),
             ..record
         };
@@ -809,6 +854,10 @@ mod tests {
         assert!(
             !encoded.contains("withheld_providers"),
             "an empty marker is absent from the wire, not present and empty: {encoded}"
+        );
+        assert!(
+            !encoded.contains("budget_draw"),
+            "and an unbudgeted turn's absent basis likewise: {encoded}"
         );
     }
 }

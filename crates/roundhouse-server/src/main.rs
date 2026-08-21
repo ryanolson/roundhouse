@@ -40,7 +40,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use roundhouse_core::context::ByteTokenizer;
-use roundhouse_core::control::{MemorySpendLedger, SpendLedger, TurnBudget};
+use roundhouse_core::control::{MemorySpendLedger, SpendLedger};
 use roundhouse_core::metrics::MetricsConfig;
 use roundhouse_core::routing::{
     AffinityPolicy, CacheLedger, CacheModel, Candidate, ProviderPricing, Target,
@@ -52,10 +52,11 @@ use roundhouse_fleet::{
     FrontierModelSpec, OpenAiResponsesClient, StaticFrontierCatalog, WireProtocol,
 };
 use roundhouse_mcp::ControlStore;
+use roundhouse_server::control_config::crosscheck::CrossChecks;
 use roundhouse_server::{
-    Admission, ControlPlane, ControlPlaneReads, Conversations, EchoLocalExecutor, Engine,
-    EngineConfig, FleetJudge, JudgeConfig, catalog_config, control_config, http, mcp_api,
-    metrics_api, responses_api,
+    ControlDirectory, ControlPlane, ControlPlaneReads, Conversations, DirectoryError,
+    EchoLocalExecutor, Engine, EngineConfig, FleetJudge, JudgeConfig, MemoryDirectoryStore,
+    admin_api, catalog_config, control_config, http, mcp_api, metrics_api, responses_api,
 };
 use roundhouse_store_redis::{RedisSessionStore, RedisSpendLedger};
 use tracing_subscriber::EnvFilter;
@@ -95,7 +96,8 @@ const REDIS_VAR: &str = "ROUNDHOUSE_REDIS_URL";
 ///
 /// Absent means no judge, which is a deployment that cannot validate — and a
 /// config that enrolled a project anyway stops the boot. See
-/// [`unkeepable_promises`].
+/// [`crosscheck`](roundhouse_server::control_config::crosscheck), which asks
+/// that question at boot and again after every admin write.
 const JUDGE_MODEL_VAR: &str = "ROUNDHOUSE_JUDGE_MODEL";
 
 /// Which real provider transport this deployment dispatches through.
@@ -201,118 +203,6 @@ fn reachable_candidates(catalog: &StaticFrontierCatalog) -> Vec<Candidate> {
     )
 }
 
-/// Refuse to serve a key whose policy admits nothing this process can route to.
-///
-/// The catalog and the control plane are separate files, so neither loader can
-/// see the other: a `TargetFilter` cannot tell at parse time that its patterns
-/// name no model, and a quality floor cannot tell that it sits above every
-/// model in the catalog. Here both are loaded, which makes this the one place
-/// the question can be asked.
-///
-/// Asking it is the same load-or-die posture both loaders already take. A
-/// policy that admits nothing does not degrade — every turn it serves ends in
-/// `policy_refused` — so starting anyway would turn one mistyped pattern into
-/// a tenant whose every request fails, discovered by the tenant.
-///
-/// Per key rather than per project, and that is not a shortcut: a key's
-/// effective policy is its project's narrowed by its own overrides, so a
-/// project whose filter is fine can still hold a key whose override intersects
-/// it down to nothing — and a turn arrives on a key.
-///
-/// The question is [`TurnPolicy::permits`] and deliberately not
-/// [`TurnPolicy::admits`]: this asks whether a target is reachable *at all*
-/// under the policy's history-independent axes, and a cadence-rationed model
-/// is reachable on some turns. Feeding `admits` a synthetic unspent window to
-/// get the same answer is how this used to be written, and it left the reader
-/// to work out from a fabricated [`FrontierHistory`] which question was being
-/// asked. What a *spent* window leaves is the separate question
-/// [`refuse_promises_of_a_local_fallback`] asks, one call below.
-///
-/// [`TurnPolicy::permits`]: roundhouse_core::control::TurnPolicy::permits
-/// [`TurnPolicy::admits`]: roundhouse_core::control::TurnPolicy::admits
-/// [`FrontierHistory`]: roundhouse_core::control::FrontierHistory
-fn refuse_policies_that_admit_nothing(
-    plane: &ControlPlane,
-    reachable: &[Candidate],
-) -> anyhow::Result<()> {
-    // Collected and sorted rather than reported on the first hit: the table is
-    // a hash map, so a deployment with two bad entries would otherwise be told
-    // about a different one on each restart. `configured_admissions` yields
-    // nothing in open mode, which is the accurate answer — every request there
-    // resolves to the unrestricted policy, and there is nothing to disagree
-    // with.
-    let mut refused: Vec<String> = plane
-        .configured_admissions()
-        .filter(|admission| {
-            !reachable
-                .iter()
-                .any(|candidate| admission.policy.permits(candidate))
-        })
-        .map(describe)
-        .collect();
-    refused.sort();
-    if !refused.is_empty() {
-        anyhow::bail!(
-            "these control-plane keys admit none of the {} model(s) this deployment can route to, \
-             so every one of their turns would fail: {}",
-            reachable.len(),
-            refused.join("; ")
-        );
-    }
-    Ok(())
-}
-
-/// How a refusal names the key an operator has to go and edit.
-///
-/// One spelling for both checks below. A digest tells an operator that two
-/// keys differ and never which one they mistyped, so the patterns go in beside
-/// it.
-fn describe(admission: &Admission) -> String {
-    format!(
-        "project `{}`, user `{}` (policy {}, allow {})",
-        admission.principal.project,
-        admission.principal.user,
-        admission.policy.digest(),
-        admission.policy.allow,
-    )
-}
-
-/// What a [`FrontierCadence`] promises about a window it has spent.
-///
-/// [`FrontierCadence`]: roundhouse_core::control::FrontierCadence
-const CADENCE_PROMISE: &str = "its frontier_cadence promises that a spent window serves locally \
-     instead of failing, and this deployment has no local capacity to serve it";
-
-/// What a degrade-mode [`Budget`] with the overflow valve off promises about a
-/// limit it has spent.
-///
-/// [`Budget`]: roundhouse_core::control::Budget
-const BUDGET_PROMISE: &str = "its budget degrades to local with overflow_when_local_saturated off, \
-     which promises that an exhausted budget serves locally instead of failing, and this \
-     deployment has no local capacity to serve it";
-
-/// What a *stored*-key credential mode promises about a member who has
-/// attached nothing.
-///
-/// Stored only, and pass-through is exempt for a reason written out at the
-/// check: a mode that reads a tier the file leaves empty is unreachable as a
-/// structural fact this boot can see, while a mode whose credential arrives on
-/// the request is unreachable only until a request arrives.
-///
-/// [`CredentialMode`]: roundhouse_core::control::CredentialMode
-const CREDENTIAL_PROMISE: &str = "its credential mode reaches no hosted provider on this \
-     deployment -- either every provider its keys name is one this process cannot route to, or \
-     its mode leaves it with no key at all -- which promises that an unreachable provider serves \
-     locally instead of failing, and this deployment has no local capacity to serve it";
-
-/// What a project's `"validate"` block promises, and what keeping it needs.
-///
-/// [`ValidationTerms`]: roundhouse_server::ValidationTerms
-const VALIDATION_PROMISE: &str = "its validate block enrols this project's sessions in the validate/steer loop, which \
-     needs a judge -- and no reachable catalog model is named by ROUNDHOUSE_JUDGE_MODEL, so \
-     every validation would be skipped as unavailable and the arm comparison the enrolment \
-     exists to produce would be empty";
-
 /// The catalog entry the judge runs on, if this deployment named a reachable
 /// one.
 ///
@@ -331,159 +221,23 @@ fn judge_spec(catalog: &StaticFrontierCatalog) -> Option<FrontierModelSpec> {
         .cloned()
 }
 
-/// Every promise this key's configuration makes about a *spent* allowance that
-/// this deployment cannot keep.
+/// A directory that will not compile, as the sentence a boot has always
+/// printed.
 ///
-/// **Two configurations, one promise, one check.** A cadence spends a
-/// per-session ration and a degrade-mode budget spends money, but both say the
-/// same sentence when their allowance runs out — *the hosted options go
-/// inadmissible and the turn serves locally instead of failing* — and both say
-/// it in a file that cannot see a fleet. Whether the sentence is true depends
-/// on one fact either way: is anything this key may reach still admissible
-/// once the allowance is gone? Asking it twice, in two functions with two
-/// lookalike error messages, would be two spellings of one question, and the
-/// second one is where the answers start to differ.
-///
-/// Each promise is asked in the vocabulary of the thing that made it, through
-/// the same predicate the router will apply at runtime rather than a
-/// restatement of it — [`TurnPolicy::admits_when_spent`] for the cadence, and
-/// [`TurnBudget::exhausted`] plus [`TurnPolicy::permits`] for the budget.
-/// A key that makes neither promise is asked nothing, which is why a
-/// deployment with no cadences and no budgets is unaffected by this check.
-///
-/// The budget half asks `permits` and not `admits_when_spent`: an exhausted
-/// budget and a spent cadence are separate allowances, and a key that has run
-/// out of one has not necessarily run out of the other. Where a key really does
-/// exhaust both, the cadence half of this same list has already refused it.
-///
-/// [`TurnPolicy::admits_when_spent`]: roundhouse_core::control::TurnPolicy::admits_when_spent
-/// [`TurnPolicy::permits`]: roundhouse_core::control::TurnPolicy::permits
-fn unkeepable_promises(
-    admission: &Admission,
-    reachable: &[Candidate],
-    judge: Option<&FrontierModelSpec>,
-) -> Vec<&'static str> {
-    let mut broken = Vec::new();
-    // The credential half, and it is here rather than at the config boundary
-    // for the reason the other three are: `config.rs` refuses a *variable this
-    // process does not have* -- an unset `env_var` stops the boot naming the
-    // variable, which is the loud half and needs no catalog. What it cannot see
-    // is whether the providers a key can authenticate to are providers this
-    // deployment can route to at all, because that is the catalog's half, and
-    // the two files cannot see each other. Only here are both loaded.
-    //
-    // Asked through the same `reachable` the router will apply at runtime
-    // rather than a restatement of it, exactly as the cadence and budget halves
-    // are.
-    //
-    // **Of stored modes only, because pass-through's answer is not a
-    // boot-knowable one.** A stored mode names tiers a file either fills or
-    // does not, so "this key reaches nothing" is a fact about the file and this
-    // is the first and last moment anything can see it. A forwarding mode holds
-    // no key at all: the credential is the caller's and arrives on the request,
-    // so `Resolution::Forwarding { presented: None }` is what *every*
-    // pass-through admission looks like before any request exists. Asked here,
-    // it reads as "reaches nothing" and refuses every pass-through project on
-    // every deployment — the mode this milestone exists for, undeployable, with
-    // the boot check as the only thing stopping it.
-    //
-    // What is boot-knowable for pass-through is whether there is any hosted
-    // provider a forwarded credential *could* cover, and a non-empty catalog is
-    // that question already answered — the same `!reachable.is_empty()` guard
-    // this check already carries. The per-request half is asked per request, by
-    // the same filter, and a turn whose caller presented nothing degrades to
-    // local with `withheld_providers` naming the provider.
-    if !admission.credentials.is_forwarding()
-        && admission
-            .credentials
-            .reachable(reachable.to_vec())
-            .candidates
-            .is_empty()
-        && !reachable.is_empty()
-    {
-        broken.push(CREDENTIAL_PROMISE);
-    }
-    // The promise that is not about a *spent* allowance — it is in this list
-    // anyway because it is the same sentence with the same remedy shape: a
-    // config says something will happen, and this is the first moment the
-    // *catalog* can be compared against it. Splitting it into its own boot
-    // check would give an operator two lookalike refusals to tell apart, which
-    // is exactly what folding the cadence and the budget into one list already
-    // refused to do.
-    //
-    // **What is checked is that a judge resolves, and that is all.** Whether
-    // the side call it makes can *authenticate* is not asked here and is
-    // deliberately not a boot promise: `FleetJudge` resolves no credential of
-    // its own — see `judge.rs`, where `TurnCredential::Absent` is written out
-    // as the honest state rather than an oversight — so on a deployment
-    // composing a real provider client the checks are refused at dispatch. That
-    // is a **runtime fail-open**, and it is the M6 interject contract holding
-    // rather than a gap this check should close: an unreachable judge abandons
-    // its side call as `Unreachable` and the turn it was checking proceeds
-    // unchanged, because the checker never breaks the checked. Refusing to boot
-    // over it would take a deployment down for a check that costs it nothing.
-    // See `tests/validate_loop.rs`:
-    // `a_judge_that_cannot_authenticate_abandons_its_check_and_the_turn_proceeds`.
-    if admission.validation.is_some() && judge.is_none() {
-        broken.push(VALIDATION_PROMISE);
-    }
-    if admission.policy.frontier_cadence.is_some()
-        && !reachable
-            .iter()
-            .any(|candidate| admission.policy.admits_when_spent(candidate))
-    {
-        broken.push(CADENCE_PROMISE);
-    }
-    if let Some(terms) = &admission.budget {
-        // Only one exhaustion setting promises local service at all: `Refuse`
-        // never made the promise, and the valve keeps it on frontier. See
-        // `Exhaustion::promises_local_service`.
-        if terms.budget.on_exhaustion.promises_local_service() {
-            let spent = TurnBudget::exhausted(terms.budget.on_exhaustion);
-            if !reachable
-                .iter()
-                .any(|candidate| admission.policy.permits(candidate) && spent.admits(candidate))
-            {
-                broken.push(BUDGET_PROMISE);
-            }
+/// [`DirectoryError`] wraps a cross-check refusal in "this change would not
+/// start this deployment (...)", which is the right sentence for a refused
+/// `PATCH` and the wrong one here: the process is not applying a change, it is
+/// declining to start, and an operator greps the log for the check's own words.
+/// Unwrapped so the boot door and the API door print the same refusal they each
+/// always have, rather than one of them printing the other's frame around it.
+fn boot_refusal(error: DirectoryError) -> anyhow::Error {
+    match error {
+        DirectoryError::CrossCheckRefused { detail, .. } => anyhow::anyhow!("{detail}"),
+        DirectoryError::Invalid(source) | DirectoryError::EnvironmentIncomplete(source) => {
+            anyhow::anyhow!(source)
         }
+        other => anyhow::anyhow!(other),
     }
-    broken
-}
-
-/// Refuse to serve a key that promises a local fallback this deployment cannot
-/// provide.
-///
-/// The promise is checked where the fleet is finally visible, which is the
-/// same place [`refuse_policies_that_admit_nothing`] checks the other half.
-/// Those two stay separate functions because they are separate questions with
-/// separate remedies: that one says "this policy names nothing at all", this
-/// one says "this configuration names something for as long as an allowance
-/// lasts". Reported together would leave an operator unsure which sentence to
-/// go and edit. What is *not* separate is the pair of promises inside this
-/// one — see [`unkeepable_promises`].
-fn refuse_promises_of_a_local_fallback(
-    plane: &ControlPlane,
-    reachable: &[Candidate],
-    judge: Option<&FrontierModelSpec>,
-) -> anyhow::Result<()> {
-    let mut refused: Vec<String> = plane
-        .configured_admissions()
-        .filter_map(|admission| {
-            let broken = unkeepable_promises(admission, reachable, judge);
-            (!broken.is_empty())
-                .then(|| format!("{} — {}", describe(admission), broken.join("; and ")))
-        })
-        .collect();
-    refused.sort();
-    if !refused.is_empty() {
-        anyhow::bail!(
-            "these control-plane keys promise this deployment something it cannot deliver, so \
-             their turns would fail or their configuration would silently do nothing: {}",
-            refused.join(" | ")
-        );
-    }
-    Ok(())
 }
 
 #[tokio::main]
@@ -519,23 +273,12 @@ async fn main() -> anyhow::Result<()> {
     // anyway would serve every request as if no key were required — the exact
     // failure the variable is set to prevent — and would do it silently, with
     // every tenant's turns landing in one unnamespaced session space.
-    let plane = Arc::new(ControlPlane::from_env()?);
-    match &*plane {
-        // Counted through the accessor rather than by reaching into
-        // `Configured { turn_keys, .. }`: the table's layout has exactly one
-        // reader outside its own module, and this is not going to be the
-        // second one for the sake of a log line.
-        ControlPlane::Configured { .. } => tracing::info!(
-            memberships = plane.configured_admissions().count(),
-            var = control_config::CONTROL_PLANE_VAR,
-            "control plane loaded; a key is required on every surface"
-        ),
-        ControlPlane::Open => tracing::warn!(
-            var = control_config::CONTROL_PLANE_VAR,
-            "no control plane configured; every request is served as the built-in \
-             default/default membership, with no key and no session namespace"
-        ),
-    }
+    //
+    // The file's half is read here and compiled below, once the catalog is
+    // known: the admin plane's directory is what every surface resolves
+    // against, and it cannot be built until the cross-checks it re-runs after
+    // every write have something to check against.
+    let file = control_config::config_from_env()?;
 
     // Both files are loaded now, and only now can they be compared. See the
     // functions: neither loader can see the other, so a policy naming no model
@@ -557,16 +300,73 @@ async fn main() -> anyhow::Result<()> {
             "validate/steer loop: no judge configured, so nothing is validated"
         ),
     }
-    refuse_policies_that_admit_nothing(&plane, &reachable)?;
-    refuse_promises_of_a_local_fallback(&plane, &reachable, judge.as_ref())?;
-    // The third cross-check, and the one this deployment's *control surface*
+    // Every cross-check, through the one list that also runs after every admin
+    // write — including the third, which this deployment's *control surface*
     // needs: that surface answers entitlement questions by principal, and the
     // config lets two keys name one membership with different overrides. A
     // deployment where they disagree would tell an agent about a policy its own
-    // key does not have — so it is refused here, where an operator reads it,
-    // rather than discovered by a tenant. See `ControlPlane::membership`.
-    if let Some(refusal) = mcp_api::describe_ambiguous_memberships(&plane) {
-        anyhow::bail!(refusal);
+    // key does not have. See `ControlPlane::membership`.
+    //
+    // The refusal is printed as the check wrote it. Prefixing it with the
+    // check's name here would give an operator two spellings of one failure --
+    // one from the boot log and one from a 422 -- to recognise as the same
+    // thing.
+    let checks = CrossChecks::new(reachable.clone(), judge.clone());
+
+    // The one thing every surface authenticates against, and the one thing the
+    // admin plane writes to. Built here rather than beside the catalog because
+    // constructing it *is* the boot check: it compiles the file, runs
+    // `checks.refuse` on the result, and refuses to exist if either says no —
+    // the same two judgements every later admin write goes through.
+    //
+    // `MemoryDirectoryStore` is this milestone's only backing store, so
+    // admin-created tenancy dies with the process; the unlock condition for a
+    // durable one is written at `ControlDirectory`.
+    //
+    // Captured before `file` moves into the match below: it is what decides,
+    // once the Redis branch is chosen further down, whether this deployment's
+    // durability is actually one thing or secretly two — see the warning
+    // there. A `None` file means [`ControlDirectory::open`] below, which has
+    // no admin plane at all, so nothing about it can be mismatched with
+    // anything.
+    //
+    // Named for what it reads (a file was configured), not for the store
+    // that follows from it, because those are two facts today only because
+    // `MemoryDirectoryStore` is this branch's *only* store. The day a
+    // durable `DirectoryStore` lands and the `Some` arm below picks between
+    // stores, this flag has to move with it — to whichever branch is still
+    // memory-backed — or the warning below keeps firing after the gap it
+    // describes is closed.
+    let control_plane_file_configured = file.is_some();
+    let directory = match file {
+        Some((file, path)) => Arc::new(
+            ControlDirectory::new(
+                file,
+                path,
+                Arc::new(MemoryDirectoryStore::new()),
+                checks,
+                roundhouse_core::now_ms(),
+            )
+            .map_err(boot_refusal)?,
+        ),
+        None => ControlDirectory::open(),
+    };
+    match &*directory.plane(roundhouse_core::now_ms()) {
+        // Counted through the accessor rather than by reaching into
+        // `Configured { turn_keys, .. }`: the table's layout has exactly one
+        // reader outside its own module, and this is not going to be the
+        // second one for the sake of a log line.
+        plane @ ControlPlane::Configured { .. } => tracing::info!(
+            memberships = plane.configured_admissions().count(),
+            var = control_config::CONTROL_PLANE_VAR,
+            "control plane loaded; a key is required on every surface"
+        ),
+        ControlPlane::Open => tracing::warn!(
+            var = control_config::CONTROL_PLANE_VAR,
+            "no control plane configured; every request is served as the built-in \
+             default/default membership, with no key and no session namespace, and the \
+             admin plane is refused for want of a root of trust"
+        ),
     }
 
     let addr: SocketAddr = std::env::var(ADDR_VAR)
@@ -604,10 +404,31 @@ async fn main() -> anyhow::Result<()> {
                 var = REDIS_VAR,
                 "sessions and committed spend are durable in Redis"
             );
+            // Durable is not one property this deployment has, it is two, and
+            // this milestone only ever gives Redis one of them. Say so loudly
+            // rather than let an operator infer "durable" from the variable
+            // name and be wrong about the half that matters when a project
+            // gets archived and recreated.
+            if control_plane_file_configured {
+                tracing::warn!(
+                    var = control_config::CONTROL_PLANE_VAR,
+                    "sessions and committed spend just became durable in Redis, but \
+                     admin-created tenancy -- every project, user and turn key an \
+                     operator creates or archives through the admin plane -- still \
+                     lives only in memory and does not survive this process's \
+                     restart. Concretely: an archived project's tombstone is what \
+                     keeps its id retired (see ProjectRecord::archived_at_ms); lose \
+                     it on restart and the ordinary admin API will let that id be \
+                     recreated as if it were new, silently joining the new tenant \
+                     to the old one's spend history in the ledger that DID survive. \
+                     The fix is a durable DirectoryStore, not yet built -- see \
+                     ControlDirectory's own deferral note for the unlock condition"
+                );
+            }
             serve(
                 Arc::new(store),
                 Arc::new(spend),
-                plane,
+                Arc::clone(&directory),
                 catalog,
                 judge,
                 reachable,
@@ -625,7 +446,7 @@ async fn main() -> anyhow::Result<()> {
             serve(
                 Arc::new(MemoryStore::new()),
                 Arc::new(MemorySpendLedger::new()),
-                plane,
+                Arc::clone(&directory),
                 catalog,
                 judge,
                 reachable,
@@ -637,7 +458,7 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-/// Compose the engine and the four surfaces over whichever backends were
+/// Compose the engine and the five surfaces over whichever backends were
 /// chosen.
 ///
 /// **The one composition site**, and two of its values are shared rather than
@@ -653,7 +474,7 @@ async fn main() -> anyhow::Result<()> {
 async fn serve<S: SessionStore>(
     store: Arc<S>,
     spend: Arc<dyn SpendLedger>,
-    plane: Arc<ControlPlane>,
+    directory: Arc<ControlDirectory>,
     catalog: StaticFrontierCatalog,
     judge: Option<FrontierModelSpec>,
     reachable: Vec<Candidate>,
@@ -667,7 +488,15 @@ async fn serve<S: SessionStore>(
         // The salt reaches the engine and nowhere else: it is an input to the
         // stamp written at session creation, and every later reader — the
         // occupant, the fold, a replay — reads the *arm*, not the salt.
-        arm_salt: plane.arm_salt().to_string(),
+        //
+        // Read once here rather than per turn, unlike everything else resolved
+        // through the directory: the salt comes from the file and no admin
+        // write can move it, and re-reading it per turn would suggest a
+        // deployment could re-randomize a study already in flight.
+        arm_salt: directory
+            .plane(roundhouse_core::now_ms())
+            .arm_salt()
+            .to_string(),
         ..EngineConfig::default()
     };
 
@@ -705,51 +534,67 @@ async fn serve<S: SessionStore>(
             // instead, because it is a tenancy decision and this is not the
             // file tenancy is written in.
             ValidatorConfig {
-                arm_salt: plane.arm_salt().to_string(),
+                arm_salt: engine_config.arm_salt.clone(),
                 ..ValidatorConfig::default()
             },
         )));
     }
     let engine = Arc::new(engine);
 
-    // Four surfaces, one process and one log: the native transport, which
+    // Five surfaces, one process and one log: the native transport, which
     // exposes sessions and the log itself; the Responses API, which lets an
     // agent written against OpenAI drive the same sessions unmodified; the
     // metrics surface, which reports on both by folding the same log; and the
     // MCP control surface, which is the only one an agent rather than a client
     // drives — it reads what the others did and lets the model ask to be routed
-    // to less than its key allows.
-    // One control plane behind all four, not one each: a key that pays for a
-    // turn on one surface and is unknown to another would be a deployment with
-    // two answers to the same question.
-    let app = http::router(Arc::clone(&plane), Arc::clone(&engine), Arc::clone(&store))
-        .merge(metrics_api::metrics_router(
-            Arc::clone(&plane),
-            engine.metrics(),
-            metrics_config,
-        ))
-        .merge(mcp_api::mcp_router(
-            Arc::clone(&plane),
-            Arc::new(ControlPlaneReads::new(
-                Arc::clone(&plane),
-                Arc::clone(&store),
-                spend,
-                Arc::clone(&conversations),
-                // The same list the startup cross-checks above are built on, and
-                // it is right for the same reason: this binary attaches no
-                // fleet, so the catalog is everything a turn of its could be
-                // routed to. A deployment that attaches one adds its local model
-                // here at the same site — see `reachable_candidates`.
-                reachable,
-            )),
-            control,
-        ))
-        .merge(responses_api::responses_router(
-            plane,
-            engine,
-            store,
-            conversations,
-        ));
+    // to less than its key allows; and the admin plane, which is the only one
+    // that *writes* tenancy — and the reason every other router above holds the
+    // directory rather than a compiled plane, since a key revoked there has to
+    // stop working on all four.
+    // One control directory behind all five, not one each: a key that pays for
+    // a turn on one surface and is unknown to another would be a deployment
+    // with two answers to the same question.
+    // The same directory behind all five: the four read-only surfaces take it as
+    // a `PlaneSource` and re-resolve per request, and the admin plane takes it
+    // whole because it is the one that writes.
+    let app = http::router(
+        Arc::clone(&directory),
+        Arc::clone(&engine),
+        Arc::clone(&store),
+    )
+    .merge(metrics_api::metrics_router(
+        Arc::clone(&directory),
+        engine.metrics(),
+        Arc::clone(&metrics_config),
+    ))
+    .merge(admin_api::admin_router(
+        Arc::clone(&directory),
+        Arc::clone(&spend),
+        engine.metrics(),
+        metrics_config,
+    ))
+    .merge(mcp_api::mcp_router(
+        Arc::clone(&directory),
+        Arc::new(ControlPlaneReads::new(
+            Arc::clone(&directory),
+            Arc::clone(&store),
+            spend,
+            Arc::clone(&conversations),
+            // The same list the startup cross-checks above are built on, and
+            // it is right for the same reason: this binary attaches no
+            // fleet, so the catalog is everything a turn of its could be
+            // routed to. A deployment that attaches one adds its local model
+            // here at the same site — see `reachable_candidates`.
+            reachable,
+        )),
+        control,
+    ))
+    .merge(responses_api::responses_router(
+        directory,
+        engine,
+        store,
+        conversations,
+    ));
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -757,7 +602,14 @@ async fn serve<S: SessionStore>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The two checks by name, because these tests are about *what each one
+    // refuses*: `CrossChecks::refuse` answers only "some check said no", and a
+    // suite written against it could not tell a cadence refusal from a budget
+    // one.
     use roundhouse_server::ControlPlaneConfig;
+    use roundhouse_server::control_config::crosscheck::{
+        refuse_policies_that_admit_nothing, refuse_promises_of_a_local_fallback,
+    };
 
     fn plane_with_policy(policy: serde_json::Value) -> ControlPlane {
         plane_with(policy, serde_json::Value::Null)

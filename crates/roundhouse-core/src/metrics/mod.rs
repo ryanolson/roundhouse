@@ -70,7 +70,7 @@ use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
 
-use crate::control::PrincipalKey;
+use crate::control::{PrincipalKey, ProjectId};
 use crate::event::{SessionEvent, SessionObserver};
 use crate::routing::Target;
 use crate::validate::Arm;
@@ -195,6 +195,26 @@ impl MetricsRecorder {
     ) -> MetricsSnapshot {
         let fold = self.fold.read().unwrap_or_else(|e| e.into_inner());
         MetricsSnapshot::build(&fold, Scope::Principal(scope), config, generated_at_ms)
+    }
+
+    /// The same report, restricted to everything one *project* spent.
+    ///
+    /// What the admin plane's reconciliation view measures against the ledger's
+    /// committed figure. A separate method rather than a loop over
+    /// [`Self::snapshot_for`] per configured member, and the difference is the
+    /// point: a project's measured spend has to include the members who are no
+    /// longer configured — a key deleted, a person removed — or the column
+    /// would shrink whenever tenancy was tidied up, and the drift against the
+    /// ledger would be blamed on the ledger. The fold knows who spent; only the
+    /// config knows who may. See [`Scope::Project`].
+    pub fn snapshot_for_project(
+        &self,
+        project: &ProjectId,
+        config: &MetricsConfig,
+        generated_at_ms: u64,
+    ) -> MetricsSnapshot {
+        let fold = self.fold.read().unwrap_or_else(|e| e.into_inner());
+        MetricsSnapshot::build(&fold, Scope::Project(project), config, generated_at_ms)
     }
 
     /// What one arm of the validate experiment decided, and how often it acted.
@@ -455,6 +475,7 @@ mod tests {
                 rate_card: None,
                 payer: Default::default(),
                 billing: Default::default(),
+                budget_draw: None,
                 withheld_providers: Vec::new(),
             },
         });
@@ -501,6 +522,7 @@ mod tests {
                 rate_card: None,
                 payer: Default::default(),
                 billing: Default::default(),
+                budget_draw: None,
                 withheld_providers: Vec::new(),
             },
         });

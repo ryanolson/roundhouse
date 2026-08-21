@@ -54,9 +54,10 @@ use roundhouse_core::control::Principal;
 use roundhouse_core::event::{IncompleteReason, SessionEvent, SessionEventKind};
 use roundhouse_core::ids::{ResponseId, SessionId, TurnId};
 use roundhouse_core::item::{Item, ItemContent};
+use roundhouse_core::now_ms;
 use roundhouse_core::store::SessionStore;
 
-use crate::control_config::ControlPlane;
+use crate::control_config::{ControlPlane, PlaneSource};
 use crate::conversations::Conversations;
 use crate::dialect::ClientDialect;
 use crate::engine::Engine;
@@ -78,7 +79,12 @@ struct Compat<S: SessionStore, T: Tokenizer + Clone> {
     engine: Arc<Engine<S, T>>,
     store: Arc<S>,
     /// Who may drive this surface, and under what session namespace.
-    plane: Arc<ControlPlane>,
+    ///
+    /// A [`PlaneSource`] rather than the compiled plane, for the reason
+    /// [`http`](crate::http)'s transport holds one: a revoked key has to stop
+    /// working on the surface it is being used on, and a router that captured
+    /// one plane at mount time would never see the revocation.
+    planes: Arc<dyn PlaneSource>,
     /// Which session this node binds a client's cache key to.
     ///
     /// Shared with the MCP control surface rather than owned here, which is why
@@ -93,7 +99,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Clone for Compat<S, T> {
         Self {
             engine: Arc::clone(&self.engine),
             store: Arc::clone(&self.store),
-            plane: Arc::clone(&self.plane),
+            planes: Arc::clone(&self.planes),
             conversations: Arc::clone(&self.conversations),
         }
     }
@@ -104,14 +110,21 @@ impl<S: SessionStore, T: Tokenizer + Clone> Clone for Compat<S, T> {
 /// Separate from [`http::router`](crate::http::router) rather than folded into
 /// it: the two speak different vocabularies over the same log, and merging them
 /// into one `Router` is the composition root's decision to make. One
-/// constructor with a required plane, for the reason given there.
+/// constructor with a required plane source, for the reason given there.
 ///
-/// `conversations` is required for the same reason the plane is, and it is
+/// `conversations` is required for the same reason it is, and it is
 /// supplied rather than minted here because the MCP surface reads the same
 /// table: a router that made its own would be a second answer to "which session
 /// is `main`?", and the two would agree only until a client edited its history.
-pub fn responses_router<S, T>(
-    plane: Arc<ControlPlane>,
+///
+/// Generic over the source and stored as `Arc<dyn PlaneSource>`, rather than
+/// taking the trait object directly. `Arc<ControlPlane>` and
+/// `Arc<ControlDirectory>` are both accepted and both unsize at the call site;
+/// a parameter typed `Arc<dyn PlaneSource>` would not accept either through the
+/// `Arc::clone(&plane)` a caller naturally writes, because the clone's own
+/// return type is inferred before any coercion could apply.
+pub fn responses_router<S, T, P>(
+    planes: Arc<P>,
     engine: Arc<Engine<S, T>>,
     store: Arc<S>,
     conversations: Arc<Conversations>,
@@ -119,13 +132,15 @@ pub fn responses_router<S, T>(
 where
     S: SessionStore,
     T: Tokenizer + Clone + Send + Sync + 'static,
+    P: PlaneSource,
 {
+    let planes: Arc<dyn PlaneSource> = planes;
     Router::new()
         .route("/v1/responses", post(create_response::<S, T>))
         .with_state(Compat {
             engine,
             store,
-            plane,
+            planes,
             conversations,
         })
 }
@@ -180,7 +195,12 @@ where
     // The admission rather than the principal alone: one lookup answers both
     // who pays and what may be routed to, and the policy is fixed here for the
     // whole turn rather than re-read during it.
-    let admission = state.plane.turn_admission(&headers)?;
+    //
+    // One snapshot for the whole request: the namespace a cache key is
+    // qualified into and the dialect the reply is rendered in are read off it
+    // too, and two of them could disagree across a refresh.
+    let plane = state.planes.plane(now_ms());
+    let admission = plane.turn_admission(&headers)?;
     let request: ResponsesRequest = parse_body(&body)?;
     if !request.stream {
         return Err(ApiError::unprocessable(
@@ -201,7 +221,9 @@ where
 
     let claimed = canonicalize(&request.instructions, &request.input)?;
     let turn_id = turn_id_for(&claimed);
-    let (session_id, input) = state.bind(&admission.principal, cache_key, claimed).await?;
+    let (session_id, input) = state
+        .bind(&plane, &admission.principal, cache_key, claimed)
+        .await?;
 
     // Read before the spawn, for the reason `http` gives: an event appended
     // between this read and the start of the turn would fall outside the
@@ -237,7 +259,7 @@ where
         // Read once and carried, rather than consulted per frame: a
         // reconfiguration must not be able to change a namespace half way
         // through a response the client is still reading.
-        dialect: state.plane.client_dialect().clone(),
+        dialect: plane.client_dialect().clone(),
         phase: Phase::Tailing,
     };
 
@@ -262,13 +284,14 @@ impl<S: SessionStore, T: Tokenizer + Clone> Compat<S, T> {
     /// engine's per-session gate keeps the log itself consistent regardless.
     async fn bind(
         &self,
+        plane: &ControlPlane,
         principal: &Principal,
         cache_key: &str,
         claimed: Vec<Item>,
     ) -> Result<(SessionId, Vec<Item>), ApiError> {
         // Computed once and used for both the fork counter and the session id,
         // so the two cannot key on different strings. See [`Conversations`].
-        let key = self.namespaced_key(principal, cache_key);
+        let key = self.namespaced_key(plane, principal, cache_key);
         let session_id = self.conversations.bind(principal, &key);
         self.create(&session_id).await?;
         if let Some(delta) = suffix_after(&self.stored_items(&session_id).await?, &claimed) {
@@ -306,8 +329,16 @@ impl<S: SessionStore, T: Tokenizer + Clone> Compat<S, T> {
     /// prefix it produces is unambiguous because a project or user id may not
     /// contain `/` — the config's slug rule is what buys that, and it is why
     /// the rule is at the config boundary rather than here.
-    fn namespaced_key(&self, principal: &Principal, cache_key: &str) -> String {
-        self.plane.qualify(principal, cache_key)
+    /// The plane is the handler's snapshot rather than a fresh read: a session
+    /// id minted under one compiled plane and checked under another is a
+    /// session created and immediately unreachable.
+    fn namespaced_key(
+        &self,
+        plane: &ControlPlane,
+        principal: &Principal,
+        cache_key: &str,
+    ) -> String {
+        plane.qualify(principal, cache_key)
     }
 
     async fn create(&self, session_id: &SessionId) -> Result<(), ApiError> {
