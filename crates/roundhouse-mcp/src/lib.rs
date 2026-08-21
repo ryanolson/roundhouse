@@ -84,11 +84,27 @@
 //! `approval_policy = "never"` a tool carrying no MCP annotations is treated
 //! as destructive and open-world, and its call is **cancelled** — the agent
 //! receiving a cancellation notice where the output should have been, with
-//! nothing in the turn saying so. The generated launch config
-//! (`crates/roundhouse-server/src/codex_launch.rs`) answers that today with
-//! `default_tools_approval_mode = "approve"`; truthful `annotations` on the
-//! descriptors in [`tools`] would be the narrower answer, and would hold for
-//! clients we did not hand a config to.
+//! nothing in the turn saying so.
+//!
+//! Both halves of the answer to that second one are now in the tree, and they
+//! are not redundant. Every descriptor in [`tools`] states all three hints
+//! (`readOnlyHint`, `destructiveHint`, `openWorldHint`), which is the narrow
+//! answer and the only one that reaches a client we never handed a config to.
+//! **That last half is read and not yet observed** — `requires_mcp_tool_approval`
+//! (`core/src/mcp_tool_call.rs:2156-2173` @ `e363b08`) consults the hints
+//! under codex's default `Auto` mode ahead of any config at all, but every
+//! e2e run in this tree drives a client holding the generated config, so what
+//! the binary does with an *un*configured stanza is source reading of the same
+//! kind the block above replaced. The generated launch config
+//! (`crates/roundhouse-server/src/codex_launch.rs`) keeps
+//! `default_tools_approval_mode = "approve"` beside them, as the Direct
+//! topology's defense in depth rather than as the fix: `codex exec` forces
+//! `approval_policy = "never"`, so a client that disagreed with our hints for
+//! any reason would cancel a writer rather than prompt about it, and there is
+//! no interactive operator in that topology to prompt. Scoping the grant to
+//! the reads instead — the narrower-looking option — was considered and
+//! refused for exactly that reason; the ruling and its citations live beside
+//! the generated stanza.
 //!
 //! *[History — recorded so nobody re-litigates it. Until M9 this block was a
 //! documented assumption citing the then-current Cargo pin `6344a65`:
@@ -99,6 +115,37 @@
 //! test was built from and the two revs are not on one line of descent —
 //! neither is an ancestor of the other, and the MCP client was reorganized
 //! between them. The Cargo pin itself is unchanged; M9 bumped nothing.]*
+//!
+//! # A third property, unread: codex names the conversation on every call
+//!
+//! Codex stamps `params._meta.threadId` on **every** `tools/call` it
+//! dispatches — `with_mcp_tool_call_thread_id_meta`
+//! (`core/src/mcp_tool_call.rs:1198-1220` @ `e363b08`, called at line 442
+//! with no conditional guard) inserts `sess.thread_id`, and captured traffic
+//! shows it byte-identical to the `prompt_cache_key` on the same turn's
+//! `/v1/responses` bodies. It rides a `_meta` object that also carries
+//! `x-codex-turn-metadata.session_id`.
+//!
+//! **Nothing here reads it.** `ControlPlaneReads::resolve_session` resolves
+//! from the tool call's own `conversation` argument (qualified into the
+//! caller's namespace) or from `Conversations::latest`, and
+//! [`fetch_steer`](ControlSurface::fetch_steer) resolves from `steer_id`
+//! alone; today's isolation is therefore tenant-scoped — a `Principal` plus a
+//! qualified name — and not thread-id-based. Recorded because the block above
+//! says what M9 proved about dispatch and resend, and a reader could take
+//! that for an audit of every field the client sends. It is not:
+//! `codexs_meta_thread_id_rides_every_tools_call_and_is_never_read`
+//! (`crates/roundhouse-server/tests/codex_e2e.rs`) passes *today*, and its
+//! passing is the point.
+//!
+//! Wiring it in is deferred rather than pending. `_meta.threadId` is the
+//! codex-native shortcut and would bind this surface to one client's
+//! conventions; [`init_session`](ControlSurface::init_session) is the
+//! client-agnostic path to the same correlation and is the one the plan
+//! carries. A cross-check between the two — the correlator we are handed
+//! versus the token we minted — is a defense-in-depth design decision with
+//! its own failure modes (what a disagreement means), not a fix for anything
+//! broken.
 //!
 //! # Note the tense: `init_session` is still write-only
 //!

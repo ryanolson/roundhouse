@@ -80,5 +80,5 @@ pub use http::router;
 pub use judge::{FleetJudge, JudgeConfig};
 pub use mcp_api::{ControlPlaneReads, describe_ambiguous_memberships, mcp_router};
 pub use metrics_api::metrics_router;
-pub use responses_api::responses_router;
+pub use responses_api::{API_PREFIX, responses_router};
 pub use tokenizer::HfTokenizer;

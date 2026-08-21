@@ -51,7 +51,7 @@ use tokio::task::JoinHandle;
 
 use roundhouse_core::context::Tokenizer;
 use roundhouse_core::control::Principal;
-use roundhouse_core::event::{IncompleteReason, SessionEvent, SessionEventKind};
+use roundhouse_core::event::{IncompleteReason, SessionEvent, SessionEventKind, Usage};
 use roundhouse_core::ids::{ResponseId, SessionId, TurnId};
 use roundhouse_core::item::{Item, ItemContent};
 use roundhouse_core::now_ms;
@@ -105,6 +105,25 @@ impl<S: SessionStore, T: Tokenizer + Clone> Clone for Compat<S, T> {
     }
 }
 
+/// The version segment every route on this surface is served under.
+///
+/// A constant for the same reason [`MCP_MOUNT_PATH`](crate::mcp_api::MCP_MOUNT_PATH)
+/// is one, and F14 is the miss that earned it: two unrelated places have to
+/// agree on this string and only one of them is in this file. The route below
+/// is where it is *served*; [`codex_launch::mcp_endpoint`](crate::codex_launch)
+/// strips it off a deployment's `base_url` to recover the root the MCP surface
+/// is mounted at, because `base_url` is defined as where this deployment serves
+/// the Responses API. A literal in each would make a version rung — `/v2` — a
+/// change that compiles, serves turns perfectly, and hands the generated config
+/// an MCP url with a bogus version segment on it. The client then starts, times
+/// out on MCP, and runs every turn with every steer silently unresolvable.
+///
+/// Deliberately *not* shared with the admin, metrics, and session routes, which
+/// spell their own `/v1` in their own files: those are a separate versioning
+/// surface with no coupling to `base_url`, and one constant across all of them
+/// would claim a site-wide policy nobody has decided on.
+pub const API_PREFIX: &str = "/v1";
+
 /// The compatibility surface's route, gated by a control plane.
 ///
 /// Separate from [`http::router`](crate::http::router) rather than folded into
@@ -136,7 +155,10 @@ where
 {
     let planes: Arc<dyn PlaneSource> = planes;
     Router::new()
-        .route("/v1/responses", post(create_response::<S, T>))
+        .route(
+            &format!("{API_PREFIX}/responses"),
+            post(create_response::<S, T>),
+        )
         .with_state(Compat {
             engine,
             store,
@@ -221,6 +243,14 @@ where
 
     let claimed = canonicalize(&request.instructions, &request.input)?;
     let turn_id = turn_id_for(&claimed);
+    // Before `bind` consumes it, and off the *claimed* conversation rather than
+    // off the session's items afterwards: the two are equal by construction —
+    // `bind` admits only the suffix that makes them so — and reading it here
+    // needs no second trip to the store. This is the number the wire reports if
+    // the interjection seam answers this turn; see
+    // [`Engine::context_contribution`] for why the wire cannot just forward what
+    // the log books.
+    let admitted_input_tokens = state.engine.admitted_input_tokens(&claimed);
     let (session_id, input) = state
         .bind(&plane, &admission.principal, cache_key, claimed)
         .await?;
@@ -250,6 +280,9 @@ where
 
     let follower = ResponsesFollower {
         tail: LogTail::new(Arc::clone(&state.store), session_id, start),
+        engine: Arc::clone(&state.engine),
+        admitted_input_tokens,
+        context_contribution: None,
         turn_id,
         response_id: None,
         turn,
@@ -454,8 +487,26 @@ enum Emitted<'a> {
 /// [`http`](crate::http) gives: dropping the handle detaches rather than
 /// cancels, and a client that hangs up must not take down a turn the log has
 /// already admitted.
-struct ResponsesFollower<S: SessionStore> {
+struct ResponsesFollower<S: SessionStore, T: Tokenizer + Clone> {
     tail: LogTail<S>,
+    /// Only ever asked what this deployment's tokenizer makes of an item; the
+    /// turn itself runs in the task below. Held rather than a cloned tokenizer
+    /// so the two estimates a seam answer reports come from the same pair of
+    /// functions [`Engine::plan`] prices a dispatched turn with.
+    engine: Arc<Engine<S, T>>,
+    /// The input this request admitted, as [`Engine::admitted_input_tokens`]
+    /// counts it. Computed once in the handler because it is a fact about the
+    /// request, not about any frame.
+    admitted_input_tokens: u64,
+    /// Set when this response answered at the interjection seam instead of
+    /// dispatching, and then reported in place of what the log booked.
+    ///
+    /// Carried on the follower rather than recomputed at the completion,
+    /// because the item it is derived from arrives in an earlier event and the
+    /// completion carries no trace of it. `None` means an ordinary dispatched
+    /// turn, whose booked usage *is* its context contribution — see
+    /// [`Engine::context_contribution`] for why the two part company only here.
+    context_contribution: Option<Usage>,
     turn_id: TurnId,
     /// Set by the `turn_started` naming this request's turn, or by the response
     /// a `turn_deduplicated` points at.
@@ -476,7 +527,7 @@ struct ResponsesFollower<S: SessionStore> {
     phase: Phase,
 }
 
-impl<S: SessionStore> ResponsesFollower<S> {
+impl<S: SessionStore, T: Tokenizer + Clone + Send + Sync + 'static> ResponsesFollower<S, T> {
     async fn next_frame(&mut self) -> Option<Event> {
         loop {
             if let Some(frame) = self.queued.pop_front() {
@@ -688,6 +739,13 @@ impl<S: SessionStore> ResponsesFollower<S> {
                 if self.item_open {
                     self.queued.push_back(item_done_frame(&self.text));
                 }
+                // The log's number unless this response answered at the seam.
+                // `unwrap_or` and not `expect`: the emission and the completion
+                // land in one append batch, so a completion with no emission
+                // before it is an ordinary dispatched turn and not an ordering
+                // bug — and if the batch ever did arrive out of order, falling
+                // back to what the log booked is the answer that still balances.
+                let usage = self.context_contribution.as_ref().unwrap_or(usage);
                 self.queued.push_back(completed_frame(response_id, usage));
                 Step::End
             }
@@ -755,20 +813,42 @@ impl<S: SessionStore> ResponsesFollower<S> {
                 // follower and the queue needs it back mutably. Each pair is
                 // built together for a second reason too: a client announced
                 // one item and handed another has no way to reconcile them.
-                let frames = match self.emitted(item) {
-                    Some(Emitted::Call(call)) => {
-                        Some([tool_call_added_frame(&call), tool_call_done_frame(&call)])
-                    }
+                // One `emitted` call yielding both, for the reason that
+                // predicate's own doc gives: a narrowing written twice has
+                // neither copy load-bearing, and a test that removed one would
+                // stay green. The contribution is *yielded* here and assigned
+                // below because `Emitted` borrows `self.dialect` — only the
+                // write has to wait for that borrow to end.
+                //
+                // Both seam answers, not only the steer. A halt is the same
+                // shape — nothing dispatched, the judge's usage booked — so the
+                // same substitution applies; that it ends the agent's loop makes
+                // the wrong number less consequential, not more correct.
+                let (frames, contribution) = match self.emitted(item) {
+                    Some(Emitted::Call(call)) => (
+                        Some([tool_call_added_frame(&call), tool_call_done_frame(&call)]),
+                        Some(
+                            self.engine
+                                .context_contribution(self.admitted_input_tokens, item),
+                        ),
+                    ),
                     // A halt: guidance committed whole, with no deltas behind
                     // it. `item_open` stays false — it tracks the *streamed*
                     // message, whose `done` the completion below emits — so
                     // the completion adds only its own frame and the sequence
                     // is the same four a steered turn is.
-                    Some(Emitted::Message(text)) => {
-                        Some([item_added_frame(), item_done_frame(text)])
-                    }
-                    None => None,
+                    Some(Emitted::Message(text)) => (
+                        Some([item_added_frame(), item_done_frame(text)]),
+                        Some(
+                            self.engine
+                                .context_contribution(self.admitted_input_tokens, item),
+                        ),
+                    ),
+                    None => (None, None),
                 };
+                if contribution.is_some() {
+                    self.context_contribution = contribution;
+                }
                 self.queued.extend(frames.into_iter().flatten());
                 Step::Continue
             }
@@ -857,5 +937,18 @@ mod tests {
     fn an_edited_history_is_refused_rather_than_appended() {
         let stored = vec![user("hello"), assistant("hi")];
         assert_eq!(suffix_after(&stored, &[user("goodbye")]), None);
+    }
+
+    #[test]
+    fn the_api_prefix_is_shaped_the_way_its_two_consumers_read_it() {
+        // Both sides concatenate rather than join: this file writes
+        // `{API_PREFIX}/responses`, and `codex_launch::mcp_endpoint` strips the
+        // same string off the tail of a deployment's `base_url`. A missing
+        // leading slash would build `v1/responses`, and a trailing one
+        // `/v1//responses` — each of which serves and strips a path the other
+        // side does not, which is F14's failure mode reached by a different
+        // route.
+        assert!(API_PREFIX.starts_with('/'), "{API_PREFIX}");
+        assert!(!API_PREFIX.ends_with('/'), "{API_PREFIX}");
     }
 }

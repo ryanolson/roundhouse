@@ -28,6 +28,32 @@
 //! is what keeps the hand-written half honest: every declared property has to
 //! deserialize into the request type it claims to describe.
 //!
+//! # Annotations are not decoration
+//!
+//! Every descriptor states all three MCP hints — `readOnlyHint`,
+//! `destructiveHint`, `openWorldHint` — as plain `bool`s rather than leaving
+//! them absent, because absent is not neutral. Codex's
+//! `requires_mcp_tool_approval` (`core/src/mcp_tool_call.rs:2156-2173`
+//! @ `e363b08`; the same function at `2182-2199` @ the Cargo pin `6344a65`)
+//! reads a missing `readOnlyHint` as `false` and a missing
+//! `destructiveHint`/`openWorldHint` as `true`, so a tool that says nothing
+//! is read as destructive-and-open-world. Under `codex exec`'s forced
+//! `approval_policy = "never"` the approval that then gets demanded cannot be
+//! asked of anyone, and the call is *cancelled* — the agent sees a
+//! cancellation where the output should have been.
+//!
+//! They are written out per tool rather than defaulted from a shared constant
+//! for the same reason the list is pinned: a ninth tool must state what it
+//! does. A `CLOSED_WORLD_READ` const the new entry copied would let it inherit
+//! two claims nobody checked against what it actually does, which is the
+//! review the size tripwire in `codex_launch.rs` exists to force.
+//!
+//! `destructiveHint: false` and `openWorldHint: false` hold for all eight:
+//! the two overlay writers can only narrow (see the crate doc), the other
+//! writers append records, and the whole surface reaches roundhouse's own
+//! control plane and nothing beyond it. Only `readOnlyHint` varies, and it
+//! varies exactly along the crate's read/write split.
+//!
 //! # Dispatch is not transport
 //!
 //! [`dispatch`] lives here and not in [`crate::transport`] on purpose. Turning
@@ -66,6 +92,16 @@ pub struct ToolDescriptor {
     pub description: &'static str,
     /// JSON Schema for the arguments object.
     pub input_schema: Value,
+    /// MCP's `readOnlyHint`: true for a tool that changes nothing.
+    ///
+    /// See the module doc's *Annotations are not decoration* for why all three
+    /// hints are stated on every tool rather than defaulted.
+    pub read_only_hint: bool,
+    /// MCP's `destructiveHint`: false for a tool whose writes are additive.
+    pub destructive_hint: bool,
+    /// MCP's `openWorldHint`: false for a tool that reaches nothing outside
+    /// this deployment.
+    pub open_world_hint: bool,
 }
 
 /// A named call with its arguments, before it has a type.
@@ -109,6 +145,9 @@ pub fn descriptors() -> Vec<ToolDescriptor> {
                 "properties": { "conversation": conversation_property() },
                 "additionalProperties": false
             }),
+            read_only_hint: true,
+            destructive_hint: false,
+            open_world_hint: false,
         },
         ToolDescriptor {
             name: "init_session",
@@ -124,6 +163,9 @@ pub fn descriptors() -> Vec<ToolDescriptor> {
                 "properties": { "conversation": conversation_property() },
                 "additionalProperties": false
             }),
+            read_only_hint: false,
+            destructive_hint: false,
+            open_world_hint: false,
         },
         ToolDescriptor {
             name: "declare_intent",
@@ -143,6 +185,9 @@ pub fn descriptors() -> Vec<ToolDescriptor> {
                 "required": ["goal", "done_when"],
                 "additionalProperties": false
             }),
+            read_only_hint: false,
+            destructive_hint: false,
+            open_world_hint: false,
         },
         ToolDescriptor {
             name: "prefer",
@@ -171,6 +216,9 @@ pub fn descriptors() -> Vec<ToolDescriptor> {
                 "required": ["mode", "scope", "reason"],
                 "additionalProperties": false
             }),
+            read_only_hint: false,
+            destructive_hint: false,
+            open_world_hint: false,
         },
         ToolDescriptor {
             name: "set_quality_floor",
@@ -191,6 +239,9 @@ pub fn descriptors() -> Vec<ToolDescriptor> {
                 "required": ["floor", "turns", "reason"],
                 "additionalProperties": false
             }),
+            read_only_hint: false,
+            destructive_hint: false,
+            open_world_hint: false,
         },
         ToolDescriptor {
             name: "fetch_steer",
@@ -203,6 +254,9 @@ pub fn descriptors() -> Vec<ToolDescriptor> {
                 "required": ["steer_id"],
                 "additionalProperties": false
             }),
+            read_only_hint: true,
+            destructive_hint: false,
+            open_world_hint: false,
         },
         ToolDescriptor {
             name: "report_outcome",
@@ -221,6 +275,9 @@ pub fn descriptors() -> Vec<ToolDescriptor> {
                 "required": ["steer_id", "outcome"],
                 "additionalProperties": false
             }),
+            read_only_hint: false,
+            destructive_hint: false,
+            open_world_hint: false,
         },
         ToolDescriptor {
             name: "explain_last_route",
@@ -230,6 +287,9 @@ pub fn descriptors() -> Vec<ToolDescriptor> {
                 "properties": { "conversation": conversation_property() },
                 "additionalProperties": false
             }),
+            read_only_hint: true,
+            destructive_hint: false,
+            open_world_hint: false,
         },
     ]
 }

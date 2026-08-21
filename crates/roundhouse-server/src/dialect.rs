@@ -12,15 +12,29 @@
 //! ([`Item::tool_call`](roundhouse_core::item::Item::tool_call)) and the
 //! spelling is applied on the way out, from here.
 //!
-//! **Why that direction and not the other.** The wire layer's canonicalization
-//! already ignores `namespace` and `id` on the way *in*
-//! (`responses_api::wire::canonical_item`), so a namespaced resend and a flat
-//! resend arrive as the same canonical item. Storing the namespace instead
-//! would make those two spellings two different items: the prefix check would
-//! disagree with itself the first time a client changed dialect, and every
-//! steered session would silently fork onto a cold generation. Keeping the
-//! namespace out of the log is what buys a second agent surface later without
-//! forking the sessions the first one wrote.
+//! **Why that direction and not the other.** Storing the namespace would make
+//! two spellings of one call two different stored items, and there is no seam
+//! that could ever reconcile them: the prefix check would disagree with itself
+//! the first time a client changed dialect, and every steered session would
+//! silently fork onto a cold generation. A neutral stored name is the one form
+//! both spellings can be mapped onto, which is what buys a second agent surface
+//! later without forking the sessions the first one wrote.
+//!
+//! **What the wire layer does and does not already do for that** (F10, review;
+//! pinned by `responses_api::wire`'s
+//! `a_flat_spelling_is_a_different_canonical_call_until_the_wire_learns_to_split_it`).
+//! `canonical_item` ignores a *separate* `namespace` field and the item `id` on
+//! the way in, which is exactly what makes [`ClientDialect::CodexResponses`]'s
+//! own resend round-trip to the bare stored name — the property the whole
+//! steering choreography rests on. It does **not** split a namespace folded
+//! into `name` itself, and nothing here should be read as claiming it does: a
+//! flat `mcp__roundhouse__fetch_steer` with no `namespace` key canonicalizes to
+//! that whole string and would fork the session on the next turn. So the day a
+//! flat variant lands, its arm owes canonicalization the *reverse* mapping —
+//! splitting the flat name back apart on the way in — as well as the rendering
+//! on the way out. Keeping the namespace out of the log makes that
+//! reconciliation possible; it does not make it already true, and an earlier
+//! draft of this paragraph claimed it did.
 //!
 //! **A replay renders today's namespace.** The dialect is read when a frame is
 //! built, not when the item was committed, so replaying an old response after
@@ -48,6 +62,12 @@ pub const DEFAULT_MCP_NAMESPACE: &str = "mcp__roundhouse";
 /// namespace field at all). Making that a variant means the day it lands the
 /// compiler names every site that has to decide, instead of a reader having to
 /// find an `if` that was never written.
+///
+/// With one exception the compiler cannot name, and it is the one F10 found:
+/// `responses_api::wire::canonical_item` reads no dialect at all — it takes
+/// whatever is in `name` verbatim — so adding a variant here does *not* make
+/// the input path stop compiling. The module doc above says what that arm owes
+/// canonicalization; the wire test named there is what goes red if it forgets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientDialect {
     /// Codex over the OpenAI Responses API: an MCP tool is named by a bare

@@ -15,9 +15,9 @@
 //!
 //! # What the suite is the closure of
 //!
-//! Three of the five tests below are named in the plan's §9 M9 rung, and they
-//! are named there rather than invented here because each closes one thing
-//! M0–M6 could only document:
+//! Three tests below are named in the plan's §9 M9 rung, and they are named
+//! there rather than invented here because each closes one thing M0–M6 could
+//! only document:
 //!
 //! - `a_real_codex_binary_executes_our_synthetic_tool_call_and_returns_its_output`
 //!   — the dispatch assumption;
@@ -29,15 +29,25 @@
 //!
 //! Green here retires the documented-assumption block that
 //! `crates/roundhouse-mcp/src/lib.rs` carried until now, which §9 makes the
-//! explicit condition. The other two tests are preconditions this suite could
-//! not assume: that `exec resume --last` continues one roundhouse session, and
-//! that our rmcp 3.1.3 service answers codex's rmcp 1.8.0 client at all.
+//! explicit condition. Two more are preconditions this suite could not assume:
+//! that `exec resume --last` continues one roundhouse session, and that our
+//! rmcp 3.1.3 service answers codex's rmcp 1.8.0 client at all. The rest were
+//! added by the M9 thermo-nuclear review — the forwarded-login stanza (F12) and
+//! mid-session revocation (F15), each the first real-binary evidence for a
+//! claim only prose had carried, plus two guards that need no binary at all
+//! (F02, F11) because what they catch is this harness lying to itself.
 //!
 //! §10 open item **2** — whether reporting a judge's usage on a steered turn
-//! disturbs the client's own bookkeeping — is *evidence* here and not a test.
-//! The `M9-USAGE-EVIDENCE` block is printed, never asserted; deciding what
-//! relationship should hold is the plan addendum's job, and an assertion in
-//! this file would be the fixture quietly making that call.
+//! disturbs the client's own bookkeeping — arrived here as *evidence* and left
+//! as a ruling. The `M9-USAGE-EVIDENCE` block is still printed and never
+//! asserted, because what a reader should conclude from four numbers is not a
+//! thing a fixture should decide. What review finding F03 settled is narrower
+//! and is now asserted, in
+//! `a_steered_turns_reported_usage_is_the_context_it_admitted`: the wire number
+//! and the ledger number answer different questions, so the wire reports the
+//! turn's context contribution while the log keeps booking the judge. The
+//! answer was "it disturbs it by 5x", which is why the block gained the ratio
+//! that makes the disturbance visible without cross-reading four blocks.
 //!
 //! # What is real here, and what is scripted
 //!
@@ -89,10 +99,25 @@
 //! printed on every run and a mismatch prints a WARNING rather than failing:
 //! the suite is evidence about a *binary*, and a green run against an unread
 //! version is exactly the silent change of meaning CLAUDE.md's vigilance rule
-//! exists to catch. One 0.146.0-specific fact is load-bearing and would move:
-//! `request_max_retries` / `stream_max_retries` are **provider-scoped** keys —
-//! the top-level spelling is rejected by `--strict-config`, which this harness
-//! passes on purpose so that drift is loud.
+//! exists to catch. Three 0.146.0-specific facts are load-bearing and would
+//! move:
+//!
+//! - `request_max_retries` / `stream_max_retries` are **provider-scoped** keys
+//!   — the top-level spelling is rejected by `--strict-config`, which this
+//!   harness passes on purpose so that drift is loud;
+//! - a failed turn's stderr carries the *server's own message body*, not just
+//!   the status (`Turn error: unexpected status 401 Unauthorized: this key has
+//!   been revoked`). `a_key_revoked_between_runs_…` asserts on that text
+//!   because absence-of-completion is satisfied by a child that died before
+//!   sending anything; a client that logged a bare status would take it red
+//!   and the assertion would need re-aiming at `turn.failed`, not deleting;
+//!   the claim — the refusal reached the agent — is the same either way;
+//! - the turn that fulfils a steer resends the steered turn's conversation plus
+//!   *exactly* the emitted call and its output, nothing interposed. That is
+//!   what makes `a_steered_turns_reported_usage_is_the_context_it_admitted` an
+//!   equality rather than a band. A client that inserted an item of its own
+//!   would move it to a residual — which the assertion prints, precisely so
+//!   the failure names the interposed item instead of being absorbed.
 //!
 //! `CODEX_HOME` still lives under `target/` rather than the system temp dir,
 //! but — corrected here after stage 4's refute found the original framing
@@ -210,6 +235,18 @@ const CHILD_DEADLINE: Duration = Duration::from_secs(60);
 /// The environment variable that overrides which binary is driven.
 const CODEX_BIN_VAR: &str = "ROUNDHOUSE_TEST_CODEX_BIN";
 
+/// The refusal a revoked turn key earns, in both of the shapes F15 asserts on.
+///
+/// Spelled here rather than inline because the two assertions read the same
+/// refusal through two different windows — the code off the response document
+/// roundhouse served, the message off the child's own stderr — and a literal
+/// copied into each would let one drift while the other kept passing. Both come
+/// from `control_config::auth`'s `AuthError::RevokedKey`, and the distinction
+/// from `unknown_key` is the whole point: a revoked key is one the directory
+/// *remembers* refusing.
+const REVOKED_KEY_CODE: &str = "revoked_key";
+const REVOKED_KEY_MESSAGE: &str = "this key has been revoked";
+
 /// The version this suite's assertions were written against.
 const VERIFIED_VERSION: &str = "codex-cli 0.146.0";
 
@@ -278,18 +315,100 @@ struct Exchange {
     /// documents is still a byte comparison of that field.
     body: Option<Value>,
     status: u16,
-    /// The response body, captured for `/mcp` only.
+    /// The response body as bytes-turned-text, captured on **every** path.
     ///
-    /// `/v1/responses` streams: buffering it here would hold the whole SSE body
-    /// until the turn ended, which is the one property that surface exists to
-    /// not have. `/mcp` answers a single JSON document per POST, so capturing it
-    /// costs nothing and is what makes the handshake assertions readable.
+    /// It used to be `/mcp` only, on the reasoning that buffering
+    /// `/v1/responses` would hold the whole SSE body until the turn ended —
+    /// "the one property that surface exists to not have". F11 showed what that
+    /// bought and what it cost. Two claims this suite makes live *only* in that
+    /// body and were therefore unobservable: a `SteerAction::Halt`'s reason is
+    /// committed as the assistant text of the very response that ends the run
+    /// (so the injection-boundary sweep in `the_next_turn_reflects_the_correction`
+    /// swept a document it could never see, and unlike a `Steer` there is no
+    /// next turn to resend it), and `response.completed.usage` — the number
+    /// codex folds into `last_token_usage` — is what F03's ruling is about.
+    ///
+    /// What buffering costs *here*, stated rather than assumed: the child sees
+    /// the frames of one turn arrive at once instead of as they are produced.
+    /// No assertion in this file is about frame arrival *timing*, every turn is
+    /// served by an in-process echo client and finishes in milliseconds, and
+    /// `codex exec` parses a complete SSE body identically to an incremental
+    /// one. The property genuinely traded away is the harness's fidelity to
+    /// backpressure, which nothing here measures; the property bought is two
+    /// findings' worth of evidence.
+    response_text: Option<String>,
+    /// The response body parsed as one JSON document, when it is one.
+    ///
+    /// `/mcp` answers exactly one document per POST, which is what makes the
+    /// handshake assertions readable. `/v1/responses` answers an SSE stream, so
+    /// this stays `None` there and [`Exchange::frames`] is the accessor.
     response: Option<Value>,
 }
 
 impl Exchange {
     fn header(&self, name: &str) -> Option<&str> {
         self.headers.get(name).map(String::as_str)
+    }
+
+    /// The SSE `data:` payloads of this response, parsed, in arrival order.
+    ///
+    /// Parsed on demand rather than at capture time because the recorder is a
+    /// transport-level thing and SSE framing is a property of one route: a
+    /// recorder that pre-parsed frames would have to know which paths stream,
+    /// which is exactly the coupling F11's fix was supposed to remove.
+    fn frames(&self) -> Vec<Value> {
+        self.response_text
+            .as_deref()
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|payload| serde_json::from_str::<Value>(payload).ok())
+            .collect()
+    }
+
+    /// The first SSE frame whose `type` is `kind`.
+    fn frame(&self, kind: &str) -> Option<Value> {
+        self.frames()
+            .into_iter()
+            .find(|frame| frame["type"].as_str() == Some(kind))
+    }
+
+    /// The `usage` object this response reported on the wire.
+    ///
+    /// The one the *client* reads: codex folds `response.completed.usage` into
+    /// `last_token_usage`, replacing it, and that is what drives its compaction
+    /// gate. Since F03 it is deliberately not the same number the log books for
+    /// the same turn, so a test asking "what did the client learn" has to read
+    /// the wire and a test asking "what did this cost" has to read the log.
+    fn wire_usage(&self) -> Option<Value> {
+        self.frame("response.completed")
+            .map(|frame| frame["response"]["usage"].clone())
+    }
+
+    /// The headers as a failure message should print them: credential-bearing
+    /// values replaced by their length.
+    ///
+    /// Under `RoundhouseKey` every captured bearer is a key this test minted
+    /// seconds earlier, so printing it whole cost nothing. `ForwardedOpenAiLogin`
+    /// (F12) is the first fixture where `Authorization` carries something that
+    /// is not ours, and although *this* seat is a hermetic constant compiled
+    /// into the file, the shape of the assertion is what a later fixture holding
+    /// a real one would copy. Redacting to a length keeps the diagnostic — "the
+    /// header arrived, and was this big" — which is the whole reason a failure
+    /// message prints headers at all.
+    fn redacted_headers(&self) -> BTreeMap<String, String> {
+        self.headers
+            .iter()
+            .map(|(name, value)| {
+                let value = match name.as_str() {
+                    "authorization" | TURN_KEY_HEADER | "chatgpt-account-id" => {
+                        format!("<{} bytes redacted>", value.len())
+                    }
+                    _ => value.clone(),
+                };
+                (name.clone(), value)
+            })
+            .collect()
     }
 }
 
@@ -324,6 +443,22 @@ impl Recorder {
                     == Some(method)
             })
             .collect()
+    }
+
+    /// The `/v1/responses` exchange whose stream emitted a synthetic call named
+    /// `name`.
+    ///
+    /// Found by frame content rather than by index into [`Self::to`]: "the
+    /// third request" is an assumption about how many requests the client
+    /// chose to make, and a client retry — or a second turn inside one process
+    /// — silently moves it. The emitted call is what makes a turn the steered
+    /// one, so that is what this looks for.
+    fn emitting_a_call(&self, name: &str) -> Option<Exchange> {
+        self.to("/v1/responses").into_iter().find(|exchange| {
+            exchange
+                .frame("response.output_item.done")
+                .is_some_and(|frame| frame["item"]["name"].as_str() == Some(name))
+        })
     }
 
     /// A one-line rendering of every exchange, for a failure message.
@@ -380,18 +515,20 @@ async fn record(State(recorder): State<Recorder>, request: Request, next: Next) 
         .await;
 
     let status = response.status().as_u16();
-    let (response_parts, response_body) = response.into_parts();
-    let (captured, response_body) = if path == MCP_MOUNT_PATH {
-        let bytes = axum::body::to_bytes(response_body, 4 * 1024 * 1024)
-            .await
-            .expect("the MCP service answers one bounded document per POST");
-        (
-            serde_json::from_slice::<Value>(&bytes).ok(),
-            Body::from(bytes),
-        )
-    } else {
-        (None, response_body)
-    };
+    let (mut response_parts, response_body) = response.into_parts();
+    // Every path, since F11: see `Exchange::response_text` for what buffering
+    // the streaming one costs and what it bought.
+    let bytes = axum::body::to_bytes(response_body, 32 * 1024 * 1024)
+        .await
+        .expect("a loopback response body is readable");
+    // The body just went from streamed to definite-length. Any framing header
+    // the streaming response carried would now describe a body that no longer
+    // exists, and hyper would serialize the mismatch rather than reconcile it —
+    // a corrupt response the child would report as a protocol error, which
+    // reads like a roundhouse bug and is not one.
+    response_parts.headers.remove("transfer-encoding");
+    response_parts.headers.remove("content-length");
+    let text = String::from_utf8(bytes.to_vec()).ok();
 
     recorder
         .exchanges
@@ -403,9 +540,10 @@ async fn record(State(recorder): State<Recorder>, request: Request, next: Next) 
             headers,
             body: parsed,
             status,
-            response: captured,
+            response: serde_json::from_slice::<Value>(&bytes).ok(),
+            response_text: text,
         });
-    Response::from_parts(response_parts, response_body)
+    Response::from_parts(response_parts, Body::from(bytes))
 }
 
 // ---------------------------------------------------------------------------
@@ -622,7 +760,10 @@ impl Rig {
 
         let base_url = format!("http://{addr}/v1");
         let catalog_path = root.join("home/models.json");
-        let mut launch = CodexLaunch::new(base_url.clone(), &catalog_path);
+        // Fallible since F13; the rig's inputs are the documented-correct
+        // shape, so a refusal here means the rig built them wrong.
+        let mut launch = CodexLaunch::new(base_url.clone(), &catalog_path)
+            .expect("the rig's own base_url and catalog path are the correct shape");
         if auth == CodexAuthKind::ForwardedOpenAiLogin {
             launch = launch.forwarding_openai_login();
             // F12: the one file this suite's module doc ("no `auth.json` is
@@ -805,11 +946,26 @@ impl Rig {
 
     /// A fork is silent from the client's side, so the only way to catch one is
     /// to ask the store whether generation one exists at all.
+    ///
+    /// Two assertions rather than one, because they fail on different evidence.
+    /// The first reads the binding: `Conversations::fork` moves `latest` to the
+    /// forked id, so a session id that still carries no generation suffix is
+    /// this node's own statement that nothing rebound. The second reads the
+    /// store, which does not depend on the binding table being right about
+    /// itself.
     async fn assert_never_forked(&self) {
-        let forked = SessionId::new(format!("{}#g1", self.session()));
+        let session = self.session();
+        let probe = fork_probe(&session);
+        assert_eq!(
+            session,
+            base_session(&session),
+            "the client's resend must have matched its prefix: this principal's latest session \
+             is `{session}`, and a generation suffix means the prefix check refused the claim \
+             and rebound the conversation"
+        );
         assert!(
-            self.store.last_seq(&forked).await.is_err(),
-            "the client's resend must have matched its prefix: `{forked}` exists, which means \
+            self.store.last_seq(&probe).await.is_err(),
+            "the client's resend must have matched its prefix: `{probe}` exists, which means \
              the prefix check refused the claim and rebound the conversation"
         );
     }
@@ -902,6 +1058,34 @@ impl Rig {
     fn clean(&self) {
         let _ = std::fs::remove_dir_all(&self.root);
     }
+}
+
+/// The generation-zero id behind `session`, whatever generation it is at.
+///
+/// `conversations::bound_session` spells generation zero as the namespaced key
+/// verbatim and every later generation as `{key}#g{n}` — pinned by
+/// `conversations::tests::a_reader_and_a_turn_resolve_one_cache_key_to_one_session`
+/// — so the suffix *is* the fork, and stripping it recovers the stem. Sound
+/// here because the stem is `{project}/{user}/{uuid}` and a UUID carries no
+/// `#`: there is no key this can truncate by accident.
+fn base_session(session: &SessionId) -> SessionId {
+    match session.as_str().split_once("#g") {
+        Some((base, _)) => SessionId::new(base),
+        None => session.clone(),
+    }
+}
+
+/// The session id a first fork of `session`'s conversation would have created.
+///
+/// A free function rather than a method on [`Rig`] so the guard it powers can
+/// be tested without a rig, a binary, or a socket — F02 was that the guard's
+/// arithmetic was vacuous, and an arithmetic no test can evaluate is exactly
+/// how that survived. Derived from [`base_session`] and never from
+/// `Conversations::latest`: a fork moves `latest` to the forked id *before*
+/// any assertion runs, so appending `#g1` to it asks about `key#g1#g1`, which
+/// nothing ever creates and whose absence therefore says nothing.
+fn fork_probe(session: &SessionId) -> SessionId {
+    SessionId::new(format!("{}#g1", base_session(session)))
 }
 
 /// Build the exact `codex` child command `Rig::spawn` runs, without running it.
@@ -1330,7 +1514,7 @@ async fn a_resumed_exec_continues_the_same_roundhouse_session() {
 /// deferred its MCP reconnect further could plausibly drop it from the same
 /// process lifetime entirely.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "F15: needs the real codex binary: --features e2e-codex -- --include-ignored; ROUNDHOUSE_TEST_CODEX_BIN overrides PATH"]
+#[ignore = "needs the real codex binary: --features e2e-codex -- --include-ignored; ROUNDHOUSE_TEST_CODEX_BIN overrides PATH"]
 async fn a_key_revoked_between_runs_fails_the_next_turn_and_leaves_no_half_written_one() {
     let rig = Rig::start("revoke").await;
 
@@ -1361,6 +1545,23 @@ async fn a_key_revoked_between_runs_fails_the_next_turn_and_leaves_no_half_writt
         second.stderr
     );
 
+    // The positive half, and the reason the negative one above is not enough: a
+    // child that died before sending anything — a bad binary, a bind failure, a
+    // deadline kill — also completes no turn, and would satisfy an
+    // absence-of-completion check while proving nothing about revocation. This
+    // asserts the client *saw* the refusal and attributed it to the turn.
+    // Matched on codex's own log line (`codex_core::session::turn: Turn error:
+    // unexpected status 401 Unauthorized: …`) plus the refusal's message, which
+    // is roundhouse's: a client that logged a bare 401 without our text would
+    // mean the tombstone's own explanation never reached the operator watching
+    // the agent.
+    assert!(
+        second.stderr.contains("401") && second.stderr.contains(REVOKED_KEY_MESSAGE),
+        "the revoked key's refusal must have reached codex as the turn's own error, but its \
+         stderr never named a 401 carrying `{REVOKED_KEY_MESSAGE}`:\n--- stderr\n{}",
+        second.stderr
+    );
+
     // The surface the resumed turn actually depends on: `/v1/responses` must
     // have been sent (a resumed run does not re-fetch tools before its first
     // turn, per the doc comment above) and refused by name, not merely by
@@ -1376,6 +1577,22 @@ async fn a_key_revoked_between_runs_fails_the_next_turn_and_leaves_no_half_writt
         "a revoked key must refuse the resumed turn with 401, not accept it or answer some \
          other status; recorder:\n{}",
         rig.recorder.transcript()
+    );
+    // By name, not merely by status, and on *this* surface — which needed F11's
+    // capture fix to be assertable at all. Before it, the only body this test
+    // could read was the `/mcp` reconnect's, which the refuter's own timestamps
+    // show is a consequence of the turn having already ended rather than its
+    // cause: the resumed run's outcome hangs on this response. `unknown_key`
+    // here would mean the tombstone never took effect on this node and the key
+    // was merely unrecognised, which is a different (and much weaker) claim.
+    assert_eq!(
+        last_turn
+            .response
+            .as_ref()
+            .and_then(|body| body["error"]["code"].as_str()),
+        Some(REVOKED_KEY_CODE),
+        "the turn surface's refusal must be the tombstone's own code: {:?}",
+        last_turn.response_text
     );
 
     // The MCP surface, if the client also reached it in this process: same
@@ -1396,7 +1613,7 @@ async fn a_key_revoked_between_runs_fails_the_next_turn_and_leaves_no_half_writt
                 .response
                 .as_ref()
                 .and_then(|body| body["error"]["code"].as_str()),
-            Some("revoked_key"),
+            Some(REVOKED_KEY_CODE),
             "the refusal must be the tombstone's own code, not `unknown_key`: {:?}",
             mcp_after.response
         );
@@ -1540,7 +1757,7 @@ async fn a_real_codex_binary_completes_the_mcp_handshake_against_our_server() {
 /// `codex_launch.rs` before this test existed — sends what its generated
 /// config says it will.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "F12: needs the real codex binary: --features e2e-codex -- --include-ignored; ROUNDHOUSE_TEST_CODEX_BIN overrides PATH"]
+#[ignore = "needs the real codex binary: --features e2e-codex -- --include-ignored; ROUNDHOUSE_TEST_CODEX_BIN overrides PATH"]
 async fn a_forwarded_login_sends_the_seat_and_our_key_on_the_same_request() {
     let rig = Rig::start_forwarding("forwarded").await;
     let run = rig.exec("Say the word alpha and stop.").await;
@@ -1557,13 +1774,13 @@ async fn a_forwarded_login_sends_the_seat_and_our_key_on_the_same_request() {
         turn.header("authorization"),
         Some(format!("Bearer {SEAT_ACCESS_TOKEN}").as_str()),
         "the forwarded stanza's Authorization must carry the client's own seat: {:?}",
-        turn.headers
+        turn.redacted_headers()
     );
     assert_eq!(
         turn.header(TURN_KEY_HEADER),
         Some(rig.secret.as_str()),
         "and roundhouse's own key must still arrive, in its own header: {:?}",
-        turn.headers
+        turn.redacted_headers()
     );
     assert_ne!(
         turn.header("authorization"),
@@ -1572,6 +1789,87 @@ async fn a_forwarded_login_sends_the_seat_and_our_key_on_the_same_request() {
          'preferred' from 'only option present' because both headers there carry the same \
          value (see this test's own module doc)"
     );
+
+    // ---- and the key that arrived is the one that resolved the principal ----
+    //
+    // Configured mode namespaces every session as `{project}/{user}/{uuid}`, so
+    // the id the surface minted *is* the statement of which membership
+    // authenticated. The claim is specific to this fixture: the only `rh_*`
+    // credential on the request rode `TURN_KEY_HEADER`, and `Authorization`
+    // carried a foreign bearer that resolves to no membership at all — so a
+    // session named for this tenant can only have come from the dedicated
+    // header being read.
+    let session = rig.session();
+    assert!(
+        session.as_str().starts_with(&format!("{PROJECT}/{USER}/")),
+        "the dedicated header must have resolved the principal even though Authorization \
+         belonged to the client's own upstream, but the session is `{session}`"
+    );
+
+    // ---- and the seat itself is in none of our records ---------------------
+    //
+    // The forwarded credential is the client's, not ours: it exists to be
+    // passed upstream, and every place roundhouse *keeps* something is a place
+    // it must not appear. Swept rather than reasoned about, because the
+    // pass-through stanza is the first shape in this system where a credential
+    // roundhouse never minted travels through it — and "we do not store it" is
+    // the claim §3 rests on. The `config.toml` is swept too: the generator must
+    // name the *mechanism* (a completed login in `CODEX_HOME`), never the seat,
+    // and a generator that inlined one would put it on disk world-readable.
+    let events = rig
+        .store
+        .read_events(&session, 0, 1024)
+        .await
+        .expect("the session exists");
+    let log = format!("{events:?}");
+    // The control, and the reason the sweep below is not tautological: a
+    // rendering that reached no item text at all would report the seat absent
+    // for the wrong reason, and pass forever. `ANSWER` is text this deployment
+    // committed to the log on this run, so finding it proves the haystack is
+    // the one the needle would be in.
+    assert!(
+        log.contains(ANSWER),
+        "control failed: the swept rendering must reach committed item text, or its silence \
+         about the seat says nothing"
+    );
+    assert!(
+        !log.contains(SEAT_ACCESS_TOKEN),
+        "the forwarded seat must never be captured into the session log: it is the client's \
+         credential passing through, and the log is a durable record an operator reads"
+    );
+    let config = std::fs::read_to_string(rig.root.join("home/config.toml"))
+        .expect("the generated config is on disk");
+    assert!(
+        config.contains("[mcp_servers."),
+        "control failed: the file read must be the generated config, or its silence about the \
+         seat says nothing"
+    );
+    assert!(
+        !config.contains(SEAT_ACCESS_TOKEN),
+        "the generated config must name the login *mechanism*, never a token: a stanza that \
+         inlined the seat would write a live credential into a file on disk"
+    );
+
+    // ---- §3 evidence: the pass-through stanza, on a real request -----------
+    //
+    // Printed rather than only asserted, because the plan's §3 describes this
+    // stanza in prose and until this test nothing had ever run it against a
+    // binary. The bearer is redacted to its length: what a reader needs from
+    // this block is that the two doors carried *different* values and which
+    // header each took, not the values themselves.
+    println!("--- M9-PASSTHROUGH-EVIDENCE ({})", rig.version);
+    println!("    stanza          : ForwardedOpenAiLogin (requires_openai_auth, no env_key)");
+    println!(
+        "    Authorization   : Bearer <{} bytes: the client's own seat, from CODEX_HOME/auth.json>",
+        SEAT_ACCESS_TOKEN.len()
+    );
+    println!(
+        "    {TURN_KEY_HEADER}: <{} bytes: roundhouse's minted turn key, via env_http_headers>",
+        rig.secret.len()
+    );
+    println!("    principal       : {session}");
+    println!("    seat in session log / generated config: no / no");
+    println!("--- end M9-PASSTHROUGH-EVIDENCE");
 
     rig.clean();
 }
@@ -1747,46 +2045,82 @@ async fn a_real_codex_binary_executes_our_synthetic_tool_call_and_returns_its_ou
         println!("    judge side call {} usage: {usage:?}", index + 1);
     }
     println!("    validated turns: {:?}", rig.validation_turns().await);
+    // The one arithmetic F03 found this block gave a reader every number for
+    // and never did: the steered turn's *wire* usage — the quantity codex
+    // replaces `last_token_usage` with — against the input the very next turn
+    // is priced on. It ran at 5.0x while the wire carried the judge's usage
+    // (1147 against 5729), which is what told the client its context had
+    // collapsed. Printed and not asserted, like the rest of this block;
+    // `a_steered_turns_reported_usage_is_the_context_it_admitted` is where the
+    // relationship behind the ratio is an assertion.
+    let wire_input = rig
+        .recorder
+        .emitting_a_call("fetch_steer")
+        .and_then(|exchange| exchange.wire_usage())
+        .and_then(|usage| usage["input_tokens"].as_u64());
+    let usages = rig.response_usage().await;
+    match (wire_input, usages.get(3)) {
+        (Some(wire), Some(next)) => println!(
+            "    steered wire input vs next turn's log input: {wire} vs {} ({:.2}x)",
+            next.input_tokens,
+            next.input_tokens as f64 / wire.max(1) as f64
+        ),
+        _ => println!("    steered wire input vs next turn's log input: not both observed"),
+    }
     println!("    final agent message: {:?}", third.last_message.trim());
     println!("--- end M9-USAGE-EVIDENCE");
 
     rig.clean();
 }
 
-/// §10.2 evidence, made concrete: F03 finds that the M9-USAGE-EVIDENCE block
-/// above prints codex's *cumulative* `total_token_usage` (the client's own
-/// `turn.completed.usage`) as if it reassured a reader about the compaction
-/// gate, when the gate and `get_context_remaining` are actually driven by
-/// `last_token_usage` — a value the pinned client *replaces*, never sums, on
-/// every response (`codex-rs/protocol/src/protocol.rs:2122-2124`
-/// `append_last_usage`; `codex-rs/core/src/context_manager/history.rs:415-419`
-/// `get_total_token_usage`, which despite its name reads
-/// `last_token_usage.total_tokens`).
+/// §10.2, ruled: **the wire and the ledger answer different questions and no
+/// longer share one number.**
 ///
-/// A steered turn's completion carries the judge's usage, not a measure of
-/// the history it stood in for (`Session::complete_with_item`'s "the usage is
-/// the interjection's"), so on the real client that usage becomes the new
-/// `last_token_usage` — collapsing it — for a turn about to resend the whole
-/// growing conversation to fulfil the steer.
+/// F03 found what sharing it cost. Codex folds `response.completed.usage` into
+/// `last_token_usage`, *replacing* it rather than summing
+/// (`codex-rs/protocol/src/protocol.rs:2122-2125` at `e363b08`), and that value
+/// — not the cumulative `total_token_usage` the evidence block prints — is what
+/// drives auto-compaction and `get_context_remaining`
+/// (`core/src/context_manager/history.rs:415-419`, which despite its name reads
+/// `last_token_usage`). A steered turn used to report the judge's usage there,
+/// measured at 1147 tokens against a fulfilling turn whose real input was 5729:
+/// the client was told its context had collapsed on the very turn before it
+/// resent the largest history the session had ever held.
 ///
-/// This asserts the relationship the "reassuring" reading implies: that the
-/// steered turn's reported usage is at least in the neighbourhood of what the
-/// very next real turn actually costs. It is not — measured on this box, the
-/// steered turn (judge side call 1's usage, exactly) reports total 1147
-/// tokens while the fulfilling turn's real input is 5666, a ~4.9x gap — which
-/// is why the assertion is written as a red line rather than a green one.
-#[ignore = "F03: the steered turn's booked usage (the judge's, exactly — asserted \
-            below) understates the fulfilling turn's real input by ~5x on this \
-            box; codex's compaction gate reads last_token_usage \
-            (core/context_manager/history.rs:415-419), which this usage replaces \
-            wholesale, not the cumulative total_token_usage the removed evidence \
-            block printed — needs the real codex binary: --features e2e-codex -- \
-            --include-ignored; ROUNDHOUSE_TEST_CODEX_BIN overrides PATH"]
+/// The ruling moved the *wire* number and left the ledger alone, so this test
+/// reads both and asserts they now disagree in the intended direction:
+///
+/// - the **log** still books the judge's usage on the steered turn (the
+///   dashboard's total stays equal to the sum of its rows — asserted first,
+///   because everything below is only interesting if the ledger did not move);
+/// - the **wire** reports the turn's context contribution, and it does so in
+///   the same tokenizer over the same rendering that prices the next turn.
+///
+/// That makes the relationship an equality rather than a band:
+///
+/// ```text
+/// wire_input(steered) + render(call) + render(result) == log_input(fulfilling)
+/// ```
+///
+/// because turn 4's prompt is exactly turn 3's admitted conversation plus the
+/// call this deployment emitted and the output the client brought back. A
+/// tolerance would have hidden the two ways this can be wrong — a tokenizer
+/// disagreement and a missing item look identical inside a band — so a miss
+/// prints its residual instead, which names what else turn 4 carried.
+///
+/// The equality is exact here because this deployment's tokenizer is
+/// [`ByteTokenizer`] (one token per byte) and `ContextAssembler` concatenates
+/// renders with no separator, so `render().len()` *is* the token count. On a
+/// BPE that merges across an item boundary it would be an equality up to the
+/// merge, which is why the sum is taken over the same per-item renders the
+/// assembler buffers rather than over a joined string.
+#[ignore = "needs the real codex binary: --features e2e-codex -- --include-ignored; ROUNDHOUSE_TEST_CODEX_BIN overrides PATH"]
 #[tokio::test]
-async fn a_steered_turns_reported_usage_understates_the_next_turns_real_input() {
+async fn a_steered_turns_reported_usage_is_the_context_it_admitted() {
     let rig = Rig::start("usage-evidence").await;
     let [_first, _second, _third] = rig.drive_to_a_steer().await;
 
+    // ---- the ledger, which the ruling deliberately did not move ------------
     let responses = rig.response_usage().await;
     assert_eq!(
         responses.len(),
@@ -1794,33 +2128,89 @@ async fn a_steered_turns_reported_usage_understates_the_next_turns_real_input() 
         "turn 1, turn 2, the steer deposit (turn 3), and the fulfilling turn \
          (turn 4): {responses:#?}"
     );
-    let steered = &responses[2];
+    let booked = &responses[2];
     let fulfilling = &responses[3];
-
     let side_calls = rig.side_call_usage().await;
     assert_eq!(
-        *steered, side_calls[0],
-        "the steered turn's booked usage must be exactly the judge's — it is \
-         not a measure of the conversation the steer stood in for, which is \
-         the premise the mismatch below rests on"
+        *booked, side_calls[0],
+        "the steered turn's *booked* usage must still be exactly the judge's: the ruling \
+         changed what the client is told, not what the deployment spent, and a dashboard \
+         whose turn row stopped equalling its side-call row would be the worse bug"
     );
 
-    // The relationship a reader who takes the display accumulator as
-    // reassuring would expect: that a steered turn's reported cost is roughly
-    // in line with what the conversation actually costs one turn later. This
-    // is the line that must go red for F03 to be more than a reading of
-    // codex's source — it is the same gap `last_token_usage` opens on the
-    // real client, made visible without needing codex-core as a dependency.
-    assert!(
-        fulfilling.input_tokens <= steered.total().saturating_mul(2),
-        "F03: the fulfilling turn's real input ({} tokens) is {:.1}x the \
-         steered turn's reported usage ({} tokens) -- on the real client this \
-         is exactly the quantity that replaces last_token_usage between the \
-         two turns, so a compaction gate reading last_token_usage sees the \
-         small number, not the real one, for the turn most likely to need it",
+    // ---- the wire, which it did -------------------------------------------
+    let steered = rig
+        .recorder
+        .emitting_a_call("fetch_steer")
+        .unwrap_or_else(|| {
+            panic!(
+                "one /v1/responses stream must have emitted the synthetic call:\n{}",
+                rig.recorder.transcript()
+            )
+        });
+    let wire = steered.wire_usage().unwrap_or_else(|| {
+        panic!(
+            "the steered response must have completed: {:?}",
+            steered.response_text
+        )
+    });
+    let wire_input = wire["input_tokens"]
+        .as_u64()
+        .expect("`input_tokens` is what codex folds into last_token_usage");
+    assert_ne!(
+        wire["total_tokens"].as_u64(),
+        Some(booked.total()),
+        "the wire must no longer report the judge's number — that equality *is* F03: it is \
+         what told a real client its context had collapsed. Wire usage: {wire}"
+    );
+    assert_eq!(
+        wire["input_tokens_details"]["cached_tokens"].as_u64(),
+        Some(0),
+        "nothing was dispatched, so nothing was served from a prefix cache; a cached count \
+         here would understate what the next turn has to prefill"
+    );
+
+    // ---- and the two are one tokenizer over one rendering ------------------
+    let items = rig.items().await;
+    let call = items
+        .iter()
+        .find(|item| matches!(item.content, ItemContent::ToolCall { .. }))
+        .expect("the steered turn emitted a call");
+    let result = items
+        .iter()
+        .find(|item| matches!(item.content, ItemContent::ToolResult { .. }))
+        .expect("the client brought its output back");
+    // `render().len()`, not a second tokenizer: `ByteTokenizer::encode` is
+    // `text.as_bytes()`, so this is `Engine::admitted_input_tokens`'s own
+    // arithmetic spelled without reaching into the engine for it.
+    let call_tokens = call.render().len() as u64;
+    let result_tokens = result.render().len() as u64;
+    let predicted = wire_input + call_tokens + result_tokens;
+
+    println!("--- M9-USAGE-RULED ({})", rig.version);
+    println!("    wire input (steered turn) : {wire_input}");
+    println!("    + emitted call render     : {call_tokens}");
+    println!("    + tool result render      : {result_tokens}");
+    println!("    = predicted next input    : {predicted}");
+    println!(
+        "    log input (fulfilling)    : {}",
+        fulfilling.input_tokens
+    );
+    println!(
+        "    ratio wire:next           : {:.2}x (was 5.0x when the wire carried the judge's)",
+        fulfilling.input_tokens as f64 / wire_input.max(1) as f64
+    );
+    println!("    booked (judge) on turn 3  : {booked:?}");
+    println!("--- end M9-USAGE-RULED");
+
+    assert_eq!(
+        predicted,
         fulfilling.input_tokens,
-        fulfilling.input_tokens as f64 / steered.total().max(1) as f64,
-        steered.total(),
+        "the number the client was told and the number the next turn is priced on must be one \
+         tokenizer over one rendering. Residual {} tokens names what else turn 4's prompt \
+         carried — an item neither `rig.items()` nor this arithmetic accounted for — and is \
+         worth reading rather than absorbing into a tolerance",
+        fulfilling.input_tokens as i64 - predicted as i64
     );
 
     rig.clean();
@@ -2042,13 +2432,19 @@ async fn the_next_turn_reflects_the_correction() {
     // physically appear is the `/mcp` response that carries the steer, since
     // that payload is the thing `render_directive` built. A sweep that read
     // only requests would be checking the client's honesty rather than ours.
+    //
+    // The response half sweeps the raw captured text and not the parsed
+    // `Exchange::response`, since F11: `/v1/responses` answers SSE, which does
+    // not parse as one document, and a `SteerAction::Halt`'s reason lands
+    // *only* there — so the parsed-only sweep was silently skipping the one
+    // response body a leak could ride out on. `the_injection_sweep_can_see_a_
+    // halts_reason_in_the_v1_responses_body` is what keeps that capture honest.
     for exchange in rig.recorder.all() {
         for (half, document) in [
-            ("request", &exchange.body),
-            ("response", &exchange.response),
+            ("request", exchange.body.as_ref().map(Value::to_string)),
+            ("response", exchange.response_text.clone()),
         ] {
-            let Some(document) = document else { continue };
-            let rendered = document.to_string();
+            let Some(rendered) = document else { continue };
             assert!(
                 !rendered.contains(JUDGE_PROSE),
                 "the judge's own prose must never leave the log: found it in the \
@@ -2102,28 +2498,30 @@ async fn the_next_turn_reflects_the_correction() {
     rig.clean();
 }
 
-/// F11: the injection-boundary sweep in `the_next_turn_reflects_the_correction`
-/// reads "every captured document, request and response alike" and asserts
-/// `JUDGE_PROSE` is absent from both halves of every exchange. That is true of
-/// what is captured — but `record` only ever parses a response body for
-/// [`MCP_MOUNT_PATH`] (see the doc comment on `Exchange::response`), so a
+/// F11's guard: the injection-boundary sweep in
+/// `the_next_turn_reflects_the_correction` reads "every captured document,
+/// request and response alike" and asserts `JUDGE_PROSE` is absent from both
+/// halves of every exchange. That was true of what was captured — but `record`
+/// used to parse a response body for [`MCP_MOUNT_PATH`] only, so a
 /// `SteerAction::Halt`'s reason — committed as the assistant text of the very
-/// `/v1/responses` response that ends the run — is never captured at all, and
-/// unlike a `Steer`, there is no next turn to resend it one turn late.
+/// `/v1/responses` response that ends the run — was never captured at all, and
+/// unlike a `Steer`, there is no next turn to resend it one turn late. The
+/// sweep was therefore accurate about its inputs and blind to the one path a
+/// Halt's prose can take.
 ///
-/// This does not need the real codex binary: it drives the actual `record`
-/// middleware, defined in this file, against a synthetic `/v1/responses`
-/// route that answers with `JUDGE_PROSE` in its body — standing in for a
-/// Halt's rendered directive — and shows the recorder never sees it.
+/// **Live, not gated**, and that is the point: it needs no codex binary,
+/// because the defect was in `record`'s capture boundary rather than in
+/// anything a real client does. It drives the actual middleware — the same
+/// function `Rig::start_as` layers over the merged app — against a synthetic
+/// `/v1/responses` route answering with `JUDGE_PROSE`, standing in for a
+/// Halt's rendered directive.
+///
+/// The assertion reads the raw captured text rather than the parsed
+/// [`Exchange::response`]: the claim is "the body was captured at all", and a
+/// route that answered a bare string would otherwise satisfy the guard by
+/// failing to parse rather than by being seen.
 #[tokio::test]
-#[ignore = "F11: record() only parses a response body for MCP_MOUNT_PATH (codex_e2e.rs:325-338), \
-            so a Halt's reason committed as the /v1/responses body is never captured and the \
-            injection-boundary sweep in `the_next_turn_reflects_the_correction` cannot see it; \
-            the mitigation documented on that test (a later turn resends the text) does not apply \
-            to Halt, which ends the run. Fix: narrow the sweep's doc claim to name Halt as \
-            structurally uncovered, or extend `record` to capture bounded non-streaming \
-            /v1/responses bodies (non-stream requests only) so a real e2e Halt test can assert on it."]
-async fn the_injection_sweep_cannot_see_a_halts_reason_in_the_v1_responses_body() {
+async fn the_injection_sweep_can_see_a_halts_reason_in_the_v1_responses_body() {
     use axum::routing::post;
     use tower::ServiceExt;
 
@@ -2162,20 +2560,79 @@ async fn the_injection_sweep_cannot_see_a_halts_reason_in_the_v1_responses_body(
         .expect("record() must have captured the request that just went through");
 
     // The claim under test: a response body containing JUDGE_PROSE on
-    // `/v1/responses` is captured (so the sweep could catch a Halt's leaked
-    // reason). Today it is not — `record` never parses this path's response
-    // — so this assertion fails, which is F11's mechanism made concrete.
+    // `/v1/responses` is captured, so the sweep *can* catch a Halt's leaked
+    // reason. Mutating `record` back to `if path == MCP_MOUNT_PATH` takes this
+    // line red, which is what makes the sweep's claim load-bearing again.
     assert!(
         exchange
-            .response
-            .as_ref()
-            .is_some_and(|body| body.to_string().contains(JUDGE_PROSE)),
+            .response_text
+            .as_deref()
+            .is_some_and(|body| body.contains(JUDGE_PROSE)),
         "record() must capture a /v1/responses response body containing the \
          judge's prose so `the_next_turn_reflects_the_correction`'s sweep can \
-         see it, but the captured exchange's `response` field was {:?}. This is \
-         exactly the gap F11 names: a Halt's reason lands only in this body, on \
-         the one path `record` never parses.",
-        exchange.response
+         see it, but the captured exchange's body was {:?}. This is exactly the \
+         gap F11 names: a Halt's reason lands only in this body, on the one path \
+         `record` used not to parse.",
+        exchange.response_text
+    );
+}
+
+/// F02's guard: the fork probe `Rig::assert_never_forked` builds must be
+/// derived from something a fork does **not** move.
+///
+/// Live and binary-free for the same reason the F11 guard above is: the defect
+/// was fixture arithmetic, not client behaviour. It drives the rig's own
+/// [`fork_probe`] — the exact function the rig calls, not a copy of it, which
+/// is what stops this guard from drifting away from the assertion it guards —
+/// against a real `Conversations` fork.
+///
+/// The original guard read `SessionId::new(format!("{}#g1", self.session()))`.
+/// `Rig::session()` is `Conversations::latest(principal)`, and
+/// `Conversations::fork` writes the *new* id into `latest` before returning it,
+/// so after a real fork the guard probed `key#g1#g1` — an id nothing in the
+/// system ever constructs — found it absent, and called that clean. It could
+/// not fail for the reason it named.
+#[tokio::test]
+async fn the_fork_probe_names_the_session_a_fork_would_have_created() {
+    let principal = Principal::new(PROJECT, USER);
+    let key = format!("{PROJECT}/{USER}/main");
+    let conversations = Conversations::new();
+    let store = MemoryStore::new();
+
+    let zero = conversations.bind(&principal, &key);
+    store
+        .create_session(&zero, "policy")
+        .await
+        .expect("generation zero is fresh");
+    assert_eq!(
+        fork_probe(&zero).as_str(),
+        format!("{key}#g1"),
+        "before any fork the probe must already name the id a fork would create"
+    );
+
+    // The fork `responses_api` performs when a client's resend disagrees with
+    // the log. `latest` now answers `key#g1`, which is what made the old
+    // arithmetic vacuous.
+    let forked = conversations.fork(&principal, &key);
+    store
+        .create_session(&forked, "policy")
+        .await
+        .expect("the fork's session is newly created");
+    let after = conversations
+        .latest(&principal)
+        .expect("a bound principal has a latest session");
+    assert_eq!(after, forked, "control: the fork moved `latest`");
+    assert_eq!(
+        fork_probe(&after),
+        forked,
+        "the probe must name the fork that happened — deriving it by appending \
+         `#g1` to an already-forked id asks about `{key}#g1#g1`, which nothing \
+         ever creates, so the store's `Err` says nothing about forking"
+    );
+    assert!(
+        store.last_seq(&fork_probe(&after)).await.is_ok(),
+        "and the store must then hold it, which is the ground truth \
+         `assert_never_forked` turns into a failure"
     );
 }
 
@@ -2202,7 +2659,7 @@ async fn the_injection_sweep_cannot_see_a_halts_reason_in_the_v1_responses_body(
 /// on every call, so its account of what M9 closed is incomplete rather than
 /// wrong.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "F09: doc-accuracy only, not a behavioral defect — needs the real codex binary: --features e2e-codex -- --include-ignored; ROUNDHOUSE_TEST_CODEX_BIN overrides PATH"]
+#[ignore = "needs the real codex binary: --features e2e-codex -- --include-ignored; ROUNDHOUSE_TEST_CODEX_BIN overrides PATH"]
 async fn codexs_meta_thread_id_rides_every_tools_call_and_is_never_read() {
     let rig = Rig::start("meta-thread-id").await;
     let [_first, _second, third] = rig.drive_to_a_steer().await;

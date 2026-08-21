@@ -418,19 +418,38 @@ impl SessionState {
                             self.open_steers.insert(call_id.clone(), event.at_ms);
                         }
                     }
-                    ItemContent::ToolResult { call_id, .. } => {
+                    ItemContent::ToolResult { call_id, output } => {
                         // Keyed on the call id and not on "a result arrived":
                         // an agent runs its own tools between our turns, and
                         // closing on any of those would report a steer
                         // fulfilled that nobody answered.
                         if self.open_steers.remove(call_id).is_some() {
-                            // Which turn closed it, for the trigger's
-                            // hysteresis. The removal above is what the
-                            // question is really about, and asking `is a steer
-                            // open` at the seam would answer `no` on exactly
-                            // this turn — the input is committed before the
-                            // seam runs.
-                            self.steer_fulfilled_on_turn = Some(self.turn_index);
+                            // Bookkeeping and hysteresis are two questions, and
+                            // a cancelled call answers them differently (F05).
+                            // The steer is closed either way — the call will
+                            // never be answered now, and leaving it open would
+                            // make an abandoned steer look permanently
+                            // in-flight. But the *hysteresis* exists to stop
+                            // the turn that delivers a correction re-triggering
+                            // the validation that emitted it, and codex's
+                            // cancellation notice delivered no correction: the
+                            // agent saw "user cancelled MCP tool call", not the
+                            // directive. Recording that turn as the fulfilling
+                            // one suppresses judging on the one turn where
+                            // nothing was fixed, and the dashboard reads a
+                            // healthy steer loop. Letting the trigger
+                            // re-evaluate instead costs at most a re-steer,
+                            // which `consecutive_interventions` and the Halt
+                            // ladder already bound.
+                            if !crate::validate::exchange::is_undelivered_tool_result(output) {
+                                // Which turn closed it, for the trigger's
+                                // hysteresis. The removal above is what the
+                                // question is really about, and asking `is a
+                                // steer open` at the seam would answer `no` on
+                                // exactly this turn — the input is committed
+                                // before the seam runs.
+                                self.steer_fulfilled_on_turn = Some(self.turn_index);
+                            }
                         }
                     }
                     ItemContent::Text { .. } => {}

@@ -580,22 +580,21 @@ mod tests {
         );
     }
 
-    /// F04 (review finding): a real codex client prepends a
-    /// `Wall time: N.NNNN seconds\nOutput:` header (verbatim, per
-    /// codex-rs `core/src/tools/context.rs::McpToolOutput::response_payload`,
-    /// pin 6344a65 lines ~124-126) to every MCP tool result before it is
-    /// echoed back as the `function_call_output` this canonicalizes into an
-    /// `Exchange`. `NoProgressRepeat::detect` hashes the *whole* output
-    /// string, so four textually-identical tool answers become four
-    /// different hashes purely from the wall-clock jitter in that header —
-    /// the same false-progress shape the adjacent test proves this signal is
-    /// supposed to reject, except here the "different output" is an
-    /// artifact of the client's wire wrapper, not real progress.
+    /// F04: the same loop, seen through a real codex client's wrapper.
+    ///
+    /// Codex prepends `Wall time: N.NNNN seconds\nOutput:` to every MCP tool
+    /// result before echoing it back as the `function_call_output` this
+    /// canonicalizes into an `Exchange` (codex-rs
+    /// `core/src/tools/context.rs::McpToolOutput::response_payload`, lines
+    /// 124-126, identical at `e363b08` and pin `6344a65`). Hashing the whole
+    /// stored string turned four textually-identical answers into four
+    /// different hashes purely from wall-clock jitter — the exact
+    /// false-progress shape the adjacent test proves this signal rejects,
+    /// except the "different output" was the client's wrapper and not
+    /// progress. `Exchange::output_hash` now hashes
+    /// `exchange::tool_output_body`, so the wrapper is invisible to the
+    /// comparison and the stored item stays verbatim.
     #[test]
-    #[ignore = "F04: NoProgressRepeat hashes the whole output string, so codex's \
-                per-call `Wall time: N.NNNN seconds` wrapper (context.rs:124-126, \
-                pin 6344a65) makes four identical tool answers hash differently \
-                and the repeat never fires"]
     fn a_codex_wrapped_repeat_still_fires() {
         let signal = NoProgressRepeat {
             occurrences: 3,
@@ -624,20 +623,19 @@ mod tests {
         assert!(fact.contains("identical output 4 times"), "{fact}");
     }
 
-    /// F04 (review finding): the same codex wrapper defeats
-    /// `ToolFailureStreak`, whose failure check
-    /// (`exchange::reads_as_failure`) is anchored on the *head* of the
-    /// output string. Codex's exec-tool wrapper (`response_text`,
-    /// context.rs:449-467, pin 6344a65) puts `Chunk ID: ...` / `Wall time:
-    /// ...` / `Output:` ahead of the tool's own text unconditionally, so the
-    /// anchored `starts_with("error"|"failed"|...)` check can never see a
-    /// codex-wrapped failure marker — this is a hard "never", not a
-    /// probabilistic miss.
+    /// F04: the same streak, seen through codex's exec wrapper.
+    ///
+    /// `exchange::reads_as_failure` is anchored on the head of the output on
+    /// purpose — an unanchored scan flags every result that *mentions* an error
+    /// it had just fixed. Codex's exec wrapper (`response_text`,
+    /// context.rs:446-465) puts `Chunk ID:` / `Wall time:` / `Output:` ahead of
+    /// the tool's own text unconditionally, so against a real client the
+    /// anchored check was not a probabilistic miss but a hard never. Anchoring
+    /// on the *body* keeps the narrow test and gives it something to anchor to.
+    /// Note the two-decimal wall time here: the recogniser prefix-matches
+    /// `Wall time: ` and never parses the number, so it does not care that
+    /// upstream formats it to four.
     #[test]
-    #[ignore = "F04: ToolFailureStreak relies on exchange::reads_as_failure, which \
-                anchors on the string head; codex's `Chunk ID:`/`Wall time:`/`Output:` \
-                wrapper (context.rs:449-467, pin 6344a65) sits ahead of the marker on \
-                every real tool result, so the anchored check never matches"]
     fn a_codex_wrapped_failure_streak_still_fires() {
         let streak = ToolFailureStreak { length: 3 };
 

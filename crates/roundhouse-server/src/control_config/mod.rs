@@ -180,6 +180,23 @@ pub const TURN_KEY_HEADER: &str = "x-roundhouse-key";
 /// allocate a namespace to say it is using the default one.
 static OPEN_DIALECT: LazyLock<ClientDialect> = LazyLock::new(ClientDialect::default);
 
+/// The stem every minted secret's prefix shares: roundhouse's own key
+/// namespace.
+///
+/// The *coarser* question than [`has_valid_key_shape`], and it exists because
+/// F07 showed the two are not the same question. "Is this string in our
+/// namespace at all" separates a wrong key from somebody else's credential;
+/// "is this string well-formed" separates a wrong key from a usable one. Read
+/// together in [`ControlPlane::presented_key`], where answering the second
+/// where the first was meant is exactly the defect.
+///
+/// Not a third spelling of [`KeyKind::prefix`]: the test
+/// `every_minted_prefix_lives_in_the_key_namespace` pins that every prefix a
+/// mint can wear begins with this, so a future `rh_service_` kind is covered
+/// without an edit here and a kind spelled outside the namespace fails there
+/// rather than silently becoming unauthenticatable.
+const KEY_NAMESPACE: &str = "rh_";
+
 /// `true` for `rh_(turn|admin)_` followed by 43 base62 characters — the shape
 /// a *presented* secret must have before its hash is even looked up, so an
 /// obviously-wrong header never reaches the hash table.
@@ -893,6 +910,23 @@ impl ControlPlane {
     /// [`TURN_KEY_HEADER`]: codex copies an environment variable's value into
     /// `env_http_headers` verbatim, so what arrives there is a bare
     /// `rh_turn_…`, while `Authorization` has a scheme by definition.
+    ///
+    /// **Two levels of check on the `Authorization` fallback, and they answer
+    /// different questions** (F07). The `Bearer ` check is about that header's
+    /// own grammar: a value with no scheme is a malformed `Authorization`,
+    /// and reporting it as missing would tell a client to add a header it
+    /// sent. The [`KEY_NAMESPACE`] check is about *whose* namespace the secret
+    /// is in: a well-formed bearer that is not an `rh_` value at all is not a
+    /// wrong roundhouse key, it is somebody else's credential — in
+    /// pass-through mode, precisely the upstream seat token the deployment
+    /// forwards — and it means no roundhouse key was presented. Before this
+    /// split, a codex run whose `env_http_headers` entry had been silently
+    /// dropped got `malformed_key` naming the seat token, sending the operator
+    /// to inspect a credential that was never theirs to send instead of the
+    /// environment variable that broke. A key-shaped-but-wrong value keeps
+    /// falling through to `malformed_key`/`unknown_key`, which is what makes
+    /// this a narrowing rather than a hole: the row an operator who really did
+    /// paste a bad key lands on is unchanged.
     fn presented_key<'a>(
         &self,
         headers: &'a HeaderMap,
@@ -922,20 +956,33 @@ impl ControlPlane {
         // already sent, which is the least actionable answer in the table.
         match headers.get(AUTHORIZATION) {
             None => Ok(None),
-            Some(value) => Ok(Some(PresentedKey {
-                secret: as_str(value)?
+            Some(value) => {
+                let secret = as_str(value)?
                     .strip_prefix("Bearer ")
-                    .ok_or(AuthError::MalformedKey)?,
-                dedicated_header: false,
-            })),
+                    .ok_or(AuthError::MalformedKey)?;
+                if !secret.starts_with(KEY_NAMESPACE) {
+                    // Not a key attempt at all — see the doc above. Answered as
+                    // "nothing presented" rather than as a refusal of its own,
+                    // so the whole table keeps one row for "no roundhouse key
+                    // reached this deployment" however the request got there.
+                    return Ok(None);
+                }
+                Ok(Some(PresentedKey {
+                    secret,
+                    dedicated_header: false,
+                }))
+            }
         }
     }
 
     /// Resolve a presented secret to what it authenticates: a membership and
     /// its resolved policy, or the admin scope.
     ///
-    /// The error table (decision 3) is: no key in either header -> `MissingKey`;
-    /// present but not `rh_(turn|admin)_<43 chars>` -> `MalformedKey`;
+    /// The error table (decision 3) is: no key in either header -> `MissingKey`
+    /// (which [`Self::presented_key`] also answers for an `Authorization`
+    /// outside [`KEY_NAMESPACE`], since that is not a key this deployment was
+    /// offered); in the namespace but not `rh_(turn|admin)_<43 chars>` ->
+    /// `MalformedKey`;
     /// well-shaped but no record of its hash -> `UnknownKey`. `WrongKeyKind`
     /// is not decided here — see [`Self::turn_admission`] — because this
     /// function has no notion of which surface is asking.
@@ -1475,21 +1522,19 @@ mod tests {
         );
     }
 
+    /// F07: a dropped `env_http_headers` entry is a missing key, not a
+    /// malformed one.
+    ///
+    /// Codex's `build_header_map` omits a header silently on three paths — the
+    /// named variable unset, blank, or holding a value `HeaderValue` rejects
+    /// (a trailing newline from `$(cat key)`) — and none of them raise the
+    /// loud `EnvVar` error its `env_key` sibling raises for the identical
+    /// case. In `ForwardedOpenAiLogin` mode `env_http_headers` is the *only*
+    /// carrier of [`TURN_KEY_HEADER`] (that stanza omits `env_key` on
+    /// purpose), so any of the three produces exactly the request below: no
+    /// dedicated header, `Authorization` still carrying the caller's own
+    /// forwarded upstream bearer.
     #[test]
-    #[ignore = "F07: codex's build_header_map drops env_http_headers silently \
-                (unset var / blank var / a value HeaderValue rejects, e.g. a \
-                trailing newline from `$(cat key)`) and none of the three raise \
-                an error the way env_key's EnvVarError sibling does. In \
-                ForwardedOpenAiLogin mode env_http_headers is the only carrier \
-                of TURN_KEY_HEADER (that stanza omits env_key on purpose), so \
-                any of those three silently produces exactly this request: no \
-                TURN_KEY_HEADER, Authorization still carrying the caller's own \
-                forwarded upstream bearer. presented_key() then reads that \
-                bearer as an attempted turn key and authenticate() fails its \
-                shape check, so the operator's dropped-header misconfiguration \
-                surfaces as malformed_key -- 'inspect the key you sent' -- \
-                when no roundhouse key was sent at all. Currently red: \
-                turn_admission returns Err(MalformedKey), not Err(MissingKey)."]
     fn a_pass_through_request_that_lost_its_dedicated_header_is_not_reported_as_a_malformed_key() {
         let plane = pass_through_plane();
 
@@ -1516,6 +1561,56 @@ mod tests {
             Some(AuthError::MissingKey),
             "a lost dedicated header must not be reported as a malformed turn key"
         );
+
+        // And the refusal has to be *actionable*, which is the whole reason the
+        // row moved: it names the header codex was supposed to fill and the
+        // mechanism that drops it, so the operator looks at the variable rather
+        // than at the seat token sitting in `Authorization`.
+        let message = AuthError::MissingKey.to_string();
+        assert!(
+            message.contains(TURN_KEY_HEADER) && message.contains("env_http_headers"),
+            "the missing-key row must name the dedicated header and how codex fills it: \
+             {message}"
+        );
+
+        // CONTROL, and it is what keeps this a narrowing rather than a hole: an
+        // operator who really did paste a bad roundhouse key still lands on the
+        // rows that tell them so. The discriminator is the namespace, not the
+        // shape — `rh_` says somebody meant a roundhouse key, however wrong.
+        for (authorization, expected) in [
+            (
+                format!("Bearer {KEY_NAMESPACE}turn_tooshort"),
+                AuthError::MalformedKey,
+            ),
+            (format!("Bearer {UNKNOWN_SECRET}"), AuthError::UnknownKey),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                AUTHORIZATION,
+                authorization.parse().expect("a valid header value"),
+            );
+            assert_eq!(
+                plane.turn_admission(&headers).err(),
+                Some(expected),
+                "`{authorization}` is in roundhouse's own key namespace, so it is a key \
+                 attempt and must be judged as one"
+            );
+        }
+    }
+
+    #[test]
+    fn every_minted_prefix_lives_in_the_key_namespace() {
+        // The coarse check `presented_key` falls back on and the fine check
+        // `has_valid_key_shape` applies must not be able to disagree about what
+        // counts as "ours": a kind whose prefix fell outside [`KEY_NAMESPACE`]
+        // would mint secrets this deployment answers `missing_key` for, which
+        // reads to the operator as a key that never arrived.
+        for kind in [KeyKind::Turn, KeyKind::Admin] {
+            assert!(
+                kind.prefix().starts_with(KEY_NAMESPACE),
+                "{kind:?} mints outside the namespace the resolver recognizes"
+            );
+        }
     }
 
     #[test]

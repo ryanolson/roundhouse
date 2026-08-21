@@ -591,28 +591,26 @@ mod tests {
         );
     }
 
-    /// F10 (review, dialect.rs:15-23): a flat resend and a namespaced resend
-    /// of *the same call* do not canonicalize alike, contradicting the
-    /// dialect.rs module comment's claim that they do.
+    /// A namespace folded into `name` is part of the name, and canonicalization
+    /// does not split it back apart (F10).
     ///
-    /// `canonical_item`'s `function_call` arm only ever ignores a *separate*
-    /// `namespace` field — it never strips a namespace folded into `name`
-    /// itself. A dialect that spells the namespace into `name` (e.g. a future
-    /// flat MCP surface emitting `mcp__roundhouse__fetch_steer` with no
-    /// `namespace` key) canonicalizes to a *different* `ItemContent::ToolCall`
-    /// than `CodexResponses`'s bare `fetch_steer` + separate `namespace`
-    /// field, even though both wire items describe one call to one tool.
+    /// The corrected half of `dialect.rs`'s "why that direction" argument. That
+    /// module's earlier draft justified keeping the namespace out of the log by
+    /// claiming a namespaced resend and a flat resend already arrive as one
+    /// canonical item, because `canonical_item` ignores `namespace` and `id` on
+    /// the way in. It ignores a *separate* `namespace` field — which is what
+    /// makes `CodexResponses`'s own resend round-trip, asserted directly above
+    /// — and nothing more. No dialect emits the flat spelling today, so nothing
+    /// is broken; what was wrong was the reason, and a reason that does not hold
+    /// is what gets a future change waved through.
+    ///
+    /// Pinned as the divergence rather than deleted with the prose, because the
+    /// day a flat variant lands this is the assertion that has to be revisited
+    /// deliberately: making it pass means teaching `canonical_item` to split a
+    /// flat name apart, and that is a wire-layer change no dialect variant makes
+    /// the compiler ask for.
     #[test]
-    #[ignore = "F10: dialect.rs's comment claims a namespaced resend and a \
-                flat resend of the same call canonicalize alike because \
-                canonical_item ignores namespace/id on the way in; that is \
-                only true of a separate `namespace` field. A flat dialect \
-                that folds the namespace into `name` itself canonicalizes to \
-                a different name, so the two resends fork. No dialect does \
-                this today (v1 has one arm), so nothing is wrong in behavior \
-                yet, but the comment's justification does not hold for the \
-                flat dialect it names."]
-    fn a_flat_and_a_namespaced_resend_of_one_call_canonicalize_alike() {
+    fn a_flat_spelling_is_a_different_canonical_call_until_the_wire_learns_to_split_it() {
         let namespaced = json!({
             "type": "function_call",
             "call_id": "call_1",
@@ -631,11 +629,27 @@ mod tests {
         let flat_item = canonicalize("", &[flat]).expect("flat form parses");
 
         assert_eq!(
+            namespaced_item,
+            vec![Item::tool_call("call_1", "fetch_steer", "{}")],
+            "a separate `namespace` field leaves no trace: this is the property \
+             the steering round trip rests on"
+        );
+        assert_eq!(
+            flat_item,
+            vec![Item::tool_call(
+                "call_1",
+                "mcp__roundhouse__fetch_steer",
+                "{}"
+            )],
+            "a namespace folded into `name` is kept verbatim, so the two \
+             spellings of one call are two canonical items"
+        );
+        assert_ne!(
             namespaced_item, flat_item,
-            "dialect.rs claims these two spellings of one call arrive as the \
-             same canonical item; they do not, because canonical_item keeps \
-             whatever is in `name` verbatim: {namespaced_item:#?} vs \
-             {flat_item:#?}"
+            "if these ever agree, `canonical_item` has learned to split a flat \
+             name — which is the change a flat `ClientDialect` variant owes the \
+             input path, and `dialect.rs`'s module doc is the paragraph that has \
+             to be re-read when it lands"
         );
     }
 

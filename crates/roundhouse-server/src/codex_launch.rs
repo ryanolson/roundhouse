@@ -26,11 +26,21 @@
 //! either re-opens a failure that is silent in the dangerous direction:
 //!
 //! - `env_key` is written *beside* `requires_openai_auth = false`, never
-//!   instead of it. At 0.146.0 the flag being `false` suppresses nothing — it
-//!   does not gate what the auth manager resolves — so a provider with neither
-//!   an `env_key` nor the flag sends whatever ambient credential happens to sit
-//!   in the client's `CODEX_HOME` to *our* `base_url`. The flag says what this
-//!   deployment is; `env_key` is what makes the resolution deterministic.
+//!   instead of it. At 0.146.0 the flag being `false` suppresses nothing —
+//!   `model-provider/src/auth.rs::resolve_provider_auth` (auth.rs:179-197
+//!   @ `e363b08`), which every live request reaches, never reads the flag at
+//!   all. It asks two questions in order: is there an `env_key` (or an
+//!   `experimental_bearer_token`), and failing that, does the auth manager hold
+//!   a `CodexAuth` — the thing a completed `codex login` persists to
+//!   `auth.json` in `CODEX_HOME`. So a provider with no `env_key` resolves to
+//!   *whatever that `CODEX_HOME` was last logged into*, aimed at **our**
+//!   `base_url`; and if it was never logged into, to
+//!   `unauthenticated_auth_provider()` — no `Authorization` header at all. Both
+//!   halves are silent, in opposite directions, which is why the deterministic
+//!   answer is written rather than left to the ambient state. The flag says
+//!   what this deployment is; `env_key` is what makes the resolution
+//!   deterministic. (F08 sharpened this: the earlier text named only the
+//!   ambient-credential half and read as if a logged-out client were safe.)
 //! - `model_catalog_json` is written under **both** auth kinds, not only the
 //!   forwarding one. The `GET {base_url}/models` fetch is gated on the ambient
 //!   auth mode in `CODEX_HOME` rather than on `requires_openai_auth`
@@ -41,11 +51,13 @@
 //!   network path at all — which is why it is the answer for both rather than
 //!   a `/v1/models` route roundhouse would have to serve.
 //!
-//! **Why this lives in the server crate.** The stanza needs three things at
+//! **Why this lives in the server crate.** The stanza needs four things at
 //! once: the address this deployment is bound to, the turn-key header name
-//! ([`TURN_KEY_HEADER`]) and the MCP mount path
-//! ([`MCP_MOUNT_PATH`]). This crate is the only
-//! place that already knows all three. `control_config` is the wrong half of
+//! ([`TURN_KEY_HEADER`]), the MCP mount path ([`MCP_MOUNT_PATH`]) and the
+//! prefix the Responses API is served at ([`API_PREFIX`] — the fourth since
+//! F14, which is what `base_url` has to end in and what the MCP url is
+//! recovered by stripping). This crate is the only place that already knows
+//! all four. `control_config` is the wrong half of
 //! the same crate — it *reads* the file an operator wrote, and this *writes*
 //! the file a client will read; putting a TOML emitter beside
 //! `ControlPlaneConfig::validate` would invite reading the two as a round trip,
@@ -76,6 +88,7 @@ use std::path::Path;
 use crate::control_config::TURN_KEY_HEADER;
 use crate::dialect::DEFAULT_MCP_NAMESPACE;
 use crate::mcp_api::MCP_MOUNT_PATH;
+use crate::responses_api::API_PREFIX;
 
 /// The environment variable a generated config names by default.
 pub const DEFAULT_KEY_ENV: &str = "ROUNDHOUSE_API_KEY";
@@ -108,6 +121,44 @@ const PROVIDER_KEY: &str = "roundhouse";
 /// reconstruction is checkable without a running agent.
 const MCP_NAMESPACE_PREFIX: &str = "mcp__";
 
+/// What `[mcp_servers.<key>].default_tools_approval_mode` is set to, and the
+/// home of the ruling on why it is server-wide rather than per tool.
+///
+/// A constant rather than a literal inside the template because the review
+/// (F01) proposed replacing it with `[mcp_servers.<key>.tools.fetch_steer]
+/// approval_mode = "approve"` — grant the one read, leave the seven writers
+/// "to the client" — and that remedy was **refused**. The per-tool table is
+/// real (`McpServerToolConfig::approval_mode`, `config/src/mcp_types.rs:54-61`
+/// @ pin `6344a65`) and does take precedence
+/// (`McpServerMetadata::tool_approval_mode`, `codex-mcp/src/server.rs:249-255`
+/// @ `e363b08`: the per-tool entry, then the server default, then
+/// `AppToolApproval::default()` = `Auto`, `config/src/mcp_types.rs:19-26`), so
+/// the mechanism the finding described exists. Two reasons not to use it, and
+/// the second is the one that survives:
+///
+/// 1. As the finding was written, it broke the writers. Dropping the server
+///    default puts the other seven tools on `Auto`, which decides from
+///    annotations alone (`requires_mcp_tool_approval`,
+///    `core/src/mcp_tool_call.rs:2155-2173` @ `e363b08`), and at the time the
+///    tools shipped `annotations: None` — so `destructive_hint.unwrap_or(true)
+///    || open_world_hint.unwrap_or(true)` said "needs approval". `codex exec`
+///    forces `approval_policy = never` (`exec/src/lib.rs:427`), under which an
+///    approval nobody can be asked for resolves to *cancelled*, not deferred:
+///    `prefer` and `set_quality_floor` would have failed permanently rather
+///    than asked permanently.
+/// 2. F06 then made the tools annotate themselves truthfully
+///    (`roundhouse-mcp/src/tools.rs`: `destructive_hint: false`,
+///    `open_world_hint: false` on all eight), which flips that same `Auto`
+///    branch to "no approval needed". So the per-tool scoping would no longer
+///    break anything — and no longer buy anything either. The narrowing it was
+///    reaching for now lives one layer down, in the annotations, where it holds
+///    for a client roundhouse never generated a file for. What is left for this
+///    line is the deployment-side belt: it is what still admits a tool whose
+///    annotations are ever wrong, missing, or dropped by an rmcp upgrade —
+///    which is precisely what the eight-tools tripwire below now demands
+///    somebody re-derive before the count moves.
+const TOOLS_APPROVAL_MODE: &str = "approve";
+
 /// How many tokens the generated catalog claims the model's context window is.
 ///
 /// A stated number rather than `null`, because the client accumulates the usage
@@ -131,9 +182,10 @@ pub enum CodexAuthKind {
     ///
     /// `requires_openai_auth = false` **with** `env_key`. Never without: at
     /// 0.146.0 the flag does not gate what the auth manager resolves, so a
-    /// provider with neither an `env_key` nor the flag sends whatever ambient
-    /// credential happens to sit in the client's `CODEX_HOME` to *our*
-    /// `base_url`. `env_key` is what makes the resolution deterministic.
+    /// provider with no `env_key` sends whatever login the client's
+    /// `CODEX_HOME` happens to hold to *our* `base_url` — or, if it holds
+    /// none, no `Authorization` at all. `env_key` is what makes the resolution
+    /// deterministic in both cases.
     RoundhouseKey,
     /// The client's ChatGPT login is forwarded upstream by roundhouse.
     ///
@@ -141,7 +193,54 @@ pub enum CodexAuthKind {
     /// carries the client's own bearer. Roundhouse's key then has to arrive
     /// somewhere else, which is what `env_http_headers` is for — see
     /// [`TURN_KEY_HEADER`].
+    ///
+    /// **The precondition is a completed `codex login`, not this flag.** The
+    /// flag chooses a code path — `provider_uses_first_party_auth_path`
+    /// (`model-provider/src/provider.rs:223-229` @ `e363b08`) is the only
+    /// production reader — and both of the paths it chooses between end in
+    /// `resolve_provider_auth`, which builds the header from the auth
+    /// manager's cached `CodexAuth` and nothing else. That cache is populated
+    /// only by `codex login` writing `auth.json` into this `CODEX_HOME`
+    /// (`login/src/auth/manager.rs`). Skip the login and the request arrives
+    /// with no `Authorization` at all — which roundhouse *admits*, because
+    /// `control_config::turn_admission` treats "the caller presented nothing"
+    /// as a first-class case and degrades the turn to local-only rather than
+    /// rejecting it (`control_config/crosscheck.rs`'s `withheld_providers`).
+    /// Nothing in the run then looks broken: turns answer, frontier routes
+    /// simply never happen. Naming the login in the generated file is the only
+    /// place an operator can learn this before spending a day on it.
     ForwardedOpenAiLogin,
+}
+
+/// Why a launch config could not be built from the inputs it was given.
+///
+/// Three refusals rather than one, because the three failures they prevent look
+/// nothing alike from the operator's chair and a single "bad launch config"
+/// would send whoever reads it to the wrong file. Each names what codex does
+/// with the value, not what this crate wanted instead.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CodexLaunchError {
+    #[error(
+        "the model catalog path `{path}` is relative. Codex resolves \
+         `model_catalog_json` against the directory it loaded config.toml from -- not the \
+         directory roundhouse was run in -- so a relative path names a file that is not \
+         there, and the client falls back to invented model metadata instead of erroring"
+    )]
+    RelativeCatalogPath { path: String },
+    #[error(
+        "the model catalog path is not valid UTF-8 (lossily: `{lossy}`). TOML holds UTF-8 \
+         strings only, so writing it means writing `Path::display()`'s substituted \
+         replacement characters -- a different path from the one on disk, with nothing \
+         anywhere saying a substitution happened"
+    )]
+    NonUtf8CatalogPath { lossy: String },
+    #[error(
+        "the base URL `{base_url}` does not end in `{API_PREFIX}`, which is where this \
+         deployment serves the Responses API. Codex posts turns to `{{base_url}}/responses`, \
+         so this stanza 404s on every turn -- while the MCP handshake, derived from the same \
+         string, still succeeds and makes the client look healthy"
+    )]
+    BaseUrlMissingApiPrefix { base_url: String },
 }
 
 /// Everything a generated launch config depends on.
@@ -150,10 +249,27 @@ pub enum CodexAuthKind {
 /// builder: there are five inputs, two of them have one sensible value, and a
 /// builder would make the two that must never be defaulted — the address and
 /// the catalog path — look optional.
+///
+/// **What [`CodexLaunch::new`] checking its inputs does and does not buy.** The
+/// fields stay `pub` and are still writable after construction, so this is a
+/// check at the door rather than an invariant the type carries; `non_exhaustive`
+/// only closes the *other* door, the struct literal an outside crate would
+/// otherwise use to skip `new` entirely. That is enough because the three
+/// checked values have no builder that touches them —
+/// [`Self::with_key_env`], [`Self::with_model`] and
+/// [`Self::forwarding_openai_login`] each move a different field — so the only
+/// way past the check is to assign `base_url` or `model_catalog_path` by hand,
+/// which reads as deliberate. Private fields with five accessors would make the
+/// guarantee total and would cost every caller a method call for a field they
+/// currently read; the honest description of what is here is "the constructor
+/// refuses the three shapes that fail silently", and it is written down rather
+/// than implied.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct CodexLaunch {
-    /// Where this deployment serves the Responses API, including the `/v1`
-    /// suffix — exactly what goes into `base_url`.
+    /// Where this deployment serves the Responses API, including the
+    /// [`API_PREFIX`] suffix — exactly what goes into `base_url`. Any trailing
+    /// slash is normalised away by [`CodexLaunch::new`].
     pub base_url: String,
     /// The environment variable the client's turn key arrives in.
     pub key_env: String,
@@ -164,23 +280,52 @@ pub struct CodexLaunch {
     /// Where [`Self::model_catalog_json`]'s output will be written, as the
     /// client will see it.
     ///
-    /// Absolute, because codex resolves a relative `model_catalog_json` against
-    /// the directory the config was loaded from — which is correct and
-    /// impossible to check from here, so the unambiguous form is the one this
-    /// type asks for.
+    /// Absolute and UTF-8, because codex resolves a relative
+    /// `model_catalog_json` against the directory the config was loaded from —
+    /// which is correct, and not the directory this process ran in.
+    /// [`CodexLaunch::new`] refuses both other shapes.
     pub model_catalog_path: String,
 }
 
 impl CodexLaunch {
     /// A bring-your-own-key launch against `base_url`, with the defaults.
-    pub fn new(base_url: impl Into<String>, model_catalog_path: &Path) -> Self {
-        Self {
-            base_url: base_url.into(),
+    ///
+    /// Fallible (F13) because each of the three refusals below produced a
+    /// config that *loads*: the client starts, half of it works, and the half
+    /// that does not fails somewhere the operator would look at roundhouse for.
+    /// A trailing slash on `base_url` is normalised rather than refused —
+    /// it is what a copy-pasted address carries, it has one unambiguous
+    /// meaning, and refusing it would teach nobody anything. The other three
+    /// have no unambiguous reading, so they are refused by name.
+    pub fn new(
+        base_url: impl Into<String>,
+        model_catalog_path: &Path,
+    ) -> Result<Self, CodexLaunchError> {
+        let base_url = base_url.into();
+        let base_url = base_url.trim_end_matches('/').to_string();
+        if !base_url.ends_with(API_PREFIX) {
+            return Err(CodexLaunchError::BaseUrlMissingApiPrefix { base_url });
+        }
+        // `to_str` before `is_absolute`: a non-UTF-8 path can be absolute, and
+        // reporting "relative" for it would name the wrong problem.
+        let catalog =
+            model_catalog_path
+                .to_str()
+                .ok_or_else(|| CodexLaunchError::NonUtf8CatalogPath {
+                    lossy: model_catalog_path.display().to_string(),
+                })?;
+        if !model_catalog_path.is_absolute() {
+            return Err(CodexLaunchError::RelativeCatalogPath {
+                path: catalog.to_string(),
+            });
+        }
+        Ok(Self {
+            base_url,
             key_env: DEFAULT_KEY_ENV.to_string(),
             auth: CodexAuthKind::RoundhouseKey,
             model: DEFAULT_MODEL_SLUG.to_string(),
-            model_catalog_path: model_catalog_path.display().to_string(),
-        }
+            model_catalog_path: catalog.to_string(),
+        })
     }
 
     /// The same, forwarding the client's own ChatGPT login upstream.
@@ -235,6 +380,14 @@ impl CodexLaunch {
                 "# forwards it upstream. No `env_key` here, deliberately: codex resolves an\n",
                 "# env key ahead of the login, so one would disable the forwarding this\n",
                 "# stanza exists for -- silently, since both produce a valid request.\n",
+                "#\n",
+                "# PRECONDITION: run `codex login` against this CODEX_HOME before launching.\n",
+                "# The flag below only selects a code path; the Authorization header itself\n",
+                "# comes from the login codex persisted to auth.json in this CODEX_HOME, and\n",
+                "# from nothing else. Skip the login and every request arrives with no\n",
+                "# Authorization at all -- which roundhouse admits and quietly degrades to\n",
+                "# local-only routing rather than refusing, so turns keep answering and no\n",
+                "# frontier route ever happens. Nothing in the run reports this.\n",
                 "requires_openai_auth = true\n",
             )
             .to_string(),
@@ -287,12 +440,14 @@ impl CodexLaunch {
              # Roundhouse's own tools run without asking the operator first, and that is a\n\
              # property of what they do rather than a convenience. `fetch_steer` reads back the\n\
              # correction this same deployment just emitted; the writing tools only ever narrow\n\
-             # what the caller's own key already allows, never widen it. Left at the default,\n\
-             # codex 0.146.0 treats an unannotated tool as needing approval, and under\n\
+             # what the caller's own key already allows, never widen it. The tools say so\n\
+             # themselves, in their MCP annotations, so a client that was handed no config at\n\
+             # all already runs them. This line is the belt for the one that was: codex 0.146.0\n\
+             # treats a tool it sees *no* annotations on as needing approval, and under\n\
              # `approval_policy = never` -- which `codex exec` forces -- an approval nobody\n\
              # can be asked for resolves to *cancelled*: the agent is handed a cancellation\n\
              # notice in place of the steer, and roundhouse's correction never arrives.\n\
-             default_tools_approval_mode = \"approve\"\n\
+             default_tools_approval_mode = \"{TOOLS_APPROVAL_MODE}\"\n\
              \n\
              [features]\n\
              # Agent identity is an OpenAI-backend credential mode; roundhouse authenticates\n\
@@ -341,6 +496,24 @@ impl CodexLaunch {
             "auto_compact_token_limit": null,
             "effective_context_window_percent": 95,
             "experimental_supported_tools": [],
+            // Stated `false` although `false` is also what omitting it yields
+            // (`supports_search_tool` is `#[serde(default)]`,
+            // `protocol/src/openai_models.rs:434-435` @ `e363b08`). The point
+            // is not the value, it is that the value has to be overwritten
+            // deliberately: this single field is the only gate on whether the
+            // client offers the model a `tool_search` tool at all
+            // (`search_tool_enabled` = `supports_search_tool &&
+            // namespace_tools_enabled`, `core/src/tools/spec_plan.rs:333-335`
+            // @ `e363b08`, and `namespace_tools` defaults *true* for every
+            // provider including this one). Turn it on and the very next turn
+            // can resend a `tool_search_call` / `tool_search_output` pair,
+            // which `responses_api::wire::canonical_item` refuses with a 422 —
+            // taking the whole turn down. F18 named the way that happens by
+            // accident: authoring this catalog by copying upstream per-model
+            // metadata, where a flagship's entry carries `true`. An absent key
+            // is silent about that; a written `false` is a line the copy has to
+            // argue with.
+            "supports_search_tool": false,
         });
         serde_json::to_string_pretty(&serde_json::json!({ "models": [entry] }))
             .expect("a catalog built from literals encodes")
@@ -354,10 +527,34 @@ impl CodexLaunch {
 /// is mounted beside it, at the deployment root. Getting it wrong produces a
 /// client that starts, times out reaching its MCP server, and then runs turns
 /// perfectly — with every steer silently unresolvable.
+///
+/// The version it strips is [`API_PREFIX`], read from the module that serves
+/// the route, not a second `"/v1"` spelled here (F14). Two literals agreed
+/// today and would part company on the edit that moved the turn surface, and
+/// the parting is silent: [`deployment_root`] keeps the un-stripped root, so
+/// the generated MCP url grows a version segment the router does not serve.
 fn mcp_endpoint(base_url: &str) -> String {
+    format!("{}{MCP_MOUNT_PATH}", deployment_root(base_url, API_PREFIX))
+}
+
+/// The deployment root a Responses `base_url` is served under, given the
+/// prefix it is served at.
+///
+/// Takes the prefix as an argument rather than closing over [`API_PREFIX`],
+/// and that parameter is the whole point: it is what lets a test drive this
+/// with a version the deployment does *not* serve and watch the derivation
+/// follow. A function that spelled the constant inline would be checkable only
+/// by reading it, which is exactly the state F14 found it in.
+///
+/// The prefix is stripped rather than the last path segment. Stripping a
+/// segment blindly would be shorter and would break a deployment served under
+/// a path of its own (`https://host/roundhouse/v1`), which is the ordinary
+/// shape behind a reverse proxy.
+fn deployment_root<'a>(base_url: &'a str, api_prefix: &str) -> &'a str {
     let root = base_url.trim_end_matches('/');
-    let root = root.strip_suffix("/v1").unwrap_or(root);
-    format!("{}{MCP_MOUNT_PATH}", root.trim_end_matches('/'))
+    root.strip_suffix(api_prefix)
+        .unwrap_or(root)
+        .trim_end_matches('/')
 }
 
 /// The `[mcp_servers.*]` table key codex must see to rebuild
@@ -390,9 +587,10 @@ mod tests {
 
     fn launch() -> CodexLaunch {
         CodexLaunch::new(
-            "http://127.0.0.1:8080/v1",
+            format!("http://127.0.0.1:8080{API_PREFIX}"),
             &PathBuf::from("/srv/roundhouse/models.json"),
         )
+        .expect("the documented-correct shape constructs")
     }
 
     fn parsed(launch: &CodexLaunch) -> toml::Value {
@@ -497,15 +695,13 @@ mod tests {
     /// never logged in resolves to `unauthenticated_auth_provider()`: no
     /// `Authorization` header at all, so `turn_admission` in `control_config`
     /// captures nothing and the turn is admitted anyway, degraded to local.
-    /// Nothing at the flag names this, so an operator handed only the flag's
-    /// comment has no way to know a skipped `codex login` is silent.
+    /// So the generated file has to say the words: an operator handed only the
+    /// flag's comment has no way to learn that a skipped `codex login` costs
+    /// them every frontier route and reports nothing. Asserting on the emitted
+    /// text rather than on a doc comment is deliberate — the doc comment is
+    /// read by whoever edits this file, and the person who needs this sentence
+    /// is the one reading the config it produced.
     #[test]
-    #[ignore = "F08: the forwarded stanza's doc comment names only requires_openai_auth as \
-                the mechanism; it does not name a completed `codex login` as the actual \
-                precondition, so an operator has no way to know a skipped login degrades \
-                every turn to local silently. See codex_launch.rs's CodexAuthKind::ForwardedOpenAiLogin \
-                doc block and the auth block in CodexLaunch::config_toml -- fixing this test means \
-                adding that sentence there, not changing the auth-resolution mechanism."]
     fn the_forwarded_stanza_tells_the_operator_the_login_is_the_precondition() {
         let forwarding = launch().forwarding_openai_login();
         let toml_text = forwarding.config_toml();
@@ -516,6 +712,16 @@ mod tests {
              nothing in the auth-resolution chain, so a client that never ran \
              `codex login` sends no Authorization header at all and every turn \
              silently degrades to local:\n{toml_text}"
+        );
+        // The control: the bring-your-own-key stanza must *not* pick the
+        // sentence up. It has no login precondition -- `env_key` is resolved
+        // ahead of any cached auth -- and telling that operator to log in
+        // would send them to configure the one thing that would break their
+        // stanza if it took effect.
+        let byok = launch().config_toml();
+        assert!(
+            !byok.to_ascii_lowercase().contains("codex login"),
+            "the bring-your-own-key stanza has no login precondition:\n{byok}"
         );
     }
 
@@ -578,70 +784,31 @@ mod tests {
     /// against. `roundhouse-server/tests/mcp_surface.rs` already pins the
     /// same list against the live wire response, but that assertion carries
     /// no message -- a ninth tool fails it, but the failure points at a
-    /// mismatched const, not at this comment. If this test goes red, re-read
-    /// the paragraph above before updating the count: a tool that spends a
-    /// budget or widens a policy is exactly the case the blanket grant does
-    /// not cover.
+    /// mismatched const, not at this comment.
+    ///
+    /// F16 sharpened what the message has to ask for. A re-read of the
+    /// paragraph above is no longer enough on its own: since F06 the tools
+    /// carry MCP annotations, and those annotations -- not this config line --
+    /// are what an unconfigured client reads. A ninth tool therefore needs two
+    /// answers, and its annotations are the one that holds everywhere.
     #[test]
     fn the_surface_is_still_the_eight_tools_the_launch_config_grants_blanket_approval_to() {
         assert_eq!(
             roundhouse_mcp::tools::TOOL_NAMES.len(),
             8,
-            "roundhouse-mcp's tool surface changed size; codex_launch.rs's \
-             default_tools_approval_mode = \"approve\" is justified above by a \
-             narrowing-only property of exactly the eight tools this pin \
-             names -- confirm a new or changed tool still only narrows what \
-             the caller's key allows before touching this number"
-        );
-    }
-
-    /// F01 (review): codex 0.146.0's `McpServerToolConfig.approval_mode`
-    /// (`config/src/mcp_types.rs:54-61,222` @ pin `6344a65`) is consulted
-    /// per-tool ahead of `default_tools_approval_mode`
-    /// (`McpServerMetadata::tool_approval_mode`,
-    /// `codex-mcp/src/server.rs:246-252` @ binary tree `e363b08` --
-    /// `core/src/mcp_tool_call.rs`'s own precedence helper is
-    /// `#[cfg(test)]`-only, so the production authority lives in
-    /// `codex-mcp`, not `core`). The claim under test: the launch config
-    /// should grant approval to `fetch_steer` alone, under
-    /// `[mcp_servers.<key>.tools.fetch_steer]`, and say nothing about the
-    /// other seven tools -- rather than the shipped blanket
-    /// `default_tools_approval_mode = "approve"`, which pre-approves every
-    /// tool on the surface, including ones that do not exist yet.
-    #[test]
-    #[ignore = "F01 (partially valid): the blanket default_tools_approval_mode grant is real \
-                and does pre-approve any future tool sight-unseen, but this test's proposed \
-                remedy is wrong. `codex exec` forces approval_policy = never \
-                (codex_launch.rs:558), so scoping approval to fetch_steer alone and 'leaving \
-                the writers to the client' does not defer those calls for review -- there is no \
-                interactive client in this topology, and any tool still requiring approval under \
-                that policy is unconditionally cancelled (core/src/mcp_tool_call.rs's \
-                requires_mcp_tool_approval_for_mode, AppToolApproval::Auto/Writes/Prompt arms, \
-                @ e363b08). Applying this test's fix would permanently break prefer and \
-                set_quality_floor rather than narrow the grant. The claim's 'no explicit review' \
-                framing also ignores the existing size tripwire \
-                (the_surface_is_still_the_eight_tools_the_launch_config_grants_blanket_approval_to), \
-                which already fails the build the moment a ninth tool lands. The narrower fix the \
-                module doc already names is truthful per-tool MCP annotations (readOnlyHint / \
-                destructiveHint / openWorldHint) in roundhouse-mcp/src/tools.rs, which \
-                requires_mcp_tool_approval (core/src/mcp_tool_call.rs) consults ahead of any \
-                config and which holds for every client, not only ones roundhouse generated a \
-                config for -- not per-tool approval_mode in codex_launch.rs, which is what this \
-                test checks for."]
-    fn only_the_steer_read_is_auto_approved_and_the_writers_are_left_to_the_client() {
-        let config = parsed(&launch());
-        let server = &config["mcp_servers"][mcp_server_key()];
-        assert_eq!(
-            server["tools"]["fetch_steer"]["approval_mode"].as_str(),
-            Some("approve"),
-            "fetch_steer must be approved by its own per-tool entry, not by a \
-             server-wide default:\n{server}"
-        );
-        assert!(
-            server.get("default_tools_approval_mode").is_none(),
-            "a per-tool grant for fetch_steer should replace the blanket \
-             default_tools_approval_mode entirely -- leaving both in place \
-             still pre-approves every present and future tool on the surface:\n{server}"
+            "roundhouse-mcp's tool surface changed size. Two things have to be \
+             re-derived before this number moves, not one: (1) does the new or \
+             changed tool still only NARROW what the caller's own key already \
+             allows -- a tool that spends a budget or widens a policy is exactly \
+             what codex_launch.rs's default_tools_approval_mode = \"approve\" \
+             does not cover; and (2) are its ANNOTATIONS in \
+             roundhouse-mcp/src/tools.rs truthful -- read_only_hint matching \
+             whether it mutates, destructive_hint and open_world_hint false only \
+             if it really cannot destroy and really cannot reach past \
+             roundhouse's own plane. Check (2) is the load-bearing one: the \
+             annotations are what a client roundhouse generated no config for \
+             reads, and codex decides approval from them alone under the default \
+             Auto mode"
         );
     }
 
@@ -659,7 +826,15 @@ mod tests {
             "http://127.0.0.1:8080/mcp"
         );
         // A base that names no version still gets one well-formed answer
-        // rather than a silently doubled path.
+        // rather than a silently doubled path. Not a supported shape: since
+        // F13 the constructor refuses it by name
+        // (`CodexLaunchError::BaseUrlMissingApiPrefix`), and
+        // `a_base_url_without_the_served_api_prefix_is_refused` is where the
+        // door is pinned. This pins the *function's* totality instead, which
+        // still matters because the fields stay writable after construction —
+        // `mcp_endpoint` must have one answer for every string, not a panic
+        // and not a doubled path, since it is reached from `mcp_url()` on
+        // whatever `base_url` currently holds.
         assert_eq!(
             mcp_endpoint("https://rh.example.com"),
             "https://rh.example.com/mcp"
@@ -691,24 +866,44 @@ mod tests {
     /// exactly the drift [`MCP_MOUNT_PATH`]'s own doc comment was written to
     /// prevent for the mount path; this is the same shape one literal to the
     /// left, unfixed.
+    ///
+    /// Fixed by [`deployment_root`], which takes the prefix as an argument so
+    /// that the "a future /v2 rung" case the original assertion described can
+    /// actually be executed rather than only argued about. The three
+    /// assertions below are three different mutations going red: hardcoding a
+    /// version back into `deployment_root`, moving [`API_PREFIX`] without
+    /// moving [`mcp_endpoint`], and "just strip the last segment".
     #[test]
-    #[ignore = "F14: mcp_endpoint hardcodes \"/v1\" instead of deriving it from \
-                responses_api::responses_router's own route literal; a future /v2 rung \
-                silently breaks the MCP url. Fix: promote a shared API_VERSION_PREFIX \
-                constant both sides read, the way MCP_MOUNT_PATH already does for the mount \
-                path."]
     fn mcp_endpoint_tracks_whatever_version_the_responses_route_actually_serves() {
-        // Simulates "a future /v2 rung moves the turn surface" (the claim's
-        // own words): if `responses_api`'s route ever serves `/v2/responses`
-        // instead of `/v1/responses`, `base_url` becomes `.../v2`, and the MCP
-        // mount -- unchanged, always at the deployment root -- must still
-        // resolve to `.../mcp`.
+        // "A future /v2 rung moves the turn surface" (the claim's own words):
+        // if `responses_api`'s route ever serves `/v2/responses`, `base_url`
+        // becomes `.../v2` and the MCP mount -- unchanged, always at the
+        // deployment root -- must still resolve to `.../mcp`. Executable only
+        // because the prefix is a parameter; red again the moment a version is
+        // spelled inside the function.
         assert_eq!(
-            mcp_endpoint("http://127.0.0.1:8080/v2"),
-            "http://127.0.0.1:8080/mcp",
-            "mcp_endpoint only recognizes the literal \"/v1\"; a routed version of \"/v2\" \
-             leaves the un-stripped root in place and the MCP url gains a bogus /v2 segment \
-             the real router does not serve"
+            deployment_root("http://127.0.0.1:8080/v2", "/v2"),
+            "http://127.0.0.1:8080",
+            "the derivation must follow whatever prefix it is given, not one it names itself"
+        );
+        // And the shipped endpoint reads the prefix the route actually serves,
+        // rather than a second literal that agrees with it today. Written as
+        // "the answer does not still contain the prefix" so that moving
+        // API_PREFIX alone -- the exact F14 edit -- fails here instead of
+        // passing by coincidence.
+        let mcp_url = mcp_endpoint(&format!("https://rh.example.com{API_PREFIX}"));
+        assert_eq!(mcp_url, format!("https://rh.example.com{MCP_MOUNT_PATH}"));
+        assert!(
+            !mcp_url.contains(API_PREFIX),
+            "the served API prefix `{API_PREFIX}` is still in the MCP url `{mcp_url}`: \
+             mcp_endpoint is stripping something else"
+        );
+        // The prefix is stripped, not the last segment. A deployment behind a
+        // reverse proxy is served under a path of its own, and the shorter
+        // implementation would eat it.
+        assert_eq!(
+            mcp_endpoint(&format!("https://host.example.com/roundhouse{API_PREFIX}")),
+            format!("https://host.example.com/roundhouse{MCP_MOUNT_PATH}")
         );
     }
 
@@ -758,6 +953,37 @@ mod tests {
         assert!(
             entry["auto_compact_token_limit"].is_null(),
             "a compaction limit would let a judge's reported usage rewrite the client's history"
+        );
+    }
+
+    /// F18: `supports_search_tool` is written, and written `false`.
+    ///
+    /// Asserting on a field whose absence means the same thing looks
+    /// redundant, and is the point: the reader defaults it to `false`
+    /// (`#[serde(default)]`, `protocol/src/openai_models.rs:434-435`
+    /// @ `e363b08`), so the risk was never that today's catalog turns it on --
+    /// it is that tomorrow's is authored by copying an upstream per-model
+    /// entry, where a flagship's `true` rides along unnoticed. This is the only
+    /// gate: `search_tool_enabled` is `supports_search_tool &&
+    /// namespace_tools_enabled` (`core/src/tools/spec_plan.rs:333-335`
+    /// @ `e363b08`), and `namespace_tools` defaults *true* for every provider,
+    /// this one included. Flip it and the client may resend a
+    /// `tool_search_call` / `tool_search_output` pair, which
+    /// `responses_api::wire::canonical_item` refuses with a 422 that takes the
+    /// whole turn with it -- the boundary
+    /// `the_item_types_a_real_client_can_resend_are_named` pins from the other
+    /// side.
+    #[test]
+    fn the_catalog_states_that_this_model_has_no_search_tool() {
+        let catalog: serde_json::Value =
+            serde_json::from_str(&launch().model_catalog_json()).expect("the catalog is JSON");
+        let entry = &catalog["models"][0];
+        assert_eq!(
+            entry.get("supports_search_tool"),
+            Some(&serde_json::Value::Bool(false)),
+            "the catalog must state `supports_search_tool: false` rather than leave it to \
+             the reader's default: it is the only thing standing between a copied upstream \
+             entry and a tool_search_call that 422s every turn it appears in:\n{entry:#}"
         );
     }
 

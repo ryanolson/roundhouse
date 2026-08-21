@@ -604,8 +604,23 @@ async fn an_unknown_key_is_refused_before_a_session_is_created() {
 
     for (key, status, code) in [
         (None, StatusCode::UNAUTHORIZED, "missing_key"),
+        // F07: a bearer outside roundhouse's own `rh_` namespace is not a wrong
+        // key, it is somebody else's credential — in pass-through mode,
+        // precisely the upstream seat token codex forwards when its
+        // `env_http_headers` entry was silently dropped. Reporting it as
+        // malformed sent operators to inspect a value that was never a
+        // roundhouse key; it now lands on the same row as sending nothing,
+        // whose message names the header and the mechanism that fills it.
         (
             Some("not-a-roundhouse-key"),
+            StatusCode::UNAUTHORIZED,
+            "missing_key",
+        ),
+        // And the row that keeps that a narrowing rather than a hole: a value
+        // in the namespace *is* a key attempt, however wrong, and still gets
+        // told so.
+        (
+            Some("rh_turn_tooshort"),
             StatusCode::UNAUTHORIZED,
             "malformed_key",
         ),
