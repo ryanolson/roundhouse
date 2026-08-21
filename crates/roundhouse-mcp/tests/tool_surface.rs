@@ -1532,3 +1532,40 @@ async fn two_surfaces_over_one_store_see_one_control_plane() {
     let seen = served(&call(&reader, &ada(), "status", json!({})).await);
     assert_eq!(seen["overlay"]["mode"], json!("local"));
 }
+
+/// F06: a client that was never handed the generated launch config -- an
+/// operator's own `codex` install, a bare MCP inspector, any client that
+/// speaks the protocol without `default_tools_approval_mode = "approve"` in
+/// its `[mcp_servers.*]` stanza -- sees exactly what `RoundhouseMcp::tools()`
+/// serializes over the wire. codex 0.146.0's `requires_mcp_tool_approval`
+/// (core/src/mcp_tool_call.rs:2182-2198 @ pin `6344a65`) treats an absent
+/// `read_only_hint` as `false` and an absent `destructive_hint`/
+/// `open_world_hint` as `true`, so a tool with no `annotations` at all reads
+/// as destructive-and-open-world regardless of what it actually does. A pure
+/// read like `fetch_steer` or `status` should be able to say `read_only_hint:
+/// true` and stop there; today it says nothing.
+#[test]
+#[ignore = "F06 (partially valid): RoundhouseMcp::tools() sets annotations: None \
+            for all 8 tools, and codex 0.146.0's requires_mcp_tool_approval \
+            treats an absent read_only_hint as false and absent \
+            destructive_hint/open_world_hint as true, so an unannotated tool \
+            reads as destructive-and-open-world under AppToolApproval::Auto. \
+            The generated launch config already papers over this for its own \
+            client with default_tools_approval_mode = \"approve\" \
+            (roundhouse-server/src/codex_launch.rs:295); this test documents \
+            the narrower, already-acknowledged (roundhouse-mcp/src/lib.rs:84-92) \
+            residual gap for any client that connects without that config."]
+fn every_tool_states_what_it_does_to_a_client_that_was_handed_no_config() {
+    use roundhouse_mcp::transport::RoundhouseMcp;
+
+    for tool in RoundhouseMcp::tools() {
+        assert!(
+            tool.annotations.is_some(),
+            "`{}` ships with no ToolAnnotations at all; a client that was not \
+             handed the generated launch config (which papers over this with \
+             `default_tools_approval_mode = \"approve\"`) reads it as \
+             destructive and open-world",
+            tool.name
+        );
+    }
+}

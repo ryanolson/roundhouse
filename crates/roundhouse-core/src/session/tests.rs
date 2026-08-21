@@ -1414,6 +1414,78 @@ async fn the_turn_whose_input_answers_a_steer_is_the_one_that_says_so() {
         .unwrap();
 }
 
+/// F05 (review finding): a cancelled or aborted steer must not read as
+/// fulfilled.
+///
+/// The fold in `SessionState::fold` closes an open steer on `call_id` alone
+/// -- it never inspects `ToolResult::output`. Codex's own approval path
+/// produces exactly this shape without any correction ever reaching the
+/// agent: an operator declining the MCP call resends the literal text
+/// `"user cancelled MCP tool call"` (codex-rs core/src/mcp_tool_call.rs,
+/// `ReviewDecision::Abort`), and a client that drops the turn entirely gets
+/// codex's own synthesized `"aborted"` filled in for it
+/// (context_manager/normalize.rs). Both close `open_steers` and set
+/// `this_turn_fulfilled_a_steer()`, which is what `validate::trigger::gate_open`
+/// reads to suppress judging on the fulfilling turn -- so the dashboard
+/// reports a healthy steer loop while no correction was ever delivered.
+/// Ignored until the fold reads the output content (or a status the wire
+/// layer stamps on cancellation) before treating a steer as answered.
+#[tokio::test]
+#[ignore = "F05: cancellation/abort text closes the steer identically to a \
+            real correction -- SessionState::fold matches ToolResult on \
+            call_id alone and never inspects `output`, so \
+            this_turn_fulfilled_a_steer() reads true and validation is \
+            suppressed even though nothing corrected the agent"]
+async fn a_cancelled_steer_is_not_recorded_as_fulfilled() {
+    let store = Arc::new(MemoryStore::new());
+    let (_, mut session) = new_session(store, "node-a").await;
+
+    // A steered turn: the call is emitted and the steer is open.
+    let admitted = session
+        .begin_turn(TurnId::new("t1"), vec![Item::user_text("go")])
+        .await
+        .unwrap();
+    let response_id = admitted.response_id().clone();
+    session
+        .complete_with_item(
+            &response_id,
+            steer_call(),
+            Usage::default(),
+            ControlRecord::default(),
+        )
+        .await
+        .unwrap();
+    assert!(!session.state().this_turn_fulfilled_a_steer());
+
+    // The next turn resends the call, but the output is codex's own
+    // cancellation text -- not a correction the agent ever saw and acted
+    // on. A hand-rolled MCP stanza without the approval override, or an
+    // interactive client that declines the call, produces exactly this.
+    session
+        .begin_turn(
+            TurnId::new("t2"),
+            vec![
+                steer_call(),
+                tool_result(STEER_CALL_ID, "user cancelled MCP tool call"),
+            ],
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        session.state().open_steer_ids().is_empty(),
+        "control: the fold still closes open_steers on call_id, cancelled \
+         or not"
+    );
+    assert!(
+        !session.state().this_turn_fulfilled_a_steer(),
+        "a cancelled call delivered no correction to the agent, so the \
+         turn it lands on must not read as the one that answered the \
+         steer -- today the fold cannot tell cancellation text from a real \
+         directive and sets this true regardless"
+    );
+}
+
 /// A judge outage must not spend the session's lifetime allowance.
 ///
 /// `validations_run` is documented as "validations this session has bought",

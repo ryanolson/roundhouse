@@ -580,6 +580,83 @@ mod tests {
         );
     }
 
+    /// F04 (review finding): a real codex client prepends a
+    /// `Wall time: N.NNNN seconds\nOutput:` header (verbatim, per
+    /// codex-rs `core/src/tools/context.rs::McpToolOutput::response_payload`,
+    /// pin 6344a65 lines ~124-126) to every MCP tool result before it is
+    /// echoed back as the `function_call_output` this canonicalizes into an
+    /// `Exchange`. `NoProgressRepeat::detect` hashes the *whole* output
+    /// string, so four textually-identical tool answers become four
+    /// different hashes purely from the wall-clock jitter in that header —
+    /// the same false-progress shape the adjacent test proves this signal is
+    /// supposed to reject, except here the "different output" is an
+    /// artifact of the client's wire wrapper, not real progress.
+    #[test]
+    #[ignore = "F04: NoProgressRepeat hashes the whole output string, so codex's \
+                per-call `Wall time: N.NNNN seconds` wrapper (context.rs:124-126, \
+                pin 6344a65) makes four identical tool answers hash differently \
+                and the repeat never fires"]
+    fn a_codex_wrapped_repeat_still_fires() {
+        let signal = NoProgressRepeat {
+            occurrences: 3,
+            window: 8,
+        };
+
+        // Four calls, identical name/arguments/underlying answer — the exact
+        // loop `a_repeat_with_a_different_output_does_not_fire` proves this
+        // signal catches when the output is a bare string. Here each output is
+        // wrapped the way a real codex client wraps it: a wall-time header
+        // whose only variation is unavoidable per-call jitter, then the same
+        // `Output:` body every time.
+        let mut stuck = Vec::new();
+        for (n, wall_time) in [0.0421, 0.0398, 0.0512, 0.0407].into_iter().enumerate() {
+            stuck.push(call(&format!("c{n}"), "pytest", r#"{"path":"tests/"}"#));
+            stuck.push(result(
+                &format!("c{n}"),
+                &format!(
+                    "Wall time: {wall_time:.4} seconds\nOutput:\nImportError: no module named app"
+                ),
+            ));
+        }
+        let fact = signal
+            .detect(&evidence_of(&stuck, &[]))
+            .expect("four codex-wrapped identical answers is still the same loop");
+        assert!(fact.contains("identical output 4 times"), "{fact}");
+    }
+
+    /// F04 (review finding): the same codex wrapper defeats
+    /// `ToolFailureStreak`, whose failure check
+    /// (`exchange::reads_as_failure`) is anchored on the *head* of the
+    /// output string. Codex's exec-tool wrapper (`response_text`,
+    /// context.rs:449-467, pin 6344a65) puts `Chunk ID: ...` / `Wall time:
+    /// ...` / `Output:` ahead of the tool's own text unconditionally, so the
+    /// anchored `starts_with("error"|"failed"|...)` check can never see a
+    /// codex-wrapped failure marker — this is a hard "never", not a
+    /// probabilistic miss.
+    #[test]
+    #[ignore = "F04: ToolFailureStreak relies on exchange::reads_as_failure, which \
+                anchors on the string head; codex's `Chunk ID:`/`Wall time:`/`Output:` \
+                wrapper (context.rs:449-467, pin 6344a65) sits ahead of the marker on \
+                every real tool result, so the anchored check never matches"]
+    fn a_codex_wrapped_failure_streak_still_fires() {
+        let streak = ToolFailureStreak { length: 3 };
+
+        let mut failing = Vec::new();
+        for n in 0..3 {
+            failing.push(call(&format!("c{n}"), "cargo", "{}"));
+            failing.push(result(
+                &format!("c{n}"),
+                &format!(
+                    "Chunk ID: chunk-{n}\nWall time: 0.{n:02} seconds\nOutput:\nError: build failed"
+                ),
+            ));
+        }
+        let fact = streak
+            .detect(&evidence_of(&failing, &[]))
+            .expect("three codex-wrapped failures in a row is still a failure streak");
+        assert!(fact.contains("all returned failures"), "{fact}");
+    }
+
     #[test]
     fn the_other_three_signals_fire_on_their_pattern_and_are_quiet_otherwise() {
         // Ping-pong: strict alternation of two names, and nothing else.

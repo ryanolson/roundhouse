@@ -1476,6 +1476,49 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "F07: codex's build_header_map drops env_http_headers silently \
+                (unset var / blank var / a value HeaderValue rejects, e.g. a \
+                trailing newline from `$(cat key)`) and none of the three raise \
+                an error the way env_key's EnvVarError sibling does. In \
+                ForwardedOpenAiLogin mode env_http_headers is the only carrier \
+                of TURN_KEY_HEADER (that stanza omits env_key on purpose), so \
+                any of those three silently produces exactly this request: no \
+                TURN_KEY_HEADER, Authorization still carrying the caller's own \
+                forwarded upstream bearer. presented_key() then reads that \
+                bearer as an attempted turn key and authenticate() fails its \
+                shape check, so the operator's dropped-header misconfiguration \
+                surfaces as malformed_key -- 'inspect the key you sent' -- \
+                when no roundhouse key was sent at all. Currently red: \
+                turn_admission returns Err(MalformedKey), not Err(MissingKey)."]
+    fn a_pass_through_request_that_lost_its_dedicated_header_is_not_reported_as_a_malformed_key() {
+        let plane = pass_through_plane();
+
+        // PROBE: exactly what codex sends once `env_http_headers` silently
+        // drops `TURN_KEY_HEADER` -- no dedicated header at all, and
+        // `Authorization` still carrying the caller's own forwarded upstream
+        // bearer (the whole point of `ForwardedOpenAiLogin`, not a roundhouse
+        // key attempt).
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            "Bearer eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJhZGEifQ.a-real-seat-token"
+                .parse()
+                .expect("a valid header value"),
+        );
+
+        // The operator never sent a malformed key -- codex dropped the header
+        // they configured correctly, and what's left (a real upstream bearer)
+        // only collides with the turn-key shape check by coincidence.
+        // `MalformedKey` sends them to inspect a key string that was never
+        // theirs to send.
+        assert_eq!(
+            plane.turn_admission(&headers).err(),
+            Some(AuthError::MissingKey),
+            "a lost dedicated header must not be reported as a malformed turn key"
+        );
+    }
+
+    #[test]
     fn qualify_and_contains_are_inverses_in_both_modes() {
         // The property the namespace rests on: an id this deployment mints for
         // a caller is an id that caller's own key then reaches. A mint and a

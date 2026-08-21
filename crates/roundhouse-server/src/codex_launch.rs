@@ -484,6 +484,41 @@ mod tests {
         assert_eq!(byok["env_key"].as_str(), Some(DEFAULT_KEY_ENV));
     }
 
+    /// F08: the forwarded stanza must name the real precondition for
+    /// forwarding, which is a completed `codex login` -- not the flag.
+    ///
+    /// At `codex-cli` 0.146.0, `model-provider/src/auth.rs::resolve_provider_auth`
+    /// (reached from both `api_auth` and `api_auth_for_scope`, the latter being
+    /// what `core/src/client.rs` calls for every live request) decides the
+    /// `Authorization` header from exactly two facts: whether `env_key` is set,
+    /// and whether the auth manager has a cached `CodexAuth` -- populated only by
+    /// a prior `codex login`, which persists it to `auth.json` in `CODEX_HOME`.
+    /// `requires_openai_auth` is never read in that function. A client that has
+    /// never logged in resolves to `unauthenticated_auth_provider()`: no
+    /// `Authorization` header at all, so `turn_admission` in `control_config`
+    /// captures nothing and the turn is admitted anyway, degraded to local.
+    /// Nothing at the flag names this, so an operator handed only the flag's
+    /// comment has no way to know a skipped `codex login` is silent.
+    #[test]
+    #[ignore = "F08: the forwarded stanza's doc comment names only requires_openai_auth as \
+                the mechanism; it does not name a completed `codex login` as the actual \
+                precondition, so an operator has no way to know a skipped login degrades \
+                every turn to local silently. See codex_launch.rs's CodexAuthKind::ForwardedOpenAiLogin \
+                doc block and the auth block in CodexLaunch::config_toml -- fixing this test means \
+                adding that sentence there, not changing the auth-resolution mechanism."]
+    fn the_forwarded_stanza_tells_the_operator_the_login_is_the_precondition() {
+        let forwarding = launch().forwarding_openai_login();
+        let toml_text = forwarding.config_toml();
+        assert!(
+            toml_text.to_ascii_lowercase().contains("codex login"),
+            "the forwarded-login stanza must name `codex login` as the actual \
+             precondition for forwarding -- `requires_openai_auth` alone gates \
+             nothing in the auth-resolution chain, so a client that never ran \
+             `codex login` sends no Authorization header at all and every turn \
+             silently degrades to local:\n{toml_text}"
+        );
+    }
+
     /// The provider name is not `OpenAI`, and the check the client makes is on
     /// this field rather than on the table key.
     #[test]
@@ -534,6 +569,82 @@ mod tests {
         );
     }
 
+    /// The blanket `"approve"` above is justified by a claim about
+    /// `roundhouse-mcp`'s tool list (every writing tool only narrows what the
+    /// caller's key already allows, never widens it) that this crate cannot
+    /// itself check. This is the tripwire for that claim: it does not
+    /// re-derive the narrowing property (nothing here can), it only pins the
+    /// surface's *size* at the count the justification above was written
+    /// against. `roundhouse-server/tests/mcp_surface.rs` already pins the
+    /// same list against the live wire response, but that assertion carries
+    /// no message -- a ninth tool fails it, but the failure points at a
+    /// mismatched const, not at this comment. If this test goes red, re-read
+    /// the paragraph above before updating the count: a tool that spends a
+    /// budget or widens a policy is exactly the case the blanket grant does
+    /// not cover.
+    #[test]
+    fn the_surface_is_still_the_eight_tools_the_launch_config_grants_blanket_approval_to() {
+        assert_eq!(
+            roundhouse_mcp::tools::TOOL_NAMES.len(),
+            8,
+            "roundhouse-mcp's tool surface changed size; codex_launch.rs's \
+             default_tools_approval_mode = \"approve\" is justified above by a \
+             narrowing-only property of exactly the eight tools this pin \
+             names -- confirm a new or changed tool still only narrows what \
+             the caller's key allows before touching this number"
+        );
+    }
+
+    /// F01 (review): codex 0.146.0's `McpServerToolConfig.approval_mode`
+    /// (`config/src/mcp_types.rs:54-61,222` @ pin `6344a65`) is consulted
+    /// per-tool ahead of `default_tools_approval_mode`
+    /// (`McpServerMetadata::tool_approval_mode`,
+    /// `codex-mcp/src/server.rs:246-252` @ binary tree `e363b08` --
+    /// `core/src/mcp_tool_call.rs`'s own precedence helper is
+    /// `#[cfg(test)]`-only, so the production authority lives in
+    /// `codex-mcp`, not `core`). The claim under test: the launch config
+    /// should grant approval to `fetch_steer` alone, under
+    /// `[mcp_servers.<key>.tools.fetch_steer]`, and say nothing about the
+    /// other seven tools -- rather than the shipped blanket
+    /// `default_tools_approval_mode = "approve"`, which pre-approves every
+    /// tool on the surface, including ones that do not exist yet.
+    #[test]
+    #[ignore = "F01 (partially valid): the blanket default_tools_approval_mode grant is real \
+                and does pre-approve any future tool sight-unseen, but this test's proposed \
+                remedy is wrong. `codex exec` forces approval_policy = never \
+                (codex_launch.rs:558), so scoping approval to fetch_steer alone and 'leaving \
+                the writers to the client' does not defer those calls for review -- there is no \
+                interactive client in this topology, and any tool still requiring approval under \
+                that policy is unconditionally cancelled (core/src/mcp_tool_call.rs's \
+                requires_mcp_tool_approval_for_mode, AppToolApproval::Auto/Writes/Prompt arms, \
+                @ e363b08). Applying this test's fix would permanently break prefer and \
+                set_quality_floor rather than narrow the grant. The claim's 'no explicit review' \
+                framing also ignores the existing size tripwire \
+                (the_surface_is_still_the_eight_tools_the_launch_config_grants_blanket_approval_to), \
+                which already fails the build the moment a ninth tool lands. The narrower fix the \
+                module doc already names is truthful per-tool MCP annotations (readOnlyHint / \
+                destructiveHint / openWorldHint) in roundhouse-mcp/src/tools.rs, which \
+                requires_mcp_tool_approval (core/src/mcp_tool_call.rs) consults ahead of any \
+                config and which holds for every client, not only ones roundhouse generated a \
+                config for -- not per-tool approval_mode in codex_launch.rs, which is what this \
+                test checks for."]
+    fn only_the_steer_read_is_auto_approved_and_the_writers_are_left_to_the_client() {
+        let config = parsed(&launch());
+        let server = &config["mcp_servers"][mcp_server_key()];
+        assert_eq!(
+            server["tools"]["fetch_steer"]["approval_mode"].as_str(),
+            Some("approve"),
+            "fetch_steer must be approved by its own per-tool entry, not by a \
+             server-wide default:\n{server}"
+        );
+        assert!(
+            server.get("default_tools_approval_mode").is_none(),
+            "a per-tool grant for fetch_steer should replace the blanket \
+             default_tools_approval_mode entirely -- leaving both in place \
+             still pre-approves every present and future tool on the surface:\n{server}"
+        );
+    }
+
     /// The MCP url is the deployment root plus the mount path, not the API
     /// base plus a suffix.
     #[test]
@@ -562,6 +673,42 @@ mod tests {
         assert_eq!(
             config["mcp_servers"][mcp_server_key()]["url"].as_str(),
             Some("http://127.0.0.1:8080/mcp")
+        );
+    }
+
+    /// F14: `mcp_endpoint` strips the literal `"/v1"`, not "whatever version
+    /// `responses_api::responses_router` actually serves" -- and nothing ties
+    /// the two together. The route is a bare literal at
+    /// `responses_api.rs:139` (`.route("/v1/responses", ...)`); this function's
+    /// `strip_suffix("/v1")` is a second, independent literal that happens to
+    /// agree with it today. A future rung that moves the turn surface (this
+    /// function's own doc: "base_url ends in the API version") only updates
+    /// one of the two if the edit is made where the route lives, and the
+    /// failure is silent: `unwrap_or(root)` keeps the un-stripped root rather
+    /// than erroring, so the generated MCP url gains a stray version segment
+    /// the real router -- mounted at the deployment root by a flat `.merge` in
+    /// `main.rs`, not nested under any version -- does not serve. That is
+    /// exactly the drift [`MCP_MOUNT_PATH`]'s own doc comment was written to
+    /// prevent for the mount path; this is the same shape one literal to the
+    /// left, unfixed.
+    #[test]
+    #[ignore = "F14: mcp_endpoint hardcodes \"/v1\" instead of deriving it from \
+                responses_api::responses_router's own route literal; a future /v2 rung \
+                silently breaks the MCP url. Fix: promote a shared API_VERSION_PREFIX \
+                constant both sides read, the way MCP_MOUNT_PATH already does for the mount \
+                path."]
+    fn mcp_endpoint_tracks_whatever_version_the_responses_route_actually_serves() {
+        // Simulates "a future /v2 rung moves the turn surface" (the claim's
+        // own words): if `responses_api`'s route ever serves `/v2/responses`
+        // instead of `/v1/responses`, `base_url` becomes `.../v2`, and the MCP
+        // mount -- unchanged, always at the deployment root -- must still
+        // resolve to `.../mcp`.
+        assert_eq!(
+            mcp_endpoint("http://127.0.0.1:8080/v2"),
+            "http://127.0.0.1:8080/mcp",
+            "mcp_endpoint only recognizes the literal \"/v1\"; a routed version of \"/v2\" \
+             leaves the un-stripped root in place and the MCP url gains a bogus /v2 segment \
+             the real router does not serve"
         );
     }
 

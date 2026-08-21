@@ -65,9 +65,13 @@
 //!
 //! **No network is needed.** The server binds `127.0.0.1:0`, the model catalog
 //! is pinned on disk (so the client's models manager has no network path at
-//! all), no `auth.json` is ever written, and the child's environment is cleared
-//! before it is built — so a login the developer happens to hold cannot leak
-//! into a request. Nothing here reaches beyond loopback. The "cannot leak"
+//! all), and the child's environment is cleared before it is built — so a
+//! login the developer happens to hold cannot leak into a request. Under
+//! `RoundhouseKey`, no `auth.json` is ever written; the one exception is
+//! [`Rig::start_forwarding`], whose crafted, unsigned `auth.json` is still
+//! hermetic (see `forwarded_login_auth_json`'s doc for why 0.146.0 accepts it
+//! without a network round trip). Nothing here reaches beyond loopback. The
+//! "cannot leak"
 //! half of that claim is enforced by
 //! `the_childs_environment_carries_only_the_allowlisted_keys_and_no_ambient_credential`
 //! below, on the constructed [`std::process::Command`] itself — added in
@@ -135,7 +139,10 @@ use roundhouse_core::store::{MemoryStore, SessionStore};
 use roundhouse_core::validate::{Validator, ValidatorConfig};
 use roundhouse_fleet::EchoFrontierClient;
 use roundhouse_mcp::ControlStore;
-use roundhouse_server::codex_launch::{CONTEXT_WINDOW_TOKENS, CodexLaunch, DEFAULT_KEY_ENV};
+use roundhouse_server::codex_launch::{
+    CONTEXT_WINDOW_TOKENS, CodexAuthKind, CodexLaunch, DEFAULT_KEY_ENV,
+};
+use roundhouse_server::control_config::directory::key_id;
 use roundhouse_server::control_config::{MembershipRole, TURN_KEY_HEADER};
 use roundhouse_server::mcp_api::MCP_MOUNT_PATH;
 use roundhouse_server::{
@@ -205,6 +212,51 @@ const CODEX_BIN_VAR: &str = "ROUNDHOUSE_TEST_CODEX_BIN";
 
 /// The version this suite's assertions were written against.
 const VERIFIED_VERSION: &str = "codex-cli 0.146.0";
+
+/// A hermetic seat token: an unsigned, three-part JWT whose payload is
+/// `{"exp":2053740800}` (2035-01-01), base64url-encoded with no padding.
+///
+/// F12 (`ForwardedOpenAiLogin` had never been driven by a real binary): the
+/// header and signature segments are never decoded by 0.146.0
+/// (`decode_jwt_payload`, `login/src/token_data.rs:117-127`, binds them to
+/// `_header_b64` / `_sig_b64` and reads neither), so they are placeholders
+/// rather than anything cryptographic; only the payload has to survive
+/// base64url decode into JSON. The far `exp` is what keeps
+/// `should_refresh_proactively` (`login/src/auth/manager.rs:2510-2532`) from
+/// ever reaching for the network: it returns as soon as a parsed `exp` is
+/// more than five minutes out, before `last_refresh` is even looked at.
+const SEAT_ACCESS_TOKEN: &str = "header.eyJleHAiOjIwNTM3NDA4MDB9.sig";
+
+/// The account id this run's hermetic login carries.
+///
+/// Lives on `TokenData.account_id` in the crafted `auth.json`, not inside the
+/// JWT payload above — `CodexAuth::get_account_id` (`login/src/auth/manager.rs:567-573`)
+/// reads the token-data field directly for every non-headers/agent-identity
+/// auth kind; the id-token JWT's own claims are never consulted for it.
+const SEAT_ACCOUNT_ID: &str = "acct-e2e-seat";
+
+/// The hermetic `$CODEX_HOME/auth.json` a real `codex login` would have
+/// written, built instead of run: `auth_mode` omitted (defaults to
+/// `AuthMode::Chatgpt`, `login/src/auth/manager.rs:1708-1720`, once no other
+/// mode's fields are set) is what a real login also leaves unset, so this
+/// matches rather than special-cases the default path.
+fn forwarded_login_auth_json(access_token: &str, account_id: &str) -> String {
+    serde_json::json!({
+        "OPENAI_API_KEY": null,
+        "tokens": {
+            // The id-token JWT is never inspected for `account_id` (see
+            // `SEAT_ACCOUNT_ID`'s doc) and its claims are all optional
+            // (`IdClaims`, codex `login/src/token_data.rs:71-79`), so an
+            // empty payload is enough to satisfy the three-part-JWT parse.
+            "id_token": "header.e30.sig",
+            "access_token": access_token,
+            "refresh_token": "unused-hermetic-refresh-token",
+            "account_id": account_id,
+        },
+        "last_refresh": "2020-01-01T00:00:00Z",
+    })
+    .to_string()
+}
 
 // ---------------------------------------------------------------------------
 // The recorder
@@ -368,6 +420,15 @@ struct Rig {
     /// is launched with, and the only place it exists outside the directory's
     /// hash.
     secret: String,
+    /// `sha256(secret)`, kept alongside it so F15's revocation test can name
+    /// the row `RevokeKey` wants without re-deriving it via a crate this file
+    /// does not otherwise depend on.
+    key_sha256: String,
+    /// The production admin plane this run minted its key from — kept live so
+    /// a test can revoke mid-run the way an operator's `DELETE` would, rather
+    /// than tearing down and rebuilding a directory the client is already
+    /// pointed at.
+    directory: Arc<ControlDirectory>,
     store: Arc<MemoryStore>,
     conversations: Arc<Conversations>,
     recorder: Recorder,
@@ -384,7 +445,15 @@ impl Rig {
     /// tenant does, which means the production `PlaneSource` — an
     /// `Arc<ControlDirectory>`, the one a shipped binary can name — and a
     /// secret that only ever existed inside `MintedKey`.
-    async fn start(label: &str) -> Self {
+    ///
+    /// Parameterized on [`CodexAuthKind`] rather than duplicated per kind: the
+    /// ~200 lines above the config write (bootstrap, directory, engine,
+    /// listener) are one fact about the deployment, not two, and a second copy
+    /// of them is exactly the fixture drift the module doc's "one function
+    /// used by both" reasoning (see `build_child_command`) warns against.
+    /// [`Self::start`] and [`Self::start_forwarding`] are the two call shapes;
+    /// this is where they meet.
+    async fn start_as(label: &str, auth: CodexAuthKind) -> Self {
         ensure_rustls_crypto_provider();
 
         // Under `target/`, not the system temp dir — precaution, not a
@@ -553,7 +622,27 @@ impl Rig {
 
         let base_url = format!("http://{addr}/v1");
         let catalog_path = root.join("home/models.json");
-        let launch = CodexLaunch::new(base_url.clone(), &catalog_path);
+        let mut launch = CodexLaunch::new(base_url.clone(), &catalog_path);
+        if auth == CodexAuthKind::ForwardedOpenAiLogin {
+            launch = launch.forwarding_openai_login();
+            // F12: the one file this suite's module doc ("no `auth.json` is
+            // ever written") did not anticipate, and deliberately still
+            // hermetic. 0.146.0 does no JWT signature check
+            // (codex `login/src/token_data.rs:117-127` decodes only the
+            // payload segment; `_sig_b64` is bound and never read) and
+            // schedules no network refresh for a token whose `exp` claim is
+            // more than five minutes out
+            // (`login/src/auth/manager.rs:2510-2532`,
+            // `CHATGPT_ACCESS_TOKEN_REFRESH_WINDOW_MINUTES = 5`), so a locally
+            // crafted, unsigned three-part JWT reproduces what a real
+            // `codex login` leaves in `CODEX_HOME` closely enough for this
+            // suite's purposes: nothing here reaches beyond loopback.
+            std::fs::write(
+                root.join("home/auth.json"),
+                forwarded_login_auth_json(SEAT_ACCESS_TOKEN, SEAT_ACCOUNT_ID),
+            )
+            .expect("writing the hermetic ChatGPT login");
+        }
         std::fs::write(root.join("home/config.toml"), launch.config_toml())
             .expect("writing the client's config");
         std::fs::write(&catalog_path, launch.model_catalog_json())
@@ -576,7 +665,9 @@ impl Rig {
 
         Self {
             root,
+            key_sha256: minted.key_sha256.clone(),
             secret: minted.secret,
+            directory,
             store,
             conversations,
             recorder,
@@ -586,9 +677,39 @@ impl Rig {
         }
     }
 
+    /// A bring-your-own-key deployment: the client holds a minted roundhouse
+    /// turn key and nothing else.
+    async fn start(label: &str) -> Self {
+        Self::start_as(label, CodexAuthKind::RoundhouseKey).await
+    }
+
+    /// A pass-through deployment: the client's own hermetic ChatGPT login
+    /// rides `Authorization`, and roundhouse's turn key still has to arrive
+    /// somewhere, which is [`TURN_KEY_HEADER`] via `env_http_headers`. See
+    /// [`Self::start_as`] for why this file never held a real login before.
+    async fn start_forwarding(label: &str) -> Self {
+        Self::start_as(label, CodexAuthKind::ForwardedOpenAiLogin).await
+    }
+
     /// The principal every request below resolves to.
     fn principal(&self) -> Principal {
         Principal::new(PROJECT, USER)
+    }
+
+    /// Revoke this run's turn key the way `DELETE /v1/admin/...` does: an
+    /// `apply` on the live directory, not a fixture shortcut. The compiled
+    /// plane swaps immediately (module doc, "Revocation, staleness, and the
+    /// two clocks") — no TTL wait is needed on this single-node rig, which is
+    /// the property F15 exists to exercise.
+    fn revoke_turn_key(&self) {
+        self.directory
+            .apply(
+                DirectoryMutation::RevokeKey {
+                    id: key_id(&self.key_sha256),
+                },
+                now_ms(),
+            )
+            .expect("the API-minted turn key is this API's to revoke");
     }
 
     /// The session codex drove, discovered rather than predicted.
@@ -1176,6 +1297,131 @@ async fn a_resumed_exec_continues_the_same_roundhouse_session() {
     rig.clean();
 }
 
+/// F15: a key revoked between two `codex exec` runs must fail the next turn,
+/// and must not leave the session with a half-written turn behind it.
+///
+/// This is the one credential-lifecycle event the M8 admin plane exists to
+/// perform, and the M9 rig is the only place able to watch it end to end: the
+/// unit suites in `control_config/directory/tests.rs` (e.g.
+/// `a_revoked_key_compiles_to_a_named_refusal`) prove the plane refuses a
+/// revoked hash, but nothing there drives a real client across the boundary —
+/// a second process, holding the same secret in its environment, that has to
+/// discover the refusal itself.
+///
+/// **Open design question this test settles empirically, for codex-cli
+/// 0.146.0, rather than assuming an answer:** does a *resumed* process's MCP
+/// reconnect refuse first, or does `/v1/responses` refuse first? The answer
+/// is not what `a_real_codex_binary_completes_the_mcp_handshake_against_our_server`
+/// would suggest by analogy. That test shows a **fresh** `exec` sends
+/// `initialize`/`tools/list` synchronously before its first turn request,
+/// because it has no cached tool list yet. A **resumed** `exec` already has
+/// one — from the rollout `resume --last` reopens — so it sends
+/// `/v1/responses` immediately and reconnects to `/mcp` concurrently rather
+/// than gating the turn on it. Stderr timestamps from a captured run show the
+/// `/v1/responses` 401 (`codex_core::session::turn: Turn error: unexpected
+/// status 401`) logged strictly before the MCP client's own 401
+/// (`failed to initialize MCP client during shutdown`) — the MCP reconnect
+/// fails too, but only as a consequence of the turn already having ended, not
+/// as its cause. So for the credential-lifecycle path this test is actually
+/// about — a revoked key discovered on a *resumed* run — `/v1/responses` is
+/// the surface the client's turn depends on, and it is the one asserted below.
+/// The MCP request is still checked when present (both must agree it is
+/// `revoked_key`), but is not required to exist, since a client version that
+/// deferred its MCP reconnect further could plausibly drop it from the same
+/// process lifetime entirely.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "F15: needs the real codex binary: --features e2e-codex -- --include-ignored; ROUNDHOUSE_TEST_CODEX_BIN overrides PATH"]
+async fn a_key_revoked_between_runs_fails_the_next_turn_and_leaves_no_half_written_one() {
+    let rig = Rig::start("revoke").await;
+
+    let first = rig.exec("Say the word alpha and stop.").await;
+    first.assert_completed("the first run, before revocation");
+    first.assert_catalog_was_used();
+
+    let session = rig.session();
+    let seq_before_revocation = rig
+        .store
+        .last_seq(&session)
+        .await
+        .expect("the first run's session exists");
+
+    rig.revoke_turn_key();
+
+    // Same `CODEX_HOME`, same secret in the child's environment (`spawn`
+    // resolves it once, in `Rig::start`, and every run reuses it) — the only
+    // thing that changed between the two runs is the directory's row.
+    let second = rig.resume("Now say the word beta and stop.").await;
+
+    assert!(
+        !second.kinds().contains(&"turn.completed".to_string()),
+        "a revoked key must not let the resumed run complete a turn, but it saw: {:?}\n\
+         --- stdout\n{}\n--- stderr\n{}",
+        second.kinds(),
+        second.stdout,
+        second.stderr
+    );
+
+    // The surface the resumed turn actually depends on: `/v1/responses` must
+    // have been sent (a resumed run does not re-fetch tools before its first
+    // turn, per the doc comment above) and refused by name, not merely by
+    // status — `unknown_key` would mean the revocation never took effect on
+    // this node, and a 200 would mean the key still worked.
+    let turns_after = rig.recorder.to("/v1/responses");
+    let last_turn = turns_after
+        .last()
+        .expect("the resumed run must have attempted its turn against /v1/responses");
+    assert_eq!(
+        last_turn.status,
+        401,
+        "a revoked key must refuse the resumed turn with 401, not accept it or answer some \
+         other status; recorder:\n{}",
+        rig.recorder.transcript()
+    );
+
+    // The MCP surface, if the client also reached it in this process: same
+    // key, same directory, so it must agree. Not required to exist — see the
+    // doc comment on why a resumed run's MCP reconnect is not load-bearing for
+    // the turn and a future client could omit it from this process lifetime
+    // entirely.
+    if let Some(mcp_after) = rig.recorder.rpc("initialize").last() {
+        assert_eq!(
+            mcp_after.status,
+            401,
+            "the same revoked key must be refused on `/mcp` too, if the client reached it; \
+             recorder:\n{}",
+            rig.recorder.transcript()
+        );
+        assert_eq!(
+            mcp_after
+                .response
+                .as_ref()
+                .and_then(|body| body["error"]["code"].as_str()),
+            Some("revoked_key"),
+            "the refusal must be the tombstone's own code, not `unknown_key`: {:?}",
+            mcp_after.response
+        );
+    }
+
+    // The claim proving fix: no half-written turn. `create_response` resolves
+    // admission before it ever reads the body or touches the store (see
+    // `responses_api.rs`'s "Before the body is even read"), so a refused
+    // second run must leave the session's log at exactly the sequence number
+    // the first run left it at — not one `TurnStarted` further, and not one
+    // partial `ItemAppended` further.
+    let seq_after_revocation = rig
+        .store
+        .last_seq(&session)
+        .await
+        .expect("the session still exists");
+    assert_eq!(
+        seq_after_revocation, seq_before_revocation,
+        "a refused turn must append nothing to the session log: expected the log to stay at \
+         seq {seq_before_revocation}, found it at {seq_after_revocation}"
+    );
+
+    rig.clean();
+}
+
 /// A real codex binary completes the MCP handshake against our own service.
 ///
 /// The first thing this milestone has to establish, and deliberately ahead of
@@ -1275,6 +1521,56 @@ async fn a_real_codex_binary_completes_the_mcp_handshake_against_our_server() {
             tool["type"] == "namespace" && tool["name"] == roundhouse_server::DEFAULT_MCP_NAMESPACE
         }),
         "codex must offer the model our namespace: {tools:?}"
+    );
+
+    rig.clean();
+}
+
+/// F12: the other credential doors, on a real request.
+///
+/// Every assertion above this one runs under `RoundhouseKey`, where a BYOK
+/// stanza names one env var for both the bearer and the dedicated header —
+/// so `authorization` and `TURN_KEY_HEADER` carry the *same* value on every
+/// prior green run, and "the dedicated header wins" is unobservable there:
+/// nothing distinguishes "preferred" from "only option considered". This is
+/// the first fixture where the two doors carry *different* values, which is
+/// the only shape in which a preference is a testable property at all, and
+/// the only real-binary evidence that `ForwardedOpenAiLogin` — whose only
+/// caller anywhere in the workspace was its own two unit tests in
+/// `codex_launch.rs` before this test existed — sends what its generated
+/// config says it will.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "F12: needs the real codex binary: --features e2e-codex -- --include-ignored; ROUNDHOUSE_TEST_CODEX_BIN overrides PATH"]
+async fn a_forwarded_login_sends_the_seat_and_our_key_on_the_same_request() {
+    let rig = Rig::start_forwarding("forwarded").await;
+    let run = rig.exec("Say the word alpha and stop.").await;
+    run.assert_completed("the forwarded-login run");
+
+    let turn = &rig.recorder.to("/v1/responses")[0];
+
+    // The turn completed at all, which `presented_key`
+    // (`control_config/mod.rs:896-940`) would refuse with `MalformedKey` had
+    // it read `Authorization` first: `SEAT_ACCESS_TOKEN` is not `rh_*`-shaped.
+    // That refusal is the mechanism this assertion pair is the wire evidence
+    // for — the completion is not incidental to it.
+    assert_eq!(
+        turn.header("authorization"),
+        Some(format!("Bearer {SEAT_ACCESS_TOKEN}").as_str()),
+        "the forwarded stanza's Authorization must carry the client's own seat: {:?}",
+        turn.headers
+    );
+    assert_eq!(
+        turn.header(TURN_KEY_HEADER),
+        Some(rig.secret.as_str()),
+        "and roundhouse's own key must still arrive, in its own header: {:?}",
+        turn.headers
+    );
+    assert_ne!(
+        turn.header("authorization"),
+        Some(format!("Bearer {}", rig.secret).as_str()),
+        "the two doors must disagree here -- RoundhouseKey's BYOK stanza cannot tell \
+         'preferred' from 'only option present' because both headers there carry the same \
+         value (see this test's own module doc)"
     );
 
     rig.clean();
@@ -1453,6 +1749,79 @@ async fn a_real_codex_binary_executes_our_synthetic_tool_call_and_returns_its_ou
     println!("    validated turns: {:?}", rig.validation_turns().await);
     println!("    final agent message: {:?}", third.last_message.trim());
     println!("--- end M9-USAGE-EVIDENCE");
+
+    rig.clean();
+}
+
+/// §10.2 evidence, made concrete: F03 finds that the M9-USAGE-EVIDENCE block
+/// above prints codex's *cumulative* `total_token_usage` (the client's own
+/// `turn.completed.usage`) as if it reassured a reader about the compaction
+/// gate, when the gate and `get_context_remaining` are actually driven by
+/// `last_token_usage` — a value the pinned client *replaces*, never sums, on
+/// every response (`codex-rs/protocol/src/protocol.rs:2122-2124`
+/// `append_last_usage`; `codex-rs/core/src/context_manager/history.rs:415-419`
+/// `get_total_token_usage`, which despite its name reads
+/// `last_token_usage.total_tokens`).
+///
+/// A steered turn's completion carries the judge's usage, not a measure of
+/// the history it stood in for (`Session::complete_with_item`'s "the usage is
+/// the interjection's"), so on the real client that usage becomes the new
+/// `last_token_usage` — collapsing it — for a turn about to resend the whole
+/// growing conversation to fulfil the steer.
+///
+/// This asserts the relationship the "reassuring" reading implies: that the
+/// steered turn's reported usage is at least in the neighbourhood of what the
+/// very next real turn actually costs. It is not — measured on this box, the
+/// steered turn (judge side call 1's usage, exactly) reports total 1147
+/// tokens while the fulfilling turn's real input is 5666, a ~4.9x gap — which
+/// is why the assertion is written as a red line rather than a green one.
+#[ignore = "F03: the steered turn's booked usage (the judge's, exactly — asserted \
+            below) understates the fulfilling turn's real input by ~5x on this \
+            box; codex's compaction gate reads last_token_usage \
+            (core/context_manager/history.rs:415-419), which this usage replaces \
+            wholesale, not the cumulative total_token_usage the removed evidence \
+            block printed — needs the real codex binary: --features e2e-codex -- \
+            --include-ignored; ROUNDHOUSE_TEST_CODEX_BIN overrides PATH"]
+#[tokio::test]
+async fn a_steered_turns_reported_usage_understates_the_next_turns_real_input() {
+    let rig = Rig::start("usage-evidence").await;
+    let [_first, _second, _third] = rig.drive_to_a_steer().await;
+
+    let responses = rig.response_usage().await;
+    assert_eq!(
+        responses.len(),
+        4,
+        "turn 1, turn 2, the steer deposit (turn 3), and the fulfilling turn \
+         (turn 4): {responses:#?}"
+    );
+    let steered = &responses[2];
+    let fulfilling = &responses[3];
+
+    let side_calls = rig.side_call_usage().await;
+    assert_eq!(
+        *steered, side_calls[0],
+        "the steered turn's booked usage must be exactly the judge's — it is \
+         not a measure of the conversation the steer stood in for, which is \
+         the premise the mismatch below rests on"
+    );
+
+    // The relationship a reader who takes the display accumulator as
+    // reassuring would expect: that a steered turn's reported cost is roughly
+    // in line with what the conversation actually costs one turn later. This
+    // is the line that must go red for F03 to be more than a reading of
+    // codex's source — it is the same gap `last_token_usage` opens on the
+    // real client, made visible without needing codex-core as a dependency.
+    assert!(
+        fulfilling.input_tokens <= steered.total().saturating_mul(2),
+        "F03: the fulfilling turn's real input ({} tokens) is {:.1}x the \
+         steered turn's reported usage ({} tokens) -- on the real client this \
+         is exactly the quantity that replaces last_token_usage between the \
+         two turns, so a compaction gate reading last_token_usage sees the \
+         small number, not the real one, for the turn most likely to need it",
+        fulfilling.input_tokens,
+        fulfilling.input_tokens as f64 / steered.total().max(1) as f64,
+        steered.total(),
+    );
 
     rig.clean();
 }
@@ -1729,6 +2098,146 @@ async fn the_next_turn_reflects_the_correction() {
         third.last_message
     );
     rig.assert_never_forked().await;
+
+    rig.clean();
+}
+
+/// F11: the injection-boundary sweep in `the_next_turn_reflects_the_correction`
+/// reads "every captured document, request and response alike" and asserts
+/// `JUDGE_PROSE` is absent from both halves of every exchange. That is true of
+/// what is captured — but `record` only ever parses a response body for
+/// [`MCP_MOUNT_PATH`] (see the doc comment on `Exchange::response`), so a
+/// `SteerAction::Halt`'s reason — committed as the assistant text of the very
+/// `/v1/responses` response that ends the run — is never captured at all, and
+/// unlike a `Steer`, there is no next turn to resend it one turn late.
+///
+/// This does not need the real codex binary: it drives the actual `record`
+/// middleware, defined in this file, against a synthetic `/v1/responses`
+/// route that answers with `JUDGE_PROSE` in its body — standing in for a
+/// Halt's rendered directive — and shows the recorder never sees it.
+#[tokio::test]
+#[ignore = "F11: record() only parses a response body for MCP_MOUNT_PATH (codex_e2e.rs:325-338), \
+            so a Halt's reason committed as the /v1/responses body is never captured and the \
+            injection-boundary sweep in `the_next_turn_reflects_the_correction` cannot see it; \
+            the mitigation documented on that test (a later turn resends the text) does not apply \
+            to Halt, which ends the run. Fix: narrow the sweep's doc claim to name Halt as \
+            structurally uncovered, or extend `record` to capture bounded non-streaming \
+            /v1/responses bodies (non-stream requests only) so a real e2e Halt test can assert on it."]
+async fn the_injection_sweep_cannot_see_a_halts_reason_in_the_v1_responses_body() {
+    use axum::routing::post;
+    use tower::ServiceExt;
+
+    let recorder = Recorder::default();
+
+    // Stands in for the Halt path (`engine.rs`'s `Interjection::Complete` arm):
+    // a `/v1/responses` response whose body is the judge's rendered directive.
+    // A real Halt never reaches this test's harness — it needs a live codex
+    // binary — so this exercises the one thing that does not: the capture
+    // boundary `record` draws before any sweep ever runs.
+    async fn halt_like_response() -> String {
+        format!("{{\"halt_reason\": \"{JUDGE_PROSE}\"}}")
+    }
+
+    let app: Router = Router::new()
+        .route("/v1/responses", post(halt_like_response))
+        .layer(axum::middleware::from_fn_with_state(
+            recorder.clone(),
+            record,
+        ));
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/responses")
+        .header("content-type", "application/json")
+        .body(Body::from("{}"))
+        .expect("a well-formed request");
+
+    let response = app.oneshot(request).await.expect("the app answers");
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+    let exchange = recorder
+        .to("/v1/responses")
+        .into_iter()
+        .next()
+        .expect("record() must have captured the request that just went through");
+
+    // The claim under test: a response body containing JUDGE_PROSE on
+    // `/v1/responses` is captured (so the sweep could catch a Halt's leaked
+    // reason). Today it is not — `record` never parses this path's response
+    // — so this assertion fails, which is F11's mechanism made concrete.
+    assert!(
+        exchange
+            .response
+            .as_ref()
+            .is_some_and(|body| body.to_string().contains(JUDGE_PROSE)),
+        "record() must capture a /v1/responses response body containing the \
+         judge's prose so `the_next_turn_reflects_the_correction`'s sweep can \
+         see it, but the captured exchange's `response` field was {:?}. This is \
+         exactly the gap F11 names: a Halt's reason lands only in this body, on \
+         the one path `record` never parses.",
+        exchange.response
+    );
+}
+
+/// F09: codex stamps `params._meta.threadId` on **every** `tools/call` it
+/// dispatches — unconditionally, via `with_mcp_tool_call_thread_id_meta`
+/// (`codex-rs/core/src/mcp_tool_call.rs` at the pin, `6344a65`) — and that
+/// value is byte-identical to the `prompt_cache_key` the same process's
+/// `/v1/responses` traffic carries, both of them the client's own
+/// `sess.thread_id`. Neither `ControlPlaneReads::resolve_session`
+/// (`crates/roundhouse-server/src/mcp_api.rs`, resolves from the tool's own
+/// `conversation` argument or `Conversations::latest`) nor `fetch_steer`
+/// (`crates/roundhouse-mcp/src/plane.rs`, resolves from `request.steer_id`
+/// alone) ever reads it.
+///
+/// This is not a behavioral defect: tenant-scoped `Principal` plus
+/// `Conversations::latest`/the qualified `conversation` argument already
+/// isolate sessions correctly with no help from `_meta`, so the assertion
+/// below is expected to **pass today**. The point it proves is narrower and
+/// still real — that a free, client-supplied session correlator rides every
+/// single tool call and is discarded — which the documented-assumption block
+/// this suite retires (`crates/roundhouse-mcp/src/lib.rs`'s module doc, "Note
+/// the tense") does not mention. That block describes dispatch and resend as
+/// proven and says nothing about a correlator M9's own captures show arriving
+/// on every call, so its account of what M9 closed is incomplete rather than
+/// wrong.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "F09: doc-accuracy only, not a behavioral defect — needs the real codex binary: --features e2e-codex -- --include-ignored; ROUNDHOUSE_TEST_CODEX_BIN overrides PATH"]
+async fn codexs_meta_thread_id_rides_every_tools_call_and_is_never_read() {
+    let rig = Rig::start("meta-thread-id").await;
+    let [_first, _second, third] = rig.drive_to_a_steer().await;
+
+    let dispatched = rig.recorder.rpc("tools/call");
+    let steer_call = dispatched
+        .iter()
+        .find(|exchange| {
+            exchange.body.as_ref().map(|body| &body["params"]["name"])
+                == Some(&Value::from("fetch_steer"))
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "codex must have dispatched our steer over /mcp:\n{}",
+                rig.recorder.transcript()
+            )
+        });
+
+    let meta_thread_id =
+        steer_call.body.as_ref().expect("a JSON-RPC body")["params"]["_meta"]["threadId"]
+            .as_str()
+            .map(str::to_string);
+    let reported_thread_id = third.thread_id();
+
+    assert_eq!(
+        meta_thread_id, reported_thread_id,
+        "codex must stamp params._meta.threadId on every tools/call with the \
+         same id it reports as thread_id on `thread.started`, but the dispatched \
+         fetch_steer call carried {meta_thread_id:?} while the client reported \
+         {reported_thread_id:?}. Roundhouse never reads this field either way \
+         (`ControlPlaneReads::resolve_session` resolves from the tool's own \
+         `conversation` argument or `Conversations::latest`; `fetch_steer` \
+         resolves from `request.steer_id` alone) — this assertion passing is \
+         exactly F09's point: the correlator exists on the wire and is unused."
+    );
 
     rig.clean();
 }
