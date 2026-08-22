@@ -79,6 +79,27 @@ runtime coupling:
    M6 trigger vocabulary lacks — windowed error severity, edit/write/read
    counts, `compacted`, `pure_bash_streak`. It slots into the `Signal` trait
    seam M6 left open for exactly this, alongside the ACG-stability candidate.
+   *[2026-08-21: landed, as `roundhouse-core/src/validate/tool_signals.rs`,
+   attributed to Switchyard `053a61e` the way the judge prompts are attributed
+   and pinned by a test. Twelve of the struct's fourteen fields ported —
+   `severity`, `no_error_streak`, the four cumulative counts, the four
+   windowed ones, `pure_bash_streak`, `tests_passed`. `turn_depth` and
+   `compacted` did not, each refused with its reason stated inline in the
+   module's `# Attribution` block; note this
+   item's own list named `compacted` as one of the fields worth having, and it
+   is the one the re-read ruled dead three ways. Two signals were registered in
+   `default_signals()` and no more: `SignalKind::ErrorSeverity` (a named
+   failure at HARD or worse in the last three results — orthogonal to
+   `ToolFailureStreak`, which is anchored and needs a consecutive run, so both
+   are kept) and `SignalKind::PureBashStreak` (four consecutive calls that
+   neither read, wrote, edited nor planned). The scorers were refused: a tier
+   recommendation is the output shape `SignalFired::fact` forbids. The port
+   also forced the exit-code accessor — `exchange::exec_exit_code`, exit status
+   from codex's header as a structured fact, error patterns over the stripped
+   body — and closed the `reads_as_failure` blindness this ruling raised
+   against our own tree, test-first: valid, exec-only, and the "a false
+   negative leaves this signal quiet" caveat does not cover a systematic
+   miss.]*
 4. **Design references, not dependencies, for M7's pass-through**:
    Switchyard's `forward_auth` is a working production answer to four
    questions M7 must answer — a redirect-disabled client so a credential

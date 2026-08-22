@@ -439,14 +439,42 @@ mod tests {
             result("c1", "ImportError: no module named app"),
             call("c2", "pytest", r#"{"path":"tests/"}"#),
             result("c2", "ImportError: no module named app"),
+            // Four rather than two, so every signal in the default set that can
+            // fire on this shape does: the repeat needs three occurrences and
+            // the build pit four consecutive uncategorised calls.
+            call("c3", "pytest", r#"{"path":"tests/"}"#),
+            result("c3", "ImportError: no module named app"),
+            call("c4", "pytest", r#"{"path":"tests/"}"#),
+            result("c4", "ImportError: no module named app"),
         ];
+        // Every fact the default signal set would state about these items, the
+        // two ported ones included — taken from the signals themselves rather
+        // than typed out, so a signal whose wording later grows a model name or
+        // a number that looks like a price is caught here and not in review.
+        let evidence = crate::validate::Evidence {
+            exchanges: crate::validate::exchanges(&items),
+            turn_tokens: &[],
+        };
+        let facts: Vec<String> = crate::validate::default_signals()
+            .iter()
+            .filter_map(|signal| signal.detect(&evidence))
+            .collect();
+        // A tripwire on the default set, not a loose sanity check: an exact
+        // count is what makes a *new* signal's wording arrive here to be
+        // scanned rather than slipping into the brief unexamined. If a fifth
+        // signal starts firing on this fixture, add its assertion below — do
+        // not loosen this to `>=`, which is how the guard stops covering the
+        // thing it exists for.
+        assert_eq!(
+            facts.len(),
+            3,
+            "the repeat and both ported signals fire on this fixture, which is \
+             what makes their wording part of what this guard covers: {facts:?}"
+        );
         let brief = ValidationBrief::build(
             &items,
             Objective::from_items(&items),
-            vec![
-                "the call `pytest` has produced identical output 2 times in the last 2 tool calls"
-                    .into(),
-            ],
+            facts,
             BriefConfig::default(),
         );
         let rendered = brief.render();
@@ -494,7 +522,11 @@ mod tests {
         assert!(rendered.contains("the parser drops trailing commas"));
         assert!(rendered.contains("pytest"));
         assert!(rendered.contains(&brief.steps[0].argument_hash));
-        assert!(rendered.contains("produced identical output 2 times"));
+        assert!(rendered.contains("produced identical output 4 times"));
+        // The two ported signals' wording reaches the judge too, and is scanned
+        // for the same forbidden strings as everything else above.
+        assert!(rendered.contains("carried a recognised failure"));
+        assert!(rendered.contains("with no file read, written or edited"));
         assert!(
             !rendered.contains("consider") && !rendered.contains("recommend"),
             "facts, never suggestions"
