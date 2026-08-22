@@ -35,7 +35,6 @@ use crate::event::{
 use crate::ids::{ResponseId, SessionId, TurnId};
 use crate::metrics::pricing::TokenShape;
 use crate::metrics::{ModelKey, ServingMode};
-use crate::routing::DecisionRecord;
 use crate::validate::Arm;
 
 /// Tokens for one grouping, split by whether the provider counted them.
@@ -507,7 +506,12 @@ impl MetricsFold {
                     response_id.clone(),
                     Pending {
                         key: ModelKey::from_target(&decision.chosen),
-                        best_frontier_alternative_usd: best_frontier_alternative(decision),
+                        // The road not taken, priced by the router at the
+                        // moment it chose. On the record rather than here
+                        // because the Relay emission reads the same number per
+                        // turn, and a `min` spelled twice would agree until one
+                        // copy learned about a new candidate kind.
+                        best_frontier_alternative_usd: decision.quoted_frontier_alternative_usd(),
                         billing: decision.billing,
                     },
                 );
@@ -840,30 +844,12 @@ fn settle(
     }
 }
 
-/// The cheapest hosted option the router passed over when it chose local.
-///
-/// Read off the decision's own `considered` list rather than recomputed, so it
-/// reflects the ledger state and prices in force at that moment. `None` when
-/// local did not win — there is no alternative to a frontier call that was
-/// itself the frontier — or when no hosted model was quoted.
-fn best_frontier_alternative(decision: &DecisionRecord) -> Option<f64> {
-    if !decision.chosen.is_local() {
-        return None;
-    }
-    decision
-        .considered
-        .iter()
-        .filter(|candidate| !candidate.target.is_local())
-        .map(|candidate| candidate.expected_cost_usd)
-        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-}
-
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
     use crate::control::Principal;
     use crate::event::{Accounting, IncompleteReason};
-    use crate::routing::{Candidate, Target};
+    use crate::routing::{Candidate, DecisionRecord, Target};
     use crate::validate::SteerAction;
 
     // The fixtures live here, with the fold they build logs for, and are

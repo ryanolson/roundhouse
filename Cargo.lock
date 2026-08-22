@@ -414,6 +414,9 @@ name = "bitflags"
 version = "2.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
+dependencies = [
+ "serde_core",
+]
 
 [[package]]
 name = "blake3"
@@ -3020,6 +3023,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "nemo-relay-types"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3701e3e33349cbb2ab608aa40df9a819b5bfd8b86cbe03391cc0e19ce4013fa6"
+dependencies = [
+ "bitflags 2.13.1",
+ "chrono",
+ "serde",
+ "serde_json",
+ "typed-builder",
+ "uuid",
+]
+
+[[package]]
 name = "nibble_vec"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4310,6 +4327,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "roundhouse-relay"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "nemo-relay-types",
+ "roundhouse-core",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "roundhouse-server"
 version = "0.1.0"
 dependencies = [
@@ -4328,6 +4357,7 @@ dependencies = [
  "roundhouse-core",
  "roundhouse-fleet",
  "roundhouse-mcp",
+ "roundhouse-relay",
  "roundhouse-server",
  "roundhouse-store-redis",
  "serde",
@@ -5624,6 +5654,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "typed-builder"
+version = "0.23.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "31aa81521b70f94402501d848ccc0ecaa8f93c8eb6999eb9747e72287757ffda"
+dependencies = [
+ "typed-builder-macro",
+]
+
+[[package]]
+name = "typed-builder-macro"
+version = "0.23.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "076a02dc54dd46795c2e9c8282ed40bcfb1e22747e955de9389a1de28190fb26"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5748,13 +5798,14 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "uuid"
-version = "1.24.0"
+version = "1.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf3923a6f5c4c6382e0b653c4117f48d631ea17f38ed86e2a828e6f7412f5239"
+checksum = "2f87b8aa10b915a06587d0dec516c282ff295b475d94abf425d62b57710070a2"
 dependencies = [
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "js-sys",
- "serde_core",
+ "serde",
+ "sha1_smol",
  "wasm-bindgen",
 ]
 

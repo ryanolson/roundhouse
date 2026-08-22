@@ -1,0 +1,62 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "roundhouse-relay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+roundhouse-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# `v5` on top of the workspace's `v4`/`serde`: every id this crate mints is a
+# name-based digest of facts already in the log, because a replayed session has
+# to serialize byte-identically and `Uuid::new_v4` would make two exports of one
+# finished session differ. Features are additive, so asking for `v5` here does
+# not change what any other crate gets.
+uuid = { workspace = true, features = ["v5"] }
+
+# ATOF stamps `BaseEvent::timestamp` as a `chrono::DateTime<Utc>` and
+# `nemo-relay-types` does not re-export chrono, so a producer has to name it.
+# Declared with the same `0.4` requirement the types crate uses, so the resolver
+# unifies on the one version already in the tree (0.4.45) rather than adding a
+# second. `default-features = false` with `std` only: this crate converts
+# `at_ms` from the log into a timestamp and never reads a clock -- `clock` and
+# `now` are exactly the features a deterministic producer must not have.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+
+# Relay's published wire types, pinned exactly.
+#
+# **Why =0.7.3 and not 0.8.** `codec/optimization.rs` -- the whole
+# `LlmOptimizationSummary` surface this crate emits -- and the entire ATOF
+# envelope (`BaseEvent`, `ScopeEvent`, `MarkEvent`, `Event`, `DataSchema`,
+# `ScopeCategory`) are **byte-identical** across 0.7.3, 0.8.0-rc.1 and the tree
+# at `1a54812`. So the reason to stay is byte-identity of what we use, not "0.8
+# is unpublished" -- 0.8.0-rc.1 was published to crates.io on 2026-08-21. The
+# `=` is not decoration: a caret against a 0.x crate is not a reproducible
+# statement of what we depend on, and `version = "0.8"` would not even resolve
+# to `0.8.0-rc.1`, since cargo excludes pre-releases from ordinary requirements.
+#
+# **What the pin costs the whole graph.** `nemo-relay-types` requires
+# `uuid = "=1.18.1"` at every version, which drags the workspace down from the
+# 1.24.0 our caret resolved to -- six releases, graph-wide, not just here. Every
+# other uuid dependent in the lock is satisfied by 1.18.1 (`moka` wants `1.1`,
+# `rmcp` and `ts-rs` want `1`, `rama-http` wants `1.18`, codex wants `1`, Dynamo
+# wants a `1.18.1` caret), so it resolves -- but it is a **ceiling**: the day any
+# dependency requires `uuid >= 1.19`, the workspace stops resolving while this
+# line stands. **Unlock condition:** a `nemo-relay-types` release that relaxes
+# its own `=1.18.1` to a caret. Moving to a newer relay is not enough on its own
+# -- HEAD pins it exactly too.
+#
+# **When 0.8 would be the move.** `MetricEnvelope`, `METRIC_DATA_SCHEMA_NAME`
+# and the rest of the metric-mark surface exist only from 0.8. Nothing here
+# emits one; the day something does, 0.7.3 cannot express it at all and this
+# line moves to `=0.8.0-rc.1` (or to 0.8.0 final, which is not out yet).
+#
+# `default-features = false` is cosmetic today (`default = []`) and states the
+# intent that `schema` stays off: we emit these types and never generate a
+# JSON-Schema from them, so `schemars` has no business in this build.
+nemo-relay-types = { version = "=0.7.3", default-features = false }

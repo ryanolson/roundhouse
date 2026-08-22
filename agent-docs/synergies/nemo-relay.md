@@ -197,6 +197,43 @@ the ~15 ATIF structs are re-implementable in an afternoon — the spec is
 published — but start with the crate: a shared type is a conversation,
 a copy is a fork.
 
+> **[2026-08-21] S2 landed**, in `crates/roundhouse-relay` (the crate depends on
+> `roundhouse-core` and `nemo-relay-types = "=0.7.3"` and nothing else of ours)
+> and three routes in `roundhouse-server/src/relay_api.rs`: `GET
+> /v1/sessions/{id}/{atof,trajectory,optimization}`. Five corrections to the text
+> above, from the round-3 re-read and from building it:
+>
+> - **twelve ATIF structs, not ~15**, and they are not "re-implementable from a
+>   published spec" — the normative definition *is* Apache-2.0 Rust source
+>   (`crates/core/src/observability/atif.rs`), so the port carries an attribution
+>   header in the form the M6 judge-prompt port set, plus a test pinning every
+>   field name against rev `1a548124`.
+> - **the mark path does not work as written.** The shipped converter's
+>   `MARK_EXTRACTOR_REGISTRY` is empty and an unregistered `(name, version)`
+>   falls through to a default that stringifies the payload into a system step
+>   with no `extra` and no `data_schema` at all. Routing decisions are emitted as
+>   `category: "context"` **scope-ends** instead, the one path that copies a
+>   producer's `data_schema` into the ATIF step's `extra` verbatim. Registering a
+>   mark extractor upstream (~20 lines of Python, their repo) stays on the S4
+>   contribution list; until it lands, our export has to be consumable by the
+>   converter people actually have.
+> - **the pin is `=0.7.3` for a new reason.** 0.8.0-rc.1 published on
+>   2026-08-21, so "0.8 is unpublished" is dead; what holds the pin is that
+>   `codec/optimization.rs` and the whole ATOF envelope are byte-identical from
+>   0.7.3 through HEAD. It costs `uuid = "=1.18.1"` graph-wide — a six-release
+>   downgrade from the 1.24.0 our caret resolved to, verified by a resolver run,
+>   and a ceiling whose unlock condition is recorded beside the pin.
+> - **`Partial` is the common case, not the exception.** Relay derives `status`
+>   from `limitations`, and carrying the capability gate's band there (the
+>   round-2 ruling's requirement) makes every locally-served turn `Partial`.
+>   That is intended: a routing saving is a gated counterfactual, and `Complete`
+>   is reserved for a hosted turn on our own key whose usage the provider
+>   reported.
+> - **a fourth limitation exists**, `roundhouse_seat_forwarded`, beyond the three
+>   the ruling named. A forwarded seat publishes no cost field at all, and a
+>   money-free summary claiming `Complete` would say every calculation was
+>   available.
+
 ### S3 — Rule the topology (with M7)
 
 Two supported deployments, one of them guarded:

@@ -39,6 +39,12 @@
 //! [`ControlPlane`] — a key revoked there has to stop working on all of them,
 //! which it cannot do if each captured its own plane at mount time.
 //!
+//! [`relay_api`] is the sixth, and the only one that speaks somebody else's
+//! vocabulary: three reads that project the same log into NeMo Relay's published
+//! formats — ATOF, ATIF and `LlmOptimizationSummary` — so a deployment
+//! interoperating with Relay's ecosystem is not instrumented twice. It holds no
+//! state and never touches the engine; see [`roundhouse_relay`].
+//!
 //! [`metrics_api`] reports on all of it. Token counts, dollars, and the savings
 //! figure are folded out of the same log as everything else — see
 //! [`roundhouse_core::metrics`] — so the dashboard cannot disagree with the
@@ -54,6 +60,7 @@ pub mod http;
 pub mod judge;
 pub mod mcp_api;
 pub mod metrics_api;
+pub mod relay_api;
 pub mod responses_api;
 pub mod tokenizer;
 
@@ -73,5 +80,6 @@ pub use http::router;
 pub use judge::{FleetJudge, JudgeConfig};
 pub use mcp_api::{ControlPlaneReads, describe_ambiguous_memberships, mcp_router};
 pub use metrics_api::metrics_router;
+pub use relay_api::relay_router;
 pub use responses_api::responses_router;
 pub use tokenizer::HfTokenizer;

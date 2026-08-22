@@ -40,6 +40,7 @@ crates.io, the pin becomes a plain version.
 |---|---|
 | `roundhouse-core` | Session state machine, event log, lease, context assembly, routing vocabulary and policies, metrics projection |
 | `roundhouse-fleet` | Local Dynamo fleet (embedded selection service) and frontier providers |
+| `roundhouse-relay` | NeMo Relay's published formats — ATOF events, ATIF v1.7 trajectories, `LlmOptimizationSummary` — produced from the same session log |
 | `roundhouse-store-redis` | Redis Streams `SessionStore`: entry id == seq, `PX` lease on the Redis clock, fenced appends via Lua. Selected by `ROUNDHOUSE_REDIS_URL`; absent means in-memory sessions that die with the process |
 | `roundhouse-server` | Turn engine, HTTP/SSE transport, metrics API and dashboard, and the binary |
 
@@ -242,6 +243,51 @@ starting anyway would serve every turn under prices nobody chose.
 
 Without the variable the binary serves its offline echo stub, for which every
 price is zero — so the demo demonstrates the token breakdown, not the savings.
+
+### The same numbers, in NeMo Relay's formats
+
+Roundhouse's log is a better producer of Relay's interchange formats than Relay's
+own exporter is: totally ordered, durable, and replayable from cold storage,
+where theirs accumulates in memory and is lost with the process. So it emits
+theirs rather than inventing parallel ones — a shared type is a conversation, a
+copy is a fork — through three reads, gated by the same namespace check as every
+other session route:
+
+| Route | Document |
+|---|---|
+| `GET /v1/sessions/{id}/atof` | the **ATOF** event stream, NDJSON, one event per line |
+| `GET /v1/sessions/{id}/trajectory` | one **ATIF v1.7** trajectory, by cold replay |
+| `GET /v1/sessions/{id}/optimization` | one **`LlmOptimizationSummary`** per dispatched turn |
+
+All three are pure functions of the log: no clock, no random ids, no engine
+involvement. Two exports of one finished session are byte-identical, which is
+what lets a consumer diff two trajectories to see what a re-run changed — every
+identifier is a UUIDv5 digest of facts already in the log rather than a v4 or a
+v7. Routing decisions ride a declared `data_schema` (`roundhouse/route`) as
+`category: "context"` scope-ends rather than as marks, because that is the one
+path the shipped NeMo-Agent-Toolkit converter copies a producer's schema into the
+ATIF step's `extra` — as a mark our routing facts would arrive stringified and
+structurally invisible.
+
+Two accounting rules from the chapter above survive into these documents, which
+is the point of producing them here rather than in a sidecar. **A forwarded
+subscription seat is priced into no field at all**: its tokens ride the typed
+contribution payload as a bare count, because roundhouse holds no rate card for a
+seat. And the **capability gate's outcome is carried, never recomputed** —
+`limitations[]` names the band the gate used, so a summary of ours never sits
+indistinguishable beside an ungated one. Relay derives `status` from
+`limitations`, so a locally-served turn always publishes as `Partial`; a hosted
+turn on our own key, whose usage the provider reported, is the only shape that is
+`Complete`, which is the honest reading rather than a defect.
+
+The types come from `nemo-relay-types`, pinned at exactly `=0.7.3` — the
+optimization surface and the whole ATOF envelope are byte-identical from there
+through Relay's HEAD. That pin imposes `uuid = "=1.18.1"` on the entire
+workspace, a six-release downgrade and a ceiling; the manifest records it and
+names its unlock condition. ATIF is not in that crate — it lives in Relay's heavy
+`crates/core` — so its twelve wire structs are ported under Apache-2.0
+attribution, with a test pinning every field name against the upstream list so
+drift arrives as a diff rather than as a consumer that cannot parse our export.
 
 ## Switchyard
 
