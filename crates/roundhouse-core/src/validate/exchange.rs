@@ -142,31 +142,103 @@ pub fn exchanges(items: &[Item]) -> Vec<Exchange> {
 /// rather than producing a wrong answer, which is why they are documented here
 /// instead of guessed at.
 pub fn tool_output_body(output: &str) -> &str {
+    match codex_header(output) {
+        Some(header) => &output[header.body_start..],
+        None => output,
+    }
+}
+
+/// The exit status codex's exec wrapper reported, when it reported one.
+///
+/// **A structured fact read from the header, and the other half of a rule the
+/// body cannot carry.** Codex writes `Process exited with code {exit_code}` for
+/// every exec call it ran to completion — *including the ones that succeeded*
+/// (`response_text`, `core/src/tools/context.rs:443-470` @ `e363b08`, identical
+/// at the Cargo pin `6344a65`) — and [`tool_output_body`] strips that section
+/// along with the rest of the wrapper. So the two obvious readings are both
+/// wrong, and wrong in opposite directions:
+///
+/// - Ask the **whole string** whether it contains `exited with code` and every
+///   exec result reads as a failure, exit 0 included. That is the shape
+///   Switchyard's `exit_nonzero` row has upstream, where the header does not
+///   exist; ported naively it would pin an error severity on for the life of
+///   any session that ran a shell.
+/// - Ask only the **body** and the exit status disappears, because the line
+///   that carries it is not in the body. That is [`reads_as_failure`]'s state
+///   before this accessor existed: blind to a `grep` with no match, a `test`
+///   that was false, a `diff` that found differences — silent non-zero exits,
+///   the most common failure shape in an agentic coding loop.
+///
+/// The split this function exists to make: **exit code from the header, text
+/// patterns over the body.** Note it is the *inverse* of F04's remedy rather
+/// than another instance of it — there the header suppressed an anchored
+/// matcher, here it would manufacture a match for an unanchored one.
+///
+/// `None` means the header had no such section, which is a different answer
+/// from `Some(0)` and deliberately not collapsed with it: an MCP result carries
+/// `Wall time:` / `Output:` and no exit status at all (`context.rs:118-138`),
+/// and inventing a success for it would claim a fact codex never stated. A
+/// section whose number does not parse as an [`i32`] is also `None` — the value
+/// is unusable, and guessing at it is how a wrapper-format change would become
+/// a silent misread rather than a quiet one.
+pub fn exec_exit_code(output: &str) -> Option<i32> {
+    codex_header(output)?.exit_code
+}
+
+/// What one walk of a codex wrapper found.
+struct CodexHeader {
+    /// Byte offset of the first byte after the `Output:` line.
+    body_start: usize,
+    exit_code: Option<i32>,
+}
+
+/// The one recogniser both derived questions ask.
+///
+/// Deliberately a single walk rather than two scanners: an exit-code reader
+/// that looked for `Process exited with code` *anywhere* would find it in a
+/// build log that printed the phrase, which is F04's mistake with the sign
+/// flipped. The recogniser that decides where the body starts is the same one
+/// that decides whether a `Process exited` line is codex's or the tool's.
+///
+/// Returns `None` for anything that is not codex's wrapper, which is what keeps
+/// every non-codex result — and therefore every fixture and every already
+/// folded log — byte-identical.
+fn codex_header(output: &str) -> Option<CodexHeader> {
     // The two section prefixes codex can lead with. Matched as prefixes and
     // never parsed: the seconds are formatted `{:.4}` today, and a recogniser
     // that insisted on four decimals would be a second place to update the
     // moment upstream changes its format string.
     if !(output.starts_with("Wall time: ") || output.starts_with("Chunk ID: ")) {
-        return output;
+        return None;
     }
     let mut consumed = 0usize;
+    let mut exit_code = None;
     for (index, line) in output.split_inclusive('\n').enumerate() {
         if index >= MAX_HEADER_LINES {
-            return output;
+            return None;
         }
         consumed += line.len();
         let line = line.strip_suffix('\n').unwrap_or(line);
         if line == "Output:" {
-            return &output[consumed..];
+            return Some(CodexHeader {
+                body_start: consumed,
+                exit_code,
+            });
+        }
+        if let Some(code) = line.strip_prefix(EXIT_SECTION) {
+            exit_code = code.parse().ok();
         }
         if !is_header_section(line) {
-            return output;
+            return None;
         }
     }
     // Ran out of input inside what looked like a header: no body was ever
-    // reached, so there is nothing to strip and the caller gets what arrived.
-    output
+    // reached, so there is nothing to strip and no header to have read.
+    None
 }
+
+/// The section prefix, named once so the recogniser and the parser cannot drift.
+const EXIT_SECTION: &str = "Process exited with code ";
 
 /// Codex's longest header: `Chunk ID`, `Wall time`, `Process exited`,
 /// `Process running`, `Original token count`, then `Output:`
@@ -179,7 +251,7 @@ fn is_header_section(line: &str) -> bool {
     [
         "Wall time: ",
         "Chunk ID: ",
-        "Process exited with code ",
+        EXIT_SECTION,
         "Process running with session ID ",
         "Original token count: ",
     ]
@@ -238,6 +310,17 @@ pub fn is_undelivered_tool_result(output: &str) -> bool {
 ///   pass, and past the gate the judge reads the transcript and answers about
 ///   the trajectory, not about this flag.
 ///
+/// **That first bullet is about occasional misses and does not cover a
+/// systematic one**, which is the judgement the exit-code finding forced and is
+/// recorded here so nobody re-derives it. "Some failures go unseen, and the
+/// disjunction absorbs it" is an argument that stops holding the moment the
+/// unseen set is defined by a *shape* rather than by chance: a silent non-zero
+/// exit is not one failure in ten, it is every `grep` with no match, every
+/// false `test`, every `diff` that found differences — against a codex client
+/// the streak signal was not quiet but dead, exactly the class of defect F04
+/// was. So the missing structured fact is read rather than tolerated, and the
+/// tolerance above is left standing for what it was written about.
+///
 /// The test is deliberately narrow — a leading marker or a structured
 /// `"error"`/`"success": false` field — rather than a scan for the word
 /// "error" anywhere, which would flag every result that *mentions* an error it
@@ -250,6 +333,13 @@ pub fn is_undelivered_tool_result(output: &str) -> bool {
 /// signal was dead (F04). Stripping here rather than at each call site means a
 /// future reader of this function cannot reintroduce the gap by forgetting to.
 pub fn reads_as_failure(output: &str) -> bool {
+    // The structured fact before any text at all: a process that exited
+    // non-zero has said it failed in the one place the body cannot, and
+    // [`exec_exit_code`] documents why reading it from the header rather than
+    // from the string is the only reading that is right in both directions.
+    if exec_exit_code(output).is_some_and(|code| code != 0) {
+        return true;
+    }
     let output = tool_output_body(output);
     // The structured shapes first: a tool that answers in JSON has said so
     // explicitly, and an explicit answer beats a textual guess.
@@ -450,6 +540,135 @@ mod tests {
         // The wall time is never parsed: the failure-streak fixture formats it
         // to two decimals and upstream to four, and both are codex's header.
         assert_eq!(tool_output_body("Wall time: 0.01 seconds\nOutput:\nx"), "x");
+    }
+
+    /// The accessor itself: where an exit code may be read from, and where it
+    /// may not.
+    #[test]
+    fn an_exit_code_is_read_from_the_header_and_never_from_the_body() {
+        // Present, zero and non-zero, with and without the optional sections
+        // around it. `Some(0)` rather than `None`: "codex said zero" and "codex
+        // said nothing" are different answers and the caller needs both.
+        assert_eq!(
+            exec_exit_code(
+                "Chunk ID: 1\nWall time: 0.4212 seconds\nProcess exited with code 0\nOutput:\nall good"
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            exec_exit_code(
+                "Wall time: 0.0210 seconds\nProcess exited with code 101\nOutput:\nerror: could not compile `foo`"
+            ),
+            Some(101)
+        );
+        assert_eq!(
+            exec_exit_code(
+                "Chunk ID: c-1\nWall time: 0.0421 seconds\nProcess exited with code 1\n\
+                 Process running with session ID s-1\nOriginal token count: 42\nOutput:\nx"
+            ),
+            Some(1)
+        );
+
+        // Absent: an MCP result has no exit status, and a header that never
+        // terminates was never a header.
+        assert_eq!(
+            exec_exit_code("Wall time: 0.0421 seconds\nOutput:\nfine"),
+            None
+        );
+        assert_eq!(
+            exec_exit_code("Wall time: 0.1 seconds\nElapsed: 3\nOutput:\nbody"),
+            None
+        );
+
+        // Never from the body. Each of these is a tool *printing* the phrase —
+        // a build log, a shell transcript, a quoted error — and reading it as
+        // roundhouse's own fact is the mistake this accessor exists to make
+        // impossible.
+        for body_only in [
+            "Process exited with code 1",
+            "the child process exited with code 3, retrying",
+            "Wall time: 0.0421 seconds\nOutput:\nProcess exited with code 9",
+            "  Chunk ID: 1\nWall time: 0.1 seconds\nProcess exited with code 4\nOutput:\n",
+        ] {
+            assert_eq!(
+                exec_exit_code(body_only),
+                None,
+                "`{body_only}` is a string that mentions an exit code, not a header codex wrote"
+            );
+        }
+
+        // Unparseable is `None`, not a guess: the value is unusable, and a
+        // wrapper-format change should degrade to quiet rather than to wrong.
+        assert_eq!(
+            exec_exit_code("Wall time: 0.1 seconds\nProcess exited with code SIGKILL\nOutput:\n"),
+            None
+        );
+    }
+
+    /// R2's non-regression requirement: a non-codex output is untouched by the
+    /// accessor's existence — same body, same fingerprint, same verdict.
+    #[test]
+    fn a_plain_string_is_unaffected_by_the_exit_code_split() {
+        for plain in [
+            "no matches",
+            "",
+            "error: unresolved import",
+            "0 errors, 0 warnings",
+        ] {
+            assert_eq!(tool_output_body(plain), plain);
+            assert_eq!(exec_exit_code(plain), None);
+            assert_eq!(short_hash(tool_output_body(plain)), short_hash(plain));
+        }
+        assert!(reads_as_failure("error: unresolved import"));
+        assert!(!reads_as_failure("0 errors, 0 warnings"));
+    }
+
+    /// The exit code is a structured fact and the body is text, and reading
+    /// either one through the other's rules is a defect.
+    ///
+    /// The claim under test (round-3 Switchyard re-read): a codex **exec**
+    /// result that exited non-zero with empty or non-error-shaped stdout reads
+    /// as clean, because the one section that says otherwise is the section
+    /// [`tool_output_body`] strips. Every string below is codex's real header
+    /// shape (`response_text`, `core/src/tools/context.rs:443-470` @ `e363b08`,
+    /// identical at the pin `6344a65`).
+    #[test]
+    fn a_nonzero_exec_exit_reads_as_a_failure_even_when_stdout_says_nothing() {
+        // A `test -f`, a `grep` with no match, a `diff` that found differences:
+        // the most common failure shape in an agentic coding loop is a silent
+        // non-zero exit, and none of them writes a marker to stdout.
+        for silent_failure in [
+            "Chunk ID: 1\nWall time: 0.0210 seconds\nProcess exited with code 1\nOutput:\n",
+            "Chunk ID: 1\nWall time: 0.0210 seconds\nProcess exited with code 1\nOutput:",
+            "Wall time: 0.0210 seconds\nProcess exited with code 2\nOutput:\nsrc/lib.rs\n",
+            // A signal death, which codex reports as a plain code like any
+            // other because its `exit_code` is an `Option<i32>` it formats
+            // unconditionally.
+            "Chunk ID: 7\nWall time: 9.9000 seconds\nProcess exited with code 137\nOutput:\n",
+        ] {
+            assert!(
+                reads_as_failure(silent_failure),
+                "`{silent_failure}` exited non-zero; the header is the only \
+                 place that says so and it must be read as a fact"
+            );
+        }
+
+        // The other half of the split, and the reason this is not "stop
+        // stripping": codex writes the section on *success* too, so a body-side
+        // substring test would read every exec result as a failure.
+        for clean in [
+            "Chunk ID: 1\nWall time: 0.4212 seconds\nProcess exited with code 0\nOutput:\nall good",
+            "Chunk ID: 1\nWall time: 0.4212 seconds\nProcess exited with code 0\nOutput:\n",
+            // An MCP result never carries the section at all, so there is no
+            // exit status to lose and nothing to invent.
+            "Wall time: 0.0421 seconds\nOutput:\nfine",
+        ] {
+            assert!(
+                !reads_as_failure(clean),
+                "`{clean}` exited zero; the `exited with code` text in the \
+                 header is codex's bookkeeping, not the tool's verdict"
+            );
+        }
     }
 
     /// F05: the three texts codex substitutes for an answer.
