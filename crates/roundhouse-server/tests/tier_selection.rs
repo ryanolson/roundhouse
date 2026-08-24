@@ -846,6 +846,98 @@ async fn a_failed_attempt_is_booked_and_the_hold_never_pyramids() {
     );
 }
 
+/// Three dispatches, two failures before the answer: each record carries only
+/// the one attempt it followed, never the accumulated history.
+///
+/// M10.2 refute finding 2: every fixture above stops at two dispatches, where
+/// "one attempt" and "the growing history" are the same length and so
+/// indistinguishable. A third dispatch is what tells them apart —
+/// `decisions[2].attempts` would hold both dead providers' failures under a
+/// cumulative fold instead of only the one immediately before it, and
+/// `fold.failed_attempts` would then count the first dead provider twice.
+/// `engine.rs`'s own comment on `attempts: preceding.take()...` names exactly
+/// this failure mode ("a cumulative list would report one dead provider as
+/// four").
+#[tokio::test]
+async fn a_three_deep_failover_never_lets_attempts_accumulate() {
+    let all_capable = TierRecipe::new(
+        vec![
+            format!("{PRIMARY}/m"),
+            format!("{SECONDARY}/m"),
+            format!("{THRIFTY}/m"),
+        ],
+        vec![],
+        PickerMode::CapableFirst,
+        roundhouse_core::routing::stage::DEFAULT_CONFIDENCE_THRESHOLD,
+    )
+    .expect("a three-deep capable tier at the shipped threshold");
+    let admission = Admission {
+        tiers: Some(Arc::new(all_capable)),
+        ..Admission::open()
+    };
+
+    let dead_first = Scripted::new(Script::Transport);
+    let dead_second = Scripted::new(Script::Status(503));
+    let alive = Scripted::answering("gamma answered");
+    let rig = rig_of(vec![
+        (PRIMARY, Arc::clone(&dead_first) as Arc<dyn FrontierClient>),
+        (
+            SECONDARY,
+            Arc::clone(&dead_second) as Arc<dyn FrontierClient>,
+        ),
+        (THRIFTY, Arc::clone(&alive) as Arc<dyn FrontierClient>),
+    ]);
+
+    let session_id = SessionId::generate();
+    rig.turn(&session_id, "t1", ask(), &admission)
+        .await
+        .expect("the third candidate answers");
+
+    assert_eq!(
+        (dead_first.calls(), dead_second.calls(), alive.calls()),
+        (1, 1, 1),
+        "three dispatches really happened, which is what makes the per-record \
+         attempts counts below a statement about the fold rather than about a \
+         turn that only ever failed once"
+    );
+
+    let decisions = rig.decisions(&session_id).await;
+    assert_eq!(decisions.len(), 3);
+    assert!(
+        decisions[0].attempts.is_empty(),
+        "nothing preceded the first dispatch"
+    );
+    assert_eq!(
+        decisions[1].attempts.len(),
+        1,
+        "the second record carries only the one failure it followed"
+    );
+    assert_eq!(
+        decisions[2].attempts.len(),
+        1,
+        "the third record carries only *its* preceding failure -- not the \
+         first dead provider's failure riding along a second time"
+    );
+    assert_eq!(decisions[2].attempts[0].target, target(SECONDARY));
+
+    let mut failed = rig
+        .fold(&session_id)
+        .await
+        .failed_attempts(Scope::Deployment);
+    failed.sort();
+    let mut expected = vec![
+        (ModelKey::from_target(&target(PRIMARY)), 1),
+        (ModelKey::from_target(&target(SECONDARY)), 1),
+    ];
+    expected.sort();
+    assert_eq!(
+        failed, expected,
+        "one row per dead provider, each counted once -- a cumulative history \
+         would double the first provider's row the moment a turn reaches a \
+         third dispatch"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // S1 + S3: the signals reach the scorer, through the extractor
 // ---------------------------------------------------------------------------

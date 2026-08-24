@@ -337,7 +337,13 @@ fn should_deescalate(signals: &TurnSignals) -> bool {
 ///
 /// **Escalate is checked before de-escalate on purpose**, and it is upstream's
 /// purpose: a critical error still wins on a turn whose tests also happened to
-/// pass.
+/// pass. At the thresholds this tree ships (`should_escalate` needs
+/// `severity >= 1.0`, `should_deescalate` needs `severity <= 0.0`), the two
+/// guards cannot both be true for any `severity`, so today the *order*
+/// between them is dead code — no fixture can make it live without widening
+/// one of those thresholds (M10.2 refute finding 1). It stays first anyway,
+/// matching upstream, for the day either threshold moves and the two guards
+/// start to overlap.
 pub fn pick_tier(signals: &TurnSignals, mode: PickerMode, confidence_threshold: f64) -> Pick {
     if should_escalate(signals) {
         return Pick {
@@ -807,10 +813,16 @@ mod tests {
     }
 
     #[test]
-    fn a_critical_result_escalates_before_a_passing_test_can_deescalate() {
-        // Both hard rules are satisfied at once. Upstream checks escalate first
-        // on purpose: a critical error still wins on a turn whose tests also
-        // happened to pass, and the ordering is the only thing that decides it.
+    fn a_critical_result_escalates_even_when_tests_also_passed() {
+        // NOT an ordering test: `severity: SEVERITY_CRITICAL` makes
+        // `should_deescalate` false on its own (`severity <= 0.0` fails), so
+        // only `should_escalate` was ever going to fire here, in either
+        // check order. What this proves is narrower and still real —
+        // `tests_passed` and a fresh write do not talk `pick_tier` out of a
+        // hard escalate. See `pick_tier`'s own doc comment: at the shipped
+        // thresholds the two guards can never both be true, so the checked-
+        // escalate-first order has no fixture that can exercise it
+        // (M10.2 refute finding 1).
         let both = TurnSignals {
             tools: ToolSignals {
                 severity: SEVERITY_CRITICAL,
