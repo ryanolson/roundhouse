@@ -243,6 +243,56 @@ starting anyway would serve every turn under prices nobody chose.
 Without the variable the binary serves its offline echo stub, for which every
 price is zero — so the demo demonstrates the token breakdown, not the savings.
 
+**Providers are data, not one hardwired transport.** The same catalog file
+carries a `"providers"` section: `name -> { base_url, routes: { models?,
+chat_completions?, responses?, messages? }, auth: { env }, extra_headers? }`
+(see `examples/catalog.example.json`'s `openrouter` and `dynamo-fleet`
+entries). `main` builds one client per definition at boot — its own connection
+pool, base URL, and static headers — and every catalog entry's `provider` has
+to name a definition or the built-in `openai`, which is the implicit provider
+`ROUNDHOUSE_FRONTIER_UPSTREAM` / `ROUNDHOUSE_OPENAI_API_BASE` have always
+named; a catalog written before this section existed still loads unchanged.
+Two load-or-die cross-checks make the registry total rather than merely usual:
+every entry's `provider` is defined, and a defined provider declares a route
+for the dialect its entries speak — both refuse the boot, not the first turn
+that would have hit the gap. (A third check, whether *this build* actually has
+a transport for that dialect, is a fact about the binary rather than the file
+and is made where the binary is composed.) The key itself is never written
+here: `auth.env` only names the environment variable it is expected to arrive
+in, so a configured provider with no key anywhere is a boot warning rather
+than a surprise found one turn at a time — the credential a turn actually
+authenticates with is still resolved per turn from the control plane's
+deployment/project/member tiers.
+
+**Fair-use session windows** cap a project's or a member's draw over a rolling
+`5h`, `24h` or `7d` window — the shape a frontier lab's own session limits use,
+not a calendar reset the way `budget` above is. Configure `ROUNDHOUSE_CONTROL_PLANE`
+(see `examples/control-plane.example.json`) with a `"fair_use": {"windows":
+[{"window": "5h", "max_tokens": ..., "max_usd": ...}]}` block at project level
+and, separately, on any key for a per-member ceiling on top of it; each window
+needs at least one cap, or it is rejected at load for reading like a limit
+while enforcing nothing. A project's and a member's windows are two
+independent ceilings that both bind — the narrower one refuses first. A turn
+over its window gets HTTP 429 `fair_use_exceeded`, naming the scope, the
+window, and the quantity that ran out, plus the earliest `retry_at_ms` the
+window could have room again — retryable, and no grant is taken for a refused
+turn. Enforcement is single-node only in this milestone (the counters live in
+the process's memory), so a deployment that sets `ROUNDHOUSE_REDIS_URL` while
+also configuring `fair_use` gets a boot warning that two nodes serving one
+project enforce two independent ceilings rather than one shared one.
+
+**Sourcing `quality_prior`.** `FrontierModelSpec::quality_prior` is
+configuration, not measurement, and `import-benchmarks` (a binary target in
+`roundhouse-fleet`, not linked into any shipped binary) is what lets that
+figure be sourced instead of guessed. It reads OpenRouter's
+`GET /api/v1/benchmarks` (`OPENROUTER_API_KEY`) and writes two files: a catalog
+fragment with each `quality_prior` normalized to `0.0..=1.0`, and a paired
+provenance record naming the index, its snapshot date, and a `citation`
+**required** for republication — the tool refuses to emit without one. It is
+configuration generation, never a runtime dependency: nothing in a shipped
+`roundhouse` binary calls OpenRouter, and its own tests run entirely offline
+against a committed response fixture, never the live route.
+
 ## Switchyard
 
 Kept behind our own `RoutingPolicy` trait rather than wired in directly. This

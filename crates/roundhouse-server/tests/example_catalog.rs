@@ -44,6 +44,18 @@ fn the_shipped_example_catalog_parses_and_validates() {
 /// in source goes stale, and zeros make it obvious the file has not been filled
 /// in. This pins that they are zero rather than plausible-looking, so nobody
 /// later "helpfully" replaces them with real numbers that then rot.
+///
+/// Two kinds of entry ship here, and only one needs a `REPLACE` name. The
+/// `anthropic`/`openai` entries are templates an operator overwrites with the
+/// model they actually call. The `openrouter` entries are the opposite on
+/// purpose — P3 wants a *real*, fully-qualified, dated id shown (the whole
+/// point being "write the full id, a bare one is not what you think it is"),
+/// and a `REPLACE` name there would defeat that. Both kinds still have to
+/// carry a zero price, which is the half of this test that actually stops a
+/// rate card from rotting in source; the name check below only has to
+/// distinguish "a placeholder" from "a real id shown for illustration", and a
+/// full id's `provider/model` slash is what tells the two apart without
+/// hard-coding a provider name here.
 #[test]
 fn the_example_prices_are_placeholders_not_a_rate_card() {
     let config = CatalogConfig::load(example_path()).unwrap();
@@ -53,9 +65,11 @@ fn the_example_prices_are_placeholders_not_a_rate_card() {
             "`{}/{}` carries a non-zero price; the example must not ship a rate card",
             spec.provider, spec.model
         );
+        let is_a_real_pinned_id_shown_for_illustration = spec.model.contains('/');
         assert!(
-            spec.model.contains("REPLACE"),
-            "`{}` reads like a real model name; the example must be obviously a template",
+            spec.model.contains("REPLACE") || is_a_real_pinned_id_shown_for_illustration,
+            "`{}` reads like a real model name; the example must be obviously a template \
+             or, if it is a real id shown for illustration, spelled as `org/model`",
             spec.model
         );
     }

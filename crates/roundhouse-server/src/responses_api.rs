@@ -60,7 +60,9 @@ use roundhouse_core::store::SessionStore;
 use crate::control_config::{ControlPlane, PlaneSource};
 use crate::conversations::Conversations;
 use crate::engine::Engine;
-use crate::http::{ApiError, LogTail, POLL_INTERVAL, READ_BATCH, parse_body, store_error};
+use crate::http::{
+    ApiError, LogTail, POLL_INTERVAL, READ_BATCH, parse_body, refuse_over_fair_use, store_error,
+};
 
 mod wire;
 use wire::{
@@ -221,6 +223,13 @@ where
     // too, and two of them could disagree across a refresh.
     let plane = state.planes.plane(now_ms());
     let admission = plane.turn_admission(&headers)?;
+    // Immediately after the key lookup and before anything is parsed, bound or
+    // granted. A rolling fair-use window is the one refusal an *agent* rather
+    // than an operator acts on, so it has to arrive as a status code with a
+    // retry time — which this is the last point in the request able to produce,
+    // since everything below spawns the turn and answers with a stream. See
+    // `http::refuse_over_fair_use`.
+    refuse_over_fair_use(&*state.engine, &admission).await?;
     let request: ResponsesRequest = parse_body(&body)?;
     if !request.stream {
         return Err(ApiError::unprocessable(

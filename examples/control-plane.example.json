@@ -54,6 +54,26 @@
     "together -- validation does not refuse an over-subscribed set of shares.",
     "Bob's key below is capped at a flat $100; Cara's is a 25% share of",
     "whatever acme's limit currently is.",
+    "A project's or a key's \"fair_use\" caps token and/or dollar draws over a",
+    "rolling window -- \"5h\", \"24h\" or \"7d\" -- shaped like a frontier lab's own",
+    "session limits, not a calendar reset like \"budget\" above. Each window needs",
+    "at least one of max_tokens or max_usd; an entry naming neither reads like a",
+    "limit and enforces nothing, and is rejected at load rather than silently",
+    "kept. It is a second axis from \"budget\", never a variant of it: a budget is",
+    "a ledger with a hold and a settlement, fair use is a rolling counter with",
+    "neither, and the two compose -- a project may carry both, either, or",
+    "neither. A key's own fair_use is a second ceiling on top of its project's,",
+    "never an overlay on it: both bind independently, and whichever is tighter",
+    "refuses first, naming its own scope (\"project\" or \"member\") and window in",
+    "the 429 rather than leaving a client to guess which one to raise. Acme's",
+    "project-level window below caps the whole project at 2,000,000 tokens per",
+    "rolling 5 hours; Bob's own window on top of it caps him individually at",
+    "400,000 tokens per rolling 24 hours, so his personal ceiling can refuse him",
+    "on a busy day even while Acme as a whole still has room. This milestone's",
+    "enforcement is single-node only -- see roundhouse_core::control::fair_use for",
+    "the unlock condition -- so a deployment running more than one process behind",
+    "ROUNDHOUSE_REDIS_URL gets two independent ceilings out of this, not one",
+    "shared one, until that lands; the process warns at boot when both apply.",
     "Point ROUNDHOUSE_CONTROL_PLANE at your copy."
   ],
 
@@ -72,6 +92,11 @@
         "on_exhaustion": "degrade_to_local",
         "overflow_when_local_saturated": true,
         "warn_at": 0.8
+      },
+      "fair_use": {
+        "windows": [
+          { "window": "5h", "max_tokens": 2000000 }
+        ]
       }
     }
   ],
@@ -96,7 +121,12 @@
       "project": "acme",
       "user": "bob",
       "key_sha256": "f18332befc03bf721896be34b6707c92110ec9a26ce4f9f9072538d982cee696",
-      "allocation": { "capped": { "limit_usd": 100.0 } }
+      "allocation": { "capped": { "limit_usd": 100.0 } },
+      "fair_use": {
+        "windows": [
+          { "window": "24h", "max_tokens": 400000 }
+        ]
+      }
     },
     {
       "project": "acme",

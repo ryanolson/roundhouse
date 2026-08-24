@@ -185,7 +185,7 @@ use roundhouse_core::validate::{Validator, ValidatorConfig};
 use roundhouse_fleet::EchoFrontierClient;
 use roundhouse_mcp::ControlStore;
 use roundhouse_server::codex_launch::{
-    CONTEXT_WINDOW_TOKENS, CodexAuthKind, CodexLaunch, DEFAULT_KEY_ENV,
+    CONTEXT_WINDOW_TOKENS, CodexAuthKind, CodexLaunch, DEFAULT_KEY_ENV, skill_files,
 };
 use roundhouse_server::control_config::directory::key_id;
 use roundhouse_server::control_config::{MembershipRole, TURN_KEY_HEADER};
@@ -869,6 +869,27 @@ impl Rig {
     /// [`Self::start_as`] for why this file never held a real login before.
     async fn start_forwarding(label: &str) -> Self {
         Self::start_as(label, CodexAuthKind::ForwardedOpenAiLogin).await
+    }
+
+    /// Write the optional third surface — the generated skills — into this
+    /// run's `CODEX_HOME`, and answer with what was written.
+    ///
+    /// A separate call rather than part of [`Self::start_as`] on purpose: every
+    /// other test in this file runs against a client that was handed *no*
+    /// skills, and that is not an oversight but the control. Skills are listed
+    /// in a developer message at thread start, so writing them for every rig
+    /// would add tokens to the prompt of the usage test that measures exactly
+    /// that, and would leave nothing in the suite proving the listing came from
+    /// these files rather than from something codex ships.
+    fn write_generated_skills(&self) -> Vec<roundhouse_server::codex_launch::GeneratedFile> {
+        let files = skill_files();
+        for file in &files {
+            let path = self.root.join("home").join(&file.relative_path);
+            std::fs::create_dir_all(path.parent().expect("a skill lives in a directory"))
+                .expect("the skill's directory");
+            std::fs::write(&path, &file.contents).expect("writing a generated skill");
+        }
+        files
     }
 
     /// The principal every request below resolves to.
@@ -1793,6 +1814,94 @@ async fn a_real_codex_binary_completes_the_mcp_handshake_against_our_server() {
     );
 
     rig.clean();
+}
+
+/// M10.1 P7: the generated plugin surface reaches the model, and it reaches it
+/// as **skills** rather than as the `prompts/` files the plan named.
+///
+/// This is the falsifier for the pivot in
+/// [`roundhouse_server::codex_launch::skills`]'s module doc. That doc argues
+/// from a source read — no `prompts` loader exists at `e363b08` or at the Cargo
+/// pin; `$CODEX_HOME/skills` is scanned by `core-skills`, and the listing is
+/// rendered from `core` so `codex exec` gets it. A source read is an opinion
+/// about a binary. This is the binary.
+///
+/// Two rigs, because the assertion that matters is a *difference*. The first
+/// writes the three generated files and must find them in the turn codex sent
+/// us; the second is identical in every other respect and writes none, and must
+/// find nothing. Without the second, "the request body contains the string
+/// `rh-prefer`" would also pass if codex shipped a skill by that name, or if
+/// some other part of the prompt happened to carry it — and it would keep
+/// passing after a regression that stopped reading the directory entirely,
+/// because a *shipped* skill listing would still be there.
+///
+/// The catalog's `include_skills_usage_instructions` is asserted on the same
+/// pair. It is the field that turns three listed file paths into an instruction
+/// to open one, and `false` is what the reader defaults to — so it is exactly
+/// the kind of "written, and the writing is the point" decision that is
+/// invisible from the generated file alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs the real codex binary: --features e2e-codex -- --include-ignored; ROUNDHOUSE_TEST_CODEX_BIN overrides PATH"]
+async fn a_real_codex_binary_is_told_about_the_generated_skills() {
+    let rig = Rig::start("skills").await;
+    let written = rig.write_generated_skills();
+    assert_eq!(written.len(), 3, "the shipped surface is three skills");
+    let run = rig.exec("Say the word alpha and stop.").await;
+    run.assert_completed("the skills run");
+
+    let turn = &rig.recorder.to("/v1/responses")[0];
+    let sent =
+        serde_json::to_string(turn.body.as_ref().expect("a JSON turn body")).expect("re-encodes");
+
+    // Codex lists a skill as `- {name}: {description} (file: {path})`
+    // (`core-skills/src/render.rs:520-532` @ `e363b08`), so both halves have to
+    // be there: the name alone could be a path fragment the client echoed, and
+    // the description is the line the model actually selects on.
+    for file in &written {
+        let name = file
+            .relative_path
+            .trim_start_matches("skills/")
+            .trim_end_matches("/SKILL.md");
+        assert!(
+            sent.contains(name),
+            "codex did not tell the model about `{name}`. Either the loader no longer reads \
+             $CODEX_HOME/skills, or the file was written somewhere it does not scan:\n{}",
+            &sent[..sent.len().min(4000)]
+        );
+    }
+    let a_description = "Use when the user asks to keep this session on this deployment";
+    assert!(
+        sent.contains(a_description),
+        "the skill *names* arrived without their descriptions, which is the half a model \
+         chooses on -- the likeliest cause is frontmatter that did not parse as a scalar"
+    );
+    // The protocol the catalog field turns on. Without
+    // `include_skills_usage_instructions` the model is handed the list and
+    // never told that reading one is how a skill is used.
+    assert!(
+        sent.contains("How to use skills"),
+        "the catalog sets include_skills_usage_instructions = true, so codex must have \
+         appended its own usage protocol to the listing"
+    );
+    rig.clean();
+
+    // The control: the same deployment, the same client, no skills written.
+    let bare = Rig::start("skills-control").await;
+    let bare_run = bare.exec("Say the word alpha and stop.").await;
+    bare_run.assert_completed("the control run");
+    let bare_sent = serde_json::to_string(
+        bare.recorder.to("/v1/responses")[0]
+            .body
+            .as_ref()
+            .expect("a JSON turn body"),
+    )
+    .expect("re-encodes");
+    assert!(
+        !bare_sent.contains("rh-prefer") && !bare_sent.contains(a_description),
+        "a client handed no skills must carry none: the assertions above would otherwise be \
+         about something codex ships rather than about what roundhouse generated"
+    );
+    bare.clean();
 }
 
 /// F12: the other credential doors, on a real request.

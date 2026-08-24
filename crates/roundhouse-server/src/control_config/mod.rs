@@ -91,6 +91,7 @@ pub mod config;
 pub mod credentials;
 pub mod crosscheck;
 pub mod directory;
+pub mod fair_use;
 pub mod validate;
 
 use std::collections::{HashMap, HashSet};
@@ -101,7 +102,8 @@ use axum::http::header::AUTHORIZATION;
 use sha2::{Digest, Sha256};
 
 use roundhouse_core::control::{
-    BudgetCounts, BudgetTerms, PresentedCredential, Principal, TurnCredentials, TurnPolicy,
+    BudgetCounts, BudgetTerms, FairUseTerms, PresentedCredential, Principal, TurnCredentials,
+    TurnPolicy,
 };
 use roundhouse_core::ids::SessionId;
 use roundhouse_core::validate::ValidationTerms;
@@ -1079,6 +1081,27 @@ pub struct Admission {
     /// pair it already carries: two facts resolved from the same key must
     /// travel together or a caller can read one without the other.
     pub budget: Option<BudgetTerms>,
+    /// This membership's rolling fair-use ceilings: its project's windows
+    /// paired with its own.
+    ///
+    /// **Not an `Option`, unlike `budget`, and the difference is what each
+    /// absence costs.** A `None` budget is what lets the engine skip the spend
+    /// ledger entirely — a durable counter two processes race for, whose call
+    /// is the one place a ledger outage may fail a turn. Empty fair-use terms
+    /// cost a `Vec::is_empty()` on the admission path and nothing else, so a
+    /// distinct "not configured" state would be two spellings of one thing
+    /// with no reader able to tell them apart. `FairUseTerms::is_empty` is the
+    /// question every caller actually asks.
+    ///
+    /// Two lists inside, project and member, because both bind and the narrower
+    /// refuses first — see [`FairUseTerms`].
+    ///
+    /// Behind an `Arc` for the reason `policy` is: an [`Admission`] is cloned
+    /// per request out of a table compiled at load, and two `Vec`s inline made
+    /// this struct large enough that `KeyScope::Turn` tripped
+    /// `clippy::large_enum_variant` — a real cost, since that enum is moved
+    /// through the auth path of every request on every surface.
+    pub fair_use: Arc<FairUseTerms>,
     /// Whether this membership's sessions are enrolled in the validate/steer
     /// loop, and under what arms — or `None` for the shipped posture, which is
     /// off.
@@ -1137,6 +1160,10 @@ impl Admission {
             principal: Principal::default_open(),
             policy: Arc::new(TurnPolicy::unrestricted()),
             budget: None,
+            // No rolling ceiling, for the reason there is no budget: an open
+            // deployment has no file to write one in, and a limit nobody
+            // configured must not start refusing turns that predate it.
+            fair_use: Arc::new(FairUseTerms::default()),
             // An open deployment has no file to enable the experiment in, and
             // enrolling its traffic anyway would meter and interrupt workloads
             // that predate the control plane — the one thing turning it on
@@ -1186,6 +1213,10 @@ impl Admission {
             principal: self.principal.clone(),
             policy: Arc::new(policy),
             budget: self.budget.clone(),
+            // Nor a fair-use window: a rolling ceiling is an operator's, and
+            // an agent that could narrow — or widen — its own would be
+            // deciding how much of a shared account it may take.
+            fair_use: self.fair_use.clone(),
             validation: self.validation.clone(),
             // Not an axis a narrowing may touch either: which key a turn
             // authenticates with is not something an agent's own overlay — or

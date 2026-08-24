@@ -93,6 +93,7 @@ fn project(id: &str) -> ProjectEntry {
         name: None,
         policy: None,
         budget: None,
+        fair_use: None,
         validate: None,
         credentials: None,
     }

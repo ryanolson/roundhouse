@@ -20,6 +20,8 @@
 //! to the spec therefore changes the format by construction, rather than
 //! leaving a hand-written schema to fall behind it.
 
+pub mod providers;
+
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -27,6 +29,8 @@ use serde::Deserialize;
 
 use roundhouse_core::metrics::{DEFAULT_CAPABILITY_BAND, MetricsConfig};
 use roundhouse_fleet::{FrontierModelSpec, StaticFrontierCatalog};
+
+pub use providers::{BUILT_IN_OPENAI, ProviderAuth, ProviderConfig, ProviderRoutes};
 
 /// Path to a catalog JSON file. Absent means the built-in offline stub.
 pub const CATALOG_VAR: &str = "ROUNDHOUSE_CATALOG";
@@ -49,6 +53,16 @@ pub struct CorrelaryConfig {
 pub struct CatalogConfig {
     /// Hosted models the router may choose between, with their prices.
     pub models: Vec<FrontierModelSpec>,
+    /// Where each [`FrontierModelSpec::provider`] actually is, keyed by that
+    /// name.
+    ///
+    /// Absent — the shape of every catalog written before M10.1 — means every
+    /// entry names [`BUILT_IN_OPENAI`], which is the implicit definition the
+    /// `ROUNDHOUSE_OPENAI_API_BASE` wiring already supplied. See
+    /// [`providers`]: this is the section that lets one process hold a client
+    /// per origin instead of one client for the whole catalog.
+    #[serde(default)]
+    pub providers: HashMap<String, ProviderConfig>,
     /// Declared local-to-hosted equivalences. Anything not declared here is
     /// inferred from traffic shape, subject to the capability gate.
     #[serde(default)]
@@ -139,6 +153,61 @@ pub enum CatalogError {
         provider: String,
         model: String,
     },
+    #[error(
+        "catalog `{path}`: `{provider}/{model}` names a provider nothing defines. Add a \
+         `\"providers\"` entry for `{provider}` naming its base URL, its routes and where its \
+         key lives, or spell the entry `\"{BUILT_IN_OPENAI}\"`, which is the one definition \
+         this build supplies implicitly. Refused here rather than at the turn that would \
+         dispatch it: a provider with no definition has no client, and a router that picked \
+         it would fail one tenant's turn for a mistake made in a file"
+    )]
+    UndefinedProvider {
+        path: String,
+        provider: String,
+        model: String,
+    },
+    #[error(
+        "catalog `{path}`: `{provider}/{model}` speaks `{dialect}`, but the `{provider}` \
+         provider declares no `routes.{field}` to send it to. A dispatch would have nowhere \
+         to POST, so the entry is unroutable as written -- add the route, or move the entry \
+         to a provider that serves that dialect"
+    )]
+    ProviderMissingRoute {
+        path: String,
+        provider: String,
+        model: String,
+        dialect: &'static str,
+        field: &'static str,
+    },
+    #[error(
+        "catalog `{path}`: provider `{provider}` has base_url `{base_url}`, which names no \
+         scheme; a request to it never leaves this process"
+    )]
+    ProviderBaseUrl {
+        path: String,
+        provider: String,
+        base_url: String,
+    },
+    #[error(
+        "catalog `{path}`: provider `{provider}` has `routes.{field}` = `{route}`, which does \
+         not begin with `/`; joined onto the base URL it would address a sibling of the API \
+         rather than a route under it"
+    )]
+    ProviderRoutePath {
+        path: String,
+        provider: String,
+        field: &'static str,
+        route: String,
+    },
+    #[error(
+        "catalog `{path}`: provider `{provider}` says its key lives in `{env}`, which is not \
+         a name an environment can hold"
+    )]
+    ProviderAuthEnv {
+        path: String,
+        provider: String,
+        env: String,
+    },
 }
 
 impl CatalogConfig {
@@ -220,6 +289,54 @@ impl CatalogConfig {
                 }
             }
             unit_interval(path, &label, "quality_prior", spec.quality_prior)?;
+        }
+
+        // Every definition judged before any entry is resolved against it, so
+        // a malformed provider is reported as a malformed provider rather than
+        // as the first entry that happened to name it.
+        for (name, provider) in &self.providers {
+            provider.validate(path, name)?;
+        }
+
+        // --- the two cross-checks that make the client registry total --------
+        //
+        // Together they are what lets `main`'s registry answer every provider
+        // name a routing decision can produce. Without them an unknown provider
+        // is discovered at dispatch — inside one tenant's turn, after the
+        // decision has been written to their log — which is the shape
+        // `frontier_client`'s load-or-die posture was written to avoid at the
+        // process level and this is the same argument one layer down.
+        //
+        // What is deliberately *not* checked here: whether this build has a
+        // transport that speaks the dialect. That is a fact about the binary,
+        // not about the file, and it is checked where the binary is composed —
+        // see `frontier_clients` in `main`. A boundary that asked it would
+        // refuse a perfectly good catalog on a build that simply has fewer
+        // clients compiled in, and would have to be edited every time one is
+        // added.
+        for spec in &self.models {
+            if spec.provider != BUILT_IN_OPENAI && !self.providers.contains_key(&spec.provider) {
+                return Err(CatalogError::UndefinedProvider {
+                    path: path.to_string(),
+                    provider: spec.provider.clone(),
+                    model: spec.model.clone(),
+                });
+            }
+            let Some(provider) = self.providers.get(&spec.provider) else {
+                // The implicit `openai` provider, whose routes are the ones
+                // `OpenAiResponsesClient` has always had. Nothing to check:
+                // there is no file entry an operator could have got wrong.
+                continue;
+            };
+            if provider.routes.for_dialect(spec.wire_protocol).is_none() {
+                return Err(CatalogError::ProviderMissingRoute {
+                    path: path.to_string(),
+                    provider: spec.provider.clone(),
+                    model: spec.model.clone(),
+                    dialect: spec.wire_protocol.wire_name(),
+                    field: ProviderRoutes::field_for(spec.wire_protocol),
+                });
+            }
         }
 
         // A correlary naming a model that is not here degrades silently inside
@@ -314,6 +431,13 @@ mod tests {
     use roundhouse_core::metrics::{Correlary, PricedBasis};
 
     const SAMPLE: &str = r#"{
+      "providers": {
+        "anthropic": {
+          "base_url": "https://api.anthropic.test/v1",
+          "routes": { "messages": "/messages" },
+          "auth": { "env": "ANTHROPIC_API_KEY" }
+        }
+      },
       "models": [
         {
           "provider": "anthropic",
@@ -411,6 +535,119 @@ mod tests {
     fn an_empty_catalog_is_refused_rather_than_started_with() {
         let error = CatalogConfig::from_json(r#"{ "models": [] }"#, "test").unwrap_err();
         assert!(matches!(error, CatalogError::Empty { .. }));
+    }
+
+    /// One entry, parameterized on the two fields the provider cross-checks
+    /// read, and nothing else — so a refusal below is unambiguously about the
+    /// provider and not about a price or a prior.
+    fn one_entry(providers: &str, provider: &str, wire_protocol: &str) -> String {
+        format!(
+            r#"{{
+              "providers": {providers},
+              "models": [{{
+                "provider": "{provider}",
+                "model": "flagship",
+                "wire_protocol": "{wire_protocol}",
+                "cache_model": {{ "kind": "deterministic", "ttl_ms": 300000 }},
+                "pricing": {{
+                  "input_per_mtok_usd": 1.0,
+                  "cached_input_per_mtok_usd": 0.1,
+                  "cache_write_per_mtok_usd": 0.0,
+                  "output_per_mtok_usd": 4.0
+                }},
+                "quality_prior": 0.7,
+                "base_ttft_ms": 300.0,
+                "ttft_ms_per_uncached_token": 0.001
+              }}]
+            }}"#
+        )
+    }
+
+    /// **P1/P2's boot cross-check, the config half.**
+    ///
+    /// A `provider` string is what the client registry is keyed by, so an
+    /// entry naming one nothing defines is a routing decision with no transport
+    /// behind it. Refusing it here — at load, before a session exists — is what
+    /// makes `an_unknown_provider_is_refused_at_boot_not_at_first_dispatch`
+    /// true of the whole process rather than of one composition site.
+    #[test]
+    fn an_entry_naming_an_undefined_provider_is_refused_at_load() {
+        let error =
+            CatalogConfig::from_json(&one_entry("{}", "openrouter", "openai_responses"), "test")
+                .expect_err("a provider nothing defines has no client to dispatch through");
+        assert!(
+            matches!(&error, CatalogError::UndefinedProvider { provider, .. }
+                if provider == "openrouter"),
+            "{error}"
+        );
+        // And the refusal points at the two ways out, because an operator
+        // holding it is deciding between them.
+        let message = error.to_string();
+        assert!(
+            message.contains("\"providers\"") && message.contains("openai"),
+            "{message}"
+        );
+
+        // CONTROL 1: the same entry with the definition present validates, so
+        // the refusal is about the missing definition and not about the name.
+        CatalogConfig::from_json(
+            &one_entry(
+                r#"{ "openrouter": { "base_url": "https://openrouter.ai/api/v1",
+                     "routes": { "responses": "/responses" },
+                     "auth": { "env": "OPENROUTER_API_KEY" } } }"#,
+                "openrouter",
+                "openai_responses",
+            ),
+            "test",
+        )
+        .expect("a defined provider is routable");
+
+        // CONTROL 2: the implicit `openai` provider still needs no section at
+        // all. This is the backward-compatibility promise in executable form —
+        // every catalog written before M10.1 is exactly this shape.
+        CatalogConfig::from_json(&one_entry("{}", "openai", "openai_responses"), "test")
+            .expect("the built-in provider needs no definition");
+    }
+
+    /// A definition that cannot carry one of its own entries.
+    ///
+    /// The failure this prevents is quiet in the worst way: the provider
+    /// exists, the client is built, the request is serialized — and there is no
+    /// path to POST it to, so the entry is unroutable for reasons that look
+    /// like an outage at the far end.
+    #[test]
+    fn a_provider_with_no_route_for_its_entrys_dialect_is_refused_at_load() {
+        let responses_only = r#"{ "openrouter": {
+            "base_url": "https://openrouter.ai/api/v1",
+            "routes": { "responses": "/responses" },
+            "auth": { "env": "OPENROUTER_API_KEY" } } }"#;
+
+        let error = CatalogConfig::from_json(
+            &one_entry(responses_only, "openrouter", "anthropic_messages"),
+            "test",
+        )
+        .expect_err("a dialect with no route has nowhere to be sent");
+        assert!(
+            matches!(
+                &error,
+                CatalogError::ProviderMissingRoute { dialect, field, .. }
+                    if *dialect == "anthropic_messages" && *field == "messages"
+            ),
+            "{error}"
+        );
+        // Named the way the file spells it, so the remedy is a field an
+        // operator can find rather than a dialect they already wrote.
+        assert!(error.to_string().contains("routes.messages"), "{error}");
+
+        // CONTROL: the identical provider serving the identical entry over the
+        // dialect it *did* declare. One field different, and it validates —
+        // which is what makes the refusal above about the route rather than
+        // about OpenRouter or about `anthropic_messages`.
+        CatalogConfig::from_json(
+            &one_entry(responses_only, "openrouter", "openai_responses"),
+            "test",
+        )
+        .expect("the declared dialect is routable");
     }
 
     #[test]

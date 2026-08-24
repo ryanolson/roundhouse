@@ -392,6 +392,11 @@ impl<T: Tokenizer + Clone> FleetJudge<T> {
                     cached_input_tokens,
                     output_tokens,
                     reasoning_tokens,
+                    // A judge's side call is booked from the catalog like
+                    // every other dispatch. What the provider says it cost is
+                    // the reconciliation view's input, not the ledger's --
+                    // see `FrontierChunk::Done::provider_reported_cost`.
+                    provider_reported_cost: _,
                 }))) => {
                     reported = Some(Usage {
                         input_tokens,

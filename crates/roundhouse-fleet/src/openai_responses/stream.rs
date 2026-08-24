@@ -205,6 +205,18 @@ fn usage_chunk(usage: &Value) -> FrontierChunk {
         cached_input_tokens: count(usage.pointer("/input_tokens_details/cached_tokens")),
         output_tokens: count(usage.get("output_tokens")),
         reasoning_tokens: count(usage.pointer("/output_tokens_details/reasoning_tokens")),
+        // `cost` is an OpenRouter extension to the Responses usage object;
+        // OpenAI's own endpoint omits it. Absent stays `None` rather than
+        // becoming zero, and the difference is the whole reason the field is an
+        // `Option`: "this provider does not report prices" and "this call was
+        // free" are the two readings a reconciliation view must never confuse,
+        // and zero is the one that reads as a saving.
+        //
+        // `as_f64` and not a parse: a non-numeric `cost` is a provider saying
+        // something this decoder does not understand, and `None` is the honest
+        // answer to that -- refusing the whole stream over an accounting extra
+        // would fail a turn that was served correctly.
+        provider_reported_cost: usage.get("cost").and_then(Value::as_f64),
     }
 }
 
@@ -270,6 +282,10 @@ mod tests {
                     cached_input_tokens: 100,
                     output_tokens: 30,
                     reasoning_tokens: 12,
+                    // OpenAI's own Responses usage object carries no `cost`,
+                    // and absent is `None` rather than zero — see
+                    // `usage_chunk`.
+                    provider_reported_cost: None,
                 },
             ],
             "the cached count is the quantity the whole system exists to \
@@ -356,6 +372,84 @@ mod tests {
             decode(&[": keep-alive\n\ndata: {\"type\":\"response.in_progress\"}\n\n"])
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    /// **P3: an OpenRouter-shaped stream parses, keep-alives and all.**
+    ///
+    /// OpenRouter injects `: OPENROUTER PROCESSING` comment lines into the SSE
+    /// body (`openrouter-api-surface.md` Q5.1, live 2026-08-24), and a
+    /// line-oriented parser that tried to JSON-decode one would fail an
+    /// otherwise perfect turn — at an interval that depends on how long the
+    /// upstream took, so it would fail *the slow turns* and look like a
+    /// timeout.
+    ///
+    /// Two placements, because they exercise different code. A comment as its
+    /// own event block reaches `decode_event` with no `data:` line at all and
+    /// is discarded by the empty-payload check; a comment *inside* an event
+    /// block has to be skipped by the line loop while the block's real `data:`
+    /// line still decodes. Only the first was covered before, by the
+    /// `": keep-alive"` control in the test above.
+    #[test]
+    fn an_openrouter_shaped_stream_with_comment_keepalives_parses() {
+        let chunks = decode(&[
+            ": OPENROUTER PROCESSING\n\n",
+            // Interleaved: the comment shares the block with the payload.
+            concat!(
+                ": OPENROUTER PROCESSING\n",
+                r#"data: {"type":"response.output_text.delta","delta":"kimi"}"#,
+                "\n\n",
+            ),
+            ": OPENROUTER PROCESSING\n\n",
+            concat!(
+                r#"data: {"type":"response.completed","response":{"usage":{"#,
+                r#""input_tokens":1200,"input_tokens_details":{"cached_tokens":900},"#,
+                r#""output_tokens":64,"output_tokens_details":{"reasoning_tokens":8},"#,
+                // The OpenRouter extension: dollars beside the counts.
+                r#""cost":0.00421,"cost_details":{"upstream_inference_cost":0.004}}}}"#,
+                "\n\n",
+            ),
+        ])
+        .expect("a keep-alive must never fail a turn");
+
+        assert_eq!(
+            chunks,
+            vec![
+                FrontierChunk::OutputText("kimi".into()),
+                FrontierChunk::Done {
+                    input_tokens: 1200,
+                    cached_input_tokens: 900,
+                    output_tokens: 64,
+                    reasoning_tokens: 8,
+                    // The number the reconciliation rung will compare our
+                    // token-priced figure against. Carried, never added to the
+                    // counts beside it.
+                    provider_reported_cost: Some(0.00421),
+                },
+            ]
+        );
+    }
+
+    /// The control that stops the assertion above being about `cost` existing
+    /// rather than about it being *read*: the identical stream with the field
+    /// absent decodes the identical counts and reports no price.
+    ///
+    /// Zero would be the tempting default and it is the one answer that is
+    /// wrong in a way nobody sees — a provider that reports no price is not a
+    /// provider that served the turn for free, and a reconciliation view fed
+    /// zeroes would report perfect agreement with a bill it never read.
+    #[test]
+    fn a_usage_object_without_cost_reports_no_price_rather_than_a_free_turn() {
+        let chunks = decode(&[COMPLETED]).unwrap();
+        assert_eq!(
+            chunks,
+            vec![FrontierChunk::Done {
+                input_tokens: 120,
+                cached_input_tokens: 100,
+                output_tokens: 30,
+                reasoning_tokens: 12,
+                provider_reported_cost: None,
+            }]
         );
     }
 

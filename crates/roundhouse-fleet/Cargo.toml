@@ -8,6 +8,18 @@ edition.workspace = true
 license.workspace = true
 description = "Local Dynamo fleet and frontier-provider execution backends for Roundhouse"
 
+# The R8 import tool: it reads OpenRouter's versioned benchmark index and
+# writes a catalog fragment plus its provenance. Declared explicitly although
+# `src/bin/<dir>/main.rs` would be auto-discovered under the same name, because
+# the manifest is where a reader looks to find out that this crate ships a
+# second artefact at all -- and because the thing worth saying about it is that
+# it is a *generator*: nothing in `src/lib.rs` can call it, and no shipped
+# `roundhouse` binary contains it. Its modules live under the target's own
+# directory for exactly that reason.
+[[bin]]
+name = "import-benchmarks"
+path = "src/bin/import-benchmarks/main.rs"
+
 [dependencies]
 roundhouse-core = { workspace = true }
 

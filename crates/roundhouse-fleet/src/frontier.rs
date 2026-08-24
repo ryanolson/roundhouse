@@ -190,6 +190,35 @@ pub enum FrontierChunk {
         /// verbose answer where the truth is an expensive silence. Zero for
         /// providers and models that do not reason.
         reasoning_tokens: u64,
+        /// What the provider says this call cost, when it says so at all.
+        ///
+        /// **A price, never a token count, and the separation is the point.**
+        /// OpenRouter attaches `cost` to the usage object of every response
+        /// (`agent-docs/research/openrouter-api-surface.md` Q3, live
+        /// 2026-08-24); OpenAI's own endpoint does not. Folding it in beside
+        /// the token counts would put a number we did not derive from our own
+        /// rate card into the column the savings figure is computed from, and
+        /// the whole reconciliation idea is that those two numbers stay apart
+        /// and are *compared* — `committed_usd` against a provider's own
+        /// ledger — rather than summed.
+        ///
+        /// `None` means the provider reported no price, which is the ordinary
+        /// answer and is emphatically not the same as free.
+        ///
+        /// **Not yet folded into [`Usage`], and that is a deferral with a
+        /// named unlock.** Nothing in this build reads a provider-reported
+        /// dollar figure — `admin_api::reconciliation` compares `committed_usd`
+        /// against `measured_usd`, both ours — and the consumer arrives with
+        /// M10.3's reconciliation rung, which is the first time the savings
+        /// claim meets an external bill. Widening `Usage` before that consumer
+        /// exists would put a field in the durable log's serde shape that no
+        /// reader could check, which is the wrong order: the log's shape should
+        /// change when something is going to read it. Until then this is
+        /// decoded and logged, so the claim that OpenRouter reports it is
+        /// checkable against a real stream rather than against a doc page.
+        ///
+        /// [`Usage`]: roundhouse_core::event::Usage
+        provider_reported_cost: Option<f64>,
     },
 }
 
@@ -216,6 +245,12 @@ impl FrontierChunk {
                 cached_input_tokens,
                 output_tokens,
                 reasoning_tokens,
+                // A non-streaming backend adapted into a stream reports the
+                // counts it was given and no price: this adapter is handed
+                // token numbers by its caller, and inventing a dollar figure
+                // from them would be exactly the rate-card-in-source mistake
+                // the catalog exists to prevent.
+                provider_reported_cost: None,
             }),
         ])
         .boxed()
@@ -317,6 +352,99 @@ pub enum FrontierError {
 #[async_trait]
 pub trait FrontierClient: Send + Sync + 'static {
     async fn execute(&self, quote: &FrontierQuote) -> Result<FrontierStream, FrontierError>;
+}
+
+/// Every transport this process can dispatch through, keyed by provider name.
+///
+/// **The M10.1 replacement for the engine's single `Arc<dyn FrontierClient>`.**
+/// Until this milestone one client was chosen at boot and every
+/// `Target::Frontier` in the process went to it, whatever its `provider` said —
+/// which is fine while a deployment addresses one origin and wrong the moment
+/// the point of the phase is a turn whose capable tier is a model on OpenRouter
+/// and whose fallback is OpenAI's own endpoint. Two origins, two keys, two
+/// connection pools, one candidate list.
+///
+/// **Two shapes, and the difference is not an optimization.**
+/// [`Self::uniform`] is one client answering every name: the offline echo stub,
+/// and the pre-M10.1 wiring where one `openai_responses` transport served the
+/// whole catalog. [`Self::keyed`] is the registry a `providers` section builds.
+/// Keeping `uniform` rather than requiring every deployment and every test to
+/// enumerate its providers is what makes this change invisible to a
+/// configuration that had nothing to enumerate.
+///
+/// **[`Self::for_provider`] is total on a booted process**, and that is a
+/// property of the boundary rather than of this type:
+/// `CatalogConfig::validate` refuses an entry naming a provider nothing
+/// defines, and the registry constructor refuses a definition this build has no
+/// transport for. So the error arm below is unreachable through a routing
+/// decision — it exists for the catalog assembled by hand in a test, which
+/// carries the obligation itself exactly as `StaticFrontierCatalog::spec_for`
+/// says.
+///
+/// `Debug` renders the provider names and never the clients: a transport holds
+/// no secret (the credential travels on the quote), but it does hold two
+/// `reqwest::Client`s whose own `Debug` is pages of pool state nobody reading a
+/// boot line wants.
+pub struct FrontierClients {
+    by_provider: std::collections::HashMap<String, std::sync::Arc<dyn FrontierClient>>,
+    /// Answers every provider name. `Some` for the one-transport deployments
+    /// this milestone did not break.
+    uniform: Option<std::sync::Arc<dyn FrontierClient>>,
+}
+
+impl std::fmt::Debug for FrontierClients {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut names: Vec<&str> = self.provider_names().collect();
+        names.sort_unstable();
+        f.debug_struct("FrontierClients")
+            .field("providers", &names)
+            .field("uniform", &self.uniform.is_some())
+            .finish()
+    }
+}
+
+impl FrontierClients {
+    /// One transport for every provider in the catalog.
+    pub fn uniform(client: std::sync::Arc<dyn FrontierClient>) -> Self {
+        Self {
+            by_provider: std::collections::HashMap::new(),
+            uniform: Some(client),
+        }
+    }
+
+    /// One transport per provider, and nothing for a name that is not here.
+    pub fn keyed(
+        by_provider: std::collections::HashMap<String, std::sync::Arc<dyn FrontierClient>>,
+    ) -> Self {
+        Self {
+            by_provider,
+            uniform: None,
+        }
+    }
+
+    /// The transport `provider`'s traffic goes through.
+    ///
+    /// Named in the error rather than reported as a generic upstream failure:
+    /// the remedy is a `providers` entry or a `ROUNDHOUSE_FRONTIER_UPSTREAM`
+    /// this build has, and both are files an operator edits.
+    pub fn for_provider(
+        &self,
+        provider: &str,
+    ) -> Result<&std::sync::Arc<dyn FrontierClient>, FrontierError> {
+        self.by_provider
+            .get(provider)
+            .or(self.uniform.as_ref())
+            .ok_or_else(|| FrontierError::UnknownProvider(provider.to_string()))
+    }
+
+    /// The provider names this registry answers for, for a boot log line.
+    ///
+    /// Empty on a uniform registry, which answers for every name and so has no
+    /// list to print — the log line at the composition root says which shape it
+    /// built rather than inferring it from a count.
+    pub fn provider_names(&self) -> impl Iterator<Item = &str> {
+        self.by_provider.keys().map(String::as_str)
+    }
 }
 
 /// Deterministic [`FrontierClient`] for tests and offline runs.

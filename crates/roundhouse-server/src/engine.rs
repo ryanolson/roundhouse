@@ -28,7 +28,8 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use roundhouse_core::context::{ContextAssembler, Tokenizer};
 use roundhouse_core::control::{
-    Billing, CredentialError, MemorySpendLedger, SpendError, SpendLedger, TurnPolicy,
+    Billing, CredentialError, FairUseError, FairUseLedger, MemoryFairUseLedger, MemorySpendLedger,
+    SpendError, SpendLedger, TurnPolicy,
 };
 use roundhouse_core::event::{Accounting, IncompleteReason, SessionObserver, Usage};
 use roundhouse_core::ids::{ResponseId, SessionId, SideCallId, TurnId};
@@ -44,8 +45,8 @@ use roundhouse_core::session::{Session, SessionError, TurnAdmission};
 use roundhouse_core::store::SessionStore;
 use roundhouse_core::validate::SideCall;
 use roundhouse_fleet::{
-    FleetError, FleetQuery, FrontierChunk, FrontierClient, FrontierError, FrontierQuote,
-    FrontierStream, LocalFleet, LocalQuote, StaticFrontierCatalog,
+    FleetError, FleetQuery, FrontierChunk, FrontierClient, FrontierClients, FrontierError,
+    FrontierQuote, FrontierStream, LocalFleet, LocalQuote, StaticFrontierCatalog,
 };
 use roundhouse_mcp::ControlStore;
 use tokio::time::Instant;
@@ -53,6 +54,7 @@ use tokio::time::Instant;
 use crate::control_config::Admission;
 
 mod control;
+mod fair_use;
 pub(crate) mod spend;
 
 #[derive(Debug, thiserror::Error)]
@@ -67,6 +69,15 @@ pub enum EngineError {
     Frontier(#[from] FrontierError),
     #[error(transparent)]
     Spend(#[from] SpendError),
+    /// The fair-use ledger could not answer.
+    ///
+    /// Its own arm rather than folded into [`Self::Spend`]: the two are
+    /// different stores answering different questions, and an operator holding
+    /// a failure has to know which counter is down — the durable one that
+    /// decides whether money may be spent, or the rolling one that decides
+    /// whether a session has had its share.
+    #[error(transparent)]
+    FairUse(#[from] FairUseError),
     /// The project's budget is spent and it is configured to refuse.
     ///
     /// A decision this deployment made about this tenant, like
@@ -342,6 +353,15 @@ impl Failed {
             // decision with no price on it, which is a defect in this process
             // rather than anything a tenant did.
             | EngineError::Spend(_)
+            // And the fair-use ledger being unreachable is the same class as
+            // `Spend`: this deployment's own store, not a decision about the
+            // tenant. It is reachable *here* only in principle — the fair-use
+            // check runs at the transport's admission, above `run_turn`, and
+            // the draw after the turn is contained — which is why it is filed
+            // rather than given a reason of its own that no client would ever
+            // see. A refusal by a rolling window is a `429` and never a
+            // terminal log event; see `Engine::fair_use_refusal`.
+            | EngineError::FairUse(_)
             | EngineError::UnpricedSettlement(_)
             | EngineError::UnresolvableTarget(_)
             | EngineError::TurnDeadline(_) => IncompleteReason::UpstreamError,
@@ -370,7 +390,23 @@ pub struct Engine<S: SessionStore, T: Tokenizer + Clone> {
     fleet: Option<Arc<dyn LocalFleet>>,
     local_executor: Arc<dyn LocalExecutor>,
     frontier_catalog: StaticFrontierCatalog,
-    frontier_client: Arc<dyn FrontierClient>,
+    /// Every transport this process can dispatch through, keyed by the
+    /// `provider` on the chosen target's catalog entry.
+    ///
+    /// **A registry and not a client since M10.1.** One client for the whole
+    /// catalog was correct while a deployment addressed one origin, and it
+    /// stops being correct the moment a single turn's candidate list spans two
+    /// — a capable tier on OpenRouter and a fallback on OpenAI's own endpoint
+    /// is the shape this phase exists to serve, and it needs two base URLs, two
+    /// credentials and two connection pools resolved per dispatch rather than
+    /// per process.
+    ///
+    /// [`Engine::new`] still takes one client and wraps it in the uniform
+    /// registry, which is what every test and every pre-M10.1 deployment means
+    /// by "the frontier client"; [`Engine::with_provider_clients`] is what the
+    /// composition root replaces it with once a catalog has a `providers`
+    /// section.
+    frontier_clients: Arc<FrontierClients>,
     policy: Arc<dyn RoutingPolicy>,
     config: EngineConfig,
     /// Folds every event this node commits into the dashboard's aggregates.
@@ -394,6 +430,19 @@ pub struct Engine<S: SessionStore, T: Tokenizer + Clone> {
     /// together on purpose: a durable log beside a ledger that forgets would
     /// re-grant a month's budget on every restart.
     spend: Arc<dyn SpendLedger>,
+    /// This deployment's rolling fair-use counters.
+    ///
+    /// Defaulted rather than required, and — unlike [`Self::spend`] — the
+    /// default is the *only* implementation this milestone has. See
+    /// [`fair_use`](roundhouse_core::control::fair_use) for what a memory
+    /// ledger does not survive and for the unlock condition on the Redis one;
+    /// the composition root warns when a deployment has made its sessions
+    /// durable while these counters have not.
+    ///
+    /// A separate field from `spend` rather than a second method on it,
+    /// because they are separate stores with separate arithmetic — the whole
+    /// content of "fair use is not a `BudgetWindow` variant".
+    fair_use: Arc<dyn FairUseLedger>,
     /// What decides whether an admitted turn is dispatched or answered here.
     ///
     /// Never an `Option`. The default occupant
@@ -441,6 +490,14 @@ pub struct Engine<S: SessionStore, T: Tokenizer + Clone> {
 }
 
 impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
+    /// An engine whose whole catalog dispatches through one transport.
+    ///
+    /// The shape a test with an echo stub means, and the shape
+    /// `ROUNDHOUSE_FRONTIER_UPSTREAM` alone produced before M10.1. Kept as the
+    /// primary constructor rather than replaced, because a caller with one
+    /// client would otherwise have to spell out a registry of one — and because
+    /// "one transport for every provider" is a real deployment posture, not a
+    /// degenerate case of the registry.
     pub fn new(
         store: Arc<S>,
         tokenizer: T,
@@ -450,17 +507,50 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         policy: Arc<dyn RoutingPolicy>,
         config: EngineConfig,
     ) -> Self {
+        Self::with_provider_clients(
+            store,
+            tokenizer,
+            local_executor,
+            frontier_catalog,
+            Arc::new(FrontierClients::uniform(frontier_client)),
+            policy,
+            config,
+        )
+    }
+
+    /// An engine that dispatches each provider's traffic through its own
+    /// transport.
+    ///
+    /// **A constructor and not a builder on [`Self::new`], deliberately.** A
+    /// builder would mean an engine briefly held a client it was about to
+    /// discard, and a registry composed on top of a uniform fallback would
+    /// answer for a provider nobody defined — quietly sending an undefined
+    /// provider's turns to whichever origin happened to be the constructor's
+    /// argument, which is exactly what the catalog's boot cross-checks exist to
+    /// make impossible. Here the registry is the whole answer to "where does
+    /// this provider's traffic go", and a name it does not hold is an error.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_provider_clients(
+        store: Arc<S>,
+        tokenizer: T,
+        local_executor: Arc<dyn LocalExecutor>,
+        frontier_catalog: StaticFrontierCatalog,
+        frontier_clients: Arc<FrontierClients>,
+        policy: Arc<dyn RoutingPolicy>,
+        config: EngineConfig,
+    ) -> Self {
         Self {
             store,
             tokenizer,
             fleet: None,
             local_executor,
             frontier_catalog,
-            frontier_client,
+            frontier_clients,
             policy,
             config,
             metrics: Arc::new(MetricsRecorder::new()),
             spend: Arc::new(MemorySpendLedger::new()),
+            fair_use: Arc::new(MemoryFairUseLedger::new()),
             interjector: roundhouse_core::interject::production_default(),
             control: None,
             turn_gates: Mutex::new(HashMap::new()),
@@ -496,6 +586,21 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
     /// default is honest rather than fail-open.
     pub fn with_spend_ledger(mut self, spend: Arc<dyn SpendLedger>) -> Self {
         self.spend = spend;
+        self
+    }
+
+    /// Count rolling fair-use draws in `fair_use` instead of this process's own
+    /// memory.
+    ///
+    /// A builder for [`Self::with_spend_ledger`]'s reason, and unused by the
+    /// shipped binary today: the memory ledger is the only implementation, so
+    /// the seam exists for the tests that need a recording one and for the
+    /// Redis implementation whose unlock condition is written at
+    /// [`FairUseLedger`]. Present now rather than added later because a trait
+    /// with exactly one implementation and no way to substitute it is a trait
+    /// nobody can prove is a seam.
+    pub fn with_fair_use_ledger(mut self, fair_use: Arc<dyn FairUseLedger>) -> Self {
+        self.fair_use = fair_use;
         self
     }
 
@@ -882,6 +987,13 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         // temporal-first-failure rule `local_stream` settles a reservation
         // under.
         let spend = self.settle(&session, admission).await;
+        // The rolling counters, after the settle and **not inside it**.
+        // `settle` returns early for a membership with no budget, and a project
+        // with fair-use windows and no dollar ceiling is exactly the shape this
+        // phase ships — a draw hung off the settle would record nothing for the
+        // projects fair use actually governs. See `Engine::record_fair_use_draw`.
+        self.record_fair_use_draw(&session, &response_id, admission)
+            .await;
         let last_seq = session.last_seq();
         // Stop renewing before handing the lease back, so no renewal can land
         // after the release and re-own a session this node has finished with.
@@ -965,7 +1077,25 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                     cached_input_tokens,
                     output_tokens,
                     reasoning_tokens,
+                    provider_reported_cost,
                 } => {
+                    // Logged and not booked, deliberately. A provider's own
+                    // dollar figure is the *other* side of the reconciliation
+                    // view — the external bill our `committed_usd` is to be
+                    // checked against — and folding it into `Usage` here would
+                    // put a number nobody derived from the catalog into the
+                    // column the savings claim is computed from. M10.3's
+                    // reconciliation rung is the consumer; until it exists this
+                    // is how an operator can see the two numbers at all. See
+                    // `FrontierChunk::Done::provider_reported_cost`.
+                    if let Some(cost_usd) = provider_reported_cost {
+                        tracing::debug!(
+                            %response_id,
+                            cost_usd,
+                            "the provider reported a price for this call; it is not booked \
+                             against the budget, which is priced from the catalog"
+                        );
+                    }
                     reported = Some(Usage {
                         input_tokens,
                         cached_input_tokens,
@@ -1465,10 +1595,9 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             }
             Target::Frontier { .. } => {
                 // The dialect travels with the request. A client cannot ask the
-                // catalog itself — it holds one `Arc<dyn FrontierClient>` for
-                // providers whose transports have nothing in common — so
-                // whatever it needs to serialize correctly has to arrive in the
-                // quote or not at all.
+                // catalog itself — each one holds one transport and one
+                // serialization — so whatever it needs to serialize correctly
+                // has to arrive in the quote or not at all.
                 let spec = self
                     .frontier_catalog
                     .spec_for(&decision.target)
@@ -1515,16 +1644,23 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                     expected_output_tokens: Some(self.config.expected_output_tokens),
                     // The credential travels here for the same reason the
                     // dialect above does: this is the only argument `execute`
-                    // receives, and the engine holds one client for every
-                    // provider. It is the *same* resolution the payer on the
+                    // receives. It is the *same* resolution the payer on the
                     // decision came from, read out of one `access_for` above —
                     // two calls could resolve two tiers if a key were attached
                     // between them, and the log would then name a payer the
                     // request did not use.
                     credential: access.credential.clone(),
                 };
-                self.bounded(deadline_at, self.frontier_client.execute(&quote))
-                    .await?
+                // **The registry is resolved from the spec, not from the
+                // process.** `spec.provider` is the same string the catalog's
+                // boundary cross-checked against the `providers` section at
+                // load, which is what makes this lookup total on a booted
+                // deployment rather than a place a turn can discover a
+                // misconfiguration. Resolving it here rather than at `choose`
+                // keeps one rule: a client is picked by the target that was
+                // chosen, never by a target that might have been.
+                let client = self.frontier_clients.for_provider(&spec.provider)?;
+                self.bounded(deadline_at, client.execute(&quote)).await?
             }
         };
 

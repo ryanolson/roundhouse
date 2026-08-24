@@ -45,13 +45,14 @@ use serde::Deserialize;
 
 use roundhouse_core::control::credential::access::ProviderKeys;
 use roundhouse_core::control::{
-    Budget, BudgetCounts, CredentialError, CredentialMode, FilterError, FrontierCadence,
-    PolicyOverrides, Principal, TargetFilter, TurnCredentials, TurnPolicy,
+    Budget, BudgetCounts, CredentialError, CredentialMode, FairUseLimit, FilterError,
+    FrontierCadence, PolicyOverrides, Principal, TargetFilter, TurnCredentials, TurnPolicy,
 };
 
 use super::Admission;
 use super::budget::{AllocationConfig, BudgetConfig, budget_terms};
 use super::credentials::CredentialsConfig;
+use super::fair_use::{FairUseConfig, fair_use_terms};
 use roundhouse_core::validate::ValidationTerms;
 
 use super::validate::ValidateConfig;
@@ -85,6 +86,17 @@ pub struct ProjectEntry {
     /// distinct value and not a budget with a very large limit.
     #[serde(default)]
     pub budget: Option<BudgetConfig>,
+    /// This project's rolling fair-use windows, capping tokens and/or dollars
+    /// over the last 5 hours, 24 hours or 7 days. Absent means no rolling
+    /// ceiling at all, which is the shipped posture and the one every project
+    /// written before M10.1 has.
+    ///
+    /// **A separate axis from `budget`, and deliberately not a `BudgetWindow`
+    /// variant** — see [`fair_use`](roundhouse_core::control::fair_use) for the
+    /// M8 hazard that decides it. The two compose rather than override: a
+    /// project may have a dollar ceiling, a rolling window, both, or neither.
+    #[serde(default)]
+    pub fair_use: Option<FairUseConfig>,
     /// Whether this project's sessions are enrolled in the validate/steer
     /// loop, and how. Absent means off — see [`ValidateConfig`], and note that
     /// off is the *shipped* posture rather than a fallback: a deployment that
@@ -148,6 +160,17 @@ pub struct KeyEntry {
     /// `overrides`.
     #[serde(default)]
     pub allocation: Option<AllocationConfig>,
+    /// This member's own rolling fair-use windows, on top of the project's.
+    ///
+    /// **A second ceiling, never an overlay.** Unlike `overrides`, which
+    /// narrows the project's policy and is refused when it would widen, a
+    /// member window neither narrows nor widens the project's — both bind
+    /// independently and the narrower one refuses first. Absent means no member
+    /// ceiling, which is not the project's ceiling repeated: copying it down
+    /// would refuse the second member of a busy project for the first member's
+    /// traffic.
+    #[serde(default)]
+    pub fair_use: Option<FairUseConfig>,
     /// This member's own provider keys — the `user` tier
     /// [`CredentialMode`] resolves against. `"mode"` and `"budget_counts"` are
     /// refused here rather than ignored: both decide who pays, and a member who
@@ -492,6 +515,41 @@ pub enum ControlPlaneError {
     )]
     CadenceRationsNothing { path: String, entry: String },
     #[error(
+        "control-plane config `{path}`: {entry}'s fair_use window `{window}` names neither \
+         max_tokens nor max_usd, so it caps nothing while reading as a limit. A scope that is \
+         meant to be uncapped says so by having no entry for that window"
+    )]
+    FairUseWindowCapsNothing {
+        path: String,
+        entry: String,
+        window: &'static str,
+    },
+    #[error(
+        "control-plane config `{path}`: {entry}'s fair_use window `{window}` has {field} = \
+         {value}, which refuses every turn forever -- that is a filter, not a rolling limit, \
+         and it must be written as one: `\"allow\": [\"local/*\"]`. A window promises that a \
+         spent limit clears on its own, and a cap nothing can get under has no earliest retry \
+         time to report"
+    )]
+    FairUseCapNotPositive {
+        path: String,
+        entry: String,
+        window: &'static str,
+        field: &'static str,
+        value: f64,
+    },
+    #[error(
+        "control-plane config `{path}`: {entry} lists the fair_use window `{window}` twice. \
+         Two caps for one window do not resolve the same way on both sides: the ledger finds \
+         the first and a reader assumes the tighter, so the limit enforced and the limit \
+         written would differ silently"
+    )]
+    FairUseDuplicateWindow {
+        path: String,
+        entry: String,
+        window: &'static str,
+    },
+    #[error(
         "control-plane config `{path}`: {entry}'s frontier_cadence allows {max_frontier} \
          frontier dispatch(es) in a window of {per_turns} turn(s) -- max_frontier must not \
          exceed per_turns"
@@ -767,6 +825,12 @@ impl ControlPlaneConfig {
         // the boot on the day it is written, not on the day somebody flips
         // `enabled`.
         let mut project_validation: HashMap<&str, Option<ValidationTerms>> = HashMap::new();
+        // And every project's resolved fair-use windows, empty meaning no
+        // rolling ceiling. Resolved here for the reason the three above are,
+        // and refused here for the same sharper one: a window that caps nothing
+        // has to stop the boot on the day it is written, not on the day a
+        // tenant discovers the limit they were promised never fired.
+        let mut project_fair_use: HashMap<&str, Vec<FairUseLimit>> = HashMap::new();
         // The deployment's own keys, resolved once: every project's resolution
         // reads them, and reading the environment per project would let one
         // variable be judged twice and -- if it changed underneath us -- judged
@@ -819,6 +883,12 @@ impl ControlPlaneConfig {
                 None => None,
             };
             project_validation.insert(project.id.as_str(), validation);
+
+            let fair_use = match &project.fair_use {
+                Some(fair_use_config) => fair_use_config.to_limits(path, &entry)?,
+                None => Vec::new(),
+            };
+            project_fair_use.insert(project.id.as_str(), fair_use);
 
             if project.credentials.is_some() {
                 project_declares_credentials.insert(project.id.as_str());
@@ -927,6 +997,24 @@ impl ControlPlaneConfig {
             // roll somebody's budget window.
             let budget = budget_terms(project_budget.clone(), allocation);
 
+            // The project's windows and this member's own, paired into the two
+            // ceilings a turn is checked against. Not copied down like
+            // `validation` and not narrowed like `overrides`: they are two
+            // independent limits, and `fair_use_terms` is the one place they
+            // are paired so nothing else can decide that an absent member block
+            // means the project's block again.
+            let member_fair_use = match &key.fair_use {
+                Some(fair_use_config) => fair_use_config.to_limits(path, &key_entry)?,
+                None => Vec::new(),
+            };
+            let fair_use = Arc::new(fair_use_terms(
+                project_fair_use
+                    .get(key.project.as_str())
+                    .expect("a project checked present above was resolved to fair use above")
+                    .clone(),
+                member_fair_use,
+            ));
+
             // Copied down from the project unchanged: an arm is the unit of a
             // comparison, so every key of one project is in one experiment.
             let validation = project_validation
@@ -986,6 +1074,7 @@ impl ControlPlaneConfig {
                     principal: Principal::new(key.project.clone(), key.user.clone()),
                     policy: Arc::new(project_policy.narrow(&overrides)),
                     budget,
+                    fair_use,
                     validation,
                     credentials,
                     budget_counts: *budget_counts,

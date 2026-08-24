@@ -22,6 +22,13 @@ use roundhouse_server::CatalogConfig;
 /// One catalog file, two entries for the same `(provider, model)`, different
 /// prices. Nothing else about the two entries differs.
 const DUPLICATE_IDENTITY: &str = r#"{
+  "providers": {
+    "anthropic": {
+      "base_url": "https://api.anthropic.test/v1",
+      "routes": { "messages": "/messages" },
+      "auth": { "env": "ANTHROPIC_API_KEY" }
+    }
+  },
   "models": [
     {
       "provider": "anthropic",

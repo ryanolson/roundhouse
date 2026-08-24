@@ -512,6 +512,7 @@ async fn deltas_are_durable_before_the_response_completes() {
             cached_input_tokens: 0,
             output_tokens: 3,
             reasoning_tokens: 0,
+            provider_reported_cost: None,
         }))
         .await
         .unwrap();

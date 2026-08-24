@@ -1,0 +1,96 @@
+{
+  "$comment": [
+    "FIXTURE. A GET /api/v1/benchmarks response shape, SCHEMA-DERIVED AND NOT CAPTURED.",
+    "Every field and both item shapes are transcribed from the `example` blocks of",
+    "UnifiedBenchmarksResponse / UnifiedBenchmarksAAItem / UnifiedBenchmarksORItem /",
+    "UnifiedBenchmarksDAItem in https://openrouter.ai/openapi.json, fetched 2026-08-24.",
+    "The endpoint itself requires an API key and no keyed call was made, so this file",
+    "must never be cited as evidence of what the live route returns -- only of what its",
+    "published schema says it returns. The model ids are the ones M10 uses as examples;",
+    "the scores are chosen to exercise this importer's branches and are not real results.",
+    "`meta.citation` is null on purpose: that is what OpenRouter documents a response",
+    "spanning several sources as returning, which is what an unfiltered fetch is.",
+    "`data` deliberately mixes four cases: an AA-only model, an OpenRouter-eval-only",
+    "model, a model both publishers scored (the precedence case), a Design Arena row",
+    "whose ELO is not a capability score, and an AA row whose index is null."
+  ],
+  "data": [
+    {
+      "source": "artificial-analysis",
+      "model_permaslug": "moonshotai/kimi-k3",
+      "display_name": "Kimi K3",
+      "intelligence_index": 63.1,
+      "coding_index": 60.4,
+      "agentic_index": 55.2,
+      "pricing": { "prompt": "0.0000006", "completion": "0.0000025" }
+    },
+    {
+      "source": "openrouter",
+      "model_permaslug": "deepseek/deepseek-v4-flash-0731",
+      "display_name": "DeepSeek V4 Flash",
+      "benchmark_type": "gpqa_diamond",
+      "accuracy": 0.72,
+      "accuracy_stddev": 0.03,
+      "avg_cost_per_task": 0.002,
+      "total_tasks": 300,
+      "last_run_timestamp": "2026-06-03T12:00:00Z"
+    },
+    {
+      "source": "artificial-analysis",
+      "model_permaslug": "openai/gpt-5.6-sol",
+      "display_name": "GPT-5.6 Sol",
+      "intelligence_index": 74.0,
+      "coding_index": 71.9,
+      "agentic_index": 68.5,
+      "pricing": { "prompt": "0.0000025", "completion": "0.00001" }
+    },
+    {
+      "source": "openrouter",
+      "model_permaslug": "openai/gpt-5.6-sol",
+      "display_name": "GPT-5.6 Sol",
+      "benchmark_type": "gpqa_diamond",
+      "accuracy": 0.81,
+      "accuracy_stddev": 0.02,
+      "avg_cost_per_task": 0.004,
+      "total_tasks": 300,
+      "last_run_timestamp": "2026-06-03T12:00:00Z"
+    },
+    {
+      "source": "design-arena",
+      "model_permaslug": "anthropic/claude-sonnet-4",
+      "display_name": "Claude Sonnet 4",
+      "arena": "models",
+      "category": "codecategories",
+      "elo": 1423,
+      "win_rate": 72,
+      "rank": 3,
+      "avg_generation_time_ms": 3200,
+      "tournament_stats": {
+        "total": 27,
+        "first_place": 12,
+        "second_place": 8,
+        "third_place": 5,
+        "fourth_place": 2
+      },
+      "pricing": { "prompt": "0.000003", "completion": "0.000015" }
+    },
+    {
+      "source": "artificial-analysis",
+      "model_permaslug": "mistral/unscored-preview",
+      "display_name": "Mistral Unscored Preview",
+      "intelligence_index": null,
+      "coding_index": null,
+      "agentic_index": null,
+      "pricing": null
+    }
+  ],
+  "meta": {
+    "as_of": "2026-06-03T12:00:00Z",
+    "version": "v1",
+    "citation": null,
+    "source": null,
+    "source_url": null,
+    "task_type": null,
+    "model_count": 5
+  }
+}

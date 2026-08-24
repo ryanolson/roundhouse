@@ -1294,6 +1294,13 @@ fn compile(
                     // `ControlPlane::membership` refuses to describe at all.
                     overrides: membership.overrides.clone(),
                     allocation: membership.allocation.clone(),
+                    // No per-key fair-use windows for the same reason as
+                    // `credentials` below: M10.1 adds no admin-plane CRUD for
+                    // them, so a member's own rolling ceiling stays a thing
+                    // only the file can say. The project's windows still apply
+                    // to an admin-minted key, because those are read off the
+                    // project record every compile.
+                    fair_use: None,
                     // No per-key credentials: M8 has no credential CRUD, so
                     // a member's own provider keys stay a thing only the
                     // file can say. See the milestone's R9.
