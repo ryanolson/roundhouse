@@ -263,12 +263,34 @@ async fn a_refused_turn_took_no_grant_and_left_no_hold() {
     let (status, error) = post(&app, "sess-two").await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(error["code"], "fair_use_exceeded");
+
+    // Give a wrongly-spawned background task a chance to run before the
+    // counter below is read. `post()`'s `oneshot` call returns as soon as the
+    // handler's own future resolves; if the gate ran *after* `tokio::spawn`
+    // (refusing the request but leaving the spawned turn scheduled), that
+    // task would sit in this current-thread runtime's queue, unpolled, until
+    // something else yields. A bare read of `spend.grants` right after `post`
+    // would pass whether or not that task ever ran -- it proves nothing about
+    // ordering, only that the *handler's own* future didn't take a grant.
+    // Yielding here hands control back to the executor, which drains any
+    // already-scheduled task (the spawned turn is fully in-memory -- an
+    // `EchoLocalExecutor` and an in-process store -- so it needs no real I/O
+    // to run to completion once polled).
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+
     assert_eq!(
         spend.grants.load(Ordering::SeqCst),
         1,
         "a refused turn must open no grant -- a hold taken here would sit \
          against the project's budget for a whole grant TTL for a turn that \
-         never ran"
+         never ran. This assertion is only meaningful together with the \
+         `yield_now` loop above: without it, a gate moved to run *after* \
+         `tokio::spawn` in `create_response` would still pass, because the \
+         wrongly-spawned task would never be polled before this current-thread \
+         test runtime is torn down at the end of the function -- see M10.1 \
+         refute finding A."
     );
 }
 

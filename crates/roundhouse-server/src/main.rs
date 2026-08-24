@@ -1027,6 +1027,93 @@ mod tests {
         ));
     }
 
+    /// Everything `tracing::warn!` wrote during one closure, as text.
+    ///
+    /// `frontier_clients` cannot refuse a provider with no key anywhere — it is
+    /// not where keys live, per its own doc comment — so a missing credential
+    /// has nowhere to go but a boot-time warning. Nothing else in this suite
+    /// reads what `tracing` emits, which is exactly why M10.1 refute's item 15
+    /// found this warning silenceable without turning a single test red: no
+    /// capture point existed. This is that point.
+    fn captured_warnings(f: impl FnOnce()) -> String {
+        use std::io;
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl io::Write for Buf {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for Buf {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buf = Buf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        String::from_utf8(buf.0.lock().unwrap().clone()).expect("tracing output is UTF-8")
+    }
+
+    /// **A provider with a definition and no key anywhere warns at boot.**
+    ///
+    /// The refute suite's item 15: silencing this line left every test in this
+    /// file green, because none of them looked at `tracing` output. The
+    /// production behavior it guards is real — an operator finds out here or
+    /// finds out from a tenant's failed turn later — so the gap was in the
+    /// test, not the code; this closes it the same way the fair-use ordering
+    /// gap was closed, by making the previously-unobserved effect observable
+    /// rather than by touching `frontier_clients` itself.
+    #[test]
+    fn a_defined_provider_with_no_key_anywhere_warns_at_boot() {
+        let catalog = StaticFrontierCatalog::new(vec![entry(
+            "openrouter",
+            "moonshotai/kimi-k3",
+            WireProtocol::OpenAiResponses,
+        )]);
+        let providers = HashMap::from([(
+            "openrouter".to_string(),
+            responses_provider("https://openrouter.ai/api/v1"),
+        )]);
+
+        let output = captured_warnings(|| {
+            frontier_clients(&catalog, &providers, &real_upstream)
+                .expect("a missing key is a warning, not a boot refusal");
+        });
+        assert!(
+            output.contains("A_PROVIDER_KEY") && output.contains("not set"),
+            "the warning must name the unset variable: {output}"
+        );
+
+        // CONTROL: the identical catalog and provider, with the env carrying
+        // the key `responses_provider` names. No warning is the only correct
+        // silence -- distinguishing it from the one above is what stops this
+        // test passing on a build that warns unconditionally.
+        let output = captured_warnings(|| {
+            frontier_clients(&catalog, &providers, &|name| {
+                (name == "A_PROVIDER_KEY" || name == FRONTIER_UPSTREAM_VAR)
+                    .then(|| real_upstream(name).unwrap_or_else(|| "present".to_string()))
+            })
+            .expect("a present key boots clean");
+        });
+        assert!(
+            !output.contains("A_PROVIDER_KEY"),
+            "a provider whose key is set must not warn about it: {output}"
+        );
+    }
+
     /// A one-key plane carrying a policy, a budget, or both.
     ///
     /// Through the config file rather than by building the lookup table, so
