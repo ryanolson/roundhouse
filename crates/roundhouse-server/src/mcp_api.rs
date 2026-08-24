@@ -271,17 +271,25 @@ impl<S: SessionStore> ControlReads for ControlPlaneReads<S> {
 
     async fn session_facts(&self, session: &SessionId) -> Result<SessionFacts, SurfaceError> {
         // Lease-free, through the engine's own fold. A second projection written
-        // here would be a second opinion about which steers are open, and the
-        // first time it disagreed the disagreement would be invisible.
+        // here would be a second opinion about what roundhouse last said to this
+        // conversation, and the first time it disagreed the disagreement would
+        // be invisible.
+        //
+        // **Since M10.0 this is the only way to answer `fetch_steer` at all.**
+        // The guidance used to be a node-local deposit keyed by the synthetic
+        // call's id, so serving it needed no log read and lost it on restart.
+        // The correction is a conversation item now and the fold is what says
+        // which item it is — which is why the tool became a read of the session
+        // rather than of a store.
         //
         // The ledger is empty because nothing here reads it: the cache-model
         // configuration only affects `SessionState::ledger`, and this projection
-        // is asked for open steers and a routing decision.
+        // is asked for the last guidance and the last routing decision.
         let state = SessionState::project(self.store.as_ref(), session, CacheLedger::new(), None)
             .await
             .map_err(|error| SurfaceError::Internal(error.to_string()))?;
         Ok(SessionFacts {
-            open_steers: state.open_steer_ids(),
+            latest_guidance: state.last_guidance().map(str::to_string),
             last_decision: state.last_decision().cloned(),
         })
     }

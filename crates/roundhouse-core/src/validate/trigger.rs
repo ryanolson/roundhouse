@@ -455,7 +455,7 @@ impl Trigger {
         if state.turn_index <= 1 {
             return false;
         }
-        if state.this_turn_fulfilled_a_steer() {
+        if state.this_turn_fulfils_a_steer() {
             return false;
         }
         if state.consecutive_interventions() >= self.config.max_consecutive_interventions {
@@ -842,8 +842,13 @@ mod tests {
     }
 
     /// The hysteresis, which is the difference between a validator and a loop.
+    ///
+    /// Renamed with M10.0: the correction is the previous turn's *answer* now,
+    /// not this turn's tool result, so the turn that fulfils a steer is the one
+    /// after the steered one. The two controls are what pin the off-by-one from
+    /// both sides.
     #[test]
-    fn a_turn_fulfilling_an_open_steer_never_fires() {
+    fn the_turn_after_a_steer_never_fires() {
         let trigger = Trigger::new(TriggerConfig::default(), default_signals());
 
         // A session that would fire on its own evidence.
@@ -854,20 +859,28 @@ mod tests {
              assertion about the steer and not about the evidence"
         );
 
-        // The same session, on the turn whose input answered the steer we
-        // emitted. Every signal still reads exactly as it did — the correction
-        // has not had a chance to change anything yet — so without this rule a
-        // steer re-triggers the validation that emitted it, forever.
+        // The same session, on the turn after the steered one. Every signal
+        // still reads exactly as it did — the correction has not had a chance to
+        // change anything yet — so without this rule a steer re-triggers the
+        // validation that emitted it, forever.
         let mut fulfilling = wide_open(stuck_items());
-        fulfilling.steer_fulfilled_on_turn = Some(fulfilling.turn_index);
-        assert!(fulfilling.this_turn_fulfilled_a_steer());
+        fulfilling.steered_on_turn = Some(fulfilling.turn_index - 1);
+        assert!(fulfilling.this_turn_fulfils_a_steer());
         assert_eq!(trigger.evaluate(&fulfilling), None);
 
-        // The control on the *other* side of the rule: a steer fulfilled on an
-        // earlier turn does not disable validation for the rest of the session.
+        // The control on the *other* side of the rule: a steer two turns back
+        // does not disable validation for the rest of the session.
         let mut earlier = wide_open(stuck_items());
-        earlier.steer_fulfilled_on_turn = Some(earlier.turn_index - 1);
+        earlier.steered_on_turn = Some(earlier.turn_index - 2);
         assert!(trigger.evaluate(&earlier).is_some());
+
+        // And the third position, which is the one a fold comparing against
+        // `turn_index` would get wrong: the turn that *emitted* the steer is
+        // already past this gate, so recording it as suppressed there would be
+        // invisible — and would shift the suppression onto the wrong turn.
+        let mut emitting = wide_open(stuck_items());
+        emitting.steered_on_turn = Some(emitting.turn_index);
+        assert!(trigger.evaluate(&emitting).is_some());
     }
 
     #[test]

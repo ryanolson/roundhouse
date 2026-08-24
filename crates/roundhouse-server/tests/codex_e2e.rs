@@ -20,12 +20,26 @@
 //! only document:
 //!
 //! - `a_real_codex_binary_executes_our_synthetic_tool_call_and_returns_its_output`
-//!   — the dispatch assumption;
+//!   — the dispatch assumption. **Deleted by M10.0 T7**, with the ruling above
+//!   `a_real_codex_binary_receives_the_correction_as_the_turns_answer`: R1
+//!   retires the tool-call channel, so there is no dispatch left to assume;
 //! - `a_real_codex_binary_resends_the_call_and_output_and_the_session_does_not_fork`
 //!   — the history-buffer resend, which §10 open item 1 records as
-//!   unverifiable without `codex-core` and names M9 as the only closure;
+//!   unverifiable without `codex-core` and names M9 as the only closure.
+//!   **Deleted by T7 as well, and its surviving half re-landed**: the claim was
+//!   never really about calls, it was that a real client *extends* its history
+//!   rather than rebuilding it, and `the_next_turn_reflects_the_correction` now
+//!   asserts that pairwise over the guidance item instead;
 //! - `the_next_turn_reflects_the_correction` — that the correction the loop
 //!   built is what the agent actually read.
+//!
+//! **What M10.0 changed about all three.** Outcome B is an assistant message
+//! now, not a synthetic tool call, so a steered run *ends* on our guidance and
+//! the turn that acts on it is a fourth `codex exec resume`. The suite is
+//! therefore one roundhouse turn per run, where it used to fold two into the
+//! third; what it proves is unchanged in kind and cheaper in mechanism — the
+//! correction reaching a real agent no longer depends on that agent being
+//! willing and able to call us back.
 //!
 //! Green here retires the documented-assumption block that
 //! `crates/roundhouse-mcp/src/lib.rs` carried until now, which §9 makes the
@@ -39,9 +53,10 @@
 //!
 //! §10 open item **2** — whether reporting a judge's usage on a steered turn
 //! disturbs the client's own bookkeeping — arrived here as *evidence* and left
-//! as a ruling. The `M9-USAGE-EVIDENCE` block is still printed and never
-//! asserted, because what a reader should conclude from four numbers is not a
-//! thing a fixture should decide. What review finding F03 settled is narrower
+//! as a ruling. The evidence block (now `M10-USAGE-RULED`, folded into the one
+//! test that rules on it) is still printed and never asserted, because what a
+//! reader should conclude from four numbers is not a thing a fixture should
+//! decide. What review finding F03 settled is narrower
 //! and is now asserted, in
 //! `a_steered_turns_reported_usage_is_the_context_it_admitted`: the wire number
 //! and the ledger number answer different questions, so the wire reports the
@@ -51,10 +66,10 @@
 //!
 //! # What is real here, and what is scripted
 //!
-//! Real: the codex binary, the HTTP transport, the MCP handshake and dispatch,
-//! the control directory, the minted turn key, the `Validator`, the trigger,
-//! the action map, the steer deposit, and the `/mcp` service that serves it
-//! back. Scripted: the judge's verdict (what a hosted reviewer would *say* is
+//! Real: the codex binary, the HTTP transport, the MCP handshake and tool
+//! listing, the control directory, the minted turn key, the `Validator`, the
+//! trigger, the action map, and the composition of the answer a steered turn is
+//! served. Scripted: the judge's verdict (what a hosted reviewer would *say* is
 //! not the subject, and a real one would make every assertion below partly
 //! about a model's opinion), the signal (`trigger.rs` owns when a signal should
 //! fire), and the frontier answer.
@@ -112,12 +127,17 @@
 //!   sending anything; a client that logged a bare status would take it red
 //!   and the assertion would need re-aiming at `turn.failed`, not deleting;
 //!   the claim — the refusal reached the agent — is the same either way;
-//! - the turn that fulfils a steer resends the steered turn's conversation plus
-//!   *exactly* the emitted call and its output, nothing interposed. That is
-//!   what makes `a_steered_turns_reported_usage_is_the_context_it_admitted` an
-//!   equality rather than a band. A client that inserted an item of its own
-//!   would move it to a residual — which the assertion prints, precisely so
-//!   the failure names the interposed item instead of being absorbed.
+//! - the turn that fulfils a steer resends the steered turn's conversation
+//!   *extended*, not rebuilt: every item that was there before comes back
+//!   byte-identical, with the correction and the new user message appended.
+//!   `the_next_turn_reflects_the_correction` asserts that pairwise over the
+//!   overlap, and it is what keeps the session from forking one turn after
+//!   anybody is looking. The M9 spelling of this bullet named the delta exactly
+//!   — "the emitted call and its output, nothing interposed" — which a text
+//!   steer makes false: the fulfilling turn is a fresh `resume` carrying a user
+//!   message this suite does not author. `a_steered_turns_reported_usage_is_the_context_it_admitted`
+//!   is still an equality rather than a band because each end is anchored to
+//!   the log's own items instead of to a predicted delta.
 //!
 //! `CODEX_HOME` still lives under `target/` rather than the system temp dir,
 //! but — corrected here after stage 4's refute found the original framing
@@ -127,7 +147,7 @@
 //! `sandbox_mode = "read-only"` posture, with no `exec_command` ever
 //! dispatched, does not reach it. Direct retest confirms this on this box:
 //! pointing `CODEX_HOME` and the workdir at `/tmp` produced two full green
-//! runs, including the whole three-run steering suite with its usage-evidence
+//! runs, including the whole steering suite with its usage-evidence
 //! block. Kept under `target/` regardless, because "the refusal path is never
 //! reached here" is a narrower and cheaper-to-attribute claim than "release
 //! builds refuse it" — the latter is not something this suite exercises or
@@ -201,9 +221,15 @@ const USER: &str = "ada";
 ///
 /// The *first sentence only*, and both halves of that matter. Roundhouse's own
 /// words, so asserting on them is asserting the agent read what roundhouse
-/// wrote; and one line, because codex wraps an MCP result as
-/// `"Wall time: …\nOutput:\n[…]"` and JSON-escapes the newlines inside it, so a
-/// multi-line fragment would never match the stored string.
+/// wrote; and one line, because the string is matched against three different
+/// renderings of the same correction — codex's `-o` file, an SSE body where the
+/// newlines are JSON-escaped, and the stored item — and only a single-line
+/// fragment survives all three unchanged.
+///
+/// The one-line constraint used to be justified by codex wrapping an MCP result
+/// as `"Wall time: …\nOutput:\n[…]"`. That rendering is gone with the tool-call
+/// channel (M10.0 R1); the constraint outlived its original reason, which is why
+/// it is restated here against the renderings that still exist.
 const GUIDANCE_FRAGMENT: &str =
     "A review of this session's recent steps found it is not making progress";
 
@@ -445,19 +471,25 @@ impl Recorder {
             .collect()
     }
 
-    /// The `/v1/responses` exchange whose stream emitted a synthetic call named
-    /// `name`.
+    /// The `/v1/responses` exchange whose stream carried the correction.
     ///
     /// Found by frame content rather than by index into [`Self::to`]: "the
-    /// third request" is an assumption about how many requests the client
-    /// chose to make, and a client retry — or a second turn inside one process
-    /// — silently moves it. The emitted call is what makes a turn the steered
-    /// one, so that is what this looks for.
-    fn emitting_a_call(&self, name: &str) -> Option<Exchange> {
+    /// third request" is an assumption about how many requests the client chose
+    /// to make, and a client retry silently moves it. What makes a turn the
+    /// steered one is what it answered with, so that is what this looks for.
+    ///
+    /// **It used to look for an emitted `function_call` item by name**
+    /// (`emitting_a_call("fetch_steer")`), which is how a steer was
+    /// recognizable while outcome B was a synthetic tool call. Since M10.0 R1
+    /// the correction is the turn's assistant text, so the discriminator is the
+    /// text: [`GUIDANCE_FRAGMENT`] is roundhouse's own opening sentence and no
+    /// dispatched turn ever produces it — the echo provider answers [`ANSWER`].
+    fn emitting_the_guidance(&self) -> Option<Exchange> {
         self.to("/v1/responses").into_iter().find(|exchange| {
             exchange
-                .frame("response.output_item.done")
-                .is_some_and(|frame| frame["item"]["name"].as_str() == Some(name))
+                .response_text
+                .as_deref()
+                .is_some_and(|body| body.contains(GUIDANCE_FRAGMENT))
         })
     }
 
@@ -650,10 +682,17 @@ impl Rig {
                         "id": PROJECT,
                         "validate": {
                             "enabled": true,
-                            // Explicit, never `auto`: under `auto` the engine's
-                            // capability detection decides, and a fixture whose
-                            // steer depended on detection would be testing §7.
-                            "channel": "tool_call",
+                            // **`text`, and `tool_call` is now a load failure**
+                            // (M10.0 T2). It used to say `tool_call` because
+                            // `auto` ran a capability probe and a fixture whose
+                            // steer depended on detection would have been
+                            // testing §7. The probe is gone — every
+                            // interjection is text — so `auto` and `text` are
+                            // one thing, and the retired spelling would make
+                            // `directory.apply` below refuse the project rather
+                            // than steer differently. `text` over `auto`
+                            // because a fixture should name what it wants.
+                            "channel": "text",
                             "arms": { "live": 1, "shadow": 0, "placebo": 0 },
                             // Zero would leave outcome B off: escalation claims
                             // the first intervention, so a cap of zero admits
@@ -880,17 +919,6 @@ impl Rig {
             .collect()
     }
 
-    /// How many validations this session decided.
-    async fn validations(&self) -> usize {
-        self.store
-            .read_events(&self.session(), 0, 1024)
-            .await
-            .expect("the session exists")
-            .into_iter()
-            .filter(|event| matches!(event.kind, SessionEventKind::ValidationDecided { .. }))
-            .count()
-    }
-
     /// The turn index each validation was decided on, in log order.
     ///
     /// The *indices*, not the count, because the count is satisfied by the
@@ -979,9 +1007,13 @@ impl Rig {
     /// spelling that out would be three places to update when the trigger's
     /// gate moves, and two of them would keep passing while asserting nothing.
     ///
-    /// Exactly three, never four: a fourth run is roundhouse turn 5, the
-    /// trigger fires again, and the validations the tests below count stop
-    /// being the ones they name.
+    /// **One run per roundhouse turn since M10.0, which it was not before.** A
+    /// tool-call steer cost the client a dispatch and a resend *inside* run 3,
+    /// so run 3 was two roundhouse turns and a fourth run would have been turn
+    /// 5. A text steer is the turn's answer: run 3 is turn 3 and ends there,
+    /// with codex printing our guidance. So the fulfilling turn is a fourth
+    /// `resume` — [`Self::resume_after_the_steer`] — and turn 5 is where the
+    /// trigger fires again.
     async fn drive_to_a_steer(&self) -> [CodexRun; 3] {
         let first = self.exec("Say the word alpha and stop.").await;
         first.assert_completed("turn 1");
@@ -989,8 +1021,22 @@ impl Rig {
         let second = self.resume("Now say the word beta and stop.").await;
         second.assert_completed("turn 2");
         let third = self.resume("Now say the word gamma and stop.").await;
-        third.assert_completed("turn 3, and the turn that fulfils the steer inside it");
+        third.assert_completed("turn 3, the steered turn");
         [first, second, third]
+    }
+
+    /// The turn that reads the correction: roundhouse turn 4, and the one turn
+    /// the trigger must refuse to judge.
+    ///
+    /// Its own function rather than an inline `resume` because two tests need
+    /// the same fourth turn and the prompt is part of the fixture: it asks for
+    /// something the agent could only produce by carrying on, which is what
+    /// separates "the client resent the guidance and continued" from "the
+    /// client stopped at the correction".
+    async fn resume_after_the_steer(&self) -> CodexRun {
+        let fourth = self.resume("Now say the word delta and stop.").await;
+        fourth.assert_completed("turn 4, the turn that fulfils the steer");
+        fourth
     }
 
     /// A first `codex exec` in this run's `CODEX_HOME`.
@@ -1374,36 +1420,6 @@ fn input_of(exchange: &Exchange) -> Vec<Value> {
         .unwrap_or_default()
 }
 
-/// The `function_call` items in a recorded request's `input`.
-fn calls_in(exchange: &Exchange) -> Vec<&Value> {
-    exchange
-        .body
-        .as_ref()
-        .and_then(|body| body["input"].as_array())
-        .map(|input| {
-            input
-                .iter()
-                .filter(|item| item["type"] == "function_call")
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// The `function_call_output` items in a recorded request's `input`.
-fn outputs_in(exchange: &Exchange) -> Vec<&Value> {
-    exchange
-        .body
-        .as_ref()
-        .and_then(|body| body["input"].as_array())
-        .map(|input| {
-            input
-                .iter()
-                .filter(|item| item["type"] == "function_call_output")
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 // ---------------------------------------------------------------------------
 // The tests
 // ---------------------------------------------------------------------------
@@ -1639,6 +1655,34 @@ async fn a_key_revoked_between_runs_fails_the_next_turn_and_leaves_no_half_writt
     rig.clean();
 }
 
+// **T7 ruling: `codexs_meta_thread_id_rides_every_tools_call_and_is_never_read`
+// is retired here, and this comment is what it leaves behind.**
+//
+// F09 recorded that codex stamps `params._meta.threadId` on **every**
+// `tools/call` it dispatches — unconditionally, via
+// `with_mcp_tool_call_thread_id_meta` (`codex-rs/core/src/mcp_tool_call.rs` at
+// the pin, `6344a65`) — byte-identical to the `prompt_cache_key` the same
+// process's `/v1/responses` traffic carries, and that roundhouse reads it
+// nowhere: neither `ControlPlaneReads::resolve_session` (resolves from the
+// tool's own `conversation` argument or `Conversations::latest`) nor the tools
+// in `roundhouse-mcp/src/plane.rs` ever look at it. That was never a defect —
+// tenant-scoped `Principal` plus the qualified `conversation` argument isolate
+// sessions with no help from `_meta` — and the test was expected to pass; what
+// it bought was evidence that a free, client-supplied correlator arrives on
+// every call and is discarded.
+//
+// **It cannot be re-observed hermetically after M10.0.** The only `tools/call`
+// a run of this suite ever produced was the client dispatching roundhouse's own
+// synthetic steer, and T4 deleted the wire projection that emitted it: this
+// deployment's `/v1/responses` stream carries assistant text and nothing else,
+// so no turn it serves can ask a model to call a tool, so no `tools/call` is
+// dispatched. Re-aiming the assertion at `tools/list` would be a different
+// claim about a different helper. The fact is therefore recorded here and in
+// `roundhouse-mcp`'s module doc rather than guarded, and the day a
+// provider-emitted tool call is relayed through this wire is the day it becomes
+// testable again — which is worth noticing, because that day is also when the
+// MCP plugin surface becomes reachable from a roundhouse-served turn.
+
 /// A real codex binary completes the MCP handshake against our own service.
 ///
 /// The first thing this milestone has to establish, and deliberately ahead of
@@ -1726,9 +1770,17 @@ async fn a_real_codex_binary_completes_the_mcp_handshake_against_our_server() {
 
     // The client's side of the same fact: codex advertises our server to the
     // model as one namespace rather than as eight tools, because MCP tools are
-    // deferred under `ToolSearchAlwaysDeferMcpTools`. Direct dispatch still
-    // resolves — which is what the steering test below proves — so this is the
-    // shape to assert, not a per-tool entry.
+    // deferred under `ToolSearchAlwaysDeferMcpTools`. So this is the shape to
+    // assert, not a per-tool entry.
+    //
+    // **What no longer stands behind that sentence.** It used to end "direct
+    // dispatch still resolves — which is what the steering test below proves",
+    // and the steering test proved it by having roundhouse emit a synthetic
+    // `fetch_steer` call the client then dispatched. T4 deleted that path, and
+    // with it the only hermetic evidence that a *dispatch* against this
+    // namespace resolves; what is proved here is the handshake and the listing.
+    // See the T7 ruling above this test for why nothing in this suite can
+    // produce a `tools/call` any more.
     let tools = turn.body.as_ref().expect("a JSON turn body")["tools"]
         .as_array()
         .cloned()
@@ -1874,202 +1926,152 @@ async fn a_forwarded_login_sends_the_seat_and_our_key_on_the_same_request() {
     rig.clean();
 }
 
-/// The whole milestone in one run: roundhouse decides to steer, emits a
-/// synthetic MCP tool call, the real client dispatches it against the real
-/// control surface, and the correction comes back into the conversation.
+/// **T7's deletions, and the ruling that takes them.**
 ///
-/// Three `codex exec` invocations because that is what three roundhouse turns
-/// costs: turn 1 is unvalidated (the trigger's turn-index gate is not
-/// configurable), turn 2 validates and escalates (the action map escalates
-/// unconditionally on the first intervention), and turn 3 validates and steers.
-/// The client then dispatches, appends, and resends — which is roundhouse turn
-/// 4, inside the third process, and the one turn that must *not* be validated.
+/// Two M9 tests used to stand here:
+/// `a_real_codex_binary_executes_our_synthetic_tool_call_and_returns_its_output`
+/// and `a_real_codex_binary_resends_the_call_and_output_and_the_session_does_not_fork`.
+/// Both asserted a dispatch round trip — roundhouse emits a synthetic
+/// `fetch_steer` call, a real client dispatches it against `/mcp`, and the
+/// tool's output comes back as a `function_call_output` the next turn admits.
+/// M10.0 R1 retires that channel: no verdict maps to a tool call, so there is no
+/// dispatch to make and no call-and-output pair to resend.
+///
+/// Deleted rather than re-pointed, because what they proved was that the
+/// *emission machinery* survived a real client, and the emission machinery is
+/// gone (T4). What survives of their subject is split across the two tests
+/// below: the correction still has to reach a real agent, and the client's
+/// resend of it still has to admit as our prefix rather than fork the session —
+/// which is the M4 claim the second of them was really about, now made of one
+/// ordinary assistant item instead of two protocol items.
+///
+/// What is *not* deleted: `a_real_codex_binary_completes_the_mcp_handshake_against_our_server`
+/// and `codexs_meta_thread_id_rides_every_tools_call_and_is_never_read`. R1
+/// re-purposes the MCP surface rather than removing it — it is the plugin
+/// surface an agent changes roundhouse's behavior through, and `fetch_steer`
+/// still answers there as a re-read of the correction in the log.
+///
+/// ---
+///
+/// The correction is the turn's answer, and a real client prints it.
+///
+/// The one thing only a real binary can say about the M10.0 pivot: that codex
+/// treats roundhouse's guidance as an ordinary assistant message — surfaces it,
+/// writes it to `-o`, and ends the run — rather than as something it has to
+/// dispatch, approve or unwrap. Everything in `steering_emission.rs` is played
+/// against Codex's own types; this is played against the process.
+///
+/// Three claims, and the third is the one the pivot bought:
+///
+/// 1. the agent received roundhouse's own words — both ends of the directive,
+///    and the restated request quoted beneath it;
+/// 2. the judge's prose did not travel with them (the injection boundary, in
+///    the one place a real client could have surfaced a leak);
+/// 3. **nothing was dispatched to get any of it**: no tool call in the log, no
+///    `tools/call` on the wire, one `codex exec` and no round trip. A tool-call
+///    steer needed the client to be willing and able to call us back; a text
+///    steer needs the client to be able to read.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs the real codex binary: --features e2e-codex -- --include-ignored; ROUNDHOUSE_TEST_CODEX_BIN overrides PATH"]
-async fn a_real_codex_binary_executes_our_synthetic_tool_call_and_returns_its_output() {
+async fn a_real_codex_binary_receives_the_correction_as_the_turns_answer() {
     let rig = Rig::start("steer").await;
-    let [first, second, third] = rig.drive_to_a_steer().await;
+    let [_first, _second, third] = rig.drive_to_a_steer().await;
 
-    // ---- what roundhouse emitted -------------------------------------------
+    // ---- what the agent was handed -----------------------------------------
+    //
+    // `-o` is read with `unwrap_or_default`, so the emptiness check is what
+    // keeps a missing file from reading as a passing empty answer.
+    assert!(
+        !third.last_message.trim().is_empty(),
+        "the steered run must end with an agent message — our guidance — but \
+         `-o` was empty. stdout:\n{}",
+        third.stdout
+    );
+    // Both ends of the directive. The opening sentence says a review found a
+    // problem and the closing one says what to do about it; an assertion on
+    // either alone passes against a correction truncated to its other half.
+    assert!(
+        third.last_message.contains(GUIDANCE_FRAGMENT),
+        "the agent must have been handed the diagnosis half of the correction: {:?}",
+        third.last_message
+    );
+    assert!(
+        third.last_message.contains(DIRECTIVE_INSTRUCTION),
+        "and the instruction half, which is what makes it a correction: {:?}",
+        third.last_message
+    );
+    // The restated request, quoted. This is the M10.0 composition
+    // (`render_steer_answer`) surviving a real client's rendering: the agent has
+    // to see the task beside the correction, or it has to reconstruct what it
+    // was doing from scrollback — which is the thing the correction just told it
+    // it is getting wrong.
+    assert!(
+        third
+            .last_message
+            .contains("> Now say the word gamma and stop."),
+        "the pending request must be restated under the guidance, every line \
+         quoted: {:?}",
+        third.last_message
+    );
+    assert!(
+        !third.last_message.contains(JUDGE_PROSE),
+        "the judge's own prose must never reach the agent — `render_directive` \
+         excludes it precisely so a model that read attacker-influenceable \
+         transcript cannot write into the answer roundhouse serves: {:?}",
+        third.last_message
+    );
+    // The negative control that makes the three above about *this* turn: the
+    // echo provider's answer is what a dispatched turn produces, and a steered
+    // turn is not dispatched.
+    assert!(
+        !third.last_message.contains(ANSWER),
+        "a steered turn is answered by roundhouse, not by a provider: {:?}",
+        third.last_message
+    );
+
+    // ---- and nothing was dispatched to get it -------------------------------
     let items = rig.items().await;
-    let calls = items
-        .iter()
-        .filter(|item| matches!(item.content, ItemContent::ToolCall { .. }))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        calls.len(),
-        1,
-        "exactly one synthetic call, or the client's resend forked rather than \
-         extended the session:\n{items:#?}"
+    assert!(
+        items.iter().all(|item| !matches!(
+            item.content,
+            ItemContent::ToolCall { .. } | ItemContent::ToolResult { .. }
+        )),
+        "M10.0 R1 retires the tool-call channel: a steered session must carry no \
+         protocol items at all:\n{items:#?}"
     );
-    let call = calls[0];
-    let ItemContent::ToolCall {
-        call_id,
-        name,
-        arguments,
-    } = &call.content
-    else {
-        unreachable!("filtered above")
-    };
-    assert_eq!(name, "fetch_steer");
-    assert_eq!(call.role, Role::Assistant);
+    assert!(
+        rig.recorder.rpc("tools/call").is_empty(),
+        "the correction must have cost no round trip. Dispatched:\n{}",
+        rig.recorder.transcript()
+    );
+
+    // ---- the guidance is an ordinary answer, and stamped like one -----------
+    let guidance = items
+        .iter()
+        .find(|item| item.content.render().contains(GUIDANCE_FRAGMENT))
+        .expect("the correction is in the conversation");
+    assert_eq!(
+        guidance.role,
+        Role::Assistant,
+        "a steer is the turn's answer, so it is the assistant's turn"
+    );
     // Emitted by this deployment, so the log carries the response it was
-    // committed under. The client-sent output below carries none, and that
-    // asymmetry is the only thing distinguishing the two on a replay.
-    assert!(call.response_id.is_some(), "an emitted call is stamped");
-
-    // ---- what the client dispatched ----------------------------------------
-    let dispatched = rig.recorder.rpc("tools/call");
-    let steer_call = dispatched
-        .iter()
-        .find(|exchange| {
-            exchange.body.as_ref().map(|body| &body["params"]["name"])
-                == Some(&Value::from("fetch_steer"))
-        })
-        .unwrap_or_else(|| {
-            panic!(
-                "codex must have dispatched our steer over /mcp:\n{}",
-                rig.recorder.transcript()
-            )
-        });
-    assert_eq!(steer_call.status, 200, "the dispatch was refused");
-    assert_eq!(
-        steer_call.body.as_ref().expect("a JSON-RPC body")["params"]["arguments"]["steer_id"]
-            .as_str(),
-        Some(call_id.as_str()),
-        "the client must have dispatched the id the emitted call named"
-    );
-
-    // ---- what came back into the conversation ------------------------------
-    let result = items
-        .iter()
-        .find(|item| matches!(item.content, ItemContent::ToolResult { .. }))
-        .expect("the client resent the tool's output");
-    let ItemContent::ToolResult {
-        call_id: back,
-        output,
-    } = &result.content
-    else {
-        unreachable!("filtered above")
-    };
-    assert_eq!(back, call_id, "the output names the call it answers");
-    assert_eq!(result.role, Role::Tool);
+    // committed under. Every item the *client* sent carries none, and that
+    // asymmetry is the only thing distinguishing the two on a replay — it
+    // survives the pivot because the stamp is on the item, not on its shape.
     assert!(
-        result.response_id.is_none(),
-        "an item the client sent is not stamped with a response of ours"
-    );
-    // `contains`, not equality: codex wraps an MCP result as
-    // "Wall time: 0.004 seconds\nOutput:\n[…]", and the wall time is measured.
-    // The M4 suite's byte-exact `ToolResult` assertion cannot be ported here,
-    // and tightening it would be pinning the client's rendering rather than our
-    // contract.
-    assert!(
-        output.contains(GUIDANCE_FRAGMENT),
-        "the correction must have reached the agent through fetch_steer, but the output was:\n{output}"
-    );
-    assert!(
-        !output.contains(JUDGE_PROSE),
-        "the judge's own prose must never reach the agent — `render_directive` excludes it \
-         precisely so a model that read attacker-influenceable transcript cannot write into a \
-         payload the agent dispatches. Output was:\n{output}"
+        guidance.response_id.is_some(),
+        "the guidance is completed under a response like any other answer"
     );
 
-    // ---- what the client resent --------------------------------------------
-    let turns = rig.recorder.to("/v1/responses");
-    let fulfilling = turns
-        .iter()
-        .find(|exchange| !calls_in(exchange).is_empty())
-        .expect("one request carried the call back");
-    let resent = calls_in(fulfilling);
-    assert_eq!(resent.len(), 1, "one call went out, so one comes back");
-    let resent = resent[0];
-    assert_eq!(resent["name"].as_str(), Some("fetch_steer"));
-    assert_eq!(
-        resent["namespace"].as_str(),
-        Some(roundhouse_server::DEFAULT_MCP_NAMESPACE),
-        "the namespace is what makes the client's exact (namespace, name) lookup resolve"
-    );
-    assert_eq!(resent["call_id"].as_str(), Some(call_id.as_str()));
-    // The one byte-exact field in the whole exchange. `arguments` is minted
-    // once and echoed as an opaque string; a re-serialization — even a
-    // semantically identical one — would canonicalize to a different item and
-    // fork the session on the next turn.
-    assert_eq!(
-        resent["arguments"].as_str(),
-        Some(arguments.as_str()),
-        "`arguments` must come back byte-for-byte"
-    );
-    let outputs = outputs_in(fulfilling);
-    assert_eq!(outputs.len(), 1, "the call is immediately answered");
-    assert_eq!(outputs[0]["call_id"].as_str(), Some(call_id.as_str()));
+    println!("--- M10-STEER-AS-TEXT ({})", rig.version);
+    println!("    codex `-o` after the steered run:");
+    for line in third.last_message.lines() {
+        println!("      | {line}");
+    }
+    println!("--- end M10-STEER-AS-TEXT");
 
-    // ---- what the loop decided ---------------------------------------------
-    assert_eq!(
-        rig.judge.asked(),
-        2,
-        "turns 2 and 3 validate; turn 1 is below the trigger's gate and turn 4 fulfils a steer"
-    );
-    assert_eq!(
-        rig.validations().await,
-        2,
-        "the fulfilling turn must never fire a validation of its own"
-    );
     rig.assert_never_forked().await;
-
-    // ---- §10.2 evidence: recorded, not asserted ----------------------------
-    //
-    // Deliberately printed rather than compared. What relationship *should*
-    // hold between a judge's usage, the usage roundhouse reports for a steered
-    // turn, and the client's own accumulation is the open question the plan's
-    // §10.2 leaves to this milestone's evidence; an assertion here would be
-    // this file deciding it.
-    //
-    // Four numbers per run and not three: the client's accumulation is only
-    // interpretable against the window it is accumulating toward, and that
-    // window is the catalog's, which this deployment wrote. A block that
-    // printed the usages without it would leave the one arithmetic a reader
-    // wants to do — how close did the client think it was to compacting —
-    // impossible without opening another file.
-    println!("--- M9-USAGE-EVIDENCE ({})", rig.version);
-    println!("    catalog context_window: {CONTEXT_WINDOW_TOKENS}");
-    for (label, run) in [("run 1", &first), ("run 2", &second), ("run 3", &third)] {
-        println!("    client {label} turn.completed.usage: {:?}", run.usage());
-    }
-    for (index, usage) in rig.response_usage().await.iter().enumerate() {
-        println!("    roundhouse response {} usage: {usage:?}", index + 1);
-    }
-    // The booked side calls, not `judge_usage()`: the constant is what the
-    // fixture would report and the log is what the deployment recorded, and
-    // §10.2 is a question about the second.
-    for (index, usage) in rig.side_call_usage().await.iter().enumerate() {
-        println!("    judge side call {} usage: {usage:?}", index + 1);
-    }
-    println!("    validated turns: {:?}", rig.validation_turns().await);
-    // The one arithmetic F03 found this block gave a reader every number for
-    // and never did: the steered turn's *wire* usage — the quantity codex
-    // replaces `last_token_usage` with — against the input the very next turn
-    // is priced on. It ran at 5.0x while the wire carried the judge's usage
-    // (1147 against 5729), which is what told the client its context had
-    // collapsed. Printed and not asserted, like the rest of this block;
-    // `a_steered_turns_reported_usage_is_the_context_it_admitted` is where the
-    // relationship behind the ratio is an assertion.
-    let wire_input = rig
-        .recorder
-        .emitting_a_call("fetch_steer")
-        .and_then(|exchange| exchange.wire_usage())
-        .and_then(|usage| usage["input_tokens"].as_u64());
-    let usages = rig.response_usage().await;
-    match (wire_input, usages.get(3)) {
-        (Some(wire), Some(next)) => println!(
-            "    steered wire input vs next turn's log input: {wire} vs {} ({:.2}x)",
-            next.input_tokens,
-            next.input_tokens as f64 / wire.max(1) as f64
-        ),
-        _ => println!("    steered wire input vs next turn's log input: not both observed"),
-    }
-    println!("    final agent message: {:?}", third.last_message.trim());
-    println!("--- end M9-USAGE-EVIDENCE");
-
     rig.clean();
 }
 
@@ -2088,7 +2090,7 @@ async fn a_real_codex_binary_executes_our_synthetic_tool_call_and_returns_its_ou
 /// resent the largest history the session had ever held.
 ///
 /// The ruling moved the *wire* number and left the ledger alone, so this test
-/// reads both and asserts they now disagree in the intended direction:
+/// reads both and asserts they disagree in the intended direction:
 ///
 /// - the **log** still books the judge's usage on the steered turn (the
 ///   dashboard's total stays equal to the sum of its rows — asserted first,
@@ -2096,58 +2098,72 @@ async fn a_real_codex_binary_executes_our_synthetic_tool_call_and_returns_its_ou
 /// - the **wire** reports the turn's context contribution, and it does so in
 ///   the same tokenizer over the same rendering that prices the next turn.
 ///
-/// That makes the relationship an equality rather than a band:
+/// **The equality this pins changed shape with M10.0, and deliberately did not
+/// become a tolerance.** It used to read
+/// `wire_input(steered) + render(call) + render(result) == log_input(fulfilling)`,
+/// which worked because the fulfilling turn happened *inside* the steered run:
+/// no human spoke between the two requests, so the delta was exactly the two
+/// protocol items. A text steer ends the run, so the fulfilling turn is a fresh
+/// `codex exec resume` carrying a new user message whose bytes this test cannot
+/// predict — and a two-item delta hardcoded here would now be wrong rather than
+/// merely fragile. So each side is anchored to the log instead:
 ///
 /// ```text
-/// wire_input(steered) + render(call) + render(result) == log_input(fulfilling)
+/// wire_input(steered)     == Σ render(items before the guidance)
+/// log_input(fulfilling)   == Σ render(items before the fulfilling answer)
 /// ```
 ///
-/// because turn 4's prompt is exactly turn 3's admitted conversation plus the
-/// call this deployment emitted and the output the client brought back. A
-/// tolerance would have hidden the two ways this can be wrong — a tokenizer
-/// disagreement and a missing item look identical inside a band — so a miss
-/// prints its residual instead, which names what else turn 4 carried.
+/// which is the same claim — one tokenizer over one rendering, on both ends of
+/// the gap — and is strictly stronger, because it names *where* a residual came
+/// from instead of leaving "what else turn 4 carried" to a comment. A tolerance
+/// would still hide the two ways this can be wrong: a tokenizer disagreement and
+/// a missing item look identical inside a band.
 ///
-/// The equality is exact here because this deployment's tokenizer is
+/// The equality is exact because this deployment's tokenizer is
 /// [`ByteTokenizer`] (one token per byte) and `ContextAssembler` concatenates
-/// renders with no separator, so `render().len()` *is* the token count. On a
-/// BPE that merges across an item boundary it would be an equality up to the
-/// merge, which is why the sum is taken over the same per-item renders the
-/// assembler buffers rather than over a joined string.
+/// renders with no separator, so `render().len()` *is* the token count. On a BPE
+/// that merges across an item boundary it would be an equality up to the merge,
+/// which is why each sum is taken over the same per-item renders the assembler
+/// buffers rather than over a joined string.
 #[ignore = "needs the real codex binary: --features e2e-codex -- --include-ignored; ROUNDHOUSE_TEST_CODEX_BIN overrides PATH"]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_steered_turns_reported_usage_is_the_context_it_admitted() {
     let rig = Rig::start("usage-evidence").await;
-    let [_first, _second, _third] = rig.drive_to_a_steer().await;
+    let [first, second, third] = rig.drive_to_a_steer().await;
+    let fourth = rig.resume_after_the_steer().await;
 
     // ---- the ledger, which the ruling deliberately did not move ------------
     let responses = rig.response_usage().await;
     assert_eq!(
         responses.len(),
         4,
-        "turn 1, turn 2, the steer deposit (turn 3), and the fulfilling turn \
-         (turn 4): {responses:#?}"
+        "turn 1, turn 2, the steered turn (3) and the fulfilling turn (4) — one \
+         roundhouse turn per `codex exec` since the correction stopped costing a \
+         round trip: {responses:#?}"
     );
     let booked = &responses[2];
     let fulfilling = &responses[3];
     let side_calls = rig.side_call_usage().await;
     assert_eq!(
-        *booked, side_calls[0],
-        "the steered turn's *booked* usage must still be exactly the judge's: the ruling \
-         changed what the client is told, not what the deployment spent, and a dashboard \
-         whose turn row stopped equalling its side-call row would be the worse bug"
+        side_calls.len(),
+        2,
+        "turns 2 and 3 each consulted the judge once: {side_calls:#?}"
+    );
+    assert_eq!(
+        *booked, side_calls[1],
+        "the steered turn's *booked* usage must still be exactly the judge call \
+         that decided it: the ruling changed what the client is told, not what \
+         the deployment spent, and a dashboard whose turn row stopped equalling \
+         its side-call row would be the worse bug"
     );
 
     // ---- the wire, which it did -------------------------------------------
-    let steered = rig
-        .recorder
-        .emitting_a_call("fetch_steer")
-        .unwrap_or_else(|| {
-            panic!(
-                "one /v1/responses stream must have emitted the synthetic call:\n{}",
-                rig.recorder.transcript()
-            )
-        });
+    let steered = rig.recorder.emitting_the_guidance().unwrap_or_else(|| {
+        panic!(
+            "one /v1/responses stream must have carried the correction:\n{}",
+            rig.recorder.transcript()
+        )
+    });
     let wire = steered.wire_usage().unwrap_or_else(|| {
         panic!(
             "the steered response must have completed: {:?}",
@@ -2170,275 +2186,220 @@ async fn a_steered_turns_reported_usage_is_the_context_it_admitted() {
          here would understate what the next turn has to prefill"
     );
 
-    // ---- and the two are one tokenizer over one rendering ------------------
-    let items = rig.items().await;
-    let call = items
-        .iter()
-        .find(|item| matches!(item.content, ItemContent::ToolCall { .. }))
-        .expect("the steered turn emitted a call");
-    let result = items
-        .iter()
-        .find(|item| matches!(item.content, ItemContent::ToolResult { .. }))
-        .expect("the client brought its output back");
+    // ---- and both ends are one tokenizer over one rendering ----------------
+    //
     // `render().len()`, not a second tokenizer: `ByteTokenizer::encode` is
     // `text.as_bytes()`, so this is `Engine::admitted_input_tokens`'s own
     // arithmetic spelled without reaching into the engine for it.
-    let call_tokens = call.render().len() as u64;
-    let result_tokens = result.render().len() as u64;
-    let predicted = wire_input + call_tokens + result_tokens;
+    let items = rig.items().await;
+    let rendered_through = |end: usize| -> u64 {
+        items[..end]
+            .iter()
+            .map(|item| item.render().len() as u64)
+            .sum()
+    };
+    let guidance_at = items
+        .iter()
+        .position(|item| item.content.render().contains(GUIDANCE_FRAGMENT))
+        .expect("the correction is in the conversation");
+    let answer_at = items
+        .iter()
+        .rposition(|item| item.content.render().contains(ANSWER))
+        .expect("the fulfilling turn was served by the provider");
+    assert!(
+        answer_at > guidance_at,
+        "the fulfilling turn's answer comes after the correction it answers:\n{items:#?}"
+    );
 
-    println!("--- M9-USAGE-RULED ({})", rig.version);
+    // Recorded, not asserted — the §10.2 evidence block the deleted tool-call
+    // test carried, kept because the one arithmetic a reader wants to do (how
+    // close did the client think it was to compacting?) needs the window the
+    // client was accumulating toward, and that window is this catalog's. What
+    // relationship *should* hold between the judge's usage, the usage roundhouse
+    // reports for a steered turn, and the client's own accumulation is the
+    // question the assertions below answer for two of the three; an assertion on
+    // the client's accumulation would be this file deciding the third.
+    println!("--- M10-USAGE-RULED ({})", rig.version);
+    println!("    catalog context_window    : {CONTEXT_WINDOW_TOKENS}");
+    for (label, run) in [
+        ("run 1", &first),
+        ("run 2", &second),
+        ("run 3 (steered)", &third),
+        ("run 4 (fulfilling)", &fourth),
+    ] {
+        println!("    client {label} turn.completed.usage: {:?}", run.usage());
+    }
     println!("    wire input (steered turn) : {wire_input}");
-    println!("    + emitted call render     : {call_tokens}");
-    println!("    + tool result render      : {result_tokens}");
-    println!("    = predicted next input    : {predicted}");
+    println!(
+        "    Σ renders before guidance : {}",
+        rendered_through(guidance_at)
+    );
     println!(
         "    log input (fulfilling)    : {}",
         fulfilling.input_tokens
+    );
+    println!(
+        "    Σ renders before answer   : {}",
+        rendered_through(answer_at)
+    );
+    println!(
+        "    the gap (guidance + turn 4's input): {}",
+        rendered_through(answer_at) - rendered_through(guidance_at)
     );
     println!(
         "    ratio wire:next           : {:.2}x (was 5.0x when the wire carried the judge's)",
         fulfilling.input_tokens as f64 / wire_input.max(1) as f64
     );
     println!("    booked (judge) on turn 3  : {booked:?}");
-    println!("--- end M9-USAGE-RULED");
+    println!(
+        "    fourth run's answer       : {:?}",
+        fourth.last_message.trim()
+    );
+    println!("--- end M10-USAGE-RULED");
 
     assert_eq!(
-        predicted,
+        wire_input,
+        rendered_through(guidance_at),
+        "the number the client was told on the steered turn must be the context \
+         this deployment admitted for it — every item committed before the \
+         correction, and nothing else. Residual {} tokens names what the wire \
+         counted that the log does not hold",
+        wire_input as i64 - rendered_through(guidance_at) as i64
+    );
+    assert_eq!(
         fulfilling.input_tokens,
-        "the number the client was told and the number the next turn is priced on must be one \
-         tokenizer over one rendering. Residual {} tokens names what else turn 4's prompt \
-         carried — an item neither `rig.items()` nor this arithmetic accounted for — and is \
-         worth reading rather than absorbing into a tolerance",
-        fulfilling.input_tokens as i64 - predicted as i64
+        rendered_through(answer_at),
+        "and the number the fulfilling turn was priced on must be every item \
+         committed before its answer — the correction included, which is the \
+         whole of prefix admission. Residual {} tokens names an item neither \
+         `rig.items()` nor this arithmetic accounted for, and is worth reading \
+         rather than absorbing into a tolerance",
+        fulfilling.input_tokens as i64 - rendered_through(answer_at) as i64
     );
-
-    rig.clean();
-}
-
-/// The M4 resend contract, over a real client instead of a hand-written
-/// history: the client sends the call *and* its output back, and roundhouse
-/// recognizes them as the prefix they are.
-///
-/// The real-binary mirror of `steering_emission.rs`'s
-/// `the_resent_call_and_its_output_extend_rather_than_fork`, which plays the
-/// same round trip with Codex's own types but with the test writing the resend.
-/// Everything that test asserts about *our* handling still holds here; what
-/// only this one can say is that the history codex actually built is the one
-/// that suite assumed it would.
-///
-/// Three claims live here and nowhere else in the suite:
-///
-/// 1. the wire `id` survives the round trip. 0.146.0 strips any item id without
-///    an interior underscore (`client.rs:927-933` at `e363b08`, via
-///    `ResponseItemId::is_prefixed`), and `fc_<response_id>` has one — so the
-///    prediction is that it comes back, and either answer is evidence;
-/// 2. the resent request is the previous one *extended*, not rebuilt: same
-///    items in the same order, two appended. A client that re-serialized its
-///    history differently would fork the session on the next turn, silently and
-///    one turn late;
-/// 3. nothing was inserted between the call and its output.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs the real codex binary: --features e2e-codex -- --include-ignored; ROUNDHOUSE_TEST_CODEX_BIN overrides PATH"]
-async fn a_real_codex_binary_resends_the_call_and_output_and_the_session_does_not_fork() {
-    let rig = Rig::start("resend").await;
-    let _runs = rig.drive_to_a_steer().await;
-
-    // ---- what roundhouse emitted, and under which response -----------------
-    let items = rig.items().await;
-    let calls = items
-        .iter()
-        .filter(|item| matches!(item.content, ItemContent::ToolCall { .. }))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        calls.len(),
-        1,
-        "the resent call must be recognized as the prefix it is, not appended a \
-         second time:\n{items:#?}"
-    );
-    let call = calls[0];
-    let ItemContent::ToolCall {
-        call_id,
-        name,
-        arguments,
-    } = &call.content
-    else {
-        unreachable!("filtered above")
-    };
-    let response_id = call
-        .response_id
-        .as_ref()
-        .expect("an emitted call is stamped with the response that emitted it");
-
-    // ---- the two requests the round trip spans -----------------------------
-    let turns = rig.recorder.to("/v1/responses");
-    let fulfilling = turns
-        .iter()
-        .position(|exchange| !calls_in(exchange).is_empty())
-        .expect("one request carried the call back");
-    assert!(
-        fulfilling > 0,
-        "the fulfilling turn is a resend, so it has a predecessor to be a resend *of*:\n{}",
-        rig.recorder.transcript()
-    );
-    let before = input_of(&turns[fulfilling - 1]);
-    let after = input_of(&turns[fulfilling]);
-
-    // Printed unconditionally: the brief asks what the client did with the
-    // fields it is free to rewrite, and an assertion answers that only when it
-    // fails. This is the one place the resent item is visible as received.
-    let resent = calls_in(&turns[fulfilling]);
-    assert_eq!(resent.len(), 1, "one call went out, so one comes back");
-    let resent = resent[0];
-    println!("--- M9-RESENT-CALL as received");
-    println!("{}", serde_json::to_string_pretty(resent).expect("JSON"));
-
-    // ---- the resent call, field by field -----------------------------------
-    assert_eq!(resent["name"].as_str(), Some(name.as_str()));
-    assert_eq!(
-        resent["namespace"].as_str(),
-        Some(roundhouse_server::DEFAULT_MCP_NAMESPACE),
-        "the namespace is what makes the client's exact (namespace, name) lookup resolve"
-    );
-    assert_eq!(resent["call_id"].as_str(), Some(call_id.as_str()));
-    assert_eq!(
-        resent["id"].as_str(),
-        Some(format!("fc_{response_id}").as_str()),
-        "0.146.0 keeps an item id only if it has an interior underscore, and `fc_…` \
-         does — so this is the assertion that our own item-id spelling survives a \
-         real client. If it is gone, the projection must stop claiming an id the \
-         client will not carry."
-    );
-    // The one byte-exact field in the whole exchange. `arguments` is minted
-    // once and echoed as an opaque string; a re-serialization — even a
-    // semantically identical one — canonicalizes to a different item and forks
-    // the session on the next turn.
-    assert_eq!(
-        resent["arguments"].as_str(),
-        Some(arguments.as_str()),
-        "`arguments` must come back byte-for-byte"
-    );
-
-    // ---- the call and its output are adjacent ------------------------------
-    let at = after
-        .iter()
-        .position(|item| item["type"] == "function_call")
-        .expect("the call is in the resent input");
-    assert_eq!(
-        after[at + 1]["type"].as_str(),
-        Some("function_call_output"),
-        "the output must sit immediately after the call it answers, or a turn \
-         that read the history in order would see an unanswered call:\n{:#?}",
-        &after[at..]
-    );
-    assert_eq!(after[at + 1]["call_id"].as_str(), Some(call_id.as_str()));
-
-    // ---- the resend extends rather than rebuilds ---------------------------
-    //
-    // Pairwise on the overlap rather than a whole-array compare, so a failure
-    // names the item that moved instead of printing two 40 KB documents. Whole
-    // `Value` equality per element is deliberate here and not the "assert on
-    // parsed values" rule being broken: the rule is about not byte-comparing
-    // *serializations*, and two items pulled from two parsed documents compare
-    // as values whatever order their fields arrived in.
-    assert_eq!(
-        after.len(),
-        before.len() + 2,
-        "the fulfilling turn resends what it had plus the call and its output, and \
-         nothing else — it is not a fresh history and there is no new user message \
-         in it (no human spoke between the two requests)"
-    );
-    for (index, (was, now)) in before.iter().zip(after.iter()).enumerate() {
-        assert_eq!(
-            was, now,
-            "item {index} was rewritten between the two requests of one turn; a \
-             client that rebuilds its history rather than extending it forks this \
-             session on the turn after the one anybody is watching"
-        );
-    }
-    assert_eq!(after[before.len()]["type"].as_str(), Some("function_call"));
-    assert_eq!(
-        after[before.len() + 1]["type"].as_str(),
-        Some("function_call_output")
-    );
-
-    // ---- and the store agrees ----------------------------------------------
-    let result = items
-        .iter()
-        .find(|item| matches!(item.content, ItemContent::ToolResult { .. }))
-        .expect("the client resent the tool's output");
-    let ItemContent::ToolResult { call_id: back, .. } = &result.content else {
-        unreachable!("filtered above")
-    };
-    assert_eq!(back, call_id, "the output names the call it answers");
-    assert_eq!(result.role, Role::Tool, "a tool result is the tool's turn");
-    // The call kept its stamp and the result never had one: that asymmetry is
-    // the only thing distinguishing an emitted call from a client-sent item on
-    // a replay, and it has to survive the client's round trip to be usable.
-    assert!(result.response_id.is_none());
-    rig.assert_never_forked().await;
 
     rig.clean();
 }
 
 /// The correction reaches the agent, the turn that acts on it is not judged
-/// again, and the run ends with an answer.
+/// again, and the session does not fork on the way.
 ///
-/// "The correction" is a term of art: it is `render_directive`'s output
-/// (`verdict.rs:441-467`), built from roundhouse's own structured facts — the
-/// step the judge located, the signals that fired — and **never** the judge's
-/// prose. So this test asserts a fragment of the directive arrived and that the
-/// judge's own sentence did not, in the same breath. The second half is the
-/// injection boundary, and it is the half a passing suite would otherwise never
-/// mention.
+/// **The other half of the pivot, and the half only a fourth run can show.** A
+/// text steer ends the run it interrupts, so "the agent acted on the correction"
+/// is not observable inside it: the client resends its history on the *next*
+/// `codex exec resume`, and the two things that must then be true are the two
+/// things a tool-call steer used to prove with a dispatch —
 ///
-/// The other claim is about restraint rather than delivery: the turn that
-/// fulfils a steer must not itself be validated. Validating it would judge the
-/// agent on a turn whose whole content is the correction being obeyed, and
-/// would do it while the previous verdict is still the freshest evidence — a
-/// loop that interrupts its own repair. `validate_loop.rs`'s
-/// `a_turn_fulfilling_an_open_steer_never_fires` proves it at the engine level;
-/// here it is proved across a real client's dispatch.
+/// 1. **the guidance admits as prefix.** It is an ordinary assistant item, so
+///    the client resends it with the rest of the conversation and roundhouse has
+///    to recognize it as the prefix it is. A fork is silent from the client's
+///    side, which is why [`Rig::assert_never_forked`] asks the store rather than
+///    the client;
+/// 2. **the fulfilling turn is not validated.** Judging it would judge the agent
+///    on a turn whose whole content is the correction being obeyed, while the
+///    previous verdict is still the freshest evidence — a loop that interrupts
+///    its own repair. `validate_loop.rs`'s
+///    `the_turn_after_a_steer_is_not_validated_and_the_one_after_that_is` proves
+///    the rule at the engine level; here it is proved across a real client's
+///    resend, which is the only place the *shape* of what came back could have
+///    broken it.
+///
+/// The injection sweep stays and is the reason this test reads every captured
+/// document rather than just the answer: after the pivot the correction rides
+/// the `/v1/responses` body itself, which is exactly the capture F11 had to fix.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs the real codex binary: --features e2e-codex -- --include-ignored; ROUNDHOUSE_TEST_CODEX_BIN overrides PATH"]
 async fn the_next_turn_reflects_the_correction() {
     let rig = Rig::start("correction").await;
     let [_first, _second, third] = rig.drive_to_a_steer().await;
+    let fourth = rig.resume_after_the_steer().await;
 
-    // ---- the directive, in the agent's context -----------------------------
+    // ---- the correction, in the agent's context, one turn later ------------
+    //
+    // Read off the *log* and not off run 3's `-o`: what matters here is that the
+    // client brought it back and roundhouse admitted it as its own, which is a
+    // claim about the stored conversation. `a_real_codex_binary_receives_the_
+    // correction_as_the_turns_answer` is where the `-o` half is asserted.
     let items = rig.items().await;
-    let result = items
+    let guidance = items
         .iter()
-        .find(|item| matches!(item.content, ItemContent::ToolResult { .. }))
-        .expect("the client resent the tool's output");
-    let ItemContent::ToolResult { output, .. } = &result.content else {
-        unreachable!("filtered above")
-    };
-    // The directive's *closing* sentence, where the steering test above asserts
-    // its opening one. Deliberately the other end of the string: an assertion
-    // on the first line would pass against a correction that had been truncated
-    // to its diagnosis, and the instruction — what the agent is being asked to
-    // do differently — is the half that makes it a correction at all.
+        .find(|item| item.content.render().contains(DIRECTIVE_INSTRUCTION))
+        .unwrap_or_else(|| panic!("the correction must be in the conversation:\n{items:#?}"));
+    assert_eq!(guidance.role, Role::Assistant);
+    assert_eq!(
+        items
+            .iter()
+            .filter(|item| item.content.render().contains(DIRECTIVE_INSTRUCTION))
+            .count(),
+        1,
+        "the resent correction must be recognized as the prefix it is, not \
+         appended a second time:\n{items:#?}"
+    );
+
+    // ---- the resend extends rather than rebuilds ---------------------------
+    //
+    // The surviving half of the deleted `a_real_codex_binary_resends_the_call_
+    // and_output_and_the_session_does_not_fork`, which is the half that was
+    // never about tool calls: a client that *rebuilds* its history rather than
+    // extending it forks this session on the turn after the one anybody is
+    // watching, and the fork is silent from the client's side. What changed is
+    // only what the delta contains — one assistant item and a new user message
+    // instead of a call and its output — so the assertion is on the overlap and
+    // not on the delta's length, which a fresh `resume` cannot predict.
+    //
+    // Pairwise on the overlap rather than a whole-array compare, so a failure
+    // names the item that moved instead of printing two 40 KB documents. Whole
+    // `Value` equality per element is deliberate and not the "assert on parsed
+    // values" rule being broken: the rule is about not byte-comparing
+    // *serializations*, and two items pulled from two parsed documents compare
+    // as values whatever order their fields arrived in.
+    let turns = rig.recorder.to("/v1/responses");
+    let steered_at = turns
+        .iter()
+        .position(|exchange| {
+            exchange
+                .response_text
+                .as_deref()
+                .is_some_and(|body| body.contains(GUIDANCE_FRAGMENT))
+        })
+        .expect("one request was answered with the correction");
+    let before = input_of(&turns[steered_at]);
+    let after = input_of(&turns[steered_at + 1]);
     assert!(
-        output.contains(DIRECTIVE_INSTRUCTION),
-        "the agent must have received the instruction half of the correction, but \
-         `fetch_steer` returned:\n{output}"
+        after.len() > before.len(),
+        "the fulfilling turn resends what it had and adds to it; an input that \
+         shrank or stood still is a client that rebuilt its history"
+    );
+    for (index, (was, now)) in before.iter().zip(after.iter()).enumerate() {
+        assert_eq!(
+            was, now,
+            "item {index} was rewritten between the steered turn and the one \
+             that fulfils it; a client that rebuilds its history rather than \
+             extending it forks this session one turn after anybody is looking"
+        );
+    }
+    assert!(
+        after[before.len()..]
+            .iter()
+            .any(|item| item.to_string().contains(DIRECTIVE_INSTRUCTION)),
+        "and the correction is *in* what it appended — the guidance is an \
+         ordinary assistant item, so the client carries it back like any other:\n{:#?}",
+        &after[before.len()..]
     );
 
     // ---- and the judge's prose nowhere at all ------------------------------
     //
-    // Every captured document, request and response alike. The request bodies
-    // are the weaker half of this check: the one place the description could
-    // physically appear is the `/mcp` response that carries the steer, since
-    // that payload is the thing `render_directive` built. A sweep that read
-    // only requests would be checking the client's honesty rather than ours.
+    // Every captured document, request and response alike. Both halves matter
+    // and they matter differently now: the correction rides the `/v1/responses`
+    // response body (it *is* the steered turn's answer), and it comes back in
+    // the next request's input — so a leak would be visible twice, and a sweep
+    // that read only one half would be checking the client's honesty rather than
+    // ours.
     //
     // The response half sweeps the raw captured text and not the parsed
     // `Exchange::response`, since F11: `/v1/responses` answers SSE, which does
-    // not parse as one document, and a `SteerAction::Halt`'s reason lands
-    // *only* there — so the parsed-only sweep was silently skipping the one
-    // response body a leak could ride out on. `the_injection_sweep_can_see_a_
-    // halts_reason_in_the_v1_responses_body` is what keeps that capture honest.
+    // not parse as one document, and a `SteerAction::Halt`'s reason lands *only*
+    // there. `the_injection_sweep_can_see_a_halts_reason_in_the_v1_responses_body`
+    // is what keeps that capture honest.
     for exchange in rig.recorder.all() {
         for (half, document) in [
             ("request", exchange.body.as_ref().map(Value::to_string)),
@@ -2450,7 +2411,7 @@ async fn the_next_turn_reflects_the_correction() {
                 "the judge's own prose must never leave the log: found it in the \
                  {half} of {} {}. `render_directive` excludes it precisely so a \
                  model that read attacker-influenceable transcript cannot write \
-                 into a payload the agent dispatches.",
+                 into the answer roundhouse serves.",
                 exchange.method,
                 exchange.path
             );
@@ -2466,8 +2427,8 @@ async fn the_next_turn_reflects_the_correction() {
     assert_eq!(
         rig.validation_turns().await,
         vec![2, 3],
-        "turns 2 and 3 validate; turn 1 is below the trigger's turn-index gate and \
-         turn 4 fulfils an open steer, which the trigger refuses to judge"
+        "turns 2 and 3 validate; turn 1 is below the trigger's turn-index gate \
+         and turn 4 fulfils the steer, which the trigger refuses to judge"
     );
     assert_eq!(
         rig.judge.asked(),
@@ -2475,23 +2436,21 @@ async fn the_next_turn_reflects_the_correction() {
         "one judge consultation per validation, and no more"
     );
 
-    // ---- the run finished as a run, not as a steer --------------------------
+    // ---- the fulfilling turn ran, and ran as an ordinary turn ---------------
     //
-    // `-o` is read with `unwrap_or_default`, so an explicit emptiness check is
-    // what keeps a missing file from reading as a passing empty answer. The
-    // exit status is already asserted by `drive_to_a_steer`; what this adds is
-    // that the fulfilling turn produced a *message*, which is the only evidence
-    // that the client came back from the tool call and finished its turn rather
-    // than ending on the dispatch.
+    // The steered run ends on our guidance; this one ends on the provider's
+    // answer, and the difference between the two `-o` files is the whole of
+    // "the agent carried on".
     assert!(
-        !third.last_message.trim().is_empty(),
-        "the steered run must end with an agent message, but `-o` was empty. stdout:\n{}",
-        third.stdout
+        third.last_message.contains(GUIDANCE_FRAGMENT),
+        "run 3 ends on the correction: {:?}",
+        third.last_message
     );
     assert!(
-        third.last_message.contains(ANSWER),
-        "and that message is the one roundhouse served: {:?}",
-        third.last_message
+        fourth.last_message.contains(ANSWER),
+        "run 4 ends on the answer roundhouse served, which is the evidence the \
+         client resumed rather than stopping at the correction: {:?}",
+        fourth.last_message
     );
     rig.assert_never_forked().await;
 
@@ -2634,67 +2593,4 @@ async fn the_fork_probe_names_the_session_a_fork_would_have_created() {
         "and the store must then hold it, which is the ground truth \
          `assert_never_forked` turns into a failure"
     );
-}
-
-/// F09: codex stamps `params._meta.threadId` on **every** `tools/call` it
-/// dispatches — unconditionally, via `with_mcp_tool_call_thread_id_meta`
-/// (`codex-rs/core/src/mcp_tool_call.rs` at the pin, `6344a65`) — and that
-/// value is byte-identical to the `prompt_cache_key` the same process's
-/// `/v1/responses` traffic carries, both of them the client's own
-/// `sess.thread_id`. Neither `ControlPlaneReads::resolve_session`
-/// (`crates/roundhouse-server/src/mcp_api.rs`, resolves from the tool's own
-/// `conversation` argument or `Conversations::latest`) nor `fetch_steer`
-/// (`crates/roundhouse-mcp/src/plane.rs`, resolves from `request.steer_id`
-/// alone) ever reads it.
-///
-/// This is not a behavioral defect: tenant-scoped `Principal` plus
-/// `Conversations::latest`/the qualified `conversation` argument already
-/// isolate sessions correctly with no help from `_meta`, so the assertion
-/// below is expected to **pass today**. The point it proves is narrower and
-/// still real — that a free, client-supplied session correlator rides every
-/// single tool call and is discarded — which the documented-assumption block
-/// this suite retires (`crates/roundhouse-mcp/src/lib.rs`'s module doc, "Note
-/// the tense") does not mention. That block describes dispatch and resend as
-/// proven and says nothing about a correlator M9's own captures show arriving
-/// on every call, so its account of what M9 closed is incomplete rather than
-/// wrong.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs the real codex binary: --features e2e-codex -- --include-ignored; ROUNDHOUSE_TEST_CODEX_BIN overrides PATH"]
-async fn codexs_meta_thread_id_rides_every_tools_call_and_is_never_read() {
-    let rig = Rig::start("meta-thread-id").await;
-    let [_first, _second, third] = rig.drive_to_a_steer().await;
-
-    let dispatched = rig.recorder.rpc("tools/call");
-    let steer_call = dispatched
-        .iter()
-        .find(|exchange| {
-            exchange.body.as_ref().map(|body| &body["params"]["name"])
-                == Some(&Value::from("fetch_steer"))
-        })
-        .unwrap_or_else(|| {
-            panic!(
-                "codex must have dispatched our steer over /mcp:\n{}",
-                rig.recorder.transcript()
-            )
-        });
-
-    let meta_thread_id =
-        steer_call.body.as_ref().expect("a JSON-RPC body")["params"]["_meta"]["threadId"]
-            .as_str()
-            .map(str::to_string);
-    let reported_thread_id = third.thread_id();
-
-    assert_eq!(
-        meta_thread_id, reported_thread_id,
-        "codex must stamp params._meta.threadId on every tools/call with the \
-         same id it reports as thread_id on `thread.started`, but the dispatched \
-         fetch_steer call carried {meta_thread_id:?} while the client reported \
-         {reported_thread_id:?}. Roundhouse never reads this field either way \
-         (`ControlPlaneReads::resolve_session` resolves from the tool's own \
-         `conversation` argument or `Conversations::latest`; `fetch_steer` \
-         resolves from `request.steer_id` alone) — this assertion passing is \
-         exactly F09's point: the correlator exists on the wire and is unused."
-    );
-
-    rig.clean();
 }

@@ -82,7 +82,7 @@ use roundhouse_core::ids::SessionId;
 use roundhouse_core::item::{Item, ItemContent};
 
 use crate::overlay::{ModeNarrowing, SessionOverlay, TimedOverlay};
-use crate::surface::{SteerOutcome, SurfaceError};
+use crate::surface::SteerOutcome;
 
 /// How long a record outlives the write that made it.
 ///
@@ -165,41 +165,31 @@ pub struct IntentRecord {
     pub declared_at_ms: u64,
 }
 
-/// A corrective payload, committed when its synthetic call was emitted.
+/// What an agent said it did about the correction it was given.
 ///
-/// `steer_id` is the `call_id` the engine put in the log — one id, not two, so
-/// the tool an agent calls and the item its client resends name the same thing
-/// and a projection can join them without a mapping table.
+/// **All that is left of `SteerRecord`, and the deletion is M10.0's.** The old
+/// record carried the *guidance* as well — deposited here when the synthetic
+/// call was emitted, because the call itself carried only an id. The guidance is
+/// a conversation item now, folded by the session's own projection, so keeping a
+/// copy here would be a second source of truth for one string, node-local and
+/// lost on restart. What remains is the one fact the log genuinely does not
+/// have: what the agent says it did next.
+///
+/// Keyed by session rather than by steer id for the same reason: there is no
+/// steer id any more. One report per conversation, overwritten by a later one —
+/// an agent that reports twice has changed its mind, and the newer answer is the
+/// one M6's arm evaluation wants.
 #[derive(Debug, Clone, PartialEq)]
-pub struct SteerRecord {
-    pub steer_id: String,
-    /// Which conversation the steer was emitted in.
-    ///
-    /// Written now and compared in M7, deliberately in that order. `fetch_steer`
-    /// is scoped by *principal* today — [`Self::principal`] is the only field
-    /// [`ControlStore::steer_for`] filters on — so a steer emitted in one of a
-    /// key's conversations is fetchable from another of the same key's. That is
-    /// the weaker of the two scopings and it is the one M5 can defend: the
-    /// tool takes a `steer_id` and no conversation, so narrowing to a
-    /// conversation needs the caller's session resolved at the seam, which is
-    /// the same read the binding join is waiting on (see
-    /// [`ControlStore::binding_in_log`]). Recording the session now is what
-    /// makes that a comparison rather than a migration: a steer deposited today
-    /// already knows which conversation it belongs to.
+pub struct OutcomeRecord {
+    /// Which conversation the report is about.
     pub session: SessionId,
-    /// Who the steer belongs to. Compared against the caller on every fetch:
-    /// the id travels through a model's context, and a context is a place ids
-    /// get copied between conversations.
+    /// Who reported. Kept even though the session is resolved per-principal at
+    /// the seam, because a record that cannot say whose it is cannot be swept,
+    /// joined, or audited on its own.
     pub principal: Principal,
-    pub guidance: String,
-    pub emitted_at_ms: u64,
-    /// What the agent said it did about the steer, if it said anything.
-    ///
-    /// Advisory in the strongest sense: nothing reads it to decide anything,
-    /// its absence is never an error, and M6's arm evaluation is the first
-    /// consumer that will.
-    pub outcome: Option<SteerOutcome>,
-    pub outcome_note: Option<String>,
+    pub outcome: SteerOutcome,
+    pub note: Option<String>,
+    pub reported_at_ms: u64,
 }
 
 /// Node-local control-plane state, keyed by the session it belongs to.
@@ -212,7 +202,7 @@ pub struct ControlStore {
 struct Inner {
     overlays: HashMap<SessionId, OverlayEntry>,
     intents: HashMap<SessionId, IntentRecord>,
-    steers: HashMap<String, SteerRecord>,
+    outcomes: HashMap<SessionId, OutcomeRecord>,
     bindings: HashMap<BindingId, SessionBinding>,
     /// The wall clock the next sweep is due at. Zero, so the first write of a
     /// process's life sweeps and the interval is measured from there.
@@ -247,7 +237,8 @@ impl Inner {
             .retain(|_, entry| entry.written_at_ms >= cutoff);
         self.intents
             .retain(|_, intent| intent.declared_at_ms >= cutoff);
-        self.steers.retain(|_, steer| steer.emitted_at_ms >= cutoff);
+        self.outcomes
+            .retain(|_, report| report.reported_at_ms >= cutoff);
         self.bindings
             .retain(|_, binding| binding.minted_at_ms >= cutoff);
     }
@@ -382,56 +373,43 @@ impl ControlStore {
         self.lock().intents.get(session).cloned()
     }
 
-    /// Commit a steer payload, after the log commit that emitted its call.
+    /// Record what an agent said it did about a correction.
     ///
-    /// The engine's interjection seam is the only honest caller. See the module
-    /// note on why the ordering is log-first.
-    pub fn deposit_steer(&self, record: SteerRecord) {
-        let mut inner = self.lock();
-        inner.sweep(record.emitted_at_ms);
-        inner.steers.insert(record.steer_id.clone(), record);
-    }
-
-    /// Read a steer this principal owns.
+    /// **Never refuses, and that is the tool's own promise kept in the store.**
+    /// `report_outcome` is advisory in the strongest sense — not reporting is
+    /// never an error and never blocks a turn — so a report against a
+    /// conversation roundhouse has not steered is filed rather than rejected.
+    /// The alternative would make the tool's answer depend on whether a
+    /// validation had happened, which is a fact the agent cannot see and would
+    /// have to guess at.
     ///
-    /// An id that does not exist and an id belonging to somebody else produce
-    /// the identical error, naming neither the other principal nor the other
-    /// session. See [`SurfaceError::UnknownSteer`] for why telling them apart
-    /// would make the tool an enumeration oracle.
-    pub fn steer_for(
-        &self,
-        principal: &Principal,
-        steer_id: &str,
-    ) -> Result<SteerRecord, SurfaceError> {
-        self.lock()
-            .steers
-            .get(steer_id)
-            .filter(|record| &record.principal == principal)
-            .cloned()
-            .ok_or_else(|| SurfaceError::UnknownSteer {
-                steer_id: steer_id.to_string(),
-            })
-    }
-
-    /// Attach an advisory outcome to a steer this principal owns.
+    /// The caller has already resolved `session` through
+    /// [`ControlReads::resolve_session`](crate::reads::ControlReads::resolve_session),
+    /// which is where the tenancy boundary is; this stores what it is given.
     pub fn record_outcome(
         &self,
         principal: &Principal,
-        steer_id: &str,
+        session: &SessionId,
         outcome: SteerOutcome,
         note: Option<String>,
-    ) -> Result<SteerRecord, SurfaceError> {
+        now_ms: u64,
+    ) -> OutcomeRecord {
+        let record = OutcomeRecord {
+            session: session.clone(),
+            principal: principal.clone(),
+            outcome,
+            note,
+            reported_at_ms: now_ms,
+        };
         let mut inner = self.lock();
-        let record = inner
-            .steers
-            .get_mut(steer_id)
-            .filter(|record| &record.principal == principal)
-            .ok_or_else(|| SurfaceError::UnknownSteer {
-                steer_id: steer_id.to_string(),
-            })?;
-        record.outcome = Some(outcome);
-        record.outcome_note = note;
-        Ok(record.clone())
+        inner.sweep(now_ms);
+        inner.outcomes.insert(session.clone(), record.clone());
+        record
+    }
+
+    /// What this conversation's agent last said it did, if it said anything.
+    pub fn outcome_for(&self, session: &SessionId) -> Option<OutcomeRecord> {
+        self.lock().outcomes.get(session).cloned()
     }
 
     /// The binding id for `(principal, session)`, minting one if it has none.
@@ -634,72 +612,59 @@ mod tests {
         SessionId::new("acme/ada/sess_1")
     }
 
-    fn steer(id: &str, owner: Principal) -> SteerRecord {
-        SteerRecord {
-            steer_id: id.into(),
-            session: session(),
-            principal: owner,
-            guidance: "you are editing a file the task did not name".into(),
-            emitted_at_ms: 1_700_000_000_000,
-            outcome: None,
-            outcome_note: None,
-        }
-    }
-
+    /// **T4's replacement for the two steer-store tests.**
+    ///
+    /// What is gone with them is named in the report: an unknown `steer_id` and
+    /// another tenant's `steer_id` used to have to read identically, or the tool
+    /// was an enumeration oracle. There is no id to enumerate any more — both
+    /// steer tools name a conversation and resolve it through
+    /// `ControlReads::resolve_session`, so the oracle question is answered by
+    /// `ForeignConversation` at a door every other session tool already uses,
+    /// and this store never sees a call it should have refused.
+    ///
+    /// What is left here is the one fact the log does not have, and the two
+    /// properties the tool's own description promises about it: a report is
+    /// never refused, and a second report replaces the first.
     #[test]
-    fn a_steer_belonging_to_another_principal_reads_the_same_as_one_that_does_not_exist() {
+    fn a_report_is_filed_for_any_conversation_and_the_newer_one_wins() {
         let store = ControlStore::new();
-        store.deposit_steer(steer("fc_1", Principal::new("other", "bob")));
 
-        let foreign = store
-            .steer_for(&principal(), "fc_1")
-            .expect_err("another key's steer is not readable");
-        let missing = store
-            .steer_for(&principal(), "fc_nope")
-            .expect_err("an id nobody minted is not readable");
+        // A conversation roundhouse has not steered. Filed, not refused: the
+        // descriptor promises reporting is never an error, and an agent cannot
+        // see whether a validation happened, so a refusal here would make the
+        // tool's answer depend on a fact it would have to guess at.
+        let filed = store.record_outcome(
+            &principal(),
+            &session(),
+            SteerOutcome::NotApplicable,
+            None,
+            1_700_000_000_000,
+        );
+        assert_eq!(filed.outcome, SteerOutcome::NotApplicable);
+        assert_eq!(store.outcome_for(&session()).unwrap(), filed);
+
+        // A second report is the agent changing its mind, and M6's arm
+        // evaluation wants the newer answer -- so it replaces rather than
+        // accumulating under a key that no longer exists to distinguish them.
+        let revised = store.record_outcome(
+            &principal(),
+            &session(),
+            SteerOutcome::Applied,
+            Some("re-read the task and started over".into()),
+            1_700_000_001_000,
+        );
+        assert_eq!(store.outcome_for(&session()).unwrap(), revised);
         assert_eq!(
-            foreign.to_string().replace("fc_1", "ID"),
-            missing.to_string().replace("fc_nope", "ID"),
-            "telling the two apart would make the tool an enumeration oracle"
-        );
-        assert!(
-            !foreign.to_string().contains("other") && !foreign.to_string().contains("bob"),
-            "and the refusal must name nothing about the tenant that does own it"
+            store.outcome_for(&session()).unwrap().note.as_deref(),
+            Some("re-read the task and started over")
         );
 
-        // The control: the owner reads it.
-        store.deposit_steer(steer("fc_2", principal()));
-        assert_eq!(
-            store.steer_for(&principal(), "fc_2").unwrap().steer_id,
-            "fc_2"
-        );
-    }
-
-    #[test]
-    fn an_outcome_for_an_unknown_steer_is_refused_and_stores_nothing() {
-        let store = ControlStore::new();
+        // The control: a conversation nobody reported on has no record, so the
+        // assertions above are about the writes and not about a default.
         assert!(
             store
-                .record_outcome(&principal(), "fc_nope", SteerOutcome::Applied, None)
-                .is_err()
-        );
-        assert!(store.steer_for(&principal(), "fc_nope").is_err());
-
-        // The control: a real steer takes its outcome, and keeps it.
-        store.deposit_steer(steer("fc_1", principal()));
-        let updated = store
-            .record_outcome(
-                &principal(),
-                "fc_1",
-                SteerOutcome::Rejected,
-                Some("already handled".into()),
-            )
-            .expect("the owner may report");
-        assert_eq!(updated.outcome, Some(SteerOutcome::Rejected));
-        assert_eq!(
-            store.steer_for(&principal(), "fc_1").unwrap().outcome,
-            Some(SteerOutcome::Rejected),
-            "the write is durable within the process, not just in the answer"
+                .outcome_for(&SessionId::new("acme/ada/other"))
+                .is_none()
         );
     }
 
@@ -871,9 +836,7 @@ mod tests {
                 declared_at_ms: 0,
             },
         );
-        let mut old_steer = steer("fc_old", principal());
-        old_steer.emitted_at_ms = 0;
-        store.deposit_steer(old_steer);
+        store.record_outcome(&principal(), &session(), SteerOutcome::Applied, None, 0);
         store.set_mode_axis(
             &session(),
             Some(TimedOverlay {
@@ -887,19 +850,27 @@ mod tests {
             0,
         );
 
-        // A month later, one write of any family sweeps all four.
-        let mut fresh_steer = steer("fc_new", principal());
-        fresh_steer.emitted_at_ms = 30 * DAY_MS;
-        store.deposit_steer(fresh_steer);
+        // A month later, one write of any family sweeps all four. Written
+        // against a *different* conversation on purpose: outcomes are keyed by
+        // session, so re-reporting on this one would overwrite the aged record
+        // and prove nothing about the sweep.
+        let other = SessionId::new("acme/ada/sess_2");
+        store.record_outcome(
+            &principal(),
+            &other,
+            SteerOutcome::Applied,
+            None,
+            30 * DAY_MS,
+        );
 
-        assert!(store.steer_for(&principal(), "fc_old").is_err());
+        assert!(store.outcome_for(&session()).is_none());
         assert!(store.intent(&session()).is_none());
         assert!(store.overlay(&session()).is_none());
         assert!(store.binding(&principal(), &session(), &old_id).is_none());
 
         // The control: the record the sweeping write itself carried is not the
         // one collected, and neither is anything written after it.
-        assert!(store.steer_for(&principal(), "fc_new").is_ok());
+        assert!(store.outcome_for(&other).is_some());
         let fresh_id = store.bind_session(&principal(), &session(), 30 * DAY_MS);
         assert!(store.binding(&principal(), &session(), &fresh_id).is_some());
     }

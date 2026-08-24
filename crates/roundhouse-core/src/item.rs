@@ -85,12 +85,23 @@ pub struct Item {
     pub role: Role,
     pub content: ItemContent,
     /// Set on assistant items so `previous_response_id` can resolve to the
-    /// exact prefix a client is continuing from — and, since M4, the
-    /// provenance stamp on a server-emitted tool call. Client input always
-    /// canonicalizes with `None` and only the emission act
-    /// (`Session::complete_with_item`) sets it, so a stamped `ToolCall` in the
-    /// log means *we* emitted it and a client cannot forge one; `open_steers`
-    /// and the steering projection both key on exactly this distinction.
+    /// exact prefix a client is continuing from, and the provenance stamp on
+    /// anything this deployment produced. Client input always canonicalizes with
+    /// `None` and only the emission act (`Session::complete_with_item`) sets it,
+    /// so a stamped item in the log is one *we* wrote and a client cannot forge
+    /// one — which is what the wire projection's "may this go out on this
+    /// response" check reads.
+    ///
+    /// **What that no longer distinguishes, since M10.0.** While the steer was a
+    /// synthetic tool call, the stamp was also a free discriminator for *which*
+    /// item was the correction: a `ToolCall` bearing a response id could only be
+    /// ours, so the session fold read the shape and knew. A steer is assistant
+    /// text now — the same shape every dispatched turn's answer has — so nothing
+    /// about an item says it is a correction, and
+    /// `SessionState::steered_on_turn` is folded from `ValidationDecided`
+    /// instead. That is deliberate: it is also what keeps a resent history
+    /// carrying the guidance admitting as an ordinary prefix, with no exclusion
+    /// rule anywhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_id: Option<ResponseId>,
 }

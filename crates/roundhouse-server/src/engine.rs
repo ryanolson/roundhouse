@@ -42,7 +42,7 @@ use roundhouse_core::routing::{
 };
 use roundhouse_core::session::{Session, SessionError, TurnAdmission};
 use roundhouse_core::store::SessionStore;
-use roundhouse_core::validate::{SideCall, SteerCapability};
+use roundhouse_core::validate::SideCall;
 use roundhouse_fleet::{
     FleetError, FleetQuery, FrontierChunk, FrontierClient, FrontierError, FrontierQuote,
     FrontierStream, LocalFleet, LocalQuote, StaticFrontierCatalog,
@@ -691,13 +691,6 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                 // log's own fallback where it declared nothing. See
                 // [`Self::objective`].
                 objective: self.objective(session_id, session.state()),
-                // Not yet detected. `Absent` is the honest value while nothing
-                // reads the request's tool list: under `SteerChannel::Auto` it
-                // degrades a correction to plain guidance, which is the safe
-                // direction, and the production default interjects on nothing
-                // regardless. Detection belongs at the wire layer against the
-                // tool list a request declared, which is §7's milestone.
-                capability: &SteerCapability::Absent,
                 // Who a check is billed to, under what key, and by what name.
                 // Not the candidate list, and never a price: an occupant may be
                 // told there is no room for a check and never what the turn it
@@ -770,15 +763,14 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             // this comment the absence reads as a missing `record_routing`,
             // which is exactly the "fix" that would break it.
             //
-            // **The text is what the item says, and for a call that is
-            // nothing.** A caller that concatenated `text` into a transcript
-            // must not find a tool call in it — the call reaches a client as a
-            // wire item, not as prose — but a halt's item *is* prose, and it is
-            // the whole point of the halt: the guidance that ends the agent's
-            // loop and hands control back to a human. Returning the empty
-            // string for both would leave the degrade path with its correction
-            // in the log and nothing on the wire. See
-            // [`Item::spoken_text`](roundhouse_core::item::Item::spoken_text).
+            // **The text is what the item says**, and since M10.0 both seam
+            // answers say something: a steer carries the guidance and the
+            // restated request, a halt carries the guidance alone. Both are
+            // assistant text, so `spoken_text` is the whole projection — it
+            // still answers the empty string for a tool call, which is what
+            // keeps a caller concatenating `text` into a transcript from
+            // finding a call in it, but nothing this seam produces is one.
+            // See [`Item::spoken_text`](roundhouse_core::item::Item::spoken_text).
             //
             // **The usage booked here is the interjection's, and it is a
             // ledger number rather than a wire number.** Reporting
@@ -799,7 +791,6 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             Interjection::Complete {
                 item,
                 usage,
-                guidance,
                 record,
             } => {
                 // The record goes in the same append batch as the item and the
@@ -810,13 +801,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                     .complete_with_item(&response_id, item.clone(), usage.clone(), record)
                     .await;
                 committed
-                    .map(|()| {
-                        // Only once the log holds the call. See
-                        // [`Self::deposit_steer`] on why that ordering is the
-                        // load-bearing half.
-                        self.deposit_steer(session_id, &admission.principal, &item, guidance);
-                        (item.spoken_text().to_string(), usage, None)
-                    })
+                    .map(|()| (item.spoken_text().to_string(), usage, None))
                     .map_err(EngineError::from)
             }
             Interjection::Proceed { record } => {
@@ -1182,6 +1167,41 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         let admission = &escalated.admission;
         let turn_policy: &TurnPolicy = &admission.policy;
 
+        // --- and narrate it, if this deployment asked us to (R2) --------------
+        //
+        // Resolved here, beside the escalation it describes, and applied ~250
+        // lines below at the frontier quote. The split is deliberate: the *gate*
+        // is a fact about the validate loop and belongs where the narrowing is
+        // composed, while the *append* is a fact about one wire and belongs
+        // where that wire's request is built. Deciding both at the quote would
+        // put a validate-loop rule inside a transport branch, where the next
+        // transport would have to grow its own copy.
+        //
+        // Three conditions, and only one of them is a config read:
+        //
+        // - a note is configured. Absent is the shipped answer, so this is
+        //   `None` on every turn of every deployment that has not opted in, and
+        //   the whole decoration path costs one `Option` check;
+        // - an escalation is in force — `this_turn_opened_an_escalation` is
+        //   `false` when there is none at all;
+        // - and it *began on this turn*. A note must ride once per switch and
+        //   never accumulate; the fold answers that, so a successor picking this
+        //   session up mid-escalation does not decorate a second time.
+        //
+        // What is deliberately *not* a fourth condition is `escalated.clamped`.
+        // A clamped escalation still narrowed routing, and an unclamped one
+        // whose floor the previous turn already met may have moved nothing — so
+        // the flag is both over- and under-inclusive as a proxy for "the target
+        // changed". The honest fix is in the wording rather than in the gate:
+        // `handoff::EXAMPLE_HANDOFF_NOTE` claims a review found trouble, which
+        // is exactly what is true here, and claims nothing about who is
+        // answering. See `validate::handoff`.
+        let handoff_note = admission
+            .validation
+            .as_ref()
+            .and_then(|terms| terms.handoff_note.as_deref())
+            .filter(|_| session.state().this_turn_opened_an_escalation());
+
         // --- drop what this principal could never use ------------------------
         //
         // The second half of the policy's reach into routing, and it exists for
@@ -1456,7 +1476,38 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                 let quote = FrontierQuote {
                     target: decision.target.clone(),
                     wire_protocol: spec.wire_protocol,
-                    prompt: assembler.rendered(),
+                    // **The forwarded request, and only the forwarded request.**
+                    // `assembler.rendered()` is a projection of the log, not the
+                    // log — so decorating it here leaves the stored items, the
+                    // prefix hashes and everything a successor would rebuild
+                    // byte-identical whether a deployment configured a note or
+                    // not. That is R2's whole safety argument, and it is a
+                    // property of *where* this line is rather than of anything
+                    // the function does.
+                    //
+                    // `isl_tokens` above is deliberately the undecorated count:
+                    // it is what the pool was quoted against and what the
+                    // decision was recorded at, and re-deriving it here would
+                    // make the audit trail describe a prompt that never went
+                    // anywhere. The note is roundhouse's own paragraph on one
+                    // turn in a session, so the understatement is bounded and
+                    // one-sided — and a frontier settle prices from the
+                    // provider's own reported usage anyway.
+                    //
+                    // The local branch above takes the token *buffer* rather
+                    // than a string and is left undecorated: re-tokenizing a
+                    // decorated prompt would desynchronize the buffer from the
+                    // block hashes the fleet routes on, which is a real cost for
+                    // a narration. Named as a gap rather than hidden — a
+                    // deployment whose escalations land locally gets the
+                    // narrowing without the note.
+                    prompt: match handoff_note {
+                        Some(note) => roundhouse_core::validate::append_handoff_note(
+                            assembler.rendered(),
+                            note,
+                        ),
+                        None => assembler.rendered(),
+                    },
                     // Stable for the life of the session: providers use it to
                     // steer requests to the same cache node, so varying it
                     // would defeat the hit we just routed on.

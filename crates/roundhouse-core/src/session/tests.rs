@@ -19,11 +19,14 @@ use std::sync::Mutex;
 
 const TTL: u64 = 30_000;
 
-/// The steer a test emits: one call id, one name, one argument string,
-/// minted once and reused by every party the way the real one is.
-const STEER_CALL_ID: &str = "rhsteer_resp_1";
-const STEER_NAME: &str = "fetch_steer";
-const STEER_ARGS: &str = r#"{"steer_id":"rhsteer_resp_1"}"#;
+/// The correction a steered turn answers with, as M10.0 renders it: the
+/// directive, then the pending request quoted line by line.
+///
+/// A literal rather than a call into `render_steer_answer`, so a test about the
+/// *fold* fails for the fold's reasons; the rendering has its own golden pin in
+/// `validate::verdict`.
+const GUIDANCE: &str = "A review of this session's recent steps found it is not making progress \
+toward the stated task.\n\nThe request you are working on is restated below.\n\n> go";
 
 async fn new_session(store: Arc<MemoryStore>, node: &str) -> (SessionId, Session<MemoryStore>) {
     let sid = SessionId::generate();
@@ -539,7 +542,7 @@ async fn a_reader_projects_a_session_without_taking_the_lease_the_writer_holds()
     session
         .complete_with_item(
             &response_id,
-            Item::tool_call(STEER_CALL_ID, STEER_NAME, STEER_ARGS),
+            steer_item(&response_id),
             Usage::default(),
             ControlRecord::default(),
         )
@@ -549,7 +552,10 @@ async fn a_reader_projects_a_session_without_taking_the_lease_the_writer_holds()
     let projected = SessionState::project(store.as_ref(), &sid, CacheLedger::new(), None)
         .await
         .expect("a projection needs no lease");
-    assert_eq!(projected.open_steer_ids(), vec![STEER_CALL_ID.to_string()]);
+    assert_eq!(
+        projected.items.last().map(|item| item.spoken_text()),
+        Some(GUIDANCE)
+    );
     assert_eq!(
         projected
             .last_decision()
@@ -583,8 +589,8 @@ async fn a_reader_projects_a_session_without_taking_the_lease_the_writer_holds()
         .unwrap();
     assert_eq!(reopened.state().items.len(), reprojected.items.len());
     assert_eq!(
-        reopened.state().open_steer_ids(),
-        reprojected.open_steer_ids()
+        reopened.state().last_guidance(),
+        reprojected.last_guidance()
     );
     assert_eq!(
         reopened.state().last_decision().map(|d| d.chosen.clone()),
@@ -796,24 +802,11 @@ impl SessionStore for BatchRecordingStore {
     }
 }
 
-/// The item a steered turn completes with, built the way the emission
-/// builds it: bare name, no namespace, arguments minted once.
-fn steer_call() -> Item {
-    Item::tool_call(STEER_CALL_ID, STEER_NAME, STEER_ARGS)
-}
-
-/// The client's half of the round trip: the output it appends after
-/// running the call, canonicalized exactly as `canonical_item` produces it
-/// — role `tool`, no response id.
-fn tool_result(call_id: &str, output: &str) -> Item {
-    Item {
-        role: Role::Tool,
-        content: ItemContent::ToolResult {
-            call_id: call_id.into(),
-            output: output.into(),
-        },
-        response_id: None,
-    }
+/// The item a steered turn completes with, built the way the seam builds it:
+/// assistant text, with the response stamp applied by `complete_with_item`
+/// rather than by the caller.
+fn steer_item(response_id: &ResponseId) -> Item {
+    Item::assistant_text(GUIDANCE, response_id.clone())
 }
 
 #[tokio::test]
@@ -841,7 +834,7 @@ async fn complete_with_item_appends_the_item_and_completes_in_one_batch() {
     session
         .complete_with_item(
             &response_id,
-            steer_call(),
+            steer_item(&response_id),
             Usage::default(),
             ControlRecord::default(),
         )
@@ -854,9 +847,9 @@ async fn complete_with_item_appends_the_item_and_completes_in_one_batch() {
         1,
         "the emitted item and the completion are a decision and its \
          realization: committed in two appends, a crash between them \
-         leaves a session holding a tool call whose turn never completed, \
-         so the client's retry does not deduplicate and the same call is \
-         emitted twice"
+         leaves a session holding a correction whose turn never completed, \
+         so the client's retry does not deduplicate and the same guidance is \
+         answered twice"
     );
     assert!(
         matches!(
@@ -877,7 +870,7 @@ async fn complete_with_item_appends_the_item_and_completes_in_one_batch() {
         .iter()
         .find(|event| {
             matches!(&event.kind, SessionEventKind::ItemAppended { item }
-                if matches!(item.content, ItemContent::ToolCall { .. }))
+                if item.spoken_text() == GUIDANCE)
         })
         .expect("the emitted item is in the log")
         .seq;
@@ -889,8 +882,18 @@ async fn complete_with_item_appends_the_item_and_completes_in_one_batch() {
     assert_eq!(completed_seq, item_seq + 1);
 }
 
+/// The provenance stamp, and the reason M10.0 could not keep using it.
+///
+/// The stamp is still the marker that says which items this deployment
+/// produced, and `complete_with_item` is still the only thing that applies one.
+/// What changed is that the stamp no longer *identifies a steer*: a steered turn
+/// completes with assistant text now, which is byte-for-byte the shape every
+/// dispatched turn completes with, so "stamped" answers "we wrote it" and
+/// nothing finer. The control below is the whole of that argument — the two
+/// items are indistinguishable — and it is why `steered_on_turn` is folded from
+/// `ValidationDecided` instead.
 #[tokio::test]
-async fn the_appended_item_carries_the_response_stamp_and_renders_as_a_tool_call() {
+async fn a_completed_item_carries_the_response_stamp_and_a_steer_looks_like_any_answer() {
     let store = Arc::new(MemoryStore::new());
     let (_, mut session) = new_session(store, "node-a").await;
 
@@ -902,7 +905,7 @@ async fn the_appended_item_carries_the_response_stamp_and_renders_as_a_tool_call
     session
         .complete_with_item(
             &response_id,
-            steer_call(),
+            steer_item(&response_id),
             Usage::default(),
             ControlRecord::default(),
         )
@@ -913,42 +916,47 @@ async fn the_appended_item_carries_the_response_stamp_and_renders_as_a_tool_call
         .state()
         .items
         .last()
-        .expect("the item was committed");
+        .expect("the item was committed")
+        .clone();
     assert_eq!(
         emitted.response_id,
-        Some(response_id),
-        "the stamp is the provenance marker the whole design rests on: an \
-         item bearing this response's id is one this response emitted, and \
-         every item on the input path carries none"
+        Some(response_id.clone()),
+        "the stamp is applied here and nowhere else: every item on the input \
+         path carries none, so a stamped item is one this deployment wrote"
     );
-    assert_eq!(
-        emitted.role,
-        Role::Assistant,
-        "the role `canonical_item` gives an incoming `function_call`, so \
-         the client's resend of this very call compares equal to it under \
-         prefix admission, which compares role and content only"
-    );
+    assert_eq!(emitted.role, Role::Assistant);
     assert_eq!(
         emitted.content,
-        ItemContent::ToolCall {
-            call_id: STEER_CALL_ID.into(),
-            name: STEER_NAME.into(),
-            arguments: STEER_ARGS.into(),
+        ItemContent::Text {
+            text: GUIDANCE.into()
         },
-        "arguments are stored as minted, never re-serialized: the client \
-         echoes the string back verbatim and it has to match by \
-         construction"
+        "the correction is the turn's answer, in the conversation, where the \
+         agent reads every other answer"
     );
+
+    // The control, and M10.0's discriminator problem as an assertion: an
+    // ordinary dispatched answer produces an item that differs from the steer
+    // in its *text* and in nothing else. Anything in the fold that tried to
+    // recognise a steer by shape or by provenance would recognise this too.
+    let admission = session
+        .begin_turn(TurnId::new("t2"), vec![Item::user_text("q2")])
+        .await
+        .unwrap();
+    let ordinary_id = admission.response_id().clone();
+    session
+        .complete(&ordinary_id, "an ordinary answer", Usage::default())
+        .await
+        .unwrap();
+    let ordinary = session.state().items.last().expect("committed").clone();
+    assert_eq!(ordinary.role, emitted.role);
+    assert!(ordinary.response_id.is_some());
     assert!(
-        !STEER_NAME.contains("__"),
-        "the log stores the bare tool name; the namespace lives only in \
-         the wire projection, so a namespaced resend and a flat one \
-         canonicalize to this same stored item"
-    );
-    assert!(
-        emitted.render().contains(STEER_NAME),
-        "an emitted call is an ordinary item on the ordinary path: it \
-         renders into the prompt like every other one"
+        matches!(
+            (&ordinary.content, &emitted.content),
+            (ItemContent::Text { .. }, ItemContent::Text { .. })
+        ),
+        "same role, same stamp, same content variant: there is nothing here \
+         to tell a steer from an answer, which is why the fold does not try"
     );
 }
 
@@ -970,7 +978,7 @@ async fn complete_with_item_registers_the_turn_for_dedup_like_complete_does() {
     session
         .complete_with_item(
             &response_id,
-            steer_call(),
+            steer_item(&response_id),
             billed.clone(),
             ControlRecord::default(),
         )
@@ -998,142 +1006,10 @@ async fn complete_with_item_registers_the_turn_for_dedup_like_complete_does() {
             .state()
             .items
             .iter()
-            .filter(
-                |item| matches!(&item.content, ItemContent::ToolCall { call_id, .. }
-                if call_id == STEER_CALL_ID)
-            )
+            .filter(|item| item.spoken_text() == GUIDANCE)
             .count(),
         1,
-        "and the call is emitted once, not once per retry"
-    );
-}
-
-#[tokio::test]
-async fn a_server_emitted_tool_call_opens_a_steer_and_the_matching_result_closes_it() {
-    let store = Arc::new(MemoryStore::new());
-    let (_, mut session) = new_session(store, "node-a").await;
-
-    let admission = session
-        .begin_turn(TurnId::new("t1"), vec![Item::user_text("q")])
-        .await
-        .unwrap();
-    let response_id = admission.response_id().clone();
-    session
-        .complete_with_item(
-            &response_id,
-            steer_call(),
-            Usage::default(),
-            ControlRecord::default(),
-        )
-        .await
-        .unwrap();
-
-    let opened_at = *session
-        .state()
-        .open_steers
-        .get(STEER_CALL_ID)
-        .expect("an emitted tool call opens a steer");
-
-    // The client answers: it resends the call verbatim -- canonicalized
-    // with no response id, exactly as `canonical_item` produces it -- and
-    // appends the output it got.
-    session
-        .begin_turn(
-            TurnId::new("t2"),
-            vec![
-                Item::user_text("q"),
-                steer_call(),
-                tool_result(STEER_CALL_ID, "{\"directive\":\"narrow the search\"}"),
-            ],
-        )
-        .await
-        .unwrap();
-
-    assert!(
-        !session.state().open_steers.contains_key(STEER_CALL_ID),
-        "the client's output for this call id closes it -- one writer, one \
-         event kind, no second source of truth"
-    );
-
-    // Fulfilment latency is derivable from the projection and the log
-    // alone, which is the reason the opening timestamp is what the
-    // projection holds.
-    let closed_at = session
-        .events_since(0, 100)
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|event| {
-            matches!(&event.kind, SessionEventKind::ItemAppended { item }
-                if matches!(&item.content, ItemContent::ToolResult { call_id, .. }
-                    if call_id == STEER_CALL_ID))
-        })
-        .expect("the closing item is in the log")
-        .at_ms;
-    assert!(
-        closed_at >= opened_at,
-        "latency is closed_at - opened_at, and it cannot be negative"
-    );
-}
-
-#[tokio::test]
-async fn an_unrelated_tool_result_leaves_the_steer_open() {
-    let store = Arc::new(MemoryStore::new());
-    let (_, mut session) = new_session(store, "node-a").await;
-
-    let admission = session
-        .begin_turn(TurnId::new("t1"), vec![Item::user_text("q")])
-        .await
-        .unwrap();
-    let response_id = admission.response_id().clone();
-    session
-        .complete_with_item(
-            &response_id,
-            steer_call(),
-            Usage::default(),
-            ControlRecord::default(),
-        )
-        .await
-        .unwrap();
-
-    // The agent's own tooling, running its own call, in the same turn the
-    // steer is still waiting on. Closing on any result rather than on the
-    // matching one would report a steer fulfilled that nobody answered.
-    session
-        .begin_turn(
-            TurnId::new("t2"),
-            vec![tool_result("call_the_agent_made", "42")],
-        )
-        .await
-        .unwrap();
-
-    assert!(
-        session.state().open_steers.contains_key(STEER_CALL_ID),
-        "only the matching call id closes a steer"
-    );
-}
-
-#[tokio::test]
-async fn a_client_sent_tool_call_in_input_opens_no_steer() {
-    let store = Arc::new(MemoryStore::new());
-    let (_, mut session) = new_session(store, "node-a").await;
-
-    // The agent telling us about a call it made itself. Identical in shape
-    // to an emitted one and different in provenance: an input item carries
-    // no response id, because `canonical_item` sets none.
-    session
-        .begin_turn(
-            TurnId::new("t1"),
-            vec![Item::tool_call("call_the_agent_made", "grep", "{}")],
-        )
-        .await
-        .unwrap();
-
-    assert!(
-        session.state().open_steers.is_empty(),
-        "a steer is opened by provenance, not by shape -- otherwise a \
-         client could open one by sending a tool call, and M6's \
-         open-steer exclusion would be a knob the client turns"
+        "and the correction is committed once, not once per retry"
     );
 }
 
@@ -1355,212 +1231,484 @@ async fn the_trigger_reads_projections_of_the_log_and_not_counters_beside_it() {
     );
 }
 
-/// The hysteresis rule's evidence, folded from the turn that carries it.
+/// The placebo arm's synthetic halt is not a correction, and must not be
+/// re-readable as one.
+///
+/// **A defect M10.0 introduced and this test is what found it.** The placebo arm
+/// interrupts without consulting the judge, and the fold represents that as
+/// `SteerAction::Halt { reason: String::new() }` — a marker, deliberately empty,
+/// because there is no judge and therefore no directive. Before M10.0 nothing
+/// read a halt's reason out of the fold, so the empty string went nowhere. The
+/// text steer gave it somewhere to go: `last_guidance` is what `fetch_steer`
+/// serves, and folding the marker into it makes the tool answer
+/// `{"guidance": ""}` — which is precisely the payload
+/// [`SurfaceError::NoGuidanceYet`] exists to refuse, because an agent reads an
+/// empty correction as "there was nothing to correct".
+///
+/// So the fold takes guidance from text that was actually written. The control
+/// below is what keeps that from being a special case for the empty string
+/// alone: a real halt's guidance *is* re-readable, because a halt does put its
+/// reason in the conversation.
 #[tokio::test]
-async fn the_turn_whose_input_answers_a_steer_is_the_one_that_says_so() {
+async fn a_placebo_intervention_leaves_no_guidance_to_re_read() {
     let store = Arc::new(MemoryStore::new());
     let (_, mut session) = new_session(store, "node-a").await;
 
-    // A steered turn: the call is emitted and the steer is open.
     let admitted = session
         .begin_turn(TurnId::new("t1"), vec![Item::user_text("go")])
         .await
         .unwrap();
     let response_id = admitted.response_id().clone();
+    let mut record = ControlRecord::default();
+    record.validation_decided(
+        crate::ids::ValidationId::generate(),
+        crate::validate::TriggerRecord::new(session.state().turn_index, 4_000, Vec::new()),
+        Arm::Placebo,
+        crate::event::ValidationOutcome::NotRun {
+            reason: crate::event::NotRunReason::PlaceboArm {
+                timing: crate::event::PlaceboTiming::Intervened,
+            },
+        },
+    );
     session
         .complete_with_item(
             &response_id,
-            steer_call(),
+            Item::assistant_text("", response_id.clone()),
             Usage::default(),
-            ControlRecord::default(),
+            record,
         )
         .await
         .unwrap();
-    assert!(!session.state().this_turn_fulfilled_a_steer());
 
-    // The next turn resends the call and appends its output. By the time the
-    // interjection seam runs, the input is already committed and `open_steers`
-    // is already empty — which is exactly why the question is about a turn
-    // index and not about whether a steer is open.
+    // The premise: the placebo really did act, so this is not a test of an arm
+    // that decided nothing.
+    assert_eq!(
+        session.state().consecutive_interventions(),
+        1,
+        "the premise: the placebo arm acts, which is the whole of what it is \
+         for -- so this is not a test of an arm that decided nothing"
+    );
+    assert_eq!(
+        session.state().last_guidance(),
+        None,
+        "an empty marker is not a correction: serving it to `fetch_steer` would \
+         hand an agent `{{\"guidance\": \"\"}}`, which reads as `there was \
+         nothing to correct` -- the one thing a steer must never be mistaken for"
+    );
+    assert_eq!(
+        session.state().steered_on_turn,
+        None,
+        "and it suppresses no validation: a placebo halt restates no task, so \
+         no turn is coming that fulfils it"
+    );
+
+    // The control, and the reason the assertion above is about *emptiness* and
+    // not about halts: a real halt writes its reason into the conversation, and
+    // that reason is re-readable exactly as a steer's directive is.
+    let admitted = session
+        .begin_turn(TurnId::new("t2"), vec![Item::user_text("again")])
+        .await
+        .unwrap();
+    let response_id = admitted.response_id().clone();
+    let mut record = ControlRecord::default();
+    record.validation_decided(
+        crate::ids::ValidationId::generate(),
+        crate::validate::TriggerRecord::new(session.state().turn_index, 4_000, Vec::new()),
+        Arm::Live,
+        crate::event::ValidationOutcome::Judged {
+            side_call_id: crate::ids::SideCallId::new("sc_halt"),
+            verdict: crate::validate::Verdict {
+                on_track: false,
+                confidence: 0.8,
+                divergence: Some(crate::validate::Divergence {
+                    at_step: 1,
+                    description: "the judge's prose, which never travels".into(),
+                }),
+                missing_context: None,
+            },
+            action: SteerAction::Halt {
+                reason: "stopping here; the last four steps repeated".to_string(),
+            },
+        },
+    );
     session
-        .begin_turn(
-            TurnId::new("t2"),
-            vec![steer_call(), tool_result(STEER_CALL_ID, "re-read the task")],
+        .complete_with_item(
+            &response_id,
+            Item::assistant_text(
+                "stopping here; the last four steps repeated",
+                response_id.clone(),
+            ),
+            Usage::default(),
+            record,
         )
         .await
         .unwrap();
-    assert!(session.state().open_steer_ids().is_empty());
+    assert_eq!(
+        session.state().last_guidance(),
+        Some("stopping here; the last four steps repeated"),
+    );
+}
+
+/// Commit a steered turn: the decision, the guidance item, and the completion,
+/// exactly as `Validator::decide` and `complete_with_item` produce them.
+///
+/// A helper rather than three copies, because the *ordering* inside the batch is
+/// what the fold depends on — the `ValidationDecided` is what says a steer
+/// happened, and it has to be committed on the turn it interrupts.
+async fn steered_turn(session: &mut Session<MemoryStore>, turn: &str, directive: &str) {
+    let admitted = session
+        .begin_turn(TurnId::new(turn), vec![Item::user_text("go")])
+        .await
+        .unwrap();
+    let response_id = admitted.response_id().clone();
+    let mut record = ControlRecord::default();
+    record.validation_decided(
+        crate::ids::ValidationId::generate(),
+        crate::validate::TriggerRecord::new(session.state().turn_index, 4_000, Vec::new()),
+        Arm::Live,
+        crate::event::ValidationOutcome::Judged {
+            side_call_id: crate::ids::SideCallId::new("sc_steer"),
+            verdict: crate::validate::Verdict {
+                on_track: false,
+                confidence: 0.8,
+                divergence: Some(crate::validate::Divergence {
+                    at_step: 1,
+                    description: "never opened the failing import".into(),
+                }),
+                missing_context: None,
+            },
+            action: SteerAction::Steer {
+                directive: directive.to_string(),
+            },
+        },
+    );
+    session
+        .complete_with_item(
+            &response_id,
+            Item::assistant_text(GUIDANCE, response_id.clone()),
+            Usage::default(),
+            record,
+        )
+        .await
+        .unwrap();
+}
+
+/// **R2/T6.** The first turn under an escalation is a fact the fold answers,
+/// and only the first turn.
+///
+/// The gate the handoff note rides. It has to come off the log rather than off a
+/// flag the engine keeps, and the reason is the failure it would otherwise have:
+/// a successor picking a session up mid-escalation — after a failover, a lease
+/// takeover, or simply a second process serving the next turn — would decorate
+/// again, and the client's own history would then carry two copies of a note
+/// that narrates one switch. That is the accumulation Switchyard's statelessness
+/// rule exists to prevent, arriving through the back door.
+///
+/// Three positions, and each one is a different way to get the arithmetic wrong:
+///
+/// - the turn the escalation was decided on says **yes**. The seam runs after
+///   `TurnStarted`, so this is also the first turn the narrowing reaches `plan`
+///   on — a gate keyed on the *next* turn would decorate a request served under
+///   an escalation the model was never told about, one turn late;
+/// - the turn after it says **no**, while `active_escalation` still says the
+///   narrowing is in force. That pair is the whole point: "escalated" and "just
+///   escalated" are different questions, and a gate that asked the first would
+///   decorate every turn of the escalation's life;
+/// - a replay of the same log answers identically, which is what makes the
+///   successor safe.
+#[tokio::test]
+async fn only_the_turn_an_escalation_was_decided_on_reads_as_its_first() {
+    let store = Arc::new(MemoryStore::new());
+    let (sid, mut session) = new_session(Arc::clone(&store), "node-a").await;
+
+    // An ordinary turn first, so "no escalation at all" is distinguishable from
+    // "an escalation that began earlier" — both answer `false`, and a test that
+    // never saw the first would not know which one it was reading.
+    routed_turn(&mut session, "t1", 1_000).await;
+    assert!(!session.state().this_turn_opened_an_escalation());
+    assert_eq!(session.state().active_escalation(), None);
+
+    // The escalated turn: decided mid-turn, applied to this same turn.
+    let admitted = session
+        .begin_turn(TurnId::new("t2"), vec![Item::user_text("still going")])
+        .await
+        .unwrap();
+    let response_id = admitted.response_id().clone();
+    let mut record = ControlRecord::default();
+    record.validation_decided(
+        crate::ids::ValidationId::new("val_1"),
+        crate::validate::TriggerRecord::new(session.state().turn_index, 4_000, Vec::new()),
+        Arm::Live,
+        crate::event::ValidationOutcome::Judged {
+            side_call_id: crate::ids::SideCallId::new("sc_1"),
+            verdict: crate::validate::Verdict {
+                on_track: false,
+                confidence: 0.8,
+                divergence: Some(crate::validate::Divergence {
+                    at_step: 1,
+                    description: "never opened the failing import".into(),
+                }),
+                missing_context: None,
+            },
+            action: SteerAction::Escalate {
+                turns: 3,
+                overrides: EscalationOverrides { min_quality: 0.9 },
+            },
+        },
+    );
+    session.record_control(record).await.unwrap();
     assert!(
-        session.state().this_turn_fulfilled_a_steer(),
+        session.state().this_turn_opened_an_escalation(),
+        "the turn the decision was committed on is the turn it first applies \
+         to, and the only one a switch can be narrated on"
+    );
+
+    session
+        .record_routing(&response_id, decision_for(local_target(), 100))
+        .await
+        .unwrap();
+    session
+        .complete(
+            &response_id,
+            "done",
+            Usage {
+                input_tokens: 100,
+                ..Usage::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // The next turn: still escalated, and no longer the first.
+    session
+        .begin_turn(TurnId::new("t3"), vec![Item::user_text("carrying on")])
+        .await
+        .unwrap();
+    assert_eq!(
+        session.state().active_escalation(),
+        Some(EscalationOverrides { min_quality: 0.9 }),
+        "three turns were asked for and one has been served, so the narrowing \
+         is still in force — which is what makes the assertion below about the \
+         gate rather than about the escalation lapsing"
+    );
+    assert!(
+        !session.state().this_turn_opened_an_escalation(),
+        "a second turn under one escalation opened nothing; narrating it again \
+         would put two copies of one switch's note in the client's history"
+    );
+
+    // And a successor rebuilding the same log agrees, mid-escalation and
+    // mid-turn — the property the gate exists in the fold to have.
+    let replayed = SessionState::project(store.as_ref(), &sid, CacheLedger::new(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        replayed.active_escalation(),
+        session.state().active_escalation()
+    );
+    assert_eq!(
+        replayed.this_turn_opened_an_escalation(),
+        session.state().this_turn_opened_an_escalation(),
+        "a process that took this session over must decorate exactly the turns \
+         this one would have, and no others"
+    );
+}
+
+/// **T3.** The turn *after* a steer is the one the hysteresis suppresses, and
+/// exactly one turn is suppressed.
+///
+/// The off-by-one is the whole test and it is where the M10.0 pivot could
+/// silently go wrong in either direction. Under the tool-call steer the
+/// correction arrived as a *result*, on the fulfilling turn's own input, so the
+/// question was about `turn_index`. Under the text steer the correction is the
+/// *previous* turn's answer, so the question is about `turn_index - 1` — and a
+/// fold that kept comparing against `turn_index` would suppress the turn that
+/// emitted the steer (already past the gate, so no symptom) and judge the turn
+/// that acts on it, which is the exact re-trigger loop the rule exists to stop.
+///
+/// The turn-after-next assertion is the other half: a rule written as "a steer
+/// ever happened" passes the first two assertions and disables validation for
+/// the rest of the session.
+#[tokio::test]
+async fn the_turn_after_a_steer_is_the_one_that_fulfils_it_and_only_that_turn() {
+    let store = Arc::new(MemoryStore::new());
+    let (_, mut session) = new_session(store, "node-a").await;
+
+    steered_turn(&mut session, "t1", "narrow the search").await;
+    assert!(
+        !session.state().this_turn_fulfils_a_steer(),
+        "the turn that *emits* the correction is not the turn that acts on it; \
+         the agent has not seen it yet"
+    );
+    assert_eq!(
+        session.state().last_guidance(),
+        Some("narrow the search"),
+        "and the correction is re-readable off the fold, which is what lets \
+         `fetch_steer` be a pure read of the session log"
+    );
+
+    // The next turn: the agent has read the guidance in its own conversation
+    // and is acting on it. Judging it would re-trigger the validation that
+    // produced it, before compliance is observable.
+    session
+        .begin_turn(TurnId::new("t2"), vec![Item::user_text("re-reading now")])
+        .await
+        .unwrap();
+    assert!(
+        session.state().this_turn_fulfils_a_steer(),
         "the turn that answers a correction looks, to every signal, exactly \
          like the turn that provoked it; without this the steer re-triggers \
          the validation that emitted it, forever"
     );
-
-    // The control: the turn after it does not.
-    let admitted = session
-        .begin_turn(TurnId::new("t3"), vec![Item::user_text("carry on")])
-        .await
-        .unwrap();
-    assert!(
-        !session.state().this_turn_fulfilled_a_steer(),
-        "a steer fulfilled two turns ago must not disable validation for the \
-         rest of the session"
-    );
-    let response_id = admitted.response_id().clone();
+    let response_id = session
+        .state()
+        .open_turns
+        .values()
+        .next()
+        .expect("t2 is open")
+        .clone();
     session
         .complete(&response_id, "done", Usage::default())
         .await
         .unwrap();
-}
 
-/// F05: a cancelled or aborted steer must not read as fulfilled.
-///
-/// `SessionState::apply` used to close an open steer on `call_id` alone,
-/// without inspecting `ToolResult::output`. Codex's own approval path produces
-/// exactly that shape with no correction reaching the agent: an operator
-/// cancelling the MCP call resends the literal `"user cancelled MCP tool call"`
-/// (codex-rs core/src/mcp_tool_call.rs:280 @ e363b08), declining it resends
-/// `"user rejected MCP tool call"` (mcp_tool_call.rs:267), and a client that
-/// drops the turn gets codex's synthesized `"aborted"`
-/// (context_manager/normalize.rs:58). All three closed `open_steers` *and* set
-/// `this_turn_fulfilled_a_steer()`, which `validate::trigger` reads to suppress
-/// judging on the fulfilling turn -- so the dashboard reported a healthy steer
-/// loop while nothing had been corrected. The fold now splits the two: the
-/// steer closes regardless (it will never be answered), the hysteresis is
-/// withheld unless something was actually delivered.
-#[tokio::test]
-async fn a_cancelled_steer_is_not_recorded_as_fulfilled() {
-    let store = Arc::new(MemoryStore::new());
-    let (_, mut session) = new_session(store, "node-a").await;
-
-    // A steered turn: the call is emitted and the steer is open.
-    let admitted = session
-        .begin_turn(TurnId::new("t1"), vec![Item::user_text("go")])
-        .await
-        .unwrap();
-    let response_id = admitted.response_id().clone();
+    // The control, and the assertion that a permanent-suppression bug fails:
+    // one turn later the gate is open again.
     session
-        .complete_with_item(
-            &response_id,
-            steer_call(),
-            Usage::default(),
-            ControlRecord::default(),
-        )
-        .await
-        .unwrap();
-    assert!(!session.state().this_turn_fulfilled_a_steer());
-
-    // The next turn resends the call, but the output is codex's own
-    // cancellation text -- not a correction the agent ever saw and acted
-    // on. A hand-rolled MCP stanza without the approval override, or an
-    // interactive client that declines the call, produces exactly this.
-    session
-        .begin_turn(
-            TurnId::new("t2"),
-            vec![
-                steer_call(),
-                tool_result(STEER_CALL_ID, "user cancelled MCP tool call"),
-            ],
-        )
-        .await
-        .unwrap();
-
-    assert!(
-        session.state().open_steer_ids().is_empty(),
-        "control: the fold still closes open_steers on call_id, cancelled \
-         or not -- a call nobody will ever answer must not read as in-flight \
-         forever"
-    );
-    assert!(
-        !session.state().this_turn_fulfilled_a_steer(),
-        "a cancelled call delivered no correction to the agent, so the \
-         turn it lands on must not read as the one that answered the steer"
-    );
-}
-
-/// F05, as the bytes actually arrive: codex wraps its cancellation notice in
-/// the same `Wall time:`/`Output:` header it wraps a real answer in
-/// (`core/src/tools/context.rs:124-126` -- `notify_mcp_tool_call_skip` returns
-/// the message as the call's result, and `McpToolOutput::response_payload`
-/// headers it like any other). This is the only place F04's stripper and F05's
-/// sentinels are proven to compose: recognising the bare text but not the
-/// wrapped one would close the finding against a fixture and leave it open
-/// against the client.
-#[tokio::test]
-async fn a_wrapped_cancellation_is_not_fulfilment_and_a_delivered_correction_is() {
-    let store = Arc::new(MemoryStore::new());
-    let (_, mut session) = new_session(store, "node-a").await;
-
-    let admitted = session
-        .begin_turn(TurnId::new("t1"), vec![Item::user_text("go")])
-        .await
-        .unwrap();
-    let response_id = admitted.response_id().clone();
-    session
-        .complete_with_item(
-            &response_id,
-            steer_call(),
-            Usage::default(),
-            ControlRecord::default(),
-        )
-        .await
-        .unwrap();
-
-    session
-        .begin_turn(
-            TurnId::new("t2"),
-            vec![
-                steer_call(),
-                tool_result(
-                    STEER_CALL_ID,
-                    "Wall time: 0.0000 seconds\nOutput:\nuser cancelled MCP tool call",
-                ),
-            ],
-        )
-        .await
-        .unwrap();
-    assert!(
-        !session.state().this_turn_fulfilled_a_steer(),
-        "the wrapper is how the cancellation actually arrives; reading only \
-         the bare text would leave the defect open against every real client"
-    );
-
-    // The control that keeps the assertion above from being satisfied by a
-    // fold that simply stopped recording fulfilment: a wrapped *directive*
-    // still fulfils, on the same path, in the same shape.
-    let admitted = session
         .begin_turn(TurnId::new("t3"), vec![Item::user_text("carry on")])
         .await
         .unwrap();
+    assert!(
+        !session.state().this_turn_fulfils_a_steer(),
+        "a steer fulfilled two turns ago must not disable validation for the \
+         rest of the session"
+    );
+}
+
+/// A halt is not a steer, and the fold must not treat it as one.
+///
+/// A halt restates nothing and ends the agent's loop, so there is no turn coming
+/// that fulfils it — the next turn is one a *human* started, and suppressing its
+/// validation would suppress a turn nobody corrected. The guidance is still
+/// re-readable, which is the difference between "not a steer" and "not
+/// recorded".
+#[tokio::test]
+async fn a_halt_leaves_the_next_turn_judgeable() {
+    let store = Arc::new(MemoryStore::new());
+    let (_, mut session) = new_session(store, "node-a").await;
+
+    let admitted = session
+        .begin_turn(TurnId::new("t1"), vec![Item::user_text("go")])
+        .await
+        .unwrap();
     let response_id = admitted.response_id().clone();
+    let mut record = ControlRecord::default();
+    record.validation_decided(
+        crate::ids::ValidationId::generate(),
+        crate::validate::TriggerRecord::new(1, 4_000, Vec::new()),
+        Arm::Live,
+        crate::event::ValidationOutcome::Judged {
+            side_call_id: crate::ids::SideCallId::new("sc_halt"),
+            verdict: crate::validate::Verdict {
+                on_track: false,
+                confidence: 0.8,
+                divergence: Some(crate::validate::Divergence {
+                    at_step: 1,
+                    description: "drifted".into(),
+                }),
+                missing_context: None,
+            },
+            action: SteerAction::Halt {
+                reason: "stopping here".into(),
+            },
+        },
+    );
     session
         .complete_with_item(
             &response_id,
-            steer_call(),
+            Item::assistant_text("stopping here", response_id.clone()),
             Usage::default(),
-            ControlRecord::default(),
+            record,
         )
         .await
         .unwrap();
+
     session
-        .begin_turn(
-            TurnId::new("t4"),
-            vec![
-                steer_call(),
-                tool_result(
-                    STEER_CALL_ID,
-                    "Wall time: 0.0130 seconds\nOutput:\nre-read the task and narrow the diff",
-                ),
-            ],
-        )
+        .begin_turn(TurnId::new("t2"), vec![Item::user_text("here is more")])
         .await
         .unwrap();
     assert!(
-        session.state().this_turn_fulfilled_a_steer(),
-        "a correction the agent actually received still suppresses judging on \
-         the turn that answers it -- that hysteresis is what stops a steer \
-         re-triggering the validation that emitted it"
+        !session.state().this_turn_fulfils_a_steer(),
+        "a halt invites nothing, so no turn fulfils it"
+    );
+    assert_eq!(
+        session.state().last_guidance(),
+        Some("stopping here"),
+        "control: the halt *is* recorded as the last correction, so the \
+         assertion above is about the hysteresis and not about a fold that \
+         stopped looking at halts"
+    );
+}
+
+/// A Shadow arm's action is computed and discarded, so it must not suppress the
+/// next turn either.
+///
+/// The observe-only arm is the control the whole experiment leans on. An arm
+/// that suppressed its own next observation would quietly destroy it — the same
+/// argument `turn_intervened` is guarded by, applied to the projection M10.0
+/// added.
+#[tokio::test]
+async fn a_shadow_arms_steer_suppresses_nothing() {
+    let store = Arc::new(MemoryStore::new());
+    let (_, mut session) = new_session(store, "node-a").await;
+
+    let admitted = session
+        .begin_turn(TurnId::new("t1"), vec![Item::user_text("go")])
+        .await
+        .unwrap();
+    let response_id = admitted.response_id().clone();
+    let mut record = ControlRecord::default();
+    record.validation_decided(
+        crate::ids::ValidationId::generate(),
+        crate::validate::TriggerRecord::new(1, 4_000, Vec::new()),
+        Arm::Shadow,
+        crate::event::ValidationOutcome::Judged {
+            side_call_id: crate::ids::SideCallId::new("sc_shadow"),
+            verdict: crate::validate::Verdict {
+                on_track: false,
+                confidence: 0.8,
+                divergence: Some(crate::validate::Divergence {
+                    at_step: 1,
+                    description: "drifted".into(),
+                }),
+                missing_context: None,
+            },
+            action: SteerAction::Steer {
+                directive: "would have said this".into(),
+            },
+        },
+    );
+    session.record_control(record).await.unwrap();
+    session
+        .complete(&response_id, "the turn ran unchanged", Usage::default())
+        .await
+        .unwrap();
+
+    session
+        .begin_turn(TurnId::new("t2"), vec![Item::user_text("carry on")])
+        .await
+        .unwrap();
+    assert!(
+        !session.state().this_turn_fulfils_a_steer(),
+        "the Shadow arm did nothing, so there is nothing for the next turn to \
+         be fulfilling -- an arm that suppressed its own next observation \
+         would destroy the control it exists to be"
+    );
+    assert_eq!(
+        session.state().last_guidance(),
+        None,
+        "and nothing it would have said is readable back: a Shadow run that \
+         served its guidance through `fetch_steer` would be a live arm"
     );
 }
 
@@ -1696,7 +1844,12 @@ async fn a_completing_interjections_own_tokens_reach_neither_trigger_projection(
         judged_continue(),
     );
     session
-        .complete_with_item(&response_id, steer_call(), judge_usage, record)
+        .complete_with_item(
+            &response_id,
+            Item::assistant_text(GUIDANCE, response_id.clone()),
+            judge_usage,
+            record,
+        )
         .await
         .unwrap();
 

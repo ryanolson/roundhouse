@@ -118,6 +118,18 @@ impl ScriptedJudge {
         Self::new(vec![Ok(answer(raw)), Ok(answer(raw)), Ok(answer(raw))])
     }
 
+    /// A judge whose verdicts change from consult to consult.
+    ///
+    /// The fixture a test needs when the *sequence* is its subject rather than
+    /// the verdict — a session that goes off track once and recovers, which is
+    /// the only shape in which a turn served under a still-active escalation is
+    /// reachable at all. Under `always(OFF_TRACK)` the intervention ladder
+    /// claims every turn after the first (escalate, then steer, then halt), so
+    /// nothing dispatches for a later assertion to read.
+    pub fn answering(raws: &[&str]) -> Arc<Self> {
+        Self::new(raws.iter().map(|raw| Ok(answer(raw))).collect())
+    }
+
     /// A judge that will not answer until `release` is notified.
     pub fn blocking(raw: &str, release: Arc<tokio::sync::Notify>) -> Arc<Self> {
         Arc::new(Self {

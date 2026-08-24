@@ -591,6 +591,37 @@ pub enum ControlPlaneError {
         entry: String,
         escalation_floor: f64,
     },
+    /// `channel = "tool_call"`, which M10.0 retired.
+    ///
+    /// **A refusal rather than a remap, and that is the whole reason this
+    /// variant exists.** Since the steer became a text instruction
+    /// (PLAN-frontier-selection.md R1/T2) no verdict maps to a tool call, so
+    /// silently serving `tool_call` as text would leave a deployment believing
+    /// it had opted into the protocol-heavy path it had deliberately chosen —
+    /// and believing it on the strength of a config file that still says so.
+    /// Naming the plan in the message is what turns "unknown value" into an
+    /// answerable question.
+    #[error(
+        "control-plane config `{path}`: {entry}'s validate.channel is `tool_call`, which no \
+         longer exists -- M10.0 retired the synthetic tool call as a steering channel (see \
+         agent-docs/PLAN-frontier-selection.md, ruling R1). Every interjection is text now; \
+         write `auto` or `text` for the same behaviour, or `off` to interject on nothing"
+    )]
+    SteerChannelRetired { path: String, entry: String },
+    /// A configured handoff note with nothing in it.
+    ///
+    /// Refused rather than treated as absent, because the two mean opposite
+    /// things: absent is "this project does not narrate its escalations", and
+    /// `""` is a project that meant to and shipped a bare marker instead. See
+    /// `ValidateConfig::to_terms` for why an empty narration is worse than none.
+    #[error(
+        "control-plane config `{path}`: {entry}'s validate.handoff_note is empty -- an \
+         escalated turn would carry a bare `[roundhouse-guidance]` marker with no reason \
+         after it, which tells a model something is wrong and refuses to say what. Write the \
+         note (roundhouse_core::validate::EXAMPLE_HANDOFF_NOTE is a starting point), or omit \
+         the key to narrate nothing"
+    )]
+    HandoffNoteEmpty { path: String, entry: String },
     #[error(
         "control-plane config `{path}`: {entry}'s budget sets \
          \"overflow_when_local_saturated\" alongside \"on_exhaustion\": \"refuse\" -- overflow \

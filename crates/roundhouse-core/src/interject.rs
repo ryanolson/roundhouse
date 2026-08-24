@@ -5,9 +5,9 @@
 //!
 //! One question, asked once per admitted turn: is this turn dispatched as the
 //! client asked, or completed here carrying something we produced instead? The
-//! second answer is the steered turn — the client gets a synthetic tool call
-//! back, runs it, and returns its output as ordinary conversation on the next
-//! turn.
+//! second answer is the steered turn — the client gets an assistant message
+//! carrying roundhouse's correction and its own request restated, reads it
+//! where it reads every other answer, and decides what to do next.
 //!
 //! **The contract with the engine**, which is what makes the answers to that
 //! question comparable across milestones:
@@ -44,15 +44,22 @@
 //! - **Both variants now carry a [`ControlRecord`]** — the side-call and
 //!   verdict facts the occupant produced. Returned rather than committed,
 //!   because the log has one writer and it is the session holding the lease.
-//! - **[`InterjectionContext`] gained five fields**, `turn_policy`,
-//!   `objective`, `capability`, `side_call` and `validation`. The first was
+//! - **[`InterjectionContext`] gained four fields**, `turn_policy`,
+//!   `objective`, `side_call` and `validation`. The first was
 //!   reserved here by name; the others arrived with it because they answer the
 //!   same shape of question — what may this decision see — and because none is
-//!   derivable from the log: a declared objective lives in the control store, a
-//!   client's dialect lives in the request, and who pays for a check and what
+//!   derivable from the log: a declared objective lives in the control store,
+//!   and who pays for a check and what
 //!   their project permits of the loop both live in the key that presented
 //!   itself. A field is added when an occupant reads it and not before, which
 //!   is why they are here now and were not before.
+//!
+//!   A fifth, `capability`, arrived with them and left in M10.0. It said what
+//!   the client's dialect could carry a correction through, which mattered only
+//!   while the strongest correction was a synthetic tool call; the text steer
+//!   needs nothing of the dialect, and the engine had in any case never supplied
+//!   anything but `Absent`. The rule the field was added under is the rule that
+//!   removed it.
 //!
 //! The production default is still the no-op. A deployment opts in by
 //! installing the validator; nothing about validation is on by having upgraded.
@@ -66,7 +73,7 @@ use crate::event::{ControlRecord, Usage};
 use crate::ids::ResponseId;
 use crate::item::Item;
 use crate::session::SessionState;
-use crate::validate::{Objective, SideCall, SteerCapability, ValidationTerms};
+use crate::validate::{Objective, SideCall, ValidationTerms};
 
 /// What the engine is to do with a turn it has already admitted.
 #[derive(Debug, Clone, PartialEq)]
@@ -90,38 +97,24 @@ pub enum Interjection {
     ///
     /// `item` is committed by
     /// [`Session::complete_with_item`](crate::session::Session::complete_with_item),
-    /// which stamps this response's id onto it — so the item is built here
-    /// without provenance and cannot claim any.
+    /// which **overwrites** the response id with the one it is completing — so
+    /// an occupant that named the wrong response, or none, cannot claim one it
+    /// was not given. The stamp is applied in exactly one place, which is what
+    /// makes "an item bearing a response id is one this deployment wrote" a
+    /// property of the commit rather than of every occupant's care.
     ///
     /// `usage` is what the decision itself cost, and it is reported to the
     /// client as this turn's usage. Reporting an empty usage instead would
     /// make the deployment's own dashboard exceed what clients were told they
     /// spent, which is the one direction an accounting error must never run.
     ///
-    /// `guidance` is the correction itself — the text the agent will read when
-    /// it calls `fetch_steer` with the id `item` names. It travels beside the
-    /// item rather than inside it because the two go to different places: the
-    /// item goes into the log and onto the wire, where an agent's client
-    /// dispatches it, and the guidance goes into the control store, where the
-    /// MCP surface reads it back. That split is what makes the correction cost
-    /// nothing in the turn that emits it and lets it be fetched byte-identically
-    /// afterwards.
-    ///
-    /// Required rather than optional. A steer whose payload nothing can serve
-    /// is a synthetic call the agent dutifully dispatches and gets an error
-    /// back from — the failure mode is silent from the deployment's side and
-    /// total from the agent's. The id is *not* repeated here: the engine reads
-    /// it off `item`, so the call an agent fetches by and the call its client
-    /// resends are one string written once.
-    ///
-    /// **Two shapes of completion, and the item is what tells them apart.** A
-    /// steer (outcome B) carries a `ToolCall`, and its guidance is deposited
-    /// for `fetch_steer` to serve. A halt (outcome C) carries assistant
-    /// *text* — the correction itself, in the conversation, ending the client's
-    /// loop and handing control back to the human — and nothing is deposited,
-    /// because there is no call for an agent to fetch by. The engine's deposit
-    /// already answers `None` for an item that is not a call, so the degrade
-    /// path needs no second branch to stay correct.
+    /// **The item is the whole of what the agent gets.** A `guidance: String`
+    /// used to travel beside it — the correction, deposited in the control store
+    /// for `fetch_steer` to serve, because the item itself was a synthetic tool
+    /// call carrying only an id. Since M10.0 both completions carry assistant
+    /// *text* and the correction is in the item, so a second copy in a
+    /// node-local store would be a second source of truth for one string, lost
+    /// on restart, for a fetch nobody needs to make.
     ///
     /// `record` carries the same facts [`Self::Proceed`]'s does, and is
     /// committed in the *same append batch* as the item and the completion. See
@@ -132,7 +125,6 @@ pub enum Interjection {
     Complete {
         item: Item,
         usage: Usage,
-        guidance: String,
         record: ControlRecord,
     },
 }
@@ -173,9 +165,9 @@ pub struct InterjectionContext<'a> {
     pub state: &'a SessionState,
     /// The response this turn has already opened.
     ///
-    /// Load-bearing rather than incidental: the steer's call id is minted from
-    /// it, which is what makes two concurrent steers unable to collide and a
-    /// steer that no emitted call named impossible to fetch.
+    /// Load-bearing rather than incidental: it is the provenance stamp on
+    /// whatever this seam completes with, which is what makes an item this
+    /// deployment produced distinguishable from one a client sent.
     pub response_id: &'a ResponseId,
     /// What this turn's membership permits.
     ///
@@ -198,13 +190,6 @@ pub struct InterjectionContext<'a> {
     /// [`Objective::from_items`] — is derivable and is what an occupant gets
     /// when nothing was declared.
     pub objective: Objective,
-    /// What this client's dialect can carry a correction through.
-    ///
-    /// Detected at the wire layer, which is the only place that sees the tool
-    /// list a request declared. **Absence is not proof**: a client may defer
-    /// tool declaration, so the policy and not this value decides whether to
-    /// emit a call anyway.
-    pub capability: &'a SteerCapability,
     /// Who a call this decision makes on its own behalf is billed to, and
     /// under what key.
     ///
@@ -277,7 +262,6 @@ mod tests {
         let interjector = production_default();
         let response_id = ResponseId::new("resp_1");
         let policy = TurnPolicy::unrestricted();
-        let capability = SteerCapability::Absent;
         let session_id = SessionId::new("acme/ada/main");
         let principal = Principal::new("acme", "ada");
 
@@ -295,7 +279,6 @@ mod tests {
             state: &'a SessionState,
             response_id: &'a ResponseId,
             policy: &'a TurnPolicy,
-            capability: &'a SteerCapability,
             side_call: SideCall<'a>,
         ) -> InterjectionContext<'a> {
             InterjectionContext {
@@ -303,7 +286,6 @@ mod tests {
                 response_id,
                 turn_policy: policy,
                 objective: Objective::Unknown,
-                capability,
                 side_call,
                 // Enrolled in nothing, which is what the production default's
                 // deployment is: the assertions below are that no *state*
@@ -315,13 +297,7 @@ mod tests {
         let mut state = SessionState::default();
         assert_eq!(
             interjector
-                .consider(&context(
-                    &state,
-                    &response_id,
-                    &policy,
-                    &capability,
-                    side_call
-                ))
+                .consider(&context(&state, &response_id, &policy, side_call))
                 .await,
             Interjection::proceed(),
             "the seam ships installed and empty: a deployment that has not \
@@ -329,21 +305,13 @@ mod tests {
         );
 
         // The two states an occupant would most want to act on: a session with
-        // history behind it, and one with a steer already outstanding. The
-        // production default acts on neither.
+        // history behind it, and one this deployment steered on the turn before.
+        // The production default acts on neither.
         state.items.push(Item::user_text("still going in circles"));
         state.turn_index = 12;
-        state
-            .open_steers
-            .insert("rhsteer_resp_0".into(), 1_700_000_000_000);
+        state.steered_on_turn = Some(11);
         let decided = interjector
-            .consider(&context(
-                &state,
-                &response_id,
-                &policy,
-                &capability,
-                side_call,
-            ))
+            .consider(&context(&state, &response_id, &policy, side_call))
             .await;
         assert_eq!(
             decided,

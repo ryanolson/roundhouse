@@ -15,6 +15,37 @@
 //! "the result after the call" is not a rule the wire guarantees. Matching on
 //! the id the client itself echoes is what makes an unanswered call visible as
 //! unanswered rather than silently paired with somebody else's output.
+//!
+//! # What M10.0 removed from here, and what it deliberately kept (T3)
+//!
+//! `is_undelivered_tool_result` is gone. It recognised the three texts codex
+//! substitutes for an answer — `"user cancelled MCP tool call"`, `"user
+//! rejected MCP tool call"`, `"aborted"` — and it existed for exactly one
+//! caller: the session fold's steer-fulfilment branch, which had to tell a
+//! correction the agent *read* from one it declined at an approval prompt (F05).
+//! The steer is assistant text now, delivered as the turn's own answer, so
+//! there is no dispatch to decline and no undelivered case to classify. Keeping
+//! the classifier for a caller that no longer exists would have been dead code
+//! wearing pinned-source knowledge.
+//!
+//! **Where that knowledge went, checked rather than assumed.** Of the three
+//! literals, only the `"aborted"` one is in `research/codex-0.146.0-vs-pin-
+//! vigilance.md` (claim 10, `ensure_call_outputs_present` synthesising an output
+//! for an unanswered call); the two approval-prompt texts are recorded in
+//! `PLAN-agentic-control-plane.md` (§ F05) and in git history, and nowhere on
+//! the vigilance list. That is a smaller loss than it looks — the vigilance list
+//! exists so a codex bump re-reads the claims *this build still depends on*, and
+//! after M10.0 no build path depends on those two — but it is stated here rather
+//! than implied, because "it is on the vigilance list" was the tempting thing to
+//! write and it would have been false.
+//!
+//! [`tool_output_body`] stays, and it is the half that was ever load-bearing
+//! beyond steering: [`ErrorSeverity`](crate::validate::ErrorSeverity) and
+//! [`exec_exit_code`] both read codex's result header, and the header is a fact
+//! about every exec result rather than about a cancelled steer. So the codex
+//! sentinel this module owes the vigilance list is the *header grammar*, not the
+//! cancellation literals — and that is what is still here to re-read when the
+//! pin moves.
 
 use sha2::{Digest, Sha256};
 
@@ -257,38 +288,6 @@ fn is_header_section(line: &str) -> bool {
     ]
     .iter()
     .any(|section| line.starts_with(section))
-}
-
-/// Whether a tool result says the call never reached the tool at all.
-///
-/// The three texts codex substitutes for an answer, all read at `e363b08` and
-/// confirmed identical at the Cargo pin `6344a65`:
-///
-/// - `"user cancelled MCP tool call"` — the operator cancelled the approval
-///   prompt (`core/src/mcp_tool_call.rs:280`).
-/// - `"user rejected MCP tool call"` — the approval was declined and no custom
-///   message was supplied (`mcp_tool_call.rs:267`).
-/// - `"aborted"` — codex synthesising a missing output for a call whose turn
-///   was dropped (`core/src/context_manager/normalize.rs:58,93,112`).
-///
-/// **Equality on the trimmed body, never a prefix or a substring.** `"aborted"`
-/// is short enough that a `contains` test would fire on a real correction
-/// reading "aborted the migration, now re-read the task" — and being wrong in
-/// that direction re-steers an agent that complied and writes a false fact into
-/// the log. Wrong in the other direction is F05 itself: a declined steer read
-/// as answered. A false positive here costs one redundant validation that the
-/// `consecutive_interventions` ladder already bounds; a false negative costs
-/// the correction entirely.
-///
-/// **Pinned to a revision, so it is on the vigilance list.** These are upstream
-/// message literals with no wire-level status beside them — codex reports a
-/// declined call as an ordinary `function_call_output` — so a codex bump has to
-/// re-read them the way any other pinned-source claim is re-read.
-pub fn is_undelivered_tool_result(output: &str) -> bool {
-    matches!(
-        tool_output_body(output).trim(),
-        "user cancelled MCP tool call" | "user rejected MCP tool call" | "aborted"
-    )
 }
 
 /// Whether a tool result reads as a failure.
@@ -667,37 +666,6 @@ mod tests {
                 !reads_as_failure(clean),
                 "`{clean}` exited zero; the `exited with code` text in the \
                  header is codex's bookkeeping, not the tool's verdict"
-            );
-        }
-    }
-
-    /// F05: the three texts codex substitutes for an answer.
-    #[test]
-    fn a_cancellation_reads_as_undelivered_and_a_directive_that_mentions_one_does_not() {
-        for undelivered in [
-            "user cancelled MCP tool call",
-            "user rejected MCP tool call",
-            "aborted",
-            // As it actually arrives: codex wraps the cancellation text the
-            // same way it wraps a real answer.
-            "Wall time: 0.0000 seconds\nOutput:\nuser cancelled MCP tool call",
-        ] {
-            assert!(
-                is_undelivered_tool_result(undelivered),
-                "`{undelivered}` is codex saying the call never ran"
-            );
-        }
-        for delivered in [
-            "re-read the task",
-            // The reason this is equality and not `contains`: a real
-            // correction is allowed to mention what was aborted.
-            "aborted the migration, now re-read the task",
-            "the user cancelled MCP tool call earlier; try the other approach",
-            "",
-        ] {
-            assert!(
-                !is_undelivered_tool_result(delivered),
-                "`{delivered}` is a directive the agent received"
             );
         }
     }

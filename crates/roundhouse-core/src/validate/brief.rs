@@ -91,17 +91,34 @@ impl Objective {
     /// and not in the log, so it reaches the brief from the interjection
     /// context. This is the fallback every session has.
     pub fn from_items(items: &[Item]) -> Objective {
-        items
-            .iter()
-            .rev()
-            .find_map(|item| match (&item.role, &item.content) {
-                (Role::User, ItemContent::Text { text }) if !text.trim().is_empty() => {
-                    Some(Objective::LastUserMessage(text.clone()))
-                }
-                _ => None,
-            })
+        trailing_user_request(items)
+            .map(|text| Objective::LastUserMessage(text.to_string()))
             .unwrap_or(Objective::Unknown)
     }
+}
+
+/// The last thing the human asked for, as the log has it.
+///
+/// **One definition, two readers.** The brief calls it the objective's fallback
+/// and the text steer calls it the pending request, and they must be the same
+/// span of bytes: a steer that restated one request while the judge was briefed
+/// on another would be correcting an agent against a task nobody set. Extracted
+/// as a function rather than left inline in [`Objective::from_items`] for
+/// exactly that reason — the second caller arrived with M10.0 and the two
+/// answers have to be one answer by construction.
+///
+/// `None` where the trailing input is not user text: a resent history ending in
+/// a tool result, or a session whose only user messages are whitespace. Callers
+/// render that absence rather than an empty string — see
+/// [`render_steer_answer`](crate::validate::render_steer_answer).
+pub fn trailing_user_request(items: &[Item]) -> Option<&str> {
+    items
+        .iter()
+        .rev()
+        .find_map(|item| match (&item.role, &item.content) {
+            (Role::User, ItemContent::Text { text }) if !text.trim().is_empty() => Some(&**text),
+            _ => None,
+        })
 }
 
 /// How much of a session the judge is shown.

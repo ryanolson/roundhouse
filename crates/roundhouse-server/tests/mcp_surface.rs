@@ -47,14 +47,17 @@ use codex_utils_rustls_provider::ensure_rustls_crypto_provider;
 
 use roundhouse_core::context::ByteTokenizer;
 use roundhouse_core::control::{MemorySpendLedger, Principal, SpendLedger};
-use roundhouse_core::event::{Accounting, ControlRecord, SessionEventKind, Usage};
-use roundhouse_core::ids::SessionId;
+use roundhouse_core::event::{
+    Accounting, ControlRecord, SessionEventKind, Usage, ValidationOutcome,
+};
+use roundhouse_core::ids::{SessionId, SideCallId, ValidationId};
 use roundhouse_core::interject::{Interjection, InterjectionContext, Interjector};
-use roundhouse_core::item::{Item, ItemContent};
+use roundhouse_core::item::Item;
 use roundhouse_core::routing::{
     AffinityPolicy, CacheLedger, CacheModel, Candidate, DecisionRecord, ProviderPricing, Target,
 };
 use roundhouse_core::store::{MemoryStore, SessionStore};
+use roundhouse_core::validate::{Arm, Divergence, SteerAction, TriggerRecord, Verdict};
 use roundhouse_fleet::{
     EchoFrontierClient, FrontierChunk, FrontierClient, FrontierError, FrontierModelSpec,
     FrontierQuote, FrontierStream, StaticFrontierCatalog, WireProtocol,
@@ -66,7 +69,7 @@ use roundhouse_server::{
 };
 
 mod common;
-use common::codex::{function_call_output_item, request, user_message};
+use common::codex::{assistant_message, function_call_output_item, request, user_message};
 use common::{BLOCK_SIZE, LOCAL_MODEL, MINUTE, admin_key, embedded_fleet, key, sha256_hex};
 
 /// What each executor answers with, so a target is legible in the answer as
@@ -204,6 +207,38 @@ enum Plan {
     Proceed,
 }
 
+/// The decision record a steering occupant owes the log.
+///
+/// One helper rather than an inline literal per call site, because the shape is
+/// load-bearing in a way a literal invites forgetting: `SteerAction::Steer` is
+/// what the session fold keys `steered_on_turn` and `last_guidance` off, so an
+/// occupant that completed with guidance and recorded `Continue` would emit the
+/// correction and leave nothing able to re-read it.
+fn steer_record(directive: &str) -> ControlRecord {
+    let mut record = ControlRecord::default();
+    record.validation_decided(
+        ValidationId::new("val_1"),
+        TriggerRecord::new(2, 4_000, Vec::new()),
+        Arm::Live,
+        ValidationOutcome::Judged {
+            side_call_id: SideCallId::new("side_1"),
+            verdict: Verdict {
+                on_track: false,
+                confidence: 0.7,
+                divergence: Some(Divergence {
+                    at_step: 3,
+                    description: "the judge's own prose, which never travels".into(),
+                }),
+                missing_context: None,
+            },
+            action: SteerAction::Steer {
+                directive: directive.to_string(),
+            },
+        },
+    );
+    record
+}
+
 /// A scripted occupant, as in `steering_emission.rs`: what this suite is about
 /// is what happens *after* something decides to steer.
 struct TestInterjector {
@@ -229,29 +264,34 @@ impl Interjector for TestInterjector {
             .unwrap_or(Plan::Proceed);
         match plan {
             Plan::Proceed => Interjection::proceed(),
-            Plan::Steer => {
-                let call_id = format!("rhsteer_{}", context.response_id);
-                Interjection::Complete {
-                    item: Item::tool_call(
-                        call_id.as_str(),
-                        "fetch_steer",
-                        json!({ "steer_id": call_id }).to_string().as_str(),
-                    ),
-                    usage: Usage {
-                        input_tokens: 96,
-                        cached_input_tokens: 32,
-                        output_tokens: 24,
-                        reasoning_tokens: 8,
-                        accounting: Accounting::Reported,
-                    },
-                    // The payload, which never reaches the wire: the client is
-                    // handed the call, and the correction is fetched separately.
-                    guidance: STEER_GUIDANCE.to_string(),
-                    // Empty: this double stands in for the interjector, not for
-                    // the validate loop behind it.
-                    record: ControlRecord::default(),
-                }
-            }
+            // **The whole of the correction, in the item.** Before M10.0 this
+            // arm minted a synthetic `fetch_steer` call and put the guidance in
+            // a `guidance` field beside it, for the engine to deposit in the
+            // control store. The steer is the turn's answer now, so the text
+            // goes in the item and there is nothing beside it -- which is what
+            // `the_steer_this_deployment_wrote_is_what_fetch_steer_re_reads`
+            // below is really asserting about.
+            Plan::Steer => Interjection::Complete {
+                item: Item::assistant_text(STEER_GUIDANCE, context.response_id.clone()),
+                usage: Usage {
+                    input_tokens: 96,
+                    cached_input_tokens: 32,
+                    output_tokens: 24,
+                    reasoning_tokens: 8,
+                    accounting: Accounting::Reported,
+                },
+                // **No longer empty, and that is M10.0's fold rule showing up in
+                // a test double.** The record used to carry nothing here,
+                // because the *item* said a steer had happened -- it was a tool
+                // call bearing a response id, a shape no client can produce. A
+                // steer is assistant text now, indistinguishable from every
+                // dispatched turn's answer, so `ValidationDecided` is the only
+                // event that can say one happened. A double that steers without
+                // saying so leaves `last_guidance` empty and `fetch_steer` with
+                // nothing to serve -- which is the same thing a *production*
+                // occupant skipping the record would do.
+                record: steer_record(STEER_GUIDANCE),
+            },
         }
     }
 }
@@ -649,24 +689,6 @@ async fn items(store: &MemoryStore, session: &str) -> Vec<Item> {
             _ => None,
         })
         .collect()
-}
-
-/// The `call_id` of the one synthetic call this session emitted.
-///
-/// Provenance, not shape: an item on the input path canonicalizes with no
-/// response stamp, so this cannot pick up a call the client sent.
-async fn emitted_call_id(store: &MemoryStore, session: &str) -> String {
-    let calls: Vec<String> = items(store, session)
-        .await
-        .into_iter()
-        .filter(|item| item.response_id.is_some())
-        .filter_map(|item| match item.content {
-            ItemContent::ToolCall { call_id, .. } => Some(call_id),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(calls.len(), 1, "these fixtures emit exactly one steer");
-    calls[0].clone()
 }
 
 // ---------------------------------------------------------------------------
@@ -1255,10 +1277,9 @@ async fn a_steered_turn_does_not_spend_the_agents_ration() {
         .await,
     );
 
-    // The steered turn. It commits a synthetic call and answers the client
-    // without ever reaching the router.
+    // The steered turn. It commits its correction as the answer and never
+    // reaches the router.
     agent.say(&rig, "keep editing whatever").await;
-    let call_id = emitted_call_id(&rig.store, session).await;
     assert_eq!(
         decisions(&rig.store, session).await.len(),
         1,
@@ -1287,10 +1308,12 @@ async fn a_steered_turn_does_not_spend_the_agents_ration() {
          before the steer"
     );
 
-    // The client answers the call, exactly as Codex does, and the next turn
-    // routes — under the overlay, which is what the agent asked for and has not
-    // yet had.
-    agent.append(as_value(function_call_output_item(&call_id, "{}")));
+    // The agent reads the correction and carries on, exactly as Codex does with
+    // any other answer, and the next turn routes — under the overlay, which is
+    // what the agent asked for and has not yet had. **No tool result is
+    // appended, and that is the M10.0 difference**: the client answered nothing,
+    // because it was handed an answer rather than a call to run.
+    agent.append(as_value(assistant_message(STEER_GUIDANCE)));
     agent.say(&rig, "back to the parser, then").await;
 
     let routed = decisions(&rig.store, session).await;
@@ -1415,26 +1438,33 @@ async fn an_mcp_call_during_a_running_turn_does_not_take_the_session_gate() {
 }
 
 // ---------------------------------------------------------------------------
-// The steer payload
+// The steer, re-readable
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn the_steer_payload_deposited_at_emission_is_what_fetch_steer_returns() {
-    // The round trip M6 will use for real: the interjector supplies a
-    // correction, the engine commits the call to the log and *then* deposits
-    // the payload, and the agent fetches it by the id the call named. One id,
-    // written once, joined without a mapping table.
+async fn the_steer_this_deployment_wrote_is_what_fetch_steer_re_reads() {
+    // **The round trip M10.0 rebuilt.** It used to be: the interjector supplied
+    // a correction, the engine committed a synthetic call to the log and *then*
+    // deposited the payload in a node-local store, and the agent fetched it by
+    // the id the call named. The correction is the turn's answer now, so there
+    // is no id, no deposit and no store -- `fetch_steer` is a fold of the
+    // session's own log, and the property worth asserting is that the two agree.
+    //
+    // What that buys, said plainly because it is the reason the tool was
+    // re-purposed rather than removed: the guidance survives a restart, because
+    // it never lived anywhere but the log; and the tool is a convenience for an
+    // agent that compacted or resumed, not a channel the correction depends on.
     let rig = steering_rig(control_plane(), [Plan::Steer]).await;
     let session = "acme/ada/main";
     let mut agent = Conversation::new(&key("ada"), "main");
     agent.say(&rig, "keep editing whatever").await;
 
-    let call_id = emitted_call_id(&rig.store, session).await;
+    // The inverse of the old assertion, and the pivot in one line: the
+    // correction *is* in the log now, as the item the client was handed.
     let log = serde_json::to_string(&events(&rig.store, session).await).expect("events serialize");
     assert!(
-        !log.contains(STEER_GUIDANCE),
-        "the correction is fetched, never pushed: nothing in the log — and so \
-         nothing on the wire — carries it: {log}"
+        log.contains(STEER_GUIDANCE),
+        "the correction is the turn's answer, so it is in the conversation: {log}"
     );
 
     let answer = served(
@@ -1442,15 +1472,15 @@ async fn the_steer_payload_deposited_at_emission_is_what_fetch_steer_returns() {
             &rig,
             Some(&key("ada")),
             "fetch_steer",
-            json!({ "steer_id": call_id }),
+            json!({ "conversation": "main" }),
         )
         .await,
     );
-    assert_eq!(answer["steer_id"], json!(call_id));
+    assert_eq!(answer["conversation"], json!(session));
     assert_eq!(
         answer["guidance"],
         json!(STEER_GUIDANCE),
-        "what the agent reads is what the decision wrote, byte for byte"
+        "what the agent re-reads is what the decision wrote, byte for byte"
     );
 
     // Pure: a second call is the same bytes, and did no work to produce them.
@@ -1459,46 +1489,48 @@ async fn the_steer_payload_deposited_at_emission_is_what_fetch_steer_returns() {
             &rig,
             Some(&key("ada")),
             "fetch_steer",
-            json!({ "steer_id": call_id }),
+            json!({ "conversation": "main" }),
         )
         .await,
     );
-    assert_eq!(again, answer, "a fetch is a read of a committed record");
+    assert_eq!(
+        again, answer,
+        "a fetch is a read of the log, not a judge call"
+    );
 
-    // Another tenant's key gets the refusal that names nothing.
+    // Another tenant's key gets the refusal that names nothing -- through
+    // `ForeignConversation` now rather than through a principal comparison the
+    // tool made for itself, which is T4's "one door" in an assertion.
     let denial = refused(
         &tools_call(
             &rig,
             Some(&key("bob")),
             "fetch_steer",
-            json!({ "steer_id": &call_id }),
+            json!({ "conversation": session }),
         )
         .await,
     );
     assert!(
-        !denial.contains("acme") && !denial.contains("ada"),
-        "a refusal that named the owner would make the tool an enumeration \
-         oracle: {denial}"
+        !denial.contains(STEER_GUIDANCE),
+        "a refusal that leaked the correction would hand another tenant the \
+         contents of the conversation it was refused: {denial}"
     );
 
-    // The advisory write lands, and the agent's answer to the call extends the
-    // session rather than forking it — the M4 round trip, now with a payload
-    // behind it.
+    // The advisory write lands, and the agent carrying on extends the session
+    // rather than forking it -- the resend that used to be a tool result and is
+    // now the guidance item itself.
     let reported = served(
         &tools_call(
             &rig,
             Some(&key("ada")),
             "report_outcome",
-            json!({ "steer_id": call_id, "outcome": "applied", "note": "back on the parser" }),
+            json!({ "conversation": "main", "outcome": "applied", "note": "back on the parser" }),
         )
         .await,
     );
     assert_eq!(reported["recorded"], json!(true));
 
-    agent.append(as_value(function_call_output_item(
-        &call_id,
-        &serde_json::to_string(&answer).expect("the tool output re-encodes"),
-    )));
+    agent.append(as_value(assistant_message(STEER_GUIDANCE)));
     agent.say(&rig, "back to the parser, then").await;
     assert_eq!(
         decisions(&rig.store, session).await.len(),
@@ -1658,11 +1690,15 @@ async fn open_mode_serves_the_mcp_surface_under_the_default_principal() {
         "the overlay an unauthenticated agent set was spent by the next turn"
     );
 
-    // And an id nobody minted is refused rather than served an empty payload,
-    // in open mode exactly as in a configured one.
-    let denial =
-        refused(&tools_call(&rig, None, "fetch_steer", json!({ "steer_id": "fc_nope" })).await);
-    assert!(denial.contains("fc_nope"), "{denial}");
+    // And a conversation with no correction in it is refused rather than served
+    // an empty payload.
+    let denial = refused(&tools_call(&rig, None, "fetch_steer", json!({})).await);
+    assert!(
+        denial.contains("no correction"),
+        "a conversation roundhouse has never steered is refused rather than \
+         served empty guidance, in open mode exactly as in a configured one: \
+         {denial}"
+    );
 }
 
 #[tokio::test]

@@ -345,32 +345,47 @@ mod tests {
     }
 
     #[test]
-    fn a_rehydrated_log_containing_an_emitted_tool_call_needs_no_new_branch() {
+    fn a_rehydrated_log_containing_a_tool_call_needs_no_new_branch() {
         // The other half of "reusing `ItemAppended` costs zero changes here",
-        // checked rather than asserted. An emitted tool call is an ordinary
-        // `Item` whose content already has a rendering, so the assembler sees
-        // nothing new; had it needed a branch, a steered session's successor
-        // would rehydrate a different prompt than the node it replaced and
-        // every block hash after the steer would move.
+        // checked rather than asserted. A tool call is an ordinary `Item` whose
+        // content already has a rendering, so the assembler sees nothing new;
+        // had it needed a branch, such a session's successor would rehydrate a
+        // different prompt than the node it replaced and every block hash after
+        // the call would move.
+        //
+        // **The call is the agent's own now (M10.0).** It used to be a synthetic
+        // `fetch_steer` this deployment emitted, stamped with its response id;
+        // no verdict maps to a tool call any more, so the only tool calls in a
+        // log are the ones a client ran of its own accord — and the stamped
+        // assistant *text* below is what a steer looks like instead. Both are in
+        // the fixture, because the claim is about every content shape passing
+        // through the assembler unbranched.
         let items = vec![
             Item::system_text("you are a careful assistant"),
             Item::user_text("first question"),
             Item {
                 role: Role::Assistant,
                 content: ItemContent::ToolCall {
-                    call_id: "rhsteer_resp_1".into(),
-                    name: "fetch_steer".into(),
-                    arguments: r#"{"steer_id":"rhsteer_resp_1"}"#.into(),
+                    call_id: "call_theirs".into(),
+                    name: "grep".into(),
+                    arguments: r#"{"q":"parser"}"#.into(),
                 },
-                response_id: Some(ResponseId::new("resp_1")),
+                response_id: None,
             },
             Item {
                 role: Role::Tool,
                 content: ItemContent::ToolResult {
-                    call_id: "rhsteer_resp_1".into(),
-                    output: r#"{"directive":"narrow the search"}"#.into(),
+                    call_id: "call_theirs".into(),
+                    output: "3 hits".into(),
                 },
                 response_id: None,
+            },
+            Item {
+                role: Role::Assistant,
+                content: ItemContent::Text {
+                    text: "narrow the search\n\n> first question".into(),
+                },
+                response_id: Some(ResponseId::new("resp_1")),
             },
             Item::user_text("second question"),
         ];

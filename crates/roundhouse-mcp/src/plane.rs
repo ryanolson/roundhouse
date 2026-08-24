@@ -356,14 +356,12 @@ impl<R: ControlReads> ControlSurface for ControlPlaneSurface<R> {
         let effective = overlay.apply_to(&ceiling);
         let targets = self.reads.admissible_targets(principal, &effective).await?;
         let balance = self.reads.balance(principal).await?;
-        let facts = self.session_facts(&session).await?;
 
         ToolOutcome::ok(&StatusResponse {
             conversation: session.to_string(),
             policy_digest: effective.digest(),
             admissible_targets: names(&targets),
             budget: balance.as_ref().map(budget_view),
-            open_steers: facts.open_steers,
             overlay: view(&overlay),
         })
     }
@@ -531,15 +529,24 @@ impl<R: ControlReads> ControlSurface for ControlPlaneSurface<R> {
         principal: &Principal,
         request: FetchSteerRequest,
     ) -> Result<ToolOutcome, SurfaceError> {
-        // The whole handler. No clock, no fleet, no judge — a read of a record
-        // committed when the steer was emitted, which is what makes a second
-        // call byte-identical and what stops a loop of calls costing anybody
+        // The whole handler. No clock, no fleet, no judge — a fold of the
+        // conversation's own log, which is what makes a second call
+        // byte-identical and what stops a loop of calls costing anybody
         // anything.
-        let record = self.store.steer_for(principal, &request.steer_id)?;
+        //
+        // The tenancy check is `session_of`, the same door every other
+        // session-scoped tool goes through: a conversation outside the caller's
+        // namespace is `ForeignConversation` and never a silent fall back to the
+        // caller's own. That replaces the principal comparison the steer-id
+        // version did for itself — one boundary, kept in one place.
+        let session = self.session_of(principal, &request.conversation).await?;
+        let facts = self.session_facts(&session).await?;
+        let guidance = facts
+            .latest_guidance
+            .ok_or_else(|| SurfaceError::NoGuidanceYet(session.to_string()))?;
         ToolOutcome::ok(&SteerResponse {
-            steer_id: record.steer_id,
-            guidance: record.guidance,
-            emitted_at_ms: record.emitted_at_ms,
+            conversation: session.to_string(),
+            guidance,
         })
     }
 
@@ -548,14 +555,20 @@ impl<R: ControlReads> ControlSurface for ControlPlaneSurface<R> {
         principal: &Principal,
         request: ReportOutcomeRequest,
     ) -> Result<ToolOutcome, SurfaceError> {
-        let record = self.store.record_outcome(
+        let session = self.session_of(principal, &request.conversation).await?;
+        // Filed, never refused: the descriptor promises that not reporting is
+        // never an error, and a store that rejected a report against a
+        // conversation nobody steered would make the tool's answer depend on a
+        // fact the agent cannot see.
+        self.store.record_outcome(
             principal,
-            &request.steer_id,
+            &session,
             request.outcome,
             request.note,
-        )?;
+            self.reads.now_ms(),
+        );
         ToolOutcome::ok(&OutcomeResponse {
-            steer_id: record.steer_id,
+            conversation: session.to_string(),
             outcome: request.outcome,
             recorded: true,
         })

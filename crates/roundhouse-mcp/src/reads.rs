@@ -40,8 +40,15 @@ use crate::surface::SurfaceError;
 /// maintains beside the log.
 #[derive(Debug, Clone, Default)]
 pub struct SessionFacts {
-    /// `call_id`s of steers this deployment emitted that no turn has answered.
-    pub open_steers: Vec<String>,
+    /// The most recent correction this deployment put in the conversation, or
+    /// `None` for a session it has never interjected on.
+    ///
+    /// **A fold of the log, which is what M10.0 made possible.** The guidance
+    /// used to live in a node-local store, deposited beside the synthetic call
+    /// that named it and lost on restart. It is a conversation item now, and the
+    /// session's own projection says which item it is — so `fetch_steer` serves
+    /// it as a pure read of the log, and a restart costs nothing.
+    pub latest_guidance: Option<String>,
     /// The most recent routing decision, or `None` for a session whose first
     /// turn has not been routed yet.
     pub last_decision: Option<DecisionRecord>,

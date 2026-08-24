@@ -29,24 +29,24 @@ use std::time::Duration;
 
 use roundhouse_core::context::ByteTokenizer;
 use roundhouse_core::control::{MemorySpendLedger, TargetFilter, TurnPolicy};
-use roundhouse_core::event::{SessionEventKind, SideCallAbandonReason, Usage};
+use roundhouse_core::event::{SessionEventKind, SideCallAbandonReason, Usage, ValidationOutcome};
 use roundhouse_core::ids::{SessionId, TurnId};
 use roundhouse_core::interject::Interjector;
-use roundhouse_core::item::{Item, ItemContent};
+use roundhouse_core::item::{Item, ItemContent, Role};
 use roundhouse_core::metrics::{MetricsConfig, Scope, ShadowPricing};
 use roundhouse_core::now_ms;
 use roundhouse_core::routing::{AffinityPolicy, CacheLedger, DecisionRecord, RoutingError, Target};
 use roundhouse_core::session::{Session, SessionState};
 use roundhouse_core::store::{MemoryStore, SessionStore, StoreError};
 use roundhouse_core::validate::{
-    ActionPolicy, Arm, ArmShares, JudgeClient, JudgeFailure, SteerChannel, ValidationTerms,
-    Validator, ValidatorConfig,
+    ActionPolicy, Arm, ArmShares, EXAMPLE_HANDOFF_NOTE, HANDOFF_MARKER, JudgeClient, JudgeFailure,
+    SteerAction, SteerChannel, ValidationTerms, Validator, ValidatorConfig,
 };
 use roundhouse_fleet::{
     EchoFrontierClient, FrontierClient, FrontierModelSpec, OpenAiResponsesClient,
     StaticFrontierCatalog,
 };
-use roundhouse_mcp::{ControlStore, IntentRecord};
+use roundhouse_mcp::{ControlStore, IntentRecord, TimedOverlay};
 use roundhouse_server::{
     Admission, EchoLocalExecutor, Engine, EngineConfig, EngineError, FleetJudge, JudgeConfig,
 };
@@ -54,11 +54,11 @@ use roundhouse_server::{
 use codex_utils_rustls_provider::ensure_rustls_crypto_provider;
 
 mod common;
-use common::frontier_catalog;
 use common::validate::{
     AlwaysFires, OFF_TRACK, ON_TRACK, ScriptedJudge, judge_spec, judge_target, judge_usage,
     open_trigger,
 };
+use common::{ScriptedFrontierClient, frontier_catalog};
 
 /// What the echo provider answers an ordinary turn with.
 const ANSWER: &str = "frontier answer";
@@ -243,19 +243,47 @@ fn enrolled(arm: Arm, action: ActionPolicy) -> Admission {
             shares,
             action,
             placebo_rate: 1.0,
+            // R2's surface is off unless a probe asks for it — the same posture
+            // the shipped config has, so every test that is not about the note
+            // is exercising the undecorated path by default.
+            handoff_note: None,
         }),
         ..Admission::open()
     }
 }
 
-/// A membership that permits a synthetic call, whatever the client declared.
+/// The same membership, configured to narrate its escalations (R2/T6).
 ///
-/// `ToolCall` rather than `Auto` because capability detection is §7's
-/// milestone: under `Auto` the engine's `SteerCapability::Absent` would degrade
-/// every correction to guidance, and no fixture here could reach outcome B.
-fn tool_call_channel() -> ActionPolicy {
+/// Built by modifying an `enrolled` admission rather than by a second
+/// constructor, so a probe and its control differ in exactly one field and the
+/// arm, the action policy and the placebo rate cannot drift between them.
+fn narrating(admission: Admission, note: &str) -> Admission {
+    Admission {
+        validation: admission.validation.map(|terms| ValidationTerms {
+            handoff_note: Some(note.to_string()),
+            ..terms
+        }),
+        ..admission
+    }
+}
+
+/// A membership that interjects, with outcome B reachable.
+///
+/// **Renamed and re-spelled with M10.0 (T2).** It used to say
+/// `SteerChannel::ToolCall`, and it had to: under `Auto` the engine passed
+/// `SteerCapability::Absent`, which degraded every correction to plain guidance,
+/// so no fixture here could reach outcome B. There is no capability probe any
+/// more — every interjection is text, which every dialect on this wire carries
+/// by definition — so `Auto` is the honest spelling and `tool_call` is refused
+/// at config load. A fixture still naming the retired value would be exercising
+/// an arm no deployment can reach.
+///
+/// `steer_after_interventions: 1` is the documented opt-in and the whole of it:
+/// escalation claims the uninterrupted turn, so a steer is only reachable on the
+/// turn after one.
+fn steering_channel() -> ActionPolicy {
     ActionPolicy {
-        channel: SteerChannel::ToolCall,
+        channel: SteerChannel::Auto,
         steer_after_interventions: 1,
         ..ActionPolicy::default()
     }
@@ -686,7 +714,7 @@ async fn a_validator_timeout_releases_the_turn_unchanged_and_is_marked_not_free(
     })]);
     let probe = rig(Arc::clone(&judge));
     let session_id = SessionId::new("acme/ada/timed-out");
-    let admission = enrolled(Arm::Live, tool_call_channel());
+    let admission = enrolled(Arm::Live, steering_channel());
     let results = drive(&probe, &session_id, &admission, 2).await;
     for result in &results {
         assert!(result.is_ok(), "a timed-out judge must not fail a turn");
@@ -783,7 +811,7 @@ async fn a_judge_that_cannot_authenticate_abandons_its_check_and_the_turn_procee
         frontier_catalog(),
     );
     let session_id = SessionId::new("acme/ada/unauthenticated-judge");
-    let admission = enrolled(Arm::Live, tool_call_channel());
+    let admission = enrolled(Arm::Live, steering_channel());
 
     // PROBE: the turns run. A judge that cannot authenticate must not be able
     // to fail the turn it was asked about — which is exactly why its
@@ -852,7 +880,7 @@ async fn the_shadow_arm_judges_and_releases_unchanged() {
     let session_id = SessionId::new("acme/ada/shadow");
     // A channel that permits action, so the arm is the only thing standing
     // between the verdict and an intervention.
-    let admission = enrolled(Arm::Shadow, tool_call_channel());
+    let admission = enrolled(Arm::Shadow, steering_channel());
     let results = drive(&probe, &session_id, &admission, 3).await;
     for result in &results {
         result.as_ref().expect("a shadow turn is an ordinary turn");
@@ -907,14 +935,7 @@ async fn the_shadow_arm_judges_and_releases_unchanged() {
 
     let live = rig(ScriptedJudge::always(OFF_TRACK));
     let live_id = SessionId::new("acme/ada/live");
-    for result in drive(
-        &live,
-        &live_id,
-        &enrolled(Arm::Live, tool_call_channel()),
-        3,
-    )
-    .await
-    {
+    for result in drive(&live, &live_id, &enrolled(Arm::Live, steering_channel()), 3).await {
         result.expect("answers");
     }
     let acted = live
@@ -976,7 +997,7 @@ async fn an_escalation_above_the_whole_pool_selects_its_best_rather_than_refusin
     let results = drive(
         &probe,
         &session_id,
-        &enrolled(Arm::Live, tool_call_channel()),
+        &enrolled(Arm::Live, steering_channel()),
         2,
     )
     .await;
@@ -1034,7 +1055,7 @@ async fn an_escalation_the_pool_can_meet_narrows_to_the_floor_it_asked_for() {
     for result in drive(
         &probe,
         &session_id,
-        &enrolled(Arm::Live, tool_call_channel()),
+        &enrolled(Arm::Live, steering_channel()),
         2,
     )
     .await
@@ -1087,7 +1108,7 @@ async fn a_floor_the_membership_itself_wrote_still_refuses() {
             allow: TargetFilter::allow_all(),
             frontier_cadence: None,
         }),
-        ..enrolled(Arm::Live, tool_call_channel())
+        ..enrolled(Arm::Live, steering_channel())
     };
     for (turn, result) in drive(&probe, &session_id, &admission, 2)
         .await
@@ -1102,6 +1123,386 @@ async fn a_floor_the_membership_itself_wrote_still_refuses() {
             "turn {turn} must be refused by the membership's own floor: {result:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// R2/T6 — the escalation handoff note, the second steering surface
+// ---------------------------------------------------------------------------
+
+/// The two turns of one fixture, as the frontier client saw them.
+///
+/// Dispatched turns only: the judge in this file is a [`ScriptedJudge`] and
+/// never reaches a frontier client, but the shared double answers a
+/// `#validate`-suffixed cache key with a verdict body precisely because a
+/// `FleetJudge` fixture *would* — so a suite that took `quotes_seen()` whole
+/// would silently start asserting against a judge prompt the day it swapped
+/// judges. Filtered here rather than at each assertion, once.
+fn dispatched_prompts(client: &ScriptedFrontierClient) -> Vec<String> {
+    client
+        .quotes_seen()
+        .into_iter()
+        .filter(|quote| !quote.prompt_cache_key.ends_with("#validate"))
+        .map(|quote| quote.prompt)
+        .collect()
+}
+
+/// The exact bytes a decorated request carries beyond an undecorated one.
+fn note_block(note: &str) -> String {
+    format!("\n\n{HANDOFF_MARKER} {note}")
+}
+
+/// **R2/T6.** The note reaches the model and never reaches the conversation.
+///
+/// The whole safety argument for a second steering surface is that it is not a
+/// second thing in the log. R1's steer *is* a conversation item — it changes
+/// what a client resends and what the prefix check hashes, which is why it costs
+/// the agent a turn. This costs it a paragraph, and the paragraph exists only in
+/// the request that was already on its way to a provider: the stored items, the
+/// prefix hashes and everything a successor would rebuild are byte-identical
+/// whether a deployment configured a note or not.
+///
+/// So the probe is run twice — once narrating, once not, over the same fixture
+/// — and three things are compared:
+///
+/// 1. the escalated turn's *forwarded* prompt differs by exactly the note block
+///    and nothing else, appended at the very end where the trailing user message
+///    is (see `validate::handoff` on why those are one position on this wire);
+/// 2. the turn *before* the escalation carries nothing, so the decoration is
+///    about the switch and not about the project;
+/// 3. the two conversations are equal, item for item.
+///
+/// The third is the assertion that would go red if the note were ever appended
+/// to the assembler's items rather than to its rendering — the failure that
+/// turns a narration into a fork.
+///
+/// **Usage is deliberately not compared between the two runs.** The double
+/// derives `input_tokens` from `quote.prompt.len()`, so a decorated turn
+/// *reports* more input than an undecorated one while `isl_tokens` — the number
+/// the decision was recorded at — is unchanged. That divergence is the
+/// documented cost of leaving the priced number undecorated (see the engine's
+/// quote site), not a defect this test should paper over by widening its subject.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_handoff_note_rides_the_first_escalated_request_and_never_the_stored_log() {
+    async fn run(label: &str, note: Option<&str>) -> (Rig, Arc<ScriptedFrontierClient>, SessionId) {
+        let judge = ScriptedJudge::always(OFF_TRACK);
+        let client = Arc::new(ScriptedFrontierClient::new(ANSWER));
+        let rig = rig_with_catalog(
+            judge,
+            Arc::clone(&client) as Arc<dyn FrontierClient>,
+            catalog_of(&[("modest", 0.6), ("flagship", 0.95)]),
+        );
+        let session_id = SessionId::new(format!("acme/ada/{label}"));
+        let enrolled = enrolled(Arm::Live, steering_channel());
+        let admission = match note {
+            Some(note) => narrating(enrolled, note),
+            None => enrolled,
+        };
+        for (turn, result) in drive(&rig, &session_id, &admission, 2)
+            .await
+            .into_iter()
+            .enumerate()
+        {
+            result.unwrap_or_else(|error| {
+                panic!("a narration must never be the reason a turn fails: turn {turn} came back {error}")
+            });
+        }
+        (rig, client, session_id)
+    }
+
+    let (probe, narrated, probe_session) =
+        run("handoff-narrated", Some(EXAMPLE_HANDOFF_NOTE)).await;
+    let (control, plain, control_session) = run("handoff-plain", None).await;
+
+    let narrated = dispatched_prompts(&narrated);
+    let plain = dispatched_prompts(&plain);
+    assert_eq!(narrated.len(), 2, "both turns reached the provider");
+    assert_eq!(plain.len(), 2);
+
+    // Turn 0 is below the trigger's turn-index gate, so no escalation has been
+    // decided and there is nothing to narrate. The two runs must be identical
+    // here — which is what makes the difference on turn 1 attributable to the
+    // escalation rather than to the config key being present at all.
+    assert_eq!(
+        narrated[0], plain[0],
+        "an unescalated turn must be forwarded exactly as it would have been \
+         with the key absent"
+    );
+    assert!(!narrated[0].contains(HANDOFF_MARKER));
+
+    // Turn 1: the judge escalated, and the forwarded request differs by exactly
+    // the note block. Equality against `plain[1] + block`, not `contains`: a
+    // `contains` passes against a note appended twice, or appended in the middle
+    // of the conversation, or a request that was rebuilt around it.
+    assert_eq!(
+        narrated[1],
+        format!("{}{}", plain[1], note_block(EXAMPLE_HANDOFF_NOTE)),
+        "the escalated request must be the undecorated one plus roundhouse's \
+         line, and nothing else"
+    );
+    assert!(
+        narrated[1].ends_with(EXAMPLE_HANDOFF_NOTE),
+        "the note rides the *trailing* message — on this wire the whole render \
+         is one user message, so the end of the prompt is the end of it"
+    );
+    assert!(
+        !plain[1].contains(HANDOFF_MARKER),
+        "the control must carry nothing: absent means off"
+    );
+
+    // And the conversation is untouched, item for item. `conversation` strips
+    // the response stamp, which is the same equality the prefix check applies —
+    // two runs of one fixture mint different response ids and are the same
+    // conversation.
+    let narrated_items = conversation(&probe.store, &probe_session).await;
+    let plain_items = conversation(&control.store, &control_session).await;
+    assert_eq!(
+        narrated_items, plain_items,
+        "R2's whole safety argument: the note is not in the log, so a client's \
+         resend and its prefix hash cannot notice that the flag moved"
+    );
+    assert!(
+        stored_items(&probe.store, &probe_session)
+            .await
+            .iter()
+            .all(|item| !item.render().contains(HANDOFF_MARKER)),
+        "and the marker is nowhere in the stored items either — the equality \
+         above would also hold if both runs had been decorated"
+    );
+
+    // The control that keeps the equalities from being vacuous: something
+    // actually escalated on turn 1, in both runs.
+    for (label, rig, session) in [
+        ("narrated", &probe, &probe_session),
+        ("plain", &control, &control_session),
+    ] {
+        let decided = decisions(&rig.store, session).await;
+        assert_eq!(
+            decided[1].chosen,
+            frontier("flagship"),
+            "the {label} run's second turn must have been escalated, or this \
+             test is comparing two unescalated turns"
+        );
+    }
+}
+
+/// **R2/T6.** Steering text never accumulates across turns.
+///
+/// The named risk, and it is upstream's too: Switchyard's notes are stateless
+/// because a note that could accumulate would put a growing pile of roundhouse's
+/// prose in front of a model that asked for none of it
+/// (`crates/libsy/src/algorithms/util/stage.rs:436-438@053a61e`). An escalation
+/// here lasts `escalation_turns` — three by default — so there are two more
+/// turns after the switch on which a naive "is an escalation in force" gate
+/// would decorate again.
+///
+/// The load-bearing half is the control: turn 3 must still be *escalated* when
+/// it carries no note, or the test passes for the wrong reason (the escalation
+/// lapsed, and nothing was suppressed at all). The policy digest is what says so
+/// — it is the fingerprint of the turn's composed policy, so an escalated turn's
+/// differs from an unescalated one's and two turns under one escalation share it.
+///
+/// **The judge recovers on the second consult, and it has to.** Under a verdict
+/// that is off-track forever the intervention ladder claims every turn after the
+/// escalation — steer, then halt — and neither dispatches, so there would be no
+/// second escalated request to check for a second note. A session that stumbles
+/// once and carries on is also the case R2 is actually for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn steering_text_never_accumulates_across_turns() {
+    let judge = ScriptedJudge::answering(&[OFF_TRACK, ON_TRACK]);
+    let client = Arc::new(ScriptedFrontierClient::new(ANSWER));
+    let probe = rig_with_catalog(
+        Arc::clone(&judge),
+        Arc::clone(&client) as Arc<dyn FrontierClient>,
+        catalog_of(&[("modest", 0.6), ("flagship", 0.95)]),
+    );
+    let session_id = SessionId::new("acme/ada/handoff-once");
+    let admission = narrating(
+        enrolled(Arm::Live, steering_channel()),
+        EXAMPLE_HANDOFF_NOTE,
+    );
+    for (turn, result) in drive(&probe, &session_id, &admission, 3)
+        .await
+        .into_iter()
+        .enumerate()
+    {
+        result.unwrap_or_else(|error| panic!("turn {turn} came back {error}"));
+    }
+
+    let prompts = dispatched_prompts(&client);
+    assert_eq!(prompts.len(), 3, "three turns reached the provider");
+    let decorated = prompts
+        .iter()
+        .filter(|prompt| prompt.contains(HANDOFF_MARKER))
+        .count();
+    assert_eq!(
+        decorated, 1,
+        "exactly one forwarded request in the session carries the note: it \
+         narrates a switch, and the switch happened once"
+    );
+    assert!(
+        prompts[1].contains(HANDOFF_MARKER),
+        "and it is the turn the escalation was decided on, not a later one"
+    );
+    assert_eq!(
+        prompts[2].matches(HANDOFF_MARKER).count(),
+        0,
+        "the third turn is still escalated and must carry nothing — a note that \
+         rode every escalated turn would also resend the second turn's, since \
+         the client's history is our own prompt"
+    );
+
+    // The control, and the reason the assertion above is about suppression
+    // rather than about the escalation quietly ending: turns 2 and 3 are served
+    // under one composed policy, and it is not the policy turn 1 ran under.
+    let decided = decisions(&probe.store, &session_id).await;
+    assert_eq!(decided.len(), 3);
+    assert_ne!(
+        decided[1].turn_policy_digest, decided[0].turn_policy_digest,
+        "turn 2 is the escalated one"
+    );
+    assert_eq!(
+        decided[2].turn_policy_digest, decided[1].turn_policy_digest,
+        "turn 3 is still under the same escalation, so its silence is the gate \
+         and not the narrowing having lapsed"
+    );
+    assert_eq!(decided[2].chosen, frontier("flagship"));
+}
+
+/// **R2/T6.** A narrowing no signal asked for is never narrated.
+///
+/// Switchyard gates its note behind `only_on_wrong_signal_escalation` (default
+/// `true`) and says exactly what an ungated one does: it "can tell the capable
+/// model the efficient one was stalling when it wasn't"
+/// (`crates/libsy/src/algorithms/util/stage.rs:452-455@053a61e`). Roundhouse has
+/// two other ways for a turn's floor to move, and neither is a signal:
+///
+/// - **the agent's own overlay.** An agent that asked for a higher floor got
+///   what it asked for; telling it a review found it stalling would be inventing
+///   a verdict nobody reached. This is the ambiguous-narrowing case, and the
+///   probe pairs an `ON_TRACK` judge — which escalates nothing — with a live
+///   floor overlay, so the turn is genuinely narrowed and genuinely unjudged;
+/// - **the Shadow arm.** It computes the whole decision and takes none of it,
+///   which is what makes it the control the live arm is measured against. A
+///   Shadow session that narrated its escalations would be acting, and the
+///   comparison would be against a group that had been intervened on.
+///
+/// Both are structural rather than checked: the only thing that can put an
+/// escalation in `SessionState` is a `ValidationDecided` under an arm that acts,
+/// and the note reads that fold. The test is what says the structure holds.
+///
+/// `the_handoff_note_rides_the_first_escalated_request_and_never_the_stored_log`
+/// is the live control for both halves — the identical note, on the same
+/// fixture, does arrive when a judge asked for the narrowing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_handoff_note_never_narrates_a_narrowing_no_signal_asked_for() {
+    // --- the agent's own ask ------------------------------------------------
+    let client = Arc::new(ScriptedFrontierClient::new(ANSWER));
+    let asked = rig_with_catalog(
+        ScriptedJudge::always(ON_TRACK),
+        Arc::clone(&client) as Arc<dyn FrontierClient>,
+        catalog_of(&[("modest", 0.6), ("flagship", 0.95)]),
+    );
+    let session_id = SessionId::new("acme/ada/handoff-overlay");
+    asked
+        .engine
+        .create_session(&session_id)
+        .await
+        .expect("a fresh session");
+    let admission = narrating(
+        enrolled(Arm::Live, steering_channel()),
+        EXAMPLE_HANDOFF_NOTE,
+    );
+    for turn in 0..2 {
+        // Re-installed each turn: an overlay is one turn's ration, spent where
+        // the policy for the turn is fixed. Two narrowed turns therefore need
+        // two writes, which is also what an agent calling `set_quality_floor`
+        // twice would produce.
+        asked.control.set_floor_axis(
+            &session_id,
+            Some(TimedOverlay {
+                ask: 0.9,
+                remaining_turns: Some(1),
+                reason: "this step needs the strong model".into(),
+            }),
+            now_ms(),
+        );
+        asked
+            .engine
+            .run_turn(
+                &session_id,
+                TurnId::new(format!("t{turn}")),
+                vec![Item::user_text(format!("question {turn}"))],
+                &admission,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("turn {turn} came back {error}"));
+    }
+
+    let prompts = dispatched_prompts(&client);
+    assert_eq!(prompts.len(), 2);
+    assert!(
+        prompts
+            .iter()
+            .all(|prompt| !prompt.contains(HANDOFF_MARKER)),
+        "an agent that narrowed its own routing asked a question and got an \
+         answer; there is no review to narrate:\n{prompts:#?}"
+    );
+    // The control that makes it about narration rather than about the overlay
+    // not working: the floor the agent asked for did reach routing.
+    let decided = decisions(&asked.store, &session_id).await;
+    assert_eq!(
+        decided[1].chosen,
+        frontier("flagship"),
+        "the overlay must have narrowed the turn, or nothing was suppressed"
+    );
+
+    // --- the Shadow arm -----------------------------------------------------
+    let observing_client = Arc::new(ScriptedFrontierClient::new(ANSWER));
+    let observing = rig_with_catalog(
+        ScriptedJudge::always(OFF_TRACK),
+        Arc::clone(&observing_client) as Arc<dyn FrontierClient>,
+        catalog_of(&[("modest", 0.6), ("flagship", 0.95)]),
+    );
+    let shadow_session = SessionId::new("acme/ada/handoff-shadow");
+    let shadow = narrating(
+        enrolled(Arm::Shadow, steering_channel()),
+        EXAMPLE_HANDOFF_NOTE,
+    );
+    for (turn, result) in drive(&observing, &shadow_session, &shadow, 2)
+        .await
+        .into_iter()
+        .enumerate()
+    {
+        result.unwrap_or_else(|error| panic!("shadow turn {turn} came back {error}"));
+    }
+
+    let shadow_prompts = dispatched_prompts(&observing_client);
+    assert_eq!(shadow_prompts.len(), 2);
+    assert!(
+        shadow_prompts
+            .iter()
+            .all(|prompt| !prompt.contains(HANDOFF_MARKER)),
+        "a Shadow arm computes an escalation and takes none of it; narrating one \
+         would make the observe-only arm act:\n{shadow_prompts:#?}"
+    );
+    // And the control for *this* half: the judge was consulted and did decide to
+    // escalate, so what was suppressed is the narration and not the verdict.
+    let kinds = events(&observing.store, &shadow_session).await;
+    assert_eq!(validations(&kinds), 1, "the shadow arm judged turn 2");
+    assert!(
+        kinds.iter().any(|kind| matches!(
+            kind,
+            SessionEventKind::ValidationDecided {
+                outcome: ValidationOutcome::Judged {
+                    action: SteerAction::Escalate { .. },
+                    ..
+                },
+                ..
+            }
+        )),
+        "the decision the shadow arm declined to take must be an escalation, or \
+         there was never a note to suppress"
+    );
 }
 
 /// The judge is shown what the agent said it was doing, not what we guessed.
@@ -1178,7 +1579,7 @@ async fn the_placebo_arm_intervenes_without_calling_the_judge() {
     let judge = ScriptedJudge::always(OFF_TRACK);
     let probe = rig(Arc::clone(&judge));
     let session_id = SessionId::new("acme/ada/placebo");
-    let admission = enrolled(Arm::Placebo, tool_call_channel());
+    let admission = enrolled(Arm::Placebo, steering_channel());
     let results = drive(&probe, &session_id, &admission, 2).await;
 
     assert_eq!(
@@ -1232,7 +1633,7 @@ async fn the_placebo_arm_intervenes_without_calling_the_judge() {
     let quiet_judge = ScriptedJudge::always(OFF_TRACK);
     let quiet = rig(Arc::clone(&quiet_judge));
     let quiet_id = SessionId::new("acme/ada/placebo-quiet");
-    let mut never = enrolled(Arm::Placebo, tool_call_channel());
+    let mut never = enrolled(Arm::Placebo, steering_channel());
     never.validation = never.validation.map(|terms| ValidationTerms {
         placebo_rate: 0.0,
         ..terms
@@ -1250,6 +1651,103 @@ async fn the_placebo_arm_intervenes_without_calling_the_judge() {
     assert_eq!(validations(&kinds), 1, "and it is still on the record");
 }
 
+/// The turn after a steer is the turn that acts on it, and it is never judged.
+///
+/// **T3, and the off-by-one is the whole of it.** The hysteresis rule used to
+/// ask "did this turn's input close an open steer" — a question about the
+/// *input*, because the correction came back as a tool result. The correction is
+/// the previous turn's *answer* now, so the fact is about the previous turn, and
+/// `SessionState::this_turn_fulfils_a_steer` compares against `turn_index - 1`.
+///
+/// Getting it wrong in either direction is invisible without this test. Compared
+/// against `turn_index`, the suppression lands on the turn that *emitted* the
+/// steer — which is already past the gate, so nothing changes there — and the
+/// turn that answers it gets judged on evidence the agent has had no chance to
+/// change, which re-triggers the validation that produced the correction. Left
+/// out entirely, the same thing happens for the rest of the session.
+///
+/// The controls are what make the assertion about the rule rather than about the
+/// budget gate: the turn before the steer *was* judged, and the turn after the
+/// fulfilling one is judged again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_turn_after_a_steer_is_not_validated_and_the_one_after_that_is() {
+    let judge = ScriptedJudge::always(OFF_TRACK);
+    let probe = rig(Arc::clone(&judge));
+    let session_id = SessionId::new("acme/ada/fulfilling");
+    let admission = enrolled(Arm::Live, steering_channel());
+    probe
+        .engine
+        .create_session(&session_id)
+        .await
+        .expect("a fresh session");
+
+    // Turn 0 has no trajectory. Turn 1 escalates (the default for a located
+    // divergence). Turn 2 has one intervention behind it and steers. Turn 3 is
+    // the fulfilling turn. Turn 4 is the control on the other side.
+    for turn in 0..5 {
+        probe
+            .engine
+            .run_turn(
+                &session_id,
+                TurnId::new(format!("t{turn}")),
+                vec![Item::user_text(format!("question {turn}"))],
+                &admission,
+            )
+            .await
+            .expect("each turn answers");
+    }
+
+    // Which turns the judge was asked about, read off the trigger record each
+    // decision carries — a count alone could not say *which* turn was skipped,
+    // and the whole claim is about one particular turn.
+    let judged: Vec<u64> = events(&probe.store, &session_id)
+        .await
+        .into_iter()
+        .filter_map(|kind| match kind {
+            SessionEventKind::ValidationDecided { trigger, .. } => Some(trigger.turn_index),
+            _ => None,
+        })
+        .collect();
+
+    // The steered turn, taken from the decisions rather than assumed: it is the
+    // one whose action is a steer, and everything below is relative to it.
+    let steered_on = events(&probe.store, &session_id)
+        .await
+        .into_iter()
+        .find_map(|kind| match kind {
+            SessionEventKind::ValidationDecided {
+                trigger,
+                outcome:
+                    ValidationOutcome::Judged {
+                        action: SteerAction::Steer { .. },
+                        ..
+                    },
+                ..
+            } => Some(trigger.turn_index),
+            _ => None,
+        })
+        .expect("the fixture must reach outcome B, or this test is about nothing");
+
+    assert!(
+        judged.contains(&(steered_on - 1)),
+        "the control on the near side: the turn before the steer was judged, so \
+         the gap below is the hysteresis and not a quiet budget refusal — \
+         judged {judged:?}, steered on {steered_on}"
+    );
+    assert!(
+        !judged.contains(&(steered_on + 1)),
+        "the turn that acts on the correction must not be judged on evidence \
+         the agent has had no chance to change — judged {judged:?}, steered on \
+         {steered_on}"
+    );
+    assert!(
+        judged.contains(&(steered_on + 2)),
+        "and the suppression is exactly one turn wide: a rule that latched \
+         would turn one correction into a session that is never checked again — \
+         judged {judged:?}, steered on {steered_on}"
+    );
+}
+
 /// A retry of a steered turn replays and never re-runs the judge.
 ///
 /// The seam sits after the dedup short-circuit, and this is what that buys: a
@@ -1262,7 +1760,7 @@ async fn an_identical_retry_of_a_steered_turn_never_revalidates() {
     let judge = ScriptedJudge::always(OFF_TRACK);
     let probe = rig(Arc::clone(&judge));
     let session_id = SessionId::new("acme/ada/steered");
-    let admission = enrolled(Arm::Live, tool_call_channel());
+    let admission = enrolled(Arm::Live, steering_channel());
     probe
         .engine
         .create_session(&session_id)
@@ -1288,16 +1786,65 @@ async fn an_identical_retry_of_a_steered_turn_never_revalidates() {
         );
     }
     assert_eq!(judge.asked(), 2);
-    let steered = stored_items(&probe.store, &session_id)
+
+    // **The premise, read off the decision rather than off the item (T1/T3).**
+    // Before M10.0 a steer was countable by shape -- a `ToolCall` in the stored
+    // items could only have been ours. It is assistant text now, which is what
+    // every dispatched turn's answer is, so the only thing that can say a steer
+    // happened is `ValidationDecided`. That is the same reason the session fold
+    // keys `steered_on_turn` off this event, and asserting it here is what
+    // proves the fixture reached outcome B rather than escalating twice.
+    let steers = events(&probe.store, &session_id)
         .await
         .into_iter()
-        .filter(|item| matches!(item.content, ItemContent::ToolCall { .. }))
+        .filter(|kind| {
+            matches!(
+                kind,
+                SessionEventKind::ValidationDecided {
+                    outcome: ValidationOutcome::Judged {
+                        action: SteerAction::Steer { .. },
+                        ..
+                    },
+                    ..
+                }
+            )
+        })
         .count();
     assert_eq!(
-        steered, 1,
+        steers, 1,
         "the fixture must actually have steered, or the retry below is a retry \
          of an ordinary turn"
     );
+
+    // And T1's shape, end to end through the real validator: the answer the
+    // agent is handed is the directive followed by its own request, quoted. The
+    // exact bytes are pinned beside `render_steer_answer`; what this asserts is
+    // that the composition is wired at all -- a seam that committed the
+    // directive alone would leave the agent reconstructing what it was doing
+    // from scrollback, which is the thing the correction says it is getting
+    // wrong.
+    let answer = stored_items(&probe.store, &session_id)
+        .await
+        .into_iter()
+        .rev()
+        .find_map(|item| match item.content {
+            ItemContent::Text { text } if item.role == Role::Assistant => Some(text),
+            _ => None,
+        })
+        .expect("the steered turn answered with an item");
+    assert!(
+        answer.contains("not making progress"),
+        "the directive is roundhouse's own vocabulary: {answer}"
+    );
+    assert!(
+        answer.contains("\n> question 2"),
+        "and the pending request is restated, quoted line by line: {answer}"
+    );
+    assert!(
+        !answer.contains("editing a file the task did not name"),
+        "while the judge's own prose still never reaches the agent: {answer}"
+    );
+
     let before = stored_items(&probe.store, &session_id).await;
 
     // The retry: the same turn id, which is what an identical resent

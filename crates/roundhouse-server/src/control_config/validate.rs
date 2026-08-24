@@ -66,11 +66,26 @@ pub struct ValidateConfig {
     pub escalation_turns: u32,
     /// How many consecutive intervening validations a `Steer` may follow.
     ///
-    /// `0`, the default, means the synthetic-call path is off: escalation
-    /// claims the uninterrupted turn, so a cap of zero admits nothing after it.
-    /// Set `1` or more to turn outcome B on. See
+    /// `0`, the default, means the steer path is off: escalation claims the
+    /// uninterrupted turn, so a cap of zero admits nothing after it. Set `1` or
+    /// more to turn outcome B on. See
     /// [`ActionPolicy::steer_after_interventions`].
     pub steer_after_interventions: u32,
+    /// What to say on the first turn served under a signal-driven escalation,
+    /// appended to the forwarded request and never to the stored conversation.
+    ///
+    /// **Absent is off**, which is R2's shipped posture and the reason this is
+    /// an `Option<String>` rather than a string with a default: a deployment
+    /// that has not decided what to tell an escalated turn has not decided to
+    /// decorate one, and substituting the example wording for a missing value
+    /// would put roundhouse's words in a request nobody asked for them in.
+    /// [`EXAMPLE_HANDOFF_NOTE`](roundhouse_core::validate::EXAMPLE_HANDOFF_NOTE)
+    /// is what a project turning it on can copy.
+    ///
+    /// The `[roundhouse-guidance]` marker is *not* part of this value —
+    /// roundhouse prepends it, so an operator cannot accidentally ship an
+    /// unattributable note. Write the sentences only.
+    pub handoff_note: Option<String>,
 }
 
 impl Default for ValidateConfig {
@@ -88,6 +103,7 @@ impl Default for ValidateConfig {
             escalation_floor: action.escalation_floor,
             escalation_turns: action.escalation_turns,
             steer_after_interventions: action.steer_after_interventions,
+            handoff_note: None,
         }
     }
 }
@@ -150,6 +166,36 @@ impl ValidateConfig {
                 escalation_floor: self.escalation_floor,
             });
         }
+        // Above the `enabled` short-circuit, on the same argument the share
+        // table is checked under: a project that names a retired channel and
+        // leaves the loop off has still named a retired channel, and the day it
+        // flips `enabled` is the worst possible moment to find out that the
+        // channel it chose stopped existing.
+        if self.channel == SteerChannel::ToolCall {
+            return Err(ControlPlaneError::SteerChannelRetired {
+                path: path.to_string(),
+                entry: entry.to_string(),
+            });
+        }
+        // Above the short-circuit for the third time, and for the third time on
+        // the same argument. A note made of whitespace is the one value that is
+        // worse than no note: it renders as a bare `[roundhouse-guidance]` in
+        // the middle of the agent's own request — roundhouse telling a model
+        // that something is wrong and refusing to say what — and the project
+        // that wrote it believes it configured a narration. `non_empty` in the
+        // session fold refuses an empty *correction* for the same reason; this
+        // is that rule applied one layer earlier, where an operator can still
+        // fix it.
+        if self
+            .handoff_note
+            .as_ref()
+            .is_some_and(|note| note.trim().is_empty())
+        {
+            return Err(ControlPlaneError::HandoffNoteEmpty {
+                path: path.to_string(),
+                entry: entry.to_string(),
+            });
+        }
         if !self.enabled {
             return Ok(None);
         }
@@ -162,6 +208,7 @@ impl ValidateConfig {
                 steer_after_interventions: self.steer_after_interventions,
             },
             placebo_rate: self.placebo_rate,
+            handoff_note: self.handoff_note.clone(),
         }))
     }
 }
@@ -169,6 +216,7 @@ impl ValidateConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use roundhouse_core::validate::{EXAMPLE_HANDOFF_NOTE, HANDOFF_MARKER};
 
     fn parse(json: serde_json::Value) -> Result<Option<ValidationTerms>, ControlPlaneError> {
         let config: ValidateConfig =
@@ -191,6 +239,54 @@ mod tests {
         // The control: the identical object with `enabled` absent resolves to
         // nothing at all, which is what stamps no arm and enrols no session.
         assert_eq!(parse(serde_json::json!({})).expect("valid"), None);
+    }
+
+    /// **T2.** `tool_call` is refused by name, never remapped.
+    ///
+    /// The remap is the tempting fix and it is the wrong one: a deployment that
+    /// wrote `tool_call` chose the protocol-heavy path deliberately, and serving
+    /// it text while its config file still says otherwise leaves it believing
+    /// something false about its own installation. The refusal has to cite the
+    /// plan, because "unknown value" reads like a typo and names nothing an
+    /// operator can go and read.
+    #[test]
+    fn a_retired_tool_call_channel_is_refused_by_name_and_never_remapped() {
+        let error = parse(serde_json::json!({
+            "enabled": true,
+            "channel": "tool_call",
+        }))
+        .expect_err("a retired channel must not load as something else");
+        let message = error.to_string();
+        assert!(
+            message.contains("project `acme`"),
+            "the refusal names the entry an operator would go and fix: {message}"
+        );
+        assert!(
+            message.contains("tool_call"),
+            "and names the value that is retired, not just the field: {message}"
+        );
+        assert!(
+            message.contains("PLAN-frontier-selection.md"),
+            "and cites the ruling, so the answer to `why` is one file away: \
+             {message}"
+        );
+
+        // Refused with the loop *off* too, on the share table's own argument:
+        // the day `enabled` flips is the worst moment to discover the channel
+        // stopped existing.
+        assert!(parse(serde_json::json!({ "enabled": false, "channel": "tool_call" })).is_err());
+
+        // The controls: the two spellings that mean what `tool_call` was chosen
+        // for now load, and they load to the same thing.
+        for channel in ["auto", "text"] {
+            let terms = parse(serde_json::json!({ "enabled": true, "channel": channel }))
+                .unwrap_or_else(|error| panic!("`{channel}` must load: {error}"))
+                .expect("an enabled project resolves to terms");
+            assert!(matches!(
+                terms.action.channel,
+                SteerChannel::Auto | SteerChannel::Text
+            ));
+        }
     }
 
     #[test]
@@ -242,6 +338,63 @@ mod tests {
             }))
             .is_ok()
         );
+    }
+
+    /// **R2/T6.** The handoff note is off unless a project writes one, and a
+    /// note that says nothing is refused rather than shipped.
+    ///
+    /// Three states, and the middle one is the whole reason this has its own
+    /// test: absent means "do not narrate", a written note means "narrate with
+    /// these words", and `""` means a project that meant to narrate and would
+    /// ship a bare `[roundhouse-guidance]` marker into an agent's own request.
+    /// Treating the third as the first is the tempting repair and it is the
+    /// wrong one — it leaves the deployment believing it configured something.
+    #[test]
+    fn a_handoff_note_is_absent_by_default_and_never_configured_empty() {
+        // Absent: R2's shipped posture, and the state most deployments are in.
+        let quiet = parse(serde_json::json!({ "enabled": true }))
+            .expect("valid")
+            .expect("an enabled project resolves to terms");
+        assert_eq!(
+            quiet.handoff_note, None,
+            "a project that said nothing about narration narrates nothing"
+        );
+
+        // Written: carried through verbatim, marker *not* included — roundhouse
+        // prepends it, so an operator cannot ship an unattributable note.
+        let narrating = parse(serde_json::json!({
+            "enabled": true,
+            "handoff_note": EXAMPLE_HANDOFF_NOTE,
+        }))
+        .expect("valid")
+        .expect("an enabled project resolves to terms");
+        assert_eq!(
+            narrating.handoff_note.as_deref(),
+            Some(EXAMPLE_HANDOFF_NOTE)
+        );
+        assert!(
+            !EXAMPLE_HANDOFF_NOTE.contains(HANDOFF_MARKER),
+            "the example a deployment copies must not carry the marker, or a \
+             decorated request would say it twice"
+        );
+
+        // Empty, in both spellings a config file can produce it.
+        for empty in ["", "   \n "] {
+            let error = parse(serde_json::json!({ "enabled": true, "handoff_note": empty }))
+                .expect_err("a note with nothing in it must not load");
+            let message = error.to_string();
+            assert!(
+                message.contains("project `acme`"),
+                "the refusal names the entry an operator would go and fix: {message}"
+            );
+            assert!(
+                message.contains("handoff_note"),
+                "and the key, since a project may have several strings: {message}"
+            );
+        }
+
+        // Refused with the loop off too, on the share table's own argument.
+        assert!(parse(serde_json::json!({ "enabled": false, "handoff_note": "" })).is_err());
     }
 
     #[test]

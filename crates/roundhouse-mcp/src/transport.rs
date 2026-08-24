@@ -340,11 +340,10 @@ mod tests {
         // MCP's own distinction, and the one that matters mid-turn: a protocol
         // error is rendered opaquely by a client -- "tool result missing" --
         // while a tool error's content reaches the model, which is the only
-        // form in which "no steer by that id" is useful.
+        // form in which "roundhouse has not corrected this conversation" is
+        // useful.
         let refused = into_result(ToolOutcome::refused(
-            &crate::surface::SurfaceError::UnknownSteer {
-                steer_id: "fc_nope".into(),
-            },
+            &crate::surface::SurfaceError::NoGuidanceYet("acme/ada/main".into()),
         ));
         assert_eq!(refused.is_error, Some(true));
         assert_eq!(refused.content.len(), 1);

@@ -468,8 +468,14 @@ async fn main() -> anyhow::Result<()> {
 /// agree only until a client edited its own history. [`ControlStore`] is the
 /// node's control-plane state, and the engine and the control surface hold
 /// opposite ends of it: the surface writes an agent's overlay and the engine
-/// spends it at the start of the next turn, the engine deposits a steer's
-/// payload and the surface serves it to `fetch_steer`.
+/// spends it at the start of the next turn.
+///
+/// **The steer used to be the second half of that sentence and is not any
+/// more.** Until M10.0 the engine deposited a correction's payload here and the
+/// surface served it to `fetch_steer`; the correction is a conversation item now
+/// (`PLAN-frontier-selection.md` R1), so it lives in the session log with
+/// everything else and this store holds only overlays, intents, bindings and the
+/// advisory outcome an agent reports.
 #[allow(clippy::too_many_arguments)]
 async fn serve<S: SessionStore>(
     store: Arc<S>,
