@@ -319,3 +319,56 @@ needed while OpenRouter's `/responses` is GA; compile-forced when it is);
 runtime attach/rotate of external keys via the admin plane; consulting
 `switchyard-server` at runtime; acting on codex's `_meta.threadId`; the P0
 proxy mode itself (D1 rules on it first).
+
+## Addendum (2026-08-24): three directives at build start
+
+Recorded as M10.0–M10.2 implementation began. Where this addendum and the
+rulings above disagree, the addendum wins.
+
+**The benchmark's success criterion is impact-or-diagnosis.** M10.4 is not
+"run the harness"; it is designed — by the orchestrator, not delegated — to
+either show Switchyard-guided selection making a measurable difference or
+produce the evidence for *why it does not*. Concretely: A/B/A arms (direct
+sol; their server on their recipe unmodified; roundhouse on the ported
+constants), enough trials on the 20-task subset for a confidence interval
+before any full-set run, and — because their Rust server's own artifacts
+"provide no task or trial attribution" — per-task cost, per-turn tier
+decisions, and the declared-baseline counterfactual price from *our*
+dashboard, which is the attribution their harness lacks. A null result must
+decompose into one of: the scorer never fired (signal starvation — show the
+signal log), it fired and the tier change didn't move solve rate (show the
+paired tasks), or the operating point was mis-calibrated for the pair (show
+the quadrant analysis from their own recalibration protocol). "It didn't
+help and we can't say why" is the one outcome this design refuses.
+
+**Budgets: unlimited now, session-window fair use as architecture.** The
+benchmark projects run with no dollar ceiling — the `unenforced` basis the
+reconciliation view already reports honestly — and R9's cap language is
+relaxed accordingly (the reconciliation rung remains the leak detector).
+What replaces hard caps in the architecture is **fair-use windows** shaped
+like the frontier labs' own session limits: rolling 5-hour, 24-hour, and
+7-day windows, each optionally capping tokens and/or dollars per project
+and per member. Rulings, shaped by the M8 window hazard (a `balance()` read
+under the wrong `BudgetWindow` destroys committed spend, which is why
+`PATCH` of a window is refused): fair use is a **separate seam from
+budgets** — a `FairUse` config and its own rolling, time-bucketed draw
+ledger — never a new `BudgetWindow` variant and never a mutation of the
+grant ledger's window arithmetic. Enforcement is admission-time: a turn
+that would exceed a rolling cap is refused with a named
+`429 fair_use_exceeded` carrying the window and the earliest retry time —
+a refusal that is a log fact and stays retryable, like every other refusal
+here. The memory implementation lands with M10.1; the Redis implementation
+is deferred by name with its unlock condition (fair use across nodes is
+only true with shared buckets; until then the boot warning names
+single-node enforcement, the same honesty mechanism the directory store
+uses). Windows are checked cheapest-first (5h before 24h before 7d) and a
+member ceiling binds even when the project has room, mirroring the budget
+ladder's own rule.
+
+**R7 stands as ruled** (keys ride the existing three tiers; zero expected
+edits under the credential deny).
+
+One build-order note recorded for honesty: PR #10 (the ToolSignals port)
+was merged into the M9 branch after #6 had already squash-merged, so its
+content never reached `main`; the M10 implementation branch re-lands the
+approved commit by cherry-pick and its PR says so.
