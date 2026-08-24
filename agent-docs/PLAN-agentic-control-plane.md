@@ -1175,10 +1175,15 @@ narrowings, never membership state).
    verifiable without `codex-core`. M0 pins the serde shape; M9 is the only
    closure. Until then it is a documented assumption with citations, per the
    house rule about what a reading-confirmed claim is worth.
+   *[2026-08-21: closed by M9 against codex-cli 0.146.0 — see the M9
+   addendum. Verbatim for `arguments`; structural for the rest.]*
 2. **Steered-turn usage on the wire.** Reporting the judge's usage keeps
    totals honest but could interact with Codex's own context bookkeeping; the
    fallback (`Usage::default()` + dashboard-only line) is specified. Decide on
    M9 evidence.
+   *[2026-08-21: decided — neither. The wire reports the steered turn's
+   context contribution; the ledger keeps booking the judge. See the M9
+   addendum for the `last_token_usage` mechanism that ruled out both.]*
 3. **Monthly windows vs the lifetime fold.** Enforced on the ledger in v1;
    `measured_usd` cannot window until the fold gains event-time buckets
    (`fold.rs:83-90` names the constraint). The reconciliation view labels the
@@ -1446,3 +1451,169 @@ than a defect, and a single project-scoped ledger read is deferred by
 name (it needs a new `SpendLedger` method, coverage in that trait's
 contract suite, and the matching Redis-Lua change — real work, not a
 one-line hoist).
+
+## Addendum (2026-08-21): M9 rulings — the real binary, and what it disproved
+
+Recorded at M9 implementation time, after the thermo-nuclear review. Where
+this addendum and the sections above disagree, the addendum wins. The
+evidence it rests on is `research/codex-0.146.0-vs-pin-vigilance.md` (the
+binary diffed against the pin and the §3 ruling rev) and the gated suite
+`crates/roundhouse-server/tests/codex_e2e.rs`, which drives `codex-cli
+0.146.0` against a bound port. Every claim below that names a codex path
+names it at `e363b08`, the tree that binary was built from.
+
+**The ladder closes, and §10 open item 1 with it.** The three M9 tests in
+§9 are green against a real binary: codex executes our synthetic
+`fetch_steer` call over the real `/mcp` service (rmcp 3.1.3 server
+answering codex's rmcp 1.8.0 client, the one pairing no source reading
+could settle), appends the output, resends the call and its output, and
+the session does not fork. The `arguments` string comes back byte-for-byte
+— the capture carried Python's `", "` spacing through a real client, which
+no re-serialization preserves, so the M4 invariant at `wire.rs:298-312` is
+now a measured fact rather than a cited one. The resend is structural, not
+byte-identical: codex re-serializes in its own field order and drops any
+item `id` without an interior underscore (`core/src/client.rs:927-933`),
+which is why `fc_<response_id>` survives and why the suite asserts on
+parsed fields with `arguments` as the one byte-exact comparison. The
+documented-assumption block in `roundhouse-mcp/src/lib.rs` is retired into
+a verified block that restates both facts against `e363b08` and keeps the
+pin-era citations as history, the way §3's own history entry does.
+
+**The binary is older than the pin, and the §3 negative does not hold for
+it.** `codex --version` on the test box is 0.146.0 (`e363b08`, 2026-07-28);
+the Cargo pin is `6344a65` (2026-08-13) and §3's `requires_openai_auth`
+ruling was read from `3b45c29` (2026-08-19). Neither the binary nor the pin
+is an ancestor of the other. The guard §3 leans on — "leave the flag unset
+and codex attaches nothing" (`auth.rs:205-207` @ `3b45c29`) — **does not
+exist at either**: `resolve_provider_auth` at `e363b08` is
+`model-provider/src/auth.rs:179-196`, and it runs `env_key` /
+`experimental_bearer_token` first and then attaches whatever ambient
+`CodexAuth` sits in `CODEX_HOME`, flag or no flag. This settles the question
+§3's history entry left open: the guard post-dates `6344a65`. The original
+`6344a65`-era ruling was correct for the pin and for this binary; the
+2026-08-19 refutation is correct only for newer revisions. Two consequences
+are now rules: **never emit a `requires_openai_auth = false` stanza without
+`env_key`** — against this binary that is not "send nothing", it is "send
+whatever you are logged in as" — and the harness runs every child with a
+cleared environment and a credential-free `CODEX_HOME`, with a test on the
+built environment rather than on the wire, because the wire cannot see a
+credential that was available but never consulted.
+
+**The catalog pin belongs in both stanzas.** §3 put `model_catalog_json`
+only under the pass-through stanza on the reasoning that only that route
+fetches `GET {base_url}/models`. At `e363b08` the fetch is gated on the
+*ambient auth mode* in `CODEX_HOME` (`models-manager/src/manager.rs:413-417`,
+`models_endpoint.rs:67-72`), never on the flag, so a BYOK stanza on a box
+holding a ChatGPT `auth.json` fetches too. The generator emits the pin for
+both auth kinds; a pinned catalog also swaps in `StaticModelsManager`,
+which has no network path at all, and that is what makes the suite
+hermetic by construction. The catalog entry is written against `e363b08`'s
+`ModelInfo` (twelve required keys), pins `shell_type = "shell_command"`,
+an explicit `context_window`, and `supports_search_tool = false` — the
+last because `canonical_item` refuses `tool_search_call` and copying an
+upstream catalog entry would reopen that 422 path with no code change.
+
+**The reference config is a library function, not a fixture.**
+`roundhouse_server::codex_launch` is the Direct-topology config from the
+round-2 launch-surface ruling: one env var feeds both `env_key` and the
+`X-Roundhouse-Key` header (derived from `TURN_KEY_HEADER`, not retyped);
+`requires_openai_auth` is set by the route's auth kind, mirroring
+Switchyard's `caller_auth_kind`; the MCP stanza's table key is literally
+`roundhouse` because codex builds the namespace as `mcp__{key}` and the
+dialect emits `mcp__roundhouse`; the mount path and the API prefix are the
+router's own constants. The pass-through kind carries a precondition §3 did
+not state: a completed `codex login` in `CODEX_HOME`. Without it the flag
+changes nothing, the request arrives with no `Authorization` at all, and
+roundhouse degrades to local-only rather than refusing — the silent
+failure, now named in the stanza's own comment. The generator refuses the
+three input shapes whose output would be silently wrong (a relative catalog
+path, a base URL without the API prefix, a trailing slash). What it does
+not yet have is an operator entry point — no CLI subcommand or admin route
+produces it — and that is **deferred by name**: whether it is a `roundhouse`
+subcommand or an admin-API read beside key minting is a surface design
+question, not this milestone's.
+
+**Codex cancels an unannotated tool call, and the steer becomes a
+cancellation notice.** Under `codex exec`, `approval_policy` is forced to
+`never` (`exec/src/lib.rs:427`), and `requires_mcp_tool_approval` treats a
+tool with no MCP annotations as destructive and open-world
+(`core/src/mcp_tool_call.rs` @ `e363b08`), so the first real-binary steer
+was answered with `"user cancelled MCP tool call"` — and roundhouse's log
+recorded a fulfilled steer whose content the agent never saw. Three
+rulings. The generated MCP stanza carries
+`default_tools_approval_mode = "approve"` as the Direct topology's
+defense-in-depth; scoping it per tool to `fetch_steer` was proposed and
+refused, because under the forced `never` a writer tool with
+`read_only_hint: false` still needs the grant and the overlays would
+silently stop working. The real fix is truthful annotations on every
+descriptor — `read_only_hint` on the three reads, `destructive_hint` and
+`open_world_hint` false on all eight (overlays only narrow; the surface
+reaches nothing but roundhouse's own plane) — so a client we never handed a
+config to auto-runs the reads under its default mode. And the fold no
+longer marks a steer fulfilled on a cancellation or codex's synthesized
+`"aborted"` filler: the open steer closes (bookkeeping), the turn stays
+eligible for validation, and the existing intervention ladder bounds what
+follows.
+
+**Half of the default signals were dead against a real client.** Codex
+wraps every tool result — `Wall time: …\nOutput:\n…` for MCP, a
+`Chunk ID` / `Process exited` block for exec — before it becomes a
+`function_call_output`. `reads_as_failure` anchored on the first bytes
+could never match, and `NoProgressRepeat` hashed the jittering wall time,
+so neither `ToolFailureStreak` nor `NoProgressRepeat` could fire on a real
+transcript. The wrapper is stripped at one seam in `exchange.rs` before
+either signal reads an output; the stored item stays the client's verbatim
+bytes, because prefix admission depends on them. Non-codex outputs hash
+identically before and after, so existing logs fold the same.
+
+**§10 open item 2, decided on evidence.** The steered turn reported the
+judge's side-call usage verbatim — 1100/300/47 against a ~40 KB body — and
+codex folded it into its session total without complaint. That
+reassurance measured the wrong number. Codex's compaction gate and its
+`get_context_remaining` tool read `last_token_usage`, which is *replaced*
+on every response (`protocol/src/protocol.rs:2108-2111`,
+`core/src/context_manager/history.rs:297-314`,
+`core/src/session/context_window.rs:27-50`), so on the steered turn the
+client believed its live context was ~1147 tokens when the history it was
+about to resend was ~5700 — a five-fold under-report, one turn wide, on
+exactly the turn it has just been told to change approach.
+`Usage::default()` (the pre-specified fallback) is strictly worse: it
+collapses the same number to the trailing-items estimate. **Ruling: the
+wire and the ledger stop sharing one number.** On a steered turn
+`response.completed.usage` reports the turn's context contribution — the
+admitted request's input as the engine's tokenizer estimates it, and the
+emitted call's size as output — while the log books exactly what it booked
+before: the judge's usage on the turn record, the side call on its own
+model row, so the dashboard's pricing is unchanged. The evidence block the
+suite prints (`M9-USAGE-EVIDENCE`) now carries the ratio between the
+steered turn's reported input and the next request's real input so the
+gap is visible in the output rather than reconstructed from four blocks.
+
+**Other rulings, briefly.** A pass-through request whose `env_http_headers`
+codex dropped silently (unset or blank variable — `build_header_map` never
+errors, unlike `env_key`) arrives with only the seat's `Authorization`; it
+is now refused `missing_key` naming the dedicated header, not
+`malformed_key` naming a credential the operator never meant as a key.
+Codex sends `_meta.threadId` and the turn-metadata session id on every MCP
+`tools/call`; the surface still ignores it — the `init_session` trick stays
+the client-agnostic path and reading `_meta` is a codex-native shortcut
+deferred to a plan of its own. `canonical_item` refuses eight of the twelve
+item types a 0.146.0 client can resend; the suite exercises the only
+conversation shape in which none occurs, and the live test that names them
+is the tripwire for the day one does.
+
+**What the harness proves and what it does not.** Hermetic: loopback only,
+a static catalog, no login, a cleared environment. The `ForwardedOpenAiLogin`
+stanza is driven with a fake `auth.json` — enough to see the seat's bearer
+and our key ride one request — but no real ChatGPT login has been forwarded
+through this code. The `auto_compact_token_limit` is `null`, so the
+compaction path itself is never reached; the §10.2 ruling rests on the
+source and on the measured gap, not on an observed compaction. Revocation
+between runs is tested. `CODEX_HOME` lives under `target/` as a precaution,
+not a measured necessity: the temp-dir symlink refusal the dive predicted
+did not reproduce and cannot be observed by a harness that never dispatches
+a sandboxed shell command. And `codex --version` is printed and warned on,
+not asserted: a suite that silently passes against 0.146.0 and silently
+changes meaning against the next release is the failure CLAUDE.md's
+vigilance rule exists to prevent, and the Cargo pin stays at `6344a65`
+until its own diff-and-map pass.

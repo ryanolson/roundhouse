@@ -10,6 +10,8 @@ SPDX-License-Identifier: Apache-2.0
 > pinned trees; its verdicts and any corrections are appended. Per
 > `agent-docs/README.md`, this snapshot gains dated bracketed notes when the
 > world moves - never silent rewrites.
+>
+> *[2026-08-21: re-read for the M9 watching brief. **GAIE `main` has not moved at all** — `git diff --stat 84436a9 HEAD` is empty and `gh api .../commits` agrees; 84436a9 is still the tip three days on. Every `gaie:<path>:<line>` citation below therefore still resolves exactly. All movement is in `llm-d/llm-d-router`, pinned for this pass at `e051872097bae66089936ae6c24af2bec7f92be6` (2026-08-21 14:36 -0700), cited below as `lldr@e051872:<path>:<line>`. See the dated section at the end.]*
 
 ़# Kubernetes Gateway API Inference Extension — evidence document
 
@@ -125,6 +127,8 @@ Spec: `gaie:docs/proposals/004-endpoint-picker-protocol/README.md`, status ***Im
 
 **Timing.** The decision point is: if request headers arrive with `EndOfStream`, pick immediately; otherwise **defer the headers response and pick only when the body's `EndOfStream` arrives**. `gaie:pkg/lwepp/handlers/server.go:139-190`, `:200-206`, `headersDeferred` at `:113`/`:186`. This is the load-bearing latency fact of §6.
 
+*[2026-08-21: unchanged, and **the same is true of the real EPP**, which is what the brief asked. llm-d-router's streaming server accumulates every `RequestBody` chunk into a `bytes.Buffer` and does all of parsing, scheduling and header generation inside `if v.RequestBody.EndOfStream` (`lldr@e051872:pkg/epp/handlers/server.go:463-513`). Envoy's `FULL_DUPLEX_STREAMED` mode is mandatory there (`lldr@e051872:README.md:47-50`) but it is a *transport* mode: the decision point is still body end-of-stream. No partial-body or headers-only routing path exists. One difference from LWEPP: **the ext-proc body path has no size cap.** The 10 MB `ResourceExhausted` guard is LWEPP-only; a repo-wide search of llm-d-router finds exactly one `max_request_body_size` and it belongs to the *disaggregation coordinator's* plain HTTP server (default 64 MB, `lldr@e051872:pkg/coordinator/config/config.go:40`, enforced by `io.LimitReader` at `pkg/coordinator/server/handlers.go:48-53`) — a different process on a different path. `errcommon.ResourceExhausted` exists in llm-d-router but is the no-endpoint/capacity code (`lldr@e051872:pkg/epp/scheduling/scheduler_profile.go:134`), not a body-size guard. The EPP's buffer is bounded only by Envoy's own limits and, once flow control queues the request, by the per-band `maxBytes` (default 1G, `lldr@e051872:docs/operations.md:22-32`).]*
+
 ### 2.3 Picker → data plane (what it returns)
 
 The EPP **MUST** communicate the chosen endpoint **both** ways, with **identical values**:
@@ -156,12 +160,16 @@ Header vocabulary the protocol reserves (`gaie:pkg/lwepp/metadata/consts.go:20-3
 
 Note that three of these name features **removed from this repo**; they survive as reserved constants in the LWEPP metadata package.
 
+*[2026-08-21: **five of these seven names were renamed in llm-d-router and the two repos now disagree.** `lldr@e051872:pkg/epp/metadata/consts.go:37-56` carries `x-llm-d-inference-fairness-id`, `x-llm-d-inference-objective`, `x-llm-d-model-name-rewrite`, `x-llm-d-slo-ttft-ms`, `x-llm-d-slo-tpot-ms` as the current spellings, with each old `x-gateway-*`/`x-slo-*` name demoted to a deprecated alias in a `headerAliases` map (`:71-77`) read through `GetLowerCaseHeaderValue` (`:88-101`). The rename landed at `81d7f46054dc83dbd202a0b53e8f264e522dd840` (2026-05-20, llm-d-router PR #1161), whose message states the rule exactly: "Use x-llm-d-prefixed names for llm-d-managed EPP headers while preserving old names as aliases. Keep GAIE endpoint picker protocol headers on their x-gateway-destination-* names." So the split is principled — the three `x-gateway-destination-*` protocol headers keep their names in both repos; everything the EPP itself owns moved to `x-llm-d-`. GAIE's own LWEPP constants were never updated (they still read `x-gateway-inference-fairness-id` at `gaie:pkg/lwepp/metadata/consts.go:33-38`), and the historical tree this table was built from also predates the rename (`gaie@a70292c^:pkg/epp/metadata/consts.go` has the old names only) — the table was right about the tree it read and wrong about the live vocabulary. llm-d-router also adds `x-gateway-destination-endpoint-scores` (`:31-34`, emitted only under `--emit-endpoint-scores`), `x-llm-d-request-dropped-reason` (`lldr@e051872:pkg/common/error/error.go:30`), and three video-shape headers (`:57-62`). Consequence for S-A and open question 3 below.]*
+
 ### 2.5 Latency envelope
 
 - **Design goal:** "The scheduler should be reasonably fast — decide request mapping to endpoints within **O(10 ms)** on average." `gaie:docs/proposals/006-scheduler/README.md:33`. Explicitly scoped to the scheduler subsystem, "not the EPP as a whole" (`:75-77`).
 - **Measured:** with `inference-perf` against Qwen3-32B on vLLM, a staged ramp **1→5000 QPS**, shared-prefix workload, streaming completions: "**p90 scheduler latency remained within 100 ms** across all stages." `gaie@a70292c^:site-src/guides/epp-configuration/resource-tuning.md:22-34`.
 - **Resource envelope for that:** EPP container requests **4 CPU cores / 8 GiB**, memory limit 16 GiB, no CPU limit. `ibid.:7-16`.
 - **Not measured anywhere in-tree:** the ext-proc round-trip itself, or the body-buffering delay. LWEPP does no scheduling work at all (round-robin, `gaie:pkg/lwepp/handlers/server.go:79-100`), so it cannot serve as a latency reference.
+
+*[2026-08-21: **this gap is now filled upstream, at exactly roundhouse's workload shape, and the numbers are worse than this section guessed.** `lldr@e051872:docs/operations.md` is an EPP container-sizing guide built from benchmarks described as "agentic" and run at 100k input / 1k output tokens. Its rule of thumb: allocate **0.5 to 1.0 CPU cores per request/second** for large agentic workloads (`:14`); measured peaks at 50 req/s of 100k/1k are **17.5-20.3 cores and 3.7-5.2 GiB** (`:82-83`); the co-located Envoy alone wants 8 cores at 100 req/s of the same shape (`:102`); idle EPP CPU reaches ~7.5 cores at 100 model-server pods purely from metric scraping (`:17`). Meanwhile the *scheduler* P50 stays at 0.1-0.2 ms (`:67-70`) — i.e. upstream's own data confirms the decision is nearly free and the cost is buffering, parsing and prefix-hashing the body. That is R2's thesis, now measured by the people who ship the thing.]*
 
 ### 2.6 One tell about how thin LWEPP is
 
@@ -264,6 +272,8 @@ One axis, filled in two ways (`rh:crates/roundhouse-core/src/routing/mod.rs:4-22
 | Admission | flow control: priority bands, fairness, TTL, displacement | `queue_admission` | budget grant/settle, degrade-to-local, overflow valve |
 | Decision unit | one HTTP request | one request | **one turn of one session** |
 
+*[2026-08-21: the **Load** row understates the GAIE/llm-d side and should be read as describing the `utilization` saturation detector only. Both trees also carry an `inflight-load-producer` that **books** load at dispatch and releases it on the response — `PreRequest` increments, `StartOfStream` releases the prefill portion, `EndOfStream` releases the rest (`lldr@e051872:pkg/epp/framework/plugins/requestcontrol/dataproducer/inflightload/README.md:13-17`; the same three hooks are already present at `gaie@a70292c^:.../inflightload/producer.go:50,101,122-152`, so this was true at the pin and the dive cited only `token_estimator.go` from that directory) — and a `concurrency-detector` saturation detector that computes `PoolSaturation = Aggregate Inflight Load / Aggregate Pool Capacity` from those booked counters with no scrape lag at all (`lldr@e051872:pkg/epp/framework/plugins/flowcontrol/saturationdetector/concurrency/README.md:11-27`; present at `gaie@a70292c^` too). Two qualifications keep the row's conclusion intact: the default profile still runs only the four scraped scorers (`lldr@e051872:test/integration/epp/testdata/default-config.yaml:4-15`, byte-identical in substance to the historical one), so booking is opt-in; and what is booked is an *estimate* (`inputTokens = bytes/4`, output `×1.5`), not Dynamo's measured reservation. New since the pin: the producer now discounts the cached prefix, adding only the **uncached** portion of the prompt to the in-flight counter via `PrefixCacheMatchInfo` (`.../inflightload/README.md:13`) — which is `effective_prefill_tokens` arrived at independently, from an approximate index instead of KV events.]*
+
 ### 3.5 Three schedulers stacked: which decision belongs where, and where they fight
 
 The honest layering, by what each layer *uniquely* knows:
@@ -287,12 +297,16 @@ Five places two owners hold the same signal:
 
 **Finding: nothing in the extension, at this pin or before it, understands a conversation, a session, or a stateful API.** The evidence is uniformly negative and worth stating precisely, because it is the fact that decides the topology.
 
+*[2026-08-21: **still true of GAIE, no longer true of llm-d-router, and the counter-example names our exact clients.** `lldr@e051872:pkg/epp/framework/plugins/requestcontrol/requestheader/agentidentity/agent_identity.go:42-62` defines an `agent-identity` plugin whose built-in priority list is `x-claude-code-session-id` (Claude Code), `x-session-affinity` (OpenCode), `session-id` (Codex ≥ 0.131.0) and `session_id` (Codex 0.130.x legacy); the Director copies the resolved value into `FairnessID` when no explicit fairness header is set (`lldr@e051872:pkg/epp/requestcontrol/director.go:290-292`), "so every turn of an agent session lands in the same flow-control fairness queue" (`.../agentidentity/README.md:6`). It landed at `f3ae7503` (2026-07-16, PR #1754) — a month after the June split, which is why reading GAIE at either revision could not have found it. Its README even documents the Claude-Code-via-LiteLLM and Codex client setups, and records the same `previous_response_id` trap roundhouse's prefix admission solves: keying on it "references the prior turn's response, not the chain root, so keying on it would shard one conversation across many queues" (`.../agentidentity/README.md`, Limitations). **The topology conclusion below is unaffected** — this is a fairness-queue label, not a session log, a lease, or a prefix-admission mechanism, and items 5 and 6 of this section (per-request ext-proc stream; an InferencePool cannot name a frontier model) are what actually decide the seam. But the premise "nothing understands a session" has moved, and the sentence should no longer be leaned on as the deciding fact. Note also the fact-checker's correction below: the "exactly four times" count in item 1 was already wrong (eight), and is left as written per the no-silent-rewrite rule.]*
+
 1. **In the pinned tree**, the string "session" occurs exactly four times outside a Slack-channel sentence: three of them inside the prefix-cache proposal *arguing against* session affinity, and one in a unit-test `Cookie: session=abc` header fixture. `gaie:docs/proposals/0602-.../README.md:39,41,51`; `gaie:pkg/lwepp/handlers/request_test.go:261`.
 2. **The proposal explicitly considered and rejected session affinity** as a design option — cons: "Limited use case; Does not exploit prefix cache between different clients; Using client IP isn't always reliable". `0602:39-52`. The chosen approach is prefix affinity precisely *because* it "doesn't require any client integration" (`0602:86-88`).
 3. **The historical EPP does parse `/v1/responses` and `/v1/conversations`** — `ResponsesRequest{Input, Instructions, Tools, CacheSalt}` and `ConversationsRequest{Items, Metadata, CacheSalt}` (`gaie@a70292c^:pkg/epp/framework/interface/requesthandling/types.go:326-353`) — **but there is no `previous_response_id`, no `store`, no conversation id, and no state anywhere.** Verified by grep across the whole historical package. Those types exist for exactly one purpose: `getUserInputBytes` marshals them so the prefix hasher has bytes to chunk (`.../approximateprefix/hashing.go:105-131`).
 4. **The one acknowledgement of the problem is an open question, in a Draft proposal:** "OpenAI API continues to evolve and most recently they added the 'responses api' which has some stateful logic… The design will be extended also to cover the OpenAI Responses API. For example the `PluginsChain` might be extended to provide common utilities to either help with state caching or letting plugins handle that completely." `gaie:docs/proposals/1964-pluggable-bbr-framework/README.md:138`. That is BBR (now in a third repo), status *Draft*, phrased as a future maybe.
 5. **The protocol is structurally per-request**: one ext-proc stream per HTTP request, `RequestContext` created fresh at the top of `Process` and discarded at stream end (`gaie:pkg/lwepp/handlers/server.go:57-63`, `:110`). Anything session-shaped would have to live in plugin-struct state keyed by something the picker invents.
 6. **An InferencePool cannot name a frontier model.** `spec.selector` selects **Pods, in the same namespace, by labels only** (`gaie:api/v1/inferencepool_types.go:64-70`), and endpoints are `podIP:portNumber` (`:72-78`). There is no ExternalName escape hatch — the EPP ref explicitly forbids `ExternalName` Services (`:140-146`). So the "co-optimize local and frontier" half of the product is **unrepresentable** in this resource model.
+
+*[2026-08-21: still exactly true of `InferencePool`, but Gateway API proper is now growing a resource that *can* name an external destination: **GEP-4894 "Backend Resource"** (status Experimental, sponsored by Agentgateway, Istio and Airlock, incubated by the new `kubernetes-sigs/wg-ai-gateway` working group) proposes a namespace-scoped `Backend` that either decorates a Service via `EndpointSelector` or "represents external destinations via `ExternalHostname`, replacing the need for insecure synthetic `ExternalName` Services" (`kubernetes-sigs/gateway-api:geps/gep-4894/index.md`, TLDR). That is the first Gateway-API-native way to write down "api.anthropic.com" as a routable backend, and the GEP explicitly lists `InferencePool` alongside `Service` and `Backend` as resource types wanting consistent configuration (`:443`). It changes nothing today — Experimental, no CRD in `kubernetes-sigs/gateway-api:apis/` (verified: only `v1`, `v1alpha2`, `v1alpha3`, `v1beta1`), and naming a frontier endpoint is not the same as pricing, budgeting or authenticating a turn against it — but it removes "the resource model cannot express it" as a permanent structural argument, which is how R8 uses it.]*
 
 **Consequence for the seam.** Roundhouse sits **in front**, not behind:
 
@@ -309,11 +323,15 @@ Five places two owners hold the same signal:
 **S-A. The SLO header vocabulary — the cheapest real win, and it is k8s-independent.**
 `x-slo-ttft-ms` / `x-slo-tpot-ms` are per-request client-supplied latency objectives (`gaie@a70292c^:site-src/guides/latency-based-predictor.md:43-44`), consumed by a headroom-tier filter, a latency scorer, and an EDF-deadline ordering policy. Roundhouse's own routing module names this exact gap in its own words: "`RoutingContext` carries no demand-side signal — no stakes, no verifiability… The cheapest honest next step is a **client-supplied per-turn quality floor**" (`rh:crates/roundhouse-core/src/routing/policy.rs:47-54`). Adopting an established header spelling instead of inventing one costs nothing and buys interop with any gateway already setting them. Same for `x-gateway-inference-fairness-id` as a tenancy identity on the wire.
 
+*[2026-08-21: **the spellings recommended here are the deprecated ones.** Per the §2.4 note, llm-d-router's current names are `x-llm-d-slo-ttft-ms`, `x-llm-d-slo-tpot-ms`, `x-llm-d-inference-fairness-id`; the four names this item lists survive only as aliases. Nothing has shipped in roundhouse yet (a grep for `x-slo`, `fairness-id` and `x-gateway-inference` over every `.rs` in the tree returns nothing), so the correction is free — but the recommendation must become *read the alias set, emit the current name*, mirroring `HeaderNames` at `lldr@e051872:pkg/epp/metadata/consts.go:79-86`, not "adopt `x-slo-ttft-ms`". Second, cheaper adoption target discovered in the same pass: the agent session headers at `lldr@e051872:.../agentidentity/agent_identity.go:44-50`. Upstream's claim that Codex emits one was **re-derived against our own codex revs rather than taken from their README**: `codex-rs/codex-api/src/requests/headers.rs:5-14` builds `session-id` and `thread-id`, and `codex-rs/codex-api/src/endpoint/responses.rs:87-91` attaches them (plus `x-client-request-id` = the thread id) to every `/v1/responses` stream request — **byte-identical at `e363b08` (the codex 0.146.0 binary on this box) and at `6344a65` (our Cargo pin)**, so the hyphenated form is what M9's real binary sends. Note upstream's plugin knows only `session-id`; `thread-id` is a second, coarser identity nobody downstream is reading yet. This is a session identity roundhouse can read at its own edge with no client change at all — the same transparent-hook-up property M9 exists to prove.]*
+
 **S-B. The Model Server Protocol (003) as roundhouse's metrics contract for *non-Dynamo* local fleets.**
 Roundhouse today has exactly one local backend shape: an embedded Dynamo `SelectionService` with a hand-fed worker catalog (`WorkerRegistration`, `rh:crates/roundhouse-fleet/src/local.rs:232-297`). If a deployment has a plain vLLM/SGLang/TRT-LLM pool with no Dynamo, roundhouse has nothing. `003`'s four gauges plus the per-server name mapping is a ready-made, multi-vendor contract for producing `Candidate{expected_prefill_tokens?, load, expected_ttft_ms}` from a bare pool. Note this would be a *second, worse* candidate source, not a replacement — it gives queue depth and kv%, not block-level overlap.
 
 **S-C. `InferencePool` as worker *discovery*, not as a scheduler.**
 This is the most concrete k8s item. Roundhouse's worker catalog is hand-fed: model name, routing group, endpoint, block size, and a per-DP-rank ZMQ map (`rh:crates/roundhouse-fleet/src/local.rs:232-249`). An InferencePool is exactly a label selector over pods + a port list, and the extension's own `activePortsAnnotation` (`inference.networking.k8s.io/active-ports`) plus the `pod-rank-idx` endpoint naming (`gaie:pkg/lwepp/datastore/datastore.go:56-66`, `:327-335`) is a solved answer to "which DP ranks on this pod are live". Adopting the *selector semantics* (or watching the CRD) gives roundhouse pod discovery with no scheduler entanglement.
+
+*[2026-08-21: upstream has since made this seam explicitly pluggable and shipped a non-Kubernetes implementation of it: an `EndpointDiscovery`/`DiscoveryNotifier` plugin interface where, when a discovery plugin is configured, "the EPP **does not** require an `InferencePool` CRD or any K8s RBAC", plus a `file-discovery` plugin reading a live-reloaded `endpoints.yaml` for "bare metal inference clusters, Slurm jobs, or local development" (`lldr@e051872:docs/discovery.md:29-45`). Two consequences: the InferencePool CRD is no longer even the EPP's own only discovery source, which weakens the case for roundhouse depending on it; and the interface shape (upsert/delete notifications behind a plugin, file-backed first, CRD-backed second) is a better model for roundhouse's hand-fed `WorkerRegistration` catalog than the CRD watch itself.]*
 
 **S-D. Flow-control vocabulary vs M3.** These are complementary, not duplicated, and the synthesis should say so explicitly:
 
@@ -342,6 +360,8 @@ Buildable: implement `envoy.service.ext_proc.v3.ExternalProcessor`, read the sub
 
 **S-H. What roundhouse actually has that the ecosystem lacks — and where to send it.**
 The select/reserve split. GAIE's scheduler design says the chosen endpoint "is **assumed** to be running that request until the EPP observes the termination… The scheduler must integrate the impact of assumed load with informer state, especially when traffic spikes" (`gaie:docs/proposals/006-scheduler/README.md:145-149`) — an explicit acknowledgement of the thundering-herd hole its own saturation detector then documents as unfixable in a reactive design. Roundhouse's mandatory `select → reserve → prefill_complete → release` lifecycle, with a loud drop-guard (`rh:crates/roundhouse-fleet/src/local.rs:174-210`), is the closed-loop version of that. **But the contribution target for this is `llm-d/llm-d-router`, not `kubernetes-sigs/gateway-api-inference-extension`** — this repo has no scheduler to contribute to.
+
+*[2026-08-21: **the target has largely closed this itself, and the contribution as framed is no longer available.** The `inflight-load-producer` books at `PreRequest` and releases at `StartOfStream`/`EndOfStream` — a select/reserve/prefill-complete/release lifecycle in different words — the `concurrency-detector` derives saturation from those booked counters rather than a scrape, and the producer now discounts the cached prefix so only uncached tokens are booked (all cited in the §3.4 note above). Upstream has also gone past this dive in adjacent places: a `CrossReplicaSyncer` for EPP state (`81aa2528`, 2026-08-03), an underflow guard for counters when an endpoint flaps (`caa32b77`), and a typed capacity-rejection path surfaced to the client as `x-llm-d-request-dropped-reason` (`645ba71e`, PR #2462, landed the day of this re-read; header at `lldr@e051872:pkg/common/error/error.go:30`). What remains genuinely ours is narrower and should be stated as such if it is ever offered: booking a *measured* overlap-adjusted number obtained from the serving engine's own KV events, rather than a `bytes/4 × 1.5` estimate discounted by an approximate character-hash index. That is a smaller, sharper claim than "the closed-loop version of assumed load", and it is a Dynamo-shaped contribution more than a roundhouse-shaped one.]*
 
 **S-I. Nothing else is contributable here.** The remaining surface of this repo is a CRD, a protocol doc, and conformance tests. Roundhouse implements none of them and does not need them.
 
@@ -380,9 +400,15 @@ Load-bearing constraints on that picture:
 
 **R1 — This repo's centre of gravity moved, and could move again.** In eight weeks the project deleted 90k lines, removed three alpha APIs, made a required field optional, and handed its scheduler and its community meeting to another org (`a70292c`, `88fd479`, `80e21c3 Make endpointPickerRef optional (#2898)`, `gaie:README.md:113-117`). The FAQ says the *remaining* pieces are also migrating — APIs and conformance into `kubernetes-sigs/gateway-api` proper (`gaie:site-src/faq.md:7-12`). **Betting on this repo's shape is betting on a target that has moved twice this year and has announced a third move.** The `v1` InferencePool CRD is the stable part; everything around it is not.
 
+*[2026-08-21: **the third move is announced and not executed, and the repo is now visibly quiet.** GAIE `main` took zero commits in the three days after the pin, and the three before it were dependabot bumps. The FAQ still describes the plan in the future tense — APIs and conformance to `kubernetes-sigs/gateway-api`, EPP to llm-d-router, BBR and the latency predictor to standalone llm-d repos (`gaie:site-src/faq.md:8-12`) — while the README says this repo "will remain the primary location for the development and maintenance of **conformance tests**" (`gaie:README.md:23`). Those two sentences contradict each other and neither has an execution date; treat the destination of the conformance suite as **unresolved**, not as settled either way. On the receiving side, `kubernetes-sigs/gateway-api:apis/` still has no inference group and no InferencePool types; `InferencePool` appears there only as prose inside GEP-4894 and GEP-1897. The energy has instead gone to a new venue, the `kubernetes-sigs/wg-ai-gateway` working group (created 2025-09-26), which is where GEP-4894 was incubated. Net: R1 is corroborated, and the watching brief should now watch three addresses, not one.]*
+
 **R2 — ext-proc in the hot path is architecturally hostile to the product.** The picker decides at body `EndOfStream` (`gaie:pkg/lwepp/handlers/server.go:200-206`), which means: (a) the *entire* prompt is buffered in the gateway before routing, (b) LWEPP caps that at 10 MB and hard-fails above it (`:103`, `:192-198`), (c) the body is re-parsed and re-hashed per request. For agentic coding — 100k+ token contexts, hundreds of turns, the *whole* conversation on every turn — this reintroduces exactly the cost roundhouse exists to remove, and at a layer roundhouse does not control. The measured envelope (p90 scheduler latency ≤ 100 ms at 4 CPU / 8 GiB, `gaie@a70292c^:.../resource-tuning.md:22-34`) is for the *scheduler only* and was measured on a 60+12-token shared-prefix workload — nothing like agentic context sizes. No in-tree number covers the ext-proc round trip or the buffering delay.
 
+*[2026-08-21: **R2 stands, and is now the best-evidenced risk in this document.** (a) The decision point is unchanged in the *real* EPP: llm-d-router buffers to `EndOfStream` before parsing or scheduling (§2.2 note). (b) `FULL_DUPLEX_STREAMED`, which llm-d-router requires, is a transport mode and does not move that point. (c) The 10 MB cap turns out to be LWEPP-only; llm-d-router's handler caps nothing, so the failure mode for a huge turn is memory, not a clean 413. (d) The missing agentic number now exists and is upstream's own: 0.5-1.0 CPU cores per request/second at 100k input tokens, ~20 cores and ~5 GiB at 50 req/s, with scheduler P50 at 0.1-0.2 ms (§2.5 note). The last figure is the important one — it says the ext-proc layer's cost for agentic contexts is *entirely* buffer-and-parse, which is precisely the cost roundhouse exists to remove. Nothing here softens the risk; the only correction is that the sentence "no in-tree number covers the buffering delay" is now out of date in the tree that matters.]*
+
 **R3 — Single active EPP per pool.** Readiness returns `NOT_SERVING` for non-leaders (`004:106-108`). Any throughput or availability argument must account for one live picker per InferencePool. (Roundhouse's own lease has the same shape at session granularity, which is a *narrower* unit and therefore a better one.)
+
+*[2026-08-21: **partially superseded.** The protocol text is unchanged (`gaie:docs/proposals/004-endpoint-picker-protocol/README.md:100-113` still says leader-only `SERVING`), but llm-d-router now documents an **Active-Active** mode with near-linear throughput scaling (1.0x/2.0x/2.7x/3.5x for 1-4 replicas, `lldr@e051872:docs/operations.md:37-49`) alongside Active-Passive, and since PR #1884 (2026-07-08) non-leader replicas keep their datastore populated so a request reaching a standby is routed instead of 503'd (`haPopulateNonLeaderDatastore`, on by default, `lldr@e051872:RELEASE-NOTES.md`). The catch is the one this document would predict: flow-control state and prefix state are **per replica and not shared**, so fairness and per-band capacity are enforced only within each replica's share, and "Active-Active mode should be avoided when using approximate prefix routing" because state partitioning "significantly degrades prefix cache hit rates" (`lldr@e051872:docs/operations.md:51-56`). So the single-active constraint has become a choice between one picker and a sharded cache model — R5's problem restated as a scaling knob, which strengthens rather than weakens the comparison drawn there.]*
 
 **R4 — Double-scheduling pathologies.** §3.5 lists five. The two that would bite first: the retry-invalidates-reservation hole (§3.5-4), and two disagreeing load models over one set of GPUs where one is knowingly 200 ms stale and treats staleness as full saturation (`.../utilization/README.md:44-50`, `.../detector.go:120-124`).
 
@@ -406,6 +432,8 @@ Load-bearing constraints on that picture:
 
 3. **Do we adopt the SLO/fairness header vocabulary now?** `x-slo-ttft-ms`, `x-slo-tpot-ms`, `x-gateway-inference-fairness-id`, `x-gateway-inference-objective`. This closes the demand-side gap roundhouse's own source names as its next honest step (`rh:crates/roundhouse-core/src/routing/policy.rs:47-54`), costs one header parser plus one `RoutingContext` field, and buys wire-compat with every conformant inference gateway. **Cheapest high-value item in the whole dive.** Decide independently of everything else here.
 
+*[2026-08-21: the question survives; the four header names in it do not. Read the §2.4 and S-A notes before implementing: emit `x-llm-d-slo-ttft-ms` / `x-llm-d-slo-tpot-ms` / `x-llm-d-inference-fairness-id`, accept the `x-slo-*` / `x-gateway-inference-*` forms as aliases, and leave the three `x-gateway-destination-*` protocol headers alone since both repos agree on those. Because nothing has been written in roundhouse yet, this costs a different string constant and not a migration — which is the whole return on re-reading before the code lands.]*
+
 4. **If k8s: does roundhouse watch `InferencePool` for worker discovery?** This is the one place the CRD earns its keep — replacing the hand-fed `WorkerRegistration` catalog with a label selector plus the `active-ports` annotation. It requires a controller-runtime-shaped watcher (Rust: `kube-rs`) and a decision about whether `endpointPickerRef` is left unset (legal since v1.5.0) or whether roundhouse writes status as a parent. Cost: a new dependency and a new failure mode. Benefit: real pod discovery, which roundhouse currently does not have.
 
 5. **Do we ever want a second local candidate source (bare vLLM/SGLang pools via the 003 metrics contract)?** It would make roundhouse useful in deployments with no Dynamo — but it introduces a second, weaker cache model and a second load model, i.e. voluntarily importing risk R5 and half of R4. Say yes or no deliberately.
@@ -413,6 +441,8 @@ Load-bearing constraints on that picture:
 6. **If roundhouse is ever fronted by a Gateway API gateway, what represents it?** Answer from evidence: a plain `Service`, never an `InferencePool` (§4, §5.3). But that leaves session affinity across roundhouse replicas unsolved by this extension — it must come from Gateway API session persistence or from the client honoring a returned session id. Worth a ruling before anyone writes a chart.
 
 7. **Is the `select/reserve` contribution worth making, and to whom?** It closes a hole GAIE's own scheduler proposal admits (`006:145-149`). But the target repo is `llm-d/llm-d-router` under a different org, and `SYNERGY-nemo-relay.md`'s S4 already sequences contributions after M7 proves the seams (`rh:SYNERGY-nemo-relay.md:229-232`). Decide whether a second contribution track exists at all.
+
+   *[2026-08-21: **answerable now, and the answer is mostly no.** Per the §3.4 and S-H notes, llm-d-router books in-flight load at dispatch, releases it at `StartOfStream`, derives saturation from those booked counters rather than a scrape, and discounts the cached prefix — the assumed-load hole this question was built on is closed upstream. What remains ours is the narrower claim that the booked number should be *measured* from the serving engine's KV events rather than estimated at `bytes/4 × 1.5` and discounted by an approximate character-hash index, and that claim is closer to a Dynamo contribution than a roundhouse one. The ruling in `../synergies/ecosystem-round-2.md` deferred this contribution anyway, so nothing operative changes; only its stated premise does.]*
 
 8. **Does the "Relay-CLI-fronts-roundhouse" topology ruling need a k8s sibling?** `SYNERGY-nemo-relay.md` §S3 rules two supported topologies (Direct; Chained via Relay) with explicit chain guards (`rh:SYNERGY-nemo-relay.md:200-228`). A gateway in front of roundhouse is structurally the *same* class of risk — a component that can route around us, change who pays, or re-encode history — and if k8s is ever in scope it needs the same four guards written down before it is called supported.
 
@@ -487,3 +517,85 @@ find for Dockerfile*/*.yaml/*.yml under /home/user/roundhouse (excluding target)
 ### Checker's confidence statement
 
 I re-derived 8 of the highest-leverage claims directly against the pinned trees (gateway-api-inference-extension @ 84436a9, its pre-deletion parent a70292c^, the pinned Dynamo checkout @ ac7b751, and the roundhouse working tree, including its uncommitted M6 review-fix diff). Seven of eight held up exactly, several down to precise line numbers and numeric defaults (the a70292c diffstat, the Dynamo cost-logit formula and its six default weights, the InferencePool CRD field semantics, the EPP readiness/leader-election health-check text, the LWEPP 10MB/EndOfStream mechanics, the unused PickResult fields, and the historical Responses/Conversations request shapes). One claim — the 'session' occurs exactly four times' count — is wrong by 2x on inspection, though it does not overturn the surrounding argument. I did not re-check the bulk of the document: the scheduler-plugin-framework interface sketch (§1.3), the flow-control/saturation-detector formulas and defaults (§1.4), the full prefix-cache hashing implementation (§3.1, hashing.go internals, LRU capacity arithmetic), the conformance report/gateway attrition table (§1.5), the roundhouse routing/policy/budget internals cited in §3.3 and §5.1/5.2 (ledger.rs, policy.rs, control/budget.rs, control/policy.rs — several of these files are among the ones with uncommitted changes, so their cited line numbers carry real risk of drift even if the substantive claims are right), the MCP tool-surface list, and every external GitHub URL/issue citation. Given the one miss I found was a simple undercounted grep rather than a fabrication or a reversed API fact, and every structural/mechanical claim I checked (CRD shapes, protocol wire behavior, dependency pins and formulas) checked out exactly, I'd treat the unchecked remainder as probably accurate in its mechanical particulars but not guaranteed — especially any specific line-number citation into a roundhouse file that shows as modified in git status, and any claim whose precision depends on an exhaustive negative search the way the session-count claim did.
+
+---
+
+## Re-read 2026-08-21 — the M9 watching brief
+
+Per the CLAUDE.md vigilance rule ("read what changed upstream before it
+lands"), this document's pin was re-read on 2026-08-21, three days before the
+SLO-header adoption item in `../synergies/ecosystem-round-2.md` would have been
+written into code. Fresh full clones under the M9 scratchpad; no roundhouse
+code was built or run.
+
+**Revisions.**
+
+| Tree | Pin this document was written against | State on 2026-08-21 |
+|---|---|---|
+| `kubernetes-sigs/gateway-api-inference-extension` | `84436a9` (2026-08-18) | `84436a9` — **identical**; `git diff --stat 84436a9 HEAD` empty, `gh api .../commits` agrees. Latest tag still `v1.6.0`. |
+| `llm-d/llm-d-router` | not pinned (referred to by name only) | `e051872097bae66089936ae6c24af2bec7f92be6` (2026-08-21 14:36 -0700); latest release `v0.10.0` (2026-08-17). Cited above as `lldr@e051872:`. |
+| `kubernetes-sigs/gateway-api` | not read | read via API only, for the migration question. |
+
+**Re-checked and unchanged** (all still resolving at `84436a9`, so §§1-2 and the
+Appendix table stand as written): the `InferencePool` v1 CRD fields, conditions
+and `EndpointPickerRefMissing` reason; the `InferencePoolImport` alpha API; the
+Endpoint Picker Protocol v1.0.0 spec including leader-only readiness; the LWEPP
+handlers, their 10 MB body cap and the defer-to-`EndOfStream` timing; the unused
+`PickResult` fields; the conformance suite and its reports; the zero
+NVIDIA/Dynamo/NeMo hits; the listed conformant gateways. `llm-d-router` still
+depends on `sigs.k8s.io/gateway-api-inference-extension v1.5.0`, one minor
+behind the released CRD (`lldr@e051872:go.mod:61`).
+
+**Claims that moved, each carrying a bracketed note above.**
+
+1. **§2.4 header vocabulary — the one with code consequences.** Five of the
+   seven reserved names were renamed to an `x-llm-d-` prefix in llm-d-router at
+   `81d7f460` (2026-05-20, PR #1161), old names kept as deprecated aliases; the
+   three `x-gateway-destination-*` protocol headers deliberately kept their
+   names. GAIE's LWEPP constants were never updated, so the two repos now
+   disagree.
+2. **§2.2 / §2.5 / R2 — ext-proc body buffering.** Unchanged in LWEPP and
+   unchanged in the real EPP: llm-d-router still decides at body `EndOfStream`,
+   `FULL_DUPLEX_STREAMED` notwithstanding, and has no body cap of its own. New:
+   an upstream container-sizing guide with measured numbers at 100k-token
+   agentic workloads.
+3. **§3.4 Load row / §5.2 S-H — booked vs scraped load.** Both trees carry a
+   booking `inflight-load-producer` and a booked-counter `concurrency-detector`;
+   the producer now discounts the cached prefix. The dive described only the
+   scraped `utilization` detector.
+4. **§4 session finding.** True of GAIE, false of llm-d-router since
+   `f3ae7503` (2026-07-16): an `agent-identity` plugin keying flow-control
+   fairness off `x-claude-code-session-id`, `x-session-affinity`, `session-id`
+   (Codex) and `session_id`. The topology conclusion is unaffected; the premise
+   is not.
+5. **§4.6 / R8 — "cannot name a frontier model".** Still true of
+   `InferencePool`; Gateway API's GEP-4894 `Backend` (Experimental) proposes
+   `ExternalHostname` for exactly that purpose.
+6. **§5.1 S-C — InferencePool as discovery.** Upstream made discovery a plugin
+   interface with a file-backed, Kubernetes-free implementation.
+7. **R1 — the third move.** Announced, not executed; no InferencePool types in
+   `kubernetes-sigs/gateway-api:apis/`. README and FAQ contradict each other on
+   where conformance ends up. A new venue, `kubernetes-sigs/wg-ai-gateway`,
+   now incubates the AI-gateway GEPs.
+8. **R3 — single active EPP.** Protocol text unchanged, but llm-d-router
+   documents Active-Active with near-linear scaling, at the cost of unshared
+   flow-control and prefix state.
+
+**Not re-derived on this pass**, and therefore inherited at their original
+confidence: the flow-control formula details in §1.4, the prefix-hashing
+arithmetic in §3.1, the Dynamo cost-logit numbers in §3.2, every `rh:` citation
+into roundhouse (line numbers there have moved through M7-M9), and the external
+GitHub issue URLs. The fact-checker's `### Corrections` entry above — the
+undercounted "session" grep — is left standing as written; it is not silently
+repaired here.
+
+**Verdict.** No decision in the round-2 ruling reverses. Watching brief: still
+a watching brief, now over three addresses instead of one. InferencePool as
+discovery: still deferred, and upstream's own move to pluggable discovery makes
+deferring cheaper to reverse. SLO headers adopted: still yes, but **at the
+current spellings** — the one operative correction, caught with zero lines of
+roundhouse code written against the stale names, because the ruling item that
+was to land with M7 did not. One further claim in the ruling is corrected at the
+premise level and not at the decision: its select/reserve sentence rests on an
+assumed-load hole upstream has since closed, which leaves the deferral intact
+and open question 7 above answered.

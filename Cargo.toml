@@ -79,6 +79,14 @@ serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2.0.17"
+# The client-launch config generator (`roundhouse-server/src/codex_launch.rs`)
+# emits a `config.toml` for Codex and parses it back in its own unit tests.
+# Already resolved in the tree at 0.8.23 (via the pinned Dynamo crates), so
+# naming it here adds a dependency edge rather than a crate. Hand-templated
+# emission with `toml` used only to *quote* free strings and to parse back:
+# serializing a struct would drop the operator-facing WHY comments, which are
+# the reason anyone reads a generated config at all.
+toml = "0.8.23"
 # Caret, resolving to 1.48.0 today: the pinned Dynamo rev's `dynamo-mocker`
 # pins tokio exactly, and an exact pin here would just restate that constraint
 # where nobody can see whose it is. When Dynamo relaxes, this floats.

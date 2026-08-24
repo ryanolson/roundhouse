@@ -650,19 +650,82 @@ async fn the_steered_turn_emits_exactly_four_frames_and_no_others() {
         "msg_1 is the assistant message's id and nothing else's"
     );
 
-    // The usage the interjection supplied, reported as this turn's — and
-    // balancing, which is what a client bills against.
+    // ---- what the completion reports, and what it is a measure of (F03) ----
+    //
+    // **Not the interjection's usage.** The judge's side call is what this turn
+    // *cost*, and the log books exactly that (asserted below). What the wire
+    // reports is what this turn contributed to the *client's context*, because
+    // that is the question codex asks of `response.completed.usage`: it folds
+    // the value into `last_token_usage`, replacing it, and that is what drives
+    // auto-compaction and `get_context_remaining`. Reporting the judge's number
+    // there told a real client its context had collapsed on the one turn before
+    // it resent the whole conversation — measured at 5.0x understated.
+    //
+    // Recomputed here from the stored items rather than re-using
+    // `Engine::admitted_input_tokens`, so the assertion is about the
+    // conversation and not about the function under test.
+    // [`ByteTokenizer`] is one token per byte, which is what makes the
+    // recomputation a `len()`.
+    let stored = stored_items(&rig.store, "sess-frames").await;
+    let (emitted_item, admitted) = stored
+        .split_last()
+        .expect("the emitted call is the last item this turn appended");
+    let admitted_tokens: u64 = admitted.iter().map(|item| item.render().len() as u64).sum();
+    let emitted_tokens = emitted_item.render().len() as u64;
+
     let usage = &frames[3].payload["response"]["usage"];
-    assert_eq!(usage["input_tokens"].as_u64(), Some(96));
-    assert_eq!(usage["output_tokens"].as_u64(), Some(24));
+    assert_eq!(
+        usage["input_tokens"].as_u64(),
+        Some(admitted_tokens),
+        "the steered turn reports the input this deployment admitted, which is \
+         what the client is holding and what the next turn resends"
+    );
+    assert_eq!(
+        usage["output_tokens"].as_u64(),
+        Some(emitted_tokens),
+        "and the item it emitted, in the prompt encoding the next turn will \
+         count that item under"
+    );
     assert_eq!(
         usage["total_tokens"].as_u64(),
-        Some(96 + 24),
+        Some(admitted_tokens + emitted_tokens),
         "totals must balance on a steered turn exactly as on a served one"
     );
     assert_eq!(
         usage["input_tokens_details"]["cached_tokens"].as_u64(),
-        Some(32)
+        Some(0),
+        "nothing was dispatched, so no provider's prefix cache served any of it"
+    );
+    // The line that would have to go red for the F03 split to be undone: the
+    // judge's usage is non-round on every axis precisely so that reporting it
+    // by accident is unmistakable.
+    let judge = steer_usage();
+    assert_ne!(
+        usage["input_tokens"].as_u64(),
+        Some(judge.input_tokens),
+        "the wire must not be reporting the interjection's usage again"
+    );
+
+    // ---- and the other half of the split: the log still books the judge -----
+    //
+    // Byte-identical to what it booked before the wire changed, which is what
+    // keeps the dashboard's total equal to the sum of its rows: a steered turn
+    // books no model row of its own and the side call books under the judge's.
+    let booked = rig
+        .store
+        .read_events(&SessionId::new("sess-frames"), 0, 1024)
+        .await
+        .expect("the session exists")
+        .into_iter()
+        .find_map(|event| match event.kind {
+            SessionEventKind::ResponseCompleted { usage, .. } => Some(usage),
+            _ => None,
+        })
+        .expect("the steered turn completed");
+    assert_eq!(
+        booked, judge,
+        "the ledger's number is the interjection's and did not move; only the \
+         wire's did"
     );
 }
 
@@ -984,6 +1047,31 @@ async fn a_halted_turn_carries_its_guidance_as_the_answer() {
     // The text itself, which is the whole point.
     let done = &frames[2].payload["item"]["content"][0]["text"];
     assert_eq!(done, HALT_GUIDANCE);
+
+    // The same F03 split the steered turn gets, and for the same reason: a halt
+    // is answered at the seam too, so its completion would otherwise report the
+    // judge's usage as the client's context contribution. That a halt ends the
+    // agent's loop makes the wrong number less consequential, not more correct
+    // — and without this the halt branch of the substitution is a code path no
+    // test reaches.
+    let stored = stored_items(&halting.store, "sess-halted").await;
+    let (guidance, admitted) = stored
+        .split_last()
+        .expect("the guidance is the last item this turn appended");
+    let usage = &frames[3].payload["response"]["usage"];
+    assert_eq!(
+        usage["input_tokens"].as_u64(),
+        Some(admitted.iter().map(|item| item.render().len() as u64).sum()),
+    );
+    assert_eq!(
+        usage["output_tokens"].as_u64(),
+        Some(guidance.render().len() as u64),
+    );
+    assert_ne!(
+        usage["input_tokens"].as_u64(),
+        Some(steer_usage().input_tokens),
+        "the wire must not be reporting the interjection's usage on a halt either"
+    );
 
     // And Codex's own parser sees a message it will surface, rather than the
     // `Other` an unrecognized shape silently becomes. A fresh rig, because the

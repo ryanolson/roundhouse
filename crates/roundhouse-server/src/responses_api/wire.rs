@@ -591,6 +591,68 @@ mod tests {
         );
     }
 
+    /// A namespace folded into `name` is part of the name, and canonicalization
+    /// does not split it back apart (F10).
+    ///
+    /// The corrected half of `dialect.rs`'s "why that direction" argument. That
+    /// module's earlier draft justified keeping the namespace out of the log by
+    /// claiming a namespaced resend and a flat resend already arrive as one
+    /// canonical item, because `canonical_item` ignores `namespace` and `id` on
+    /// the way in. It ignores a *separate* `namespace` field — which is what
+    /// makes `CodexResponses`'s own resend round-trip, asserted directly above
+    /// — and nothing more. No dialect emits the flat spelling today, so nothing
+    /// is broken; what was wrong was the reason, and a reason that does not hold
+    /// is what gets a future change waved through.
+    ///
+    /// Pinned as the divergence rather than deleted with the prose, because the
+    /// day a flat variant lands this is the assertion that has to be revisited
+    /// deliberately: making it pass means teaching `canonical_item` to split a
+    /// flat name apart, and that is a wire-layer change no dialect variant makes
+    /// the compiler ask for.
+    #[test]
+    fn a_flat_spelling_is_a_different_canonical_call_until_the_wire_learns_to_split_it() {
+        let namespaced = json!({
+            "type": "function_call",
+            "call_id": "call_1",
+            "namespace": "mcp__roundhouse",
+            "name": "fetch_steer",
+            "arguments": "{}",
+        });
+        let flat = json!({
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "mcp__roundhouse__fetch_steer",
+            "arguments": "{}",
+        });
+
+        let namespaced_item = canonicalize("", &[namespaced]).expect("namespaced form parses");
+        let flat_item = canonicalize("", &[flat]).expect("flat form parses");
+
+        assert_eq!(
+            namespaced_item,
+            vec![Item::tool_call("call_1", "fetch_steer", "{}")],
+            "a separate `namespace` field leaves no trace: this is the property \
+             the steering round trip rests on"
+        );
+        assert_eq!(
+            flat_item,
+            vec![Item::tool_call(
+                "call_1",
+                "mcp__roundhouse__fetch_steer",
+                "{}"
+            )],
+            "a namespace folded into `name` is kept verbatim, so the two \
+             spellings of one call are two canonical items"
+        );
+        assert_ne!(
+            namespaced_item, flat_item,
+            "if these ever agree, `canonical_item` has learned to split a flat \
+             name — which is the change a flat `ClientDialect` variant owes the \
+             input path, and `dialect.rs`'s module doc is the paragraph that has \
+             to be re-read when it lands"
+        );
+    }
+
     /// The turn id of a fixed pre-M4-shaped conversation, pinned as a literal.
     ///
     /// The idempotency story rests on this hash being a pure function of the
@@ -615,6 +677,42 @@ mod tests {
         )
         .expect("a fixed, well-formed conversation canonicalizes");
         assert_eq!(turn_id_for(&claimed).to_string(), "turn_6a7aaa94e5b59fd2");
+    }
+
+    /// F18 (review): codex's `ResponseItem` enum has resendable variants far
+    /// beyond `message`/`function_call`/`function_call_output`/`reasoning` —
+    /// `tool_search_call`, `local_shell_call`, the three compaction shapes,
+    /// and more. None of them can appear in a v1 turn (no tool loop means no
+    /// tool_search/shell/compaction), so today's suite only ever resends the
+    /// four shapes above and never proves what `canonical_item` does with the
+    /// rest. This pins that boundary as documented, enumerated behavior: each
+    /// of these types must 422 with an error that *names the type*, so a
+    /// future tool-loop milestone that starts emitting one finds a named
+    /// failure instead of a silent behavior change.
+    #[test]
+    fn the_item_types_a_real_client_can_resend_are_named() {
+        let refused_types = [
+            "agent_message",
+            "local_shell_call",
+            "tool_search_call",
+            "tool_search_output",
+            "custom_tool_call",
+            "custom_tool_call_output",
+            "web_search_call",
+            "image_generation_call",
+            "compaction",
+            "compaction_trigger",
+            "context_compaction",
+        ];
+        for kind in refused_types {
+            let err = canonicalize("", &[json!({ "type": kind })])
+                .expect_err(&format!("`{kind}` must be refused, not silently dropped"));
+            let message = format!("{err:?}");
+            assert!(
+                message.contains(kind),
+                "error for `{kind}` does not name the type it refused: {message}"
+            );
+        }
     }
 
     #[test]

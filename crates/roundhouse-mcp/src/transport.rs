@@ -50,6 +50,7 @@ use rmcp::ErrorData as McpError;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
     ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
+    ToolAnnotations,
 };
 use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
@@ -78,6 +79,15 @@ impl RoundhouseMcp {
     /// is on the descriptors, and
     /// `the_adapter_lists_exactly_what_the_surface_declares` is what keeps this
     /// function from becoming a place a tool can be added or renamed.
+    ///
+    /// The three MCP hints ride along because the *client* reads them, not us:
+    /// an absent annotation is not a neutral one, and codex resolves the
+    /// absence to destructive-and-open-world (see [`crate::tools`]'s
+    /// *Annotations are not decoration*). They are projected here rather than
+    /// restated because [`get_tool`](ServerHandler::get_tool) and
+    /// [`list_tools`](ServerHandler::list_tools) both answer out of this one
+    /// function, so there is exactly one place the wire form can drift from
+    /// the descriptor.
     pub fn tools() -> Vec<Tool> {
         descriptors()
             .into_iter()
@@ -91,6 +101,18 @@ impl RoundhouseMcp {
                     Cow::Borrowed(tool.name),
                     Cow::Borrowed(tool.description),
                     Arc::new(schema),
+                )
+                .with_annotations(
+                    // `idempotent_hint` is deliberately left unset. It is the
+                    // one hint whose honest answer differs per tool -- the
+                    // reads are idempotent, `declare_intent` and the overlay
+                    // writers are not -- and codex's approval arithmetic never
+                    // consults it, so a value here would be a claim made for
+                    // no reader.
+                    ToolAnnotations::new()
+                        .read_only(tool.read_only_hint)
+                        .destructive(tool.destructive_hint)
+                        .open_world(tool.open_world_hint),
                 )
             })
             .collect()
@@ -286,6 +308,28 @@ mod tests {
                 published.output_schema.is_none(),
                 "`{}` must not advertise structured output: the single text \
                  block is what round-trips through the conversation",
+                declared.name
+            );
+            // The hints are the half of the contract the *client* acts on
+            // before it ever calls anything, so an adapter that dropped them
+            // would restore F06 silently: the descriptor would still read
+            // truthfully and the wire would still say destructive-and-open-world.
+            let annotations = published
+                .annotations
+                .as_ref()
+                .unwrap_or_else(|| panic!("`{}` publishes no annotations", declared.name));
+            assert_eq!(
+                (
+                    annotations.read_only_hint,
+                    annotations.destructive_hint,
+                    annotations.open_world_hint
+                ),
+                (
+                    Some(declared.read_only_hint),
+                    Some(declared.destructive_hint),
+                    Some(declared.open_world_hint)
+                ),
+                "`{}`'s published hints are not the ones it declares",
                 declared.name
             );
         }

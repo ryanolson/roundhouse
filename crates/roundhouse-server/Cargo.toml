@@ -40,6 +40,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
+# Quoting and parse-back for the generated Codex `config.toml`. See
+# `src/codex_launch.rs`.
+toml = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tracing = { workspace = true }
@@ -58,6 +61,15 @@ uuid = { workspace = true }
 # those builds and nothing else, which is the same mechanism (and the same
 # reasoning) `roundhouse-store-redis` uses for its `LeaseControl` hook.
 test-support = []
+
+# Compiles `tests/codex_e2e.rs`, which drives a **real `codex` binary** against
+# a loopback rig. Off by default and deliberately *not* added to the
+# self-dev-dependency below: the suite spawns processes, so a developer who has
+# no `codex` on PATH, or a CI runner that must not spawn one, gets a test binary
+# with nothing in it rather than a failure to explain. Features are additive, so
+# `--features e2e-codex` unifies with the `test-support` the dev-dependency
+# already turns on. See `tests/codex_e2e.rs` for the invocation.
+e2e-codex = []
 
 [dev-dependencies]
 # `test-support` is the fixed-plane `PlaneSource` above: it exists so the six

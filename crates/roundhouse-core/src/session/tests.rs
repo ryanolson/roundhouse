@@ -1414,6 +1414,156 @@ async fn the_turn_whose_input_answers_a_steer_is_the_one_that_says_so() {
         .unwrap();
 }
 
+/// F05: a cancelled or aborted steer must not read as fulfilled.
+///
+/// `SessionState::apply` used to close an open steer on `call_id` alone,
+/// without inspecting `ToolResult::output`. Codex's own approval path produces
+/// exactly that shape with no correction reaching the agent: an operator
+/// cancelling the MCP call resends the literal `"user cancelled MCP tool call"`
+/// (codex-rs core/src/mcp_tool_call.rs:280 @ e363b08), declining it resends
+/// `"user rejected MCP tool call"` (mcp_tool_call.rs:267), and a client that
+/// drops the turn gets codex's synthesized `"aborted"`
+/// (context_manager/normalize.rs:58). All three closed `open_steers` *and* set
+/// `this_turn_fulfilled_a_steer()`, which `validate::trigger` reads to suppress
+/// judging on the fulfilling turn -- so the dashboard reported a healthy steer
+/// loop while nothing had been corrected. The fold now splits the two: the
+/// steer closes regardless (it will never be answered), the hysteresis is
+/// withheld unless something was actually delivered.
+#[tokio::test]
+async fn a_cancelled_steer_is_not_recorded_as_fulfilled() {
+    let store = Arc::new(MemoryStore::new());
+    let (_, mut session) = new_session(store, "node-a").await;
+
+    // A steered turn: the call is emitted and the steer is open.
+    let admitted = session
+        .begin_turn(TurnId::new("t1"), vec![Item::user_text("go")])
+        .await
+        .unwrap();
+    let response_id = admitted.response_id().clone();
+    session
+        .complete_with_item(
+            &response_id,
+            steer_call(),
+            Usage::default(),
+            ControlRecord::default(),
+        )
+        .await
+        .unwrap();
+    assert!(!session.state().this_turn_fulfilled_a_steer());
+
+    // The next turn resends the call, but the output is codex's own
+    // cancellation text -- not a correction the agent ever saw and acted
+    // on. A hand-rolled MCP stanza without the approval override, or an
+    // interactive client that declines the call, produces exactly this.
+    session
+        .begin_turn(
+            TurnId::new("t2"),
+            vec![
+                steer_call(),
+                tool_result(STEER_CALL_ID, "user cancelled MCP tool call"),
+            ],
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        session.state().open_steer_ids().is_empty(),
+        "control: the fold still closes open_steers on call_id, cancelled \
+         or not -- a call nobody will ever answer must not read as in-flight \
+         forever"
+    );
+    assert!(
+        !session.state().this_turn_fulfilled_a_steer(),
+        "a cancelled call delivered no correction to the agent, so the \
+         turn it lands on must not read as the one that answered the steer"
+    );
+}
+
+/// F05, as the bytes actually arrive: codex wraps its cancellation notice in
+/// the same `Wall time:`/`Output:` header it wraps a real answer in
+/// (`core/src/tools/context.rs:124-126` -- `notify_mcp_tool_call_skip` returns
+/// the message as the call's result, and `McpToolOutput::response_payload`
+/// headers it like any other). This is the only place F04's stripper and F05's
+/// sentinels are proven to compose: recognising the bare text but not the
+/// wrapped one would close the finding against a fixture and leave it open
+/// against the client.
+#[tokio::test]
+async fn a_wrapped_cancellation_is_not_fulfilment_and_a_delivered_correction_is() {
+    let store = Arc::new(MemoryStore::new());
+    let (_, mut session) = new_session(store, "node-a").await;
+
+    let admitted = session
+        .begin_turn(TurnId::new("t1"), vec![Item::user_text("go")])
+        .await
+        .unwrap();
+    let response_id = admitted.response_id().clone();
+    session
+        .complete_with_item(
+            &response_id,
+            steer_call(),
+            Usage::default(),
+            ControlRecord::default(),
+        )
+        .await
+        .unwrap();
+
+    session
+        .begin_turn(
+            TurnId::new("t2"),
+            vec![
+                steer_call(),
+                tool_result(
+                    STEER_CALL_ID,
+                    "Wall time: 0.0000 seconds\nOutput:\nuser cancelled MCP tool call",
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+    assert!(
+        !session.state().this_turn_fulfilled_a_steer(),
+        "the wrapper is how the cancellation actually arrives; reading only \
+         the bare text would leave the defect open against every real client"
+    );
+
+    // The control that keeps the assertion above from being satisfied by a
+    // fold that simply stopped recording fulfilment: a wrapped *directive*
+    // still fulfils, on the same path, in the same shape.
+    let admitted = session
+        .begin_turn(TurnId::new("t3"), vec![Item::user_text("carry on")])
+        .await
+        .unwrap();
+    let response_id = admitted.response_id().clone();
+    session
+        .complete_with_item(
+            &response_id,
+            steer_call(),
+            Usage::default(),
+            ControlRecord::default(),
+        )
+        .await
+        .unwrap();
+    session
+        .begin_turn(
+            TurnId::new("t4"),
+            vec![
+                steer_call(),
+                tool_result(
+                    STEER_CALL_ID,
+                    "Wall time: 0.0130 seconds\nOutput:\nre-read the task and narrow the diff",
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+    assert!(
+        session.state().this_turn_fulfilled_a_steer(),
+        "a correction the agent actually received still suppresses judging on \
+         the turn that answers it -- that hysteresis is what stops a steer \
+         re-triggering the validation that emitted it"
+    );
+}
+
 /// A judge outage must not spend the session's lifetime allowance.
 ///
 /// `validations_run` is documented as "validations this session has bought",
