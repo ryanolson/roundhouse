@@ -18,7 +18,9 @@ use serde::{Deserialize, Serialize};
 
 use roundhouse_core::control::{CredentialError, TurnCredential};
 use roundhouse_core::metrics::{ReferenceModel, ShadowPricing};
-use roundhouse_core::routing::{CacheLedger, CacheModel, Candidate, ProviderPricing, Target};
+use roundhouse_core::routing::{
+    AttemptClass, CacheLedger, CacheModel, Candidate, ProviderPricing, Target,
+};
 
 use crate::usage::WireProtocol;
 
@@ -338,6 +340,68 @@ pub enum FrontierError {
         got: &'static str,
         target: String,
     },
+    /// The request never reached a model: DNS, connect, TLS, a reset — or the
+    /// client gave up waiting.
+    ///
+    /// **Split out of [`Self::Upstream`] so that failover has something to
+    /// match on.** A per-dispatch fallback has to distinguish "this origin is
+    /// not answering" from "this origin answered and said no", and the only
+    /// honest way to do that is for the transport to state which one happened
+    /// at the point it knows. Recovering it downstream by grepping an error
+    /// string would be a routing decision resting on a `format!`.
+    #[error("the request to the upstream failed: {message}")]
+    Transport {
+        message: String,
+        /// The client's own patience ran out, rather than the connection
+        /// failing. A separate field and not a separate variant, because every
+        /// caller that treats one as a reason to try elsewhere treats the other
+        /// the same way, and the distinction is worth exactly one row in an
+        /// audit trail.
+        timed_out: bool,
+    },
+    /// The origin answered, with a status that was not a success.
+    ///
+    /// Structured rather than formatted into [`Self::Upstream`] for the reason
+    /// above, and carrying the body because that is what it carried before this
+    /// variant existed — a 400 whose message says which field was rejected is
+    /// most of the diagnosis. The body is redacted on construction like every
+    /// other message leaving a client, and it is deliberately *not* what travels
+    /// into the decision record: an attempt row carries the status and the
+    /// class, never the prose.
+    #[error("the upstream answered {status}: {message}")]
+    Status { status: u16, message: String },
+}
+
+impl FrontierError {
+    /// Why this failure is worth trying a different target for, or `None` when
+    /// it is not.
+    ///
+    /// **The whole failover trigger, in one function.** Upstream's retryable
+    /// set is the same three shapes (`client.rs:587-596` @ `053a61e`) and its
+    /// status predicate is [`AttemptClass::is_retryable_http_status`], which
+    /// this delegates to rather than restating. Everything else answers `None`
+    /// — a missing credential, a dialect nobody can serialize, an unknown
+    /// provider, and any 4xx that is not 408 or 429 are all the same kind of
+    /// fact: a second target would fail the same way, and pretending otherwise
+    /// turns one misconfiguration into a tour of the whole tier.
+    ///
+    /// A model *refusal* is not in this enum at all, which is the point: a
+    /// refusal arrives as a completed stream, so it reaches the caller as an
+    /// answer and there is nothing here for it to match.
+    pub fn failover_class(&self) -> Option<AttemptClass> {
+        match self {
+            FrontierError::Transport { timed_out, .. } => Some(match timed_out {
+                true => AttemptClass::Timeout,
+                false => AttemptClass::Transport,
+            }),
+            FrontierError::Status { status, .. } => AttemptClass::is_retryable_http_status(*status)
+                .then_some(AttemptClass::Status { status: *status }),
+            FrontierError::UnknownProvider(_)
+            | FrontierError::Upstream(_)
+            | FrontierError::Credential(_)
+            | FrontierError::UnsupportedDialect { .. } => None,
+        }
+    }
 }
 
 /// Executes a turn against a hosted provider.
@@ -479,6 +543,67 @@ mod tests {
     use roundhouse_core::control::Secret;
 
     const MINUTE: u64 = 60_000;
+
+    /// Every arm, classified, because a failover trigger that is right about
+    /// five shapes and wrong about the sixth fails over on a bad API key —
+    /// which is a way of trying the same wrong credential against every
+    /// provider in the tier.
+    #[test]
+    fn only_the_shapes_that_never_reached_a_model_are_worth_another_target() {
+        let transport = FrontierError::Transport {
+            message: "connection refused".into(),
+            timed_out: false,
+        };
+        assert_eq!(transport.failover_class(), Some(AttemptClass::Transport));
+
+        let timed_out = FrontierError::Transport {
+            message: "operation timed out".into(),
+            timed_out: true,
+        };
+        assert_eq!(timed_out.failover_class(), Some(AttemptClass::Timeout));
+
+        for status in [408u16, 429, 500, 503] {
+            assert_eq!(
+                FrontierError::Status {
+                    status,
+                    message: "busy".into(),
+                }
+                .failover_class(),
+                Some(AttemptClass::Status { status }),
+                "{status} says `not now`"
+            );
+        }
+
+        // The discriminating half. Each of these is somebody's mistake, and a
+        // second target repeats it.
+        for terminal in [
+            FrontierError::Status {
+                status: 401,
+                message: "invalid api key".into(),
+            },
+            FrontierError::Status {
+                status: 404,
+                message: "no such model".into(),
+            },
+            FrontierError::Status {
+                status: 422,
+                message: "unknown field".into(),
+            },
+            FrontierError::UnknownProvider("moonshot".into()),
+            FrontierError::Upstream("the upstream sent an unparseable event".into()),
+            FrontierError::UnsupportedDialect {
+                expected: "openai_responses",
+                got: "anthropic_messages",
+                target: "anthropic/claude".into(),
+            },
+        ] {
+            assert_eq!(
+                terminal.failover_class(),
+                None,
+                "`{terminal}` is an answer, not an outage"
+            );
+        }
+    }
 
     fn catalog() -> StaticFrontierCatalog {
         StaticFrontierCatalog::new(vec![FrontierModelSpec {

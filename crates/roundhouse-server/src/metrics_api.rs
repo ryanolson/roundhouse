@@ -249,6 +249,8 @@ mod tests {
                         billing: Default::default(),
                         budget_draw: None,
                         withheld_providers: Vec::new(),
+                        declared_baseline: None,
+                        attempts: Vec::new(),
                     },
                 },
             },

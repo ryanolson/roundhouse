@@ -44,7 +44,8 @@ use roundhouse_core::context::ByteTokenizer;
 use roundhouse_core::control::{MemorySpendLedger, SpendLedger};
 use roundhouse_core::metrics::MetricsConfig;
 use roundhouse_core::routing::{
-    AffinityPolicy, CacheLedger, CacheModel, Candidate, ProviderPricing, Target,
+    AffinityPolicy, CacheLedger, CacheModel, Candidate, ProviderPricing, RoutingPolicy,
+    StagePolicy, Target,
 };
 use roundhouse_core::store::{MemoryStore, SessionStore};
 use roundhouse_core::validate::{Validator, ValidatorConfig};
@@ -381,6 +382,42 @@ fn boot_refusal(error: DirectoryError) -> anyhow::Error {
         }
         other => anyhow::anyhow!(other),
     }
+}
+
+/// Does any project on this plane route between tiers? (M10.2, S3)
+///
+/// The whole of the composition root's tier decision, named so it can be
+/// asserted: `serve` reads it once and wraps
+/// [`StagePolicy`](roundhouse_core::routing::StagePolicy) around the ordinary
+/// policy when it is true. Read through `configured_admissions` — the same
+/// accessor the fair-use boot flag uses, and for the same reason: the key
+/// table's layout has exactly one reader outside its own module and this is not
+/// going to be the second.
+///
+/// **Conditional composition, and the condition is not a micro-optimization.**
+/// `StagePolicy` delegates to its inner policy for every project with no recipe,
+/// and the target and rationale it produces there are pinned byte-identical to
+/// the inner policy's — but [`DecisionRecord::policy`] reports `stage`, because
+/// that is the object in force, and reporting `affinity` would make the audit
+/// trail name a router that did not serve the turn. Composing it unconditionally
+/// would therefore relabel every existing deployment's decisions on an upgrade
+/// that changed no routing at all. Composing it only where a recipe exists moves
+/// the field exactly when the router moved.
+///
+/// **The hole this leaves is a recipe added through the admin plane after boot**,
+/// which nothing here can see, and which would otherwise be the worst shape a
+/// config mistake can take: an operator's recipe re-routing nothing, with every
+/// surface reporting the configuration as fine. The engine warns once when a
+/// turn arrives carrying a recipe its policy cannot read — see
+/// `Engine::unread_recipe` — which states the same fact at the one moment it is
+/// knowable. `ControlPlane::Open` has no file to write a recipe in and answers
+/// `false` by construction.
+///
+/// [`DecisionRecord::policy`]: roundhouse_core::routing::DecisionRecord::policy
+fn composes_the_stage_router(plane: &ControlPlane) -> bool {
+    plane
+        .configured_admissions()
+        .any(|admission| admission.tiers.is_some())
 }
 
 #[tokio::main]
@@ -727,13 +764,28 @@ async fn serve<S: SessionStore>(
         ..EngineConfig::default()
     };
 
+    let tiers_configured = composes_the_stage_router(&directory.plane(roundhouse_core::now_ms()));
+    if tiers_configured {
+        tracing::info!(
+            "a project configures a tier recipe; the stage router is composed over the \
+             ordinary policy, and projects with no recipe route through it unchanged"
+        );
+    }
+
     let mut engine = Engine::with_provider_clients(
         Arc::clone(&store),
         ByteTokenizer,
         Arc::new(EchoLocalExecutor::new("local answer")),
         catalog,
         Arc::clone(&frontier),
-        Arc::new(AffinityPolicy::new()),
+        // The recipe reader wrapped around the ordinary policy, or the ordinary
+        // policy alone. See `tiers_configured` for why the wrapper is not
+        // composed unconditionally.
+        match tiers_configured {
+            true => Arc::new(StagePolicy::new(Box::new(AffinityPolicy::new())))
+                as Arc<dyn RoutingPolicy>,
+            false => Arc::new(AffinityPolicy::new()) as Arc<dyn RoutingPolicy>,
+        },
         engine_config.clone(),
     )
     .with_spend_ledger(Arc::clone(&spend))
@@ -1135,6 +1187,68 @@ mod tests {
             ControlPlaneConfig::from_json(&json, "startup cross-check fixture")
                 .expect("the fixture config must validate"),
         )
+    }
+
+    /// The same one-key plane, plus a tier recipe on the project.
+    ///
+    /// Built by adding one field to `plane_with`'s output rather than by a
+    /// second constructor, so the probe below and its control differ in exactly
+    /// that field.
+    fn plane_with_tiers(tiers: serde_json::Value) -> ControlPlane {
+        let json = serde_json::json!({
+            "projects": [{ "id": "acme", "tiers": tiers }],
+            "users": [{ "id": "ada" }],
+            "keys": [{ "project": "acme", "user": "ada", "key_sha256": "a".repeat(64) }],
+        })
+        .to_string();
+        ControlPlane::configured(
+            ControlPlaneConfig::from_json(&json, "startup cross-check fixture")
+                .expect("the fixture config must validate"),
+        )
+    }
+
+    /// **M10.2, S3.** The stage router is composed for the deployments that
+    /// configured one and for no others.
+    ///
+    /// Both halves fail differently and both are silent. Composing it for a
+    /// deployment with no recipe relabels every decision in its log `stage` on
+    /// an upgrade that changed no routing; *not* composing it for one that has a
+    /// recipe leaves the recipe resolving to an `Admission` field nothing reads
+    /// — an operator's routing configuration doing nothing, with every surface
+    /// reporting the file as valid. See `composes_the_stage_router`.
+    #[test]
+    fn the_stage_router_is_composed_exactly_when_a_project_configures_tiers() {
+        assert!(
+            composes_the_stage_router(&plane_with_tiers(serde_json::json!({
+                "capable": ["anthropic/big"],
+                "efficient": ["local/small"],
+            }))),
+            "a project with a recipe must get the router that reads one"
+        );
+
+        // CONTROL: the same plane shape, the same key, no `tiers`. A recipe is
+        // the only thing that may move this answer -- not a policy, not a
+        // budget, both of which every one of these fixtures also carries.
+        for plane in [
+            plane_with_policy(serde_json::json!({ "min_quality": 0.5 })),
+            plane_with(
+                serde_json::json!({}),
+                serde_json::json!({
+                    "limit_usd": 10.0,
+                    "window": "total",
+                    "on_exhaustion": "degrade_to_local"
+                }),
+            ),
+        ] {
+            assert!(
+                !composes_the_stage_router(&plane),
+                "a project that configured no recipe must route through the \
+                 policy it always did, under the name it always had"
+            );
+        }
+
+        // And an unconfigured deployment has no file to write a recipe in.
+        assert!(!composes_the_stage_router(&ControlPlane::Open));
     }
 
     #[test]

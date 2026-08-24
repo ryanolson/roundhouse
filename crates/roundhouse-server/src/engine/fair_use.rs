@@ -247,6 +247,7 @@ mod tests {
             validation: None,
             credentials: TurnCredentials::unrestricted(),
             budget_counts: Default::default(),
+            tiers: None,
         }
     }
 

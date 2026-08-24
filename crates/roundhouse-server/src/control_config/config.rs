@@ -53,6 +53,8 @@ use super::Admission;
 use super::budget::{AllocationConfig, BudgetConfig, budget_terms};
 use super::credentials::CredentialsConfig;
 use super::fair_use::{FairUseConfig, fair_use_terms};
+use roundhouse_core::routing::stage::DEFAULT_CONFIDENCE_THRESHOLD;
+use roundhouse_core::routing::{PickerMode, TierRecipe, TierRecipeError};
 use roundhouse_core::validate::ValidationTerms;
 
 use super::validate::ValidateConfig;
@@ -117,6 +119,64 @@ pub struct ProjectEntry {
     /// authenticates itself, exactly as a pre-M7 deployment routes.
     #[serde(default)]
     pub credentials: Option<CredentialsConfig>,
+    /// The two ordered candidate lists this project's turns are routed between,
+    /// and how an undecided turn breaks the tie. Absent means no tier routing:
+    /// the deployment's ordinary policy chooses, exactly as it did before M10.
+    ///
+    /// **On the project and not inside `policy`**, which is the placement
+    /// `validate` already argues for and which one more consideration settles
+    /// here: [`PolicyConfig`] serves *both* a project's policy and a key's
+    /// `overrides`, and an overlay's whole contract is that it narrows. A tier
+    /// recipe has no narrowing reading — a key that "narrowed" its project's
+    /// capable tier would be choosing which model answers, which is the one
+    /// decision this design keeps out of a caller's hands. Leaving it out of
+    /// that shape means there is no place to write the sentence at all.
+    #[serde(default)]
+    pub tiers: Option<TiersConfig>,
+}
+
+/// The shape of a project's `"tiers"` object.
+///
+/// `deny_unknown_fields` for [`ProjectEntry`]'s reason and for one of its own:
+/// `capable`/`efficient` are the whole of what the recipe routes between, so a
+/// misspelt `capible` would resolve to an empty tier — which is not an error,
+/// because an empty tier is a legitimate one-sided recipe, and would therefore
+/// route every turn to the other tier forever with nothing anywhere saying why.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TiersConfig {
+    /// Ordered [`Target::policy_identity`](roundhouse_core::routing::Target::policy_identity)
+    /// names — `provider/model`, or `local/model` — for the capable tier.
+    pub capable: Vec<String>,
+    /// The same, for the efficient tier.
+    pub efficient: Vec<String>,
+    /// Where an undecided turn lands. Defaults to `efficient_first`, which is
+    /// the shape every published Switchyard number was measured at.
+    pub picker: PickerMode,
+    /// How sure the scorer must be before it overrules the picker. Defaults to
+    /// upstream's shipped operating point.
+    pub confidence_threshold: Option<f64>,
+}
+
+impl TiersConfig {
+    /// **Validated here rather than at the first request**, which is upstream's
+    /// own choice and worth mirroring for the reason it is worth making
+    /// anywhere: an operator watching a boot can fix a threshold, and a client
+    /// receiving a 500 on turn four hundred cannot.
+    fn to_recipe(&self, path: &str, entry: &str) -> Result<TierRecipe, ControlPlaneError> {
+        TierRecipe::new(
+            self.capable.clone(),
+            self.efficient.clone(),
+            self.picker,
+            self.confidence_threshold
+                .unwrap_or(DEFAULT_CONFIDENCE_THRESHOLD),
+        )
+        .map_err(|source| ControlPlaneError::TierRecipeRejected {
+            path: path.to_string(),
+            entry: entry.to_string(),
+            source,
+        })
+    }
 }
 
 /// One entry of the config's `"users"` array.
@@ -501,6 +561,12 @@ pub enum ControlPlaneError {
         entry: String,
         min_quality: f64,
     },
+    #[error("control-plane config `{path}`: {entry}'s `tiers` block is refused -- {source}")]
+    TierRecipeRejected {
+        path: String,
+        entry: String,
+        source: TierRecipeError,
+    },
     #[error(
         "control-plane config `{path}`: {entry}'s frontier_cadence.per_turns is 0 -- a window \
          must be at least one turn wide"
@@ -831,6 +897,13 @@ impl ControlPlaneConfig {
         // has to stop the boot on the day it is written, not on the day a
         // tenant discovers the limit they were promised never fired.
         let mut project_fair_use: HashMap<&str, Vec<FairUseLimit>> = HashMap::new();
+        // And every project's tier recipe, `None` meaning it routes through the
+        // deployment's ordinary policy. Resolved here for the reason the four
+        // above are, and refused here for the same sharper one: a threshold no
+        // confidence can reach has to stop the boot on the day it is written,
+        // not on the day somebody notices every turn is landing on the picker
+        // default.
+        let mut project_tiers: HashMap<&str, Option<Arc<TierRecipe>>> = HashMap::new();
         // The deployment's own keys, resolved once: every project's resolution
         // reads them, and reading the environment per project would let one
         // variable be judged twice and -- if it changed underneath us -- judged
@@ -889,6 +962,24 @@ impl ControlPlaneConfig {
                 None => Vec::new(),
             };
             project_fair_use.insert(project.id.as_str(), fair_use);
+
+            let tiers = match &project.tiers {
+                Some(tiers_config) => {
+                    let recipe = tiers_config.to_recipe(path, &entry)?;
+                    // Upstream's startup warning, at upstream's moment. It is
+                    // not a refusal because `capable_first` is a legitimate
+                    // experiment -- it is the shape this phase exists to
+                    // benchmark -- and it is not silence because quoting a
+                    // calibration for a configuration nobody measured is the
+                    // one dishonest thing this port could do.
+                    if let Some(warning) = recipe.uncalibrated_warning() {
+                        tracing::warn!(project = %project.id, "{warning}");
+                    }
+                    Some(Arc::new(recipe))
+                }
+                None => None,
+            };
+            project_tiers.insert(project.id.as_str(), tiers);
 
             if project.credentials.is_some() {
                 project_declares_credentials.insert(project.id.as_str());
@@ -1078,6 +1169,13 @@ impl ControlPlaneConfig {
                     validation,
                     credentials,
                     budget_counts: *budget_counts,
+                    // The project's, never the key's: see `ProjectEntry::tiers`
+                    // for why a member has no place narrowing which model
+                    // answers.
+                    tiers: project_tiers
+                        .get(key.project.as_str())
+                        .expect("a project checked present above was resolved to tiers above")
+                        .clone(),
                 },
             );
         }

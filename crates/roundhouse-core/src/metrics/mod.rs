@@ -477,6 +477,8 @@ mod tests {
                 billing: Default::default(),
                 budget_draw: None,
                 withheld_providers: Vec::new(),
+                declared_baseline: None,
+                attempts: Vec::new(),
             },
         });
         // Failed before anything was sent: empty usage is the engine's way of
@@ -524,6 +526,8 @@ mod tests {
                 billing: Default::default(),
                 budget_draw: None,
                 withheld_providers: Vec::new(),
+                declared_baseline: None,
+                attempts: Vec::new(),
             },
         });
         log.push(SessionEventKind::ResponseIncomplete {

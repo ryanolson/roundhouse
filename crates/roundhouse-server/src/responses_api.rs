@@ -59,7 +59,7 @@ use roundhouse_core::store::SessionStore;
 
 use crate::control_config::{ControlPlane, PlaneSource};
 use crate::conversations::Conversations;
-use crate::engine::Engine;
+use crate::engine::{Engine, TurnInput};
 use crate::http::{
     ApiError, LogTail, POLL_INTERVAL, READ_BATCH, parse_body, refuse_over_fair_use, store_error,
 };
@@ -173,18 +173,32 @@ where
 
 /// The part of a Responses request this surface reads.
 ///
-/// Everything else a client sends — `model`, `tools`, `tool_choice`,
+/// Everything else a client sends — `tools`, `tool_choice`,
 /// `parallel_tool_calls`, `reasoning`, `text`, `include`, `store`,
 /// `client_metadata` — is accepted and ignored. Ignoring rather than rejecting
 /// is the point of a compatibility surface: v1 chooses its target by routing
 /// policy rather than by requested model and runs no tool loop, and a client
 /// that had to strip fields before talking to us would not be a client of the
 /// same API.
+///
+/// **`model` was on that list until M10 and is now accepted, *recorded*, and
+/// still never routed on.** The change is one word and it is the one word that
+/// matters: nothing below reads it to pick a target, and the router cannot —
+/// it never receives it. What it becomes is the turn's *declared baseline*, the
+/// name the savings figure prices its counterfactual against, which is a
+/// question only the client can answer and which ignoring the field threw away.
 #[derive(Debug, Deserialize)]
 struct ResponsesRequest {
     /// The system prompt, sent whole on every turn.
     #[serde(default)]
     instructions: String,
+    /// What the client believes it is talking to.
+    ///
+    /// Recorded verbatim on the decision and read only by pricing. A client
+    /// that names nothing is not a client that named the default: the
+    /// counterfactual is inferred for that turn, and the log says which.
+    #[serde(default)]
+    model: Option<String>,
     /// The conversation so far, this turn's new items included.
     ///
     /// Held as raw JSON so an unsupported item type can be named in the refusal
@@ -276,9 +290,21 @@ where
         let session_id = session_id.clone();
         let turn_id = turn_id.clone();
         let admission = admission.clone();
+        // Empty is treated as absent. A client that sends `"model": ""` has
+        // named nothing, and recording the empty string would put a baseline
+        // in the log that no catalog can resolve and no reader can act on.
+        let declared_baseline = request.model.filter(|model| !model.trim().is_empty());
         async move {
             engine
-                .run_turn(&session_id, turn_id, input, &admission)
+                .run_turn(
+                    &session_id,
+                    turn_id,
+                    TurnInput {
+                        items: input,
+                        declared_baseline,
+                    },
+                    &admission,
+                )
                 .await
                 .map(|_| ())
                 .map_err(|error| error.to_string())

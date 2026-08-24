@@ -30,8 +30,10 @@ use async_trait::async_trait;
 use roundhouse_core::context::ByteTokenizer;
 use roundhouse_core::ids::{SessionId, TurnId};
 use roundhouse_core::item::Item;
-use roundhouse_core::routing::{AffinityPolicy, CacheModel, ProviderPricing, Target};
-use roundhouse_core::store::MemoryStore;
+use roundhouse_core::routing::{
+    AffinityPolicy, CacheModel, PickerMode, ProviderPricing, StagePolicy, Target, TierRecipe,
+};
+use roundhouse_core::store::{MemoryStore, SessionStore};
 use roundhouse_fleet::{
     EchoFrontierClient, FrontierChunk, FrontierClient, FrontierClients, FrontierError,
     FrontierModelSpec, FrontierQuote, FrontierStream, StaticFrontierCatalog, WireProtocol,
@@ -243,6 +245,204 @@ async fn a_provider_the_registry_does_not_hold_fails_the_turn_rather_than_borrow
         ),
     );
     assert_eq!(one_turn(&engine).await.text, "alpha");
+}
+
+// ---------------------------------------------------------------------------
+// M10.2 × M10.1: a failover crosses providers, so it crosses transports
+// ---------------------------------------------------------------------------
+
+/// A transport that is not there, and counts the attempts anyway.
+///
+/// `Transport` is the class that falls forward — see
+/// `FrontierError::failover_class` — so this is a provider outage and not a
+/// provider's answer.
+struct DeadRecorder {
+    calls: AtomicUsize,
+}
+
+impl DeadRecorder {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            calls: AtomicUsize::new(0),
+        })
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl FrontierClient for DeadRecorder {
+    async fn execute(&self, _quote: &FrontierQuote) -> Result<FrontierStream, FrontierError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(FrontierError::Transport {
+            message: "connection refused".into(),
+            timed_out: false,
+        })
+    }
+}
+
+/// Two hosted entries on two providers, both free, both instant.
+fn catalog_of(providers: [&str; 2]) -> StaticFrontierCatalog {
+    StaticFrontierCatalog::new(
+        providers
+            .into_iter()
+            .map(|provider| FrontierModelSpec {
+                provider: provider.into(),
+                model: "flagship".into(),
+                wire_protocol: WireProtocol::OpenAiResponses,
+                cache_model: CacheModel::Deterministic { ttl_ms: 5 * MINUTE },
+                pricing: ProviderPricing::free(),
+                quality_prior: 0.9,
+                base_ttft_ms: 1.0,
+                ttft_ms_per_uncached_token: 0.0,
+            })
+            .collect(),
+    )
+}
+
+/// A one-tier recipe naming both providers in the order given.
+///
+/// The ordering is the whole fixture: `StagePolicy` makes the first admitted
+/// entry the target and the rest of the *same* tier the ordered fallbacks, so
+/// this is what decides which transport is tried second. An `AffinityPolicy`
+/// alone produces no fallbacks at all — a decision with an empty `fallbacks`
+/// dispatches exactly once — which is why a failover test has to compose the
+/// stage router even when the claim is about the registry.
+fn recipe_over(order: [&str; 2]) -> Admission {
+    Admission {
+        tiers: Some(Arc::new(
+            TierRecipe::new(
+                order
+                    .into_iter()
+                    .map(|provider| format!("{provider}/flagship"))
+                    .collect(),
+                Vec::new(),
+                PickerMode::CapableFirst,
+                roundhouse_core::routing::stage::DEFAULT_CONFIDENCE_THRESHOLD,
+            )
+            .expect("a one-sided recipe is a legitimate recipe"),
+        )),
+        ..Admission::open()
+    }
+}
+
+/// **The claim, and it is the join this phase exists for.** A dispatch that
+/// falls forward onto a second provider goes out through *that provider's*
+/// transport.
+///
+/// The two halves were built one rung apart and neither proves this alone.
+/// M10.1 proved the registry resolves a client from the chosen entry, on a turn
+/// with one dispatch. M10.2 proved a dead target advances to the next candidate,
+/// on a fleet whose transports it did not distinguish by origin. What neither
+/// can see is an engine that resolved the client *once per turn* and reused it:
+/// every M10.1 test still passes, because their turns dispatch once, and every
+/// M10.2 failover test still passes, because a scripted client that answers
+/// answers whoever calls it. Here the second attempt reaching alpha's transport
+/// would be a turn served by beta's catalog entry, beta's rate card and beta's
+/// row in the log, through a connection pool pointed at alpha's origin — an
+/// outage that reads as a billing discrepancy.
+///
+/// The control reverses the recipe and swaps which transport is dead, so the
+/// direction is the operator's ordering rather than "beta answers".
+#[tokio::test]
+async fn a_failover_onto_a_second_provider_uses_that_providers_transport() {
+    async fn run(
+        dead: &str,
+        alive: &str,
+        order: [&str; 2],
+    ) -> (usize, usize, TurnResult, Vec<String>) {
+        let dead_client = DeadRecorder::new();
+        let alive_client = Recorder::new("the-survivor-served-this");
+        let store = Arc::new(MemoryStore::new());
+        let engine = Engine::with_provider_clients(
+            Arc::clone(&store),
+            ByteTokenizer,
+            Arc::new(EchoLocalExecutor::new("local answer")) as Arc<dyn LocalExecutor>,
+            catalog_of(order),
+            Arc::new(FrontierClients::keyed(
+                [
+                    (
+                        dead.to_string(),
+                        Arc::clone(&dead_client) as Arc<dyn FrontierClient>,
+                    ),
+                    (
+                        alive.to_string(),
+                        Arc::clone(&alive_client) as Arc<dyn FrontierClient>,
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            )),
+            Arc::new(StagePolicy::new(Box::new(AffinityPolicy::new()))),
+            config(),
+        );
+
+        let session_id = SessionId::generate();
+        engine.create_session(&session_id).await.unwrap();
+        let result = engine
+            .run_turn(
+                &session_id,
+                TurnId::new("t1"),
+                vec![Item::user_text("which client served this?")],
+                &recipe_over(order),
+            )
+            .await
+            .expect("the second provider is alive, so the turn completes");
+
+        // Which provider each `Routed` names, oldest first — the log's own
+        // account of the same fact the counters carry.
+        let dispatched: Vec<String> = store
+            .read_events(&session_id, 0, 1_000)
+            .await
+            .expect("an in-memory log reads")
+            .into_iter()
+            .filter_map(|event| match event.kind {
+                roundhouse_core::event::SessionEventKind::Routed { decision, .. } => {
+                    Some(decision.chosen.policy_identity())
+                }
+                _ => None,
+            })
+            .collect();
+
+        (
+            dead_client.calls(),
+            alive_client.calls(),
+            result,
+            dispatched,
+        )
+    }
+
+    // alpha first in the recipe and alpha is the outage.
+    let (dead_calls, alive_calls, result, dispatched) =
+        run("alpha", "beta", ["alpha", "beta"]).await;
+    assert_eq!(
+        (dead_calls, alive_calls),
+        (1, 1),
+        "one attempt each: the dead provider was tried once and not retried, and \
+         the survivor was reached exactly once"
+    );
+    assert_eq!(result.text, "the-survivor-served-this");
+    assert_eq!(
+        dispatched,
+        vec!["alpha/flagship".to_string(), "beta/flagship".to_string()],
+        "and the log carries one decision per dispatch, in order, each naming the \
+         provider whose transport it went to"
+    );
+
+    // CONTROL: the recipe reversed and the outage moved with it. Same two
+    // transports, same two catalog entries — so the pair together say the
+    // fall-forward follows the operator's ordering, rather than that one of
+    // these recorders is special.
+    let (dead_calls, alive_calls, result, dispatched) =
+        run("beta", "alpha", ["beta", "alpha"]).await;
+    assert_eq!((dead_calls, alive_calls), (1, 1));
+    assert_eq!(result.text, "the-survivor-served-this");
+    assert_eq!(
+        dispatched,
+        vec!["beta/flagship".to_string(), "alpha/flagship".to_string()]
+    );
 }
 
 /// The routing decision the tests above lean on: the hosted entry is what the

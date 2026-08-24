@@ -194,6 +194,8 @@ pub fn every_event_kind() -> Vec<SessionEventKind> {
                 billing: Default::default(),
                 budget_draw: None,
                 withheld_providers: Vec::new(),
+                declared_baseline: None,
+                attempts: Vec::new(),
             },
         },
         SessionEventKind::OutputTextDelta {

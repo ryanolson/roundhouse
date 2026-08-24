@@ -393,6 +393,8 @@ pub async fn decision() -> DecisionRecord {
             turn_policy: &ceiling,
             frontier_history: &history,
             budget: &budget,
+            signals: None,
+            tiers: None,
         })
         .await
         .expect("a three-candidate fleet under an unrestricted policy routes");
@@ -416,5 +418,7 @@ pub async fn decision() -> DecisionRecord {
         billing: Default::default(),
         budget_draw: None,
         withheld_providers: Vec::new(),
+        declared_baseline: None,
+        attempts: Vec::new(),
     }
 }

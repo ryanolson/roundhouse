@@ -464,11 +464,21 @@ impl<T: Tokenizer + Clone> FleetJudge<T> {
                 // report.
                 // A dialect the client cannot serialize joins them: it is a
                 // deployment mistake, and like the other two it means the
-                // request was never sent.
+                // request was never sent. So does a transport failure, which is
+                // the most literal reading of "nobody could reach it" the enum
+                // has — it earned its own variant for failover's sake, and the
+                // question this match asks is unchanged by that.
                 FrontierError::UnknownProvider(_)
                 | FrontierError::Credential(_)
-                | FrontierError::UnsupportedDialect { .. } => SideCallAbandonReason::Unreachable,
-                FrontierError::Upstream(_) => SideCallAbandonReason::Refused,
+                | FrontierError::UnsupportedDialect { .. }
+                | FrontierError::Transport { .. } => SideCallAbandonReason::Unreachable,
+                // The provider answered. A 503 and an unparseable body are both
+                // an answer this deployment could not use, which is what
+                // `Refused` has always meant here — a judge does not fail over,
+                // so the split that matters to routing does not matter to this.
+                FrontierError::Upstream(_) | FrontierError::Status { .. } => {
+                    SideCallAbandonReason::Refused
+                }
             },
         }
     }
@@ -618,6 +628,16 @@ mod tests {
                     expected,
                     got,
                     target: target.clone(),
+                }),
+                Some(FrontierError::Transport { message, timed_out }) => {
+                    Err(FrontierError::Transport {
+                        message: message.clone(),
+                        timed_out: *timed_out,
+                    })
+                }
+                Some(FrontierError::Status { status, message }) => Err(FrontierError::Status {
+                    status: *status,
+                    message: message.clone(),
                 }),
                 None => Ok(FrontierChunk::whole_response(
                     r#"{"on_track":true,"confidence":0.9,"divergence":null,"missing_context":null}"#

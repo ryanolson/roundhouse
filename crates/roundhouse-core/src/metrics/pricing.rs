@@ -422,12 +422,50 @@ impl ShadowPricing {
     /// declared. That is the correct asymmetry: inference is an argument from
     /// this deployment's own history, and there is no history for a model it
     /// has never used.
+    /// The reference model a client's `model` field names, or `None`.
+    ///
+    /// Two spellings are accepted because two are in use: a bare model id, the
+    /// way an OpenAI client writes one, and the qualified `provider/model` an
+    /// OpenRouter id already is. A bare name that two providers both serve is
+    /// deliberately *not* resolved — picking one would be arbitrary, and the
+    /// catalog boundary already refuses two entries for one `(provider, model)`
+    /// precisely so that the router and the dashboard cannot resolve an
+    /// ambiguity two different ways.
+    pub fn reference_named(&self, named: &str) -> Option<&ReferenceModel> {
+        if let Some((provider, model)) = named.split_once('/')
+            && let Some(qualified) = self
+                .references
+                .iter()
+                .find(|r| r.provider == provider && r.model == model)
+        {
+            return Some(qualified);
+        }
+        let mut bare = self.references.iter().filter(|r| r.model == named);
+        match (bare.next(), bare.next()) {
+            (Some(only), None) => Some(only),
+            _ => None,
+        }
+    }
+
+    /// Choose the correlary for one local model.
+    ///
+    /// `declared_baseline` is what this row's turns said they were talking to,
+    /// where they all said the same thing — see
+    /// [`DeclaredBaseline`](super::fold::DeclaredBaseline). It sits *below* an
+    /// operator's [`Self::declare`] and *above* inference, which is the only
+    /// order the three can take: a procurement decision written into the
+    /// deployment's config outranks what a client happened to put in a JSON
+    /// field, and both outrank an argument from traffic shape. A baseline that
+    /// names no model this deployment has a rate card for is not an error and
+    /// not a silent upgrade — the row prices through inference, and the basis
+    /// says `inferred`, which is the true account of what happened.
     pub fn resolve(
         &self,
         local_model: &str,
         local_quality_prior: f64,
         local_shape: Option<TokenShape>,
         observed: &HashMap<(String, String), TokenShape>,
+        declared_baseline: Option<&str>,
     ) -> Correlary {
         if let Some(declared) = self.declared.get(local_model) {
             let reference = self
@@ -452,6 +490,22 @@ impl ShadowPricing {
                         "declared correlary `{}/{}` has no rate card",
                         declared.provider, declared.model
                     ),
+                },
+            };
+        }
+
+        if let Some(named) = declared_baseline
+            && let Some(reference) = self.reference_named(named)
+        {
+            return Correlary::Priced {
+                local_model: local_model.to_string(),
+                reference: reference.clone(),
+                // The client's own words, quoted rather than paraphrased, so a
+                // reader of the dashboard can tell a saving priced against the
+                // model the caller asked for from one priced against the model
+                // an operator wrote down.
+                basis: PricedBasis::Declared {
+                    note: format!("the request's `model` field named `{named}`"),
                 },
             };
         }
@@ -607,7 +661,7 @@ mod tests {
 
         // Shape points squarely at openai/small; the declaration overrules it.
         let local = TokenShape::from_rollup(&usage(10_000, 5_000, 500, 0), 10);
-        let correlary = pricer.resolve("llama", 0.6, local, &observed);
+        let correlary = pricer.resolve("llama", 0.6, local, &observed, None);
 
         assert_eq!(correlary.reference().unwrap().model, "big");
         assert!(matches!(
@@ -617,6 +671,125 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// S4, the pricing half: the model a client named is the counterfactual its
+    /// turns are priced against.
+    #[test]
+    fn the_declared_baseline_prices_the_counterfactual_it_names() {
+        let observed = shapes(&[
+            (
+                "anthropic",
+                "big",
+                TokenShape::from_rollup(&usage(1_000, 0, 900, 0), 1).unwrap(),
+            ),
+            (
+                "openai",
+                "small",
+                TokenShape::from_rollup(&usage(10_000, 5_000, 500, 0), 10).unwrap(),
+            ),
+        ]);
+        let pricer = ShadowPricing::new(vec![
+            reference("anthropic", "big", 0.6),
+            reference("openai", "small", 0.6),
+        ]);
+        // Shape points squarely at openai/small, exactly as in
+        // `a_declaration_beats_a_closer_shape_match` above -- so if the
+        // baseline moves this, it is the baseline that moved it.
+        let local = TokenShape::from_rollup(&usage(10_000, 5_000, 500, 0), 10);
+
+        let named = pricer.resolve("llama", 0.6, local, &observed, Some("big"));
+        assert_eq!(named.reference().unwrap().model, "big");
+        match &named {
+            Correlary::Priced {
+                basis: PricedBasis::Declared { note },
+                ..
+            } => assert!(
+                note.contains("`model`") && note.contains("big"),
+                "a saving priced against what the caller asked for has to say \
+                 so, and say what was asked: {note}"
+            ),
+            other => panic!("a resolvable baseline is a declaration: {other:?}"),
+        }
+
+        // The qualified spelling an OpenRouter id already is.
+        assert_eq!(
+            pricer
+                .resolve("llama", 0.6, local, &observed, Some("anthropic/big"))
+                .reference()
+                .unwrap()
+                .model,
+            "big"
+        );
+
+        // The control: the same row with no baseline infers, and infers the
+        // *other* model. This is what makes the assertions above about the
+        // baseline rather than about a coincidence of ordering.
+        let inferred = pricer.resolve("llama", 0.6, local, &observed, None);
+        assert_eq!(inferred.reference().unwrap().model, "small");
+        assert!(matches!(
+            inferred,
+            Correlary::Priced {
+                basis: PricedBasis::Inferred { .. },
+                ..
+            }
+        ));
+
+        // An operator's declaration still outranks the client's: a procurement
+        // decision is not overruled by a JSON field.
+        let declared =
+            pricer
+                .clone()
+                .declare("llama", "openai", "small", "matched on our eval suite");
+        assert_eq!(
+            declared
+                .resolve("llama", 0.6, local, &observed, Some("big"))
+                .reference()
+                .unwrap()
+                .model,
+            "small"
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_baseline_infers_and_never_silently_upgrades_to_declared() {
+        let observed = shapes(&[(
+            "openai",
+            "small",
+            TokenShape::from_rollup(&usage(10_000, 5_000, 500, 0), 10).unwrap(),
+        )]);
+        let pricer = ShadowPricing::new(vec![reference("openai", "small", 0.6)]);
+        let local = TokenShape::from_rollup(&usage(10_000, 5_000, 500, 0), 10);
+
+        // A model this deployment has no rate card for. Not an error, and not a
+        // declaration: the row prices through inference and the basis says so,
+        // which is the true account. The name itself is not lost -- it is on
+        // every decision in the log, verbatim.
+        let correlary = pricer.resolve("llama", 0.6, local, &observed, Some("kimi-k3"));
+        assert!(matches!(
+            correlary,
+            Correlary::Priced {
+                basis: PricedBasis::Inferred { .. },
+                ..
+            }
+        ));
+
+        // And a bare name two providers both serve resolves to neither: picking
+        // one would be arbitrary, and the catalog refuses duplicate identity
+        // for the same reason.
+        let ambiguous = ShadowPricing::new(vec![
+            reference("openai", "shared", 0.6),
+            reference("anthropic", "shared", 0.6),
+        ]);
+        assert!(ambiguous.reference_named("shared").is_none());
+        assert_eq!(
+            ambiguous
+                .reference_named("anthropic/shared")
+                .unwrap()
+                .provider,
+            "anthropic",
+            "the control: qualified, it is not ambiguous at all"
+        );
     }
 
     #[test]
@@ -630,7 +803,7 @@ mod tests {
 
         // Identical traffic shape, wildly different capability.
         let local = TokenShape::from_rollup(&usage(10_000, 5_000, 500, 0), 10);
-        let correlary = pricer.resolve("tiny-7b", 0.35, local, &observed);
+        let correlary = pricer.resolve("tiny-7b", 0.35, local, &observed, None);
 
         assert!(correlary.reference().is_none());
         assert!(matches!(correlary, Correlary::Unpriced { .. }));
@@ -661,7 +834,7 @@ mod tests {
         ]);
 
         let local = TokenShape::from_rollup(&usage(20_000, 10_000, 300, 0), 10);
-        let correlary = pricer.resolve("llama", 0.6, local, &observed);
+        let correlary = pricer.resolve("llama", 0.6, local, &observed, None);
 
         assert_eq!(correlary.reference().unwrap().model, "terse");
         match &correlary {
@@ -678,7 +851,7 @@ mod tests {
         let pricer = ShadowPricing::new(vec![reference("anthropic", "unused", 0.6)]);
         let local = TokenShape::from_rollup(&usage(1_000, 0, 100, 0), 1);
 
-        let correlary = pricer.resolve("llama", 0.6, local, &HashMap::new());
+        let correlary = pricer.resolve("llama", 0.6, local, &HashMap::new(), None);
         assert!(correlary.reference().is_none());
     }
 
@@ -701,6 +874,7 @@ mod tests {
             0.6,
             TokenShape::from_rollup(&usage(1_000, 0, 100, 0), 1),
             &observed,
+            None,
         );
         assert!(
             correlary.reference().is_none(),
@@ -716,7 +890,7 @@ mod tests {
             "big",
             "",
         );
-        let correlary = pricer.resolve("llama", 0.6, None, &HashMap::new());
+        let correlary = pricer.resolve("llama", 0.6, None, &HashMap::new(), None);
 
         // 100k prompt, 90% of it cached, 1k output, at 3.00 / 0.30 / 15.00.
         let served = usage(100_000, 90_000, 1_000, 0);

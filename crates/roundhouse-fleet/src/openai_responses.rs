@@ -369,16 +369,24 @@ impl FrontierClient for OpenAiResponsesClient {
                 // header, so there is nothing to redact here -- stated because
                 // the next person to add context to this message needs to know
                 // it is not exempt.
-                FrontierError::Upstream(format!("the request to the upstream failed: {source}"))
+                //
+                // `is_timeout` is read here and nowhere else: it is a fact the
+                // transport knows and nothing downstream can recover, and it is
+                // the difference between an attempt row that says the provider
+                // was unreachable and one that says it was slow.
+                FrontierError::Transport {
+                    timed_out: source.is_timeout(),
+                    message: source.to_string(),
+                }
             })?;
 
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            return Err(FrontierError::Upstream(format!(
-                "the upstream answered {status}: {}",
-                route.credential.redact(body)
-            )));
+            return Err(FrontierError::Status {
+                status: status.as_u16(),
+                message: route.credential.redact(body),
+            });
         }
 
         Ok(decode(
@@ -444,13 +452,23 @@ fn bytes_state(
 /// The same error with any echoed credential removed.
 ///
 /// Every error leaving this module goes through here or through
-/// [`TurnCredential::redact`] directly. Only the [`FrontierError::Upstream`]
-/// arm can carry an upstream's words; the others are this client's own
-/// sentences and have nothing to scrub.
+/// [`TurnCredential::redact`] directly. Two arms can carry an upstream's words
+/// — [`FrontierError::Upstream`] and [`FrontierError::Status`] — and both are
+/// scrubbed; the others are this client's own sentences and have nothing to
+/// scrub. The match is exhaustive rather than a wildcard so that a variant
+/// added later cannot join the list of things that carry a body without
+/// somebody deciding it should.
 fn redact_error(credential: &TurnCredential, error: FrontierError) -> FrontierError {
     match error {
         FrontierError::Upstream(message) => FrontierError::Upstream(credential.redact(message)),
-        other => other,
+        FrontierError::Status { status, message } => FrontierError::Status {
+            status,
+            message: credential.redact(message),
+        },
+        other @ (FrontierError::UnknownProvider(_)
+        | FrontierError::Credential(_)
+        | FrontierError::UnsupportedDialect { .. }
+        | FrontierError::Transport { .. }) => other,
     }
 }
 

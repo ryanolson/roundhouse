@@ -528,6 +528,7 @@ mod the_live_admission_cannot_move_a_finished_turns_charge {
             validation: None,
             credentials: TurnCredentials::unrestricted(),
             budget_counts,
+            tiers: None,
         }
     }
 
@@ -596,6 +597,8 @@ mod the_live_admission_cannot_move_a_finished_turns_charge {
                     billing: Billing::Billed,
                     budget_draw: logged,
                     withheld_providers: Vec::new(),
+                    declared_baseline: None,
+                    attempts: Vec::new(),
                 },
             )
             .await

@@ -68,6 +68,8 @@ fn decision_for(target: Target, isl: u64) -> DecisionRecord {
         billing: Default::default(),
         budget_draw: Some(BudgetCounts::AllFrontierSpend),
         withheld_providers: Vec::new(),
+        declared_baseline: None,
+        attempts: Vec::new(),
     }
 }
 

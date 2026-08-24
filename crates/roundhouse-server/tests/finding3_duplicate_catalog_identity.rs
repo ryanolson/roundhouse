@@ -126,6 +126,8 @@ fn one_frontier_call(usage: Usage) -> Vec<SessionEvent> {
                     billing: Default::default(),
                     budget_draw: None,
                     withheld_providers: Vec::new(),
+                    declared_baseline: None,
+                    attempts: Vec::new(),
                 },
             },
         },

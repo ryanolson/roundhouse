@@ -490,7 +490,7 @@ mod tests {
 
         let correlary = metrics
             .pricing
-            .resolve("llama", 0.62, None, &HashMap::new());
+            .resolve("llama", 0.62, None, &HashMap::new(), None);
         assert_eq!(correlary.reference().unwrap().model, "claude-sonnet");
         match &correlary {
             Correlary::Priced {

@@ -106,6 +106,7 @@ use roundhouse_core::control::{
     TurnPolicy,
 };
 use roundhouse_core::ids::SessionId;
+use roundhouse_core::routing::TierRecipe;
 use roundhouse_core::validate::ValidationTerms;
 
 use crate::dialect::ClientDialect;
@@ -1140,6 +1141,21 @@ pub struct Admission {
     /// budget, and harmless where there is not — a membership with no budget
     /// never reaches the ledger at all.
     pub budget_counts: BudgetCounts,
+    /// The two ordered candidate lists this project's turns are routed between,
+    /// or `None` where it configured none.
+    ///
+    /// **Resolved here, beside `policy`, and deliberately not folded into it.**
+    /// A policy is a *constraint* — what this principal may reach — and it is
+    /// fingerprinted onto every decision as the audit trail's account of the
+    /// limits in force. A recipe is a *preference* among targets already
+    /// reachable. Folding one into the other would move the policy digest of
+    /// every project that configured a recipe and changed no entitlement, and
+    /// would make `unkeepable_promises` — which checks a policy's promises
+    /// against the catalog — answer a second question it was never asked.
+    ///
+    /// Behind an `Arc` for the reason `policy` is: an [`Admission`] is cloned
+    /// per request out of a table compiled at load.
+    pub tiers: Option<Arc<TierRecipe>>,
 }
 
 impl Admission {
@@ -1177,6 +1193,9 @@ impl Admission {
             // which is what `TurnCredentials::unrestricted` is written out for.
             credentials: TurnCredentials::unrestricted(),
             budget_counts: BudgetCounts::default(),
+            // No file to write a recipe in, and inventing one would re-route
+            // every turn of a deployment that never asked to be tier-routed.
+            tiers: None,
         }
     }
 
@@ -1224,6 +1243,11 @@ impl Admission {
             // turn reach a provider its project cannot pay for.
             credentials: self.credentials.clone(),
             budget_counts: self.budget_counts,
+            // Nor is the recipe. An overlay narrows what a turn may *reach*;
+            // which of the reachable tiers should answer is scored from the
+            // session's own evidence, and an agent that could edit the lists
+            // would be choosing its own model by another name.
+            tiers: self.tiers.clone(),
         }
     }
 }

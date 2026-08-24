@@ -96,6 +96,7 @@ fn project(id: &str) -> ProjectEntry {
         fair_use: None,
         validate: None,
         credentials: None,
+        tiers: None,
     }
 }
 

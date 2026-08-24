@@ -418,6 +418,11 @@ mod tests {
                 turn_policy: &self.turn_policy,
                 frontier_history: &self.frontier_history,
                 budget: &self.budget,
+                // Neither axis exists for these two policies: they score
+                // candidates, they do not pick tiers. `stage.rs` has the
+                // fixture that fills both in.
+                signals: None,
+                tiers: None,
             }
         }
     }
@@ -534,47 +539,45 @@ mod tests {
         };
         let scored =
             "score 0.0000 over 3 candidate(s); expected prefill 500 of 10000 tokens (95% cached)";
+        // The two fields M10 added, pinned empty on every arm rather than
+        // spread through four literals: neither policy here picks a tier, so
+        // neither has a runner-up to fall forward to or a source to state, and
+        // a decision from one of them that acquired either would be dispatching
+        // twice for a turn M1 dispatched once.
+        let unstaged = |target: Target, rationale: &str| Decision {
+            target,
+            rationale: rationale.into(),
+            budget_state: BudgetState::Unconstrained,
+            fallbacks: Vec::new(),
+            source: None,
+        };
 
         for (label, decision, expected) in [
             (
                 "affinity, ordinary turn",
                 choose(&affinity, &candidates, 1).await,
-                Decision {
-                    target: warm_local.clone(),
-                    rationale: scored.into(),
-                    budget_state: BudgetState::Unconstrained,
-                },
+                unstaged(warm_local.clone(), scored),
             ),
             (
                 "escalation, ordinary turn",
                 choose(&escalation, &candidates, 1).await,
-                Decision {
-                    target: warm_local.clone(),
-                    rationale: scored.into(),
-                    budget_state: BudgetState::Unconstrained,
-                },
+                unstaged(warm_local.clone(), scored),
             ),
             (
                 "affinity, audit-numbered turn",
                 choose(&affinity, &candidates, 4).await,
-                Decision {
-                    target: warm_local,
-                    rationale: scored.into(),
-                    budget_state: BudgetState::Unconstrained,
-                },
+                unstaged(warm_local, scored),
             ),
             (
                 "escalation, audit turn",
                 choose(&escalation, &candidates, 4).await,
-                Decision {
-                    target: Target::Frontier {
+                unstaged(
+                    Target::Frontier {
                         provider: "anthropic".into(),
                         model: "claude".into(),
                     },
-                    rationale: "audit turn (every 4); escalated to highest quality prior 0.95"
-                        .into(),
-                    budget_state: BudgetState::Unconstrained,
-                },
+                    "audit turn (every 4); escalated to highest quality prior 0.95",
+                ),
             ),
         ] {
             assert_eq!(decision, expected, "{label} must be byte-identical to M1");

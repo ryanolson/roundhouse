@@ -577,6 +577,12 @@ impl MetricsSnapshot {
                         config.local_quality(&key.model),
                         shape,
                         &frontier_shapes,
+                        // What this row's turns said they were talking to,
+                        // where they agreed. The counterfactual a client named
+                        // is a better answer than one inferred from traffic
+                        // shape, and a worse one than a procurement decision an
+                        // operator wrote down — `resolve` holds that order.
+                        counters.declared_baseline.resolved(),
                     );
                     ModelAccounting::Local {
                         shadow_usd: correlary.shadow_cost_usd(&priceable),

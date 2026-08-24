@@ -228,6 +228,12 @@ pub struct SessionState {
     /// that. Counting only successes would let a provider outage multiply the
     /// frontier traffic of every session retrying through it, at the moment
     /// the knob is most supposed to hold.
+    ///
+    /// Since M10 a turn may write more than one `Routed` — one per dispatch, on
+    /// a decision that fell forward to a fallback — and this fold needs no
+    /// change to be right about it: a turn that reached for two hosted models
+    /// counted two reaches, which is the sentence above applied literally
+    /// rather than a special case bolted onto it.
     pub frontier_history: FrontierHistory,
     /// The most recent response to terminate, priced-ready.
     ///

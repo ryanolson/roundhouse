@@ -281,6 +281,84 @@ the process's memory), so a deployment that sets `ROUNDHOUSE_REDIS_URL` while
 also configuring `fair_use` gets a boot warning that two nodes serving one
 project enforce two independent ceilings rather than one shared one.
 
+**Two-tier selection.** A project's `"tiers"` block turns routing into a choice
+between two ordered lists — `"capable"` and `"efficient"`, each naming target
+identities (`provider/model`, or `local/model` for one of the fleet's own) —
+plus `"picker"` (`efficient_first`, the default and the only operating point
+anyone has calibrated, or `capable_first`, which the process warns about at
+boot) and `"confidence_threshold"` (`0.0..=1.0`, default `0.5`). Absent
+`"tiers"` is the shipped answer, and a project without one routes exactly as it
+did before this existed.
+
+What moves a turn between the tiers is the session's own recent tool results —
+error severity, whether the agent is producing work or spinning in place, how
+deep the session is — scored by a port of Switchyard's coding-agent scorer.
+**No model call is involved anywhere in the decision**: it is a `tanh` over four
+numbers read out of the log the fold already holds, so an agent that starts
+looping is moved up a tier and one that just made its tests pass is moved back
+down, at no latency and no cost. (The judge that *does* call a model lives in
+the validate loop, which is a different surface.)
+
+Three properties of the lists are worth knowing before writing one:
+
+- **Admission runs first and a tier can only narrow.** A target this key's
+  policy, quality floor, or credentials do not admit is skipped and never
+  resurrected; a tier that empties entirely falls to the other one, with the
+  decision's rationale saying so.
+- **Order is the operator's, and it is also the failover order.** The first
+  admitted entry of the picked tier serves the turn and the rest of that same
+  tier are its ordered fallbacks. A fallback fires only on a hosted dispatch
+  that never reached a model — transport error, timeout, 408, 429, 5xx — under
+  the *same turn deadline* and the *same single budget grant*, so a flaky
+  provider cannot pyramid holds or spend N times the turn's allowance. A refusal
+  or a content filter is an *answer* and is not retried, and a local target does
+  not fail over at all.
+- **A target may not be named twice**, within a tier or across both. Rejected at
+  load rather than deduplicated: a repeat inside one tier is a retry of the model
+  that just failed wearing a failover's clothes, and a name in both tiers makes
+  the scorer's choice a no-op that still reads like a decision.
+
+Two consequences that follow from the design and are easier to meet in the
+README than to rediscover in a log:
+
+- **A cadence counts attempts, not turns.** `frontier_cadence` is folded at each
+  `Routed`, and there is one `Routed` per *dispatch*, so a project at
+  `max_frontier: 1, per_turns: 3` that fell forward twice has spent two rations
+  on one turn. That is deliberate and conservative — a dispatch that failed on
+  the way out really did reach for a hosted model — and it means a provider
+  outage tightens the ration rather than loosening it.
+- **`DecisionRecord::policy` reads `stage` on a deployment that configured any
+  recipe**, including for its projects that configured none, because the stage
+  router is the object in force and reporting the inner policy's name would make
+  the audit trail credit the wrong router. Their target and rationale are
+  byte-identical to what the inner policy would have produced. The wrapper is
+  composed **only when some project has a recipe at boot**, precisely so that
+  this field does not move on a deployment whose routing did not; a recipe added
+  through the admin plane *after* boot therefore selects nothing until a
+  restart, and the process warns once, naming the router that could not read it.
+
+**The client's `model` field is recorded, never routed on.** `/v1/responses`
+accepts a `model` and has always ignored it — roundhouse chooses the target. It
+is now written verbatim onto the decision as the *declared baseline* and read by
+exactly one consumer: the dashboard's counterfactual, which prices a local turn
+against the model the client said it thought it was talking to rather than
+against one inferred from the catalog. When it resolves, the saving is reported
+on the `Declared` basis; when it does not, the value is still recorded verbatim
+and the pricing falls back to inference on the `Inferred` basis, never a silent
+upgrade. No line of routing reads it.
+
+**The handoff note now rides a tier escalation too.** A project that configured
+`handoff_note` gets one sentence appended to the *forwarded request only* on the
+first turn a signal moves the session onto the capable tier — the same mechanism
+the validate loop's escalation already used, under the same rules: it never
+touches the stored conversation, it rides once per switch rather than
+accumulating, and it narrates only a signal-driven move. A fall-open onto the
+capable tier under `capable_first`, a signal-driven move *down* a tier, and a
+capable pick the key cannot reach all carry nothing — in each of those the model
+reading the note would be told the preceding steps came from something in
+trouble when nothing said they did, or that a change of hands happened when none
+did.
+
 **Sourcing `quality_prior`.** `FrontierModelSpec::quality_prior` is
 configuration, not measurement, and `import-benchmarks` (a binary target in
 `roundhouse-fleet`, not linked into any shipped binary) is what lets that
@@ -305,6 +383,21 @@ persistence, which collides with the requirement to survive process death, and
 the library is self-described pre-alpha whose core vocabulary changed shape
 three times in one week of 2026-08. Behind the trait, it is an option rather
 than a dependency.
+
+What has been taken across is the part that does not move: the **coding-agent
+scorer** and its constants, ported into `roundhouse-core/src/routing/stage.rs`
+with the upstream revision named in the module's attribution and pinned by a
+test that reads the attribution text rather than its own literals. That is the
+asset — the table of error patterns and the calibration behind the thresholds
+are trace-mined rather than reasoned, so an editorial improvement made on the
+way across would be an unmeasured heuristic wearing a measured one's
+provenance. Every divergence is documented at the divergence: `compacted` has no
+input in this tree and so the hard escalate is severity-only; `turn_depth` is
+the exchange count rather than the message count; and upstream's
+`ConsultClassifier` outcome is folded away entirely, because routing here makes
+no model calls — an undecided turn lands on the picker's default tier and is
+marked as having got there by falling open, which is what stops the handoff note
+narrating it.
 
 ## Build and test
 
@@ -376,6 +469,28 @@ selection plane runs inside the test binary.
 - **Capability gates the correlary** — local traffic with no comparable hosted
   model is reported unpriced and contributes nothing to the savings figure,
   rather than falling back to the nearest rate card.
+- **The tier a turn lands on is read from the session, not asserted** — a
+  stalling session is driven through the real signal extractor as *items* and
+  comes out on the capable tier; a session that produced work and passed its
+  tests comes back down; a quiet one falls open. Each has a control that varies
+  only the exchanges, so none of them is a test about the picker.
+- **A dead provider costs one attempt, not the turn** — a transport failure
+  advances to the next candidate of the same tier inside one turn, one deadline
+  and **one grant settled once**; a refusal, a 401 and a 404 fail where they
+  stand; a stream that dies after the first delta is not retried; and an
+  exhausted tier fails with every attempt on the record rather than spilling
+  into the other tier.
+- **A failover crosses transports as well as targets** — the second attempt goes
+  out through the second provider's own client, with its own base URL and
+  credential resolved for that dispatch; an engine that resolved one client per
+  turn passes every single-dispatch registry test and fails this one.
+- **The handoff note narrates only a switch that happened** — it rides the first
+  signal-driven move onto the capable tier and survives a failover inside that
+  turn, and carries nothing on a fall-open, a signal-driven de-escalation, a
+  second consecutive capable turn, or a capable pick the key cannot reach.
+- **A recipe nothing reads is not silent** — a `tiers` block on a process whose
+  router cannot read one warns once, naming that router; the same recipe on the
+  stage router says nothing at all.
 
 ## Codex as the compliance oracle
 
