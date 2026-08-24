@@ -237,3 +237,140 @@ a target class and a header vocabulary rather than as rivals. The moat was
 never the wire format; it is the turn, priced exactly, under policy, with an
 audit trail — and after this round, that claim carries four pinned trees of
 evidence instead of an assertion.
+
+## Addendum (2026-08-21): round 3 — the re-read before the follow-ons
+
+Recorded after M9, before any of the four follow-ons this ruling scheduled
+landed, per the vigilance rule: each upstream was re-cloned and read at HEAD
+against its round-2 pin, and each dive was independently fact-checked (42
+claims re-derived, none refuted). Evidence: the dated bracketed notes in
+`../research/vllm-agentic-api-deep-dive.md`,
+`../research/relay-switchyard-dedup-deep-dive.md`,
+`../research/nemo-relay-deep-dive.md` and
+`../research/k8s-gateway-inference-deep-dive.md`. Where this addendum and
+the text above disagree, the addendum wins.
+
+**The "new first proof" is re-scoped, because the actor named cannot
+perform it.** Item 5 said a Codex session running against agentic-api could
+declare roundhouse's `/mcp` as a tool. Codex's `ToolSpec` is a closed
+five-arm enum — `function`, `namespace`, `tool_search`, `web_search`,
+`custom` — with no `mcp` arm, byte-identical at the pin and at `e363b08`;
+`[mcp_servers]` makes *codex* the MCP client and the declaration reaches
+the wire as a `namespace`. And in every topology where the Responses turn
+does not pass through roundhouse, the control tools have no session to
+answer about: `status` resolves a conversation by the caller's
+`prompt_cache_key`, and a turn roundhouse never routed has none. The one
+topology in which both halves of the product sentence hold is roundhouse in
+front with agentic-api behind — the topology this ruling already chose —
+and in it the MCP proof does not involve agentic-api at all. **M9 delivered
+that proof** (a real codex binary, a generated config, our `/mcp`, no PR on
+either side). The agentic-api leg survives as a **compatibility test**, not
+a first proof: agentic-api's own request-side `type: "mcp"` tool (with
+`server_label`, `server_url`, `authorization`, `require_approval = "never"`
+— mandatory, and the only accepted value) driven by a scripted client
+against `agentic serve --upstream … --skip-llm-ready-check`, which runs with
+no GPU and no Python, proving our surface survives a second gateway's rmcp
+1.8 client and its `mcp__roundhouse__<tool>` flattening. The write-up must
+say plainly that the client is a script and the tools answer about a turn
+roundhouse did not route. Two facts for whoever runs it: at the pin the
+request would have been refused (`parallel_tool_calls` with a built-in
+tool); HEAD forces it `false` upstream instead, so the demo works only
+after `#197`. And agentic-api needs Rust 1.98.0 against our 1.96.1 — a
+toolchain ceiling to record beside any future dependency line. Its
+`[mcp_servers.*].headers` takes a literal bearer with no env indirection;
+`bearer_token_env_var` there is a smaller and better first upstream PR than
+rustls, with a precedent in codex's own schema. The Interactions API
+watching brief closes in the negative: the goal was deleted, not deferred.
+
+**S2's pin rationale was overtaken twenty hours before the re-read, and the
+pin stays where it was for a different reason.** `nemo-relay-types
+0.8.0-rc.1` is on crates.io, byte-identical to `crates/types/src` at our
+`ca08901`. The reason to pin `=0.7.3` is no longer "0.8 is unpublished" but
+that `codec/optimization.rs` — `LlmOptimizationSummary`, `Contribution`,
+`Partial`, `limitations` — and the entire ATOF envelope are byte-identical
+from 0.7.3 through HEAD. That holds exactly as long as S2 emits summaries
+and scope/mark events, which is S2 as written; the 0.8-only
+`MetricEnvelope` / `METRIC_DATA_SCHEMA_NAME` vocabulary is out of scope and
+would move the pin. A crates.io `=x.y.z` is immutable and therefore as
+reproducible as a git rev, so the version-identity rule is satisfied, not
+bent. The cost that must be written beside the pin: the crate carries
+`uuid = "=1.18.1"`, a six-release downgrade from our resolved 1.24.0 and a
+ceiling on the whole graph; every dependent in our lock is satisfied by it
+today, and the unlock condition is a Relay release that relaxes the pin.
+ATIF is twelve structs, not "~15", re-implemented from Apache-2.0 source
+and two published guides, attributed the way the judge prompts were.
+Carrying the capability-gate result in `limitations[]` forces
+`status: Partial` — intended, because the number must never sit
+indistinguishable beside an ungated one. Relay also deleted its entire
+Switchyard integration (`88d1b1b`, #811) — four citations in the standing
+evidence now point at files that no longer exist, and the seam moved to
+Switchyard's side, where it exists only on an unmerged branch as a
+`publish = false` cdylib. The two neighbours are no longer fused anywhere
+a consumer can reach, which hardens port-not-crate rather than moving it.
+
+**The `ToolSignals` port stands, re-scoped and with one ruling made here.**
+The target did not move — `tool_signals.rs` and `util/stage.rs` are
+byte-identical to the pin. The struct is fourteen fields, not sixteen;
+twelve port. `turn_depth` does not (our `Evidence` carries exchanges, not
+messages, and upstream itself calls the count wire-format dependent) and
+`compacted` does not, three ways: our exchange extractor drops text items,
+the marker is Claude Code's, and roundhouse forks a compacted conversation
+onto a fresh session, so nothing is left to latch onto. The scorers —
+`pick_tier`, `score_signal` — are refused a place behind `Signal`:
+`SignalFired::fact` is "never a suggestion" and a tier recommendation is
+exactly that; if wanted, they belong beside `routing/policy.rs`. The sharp
+design fact: codex's exec header is half signal and half noise.
+Switchyard's `exit_nonzero` is an unanchored `contains("exited with code")`
+and codex writes `Process exited with code 0` on every exec result, so
+feeding the whole string scores a soft error on every success, while
+feeding only `tool_output_body` loses the exit code entirely because that
+line is one the stripper removes. The port reads the exit code from the
+header as a structured fact and runs the error table over the body — the
+inverse of M9's F04 remedy, and a second accessor beside
+`tool_output_body`. The same pass raised a claim against our own tree:
+`reads_as_failure` is blind to codex exit codes today, so
+`ToolFailureStreak` cannot fire on a non-zero exit with empty stdout — the
+most common failure shape in a coding loop. It is ruled here as a finding
+to be validated test-first in the port's own PR, because the fix and the
+port want the same accessor. Adoption 1 (`switchyard-protocol`) got cheaper
+per unit of value: sub-agent detection now fires on current codex lineage.
+Switchyard deleted its launchers (`#501`), so `requires_openai_auth`
+appears nowhere there; the hypothesis keeps its evidence (`caller_auth_kind`
+is public Rust) and loses its citation. And Switchyard dropped
+`prompt_cache_key` on every IR-mutating Responses re-encode until `#509`
+landed on the day of this re-read — roundhouse refuses without it, so that
+chain broke on every turn: the first concrete instance of the fourth chain
+hazard, and the argument that S3's re-encoded-history guard test is not
+optional.
+
+**The Kubernetes watching brief stays a watching brief, with one correction
+that would otherwise have been written into code wrong.** GAIE has not
+moved — same SHA for three days, which is what a repository mid-handoff
+looks like. The header vocabulary in item 6 names the *deprecated* aliases:
+`llm-d-router` renamed every EPP-owned header to an `x-llm-d-` prefix
+(`81d7f460`, keeping the old names as live aliases), while the three
+`x-gateway-destination-*` names the endpoint-picker protocol defines kept
+their spelling in both repos. Read `x-llm-d-slo-ttft-ms`,
+`x-llm-d-slo-tpot-ms`, `x-llm-d-inference-fairness-id`; accept the alias
+set and emit the current name. Item 6 said this lands with M7; M7 shipped
+and it did not, which is the only reason the correction costs a string
+constant rather than a migration. Found in the same pass: upstream's
+`agent-identity` plugin keys fairness off headers the agents already send,
+and codex's `session-id` is one of them, on every `/v1/responses` request,
+byte-identical at the binary and the pin — a per-session identity on the
+wire with no client change. The select/reserve contribution's premise is
+gone: llm-d-router closed the assumed-load hole itself with an in-flight
+producer that books at dispatch and discounts the cached prefix. The
+operative decision (no second contribution track before M7 proves the
+first) is unchanged and reinforced; what remains genuinely ours is booking
+a *measured* overlap from the engine's own KV events, which is closer to a
+Dynamo contribution than a roundhouse one. InferencePool-as-discovery is
+now optional upstream too, so deferring it is cheaper to reverse.
+
+**What this changes in the plan, restated.** The follow-on order stands —
+the agentic-api leg first, as a compatibility test rather than a proof;
+S2 on `=0.7.3` with the `uuid` ceiling recorded; the `ToolSignals` port
+with the exit-code accessor and the `reads_as_failure` finding ruled
+test-first in the same PR; the SLO headers, when they land, under the
+`x-llm-d-` spelling with aliases. Four evidence citations retired by Relay's
+deletion are bracketed, not rewritten.

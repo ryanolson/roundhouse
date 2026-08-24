@@ -131,7 +131,12 @@ and that distinction matters for how the synthesis weighs them.
    cost_estimator.py:500, launcher_runtime.py:251, …}` — 2,503 Python lines
    that host an in-process native Rust server and drive Codex/Claude/OpenClaw
    against it. This is a **second** NVIDIA implementation of the launch surface
-   roundhouse's M9 plans and Relay already ships.
+   roundhouse's M9 plans and Relay already ships. *[2026-08-21: **deleted
+   upstream.** `43fc1a7` ("chore: Remove Python launchers and `switchyard`
+   CLI", #501) removes `switchyard/cli/launch_command.py`, all of
+   `switchyard/cli/launchers/`, `switchyard_cli.py`, and their tests — every
+   file cited in this finding. There is no `switchyard launch` at HEAD
+   (`053a61e`), and the three-launch-surface count in E2 is now two.]*
 3. **`requires_openai_auth` is a switch upstream, not a constant.** Relay
    hardcodes `requires_openai_auth=true`
    (`crates/cli/src/agents/codex/launch.rs:199-205`). Switchyard's launcher
@@ -143,6 +148,21 @@ and that distinction matters for how the synthesis weighs them.
    (`codex_cli_launcher.py:169`, `native_server.py:56-58`,
    `crates/switchyard-server/src/lib.rs:279-283`). This is the missing input to
    PLAN §3's open caveat (`PLAN-agentic-control-plane.md:437-447`).
+   *[2026-08-21: the Python half of this evidence is gone. `43fc1a7` (#501)
+   deleted `codex_cli_launcher.py`, and `git grep requires_openai_auth HEAD`
+   in Switchyard now returns nothing — **the flag appears nowhere in the tree
+   at `053a61e`**. What survives is the *input* to the conditional, promoted to
+   a public Rust API: `ServerHandle::caller_auth_kind(model) -> Option<&str>`
+   (`crates/switchyard-server/src/lib.rs:324-329` @ `053a61e`), fed by
+   `ClientFormat::caller_auth_kind` (`config.rs:338-343`: Anthropic-Messages →
+   Anthropic, OpenAI-Chat/Responses → OpenAI) and by the route-level check that
+   one route may not forward two credential families (`config.rs:213-221`). So
+   the *hypothesis* — that this is a route property — is still supported, but
+   Switchyard no longer states the codex-side conclusion anywhere. M7's
+   verification item can cite `caller_auth_kind` as the route-property
+   evidence; it can no longer cite a Switchyard line that writes
+   `requires_openai_auth`, and any citation of `codex_cli_launcher.py` must be
+   rev-qualified to `5341f71` or earlier.]*
 4. **Switchyard has a production pass-through-auth implementation.**
    `LlmClientConfig.forward_auth: bool` (`crates/switchyard-server/src/config.rs:254`),
    mutually exclusive with `api_key_env` (`config.rs:873-877`); a route may not
@@ -189,6 +209,16 @@ and that distinction matters for how the synthesis weighs them.
    (`stage.rs:323`), `pick_tier` (`stage.rs:373`). *`ToolSignalProcessor`
    (`tool_signals.rs:277`) is **not** re-exported — `mod algorithms;` is
    private at `lib.rs:17`, so only the explicit `pub use` list is reachable.*
+   *[2026-08-21: **the count is 14, not 16** — `severity`, `no_error_streak`,
+   `edit_count`, `write_count`, `read_count`, `todowrite_count`, the four
+   `recent_*` counters, `pure_bash_streak`, `tests_passed`, `turn_depth`,
+   `compacted` (`tool_signals.rs:206-246` @ `053a61e`). Everything else in this
+   finding re-verified verbatim. Both files are **byte-identical** to
+   `5341f71` (`md5 822def5b…` for `tool_signals.rs`, `da0b2402…` for
+   `util/stage.rs`); `tool_signals.rs` was last touched 2026-08-03 by a
+   docs-only commit (`e012780`) and `util/stage.rs` 2026-08-12 (`48b3b71`), so
+   the port target did not move across 23 commits. `ToolSignals` and
+   `DEFAULT_RECENT_WINDOW` are at `lib.rs:34`, the scorers at `lib.rs:38-42`.]*
 8. **`switchyard-protocol::Metadata` normalizes every coding-agent correlation
    header roundhouse cares about.** `Metadata::from_headers`
    (`crates/protocol/src/metadata.rs:200-224`) resolves 15 fields —
@@ -200,7 +230,19 @@ and that distinction matters for how the synthesis weighs them.
    `x-claude-code-{session,agent,parent-agent}-id`, `x-nemo-relay-session-id`,
    `x-dynamo-{session-id,parent-session-id,session-final}`, `x-openai-subagent`,
    and bare `session-id`/`thread-id`/`x-request-id`
-   (`metadata.rs:15-65`).
+   (`metadata.rs:15-65`). *[2026-08-21: the enumerated list is 16 names, not
+   15 — an off-by-one in this document, not a change upstream; `Metadata` still
+   carries exactly those 16 `pub` fields at `metadata.rs:160-196` @ `053a61e`
+   and `crates/protocol/Cargo.toml` still names the same six dependencies, so
+   the S-a cost figure is unchanged. What *did* move is the derivation: a new
+   alias `x-codex-turn-metadata.thread_source` (`metadata.rs:19`) now makes
+   `is_subagent` and `is_delegated_work` fire on **current** codex child
+   lineage — `thread_source == "subagent"` **and** a parent id together
+   (`metadata.rs:258-275`) — because, in upstream's words, "current Codex
+   releases identify spawned children through lineage rather than
+   `subagent_kind`". Adoption S-a therefore gets sub-agent detection for the
+   codex the M9 box actually runs, which the `subagent_kind` path alone would
+   have missed.]*
 9. **ATIF is not in `nemo-relay-types`.** `AtifTrajectory` and
    `ATIF_SCHEMA_VERSION = "ATIF-v1.7"` live in
    `nemo-relay/crates/core/src/observability/atif.rs:55` — the heavy core
@@ -209,6 +251,32 @@ and that distinction matters for how the synthesis weighs them.
    (`crates/types/src/codec/optimization.rs:255`) *are* in types. So
    "emit ATOF/ATIF via `nemo-relay-types`" is half true; the ATIF structs must
    be re-implemented, exactly as the deep dive's D.1 row 2 said.
+   *[2026-08-21 @ NeMo-Relay `1a54812`: **reaffirmed, still `ATIF-v1.7`, and one
+   correction to what "the spec is published" means.** `ATIF_SCHEMA_VERSION` is
+   still at `crates/core/src/observability/atif.rs:55`, `atif.rs` is
+   **byte-identical** between `ca08901` and HEAD (3,645 lines both), and
+   `git grep 'ATIF-v1\.'` over HEAD returns only `v1.7` — no v1.8. But the
+   "afternoon of re-implementation from a published spec" (synergies/nemo-relay
+   S2) rests on a source that is *Apache-2.0 Rust code*, not a normative field
+   schema: `docs/configure-plugins/observability/atif.mdx` (529 lines) is a
+   `plugins.toml` configuration doc, and the only field-level documents are
+   `atif.rs` itself and NeMo-Agent-Toolkit's
+   `packages/nvidia_nat_atif/atif-step-extra-guide.md` +
+   `atof-to-atif-conversion-guide.md` (@ `c933737`). So the re-implementation is
+   an attribution question of the same shape as the M6 judge-prompt port, not
+   merely typing. Also: **the struct count is twelve, not "~15"** (D.1 row 2 of
+   the older dive) — `AtifTrajectory:301`, `AtifAgentInfo:63`, `AtifStep:81`,
+   `AtifMetrics:122`, `AtifFinalMetrics:151`, `AtifToolCall:174`,
+   `AtifObservation:188`, `AtifObservationResult:195`,
+   `AtifSubagentTrajectoryRef:212`, `AtifAncestry:226`, `AtifInvocationInfo:244`,
+   `AtifStepExtra:267`; `AtifExporter:345` is the host-side plugin, not a wire
+   type. The Python side adds a thirteenth, `AtifToolCallExtra`
+   (`nvidia_nat_atif/src/nat/atif/atif_step_extra.py:168`), with no Rust
+   counterpart. And the ATOF half of the sentence needs one qualifier of its
+   own: `ATOF_VERSION = "0.1"` is in the published 0.7.3
+   (`0.7.3:src/api/event.rs:34`), but `METRIC_DATA_SCHEMA_VERSION` — cited by
+   the older dive at `event.rs:45` — is **0.8-only**, so which ATOF constants
+   are "in types" depends on which version you pin. See finding 11's note.]*
 10. **Relay's `PricingCatalog` is also core-only.**
     `crates/core/src/codec/model_pricing.rs:84` (825 lines), with
     `aliases:274`, `rate_schedule:286`, `prompt_cache:288`,
@@ -222,6 +290,41 @@ and that distinction matters for how the synthesis weighs them.
     unpublished. `crates/types/src` carries a `feat!` breaking commit in the
     window (`56158e4 feat!: add canonical tool execution results (#575)`,
     2026-08-13).
+    *[2026-08-21: **superseded — 0.8 is published now, and the unlock condition
+    in the round-2 ruling has fired.** `nemo-relay-types 0.8.0-rc.1` went to
+    crates.io at **2026-08-21T02:53:49Z**, about twenty hours before this
+    re-read (`https://index.crates.io/ne/mo/nemo-relay-types`, cross-checked
+    against the v1 API with a `User-Agent` — without one crates.io returns a
+    data-access-policy error, not data). `max_stable_version` is still `0.7.3`;
+    `max_version` and `newest_version` are `0.8.0-rc.1`; 0.8.0-final is not out,
+    and **that** is the condition to record next to whatever pin we take. Its
+    twelve source files are **byte-identical to `ca08901:crates/types/src`**,
+    verified file by file — so the `56158e4` `feat!` this finding names is now
+    on crates.io. The substance of "crates.io lags the tree" survives, because
+    the tree is at workspace `0.9.0` (`HEAD:Cargo.toml:23`) and `api/registry.rs`
+    (+105) landed after `0.8.0-rc.1` was cut; only the numbers moved. Two facts
+    that decide whether the pin must actually move: **(a)**
+    `codec/optimization.rs` is **byte-identical across 0.7.3, 0.8.0-rc.1 and
+    HEAD**, as is the entire ATOF envelope (`BaseEvent`, `ScopeEvent`,
+    `MarkEvent`, `Event`, `DataSchema`, `ScopeCategory`) — so for emitting
+    summaries and scope/mark events, 0.7.3 is not a compromise, it is
+    equivalent; **(b)** the whole metric-mark surface — `MetricEnvelope`,
+    `MetricMeasurement`, `InstrumentDescriptor`, `MetricAttributes`,
+    `validate_metric_measurements`, `LogSeverity`, and the constants
+    `METRIC_DATA_SCHEMA_NAME`/`_VERSION` — exists **only from 0.8**
+    (`0.8.0-rc.1:src/api/event.rs:36-723`; `0.7.3:src/api/event.rs` is 865 lines
+    to 0.8's 1,577 and has none of them). The 0.7.3 pin is sufficient for S2 as
+    written and insufficient the moment metrics marks are in scope. Other
+    0.8-only content, none of it load-bearing for an emit-only consumer:
+    `CategoryProfile.tool_result_annotation` (the `feat!` itself, additive
+    `Option<Json>`), `api/tool.rs`'s `ToolExecutionResult` +
+    `TOOL_EXECUTION_RESULT_SCHEMA`, `codec/identity.rs` (74 lines, a whole new
+    module), `ApiSpecificResponse::{OCIGenAI, GeminiGenerateContent}`, and one
+    behavioural tightening — `CostEstimate::total_or_component_sum` now returns
+    `None` unless `source == ProviderReported`
+    (`0.8.0-rc.1:src/codec/response.rs:151-158`), i.e. Relay independently
+    hardened the same measured/estimated boundary this document's §5 argues
+    about.]*
 
 ---
 
@@ -530,6 +633,30 @@ call reintroduces SWITCH-1224, silently and without a failing test". That is a
 live class of bug in exactly the chained position, and it argues the S3 guard-3
 re-encoded-history test is not optional.
 
+*[2026-08-21: **this hazard fired upstream, twice, and one instance would have
+broken a roundhouse chain outright.*** *Switchyard's Responses encoder replays
+the preserved inbound body verbatim when source and target format match
+(`codecs/responses/buffered.rs:118-131`, default policy `InMemory` at
+`policy.rs:88`), so a pure Responses→Responses hop was always lossless — but
+any hop that mutates the IR calls `drop_exact_replay` and falls to the
+reconstructing encoder, and until `053a61e` ("fix: re-emit captured provider
+extensions when encoding to the Responses format", #509, **2026-08-21 16:45
+UTC — the current HEAD**) that encoder had no extensions allowlist and dropped
+`prompt_cache_key` on the floor. Roundhouse does not merely read
+`prompt_cache_key`: it **requires** it and answers 422 without one
+("`prompt_cache_key` is required: it names the session",
+`responses_api.rs:236-240`). So `codex → Switchyard (with a target system
+prompt) → roundhouse` returned 422 on every turn at any Switchyard revision
+before today. Fails loudly rather than forking sessions silently, which is the
+good direction — but it is a total chain break, and the fix is one commit old.
+The second instance is `0acde7b` (#439, 2026-08-20): serde_json's default
+BTreeMap-backed `Map` alphabetized every proxied JSON object, which is semantic
+for `response_format.json_schema` on order-enforcing backends; fixed by
+enabling `preserve_order`. Not a roundhouse defect today — this surface reads a
+typed request and forwards no `response_format` (`responses_api.rs:174-196`) —
+but it is the named hazard for the day it does, and roundhouse does not enable
+`preserve_order`.]*
+
 **What the topology deletes from M9.** M9's stated burden
 (`PLAN-agentic-control-plane.md:1024-1032`) is "a generated config with both
 entries sharing one env var, a scripted task, a forced steer" plus the three
@@ -558,6 +685,33 @@ off by default), `serde 1`, `serde_json 1`, `typed-builder 0.23.2`,
 `uuid` (workspace, `=1.18.1` at `Cargo.toml:44` — **identical to roundhouse's
 pin**, `roundhouse/Cargo.toml:80`). 4,506 lines. This is still the only cheap
 Relay import.
+*[2026-08-21: three corrections, one of which changes the cost. **(i) The
+`uuid` claim no longer holds.** Roundhouse declares
+`uuid = { version = "1.18.1", features = ["v4","serde"] }` at
+`Cargo.toml:95` (the line moved from `:80`) — a *caret* requirement, currently
+resolved to **1.24.0** (`Cargo.lock:5758-5759`). Relay's is an **exact** pin,
+`uuid = "=1.18.1"` (`HEAD:Cargo.toml:41`, and the same in both published
+tarballs), so adopting the crate forces the whole graph down six releases and
+imposes a ceiling: any future dependency wanting `uuid ≥ 1.19` becomes
+unresolvable while the pin stands. It *does* resolve today — every uuid
+dependent in our lock is satisfied by 1.18.1 (`moka 0.12.16` → `1.1`,
+`rmcp 3.1.3` and `ts-rs 11.1.0` → `1`, `rama-http 0.3.0-alpha.4` → `1.18`,
+codex `6344a65` → `1`, Dynamo `ac7b751` → `^1.18.1`), argued from requirement
+strings rather than a resolver run since no cargo build was available. This is
+exactly the CLAUDE.md "record the unlock condition next to the pin" case and
+belongs in the manifest comment the way redis 1.2.4 names Dynamo's
+`tokio = "=1.48.0"`. **(ii) The line count is a method difference, not an
+error to fix**: `crates/types` measures **4,659** lines including tests,
+fixtures and README at *both* `c37b551` and `ca08901`, and **3,555** for
+`src/` alone; the published 0.7.3 tarball is **2,549**. **(iii) Two new crate
+names, not zero**: `typed-builder 0.23.2` → `typed-builder-macro =0.23.2` →
+`proc-macro2`/`quote`/`syn`, the last three already in our lock. `bitflags`'s
+`serde` feature is additive over our existing 2.13.1, and `schemars` stays off
+(`default = []`). Still no TLS, no reqwest, no OpenSSL, no OTel — "the only
+cheap Relay import" is intact. **MSRV is undeclared**: no `rust-version` key in
+either tarball and `rust_version: null` on the crates.io API for every
+version, so do not assert 1.96.1; edition 2024 implies ≥1.85 and 1.96.1 is
+merely Relay's dev toolchain.]*
 
 **What is actually in it.** ATOF: `ATOF_VERSION = "0.1"`
 (`crates/types/src/api/event.rs:36`), `METRIC_DATA_SCHEMA_VERSION = "1"`
@@ -566,6 +720,29 @@ with `status:261`, `limitations:264`, `baseline_model:267`,
 `effective_model:270`, `estimated_cost_saved:287`;
 `LlmOptimizationEvidenceQuality` (`:143`); `LlmOptimizationContribution`
 (`:180`).
+*[2026-08-21: **all of these line numbers are the tree's (= 0.8's); against the
+published 0.7.3 the optimization ones hold exactly and the ATOF ones do not.**
+`codec/optimization.rs` is byte-identical across 0.7.3, 0.8.0-rc.1 and HEAD, so
+`:255/:261/:264/:267/:270/:287/:143/:180` all resolve in the 0.7.3 tarball too.
+`api/event.rs` does not: `ATOF_VERSION` is at `:34` in 0.7.3 (not `:36`), and
+**`METRIC_DATA_SCHEMA_VERSION` does not exist there at all** — it and the
+entire metric-mark surface arrive with 0.8. Two further facts the field list
+above does not show, both load-bearing for the contribution plan and for S4's
+"carry the gate's result in `limitations[]`": **`limitations` is a free-form
+`Vec<String>`** (`optimization.rs:264`, doc "machine-readable reasons"), so the
+plan is expressible — Relay's own producer uses a snake_case vocabulary
+(`missing_baseline_model`, `missing_baseline_pricing`, `cost_currency_mismatch`,
+…) with an `add_limitation` seam that inserts arbitrary strings
+(`HEAD:crates/core/src/api/optimization.rs:290,309`); but **`status` is derived,
+not chosen** — Relay writes
+`status: if limitations.is_empty() { Complete } else { Partial }` (`:841-845`),
+so every roundhouse summary that names an `Unpriced` correlary publishes as
+`Partial`. Also worth recording as the sanctioned extension point, since it is
+in the types crate and not core: `LlmOptimizationPayload`
+(`optimization.rs:171-176`) with `const SCHEMA_NAME`/`SCHEMA_VERSION`, consumed
+by `Contribution::with_payload` (`:230`), is where `capability_band`,
+`PricedBasis`, `routing_savings_at_decision_usd` and `seat_tokens` — none of
+which have a `LlmOptimizationSummary` field at any version — can ride typed.]*
 
 **What is not.** ATIF (`ATIF_SCHEMA_VERSION = "ATIF-v1.7"`,
 `crates/core/src/observability/atif.rs:55`) is in **`nemo-relay` core**, which
@@ -578,6 +755,30 @@ thing in either tree.
 (`56158e4`, canonical tool execution results, 2026-08-13). Churn on
 `crates/types/src` is **6 commits in 16 days** — the lowest-churn surface in
 either external tree, and roughly a fifth of libsy's rate (§3.1).
+*[2026-08-21: **the "lags by a minor and a `feat!`" cost is gone** — see the
+note at finding 11. `0.8.0-rc.1` (published 2026-08-21T02:53:49Z) is
+byte-identical to `ca08901:crates/types/src`, so the `feat!` is on crates.io.
+The three forms of the pin, priced, since round-2's version-identity rule
+("pin a git rev, never a version or a tag") and S2's "pin the published 0.7.3"
+appear to disagree — they do not, narrowly: the rule's justification is that a
+tag or a version can *rename* an API over time, and crates.io versions are
+immutable, so `=x.y.z` there is as reproducible as a rev. What is never
+reproducible is a caret against a 0.x crate.
+**A** `nemo-relay-types = { version = "=0.7.3", default-features = false }` —
+stable channel, byte-equal to HEAD for optimization + ATOF envelope, no metric
+marks. **B** `= "=0.8.0-rc.1"` — note the `=` is mandatory: a bare `"0.8"`
+will not resolve to a pre-release. **C**
+`{ git = "https://github.com/NVIDIA/NeMo-Relay", rev = "513b7da" }` (the
+`0.8.0-rc.1` tag) — the only form that can reach `api/registry.rs` and the only
+one that needs no upstream release to move. Note the repository URL while it is
+in front of us: the crate metadata says `NVIDIA/NeMo-Relay`
+(`0.7.3/Cargo.toml:23`), **not** `NVIDIA-NeMo/NeMo-Relay`, which 404s;
+Switchyard really is under `NVIDIA-NeMo/`. Whichever form, the manifest comment
+must carry both the `uuid = "=1.18.1"` ceiling (note at the top of this
+subsection) and the unlock condition **"`nemo-relay-types 0.8.0` final on
+crates.io"** — time-sensitive, because HEAD is a `release/0.8` merge dated
+today and the repo cuts a `0.8.0-alpha.YYYYMMDD` tag daily
+(`0.8.0-alpha.20260802` … `0.8.0-alpha.20260821`).]*
 
 **Invariant strain: none, with one caveat.** Emission is downstream of the log,
 so nothing about the single writer changes. The caveat is
@@ -688,6 +889,79 @@ applies in full (jsonschema, jsonptr, OTel 0.32, tracing-opentelemetry 0.33) —
 for four pure functions. Re-implementing them from the published source (~1,100
 lines in `tool_signals.rs`, Apache-2.0) is the port-not-crate call the ruling
 already applies to ACG stability.
+
+*[2026-08-21, four corrections and one sharpening, all against `053a61e`:*
+
+- ***Sixteen fields is 14** (see the note on finding 7). Both source files are
+  byte-identical to `5341f71`.*
+- ***"Unliftable" is too broad as stated in `validate/prompt.rs:22-25`.** For
+  this asset the items are re-exported at the crate root:
+  `ToolSignals`/`DEFAULT_RECENT_WINDOW` (`lib.rs:34`) and
+  `CodingAgentDimensions`, `PickOutcome`, `PickerMode`, `ScoreResult`, `Tier`,
+  `dimensions_from_signal`, `pick_tier`, `score_signal` (`lib.rs:38-42`).
+  Every `ToolSignals` field is `pub` and the struct derives `Default`, so the
+  three scorers are callable from a struct literal without ever constructing a
+  `switchyard_protocol::Request`. The half that **is** unliftable is the one
+  that matters: `mod tool_signals` is `pub(crate)` (`algorithms/util.rs:13`),
+  so `ToolSignalProcessor`, `classify_text`, and the whole `ERROR_PATTERNS` /
+  tool-name / test-phrase table set are unreachable — the extractor must be
+  re-implemented either way. The port-not-crate call therefore stands, but on
+  the correct half of the asset.*
+- ***The dependency cost is now countable, and higher than "§2a".** Roundhouse
+  has **none** of `opentelemetry`, `jsonschema`, `jsonptr`, `regex`, or
+  `parking_lot` as a normal dependency (workspace `Cargo.toml`), and libsy
+  needs all five (`crates/libsy/Cargo.toml:19-38`). Worse for the crate route:
+  `opentelemetry 0.31` is already in roundhouse's lock (`Cargo.lock:3193`) via
+  `codex-http-client`, and the manifest states in terms that that graph "must
+  not reach the shipped binary" and is dev-only by design
+  (`crates/roundhouse-server/Cargo.toml:88-98`). libsy pins the 0.32 line, so
+  the crate route puts two OTel API majors — two separate global meter
+  providers — into one test binary. Same argument round 2 used against rmcp
+  1.8 vs 3.1.*
+- ***The scorers do not belong in the `Signal` seam at all.**
+  `pick_tier` answers "which model tier" (`stage.rs:373-405`); `Signal::detect`
+  answers "state a fact about trouble" and returns `Option<String>`
+  (`trigger.rs:150-155`). Porting `pick_tier` behind `Signal` would be a
+  category error, and `SignalFired::fact`'s own rule — "never a suggestion"
+  (`trigger.rs:79-88`) — forbids the output shape. The extractor is what the
+  `Signal` seam wants; the scorers, if they are wanted anywhere, belong beside
+  `routing/policy.rs`. The field-by-field port table is in the 2026-08-21
+  section at the end of this document.*
+- *Sharpening: **the codex exec header is neither wholly noise nor wholly
+  signal, and a port that treats it as either is wrong in a different
+  direction.** Switchyard's `exit_nonzero` pattern matches the bare substring
+  `"exited with code"` with no digit constraint (`tool_signals.rs:84-94`) and
+  matching is unanchored `contains` (`:530-541`); codex writes `Process exited
+  with code {exit_code}` whenever an exec call has one — **zero or non-zero**
+  (`core/src/tools/context.rs:443-470` @ `e363b08`, `response_text`). So a port
+  fed `Exchange::output` verbatim scores SOFT `0.3` on every exec result
+  including exit 0 and pins `no_error_streak` at 0 forever (`:543-553`). But a
+  port fed only `tool_output_body(output)` cannot see the exit code at all —
+  `Process exited with code ` is one of the sections that function strips
+  (`validate/exchange.rs:171-188`). The correct shape is neither: read the
+  **exit code from the header as a structured fact**, and run the
+  **error-pattern table over the body**. The mechanism is not F04's — F04 was an
+  anchored matcher the header *suppressed*, this is a `contains` matcher the
+  header *manufactures*, and the remedies differ accordingly.*
+- *A finding this turned up that is **not** about the port, recorded separately
+  so it is not folded into one: **`reads_as_failure` has the same blind spot
+  today.** It asks `tool_output_body(output)` (`exchange.rs:252-253`) and then tests
+  anchored markers or a structured `error` / `success: false`, so a codex **exec**
+  result that exited non-zero with empty or non-error-shaped stdout reads as
+  **clean** — a `grep` with no match, a `test` that is false, a `diff` that found
+  differences. Reproduced against the real header shape: `"Chunk ID: 1\nWall
+  time: 0.0210 seconds\nProcess exited with code 1\nOutput:\n"` strips to the
+  empty string and `reads_as_failure` returns `false`, so `ToolFailureStreak`
+  cannot fire on it. **Exec-only**: MCP results carry `Wall time: {:.4}
+  seconds\nOutput:` and no exit-code section at all
+  (`core/src/tools/context.rs:118-138` @ `e363b08`), so there is nothing to lose
+  there — and `is_undelivered_tool_result` is *correct* to strip, since its
+  three sentinels are body text the header would otherwise stop the equality
+  test from ever matching. The strip is not uniformly suspect; it is missing one
+  structured fact only exec results carry. A claim, not a ruling — it wants a
+  failing test first per `CLAUDE.md`, and the fix (an exit-code accessor beside
+  `tool_output_body`, correctly `None` for MCP results) is the same seam the
+  port needs anyway.]*
 
 ---
 
@@ -861,8 +1135,8 @@ Two things we *should* take rather than give, on the same axis:
 | Seam | Mechanism | Cost | What we get |
 |---|---|---|---|
 | **S-a** `switchyard-protocol::Metadata::from_headers` | one crate, 6 deps all present (`crates/protocol/Cargo.toml:18-24`) | **S** | Every coding-agent correlation header normalized (`metadata.rs:15-65, 200-224`), sub-agent lineage we have no vocabulary for, Dynamo header aliases for free |
-| **S-b** `LlmOptimizationSummary` + ATOF via `nemo-relay-types` | one crate, 7 light deps, `uuid` identical | **S** | The savings story as a published NVIDIA type; an existing ATOF→ATIF converter downstream |
-| **S-c** `ToolSignals` + `score_signal`/`pick_tier` | port ~1,100 lines (Apache-2.0) or take libsy whole | **M** port / **L** crate | Four to six new no-model-call trigger signals including `compacted` and windowed `severity` |
+| **S-b** `LlmOptimizationSummary` + ATOF via `nemo-relay-types` | one crate, 7 light deps, `uuid` identical | **S** | The savings story as a published NVIDIA type; an existing ATOF→ATIF converter downstream *[2026-08-21: two qualifiers. "`uuid` identical" is **false** as of this re-read — ours is a caret resolved to 1.24.0, theirs an exact `=1.18.1`; see §2(e). And "an existing ATOF→ATIF converter downstream" is true but weaker than it sounds. The converter is `NeMo-Agent-Toolkit@c933737:packages/nvidia_nat_atif/src/nat/atof/scripts/atof_to_atif_converter.py` (1,039 lines, still shipping, now with eight test modules and committed worked examples), but its `MARK_EXTRACTOR_REGISTRY` ships **empty** (`extractors.py:757`), so a `data_schema` we declare for routing marks resolves to the default `NatRoleMarkExtractor` and our payload lands as a JSON *string* in a `system` step (`converter:638-643`) unless `data.role ∈ {user,system,agent}`. Nothing is dropped; nothing is structured either. The only converter path that carries `data_schema` into ATIF `step.extra` is a `category: "context"` scope-end (`converter:672-673`) — so if structural preservation with no upstream PR is the goal, that is the seam, not the mark path.]* |
+| **S-c** `ToolSignals` + `score_signal`/`pick_tier` | port ~1,100 lines (Apache-2.0) or take libsy whole | **M** port / **L** crate | Four to six new no-model-call trigger signals including `compacted` and windowed `severity` *[2026-08-21: 12 of the 14 fields port; `turn_depth` and `compacted` do not — `Evidence` carries no message count, and `exchanges()` drops `ItemContent::Text` outright (`validate/exchange.rs:91`) so the compaction scan has no input at all. `compacted` is additionally premised on the summary self-latching in the prefix, and that premise is false here: roundhouse *forks* a compacted conversation onto a fresh empty session (`responses_api.rs:330-340`), leaving no prefix to latch onto. `tests_passed` ports as a *gate* condition, not a `Signal` — the seam has no vocabulary for "quiet". Crate route re-costed above: five dependency families roundhouse does not have, plus an OTel major split.]* |
 | **S-d** Advisor-gate mechanisms as ideas | already ported (S5): two-counter budget, anchored parse, discarded-work accounting, injection defense — `judge-system-prompt.md:1-21` records the attribution at rev `47babb1` | **done** | — |
 | **S-e** `forward_auth` as the M7 pass-through *design reference* | read, don't depend | **S** | The redirect-none client, the mutual-exclusion check, the per-provider forwarded-header set, `redact_forwarded_auth`, and the route-level provider check — a working answer to four questions M7 has to answer anyway |
 | **S-f** `AgentHints.osl` as grant-sizing input | read the header `x-nemo-relay-adaptive-agent-hints` when a Relay sits in front | **S** | Better `expected_output_tokens` for the budget grant |
@@ -900,6 +1174,12 @@ of bug is real in exactly this position.
 Python), and roundhouse's planned M9 config generation all do the same thing
 and disagree about `requires_openai_auth`. Adopting one does not delete the
 other two's existence; it picks which one a deployment is told to use.
+*[2026-08-21: **two, not three.** `43fc1a7` (#501) deleted the Switchyard
+launcher and with it the only implementation that set `requires_openai_auth`
+conditionally, so the disagreement is back to Relay's hardcoded `true` against
+PLAN §3's leave-unset — with `caller_auth_kind` surviving as the *reason* to
+believe it is a route property (see the note at finding 1.2.3). Nothing about
+this shrinks M9: the one test M9 exists for is untouched by any front end.]*
 
 **E3 — version identity collision.** `switchyard-libsy 0.2.0` on crates.io
 (2026-08-10), `tag v0.2.0` in every doc, and `main` all answer to "0.2.0" and
@@ -964,7 +1244,12 @@ source for "switchyard" still finds the wrong artifact first; our README fix
    with hook-level visibility and two live routing hazards, or Switchyard's
    Python launcher with a proxy-bypass guard and no hooks. Or roundhouse's own
    M9 config generation, which the one test M9 exists for does not let us skip
-   either way.
+   either way. *[2026-08-21: **the question is now binary — Switchyard deleted
+   its launcher** (`43fc1a7`, #501). The round-2 ruling had already declined to
+   bless it; upstream has since agreed by removing it. The
+   `wait_for_proxy_ready` proxy-bypass guard cited as its one advantage over
+   Relay's went with it, so if that guard is worth having it has to be
+   re-derived rather than pointed at.]*
 4. **Do we take `switchyard-protocol` as the header front door?** It is the
    cheapest adoption in either tree, lands on a real gap, and its `Role`/content
    types map 1:1 onto ours — but it churned 9 times in 8 days and its published
@@ -972,6 +1257,17 @@ source for "switchyard" still finds the wrong artifact first; our README fix
 5. **Is `nemo-relay-types` pinned to crates.io 0.7.3 or to a git rev of 0.8.0?**
    The types we want (`LlmOptimizationSummary`, ATOF envelope) exist in both;
    the tree carries one `feat!` beyond the published crate.
+   *[2026-08-21: **the question now has a decidable shape, and it is not about
+   the version.** Both `codec/optimization.rs` and the whole ATOF envelope are
+   byte-identical across 0.7.3, 0.8.0-rc.1 and HEAD, so for S2 as written
+   ("ATOF events from the session log … `LlmOptimizationSummary`/`Contribution`
+   for the savings story") `=0.7.3` is equivalent, not a compromise. The pin
+   must move only if S2's "with M6's metrics work" means emitting
+   Relay-conformant **metric marks**: `MetricEnvelope` and the
+   `METRIC_DATA_SCHEMA_NAME`/`_VERSION` vocabulary — the pairing the older
+   dive's overlap row 20 makes against our metrics fold — are 0.8-only. So the
+   question to put to the ruling is "does S2 emit metric marks?", and the
+   version follows from the answer.]*
 6. **Does emitting `LlmOptimizationSummary` without the gate upstream weaken our
    own claim?** Their `baseline_model` is ungated by design. Publishing into
    that schema means our number sits beside numbers produced without the
@@ -1074,3 +1370,424 @@ crates/libsy/src/core/state.rs is exactly 34 lines; State struct has `#[derive(D
 ### Checker's confidence statement
 
 I re-derived 9 of the highest-stakes claims directly against the pinned trees (nemo-relay@ca08901, switchyard@5341f71, roundhouse@current) rather than trusting the document's prose, covering every category the task flagged as dangerous: two 'X does not exist' negatives (Relay MCP returns empty tools/list; Switchyard has no MCP surface in its core dirs), one public/private-visibility claim (the escalation module and its four private types), two exact API-shape quotes (the Algorithm trait and roundhouse's own RoutingPolicy trait), one stateful-vs-stateless claim central to three separate invariant-strain rulings (libsy::State plus two process-local Mutex<HashMap> session stores with 1-hour TTLs), one cross-repo protocol/config claim (requires_openai_auth hardcoded vs conditional), and one dependency-weight claim (reqwest 0.13.4 vs 0.12.24, opentelemetry 0.32 vs dev-only 0.31.0) plus the fail-open/verdict:\"APPROVE\" mechanic that directly collides with roundhouse's no-fail-open invariant. Every single one checked out exactly as stated, down to specific line numbers -- the document's file:line citations are trustworthy to an unusual degree of precision everywhere I looked, with zero drift even on multi-part compound claims. I did not verify: the crates.io-fetched claims (finding 1.2.1's 'eleven exports at tag v0.2.0 vs seven on main', the v0.7.3/0.8.0 nemo-relay-types version claim, published-package data) since those require live network fetches against crates.io/raw.githubusercontent.com rather than the pinned local clones; the large churn/commit-count tables in section 3.1 and the git-log-derived 'six commits, byte-identical crates' claims in section 1.1 (plausible and internally consistent but not independently re-run); the ~40 other individual file:line citations scattered through sections 2, 4, and 5 (e.g., TokenBreakdown::cache_hit_ratio, the MCP tool-name array, ToolSignals' 16 fields, the Cargo.lock rand/uuid unification rows). Given the flawless hit rate on a stratified, adversarially-chosen sample spanning every dangerous category, and that this author's citation discipline showed no near-misses or rounding even under close scrutiny, I'd treat the unchecked remainder as highly likely accurate -- but I would still spot-check any single claim from it before it individually decided a close call, since I only sampled roughly 9 of well over 150 file:line citations in the full document."
+
+
+---
+
+## Re-read 2026-08-21 — Switchyard half, `5341f71` → `053a61e`
+
+Vigilance pass under `CLAUDE.md`'s synergy rule, before the ToolSignals port
+lands. Fresh full clone; **`053a61e`** ("fix: re-emit captured provider
+extensions when encoding to the Responses format", #509, 2026-08-21 16:45 UTC)
+is `origin/main` HEAD, **23 commits** and 2 days past the pin, 128 files,
++10,527 / −4,440. Every claim below carries `file:line@053a61e` unless it
+names another rev. The Relay half of this document is re-read separately; only
+the Switchyard-side statements are touched here.
+
+**The port target did not move.** `crates/libsy/src/algorithms/util/tool_signals.rs`
+and `util/stage.rs` are byte-identical to `5341f71` (md5 `822def5b…` /
+`da0b2402…`), last touched 2026-08-03 (`e012780`, docs-only) and 2026-08-12
+(`48b3b71`). A port written against the pin is a port written against HEAD.
+
+**Re-checked and unchanged:** `ToolSignals::from_request` at `tool_signals.rs:253`;
+the three scorers at `util/stage.rs:250` / `:323` / `:373`; `ToolSignalProcessor`
+still unreachable (`algorithms/util.rs:13`, `pub(crate) mod tool_signals`);
+`switchyard-protocol`'s six dependencies (`crates/protocol/Cargo.toml:18-24`);
+`Metadata`'s 16 `pub` fields (`metadata.rs:160-196`); toolchain `1.96.1` and
+edition 2024, identical to ours; Apache-2.0 with the same
+`SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES`
+header both trees carry.
+
+**Corrected:** `ToolSignals` has **14** fields, not 16 (finding 7, §(h), S-c).
+`Metadata::from_headers` resolves **16** named fields, not 15 — this
+document's own list already had 16 (finding 8). Both are this document's
+arithmetic, not upstream movement.
+
+**Moved, with product consequences** — each noted at its claim above:
+
+| # | What moved | Where it lands |
+|---|---|---|
+| `43fc1a7` (#501) | Python launchers + `switchyard` CLI **deleted** (2,503 lines); `requires_openai_auth` now appears **nowhere** in the tree | findings 1.2.2 / 1.2.3, E2, open question 3 |
+| — | `caller_auth_kind` survives as public Rust (`switchyard-server/src/lib.rs:324-329`, `config.rs:213-221, 338-343`) | the route-property hypothesis keeps its evidence; M7's citation changes |
+| `053a61e` (#509) | Responses encoder gained the extensions allowlist incl. `prompt_cache_key` (`codecs/responses/buffered.rs:1476-1495`, `copy_responses_request_extensions`) — **before today, an IR-mutating Switchyard hop stripped it, and roundhouse 422s without it** (`responses_api.rs:236-240`) | the "fourth hazard" paragraph |
+| `0acde7b` (#439) | `serde_json` `preserve_order` enabled — object key order is semantic for `response_format.json_schema` | same paragraph |
+| `c7beccd` (#384) | new `switchyard-translation/src/codex_namespaces.rs` — codex's `namespace` container flattened to `<namespace>__<tool>` and restored on the way back | see below |
+| `#505`, `metadata.rs:19,258-275` | `x-codex-turn-metadata.thread_source` — current codex marks children by lineage, not `subagent_kind` | finding 8, adoption S-a |
+
+**The one genuinely new asset for us: `codex_namespaces.rs`.** Switchyard
+independently arrived at roundhouse's own tool-call dialect problem and solved
+the half we deferred. Codex dispatches on `(name, namespace)` and expects the
+`namespace` field back on the call it receives
+(`codex_namespaces.rs:4-25@053a61e`); an OpenAI-compatible upstream takes flat
+`function` tools only, so their request codec flattens each container to
+`<namespace>__<tool>` (`:33,42-43`) and carries the reverse mapping in
+`ProviderExtensions` under a prefixed key so no codec leaks it outbound
+(`:39,56-61`). Their separator is `__` and their worked example is
+`mcp__open_websearch__search` (`libsy-llm-client/src/client.rs:2057-2122`) —
+the exact construction `roundhouse-server/src/dialect.rs:29-33` names as the
+future flat spelling it owes canonicalization a reverse mapping for. When the
+second `ClientDialect` arm lands, this file is its design reference, and the
+`ProviderExtensions` trick is the answer to "where does the mapping live
+without a provider-neutral type growing a codex field".
+
+**Negative claims re-verified, one with corrected phrasing.** Switchyard still
+has **no MCP server and no MCP client**: `grep -rn 'rmcp|tools/list|jsonrpc'`
+over `crates/` returns nothing at `053a61e`. But the 2026-08-19 checker's
+grep-shaped restatement — `grep -rli mcp crates/ switchyard/` → no matches —
+is now **stale**: it hits three files (`codex_namespaces.rs`,
+`libsy-llm-client/src/client.rs`, `switchyard-server/tests/server.rs`), all of
+them namespace *string* handling. The substance holds; the test for it does
+not.
+
+**Also landed, watched not adopted:** `switchyard-soak` (a new 3,200-line
+scenario-driven soak harness, `crates/switchyard-soak/`); `algorithms/subagent.rs`
++ `util/subagent.rs` (sub-agent routing built on the `thread_source` lineage
+above); `util/robustness.rs` (`safe_error_summary` — an exhaustive match that
+strips upstream bodies and model replies out of judge-path logs, deliberately
+not defaulting to `to_string()` so a new error variant cannot start leaking by
+omission; the same discipline `validate/` should be held to);
+`switchyard-server` gained a `/decision` endpoint (#456) and base-URL
+validation (#405); and `6aed489` (#492) moved
+`usage_metrics.rs` to commit usage **before** yielding the terminal event,
+because a Responses client may drop the stream the instant `response.completed`
+arrives and the wrapper never resumes — structurally absent here, since
+roundhouse settles every turn at the engine's one settle seam
+(`engine.rs:735-800`) rather than in a stream wrapper, but it is the failure
+mode any pass-through metering would inherit.
+
+### The Relay↔Switchyard seam, from the Switchyard side
+
+Prompted by the Relay re-read (Relay deleted its built-in Switchyard
+integration in `88d1b1b`, ~4,700 lines, and its migration guide points at
+"Switchyard 0.3.0" shipping a dynamic plugin). From this tree:
+
+- **Switchyard main is `0.2.0`, not 0.3.x** (`Cargo.toml:18@053a61e`,
+  `[workspace.package] version = "0.2.0"`). Latest tag in the repo is
+  `v0.2.0`; there is no 0.3 tag or branch.
+- **No Relay plugin crate exists on main.** Workspace members at HEAD are
+  libsy, libsy-llm-client, protocol, switchyard-py, switchyard-server,
+  switchyard-skill-distillation, switchyard-soak, switchyard-translation
+  (`Cargo.toml:6-15`) — no plugin. `grep -rn 'extern "C"|no_mangle'` over
+  `crates/` returns nothing, and the words "relay"/"NeMo Relay" appear
+  **zero** times in `CHANGELOG.md`, `docs/`, or `README.md`. The only Relay
+  presence on main is two correlation-header constants,
+  `x-nemo-relay-session-id` and `x-nemo-relay-subagent-id`
+  (`crates/protocol/src/metadata.rs:39-40`).
+- **The plugin exists, unmerged.** `origin/feature/nemo-relay-plugin-owned-http-client`
+  (tip `06dd8ea`, 2026-08-20 22:02 −0700; 6 commits ahead of main, 22 behind)
+  adds `crates/switchyard-nemo-relay-plugin/` — 4,461 lines over its merge
+  base, opened by `a608c33` "feat(relay): add Switchyard-owned HTTP dynamic
+  plugin". It is `crate-type = ["cdylib"]` and `publish = false`, depending on
+  `nemo-relay-plugin` plus switchyard-libsy / -llm-client / -protocol /
+  -translation (`crates/switchyard-nemo-relay-plugin/Cargo.toml:15-30@06dd8ea`),
+  and it carries its own `relay-plugin.toml`, `config.schema.json`, and a
+  bundle-packaging script. Two older Relay-integration branches
+  (`topic/nemo-relay-integration`, `rlempka/libsy-relay-integration`) are 250+
+  commits stale.
+- **What that means for us.** The seam is **open on both sides right now**:
+  Relay rejects the old config, and the replacement is an unmerged branch
+  under a version Switchyard has not cut. So the chained topology this
+  document costed as "Relay with Switchyard inside" is not a shipping
+  configuration at either project's HEAD, which removes the last standing
+  argument against the round-2 launch-surface ruling rather than changing it —
+  roundhouse's own M9 config generation is, by elimination, the only front end
+  that works end to end today. **The ToolSignals port is untouched**: its two
+  files are byte-identical across all of this, the plugin branch does not edit
+  them, and `publish = false` + `cdylib` means the plugin produces no library
+  artifact anyone could consume in place of the port. If anything it hardens
+  the port-not-crate call — the only consumable route to those scorers is
+  still `switchyard-libsy` whole, with the five dependency families and the
+  OTel major split priced above.
+
+### The `ToolSignals` port table
+
+Switchyard field (`tool_signals.rs:206-246@053a61e`) → what supplies it in
+roundhouse (`validate/exchange.rs`, `validate/trigger.rs` @ this tree). Twelve
+of fourteen port; the two that do not are the two that read something
+`Evidence` does not carry.
+
+| Switchyard field | Derivation upstream | Roundhouse input | Verdict |
+|---|---|---|---|
+| `severity: f32` | max of `classify_text` over the last `recent_window` tool-result texts (`:416-423`); table at `:32-95`, `SOFT 0.3 / HARD 0.7 / CRITICAL 1.0` (`:25-27`) | `Evidence::exchanges[..].output`, **via `tool_output_body`** | ports — new `SignalKind::ErrorSeverity`. *Orthogonal to* `ToolFailureStreak`, not wider than it: `reads_as_failure` catches `{"success": false}` / `{"error": …}` that no `ERROR_PATTERN` matches, and `ERROR_PATTERNS` catches `traceback (most recent call last)` mid-body that the anchored check misses. The new part is the *window* — this fires on 1-of-3 where the streak needs 3 consecutive |
+| `no_error_streak: u32` | trailing run of clean results (`:543-553`) | same | ports; the trigger's first "things are fine" quantity |
+| `edit_count` / `write_count` / `read_count` / `todowrite_count` | `classify_tool_call` over every call (`:302-331`, `:441-477`) | `Exchange::name` + `Exchange::arguments` | ports — but `arguments` is a `String` here and their `command_of` reads `Value["command"]` (`:390-395`), so the port owes a `serde_json::from_str` first |
+| the four `recent_*` counters | same, over the last `recent_window` calls (`:430-476`) | same | ports |
+| `pure_bash_streak: u32` | trailing run of `Other`-category calls (`:441-449`) | same | ports; the "build pit" proxy we have no vocabulary for |
+| `tests_passed: bool` | `TEST_PASS_PHRASES` in the window, minus `TEST_FAILURE_LITERAL` and `has_nonzero_failure_count` (`:555-598`) | stripped body | ports as a **gate condition, not a `Signal`** — `Signal::detect` only ever says "trouble" (`trigger.rs:150-155`); a "the turn is settling" fact has no slot |
+| `turn_depth: u32` | `messages.len()` (`:343,379`) | **nothing** — `Evidence` carries `exchanges` + `turn_tokens` only (`trigger.rs:127-133`) | not portable without widening `Evidence`; upstream itself calls it "wire-format dependent" and "approximate across request origins" (`:236-238`), so a count of *exchanges* is the better roundhouse quantity anyway |
+| `compacted: bool` | any `Text` block contains `"session is being continued"` (`:371-373,386`) | **nothing, three ways** — `exchanges()` drops `ItemContent::Text` outright (`exchange.rs:91`) so the scan has no input; the marker is Claude Code's, not codex's; and the self-latching premise fails because roundhouse forks a compacted conversation onto a fresh empty session (`responses_api.rs:330-340`), leaving no prefix to latch onto. M9's generated config also disables *both* codex compaction paths — `auto_compact_token_limit: null` (`codex_launch.rs:496`) for the local one, provider `name = "Roundhouse"` rather than `"OpenAI"` for the remote one (`codex_launch.rs:415-419`) — though neither excludes a user-invoked compact | not portable as written; revisit only if a Claude Code surface lands |
+
+Two consequences the table makes concrete:
+
+1. **The codex exec header is half signal and half noise, and the port must
+   split it** — the error-pattern table runs over `tool_output_body(output)`,
+   while the exit code is read *from* the header as a structured fact rather
+   than pattern-matched out of it. Feeding the raw string in fires
+   `exit_nonzero` on every exec including exit 0; feeding only the body loses
+   the exit status entirely. See §(h), including the separate
+   `reads_as_failure` claim the same accessor would close.
+2. **`dimensions_from_signal` / `score_signal` / `pick_tier` do not port into
+   the `Signal` seam at all.** `spinning` and `exploring` are gated on
+   `turn_depth >= STALL_MIN_TURN_DEPTH` (`stage.rs:36,250-274`), so they are
+   blocked on the row above; and `pick_tier` answers "which tier", which is a
+   `routing/policy.rs` question, not a `validate/trigger.rs` one. What the
+   `Signal` seam wants is the extractor.
+
+**Attribution form for a code port.** There is no precedent in this tree —
+`validate/prompt.rs` is a *text* port (HTML-comment header in the `.md`, plus
+`the_attribution_travels_with_the_file_and_not_with_the_prompt` pinning repo,
+40-char rev, both source paths and the licence), and
+`control/credential/forwarded.rs` / `fleet/src/openai_responses.rs:25` are
+design references cited in module docs with no header. For Rust carrying
+Switchyard's *logic*, the form that matches the house is prompt.rs's:
+a module-doc `# Attribution` block naming `NVIDIA Switchyard (Apache-2.0)`,
+the full 40-char rev the port was read at, and
+`crates/libsy/src/algorithms/util/tool_signals.rs`, plus a test asserting the
+citation survives an edit. Both trees carry the identical
+`SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES`
+line and the same Apache-2.0, so what attribution owes here is **provenance and
+revision**, not a third-party copyright notice — and the revision is the half
+that rots, which is why it is pinned by a test rather than left in prose.
+
+---
+
+## Re-read 2026-08-21 — Relay half, `ca08901` → `1a54812`
+
+Upstream re-cloned fresh. **The repository is `github.com/NVIDIA/NeMo-Relay`;
+`NVIDIA-NeMo/NeMo-Relay` 404s** — the crate metadata is the authority
+(`nemo-relay-types-0.7.3/Cargo.toml:23`), and it is worth writing down because
+Switchyard genuinely is under `NVIDIA-NeMo/`, so the two NeMo neighbours sit in
+different GitHub orgs.
+
+| rev | date | what |
+|---|---|---|
+| `1a54812` | 2026-08-21 17:22 −0400 | HEAD of `origin/main`, "Merge pull request #855 from NVIDIA/release/0.8". Workspace `version = "0.9.0"` (`Cargo.toml:23`); `rust-toolchain.toml:5` still `1.96.1`. |
+| `513b7da` | 2026-08-20 21:32 −0500 | tag `0.8.0-rc.1` (`ca08901` is an ancestor) |
+| `ca08901` | 2026-08-19 | this document's pin — 42 commits, 135 files, +13,203/−6,643 behind HEAD |
+| `c37b551` | 2026-08-18 | `nemo-relay-deep-dive.md`'s pin — 48 commits behind |
+
+Secondary tree for the converter question:
+`github.com/NVIDIA/NeMo-Agent-Toolkit` @ `c933737` (2026-08-17). Crate tarballs
+`nemo-relay-types-0.7.3` and `-0.8.0-rc.1` from `static.crates.io`. **No cargo
+invocation** — the box has one build lock shared with two concurrent dives — so
+every dependency claim is derived from manifests, the sparse index and
+roundhouse's own `Cargo.lock`, and the `uuid` resolution below is argued from
+requirement strings rather than demonstrated by a resolver run.
+
+### What moved
+
+1. **`nemo-relay-types 0.8.0-rc.1` was published**, 2026-08-21T02:53:49Z —
+   about twenty hours before this pass, and byte-identical to
+   `ca08901:crates/types/src` across all twelve files. The round-2 ruling's
+   "move when they publish" condition has fired. Details and the three forms
+   of the pin: the notes at finding 11 and §2(e) above.
+2. **Relay deleted `crates/switchyard` entirely.** `88d1b1b` (2026-08-19),
+   `refactor(switchyard)!: remove built-in service integration (#811)` —
+   removes the `nemo-relay-switchyard` crate, the CLI `switchyard` feature and
+   the service-backed component (~4,700 lines); a config carrying
+   `[[components]] kind = "switchyard"` is now **rejected** with a migration
+   diagnostic (`HEAD:crates/cli/src/server/mod.rs`). Three citations in
+   `nemo-relay-deep-dive.md` — overlap rows 5 and 10, and "Three facts" #2 —
+   point at files that no longer exist at HEAD; they remain valid at
+   `ca08901`/`c37b551` and are bracketed in place there.
+   `HEAD:docs/reference/migration-guides.mdx:75-101` hands the integration to
+   "Switchyard 0.3.0"; the PR body names `NVIDIA-NeMo/Switchyard#270`. The
+   Switchyard half of this document, above, records what that looks like from
+   the other side — main is still `0.2.0` and the replacement plugin is an
+   unmerged branch, so the seam is open on both sides at once.
+3. **`crates/types/src/api/registry.rs`** (+105) and `api/mod.rs` (+2) — a new
+   public module in the types crate, landed **after** `0.8.0-rc.1` was cut, so
+   only a git-rev pin reaches it.
+
+### What did not move, checked because something depended on it
+
+- **The Codex/Claude launch surface is byte-identical.**
+  `git diff --stat ca08901 HEAD -- crates/cli/src/agents/codex/ crates/cli/src/agents/claude/ crates/cli/src/provider_auth.rs`
+  is **empty**; widened to `c37b551..HEAD` and including `gateway/`, the whole
+  diff is one line in `crates/cli/src/gateway/mod.rs`. Every citation both
+  dives make here still resolves verbatim at HEAD: `requires_openai_auth=true`
+  hardcoded at `crates/cli/src/agents/codex/launch.rs:201`;
+  `CHATGPT_CODEX_BASE_URL` at `alignment.rs:23`;
+  `chatgpt_upstream_url_if_needed` at `:85`; `has_chatgpt_auth_token`
+  (`Bearer eyJ` / `Bearer at-`) at `:121-125`; the 32-byte `nrp_` token minted
+  and consumed at `provider_auth.rs:21,37,46`. **So S3's chain guards and M7's
+  `requires_openai_auth` evidence need no re-derivation on the Relay side.**
+  The version gate is also unmoved — `minimum_version: (0, 143, 0)` for Codex
+  (`crates/cli/src/agents/codex/mod.rs:22`), `(2, 1, 121)` for Claude Code;
+  the box's `codex-cli 0.146.0` passes.
+- **ATIF is byte-identical**, `atif.rs` 3,645 lines at both revisions, still
+  `ATIF-v1.7`, still in core. See the note at finding 9.
+- **ATOF is still `0.1`**, and the envelope types a producer needs —
+  `BaseEvent`, `ScopeEvent`, `MarkEvent`, `Event`, `DataSchema`,
+  `ScopeCategory` — are byte-identical between published 0.7.3 and 0.8.0-rc.1.
+  The only 0.8 change anywhere in the envelope is one additive optional field,
+  `CategoryProfile.tool_result_annotation`.
+- **`codec/optimization.rs` is byte-identical across 0.7.3, 0.8.0-rc.1 and
+  HEAD** — the savings surface S2 wants has not moved at all since before our
+  first pin.
+
+### A second Codex launch surface neither dive recorded
+
+Not a change — it predates both pins — but a gap in the evidence that the M9
+launch-surface comparison should close. `crates/cli/src/agents/codex/host.rs`
+(added `2e4ebd2`, **2026-07-14**, "feat(cli)!: add MCP-managed shared gateway
+for coding agents (#395)") is a *persistent installer* alongside the argv
+`--config` path both dives describe. It rewrites `~/.codex/config.toml` in
+place with `toml_edit`, atomically and privately, with backup, restore and
+uninstall (`host.rs:48,126,163,1732,1772`). Two differences from the argv path
+matter. The provider is named `"NeMo Relay"` rather than
+`"NeMo Relay OpenAI"`, and the credential travels as a **static**
+`http_headers = { "x-nemo-relay-client-token" = <token> }` written to disk
+(`host.rs:844-846`; the constant is at
+`crates/cli/src/configuration/mod.rs:480`) rather than the argv path's
+env-indirect `env_http_headers` (`launch.rs:199-205`). Everything else is
+shared: `requires_openai_auth = true`, `wire_api = "responses"`,
+`supports_websockets = false`, `features.hooks = true`, `multi_agent_v2`
+disabled (`host.rs:838-841`).
+
+The reason to record it: roundhouse's `codex_launch.rs` writes a Codex config
+too, and Relay has already solved the hardest part of the persistent variant —
+**uninstalling cleanly from a file the user also edits**. It keeps a
+challenge/`client_token` proof so it can tell installer-owned fields from user
+edits (`host.rs:800-830`, `codex_provider_has_only_generated_fields`), and the
+backup-refresh comment at `:860-870` states the failure mode exactly:
+*"Reusing the whole file as the new backup would make those generated fields
+survive uninstall."* That is a design reference for free, in the same class as
+Switchyard's `forward_auth` (row S-e).
+
+### The ATOF→ATIF converter, re-checked
+
+`NeMo-Agent-Toolkit@c933737` ships `packages/nvidia_nat_atif/` — a 1,039-line
+converter (`src/nat/atof/scripts/atof_to_atif_converter.py`), pydantic models
+of `AtifStepExtra`, eight test modules including `test_spec_compliance.py` and
+`test_atif_v17_validators.py`, committed worked examples, and a second bridge
+at `nvidia_nat_core/src/nat/experimental/relay_telemetry_bridge.py`. It is
+alive and larger than when the ruling cited it.
+
+What it expects for custom marks, precisely, since S2 promises it "consumes
+them without new code": `data_schema` is `{name, version}` and dispatch is
+**per event** across three registries — LLM, tool, mark
+(`extractors.py:753-757`, resolvers at `:791-820`). `MARK_EXTRACTOR_REGISTRY`
+and `TOOL_EXTRACTOR_REGISTRY` ship **empty**, and an unregistered
+`(name, version)` falls through to `NatRoleMarkExtractor` (`:751`), which lifts
+a mark to a sourced step only when `data.role ∈ {"user","system","agent"}` and
+otherwise emits `{"source": "system", "message": json.dumps(data)}`
+(`converter:638-643`). So the promise holds in the weak sense — the trajectory
+stays valid, nothing is dropped — and fails in the sense the ruling meant:
+routing facts arrive stringified and structurally invisible. Three options,
+priced: emit `data.role: "system"` plus `data.content` (zero code, still
+unstructured); register a mark extractor upstream (~20 lines of Python, but a
+PR in their repo); or emit routing decisions as **`category: "context"`
+scope-ends**, which is the only converter path that copies `data_schema` into
+ATIF `step.extra` verbatim (`converter:672-673`). One asymmetry worth knowing:
+only the *mark* path degrades gracefully — an LLM scope event whose non-empty
+`data` yields nothing raises `ShapeMismatchError` (`converter:82-95`), a hard
+failure.
+
+### Everything re-checked this pass
+
+crates.io version ladder and publish dates (sparse index +
+`crates.io/api/v1`, the latter needing a `User-Agent` or it returns a
+data-access-policy error); `nemo-relay-types` 0.7.3 vs 0.8.0-rc.1 vs HEAD,
+file by file and public-item by public-item; `codec/optimization.rs`
+field-for-field; `Usage`/`CostEstimate`/`CostSource`; `limitations` typing and
+Relay's own limitation vocabulary and `status` derivation
+(`HEAD:crates/core/src/api/optimization.rs:290,309,841-845`); the ATOF
+envelope types; the dependency list, TLS posture, MSRV and the `uuid` exact
+pin against every uuid dependent in roundhouse's lock; `atif.rs` byte-identity
+and its twelve struct definitions with fields; the ATIF and ATOF doc
+locations at HEAD; the ATOF→ATIF converter and its three registries;
+`crates/cli/src/agents/**` and `provider_auth.rs` byte-identity across both
+pins; the codex/claude version gates; and the full `ca08901..HEAD` file-level
+diff, which is how the `crates/switchyard` deletion surfaced.
+
+**Not checked**: whether Relay treats `0.8.0-rc.1` as API-stable; the
+`crates/worker` / `worker-proto` ABI churn (+375 lines, out-of-process plugin
+transport, which no roundhouse plan touches); the Node/Python/FFI binding
+churn that makes up most of the remaining diff; and the resolver behaviour of
+the `uuid = "=1.18.1"` pin, which a later exclusive stage can settle in
+seconds with `cargo update -p uuid --precise 1.18.1`.
+
+### The exact tables the port re-implements
+
+Transcribed verbatim from `crates/libsy/src/algorithms/util/tool_signals.rs@053a61e`
+so the port does not need the clone. All matching is `text.to_lowercase().contains(sub)`
+(`:530-541`) unless noted; severities are `SOFT = 0.3`, `HARD = 0.7`,
+`CRITICAL = 1.0` (`:25-27`).
+
+**`ERROR_PATTERNS` (`:32-95`)** — max severity across matches wins.
+
+| Name | Sev | Substrings (lower-cased) |
+|---|---|---|
+| `oom` | CRITICAL | `out of memory`, `memoryerror`, `cannot allocate memory` |
+| `connection_refused` | CRITICAL | `connection refused`, `connectionrefusederror`, `econnrefused` |
+| `traceback` | HARD | `traceback (most recent call last)` |
+| `import_error` | HARD | `modulenotfounderror:`, `importerror:`, `no module named ` |
+| `cmd_not_found` | HARD | `command not found`, `not found\n`, `/usr/bin/env: ` |
+| `assertion` | HARD | `assertionerror` |
+| `value_error` | HARD | `valueerror:` |
+| `syntax_error` | HARD | `syntaxerror:` |
+| `timeout` | HARD | `timed out`, `timeouterror`, `timeout expired`, `deadline exceeded` |
+| `no_such_file` | HARD | `filenotfounderror:`, `no such file or directory`, `file does not exist` |
+| `exit_nonzero` | SOFT | `exit code 1`, `exit code 2`, `exit status 1`, `returned non-zero`, `exited with code` |
+
+Two entries carry upstream provenance worth carrying forward. `no_such_file`'s
+third substring is anchored as `file does not exist` rather than a bare `does
+not exist` — upstream's comment records it as "trace-mined across 1006 local
+trajectories at 22 true / 2 false positives" (`:77-80`). And `exit_nonzero` is
+the row the codex header breaks: see the split rule in §(h).
+
+**Tool-name tables (`:97-163`)** — matched against `name.to_lowercase()` exactly.
+
+- `WRITE_TOOL_NAMES` (`:107`): `write`, `create_file`, `new_file`, `write_file`
+- `EDIT_TOOL_NAMES` (`:97-105`): `edit`, `multiedit`, `notebookedit`, `str_replace`, `str_replace_based_edit_tool`, `text_editor`, `patch`
+- `READ_TOOL_NAMES` (`:147`): `read`, `view`, `read_file`, `search_files`
+- `PLAN_TOOL_NAMES` (`:151`): `todowrite`, `todo_write`, `todo`, **`update_plan`** — upstream's comment: "`update_plan` is codex's equivalent of `todowrite`"
+- `BASH_TOOL_NAMES` (`:157-163`): `bash` (claude-code), **`shell_command` (codex)**, `shell`, **`local_shell_call`**, `terminal` (hermes)
+
+**Bash-command patterns** — applied to the lower-cased `arguments["command"]`
+only for a `BASH_TOOL_NAMES` call, in this order, first match wins
+(`:302-331`); write/edit redirection deliberately trumps a read-like operand.
+
+- `BASH_WRITE_PATTERNS` (`:112-126`): `cat >`, `cat >>`, `echo >`, `echo >>`, `tee `, `printf >`, `printf >>`, `> /`, `>> /`, `<< 'eof'`, `<<eof`, `<<'eof'`, `<< eof`
+- `BASH_EDIT_PATTERNS` (`:128-138`): `sed -i`, `sed --in-place`, `awk -i inplace`, `awk 'inplace=1'`, `patch `, `patch -p`, `perl -i`, `perl -p -i`, `perl -pi`
+- `BASH_READ_PATTERNS` (`:142-145`): `cat /`, `cat ./`, `cat ../`, `grep `, `ls `, `ls -`, `find `, `head `, `tail `, `wc `, `diff `, `which `, `ps `, `df `, `du `, `stat `, `file `, `less `, `more `
+
+Anything matching none of the five categories is `ToolCategory::Other`, which
+is what `pure_bash_streak` counts.
+
+**Test-outcome markers (`:165-189`, evaluated at `:555-598`)** — a window
+result counts as a pass iff it contains a pass phrase **and** no failure
+literal **and** no non-zero failure count. Upstream states the bias
+explicitly: "Prefer false negatives: `tests_passed` routes the picker to
+EFFICIENT, so a false positive would drop tier on an unfinished task"
+(`:165-166`).
+
+- `TEST_PASS_PHRASES` (`:167-178`): `" passed"`, `"passed in"`, `"tests passed"`, `"all tests passed"`, `"test ok"`, `"test result: ok"`, `"passed.\n"`, `"tests pass"`, `"\nok "` (newline-anchored, for `go test`), `"✓ "`
+- `TEST_FAILURE_LITERAL` (`:184`): `"✗ "`, `"fatal:"`, `"assertionerror"`, `"error:"`
+- `NUMERIC_FAILURE_KEYWORDS` (`:189`): `failed`, `failure`, `failures`, `errors`, `error` — each trips only when a **non-zero** integer precedes it modulo whitespace *and* a non-alphanumeric follows it (`has_nonzero_failure_count`, `:570-598`), so cargo's `0 failed`, go's `0 errors` and `errored` mid-word do not count
+
+**Compaction marker (`:386`)**: `COMPACTION_MARKER = "session is being
+continued"`, matched case-insensitively against every `ContentBlock::Text` in
+the conversation — Claude Code's compaction preamble, not codex's. See the
+port table for why this row does not port.
+
+**Window default (`:197`)**: `DEFAULT_RECENT_WINDOW = 3`, overridable per call
+via `ToolSignals::from_request(request, Some(n))`.
+
+**A checked non-finding, recorded because negatives are the dangerous claims.**
+`tests_passed` does **not** inherit the header problem. `TEST_PASS_PHRASES`
+contains the unanchored `" passed"`, and `TEST_FAILURE_LITERAL` /
+`NUMERIC_FAILURE_KEYWORDS` contain `"error:"`, `"fatal:"`, `errors`, `failed`
+— so the question is whether codex's header can either fake a pass or veto a
+real one. Run rather than reasoned: prepending the full exec header
+(`Chunk ID: 1` / `Wall time: 1.0000 seconds` / `Process exited with code 0` /
+`Output:`) to a clean cargo summary (`test result: ok. 42 passed; 0 failed; 0
+ignored`) yields `tests_passed = true` **both with and without** the header —
+identical pass hits, no failure literal, no non-zero count. The reason is
+structural: `has_nonzero_failure_count` pairs digits with a keyword only across
+*whitespace* (`tool_signals.rs:570-598`), and every digit in the header is
+followed by ` seconds`, `\n`, or `Output:` — never by a failure keyword. So
+this row ports over either string. Only the severity/streak rows need the
+header split.
+
