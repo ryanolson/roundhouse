@@ -23,6 +23,10 @@ roundhouse-fleet = { workspace = true }
 # knows nothing of this crate, and supplies the seams (`ControlReads`) this one
 # implements. See `src/mcp_api.rs`.
 roundhouse-mcp = { workspace = true }
+# The Relay-format emitters. Same one-way direction as `roundhouse-mcp`: that
+# crate depends on `roundhouse-core` and nothing else of ours, and this one is the
+# composition root that mounts a router over it. See `src/relay_api.rs`.
+roundhouse-relay = { workspace = true }
 roundhouse-store-redis = { workspace = true }
 
 anyhow = { workspace = true }

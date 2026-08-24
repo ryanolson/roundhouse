@@ -7,6 +7,7 @@ members = [
     "crates/roundhouse-core",
     "crates/roundhouse-fleet",
     "crates/roundhouse-mcp",
+    "crates/roundhouse-relay",
     "crates/roundhouse-store-redis",
     "crates/roundhouse-server",
 ]
@@ -20,6 +21,7 @@ license = "Apache-2.0"
 roundhouse-core = { path = "crates/roundhouse-core" }
 roundhouse-fleet = { path = "crates/roundhouse-fleet" }
 roundhouse-mcp = { path = "crates/roundhouse-mcp" }
+roundhouse-relay = { path = "crates/roundhouse-relay" }
 roundhouse-store-redis = { path = "crates/roundhouse-store-redis" }
 
 # Dynamo crates, pinned to an upstream commit of ai-dynamo/dynamo.
