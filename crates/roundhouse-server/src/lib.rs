@@ -43,9 +43,15 @@
 //! figure are folded out of the same log as everything else — see
 //! [`roundhouse_core::metrics`] — so the dashboard cannot disagree with the
 //! audit trail it summarizes.
+//!
+//! [`codex_launch`] faces the other way from all six: it *writes* the config an
+//! unmodified Codex reads in order to point at this deployment. It is here
+//! because the stanza needs the bound address, the turn-key header name and the
+//! MCP mount path at once, and this crate is the only one that knows all three.
 
 pub mod admin_api;
 pub mod catalog_config;
+pub mod codex_launch;
 pub mod control_config;
 pub mod conversations;
 pub mod dialect;
@@ -59,6 +65,7 @@ pub mod tokenizer;
 
 pub use admin_api::admin_router;
 pub use catalog_config::{CatalogConfig, CatalogError};
+pub use codex_launch::{CodexAuthKind, CodexLaunch};
 pub use control_config::{
     Admission, AuthError, ControlDirectory, ControlPlane, ControlPlaneConfig, ControlPlaneError,
     CrossChecks, DirectoryError, DirectoryMutation, DirectoryStore, DirectoryView, KeyScope,
@@ -73,5 +80,5 @@ pub use http::router;
 pub use judge::{FleetJudge, JudgeConfig};
 pub use mcp_api::{ControlPlaneReads, describe_ambiguous_memberships, mcp_router};
 pub use metrics_api::metrics_router;
-pub use responses_api::responses_router;
+pub use responses_api::{API_PREFIX, responses_router};
 pub use tokenizer::HfTokenizer;

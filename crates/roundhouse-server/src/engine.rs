@@ -780,10 +780,22 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             // in the log and nothing on the wire. See
             // [`Item::spoken_text`](roundhouse_core::item::Item::spoken_text).
             //
-            // The usage is the interjection's — reporting `Usage::default()`
-            // instead would make this deployment's own dashboard exceed what
-            // clients were told they spent, which is the one direction an
-            // accounting error must never run.
+            // **The usage booked here is the interjection's, and it is a
+            // ledger number rather than a wire number.** Reporting
+            // `Usage::default()` instead would make this deployment's own
+            // dashboard exceed what clients were told they spent, which is the
+            // one direction an accounting error must never run.
+            //
+            // What this usage is *not* is a measure of the conversation the
+            // steer stood in for — and until F03 the Responses surface
+            // forwarded it verbatim as `response.completed.usage`, which codex
+            // reads as the turn's context contribution and folds into
+            // `last_token_usage` (`codex-rs/protocol/src/protocol.rs:2122-2125`
+            // and `core/src/context_manager/history.rs:297-314,415-419` at
+            // `e363b08`). The two questions now have two answers: the log keeps
+            // this one, and [`Engine::context_contribution`] is what the wire
+            // reports. That split is why nothing about this line changed and
+            // why `a_side_call_books_under_its_own_model_row` is unaffected.
             Interjection::Complete {
                 item,
                 usage,
@@ -997,6 +1009,89 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         })
     }
 
+    /// What this deployment's tokenizer makes of a conversation, as the input
+    /// sequence length of the request that would carry it.
+    ///
+    /// Public for one caller — the Responses surface, which needs this number
+    /// for a turn the interjection seam answers and therefore never dispatches.
+    /// It goes through [`ContextAssembler::rehydrate`] with *this engine's*
+    /// tokenizer and block size, which is the whole point of exposing it rather
+    /// than letting the surface tokenize for itself: [`Self::plan`] prices a
+    /// dispatched turn on exactly this quantity, so the number reported for a
+    /// steered turn and the number reported for the turn after it are produced
+    /// by one function and cannot drift into two conventions.
+    ///
+    /// Summed per item rather than built through [`Self::assembler_over`], so
+    /// this can borrow. An assembler owns what it pushes, and cloning the whole
+    /// conversation here would be a `Vec<Item>` copied on *every* request —
+    /// including the ordinary dispatched turns that discard this number — to
+    /// produce a count. The identity that makes the borrowing form exact rather
+    /// than approximate is `ContextAssembler::push`, which is precisely
+    /// `encode(item.render())` appended per item; it is pinned by
+    /// `the_admitted_input_count_is_what_the_assembler_would_buffer`, which goes
+    /// red if that step ever stops being per-item and sends this back to
+    /// building the assembler.
+    pub fn admitted_input_tokens(&self, items: &[Item]) -> u64 {
+        items
+            .iter()
+            .map(|item| self.tokenizer.encode(&item.render()).len() as u64)
+            .sum()
+    }
+
+    /// The one place a conversation becomes a priced buffer for this engine.
+    ///
+    /// Extracted so [`Self::plan`] and any future caller cannot answer "how big
+    /// is this conversation" differently — which is the drift that would make a
+    /// steered turn's reported input and the next turn's priced input two
+    /// conventions instead of one number.
+    fn assembler_over(&self, items: Vec<Item>) -> ContextAssembler<T> {
+        ContextAssembler::rehydrate(self.tokenizer.clone(), self.config.block_size, items)
+    }
+
+    /// What a turn answered at the interjection seam contributed to the
+    /// *client's* context, as a [`Usage`] the wire can report.
+    ///
+    /// **The wire and the ledger answer different questions, and F03 is what it
+    /// cost to have them share one number.** The log books what this deployment
+    /// spent — for a steered turn, the judge's side call and nothing else, which
+    /// is what keeps the dashboard's total equal to the sum of its rows. A
+    /// client reads the same field as something else entirely: codex folds
+    /// `response.completed.usage` into `last_token_usage`, *replacing* it
+    /// (`protocol/src/protocol.rs:2122-2125` at `e363b08`), and that value is
+    /// what drives auto-compaction and `get_context_remaining`
+    /// (`core/src/context_manager/history.rs:415-419`, which despite its name
+    /// reads `last_token_usage`). Reporting the judge's usage there told a real
+    /// client its context had collapsed to ~1100 tokens on the very turn before
+    /// it resent a ~5700-token history — measured at 5.0x on this box.
+    ///
+    /// So the wire reports the turn's *context contribution*: the input this
+    /// deployment admitted, and the item it emitted. Neither number is money and
+    /// neither is booked; [`Accounting::Estimated`] says so, since both come
+    /// from our tokenizer rather than from a provider.
+    ///
+    /// The alternative — leaving the wire number alone and documenting the
+    /// one-turn corruption as accepted, since the next real turn resynchronizes
+    /// `last_token_usage` — was refused because the turn it corrupts is the
+    /// fulfilling turn: the one carrying the largest history the session has
+    /// ever held, and so the one most likely to need the compaction the wrong
+    /// number suppresses.
+    pub fn context_contribution(&self, admitted_input_tokens: u64, emitted: &Item) -> Usage {
+        Usage {
+            input_tokens: admitted_input_tokens,
+            // Nothing was dispatched, so nothing was served from any provider's
+            // prefix cache. Zero is the honest answer and also the conservative
+            // one: a cached count invented here would understate what the next
+            // turn has to prefill.
+            cached_input_tokens: 0,
+            // The prompt encoding, not the spoken text: a tool call says nothing
+            // to a human but occupies context exactly as `plan` will count it
+            // when the client resends it next turn.
+            output_tokens: self.tokenizer.encode(&emitted.render()).len() as u64,
+            reasoning_tokens: 0,
+            accounting: Accounting::Estimated,
+        }
+    }
+
     /// Stand in for a provider that reported nothing.
     ///
     /// Input is not really an estimate — it is the prompt this engine
@@ -1031,11 +1126,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
     ) -> Result<(FrontierStream, Decision, usize), EngineError> {
         // Rebuild the prompt from the committed log, so what we price is
         // exactly what a successor would reconstruct.
-        let assembler = ContextAssembler::rehydrate(
-            self.tokenizer.clone(),
-            self.config.block_size,
-            session.state().items.clone(),
-        );
+        let assembler = self.assembler_over(session.state().items.clone());
         let isl_tokens = assembler.buffer().isl_tokens();
         let turn_index = session.turn_index().saturating_sub(1);
 
@@ -1483,6 +1574,7 @@ async fn replay_output<S: SessionStore>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use roundhouse_core::context::ByteTokenizer;
     use roundhouse_core::control::{FrontierHistory, TargetFilter, TurnBudget};
     use roundhouse_core::ids::SessionId;
     use roundhouse_core::routing::{AffinityPolicy, RoutingContext};
@@ -1565,6 +1657,40 @@ mod tests {
             logged_reason(&AffinityPolicy::new(), &filtered, &candidates).await,
             IncompleteReason::PolicyRefused,
         );
+    }
+
+    /// The identity [`Engine::admitted_input_tokens`] borrows on.
+    ///
+    /// It sums `encode(item.render())` per item instead of building a
+    /// [`ContextAssembler`], because the assembler owns what it pushes and the
+    /// Responses surface would otherwise clone the whole conversation on every
+    /// request to produce one count. That substitution is exact only while
+    /// `ContextAssembler::push` *is* that step — this is the assertion that
+    /// notices if it stops being, at which point the count has to go back
+    /// through `assembler_over` and pay the clone.
+    #[test]
+    fn the_admitted_input_count_is_what_the_assembler_would_buffer() {
+        let items = vec![
+            Item::system_text("be brief"),
+            Item::user_text("what does canonicalize do with a namespace?"),
+            Item::assistant_text("it drops it", ResponseId::new("resp_1")),
+        ];
+        let tokenizer = ByteTokenizer;
+        // A block size that does not divide the conversation, so a boundary
+        // effect would show up rather than cancel.
+        let assembled = ContextAssembler::rehydrate(tokenizer, 7, items.clone())
+            .buffer()
+            .isl_tokens() as u64;
+        let summed: u64 = items
+            .iter()
+            .map(|item| tokenizer.encode(&item.render()).len() as u64)
+            .sum();
+        assert_eq!(
+            summed, assembled,
+            "the per-item sum and the assembler's input sequence length must be \
+             one number"
+        );
+        assert!(summed > 0, "the fixture must have something to count");
     }
 
     #[tokio::test]

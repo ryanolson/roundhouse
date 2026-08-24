@@ -85,6 +85,16 @@ fn the_tool_list_is_stable_and_golden_pinned() {
     // folds it into the prompt, so every session in a deployment re-primes its
     // prompt cache the moment it moves. Update the literal only once the change
     // is the intended one.
+    //
+    // **What the digest covers is name, description and schema, and not the
+    // MCP annotations**, which also go on the wire in `tools/list`. They are
+    // pinned instead by
+    // `every_tool_states_what_it_does_to_a_client_that_was_handed_no_config`,
+    // which asserts the exact triple per tool rather than hashing it, because
+    // the useful failure there names the tool and the hint rather than saying
+    // a digest moved. The split is why adding the hints (F06) left this
+    // literal untouched -- worth knowing before reading the digest as a pin on
+    // everything a client sees.
     let list: Vec<Value> = descriptors()
         .into_iter()
         .map(|tool| {
@@ -1531,4 +1541,70 @@ async fn two_surfaces_over_one_store_see_one_control_plane() {
     .await;
     let seen = served(&call(&reader, &ada(), "status", json!({})).await);
     assert_eq!(seen["overlay"]["mode"], json!("local"));
+}
+
+/// F06: a client that was never handed the generated launch config -- an
+/// operator's own `codex` install, a bare MCP inspector, any client that
+/// speaks the protocol without `default_tools_approval_mode = "approve"` in
+/// its `[mcp_servers.*]` stanza -- sees exactly what `RoundhouseMcp::tools()`
+/// serializes over the wire. codex 0.146.0's `requires_mcp_tool_approval`
+/// (`core/src/mcp_tool_call.rs:2156-2173` @ `e363b08`, identical at
+/// `2182-2199` @ the Cargo pin `6344a65`) treats an absent `read_only_hint`
+/// as `false` and an absent `destructive_hint`/`open_world_hint` as `true`,
+/// so a tool with no `annotations` at all reads as destructive-and-open-world
+/// regardless of what it actually does -- and under `approval_policy = never`
+/// an approval nobody can be asked for resolves to *cancelled*.
+///
+/// This asserts the exact triple per tool rather than merely that annotations
+/// exist, because `ToolAnnotations::default()` is `Some(..)` and serializes to
+/// `{}`: it would satisfy an `is_some()` check while leaving codex's
+/// arithmetic reading exactly what it reads today. The read set is spelled out
+/// here as a literal so a ninth tool arrives unclassified and fails, which is
+/// the review F16's tripwire demands.
+#[test]
+fn every_tool_states_what_it_does_to_a_client_that_was_handed_no_config() {
+    use roundhouse_mcp::transport::RoundhouseMcp;
+
+    // The crate's own read/write split (see the module doc's "No tool appends
+    // to a session log"): these three answer out of committed state, the other
+    // five write to the node-local `ControlStore`.
+    let reads = ["status", "fetch_steer", "explain_last_route"];
+
+    for tool in RoundhouseMcp::tools() {
+        let annotations = tool.annotations.as_ref().unwrap_or_else(|| {
+            panic!(
+                "`{}` ships with no ToolAnnotations at all; a client that was \
+                 not handed the generated launch config (which papers over \
+                 this with `default_tools_approval_mode = \"approve\"`) reads \
+                 it as destructive and open-world",
+                tool.name
+            )
+        });
+        let expected_read_only = reads.contains(&tool.name.as_ref());
+        assert_eq!(
+            annotations.read_only_hint,
+            Some(expected_read_only),
+            "`{}` must say whether it writes: codex defaults an absent \
+             read_only_hint to false, and a read that stays silent buys an \
+             approval it never needed",
+            tool.name
+        );
+        // Both false for all eight: an overlay only ever narrows (nothing here
+        // destroys committed state) and the whole surface reaches roundhouse's
+        // own control plane and nothing outside it.
+        assert_eq!(
+            annotations.destructive_hint,
+            Some(false),
+            "`{}` must deny destructiveness explicitly; absent, codex reads it \
+             as true and demands an approval `codex exec` can never give",
+            tool.name
+        );
+        assert_eq!(
+            annotations.open_world_hint,
+            Some(false),
+            "`{}` must deny an open world explicitly; absent, codex reads it \
+             as true and demands an approval `codex exec` can never give",
+            tool.name
+        );
+    }
 }

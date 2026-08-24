@@ -580,6 +580,81 @@ mod tests {
         );
     }
 
+    /// F04: the same loop, seen through a real codex client's wrapper.
+    ///
+    /// Codex prepends `Wall time: N.NNNN seconds\nOutput:` to every MCP tool
+    /// result before echoing it back as the `function_call_output` this
+    /// canonicalizes into an `Exchange` (codex-rs
+    /// `core/src/tools/context.rs::McpToolOutput::response_payload`, lines
+    /// 124-126, identical at `e363b08` and pin `6344a65`). Hashing the whole
+    /// stored string turned four textually-identical answers into four
+    /// different hashes purely from wall-clock jitter — the exact
+    /// false-progress shape the adjacent test proves this signal rejects,
+    /// except the "different output" was the client's wrapper and not
+    /// progress. `Exchange::output_hash` now hashes
+    /// `exchange::tool_output_body`, so the wrapper is invisible to the
+    /// comparison and the stored item stays verbatim.
+    #[test]
+    fn a_codex_wrapped_repeat_still_fires() {
+        let signal = NoProgressRepeat {
+            occurrences: 3,
+            window: 8,
+        };
+
+        // Four calls, identical name/arguments/underlying answer — the exact
+        // loop `a_repeat_with_a_different_output_does_not_fire` proves this
+        // signal catches when the output is a bare string. Here each output is
+        // wrapped the way a real codex client wraps it: a wall-time header
+        // whose only variation is unavoidable per-call jitter, then the same
+        // `Output:` body every time.
+        let mut stuck = Vec::new();
+        for (n, wall_time) in [0.0421, 0.0398, 0.0512, 0.0407].into_iter().enumerate() {
+            stuck.push(call(&format!("c{n}"), "pytest", r#"{"path":"tests/"}"#));
+            stuck.push(result(
+                &format!("c{n}"),
+                &format!(
+                    "Wall time: {wall_time:.4} seconds\nOutput:\nImportError: no module named app"
+                ),
+            ));
+        }
+        let fact = signal
+            .detect(&evidence_of(&stuck, &[]))
+            .expect("four codex-wrapped identical answers is still the same loop");
+        assert!(fact.contains("identical output 4 times"), "{fact}");
+    }
+
+    /// F04: the same streak, seen through codex's exec wrapper.
+    ///
+    /// `exchange::reads_as_failure` is anchored on the head of the output on
+    /// purpose — an unanchored scan flags every result that *mentions* an error
+    /// it had just fixed. Codex's exec wrapper (`response_text`,
+    /// context.rs:446-465) puts `Chunk ID:` / `Wall time:` / `Output:` ahead of
+    /// the tool's own text unconditionally, so against a real client the
+    /// anchored check was not a probabilistic miss but a hard never. Anchoring
+    /// on the *body* keeps the narrow test and gives it something to anchor to.
+    /// Note the two-decimal wall time here: the recogniser prefix-matches
+    /// `Wall time: ` and never parses the number, so it does not care that
+    /// upstream formats it to four.
+    #[test]
+    fn a_codex_wrapped_failure_streak_still_fires() {
+        let streak = ToolFailureStreak { length: 3 };
+
+        let mut failing = Vec::new();
+        for n in 0..3 {
+            failing.push(call(&format!("c{n}"), "cargo", "{}"));
+            failing.push(result(
+                &format!("c{n}"),
+                &format!(
+                    "Chunk ID: chunk-{n}\nWall time: 0.{n:02} seconds\nOutput:\nError: build failed"
+                ),
+            ));
+        }
+        let fact = streak
+            .detect(&evidence_of(&failing, &[]))
+            .expect("three codex-wrapped failures in a row is still a failure streak");
+        assert!(fact.contains("all returned failures"), "{fact}");
+    }
+
     #[test]
     fn the_other_three_signals_fire_on_their_pattern_and_are_quiet_otherwise() {
         // Ping-pong: strict alternation of two names, and nothing else.
