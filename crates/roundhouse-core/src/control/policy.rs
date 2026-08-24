@@ -1169,6 +1169,57 @@ mod tests {
         );
     }
 
+    /// M10 review G05: a turn that falls forward writes one `Routed` per
+    /// dispatch (`Session::fold`'s comment on `frontier_history` says so
+    /// explicitly), so `dispatches` can hold more entries than the session has
+    /// routed turns. `frontier_in_last` reads `turns` as an index into that
+    /// vector, one entry per element, with no notion of a turn boundary — so a
+    /// failover turn's extra entries eat into the window exactly as if they
+    /// were extra turns, and an older hosted turn ages out before `per_turns`
+    /// real turns have actually elapsed.
+    ///
+    /// `#[ignore]`: the fold this pins — one vector slot per routed turn,
+    /// however many dispatches that turn took — does not exist yet; only the
+    /// per-dispatch vector does. Proves the defect, does not fix it.
+    #[test]
+    #[ignore = "G05: frontier_in_last(turns) indexes dispatches, not routed \
+                turns, so a failover turn (which folds more than one `Routed` \
+                into one turn) shortens the trailing window and ages an older \
+                hosted turn out early; see PLAN-frontier-selection.md, no \
+                ruling yet on whether the window should count turns or \
+                dispatches"]
+    fn a_failover_turn_does_not_shorten_the_cadence_window() {
+        let mut history = FrontierHistory::default();
+
+        // Turn 1: reaches the hosted model once.
+        history.record(&frontier("anthropic", "claude"));
+        // Turn 2: local.
+        history.record(&local("llama"));
+        // Turn 3: falls forward twice before landing locally — three
+        // `Routed` events folded from one routed turn.
+        history.record(&frontier("anthropic", "claude"));
+        history.record(&frontier("openai", "gpt-5"));
+        history.record(&local("llama"));
+        // Turns 4 through 10: local. Ten routed turns total.
+        for _ in 0..7 {
+            history.record(&local("llama"));
+        }
+
+        // Ten real turns have elapsed, so a ten-turn trailing window spans
+        // the whole session and turn 1's hosted dispatch is still inside it:
+        // 1 reach from turn 1, plus the 2 frontier attempts turn 3 made
+        // before it landed locally.
+        assert_eq!(
+            history.frontier_in_last(10),
+            3,
+            "turn 1's reach must still be inside a ten-turn window when the \
+             session is exactly ten turns old; today `frontier_in_last` \
+             treats each of turn 3's three dispatches as its own turn, so \
+             `take(10)` stops two dispatches short of turn 1 and returns 2 — \
+             turn 1 has aged out three turns early"
+        );
+    }
+
     #[test]
     fn permits_ignores_the_cadence_and_admits_when_spent_is_what_survives_it() {
         // The three questions, told apart on one policy. `permits` is the

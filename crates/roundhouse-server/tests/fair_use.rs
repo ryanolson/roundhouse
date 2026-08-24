@@ -522,3 +522,121 @@ async fn a_member_ceiling_refuses_over_the_wire_while_the_project_has_room() {
         "a member with no ceiling of his own must not inherit hers"
     );
 }
+
+/// G10 (thermo-nuclear review, M10): a 429 the pinned codex binary can act on.
+///
+/// codex's own `429` handling (`codex-api::api_bridge::map_api_error`, pin
+/// `6344a655`, identical at the box binary's `e363b08`) recognizes exactly one
+/// machine-readable shape for a rate limit it should *not* just fail on: a
+/// body that deserializes as `UsageErrorResponse { error: { type, plan_type,
+/// resets_at } }` with `type == "usage_limit_reached"`. Anything else on
+/// `429` -- including a body with our `code`/`scope`/`window`/`retry_at_ms`
+/// fields and no `type` at all -- is classified `CodexErr::RetryLimit`
+/// ("exceeded retry limit, last status: 429"), discarding window/retry_at_ms.
+///
+/// PARTIALLY VALID, corrected mechanism: the finding describes this as codex
+/// "burning its retry budget in seconds of exponential backoff" before giving
+/// up. It does not. Every `RetryConfig`/`ApiRetryConfig` construction site at
+/// both `6344a655` and `e363b08` -- there are ~20, `grep -rn "retry_429"
+/// --include=*.rs` -- hardcodes `retry_429: false`; codex never retries a
+/// `429` at the transport level regardless of provider config, so
+/// `codex-client::retry::backoff` never runs for this status and no attempt
+/// budget is burned. `map_api_error`'s `TransportError::Http{status: 429,
+/// ..}` arm builds `CodexErr::RetryLimit` directly, on the first and only
+/// attempt, the instant the body fails to match `usage_limit_reached` --
+/// reusing the same terminal message and losing the same information as a
+/// real retry-exhaustion would, but with no backoff delay and no wasted
+/// attempts in between. The reported defect (window/retry_at_ms invisible to
+/// codex, reported as an undifferentiated retry-limit error) is real; "burns
+/// its retry budget" is not what happens.
+///
+/// This is the hermetic mirror the finding proposed: no real codex binary, no
+/// network -- asserts the *fixed* behavior (a 429 codex would classify as
+/// `UsageLimitReached`) and fails today because that is not what we send.
+/// Ignored per CLAUDE.md: ruled, not fixed here -- see the `#[ignore]` reason.
+#[tokio::test]
+#[ignore = "G10 (partially valid: real defect, wrong stated mechanism -- see \
+            doc comment): our 429 sends `error.code`, not `error.type`, so \
+            codex's `map_api_error` (pin 6344a655 == e363b08, \
+            codex-api/src/api_bridge.rs) never matches \
+            `Some(\"usage_limit_reached\")` and classifies it \
+            `CodexErr::RetryLimit` on the first attempt -- NOT, as the \
+            finding states, after exhausting a backoff budget: `retry_429` is \
+            hardcoded `false` at every RetryConfig construction site in the \
+            pinned tree, so codex never retries a 429 at all. Either way \
+            window/retry_at_ms are discarded. Fixing this test (send an \
+            `error.type: \"usage_limit_reached\"` + `resets_at` (unix \
+            seconds) alongside our existing fields) is production code, out \
+            of scope for a refute stage."]
+async fn the_fair_use_429_body_decodes_as_the_shape_codex_treats_specially() {
+    /// Mirrors `codex-api::api_bridge::UsageErrorResponse` /
+    /// `UsageErrorBody` at pin `6344a655a5966f92e009a74928fb0559b41f9093`
+    /// (`codex-rs/codex-api/src/api_bridge.rs`) field-for-field: the exact
+    /// struct codex's own `serde_json::from_str` targets on a `429`.
+    #[derive(serde::Deserialize)]
+    struct UsageErrorResponse {
+        error: UsageErrorBody,
+    }
+    #[derive(serde::Deserialize)]
+    struct UsageErrorBody {
+        #[serde(rename = "type")]
+        error_type: Option<String>,
+        #[allow(dead_code)]
+        resets_at: Option<i64>,
+    }
+
+    let plane = plane(1);
+    let fair_use = Arc::new(MemoryFairUseLedger::new());
+    let store = Arc::new(MemoryStore::new());
+    let engine = engine(
+        Arc::clone(&store),
+        Arc::new(CountingLedger::default()),
+        Arc::clone(&fair_use) as Arc<dyn FairUseLedger>,
+    );
+    let app = app(plane, engine, store);
+
+    let (status, _) = post(&app, "sess-one").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let body = request("sess-two", vec![user_message("count some tokens")]);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header(CONTENT_TYPE, "application/json")
+                .header(AUTHORIZATION, format!("Bearer {}", key("ada")))
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    // No `Retry-After` either, though codex's own retry loop never reads one
+    // (`codex-client/src/retry.rs` backoff takes no header input at all) --
+    // that half of the finding is about a generic HTTP client, not codex.
+
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+
+    // THE CLAIM, as the fixed behavior: for codex to classify this refusal as
+    // `UsageLimitReached` (scheduled, worth reporting -- not just retried into
+    // exhaustion) rather than fall through to `CodexErr::RetryLimit`,
+    // `map_api_error`'s `err.error.error_type.as_deref() ==
+    // Some("usage_limit_reached")` must be true. `from_str` succeeds today
+    // (our body is well-formed JSON with an `error` object) but `error_type`
+    // decodes to `None`, because we send `error.code`, not `error.type` -- so
+    // this assertion fails now, for exactly the reason G10 gives.
+    let decoded: UsageErrorResponse = serde_json::from_str(&text)
+        .expect("well-formed JSON with an `error` object -- codex's from_str does parse this");
+    assert_eq!(
+        decoded.error.error_type.as_deref(),
+        Some("usage_limit_reached"),
+        "G10: our 429 body has no `error.type` field (we send `error.code` \
+         instead), so codex's own check in `map_api_error` is false and this \
+         429 is routed to `CodexErr::RetryLimit` instead of \
+         `CodexErr::UsageLimitReached` -- window/retry_at_ms are invisible to \
+         codex's own error handling: {text}"
+    );
+}

@@ -1130,6 +1130,46 @@ mod tests {
         }
     }
 
+    /// G04 (review finding): `classify_tool_call` has no case for roundhouse's
+    /// own `mcp__roundhouse__*` control tools, so they fall through to
+    /// `Other` exactly like an unrecognised tool — which means the four
+    /// control calls the `rh-status` skill tells an agent to make in sequence
+    /// (`status`, `explain_last_route`, `prefer`, `set_quality_floor`) read as
+    /// a four-call build-pit streak. **Ignored**: this is the claim, not the
+    /// fix; the control call proves the streak length still fires on real
+    /// uncategorised shell work, so removing the ignore is step one of the
+    /// fix rather than a cleanup after it.
+    #[test]
+    #[ignore = "G04: mcp__roundhouse__* control calls are classified as Other and streak like an unrecognised tool"]
+    fn our_own_control_calls_are_not_an_agents_build_pit() {
+        let control_only = session(&[
+            ("mcp__roundhouse__status", "{}", Some("ok")),
+            ("mcp__roundhouse__explain_last_route", "{}", Some("ok")),
+            ("mcp__roundhouse__prefer", r#"{"mode":"cheap"}"#, Some("ok")),
+            (
+                "mcp__roundhouse__set_quality_floor",
+                r#"{"floor":0.5}"#,
+                Some("ok"),
+            ),
+        ]);
+        assert_eq!(
+            ToolSignals::from_exchanges(&control_only).pure_bash_streak,
+            0,
+            "roundhouse's own control traffic must not read as an agent build pit"
+        );
+
+        // Control: an agent genuinely spinning on shell calls still streaks —
+        // this is what proves the assertion above is about tool identity and
+        // not about the streak length being broken.
+        let shell_pit = session(&[
+            ("bash", &shell("cargo build"), Some("err")),
+            ("bash", &shell("cargo build"), Some("err")),
+            ("bash", &shell("cargo build"), Some("err")),
+            ("bash", &shell("cargo build"), Some("err")),
+        ]);
+        assert_eq!(ToolSignals::from_exchanges(&shell_pit).pure_bash_streak, 4);
+    }
+
     /// The build pit: consecutive uncategorised calls, counting back from the
     /// end and ending at the first thing that read, wrote, edited or planned.
     #[test]

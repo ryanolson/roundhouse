@@ -756,6 +756,65 @@ mod tests {
         assert!((producing.score + 0.5f64.tanh()).abs() < 1e-9);
     }
 
+    /// G04 (review finding): the trailing window `dimensions_from_signal`
+    /// reads from is [`ToolSignals`]'s own `recent_*` counts, and those come
+    /// from [`classify_tool_call`](crate::validate::tool_signals) — which has
+    /// no case for `mcp__roundhouse__*`, so a session that just made four
+    /// productive edits and then followed the `rh-status` skill (`status`,
+    /// `explain_last_route`, `prefer`, `set_quality_floor`) reads as
+    /// `spinning` on its last three calls being uncategorised `Other`
+    /// traffic, not on the agent actually being stuck. **Ignored**: this is
+    /// the claim, not the fix.
+    #[test]
+    #[ignore = "G04: trailing mcp__roundhouse__* control calls synthesize spinning=1.0 despite real production work earlier in the session"]
+    fn our_own_control_calls_do_not_synthesize_a_stall() {
+        use crate::validate::Exchange;
+
+        fn control_call(id: &str, name: &str, arguments: &str) -> Exchange {
+            Exchange {
+                call_id: id.into(),
+                name: name.into(),
+                arguments: arguments.into(),
+                output: Some("ok".into()),
+                failed: false,
+            }
+        }
+
+        // Six exchanges of real production work, then the four trailing
+        // control calls the generated `rh-status` skill tells an agent to
+        // make. Ten exchanges total clears `STALL_MIN_TURN_DEPTH` (8).
+        let mut exchanges = Vec::new();
+        for n in 0..6 {
+            exchanges.push(control_call(&format!("p{n}"), "edit", "{}"));
+        }
+        exchanges.push(control_call("c0", "mcp__roundhouse__status", "{}"));
+        exchanges.push(control_call(
+            "c1",
+            "mcp__roundhouse__explain_last_route",
+            "{}",
+        ));
+        exchanges.push(control_call(
+            "c2",
+            "mcp__roundhouse__prefer",
+            r#"{"mode":"cheap"}"#,
+        ));
+        exchanges.push(control_call(
+            "c3",
+            "mcp__roundhouse__set_quality_floor",
+            r#"{"floor":0.5}"#,
+        ));
+        assert_eq!(exchanges.len(), 10);
+
+        let signals = TurnSignals::from_exchanges(&exchanges);
+        assert_eq!(signals.turn_depth, 10);
+        let dims = dimensions_from_signal(&signals);
+        assert_eq!(
+            dims.spinning, 0.0,
+            "four trailing reads of roundhouse's own control surface must not \
+             read as the agent spinning: {dims:?}"
+        );
+    }
+
     #[test]
     fn spinning_and_exploring_never_both_fire() {
         // Deep enough, no production, nothing investigative: spinning.

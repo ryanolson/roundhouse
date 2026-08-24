@@ -609,6 +609,35 @@ mod tests {
             .expect("the built-in provider needs no definition");
     }
 
+    /// **Thermo-nuclear review G15, reachability half.** The boundary refuses
+    /// a `provider` naming nothing, and it refuses a provider missing a route
+    /// for its entry's dialect — but nothing here refuses a `providers` map
+    /// that explicitly redefines the key `openai`. That means the scenario
+    /// `an_explicit_openai_definition_says_it_is_taking_over_from_the_variables`
+    /// (in `main.rs`) exercises is one an operator can actually reach through
+    /// a parsed catalog file, not just through `frontier_clients` called
+    /// directly: nothing here stops them writing `"providers": {"openai":
+    /// {...}}` next to `ROUNDHOUSE_OPENAI_API_BASE` and getting no refusal, no
+    /// warning, and a silently shadowed variable.
+    #[test]
+    fn an_explicit_openai_provider_entry_validates_unremarked() {
+        CatalogConfig::from_json(
+            &one_entry(
+                r#"{ "openai": { "base_url": "https://openai-relay.internal/v1",
+                     "routes": { "responses": "/responses" },
+                     "auth": { "env": "OPENAI_RELAY_KEY" } } }"#,
+                "openai",
+                "openai_responses",
+            ),
+            "test",
+        )
+        .expect(
+            "the config boundary has no check that would refuse a `providers.openai` entry, \
+             which is what makes the shadowing in `frontier_clients` reachable from a file an \
+             operator actually writes rather than only from a hand-built HashMap",
+        );
+    }
+
     /// A definition that cannot carry one of its own entries.
     ///
     /// The failure this prevents is quiet in the worst way: the provider
@@ -654,5 +683,52 @@ mod tests {
     fn a_malformed_catalog_names_the_file_it_could_not_parse() {
         let error = CatalogConfig::from_json("{ not json", "/etc/roundhouse.json").unwrap_err();
         assert!(error.to_string().contains("/etc/roundhouse.json"));
+    }
+
+    /// G17 (M10 review): the `catalog.example.json` `$comment` spends eleven
+    /// lines warning that a tilde-alias (`~deepseek/deepseek-v4-flash-latest`)
+    /// is a rolling pointer OpenRouter may re-point at any time, and that the
+    /// catalog "has no mechanism to re-resolve it later" — but `validate`
+    /// never inspects the shape of `spec.model` at all, so that discipline is
+    /// prose, not a check. This asserts the load either refuses a tilde-alias
+    /// id or at least surfaces it, which is what "has no mechanism" should not
+    /// mean if the rule mattered enough to state.
+    #[test]
+    #[ignore = "G17: validate() never inspects the shape of spec.model, so a \
+                tilde-alias (rolling pointer) loads silently with no refusal \
+                and no warning -- fixing this is a design ruling (refuse vs. \
+                warn vs. allow-with-audit-log), not a mechanical patch, so it \
+                is left as evidence rather than fixed here"]
+    fn a_rolling_alias_is_named_at_load() {
+        let with_alias = format!(
+            r#"{{
+              "providers": {{ "openrouter": {{
+                "base_url": "https://openrouter.ai/api/v1",
+                "routes": {{ "responses": "/responses" }},
+                "auth": {{ "env": "OPENROUTER_API_KEY" }}
+              }} }},
+              "models": [{{
+                "provider": "openrouter",
+                "model": "~deepseek/deepseek-v4-flash-latest",
+                "wire_protocol": "openai_responses",
+                "cache_model": {{ "kind": "deterministic", "ttl_ms": 300000 }},
+                "pricing": {{
+                  "input_per_mtok_usd": 1.0,
+                  "cached_input_per_mtok_usd": 0.1,
+                  "cache_write_per_mtok_usd": 0.0,
+                  "output_per_mtok_usd": 4.0
+                }},
+                "quality_prior": 0.7,
+                "base_ttft_ms": 300.0,
+                "ttft_ms_per_uncached_token": 0.001
+              }}]
+            }}"#
+        );
+        let error = CatalogConfig::from_json(&with_alias, "test")
+            .expect_err("a rolling-pointer model id mis-prices every turn after OpenRouter re-points it, same as a duplicate identity or an off-scale prior");
+        assert!(
+            matches!(&error, CatalogError::InvalidValue { field, .. } if *field == "model"),
+            "{error}"
+        );
     }
 }

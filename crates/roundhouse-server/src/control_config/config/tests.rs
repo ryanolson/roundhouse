@@ -262,6 +262,73 @@ fn the_example_file_validates() {
     }
 }
 
+/// Review finding G07: the shipped `roundhouse` binary attaches no
+/// [`LocalFleet`], so `local/<model>` names nothing `reachable_candidates`
+/// (main.rs) ever quotes -- see that function's own doc comment. The check
+/// above only asks whether acme's `allow` *admits* each recipe entry, which
+/// `local/REPLACE-with-your-local-model` passes (the pattern is `local/*`);
+/// it never asks whether the catalog this binary actually ships can quote a
+/// candidate for that identity at all. This test asks the second question,
+/// against the same shipped catalog example the control-plane example is
+/// meant to be read beside, and with no fleet -- mirroring the shipped
+/// binary's actual wiring.
+///
+/// [`LocalFleet`]: roundhouse_fleet::LocalFleet
+#[test]
+#[ignore = "G07: the shipped example's efficient tier names \
+            `local/REPLACE-with-your-local-model`, which the shipped binary's own catalog \
+            example never quotes a candidate for (no LocalFleet is attached in main.rs::serve) \
+            -- every turn falls to the capable tier silently, and the republished rationale \
+            blames the key's admission rather than the missing fleet. Confirmed test-first; \
+            see review ruling G07. Removing this ignore is the first step of the fix, not a \
+            cleanup after it."]
+fn every_target_the_examples_recipe_names_is_one_this_binary_could_quote() {
+    let control_plane_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/control-plane.example.json");
+    let config = ControlPlaneConfig::load(&control_plane_path)
+        .unwrap_or_else(|error| panic!("the shipped example must validate: {error}"));
+
+    let catalog_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/catalog.example.json");
+    let catalog = crate::CatalogConfig::load(&catalog_path)
+        .unwrap_or_else(|error| panic!("the shipped catalog example must validate: {error}"))
+        .catalog();
+
+    // Same recipe for the same reason `the_example_file_validates` above
+    // handled multiplicity -- this milestone's example ships one project.
+    let recipe = config
+        .turn_keys
+        .values()
+        .next()
+        .and_then(|admission| admission.tiers.as_ref())
+        .expect("the example ships a key with a recipe");
+
+    // `reachable_candidates` in main.rs, reproduced here rather than called:
+    // that function lives in the `roundhouse` binary crate and is not
+    // reachable from this lib crate's tests. No `LocalFleet` is attached --
+    // matching `serve()`'s actual wiring, which is the fact this test exists
+    // to check against the example.
+    let mut ledger = roundhouse_core::routing::CacheLedger::new();
+    catalog.apply_to_ledger(&mut ledger);
+    let reachable = catalog.quote(&ledger, roundhouse_core::now_ms(), 1_024, 256);
+    let reachable_identities: HashSet<String> = reachable
+        .iter()
+        .map(|candidate| candidate.target.policy_identity())
+        .collect();
+
+    for tier in [Tier::Capable, Tier::Efficient] {
+        for named in recipe.list(tier) {
+            assert!(
+                reachable_identities.contains(named),
+                "the example's {tier:?} tier names `{named}`, which the shipped catalog \
+                 example never quotes a candidate for (reachable: {reachable_identities:?}); \
+                 with no LocalFleet attached the shipped binary can never route to it, so \
+                 every turn falls to the other tier silently"
+            );
+        }
+    }
+}
+
 // -----------------------------------------------------------------------
 // Decision 8: budget on projects, allocation on keys
 // -----------------------------------------------------------------------

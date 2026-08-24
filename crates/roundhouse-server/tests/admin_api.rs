@@ -2615,6 +2615,70 @@ async fn the_correctly_spelled_field_on_project_create_still_succeeds() {
     );
 }
 
+/// G14: `POST` accepts a project's `fair_use` block (it is just [`ProjectEntry`]
+/// on the wire), but nothing on the admin surface can read it back or move it
+/// afterwards. An operator who sets a 5h fair-use window at create time has no
+/// way to raise it later except delete-and-recreate -- exactly what the
+/// archived-id tombstone exists to make unnecessary -- and no way to confirm
+/// what is in force without going to the file. `#[ignore]`d until `ProjectDto`
+/// grows a `fair_use` field and `ProjectPatch` grows a `fair_use` axis.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "G14: fair_use is accepted on create but unreadable via GET and \
+            unwritable via PATCH (deny_unknown_fields), so a project's \
+            fair-use window can only ever be set once"]
+async fn a_projects_fair_use_can_be_created_read_back_and_changed() {
+    let rig = plain().await;
+
+    // Created with a 5h fair-use window, same as the create route already
+    // accepts today -- the create half of this claim is not in dispute.
+    let (create_status, create_text) = send(
+        &rig.app,
+        "POST",
+        "/v1/admin/projects",
+        Some(&root()),
+        Some(json!({
+            "id": "axis-co",
+            "fair_use": { "windows": [{ "window": "5h", "max_usd": 5.0 }] },
+        })),
+    )
+    .await;
+    assert_eq!(
+        create_status,
+        StatusCode::CREATED,
+        "create with fair_use is accepted today: {create_text}"
+    );
+
+    // Read back: the project view has no field fair_use could appear in at
+    // all, so an operator cannot confirm what is in force without reading the
+    // control-plane file directly.
+    let read_back = read(&rig.app, "/v1/admin/projects/axis-co").await;
+    assert!(
+        read_back.get("fair_use").is_some(),
+        "GET /v1/admin/projects/{{id}} does not expose fair_use at all -- an \
+         operator has no way to read back what was just created: {read_back}"
+    );
+
+    // Changed: PATCHing the same axis the create route just accepted is
+    // refused as an *unknown field*, not as some substantive policy refusal --
+    // ProjectPatch's deny_unknown_fields schema never learned this axis exists.
+    let (patch_status, patch_text) = send(
+        &rig.app,
+        "PATCH",
+        "/v1/admin/projects/axis-co",
+        Some(&root()),
+        Some(json!({
+            "fair_use": { "windows": [{ "window": "5h", "max_usd": 50.0 }] },
+        })),
+    )
+    .await;
+    assert_ne!(
+        patch_status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "PATCH fair_use must not 422 as an unknown field for an axis the \
+         create route on this same resource just accepted: {patch_text}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_budget_window_change_is_refused_over_http_naming_the_mechanism() {
     // The one `PATCH` axis that is refused, and the reason has to travel with

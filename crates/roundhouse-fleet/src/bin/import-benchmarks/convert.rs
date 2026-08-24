@@ -561,6 +561,36 @@ mod tests {
         }
     }
 
+    /// G13: the README says the tool "refuses to emit without" a citation.
+    /// A null `meta.citation` is the ordinary multi-source case -- the
+    /// SNAPSHOT fixture's own comment says so -- and it is *emitted*, with
+    /// `citation: null` plus the item's own `source` discriminator, not
+    /// refused. `NoAttribution` only fires when neither `meta.citation` nor
+    /// the item's `source` is present, a path this fixture never takes.
+    /// Left as a live (non-`#[ignore]`) guard: it already passes today, and
+    /// that pass *is* the evidence the README sentence overstates the
+    /// refusal -- once the doc is corrected this test is what keeps it
+    /// correct.
+    #[test]
+    fn a_null_meta_citation_is_emitted_when_the_items_name_their_own_source() {
+        let import = convert(SNAPSHOT, &request()).expect("a null meta.citation is not a refusal");
+        assert!(
+            import.provenance["meta"]["citation"].is_null(),
+            "this fixture's meta.citation must be null to exercise the multi-source case"
+        );
+        let first_entry = import.provenance["entries"]
+            .as_array()
+            .expect("entries is an array")
+            .first()
+            .expect("at least one entry");
+        assert!(
+            first_entry["attribution"]["source"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()),
+            "entries[0].attribution.source must be present when meta.citation is null: {first_entry}"
+        );
+    }
+
     /// A single-source fetch is the other half of the same claim: when the
     /// response *does* carry a citation, every entry carries that citation.
     ///
@@ -794,6 +824,39 @@ mod tests {
         let error = convert(&body.to_string(), &request()).expect_err("unattributable");
         assert!(error.to_string().contains("x/y"));
         assert!(error.to_string().contains("REQUIRED"));
+    }
+
+    /// G12: `NoAttribution` refuses on the ground that "the savings dashboard
+    /// republishes it", but the fragment this tool emits -- the file that
+    /// actually reaches a deployment's catalog -- has no field to carry that
+    /// attribution through. It lives only in the sibling provenance file,
+    /// which nothing in `roundhouse-server` or `roundhouse-core` loads (see
+    /// `pricing.rs`'s `quality_prior_is_republished_with_no_attribution_riding_along`
+    /// for where the number the refusal is protecting actually surfaces).
+    /// Left `#[ignore]`: it documents a real gap between the refusal's stated
+    /// justification and the tree's actual attribution path, not a defect
+    /// this tool alone can fix -- the fix is either a fragment-level
+    /// attribution field plus a catalog loader that carries it, or a
+    /// rewritten justification that stops claiming a path that doesn't exist.
+    #[test]
+    #[ignore = "G12: the fragment (what actually reaches a catalog) carries no attribution \
+                field; only the unloaded sibling provenance file does"]
+    fn the_attribution_the_refusal_defends_can_reach_the_surface_that_republishes_it() {
+        let import = imported();
+        let models = import.fragment["models"]
+            .as_array()
+            .expect("models is an array");
+        assert!(!models.is_empty());
+        for entry in models {
+            assert!(
+                entry.get("attribution").is_some(),
+                "fragment entry carries no `attribution` field, so a catalog built from \
+                 this file alone (which is what `$comment` tells an operator to do -- \
+                 merge quality_prior onto their own catalog) has no attribution to \
+                 republish, even though NoAttribution's justification is that \
+                 attribution is needed on this exact path: {entry}"
+            );
+        }
     }
 
     /// The undated `/models` rows are refused as an input by shape.

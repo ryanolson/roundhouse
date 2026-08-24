@@ -382,3 +382,138 @@ impl CrossChecks {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use roundhouse_core::control::{FrontierCadence, TurnPolicy};
+    use roundhouse_core::routing::{PickerMode, Target, TierRecipe};
+
+    use super::*;
+
+    fn candidate(target: Target, quality_prior: f64) -> Candidate {
+        Candidate {
+            target,
+            expected_prefill_tokens: 1_000.0,
+            matched_prefix_tokens: 0,
+            expected_ttft_ms: 100.0,
+            expected_cost_usd: 0.0,
+            quality_prior,
+            load: None,
+        }
+    }
+
+    fn frontier(provider: &str, model: &str) -> Target {
+        Target::Frontier {
+            provider: provider.into(),
+            model: model.into(),
+        }
+    }
+
+    fn local(model: &str) -> Target {
+        Target::Local {
+            worker_id: 7,
+            dp_rank: 0,
+            model: model.into(),
+        }
+    }
+
+    /// M10 review G02: a hosted-only tier recipe defeats the cadence's
+    /// degrade-to-local promise, and this boot check — the one written to
+    /// catch exactly a promise a deployment cannot keep — is blind to it.
+    ///
+    /// `unkeepable_promises` asks `admission.policy.admits_when_spent`, which
+    /// is a pure `TurnPolicy` question (allow filter, quality floor, is the
+    /// candidate local) with no notion of `admission.tiers` at all. A local
+    /// worker the policy permits satisfies it regardless of whether any tier
+    /// in the recipe names that worker, so a recipe that names only hosted
+    /// targets reads as a kept promise here even though `StagePolicy::choose`
+    /// (`routing/stage.rs`) will find `entitled == [local]`,
+    /// `tier_pool` empty for both tiers, and refuse the turn as
+    /// `NoViableCandidate` the moment the cadence is spent.
+    ///
+    /// CONTROL:
+    /// `the_boot_check_does_catch_a_cadence_promise_with_no_local_capacity_at_all`
+    /// below is the same check with no `tiers` axis in play at all, and it
+    /// does report `CADENCE_PROMISE` — proving the check's ordinary mechanism
+    /// works and it is specifically the tiers axis this check never reads.
+    #[test]
+    #[ignore = "G02: unkeepable_promises checks admission.policy.admits_when_spent \
+                against `reachable`, never admission.tiers, so a hosted-only tier \
+                recipe under a spent cadence reports clean here and dies \
+                NoViableCandidate at runtime -- see recommended_fix"]
+    fn a_hosted_only_tier_recipe_breaks_the_cadence_promise_the_boot_check_misses() {
+        let policy = TurnPolicy {
+            frontier_cadence: Some(FrontierCadence {
+                max_frontier: 2,
+                per_turns: 10,
+            }),
+            ..TurnPolicy::unrestricted()
+        };
+        // Both tiers name only a hosted target -- the recipe the finding
+        // describes, where degrading to local has nothing to route to.
+        let recipe = TierRecipe::new(
+            vec!["openrouter/capable-m".to_string()],
+            vec!["openrouter/efficient-m".to_string()],
+            PickerMode::EfficientFirst,
+            roundhouse_core::routing::stage::DEFAULT_CONFIDENCE_THRESHOLD,
+        )
+        .expect("a two-tier recipe at the shipped threshold");
+
+        let admission = Admission {
+            policy: Arc::new(policy),
+            tiers: Some(Arc::new(recipe)),
+            ..Admission::open()
+        };
+
+        // The deployment is live: both the hosted target and a local worker
+        // are reachable, which is exactly what makes the cadence's promise
+        // ("a spent window serves locally") one this fleet *could* keep --
+        // if the recipe named the local worker.
+        let reachable = vec![
+            candidate(frontier("openrouter", "capable-m"), 0.9),
+            candidate(frontier("openrouter", "efficient-m"), 0.7),
+            candidate(local("llama"), 0.6),
+        ];
+
+        let broken = unkeepable_promises(&admission, &reachable, None);
+        assert!(
+            broken.contains(&CADENCE_PROMISE),
+            "the tier recipe names no local target, so a spent cadence has \
+             nothing to degrade to at runtime -- but `unkeepable_promises` \
+             never reads `admission.tiers` and reports this configuration \
+             clean: {broken:?}"
+        );
+    }
+
+    /// CONTROL for the ignored test above: the same cadence, no `tiers` at
+    /// all, and no local candidate anywhere in `reachable` -- the shape this
+    /// check was written for. It still reports `CADENCE_PROMISE`, which is
+    /// what proves the check's ordinary mechanism works and isolates the
+    /// finding to the one axis (`admission.tiers`) it never reads.
+    #[test]
+    fn the_boot_check_does_catch_a_cadence_promise_with_no_local_capacity_at_all() {
+        let policy = TurnPolicy {
+            frontier_cadence: Some(FrontierCadence {
+                max_frontier: 2,
+                per_turns: 10,
+            }),
+            ..TurnPolicy::unrestricted()
+        };
+        let admission = Admission {
+            policy: Arc::new(policy),
+            tiers: None,
+            ..Admission::open()
+        };
+        let reachable = vec![candidate(frontier("openrouter", "capable-m"), 0.9)];
+
+        let broken = unkeepable_promises(&admission, &reachable, None);
+        assert!(
+            broken.contains(&CADENCE_PROMISE),
+            "no local candidate is reachable at all, so the cadence's promise \
+             cannot be kept and the check exists precisely to catch this: \
+             {broken:?}"
+        );
+    }
+}

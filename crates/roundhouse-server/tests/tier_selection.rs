@@ -30,8 +30,8 @@ use futures::StreamExt;
 use roundhouse_core::context::ByteTokenizer;
 use roundhouse_core::control::{
     Allocation, Balance, BalanceQuery, Budget, BudgetTerms, BudgetWindow, DEFAULT_WARN_AT,
-    Exhaustion, Grant, GrantRequest, MemorySpendLedger, Settled, Settlement, SpendError,
-    SpendLedger,
+    Exhaustion, FrontierCadence, Grant, GrantRequest, MemorySpendLedger, Settled, Settlement,
+    SpendError, SpendLedger, TurnPolicy,
 };
 use roundhouse_core::event::SessionEventKind;
 use roundhouse_core::ids::{SessionId, TurnId};
@@ -221,6 +221,26 @@ fn budgeted_admission_with(picker: PickerMode) -> Admission {
     }
 }
 
+/// The same recipe with a frontier cadence spent after one dispatch.
+///
+/// **M10 review G02.** `recipe()`'s two tiers are `[alpha, beta]` and
+/// `[gamma]` — every admission built from it is already a hosted-only recipe,
+/// since neither tier ever names `local`. That is the shape the finding
+/// describes: a recipe naming only hosted targets, layered under a cadence
+/// that promises a spent window serves locally.
+fn rationed_admission_with(picker: PickerMode) -> Admission {
+    Admission {
+        policy: Arc::new(TurnPolicy {
+            frontier_cadence: Some(FrontierCadence {
+                max_frontier: 1,
+                per_turns: 10,
+            }),
+            ..TurnPolicy::unrestricted()
+        }),
+        ..admission_with(picker)
+    }
+}
+
 struct Rig {
     engine: Arc<Engine<MemoryStore, ByteTokenizer>>,
     store: Arc<MemoryStore>,
@@ -269,6 +289,41 @@ fn rig_with(
         // a project *without* one is an assertion about this same object.
         Arc::new(StagePolicy::new(Box::new(AffinityPolicy::new()))),
     )
+}
+
+/// The stage router over a fleet with one live local worker.
+///
+/// Every other rig in this file wires `fleet: None`, so `local` never appears
+/// among the candidates a policy is even asked about -- fine for a suite
+/// about hosted failover, wrong for a claim about degrading *to* local.
+/// `common::embedded_fleet` is the one `LocalFleet` this crate can build:
+/// `Reservation`'s fields are private to `roundhouse-fleet`, so a hand-rolled
+/// mock cannot satisfy the trait from outside it.
+async fn rig_with_fleet(clients: Vec<(&str, Arc<dyn FrontierClient>)>) -> Rig {
+    let store = Arc::new(MemoryStore::new());
+    let registry = FrontierClients::keyed(
+        clients
+            .into_iter()
+            .map(|(provider, client)| (provider.to_string(), client))
+            .collect(),
+    );
+    let engine = Engine::with_provider_clients(
+        Arc::clone(&store),
+        ByteTokenizer,
+        Arc::new(EchoLocalExecutor::new("local")) as Arc<dyn LocalExecutor>,
+        catalog(),
+        Arc::new(registry),
+        Arc::new(StagePolicy::new(Box::new(AffinityPolicy::new()))),
+        EngineConfig {
+            turn_deadline_ms: 5_000,
+            ..EngineConfig::default()
+        },
+    )
+    .with_fleet(common::embedded_fleet().await as Arc<dyn roundhouse_fleet::LocalFleet>);
+    Rig {
+        engine: Arc::new(engine),
+        store,
+    }
 }
 
 fn rig_inner(
@@ -727,6 +782,58 @@ async fn exhausted_fallbacks_fail_with_the_history_on_the_record() {
     assert!(terminal, "the turn terminated rather than being left open");
 }
 
+/// M10 review finding G03: the terminal failure of an exhausted recipe is the
+/// one attempt with no successor `Routed` to ride, and `Failed::before_output`
+/// evidences it with empty `Usage` — which is exactly the shape
+/// `MetricsFold`'s `consumed` gate (fold.rs) drops. A single-provider outage
+/// would report zero failed attempts for the whole outage.
+///
+/// CONTROL: `a_failed_attempt_is_booked_and_the_hold_never_pyramids` above
+/// proves the *non*-terminal dead provider (PRIMARY here too) is marked, so
+/// this is not a claim that the mechanism marks nothing.
+#[tokio::test]
+#[ignore = "G03: the exhausted recipe's terminal target (SECONDARY, the one \
+            the client's error actually names) never reaches \
+            failed_attempts -- Failed::before_output's empty Usage fails \
+            fold.rs's `consumed` gate for the ResponseIncomplete it produces"]
+async fn an_exhausted_recipe_leaves_its_last_dead_provider_unmarked() {
+    let first = Scripted::new(Script::Transport);
+    let second = Scripted::new(Script::Status(503));
+    let untouched = Scripted::answering("gamma answered");
+    let rig = rig_of(vec![
+        (PRIMARY, Arc::clone(&first) as Arc<dyn FrontierClient>),
+        (SECONDARY, Arc::clone(&second) as Arc<dyn FrontierClient>),
+        (THRIFTY, Arc::clone(&untouched) as Arc<dyn FrontierClient>),
+    ]);
+
+    let session_id = SessionId::generate();
+    rig.turn(
+        &session_id,
+        "t1",
+        ask(),
+        &admission_with(PickerMode::CapableFirst),
+    )
+    .await
+    .expect_err("both entries of the tier are gone");
+
+    let mut failed = rig
+        .fold(&session_id)
+        .await
+        .failed_attempts(Scope::Deployment);
+    failed.sort();
+    let mut expected = vec![
+        (ModelKey::from_target(&target(PRIMARY)), 1),
+        (ModelKey::from_target(&target(SECONDARY)), 1),
+    ];
+    expected.sort();
+    assert_eq!(
+        failed, expected,
+        "SECONDARY is the target whose 503 the client actually received -- an \
+         outage entirely on SECONDARY (a single-provider deployment) would \
+         report this vec empty for as long as the outage lasts"
+    );
+}
+
 /// A grant per *turn*, not per attempt — and a failed attempt is marked rather
 /// than free.
 ///
@@ -1121,6 +1228,121 @@ async fn a_tests_passed_production_turn_deescalates() {
     );
 }
 
+/// M10 review finding G02: a hosted-only tier recipe defeats the cadence's
+/// degrade-to-local promise.
+///
+/// `RoutingContext::admissible` runs the cadence exclusion in its very first
+/// filter (`TurnPolicy::admits` -> `cadence_allows`), which is exactly why a
+/// spent cadence leaves `local` in the admitted pool and nothing else —
+/// `local` is unconditionally cadence-exempt. `StagePolicy::tier_pool` then
+/// narrows that pool to the recipe's own membership, and this recipe (like
+/// every other one in this file) names only hosted targets in both tiers. The
+/// entitled set and the recipe's set do not intersect, so the turn that the
+/// cadence promised would degrade to local instead dies as
+/// `NoViableCandidate`.
+///
+/// CONTROL:
+/// `a_spent_cadence_with_no_recipe_degrades_to_local` below is the identical
+/// fleet and cadence with the recipe removed, and it passes -- which is what
+/// pins the recipe, and not the fleet or the cadence machinery, as the cause
+/// of the failure here.
+#[tokio::test]
+#[ignore = "G02: a hosted-only tier recipe leaves entitled == [local] out of \
+            reach of tier_pool once the cadence is spent, so the turn dies \
+            NoViableCandidate instead of degrading to local as the cadence \
+            promises -- see recommended_fix"]
+async fn a_spent_cadence_serves_locally_even_under_a_tier_recipe() {
+    let rig = rig_with_fleet(vec![
+        (
+            PRIMARY,
+            Scripted::answering("alpha answered") as Arc<dyn FrontierClient>,
+        ),
+        (
+            SECONDARY,
+            Scripted::answering("beta answered") as Arc<dyn FrontierClient>,
+        ),
+        (
+            THRIFTY,
+            Scripted::answering("gamma answered") as Arc<dyn FrontierClient>,
+        ),
+    ])
+    .await;
+
+    let session_id = SessionId::generate();
+    let admission = rationed_admission_with(PickerMode::EfficientFirst);
+
+    // Turn 1: unremarkable input scores `efficient` under `EfficientFirst`'s
+    // fall-open default, which the ration -- one frontier dispatch per ten
+    // turns, none spent yet -- still admits.
+    let first = rig
+        .turn(&session_id, "t1", ask(), &admission)
+        .await
+        .expect("the first hosted dispatch is within the ration");
+    assert_eq!(first.decision.unwrap().target, target(THRIFTY));
+
+    // Turn 2: the ration is spent. Admission excludes every hosted candidate
+    // in its first filter and leaves only `local` -- entitled == [local] --
+    // which is exactly the fleet state the cadence's promise is about.
+    let second = rig.turn(&session_id, "t2", ask(), &admission).await;
+    assert!(
+        second.is_ok(),
+        "the cadence promises a spent window serves locally instead of \
+         failing, but the recipe narrows to its own membership *after* \
+         admission already let `local` through and neither tier names it -- \
+         the turn a live local worker should have served instead failed as: \
+         {second:?}"
+    );
+}
+
+/// CONTROL for `a_spent_cadence_serves_locally_even_under_a_tier_recipe`: the
+/// identical fleet and cadence, minus the recipe. Kept live (not ignored) so
+/// the ignored test above cannot be tautological — this proves the fleet and
+/// the cadence machinery both work and that a hosted-only recipe is what
+/// stands in the way there, not some other difference between the two
+/// admissions.
+#[tokio::test]
+async fn a_spent_cadence_with_no_recipe_degrades_to_local() {
+    let rig = rig_with_fleet(vec![
+        (
+            PRIMARY,
+            Scripted::answering("alpha answered") as Arc<dyn FrontierClient>,
+        ),
+        (
+            SECONDARY,
+            Scripted::answering("beta answered") as Arc<dyn FrontierClient>,
+        ),
+        (
+            THRIFTY,
+            Scripted::answering("gamma answered") as Arc<dyn FrontierClient>,
+        ),
+    ])
+    .await;
+
+    let no_recipe = Admission {
+        policy: Arc::new(TurnPolicy {
+            frontier_cadence: Some(FrontierCadence {
+                max_frontier: 1,
+                per_turns: 10,
+            }),
+            ..TurnPolicy::unrestricted()
+        }),
+        ..Admission::open()
+    };
+    let session_id = SessionId::generate();
+    rig.turn(&session_id, "t1", ask(), &no_recipe)
+        .await
+        .expect("turn 1 spends the ration");
+    let second = rig
+        .turn(&session_id, "t2", ask(), &no_recipe)
+        .await
+        .expect("with no recipe to narrow it, the spent cadence degrades to local as promised");
+    assert_eq!(
+        second.text, "local",
+        "turn 2 must actually be the local worker answering, not a second \
+         hosted dispatch that happened to succeed"
+    );
+}
+
 /// A project with no recipe routes exactly as it did before M10, through the
 /// same composed policy object.
 #[tokio::test]
@@ -1405,5 +1627,63 @@ fn a_recipe_a_router_cannot_read_warns_once_and_only_there() {
         !read.contains("selecting nothing"),
         "a recipe the router *does* read is the ordinary case and must be \
          silent: {read}"
+    );
+}
+
+/// **M10 review G09.** A typo'd tier entry names a model this deployment's
+/// catalog has never heard of. The key's own policy is
+/// [`Admission::open`] — unrestricted, admits everything — so when the
+/// picked tier comes up empty the *only* possible reason is that the catalog
+/// never held the name, never that this key refused it. The rationale must
+/// say that, not the sentence `tier_pool` (stage.rs) hands out for both
+/// causes today: "the efficient tier was picked and this key admits none of
+/// it".
+#[tokio::test]
+#[ignore = "G09: no boot/write-time crosscheck refuses a tiers recipe naming a target absent \
+            from the catalog (crosscheck.rs has refuse_policies_that_admit_nothing for key \
+            admission but nothing analogous for tier-target catalog existence), so \
+            stage.rs's tier_pool treats catalog-absence and key-non-admission identically and \
+            the republished rationale blames 'this key admits none of it' for both -- fails on \
+            that string today"]
+async fn a_tier_target_no_catalog_holds_is_not_reported_as_an_admission_refusal() {
+    let recipe = TierRecipe::new(
+        vec![format!("{PRIMARY}/m")],
+        // Not a provider `rig_of`'s catalog() ever names -- a typo, not a
+        // key restriction.
+        vec!["gamma-typo/m".to_string()],
+        PickerMode::EfficientFirst,
+        roundhouse_core::routing::stage::DEFAULT_CONFIDENCE_THRESHOLD,
+    )
+    .expect("capable non-empty, efficient non-empty, no repeats");
+    let admission = Admission {
+        tiers: Some(Arc::new(recipe)),
+        ..Admission::open()
+    };
+
+    let rig = rig_of(vec![(
+        PRIMARY,
+        Scripted::answering("alpha answered") as Arc<dyn FrontierClient>,
+    )]);
+    let session_id = SessionId::generate();
+    // `ask()`: an unremarkable, signal-free turn, so the picker's default
+    // (`efficient_first`) sends it to the efficient tier -- the tier the
+    // catalog cannot fill.
+    let result = rig
+        .turn(&session_id, "t1", ask(), &admission)
+        .await
+        .unwrap();
+    assert_eq!(
+        result.text, "alpha answered",
+        "the capable fallback still serves the turn"
+    );
+    let decision = result.decision.expect("a dispatched turn records one");
+    assert_eq!(decision.target, target(PRIMARY));
+    assert!(
+        !decision.rationale.contains("this key admits none of it"),
+        "the key is Admission::open() -- unrestricted -- so nothing here was \
+         refused by the key; the efficient tier came up empty because \
+         `gamma-typo/m` is not in this deployment's catalog, and the \
+         rationale should say that, not misattribute it to key admission: {}",
+        decision.rationale
     );
 }

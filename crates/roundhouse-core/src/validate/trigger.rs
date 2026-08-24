@@ -528,6 +528,37 @@ mod tests {
         }
     }
 
+    /// G04 (review finding): `NoProgressRepeat` matches on
+    /// `name + arguments + output_hash` alone, with no exception for
+    /// roundhouse's own control surface — and `fetch_steer`,
+    /// `explain_last_route`, and `status` are deliberately pure per
+    /// `roundhouse-mcp/src/surface.rs`'s `SteerResponse` doc ("every field is
+    /// a fold of the conversation's own log, so two calls produce identical
+    /// bytes"), which is exactly the shape this signal is built to catch. An
+    /// agent that calls `status` three times with nothing else changing (a
+    /// legitimate idempotent poll of its own budget) reads as the same stuck
+    /// loop as three identical `pytest` failures. **Ignored**: this is the
+    /// claim, not the fix.
+    #[test]
+    #[ignore = "G04: three identical reads of roundhouse's own control surface fire NoProgressRepeat exactly like a stuck agent loop"]
+    fn three_identical_reads_of_our_own_surface_are_not_a_no_progress_repeat() {
+        let signal = NoProgressRepeat {
+            occurrences: 3,
+            window: 8,
+        };
+
+        let mut polling = Vec::new();
+        for n in 0..3 {
+            polling.push(call(&format!("s{n}"), "mcp__roundhouse__status", "{}"));
+            polling.push(result(&format!("s{n}"), r#"{"budget_remaining_usd":4.2}"#));
+        }
+        assert_eq!(
+            signal.detect(&evidence_of(&polling, &[])),
+            None,
+            "an idempotent poll of roundhouse's own control surface is not a no-progress repeat"
+        );
+    }
+
     /// The sharpest of the four, and the one a naive implementation gets wrong.
     #[test]
     fn a_repeat_with_a_different_output_does_not_fire() {

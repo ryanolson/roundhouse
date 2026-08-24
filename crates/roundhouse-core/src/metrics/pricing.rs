@@ -814,6 +814,101 @@ mod tests {
         );
     }
 
+    /// G12 (review finding, control half): `import-benchmarks`'s
+    /// `NoAttribution` refuses to emit a `quality_prior` without attribution
+    /// because "the savings dashboard republishes it". This is the number it
+    /// means: `local_quality_prior`, carried verbatim into a serialized,
+    /// client-visible `Correlary::Unpriced` reason (reachable from
+    /// `roundhouse-server`'s `/v1/metrics` and `/v1/metrics/dashboard`
+    /// routes) with no attribution field anywhere on the wire. The number the
+    /// refusal exists to protect reaches a served surface unattributed
+    /// regardless of what the refusal blocks upstream.
+    #[test]
+    fn quality_prior_is_republished_with_no_attribution_riding_along() {
+        let observed = shapes(&[(
+            "anthropic",
+            "flagship",
+            TokenShape::from_rollup(&usage(10_000, 5_000, 500, 0), 10).unwrap(),
+        )]);
+        let pricer = ShadowPricing::new(vec![reference("anthropic", "flagship", 0.95)]);
+        // Identical traffic shape, wildly different capability -- the same
+        // capability-gate rejection as `the_capability_gate_blocks_a_flagship_stand_in`,
+        // but here it is the `reason` string, not just the `Unpriced` variant,
+        // under test.
+        let local = TokenShape::from_rollup(&usage(10_000, 5_000, 500, 0), 10);
+        let correlary = pricer.resolve("tiny-7b", 0.35, local, &observed, None);
+
+        let Correlary::Unpriced { reason, .. } = &correlary else {
+            panic!("expected Unpriced: {correlary:?}");
+        };
+        assert!(
+            reason.contains("0.35"),
+            "the local quality_prior should be legible in the reason a client reads: {reason}"
+        );
+
+        let wire = serde_json::to_value(&correlary).expect("Correlary serializes");
+        assert_eq!(wire["basis"]["kind"], "unpriced");
+        let wire_reason = wire["basis"]["reason"].as_str().unwrap();
+        assert!(
+            wire_reason.contains("0.35"),
+            "the number rides the wire verbatim: {wire}"
+        );
+        assert!(
+            wire.get("attribution").is_none() && !wire_reason.contains("citation"),
+            "nothing on the wire carries where 0.35 came from: {wire}"
+        );
+    }
+
+    /// G01 (review finding): `declared_baseline` is read straight from the
+    /// client's `model` field (`responses_api.rs:296`) and the early return
+    /// for it in `resolve` sits above the capability gate, so a tenant can
+    /// pick the counterfactual the savings dashboard prices against just by
+    /// naming a flagship in the request -- the same trap the gate exists to
+    /// close for shape-based inference, reopened for anything spelled as a
+    /// declaration instead of inferred from traffic.
+    #[test]
+    #[ignore = "G01: declared_baseline (client-controlled, responses_api.rs:296) hits the \
+                early return in resolve() before the capability gate at pricing.rs:517-530 \
+                runs, so an untrusted request field can price a 7B local model at flagship \
+                rates -- panics naming the flagship reference instead of returning Unpriced"]
+    fn a_declared_baseline_does_not_buy_a_way_past_the_capability_gate() {
+        let observed = shapes(&[(
+            "anthropic",
+            "flagship",
+            TokenShape::from_rollup(&usage(10_000, 5_000, 500, 0), 10).unwrap(),
+        )]);
+        let pricer = ShadowPricing::new(vec![reference("anthropic", "flagship", 0.95)]);
+        let local = TokenShape::from_rollup(&usage(10_000, 5_000, 500, 0), 10);
+
+        // Same tiny-7b / flagship pairing as the capability-gate control
+        // above, but this time the flagship name arrives the way a client's
+        // `model` field arrives: as `declared_baseline`, not as an operator's
+        // `declare()`.
+        let correlary = pricer.resolve(
+            "tiny-7b",
+            0.35,
+            local,
+            &observed,
+            Some("anthropic/flagship"),
+        );
+
+        assert!(
+            !matches!(
+                correlary,
+                Correlary::Priced {
+                    basis: PricedBasis::Declared { .. },
+                    ..
+                }
+            ),
+            "a client-supplied declared_baseline must not buy past the capability gate: {correlary:?}"
+        );
+        assert_eq!(
+            correlary.shadow_cost_usd(&usage(10_000, 5_000, 500, 0)),
+            0.0,
+            "an unpriced correlary must contribute nothing to the saving"
+        );
+    }
+
     #[test]
     fn among_comparable_models_the_nearest_shape_wins() {
         let observed = shapes(&[

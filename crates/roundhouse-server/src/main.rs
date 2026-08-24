@@ -1025,6 +1025,34 @@ mod tests {
         .expect("a dialect this build speaks is routable");
     }
 
+    /// G08 (review finding): the file `examples/catalog.example.json` tells an
+    /// operator to copy it, and its own README calls it the starting point.
+    /// `tests/example_catalog.rs` only proves it survives `CatalogConfig::load`
+    /// — the config boundary's checks — never this file's third cross-check,
+    /// which only runs here because it is a fact about the binary, not the
+    /// file. The shipped `anthropic`/`anthropic_messages` entry is exactly the
+    /// shape `a_dialect_this_build_cannot_speak_stops_the_boot_and_names_the_entry`
+    /// exercises by hand above, so the desired property is that the shipped
+    /// example, loaded for real and pointed at a real upstream the way the
+    /// README instructs, boots the shipped binary rather than being refused
+    /// by a dialect this build has no client for.
+    #[test]
+    #[ignore = "G08: the shipped example's first models entry is anthropic/anthropic_messages, \
+                which the P2 dialect cross-check refuses the instant a real upstream is named \
+                -- exactly what the file's own README tells an operator to do. Fix by shipping \
+                an OpenAI Responses entry as the copy-first example instead."]
+    fn the_shipped_example_catalog_boots_the_shipped_binary() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/catalog.example.json");
+        let config = roundhouse_server::CatalogConfig::load(&path)
+            .expect("tests/example_catalog.rs already pins that this file parses and validates");
+
+        frontier_clients(&config.catalog(), &config.providers, &real_upstream).expect(
+            "an operator who copies the README's own example and names a real upstream must \
+             get a booted process, not a boot-time refusal naming a dialect they never chose",
+        );
+    }
+
     /// **P2: one client per provider, not one client for the catalog.**
     ///
     /// The property the whole registry exists for. Two entries whose providers
@@ -1163,6 +1191,54 @@ mod tests {
         assert!(
             !output.contains("A_PROVIDER_KEY"),
             "a provider whose key is set must not warn about it: {output}"
+        );
+    }
+
+    /// **Thermo-nuclear review G15.** An explicit `providers.openai` entry
+    /// takes the `Some(definition)` arm and dispatches on `definition.base_url`
+    /// alone — the `None` arm is the only place `ROUNDHOUSE_OPENAI_API_BASE`
+    /// and `ROUNDHOUSE_OPENAI_PASS_THROUGH_BASE` are read at all. A deployment
+    /// behind a corporate egress proxy that sets the former, then adds an
+    /// `openai` provider entry to attach `extra_headers`, has the proxy
+    /// silently stop being used: the only boot output is an `info!` line
+    /// naming the definition's own base URL, worded exactly like the case
+    /// where no variable was ever set. This asserts the boot output says so by
+    /// naming the shadowed variable when both are present.
+    #[test]
+    #[ignore = "G15: the Some(definition) arm of frontier_clients's match logs only its own \
+                base_url; it never names ROUNDHOUSE_OPENAI_API_BASE or \
+                ROUNDHOUSE_OPENAI_PASS_THROUGH_BASE even when one is set and shadowed, so an \
+                operator who added a `providers.openai` entry cannot tell their proxy stopped \
+                being used from a boot log that reads identically to the no-shadowing case"]
+    fn an_explicit_openai_definition_says_it_is_taking_over_from_the_variables() {
+        let catalog = StaticFrontierCatalog::new(vec![entry(
+            BUILT_IN_OPENAI,
+            "gpt-5.6-sol",
+            WireProtocol::OpenAiResponses,
+        )]);
+        let providers = HashMap::from([(
+            BUILT_IN_OPENAI.to_string(),
+            responses_provider("https://openai-relay.internal/v1"),
+        )]);
+        let env = |name: &str| match name {
+            FRONTIER_UPSTREAM_VAR => Some("openai_responses".to_string()),
+            OPENAI_API_BASE_VAR => Some("https://egress-proxy.internal/v1".to_string()),
+            "A_PROVIDER_KEY" => Some("present".to_string()),
+            _ => None,
+        };
+
+        let output = captured_warnings(|| {
+            frontier_clients(&catalog, &providers, &env)
+                .expect("an explicit openai definition with its key present boots clean");
+        });
+        assert!(
+            output.contains(OPENAI_API_BASE_VAR),
+            "an explicit `openai` provider definition silently overrides \
+             {OPENAI_API_BASE_VAR} (and, unexercised here, \
+             {OPENAI_PASS_THROUGH_BASE_VAR}); the boot log must name the \
+             shadowed variable so an operator who set it does not conclude \
+             their proxy is still in the path from an info! line that reads \
+             identically either way: {output}"
         );
     }
 
