@@ -59,6 +59,7 @@ pub mod arm;
 pub mod brief;
 pub mod exchange;
 pub mod prompt;
+pub mod tool_signals;
 pub mod trigger;
 pub mod verdict;
 
@@ -79,8 +80,13 @@ use crate::routing::Target;
 
 pub use arm::{Arm, ArmShares, placebo_intervenes};
 pub use brief::{BriefConfig, BriefStep, Objective, ValidationBrief};
-pub use exchange::{Exchange, exchanges};
+pub use exchange::{Exchange, exchanges, exec_exit_code, tool_output_body};
 pub use prompt::judge_system_prompt;
+pub use tool_signals::{
+    CRITICAL, DEFAULT_RECENT_WINDOW, ERROR_SEVERITY_THRESHOLD, ErrorSeverity, HARD,
+    PURE_BASH_STREAK_LENGTH, PureBashStreak, ResultSeverity, SOFT, ToolSignals, classify_body,
+    classify_result, recent_severities,
+};
 pub use trigger::{
     CostAnomaly, Evidence, NoProgressRepeat, PingPong, Signal, SignalFired, SignalKind,
     ToolFailureStreak, Trigger, TriggerConfig, TriggerRecord, default_signals,

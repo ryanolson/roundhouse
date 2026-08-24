@@ -51,6 +51,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::session::SessionState;
 use crate::validate::exchange::{Exchange, exchanges};
+use crate::validate::tool_signals::{ErrorSeverity, PureBashStreak};
 
 /// Which of the trigger's observations fired.
 ///
@@ -68,6 +69,12 @@ pub enum SignalKind {
     ToolFailureStreak,
     /// A turn far outside this session's own trailing distribution.
     CostAnomaly,
+    /// A named failure in the recent tool output — a traceback, an import
+    /// error, a timeout — at or above a severity threshold.
+    ErrorSeverity,
+    /// Consecutive shell or unrecognised calls with nothing read, written or
+    /// edited between them.
+    PureBashStreak,
 }
 
 /// One observation, and the sentence that states it as a fact.
@@ -343,6 +350,14 @@ pub fn default_signals() -> Vec<Box<dyn Signal>> {
             min_samples: 4,
             multiple: 3.0,
         }),
+        // The two ported ones, registered here rather than left opt-in for the
+        // reason the other four are: `with_signals` exists so a deployment can
+        // *narrow* the set, and a signal nobody enables is a signal nobody
+        // measures. Their thresholds are named constants beside their types
+        // rather than literals here, because unlike the four above they are
+        // upstream's numbers and the provenance travels with them.
+        Box::new(ErrorSeverity::default()),
+        Box::new(PureBashStreak::default()),
     ]
 }
 
@@ -655,6 +670,54 @@ mod tests {
         assert!(fact.contains("all returned failures"), "{fact}");
     }
 
+    /// The consequence of the exit-code claim, at the level where it costs
+    /// something.
+    ///
+    /// `exchange::reads_as_failure`'s own test pins the accessor; this one pins
+    /// what the accessor is *for*. Three `cargo test` runs that exited non-zero
+    /// and printed nothing to stdout is a session in trouble, and if the exit
+    /// code is invisible the streak signal is not merely quiet against codex
+    /// exec traffic — it is dead, the same way F04 killed it before the body
+    /// was anchored.
+    #[test]
+    fn a_streak_of_silent_nonzero_exits_still_fires() {
+        let streak = ToolFailureStreak { length: 3 };
+
+        let mut failing = Vec::new();
+        for n in 0..3 {
+            failing.push(call(
+                &format!("c{n}"),
+                "shell_command",
+                r#"{"command":"./ci"}"#,
+            ));
+            failing.push(result(
+                &format!("c{n}"),
+                &format!("Chunk ID: chunk-{n}\nWall time: 0.0{n}10 seconds\nProcess exited with code 1\nOutput:\n"),
+            ));
+        }
+        let fact = streak
+            .detect(&evidence_of(&failing, &[]))
+            .expect("three non-zero exits in a row is a failure streak whatever stdout said");
+        assert!(fact.contains("all returned failures"), "{fact}");
+
+        // The control that keeps this about the exit code and not about the
+        // header: the identical shape at exit 0 is three successes, and a
+        // streak that fired here would fire on every exec session there is.
+        let mut succeeding = Vec::new();
+        for n in 0..3 {
+            succeeding.push(call(
+                &format!("c{n}"),
+                "shell_command",
+                r#"{"command":"./ci"}"#,
+            ));
+            succeeding.push(result(
+                &format!("c{n}"),
+                &format!("Chunk ID: chunk-{n}\nWall time: 0.0{n}10 seconds\nProcess exited with code 0\nOutput:\nok\n"),
+            ));
+        }
+        assert_eq!(streak.detect(&evidence_of(&succeeding, &[])), None);
+    }
+
     #[test]
     fn the_other_three_signals_fire_on_their_pattern_and_are_quiet_otherwise() {
         // Ping-pong: strict alternation of two names, and nothing else.
@@ -755,8 +818,26 @@ mod tests {
         let fired = trigger
             .evaluate(&stuck)
             .expect("an open gate plus evidence is the one case that consults");
-        assert_eq!(fired.signals.len(), 1);
-        assert_eq!(fired.signals[0].kind, SignalKind::NoProgressRepeat);
+        // Named exhaustively rather than counted loosely, because *which*
+        // signals a fixture trips is the thing that silently changes when the
+        // default set grows. Four identical failing `pytest` runs are three
+        // separate observations, and each is about a different property of the
+        // same four exchanges: the same answer four times over (the repeat),
+        // `no module named ` in the body (a hard error in the window), and four
+        // consecutive calls to a tool none of the ported tables recognise with
+        // nothing read, written or edited between them (the build pit). The
+        // failure streak stays quiet — `ImportError:` is not one of
+        // `reads_as_failure`'s anchored markers — which is the disagreement
+        // `ErrorSeverity`'s doc says the two signals exist to have.
+        let kinds: Vec<SignalKind> = fired.signals.iter().map(|signal| signal.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                SignalKind::NoProgressRepeat,
+                SignalKind::ErrorSeverity,
+                SignalKind::PureBashStreak,
+            ]
+        );
         assert_eq!(fired.turn_index, stuck.turn_index);
     }
 
