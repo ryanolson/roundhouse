@@ -743,6 +743,35 @@ impl AttemptClass {
     }
 }
 
+impl DecisionRecord {
+    /// The cheapest hosted option the router had quoted at the moment it chose
+    /// local, or `None` when it did not choose local.
+    ///
+    /// The road not taken, priced by the router itself rather than by a rate
+    /// card afterwards — which is what makes it an *independent* estimate of the
+    /// same counterfactual [`Correlary`](crate::metrics::Correlary) produces,
+    /// and therefore worth reporting beside that one rather than instead of it.
+    ///
+    /// On the record rather than in the fold that first needed it, because it is
+    /// a question about a decision and there are now two readers: the metrics
+    /// fold sums it into `routing_savings_at_decision_usd`, and the Relay
+    /// emission publishes it per turn. Two copies of a `min` over the same
+    /// vector would agree until one of them learned about a new candidate kind.
+    ///
+    /// `None` for a hosted dispatch, and that is not the same as zero: there is
+    /// no counterfactual to price when the hosted call is the one that happened.
+    pub fn quoted_frontier_alternative_usd(&self) -> Option<f64> {
+        if !self.chosen.is_local() {
+            return None;
+        }
+        self.considered
+            .iter()
+            .filter(|candidate| !candidate.target.is_local())
+            .map(|candidate| candidate.expected_cost_usd)
+            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+    }
+}
+
 /// Why no target was chosen.
 ///
 /// The three empty-set arms are told apart by *whose decision emptied the

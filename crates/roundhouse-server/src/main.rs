@@ -59,7 +59,8 @@ use roundhouse_server::control_config::crosscheck::CrossChecks;
 use roundhouse_server::{
     ControlDirectory, ControlPlane, ControlPlaneReads, Conversations, DirectoryError,
     EchoLocalExecutor, Engine, EngineConfig, FleetJudge, JudgeConfig, MemoryDirectoryStore,
-    admin_api, catalog_config, control_config, http, mcp_api, metrics_api, responses_api,
+    admin_api, catalog_config, control_config, http, mcp_api, metrics_api, relay_api,
+    responses_api,
 };
 use roundhouse_store_redis::{RedisSessionStore, RedisSpendLedger};
 use tracing_subscriber::EnvFilter;
@@ -881,6 +882,15 @@ async fn serve<S: SessionStore>(
         Arc::clone(&directory),
         Arc::clone(&spend),
         engine.metrics(),
+        Arc::clone(&metrics_config),
+    ))
+    // The Relay-format reads. They take the rate card for the reason the
+    // metrics surface does -- pricing is a reporting concern -- and the store
+    // rather than the engine, because every document is a projection of the
+    // log and nothing else.
+    .merge(relay_api::relay_router(
+        Arc::clone(&directory),
+        Arc::clone(&store),
         metrics_config,
     ))
     .merge(mcp_api::mcp_router(
