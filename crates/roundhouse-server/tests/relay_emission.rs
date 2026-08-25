@@ -84,6 +84,8 @@ fn decision(chosen: Target) -> DecisionRecord {
         Some(HOSTED)
     };
     DecisionRecord {
+        attempts: Vec::new(),
+        declared_baseline: None,
         chosen,
         rationale: "warmest prefix".into(),
         policy: "affinity".into(),
@@ -148,6 +150,7 @@ async fn store_with(
             item: Item::assistant_text(format!("answer {turn}"), response_id.clone()),
         });
         kinds.push(SessionEventKind::ResponseCompleted {
+            provider_reported_cost_usd: None,
             response_id,
             usage: Usage {
                 input_tokens: 1_000,

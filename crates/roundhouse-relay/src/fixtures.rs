@@ -84,6 +84,8 @@ pub fn decision(chosen: Target, considered: Vec<Candidate>) -> DecisionRecord {
         Some(HOSTED)
     };
     DecisionRecord {
+        attempts: Vec::new(),
+        declared_baseline: None,
         chosen,
         rationale: "warmest prefix".into(),
         policy: "affinity".into(),
@@ -178,6 +180,7 @@ impl Log {
             item: Item::assistant_text(format!("answer {turn_id}"), response.clone()),
         });
         self.push(SessionEventKind::ResponseCompleted {
+            provider_reported_cost_usd: None,
             response_id: response,
             usage: u,
         })
@@ -219,6 +222,7 @@ impl Log {
             decision: decision(frontier("anthropic", "claude"), Vec::new()),
         });
         self.push(SessionEventKind::ResponseIncomplete {
+            terminal_attempt: None,
             response_id: response,
             reason,
             usage: Usage::default(),
@@ -241,6 +245,7 @@ impl Log {
             decision: decision(frontier("anthropic", "claude"), Vec::new()),
         });
         self.push(SessionEventKind::ResponseIncomplete {
+            terminal_attempt: None,
             response_id: response,
             reason: IncompleteReason::UpstreamError,
             usage: u,
@@ -274,6 +279,7 @@ impl Log {
         };
         self.push(SessionEventKind::ItemAppended { item: call });
         self.push(SessionEventKind::ResponseCompleted {
+            provider_reported_cost_usd: None,
             response_id: response,
             usage: usage(1_000, 0, 40),
         })
@@ -314,6 +320,7 @@ impl Log {
             item: Item::assistant_text("done", response.clone()),
         });
         self.push(SessionEventKind::ResponseCompleted {
+            provider_reported_cost_usd: None,
             response_id: response,
             usage: usage(2_000, 1_000, 20),
         })

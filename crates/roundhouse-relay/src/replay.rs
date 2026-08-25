@@ -249,7 +249,19 @@ impl SessionReplay {
                         turn.text.push_str(text);
                     }
                 }
-                SessionEventKind::ResponseCompleted { response_id, usage } => {
+                // The two M10 fields are bound and unread for now, not wildcarded
+                // away: provider-reported dollars belong in the summary's
+                // actual_cost as a ProviderReported CostEstimate, and a terminal
+                // attempt belongs on the trajectory step that failed — both are
+                // emission design (which Relay fields, which basis stamps), not
+                // replay mechanics, and are deferred to the S2 follow-on rather
+                // than half-shipped inside a merge. Binding them by name means
+                // the next field the engine adds still breaks this match loudly.
+                SessionEventKind::ResponseCompleted {
+                    response_id,
+                    usage,
+                    provider_reported_cost_usd: _,
+                } => {
                     if let Some(turn) = replay.turn_mut(response_id) {
                         turn.usage = usage.clone();
                         turn.outcome = TurnOutcome::Completed;
@@ -261,6 +273,7 @@ impl SessionReplay {
                     response_id,
                     reason,
                     usage,
+                    terminal_attempt: _,
                 } => {
                     if let Some(turn) = replay.turn_mut(response_id) {
                         turn.usage = usage.clone();

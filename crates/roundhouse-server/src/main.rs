@@ -1204,7 +1204,19 @@ mod tests {
             .with_writer(buf.clone())
             .with_ansi(false)
             .finish();
-        tracing::subscriber::with_default(subscriber, f);
+        // Rebuilding the interest cache *inside* the thread-local default is
+        // the second half of the serialization above. The merge that brought
+        // more uncaptured `frontier_clients` callers into this binary made the
+        // poisoned-cache case go from one-in-hundreds to two-in-three: a
+        // concurrent test evaluating the warn callsite under the no-op global
+        // dispatcher caches "never interested", and this capture then records
+        // the info line but not the warning it exists to assert on. Rebuilding
+        // while our subscriber is the active default re-evaluates every
+        // callsite against a dispatcher that wants them.
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            f()
+        });
         String::from_utf8(buf.0.lock().unwrap().clone()).expect("tracing output is UTF-8")
     }
 
