@@ -372,6 +372,34 @@ struct Completed {
     text: String,
     usage: Usage,
     decision: Decision,
+    /// What the provider said this call cost, on the providers that say.
+    ///
+    /// Beside `usage` and never inside it: `usage` is what this deployment
+    /// prices from its own catalog, and this is the external bill that pricing
+    /// is later reconciled against. See
+    /// `SessionEventKind::ResponseCompleted::provider_reported_cost_usd`.
+    provider_reported_cost_usd: Option<f64>,
+}
+
+/// How [`Engine::plan`] failed, and the dead dispatch that explains it.
+///
+/// A struct rather than a bare [`EngineError`] because the failover loop knows
+/// one thing the error string does not: *which target* the client's error is
+/// about, and how it failed. Every path into `plan` that is not the loop
+/// converts through [`From`], so the ordinary `?` sites read exactly as they
+/// did and only the one place that has an attempt to carry says so.
+struct PlanFailure {
+    error: EngineError,
+    terminal_attempt: Option<DispatchAttempt>,
+}
+
+impl<E: Into<EngineError>> From<E> for PlanFailure {
+    fn from(error: E) -> Self {
+        Self {
+            error: error.into(),
+            terminal_attempt: None,
+        }
+    }
 }
 
 /// A dispatch that did not, and everything that survived it.
@@ -385,6 +413,16 @@ struct Failed {
     error: EngineError,
     partial: String,
     evidence: Usage,
+    /// The dispatch this failure *is*, when it came from a target.
+    ///
+    /// Carried out of [`Engine::plan`]'s failover loop rather than
+    /// reconstructed at the settle seam, because the seam cannot reconstruct
+    /// it: the target and the class live in the loop, and the error the loop
+    /// returns is a string by the time it crosses the boundary. Every earlier
+    /// attempt of the same turn rides the `Routed` of the dispatch it caused;
+    /// this is the one that caused none. See
+    /// `SessionEventKind::ResponseIncomplete::terminal_attempt`.
+    terminal_attempt: Option<DispatchAttempt>,
 }
 
 impl Failed {
@@ -394,11 +432,16 @@ impl Failed {
     /// provider and the empty usage keeps the ledger's reading of that target
     /// cold. Over-claiming warmth here is the mispricing the evidence rule on
     /// `SessionState`'s pending routings exists to prevent.
-    fn before_output(error: impl Into<EngineError>) -> Self {
+    fn before_output(failure: impl Into<PlanFailure>) -> Self {
+        let PlanFailure {
+            error,
+            terminal_attempt,
+        } = failure.into();
         Self {
-            error: error.into(),
+            error,
             partial: String::new(),
             evidence: Usage::default(),
+            terminal_attempt,
         }
     }
 
@@ -426,6 +469,11 @@ impl Failed {
             error: error.into(),
             partial,
             evidence,
+            // A body that died after the stream opened names no failed
+            // *dispatch*: the target answered, and a second attempt was never
+            // an option (see `plan`'s note on why the failover boundary is
+            // `execute` and not the stream).
+            terminal_attempt: None,
         }
     }
 
@@ -1110,8 +1158,16 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                         text,
                         usage,
                         decision,
+                        provider_reported_cost_usd,
                     }) => {
-                        let committed = session.complete(&response_id, &text, usage.clone()).await;
+                        let committed = session
+                            .complete(
+                                &response_id,
+                                &text,
+                                usage.clone(),
+                                provider_reported_cost_usd,
+                            )
+                            .await;
                         committed
                             .map(|()| (text, usage, Some(decision)))
                             .map_err(EngineError::from)
@@ -1133,9 +1189,16 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                             error,
                             partial,
                             evidence,
+                            terminal_attempt,
                         } = failed;
                         let _ = session
-                            .mark_incomplete(&response_id, partial, reason, evidence)
+                            .mark_incomplete(
+                                &response_id,
+                                partial,
+                                reason,
+                                evidence,
+                                terminal_attempt,
+                            )
                             .await;
                         Err(error)
                     }
@@ -1222,6 +1285,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         // eventually spoke.
         let mut text = String::new();
         let mut reported: Option<Usage> = None;
+        let mut reported_cost_usd: Option<f64> = None;
         loop {
             let chunk = match tokio::time::timeout_at(deadline_at, stream.next()).await {
                 Ok(Some(Ok(chunk))) => chunk,
@@ -1253,23 +1317,20 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                     reasoning_tokens,
                     provider_reported_cost,
                 } => {
-                    // Logged and not booked, deliberately. A provider's own
+                    // Recorded and not booked, deliberately. A provider's own
                     // dollar figure is the *other* side of the reconciliation
                     // view — the external bill our `committed_usd` is to be
                     // checked against — and folding it into `Usage` here would
                     // put a number nobody derived from the catalog into the
-                    // column the savings claim is computed from. M10.3's
-                    // reconciliation rung is the consumer; until it exists this
-                    // is how an operator can see the two numbers at all. See
+                    // column the savings claim is computed from. It rides the
+                    // terminal event to the log instead, which is what makes it
+                    // survive the process that measured it; before review
+                    // finding G11 it was spent on a `tracing::debug!` that the
+                    // binary's own default `info` filter drops, so on any
+                    // deployment that did not set `RUST_LOG` the number existed
+                    // nowhere at all by the time the turn returned. See
                     // `FrontierChunk::Done::provider_reported_cost`.
-                    if let Some(cost_usd) = provider_reported_cost {
-                        tracing::debug!(
-                            %response_id,
-                            cost_usd,
-                            "the provider reported a price for this call; it is not booked \
-                             against the budget, which is priced from the catalog"
-                        );
-                    }
+                    reported_cost_usd = provider_reported_cost;
                     reported = Some(Usage {
                         input_tokens,
                         cached_input_tokens,
@@ -1295,6 +1356,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             text,
             usage,
             decision,
+            provider_reported_cost_usd: reported_cost_usd,
         })
     }
 
@@ -1413,7 +1475,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         deadline_at: Instant,
         admission: &Admission,
         declared_baseline: Option<&str>,
-    ) -> Result<(FrontierStream, Decision, usize), EngineError> {
+    ) -> Result<(FrontierStream, Decision, usize), PlanFailure> {
         // Rebuild the prompt from the committed log, so what we price is
         // exactly what a successor would reconstruct.
         let assembler = self.assembler_over(session.state().items.clone());
@@ -1624,7 +1686,8 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                 CredentialError::NoCredential {
                     provider: withheld_providers.join(", "),
                 },
-            )));
+            ))
+            .into());
         }
 
         // --- reserve what this turn may spend --------------------------------
@@ -1643,7 +1706,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             .open_grant(session, response_id, &candidates, admission)
             .await?;
         if budget.refuses() {
-            return Err(EngineError::BudgetRefused);
+            return Err(EngineError::BudgetRefused.into());
         }
 
         // --- choose --------------------------------------------------------
@@ -1922,6 +1985,18 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                     // The provider answered, or nobody could have: a second
                     // target answers a 401 or an unserializable dialect exactly
                     // the same way.
+                    //
+                    // **And `preceding` stays as it is, so this failure marks no
+                    // attempt.** `DispatchAttempt` carries a class, and there is
+                    // no honest class for "not a failover reason" — the three it
+                    // has are the three that justify trying somebody else. More
+                    // to the point, `failed_attempts` counts *dispatches that
+                    // were fallen forward from*, and a 401 or a dialect this
+                    // build cannot speak is this deployment's own
+                    // misconfiguration; booking it against the provider's row
+                    // would report a model as failing when what failed was our
+                    // key or our catalog. The boot-time cross-checks are where
+                    // those two are supposed to die, and they die there loudly.
                     failure = Some(error);
                     break;
                 }
@@ -1962,9 +2037,17 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             // `unreachable` by construction: the loop leaves `opened` empty only
             // through a branch that sets `failure` first, and `ordered` is never
             // empty because it starts with the target the policy chose.
-            None => Err(failure.unwrap_or_else(|| {
-                unreachable!("a loop that opened nothing recorded why on every path")
-            })),
+            // The attempt rides out with the error, because this is the only
+            // frame that still has both. `preceding` holds it for the same
+            // reason it held every earlier one — it is set by the classified
+            // branch of the connect match — and the loop ended without a
+            // successor `Routed` to hand it to.
+            None => Err(PlanFailure {
+                error: failure.unwrap_or_else(|| {
+                    unreachable!("a loop that opened nothing recorded why on every path")
+                }),
+                terminal_attempt: preceding.take(),
+            }),
         }
     }
 

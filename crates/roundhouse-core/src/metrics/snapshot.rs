@@ -392,6 +392,22 @@ pub struct Savings {
     pub routing_savings_at_decision_usd: f64,
     /// `cache_savings_usd + routing_savings_usd`.
     pub total_usd: f64,
+    /// Neither measured by us nor estimated by us: what the providers
+    /// themselves billed, summed over the calls that said so.
+    ///
+    /// **Published beside the figures above and added into none of them**, for
+    /// the reason `seat_tokens` sits outside this struct entirely: it is a
+    /// different kind of number. Everything else here is priced from this
+    /// deployment's catalog, and this is the external bill the admin plane's
+    /// reconciliation view checks that pricing against — folded in, the drift
+    /// column would be comparing a number with itself and the one disagreement
+    /// worth seeing would vanish into agreement.
+    ///
+    /// `None` when no call in scope reported a price, which is most
+    /// deployments: a provider that reports nothing and a provider that reports
+    /// zero are both `0.0`, and only the second is a figure a reader may act
+    /// on.
+    pub provider_reported_usd: Option<f64>,
 }
 
 /// Everything the dashboard renders, at one instant.
@@ -437,6 +453,15 @@ pub struct MetricsSnapshot {
     /// The capability band the correlary inference was gated on, echoed so a
     /// reader can see how loose the comparison was allowed to be.
     pub capability_band: f64,
+    /// The attribution for imported quality priors, or `None` when this
+    /// deployment's priors are its own configuration.
+    ///
+    /// Beside `capability_band` rather than inside [`Savings`], for two
+    /// reasons: [`Savings`] is `Copy` and every field on it is dollars, and the
+    /// citation qualifies the *gate* — the thing the priors are an input to —
+    /// rather than any one figure. The dashboard renders it under the savings
+    /// hero, which is where the derived number it attributes is published.
+    pub quality_prior_citation: Option<String>,
 }
 
 /// What the snapshot needs beyond the fold: rate cards, declared correlaries,
@@ -448,6 +473,19 @@ pub struct MetricsConfig {
     pub local_quality_priors: HashMap<String, f64>,
     /// Used for a local model with no entry above.
     pub default_local_quality_prior: f64,
+    /// Who to credit for the quality priors above, when they were imported from
+    /// a published index rather than hand-written.
+    ///
+    /// **Reporting configuration, not a number**, and it is here for the same
+    /// reason the rate card is: this document republishes a figure derived from
+    /// those priors — the routing saving is priced through the capability gate
+    /// they feed — and the index they came from requires attribution when its
+    /// data is republished. `None` on every deployment whose priors are its own
+    /// configuration, which is every deployment that never ran
+    /// `import-benchmarks`. Set at boot by the catalog loader, which finds the
+    /// provenance file beside the catalog; see `catalog_config` in
+    /// `roundhouse-server` (M10 review G12).
+    pub quality_prior_citation: Option<String>,
 }
 
 impl MetricsConfig {
@@ -456,7 +494,13 @@ impl MetricsConfig {
             pricing,
             local_quality_priors: HashMap::new(),
             default_local_quality_prior: 0.5,
+            quality_prior_citation: None,
         }
+    }
+
+    pub fn with_quality_prior_citation(mut self, citation: impl Into<String>) -> Self {
+        self.quality_prior_citation = Some(citation.into());
+        self
     }
 
     pub fn with_local_quality(mut self, model: impl Into<String>, prior: f64) -> Self {
@@ -629,6 +673,19 @@ impl MetricsSnapshot {
             routing_savings_usd: totals.shadow_usd,
             routing_savings_at_decision_usd: rows.values().map(|c| c.quoted_alternative_usd).sum(),
             total_usd: totals.cache_savings_usd + totals.shadow_usd,
+            // Summed straight off the rows rather than through `Rollup`, which
+            // is the accumulator every *catalog-priced* figure above goes
+            // through. Keeping it out of that pass is the mechanical half of
+            // "never merged": there is no line in `Rollup::absorb` for a
+            // future edit to accidentally add it to.
+            provider_reported_usd: match rows
+                .values()
+                .map(|c| c.provider_reported_calls)
+                .sum::<u64>()
+            {
+                0 => None,
+                _ => Some(rows.values().map(|c| c.provider_reported_usd).sum()),
+            },
         };
 
         Self {
@@ -648,6 +705,7 @@ impl MetricsSnapshot {
             providers,
             serving_modes,
             capability_band: config.pricing.capability_band(),
+            quality_prior_citation: config.quality_prior_citation.clone(),
         }
     }
 }

@@ -21,14 +21,25 @@
 //!
 //! [`PolicyConfig`]: super::config::PolicyConfig
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use roundhouse_core::control::{FairUseLimit, FairUseTerms, FairUseWindow};
 
 use super::config::ControlPlaneError;
 
 /// One project's or one key's `"fair_use"` object.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// **`Serialize` as well as `Deserialize`, which the other config shapes are
+/// deliberately not.** [`ProjectDto`](crate::admin_api) shows a project's
+/// budget as a bare `budgeted: bool` and sends a reader to the budget view for
+/// the number, on the ground that a limit shown without what has been spent
+/// against it is the figure people quote. Fair use has no such second view —
+/// the rolling counters are not a ledger anyone can read a balance out of — so
+/// the block an operator wrote *is* the whole answer to "what is in force", and
+/// the admin plane accepts that same shape on create and on `PATCH`. One
+/// vocabulary read back and written, rather than a hand-rolled view struct that
+/// would be the second spelling of a window (G14).
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FairUseConfig {
     pub windows: Vec<FairUseWindowConfig>,
@@ -40,13 +51,17 @@ pub struct FairUseConfig {
 /// `max_tokens` is a window that caps *nothing*, which reads in the file as a
 /// limit and behaves as an absence — the exact class of mistake the control
 /// plane's other shapes carry this attribute for.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FairUseWindowConfig {
     pub window: FairUseWindow,
-    #[serde(default)]
+    /// `skip_serializing_if` on the read path only: an absent cap and a `null`
+    /// one mean the same thing to the loader, and echoing `"max_usd": null`
+    /// back would show an operator a field they did not write beside one they
+    /// did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_usd: Option<f64>,
 }
 

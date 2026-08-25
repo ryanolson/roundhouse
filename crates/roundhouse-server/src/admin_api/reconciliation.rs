@@ -118,6 +118,21 @@ impl Stamp {
         }
     }
 
+    /// The stamp on the provider-reported column.
+    ///
+    /// Process-lifetime like [`Self::measured`], and for the same reason: the
+    /// figure is folded in memory from the log this process has read. What the
+    /// basis adds is that nobody here produced the number — it is the upstream's
+    /// own arithmetic, which is the entire reason it is worth putting beside
+    /// ours.
+    fn provider_reported() -> Self {
+        Self {
+            basis: "provider-reported",
+            window: "lifetime",
+            window_start_ms: None,
+        }
+    }
+
     /// The stamp on a row with no committed figure. See [`Basis`].
     fn absent(basis: &'static str) -> Self {
         Self {
@@ -193,11 +208,15 @@ impl Basis {
 /// `GET /v1/admin/projects/{p}/budget` — what the ledger says, what the log
 /// says, and the gap.
 ///
-/// **No total field, and there never will be one.** The two figures are not
+/// **No total field, and there never will be one.** The figures are not
 /// addends of anything: `committed_usd` is what a project was charged against
-/// its ceiling and `measured_usd` is what this process measured it spending, and
-/// a sum of the two is a number with no referent that a dashboard would print
-/// anyway. What *is* published is their difference, which does have a referent.
+/// its ceiling, `measured_usd` is what this process measured it spending, and
+/// `provider_reported_usd` is what the upstreams themselves billed — a sum of
+/// any of them is a number with no referent that a dashboard would print
+/// anyway. What *is* published is the difference of the first two, which does
+/// have a referent. The third stays out of that difference deliberately: it is
+/// the only column here this deployment did not compute, and folding it in
+/// would turn the cross-check into a self-check.
 ///
 /// `drift_usd` is `committed - measured`, unclamped in both directions. Negative
 /// means the fold saw spend the ledger did not, for one of three causes, two of
@@ -241,7 +260,27 @@ struct BudgetViewDto {
     measured_usd: f64,
     measured: Stamp,
     /// `committed_usd - measured_usd`, or `null` exactly when `committed_usd` is.
+    ///
+    /// **`provider_reported_usd` is not in it, and never will be.** The whole
+    /// use of the column below is to be a number this deployment did not
+    /// produce; folding it into the difference would make the drift a
+    /// comparison of our arithmetic with itself, and the one disagreement the
+    /// view exists to show would read as agreement.
     drift_usd: Option<f64>,
+    /// What the providers themselves billed for this project's calls, over the
+    /// same process lifetime `measured_usd` covers.
+    ///
+    /// **A third number, not a third addend.** `committed_usd` is what the
+    /// ledger charged, `measured_usd` is what this process priced from the
+    /// catalog, and this is what the upstream said — three answers to one
+    /// question from three machines, published side by side under their own
+    /// stamps rather than reconciled into one figure nobody could check.
+    ///
+    /// `null` when no call in this scope reported a price, which is most
+    /// deployments: a provider that bills nothing and a provider that says
+    /// nothing are different facts, and only the first is a figure.
+    provider_reported_usd: Option<f64>,
+    provider_reported: Stamp,
     seat_tokens: TokenBreakdown,
     members: Vec<MemberBudgetDto>,
     /// The sum of every member's `Share` allocation, or `null` where no member
@@ -274,6 +313,10 @@ struct MemberBudgetDto {
     measured_usd: f64,
     measured: Stamp,
     drift_usd: Option<f64>,
+    /// This member's share of what the providers themselves billed. Same rule
+    /// as the project's: published, never summed into `drift_usd`.
+    provider_reported_usd: Option<f64>,
+    provider_reported: Stamp,
     seat_tokens: TokenBreakdown,
     /// This member's `Share` fraction, if their allocation is one.
     allocation_share: Option<f64>,
@@ -500,6 +543,8 @@ pub(super) async fn budget_view(
             committed: stamp,
             measured_usd,
             measured: Stamp::measured(),
+            provider_reported_usd: measured.savings.provider_reported_usd.map(dollars),
+            provider_reported: Stamp::provider_reported(),
             seat_tokens: measured.seat_tokens,
             allocation_share: share,
         });
@@ -525,6 +570,8 @@ pub(super) async fn budget_view(
         measured_usd,
         measured: Stamp::measured(),
         drift_usd: committed_usd.map(|committed| dollars(committed - measured_usd)),
+        provider_reported_usd: project_measured.savings.provider_reported_usd.map(dollars),
+        provider_reported: Stamp::provider_reported(),
         seat_tokens: project_measured.seat_tokens,
         members,
         allocation_share_sum: (!shares.is_empty()).then(|| shares.iter().sum()),

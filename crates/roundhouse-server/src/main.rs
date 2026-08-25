@@ -261,6 +261,37 @@ fn frontier_clients(
                     entries = specs.len(),
                     "dispatching this provider's turns over the OpenAI Responses wire"
                 );
+                // **The built-in `openai` provider, explicitly redefined.**
+                // This arm reads `definition.base_url` for both bases and never
+                // reads the two variables, and that precedence is the intended
+                // design — an operator who writes the provider down has said
+                // where it is, and the comment above says why both bases come
+                // from the one origin. What was missing is that the line above
+                // reads identically whether or not those variables are set, so
+                // a deployment behind an egress proxy that added an `openai`
+                // definition to attach `extra_headers` had the proxy silently
+                // leave the path (M10 review G15). A warning rather than a
+                // refusal: the configuration is legitimate, and refusing it
+                // would make attaching a header impossible for anyone who had
+                // ever set the variable. Named per variable rather than in one
+                // line, because the two address different origins — stored key
+                // and forwarded seat — and a deployment may have set only one.
+                if provider == BUILT_IN_OPENAI {
+                    for var in [OPENAI_API_BASE_VAR, OPENAI_PASS_THROUGH_BASE_VAR] {
+                        if let Some(shadowed) = env(var) {
+                            tracing::warn!(
+                                %provider,
+                                shadowed_var = var,
+                                shadowed_value = %shadowed,
+                                definition_base_url = %definition.base_url,
+                                "an explicit `openai` provider definition takes precedence over \
+                                 this variable, which is not read while the definition stands; \
+                                 every turn of this provider's is dispatched at the definition's \
+                                 base URL, not at the one the variable names"
+                            );
+                        }
+                    }
+                }
                 // A provider with no key anywhere is a warning and not a
                 // refusal, because this file is not where keys live: a member
                 // or a project may attach one through the control plane's
@@ -1036,11 +1067,14 @@ mod tests {
     /// example, loaded for real and pointed at a real upstream the way the
     /// README instructs, boots the shipped binary rather than being refused
     /// by a dialect this build has no client for.
+    ///
+    /// **Closed by moving the entry, not by adding a client.** The example now
+    /// keeps `providers.anthropic` as a definition nothing names — the same
+    /// treatment `dynamo-fleet` already had, and for the same reason — so the
+    /// shape stays documented while the file boots. The alternative, an
+    /// Anthropic Messages client, is a transport this milestone did not set out
+    /// to add and would have been added to satisfy a comment.
     #[test]
-    #[ignore = "G08: the shipped example's first models entry is anthropic/anthropic_messages, \
-                which the P2 dialect cross-check refuses the instant a real upstream is named \
-                -- exactly what the file's own README tells an operator to do. Fix by shipping \
-                an OpenAI Responses entry as the copy-first example instead."]
     fn the_shipped_example_catalog_boots_the_shipped_binary() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../examples/catalog.example.json");
@@ -1138,6 +1172,23 @@ mod tests {
             }
         }
 
+        // **One capture at a time, and not for tidiness.** `with_default`
+        // installs a *thread-local* subscriber, and installing one makes
+        // `tracing` reconsider its callsite interest cache against the global
+        // dispatcher — which in a test binary is nobody. A reconsideration that
+        // lands while another test is mid-capture can cache "nothing is
+        // interested" for the very callsite that test is asserting on, and its
+        // warning silently never arrives: the guard goes red for a reason that
+        // has nothing to do with the code under test, on one run in some
+        // hundreds. Seen for real once G15 gave this helper a second caller.
+        // The cost is microseconds of serialized test time; the alternative is
+        // an intermittently green guard, which enforces nothing and gets
+        // re-diagnosed from scratch by whoever meets it next.
+        static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+        let _serialized = ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         let buf = Buf::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(buf.clone())
@@ -1203,13 +1254,14 @@ mod tests {
     /// silently stop being used: the only boot output is an `info!` line
     /// naming the definition's own base URL, worded exactly like the case
     /// where no variable was ever set. This asserts the boot output says so by
-    /// naming the shadowed variable when both are present.
+    /// naming each shadowed variable that is actually set.
+    ///
+    /// **Both variables, not just the one the finding exercised.** They address
+    /// different origins — a stored key's API base and a forwarded ChatGPT
+    /// seat's — and a deployment may well have set only the second, so a
+    /// warning wired for one of them would leave the other exactly as silent as
+    /// before.
     #[test]
-    #[ignore = "G15: the Some(definition) arm of frontier_clients's match logs only its own \
-                base_url; it never names ROUNDHOUSE_OPENAI_API_BASE or \
-                ROUNDHOUSE_OPENAI_PASS_THROUGH_BASE even when one is set and shadowed, so an \
-                operator who added a `providers.openai` entry cannot tell their proxy stopped \
-                being used from a boot log that reads identically to the no-shadowing case"]
     fn an_explicit_openai_definition_says_it_is_taking_over_from_the_variables() {
         let catalog = StaticFrontierCatalog::new(vec![entry(
             BUILT_IN_OPENAI,
@@ -1223,6 +1275,7 @@ mod tests {
         let env = |name: &str| match name {
             FRONTIER_UPSTREAM_VAR => Some("openai_responses".to_string()),
             OPENAI_API_BASE_VAR => Some("https://egress-proxy.internal/v1".to_string()),
+            OPENAI_PASS_THROUGH_BASE_VAR => Some("https://egress-proxy.internal/v1".to_string()),
             "A_PROVIDER_KEY" => Some("present".to_string()),
             _ => None,
         };
@@ -1231,14 +1284,51 @@ mod tests {
             frontier_clients(&catalog, &providers, &env)
                 .expect("an explicit openai definition with its key present boots clean");
         });
+        for var in [OPENAI_API_BASE_VAR, OPENAI_PASS_THROUGH_BASE_VAR] {
+            assert!(
+                output.contains(var),
+                "an explicit `openai` provider definition silently overrides \
+                 {var}; the boot log must name the shadowed variable so an \
+                 operator who set it does not conclude their proxy is still in \
+                 the path from an info! line that reads identically either way: \
+                 {output}"
+            );
+        }
         assert!(
-            output.contains(OPENAI_API_BASE_VAR),
-            "an explicit `openai` provider definition silently overrides \
-             {OPENAI_API_BASE_VAR} (and, unexercised here, \
-             {OPENAI_PASS_THROUGH_BASE_VAR}); the boot log must name the \
-             shadowed variable so an operator who set it does not conclude \
-             their proxy is still in the path from an info! line that reads \
-             identically either way: {output}"
+            output.contains("https://openai-relay.internal/v1"),
+            "and the origin that won, since the remedy is to choose between the \
+             two: {output}"
+        );
+
+        // CONTROL 1: the identical definition with neither variable set. This is
+        // the ordinary case — an operator who never had a proxy — and naming a
+        // variable they did not set would be the same noise in the other
+        // direction, which is how a real warning gets ignored.
+        let output = captured_warnings(|| {
+            frontier_clients(&catalog, &providers, &|name| match name {
+                FRONTIER_UPSTREAM_VAR => Some("openai_responses".to_string()),
+                "A_PROVIDER_KEY" => Some("present".to_string()),
+                _ => None,
+            })
+            .expect("a definition with no variables to shadow boots clean");
+        });
+        assert!(
+            !output.contains(OPENAI_API_BASE_VAR) && !output.contains(OPENAI_PASS_THROUGH_BASE_VAR),
+            "nothing was shadowed here, so nothing may be reported as shadowed: {output}"
+        );
+
+        // CONTROL 2: the same variables set with *no* explicit definition —
+        // the `None` arm, where they are read and honored. The warning is about
+        // a definition taking precedence, so the arm that obeys them must stay
+        // silent about it.
+        let output = captured_warnings(|| {
+            frontier_clients(&catalog, &HashMap::new(), &env)
+                .expect("the implicit provider reads the variables");
+        });
+        assert!(
+            !output.contains("takes precedence"),
+            "the implicit arm honors both variables; a shadowing warning there \
+             would send an operator to remove a definition they never wrote: {output}"
         );
     }
 

@@ -267,6 +267,7 @@ mod tests {
                         reasoning_tokens: 100,
                         ..Default::default()
                     },
+                    provider_reported_cost_usd: None,
                 },
             },
         ]);

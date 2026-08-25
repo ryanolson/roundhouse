@@ -317,6 +317,14 @@ Three properties of the lists are worth knowing before writing one:
   load rather than deduplicated: a repeat inside one tier is a retry of the model
   that just failed wearing a failover's clothes, and a name in both tiers makes
   the scorer's choice a no-op that still reads like a decision.
+- **A `local/` entry needs a fleet, and so does the shipped example.** The
+  binary in this repository attaches none — it quotes the catalog and nothing
+  else — so `examples/control-plane.example.json`, whose efficient tier names a
+  local model and whose cadence promises local service on a spent window,
+  describes a deployment that has one. Pointing `ROUNDHOUSE_CONTROL_PLANE` at it
+  from a fleetless process is refused at boot, naming the keys and the capacity
+  they do not have, rather than started with a cheap tier that is empty on every
+  turn while the rationale blames the key's admission for it.
 
 Two consequences that follow from the design and are easier to meet in the
 README than to rediscover in a log:
@@ -365,11 +373,38 @@ configuration, not measurement, and `import-benchmarks` (a binary target in
 figure be sourced instead of guessed. It reads OpenRouter's
 `GET /api/v1/benchmarks` (`OPENROUTER_API_KEY`) and writes two files: a catalog
 fragment with each `quality_prior` normalized to `0.0..=1.0`, and a paired
-provenance record naming the index, its snapshot date, and a `citation`
-**required** for republication — the tool refuses to emit without one. It is
-configuration generation, never a runtime dependency: nothing in a shipped
-`roundhouse` binary calls OpenRouter, and its own tests run entirely offline
-against a committed response fixture, never the live route.
+provenance record naming the index, its snapshot date, and the attribution
+OpenRouter requires when the data is republished. It is configuration
+generation, never a runtime dependency: nothing in a shipped `roundhouse`
+binary calls OpenRouter, and its own tests run entirely offline against a
+committed response fixture, never the live route.
+
+**What the tool refuses, exactly.** An entry it cannot attribute *at all* —
+neither a `meta.citation` nor the item's own `source` discriminator — is
+refused rather than emitted uncited. A **null `meta.citation` is not that
+case**: it is the ordinary multi-source response, which OpenRouter's own schema
+says to attribute per item, and it is emitted with `"citation": null` beside
+each entry's `source`. (This paragraph is the correction of a README sentence
+that claimed the tool "refuses to emit without" a citation; it does not, the
+tool's own test pins the null case, and an operator who believed the stronger
+claim would read a `null` as a malfunction or as permission to republish
+uncited.)
+
+**Republishing an imported number means shipping its provenance file.**
+The catalog fragment carries model identity and `quality_prior` and nothing
+else — deliberately, since a catalog entry is `deny_unknown_fields` and an
+attribution field on it would be a schema this project invented for someone
+else's data. The attribution therefore lives only in the paired
+`quality-prior.provenance.json`, so **keep the two files together**: any figure
+this deployment publishes that was derived from an imported `quality_prior` —
+the savings dashboard's routing saving above all, which is priced through the
+capability gate those priors feed — carries OpenRouter's attribution
+obligation with it. To make that automatic, the server looks for
+`quality-prior.provenance.json` *beside the file `ROUNDHOUSE_CATALOG` names*
+and, when it finds one, renders its citation under the dashboard's savings
+figure. No file, no line, and never a boot failure: the catalog is named by an
+operator and load-or-die, while this one is discovered, and a discovered file
+must not be able to stop a deployment starting.
 
 ## Switchyard
 

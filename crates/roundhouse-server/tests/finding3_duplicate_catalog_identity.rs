@@ -138,6 +138,7 @@ fn one_frontier_call(usage: Usage) -> Vec<SessionEvent> {
             kind: SessionEventKind::ResponseCompleted {
                 response_id: response,
                 usage,
+                provider_reported_cost_usd: None,
             },
         },
     ]

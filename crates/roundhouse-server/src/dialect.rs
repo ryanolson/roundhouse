@@ -52,7 +52,14 @@
 /// builds the namespace object from the server's configured name), so this
 /// constant is the server name `roundhouse` under that rule rather than a
 /// string this crate invented.
-pub const DEFAULT_MCP_NAMESPACE: &str = "mcp__roundhouse";
+///
+/// Re-exported from `roundhouse-core` rather than spelled here (G04): the
+/// validate loop's signal fold has to *recognise* a call under this namespace
+/// as roundhouse's own control traffic, it lives a crate below this one, and
+/// two literals that must agree in two crates is a rename that goes silently
+/// half-done. The core definition carries the note about what an operator
+/// renaming [`ClientDialect::namespace`] gets instead.
+pub const DEFAULT_MCP_NAMESPACE: &str = roundhouse_core::validate::CONTROL_TOOL_NAMESPACE;
 
 /// The tool-call spelling this deployment emits.
 ///

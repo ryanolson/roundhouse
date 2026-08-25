@@ -396,6 +396,15 @@ impl<T: Tokenizer + Clone> FleetJudge<T> {
                     // every other dispatch. What the provider says it cost is
                     // the reconciliation view's input, not the ledger's --
                     // see `FrontierChunk::Done::provider_reported_cost`.
+                    //
+                    // Still discarded here after the main path learned to keep
+                    // it (review finding G11), and the asymmetry is structural
+                    // rather than an oversight: a side call terminates as
+                    // `SideCallCompleted`, which pairs with no `Routed` and
+                    // carries no settlement, so there is no terminal event with
+                    // a column to put a provider figure in. Widening that event
+                    // is a decision about what a side call is for, not a
+                    // consequence of this fix.
                     provider_reported_cost: _,
                 }))) => {
                     reported = Some(Usage {

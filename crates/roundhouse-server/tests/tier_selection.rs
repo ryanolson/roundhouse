@@ -36,7 +36,9 @@ use roundhouse_core::control::{
 use roundhouse_core::event::SessionEventKind;
 use roundhouse_core::ids::{SessionId, TurnId};
 use roundhouse_core::item::{Item, ItemContent, Role};
-use roundhouse_core::metrics::{MetricsFold, ModelKey, Scope};
+use roundhouse_core::metrics::{
+    MetricsConfig, MetricsFold, MetricsSnapshot, ModelKey, Scope, ShadowPricing,
+};
 use roundhouse_core::routing::{
     AffinityPolicy, AttemptClass, CacheModel, DecisionSource, PickerMode, ProviderPricing,
     StagePolicy, Target, TierRecipe,
@@ -792,10 +794,6 @@ async fn exhausted_fallbacks_fail_with_the_history_on_the_record() {
 /// proves the *non*-terminal dead provider (PRIMARY here too) is marked, so
 /// this is not a claim that the mechanism marks nothing.
 #[tokio::test]
-#[ignore = "G03: the exhausted recipe's terminal target (SECONDARY, the one \
-            the client's error actually names) never reaches \
-            failed_attempts -- Failed::before_output's empty Usage fails \
-            fold.rs's `consumed` gate for the ResponseIncomplete it produces"]
 async fn an_exhausted_recipe_leaves_its_last_dead_provider_unmarked() {
     let first = Scripted::new(Script::Transport);
     let second = Scripted::new(Script::Status(503));
@@ -831,6 +829,105 @@ async fn an_exhausted_recipe_leaves_its_last_dead_provider_unmarked() {
         "SECONDARY is the target whose 503 the client actually received -- an \
          outage entirely on SECONDARY (a single-provider deployment) would \
          report this vec empty for as long as the outage lasts"
+    );
+
+    // The event the count is folded from, and what it says. `failed_attempts`
+    // collapses to `(ModelKey, count)`, so the *class* the ruling asked the
+    // terminal attempt to carry ("target + error class") is written and read
+    // nowhere else -- without this, flipping `Status { 503 }` to `Timeout`
+    // leaves every guard above green. It also pins the new field's serde
+    // round-trip on the incomplete side.
+    let terminal = rig
+        .store
+        .read_events(&session_id, 0, 1_000)
+        .await
+        .unwrap()
+        .into_iter()
+        .find_map(|event| match event.kind {
+            SessionEventKind::ResponseIncomplete {
+                terminal_attempt, ..
+            } => Some(terminal_attempt),
+            _ => None,
+        })
+        .expect("the turn terminated")
+        .expect("the last dispatch failed against a target, and the event names it");
+    assert_eq!(terminal.target, target(SECONDARY));
+    assert_eq!(terminal.class, AttemptClass::Status { status: 503 });
+}
+
+/// The finding's own failure scenario, which the two-target rig above does not
+/// reach: **one** provider, down.
+///
+/// N=2 proves the last of several attempts is marked. N=1 is the case where
+/// first and last are the same dispatch, so there is no preceding `Routed` to
+/// carry it and no successor to ride -- an hour of outage reporting an empty
+/// `failed_attempts` is exactly what G03's failure scenario describes, and it
+/// is a different code path from the one above rather than the same one with a
+/// smaller number.
+///
+/// The second assertion is the half that keeps the first honest: the attempt is
+/// counted **without** inventing a call. `failed_attempts` must never enter
+/// `calls`, which is the denominator of every rate on the dashboard -- a
+/// provider that 503s every request would otherwise make itself look like the
+/// cheapest model in the fleet.
+#[tokio::test]
+async fn a_single_provider_outage_names_the_provider_rather_than_reporting_nothing() {
+    let only = Scripted::new(Script::Status(503));
+    let untouched = Scripted::answering("gamma answered");
+    let rig = rig_of(vec![
+        (PRIMARY, Arc::clone(&only) as Arc<dyn FrontierClient>),
+        (
+            SECONDARY,
+            Scripted::answering("never asked") as Arc<dyn FrontierClient>,
+        ),
+        (THRIFTY, Arc::clone(&untouched) as Arc<dyn FrontierClient>),
+    ]);
+
+    // A capable tier of exactly one entry: this deployment has one hosted
+    // model it may reach, which is the shape the failure scenario is about.
+    let admission = Admission {
+        tiers: Some(Arc::new(
+            TierRecipe::new(
+                vec![format!("{PRIMARY}/m")],
+                vec![format!("{THRIFTY}/m")],
+                PickerMode::CapableFirst,
+                roundhouse_core::routing::stage::DEFAULT_CONFIDENCE_THRESHOLD,
+            )
+            .expect("a one-entry capable tier"),
+        )),
+        ..Admission::open()
+    };
+
+    let session_id = SessionId::generate();
+    rig.turn(&session_id, "t1", ask(), &admission)
+        .await
+        .expect_err("the only provider is down");
+
+    assert_eq!(only.calls(), 1, "one target, one dispatch, no failover");
+    assert_eq!(
+        untouched.calls(),
+        0,
+        "an exhausted tier does not spill into the other one"
+    );
+
+    let fold = rig.fold(&session_id).await;
+    assert_eq!(
+        fold.failed_attempts(Scope::Deployment),
+        vec![(ModelKey::from_target(&target(PRIMARY)), 1)],
+        "the one dispatch is both the first and the last, so nothing but the \
+         terminal event can carry it"
+    );
+    assert_eq!(
+        MetricsSnapshot::build(
+            &fold,
+            Scope::Deployment,
+            &MetricsConfig::new(ShadowPricing::new(Vec::new())),
+            0,
+        )
+        .calls,
+        0,
+        "and it is marked, not booked: a dispatch that reached nobody must not \
+         enter the denominator of every rate on the dashboard"
     );
 }
 
@@ -1247,10 +1344,6 @@ async fn a_tests_passed_production_turn_deescalates() {
 /// pins the recipe, and not the fleet or the cadence machinery, as the cause
 /// of the failure here.
 #[tokio::test]
-#[ignore = "G02: a hosted-only tier recipe leaves entitled == [local] out of \
-            reach of tier_pool once the cadence is spent, so the turn dies \
-            NoViableCandidate instead of degrading to local as the cadence \
-            promises -- see recommended_fix"]
 async fn a_spent_cadence_serves_locally_even_under_a_tier_recipe() {
     let rig = rig_with_fleet(vec![
         (
@@ -1639,12 +1732,6 @@ fn a_recipe_a_router_cannot_read_warns_once_and_only_there() {
 /// causes today: "the efficient tier was picked and this key admits none of
 /// it".
 #[tokio::test]
-#[ignore = "G09: no boot/write-time crosscheck refuses a tiers recipe naming a target absent \
-            from the catalog (crosscheck.rs has refuse_policies_that_admit_nothing for key \
-            admission but nothing analogous for tier-target catalog existence), so \
-            stage.rs's tier_pool treats catalog-absence and key-non-admission identically and \
-            the republished rationale blames 'this key admits none of it' for both -- fails on \
-            that string today"]
 async fn a_tier_target_no_catalog_holds_is_not_reported_as_an_admission_refusal() {
     let recipe = TierRecipe::new(
         vec![format!("{PRIMARY}/m")],

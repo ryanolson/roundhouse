@@ -287,6 +287,14 @@ that the API does not have, so a hard refresh loses nothing.
         <div class="split-note">What the router priced the hosted alternative at, at decision time. Not added in.</div>
       </div>
     </div>
+    <!-- Present only when this deployment's quality priors were imported from a
+         published index and the provenance file sits beside the catalog. The
+         index requires attribution when its data is republished, and the
+         routing saving above is priced through the capability gate those priors
+         feed -- so this is where the credit belongs. Hidden, not blank, when
+         there is nothing to attribute: an empty line reads as a value that
+         failed to load. -->
+    <div class="split-note" id="savings-citation" hidden></div>
   </section>
 
   <div class="kpis">
@@ -715,6 +723,12 @@ that the API does not have, so a hard refresh loses nothing.
     $("savings-quoted").textContent = usd(data.savings.routing_savings_at_decision_usd);
     $("savings-routing-note").textContent =
       `Priced against each local model's correlary, gated at ±${data.capability_band.toFixed(2)} of quality prior.`;
+
+    const citation = $("savings-citation");
+    citation.hidden = !data.quality_prior_citation;
+    citation.textContent = data.quality_prior_citation
+      ? `Quality priors: ${data.quality_prior_citation}`
+      : "";
 
     $("kpi-spend").textContent = usd(data.savings.frontier_spend_usd);
     // Never the bare word "measured" unless it is: this label was a hardcoded

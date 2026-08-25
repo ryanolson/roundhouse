@@ -64,7 +64,9 @@
 
 use async_trait::async_trait;
 
-use crate::routing::{Candidate, Decision, RoutingContext, RoutingError, RoutingPolicy, Target};
+use crate::routing::{
+    Admitted, Candidate, Decision, RoutingContext, RoutingError, RoutingPolicy, Target,
+};
 use crate::validate::tool_signals::ToolSignals;
 
 // ─── the constants, verbatim ─────────────────────────────────────────────────
@@ -480,6 +482,23 @@ impl TierRecipe {
         }
     }
 
+    /// Every target this recipe names, capable tier first.
+    ///
+    /// The tier-blind question — *could this recipe select that target at
+    /// all?* — which is what the boot cross-checks ask (`crosscheck.rs`:
+    /// a recipe that names no local target cannot keep a degrade-to-local
+    /// promise, and one that names a model no catalog holds is a typo the
+    /// deployment should refuse over). Answered here rather than by two call
+    /// sites chaining `list(Capable)` and `list(Efficient)` themselves,
+    /// because a third tier — if one is ever added — would otherwise be
+    /// invisible to checks written before it existed.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.capable
+            .iter()
+            .chain(self.efficient.iter())
+            .map(String::as_str)
+    }
+
     /// The startup warning a `capable_first` recipe earns, or `None`.
     ///
     /// Upstream's server prints its equivalent and this one says the same
@@ -548,6 +567,71 @@ impl StagePolicy {
             })
             .collect()
     }
+
+    /// What a turn does when admission left capacity the recipe does not name.
+    ///
+    /// **Degrade-to-local outranks a recipe, and that is the whole of this
+    /// function.** [`RoutingContext::admissible`] applies the cadence and the
+    /// budget in its first filters, and both are frontier-only knobs — so a
+    /// spent window or an exhausted `degrade_to_local` budget leaves precisely
+    /// the local candidates admitted, which is the state two configuration
+    /// surfaces promise in words ("the hosted options go inadmissible and the
+    /// turn serves locally instead of failing"). A recipe is a preference
+    /// among what admission already entitles and never a second gate on it —
+    /// [`Self::tier_pool`] states the narrowing half of the same rule — so a
+    /// recipe that happens to name no local target must not turn a documented
+    /// degradation into a client-visible failure. M10 review G02.
+    ///
+    /// **Narrower than "fall back to `inner`" on purpose.** Handing the whole
+    /// admitted pool to the inner policy would also let an unnamed *hosted*
+    /// candidate take the turn, which is the one reading of a recipe an
+    /// operator would not expect: they wrote down which hosted models may
+    /// answer. The promise that survives a recipe is the local one, because it
+    /// is the only one the configuration file makes.
+    ///
+    /// [`Admitted::decide`] rather than `decide_staged`: no tier served this
+    /// turn, so `source` is honestly `None` and the handoff gate
+    /// (`engine::opened_a_tier_escalation`) reads it as "no tier decision" —
+    /// stamping a [`DecisionSource`] here would tell that gate a scorer's pick
+    /// had been honoured when it was bypassed.
+    fn degrade_past_the_recipe(
+        recipe: &TierRecipe,
+        admitted: &Admitted<'_>,
+    ) -> Result<Decision, RoutingError> {
+        let Some(degrade) = admitted
+            .pool()
+            .iter()
+            .copied()
+            .find(|candidate| candidate.target.is_local())
+        else {
+            // The recipe named targets, the pool holds none of them, and there
+            // is no local capacity to degrade onto either. The error taxonomy
+            // is deliberately not extended for this -- three empty-set arms
+            // already send an operator to three different files, and a fourth
+            // would be a fifth thing to learn -- so the recipe fact goes where
+            // an operator can find it without a new variant.
+            tracing::warn!(
+                capable = ?recipe.list(Tier::Capable),
+                efficient = ?recipe.list(Tier::Efficient),
+                "no admitted candidate matches any target this project's tier recipe names, and \
+                 no local worker is admitted either; the turn fails as an unviable candidate set, \
+                 but the recipe is what to look at"
+            );
+            return Err(admitted.refuse_no_viable());
+        };
+        Ok(admitted.decide(
+            degrade.target.clone(),
+            // **No price in this string**, the same rule the staged rationale
+            // below states at length: a rationale is republished into the
+            // calling model's own context by `explain_last_route`.
+            format!(
+                "stage router: no target this project's tier recipe names is admissible on this \
+                 turn, so the turn degrades to {} -- a spent allowance promises local service and \
+                 a recipe does not override it",
+                degrade.target.policy_identity()
+            ),
+        ))
+    }
 }
 
 #[async_trait]
@@ -592,22 +676,9 @@ impl RoutingPolicy for StagePolicy {
                 let other = Self::tier_pool(recipe, pick.tier.other(), pool);
                 match other.is_empty() {
                     false => (pick.tier.other(), other),
-                    true => {
-                        // The recipe named targets and the pool holds none of
-                        // them. The error taxonomy is deliberately not extended
-                        // for this -- three empty-set arms already send an
-                        // operator to three different files, and a fourth would
-                        // be a fifth thing to learn -- so the recipe fact goes
-                        // where an operator can find it without a new variant.
-                        tracing::warn!(
-                            capable = ?recipe.list(Tier::Capable),
-                            efficient = ?recipe.list(Tier::Efficient),
-                            "no admitted candidate matches any target this project's tier \
-                             recipe names; the turn fails as an unviable candidate set, but \
-                             the recipe is what to look at"
-                        );
-                        return Err(admitted.refuse_no_viable());
-                    }
+                    // The recipe named targets and the pool holds none of them.
+                    // Whether that is a failure depends on what admission left.
+                    true => return Self::degrade_past_the_recipe(recipe, &admitted),
                 }
             }
         };
@@ -637,8 +708,28 @@ impl RoutingPolicy for StagePolicy {
             ));
         }
         if serving != pick.tier {
+            // **"this turn", not "this key", and the edit is the whole of G09
+            // at this seam.** An empty tier has four possible causes and this
+            // policy can tell them apart from none of them: the key's own
+            // filter, a spent cadence or budget, a credential that reaches no
+            // provider — and a recipe entry naming a model this deployment does
+            // not serve at all. Blaming the key by name sent an operator with a
+            // transposed digit in a model id off to widen an `allow` list that
+            // was never the problem, and the sentence is republished to the
+            // calling model by `explain_last_route`, so it was wrong in two
+            // places at once.
+            //
+            // The narrower sentence is not recoverable here: `ctx.candidates`
+            // has already been filtered by `TurnPolicy::permits` and by the
+            // credential filter before the router sees it (engine.rs), so a
+            // name missing from it is a typo and a policy exclusion wearing the
+            // same clothes. The typo is caught where both files are loaded --
+            // `crosscheck::refuse_tier_recipes_naming_absent_targets` refuses
+            // it at boot and at every admin write -- which leaves this string
+            // saying only what a router honestly knows: nothing admissible on
+            // this turn carries an identity the picked tier names.
             rationale.push_str(&format!(
-                "; the {} tier was picked and this key admits none of it",
+                "; the {} tier was picked and this turn admits none of it",
                 pick.tier.label()
             ));
         }
@@ -656,7 +747,7 @@ impl RoutingPolicy for StagePolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control::{FrontierHistory, TargetFilter, TurnBudget, TurnPolicy};
+    use crate::control::{FrontierCadence, FrontierHistory, TargetFilter, TurnBudget, TurnPolicy};
     use crate::ids::SessionId;
     use crate::routing::CacheLedger;
     use crate::routing::policy::AffinityPolicy;
@@ -756,17 +847,22 @@ mod tests {
         assert!((producing.score + 0.5f64.tanh()).abs() < 1e-9);
     }
 
-    /// G04 (review finding): the trailing window `dimensions_from_signal`
-    /// reads from is [`ToolSignals`]'s own `recent_*` counts, and those come
-    /// from [`classify_tool_call`](crate::validate::tool_signals) — which has
-    /// no case for `mcp__roundhouse__*`, so a session that just made four
-    /// productive edits and then followed the `rh-status` skill (`status`,
-    /// `explain_last_route`, `prefer`, `set_quality_floor`) reads as
-    /// `spinning` on its last three calls being uncategorised `Other`
-    /// traffic, not on the agent actually being stuck. **Ignored**: this is
-    /// the claim, not the fix.
+    /// G04 (review finding, now fixed): the trailing window
+    /// `dimensions_from_signal` reads from is [`ToolSignals`]'s own `recent_*`
+    /// counts, and those used to include `mcp__roundhouse__*` as uncategorised
+    /// `Other` traffic — so a session that made six productive edits and then
+    /// followed the `rh-status` skill (`status`, `explain_last_route`,
+    /// `prefer`, `set_quality_floor`) read as `spinning` on the identity of
+    /// its last three calls rather than on the agent being stuck.
+    ///
+    /// **The depth is load-bearing and a four-exchange fixture would make this
+    /// vacuous**: at `turn_depth < STALL_MIN_TURN_DEPTH` nothing fires anyway
+    /// and the assertion would have passed before the fix. Ten exchanges is
+    /// what makes `spinning == 1.0` the old answer. The production assertion
+    /// is the other half: without it, "spinning is zero" would also be
+    /// satisfied by a fix that zeroed every count instead of dropping our own
+    /// calls from the walk.
     #[test]
-    #[ignore = "G04: trailing mcp__roundhouse__* control calls synthesize spinning=1.0 despite real production work earlier in the session"]
     fn our_own_control_calls_do_not_synthesize_a_stall() {
         use crate::validate::Exchange;
 
@@ -812,6 +908,47 @@ mod tests {
             dims.spinning, 0.0,
             "four trailing reads of roundhouse's own control surface must not \
              read as the agent spinning: {dims:?}"
+        );
+        assert!(
+            dims.production_intensity > 0.0,
+            "and they must not zero the production the agent actually did: {dims:?}"
+        );
+
+        // The half of limb C this fix does NOT close, pinned at its real value
+        // rather than left for somebody to rediscover. `turn_depth` is
+        // `exchanges.len()` (above), counted *before* the control calls are
+        // dropped, so our own surface still supplies the depth that opens the
+        // stall gate — Lens A's words, and the half of the limb the three
+        // shipped tests do not reach. Five uncategorised `cargo` calls are a
+        // build loop too shallow to be a stall; three reads of our own status
+        // tool make the same session deep enough, and the window behind the
+        // gate is unchanged because those three are dropped from it.
+        //
+        // Closing it is one line here — `task_exchanges(exchanges).len()` —
+        // and it is a non-test `routing/stage.rs` change, which M10's fix
+        // clusters assign elsewhere; see reports/m10-fix-D.md for the ruling
+        // asked for and the default taken.
+        let shallow_pit: Vec<Exchange> = (0..5)
+            .map(|n| control_call(&format!("b{n}"), "cargo", "{}"))
+            .collect();
+        let alone = TurnSignals::from_exchanges(&shallow_pit);
+        assert_eq!(
+            (alone.turn_depth, dimensions_from_signal(&alone).spinning),
+            (5, 0.0),
+            "five uncategorised calls are not deep enough to be a stall on their own"
+        );
+
+        let mut with_control = shallow_pit;
+        with_control.extend(
+            (0..3).map(|n| control_call(&format!("c{n}"), "mcp__roundhouse__status", "{}")),
+        );
+        let inflated = TurnSignals::from_exchanges(&with_control);
+        let dims = dimensions_from_signal(&inflated);
+        assert_eq!(
+            (inflated.turn_depth, dims.spinning),
+            (8, 1.0),
+            "three reads of our own control surface still supply the depth that calls the \
+             same session a stall: {dims:?}"
         );
     }
 
@@ -1147,6 +1284,91 @@ mod tests {
 
     fn stage() -> StagePolicy {
         StagePolicy::new(Box::new(AffinityPolicy::new()))
+    }
+
+    /// One of our own workers, which no recipe in this module names.
+    fn local_worker() -> Candidate {
+        Candidate {
+            target: Target::Local {
+                worker_id: 7,
+                dp_rank: 0,
+                model: "small".into(),
+            },
+            expected_prefill_tokens: 1_000.0,
+            matched_prefix_tokens: 0,
+            expected_ttft_ms: 900.0,
+            expected_cost_usd: 0.0,
+            quality_prior: 0.55,
+            load: None,
+        }
+    }
+
+    /// **M10 review G02.** A recipe that names no local target must not turn a
+    /// documented degradation into a failed turn.
+    ///
+    /// The cadence is written spent — `max_frontier: 0` excludes every hosted
+    /// candidate in `admissible`'s first filter and exempts local, which is the
+    /// admitted set a *ration* leaves once it is used up. Constructed that way
+    /// rather than by spending a window, because `FrontierHistory::record` is
+    /// crate-private on purpose: the only truthful producer is the session
+    /// projection, and the engine-level guard
+    /// (`tests/tier_selection.rs::a_spent_cadence_serves_locally_even_under_a_tier_recipe`)
+    /// is the one that spends a real one.
+    #[tokio::test]
+    async fn a_pool_narrowed_to_local_is_served_even_though_no_tier_names_it() {
+        let mut candidates = fleet();
+        candidates.push(local_worker());
+        let spent = Fixture::open()
+            .with_recipe(recipe(PickerMode::EfficientFirst))
+            .under(TurnPolicy {
+                frontier_cadence: Some(FrontierCadence {
+                    max_frontier: 0,
+                    per_turns: 10,
+                }),
+                ..TurnPolicy::unrestricted()
+            });
+
+        let decision = stage().choose(&spent.ctx(&candidates)).await.unwrap();
+        assert_eq!(
+            decision.target, candidates[3].target,
+            "the recipe names sol, luna and terra and admission left none of \
+             them; the local worker it does not name is what the cadence \
+             promised: {}",
+            decision.rationale
+        );
+        assert_eq!(
+            decision.source, None,
+            "no tier served this turn, and stamping one would tell the handoff \
+             gate a scorer's pick had been honoured"
+        );
+        assert!(decision.fallbacks.is_empty());
+        assert!(
+            decision.rationale.contains("local/small"),
+            "the rationale names what took the turn and why: {}",
+            decision.rationale
+        );
+
+        // CONTROL: both tiers empty with no local candidate to degrade onto.
+        // Nothing was promised here and nothing is invented — the turn refuses
+        // exactly as it did before G02.
+        let absent = Fixture::open().with_recipe(
+            TierRecipe::new(
+                vec!["openai/absent-a".into()],
+                vec!["openai/absent-b".into()],
+                PickerMode::EfficientFirst,
+                DEFAULT_CONFIDENCE_THRESHOLD,
+            )
+            .unwrap(),
+        );
+        let hosted_only = fleet();
+        let error = stage()
+            .choose(&absent.ctx(&hosted_only))
+            .await
+            .expect_err("a recipe naming nothing admitted, with nowhere local to go");
+        assert!(
+            matches!(error, RoutingError::NoViableCandidate { .. }),
+            "{error:?}"
+        );
     }
 
     #[tokio::test]

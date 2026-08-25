@@ -262,27 +262,40 @@ fn the_example_file_validates() {
     }
 }
 
-/// Review finding G07: the shipped `roundhouse` binary attaches no
+/// Review finding G07, ruled on a corrected mechanism — see
+/// `reports/m10-fix-C.md`, and the rename from
+/// `..._is_one_this_binary_could_quote`, which named a property the shipped
+/// binary cannot have.
+///
+/// **The finding's question.** The shipped `roundhouse` binary attaches no
 /// [`LocalFleet`], so `local/<model>` names nothing `reachable_candidates`
-/// (main.rs) ever quotes -- see that function's own doc comment. The check
-/// above only asks whether acme's `allow` *admits* each recipe entry, which
-/// `local/REPLACE-with-your-local-model` passes (the pattern is `local/*`);
-/// it never asks whether the catalog this binary actually ships can quote a
-/// candidate for that identity at all. This test asks the second question,
-/// against the same shipped catalog example the control-plane example is
-/// meant to be read beside, and with no fleet -- mirroring the shipped
-/// binary's actual wiring.
+/// (main.rs) ever quotes, and the check above only asks whether acme's `allow`
+/// *admits* each recipe entry — which `local/REPLACE-with-your-local-model`
+/// passes, the pattern being `local/*`. True, and its predicted consequence —
+/// every turn falling silently to the expensive tier — is not: the same file's
+/// `frontier_cadence` promises local service on a spent window, and
+/// [`refuse_promises_of_a_local_fallback`] refuses the whole plane at boot
+/// before a socket is opened. A fleetless operator meets a refusal naming the
+/// missing local capacity, not a quiet bill.
+///
+/// **What was actually broken, and what this test guards.** On the deployment
+/// these two files *describe* — one whose fleet serves the local model the
+/// catalog example declares in `local_quality` — ada's key was still refused,
+/// because her `min_quality: 0.8` override put that model's declared 0.62
+/// below her floor and so took her own cadence's fallback away. The shipped
+/// pair booted nothing at all, fleeted or fleetless, and nothing said so. Both
+/// halves are asserted here: the pair boots the deployment it describes, and
+/// the fleetless refusal is the documented one rather than silence.
+///
+/// The local candidate is built from the catalog example's own `local_quality`
+/// rather than hard-coded, so the two files' spelling of the local model is
+/// what is being compared. That is the shape the finding's silent-expensive-tier
+/// scenario really has: a typo between the files, on a deployment with a fleet.
 ///
 /// [`LocalFleet`]: roundhouse_fleet::LocalFleet
+/// [`refuse_promises_of_a_local_fallback`]: crate::control_config::crosscheck::refuse_promises_of_a_local_fallback
 #[test]
-#[ignore = "G07: the shipped example's efficient tier names \
-            `local/REPLACE-with-your-local-model`, which the shipped binary's own catalog \
-            example never quotes a candidate for (no LocalFleet is attached in main.rs::serve) \
-            -- every turn falls to the capable tier silently, and the republished rationale \
-            blames the key's admission rather than the missing fleet. Confirmed test-first; \
-            see review ruling G07. Removing this ignore is the first step of the fix, not a \
-            cleanup after it."]
-fn every_target_the_examples_recipe_names_is_one_this_binary_could_quote() {
+fn every_target_the_examples_recipe_names_is_one_the_deployment_it_describes_can_quote() {
     let control_plane_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../examples/control-plane.example.json");
     let config = ControlPlaneConfig::load(&control_plane_path)
@@ -290,9 +303,9 @@ fn every_target_the_examples_recipe_names_is_one_this_binary_could_quote() {
 
     let catalog_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../examples/catalog.example.json");
-    let catalog = crate::CatalogConfig::load(&catalog_path)
-        .unwrap_or_else(|error| panic!("the shipped catalog example must validate: {error}"))
-        .catalog();
+    let catalog_config = crate::CatalogConfig::load(&catalog_path)
+        .unwrap_or_else(|error| panic!("the shipped catalog example must validate: {error}"));
+    let catalog = catalog_config.catalog();
 
     // Same recipe for the same reason `the_example_file_validates` above
     // handled multiplicity -- this milestone's example ships one project.
@@ -301,17 +314,39 @@ fn every_target_the_examples_recipe_names_is_one_this_binary_could_quote() {
         .values()
         .next()
         .and_then(|admission| admission.tiers.as_ref())
-        .expect("the example ships a key with a recipe");
+        .expect("the example ships a key with a recipe")
+        .clone();
+    let plane = crate::ControlPlane::configured(config);
 
     // `reachable_candidates` in main.rs, reproduced here rather than called:
     // that function lives in the `roundhouse` binary crate and is not
-    // reachable from this lib crate's tests. No `LocalFleet` is attached --
-    // matching `serve()`'s actual wiring, which is the fact this test exists
-    // to check against the example.
+    // reachable from this lib crate's tests.
     let mut ledger = roundhouse_core::routing::CacheLedger::new();
     catalog.apply_to_ledger(&mut ledger);
-    let reachable = catalog.quote(&ledger, roundhouse_core::now_ms(), 1_024, 256);
-    let reachable_identities: HashSet<String> = reachable
+    let fleetless = catalog.quote(&ledger, roundhouse_core::now_ms(), 1_024, 256);
+
+    // The deployment the two files describe: the catalog's hosted entries plus
+    // a worker for every local model the catalog itself declares a quality for.
+    // Quoted at that declared prior, because the floor a key's override sets is
+    // compared against exactly this number and the whole defect lived in that
+    // comparison.
+    let mut described = fleetless.clone();
+    for (model, prior) in &catalog_config.local_quality {
+        described.push(roundhouse_core::routing::Candidate {
+            target: Target::Local {
+                worker_id: 1,
+                dp_rank: 0,
+                model: model.clone(),
+            },
+            expected_prefill_tokens: 1_024.0,
+            matched_prefix_tokens: 0,
+            expected_ttft_ms: 60.0,
+            expected_cost_usd: 0.0,
+            quality_prior: *prior,
+            load: Some(0.0),
+        });
+    }
+    let described_identities: HashSet<String> = described
         .iter()
         .map(|candidate| candidate.target.policy_identity())
         .collect();
@@ -319,14 +354,45 @@ fn every_target_the_examples_recipe_names_is_one_this_binary_could_quote() {
     for tier in [Tier::Capable, Tier::Efficient] {
         for named in recipe.list(tier) {
             assert!(
-                reachable_identities.contains(named),
-                "the example's {tier:?} tier names `{named}`, which the shipped catalog \
-                 example never quotes a candidate for (reachable: {reachable_identities:?}); \
-                 with no LocalFleet attached the shipped binary can never route to it, so \
-                 every turn falls to the other tier silently"
+                described_identities.contains(named),
+                "the example's {tier:?} tier names `{named}`, which neither file's own \
+                 contents can produce a candidate for ({described_identities:?}): a hosted \
+                 entry the catalog does not price, or a local model it declares no quality \
+                 for, is a tier that is empty on every turn -- and an empty tier is not a \
+                 failure, it is the other tier serving the turn at another price"
             );
         }
     }
+
+    // And the deployment described boots: every key, not just the project's,
+    // since a turn arrives on a key and ada's own narrowing is where this broke.
+    crate::control_config::crosscheck::CrossChecks::new(described, None)
+        .refuse(&plane)
+        .unwrap_or_else(|refusal| {
+            panic!(
+                "the two shipped examples must describe a deployment that starts: {} said {}",
+                refusal.check, refusal.detail
+            )
+        });
+
+    // CONTROL, and the half that makes the assertion above non-vacuous: the
+    // same plane on a *fleetless* process -- the shipped binary's own wiring --
+    // is refused, and refused by name. If this ever passed, the examples would
+    // be describing a deployment nobody can tell apart from the one they get,
+    // and the finding's silent-expensive-tier scenario would be back.
+    let refusal = crate::control_config::crosscheck::CrossChecks::new(fleetless, None)
+        .refuse(&plane)
+        .expect_err(
+            "the shipped control plane promises local service and the shipped binary \
+             attaches no fleet; a process that started here would serve the promise's \
+             opposite in silence",
+        );
+    assert!(
+        refusal.detail.contains("no local capacity") && refusal.detail.contains("project `acme`"),
+        "the fleetless refusal is what an operator copying both files actually meets, so \
+         it has to name the capacity and the keys rather than the tier that went empty: {}",
+        refusal.detail
+    );
 }
 
 // -----------------------------------------------------------------------

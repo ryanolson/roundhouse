@@ -57,8 +57,8 @@ use roundhouse_core::now_ms;
 
 use crate::control_config::{
     AllocationConfig, ApiKeyRecord, AuthError, ControlDirectory, ControlPlane, DirectoryMutation,
-    DirectoryView, KeyRecordScope, KeyScope, MembershipRecord, MembershipRole, PolicyConfig,
-    ProjectEntry, ProjectPatch, ProjectRecord, UserEntry, UserRecord,
+    DirectoryView, FairUseConfig, KeyRecordScope, KeyScope, MembershipRecord, MembershipRole,
+    PolicyConfig, ProjectEntry, ProjectPatch, ProjectRecord, UserEntry, UserRecord,
 };
 use crate::http::{ApiError, parse_body};
 
@@ -228,6 +228,22 @@ struct ProjectDto {
     /// budget view, beside what it *has* spent, and a limit shown alone is the
     /// number people quote without the one that matters.
     budgeted: bool,
+    /// This project's rolling fair-use windows, echoed whole — not as a
+    /// `fair_used: bool` mirroring `budgeted` above.
+    ///
+    /// The asymmetry is the point and G14 is the record of it. `budgeted` can
+    /// be a flag because the budget *view* answers the follow-up question with
+    /// spend beside the limit. There is no fair-use view: the ledger's rolling
+    /// counters are not a balance anyone reads. So a flag here would answer
+    /// "is there a ceiling" and leave "which one" unanswerable from any
+    /// surface, which is exactly the operator's position this field exists to
+    /// end — and the `PATCH` route accepts this same block back.
+    ///
+    /// Rendered as `null` rather than omitted when there is no block, like
+    /// every other optional field on this view: "this project has no rolling
+    /// ceiling" is an answer, and a field that vanishes is one a reader cannot
+    /// tell from a field this deployment is too old to have.
+    fair_use: Option<FairUseConfig>,
 }
 
 impl From<&ProjectRecord> for ProjectDto {
@@ -239,6 +255,7 @@ impl From<&ProjectRecord> for ProjectDto {
             created_at_ms: record.created_at_ms,
             archived_at_ms: record.archived_at_ms,
             budgeted: record.entry.budget.is_some(),
+            fair_use: record.entry.fair_use.clone(),
         }
     }
 }
@@ -310,6 +327,16 @@ struct KeyDto {
     provenance: String,
     created_at_ms: Option<u64>,
     revoked_at_ms: Option<u64>,
+    /// This member's own rolling windows, the second ceiling that binds beside
+    /// the project's — `null` for a key that declares none, and always `null`
+    /// for an admin key, which pays for nothing.
+    ///
+    /// Read-only here, and only a file-declared key can carry one: the admin
+    /// plane mints a key under a membership and has no route that writes a
+    /// member window. Showing it anyway is what makes the *project* view's
+    /// answer complete — a member refused while the project has room is
+    /// otherwise a refusal no admin surface can explain.
+    fair_use: Option<FairUseConfig>,
 }
 
 impl From<&ApiKeyRecord> for KeyDto {
@@ -330,6 +357,7 @@ impl From<&ApiKeyRecord> for KeyDto {
             provenance: record.provenance.to_string(),
             created_at_ms: record.created_at_ms,
             revoked_at_ms: record.revoked_at_ms,
+            fair_use: record.fair_use.clone(),
         }
     }
 }

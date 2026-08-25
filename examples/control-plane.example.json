@@ -27,8 +27,15 @@
     "the same three axes. Narrowing only: an override that would raise the",
     "admissible set on any axis -- a lower min_quality, a looser cadence -- is",
     "rejected at load, naming both the key and the project it belongs to, rather",
-    "than silently clamped. Ada's key below tightens the floor from 0.5 to 0.8",
+    "than silently clamped. Ada's key below tightens the floor from 0.5 to 0.6",
     "and the cadence from 2-per-10 to 1-per-10; it could not loosen either.",
+    "Why 0.6 and not something higher: a floor above the local model's declared",
+    "local_quality (0.62 in the catalog example beside this file) takes the",
+    "cadence's own fallback away -- the spent window promises local service and",
+    "the floor has just made the only local model inadmissible for this key --",
+    "and the boot cross-check refuses exactly that, naming ada. Two narrowings",
+    "that are each fine alone can be unkeepable together, which is the whole",
+    "reason the check compares the two files rather than validating each.",
     "A project's \"budget\" sets its spending ceiling: limit_usd, a window",
     "(\"total\" for the life of the project, \"monthly\" resetting each UTC",
     "calendar month), on_exhaustion (\"degrade_to_local\" keeps serving from",
@@ -108,6 +115,16 @@
     "retry of the model that just failed wearing a failover's clothes, and a",
     "name in both tiers makes the scorer's choice a no-op that still reads like",
     "a decision. Both are rejected at load rather than deduplicated.",
+    "One thing about this file as a whole. Acme's efficient tier names",
+    "\"local/REPLACE-with-your-local-model\" and its cadence promises local service",
+    "once the window is spent, and both are promises only a deployment with a local",
+    "fleet can keep. The shipped roundhouse binary attaches none -- it quotes the",
+    "catalog and nothing else -- so this file describes a deployment that has one,",
+    "and pointing ROUNDHOUSE_CONTROL_PLANE at it from a fleetless process is refused",
+    "at boot, naming acme's keys and the local capacity they do not have. The",
+    "refusal is the design working rather than a rough edge: what it buys is that",
+    "nobody ever runs a two-tier example whose cheap tier is empty on every turn",
+    "while the rationale blames the key's admission for it.",
     "Point ROUNDHOUSE_CONTROL_PLANE at your copy."
   ],
 
@@ -153,7 +170,7 @@
       "user": "ada",
       "key_sha256": "bd7419bcfc5b931146425c95c682a5194d389c26329672f651fc2eefbd9d95c1",
       "overrides": {
-        "min_quality": 0.8,
+        "min_quality": 0.6,
         "frontier_cadence": { "max_frontier": 1, "per_turns": 10 }
       }
     },

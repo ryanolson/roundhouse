@@ -185,7 +185,8 @@ use roundhouse_core::validate::{Validator, ValidatorConfig};
 use roundhouse_fleet::EchoFrontierClient;
 use roundhouse_mcp::ControlStore;
 use roundhouse_server::codex_launch::{
-    CONTEXT_WINDOW_TOKENS, CodexAuthKind, CodexLaunch, DEFAULT_KEY_ENV, skill_files,
+    CONTEXT_WINDOW_TOKENS, CodexAuthKind, CodexLaunch, DEFAULT_KEY_ENV, namespaced_tool_name,
+    skill_files,
 };
 use roundhouse_server::control_config::directory::key_id;
 use roundhouse_server::control_config::{MembershipRole, TURN_KEY_HEADER};
@@ -1811,6 +1812,119 @@ async fn a_real_codex_binary_completes_the_mcp_handshake_against_our_server() {
             tool["type"] == "namespace" && tool["name"] == roundhouse_server::DEFAULT_MCP_NAMESPACE
         }),
         "codex must offer the model our namespace: {tools:?}"
+    );
+
+    rig.clean();
+}
+
+/// G16: the delimiter a generated skill spells is the one the real binary
+/// joins a namespace with.
+///
+/// **What was missing, and why a unit test could not supply it.**
+/// `codex_launch::skills` builds every tool name a `SKILL.md` names as
+/// `{namespace}{delimiter}{tool}`, and the failure of getting either half
+/// wrong is silent: the model calls a name, gets "no such tool", and moves on.
+/// The namespace half was already pinned against the binary — the handshake
+/// test above asserts codex advertises `DEFAULT_MCP_NAMESPACE` — but the
+/// delimiter was pinned only by `skills.rs` asserting its own constant equals
+/// its own literal, which stays green through any upstream change.
+///
+/// **What this reads off the wire.** Codex builds an MCP namespace as
+/// `mcp{DELIMITER}{server}` from the `[mcp_servers.<key>]` table key
+/// (`codex-mcp/src/mcp/mod.rs:78-81` @ `e363b08`, using the same
+/// `MCP_TOOL_NAME_DELIMITER` constant that
+/// `core/src/tools/handlers/mcp.rs:53` joins a tool name with). So the
+/// delimiter is *recoverable* from what the binary sent us: take the namespace
+/// codex put in the request, remove the `mcp` prefix and the server key we
+/// configured, and what is left is the join codex used. The tool name is read
+/// off the same object. Only the *construction* is ours, which is the whole
+/// claim: a codex that moved to `mcp.roundhouse` yields `.` here and this goes
+/// red, where before nothing did.
+///
+/// **The limit, stated rather than glossed.** codex holds this literal in
+/// three places — `codex-mcp/src/mcp/mod.rs:62`, `codex-mcp/src/tools.rs:225`
+/// and `core/src/tools/handlers/mcp.rs:30` — and what is observed here is the
+/// namespace-building copy, not the tool-joining one. Observing the join
+/// itself would need codex to emit or accept a *flat* name, and at `e363b08`
+/// it does neither for this provider: `namespace_tools` is a provider
+/// capability that defaults on with no config knob
+/// (`model-provider/src/provider.rs:35-47`), the namespace object carries each
+/// tool under its **bare** name
+/// (`tools/src/responses_api.rs:107-114`, `.renamed(tool_name.name)`) — which
+/// this test's own `assert!` on `prefer` confirms from the wire — and no
+/// `tools/call` is producible in this rig at all (see the T7 ruling above).
+/// Three copies of one literal moving apart is a smaller risk than the one
+/// this closes, which was no executable tie to the binary of any kind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs the real codex binary: --features e2e-codex -- --include-ignored; ROUNDHOUSE_TEST_CODEX_BIN overrides PATH"]
+async fn the_delimiter_a_skill_spells_is_the_one_the_real_binary_namespaces_with() {
+    let rig = Rig::start("delimiter").await;
+    let run = rig.exec("Say the word alpha and stop.").await;
+    run.assert_completed("the delimiter run");
+
+    let turn = &rig.recorder.to("/v1/responses")[0];
+    let tools = turn.body.as_ref().expect("a JSON turn body")["tools"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let ours = tools
+        .iter()
+        .find(|tool| {
+            tool["type"] == "namespace" && tool["name"] == roundhouse_server::DEFAULT_MCP_NAMESPACE
+        })
+        .unwrap_or_else(|| panic!("codex must offer the model our namespace: {tools:?}"));
+    let namespace = ours["name"].as_str().expect("a namespace name");
+
+    // The server key as *codex* read it, out of the file this rig handed it,
+    // rather than as this test believes it to be. The key and the namespace
+    // are the two ends of the construction being checked, and taking one of
+    // them from our own constant would put the answer into the question.
+    let config = std::fs::read_to_string(rig.root.join("home/config.toml"))
+        .expect("the generated client config");
+    let server_key = config
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("[mcp_servers.")
+                .and_then(|rest| rest.strip_suffix(']'))
+        })
+        .expect("the generated config declares one MCP server");
+
+    let delimiter = namespace
+        .strip_prefix("mcp")
+        .and_then(|rest| rest.strip_suffix(server_key))
+        .unwrap_or_else(|| {
+            panic!(
+                "codex no longer builds an MCP namespace as `mcp<delimiter>{server_key}`: it \
+                 sent `{namespace}`. Every generated SKILL.md names tools under a construction \
+                 this binary does not use."
+            )
+        });
+
+    // The tool half, also off the wire: `prefer` is one of the tools the
+    // generated skills tell the model to call, and codex listed it here.
+    let listed: Vec<&str> = ours["tools"]
+        .as_array()
+        .map(|tools| {
+            tools
+                .iter()
+                .filter(|tool| tool["type"] == "function")
+                .filter_map(|tool| tool["name"].as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        listed.contains(&"prefer"),
+        "codex must list the tools our namespace serves, got {listed:?}"
+    );
+
+    assert_eq!(
+        namespaced_tool_name("prefer"),
+        format!("{namespace}{delimiter}prefer"),
+        "a generated skill names `{}` while this binary joins its namespace with `{delimiter}`; \
+         a skill that names a tool codex cannot resolve fails as a model that quietly calls \
+         nothing",
+        namespaced_tool_name("prefer")
     );
 
     rig.clean();

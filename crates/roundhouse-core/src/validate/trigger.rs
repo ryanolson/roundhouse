@@ -50,7 +50,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::session::SessionState;
-use crate::validate::exchange::{Exchange, exchanges};
+use crate::validate::exchange::{Exchange, exchanges, task_exchanges};
 use crate::validate::tool_signals::{ErrorSeverity, PureBashStreak};
 
 /// Which of the trigger's observations fired.
@@ -149,6 +149,25 @@ impl<'a> Evidence<'a> {
             turn_tokens: state.recent_turn_tokens(),
         }
     }
+
+    /// The exchanges that are the agent working on its task — every signal's
+    /// input (G04).
+    ///
+    /// A method on the shared read rather than a filter inside each signal, and
+    /// the difference is the finding: `NoProgressRepeat` was the limb that was
+    /// reported, but `PingPong` alternates just as happily between two control
+    /// tools, and a `fetch_steer` answered `NoGuidanceYet` reads as a failure to
+    /// [`reads_as_failure`](super::exchange::reads_as_failure) and feeds
+    /// [`ToolFailureStreak`]. Fixing the reported limb and leaving the others is
+    /// exactly what one shared read makes impossible.
+    ///
+    /// `exchanges` stays whole, because the brief still has to *render* what
+    /// happened: a judge reading a trajectory with our own calls silently
+    /// deleted would be shown a session that skips from one command to another
+    /// with no account of the gap.
+    pub fn task_exchanges(&self) -> Vec<&Exchange> {
+        task_exchanges(&self.exchanges)
+    }
 }
 
 /// One piece of evidence that a session is in trouble.
@@ -188,13 +207,8 @@ impl Signal for NoProgressRepeat {
     }
 
     fn detect(&self, evidence: &Evidence<'_>) -> Option<String> {
-        let window: Vec<&Exchange> = evidence
-            .exchanges
-            .iter()
-            .rev()
-            .take(self.window)
-            .rev()
-            .collect();
+        let task = evidence.task_exchanges();
+        let window = &task[task.len().saturating_sub(self.window)..];
         let latest = window.last()?;
         // An unanswered call is not a repeat of anything yet: the output is
         // half the comparison and it has not arrived.
@@ -232,10 +246,11 @@ impl Signal for PingPong {
 
     fn detect(&self, evidence: &Evidence<'_>) -> Option<String> {
         let span = self.cycles.checked_mul(2)?;
-        if span < 4 || evidence.exchanges.len() < span {
+        let task = evidence.task_exchanges();
+        if span < 4 || task.len() < span {
             return None;
         }
-        let names: Vec<&str> = evidence.exchanges[evidence.exchanges.len() - span..]
+        let names: Vec<&str> = task[task.len() - span..]
             .iter()
             .map(|call| call.name.as_str())
             .collect();
@@ -265,10 +280,11 @@ impl Signal for ToolFailureStreak {
     }
 
     fn detect(&self, evidence: &Evidence<'_>) -> Option<String> {
-        if self.length == 0 || evidence.exchanges.len() < self.length {
+        let task = evidence.task_exchanges();
+        if self.length == 0 || task.len() < self.length {
             return None;
         }
-        let tail = &evidence.exchanges[evidence.exchanges.len() - self.length..];
+        let tail = &task[task.len() - self.length..];
         // Answered *and* failed. An unanswered call is not a failure — the most
         // recent call of a turn still in flight would otherwise end every
         // streak in a fire.
@@ -536,11 +552,11 @@ mod tests {
     /// a fold of the conversation's own log, so two calls produce identical
     /// bytes"), which is exactly the shape this signal is built to catch. An
     /// agent that calls `status` three times with nothing else changing (a
-    /// legitimate idempotent poll of its own budget) reads as the same stuck
-    /// loop as three identical `pytest` failures. **Ignored**: this is the
-    /// claim, not the fix.
+    /// legitimate idempotent poll of its own budget) used to read as the same
+    /// stuck loop as three identical `pytest` failures. The signal reads
+    /// [`Evidence::task_exchanges`] now, and the control below is what proves
+    /// it still finds a real loop with our own calls sitting on top of it.
     #[test]
-    #[ignore = "G04: three identical reads of roundhouse's own control surface fire NoProgressRepeat exactly like a stuck agent loop"]
     fn three_identical_reads_of_our_own_surface_are_not_a_no_progress_repeat() {
         let signal = NoProgressRepeat {
             occurrences: 3,
@@ -557,6 +573,21 @@ mod tests {
             None,
             "an idempotent poll of roundhouse's own control surface is not a no-progress repeat"
         );
+
+        // Control, live: the same three polls with a real stuck loop *behind*
+        // them. The repeat is still found, which is what says the exemption
+        // dropped our calls from the walk rather than blinding the signal to
+        // whatever happens to sit at the end of it.
+        let mut mixed = Vec::new();
+        for n in 0..3 {
+            mixed.push(call(&format!("p{n}"), "pytest", r#"{"path":"tests/"}"#));
+            mixed.push(result(&format!("p{n}"), "ImportError: no module named app"));
+        }
+        mixed.extend(polling);
+        let fact = signal
+            .detect(&evidence_of(&mixed, &[]))
+            .expect("the pytest loop is still a loop with our own calls after it");
+        assert!(fact.contains("pytest"), "{fact}");
     }
 
     /// The sharpest of the four, and the one a naive implementation gets wrong.

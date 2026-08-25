@@ -81,7 +81,10 @@ use crate::routing::Target;
 
 pub use arm::{Arm, ArmShares, placebo_intervenes};
 pub use brief::{BriefConfig, BriefStep, Objective, ValidationBrief, trailing_user_request};
-pub use exchange::{Exchange, exchanges, exec_exit_code, tool_output_body};
+pub use exchange::{
+    CONTROL_TOOL_DELIMITER, CONTROL_TOOL_NAMESPACE, Exchange, exchanges, exec_exit_code,
+    is_control_call, task_exchanges, tool_output_body,
+};
 pub use handoff::{EXAMPLE_HANDOFF_NOTE, HANDOFF_MARKER, append_handoff_note};
 pub use prompt::judge_system_prompt;
 pub use tool_signals::{

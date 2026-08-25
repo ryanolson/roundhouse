@@ -391,19 +391,22 @@ mod tests {
 
         /// `true` for a routed turn that went to a hosted model.
         fn having_routed(mut self, dispatches: &[bool]) -> Self {
-            for &to_frontier in dispatches {
-                self.frontier_history.record(&if to_frontier {
-                    Target::Frontier {
-                        provider: "anthropic".into(),
-                        model: "claude".into(),
-                    }
-                } else {
-                    Target::Local {
-                        worker_id: 1,
-                        dp_rank: 0,
-                        model: "llama".into(),
-                    }
-                });
+            for (turn_index, &to_frontier) in dispatches.iter().enumerate() {
+                self.frontier_history.record(
+                    &if to_frontier {
+                        Target::Frontier {
+                            provider: "anthropic".into(),
+                            model: "claude".into(),
+                        }
+                    } else {
+                        Target::Local {
+                            worker_id: 1,
+                            dp_rank: 0,
+                            model: "llama".into(),
+                        }
+                    },
+                    turn_index as u64,
+                );
             }
             self
         }

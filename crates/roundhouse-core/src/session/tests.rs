@@ -126,7 +126,7 @@ async fn replaying_a_completed_turn_id_does_not_generate_twice() {
         .unwrap();
     let response_id = first.response_id().clone();
     session
-        .complete(&response_id, "hi there", Usage::default())
+        .complete(&response_id, "hi there", Usage::default(), None)
         .await
         .unwrap();
 
@@ -163,6 +163,7 @@ async fn an_interrupted_turn_is_retryable_rather_than_deduplicated() {
             "partial",
             IncompleteReason::OwnerLost,
             Usage::default(),
+            None,
         )
         .await
         .unwrap();
@@ -208,7 +209,7 @@ async fn the_settlement_projection_names_the_last_terminal_event_and_where_it_we
         ..Usage::default()
     };
     session
-        .complete(&first_id, "hi", billed.clone())
+        .complete(&first_id, "hi", billed.clone(), None)
         .await
         .unwrap();
 
@@ -254,6 +255,7 @@ async fn the_settlement_projection_names_the_last_terminal_event_and_where_it_we
             "",
             IncompleteReason::BudgetExhausted,
             Usage::default(),
+            None,
         )
         .await
         .unwrap();
@@ -350,6 +352,7 @@ async fn an_incomplete_response_records_its_dispatch_at_the_terminal_event() {
                 reasoning_tokens: 0,
                 ..Default::default()
             },
+            None,
         )
         .await
         .unwrap();
@@ -401,6 +404,7 @@ async fn an_incomplete_response_with_no_billed_input_leaves_the_target_cold() {
             "",
             IncompleteReason::UpstreamError,
             Usage::default(),
+            None,
         )
         .await
         .unwrap();
@@ -435,7 +439,7 @@ async fn a_successor_node_reconstructs_identical_state_from_the_log() {
         .await
         .unwrap();
     session
-        .complete(&response_id, "part one and two", Usage::default())
+        .complete(&response_id, "part one and two", Usage::default(), None)
         .await
         .unwrap();
 
@@ -484,7 +488,7 @@ async fn the_frontier_window_is_a_projection_a_successor_reconstructs() {
         // still spent its ration: the window is folded from `Routed`.
         if turn != 3 {
             session
-                .complete(&response_id, "a", Usage::default())
+                .complete(&response_id, "a", Usage::default(), None)
                 .await
                 .unwrap();
         }
@@ -946,7 +950,7 @@ async fn a_completed_item_carries_the_response_stamp_and_a_steer_looks_like_any_
         .unwrap();
     let ordinary_id = admission.response_id().clone();
     session
-        .complete(&ordinary_id, "an ordinary answer", Usage::default())
+        .complete(&ordinary_id, "an ordinary answer", Usage::default(), None)
         .await
         .unwrap();
     let ordinary = session.state().items.last().expect("committed").clone();
@@ -1051,7 +1055,10 @@ async fn routed_turn(session: &mut Session<MemoryStore>, turn: &str, tokens: u64
         ..Usage::default()
     };
     let billed = usage.total();
-    session.complete(&response_id, "done", usage).await.unwrap();
+    session
+        .complete(&response_id, "done", usage, None)
+        .await
+        .unwrap();
     billed
 }
 
@@ -1192,6 +1199,7 @@ async fn the_trigger_reads_projections_of_the_log_and_not_counters_beside_it() {
                 input_tokens: 100,
                 ..Usage::default()
             },
+            None,
         )
         .await
         .unwrap();
@@ -1477,6 +1485,7 @@ async fn only_the_turn_an_escalation_was_decided_on_reads_as_its_first() {
                 input_tokens: 100,
                 ..Usage::default()
             },
+            None,
         )
         .await
         .unwrap();
@@ -1570,7 +1579,7 @@ async fn the_turn_after_a_steer_is_the_one_that_fulfils_it_and_only_that_turn() 
         .expect("t2 is open")
         .clone();
     session
-        .complete(&response_id, "done", Usage::default())
+        .complete(&response_id, "done", Usage::default(), None)
         .await
         .unwrap();
 
@@ -1692,7 +1701,12 @@ async fn a_shadow_arms_steer_suppresses_nothing() {
     );
     session.record_control(record).await.unwrap();
     session
-        .complete(&response_id, "the turn ran unchanged", Usage::default())
+        .complete(
+            &response_id,
+            "the turn ran unchanged",
+            Usage::default(),
+            None,
+        )
         .await
         .unwrap();
 

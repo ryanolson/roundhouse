@@ -50,6 +50,30 @@
 //! `--provider` or a filter is how an operator stays under that without
 //! learning about it from a 429.
 //!
+//! # What the two files oblige an operator to do
+//!
+//! The fragment carries model identity and `quality_prior` and nothing else;
+//! the attribution OpenRouter requires when this data is republished lives in
+//! the provenance file alone, because a catalog entry is `deny_unknown_fields`
+//! and an attribution field on it would be a schema this project invented for
+//! somebody else's data. **So: republishing any number derived from an imported
+//! `quality_prior` means shipping the paired provenance file's citation with
+//! it.** That is not an abstract obligation — roundhouse's own savings
+//! dashboard is such a republication, since the routing saving is priced
+//! through the capability gate these priors feed. The server closes the loop by
+//! reading `quality-prior.provenance.json` if it sits beside the file
+//! `ROUNDHOUSE_CATALOG` names and rendering its citation under that figure; an
+//! operator who files the two apart gets no line and owes the attribution
+//! themselves.
+//!
+//! # What is refused, exactly
+//!
+//! An entry that can be attributed *neither* by `meta.citation` *nor* by its
+//! own `source` discriminator. A null `meta.citation` on its own is not a
+//! refusal: it is the ordinary multi-source response, which the schema says to
+//! attribute per item, and it is emitted with `"citation": null` beside each
+//! entry's `source`.
+//!
 //! Arguments are parsed by hand rather than with a CLI crate. Eight flags, all
 //! `--name value`, in a binary nothing else depends on — a dependency added
 //! here is one the whole workspace resolves against, which is the trade
@@ -155,7 +179,10 @@ async fn run() -> Result<(), String> {
     // travels with it, and an operator who never reads a README still sees this.
     println!(
         "The provenance file carries the attribution OpenRouter requires when this data is \
-         republished. Keep the two files together."
+         republished, and the fragment carries none -- republishing a number derived from \
+         these priors means shipping that citation with it. Keep the two files together, and \
+         put the provenance file beside the catalog ROUNDHOUSE_CATALOG names if you want the \
+         savings dashboard to cite it for you."
     );
     Ok(())
 }

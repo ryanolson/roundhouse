@@ -125,6 +125,83 @@ pub fn exchanges(items: &[Item]) -> Vec<Exchange> {
     exchanges
 }
 
+// ─── the agent's work, and our own control traffic ───────────────────────────
+
+/// The namespace codex flattens roundhouse's own MCP tools under.
+///
+/// The definition, not a copy: `roundhouse-server`'s
+/// `dialect::DEFAULT_MCP_NAMESPACE` re-exports this, and the server's rich doc
+/// about what an operator may rename lives there. It is stated *here* because
+/// the code that has to recognise a control call is below the server —
+/// [`ToolSignals`](super::ToolSignals) and the trigger's signals are in this
+/// crate and cannot see `roundhouse-server`. A second literal in this crate was
+/// the alternative and it fails in the direction that costs most: a rename
+/// would leave this classifier matching a name nothing emits, every control
+/// call would go back to reading as agent trouble, and nothing would be red.
+///
+/// **The one case this does not cover, stated rather than implied.** A
+/// deployment may set its own namespace (`ClientDialect`'s `namespace` field,
+/// written from file config in `control_config`), and this fold is pure — it
+/// takes a slice of exchanges and no deployment config. So a renamed
+/// deployment loses the exemption and gets today's behaviour back. Threading
+/// the dialect into the signal fold is what would close it, and it would put
+/// deployment configuration inside the one part of the validate loop that is a
+/// function of the session log alone. The unlock condition, for whoever wants
+/// it: a `SignalContext` carrying the dialect, passed everywhere
+/// `ToolSignals::from_exchanges` is called today.
+pub const CONTROL_TOOL_NAMESPACE: &str = "mcp__roundhouse";
+
+/// What codex puts between a namespace and a tool's own name.
+///
+/// `codex-mcp/src/mcp/mod.rs:78-81` @ `e363b08` builds the namespace as
+/// `mcp{DELIMITER}{server}{DELIMITER}` and `core/src/tools/handlers/mcp.rs:53`
+/// joins `{namespace}{DELIMITER}{name}`; [`CONTROL_TOOL_NAMESPACE`] is the
+/// `mcp{DELIMITER}{server}` half without the trailing delimiter.
+///
+/// One definition for two readers, which is the whole reason it is here rather
+/// than beside either of them: `codex_launch::skills` *renders* this join into
+/// every generated skill file, and this module has to *recognise* what comes
+/// back. Two literals could drift apart, and the drift is silent in both
+/// directions — a skill naming a tool codex cannot resolve, and a control call
+/// this classifier no longer recognises.
+pub const CONTROL_TOOL_DELIMITER: &str = "__";
+
+/// Whether this call is the agent talking to *us* rather than working on its
+/// task.
+///
+/// Matched on the namespace and the delimiter together, not on the namespace
+/// alone: a second MCP server called `roundhouse_extra` flattens to
+/// `mcp__roundhouse_extra__…`, which a bare `starts_with` would swallow into
+/// our own control traffic and quietly exempt somebody else's tools from every
+/// signal in the trigger.
+pub fn is_control_call(name: &str) -> bool {
+    name.strip_prefix(CONTROL_TOOL_NAMESPACE)
+        .and_then(|rest| rest.strip_prefix(CONTROL_TOOL_DELIMITER))
+        .is_some_and(|tool| !tool.is_empty())
+}
+
+/// The exchanges that are the agent working on its task.
+///
+/// **Roundhouse's own control calls are dropped, not re-categorised** (G04).
+/// Every signal in the trigger and every count in
+/// [`ToolSignals`](super::ToolSignals) asks a question about what the *agent*
+/// is doing, and an agent reading its own budget is not doing the task: a
+/// fifth `ToolCategory` would still leave `status`, `explain_last_route`,
+/// `prefer` and `set_quality_floor` inside the streaks, the windows and the
+/// depth that the signals are computed over — which is how four calls made
+/// because our own generated `rh-status` skill told the model to make them
+/// bought a judge side-call the session did not need.
+///
+/// A `Vec<&Exchange>` rather than a filtered clone because the outputs are
+/// whole tool results and this runs on the turn path; the borrowed view costs
+/// one pointer per call and the clone would cost the transcript.
+pub fn task_exchanges(exchanges: &[Exchange]) -> Vec<&Exchange> {
+    exchanges
+        .iter()
+        .filter(|exchange| !is_control_call(&exchange.name))
+        .collect()
+}
+
 /// The tool's own answer, with a codex wrapper header removed if it wrote one.
 ///
 /// **Why this lives here and not at the wire boundary.** Codex prepends a

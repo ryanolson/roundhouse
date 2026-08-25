@@ -20,7 +20,7 @@ use crate::event::{
 };
 use crate::ids::{ResponseId, SessionId, TurnId};
 use crate::item::Item;
-use crate::routing::{CacheLedger, DecisionRecord, ProviderPricing, Target};
+use crate::routing::{CacheLedger, DecisionRecord, DispatchAttempt, ProviderPricing, Target};
 use crate::store::{Lease, SessionStore, StoreError};
 use crate::validate::{Arm, EscalationOverrides, SteerAction};
 
@@ -186,6 +186,21 @@ pub struct TerminalSettlement {
     /// estimate is what a provider that reported nothing gets charged on, and
     /// it is charged exactly as a measurement would be.
     pub usage: Usage,
+    /// What the provider itself said the call cost, where it said anything.
+    ///
+    /// **Carried, and deliberately not settled against.** Every other field
+    /// here is an input to what this turn is *charged*; this one is the
+    /// external bill that charge is later reconciled against, and a settle that
+    /// reached for it would be checking the catalog's arithmetic against a
+    /// number the catalog did not produce. It rides here because a settle is
+    /// the one place that already holds the terminal event, not because it has
+    /// a use for it. See
+    /// [`SessionEventKind::ResponseCompleted::provider_reported_cost_usd`].
+    ///
+    /// `None` for an incomplete response, which by construction never carried
+    /// one: the price arrives on the stream's final frame, and a response that
+    /// terminated without one never saw it.
+    pub provider_reported_cost_usd: Option<f64>,
 }
 
 /// State derived from the event log.
@@ -230,10 +245,15 @@ pub struct SessionState {
     /// the knob is most supposed to hold.
     ///
     /// Since M10 a turn may write more than one `Routed` — one per dispatch, on
-    /// a decision that fell forward to a fallback — and this fold needs no
-    /// change to be right about it: a turn that reached for two hosted models
-    /// counted two reaches, which is the sentence above applied literally
-    /// rather than a special case bolted onto it.
+    /// a decision that fell forward to a fallback — and the *numerator* needs
+    /// no change to be right about it: a turn that reached for two hosted
+    /// models counted two reaches, which is the sentence above applied
+    /// literally rather than a special case bolted onto it. The **window** did
+    /// need one, and that was review finding G05: the projection groups its
+    /// entries by `turn_index` so a cadence's `per_turns` counts turns, not
+    /// dispatches. Ungrouped, a failover turn made the window shorter than the
+    /// operator wrote, aging an older hosted turn out early and relaxing the
+    /// ration on exactly the sessions that had been failing over.
     pub frontier_history: FrontierHistory,
     /// The most recent response to terminate, priced-ready.
     ///
@@ -459,7 +479,14 @@ impl SessionState {
                 response_id,
                 decision,
             } => {
-                self.frontier_history.record(&decision.chosen);
+                // Under this turn's index, which is what makes the cadence's
+                // `per_turns` a promise about turns: a decision that falls
+                // forward writes one `Routed` per dispatch, and all of them
+                // share the index because `turn_index` moves only at
+                // `TurnStarted`. See `FrontierHistory` on what a flat
+                // per-dispatch vector cost (review finding G05).
+                self.frontier_history
+                    .record(&decision.chosen, self.turn_index);
                 self.last_decision = Some(decision.clone());
                 // Held rather than recorded; see `pending_routings`.
                 self.pending_routings.insert(
@@ -474,7 +501,9 @@ impl SessionState {
                     },
                 );
             }
-            SessionEventKind::ResponseCompleted { response_id, usage }
+            SessionEventKind::ResponseCompleted {
+                response_id, usage, ..
+            }
             | SessionEventKind::ResponseIncomplete {
                 response_id, usage, ..
             } => {
@@ -520,6 +549,16 @@ impl SessionState {
                     budget_draw: routing.as_ref().and_then(|routing| routing.budget_draw),
                     target: routing.map(|routing| routing.target),
                     usage: usage.clone(),
+                    // Off the completed event only. An incomplete response
+                    // never reached the frame the price rides on, so `None`
+                    // here is the true reading rather than a lost value.
+                    provider_reported_cost_usd: match &event.kind {
+                        SessionEventKind::ResponseCompleted {
+                            provider_reported_cost_usd,
+                            ..
+                        } => *provider_reported_cost_usd,
+                        _ => None,
+                    },
                 });
 
                 // A turn is only settled once its response terminates, which is
@@ -1205,17 +1244,26 @@ impl<S: SessionStore> Session<S> {
     /// produced item and the terminal event in one append batch — is a property
     /// of *completing*, not of completing with a particular shape of item, and
     /// stating it twice is how the two spellings drift apart.
+    /// `provider_reported_cost_usd` is what the upstream said the call cost, on
+    /// the providers that say — see
+    /// [`SessionEventKind::ResponseCompleted::provider_reported_cost_usd`] for
+    /// why it is a sidecar rather than part of `usage`. It is a parameter here
+    /// and absent from [`Self::complete_with_item`] because only a *dispatched*
+    /// turn can have one: the other spelling completes a turn an interjector
+    /// answered, which reached no provider at all and so has no bill to report.
     pub async fn complete(
         &mut self,
         response_id: &ResponseId,
         text: impl Into<String>,
         usage: Usage,
+        provider_reported_cost_usd: Option<f64>,
     ) -> Result<(), SessionError> {
-        self.complete_with_item(
+        self.commit_completion(
             response_id,
             Item::assistant_text(text, response_id.clone()),
             usage,
             ControlRecord::default(),
+            provider_reported_cost_usd,
         )
         .await
     }
@@ -1272,6 +1320,24 @@ impl<S: SessionStore> Session<S> {
         usage: Usage,
         record: ControlRecord,
     ) -> Result<(), SessionError> {
+        // `None`, and it is a claim rather than a default: this spelling exists
+        // for the turn an interjector answered, which dispatched nothing, so
+        // there is no upstream to have reported a price. The dispatched turn's
+        // spelling one method up is the one that carries a figure.
+        self.commit_completion(response_id, item, usage, record, None)
+            .await
+    }
+
+    /// The one place a completion is committed, and the reason the two public
+    /// spellings cannot disagree about the batch they write.
+    async fn commit_completion(
+        &mut self,
+        response_id: &ResponseId,
+        item: Item,
+        usage: Usage,
+        record: ControlRecord,
+        provider_reported_cost_usd: Option<f64>,
+    ) -> Result<(), SessionError> {
         let item = Item {
             response_id: Some(response_id.clone()),
             ..item
@@ -1281,6 +1347,7 @@ impl<S: SessionStore> Session<S> {
         kinds.push(SessionEventKind::ResponseCompleted {
             response_id: response_id.clone(),
             usage,
+            provider_reported_cost_usd,
         });
         self.commit(kinds).await?;
         Ok(())
@@ -1310,12 +1377,20 @@ impl<S: SessionStore> Session<S> {
     /// The partial text is committed as an assistant item so the successor can
     /// resume from it. That partial is also, conveniently, a guaranteed cache
     /// hit on the target that produced it.
+    ///
+    /// `terminal_attempt` is the dispatch this failure *is*, when the failure
+    /// came from a target rather than from a refusal or a deadline — see
+    /// [`SessionEventKind::ResponseIncomplete::terminal_attempt`]. It is
+    /// carried here rather than derived from `usage` because a dispatch that
+    /// reached nobody has no usage to derive it from, which is precisely the
+    /// case it exists for.
     pub async fn mark_incomplete(
         &mut self,
         response_id: &ResponseId,
         partial: impl Into<String>,
         reason: IncompleteReason,
         usage: Usage,
+        terminal_attempt: Option<DispatchAttempt>,
     ) -> Result<(), SessionError> {
         let partial = partial.into();
         let mut kinds = Vec::with_capacity(2);
@@ -1328,6 +1403,7 @@ impl<S: SessionStore> Session<S> {
             response_id: response_id.clone(),
             reason,
             usage,
+            terminal_attempt,
         });
         self.commit(kinds).await?;
         Ok(())

@@ -414,14 +414,17 @@ impl ShadowPricing {
         &self.references
     }
 
-    /// Choose the correlary for one local model.
+    /// The capability gate itself, as one predicate two callers share.
     ///
-    /// `observed` carries the traffic shape measured for each hosted model in
-    /// the same window. A hosted model this deployment has never actually
-    /// called has no observed shape, so it cannot be inferred against — only
-    /// declared. That is the correct asymmetry: inference is an argument from
-    /// this deployment's own history, and there is no history for a model it
-    /// has never used.
+    /// Extracted rather than written twice: the two places a reference may be
+    /// chosen — a client's declared baseline and the shape-distance inference —
+    /// have to agree on what "comparable" means, and a second copy of the
+    /// comparison is exactly where they would stop agreeing. That divergence is
+    /// what review finding G01 was: the declared path had no copy at all.
+    fn within_capability_band(&self, reference: &ReferenceModel, local_quality_prior: f64) -> bool {
+        (reference.quality_prior - local_quality_prior).abs() <= self.capability_band
+    }
+
     /// The reference model a client's `model` field names, or `None`.
     ///
     /// Two spellings are accepted because two are in use: a bare model id, the
@@ -449,6 +452,13 @@ impl ShadowPricing {
 
     /// Choose the correlary for one local model.
     ///
+    /// `observed` carries the traffic shape measured for each hosted model in
+    /// the same window. A hosted model this deployment has never actually
+    /// called has no observed shape, so it cannot be inferred against — only
+    /// declared. That is the correct asymmetry: inference is an argument from
+    /// this deployment's own history, and there is no history for a model it
+    /// has never used.
+    ///
     /// `declared_baseline` is what this row's turns said they were talking to,
     /// where they all said the same thing — see
     /// [`DeclaredBaseline`](super::fold::DeclaredBaseline). It sits *below* an
@@ -459,6 +469,20 @@ impl ShadowPricing {
     /// names no model this deployment has a rate card for is not an error and
     /// not a silent upgrade — the row prices through inference, and the basis
     /// says `inferred`, which is the true account of what happened.
+    ///
+    /// **A baseline that names a model the capability gate refuses is refused,
+    /// not inferred around.** `declared_baseline` arrives from an untrusted
+    /// request field, so it buys ordering against the other two sources and
+    /// nothing else — the gate that stops a 7B row being priced against a
+    /// flagship by shape argument has to stop it being priced against one by
+    /// spelling, or the number improves the more absurd the claim is. An
+    /// operator's [`Self::declare`] is exempt and stays exempt: it is a
+    /// procurement decision this deployment wrote down, and the whole reason
+    /// the two are separate fields is that one of them is a claim by somebody
+    /// we do not control. Falling through to inference on refusal would answer
+    /// a claim the caller made with a number about a different model and label
+    /// it `inferred`, which is why the refusal is [`Correlary::Unpriced`]
+    /// naming both the model and the verdict instead.
     pub fn resolve(
         &self,
         local_model: &str,
@@ -497,6 +521,20 @@ impl ShadowPricing {
         if let Some(named) = declared_baseline
             && let Some(reference) = self.reference_named(named)
         {
+            // The same gate the inference path below runs, run here too, and
+            // run *before* the answer is chosen rather than after. See this
+            // function's doc: the claim comes off a request field, so it orders
+            // against `declare` and inference and buys nothing else.
+            if !self.within_capability_band(reference, local_quality_prior) {
+                return unpriced(
+                    local_model,
+                    format!(
+                        "the request's `model` field named `{named}`, whose quality prior \
+                         {:.2} is more than {:.2} from {local_model}'s {:.2}",
+                        reference.quality_prior, self.capability_band, local_quality_prior
+                    ),
+                );
+            }
             return Correlary::Priced {
                 local_model: local_model.to_string(),
                 reference: reference.clone(),
@@ -518,7 +556,7 @@ impl ShadowPricing {
         let comparable: Vec<&ReferenceModel> = self
             .references
             .iter()
-            .filter(|r| (r.quality_prior - local_quality_prior).abs() <= self.capability_band)
+            .filter(|r| self.within_capability_band(r, local_quality_prior))
             .collect();
         if comparable.is_empty() {
             return unpriced(
@@ -812,6 +850,65 @@ mod tests {
             0.0,
             "an unpriced correlary must contribute nothing to the saving"
         );
+
+        // G01: the declared path runs the same gate, both ways. A baseline the
+        // gate accepts prices as `Declared` — the client's claim is answered,
+        // not dropped — and one it refuses is `Unpriced`, never a quiet
+        // downgrade to `Inferred` against some other model.
+        let near = pricer.resolve(
+            "tiny-7b",
+            0.93,
+            local,
+            &observed,
+            Some("anthropic/flagship"),
+        );
+        assert!(
+            matches!(
+                near,
+                Correlary::Priced {
+                    basis: PricedBasis::Declared { .. },
+                    ..
+                }
+            ),
+            "a declared baseline inside the band still prices as declared: {near:?}"
+        );
+        let far = pricer.resolve(
+            "tiny-7b",
+            0.35,
+            local,
+            &observed,
+            Some("anthropic/flagship"),
+        );
+        let Correlary::Unpriced { reason, .. } = &far else {
+            panic!("a declared baseline outside the band must not price: {far:?}");
+        };
+        assert!(
+            reason.contains("anthropic/flagship") && reason.contains("0.35"),
+            "the refusal names the model the client declared and the gate's own \
+             verdict, so the caller's claim is answered rather than ignored: {reason}"
+        );
+
+        // The control that keeps the asymmetry from being "fixed" away: an
+        // *operator's* declaration of the identical absurd pairing still
+        // prices. Config is a procurement decision this deployment wrote down;
+        // a request field is a claim by somebody it does not control, and that
+        // difference is the whole reason the two are separate inputs.
+        let declared_by_operator = ShadowPricing::new(vec![reference(
+            "anthropic",
+            "flagship",
+            0.95,
+        )])
+        .declare("tiny-7b", "anthropic", "flagship", "procurement says so");
+        assert!(
+            matches!(
+                declared_by_operator.resolve("tiny-7b", 0.35, local, &observed, None),
+                Correlary::Priced {
+                    basis: PricedBasis::Declared { .. },
+                    ..
+                }
+            ),
+            "an operator's declare() is exempt from the gate and stays exempt"
+        );
     }
 
     /// G12 (review finding, control half): `import-benchmarks`'s
@@ -867,10 +964,6 @@ mod tests {
     /// close for shape-based inference, reopened for anything spelled as a
     /// declaration instead of inferred from traffic.
     #[test]
-    #[ignore = "G01: declared_baseline (client-controlled, responses_api.rs:296) hits the \
-                early return in resolve() before the capability gate at pricing.rs:517-530 \
-                runs, so an untrusted request field can price a 7B local model at flagship \
-                rates -- panics naming the flagship reference instead of returning Unpriced"]
     fn a_declared_baseline_does_not_buy_a_way_past_the_capability_gate() {
         let observed = shapes(&[(
             "anthropic",

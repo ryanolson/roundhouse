@@ -76,6 +76,102 @@ pub struct CatalogConfig {
     /// How far apart two models' quality priors may be and still be compared.
     #[serde(default = "default_capability_band")]
     pub capability_band: f64,
+    /// The citation for imported `quality_prior`s, if a provenance file was
+    /// found beside this catalog. Never read from the catalog JSON itself —
+    /// see [`quality_prior_citation`].
+    #[serde(skip)]
+    pub quality_prior_citation: Option<String>,
+}
+
+/// What `import-benchmarks` writes beside the fragment, under its default name.
+const PROVENANCE_FILE: &str = "quality-prior.provenance.json";
+
+/// The attribution for imported quality priors, discovered beside the catalog.
+///
+/// **Why the server reads a file nobody named it.** `import-benchmarks` sources
+/// `quality_prior` from OpenRouter's published index, which requires
+/// attribution when the data is republished — and roundhouse republishes
+/// figures derived from it: the savings dashboard's routing saving is priced
+/// through the capability gate those priors feed. The fragment the tool emits
+/// cannot carry the attribution (a catalog entry is `deny_unknown_fields`, and
+/// inventing a field there would put somebody else's schema into every
+/// catalog), so the obligation lives in the paired provenance file. Reading it
+/// here is what turns "keep the two files together" from an instruction into
+/// something the deployment does on the operator's behalf (M10 review G12).
+///
+/// **The convention is the tool's own default filename**, `--provenance`'s
+/// default and what the README tells an operator to keep beside the catalog. A
+/// deployment that renamed the file on the command line is not discovered and
+/// gets no line — deliberately, since guessing at other names would mean
+/// parsing every JSON file in the catalog's directory to see whether it looks
+/// like provenance, and a heuristic that reads unrelated files is a worse
+/// answer than a convention written down in two places.
+///
+/// **Discovered, therefore never fatal.** [`CatalogConfig::load`] is
+/// load-or-die because an operator named that path; nothing named this one, so
+/// a missing file yields no citation and no complaint, and a malformed or
+/// unattributed one yields a warning and no citation. The alternative — a parse
+/// error here stopping the process — would let a stray file in a directory take
+/// a deployment down, which is a much worse failure than an uncited figure.
+fn quality_prior_citation(catalog_path: &Path) -> Option<String> {
+    let path = catalog_path.parent()?.join(PROVENANCE_FILE);
+    let json = std::fs::read_to_string(&path).ok()?;
+    let document: serde_json::Value = match serde_json::from_str(&json) {
+        Ok(document) => document,
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "a quality-prior provenance file sits beside the catalog but does not parse;                  the savings figure will be published without its citation"
+            );
+            return None;
+        }
+    };
+    let meta = &document["meta"];
+    // The response's own citation when it named one. When it did not — the
+    // ordinary multi-source case — the schema says to attribute per item, so
+    // the line names the publishers the entries were attributed to instead.
+    // Deduplicated and ordered by first appearance rather than sorted: the
+    // provenance file's own entry order is what an operator reading the file
+    // beside the dashboard sees.
+    let attribution = match meta["citation"].as_str().filter(|c| !c.trim().is_empty()) {
+        Some(citation) => citation.to_string(),
+        None => {
+            let mut sources: Vec<&str> = Vec::new();
+            for entry in document["entries"].as_array().into_iter().flatten() {
+                if let Some(source) = entry["attribution"]["source"]
+                    .as_str()
+                    .filter(|s| !s.trim().is_empty())
+                    && !sources.contains(&source)
+                {
+                    sources.push(source);
+                }
+            }
+            if sources.is_empty() {
+                tracing::warn!(
+                    path = %path.display(),
+                    "the quality-prior provenance file beside the catalog carries no citation                      and no per-entry source, so there is nothing to attribute with"
+                );
+                return None;
+            }
+            format!("attributed per source: {}", sources.join(", "))
+        }
+    };
+    // The dataset's own version and date, appended when present: a citation
+    // without them re-reads as current the day the upstream leaderboard moves,
+    // which is exactly the failure `CLAUDE.md` asks an imported index to be
+    // stamped against.
+    let stamp = [meta["version"].as_str(), meta["as_of"].as_str()]
+        .into_iter()
+        .flatten()
+        .filter(|value| !value.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(", as of ");
+    Some(if stamp.is_empty() {
+        attribution
+    } else {
+        format!("{attribution} ({stamp})")
+    })
 }
 
 /// A value the capability gate compares must live on the scale the gate is
@@ -98,6 +194,25 @@ fn unit_interval(
         expected: "the capability scale is 0.0..=1.0",
     })
 }
+
+/// The one provider whose model ids carry a documented rolling-pointer form.
+///
+/// Scoped by provider name rather than applied to every entry, because `~` is
+/// an alias marker only in OpenRouter's id vocabulary: every other provider's
+/// model id is an opaque string, and a blanket shape rule would refuse a
+/// legitimate id for resembling somebody else's convention (M10 review G17).
+///
+/// **The cost of the narrow rule, written down rather than discovered.** A
+/// deployment that names its OpenRouter definition something else — `"or"`,
+/// `"router"` — writes ids this check never reads, and the `$comment` in
+/// `examples/catalog.example.json` stays their only defence. Widening it to
+/// match on `base_url` was the alternative and is worse: the refusal would then
+/// depend on a field the message does not name, so an operator who renamed the
+/// provider would be told their model id is wrong by a check keyed on their URL.
+const ROLLING_ALIAS_PROVIDER: &str = "openrouter";
+
+/// What OpenRouter prefixes an id with when it means "whatever is newest".
+const ROLLING_ALIAS_MARKER: char = '~';
 
 fn default_local_quality() -> f64 {
     0.5
@@ -152,6 +267,22 @@ pub enum CatalogError {
         local_model: String,
         provider: String,
         model: String,
+    },
+    #[error(
+        "catalog `{path}`: `{provider}/{model}` names a rolling pointer rather than a model. \
+         `{provider}` re-points a `~`-prefixed alias whenever it likes, and this catalog has no \
+         mechanism to re-resolve one: the price beside it was quoted for whatever the alias meant \
+         the day it was written, so every turn after a re-point is dispatched on one model and \
+         priced on another, and the dashboard reports the difference as a saving. Write the full \
+         dated id you mean -- `{suggestion}` if that is still the model you want"
+    )]
+    RollingModelAlias {
+        path: String,
+        provider: String,
+        model: String,
+        /// The same id with the alias marker gone, so the message ends in
+        /// something an operator can paste and then date, rather than in advice.
+        suggestion: String,
     },
     #[error(
         "catalog `{path}`: `{provider}/{model}` names a provider nothing defines. Add a \
@@ -253,6 +384,32 @@ impl CatalogConfig {
                     path: path.to_string(),
                     provider: spec.provider.clone(),
                     model: spec.model.clone(),
+                });
+            }
+
+            // The fourth way one line of this file silently mis-prices a turn,
+            // and until now the only one left to prose. A duplicate identity,
+            // a negative rate and an off-scale prior are all refused here
+            // because each resolves differently on the two sides of the
+            // process; a rolling alias resolves consistently and then *moves*,
+            // which is the same defect with a delay — the rate card stays
+            // beside an id that no longer means what it meant, and the
+            // dashboard reports the gap as a saving. Refused rather than
+            // warned, for the reason `UndefinedProvider` is: the catalog is the
+            // one place the ambiguity is still cheap to remove, and a warning
+            // at load is read once and then scrolled past for the life of the
+            // deployment.
+            if spec.provider == ROLLING_ALIAS_PROVIDER
+                && spec.model.starts_with(ROLLING_ALIAS_MARKER)
+            {
+                return Err(CatalogError::RollingModelAlias {
+                    path: path.to_string(),
+                    provider: spec.provider.clone(),
+                    model: spec.model.clone(),
+                    suggestion: spec
+                        .model
+                        .trim_start_matches(ROLLING_ALIAS_MARKER)
+                        .to_string(),
                 });
             }
 
@@ -378,7 +535,12 @@ impl CatalogConfig {
             path: display.clone(),
             source,
         })?;
-        Self::from_json(&json, &display)
+        let mut config = Self::from_json(&json, &display)?;
+        // Read here rather than in `from_json`: the citation is a fact about
+        // where this file *is*, and `from_json` is the boundary tests hand a
+        // string with no path behind it.
+        config.quality_prior_citation = quality_prior_citation(path);
+        Ok(config)
     }
 
     pub fn catalog(&self) -> StaticFrontierCatalog {
@@ -407,6 +569,11 @@ impl CatalogConfig {
             MetricsConfig::new(pricing).with_default_local_quality(self.default_local_quality);
         for (model, prior) in &self.local_quality {
             config = config.with_local_quality(model, *prior);
+        }
+        // The attribution travels with the priors, into the one document that
+        // republishes a figure derived from them.
+        if let Some(citation) = &self.quality_prior_citation {
+            config = config.with_quality_prior_citation(citation);
         }
         config
     }
@@ -690,45 +857,93 @@ mod tests {
     /// is a rolling pointer OpenRouter may re-point at any time, and that the
     /// catalog "has no mechanism to re-resolve it later" — but `validate`
     /// never inspects the shape of `spec.model` at all, so that discipline is
-    /// prose, not a check. This asserts the load either refuses a tilde-alias
-    /// id or at least surfaces it, which is what "has no mechanism" should not
-    /// mean if the rule mattered enough to state.
+    /// prose, not a check. This asserts the load refuses a tilde-alias id,
+    /// which is what "has no mechanism to re-resolve it later" has to mean if
+    /// the rule mattered enough to state.
+    ///
+    /// **Refusal, provider-scoped.** The ruling on G17 was between refuse, warn
+    /// and accept; refuse is what the three neighbouring identity checks already
+    /// do, and the scope is `openrouter` alone because `~` is a marker in that
+    /// provider's id vocabulary and nobody else's — see
+    /// [`ROLLING_ALIAS_PROVIDER`]. The controls below are what keep this from
+    /// becoming a blanket shape rule over every provider's ids.
     #[test]
-    #[ignore = "G17: validate() never inspects the shape of spec.model, so a \
-                tilde-alias (rolling pointer) loads silently with no refusal \
-                and no warning -- fixing this is a design ruling (refuse vs. \
-                warn vs. allow-with-audit-log), not a mechanical patch, so it \
-                is left as evidence rather than fixed here"]
     fn a_rolling_alias_is_named_at_load() {
-        let with_alias = format!(
-            r#"{{
-              "providers": {{ "openrouter": {{
-                "base_url": "https://openrouter.ai/api/v1",
-                "routes": {{ "responses": "/responses" }},
-                "auth": {{ "env": "OPENROUTER_API_KEY" }}
-              }} }},
-              "models": [{{
-                "provider": "openrouter",
-                "model": "~deepseek/deepseek-v4-flash-latest",
-                "wire_protocol": "openai_responses",
-                "cache_model": {{ "kind": "deterministic", "ttl_ms": 300000 }},
-                "pricing": {{
-                  "input_per_mtok_usd": 1.0,
-                  "cached_input_per_mtok_usd": 0.1,
-                  "cache_write_per_mtok_usd": 0.0,
-                  "output_per_mtok_usd": 4.0
-                }},
-                "quality_prior": 0.7,
-                "base_ttft_ms": 300.0,
-                "ttft_ms_per_uncached_token": 0.001
-              }}]
-            }}"#
+        /// One entry, parameterized on the two fields this check reads. The
+        /// definition below is named after whichever provider the entry claims,
+        /// so a provider rename moves both halves together and the controls
+        /// differ from the probe in exactly the string under test.
+        fn one_model(provider: &str, model: &str) -> String {
+            format!(
+                r#"{{
+                  "providers": {{ "{provider}": {{
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "routes": {{ "responses": "/responses" }},
+                    "auth": {{ "env": "OPENROUTER_API_KEY" }}
+                  }} }},
+                  "models": [{{
+                    "provider": "{provider}",
+                    "model": "{model}",
+                    "wire_protocol": "openai_responses",
+                    "cache_model": {{ "kind": "deterministic", "ttl_ms": 300000 }},
+                    "pricing": {{
+                      "input_per_mtok_usd": 1.0,
+                      "cached_input_per_mtok_usd": 0.1,
+                      "cache_write_per_mtok_usd": 0.0,
+                      "output_per_mtok_usd": 4.0
+                    }},
+                    "quality_prior": 0.7,
+                    "base_ttft_ms": 300.0,
+                    "ttft_ms_per_uncached_token": 0.001
+                  }}]
+                }}"#
+            )
+        }
+
+        let error = CatalogConfig::from_json(
+            &one_model("openrouter", "~deepseek/deepseek-v4-flash-latest"),
+            "test",
+        )
+        .expect_err(
+            "a rolling-pointer model id mis-prices every turn after OpenRouter re-points it, \
+             same as a duplicate identity or an off-scale prior",
         );
-        let error = CatalogConfig::from_json(&with_alias, "test")
-            .expect_err("a rolling-pointer model id mis-prices every turn after OpenRouter re-points it, same as a duplicate identity or an off-scale prior");
         assert!(
-            matches!(&error, CatalogError::InvalidValue { field, .. } if *field == "model"),
+            matches!(
+                &error,
+                CatalogError::RollingModelAlias { model, .. }
+                    if model == "~deepseek/deepseek-v4-flash-latest"
+            ),
             "{error}"
         );
+        // The remedy in the message, not just the diagnosis: an operator reads
+        // this in a boot log and needs the id to paste and then date.
+        assert!(
+            error
+                .to_string()
+                .contains("deepseek/deepseek-v4-flash-latest`"),
+            "the refusal must end in the id with the marker gone: {error}"
+        );
+
+        // CONTROL 1: the same provider with the full dated id the example's own
+        // `$comment` tells an operator to write. One character different, and it
+        // loads — which is what makes the refusal about the alias marker rather
+        // than about OpenRouter or about slashes in an id.
+        CatalogConfig::from_json(
+            &one_model("openrouter", "deepseek/deepseek-v4-flash-0731"),
+            "test",
+        )
+        .expect("a frozen dated snapshot is exactly what this check is asking for");
+
+        // CONTROL 2: the identical alias-shaped id under a provider that is not
+        // OpenRouter. `~` means "whatever is newest" in one provider's id
+        // vocabulary and is an ordinary character everywhere else, so refusing
+        // it here would be this boundary inventing a rule for a file it cannot
+        // read — see `ROLLING_ALIAS_PROVIDER`.
+        CatalogConfig::from_json(
+            &one_model("some-other-gateway", "~deepseek/deepseek-v4-flash-latest"),
+            "test",
+        )
+        .expect("another provider's ids are opaque strings and not ours to shape-check");
     }
 }

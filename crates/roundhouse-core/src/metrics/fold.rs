@@ -157,6 +157,24 @@ pub(super) struct Counters {
     /// fallback quietly carries the traffic — which, without this, looks
     /// identical to a recipe whose first entry was never picked.
     pub(super) failed_attempts: u64,
+    /// Summed over this row's calls: what the providers themselves said those
+    /// calls cost.
+    ///
+    /// **Not a part of any dollar figure here and never added into one.** Every
+    /// other dollar in this struct is priced from the catalog, which is the
+    /// number a savings claim is computed from; this is the external bill that
+    /// claim is *checked against*. Summing them would make the reconciliation
+    /// view's drift a comparison of a number with itself, which is the one
+    /// thing that view exists not to do.
+    pub(super) provider_reported_usd: f64,
+    /// How many of [`Self::calls`] reported a price at all.
+    ///
+    /// The discriminator, and it is why the sum above is not published bare: a
+    /// row where no provider reported anything and a row where one reported
+    /// zero dollars are both `0.0`, and only the second is a figure. Most
+    /// providers report nothing, so without this the view would publish a
+    /// confident `$0.00` for almost every deployment.
+    pub(super) provider_reported_calls: u64,
     /// What this row's turns declared they were talking to.
     ///
     /// Only meaningful on a local row, which is the only place a counterfactual
@@ -262,6 +280,8 @@ impl Counters {
         self.side_calls += other.side_calls;
         self.abandoned_side_calls += other.abandoned_side_calls;
         self.failed_attempts += other.failed_attempts;
+        self.provider_reported_usd += other.provider_reported_usd;
+        self.provider_reported_calls += other.provider_reported_calls;
         self.declared_baseline.absorb(&other.declared_baseline);
     }
 }
@@ -627,13 +647,64 @@ impl MetricsFold {
                     },
                 );
             }
-            SessionEventKind::ResponseCompleted { response_id, usage }
+            SessionEventKind::ResponseCompleted {
+                response_id, usage, ..
+            }
             | SessionEventKind::ResponseIncomplete {
                 response_id, usage, ..
             } => {
+                // The turn's own last dead dispatch, booked before anything
+                // else in this arm and outside every gate below it.
+                //
+                // **Unconditionally, and that is the whole of review finding
+                // G03.** Every other failed attempt arrives on the `Routed` of
+                // the dispatch it caused, above; this one caused none, so it
+                // rides the terminal event instead. Gating it on `pending` or
+                // on `consumed` — the two guards the settle path below needs —
+                // would drop exactly the attempts it exists for, since a
+                // dispatch that reached nobody has no usage and a turn whose
+                // recipe is exhausted is the case where the last target is the
+                // only one the client's error names. A single-provider
+                // deployment in an outage reported an empty `failed_attempts`
+                // for the whole outage: inverted at the moment it matters.
+                if let SessionEventKind::ResponseIncomplete {
+                    terminal_attempt: Some(attempt),
+                    ..
+                } = &event.kind
+                {
+                    self.by_principal
+                        .entry(payer.clone())
+                        .or_default()
+                        .entry(ModelKey::from_target(&attempt.target))
+                        .or_default()
+                        .failed_attempts += 1;
+                }
                 // Settled: this response is nobody's open turn any more.
                 if let Some(turn_id) = self.turn_of_response.remove(response_id) {
                     self.response_of_turn.remove(&turn_id);
+                }
+                // The provider's own figure for this call, accumulated on the
+                // row that made it and **never on the row's dollars**. It is
+                // the external bill the reconciliation view checks
+                // `frontier_spend_usd` against, so adding the two would be the
+                // view comparing a number with itself. Booked before the
+                // `consumed` gate for the same reason the attempt above is: a
+                // provider that reported a price reported one whatever this
+                // deployment's own evidence rule makes of the tokens.
+                if let SessionEventKind::ResponseCompleted {
+                    provider_reported_cost_usd: Some(cost_usd),
+                    ..
+                } = &event.kind
+                    && let Some(pending) = self.pending.get(response_id)
+                {
+                    let counters = self
+                        .by_principal
+                        .entry(payer.clone())
+                        .or_default()
+                        .entry(pending.key.clone())
+                        .or_default();
+                    counters.provider_reported_usd += cost_usd;
+                    counters.provider_reported_calls += 1;
                 }
                 let Some(pending) = self.pending.remove(response_id) else {
                     return true;
@@ -1111,6 +1182,37 @@ pub(super) mod tests {
             )
         }
 
+        /// The same turn, on a provider that reports what it charged.
+        ///
+        /// A separate method for `seat_turn`'s reason: every fixture that
+        /// predates the sidecar is a fixture whose upstream said nothing, and
+        /// that is a statement about those logs rather than a defaulted
+        /// argument.
+        pub(crate) fn turn_costing(
+            &mut self,
+            response: &str,
+            target: Target,
+            usage: Usage,
+            provider_reported_cost_usd: f64,
+        ) -> &mut Self {
+            self.turn(response, target.clone(), Vec::new(), usage.clone());
+            // Rewrite the completion this just wrote rather than duplicating
+            // the whole builder: the only difference is the sidecar, and a
+            // second copy of the decision record is a second thing to keep in
+            // step with the first.
+            for event in self.events.iter_mut().rev() {
+                if let SessionEventKind::ResponseCompleted {
+                    provider_reported_cost_usd: slot,
+                    ..
+                } = &mut event.kind
+                {
+                    *slot = Some(provider_reported_cost_usd);
+                    break;
+                }
+            }
+            self
+        }
+
         fn turn_billed(
             &mut self,
             billing: Billing,
@@ -1145,7 +1247,11 @@ pub(super) mod tests {
                     attempts: Vec::new(),
                 },
             });
-            self.push(SessionEventKind::ResponseCompleted { response_id, usage });
+            self.push(SessionEventKind::ResponseCompleted {
+                response_id,
+                usage,
+                provider_reported_cost_usd: None,
+            });
             self
         }
 
@@ -1183,7 +1289,11 @@ pub(super) mod tests {
                     attempts: Vec::new(),
                 },
             });
-            self.push(SessionEventKind::ResponseCompleted { response_id, usage });
+            self.push(SessionEventKind::ResponseCompleted {
+                response_id,
+                usage,
+                provider_reported_cost_usd: None,
+            });
             self
         }
 
@@ -1290,6 +1400,7 @@ pub(super) mod tests {
             response_id: ResponseId::new("r2"),
             reason: IncompleteReason::UpstreamError,
             usage: Usage::default(),
+            terminal_attempt: None,
         });
 
         let mut fold = MetricsFold::new();

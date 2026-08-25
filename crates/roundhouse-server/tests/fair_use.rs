@@ -551,23 +551,11 @@ async fn a_member_ceiling_refuses_over_the_wire_while_the_project_has_room() {
 /// its retry budget" is not what happens.
 ///
 /// This is the hermetic mirror the finding proposed: no real codex binary, no
-/// network -- asserts the *fixed* behavior (a 429 codex would classify as
-/// `UsageLimitReached`) and fails today because that is not what we send.
-/// Ignored per CLAUDE.md: ruled, not fixed here -- see the `#[ignore]` reason.
+/// network -- it decodes our own refusal with codex's own struct and asserts
+/// both halves codex acts on, the classification (`type`) and the time
+/// (`resets_at`). Fixed in the G10 pass: `refuse_over_fair_use` now sends both
+/// beside our existing fields.
 #[tokio::test]
-#[ignore = "G10 (partially valid: real defect, wrong stated mechanism -- see \
-            doc comment): our 429 sends `error.code`, not `error.type`, so \
-            codex's `map_api_error` (pin 6344a655 == e363b08, \
-            codex-api/src/api_bridge.rs) never matches \
-            `Some(\"usage_limit_reached\")` and classifies it \
-            `CodexErr::RetryLimit` on the first attempt -- NOT, as the \
-            finding states, after exhausting a backoff budget: `retry_429` is \
-            hardcoded `false` at every RetryConfig construction site in the \
-            pinned tree, so codex never retries a 429 at all. Either way \
-            window/retry_at_ms are discarded. Fixing this test (send an \
-            `error.type: \"usage_limit_reached\"` + `resets_at` (unix \
-            seconds) alongside our existing fields) is production code, out \
-            of scope for a refute stage."]
 async fn the_fair_use_429_body_decodes_as_the_shape_codex_treats_specially() {
     /// Mirrors `codex-api::api_bridge::UsageErrorResponse` /
     /// `UsageErrorBody` at pin `6344a655a5966f92e009a74928fb0559b41f9093`
@@ -581,7 +569,6 @@ async fn the_fair_use_429_body_decodes_as_the_shape_codex_treats_specially() {
     struct UsageErrorBody {
         #[serde(rename = "type")]
         error_type: Option<String>,
-        #[allow(dead_code)]
         resets_at: Option<i64>,
     }
 
@@ -613,9 +600,11 @@ async fn the_fair_use_429_body_decodes_as_the_shape_codex_treats_specially() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-    // No `Retry-After` either, though codex's own retry loop never reads one
-    // (`codex-client/src/retry.rs` backoff takes no header input at all) --
-    // that half of the finding is about a generic HTTP client, not codex.
+    // Deliberately no `Retry-After` assertion: codex's retry loop
+    // (`codex-client/src/retry.rs`) takes no server-supplied time at all and
+    // never retries a 429 in the first place, so a header would be aimed at a
+    // reader that does not exist. That half of the finding is about a generic
+    // HTTP client, not about the client this test speaks for.
 
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     let text = String::from_utf8(bytes.to_vec()).unwrap();
@@ -633,10 +622,32 @@ async fn the_fair_use_429_body_decodes_as_the_shape_codex_treats_specially() {
     assert_eq!(
         decoded.error.error_type.as_deref(),
         Some("usage_limit_reached"),
-        "G10: our 429 body has no `error.type` field (we send `error.code` \
-         instead), so codex's own check in `map_api_error` is false and this \
-         429 is routed to `CodexErr::RetryLimit` instead of \
-         `CodexErr::UsageLimitReached` -- window/retry_at_ms are invisible to \
-         codex's own error handling: {text}"
+        "G10: without an `error.type` field codex's own check in \
+         `map_api_error` is false and this 429 is routed to \
+         `CodexErr::RetryLimit` instead of `CodexErr::UsageLimitReached` -- \
+         window/retry_at_ms are then invisible to codex's error handling: \
+         {text}"
+    );
+
+    // The other half of the finding, and the half a `type`-only fix would
+    // leave broken: codex reads *when* from `error.resets_at`, in unix
+    // seconds. Our own `retry_at_ms` is the same instant in milliseconds, so
+    // the two must agree -- and agree by rounding up, because `retry_at_ms` is
+    // a floor and a truncated second sends codex back before the window has
+    // room.
+    let value: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    let retry_at_ms = value["error"]["retry_at_ms"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("the refusal keeps naming the earliest retry in ms: {text}"));
+    assert_eq!(
+        decoded.error.resets_at,
+        Some(i64::try_from(retry_at_ms.div_ceil(1_000)).expect("an epoch second fits an i64")),
+        "G10: `error.resets_at` must carry the same instant as `retry_at_ms`, \
+         rounded up to the whole second codex parses -- a 429 codex classifies \
+         but cannot time is a 429 it can only guess at: {text}"
+    );
+    assert!(
+        retry_at_ms > 0,
+        "a refusal with no retry time would make the assertion above vacuous: {text}"
     );
 }

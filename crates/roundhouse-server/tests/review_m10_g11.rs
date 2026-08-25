@@ -70,20 +70,18 @@ impl FrontierClient for PacedFrontierClient {
 }
 
 /// G11: a provider-reported price must survive the turn that earned it,
-/// readable from the durable routing/settlement record — not only from a
-/// `tracing::debug!` line the binary's own default filter drops.
+/// readable from the durable log — not only from a `tracing::debug!` line the
+/// binary's own default filter drops.
 ///
-/// This does not compile today: neither `DecisionRecord` (the `Routed`
-/// event's payload) nor `TerminalSettlement`/`Usage` (what `ResponseCompleted`
-/// carries) has a `provider_reported_cost_usd` field. Per CLAUDE.md's
-/// "Validating a claim", the missing field *is* the defect, so the compile
-/// failure is the correct evidence rather than an unwritable runtime
-/// assertion — see the `#[ignore]`d body below, kept for the field name the
-/// fix must add and the assertion it must satisfy once it exists.
+/// **Asserted against `ResponseCompleted`, not against `DecisionRecord`**, and
+/// the move is the finding's own mechanism read one step further: `Routed` is
+/// written *before* the dispatch is attempted, and the provider's price arrives
+/// on the stream's last frame, so the decision record cannot learn it without
+/// mutating a committed event. The settle side is where it can land, and
+/// reading it back out of the store rather than off an in-memory projection is
+/// the stronger claim — it proves the number survives the process that measured
+/// it, which is the whole of what P3 asked for.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "G11: provider_reported_cost_usd does not exist on DecisionRecord or \
-            TerminalSettlement/Usage; does not compile until the fix adds it. \
-            See engine.rs:1249-1272 (tracing::debug! is the only consumer today)."]
 async fn a_provider_reported_price_survives_the_turn_that_earned_it() {
     let store = Arc::new(MemoryStore::new());
     let (client, chunks) = PacedFrontierClient::new();
@@ -135,23 +133,125 @@ async fn a_provider_reported_price_survives_the_turn_that_earned_it() {
     running.await.unwrap().expect("the stream completed");
 
     let events = store.read_events(&session_id, 0, 1024).await.unwrap();
-    let decision = events
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event.kind, SessionEventKind::Routed { .. })),
+        "the turn was routed"
+    );
+    let reported = events
         .iter()
         .find_map(|event| match &event.kind {
-            SessionEventKind::Routed { decision, .. } => Some(decision.clone()),
+            SessionEventKind::ResponseCompleted {
+                provider_reported_cost_usd,
+                ..
+            } => Some(*provider_reported_cost_usd),
             _ => None,
         })
-        .expect("the turn was routed");
+        .expect("the turn completed");
 
-    // This is the line that does not compile today: `DecisionRecord` has no
-    // such field, which is exactly G11's claim — the value is parsed
-    // (`stream.rs:219`), carried on `FrontierChunk::Done` (`frontier.rs:223`),
-    // and then reaches nowhere durable.
     assert_eq!(
-        decision.provider_reported_cost_usd,
+        reported,
         Some(0.00421),
         "P3 rules this a sidecar on the decision/settle record; a \
          tracing::debug! below the binary's own default filter is neither a \
          record nor visible",
+    );
+
+    // Durable, not merely in-memory: the same bytes a successor process would
+    // replay. This is the property the `debug!` never had.
+    let replayed: SessionEventKind = serde_json::from_str(
+        &serde_json::to_string(
+            &events
+                .iter()
+                .find(|event| matches!(event.kind, SessionEventKind::ResponseCompleted { .. }))
+                .unwrap()
+                .kind,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let SessionEventKind::ResponseCompleted {
+        provider_reported_cost_usd,
+        ..
+    } = replayed
+    else {
+        unreachable!("filtered to the completed event")
+    };
+    assert_eq!(provider_reported_cost_usd, Some(0.00421));
+}
+
+/// The control: a turn whose provider reports nothing records `None`, not a
+/// confident zero. A provider that bills nothing and a provider that says
+/// nothing are different facts, and the reconciliation view publishes only the
+/// first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_silent_provider_records_no_price_rather_than_zero() {
+    let store = Arc::new(MemoryStore::new());
+    let (client, chunks) = PacedFrontierClient::new();
+    let engine = Arc::new(Engine::new(
+        store.clone(),
+        ByteTokenizer,
+        Arc::new(EchoLocalExecutor::new("local answer")),
+        frontier_catalog(),
+        Arc::new(client),
+        Arc::new(AffinityPolicy::new()),
+        config(),
+    ));
+    let session_id = SessionId::generate();
+    engine.create_session(&session_id).await.unwrap();
+
+    let running = tokio::spawn({
+        let engine = Arc::clone(&engine);
+        let session_id = session_id.clone();
+        async move {
+            engine
+                .run_turn(
+                    &session_id,
+                    TurnId::new("t0"),
+                    vec![Item::user_text("price it")],
+                    &Admission::open(),
+                )
+                .await
+        }
+    });
+
+    chunks
+        .send(Ok(FrontierChunk::OutputText("answer".into())))
+        .await
+        .unwrap();
+    chunks
+        .send(Ok(FrontierChunk::Done {
+            input_tokens: 40,
+            cached_input_tokens: 0,
+            output_tokens: 3,
+            reasoning_tokens: 0,
+            provider_reported_cost: None,
+        }))
+        .await
+        .unwrap();
+    drop(chunks);
+
+    running.await.unwrap().expect("the stream completed");
+
+    let events = store.read_events(&session_id, 0, 1024).await.unwrap();
+    let completed = events
+        .iter()
+        .find(|event| matches!(event.kind, SessionEventKind::ResponseCompleted { .. }))
+        .expect("the turn completed");
+    let SessionEventKind::ResponseCompleted {
+        provider_reported_cost_usd,
+        ..
+    } = &completed.kind
+    else {
+        unreachable!("filtered to the completed event")
+    };
+    assert_eq!(*provider_reported_cost_usd, None);
+    assert!(
+        !serde_json::to_string(&completed.kind)
+            .unwrap()
+            .contains("provider_reported_cost_usd"),
+        "skipped on the wire when absent, so a deployment whose upstreams stay \
+         silent writes the bytes it wrote before the field existed"
     );
 }

@@ -154,6 +154,7 @@ impl Log {
         self.push(SessionEventKind::ResponseCompleted {
             response_id: response.clone(),
             usage: usage(4_000, 300),
+            provider_reported_cost_usd: None,
         });
         response
     }
@@ -173,6 +174,7 @@ impl Log {
             response_id: response.clone(),
             reason: IncompleteReason::UpstreamError,
             usage: usage(4_000, 12),
+            terminal_attempt: None,
         });
         response
     }
@@ -279,6 +281,7 @@ fn settled_dispatches_are_retired_by_either_terminal_event() {
         response_id: response,
         reason: IncompleteReason::UpstreamError,
         usage: Usage::default(),
+        terminal_attempt: None,
     });
 
     let mut fold = MetricsFold::new();

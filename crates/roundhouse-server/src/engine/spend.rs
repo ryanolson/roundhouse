@@ -342,6 +342,9 @@ mod tests {
             billing: Billing::Billed,
             budget_draw: Some(BudgetCounts::AllFrontierSpend),
             usage: one_mtok_out(),
+            // Never an input to a settle, which is exactly what this fixture's
+            // subject is; see the field's own note on why it rides here at all.
+            provider_reported_cost_usd: None,
         }
     }
 
@@ -604,7 +607,7 @@ mod the_live_admission_cannot_move_a_finished_turns_charge {
             .await
             .unwrap();
         session
-            .complete(&response_id, "hi", frontier_usage())
+            .complete(&response_id, "hi", frontier_usage(), None)
             .await
             .unwrap();
 

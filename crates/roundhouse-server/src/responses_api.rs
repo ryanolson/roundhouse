@@ -740,7 +740,9 @@ impl<S: SessionStore, T: Tokenizer + Clone + Send + Sync + 'static> ResponsesFol
                 self.queued.push_back(delta_frame(text));
                 Step::Continue
             }
-            SessionEventKind::ResponseCompleted { response_id, usage } => {
+            SessionEventKind::ResponseCompleted {
+                response_id, usage, ..
+            } => {
                 if self.item_open {
                     self.queued.push_back(item_done_frame(&self.text));
                 }
@@ -779,6 +781,7 @@ impl<S: SessionStore, T: Tokenizer + Clone + Send + Sync + 'static> ResponsesFol
                 // when there is some. Bound by name so a field added here
                 // cannot be dropped without someone reading this line.
                 usage: _,
+                ..
             } => {
                 let message = match reason {
                     IncompleteReason::BudgetExhausted => {
@@ -798,6 +801,7 @@ impl<S: SessionStore, T: Tokenizer + Clone + Send + Sync + 'static> ResponsesFol
                 // usage in this dialect, and the log is where the accounting
                 // for a truncated turn is read from.
                 usage: _,
+                ..
             } => {
                 self.queued.push_back(incomplete_frame(response_id, reason));
                 Step::End

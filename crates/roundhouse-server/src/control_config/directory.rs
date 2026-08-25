@@ -708,6 +708,9 @@ impl Managed {
                 provenance: Provenance::Config,
                 created_at_ms: None,
                 revoked_at_ms: None,
+                // The one place a member window can come from: the file
+                // declares it on the key entry, and no mutation writes one.
+                fair_use: key.fair_use.clone(),
             });
         }
         for hash in &self.file.admin_keys {
@@ -719,6 +722,9 @@ impl Managed {
                 provenance: Provenance::Config,
                 created_at_ms: None,
                 revoked_at_ms: None,
+                // An admin key belongs to no membership, so there is no scope a
+                // rolling ceiling could be drawn against.
+                fair_use: None,
             });
         }
         view.projects.extend(records.projects.iter().cloned());
@@ -924,6 +930,13 @@ impl Managed {
                 if let Some(Some(budget)) = patch.budget {
                     project.entry.budget = Some(budget);
                 }
+                // No transition guard above for this one, unlike `budget`: see
+                // [`ProjectPatch::fair_use`] — a fair-use window has no
+                // committed spend to reinterpret, so there is nothing a change
+                // of window could destroy.
+                if let Some(Some(fair_use)) = patch.fair_use {
+                    project.entry.fair_use = Some(fair_use);
+                }
                 if let Some(Some(validate)) = patch.validate {
                     project.entry.validate = Some(validate);
                 }
@@ -1016,6 +1029,8 @@ impl Managed {
                     provenance: Provenance::Admin,
                     created_at_ms: Some(now_ms),
                     revoked_at_ms: None,
+                    // No route writes a member window; see the field's doc.
+                    fair_use: None,
                 });
             }
             DirectoryMutation::MintAdminKey { key } => {
@@ -1028,6 +1043,7 @@ impl Managed {
                     provenance: Provenance::Admin,
                     created_at_ms: Some(now_ms),
                     revoked_at_ms: None,
+                    fair_use: None,
                 });
             }
             DirectoryMutation::RevokeKey { id } => {

@@ -424,6 +424,81 @@ mod tests {
         assert!(snapshot.savings.frontier_spend_usd > 0.0);
     }
 
+    /// M10 review G11: the provider's own figure reaches the report, at every
+    /// scope, and changes none of the figures the savings claim is computed
+    /// from.
+    ///
+    /// The second half is the load-bearing one. `admin_api::reconciliation`
+    /// publishes `drift_usd = committed_usd - measured_usd`, and `measured_usd`
+    /// is `frontier_spend_usd` — so proving that number is byte-identical with
+    /// and without a provider-reported price is proving the sidecar cannot
+    /// reach drift. Asserted here rather than in the view because this is where
+    /// the arithmetic is; the view only formats it.
+    #[test]
+    fn a_provider_reported_price_is_published_beside_our_own_and_added_into_none_of_it() {
+        let mut quiet = LogBuilder::new("s1");
+        quiet.created(Some(principal("acme", "ada")));
+        quiet.turn(
+            "r1",
+            frontier("anthropic", "claude"),
+            vec![],
+            usage(10_000, 8_000, 500, 0),
+        );
+        let mut quiet_fold = MetricsFold::new();
+        quiet_fold.extend(quiet.events());
+        let quiet_snapshot = snapshot(&quiet_fold);
+
+        let mut loud = LogBuilder::new("s1");
+        loud.created(Some(principal("acme", "ada")));
+        loud.turn_costing(
+            "r1",
+            frontier("anthropic", "claude"),
+            usage(10_000, 8_000, 500, 0),
+            0.00421,
+        );
+        let mut loud_fold = MetricsFold::new();
+        loud_fold.extend(loud.events());
+        let loud_snapshot = snapshot(&loud_fold);
+
+        assert_eq!(
+            quiet_snapshot.savings.provider_reported_usd, None,
+            "a provider that says nothing leaves no figure, not a confident zero"
+        );
+        assert_eq!(
+            loud_snapshot.savings.provider_reported_usd,
+            Some(0.00421),
+            "the deployment scope sums it out of the rows the same way every \
+             other figure is summed"
+        );
+
+        // The invariant the reconciliation view's drift column depends on.
+        assert_eq!(
+            loud_snapshot.savings.frontier_spend_usd, quiet_snapshot.savings.frontier_spend_usd,
+            "an upstream's own price must not move what we priced from the \
+             catalog; drift is committed minus this, and a sidecar inside it \
+             would make the cross-check a self-check"
+        );
+        assert_eq!(
+            loud_snapshot.savings.total_usd,
+            quiet_snapshot.savings.total_usd
+        );
+        assert_eq!(
+            loud_snapshot.savings.cache_savings_usd,
+            quiet_snapshot.savings.cache_savings_usd
+        );
+
+        // And the principal scope, which is the one the per-member rows of the
+        // reconciliation view read. A figure that summed only at deployment
+        // scope would read zero on every member row with nothing red.
+        let mine = MetricsSnapshot::build(
+            &loud_fold,
+            Scope::Principal(&PrincipalKey::from(&principal("acme", "ada"))),
+            &config(),
+            9_999,
+        );
+        assert_eq!(mine.savings.provider_reported_usd, Some(0.00421));
+    }
+
     #[test]
     fn an_unreported_call_is_marked_rather_than_counted_as_free() {
         let mut log = LogBuilder::new("s1");
@@ -487,6 +562,7 @@ mod tests {
             response_id,
             reason: IncompleteReason::UpstreamError,
             usage: Usage::default(),
+            terminal_attempt: None,
         });
 
         let mut fold = MetricsFold::new();
@@ -534,6 +610,7 @@ mod tests {
             response_id,
             reason: IncompleteReason::UpstreamError,
             usage: usage(10_000, 0, 0, 0),
+            terminal_attempt: None,
         });
 
         let mut fold = MetricsFold::new();

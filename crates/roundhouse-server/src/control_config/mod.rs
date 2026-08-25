@@ -125,6 +125,7 @@ pub use directory::{
     MembershipRole, MemoryDirectoryStore, PlaneSource, ProjectPatch, ProjectRecord, Provenance,
     StoreFailure, UserRecord,
 };
+pub use fair_use::{FairUseConfig, FairUseWindowConfig};
 pub use validate::{ArmSharesConfig, ValidateConfig};
 
 /// Path to a control-plane JSON file. Absent means [`ControlPlane::Open`].

@@ -16,6 +16,7 @@ use serde::Deserialize;
 
 use super::super::budget::AllocationConfig;
 use super::super::config::{PolicyConfig, ProjectEntry, UserEntry};
+use super::super::fair_use::FairUseConfig;
 
 /// Who owns a row: the file, or the API.
 ///
@@ -245,6 +246,14 @@ pub struct ApiKeyRecord {
     pub created_at_ms: Option<u64>,
     /// When this key was revoked, if it was. See the module doc on tombstones.
     pub revoked_at_ms: Option<u64>,
+    /// This member's own fair-use windows, as the file declared them.
+    ///
+    /// Carried on the record rather than looked up from the file at render
+    /// time, so the read surface answers from the same view every other field
+    /// comes from. Always `None` for an API-minted key and for an admin key:
+    /// there is no route that writes a member window, and a value here that the
+    /// admin plane invented would be a ceiling nobody wrote (G14).
+    pub fair_use: Option<FairUseConfig>,
 }
 
 impl ApiKeyRecord {

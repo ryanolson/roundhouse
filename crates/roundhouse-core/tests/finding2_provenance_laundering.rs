@@ -113,6 +113,7 @@ fn log(calls: &[Usage]) -> Vec<SessionEvent> {
             SessionEventKind::ResponseCompleted {
                 response_id,
                 usage: usage.clone(),
+                provider_reported_cost_usd: None,
             },
         );
     }

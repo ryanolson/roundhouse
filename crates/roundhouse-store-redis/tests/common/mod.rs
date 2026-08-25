@@ -211,6 +211,7 @@ pub fn every_event_kind() -> Vec<SessionEventKind> {
                 reasoning_tokens: 2,
                 accounting: Accounting::Reported,
             },
+            provider_reported_cost_usd: None,
         },
         SessionEventKind::ResponseIncomplete {
             response_id: response_id.clone(),
@@ -219,6 +220,7 @@ pub fn every_event_kind() -> Vec<SessionEventKind> {
                 accounting: Accounting::Estimated,
                 ..Usage::default()
             },
+            terminal_attempt: None,
         },
         SessionEventKind::TurnDeduplicated {
             turn_id: TurnId::generate(),

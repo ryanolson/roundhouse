@@ -81,7 +81,7 @@
 
 use serde_json::Value;
 
-use crate::validate::exchange::{Exchange, exec_exit_code, tool_output_body};
+use crate::validate::exchange::{Exchange, exec_exit_code, task_exchanges, tool_output_body};
 use crate::validate::trigger::{Evidence, Signal, SignalKind};
 
 // ─── severity constants ──────────────────────────────────────────────────────
@@ -332,13 +332,24 @@ impl ToolSignals {
 
     /// The signals over a session's exchanges, at an explicit window.
     pub fn with_window(exchanges: &[Exchange], window: usize) -> Self {
+        // G04: roundhouse's own control calls are dropped before a single
+        // count is taken — see [`task_exchanges`]. Filtering *here* rather than
+        // asking every caller to filter is what stops the one caller that does
+        // not go through [`Evidence`] (`routing::stage::TurnSignals`, on the
+        // turn path) from reading the unfiltered list; the same function is
+        // applied at `Evidence`'s shared read for the signals that walk the
+        // exchanges themselves, and applying it twice costs a pass and changes
+        // nothing, because whether a call is ours does not depend on its
+        // neighbours.
+        let exchanges = task_exchanges(exchanges);
+        let exchanges = exchanges.as_slice();
         // Results and calls are two different sequences and are windowed
         // separately, which is upstream's shape: a call still in flight has no
         // result to classify, and an exchange whose tool answered with nothing
         // is still a result — the empty body of a command that exited non-zero
         // and printed nothing is exactly the case the severity split exists
         // for, so it is kept in the window rather than dropped.
-        let severities = recent_severities(exchanges, window);
+        let severities = severities_of(exchanges, window);
         let severity = severities
             .iter()
             .fold(0.0f32, |worst, result| worst.max(result.severity));
@@ -396,7 +407,16 @@ pub struct ResultSeverity {
 /// The per-result severities over the last `window` answered tool calls,
 /// oldest first.
 pub fn recent_severities(exchanges: &[Exchange], window: usize) -> Vec<ResultSeverity> {
-    let answered: Vec<&Exchange> = exchanges
+    severities_of(&task_exchanges(exchanges), window)
+}
+
+/// [`recent_severities`] over an already-filtered view.
+///
+/// Split out rather than inlined so the filter is applied exactly once per
+/// walk: the public entry point owes it to a caller holding a raw log, and
+/// [`ToolSignals::with_window`] has already paid it.
+fn severities_of(exchanges: &[&Exchange], window: usize) -> Vec<ResultSeverity> {
+    let answered: Vec<&&Exchange> = exchanges
         .iter()
         .filter(|exchange| exchange.output.is_some())
         .collect();
@@ -448,7 +468,7 @@ pub fn classify_body(text: &str) -> (f32, Vec<&'static str>) {
 }
 
 /// Consecutive clean results counting back from the most recent.
-fn no_error_streak(exchanges: &[Exchange]) -> u32 {
+fn no_error_streak(exchanges: &[&Exchange]) -> u32 {
     let mut streak = 0u32;
     for exchange in exchanges.iter().rev() {
         let Some(output) = exchange.output.as_deref() else {
@@ -465,7 +485,7 @@ fn no_error_streak(exchanges: &[Exchange]) -> u32 {
     streak
 }
 
-fn detect_tests_passed(exchanges: &[Exchange], window: usize) -> bool {
+fn detect_tests_passed(exchanges: &[&Exchange], window: usize) -> bool {
     recent_bodies(exchanges, window).iter().any(|body| {
         let lower = body.to_lowercase();
         TEST_PASS_PHRASES.iter().any(|p| lower.contains(p))
@@ -475,7 +495,7 @@ fn detect_tests_passed(exchanges: &[Exchange], window: usize) -> bool {
 }
 
 /// The stripped bodies of the last `window` answered calls, oldest first.
-fn recent_bodies(exchanges: &[Exchange], window: usize) -> Vec<&str> {
+fn recent_bodies<'a>(exchanges: &[&'a Exchange], window: usize) -> Vec<&'a str> {
     let answered: Vec<&str> = exchanges
         .iter()
         .filter_map(|exchange| exchange.output.as_deref().map(tool_output_body))
@@ -1130,17 +1150,14 @@ mod tests {
         }
     }
 
-    /// G04 (review finding): `classify_tool_call` has no case for roundhouse's
-    /// own `mcp__roundhouse__*` control tools, so they fall through to
-    /// `Other` exactly like an unrecognised tool — which means the four
-    /// control calls the `rh-status` skill tells an agent to make in sequence
-    /// (`status`, `explain_last_route`, `prefer`, `set_quality_floor`) read as
-    /// a four-call build-pit streak. **Ignored**: this is the claim, not the
-    /// fix; the control call proves the streak length still fires on real
-    /// uncategorised shell work, so removing the ignore is step one of the
-    /// fix rather than a cleanup after it.
+    /// G04 (review finding, now fixed): roundhouse's own control tools used to
+    /// fall through `classify_tool_call` to `Other` exactly like an
+    /// unrecognised tool — so the four control calls the `rh-status` skill
+    /// tells an agent to make in sequence (`status`, `explain_last_route`,
+    /// `prefer`, `set_quality_floor`) read as a four-call build-pit streak.
+    /// They are dropped from the walk now; the control call is what proves the
+    /// streak length still fires on real uncategorised shell work.
     #[test]
-    #[ignore = "G04: mcp__roundhouse__* control calls are classified as Other and streak like an unrecognised tool"]
     fn our_own_control_calls_are_not_an_agents_build_pit() {
         let control_only = session(&[
             ("mcp__roundhouse__status", "{}", Some("ok")),
@@ -1168,6 +1185,32 @@ mod tests {
             ("bash", &shell("cargo build"), Some("err")),
         ]);
         assert_eq!(ToolSignals::from_exchanges(&shell_pit).pure_bash_streak, 4);
+
+        // Control, and the one that keeps the exemption honest: *somebody
+        // else's* MCP server is still an unrecognised tool. The exemption is
+        // for the surface roundhouse serves, not for the `mcp__` prefix — a
+        // classifier that read the prefix alone would silently exempt every
+        // MCP tool an agent uses, which is the opposite of the finding.
+        let other_server = session(&[
+            ("mcp__other__query", "{}", Some("ok")),
+            ("mcp__other__query", "{}", Some("ok")),
+            ("mcp__other__query", "{}", Some("ok")),
+            ("mcp__other__query", "{}", Some("ok")),
+        ]);
+        assert_eq!(
+            ToolSignals::from_exchanges(&other_server).pure_bash_streak,
+            4,
+            "another deployment's MCP tools are the agent's work, not our control plane"
+        );
+
+        // And the near-miss on our own name: `mcp__roundhouse_extra` is a
+        // different server, and the delimiter is what tells them apart.
+        let neighbour = session(&[("mcp__roundhouse_extra__query", "{}", Some("ok"))]);
+        assert_eq!(
+            ToolSignals::from_exchanges(&neighbour).pure_bash_streak,
+            1,
+            "a server whose name merely starts with ours is not ours"
+        );
     }
 
     /// The build pit: consecutive uncategorised calls, counting back from the

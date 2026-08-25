@@ -104,11 +104,17 @@ const SKILL_FILE: &str = "SKILL.md";
 /// `mcp__{server}__` and `core/src/tools/handlers/mcp.rs:53` joins
 /// `{namespace}{DELIMITER}{name}`; [`DEFAULT_MCP_NAMESPACE`] is the `mcp__{server}`
 /// half without the trailing delimiter, which is the form codex advertises the
-/// namespace tool itself under. Spelled as a constant beside the two citations
-/// because a skill that named a tool codex cannot resolve is the failure this
-/// whole module is downstream of, and it is silent: the model calls a name,
-/// gets "no such tool", and moves on.
-const MCP_TOOL_NAME_DELIMITER: &str = "__";
+/// namespace tool itself under. A skill that named a tool codex cannot resolve
+/// is the failure this whole module is downstream of, and it is silent: the
+/// model calls a name, gets "no such tool", and moves on.
+///
+/// Re-exported from `roundhouse-core` (G04/G16), where the citations above are
+/// repeated beside the definition: this module *renders* the join and the
+/// validate loop's signal fold has to *recognise* it, and a second literal
+/// would let the two drift with nothing red on either side.
+/// `the_delimiter_a_skill_spells_is_the_one_the_real_binary_namespaces_with`
+/// in the gated e2e suite is what ties the value itself to the binary.
+const MCP_TOOL_NAME_DELIMITER: &str = roundhouse_core::validate::CONTROL_TOOL_DELIMITER;
 
 /// One file a client will find, as the client will find it.
 ///

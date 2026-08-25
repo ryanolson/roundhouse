@@ -75,8 +75,19 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
     /// what a client can actually act on, plus a structured log line at the
     /// gate for the operator who wants to see the ceiling working. Terminating
     /// a response instead would put the refusal in the log and cost the client
-    /// the status code, and the status code is the half an agent's HTTP stack
-    /// already knows how to back off on.
+    /// the status code — and the status code is what a client's error handling
+    /// branches on before it reads anything else.
+    ///
+    /// **The status code alone is not enough, and G10 is the record of why.**
+    /// This doc used to call it "the half an agent's HTTP stack already knows
+    /// how to back off on"; for the one agent this product exists to serve that
+    /// was false. codex does not retry a `429` at all (`retry_429` is hardcoded
+    /// `false` at every `RetryConfig` construction site in the pinned tree) and
+    /// reads exactly one machine-readable shape: `error.type ==
+    /// "usage_limit_reached"` with `error.resets_at` in unix seconds. The body
+    /// therefore carries those two spellings beside our own — see
+    /// `refuse_over_fair_use` in [`http`](crate::http), which also says why they
+    /// ride on this refusal and on no other.
     ///
     /// A membership with no windows short-circuits before the ledger is
     /// touched, so the shipped posture — every project, until an operator
@@ -294,6 +305,7 @@ mod tests {
                     reasoning_tokens: 0,
                     accounting: Accounting::Reported,
                 },
+                None,
             )
             .await
             .unwrap();
