@@ -791,6 +791,74 @@ see open question 3.
 
 ---
 
+## 5.5 Addendum (2026-08-27, same day): live capture of the 2.1.247 binary
+
+A loopback capture rig (mock `/v1/messages` server logging full headers and
+bodies, answering a well-formed minimal SSE stream) was run against the
+**native 2.1.247 binary** on this box — the client an e2e suite would
+actually spawn — in three variants: an ambient run inheriting this CCR
+container's host-managed OAuth, a fully cleared-env run under a fake
+`ANTHROPIC_API_KEY`, and a cleared-env run under a fake
+`ANTHROPIC_AUTH_TOKEN`. All three completed cleanly consuming the mock
+stream (exit 0, no parser complaints). Raw captures live in the session
+scratchpad (`capture/*.jsonl`, credential values redacted); this addendum
+records what moved against the v2.1.42 read above. Where they disagree,
+**this addendum wins for the current client line**.
+
+1. **`metadata.user_id` changed shape.** At 2.1.247 it is a JSON-encoded
+   object *string* — `{"device_id":"<64 hex>","account_uuid":"<uuid or
+   empty>","session_id":"<uuid>"}` — not §2.3/§4.2's underscore-delimited
+   `user_<hex>_account_<uuid>_session_<uuid>`. The `_session_`-split
+   fallback that claude-code-router ships (and §4.2 cites) does **not**
+   parse this shape; a robust reader handles both: parse as JSON and take
+   `.session_id`, else split on `_session_`. `session_id` matched the
+   header (below) in every run and persisted across `--continue`.
+2. **`X-Claude-Code-Session-Id` is real at 2.1.247** — present on every
+   inference request (§4.1's "added after v2.1.42" inference is confirmed
+   live), a fresh UUID per invocation unless `CLAUDE_CODE_SESSION_ID` is in
+   the env, stable across `--continue`. `x-claude-code-agent-id` /
+   `-parent-agent-id` appeared in no run (single-agent turns — consistent
+   with the docs' "only on subagent requests").
+3. **Betas ride the header only.** No `betas` body array in any run; the
+   path is `POST /v1/messages?beta=true` (confirmed at 2.1.247). Header
+   under cleared-env API-key auth, verbatim: `claude-code-20250219,
+   interleaved-thinking-2025-05-14, thinking-token-count-2026-05-13,
+   context-management-2025-06-27, prompt-caching-scope-2026-01-05` (note
+   `thinking-token-count-2026-05-13`, post-2.1.42). The ambient managed-
+   OAuth run added `oauth-2025-04-20` **and** `extended-cache-ttl-2025-04-11`
+   — and only that run's `cache_control` carried `"ttl": "1h"`; the
+   auth-token run also used `Authorization: Bearer` but got neither flag,
+   so the 1h TTL rides the managed-OAuth population specifically,
+   confirming §2.3's subscription gating from the outside.
+4. **The body is the beta shape.** `context_management` was present in
+   every run (`{"edits":[{"type":"clear_thinking_20251015","keep":"all"}]}`
+   — `keep` is undocumented), `thinking` used `budget_tokens` with a
+   `display` field; `max_tokens: 32000`. A serve surface must accept the
+   `BetaCreateMessageParams` property set.
+5. **`system` is three blocks**, and block 0 is the attribution
+   pseudo-header (`x-anthropic-billing-header: cc_version=2.1.247.3b2;
+   cc_entrypoint=<entrypoint>;`) with **no** `cache_control` — deliberately
+   ahead of the first breakpoint so it never invalidates the cached prefix;
+   blocks 1-2 (agent-SDK line, full system prompt) each carry a breakpoint.
+   §4.4's per-conversation-stability reading holds at 2.1.247.
+6. **`count_tokens` was never called** in single non-interactive turns —
+   whether longer interactive sessions call it remains UNVERIFIED; serving
+   it stays worthwhile (the fallback probe costs a real create).
+7. **A `--continue` second turn resends full history** ([user, assistant,
+   user] with the mock's own reply replayed verbatim as the assistant item)
+   — full-resend-with-prefix-admission is exactly the right serve model.
+8. **Two cautions for anyone rebuilding the rig.** In this CCR container
+   the ambient env silently overrides `ANTHROPIC_API_KEY` with the
+   host-managed OAuth token (clear the env to test API-key auth), and one
+   out-of-protocol probe (`claude config list` under `env -i` with no base
+   URL override) still reached a real model through credentials living
+   outside both the env and `CLAUDE_CONFIG_DIR` — clearing those two is
+   NOT sufficient isolation; keep rigs pointed at loopback via
+   `ANTHROPIC_BASE_URL` and treat any un-logged run as having gone to
+   production. The ambient run also fired one `GET
+   /v1/code/agent-proxy/ca-cert` probe (Bun user-agent, no auth) — CCR
+   plumbing, not the Messages protocol.
+
 ## 6. Open questions — decisions this evidence does not make
 
 1. **Key prefix admission on the header or on `metadata.user_id`?** The header is

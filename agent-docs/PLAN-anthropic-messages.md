@@ -214,9 +214,13 @@ Specifics that are rulings, not options:
 - **Route on the path** — `/v1/messages` and `/v1/messages/count_tokens`;
   the `?beta=true` query Claude Code appends is ignored by axum path routing
   and must be proven harmless by test, including through a chained Relay.
-- **Session naming**: `x-claude-code-session-id` header first;
-  else the `_session_` suffix of `metadata.user_id`; else the whole
-  `metadata.user_id`; else an anonymous fresh session. Each resolved key is
+- **Session naming**: `x-claude-code-session-id` header first (confirmed
+  live at 2.1.247 by the same-day capture — evidence doc §5.5); else
+  `metadata.user_id`, parsed for the session component in **both shapes it
+  has shipped in**: the 2.1.247 JSON-object string (`{"device_id":…,
+  "account_uuid":…,"session_id":…}` — take `.session_id`) and the older
+  underscore form (split on `_session_`); else the whole `metadata.user_id`
+  string; else an anonymous fresh session. Each resolved key is
   qualified into the caller's namespace and bound through `Conversations`
   exactly as `prompt_cache_key` is. Claude Code always sends `user_id` (every
   version read), so the product path never reaches the anonymous arm; the
@@ -373,10 +377,14 @@ cadence. Stage briefs carry §3 verbatim.
   model entry (un-gating the example's own anticipation note).
 - **M11.1 — the serve surface.** `ItemContent` extended additively;
   `messages_api.rs` + `count_tokens` (R5); session naming; oracle tier 1
-  (R6). The first task of the rung settles the one empirical unknown the
-  schema depends on: capture what the real client (2.1.247) actually sends —
-  beta vs non-beta shape, headers, betas — with a loopback rig, before the
-  serve types are frozen.
+  (R6). The empirical unknown this rung was to settle first is **already
+  settled** — the 2026-08-27 loopback capture of the real 2.1.247 binary
+  (evidence doc §5.5): the request is the **beta shape** (`?beta=true` path,
+  `context_management` in the body, betas riding the header only, no `betas`
+  array), `system` arrives as blocks with the attribution pseudo-header as
+  an uncached block 0, and a `--continue` turn resends full history. The
+  serve types accept the `BetaCreateMessageParams` property surface, and
+  the conformance fixtures start from the captured bodies.
 - **M11.2 — the real client, both topologies.** `claude_launch` (R8's
   library half); the gated `e2e-claude` suite (R6 tier 2) driving Direct;
   the chained topology against `nemo-relay` at its then-current release with
