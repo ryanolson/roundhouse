@@ -414,6 +414,42 @@ impl ShadowPricing {
         &self.references
     }
 
+    /// The capability gate itself, as one predicate two callers share.
+    ///
+    /// Extracted rather than written twice: the two places a reference may be
+    /// chosen — a client's declared baseline and the shape-distance inference —
+    /// have to agree on what "comparable" means, and a second copy of the
+    /// comparison is exactly where they would stop agreeing. That divergence is
+    /// what review finding G01 was: the declared path had no copy at all.
+    fn within_capability_band(&self, reference: &ReferenceModel, local_quality_prior: f64) -> bool {
+        (reference.quality_prior - local_quality_prior).abs() <= self.capability_band
+    }
+
+    /// The reference model a client's `model` field names, or `None`.
+    ///
+    /// Two spellings are accepted because two are in use: a bare model id, the
+    /// way an OpenAI client writes one, and the qualified `provider/model` an
+    /// OpenRouter id already is. A bare name that two providers both serve is
+    /// deliberately *not* resolved — picking one would be arbitrary, and the
+    /// catalog boundary already refuses two entries for one `(provider, model)`
+    /// precisely so that the router and the dashboard cannot resolve an
+    /// ambiguity two different ways.
+    pub fn reference_named(&self, named: &str) -> Option<&ReferenceModel> {
+        if let Some((provider, model)) = named.split_once('/')
+            && let Some(qualified) = self
+                .references
+                .iter()
+                .find(|r| r.provider == provider && r.model == model)
+        {
+            return Some(qualified);
+        }
+        let mut bare = self.references.iter().filter(|r| r.model == named);
+        match (bare.next(), bare.next()) {
+            (Some(only), None) => Some(only),
+            _ => None,
+        }
+    }
+
     /// Choose the correlary for one local model.
     ///
     /// `observed` carries the traffic shape measured for each hosted model in
@@ -422,12 +458,38 @@ impl ShadowPricing {
     /// declared. That is the correct asymmetry: inference is an argument from
     /// this deployment's own history, and there is no history for a model it
     /// has never used.
+    ///
+    /// `declared_baseline` is what this row's turns said they were talking to,
+    /// where they all said the same thing — see
+    /// [`DeclaredBaseline`](super::fold::DeclaredBaseline). It sits *below* an
+    /// operator's [`Self::declare`] and *above* inference, which is the only
+    /// order the three can take: a procurement decision written into the
+    /// deployment's config outranks what a client happened to put in a JSON
+    /// field, and both outrank an argument from traffic shape. A baseline that
+    /// names no model this deployment has a rate card for is not an error and
+    /// not a silent upgrade — the row prices through inference, and the basis
+    /// says `inferred`, which is the true account of what happened.
+    ///
+    /// **A baseline that names a model the capability gate refuses is refused,
+    /// not inferred around.** `declared_baseline` arrives from an untrusted
+    /// request field, so it buys ordering against the other two sources and
+    /// nothing else — the gate that stops a 7B row being priced against a
+    /// flagship by shape argument has to stop it being priced against one by
+    /// spelling, or the number improves the more absurd the claim is. An
+    /// operator's [`Self::declare`] is exempt and stays exempt: it is a
+    /// procurement decision this deployment wrote down, and the whole reason
+    /// the two are separate fields is that one of them is a claim by somebody
+    /// we do not control. Falling through to inference on refusal would answer
+    /// a claim the caller made with a number about a different model and label
+    /// it `inferred`, which is why the refusal is [`Correlary::Unpriced`]
+    /// naming both the model and the verdict instead.
     pub fn resolve(
         &self,
         local_model: &str,
         local_quality_prior: f64,
         local_shape: Option<TokenShape>,
         observed: &HashMap<(String, String), TokenShape>,
+        declared_baseline: Option<&str>,
     ) -> Correlary {
         if let Some(declared) = self.declared.get(local_model) {
             let reference = self
@@ -456,6 +518,36 @@ impl ShadowPricing {
             };
         }
 
+        if let Some(named) = declared_baseline
+            && let Some(reference) = self.reference_named(named)
+        {
+            // The same gate the inference path below runs, run here too, and
+            // run *before* the answer is chosen rather than after. See this
+            // function's doc: the claim comes off a request field, so it orders
+            // against `declare` and inference and buys nothing else.
+            if !self.within_capability_band(reference, local_quality_prior) {
+                return unpriced(
+                    local_model,
+                    format!(
+                        "the request's `model` field named `{named}`, whose quality prior \
+                         {:.2} is more than {:.2} from {local_model}'s {:.2}",
+                        reference.quality_prior, self.capability_band, local_quality_prior
+                    ),
+                );
+            }
+            return Correlary::Priced {
+                local_model: local_model.to_string(),
+                reference: reference.clone(),
+                // The client's own words, quoted rather than paraphrased, so a
+                // reader of the dashboard can tell a saving priced against the
+                // model the caller asked for from one priced against the model
+                // an operator wrote down.
+                basis: PricedBasis::Declared {
+                    note: format!("the request's `model` field named `{named}`"),
+                },
+            };
+        }
+
         let Some(local_shape) = local_shape else {
             return unpriced(local_model, "no local traffic to compare".to_string());
         };
@@ -464,7 +556,7 @@ impl ShadowPricing {
         let comparable: Vec<&ReferenceModel> = self
             .references
             .iter()
-            .filter(|r| (r.quality_prior - local_quality_prior).abs() <= self.capability_band)
+            .filter(|r| self.within_capability_band(r, local_quality_prior))
             .collect();
         if comparable.is_empty() {
             return unpriced(
@@ -607,7 +699,7 @@ mod tests {
 
         // Shape points squarely at openai/small; the declaration overrules it.
         let local = TokenShape::from_rollup(&usage(10_000, 5_000, 500, 0), 10);
-        let correlary = pricer.resolve("llama", 0.6, local, &observed);
+        let correlary = pricer.resolve("llama", 0.6, local, &observed, None);
 
         assert_eq!(correlary.reference().unwrap().model, "big");
         assert!(matches!(
@@ -617,6 +709,125 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// S4, the pricing half: the model a client named is the counterfactual its
+    /// turns are priced against.
+    #[test]
+    fn the_declared_baseline_prices_the_counterfactual_it_names() {
+        let observed = shapes(&[
+            (
+                "anthropic",
+                "big",
+                TokenShape::from_rollup(&usage(1_000, 0, 900, 0), 1).unwrap(),
+            ),
+            (
+                "openai",
+                "small",
+                TokenShape::from_rollup(&usage(10_000, 5_000, 500, 0), 10).unwrap(),
+            ),
+        ]);
+        let pricer = ShadowPricing::new(vec![
+            reference("anthropic", "big", 0.6),
+            reference("openai", "small", 0.6),
+        ]);
+        // Shape points squarely at openai/small, exactly as in
+        // `a_declaration_beats_a_closer_shape_match` above -- so if the
+        // baseline moves this, it is the baseline that moved it.
+        let local = TokenShape::from_rollup(&usage(10_000, 5_000, 500, 0), 10);
+
+        let named = pricer.resolve("llama", 0.6, local, &observed, Some("big"));
+        assert_eq!(named.reference().unwrap().model, "big");
+        match &named {
+            Correlary::Priced {
+                basis: PricedBasis::Declared { note },
+                ..
+            } => assert!(
+                note.contains("`model`") && note.contains("big"),
+                "a saving priced against what the caller asked for has to say \
+                 so, and say what was asked: {note}"
+            ),
+            other => panic!("a resolvable baseline is a declaration: {other:?}"),
+        }
+
+        // The qualified spelling an OpenRouter id already is.
+        assert_eq!(
+            pricer
+                .resolve("llama", 0.6, local, &observed, Some("anthropic/big"))
+                .reference()
+                .unwrap()
+                .model,
+            "big"
+        );
+
+        // The control: the same row with no baseline infers, and infers the
+        // *other* model. This is what makes the assertions above about the
+        // baseline rather than about a coincidence of ordering.
+        let inferred = pricer.resolve("llama", 0.6, local, &observed, None);
+        assert_eq!(inferred.reference().unwrap().model, "small");
+        assert!(matches!(
+            inferred,
+            Correlary::Priced {
+                basis: PricedBasis::Inferred { .. },
+                ..
+            }
+        ));
+
+        // An operator's declaration still outranks the client's: a procurement
+        // decision is not overruled by a JSON field.
+        let declared =
+            pricer
+                .clone()
+                .declare("llama", "openai", "small", "matched on our eval suite");
+        assert_eq!(
+            declared
+                .resolve("llama", 0.6, local, &observed, Some("big"))
+                .reference()
+                .unwrap()
+                .model,
+            "small"
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_baseline_infers_and_never_silently_upgrades_to_declared() {
+        let observed = shapes(&[(
+            "openai",
+            "small",
+            TokenShape::from_rollup(&usage(10_000, 5_000, 500, 0), 10).unwrap(),
+        )]);
+        let pricer = ShadowPricing::new(vec![reference("openai", "small", 0.6)]);
+        let local = TokenShape::from_rollup(&usage(10_000, 5_000, 500, 0), 10);
+
+        // A model this deployment has no rate card for. Not an error, and not a
+        // declaration: the row prices through inference and the basis says so,
+        // which is the true account. The name itself is not lost -- it is on
+        // every decision in the log, verbatim.
+        let correlary = pricer.resolve("llama", 0.6, local, &observed, Some("kimi-k3"));
+        assert!(matches!(
+            correlary,
+            Correlary::Priced {
+                basis: PricedBasis::Inferred { .. },
+                ..
+            }
+        ));
+
+        // And a bare name two providers both serve resolves to neither: picking
+        // one would be arbitrary, and the catalog refuses duplicate identity
+        // for the same reason.
+        let ambiguous = ShadowPricing::new(vec![
+            reference("openai", "shared", 0.6),
+            reference("anthropic", "shared", 0.6),
+        ]);
+        assert!(ambiguous.reference_named("shared").is_none());
+        assert_eq!(
+            ambiguous
+                .reference_named("anthropic/shared")
+                .unwrap()
+                .provider,
+            "anthropic",
+            "the control: qualified, it is not ambiguous at all"
+        );
     }
 
     #[test]
@@ -630,10 +841,160 @@ mod tests {
 
         // Identical traffic shape, wildly different capability.
         let local = TokenShape::from_rollup(&usage(10_000, 5_000, 500, 0), 10);
-        let correlary = pricer.resolve("tiny-7b", 0.35, local, &observed);
+        let correlary = pricer.resolve("tiny-7b", 0.35, local, &observed, None);
 
         assert!(correlary.reference().is_none());
         assert!(matches!(correlary, Correlary::Unpriced { .. }));
+        assert_eq!(
+            correlary.shadow_cost_usd(&usage(10_000, 5_000, 500, 0)),
+            0.0,
+            "an unpriced correlary must contribute nothing to the saving"
+        );
+
+        // G01: the declared path runs the same gate, both ways. A baseline the
+        // gate accepts prices as `Declared` — the client's claim is answered,
+        // not dropped — and one it refuses is `Unpriced`, never a quiet
+        // downgrade to `Inferred` against some other model.
+        let near = pricer.resolve(
+            "tiny-7b",
+            0.93,
+            local,
+            &observed,
+            Some("anthropic/flagship"),
+        );
+        assert!(
+            matches!(
+                near,
+                Correlary::Priced {
+                    basis: PricedBasis::Declared { .. },
+                    ..
+                }
+            ),
+            "a declared baseline inside the band still prices as declared: {near:?}"
+        );
+        let far = pricer.resolve(
+            "tiny-7b",
+            0.35,
+            local,
+            &observed,
+            Some("anthropic/flagship"),
+        );
+        let Correlary::Unpriced { reason, .. } = &far else {
+            panic!("a declared baseline outside the band must not price: {far:?}");
+        };
+        assert!(
+            reason.contains("anthropic/flagship") && reason.contains("0.35"),
+            "the refusal names the model the client declared and the gate's own \
+             verdict, so the caller's claim is answered rather than ignored: {reason}"
+        );
+
+        // The control that keeps the asymmetry from being "fixed" away: an
+        // *operator's* declaration of the identical absurd pairing still
+        // prices. Config is a procurement decision this deployment wrote down;
+        // a request field is a claim by somebody it does not control, and that
+        // difference is the whole reason the two are separate inputs.
+        let declared_by_operator = ShadowPricing::new(vec![reference(
+            "anthropic",
+            "flagship",
+            0.95,
+        )])
+        .declare("tiny-7b", "anthropic", "flagship", "procurement says so");
+        assert!(
+            matches!(
+                declared_by_operator.resolve("tiny-7b", 0.35, local, &observed, None),
+                Correlary::Priced {
+                    basis: PricedBasis::Declared { .. },
+                    ..
+                }
+            ),
+            "an operator's declare() is exempt from the gate and stays exempt"
+        );
+    }
+
+    /// G12 (review finding, control half): `import-benchmarks`'s
+    /// `NoAttribution` refuses to emit a `quality_prior` without attribution
+    /// because "the savings dashboard republishes it". This is the number it
+    /// means: `local_quality_prior`, carried verbatim into a serialized,
+    /// client-visible `Correlary::Unpriced` reason (reachable from
+    /// `roundhouse-server`'s `/v1/metrics` and `/v1/metrics/dashboard`
+    /// routes) with no attribution field anywhere on the wire. The number the
+    /// refusal exists to protect reaches a served surface unattributed
+    /// regardless of what the refusal blocks upstream.
+    #[test]
+    fn quality_prior_is_republished_with_no_attribution_riding_along() {
+        let observed = shapes(&[(
+            "anthropic",
+            "flagship",
+            TokenShape::from_rollup(&usage(10_000, 5_000, 500, 0), 10).unwrap(),
+        )]);
+        let pricer = ShadowPricing::new(vec![reference("anthropic", "flagship", 0.95)]);
+        // Identical traffic shape, wildly different capability -- the same
+        // capability-gate rejection as `the_capability_gate_blocks_a_flagship_stand_in`,
+        // but here it is the `reason` string, not just the `Unpriced` variant,
+        // under test.
+        let local = TokenShape::from_rollup(&usage(10_000, 5_000, 500, 0), 10);
+        let correlary = pricer.resolve("tiny-7b", 0.35, local, &observed, None);
+
+        let Correlary::Unpriced { reason, .. } = &correlary else {
+            panic!("expected Unpriced: {correlary:?}");
+        };
+        assert!(
+            reason.contains("0.35"),
+            "the local quality_prior should be legible in the reason a client reads: {reason}"
+        );
+
+        let wire = serde_json::to_value(&correlary).expect("Correlary serializes");
+        assert_eq!(wire["basis"]["kind"], "unpriced");
+        let wire_reason = wire["basis"]["reason"].as_str().unwrap();
+        assert!(
+            wire_reason.contains("0.35"),
+            "the number rides the wire verbatim: {wire}"
+        );
+        assert!(
+            wire.get("attribution").is_none() && !wire_reason.contains("citation"),
+            "nothing on the wire carries where 0.35 came from: {wire}"
+        );
+    }
+
+    /// G01 (review finding): `declared_baseline` is read straight from the
+    /// client's `model` field (`responses_api.rs:296`) and the early return
+    /// for it in `resolve` sits above the capability gate, so a tenant can
+    /// pick the counterfactual the savings dashboard prices against just by
+    /// naming a flagship in the request -- the same trap the gate exists to
+    /// close for shape-based inference, reopened for anything spelled as a
+    /// declaration instead of inferred from traffic.
+    #[test]
+    fn a_declared_baseline_does_not_buy_a_way_past_the_capability_gate() {
+        let observed = shapes(&[(
+            "anthropic",
+            "flagship",
+            TokenShape::from_rollup(&usage(10_000, 5_000, 500, 0), 10).unwrap(),
+        )]);
+        let pricer = ShadowPricing::new(vec![reference("anthropic", "flagship", 0.95)]);
+        let local = TokenShape::from_rollup(&usage(10_000, 5_000, 500, 0), 10);
+
+        // Same tiny-7b / flagship pairing as the capability-gate control
+        // above, but this time the flagship name arrives the way a client's
+        // `model` field arrives: as `declared_baseline`, not as an operator's
+        // `declare()`.
+        let correlary = pricer.resolve(
+            "tiny-7b",
+            0.35,
+            local,
+            &observed,
+            Some("anthropic/flagship"),
+        );
+
+        assert!(
+            !matches!(
+                correlary,
+                Correlary::Priced {
+                    basis: PricedBasis::Declared { .. },
+                    ..
+                }
+            ),
+            "a client-supplied declared_baseline must not buy past the capability gate: {correlary:?}"
+        );
         assert_eq!(
             correlary.shadow_cost_usd(&usage(10_000, 5_000, 500, 0)),
             0.0,
@@ -661,7 +1022,7 @@ mod tests {
         ]);
 
         let local = TokenShape::from_rollup(&usage(20_000, 10_000, 300, 0), 10);
-        let correlary = pricer.resolve("llama", 0.6, local, &observed);
+        let correlary = pricer.resolve("llama", 0.6, local, &observed, None);
 
         assert_eq!(correlary.reference().unwrap().model, "terse");
         match &correlary {
@@ -678,7 +1039,7 @@ mod tests {
         let pricer = ShadowPricing::new(vec![reference("anthropic", "unused", 0.6)]);
         let local = TokenShape::from_rollup(&usage(1_000, 0, 100, 0), 1);
 
-        let correlary = pricer.resolve("llama", 0.6, local, &HashMap::new());
+        let correlary = pricer.resolve("llama", 0.6, local, &HashMap::new(), None);
         assert!(correlary.reference().is_none());
     }
 
@@ -701,6 +1062,7 @@ mod tests {
             0.6,
             TokenShape::from_rollup(&usage(1_000, 0, 100, 0), 1),
             &observed,
+            None,
         );
         assert!(
             correlary.reference().is_none(),
@@ -716,7 +1078,7 @@ mod tests {
             "big",
             "",
         );
-        let correlary = pricer.resolve("llama", 0.6, None, &HashMap::new());
+        let correlary = pricer.resolve("llama", 0.6, None, &HashMap::new(), None);
 
         // 100k prompt, 90% of it cached, 1k output, at 3.00 / 0.30 / 15.00.
         let served = usage(100_000, 90_000, 1_000, 0);

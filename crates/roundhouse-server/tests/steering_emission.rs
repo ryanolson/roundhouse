@@ -1,34 +1,63 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! M4 of `PLAN-agentic-control-plane.md`: emitting a synthetic tool call, and
-//! surviving the client's resend of it.
+//! Answering a turn with a correction instead of running it, and surviving the
+//! client's resend of that correction.
 //!
-//! The milestone is one primitive and its consequences. A turn can complete
-//! carrying a `function_call` this deployment invented instead of running the
-//! completion the client asked for; the client dispatches that call, and comes
-//! back next turn with the call *and* its output in the history it re-sends.
-//! Everything here is about that round trip: that Codex's own parser sees a
-//! `FunctionCall` rather than silently dropping an item it cannot read, that
-//! the four frames are the only four, that the resend extends the session
+//! One primitive and its consequences. A turn can complete carrying an item
+//! this deployment produced instead of the completion the client asked for; the
+//! client reads it, carries on, and comes back next turn with that item in the
+//! history it re-sends. Everything here is about that round trip: that Codex's
+//! own parser sees the item rather than silently dropping one it cannot read,
+//! that the four frames are the only four, that the resend extends the session
 //! instead of forking it, and that none of it books a model row or opens a
 //! grant — because nothing was dispatched.
 //!
-//! **What stands in for M6.** The trigger, the judge and the action map are
-//! not built yet, so the decision to steer is made by [`TestInterjector`], a
-//! test-only occupant of the *real* seam
-//! ([`roundhouse_core::interject::Interjector`]) that M6's validator will
-//! occupy unchanged. It is a scripted queue rather than anything clever on
-//! purpose: what this suite is about is what happens *after* something decides
-//! to steer, and a decision procedure with opinions of its own would make
-//! every assertion below partly about the decision.
+//! # What M10.0 changed, and what it deliberately did not
+//!
+//! Until M10.0 the emitted item was a synthetic `function_call` naming
+//! `fetch_steer`: the client dispatched it, fetched the correction over MCP, and
+//! returned its output as a tool result the next turn. Ruling R1/T1 of
+//! `PLAN-frontier-selection.md` retired that channel. The steered turn is
+//! answered with **assistant text** — the rendered directive followed by the
+//! pending request restated, quoted line by line — so the agent reads the
+//! correction where it reads every other answer and decides with no round trip.
+//!
+//! Three consequences run through every test below.
+//!
+//! - **The resend is one item, not two.** The old round trip put a call *and*
+//!   its output back in the history; the new one puts back the assistant message
+//!   the client was handed. The prefix property being asserted is unchanged and
+//!   the item being asserted about is different — which is why the fork tests
+//!   are re-aimed rather than deleted.
+//! - **The frame count is the same four**, and that is not a coincidence worth
+//!   losing: a seam answer is committed whole and streamed as nothing, so it is
+//!   announced and finished in one pair either way. `STEERED_FRAMES` is
+//!   therefore still the list, and a halt and a steer are now literally the same
+//!   sequence.
+//! - **The inbound machinery is untouched (T4).** An agent still runs its own
+//!   MCP tools between our turns and still re-sends them namespaced, so
+//!   canonicalization still has to ignore a `namespace` field and an item id.
+//!   The tests that pin that are re-pointed at a *client's* call, which is the
+//!   only kind there is now — see
+//!   `a_clients_own_tool_call_is_not_projected_as_an_emitted_one`, which used to
+//!   be a control and is now the whole rule.
+//!
+//! **What stands in for the validator.** The decision to steer is made by
+//! [`TestInterjector`], a test-only occupant of the *real* seam
+//! ([`roundhouse_core::interject::Interjector`]) that the validator occupies
+//! unchanged. It is a scripted queue rather than anything clever on purpose:
+//! what this suite is about is what happens *after* something decides to steer,
+//! and a decision procedure with opinions of its own would make every assertion
+//! below partly about the decision. `validate_loop.rs` is where the real one
+//! runs.
 //!
 //! **Why these are integration tests.** Every claim spans the seam, the log,
 //! the projection and a real client parser at once. The unit tests one layer
 //! down already prove that `complete_with_item` commits one batch and that
 //! `suffix_after` admits a suffix; what they cannot prove is that the item a
-//! session committed comes back out of the wire as an item Codex will
-//! dispatch, and re-enters as the same canonical item it went in as.
+//! session committed comes back out of the wire as an item Codex will surface,
+//! and re-enters as the same canonical item it went in as.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -51,14 +80,17 @@ use roundhouse_core::control::{
     Balance, BalanceQuery, Grant, GrantRequest, MemorySpendLedger, Settled, Settlement, SpendError,
     SpendLedger,
 };
-use roundhouse_core::event::{Accounting, ControlRecord, SessionEventKind, Usage};
-use roundhouse_core::ids::{ResponseId, SessionId};
+use roundhouse_core::event::{
+    Accounting, ControlRecord, SessionEventKind, Usage, ValidationOutcome,
+};
+use roundhouse_core::ids::{SessionId, SideCallId, ValidationId};
 use roundhouse_core::interject::{Interjection, InterjectionContext, Interjector};
 use roundhouse_core::item::{Item, ItemContent, Role};
 use roundhouse_core::metrics::{MetricsConfig, MetricsSnapshot, ShadowPricing};
 use roundhouse_core::now_ms;
 use roundhouse_core::routing::AffinityPolicy;
 use roundhouse_core::store::{MemoryStore, SessionStore};
+use roundhouse_core::validate::{Arm, Divergence, SteerAction, TriggerRecord, Verdict};
 use roundhouse_fleet::EchoFrontierClient;
 use roundhouse_server::{
     ControlPlane, ControlPlaneConfig, Conversations, EchoLocalExecutor, Engine, EngineConfig,
@@ -67,19 +99,21 @@ use roundhouse_server::{
 
 mod common;
 use common::codex::{
-    Frame, NoAuth, RouterTransport, StaticToken, collect, frames, function_call_item,
-    function_call_output_item, reasoning_item, request, user_message,
+    Frame, NoAuth, RouterTransport, StaticToken, assistant_message, collect, frames,
+    function_call_item, function_call_output_item, reasoning_item, request, user_message,
 };
 use common::{frontier_catalog, sha256_hex};
 
 /// What the echo provider answers an *ordinary* turn with.
 const ANSWER: &str = "frontier answer";
 
-/// The neutral tool name the log stores, with no namespace on it.
-const STEER_TOOL: &str = "fetch_steer";
-
-/// The namespace the wire projection renders, and the one Codex's exact
-/// `ToolName { name, namespace }` lookup would resolve against.
+/// The namespace a codex client puts on the MCP tools it runs of its own
+/// accord, and the one Codex's exact `ToolName { name, namespace }` lookup
+/// resolves against.
+///
+/// Inbound only since M10.0: this deployment projects no tool call any more, so
+/// the only place a namespace appears on this wire is on a call the *client*
+/// sent us.
 const NAMESPACE: &str = "mcp__roundhouse";
 
 // ---------------------------------------------------------------------------
@@ -89,51 +123,46 @@ const NAMESPACE: &str = "mcp__roundhouse";
 /// What [`TestInterjector`] does with one turn.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Plan {
-    /// Answer the turn with a synthetic call instead of running it.
+    /// Answer the turn with the correction and the task restated, instead of
+    /// running it — outcome B, and since M10.0 an assistant message.
     Steer,
-    /// Answer the turn with plain guidance and no call — the degrade path, and
-    /// M6's outcome C. Named here because it is the *other* completion shape
-    /// the seam admits, and this file is where completion shapes are pinned to
-    /// frames.
+    /// Answer the turn with plain guidance and nothing to act on — outcome C,
+    /// which ends the client's loop. Named here because it is the *other*
+    /// completion shape the seam admits, and this file is where completion
+    /// shapes are pinned to frames.
+    ///
+    /// The two are the same *shape* now and differ only in what the text
+    /// invites, which is exactly why both are still scripted here: the
+    /// projection cannot tell them apart, so a test that covered only one would
+    /// leave the other's substitution unreached.
     Halt,
     /// Leave the turn alone, exactly as the production default does.
     Proceed,
 }
 
-/// One emitted steer, as the interjector minted it.
+/// The directive half of the correction — roundhouse's own words.
 ///
-/// Kept so a test can play the agent afterwards with the *same* bytes the
-/// server emitted, rather than with its own reconstruction of them — which is
-/// the whole point of minting the arguments once and storing them in the item.
-#[derive(Clone, Debug)]
-struct Steer {
-    call_id: String,
-    arguments: String,
-    /// The correction itself, which the engine deposits into the control store
-    /// for `fetch_steer` to serve. Never on the wire and never in the log: what
-    /// the client is handed is the call, and the payload is fetched separately.
-    guidance: String,
-}
-
-/// The steer this response would carry.
-///
-/// Minted from the [`ResponseId`], which is what makes two steers unable to
-/// collide and a steer that no emitted call named impossible to name.
-fn mint(response_id: &ResponseId) -> Steer {
-    let call_id = format!("rhsteer_{response_id}");
-    let arguments = serde_json::json!({ "steer_id": call_id }).to_string();
-    Steer {
-        call_id,
-        arguments,
-        guidance: STEER_GUIDANCE.to_string(),
-    }
-}
-
-/// What the correction says.
-///
-/// Distinctive on purpose: an assertion that this text reached an agent through
-/// `fetch_steer` and never through the wire is an assertion about a literal.
+/// Distinctive on purpose: an assertion that this text reached the agent *as the
+/// turn's answer* is an assertion about a literal. Before M10.0 the assertion
+/// was the opposite one — that this text reached the agent through `fetch_steer`
+/// and never through the wire — and the literal is kept so the inversion is
+/// visible in the diff rather than hidden behind a renamed constant.
 const STEER_GUIDANCE: &str = "you are editing a file the task did not name; go back to the parser";
+
+/// The whole answer a steered turn hands back: the directive, then the pending
+/// request restated and quoted.
+///
+/// Written out rather than composed by calling
+/// [`render_steer_answer`](roundhouse_core::validate::render_steer_answer),
+/// deliberately. This suite is about what happens to an item *after* something
+/// decided to emit it, so its fixture must not be a call into the function under
+/// test in some other suite — the composition's own golden lives beside
+/// `render_steer_answer`, and `validate_loop.rs` is where the real validator's
+/// output is asserted end to end. A literal here means a change to the
+/// composition cannot silently change what this file is asserting about.
+const STEER_ANSWER: &str = "you are editing a file the task did not name; go back to the parser\n\n\
+     The request you are working on is restated below. Every line of it is quoted: the guidance \
+     above is roundhouse's, and the quoted lines are the ones you sent.\n\n> hello";
 
 /// What a halt says.
 ///
@@ -172,7 +201,6 @@ struct TestInterjector {
     /// How many times the seam was consulted, which is the assertion behind
     /// "a retry never re-runs the judge".
     calls: AtomicUsize,
-    steers: Mutex<Vec<Steer>>,
 }
 
 impl TestInterjector {
@@ -180,24 +208,47 @@ impl TestInterjector {
         Arc::new(Self {
             script: Mutex::new(script.into_iter().collect()),
             calls: AtomicUsize::new(0),
-            steers: Mutex::new(Vec::new()),
         })
     }
 
     fn calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
     }
+}
 
-    /// The one steer emitted so far. Every test here emits at most one.
-    fn steer(&self) -> Steer {
-        let steers = self.steers.lock().expect("recording mutex");
-        assert_eq!(
-            steers.len(),
-            1,
-            "these fixtures emit exactly one steer: {steers:?}"
-        );
-        steers[0].clone()
-    }
+/// The decision record a steering occupant owes the log.
+///
+/// **The bookkeeping M10.0 moved, and the reason it had to move.** Until M10.0
+/// the *item* said a steer had happened: a tool call bearing a response id is a
+/// shape no client can produce, so the session fold read provenance and knew. A
+/// steer is assistant text now — the same shape every dispatched turn's answer
+/// has — so no property of the item can tell them apart, and the fact is taken
+/// off `ValidationDecided` instead. A double that steered without recording one
+/// would leave `steered_on_turn` unset and the trigger's hysteresis silently
+/// off, which is exactly what a *production* occupant skipping it would do.
+fn steer_record(directive: &str) -> ControlRecord {
+    let mut record = ControlRecord::default();
+    record.validation_decided(
+        ValidationId::new("val_1"),
+        TriggerRecord::new(2, 4_000, Vec::new()),
+        Arm::Live,
+        ValidationOutcome::Judged {
+            side_call_id: SideCallId::new("side_1"),
+            verdict: Verdict {
+                on_track: false,
+                confidence: 0.7,
+                divergence: Some(Divergence {
+                    at_step: 3,
+                    description: "the judge's prose, which never travels".into(),
+                }),
+                missing_context: None,
+            },
+            action: SteerAction::Steer {
+                directive: directive.to_string(),
+            },
+        },
+    );
+    record
 }
 
 #[async_trait]
@@ -212,12 +263,14 @@ impl Interjector for TestInterjector {
             .unwrap_or(Plan::Proceed);
         match plan {
             Plan::Proceed => Interjection::proceed(),
+            // Built with **no response stamp**, deliberately, where the steer
+            // below is built with one. `complete_with_item` overwrites it in
+            // exactly one place, so the two spellings have to produce the same
+            // committed item — which is what makes "an item bearing a response
+            // id is one this deployment wrote" a property of the commit rather
+            // than of every occupant's care. The pair here is what goes red if
+            // that stamp ever moves back out to the caller.
             Plan::Halt => Interjection::Complete {
-                // Assistant text, with no response stamp: the stamp is
-                // `complete_with_item`'s to put on, exactly as it is for a
-                // call. Nothing is deposited for a halt, because there is no
-                // call an agent could fetch by — the engine's deposit already
-                // answers `None` for this shape.
                 item: Item {
                     role: Role::Assistant,
                     content: ItemContent::Text {
@@ -226,32 +279,17 @@ impl Interjector for TestInterjector {
                     response_id: None,
                 },
                 usage: steer_usage(),
-                guidance: HALT_GUIDANCE.to_string(),
+                // Nothing beside the item. A halt restates no task, so there
+                // was never anything for a `guidance` field to hold that the
+                // item did not already carry — and since M10.0 that is true of
+                // the steer as well, which is why the field is gone.
                 record: ControlRecord::default(),
             },
-            Plan::Steer => {
-                let steer = mint(context.response_id);
-                self.steers
-                    .lock()
-                    .expect("recording mutex")
-                    .push(steer.clone());
-                Interjection::Complete {
-                    // The bare name, with no namespace: the log keeps one
-                    // spelling per tool and the dialect supplies the rest.
-                    item: Item::tool_call(
-                        steer.call_id.as_str(),
-                        STEER_TOOL,
-                        steer.arguments.as_str(),
-                    ),
-                    usage: steer_usage(),
-                    guidance: steer.guidance,
-                    // Empty: this double stands in for the interjector, not for
-                    // the validate loop behind it, and a steer with no
-                    // validation behind it is exactly what M4's assertions are
-                    // about.
-                    record: ControlRecord::default(),
-                }
-            }
+            Plan::Steer => Interjection::Complete {
+                item: Item::assistant_text(STEER_ANSWER, context.response_id.clone()),
+                usage: steer_usage(),
+                record: steer_record(STEER_GUIDANCE),
+            },
         }
     }
 }
@@ -468,18 +506,6 @@ fn response_id(events: &[ResponseEvent]) -> String {
         .expect("a completed turn names its response")
 }
 
-fn assistant_message(text: &str) -> ResponseItem {
-    ResponseItem::Message {
-        id: None,
-        role: "assistant".to_string(),
-        content: vec![ContentItem::OutputText {
-            text: text.to_string(),
-        }],
-        phase: None,
-        internal_chat_message_metadata_passthrough: None,
-    }
-}
-
 /// The frame types, in order — the list an exhaustive assertion compares.
 fn kinds(frames: &[Frame]) -> Vec<&str> {
     frames.iter().map(Frame::kind).collect()
@@ -521,24 +547,30 @@ fn frames_carrying_a_call(frames: &[Frame]) -> usize {
 // Tests
 // ---------------------------------------------------------------------------
 
-/// The whole milestone's premise, checked against the parser that will consume
-/// it: a synthetic call arrives as a `FunctionCall` with its namespace in its
-/// own field, and **not** as `ResponseItem::Other`.
+/// The whole premise, checked against the parser that will consume it: the
+/// correction arrives as an assistant `Message` and **not** as
+/// `ResponseItem::Other`.
 ///
 /// `Other` is what an item of an unknown or unparseable shape silently becomes
 /// (`codex_conformance.rs` names the same failure for messages). Every
 /// sequence-level assertion in this file would still pass with an `Other` in
-/// place of the call, and Codex would dispatch nothing at all — so the negative
-/// half is the half that matters.
+/// place of the answer, and the agent would be handed nothing at all — so the
+/// negative half is the half that matters.
+///
+/// **This replaces `a_synthetic_function_call_arrives_as_codex_parses_it`**,
+/// which asserted the same property of a `FunctionCall` carrying a separate
+/// `namespace` field. That item no longer exists (T4). What survives the change
+/// is the *reason* for an oracle test at all — codex's parser is the contract,
+/// not our reading of it — and the shape it is asked about is now the shape a
+/// steered turn actually emits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_synthetic_function_call_arrives_as_codex_parses_it() {
+async fn a_steer_arrives_as_a_message_codex_will_surface() {
     let rig = rig([Plan::Steer]);
 
     let events = drive(&rig, request("sess-parses", vec![user_message("hello")]))
         .await
         .expect("a steered turn is a completed turn, not a failure");
 
-    let steer = rig.interjector.steer();
     let done: Vec<&ResponseItem> = events
         .iter()
         .filter_map(|event| match event {
@@ -552,43 +584,41 @@ async fn a_synthetic_function_call_arrives_as_codex_parses_it() {
         "a steered turn produces exactly one item: {events:#?}"
     );
     match done[0] {
-        ResponseItem::FunctionCall {
-            name,
-            namespace,
-            call_id,
-            arguments,
-            ..
-        } => {
-            assert_eq!(name, STEER_TOOL, "the wire carries the bare tool name");
+        ResponseItem::Message { role, content, .. } => {
+            assert_eq!(role, "assistant", "the correction is roundhouse speaking");
+            let text = content
+                .iter()
+                .find_map(|part| match part {
+                    ContentItem::OutputText { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .expect("an assistant message carries output text");
             assert_eq!(
-                namespace.as_deref(),
-                Some(NAMESPACE),
-                "the namespace must be a separate field: Codex dispatches on an \
-                 exact ToolName {{ name, namespace }} lookup and a flat name \
-                 resolves against nothing"
+                text, STEER_ANSWER,
+                "the answer arrives whole: the directive and the restated request"
             );
-            assert_eq!(call_id, &steer.call_id);
-            assert_eq!(
-                arguments, &steer.arguments,
-                "the arguments are minted once and echoed, never re-serialized"
+            assert!(
+                text.contains("\n> hello"),
+                "and the restatement is quoted line by line, which is what stops \
+                 a request reading as roundhouse's own voice: {text}"
             );
         }
         other => panic!(
-            "the item must parse as FunctionCall, not silently become \
-             ResponseItem::Other — an `Other` here is a call Codex will never \
-             dispatch, and every other assertion in this suite would still \
-             pass: {other:?}"
+            "the item must parse as an assistant Message, not silently become \
+             ResponseItem::Other — an `Other` here is an answer the agent never \
+             sees, and every other assertion in this suite would still pass: \
+             {other:?}"
         ),
     }
 
-    // The announced item is the same call, not an empty message: a client that
-    // was told about a message and then handed a call has nowhere to put it.
+    // The announced item is the same message, not something else: a client that
+    // was told about one item and handed another has nowhere to put it.
     let ResponseEvent::OutputItemAdded(added) = &events[1] else {
         panic!("expected an added item second: {:?}", events[1]);
     };
     assert!(
-        matches!(added, ResponseItem::FunctionCall { .. }),
-        "the added frame must announce the call itself: {added:?}"
+        matches!(added, ResponseItem::Message { .. }),
+        "the added frame must announce the message itself: {added:?}"
     );
 }
 
@@ -619,35 +649,43 @@ async fn the_steered_turn_emits_exactly_four_frames_and_no_others() {
         );
     }
 
-    let steer = rig.interjector.steer();
     let added = &frames[1].payload["item"];
     let done = &frames[2].payload["item"];
-    assert_eq!(added, done, "both frames carry the complete item");
 
-    // The golden shape, asserted whole rather than field by field: an extra
-    // field, or a `namespace` folded into `name`, is exactly the drift that
-    // would leave Codex's exact lookup with nothing to match.
-    let item_id = added["id"].as_str().expect("the item is named");
+    // **The `added` frame is an empty shell and the `done` frame carries the
+    // text, and that asymmetry is the message path's, not a regression.** A
+    // call was announced complete because its arguments never streamed; a
+    // message is announced empty because ordinarily its text arrives as deltas.
+    // A seam answer streams no deltas, so the pair is "announce, then finish
+    // whole" — which is exactly what the halted turn has always done, and is
+    // now what a steered turn does too.
     assert_eq!(
         *added,
         serde_json::json!({
-            "type": "function_call",
-            "id": item_id,
-            "namespace": NAMESPACE,
-            "name": STEER_TOOL,
-            "call_id": steer.call_id,
-            "arguments": steer.arguments,
+            "type": "message",
+            "id": "msg_1",
+            "role": "assistant",
+            "content": [{ "type": "output_text", "text": "" }],
         }),
-        "the emitted item's shape is the contract with Codex's parser"
+        "the added frame announces the message item with an empty text part -- \
+         a shell for deltas that, on this path, never come"
     );
-    assert!(
-        item_id.starts_with("fc_"),
-        "a call's item id lives in its own space, never the message space: \
-         {item_id}"
+    assert_eq!(
+        *done,
+        serde_json::json!({
+            "type": "message",
+            "id": "msg_1",
+            "role": "assistant",
+            "content": [{ "type": "output_text", "text": STEER_ANSWER }],
+        }),
+        "the done frame is the whole answer, and its shape is the contract with \
+         Codex's parser"
     );
-    assert_ne!(
-        item_id, "msg_1",
-        "msg_1 is the assistant message's id and nothing else's"
+    assert_eq!(
+        frames_carrying_a_call(&frames),
+        0,
+        "no verdict maps to a tool call any more (T2/T4), so nothing this \
+         deployment emits may arrive as one for a client to dispatch"
     );
 
     // ---- what the completion reports, and what it is a measure of (F03) ----
@@ -669,7 +707,7 @@ async fn the_steered_turn_emits_exactly_four_frames_and_no_others() {
     let stored = stored_items(&rig.store, "sess-frames").await;
     let (emitted_item, admitted) = stored
         .split_last()
-        .expect("the emitted call is the last item this turn appended");
+        .expect("the correction is the last item this turn appended");
     let admitted_tokens: u64 = admitted.iter().map(|item| item.render().len() as u64).sum();
     let emitted_tokens = emitted_item.render().len() as u64;
 
@@ -729,76 +767,69 @@ async fn the_steered_turn_emits_exactly_four_frames_and_no_others() {
     );
 }
 
-/// The other half of the round trip: the client dispatches the call and comes
-/// back with the call *and* its output, and the session extends rather than
-/// forks.
+/// The other half of the round trip: the agent carries on, re-sending the
+/// correction in its history, and the session extends rather than forks.
 ///
-/// Played with Codex's own types, so the resent `function_call` carries the
-/// namespace and the item id our projection put on it — the two fields
-/// canonicalization ignores. If it did not ignore them, the claimed prefix
-/// would disagree with the stored one and this session would silently rebind
-/// to a fresh, cold generation.
+/// **One item comes back now, not two.** The old shape put the emitted call
+/// *and* the output the client produced by running it back into the history;
+/// the correction is the turn's answer now, so what returns is the assistant
+/// message itself — and prefix admission of it is ordinary, which is the whole
+/// of T1's "the item is stored and response_id-stamped like any answer".
+///
+/// Played with Codex's own types, so the resent message carries the shape a real
+/// client sends rather than our reconstruction of it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_resent_call_and_its_output_extend_rather_than_fork() {
+async fn the_resent_guidance_extends_rather_than_forks() {
     let rig = rig([Plan::Steer]);
     let session = "sess-resend";
 
     drive(&rig, request(session, vec![user_message("hello")]))
         .await
         .expect("the steered turn completes");
-    let steer = rig.interjector.steer();
 
     let after_steer = stored_items(&rig.store, session).await;
     assert_eq!(
         after_steer.len(),
         3,
-        "instructions, the question, and the emitted call: {after_steer:#?}"
+        "instructions, the question, and the correction: {after_steer:#?}"
     );
 
-    // Exactly what the agent sends next: everything it had, plus the call it
-    // was handed, plus the output it produced by running it.
+    // Exactly what the agent sends next: everything it had, plus the answer it
+    // was handed, plus what it decided to say having read it.
     let resent = vec![
         user_message("hello"),
-        function_call_item(
-            STEER_TOOL,
-            Some(NAMESPACE),
-            &steer.call_id,
-            &steer.arguments,
-        ),
-        function_call_output_item(&steer.call_id, "slow down and re-read the failure"),
+        assistant_message(STEER_ANSWER),
+        user_message("right — back to the parser"),
     ];
     let second = drive(&rig, request(session, resent))
         .await
-        .expect("the turn fulfilling the steer completes");
+        .expect("the turn after the steer completes");
     assert!(!response_id(&second).is_empty());
 
     assert_never_forked(&rig.store, session).await;
     let items = stored_items(&rig.store, session).await;
     assert_eq!(
         items[3].content,
-        ItemContent::ToolResult {
-            call_id: steer.call_id.clone(),
-            output: "slow down and re-read the failure".to_string(),
+        ItemContent::Text {
+            text: "right — back to the parser".to_string(),
         },
-        "the suffix admitted is exactly the output, and nothing before it: \
-         {items:#?}"
+        "the suffix admitted is exactly the new question, and nothing before \
+         it: {items:#?}"
     );
-    assert_eq!(
-        items[3].role,
-        Role::Tool,
-        "a tool result is the tool's turn to speak"
-    );
+    assert_eq!(items[3].role, Role::User);
     assert_eq!(
         items
             .iter()
-            .filter(|item| matches!(item.content, ItemContent::ToolCall { .. }))
+            .filter(|item| item.role == Role::Assistant
+                && matches!(&item.content, ItemContent::Text { text } if text == STEER_ANSWER))
             .count(),
         1,
-        "the resent call must be recognized as the prefix it is, not appended \
-         a second time: {items:#?}"
+        "the resent correction must be recognized as the prefix it is, not \
+         appended a second time: {items:#?}"
     );
-    // The call kept its stamp and the result never had one: that asymmetry is
-    // what lets a projection tell an emitted call from a client-sent one.
+    // The correction kept its stamp and the client's own message never had one:
+    // that asymmetry is what lets a projection tell an item this deployment
+    // wrote from one a client sent.
     assert!(items[2].response_id.is_some());
     assert!(items[3].response_id.is_none());
     // And the fifth item is this turn's ordinary answer, which is what proves
@@ -811,13 +842,13 @@ async fn the_resent_call_and_its_output_extend_rather_than_fork() {
     );
 }
 
-/// The N+2 case, where the tool result has moved *inside* the overlap.
+/// The N+2 case, where the correction has moved *inside* the overlap.
 ///
-/// On turn N+1 the result is fresh suffix and never compared; on N+2 it is
-/// compared, against the client's own stored copy of it. That is the turn where
-/// a canonicalization that renders a tool result differently coming in than it
-/// stored going out would fork — and it would fork one turn *after* the one
-/// anybody was watching.
+/// On turn N+1 the guidance item is the tail of the claimed prefix; on N+2 it is
+/// deep inside it, compared against the client's own stored copy. That is the
+/// turn where a canonicalization that renders an assistant message differently
+/// coming in than it stored going out would fork — and it would fork one turn
+/// *after* the one anybody was watching.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_third_turn_after_a_steer_still_matches_its_prefix() {
     let rig = rig([Plan::Steer]);
@@ -826,82 +857,64 @@ async fn a_third_turn_after_a_steer_still_matches_its_prefix() {
     drive(&rig, request(session, vec![user_message("hello")]))
         .await
         .expect("the steered turn completes");
-    let steer = rig.interjector.steer();
 
-    let fulfilled = vec![
+    let after = vec![
         user_message("hello"),
-        function_call_item(
-            STEER_TOOL,
-            Some(NAMESPACE),
-            &steer.call_id,
-            &steer.arguments,
-        ),
-        function_call_output_item(&steer.call_id, "understood"),
+        assistant_message(STEER_ANSWER),
+        user_message("right — back to the parser"),
     ];
-    drive(&rig, request(session, fulfilled.clone()))
+    drive(&rig, request(session, after.clone()))
         .await
-        .expect("the fulfilling turn completes");
+        .expect("the turn after the steer completes");
 
-    let mut third = fulfilled;
+    let mut third = after;
     third.push(assistant_message(ANSWER));
     third.push(user_message("and now this"));
     drive(&rig, request(session, third))
         .await
-        .expect("the turn after the fulfilment completes");
+        .expect("the turn after that completes");
 
     assert_never_forked(&rig.store, session).await;
     let items = stored_items(&rig.store, session).await;
     assert_eq!(
         items
             .iter()
-            .filter(|item| matches!(item.content, ItemContent::ToolCall { .. }))
+            .filter(
+                |item| matches!(&item.content, ItemContent::Text { text } if text == STEER_ANSWER)
+            )
             .count(),
         1,
-        "the call is stored once however many turns re-send it: {items:#?}"
-    );
-    assert_eq!(
-        items
-            .iter()
-            .filter(|item| matches!(item.content, ItemContent::ToolResult { .. }))
-            .count(),
-        1,
-        "and so is its output: {items:#?}"
+        "the correction is stored once however many turns re-send it: {items:#?}"
     );
     assert_eq!(
         items.len(),
         7,
-        "instructions, question, call, output, answer, question, answer: \
-         {items:#?}"
+        "instructions, question, correction, question, answer, question, \
+         answer: {items:#?}"
     );
 }
 
-/// An agent that reasons between the call and its output does not fork the
-/// session either.
+/// An agent that reasons after being corrected does not fork the session
+/// either.
 ///
 /// `reasoning` items are dropped on the way in, on every request alike — which
 /// is what keeps the claimed prefix equal to the stored one. Worth its own test
-/// because a steered turn is exactly when a real agent reasons: it was handed a
-/// tool call it did not ask for.
+/// because a steered turn is exactly when a real agent reasons: it was told its
+/// approach was going nowhere and handed its own request back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_reasoning_item_between_the_call_and_its_output_does_not_fork() {
+async fn a_reasoning_item_after_the_correction_does_not_fork() {
     let rig = rig([Plan::Steer]);
     let session = "sess-reasoning";
 
     drive(&rig, request(session, vec![user_message("hello")]))
         .await
         .expect("the steered turn completes");
-    let steer = rig.interjector.steer();
 
     let resent = vec![
         user_message("hello"),
-        function_call_item(
-            STEER_TOOL,
-            Some(NAMESPACE),
-            &steer.call_id,
-            &steer.arguments,
-        ),
+        assistant_message(STEER_ANSWER),
         reasoning_item("rs_1"),
-        function_call_output_item(&steer.call_id, "understood"),
+        user_message("right — back to the parser"),
     ];
     drive(&rig, request(session, resent))
         .await
@@ -912,10 +925,10 @@ async fn a_reasoning_item_between_the_call_and_its_output_does_not_fork() {
     assert_eq!(
         items.len(),
         5,
-        "instructions, question, call, output, answer — the reasoning item is \
-         dropped rather than stored: {items:#?}"
+        "instructions, question, correction, question, answer — the reasoning \
+         item is dropped rather than stored: {items:#?}"
     );
-    assert!(matches!(items[3].content, ItemContent::ToolResult { .. }));
+    assert_eq!(items[3].role, Role::User);
 }
 
 /// An identical retry of a steered turn replays it, and never re-enters the
@@ -1141,13 +1154,8 @@ async fn a_steered_turn_opens_no_grant_and_books_no_model_row() {
             "sess-books",
             vec![
                 user_message("hello"),
-                function_call_item(
-                    STEER_TOOL,
-                    Some(NAMESPACE),
-                    &rig.interjector.steer().call_id,
-                    &rig.interjector.steer().arguments,
-                ),
-                function_call_output_item(&rig.interjector.steer().call_id, "understood"),
+                assistant_message(STEER_ANSWER),
+                user_message("right — back to the parser"),
             ],
         ),
     )
@@ -1170,46 +1178,42 @@ async fn a_steered_turn_opens_no_grant_and_books_no_model_row() {
     );
 }
 
-/// The namespace and the item id are wire decoration, and the turn id is a
-/// hash of the conversation — so neither may move it.
+/// A namespace and an item id are wire decoration, and the turn id is a hash of
+/// the conversation — so neither may move it.
 ///
-/// Observable only through deduplication, which is the honest place for it:
-/// a client that re-sends the same conversation spelled *flat* — no namespace,
-/// no item id, the shape a future Messages surface would send — must land on
-/// the same turn id and be answered with the response the namespaced spelling
+/// **Re-aimed at the client's own MCP calls (T4).** This used to send back the
+/// call *we* emitted, spelled two ways; there is no such call now, so it sends
+/// back a call the agent ran of its own accord, which is the only kind of tool
+/// call this wire still carries — and the property being pinned is unchanged,
+/// because it was never about whose call it was.
+///
+/// Observable only through deduplication, which is the honest place for it: a
+/// client that re-sends the same conversation spelled *flat* — no namespace, no
+/// item id, the shape a future Messages surface would send — must land on the
+/// same turn id and be answered with the response the namespaced spelling
 /// already produced. If canonicalization read either field, this would be a new
 /// turn, generated and billed a second time.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_clients_namespace_and_item_id_do_not_perturb_the_turn_hash() {
-    let rig = rig([Plan::Steer]);
+    let rig = rig([Plan::Proceed]);
     let session = "sess-hash";
-
-    drive(&rig, request(session, vec![user_message("hello")]))
-        .await
-        .expect("the steered turn completes");
-    let steer = rig.interjector.steer();
 
     let namespaced = vec![
         user_message("hello"),
-        function_call_item(
-            STEER_TOOL,
-            Some(NAMESPACE),
-            &steer.call_id,
-            &steer.arguments,
-        ),
-        function_call_output_item(&steer.call_id, "understood"),
+        function_call_item("grep", Some(NAMESPACE), "call_theirs", r#"{"q":"x"}"#),
+        function_call_output_item("call_theirs", "3 hits"),
     ];
     let first = drive(&rig, request(session, namespaced))
         .await
-        .expect("the namespaced resend completes");
+        .expect("the namespaced turn completes");
 
     // The same conversation, spelled without a namespace and without an item
     // id. Everything a dialect adds is gone; everything the hash reads is the
     // same.
     let flat = vec![
         user_message("hello"),
-        function_call_item(STEER_TOOL, None, &steer.call_id, &steer.arguments),
-        function_call_output_item(&steer.call_id, "understood"),
+        function_call_item("grep", None, "call_theirs", r#"{"q":"x"}"#),
+        function_call_output_item("call_theirs", "3 hits"),
     ];
     let second = drive(&rig, request(session, flat))
         .await
@@ -1226,30 +1230,47 @@ async fn the_clients_namespace_and_item_id_do_not_perturb_the_turn_hash() {
     assert_eq!(
         items.len(),
         5,
-        "and nothing was appended a second time: {items:#?}"
+        "instructions, question, call, output, answer — and nothing appended a \
+         second time: {items:#?}"
     );
 }
 
-/// The wire projection is the *only* place a namespace exists.
+/// A namespace is a wire fact and never a stored one.
 ///
 /// A negative assertion over the log's own bytes, because the cost of getting
-/// this wrong is invisible until a second dialect appears: a namespace stored
-/// in the item would make Codex's resend and a flat resend canonicalize to two
-/// different items, and every steered session would fork on the turn a client
-/// changed dialect.
+/// this wrong is invisible until a second dialect appears: a namespace stored in
+/// the item would make Codex's resend and a flat resend canonicalize to two
+/// different items, and every session carrying an agent's own MCP calls would
+/// fork on the turn that agent changed dialect.
+///
+/// **Asked of an inbound call now (T4)**, because outbound calls no longer
+/// exist. That makes the claim narrower and more honest than it was: the
+/// namespace is stripped by `canonical_item`, and this is the assertion that
+/// says so against a real client's bytes rather than against our own projection
+/// of them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_log_stores_the_bare_tool_name_and_no_namespace() {
-    let rig = rig([Plan::Steer]);
+    let rig = rig([Plan::Proceed]);
 
-    drive(&rig, request("sess-bare", vec![user_message("hello")]))
-        .await
-        .expect("the steered turn completes");
+    drive(
+        &rig,
+        request(
+            "sess-bare",
+            vec![
+                user_message("hello"),
+                function_call_item("grep", Some(NAMESPACE), "call_theirs", r#"{"q":"x"}"#),
+                function_call_output_item("call_theirs", "3 hits"),
+            ],
+        ),
+    )
+    .await
+    .expect("the turn completes");
 
     let items = stored_items(&rig.store, "sess-bare").await;
     let ItemContent::ToolCall { name, .. } = &items[2].content else {
-        panic!("the third item is the emitted call: {items:#?}");
+        panic!("the third item is the client's own call: {items:#?}");
     };
-    assert_eq!(name, STEER_TOOL);
+    assert_eq!(name, "grep", "the log keeps the bare tool name");
     let encoded: Value = serde_json::to_value(&items[2]).expect("an item serializes");
     assert!(
         !encoded.to_string().contains(NAMESPACE),
@@ -1311,15 +1332,14 @@ async fn a_clients_own_tool_call_is_not_projected_as_an_emitted_one() {
     );
 }
 
-/// An earlier turn's steer does not leak into a later response's replay.
+/// An earlier turn's correction does not leak into a later response's replay.
 ///
-/// The third narrowness control, for the half of the provenance check that
-/// compares stamps rather than merely requiring one. A replay re-reads the
-/// session's log from the beginning, so every emitted call this session ever
-/// made passes under `concerns()` — and only the one bearing *this* response's
-/// id may go out. Without the comparison, the retry below would replay turn
-/// one's steer alongside turn two's answer, and the agent would dispatch a
-/// call it answered two turns ago.
+/// The provenance check compares *stamps* rather than merely requiring one. A
+/// replay re-reads the session's log from the beginning, so every item this
+/// session ever emitted passes under `concerns()` — and only the one bearing
+/// *this* response's id may go out. Without the comparison, the retry below
+/// would replay turn one's correction alongside turn two's answer, and the agent
+/// would be handed a correction it read two turns ago as though it were fresh.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_earlier_steer_is_not_replayed_into_a_later_response() {
     let rig = rig([Plan::Steer]);
@@ -1328,26 +1348,20 @@ async fn an_earlier_steer_is_not_replayed_into_a_later_response() {
     drive(&rig, request(session, vec![user_message("hello")]))
         .await
         .expect("the steered turn completes");
-    let steer = rig.interjector.steer();
 
-    let fulfilled = vec![
+    let after = vec![
         user_message("hello"),
-        function_call_item(
-            STEER_TOOL,
-            Some(NAMESPACE),
-            &steer.call_id,
-            &steer.arguments,
-        ),
-        function_call_output_item(&steer.call_id, "understood"),
+        assistant_message(STEER_ANSWER),
+        user_message("right — back to the parser"),
     ];
-    drive(&rig, request(session, fulfilled.clone()))
+    drive(&rig, request(session, after.clone()))
         .await
-        .expect("the fulfilling turn completes");
+        .expect("the turn after the steer completes");
 
     // The identical body again: deduplicated onto the second response, whose
     // entries are replayed out of a log that also holds the first response's
-    // emitted call.
-    let replay = drive_frames(&rig, request(session, fulfilled)).await;
+    // correction.
+    let replay = drive_frames(&rig, request(session, after)).await;
     assert_eq!(
         kinds(&replay),
         vec![
@@ -1358,6 +1372,12 @@ async fn an_earlier_steer_is_not_replayed_into_a_later_response() {
             "response.completed",
         ],
         "the replay is the second response and nothing else: {replay:#?}"
+    );
+    let answered = &replay[3].payload["item"]["content"][0]["text"];
+    assert_eq!(
+        answered, ANSWER,
+        "and what it replays is that response's own answer, not the earlier \
+         correction: {answered}"
     );
     assert_eq!(frames_carrying_a_call(&replay), 0);
 }

@@ -85,6 +85,17 @@ pub const DEFAULT_API_BASE: &str = "https://api.openai.com/v1";
 /// bases are separate fields rather than one with a header switch.
 pub const DEFAULT_PASS_THROUGH_BASE: &str = "https://chatgpt.com/backend-api/codex";
 
+/// Where the Responses route lives under a base URL, absent a definition
+/// saying otherwise.
+///
+/// OpenAI serves it here and so does OpenRouter
+/// (`https://openrouter.ai/api/v1/responses`, GA since 2026-07-25). A
+/// deployment addressing something else — a Dynamo frontend behind a path
+/// prefix, a `switchyard-server` — states its own path in the catalog's
+/// `providers` section rather than editing this constant, which is the whole
+/// point of routes being data.
+pub const DEFAULT_RESPONSES_PATH: &str = "/responses";
+
 /// The dialect this client serializes. Anything else is refused rather than
 /// mis-serialized — see [`FrontierError::UnsupportedDialect`].
 const SPOKEN: WireProtocol = WireProtocol::OpenAiResponses;
@@ -103,6 +114,21 @@ pub struct OpenAiResponsesClient {
     forwarding: reqwest::Client,
     api_base: String,
     pass_through_base: String,
+    /// The path under the base URL that a Responses request is POSTed to.
+    ///
+    /// Configurable since M10.1's provider registry, because the same client
+    /// now serves several origins and they do not all agree on where the route
+    /// lives — the whole content of a `providers` entry's
+    /// `routes.responses`. [`DEFAULT_RESPONSES_PATH`] is what a definition that
+    /// says nothing gets, which is what OpenAI and OpenRouter both use.
+    responses_path: String,
+    /// Static headers this provider asked for, sent on every request.
+    ///
+    /// Applied *before* the credential headers and never after — see
+    /// [`Self::route`]. A definition that could overwrite `Authorization`
+    /// would be a file that is not the credential file deciding whose money a
+    /// turn spends.
+    extra_headers: HeaderMap,
 }
 
 impl OpenAiResponsesClient {
@@ -141,7 +167,53 @@ impl OpenAiResponsesClient {
             )?,
             api_base: trim_base(api_base.into()),
             pass_through_base: trim_base(pass_through_base.into()),
+            responses_path: DEFAULT_RESPONSES_PATH.to_string(),
+            extra_headers: HeaderMap::new(),
         })
+    }
+
+    /// Serve the Responses route at a path other than
+    /// [`DEFAULT_RESPONSES_PATH`].
+    ///
+    /// A builder rather than a fifth constructor argument: every existing call
+    /// site means the default, and a parameter they all had to spell would put
+    /// the same string in a dozen places for one deployment that needs a
+    /// different one.
+    pub fn with_responses_path(mut self, path: impl Into<String>) -> Self {
+        self.responses_path = path.into();
+        self
+    }
+
+    /// Send `headers` on every request this client makes.
+    ///
+    /// Fallible because a header name or value that the HTTP stack will not
+    /// accept is a configuration mistake, and discovering it at the first
+    /// dispatch would fail one tenant's turn for a line in a file — the same
+    /// argument [`Self::new`] makes for being fallible at all. The composition
+    /// root turns this into a boot refusal.
+    ///
+    /// Values are **not** marked sensitive: these are identification headers a
+    /// gateway asks for, written in a file that is not the credential file, and
+    /// marking them would hide from diagnostics exactly the fields an operator
+    /// put there to be seen. A key does not belong here — it travels on the
+    /// quote.
+    pub fn with_extra_headers<I>(mut self, headers: I) -> Result<Self, FrontierError>
+    where
+        I: IntoIterator<Item = (String, String)>,
+    {
+        for (name, value) in headers {
+            let parsed = HeaderName::from_bytes(name.as_bytes())
+                .ok()
+                .zip(HeaderValue::from_str(&value).ok())
+                .ok_or_else(|| {
+                    FrontierError::Upstream(format!(
+                        "`{name}` is not a header this client can send; refusing to build a \
+                         transport that would drop a header a provider asked for"
+                    ))
+                })?;
+            self.extra_headers.insert(parsed.0, parsed.1);
+        }
+        Ok(self)
     }
 
     /// The request body this quote becomes.
@@ -193,7 +265,10 @@ impl OpenAiResponsesClient {
                 // out: that is the one seam that yields plaintext, and routing
                 // every read through it is what makes a grep for it complete.
                 let key = credential.require_api_key(provider)?;
-                let mut headers = HeaderMap::new();
+                // Seeded with the provider's static headers, then the
+                // credential on top: a definition cannot displace the one
+                // header that decides whose money this turn spends.
+                let mut headers = self.extra_headers.clone();
                 headers.insert(
                     reqwest::header::AUTHORIZATION,
                     sensitive(&format!("Bearer {key}")).ok_or_else(|| {
@@ -210,7 +285,7 @@ impl OpenAiResponsesClient {
                 })
             }
             TurnCredential::Forwarded(forwarded) => {
-                let mut headers = HeaderMap::new();
+                let mut headers = self.extra_headers.clone();
                 for (name, value) in forwarded.headers() {
                     // Both halves are already bounded: the name comes from the
                     // allowlist and the value passed the edge's forwardable
@@ -284,7 +359,7 @@ impl FrontierClient for OpenAiResponsesClient {
         let route = self.route(&quote.credential, provider)?;
         let response = route
             .client
-            .post(format!("{}/responses", route.base))
+            .post(format!("{}{}", route.base, self.responses_path))
             .headers(route.headers.clone())
             .json(&Self::body(quote, model))
             .send()
@@ -294,16 +369,24 @@ impl FrontierClient for OpenAiResponsesClient {
                 // header, so there is nothing to redact here -- stated because
                 // the next person to add context to this message needs to know
                 // it is not exempt.
-                FrontierError::Upstream(format!("the request to the upstream failed: {source}"))
+                //
+                // `is_timeout` is read here and nowhere else: it is a fact the
+                // transport knows and nothing downstream can recover, and it is
+                // the difference between an attempt row that says the provider
+                // was unreachable and one that says it was slow.
+                FrontierError::Transport {
+                    timed_out: source.is_timeout(),
+                    message: source.to_string(),
+                }
             })?;
 
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            return Err(FrontierError::Upstream(format!(
-                "the upstream answered {status}: {}",
-                route.credential.redact(body)
-            )));
+            return Err(FrontierError::Status {
+                status: status.as_u16(),
+                message: route.credential.redact(body),
+            });
         }
 
         Ok(decode(
@@ -369,13 +452,23 @@ fn bytes_state(
 /// The same error with any echoed credential removed.
 ///
 /// Every error leaving this module goes through here or through
-/// [`TurnCredential::redact`] directly. Only the [`FrontierError::Upstream`]
-/// arm can carry an upstream's words; the others are this client's own
-/// sentences and have nothing to scrub.
+/// [`TurnCredential::redact`] directly. Two arms can carry an upstream's words
+/// — [`FrontierError::Upstream`] and [`FrontierError::Status`] — and both are
+/// scrubbed; the others are this client's own sentences and have nothing to
+/// scrub. The match is exhaustive rather than a wildcard so that a variant
+/// added later cannot join the list of things that carry a body without
+/// somebody deciding it should.
 fn redact_error(credential: &TurnCredential, error: FrontierError) -> FrontierError {
     match error {
         FrontierError::Upstream(message) => FrontierError::Upstream(credential.redact(message)),
-        other => other,
+        FrontierError::Status { status, message } => FrontierError::Status {
+            status,
+            message: credential.redact(message),
+        },
+        other @ (FrontierError::UnknownProvider(_)
+        | FrontierError::Credential(_)
+        | FrontierError::UnsupportedDialect { .. }
+        | FrontierError::Transport { .. }) => other,
     }
 }
 
@@ -475,6 +568,106 @@ mod tests {
         // Completions it starts adding `stream_options.include_usage` rather
         // than silently reporting nothing.
         assert!(body.get("stream_options").is_none());
+    }
+
+    /// **P3: the outbound body names only fields OpenRouter's schema has.**
+    ///
+    /// The same client now serves OpenAI's endpoint and OpenRouter's, and their
+    /// `ResponsesRequest` schemas are not the same set. OpenRouter's has no
+    /// `stream_options` and no `client_metadata`
+    /// (`agent-docs/research/openrouter-api-surface.md` Q1, read from
+    /// `openapi.json` on 2026-08-24), and whether it *rejects* an unknown
+    /// top-level field or ignores it is untested — the route authenticates
+    /// before it validates, so an unauthenticated probe cannot reach the
+    /// validator. Sending only what both schemas name is what makes that open
+    /// question not matter.
+    ///
+    /// A whitelist rather than a blacklist, because the failure this guards is
+    /// somebody *adding* a field: a deny-list of two names would stay green
+    /// while a third arrived.
+    #[test]
+    fn the_outbound_body_names_only_fields_both_responses_schemas_have() {
+        let body = OpenAiResponsesClient::body(&quote(TurnCredential::Absent, SPOKEN), "kimi-k3");
+        let sent: Vec<&str> = body
+            .as_object()
+            .expect("the body is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        for field in &sent {
+            assert!(
+                matches!(
+                    *field,
+                    "model"
+                        | "stream"
+                        | "input"
+                        | "prompt_cache_key"
+                        | "max_output_tokens"
+                        | "store"
+                ),
+                "`{field}` is not a field OpenRouter's ResponsesRequest names; a request \
+                 carrying it may be rejected outright by a provider this client now serves"
+            );
+        }
+        // The two codex sends that OpenRouter's schema does not have, named
+        // rather than merely absent from the list above — this is the
+        // assertion a future edit has to argue with.
+        assert!(body.get("stream_options").is_none());
+        assert!(body.get("client_metadata").is_none());
+        // And the two constraints its schema states outright: `store` is
+        // `const: false`, and a non-null `previous_response_id` is a 400.
+        assert_eq!(body["store"], json!(false));
+        assert!(body.get("previous_response_id").is_none());
+    }
+
+    #[test]
+    fn a_provider_definition_moves_the_route_and_rides_its_own_headers() {
+        // The registry's case: one client type, two origins that do not agree
+        // on where the route lives or what they want to be told about the
+        // caller.
+        let client = OpenAiResponsesClient::with_bases(
+            "https://gateway.test/openai",
+            "https://gateway.test/openai",
+        )
+        .unwrap()
+        .with_responses_path("/v1/responses")
+        .with_extra_headers([("X-OpenRouter-Title".to_string(), "roundhouse".to_string())])
+        .unwrap();
+        assert_eq!(client.responses_path, "/v1/responses");
+
+        let stored = TurnCredential::Stored(Secret::api_key("sk-or-v1-ZZZZ").unwrap());
+        let route = client.route(&stored, "openrouter").unwrap();
+        assert_eq!(route.headers["x-openrouter-title"], "roundhouse");
+        assert_eq!(
+            route.headers[reqwest::header::AUTHORIZATION],
+            "Bearer sk-or-v1-ZZZZ"
+        );
+
+        // PROBE: a definition that tries to supply its own `Authorization`.
+        // The credential is applied after the static headers, so the file
+        // cannot decide whose money a turn spends — which is the one thing a
+        // non-credential file must never be able to do.
+        let hijack = OpenAiResponsesClient::new()
+            .unwrap()
+            .with_extra_headers([(
+                "authorization".to_string(),
+                "Bearer not-the-key".to_string(),
+            )])
+            .unwrap();
+        assert_eq!(
+            hijack.route(&stored, "openrouter").unwrap().headers[reqwest::header::AUTHORIZATION],
+            "Bearer sk-or-v1-ZZZZ",
+            "the resolved credential must win over anything the catalog file says"
+        );
+
+        // A header the HTTP stack cannot carry is a boot-time refusal rather
+        // than a request that silently goes out without it.
+        assert!(
+            OpenAiResponsesClient::new()
+                .unwrap()
+                .with_extra_headers([("not a header".to_string(), "x".to_string())])
+                .is_err()
+        );
     }
 
     #[test]

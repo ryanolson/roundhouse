@@ -22,6 +22,13 @@ use roundhouse_server::CatalogConfig;
 /// One catalog file, two entries for the same `(provider, model)`, different
 /// prices. Nothing else about the two entries differs.
 const DUPLICATE_IDENTITY: &str = r#"{
+  "providers": {
+    "anthropic": {
+      "base_url": "https://api.anthropic.test/v1",
+      "routes": { "messages": "/messages" },
+      "auth": { "env": "ANTHROPIC_API_KEY" }
+    }
+  },
   "models": [
     {
       "provider": "anthropic",
@@ -119,6 +126,8 @@ fn one_frontier_call(usage: Usage) -> Vec<SessionEvent> {
                     billing: Default::default(),
                     budget_draw: None,
                     withheld_providers: Vec::new(),
+                    declared_baseline: None,
+                    attempts: Vec::new(),
                 },
             },
         },
@@ -129,6 +138,7 @@ fn one_frontier_call(usage: Usage) -> Vec<SessionEvent> {
             kind: SessionEventKind::ResponseCompleted {
                 response_id: response,
                 usage,
+                provider_reported_cost_usd: None,
             },
         },
     ]

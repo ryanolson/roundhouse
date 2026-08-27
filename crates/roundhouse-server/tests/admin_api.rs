@@ -193,10 +193,24 @@ struct Rig {
 /// A deployment whose admin plane is real: a managed directory over a memory
 /// store, so writes compile and take effect on this node immediately.
 async fn rig(ledger: Arc<dyn SpendLedger>) -> Rig {
+    rig_over(file(), ledger).await
+}
+
+/// The same deployment over a caller-supplied control-plane file.
+///
+/// Split out for G14's key view, which needs a *file-declared* key carrying a
+/// member `fair_use` block — the only provenance under which one can exist.
+/// Putting that block on the shared [`file`] instead would have changed what
+/// every other test in this module reads back from `GET /v1/admin/keys`, which
+/// is the hazard `pass_through_file` already keeps its own fixture for.
+async fn rig_over(
+    file: roundhouse_server::ControlPlaneConfig,
+    ledger: Arc<dyn SpendLedger>,
+) -> Rig {
     ensure_rustls_crypto_provider();
     let directory = Arc::new(
         ControlDirectory::new(
-            file(),
+            file,
             "ROUNDHOUSE_CONTROL_PLANE",
             Arc::new(MemoryDirectoryStore::new()),
             CrossChecks::new(reachable(), None),
@@ -1066,6 +1080,12 @@ async fn the_budget_view_reports_committed_and_measured_separately() {
 
     // The exact key set. A field added without a decision is how a total gets
     // into a document that promises not to have one.
+    //
+    // `provider_reported_usd` and its stamp are the third column, added under
+    // M10's G11 ruling: what the upstream itself billed, published beside our
+    // two figures and summed into neither. `null` here, because this fixture's
+    // scripted provider reports no price — which is the honest reading and not
+    // a zero, and the difference is asserted below.
     assert_eq!(
         keys_of(&view),
         vec![
@@ -1078,6 +1098,8 @@ async fn the_budget_view_reports_committed_and_measured_separately() {
             "measured_usd",
             "members",
             "project",
+            "provider_reported",
+            "provider_reported_usd",
             "seat_tokens",
         ],
         "{view}"
@@ -1153,6 +1175,8 @@ async fn the_budget_view_reports_committed_and_measured_separately() {
             "member_committed_usd",
             "member_remaining_usd",
             "provenance",
+            "provider_reported",
+            "provider_reported_usd",
             "seat_tokens",
             "user",
         ],
@@ -1173,6 +1197,22 @@ async fn the_budget_view_reports_committed_and_measured_separately() {
     // always read it — zero here, because nothing in this fixture forwards a
     // subscription seat.
     assert_eq!(view["seat_tokens"]["total"], 0);
+
+    // G11's column, and the two claims it has to make. A provider that reported
+    // nothing leaves `null` rather than a confident `$0.00` — the fixture's
+    // scripted upstream sends no `cost` — and the stamp says whose arithmetic
+    // the number would be if there were one.
+    assert!(
+        view["provider_reported_usd"].is_null() && member["provider_reported_usd"].is_null(),
+        "nothing in this fixture reported a price, and a zero here would be a \
+         figure this deployment cannot support: {view}"
+    );
+    assert_eq!(view["provider_reported"]["basis"], "provider-reported");
+    assert_eq!(
+        view["provider_reported"]["window"], "lifetime",
+        "folded in this process's memory like `measured`, and stamped the same \
+         way so a reader does not compare it against the ledger's window"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2613,6 +2653,214 @@ async fn the_correctly_spelled_field_on_project_create_still_succeeds() {
         StatusCode::CREATED,
         "the real field name is enough: {text}"
     );
+}
+
+/// G14: a project's `fair_use` block is settable, readable and movable.
+///
+/// `POST` has always accepted one (the body is just [`ProjectEntry`] on the
+/// wire), and before this fix nothing on the admin surface could read it back or
+/// change it: `ProjectDto` had no field for it and `ProjectPatch` is
+/// `deny_unknown_fields`, so `PATCH {"fair_use": ...}` was a 422 for an axis the
+/// create route on the same resource had just accepted. The only remedy left was
+/// delete-and-recreate, which the archived-id tombstone exists to make
+/// unnecessary.
+///
+/// The read asserts the *block*, not a flag: an operator asking "what is in
+/// force" needs the window and the cap, and fair use has no second view (the
+/// way `budgeted: bool` has the budget view) to send them to for the number.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_projects_fair_use_can_be_created_read_back_and_changed() {
+    let rig = plain().await;
+
+    // Created with a 5h fair-use window, same as the create route already
+    // accepts today -- the create half of this claim is not in dispute.
+    let (create_status, create_text) = send(
+        &rig.app,
+        "POST",
+        "/v1/admin/projects",
+        Some(&root()),
+        Some(json!({
+            "id": "axis-co",
+            "fair_use": { "windows": [{ "window": "5h", "max_usd": 5.0 }] },
+        })),
+    )
+    .await;
+    assert_eq!(
+        create_status,
+        StatusCode::CREATED,
+        "create with fair_use is accepted today: {create_text}"
+    );
+
+    // Read back, in the file's own vocabulary -- which is also the vocabulary
+    // the PATCH below is written in, so there is one spelling of a window and
+    // not two.
+    let read_back = read(&rig.app, "/v1/admin/projects/axis-co").await;
+    assert_eq!(
+        read_back["fair_use"],
+        json!({ "windows": [{ "window": "5h", "max_usd": 5.0 }] }),
+        "GET must echo the block that is in force, cap and all -- a flag saying \
+         only that some ceiling exists leaves the operator exactly where this \
+         finding found them: {read_back}"
+    );
+
+    // Changed: the same axis the create route accepted, moved.
+    let (patch_status, patch_text) = send(
+        &rig.app,
+        "PATCH",
+        "/v1/admin/projects/axis-co",
+        Some(&root()),
+        Some(json!({
+            "fair_use": { "windows": [{ "window": "5h", "max_usd": 50.0 }] },
+        })),
+    )
+    .await;
+    assert_eq!(
+        patch_status,
+        StatusCode::OK,
+        "PATCH fair_use must not be refused as an unknown field for an axis the \
+         create route on this same resource accepts: {patch_text}"
+    );
+    let after = read(&rig.app, "/v1/admin/projects/axis-co").await;
+    assert_eq!(
+        after["fair_use"]["windows"][0]["max_usd"], 50.0,
+        "the raised cap is what a later read reports -- a 200 that changed \
+         nothing would be the same silence in a different place: {after}"
+    );
+
+    // And the patched block really went through the one compiler rather than
+    // being stored as opaque JSON: a window that caps nothing is refused here
+    // exactly as it is refused at boot. A PATCH that skipped validation would
+    // answer 200 and leave a ceiling that enforces nothing until the next
+    // restart failed to start.
+    let (invalid_status, invalid_text) = send(
+        &rig.app,
+        "PATCH",
+        "/v1/admin/projects/axis-co",
+        Some(&root()),
+        Some(json!({ "fair_use": { "windows": [{ "window": "24h" }] } })),
+    )
+    .await;
+    assert_eq!(
+        invalid_status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a window naming neither cap must be refused on the way in: \
+         {invalid_text}"
+    );
+    let unchanged = read(&rig.app, "/v1/admin/projects/axis-co").await;
+    assert_eq!(
+        unchanged["fair_use"]["windows"][0]["max_usd"], 50.0,
+        "and the refused patch must have changed nothing: {unchanged}"
+    );
+}
+
+/// The window axis a `PATCH` may move, and the one it may not, side by side.
+///
+/// A budget's window is refused because committed spend is counted *within* one
+/// (see `a_budget_window_change_is_refused_over_http_naming_the_mechanism`). A
+/// fair-use window has nothing committed to reinterpret -- the ledger buckets
+/// draws by wall-clock index under `(project, member)` and reads the configured
+/// span at admission time -- so moving one is an ordinary change, and this is
+/// the test that says the asymmetry is deliberate rather than an oversight
+/// nobody has hit yet.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fair_use_window_may_be_moved_where_a_budget_window_may_not() {
+    let rig = plain().await;
+    admin(
+        &rig.app,
+        "POST",
+        "/v1/admin/projects",
+        Some(json!({
+            "id": "window-co",
+            "fair_use": { "windows": [{ "window": "5h", "max_tokens": 1000 }] },
+        })),
+    )
+    .await;
+
+    let (status, text) = send(
+        &rig.app,
+        "PATCH",
+        "/v1/admin/projects/window-co",
+        Some(&root()),
+        Some(json!({
+            "fair_use": { "windows": [{ "window": "7d", "max_tokens": 1000 }] },
+        })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "widening a rolling window destroys no committed figure, so nothing \
+         here refuses it: {text}"
+    );
+    let after = read(&rig.app, "/v1/admin/projects/window-co").await;
+    assert_eq!(after["fair_use"]["windows"][0]["window"], "7d");
+
+    // An explicit `null` is still refused, naming the axis -- the same rule
+    // every other patchable axis is under, since "remove this ceiling" widens
+    // silently and has no spelling here on purpose.
+    let (null_status, null_code) = refused(
+        &rig.app,
+        "PATCH",
+        "/v1/admin/projects/window-co",
+        Some(json!({ "fair_use": Value::Null })),
+    )
+    .await;
+    assert_eq!(null_status, StatusCode::BAD_REQUEST);
+    assert_eq!(null_code, "null_patch_unsupported");
+}
+
+/// The other half of G14's read: a *member's* own windows, on the key view.
+///
+/// A member ceiling binds independently of the project's, so a member refused
+/// while the project has room is a refusal no project view can explain. Only a
+/// file-declared key can carry one -- the admin plane mints keys under a
+/// membership and has no route that writes a member window -- which is what
+/// this fixture's own file is for, and what the `null` on the API-minted key
+/// below pins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_members_own_fair_use_windows_are_readable_on_the_key_view() {
+    let file = control_plane(
+        json!({
+            "projects": [{ "id": "acme" }],
+            "users": [{ "id": "ada" }],
+            "keys": [{
+                "project": "acme",
+                "user": "ada",
+                "key_sha256": sha256_hex(&key("ada")),
+                "fair_use": { "windows": [{ "window": "24h", "max_tokens": 2_000_000 }] },
+            }],
+            "admin_keys": [sha256_hex(&root())],
+        }),
+        "admin-api member fair-use fixture",
+    );
+    let rig = rig_over(file, Arc::new(MemorySpendLedger::new())).await;
+
+    let keys = read(&rig.app, "/v1/admin/keys").await;
+    let declared = keys["data"]
+        .as_array()
+        .expect("a listing")
+        .iter()
+        .find(|row| row["user"] == "ada")
+        .expect("the file's key is listed")
+        .clone();
+    assert_eq!(
+        declared["fair_use"],
+        json!({ "windows": [{ "window": "24h", "max_tokens": 2_000_000 }] }),
+        "the member ceiling in force has to be readable from the surface that \
+         lists the key it belongs to: {declared}"
+    );
+
+    // The control, and the honest half: an admin key pays for nothing and has
+    // no scope a rolling ceiling could be drawn against, so it reports `null`
+    // rather than inheriting anything.
+    let admin_row = keys["data"]
+        .as_array()
+        .expect("a listing")
+        .iter()
+        .find(|row| row["scope"] == "admin")
+        .expect("the file's admin key is listed")
+        .clone();
+    assert!(admin_row["fair_use"].is_null(), "{admin_row}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

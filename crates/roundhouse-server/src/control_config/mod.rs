@@ -91,6 +91,7 @@ pub mod config;
 pub mod credentials;
 pub mod crosscheck;
 pub mod directory;
+pub mod fair_use;
 pub mod validate;
 
 use std::collections::{HashMap, HashSet};
@@ -101,9 +102,11 @@ use axum::http::header::AUTHORIZATION;
 use sha2::{Digest, Sha256};
 
 use roundhouse_core::control::{
-    BudgetCounts, BudgetTerms, PresentedCredential, Principal, TurnCredentials, TurnPolicy,
+    BudgetCounts, BudgetTerms, FairUseTerms, PresentedCredential, Principal, TurnCredentials,
+    TurnPolicy,
 };
 use roundhouse_core::ids::SessionId;
+use roundhouse_core::routing::TierRecipe;
 use roundhouse_core::validate::ValidationTerms;
 
 use crate::dialect::ClientDialect;
@@ -122,6 +125,7 @@ pub use directory::{
     MembershipRole, MemoryDirectoryStore, PlaneSource, ProjectPatch, ProjectRecord, Provenance,
     StoreFailure, UserRecord,
 };
+pub use fair_use::{FairUseConfig, FairUseWindowConfig};
 pub use validate::{ArmSharesConfig, ValidateConfig};
 
 /// Path to a control-plane JSON file. Absent means [`ControlPlane::Open`].
@@ -1079,6 +1083,27 @@ pub struct Admission {
     /// pair it already carries: two facts resolved from the same key must
     /// travel together or a caller can read one without the other.
     pub budget: Option<BudgetTerms>,
+    /// This membership's rolling fair-use ceilings: its project's windows
+    /// paired with its own.
+    ///
+    /// **Not an `Option`, unlike `budget`, and the difference is what each
+    /// absence costs.** A `None` budget is what lets the engine skip the spend
+    /// ledger entirely — a durable counter two processes race for, whose call
+    /// is the one place a ledger outage may fail a turn. Empty fair-use terms
+    /// cost a `Vec::is_empty()` on the admission path and nothing else, so a
+    /// distinct "not configured" state would be two spellings of one thing
+    /// with no reader able to tell them apart. `FairUseTerms::is_empty` is the
+    /// question every caller actually asks.
+    ///
+    /// Two lists inside, project and member, because both bind and the narrower
+    /// refuses first — see [`FairUseTerms`].
+    ///
+    /// Behind an `Arc` for the reason `policy` is: an [`Admission`] is cloned
+    /// per request out of a table compiled at load, and two `Vec`s inline made
+    /// this struct large enough that `KeyScope::Turn` tripped
+    /// `clippy::large_enum_variant` — a real cost, since that enum is moved
+    /// through the auth path of every request on every surface.
+    pub fair_use: Arc<FairUseTerms>,
     /// Whether this membership's sessions are enrolled in the validate/steer
     /// loop, and under what arms — or `None` for the shipped posture, which is
     /// off.
@@ -1117,6 +1142,21 @@ pub struct Admission {
     /// budget, and harmless where there is not — a membership with no budget
     /// never reaches the ledger at all.
     pub budget_counts: BudgetCounts,
+    /// The two ordered candidate lists this project's turns are routed between,
+    /// or `None` where it configured none.
+    ///
+    /// **Resolved here, beside `policy`, and deliberately not folded into it.**
+    /// A policy is a *constraint* — what this principal may reach — and it is
+    /// fingerprinted onto every decision as the audit trail's account of the
+    /// limits in force. A recipe is a *preference* among targets already
+    /// reachable. Folding one into the other would move the policy digest of
+    /// every project that configured a recipe and changed no entitlement, and
+    /// would make `unkeepable_promises` — which checks a policy's promises
+    /// against the catalog — answer a second question it was never asked.
+    ///
+    /// Behind an `Arc` for the reason `policy` is: an [`Admission`] is cloned
+    /// per request out of a table compiled at load.
+    pub tiers: Option<Arc<TierRecipe>>,
 }
 
 impl Admission {
@@ -1137,6 +1177,10 @@ impl Admission {
             principal: Principal::default_open(),
             policy: Arc::new(TurnPolicy::unrestricted()),
             budget: None,
+            // No rolling ceiling, for the reason there is no budget: an open
+            // deployment has no file to write one in, and a limit nobody
+            // configured must not start refusing turns that predate it.
+            fair_use: Arc::new(FairUseTerms::default()),
             // An open deployment has no file to enable the experiment in, and
             // enrolling its traffic anyway would meter and interrupt workloads
             // that predate the control plane — the one thing turning it on
@@ -1150,6 +1194,9 @@ impl Admission {
             // which is what `TurnCredentials::unrestricted` is written out for.
             credentials: TurnCredentials::unrestricted(),
             budget_counts: BudgetCounts::default(),
+            // No file to write a recipe in, and inventing one would re-route
+            // every turn of a deployment that never asked to be tier-routed.
+            tiers: None,
         }
     }
 
@@ -1186,6 +1233,10 @@ impl Admission {
             principal: self.principal.clone(),
             policy: Arc::new(policy),
             budget: self.budget.clone(),
+            // Nor a fair-use window: a rolling ceiling is an operator's, and
+            // an agent that could narrow — or widen — its own would be
+            // deciding how much of a shared account it may take.
+            fair_use: self.fair_use.clone(),
             validation: self.validation.clone(),
             // Not an axis a narrowing may touch either: which key a turn
             // authenticates with is not something an agent's own overlay — or
@@ -1193,6 +1244,11 @@ impl Admission {
             // turn reach a provider its project cannot pay for.
             credentials: self.credentials.clone(),
             budget_counts: self.budget_counts,
+            // Nor is the recipe. An overlay narrows what a turn may *reach*;
+            // which of the reachable tiers should answer is scored from the
+            // session's own evidence, and an agent that could edit the lists
+            // would be choosing its own model by another name.
+            tiers: self.tiers.clone(),
         }
     }
 }

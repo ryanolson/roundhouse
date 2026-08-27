@@ -15,6 +15,37 @@
 //! "the result after the call" is not a rule the wire guarantees. Matching on
 //! the id the client itself echoes is what makes an unanswered call visible as
 //! unanswered rather than silently paired with somebody else's output.
+//!
+//! # What M10.0 removed from here, and what it deliberately kept (T3)
+//!
+//! `is_undelivered_tool_result` is gone. It recognised the three texts codex
+//! substitutes for an answer — `"user cancelled MCP tool call"`, `"user
+//! rejected MCP tool call"`, `"aborted"` — and it existed for exactly one
+//! caller: the session fold's steer-fulfilment branch, which had to tell a
+//! correction the agent *read* from one it declined at an approval prompt (F05).
+//! The steer is assistant text now, delivered as the turn's own answer, so
+//! there is no dispatch to decline and no undelivered case to classify. Keeping
+//! the classifier for a caller that no longer exists would have been dead code
+//! wearing pinned-source knowledge.
+//!
+//! **Where that knowledge went, checked rather than assumed.** Of the three
+//! literals, only the `"aborted"` one is in `research/codex-0.146.0-vs-pin-
+//! vigilance.md` (claim 10, `ensure_call_outputs_present` synthesising an output
+//! for an unanswered call); the two approval-prompt texts are recorded in
+//! `PLAN-agentic-control-plane.md` (§ F05) and in git history, and nowhere on
+//! the vigilance list. That is a smaller loss than it looks — the vigilance list
+//! exists so a codex bump re-reads the claims *this build still depends on*, and
+//! after M10.0 no build path depends on those two — but it is stated here rather
+//! than implied, because "it is on the vigilance list" was the tempting thing to
+//! write and it would have been false.
+//!
+//! [`tool_output_body`] stays, and it is the half that was ever load-bearing
+//! beyond steering: [`ErrorSeverity`](crate::validate::ErrorSeverity) and
+//! [`exec_exit_code`] both read codex's result header, and the header is a fact
+//! about every exec result rather than about a cancelled steer. So the codex
+//! sentinel this module owes the vigilance list is the *header grammar*, not the
+//! cancellation literals — and that is what is still here to re-read when the
+//! pin moves.
 
 use sha2::{Digest, Sha256};
 
@@ -94,6 +125,83 @@ pub fn exchanges(items: &[Item]) -> Vec<Exchange> {
     exchanges
 }
 
+// ─── the agent's work, and our own control traffic ───────────────────────────
+
+/// The namespace codex flattens roundhouse's own MCP tools under.
+///
+/// The definition, not a copy: `roundhouse-server`'s
+/// `dialect::DEFAULT_MCP_NAMESPACE` re-exports this, and the server's rich doc
+/// about what an operator may rename lives there. It is stated *here* because
+/// the code that has to recognise a control call is below the server —
+/// [`ToolSignals`](super::ToolSignals) and the trigger's signals are in this
+/// crate and cannot see `roundhouse-server`. A second literal in this crate was
+/// the alternative and it fails in the direction that costs most: a rename
+/// would leave this classifier matching a name nothing emits, every control
+/// call would go back to reading as agent trouble, and nothing would be red.
+///
+/// **The one case this does not cover, stated rather than implied.** A
+/// deployment may set its own namespace (`ClientDialect`'s `namespace` field,
+/// written from file config in `control_config`), and this fold is pure — it
+/// takes a slice of exchanges and no deployment config. So a renamed
+/// deployment loses the exemption and gets today's behaviour back. Threading
+/// the dialect into the signal fold is what would close it, and it would put
+/// deployment configuration inside the one part of the validate loop that is a
+/// function of the session log alone. The unlock condition, for whoever wants
+/// it: a `SignalContext` carrying the dialect, passed everywhere
+/// `ToolSignals::from_exchanges` is called today.
+pub const CONTROL_TOOL_NAMESPACE: &str = "mcp__roundhouse";
+
+/// What codex puts between a namespace and a tool's own name.
+///
+/// `codex-mcp/src/mcp/mod.rs:78-81` @ `e363b08` builds the namespace as
+/// `mcp{DELIMITER}{server}{DELIMITER}` and `core/src/tools/handlers/mcp.rs:53`
+/// joins `{namespace}{DELIMITER}{name}`; [`CONTROL_TOOL_NAMESPACE`] is the
+/// `mcp{DELIMITER}{server}` half without the trailing delimiter.
+///
+/// One definition for two readers, which is the whole reason it is here rather
+/// than beside either of them: `codex_launch::skills` *renders* this join into
+/// every generated skill file, and this module has to *recognise* what comes
+/// back. Two literals could drift apart, and the drift is silent in both
+/// directions — a skill naming a tool codex cannot resolve, and a control call
+/// this classifier no longer recognises.
+pub const CONTROL_TOOL_DELIMITER: &str = "__";
+
+/// Whether this call is the agent talking to *us* rather than working on its
+/// task.
+///
+/// Matched on the namespace and the delimiter together, not on the namespace
+/// alone: a second MCP server called `roundhouse_extra` flattens to
+/// `mcp__roundhouse_extra__…`, which a bare `starts_with` would swallow into
+/// our own control traffic and quietly exempt somebody else's tools from every
+/// signal in the trigger.
+pub fn is_control_call(name: &str) -> bool {
+    name.strip_prefix(CONTROL_TOOL_NAMESPACE)
+        .and_then(|rest| rest.strip_prefix(CONTROL_TOOL_DELIMITER))
+        .is_some_and(|tool| !tool.is_empty())
+}
+
+/// The exchanges that are the agent working on its task.
+///
+/// **Roundhouse's own control calls are dropped, not re-categorised** (G04).
+/// Every signal in the trigger and every count in
+/// [`ToolSignals`](super::ToolSignals) asks a question about what the *agent*
+/// is doing, and an agent reading its own budget is not doing the task: a
+/// fifth `ToolCategory` would still leave `status`, `explain_last_route`,
+/// `prefer` and `set_quality_floor` inside the streaks, the windows and the
+/// depth that the signals are computed over — which is how four calls made
+/// because our own generated `rh-status` skill told the model to make them
+/// bought a judge side-call the session did not need.
+///
+/// A `Vec<&Exchange>` rather than a filtered clone because the outputs are
+/// whole tool results and this runs on the turn path; the borrowed view costs
+/// one pointer per call and the clone would cost the transcript.
+pub fn task_exchanges(exchanges: &[Exchange]) -> Vec<&Exchange> {
+    exchanges
+        .iter()
+        .filter(|exchange| !is_control_call(&exchange.name))
+        .collect()
+}
+
 /// The tool's own answer, with a codex wrapper header removed if it wrote one.
 ///
 /// **Why this lives here and not at the wire boundary.** Codex prepends a
@@ -142,31 +250,103 @@ pub fn exchanges(items: &[Item]) -> Vec<Exchange> {
 /// rather than producing a wrong answer, which is why they are documented here
 /// instead of guessed at.
 pub fn tool_output_body(output: &str) -> &str {
+    match codex_header(output) {
+        Some(header) => &output[header.body_start..],
+        None => output,
+    }
+}
+
+/// The exit status codex's exec wrapper reported, when it reported one.
+///
+/// **A structured fact read from the header, and the other half of a rule the
+/// body cannot carry.** Codex writes `Process exited with code {exit_code}` for
+/// every exec call it ran to completion — *including the ones that succeeded*
+/// (`response_text`, `core/src/tools/context.rs:443-470` @ `e363b08`, identical
+/// at the Cargo pin `6344a65`) — and [`tool_output_body`] strips that section
+/// along with the rest of the wrapper. So the two obvious readings are both
+/// wrong, and wrong in opposite directions:
+///
+/// - Ask the **whole string** whether it contains `exited with code` and every
+///   exec result reads as a failure, exit 0 included. That is the shape
+///   Switchyard's `exit_nonzero` row has upstream, where the header does not
+///   exist; ported naively it would pin an error severity on for the life of
+///   any session that ran a shell.
+/// - Ask only the **body** and the exit status disappears, because the line
+///   that carries it is not in the body. That is [`reads_as_failure`]'s state
+///   before this accessor existed: blind to a `grep` with no match, a `test`
+///   that was false, a `diff` that found differences — silent non-zero exits,
+///   the most common failure shape in an agentic coding loop.
+///
+/// The split this function exists to make: **exit code from the header, text
+/// patterns over the body.** Note it is the *inverse* of F04's remedy rather
+/// than another instance of it — there the header suppressed an anchored
+/// matcher, here it would manufacture a match for an unanchored one.
+///
+/// `None` means the header had no such section, which is a different answer
+/// from `Some(0)` and deliberately not collapsed with it: an MCP result carries
+/// `Wall time:` / `Output:` and no exit status at all (`context.rs:118-138`),
+/// and inventing a success for it would claim a fact codex never stated. A
+/// section whose number does not parse as an [`i32`] is also `None` — the value
+/// is unusable, and guessing at it is how a wrapper-format change would become
+/// a silent misread rather than a quiet one.
+pub fn exec_exit_code(output: &str) -> Option<i32> {
+    codex_header(output)?.exit_code
+}
+
+/// What one walk of a codex wrapper found.
+struct CodexHeader {
+    /// Byte offset of the first byte after the `Output:` line.
+    body_start: usize,
+    exit_code: Option<i32>,
+}
+
+/// The one recogniser both derived questions ask.
+///
+/// Deliberately a single walk rather than two scanners: an exit-code reader
+/// that looked for `Process exited with code` *anywhere* would find it in a
+/// build log that printed the phrase, which is F04's mistake with the sign
+/// flipped. The recogniser that decides where the body starts is the same one
+/// that decides whether a `Process exited` line is codex's or the tool's.
+///
+/// Returns `None` for anything that is not codex's wrapper, which is what keeps
+/// every non-codex result — and therefore every fixture and every already
+/// folded log — byte-identical.
+fn codex_header(output: &str) -> Option<CodexHeader> {
     // The two section prefixes codex can lead with. Matched as prefixes and
     // never parsed: the seconds are formatted `{:.4}` today, and a recogniser
     // that insisted on four decimals would be a second place to update the
     // moment upstream changes its format string.
     if !(output.starts_with("Wall time: ") || output.starts_with("Chunk ID: ")) {
-        return output;
+        return None;
     }
     let mut consumed = 0usize;
+    let mut exit_code = None;
     for (index, line) in output.split_inclusive('\n').enumerate() {
         if index >= MAX_HEADER_LINES {
-            return output;
+            return None;
         }
         consumed += line.len();
         let line = line.strip_suffix('\n').unwrap_or(line);
         if line == "Output:" {
-            return &output[consumed..];
+            return Some(CodexHeader {
+                body_start: consumed,
+                exit_code,
+            });
+        }
+        if let Some(code) = line.strip_prefix(EXIT_SECTION) {
+            exit_code = code.parse().ok();
         }
         if !is_header_section(line) {
-            return output;
+            return None;
         }
     }
     // Ran out of input inside what looked like a header: no body was ever
-    // reached, so there is nothing to strip and the caller gets what arrived.
-    output
+    // reached, so there is nothing to strip and no header to have read.
+    None
 }
+
+/// The section prefix, named once so the recogniser and the parser cannot drift.
+const EXIT_SECTION: &str = "Process exited with code ";
 
 /// Codex's longest header: `Chunk ID`, `Wall time`, `Process exited`,
 /// `Process running`, `Original token count`, then `Output:`
@@ -179,44 +359,12 @@ fn is_header_section(line: &str) -> bool {
     [
         "Wall time: ",
         "Chunk ID: ",
-        "Process exited with code ",
+        EXIT_SECTION,
         "Process running with session ID ",
         "Original token count: ",
     ]
     .iter()
     .any(|section| line.starts_with(section))
-}
-
-/// Whether a tool result says the call never reached the tool at all.
-///
-/// The three texts codex substitutes for an answer, all read at `e363b08` and
-/// confirmed identical at the Cargo pin `6344a65`:
-///
-/// - `"user cancelled MCP tool call"` — the operator cancelled the approval
-///   prompt (`core/src/mcp_tool_call.rs:280`).
-/// - `"user rejected MCP tool call"` — the approval was declined and no custom
-///   message was supplied (`mcp_tool_call.rs:267`).
-/// - `"aborted"` — codex synthesising a missing output for a call whose turn
-///   was dropped (`core/src/context_manager/normalize.rs:58,93,112`).
-///
-/// **Equality on the trimmed body, never a prefix or a substring.** `"aborted"`
-/// is short enough that a `contains` test would fire on a real correction
-/// reading "aborted the migration, now re-read the task" — and being wrong in
-/// that direction re-steers an agent that complied and writes a false fact into
-/// the log. Wrong in the other direction is F05 itself: a declined steer read
-/// as answered. A false positive here costs one redundant validation that the
-/// `consecutive_interventions` ladder already bounds; a false negative costs
-/// the correction entirely.
-///
-/// **Pinned to a revision, so it is on the vigilance list.** These are upstream
-/// message literals with no wire-level status beside them — codex reports a
-/// declined call as an ordinary `function_call_output` — so a codex bump has to
-/// re-read them the way any other pinned-source claim is re-read.
-pub fn is_undelivered_tool_result(output: &str) -> bool {
-    matches!(
-        tool_output_body(output).trim(),
-        "user cancelled MCP tool call" | "user rejected MCP tool call" | "aborted"
-    )
 }
 
 /// Whether a tool result reads as a failure.
@@ -238,6 +386,17 @@ pub fn is_undelivered_tool_result(output: &str) -> bool {
 ///   pass, and past the gate the judge reads the transcript and answers about
 ///   the trajectory, not about this flag.
 ///
+/// **That first bullet is about occasional misses and does not cover a
+/// systematic one**, which is the judgement the exit-code finding forced and is
+/// recorded here so nobody re-derives it. "Some failures go unseen, and the
+/// disjunction absorbs it" is an argument that stops holding the moment the
+/// unseen set is defined by a *shape* rather than by chance: a silent non-zero
+/// exit is not one failure in ten, it is every `grep` with no match, every
+/// false `test`, every `diff` that found differences — against a codex client
+/// the streak signal was not quiet but dead, exactly the class of defect F04
+/// was. So the missing structured fact is read rather than tolerated, and the
+/// tolerance above is left standing for what it was written about.
+///
 /// The test is deliberately narrow — a leading marker or a structured
 /// `"error"`/`"success": false` field — rather than a scan for the word
 /// "error" anywhere, which would flag every result that *mentions* an error it
@@ -250,6 +409,13 @@ pub fn is_undelivered_tool_result(output: &str) -> bool {
 /// signal was dead (F04). Stripping here rather than at each call site means a
 /// future reader of this function cannot reintroduce the gap by forgetting to.
 pub fn reads_as_failure(output: &str) -> bool {
+    // The structured fact before any text at all: a process that exited
+    // non-zero has said it failed in the one place the body cannot, and
+    // [`exec_exit_code`] documents why reading it from the header rather than
+    // from the string is the only reading that is right in both directions.
+    if exec_exit_code(output).is_some_and(|code| code != 0) {
+        return true;
+    }
     let output = tool_output_body(output);
     // The structured shapes first: a tool that answers in JSON has said so
     // explicitly, and an explicit answer beats a textual guess.
@@ -452,33 +618,131 @@ mod tests {
         assert_eq!(tool_output_body("Wall time: 0.01 seconds\nOutput:\nx"), "x");
     }
 
-    /// F05: the three texts codex substitutes for an answer.
+    /// The accessor itself: where an exit code may be read from, and where it
+    /// may not.
     #[test]
-    fn a_cancellation_reads_as_undelivered_and_a_directive_that_mentions_one_does_not() {
-        for undelivered in [
-            "user cancelled MCP tool call",
-            "user rejected MCP tool call",
-            "aborted",
-            // As it actually arrives: codex wraps the cancellation text the
-            // same way it wraps a real answer.
-            "Wall time: 0.0000 seconds\nOutput:\nuser cancelled MCP tool call",
+    fn an_exit_code_is_read_from_the_header_and_never_from_the_body() {
+        // Present, zero and non-zero, with and without the optional sections
+        // around it. `Some(0)` rather than `None`: "codex said zero" and "codex
+        // said nothing" are different answers and the caller needs both.
+        assert_eq!(
+            exec_exit_code(
+                "Chunk ID: 1\nWall time: 0.4212 seconds\nProcess exited with code 0\nOutput:\nall good"
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            exec_exit_code(
+                "Wall time: 0.0210 seconds\nProcess exited with code 101\nOutput:\nerror: could not compile `foo`"
+            ),
+            Some(101)
+        );
+        assert_eq!(
+            exec_exit_code(
+                "Chunk ID: c-1\nWall time: 0.0421 seconds\nProcess exited with code 1\n\
+                 Process running with session ID s-1\nOriginal token count: 42\nOutput:\nx"
+            ),
+            Some(1)
+        );
+
+        // Absent: an MCP result has no exit status, and a header that never
+        // terminates was never a header.
+        assert_eq!(
+            exec_exit_code("Wall time: 0.0421 seconds\nOutput:\nfine"),
+            None
+        );
+        assert_eq!(
+            exec_exit_code("Wall time: 0.1 seconds\nElapsed: 3\nOutput:\nbody"),
+            None
+        );
+
+        // Never from the body. Each of these is a tool *printing* the phrase —
+        // a build log, a shell transcript, a quoted error — and reading it as
+        // roundhouse's own fact is the mistake this accessor exists to make
+        // impossible.
+        for body_only in [
+            "Process exited with code 1",
+            "the child process exited with code 3, retrying",
+            "Wall time: 0.0421 seconds\nOutput:\nProcess exited with code 9",
+            "  Chunk ID: 1\nWall time: 0.1 seconds\nProcess exited with code 4\nOutput:\n",
         ] {
-            assert!(
-                is_undelivered_tool_result(undelivered),
-                "`{undelivered}` is codex saying the call never ran"
+            assert_eq!(
+                exec_exit_code(body_only),
+                None,
+                "`{body_only}` is a string that mentions an exit code, not a header codex wrote"
             );
         }
-        for delivered in [
-            "re-read the task",
-            // The reason this is equality and not `contains`: a real
-            // correction is allowed to mention what was aborted.
-            "aborted the migration, now re-read the task",
-            "the user cancelled MCP tool call earlier; try the other approach",
+
+        // Unparseable is `None`, not a guess: the value is unusable, and a
+        // wrapper-format change should degrade to quiet rather than to wrong.
+        assert_eq!(
+            exec_exit_code("Wall time: 0.1 seconds\nProcess exited with code SIGKILL\nOutput:\n"),
+            None
+        );
+    }
+
+    /// R2's non-regression requirement: a non-codex output is untouched by the
+    /// accessor's existence — same body, same fingerprint, same verdict.
+    #[test]
+    fn a_plain_string_is_unaffected_by_the_exit_code_split() {
+        for plain in [
+            "no matches",
             "",
+            "error: unresolved import",
+            "0 errors, 0 warnings",
+        ] {
+            assert_eq!(tool_output_body(plain), plain);
+            assert_eq!(exec_exit_code(plain), None);
+            assert_eq!(short_hash(tool_output_body(plain)), short_hash(plain));
+        }
+        assert!(reads_as_failure("error: unresolved import"));
+        assert!(!reads_as_failure("0 errors, 0 warnings"));
+    }
+
+    /// The exit code is a structured fact and the body is text, and reading
+    /// either one through the other's rules is a defect.
+    ///
+    /// The claim under test (round-3 Switchyard re-read): a codex **exec**
+    /// result that exited non-zero with empty or non-error-shaped stdout reads
+    /// as clean, because the one section that says otherwise is the section
+    /// [`tool_output_body`] strips. Every string below is codex's real header
+    /// shape (`response_text`, `core/src/tools/context.rs:443-470` @ `e363b08`,
+    /// identical at the pin `6344a65`).
+    #[test]
+    fn a_nonzero_exec_exit_reads_as_a_failure_even_when_stdout_says_nothing() {
+        // A `test -f`, a `grep` with no match, a `diff` that found differences:
+        // the most common failure shape in an agentic coding loop is a silent
+        // non-zero exit, and none of them writes a marker to stdout.
+        for silent_failure in [
+            "Chunk ID: 1\nWall time: 0.0210 seconds\nProcess exited with code 1\nOutput:\n",
+            "Chunk ID: 1\nWall time: 0.0210 seconds\nProcess exited with code 1\nOutput:",
+            "Wall time: 0.0210 seconds\nProcess exited with code 2\nOutput:\nsrc/lib.rs\n",
+            // A signal death, which codex reports as a plain code like any
+            // other because its `exit_code` is an `Option<i32>` it formats
+            // unconditionally.
+            "Chunk ID: 7\nWall time: 9.9000 seconds\nProcess exited with code 137\nOutput:\n",
         ] {
             assert!(
-                !is_undelivered_tool_result(delivered),
-                "`{delivered}` is a directive the agent received"
+                reads_as_failure(silent_failure),
+                "`{silent_failure}` exited non-zero; the header is the only \
+                 place that says so and it must be read as a fact"
+            );
+        }
+
+        // The other half of the split, and the reason this is not "stop
+        // stripping": codex writes the section on *success* too, so a body-side
+        // substring test would read every exec result as a failure.
+        for clean in [
+            "Chunk ID: 1\nWall time: 0.4212 seconds\nProcess exited with code 0\nOutput:\nall good",
+            "Chunk ID: 1\nWall time: 0.4212 seconds\nProcess exited with code 0\nOutput:\n",
+            // An MCP result never carries the section at all, so there is no
+            // exit status to lose and nothing to invent.
+            "Wall time: 0.0421 seconds\nOutput:\nfine",
+        ] {
+            assert!(
+                !reads_as_failure(clean),
+                "`{clean}` exited zero; the `exited with code` text in the \
+                 header is codex's bookkeeping, not the tool's verdict"
             );
         }
     }

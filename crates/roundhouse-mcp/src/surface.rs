@@ -85,7 +85,7 @@ pub trait ControlSurface: Send + Sync + 'static {
         request: SetQualityFloorRequest,
     ) -> Result<ToolOutcome, SurfaceError>;
 
-    /// Read the corrective payload a synthetic tool call named.
+    /// Re-read the correction roundhouse last put in this conversation.
     async fn fetch_steer(
         &self,
         principal: &Principal,
@@ -187,7 +187,8 @@ pub struct SetQualityFloorRequest {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FetchSteerRequest {
-    pub steer_id: String,
+    #[serde(default)]
+    pub conversation: Conversation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -201,7 +202,8 @@ pub enum SteerOutcome {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReportOutcomeRequest {
-    pub steer_id: String,
+    #[serde(default)]
+    pub conversation: Conversation,
     pub outcome: SteerOutcome,
     #[serde(default)]
     pub note: Option<String>,
@@ -243,8 +245,6 @@ pub struct StatusResponse {
     /// whether to wrap up, and the honest answer where no ceiling exists is
     /// that the question does not apply.
     pub budget: Option<BudgetView>,
-    /// Steers this deployment has emitted that no turn has answered yet.
-    pub open_steers: Vec<String>,
     /// The agent's own standing narrowing, if it has one.
     pub overlay: Option<OverlayView>,
 }
@@ -356,22 +356,30 @@ pub struct IntentResponse {
 
 /// What `fetch_steer` says.
 ///
-/// Every field is read from a record committed when the steer was emitted, so
-/// two calls produce identical bytes and neither does any work a provider could
-/// bill for. That is not an optimization: a handler that ran the judge on
-/// invocation would let a model — or a prompt injection reading this very
-/// description — drain the validate budget by calling the tool in a loop.
+/// Every field is a fold of the conversation's own log, so two calls produce
+/// identical bytes and neither does any work a provider could bill for. That is
+/// not an optimization: a handler that ran the judge on invocation would let a
+/// model — or a prompt injection reading this very description — drain the
+/// validate budget by calling the tool in a loop.
+///
+/// **The tool is a convenience since M10.0, not a channel.** The correction is
+/// an assistant message in the conversation the caller is already holding, so
+/// an agent that kept its context needs nothing from here; what this serves is
+/// the same guidance to an agent that compacted, resumed, or lost its
+/// scrollback. That is why it was re-purposed rather than removed: the tool
+/// count is a published contract, and a surface that shrank would invalidate
+/// every prompt cache in the deployment to delete a read that still answers a
+/// real question.
 #[derive(Debug, Clone, Serialize)]
 pub struct SteerResponse {
-    pub steer_id: String,
+    pub conversation: String,
     pub guidance: String,
-    pub emitted_at_ms: u64,
 }
 
 /// What `report_outcome` says.
 #[derive(Debug, Clone, Serialize)]
 pub struct OutcomeResponse {
-    pub steer_id: String,
+    pub conversation: String,
     pub outcome: SteerOutcome,
     pub recorded: bool,
 }
@@ -469,14 +477,18 @@ impl ToolOutcome {
 
 /// Why a tool call was refused.
 ///
-/// # The two that read alike on purpose
+/// # Where the steer tools' tenancy check moved
 ///
-/// An unknown `steer_id` and another principal's `steer_id` produce the *same*
-/// variant with the same rendering. Telling them apart would turn the tool into
-/// an oracle: a caller could enumerate ids and learn which ones exist in some
-/// other tenant's session, which is a slow leak of exactly the fact tenancy
-/// exists to hide. So `fetch_steer` resolves the id, compares principals, and —
-/// when either check fails — says only that this caller has no such steer.
+/// `fetch_steer` used to take a `steer_id` and compare principals itself, and
+/// the refusal was deliberately identical for "no such id" and "somebody else's
+/// id" — telling them apart would have made the tool an enumeration oracle for
+/// other tenants' sessions. M10.0 took the id away: both steer tools name a
+/// *conversation* now, so they resolve through
+/// [`ControlReads::resolve_session`](crate::reads::ControlReads::resolve_session)
+/// like every other session-scoped tool, and the boundary they sit behind is
+/// [`Self::ForeignConversation`] — the one every other session tool is already
+/// guarded by. The oracle argument is unchanged and is now somebody else's
+/// invariant to keep, which is the point of having one door.
 #[derive(Debug, thiserror::Error)]
 pub enum SurfaceError {
     #[error("no tool named `{0}` is served here")]
@@ -494,8 +506,13 @@ pub enum SurfaceError {
         field: &'static str,
         requirement: &'static str,
     },
-    #[error("no steer `{steer_id}` belongs to this key")]
-    UnknownSteer { steer_id: String },
+    /// Nothing has been steered in this conversation.
+    ///
+    /// A refusal rather than an empty payload, on `fetch_steer`'s original
+    /// argument: an agent handed `{"guidance": ""}` reads it as a correction
+    /// that said nothing, which is a worse answer than "there is none".
+    #[error("conversation `{0}` has had no correction from roundhouse")]
+    NoGuidanceYet(String),
     #[error("this key has no conversation yet; start a turn before asking about one")]
     NoSession,
     #[error("conversation `{0}` does not belong to this key")]

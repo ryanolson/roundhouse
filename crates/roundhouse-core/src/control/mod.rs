@@ -52,6 +52,7 @@
 
 pub mod budget;
 pub mod credential;
+pub mod fair_use;
 pub mod payer;
 pub mod policy;
 pub mod spend;
@@ -67,6 +68,10 @@ pub use credential::{
     CredentialError, CredentialKind, CredentialMode, CredentialRef, ForwardedCredential,
     OauthEvidence, PresentedCredential, ProviderAccess, Reachable, Secret, TurnCredential,
     TurnCredentials,
+};
+pub use fair_use::{
+    FairUseError, FairUseLedger, FairUseLimit, FairUseQuantity, FairUseRefusal, FairUseScope,
+    FairUseTerms, FairUseWindow, MemoryFairUseLedger,
 };
 pub use payer::{Billing, BudgetCounts, Payer, SettledSpend};
 pub use policy::{

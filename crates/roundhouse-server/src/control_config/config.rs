@@ -45,13 +45,16 @@ use serde::Deserialize;
 
 use roundhouse_core::control::credential::access::ProviderKeys;
 use roundhouse_core::control::{
-    Budget, BudgetCounts, CredentialError, CredentialMode, FilterError, FrontierCadence,
-    PolicyOverrides, Principal, TargetFilter, TurnCredentials, TurnPolicy,
+    Budget, BudgetCounts, CredentialError, CredentialMode, FairUseLimit, FilterError,
+    FrontierCadence, PolicyOverrides, Principal, TargetFilter, TurnCredentials, TurnPolicy,
 };
 
 use super::Admission;
 use super::budget::{AllocationConfig, BudgetConfig, budget_terms};
 use super::credentials::CredentialsConfig;
+use super::fair_use::{FairUseConfig, fair_use_terms};
+use roundhouse_core::routing::stage::DEFAULT_CONFIDENCE_THRESHOLD;
+use roundhouse_core::routing::{PickerMode, TierRecipe, TierRecipeError};
 use roundhouse_core::validate::ValidationTerms;
 
 use super::validate::ValidateConfig;
@@ -85,6 +88,17 @@ pub struct ProjectEntry {
     /// distinct value and not a budget with a very large limit.
     #[serde(default)]
     pub budget: Option<BudgetConfig>,
+    /// This project's rolling fair-use windows, capping tokens and/or dollars
+    /// over the last 5 hours, 24 hours or 7 days. Absent means no rolling
+    /// ceiling at all, which is the shipped posture and the one every project
+    /// written before M10.1 has.
+    ///
+    /// **A separate axis from `budget`, and deliberately not a `BudgetWindow`
+    /// variant** — see [`fair_use`](roundhouse_core::control::fair_use) for the
+    /// M8 hazard that decides it. The two compose rather than override: a
+    /// project may have a dollar ceiling, a rolling window, both, or neither.
+    #[serde(default)]
+    pub fair_use: Option<FairUseConfig>,
     /// Whether this project's sessions are enrolled in the validate/steer
     /// loop, and how. Absent means off — see [`ValidateConfig`], and note that
     /// off is the *shipped* posture rather than a fallback: a deployment that
@@ -105,6 +119,64 @@ pub struct ProjectEntry {
     /// authenticates itself, exactly as a pre-M7 deployment routes.
     #[serde(default)]
     pub credentials: Option<CredentialsConfig>,
+    /// The two ordered candidate lists this project's turns are routed between,
+    /// and how an undecided turn breaks the tie. Absent means no tier routing:
+    /// the deployment's ordinary policy chooses, exactly as it did before M10.
+    ///
+    /// **On the project and not inside `policy`**, which is the placement
+    /// `validate` already argues for and which one more consideration settles
+    /// here: [`PolicyConfig`] serves *both* a project's policy and a key's
+    /// `overrides`, and an overlay's whole contract is that it narrows. A tier
+    /// recipe has no narrowing reading — a key that "narrowed" its project's
+    /// capable tier would be choosing which model answers, which is the one
+    /// decision this design keeps out of a caller's hands. Leaving it out of
+    /// that shape means there is no place to write the sentence at all.
+    #[serde(default)]
+    pub tiers: Option<TiersConfig>,
+}
+
+/// The shape of a project's `"tiers"` object.
+///
+/// `deny_unknown_fields` for [`ProjectEntry`]'s reason and for one of its own:
+/// `capable`/`efficient` are the whole of what the recipe routes between, so a
+/// misspelt `capible` would resolve to an empty tier — which is not an error,
+/// because an empty tier is a legitimate one-sided recipe, and would therefore
+/// route every turn to the other tier forever with nothing anywhere saying why.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TiersConfig {
+    /// Ordered [`Target::policy_identity`](roundhouse_core::routing::Target::policy_identity)
+    /// names — `provider/model`, or `local/model` — for the capable tier.
+    pub capable: Vec<String>,
+    /// The same, for the efficient tier.
+    pub efficient: Vec<String>,
+    /// Where an undecided turn lands. Defaults to `efficient_first`, which is
+    /// the shape every published Switchyard number was measured at.
+    pub picker: PickerMode,
+    /// How sure the scorer must be before it overrules the picker. Defaults to
+    /// upstream's shipped operating point.
+    pub confidence_threshold: Option<f64>,
+}
+
+impl TiersConfig {
+    /// **Validated here rather than at the first request**, which is upstream's
+    /// own choice and worth mirroring for the reason it is worth making
+    /// anywhere: an operator watching a boot can fix a threshold, and a client
+    /// receiving a 500 on turn four hundred cannot.
+    fn to_recipe(&self, path: &str, entry: &str) -> Result<TierRecipe, ControlPlaneError> {
+        TierRecipe::new(
+            self.capable.clone(),
+            self.efficient.clone(),
+            self.picker,
+            self.confidence_threshold
+                .unwrap_or(DEFAULT_CONFIDENCE_THRESHOLD),
+        )
+        .map_err(|source| ControlPlaneError::TierRecipeRejected {
+            path: path.to_string(),
+            entry: entry.to_string(),
+            source,
+        })
+    }
 }
 
 /// One entry of the config's `"users"` array.
@@ -148,6 +220,17 @@ pub struct KeyEntry {
     /// `overrides`.
     #[serde(default)]
     pub allocation: Option<AllocationConfig>,
+    /// This member's own rolling fair-use windows, on top of the project's.
+    ///
+    /// **A second ceiling, never an overlay.** Unlike `overrides`, which
+    /// narrows the project's policy and is refused when it would widen, a
+    /// member window neither narrows nor widens the project's — both bind
+    /// independently and the narrower one refuses first. Absent means no member
+    /// ceiling, which is not the project's ceiling repeated: copying it down
+    /// would refuse the second member of a busy project for the first member's
+    /// traffic.
+    #[serde(default)]
+    pub fair_use: Option<FairUseConfig>,
     /// This member's own provider keys — the `user` tier
     /// [`CredentialMode`] resolves against. `"mode"` and `"budget_counts"` are
     /// refused here rather than ignored: both decide who pays, and a member who
@@ -478,6 +561,12 @@ pub enum ControlPlaneError {
         entry: String,
         min_quality: f64,
     },
+    #[error("control-plane config `{path}`: {entry}'s `tiers` block is refused -- {source}")]
+    TierRecipeRejected {
+        path: String,
+        entry: String,
+        source: TierRecipeError,
+    },
     #[error(
         "control-plane config `{path}`: {entry}'s frontier_cadence.per_turns is 0 -- a window \
          must be at least one turn wide"
@@ -491,6 +580,41 @@ pub enum ControlPlaneError {
          spend"
     )]
     CadenceRationsNothing { path: String, entry: String },
+    #[error(
+        "control-plane config `{path}`: {entry}'s fair_use window `{window}` names neither \
+         max_tokens nor max_usd, so it caps nothing while reading as a limit. A scope that is \
+         meant to be uncapped says so by having no entry for that window"
+    )]
+    FairUseWindowCapsNothing {
+        path: String,
+        entry: String,
+        window: &'static str,
+    },
+    #[error(
+        "control-plane config `{path}`: {entry}'s fair_use window `{window}` has {field} = \
+         {value}, which refuses every turn forever -- that is a filter, not a rolling limit, \
+         and it must be written as one: `\"allow\": [\"local/*\"]`. A window promises that a \
+         spent limit clears on its own, and a cap nothing can get under has no earliest retry \
+         time to report"
+    )]
+    FairUseCapNotPositive {
+        path: String,
+        entry: String,
+        window: &'static str,
+        field: &'static str,
+        value: f64,
+    },
+    #[error(
+        "control-plane config `{path}`: {entry} lists the fair_use window `{window}` twice. \
+         Two caps for one window do not resolve the same way on both sides: the ledger finds \
+         the first and a reader assumes the tighter, so the limit enforced and the limit \
+         written would differ silently"
+    )]
+    FairUseDuplicateWindow {
+        path: String,
+        entry: String,
+        window: &'static str,
+    },
     #[error(
         "control-plane config `{path}`: {entry}'s frontier_cadence allows {max_frontier} \
          frontier dispatch(es) in a window of {per_turns} turn(s) -- max_frontier must not \
@@ -591,6 +715,37 @@ pub enum ControlPlaneError {
         entry: String,
         escalation_floor: f64,
     },
+    /// `channel = "tool_call"`, which M10.0 retired.
+    ///
+    /// **A refusal rather than a remap, and that is the whole reason this
+    /// variant exists.** Since the steer became a text instruction
+    /// (PLAN-frontier-selection.md R1/T2) no verdict maps to a tool call, so
+    /// silently serving `tool_call` as text would leave a deployment believing
+    /// it had opted into the protocol-heavy path it had deliberately chosen —
+    /// and believing it on the strength of a config file that still says so.
+    /// Naming the plan in the message is what turns "unknown value" into an
+    /// answerable question.
+    #[error(
+        "control-plane config `{path}`: {entry}'s validate.channel is `tool_call`, which no \
+         longer exists -- M10.0 retired the synthetic tool call as a steering channel (see \
+         agent-docs/PLAN-frontier-selection.md, ruling R1). Every interjection is text now; \
+         write `auto` or `text` for the same behaviour, or `off` to interject on nothing"
+    )]
+    SteerChannelRetired { path: String, entry: String },
+    /// A configured handoff note with nothing in it.
+    ///
+    /// Refused rather than treated as absent, because the two mean opposite
+    /// things: absent is "this project does not narrate its escalations", and
+    /// `""` is a project that meant to and shipped a bare marker instead. See
+    /// `ValidateConfig::to_terms` for why an empty narration is worse than none.
+    #[error(
+        "control-plane config `{path}`: {entry}'s validate.handoff_note is empty -- an \
+         escalated turn would carry a bare `[roundhouse-guidance]` marker with no reason \
+         after it, which tells a model something is wrong and refuses to say what. Write the \
+         note (roundhouse_core::validate::EXAMPLE_HANDOFF_NOTE is a starting point), or omit \
+         the key to narrate nothing"
+    )]
+    HandoffNoteEmpty { path: String, entry: String },
     #[error(
         "control-plane config `{path}`: {entry}'s budget sets \
          \"overflow_when_local_saturated\" alongside \"on_exhaustion\": \"refuse\" -- overflow \
@@ -736,6 +891,19 @@ impl ControlPlaneConfig {
         // the boot on the day it is written, not on the day somebody flips
         // `enabled`.
         let mut project_validation: HashMap<&str, Option<ValidationTerms>> = HashMap::new();
+        // And every project's resolved fair-use windows, empty meaning no
+        // rolling ceiling. Resolved here for the reason the three above are,
+        // and refused here for the same sharper one: a window that caps nothing
+        // has to stop the boot on the day it is written, not on the day a
+        // tenant discovers the limit they were promised never fired.
+        let mut project_fair_use: HashMap<&str, Vec<FairUseLimit>> = HashMap::new();
+        // And every project's tier recipe, `None` meaning it routes through the
+        // deployment's ordinary policy. Resolved here for the reason the four
+        // above are, and refused here for the same sharper one: a threshold no
+        // confidence can reach has to stop the boot on the day it is written,
+        // not on the day somebody notices every turn is landing on the picker
+        // default.
+        let mut project_tiers: HashMap<&str, Option<Arc<TierRecipe>>> = HashMap::new();
         // The deployment's own keys, resolved once: every project's resolution
         // reads them, and reading the environment per project would let one
         // variable be judged twice and -- if it changed underneath us -- judged
@@ -788,6 +956,30 @@ impl ControlPlaneConfig {
                 None => None,
             };
             project_validation.insert(project.id.as_str(), validation);
+
+            let fair_use = match &project.fair_use {
+                Some(fair_use_config) => fair_use_config.to_limits(path, &entry)?,
+                None => Vec::new(),
+            };
+            project_fair_use.insert(project.id.as_str(), fair_use);
+
+            let tiers = match &project.tiers {
+                Some(tiers_config) => {
+                    let recipe = tiers_config.to_recipe(path, &entry)?;
+                    // Upstream's startup warning, at upstream's moment. It is
+                    // not a refusal because `capable_first` is a legitimate
+                    // experiment -- it is the shape this phase exists to
+                    // benchmark -- and it is not silence because quoting a
+                    // calibration for a configuration nobody measured is the
+                    // one dishonest thing this port could do.
+                    if let Some(warning) = recipe.uncalibrated_warning() {
+                        tracing::warn!(project = %project.id, "{warning}");
+                    }
+                    Some(Arc::new(recipe))
+                }
+                None => None,
+            };
+            project_tiers.insert(project.id.as_str(), tiers);
 
             if project.credentials.is_some() {
                 project_declares_credentials.insert(project.id.as_str());
@@ -896,6 +1088,24 @@ impl ControlPlaneConfig {
             // roll somebody's budget window.
             let budget = budget_terms(project_budget.clone(), allocation);
 
+            // The project's windows and this member's own, paired into the two
+            // ceilings a turn is checked against. Not copied down like
+            // `validation` and not narrowed like `overrides`: they are two
+            // independent limits, and `fair_use_terms` is the one place they
+            // are paired so nothing else can decide that an absent member block
+            // means the project's block again.
+            let member_fair_use = match &key.fair_use {
+                Some(fair_use_config) => fair_use_config.to_limits(path, &key_entry)?,
+                None => Vec::new(),
+            };
+            let fair_use = Arc::new(fair_use_terms(
+                project_fair_use
+                    .get(key.project.as_str())
+                    .expect("a project checked present above was resolved to fair use above")
+                    .clone(),
+                member_fair_use,
+            ));
+
             // Copied down from the project unchanged: an arm is the unit of a
             // comparison, so every key of one project is in one experiment.
             let validation = project_validation
@@ -955,9 +1165,17 @@ impl ControlPlaneConfig {
                     principal: Principal::new(key.project.clone(), key.user.clone()),
                     policy: Arc::new(project_policy.narrow(&overrides)),
                     budget,
+                    fair_use,
                     validation,
                     credentials,
                     budget_counts: *budget_counts,
+                    // The project's, never the key's: see `ProjectEntry::tiers`
+                    // for why a member has no place narrowing which model
+                    // answers.
+                    tiers: project_tiers
+                        .get(key.project.as_str())
+                        .expect("a project checked present above was resolved to tiers above")
+                        .clone(),
                 },
             );
         }

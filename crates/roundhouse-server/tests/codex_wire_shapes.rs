@@ -15,6 +15,26 @@
 //! parser is a fact about the parser. If one of these fails, that is a finding
 //! against the plan, not a test to loosen.
 //!
+//! # Addendum (M10.0): what these facts now underwrite
+//!
+//! The design these were pinned for is gone. `PLAN-frontier-selection.md` R1
+//! retired the synthetic tool call as a steering channel, so **roundhouse emits
+//! no `function_call` at all** — the steered turn is answered with assistant
+//! text and the outbound projection that built these frames was deleted with
+//! it (T4).
+//!
+//! The facts themselves are unchanged and are kept for the half that is still
+//! live: a codex agent runs its *own* MCP tools between our turns and re-sends
+//! them namespaced, so the input path still meets exactly this object, and
+//! `canonical_item` still has to read a separate `namespace` field and an item
+//! `id` as decoration. The fixtures below are therefore written as a client's
+//! own call rather than as one of ours — which is what they were always really
+//! about, since nothing here has ever involved a roundhouse server.
+//!
+//! Read them as parser facts, not as emission requirements. Where the prose
+//! below says what roundhouse "must emit", it now says what a client does send;
+//! the assertions did not move.
+//!
 //! Test 1 needs no transport: `serde_json` round-trips `ResponseItem` on its
 //! own. Tests 2 and 3 need a stream, so they drive Codex's real
 //! `codex_api::ResponsesClient` over `CannedTransport` — a fixed SSE byte body
@@ -142,9 +162,9 @@ fn usage_object(input_tokens: u64, output_tokens: u64) -> Value {
 /// Pinned fact 1: `ResponseItem::FunctionCall`'s exact wire shape, field for
 /// field, including which optionals are truly absent rather than `null`.
 ///
-/// This is the object roundhouse will build with `codex_protocol`'s own type
-/// and place inside a `response.output_item.done` frame to emit a synthetic
-/// tool call. Asserting equality of the whole `Value` — not just the fields a
+/// This is the object a codex client builds with `codex_protocol`'s own type
+/// and places inside its request when it re-sends an MCP call it ran. Asserting
+/// equality of the whole `Value` — not just the fields a
 /// hand-written check would think to look at — is what proves a skipped
 /// optional (`id`, `encrypted_function_args`,
 /// `internal_chat_message_metadata_passthrough`) is really missing from the
@@ -155,27 +175,22 @@ fn usage_object(input_tokens: u64, output_tokens: u64) -> Value {
 #[test]
 fn a_namespaced_function_call_round_trips_through_codex_protocol() {
     let arguments = r#"{"cursor":null}"#.to_string();
-    let item = function_call_item(
-        "fetch_steer",
-        Some("mcp__roundhouse"),
-        "rhsteer_x",
-        &arguments,
-    );
+    let item = function_call_item("grep", Some("mcp__roundhouse"), "call_theirs", &arguments);
 
     let value = serde_json::to_value(&item).expect("a FunctionCall item always serializes");
     assert_eq!(
         value,
         json!({
             "type": "function_call",
-            "name": "fetch_steer",
+            "name": "grep",
             "namespace": "mcp__roundhouse",
             "arguments": arguments,
-            "call_id": "rhsteer_x",
+            "call_id": "call_theirs",
         }),
-        "this is the exact object roundhouse must emit inside \
-         response.output_item.done; any drift here is a drift in what Codex's \
-         own exact-HashMap dispatch (router.rs:164, registry.rs:440-444) will \
-         accept: {value}"
+        "this is the exact object a codex client sends for an MCP call it ran; \
+         any drift here is a drift in what Codex's own exact-HashMap dispatch \
+         (router.rs:164, registry.rs:440-444) resolved it against, and in what \
+         `canonical_item` therefore has to strip on the way in: {value}"
     );
 
     let parsed: ResponseItem =
@@ -184,13 +199,14 @@ fn a_namespaced_function_call_round_trips_through_codex_protocol() {
         ResponseItem::FunctionCall {
             name, namespace, ..
         } => {
-            assert_eq!(name, "fetch_steer");
+            assert_eq!(name, "grep");
             assert_eq!(
                 namespace.as_deref(),
                 Some("mcp__roundhouse"),
-                "a synthetic call must carry namespace as a separate wire field \
-                 or it will not resolve against Codex's ToolName{{name, namespace}} \
-                 lookup"
+                "a namespaced call carries namespace as a separate wire field; \
+                 a flat `mcp__server__tool` resolves against nothing in Codex's \
+                 ToolName{{name, namespace}} lookup, which is why the log stores \
+                 the bare name and canonicalization ignores this field"
             );
         }
         other => panic!("expected ResponseItem::FunctionCall, got {other:?}"),
@@ -216,9 +232,9 @@ async fn a_function_call_done_frame_parses_without_a_preceding_added() {
     ensure_rustls_crypto_provider();
 
     let call_item = function_call_item(
-        "fetch_steer",
+        "grep",
         Some("mcp__roundhouse"),
-        "rhsteer_x",
+        "call_theirs",
         r#"{"cursor":null}"#,
     );
     let body = sse_body(vec![
@@ -264,7 +280,7 @@ async fn a_function_call_done_frame_parses_without_a_preceding_added() {
         ResponseItem::FunctionCall {
             name, namespace, ..
         } => {
-            assert_eq!(name, "fetch_steer");
+            assert_eq!(name, "grep");
             assert_eq!(namespace.as_deref(), Some("mcp__roundhouse"));
         }
         // The failure mode this whole test exists to catch: an item whose
@@ -281,10 +297,13 @@ async fn a_function_call_done_frame_parses_without_a_preceding_added() {
 /// event at all — it sits in `process_responses_event`'s unhandled arm
 /// (sse/responses.rs:488-499) and is traced, never forwarded.
 ///
-/// This is why roundhouse must never stream a synthetic call's arguments: no
-/// currently-pinned client surface would observe the deltas, so the only
-/// wire-correct way to deliver a synthetic `function_call` is whole, inside
-/// its `response.output_item.done`.
+/// This was the reason roundhouse never streamed a synthetic call's arguments:
+/// no currently-pinned client surface observes the deltas, so the only
+/// wire-correct way to deliver a `function_call` is whole, inside its
+/// `response.output_item.done`. **Roundhouse emits no such call any more**
+/// (M10.0), so the fact is kept as a parser fact rather than as a constraint on
+/// us — and it is the one that would have to be re-read first if a future
+/// surface ever wants to send one.
 ///
 /// The fixture also carries one `response.custom_tool_call_input.delta`
 /// control frame, interspersed with the frames under test. That event name
@@ -302,9 +321,9 @@ async fn function_call_argument_deltas_are_not_observed_by_this_client() {
     ensure_rustls_crypto_provider();
 
     let call_item = function_call_item(
-        "fetch_steer",
+        "grep",
         Some("mcp__roundhouse"),
-        "rhsteer_y",
+        "call_mine",
         r#"{"cursor":null}"#,
     );
 
@@ -324,8 +343,8 @@ async fn function_call_argument_deltas_are_not_observed_by_this_client() {
         "response.custom_tool_call_input.delta",
         json!({
             "type": "response.custom_tool_call_input.delta",
-            "item_id": "ctc_rhsteer_y",
-            "call_id": "rhsteer_y",
+            "item_id": "ctc_call_mine",
+            "call_id": "call_mine",
             "delta": "control-frame-reaches-the-parser",
         }),
     ));
@@ -335,7 +354,7 @@ async fn function_call_argument_deltas_are_not_observed_by_this_client() {
             json!({
                 "type": "response.function_call_arguments.delta",
                 "item_id": format!("fc_{index}"),
-                "call_id": "rhsteer_y",
+                "call_id": "call_mine",
                 "delta": chunk,
             }),
         ));
@@ -377,8 +396,8 @@ async fn function_call_argument_deltas_are_not_observed_by_this_client() {
             call_id,
             delta,
         } => {
-            assert_eq!(item_id, "ctc_rhsteer_y");
-            assert_eq!(call_id.as_deref(), Some("rhsteer_y"));
+            assert_eq!(item_id, "ctc_call_mine");
+            assert_eq!(call_id.as_deref(), Some("call_mine"));
             assert_eq!(delta, "control-frame-reaches-the-parser");
         }
         other => unreachable!("filtered to ToolCallInputDelta above: {other:?}"),

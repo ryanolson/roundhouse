@@ -269,6 +269,30 @@ pub fn user_message(text: &str) -> ResponseItem {
     }
 }
 
+/// An assistant message as a client re-sends one, built from Codex's own type.
+///
+/// Shared here rather than redefined per suite because M10.0 gave three of them
+/// the same need: the steer is an assistant message now, so replaying "the agent
+/// carried on after being corrected" means appending one of these to the resent
+/// history — and the bytes have to be the ones a real client would send, or the
+/// prefix check is being tested against our own reconstruction.
+///
+/// `OutputText`, not `InputText`: an assistant item the client echoes back
+/// carries the output part, and canonicalization reads the role from the item
+/// rather than from the part — but a part that disagreed with the role is
+/// exactly the drift an oracle fixture exists to prevent.
+pub fn assistant_message(text: &str) -> ResponseItem {
+    ResponseItem::Message {
+        id: None,
+        role: "assistant".to_string(),
+        content: vec![ContentItem::OutputText {
+            text: text.to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    }
+}
+
 /// A `function_call` item built from Codex's own type, never hand-written
 /// JSON — the same rationale as [`request`]: a field this struct adds or
 /// renames arrives here without anyone having transcribed it, which is the

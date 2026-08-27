@@ -35,6 +35,7 @@
 //! correct — nothing was billed — and is why the offline demo is a demo of the
 //! token breakdown rather than of the savings.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -43,15 +44,17 @@ use roundhouse_core::context::ByteTokenizer;
 use roundhouse_core::control::{MemorySpendLedger, SpendLedger};
 use roundhouse_core::metrics::MetricsConfig;
 use roundhouse_core::routing::{
-    AffinityPolicy, CacheLedger, CacheModel, Candidate, ProviderPricing, Target,
+    AffinityPolicy, CacheLedger, CacheModel, Candidate, ProviderPricing, RoutingPolicy,
+    StagePolicy, Target,
 };
 use roundhouse_core::store::{MemoryStore, SessionStore};
 use roundhouse_core::validate::{Validator, ValidatorConfig};
 use roundhouse_fleet::{
     DEFAULT_API_BASE, DEFAULT_PASS_THROUGH_BASE, EchoFrontierClient, FrontierClient,
-    FrontierModelSpec, OpenAiResponsesClient, StaticFrontierCatalog, WireProtocol,
+    FrontierClients, FrontierModelSpec, OpenAiResponsesClient, StaticFrontierCatalog, WireProtocol,
 };
 use roundhouse_mcp::ControlStore;
+use roundhouse_server::catalog_config::{BUILT_IN_OPENAI, ProviderConfig};
 use roundhouse_server::control_config::crosscheck::CrossChecks;
 use roundhouse_server::{
     ControlDirectory, ControlPlane, ControlPlaneReads, Conversations, DirectoryError,
@@ -122,52 +125,224 @@ const OPENAI_API_BASE_VAR: &str = "ROUNDHOUSE_OPENAI_API_BASE";
 /// endpoint the pass-through stanza implies.
 const OPENAI_PASS_THROUGH_BASE_VAR: &str = "ROUNDHOUSE_OPENAI_PASS_THROUGH_BASE";
 
-/// The transport a turn is dispatched through, as this deployment configured it.
+/// What a variable of this process's environment holds.
+///
+/// A closure rather than `std::env::var` called inside the constructor below,
+/// and the reason is testability rather than taste: the registry's refusals are
+/// the load-bearing half of "an unknown provider is refused at boot, not at
+/// first dispatch", and a test that had to mutate the process environment to
+/// reach them would race every other test in the binary. Passing the
+/// environment in makes each refusal a pure function of two files and a map.
+type Env<'a> = &'a dyn Fn(&str) -> Option<String>;
+
+/// The environment as this process actually has it.
+fn process_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().to_string())
+}
+
+/// The transport each provider's turns are dispatched through, as this
+/// deployment configured it.
 ///
 /// Load-or-die on a *named* transport, the same posture the catalog and the
 /// control plane take: a deployment that asked for a real upstream and got the
 /// echo stub would report a full dashboard of turns that never left the
 /// process. An unrecognised name is refused rather than falling back, for the
 /// same reason.
-fn frontier_client() -> anyhow::Result<Arc<dyn FrontierClient>> {
-    let named = match std::env::var(FRONTIER_UPSTREAM_VAR) {
-        Ok(named) if !named.trim().is_empty() => named.trim().to_string(),
-        _ => {
-            tracing::warn!(
-                var = FRONTIER_UPSTREAM_VAR,
-                "no frontier upstream configured; serving the offline echo stub, which \
-                 reaches no provider and bills nothing"
-            );
-            return Ok(Arc::new(EchoFrontierClient::new("frontier answer")));
-        }
+///
+/// **The M10.1 change is that this returns a registry rather than a client**,
+/// and with it the third of the three boot cross-checks the phase adds. The
+/// first two are the catalog boundary's, because they are pure functions of the
+/// file: every entry's provider is defined or is the built-in `openai`, and a
+/// defined provider declares a route for the dialect its entries speak. The
+/// third can only be asked here, because it is a fact about the *binary* — this
+/// build has one transport, `OpenAiResponsesClient`, so a provider whose entries
+/// speak anything else has nowhere to go, and a boundary that asked it would
+/// refuse a good catalog on a build with fewer clients compiled in.
+///
+/// Together the three make [`FrontierClients::for_provider`] total on a booted
+/// process: the router cannot produce a provider name this registry does not
+/// hold. That is the property the whole change is for — the alternative is a
+/// tenant discovering the misconfiguration inside their own turn, after the
+/// decision has already been written to their log.
+fn frontier_clients(
+    catalog: &StaticFrontierCatalog,
+    providers: &HashMap<String, ProviderConfig>,
+    env: Env<'_>,
+) -> anyhow::Result<FrontierClients> {
+    let Some(named) = env(FRONTIER_UPSTREAM_VAR) else {
+        tracing::warn!(
+            var = FRONTIER_UPSTREAM_VAR,
+            "no frontier upstream configured; serving the offline echo stub, which \
+             reaches no provider and bills nothing"
+        );
+        // Uniform rather than keyed, and it is the one place uniform is
+        // *right*: the stub answers every provider identically because it
+        // reaches none of them, so enumerating the catalog here would build a
+        // map whose keys mean nothing.
+        return Ok(FrontierClients::uniform(Arc::new(EchoFrontierClient::new(
+            "frontier answer",
+        ))));
     };
-    let base = |var: &str, default: &str| {
-        std::env::var(var)
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| default.to_string())
-    };
-    match named.as_str() {
-        "openai_responses" => {
-            let api_base = base(OPENAI_API_BASE_VAR, DEFAULT_API_BASE);
-            let pass_through_base = base(OPENAI_PASS_THROUGH_BASE_VAR, DEFAULT_PASS_THROUGH_BASE);
-            // The bases are logged and the credentials are not, which is the
-            // whole of what an operator needs to see here: which origin this
-            // process will talk to. A URL is configuration; a key is not.
-            tracing::info!(
-                %api_base,
-                %pass_through_base,
-                "dispatching frontier turns over the OpenAI Responses wire"
-            );
-            Ok(Arc::new(OpenAiResponsesClient::with_bases(
-                api_base,
-                pass_through_base,
-            )?))
-        }
-        other => anyhow::bail!(
-            "{FRONTIER_UPSTREAM_VAR} names `{other}`, which is not a transport this build has;              the supported value is `openai_responses`, and leaving the variable unset serves              the offline echo stub"
-        ),
+    if named != "openai_responses" {
+        anyhow::bail!(
+            "{FRONTIER_UPSTREAM_VAR} names `{named}`, which is not a transport this build has; \
+             the supported value is `openai_responses`, and leaving the variable unset serves \
+             the offline echo stub"
+        );
     }
+
+    // Which dialects each provider is actually asked to speak, so the refusal
+    // below can name the entry an operator would go and move rather than the
+    // provider in the abstract.
+    let mut wanted: HashMap<&str, Vec<&FrontierModelSpec>> = HashMap::new();
+    for spec in catalog.models() {
+        wanted.entry(spec.provider.as_str()).or_default().push(spec);
+    }
+
+    let mut clients: HashMap<String, Arc<dyn FrontierClient>> = HashMap::new();
+    for (provider, specs) in wanted {
+        // **Definition first, dialect second, and the order is the message.**
+        // An entry that is both undefined and in an unspeakable dialect has one
+        // remedy — write the provider down — and being told about the dialect
+        // instead sends an operator to change a `wire_protocol` that was never
+        // the problem. Reachable from a catalog this process did not parse: the
+        // built-in echo catalog is exactly one, and it prices every turn at
+        // zero, so a deployment that named a real upstream and got that would
+        // dispatch real traffic under fabricated free prices and then report
+        // the savings.
+        let definition = providers.get(provider);
+        if definition.is_none() && provider != BUILT_IN_OPENAI {
+            anyhow::bail!(
+                "catalog entry `{provider}/{}` names a provider nothing defines, and \
+                 {FRONTIER_UPSTREAM_VAR} names a real upstream. Add a `\"providers\"` entry \
+                 for `{provider}` to the file {} names, or unset {FRONTIER_UPSTREAM_VAR} to \
+                 serve the offline stub",
+                specs[0].model,
+                catalog_config::CATALOG_VAR,
+            );
+        }
+
+        // The one dialect this build serializes. Checked per *entry* rather
+        // than per provider so the message names a model: "openrouter speaks
+        // something we cannot" sends an operator to the wrong line when four of
+        // its five entries are fine.
+        for spec in &specs {
+            if spec.wire_protocol != WireProtocol::OpenAiResponses {
+                anyhow::bail!(
+                    "catalog entry `{provider}/{}` speaks `{}`, and this build has no client \
+                     for that dialect -- its only transport is `openai_responses`. Refused at \
+                     boot rather than at the turn that would dispatch it: a routing decision \
+                     naming this entry would fail one tenant's turn for a line in a file",
+                    spec.model,
+                    spec.wire_protocol.wire_name(),
+                );
+            }
+        }
+
+        let client = match definition {
+            Some(definition) => {
+                // Both bases are this provider's own origin. A pass-through
+                // credential is a ChatGPT device login and the header allowlist
+                // is per provider, so a forwarded seat cannot resolve for
+                // anything but `openai` anyway -- but pointing the forwarding
+                // client at the same origin rather than at chatgpt.com is what
+                // makes that a redundancy instead of a way for a seat to reach
+                // an origin nobody configured it for.
+                let route = definition
+                    .routes
+                    .for_dialect(WireProtocol::OpenAiResponses)
+                    .expect("the catalog boundary refuses an entry whose dialect has no route");
+                tracing::info!(
+                    %provider,
+                    base_url = %definition.base_url,
+                    %route,
+                    entries = specs.len(),
+                    "dispatching this provider's turns over the OpenAI Responses wire"
+                );
+                // **The built-in `openai` provider, explicitly redefined.**
+                // This arm reads `definition.base_url` for both bases and never
+                // reads the two variables, and that precedence is the intended
+                // design — an operator who writes the provider down has said
+                // where it is, and the comment above says why both bases come
+                // from the one origin. What was missing is that the line above
+                // reads identically whether or not those variables are set, so
+                // a deployment behind an egress proxy that added an `openai`
+                // definition to attach `extra_headers` had the proxy silently
+                // leave the path (M10 review G15). A warning rather than a
+                // refusal: the configuration is legitimate, and refusing it
+                // would make attaching a header impossible for anyone who had
+                // ever set the variable. Named per variable rather than in one
+                // line, because the two address different origins — stored key
+                // and forwarded seat — and a deployment may have set only one.
+                if provider == BUILT_IN_OPENAI {
+                    for var in [OPENAI_API_BASE_VAR, OPENAI_PASS_THROUGH_BASE_VAR] {
+                        if let Some(shadowed) = env(var) {
+                            tracing::warn!(
+                                %provider,
+                                shadowed_var = var,
+                                shadowed_value = %shadowed,
+                                definition_base_url = %definition.base_url,
+                                "an explicit `openai` provider definition takes precedence over \
+                                 this variable, which is not read while the definition stands; \
+                                 every turn of this provider's is dispatched at the definition's \
+                                 base URL, not at the one the variable names"
+                            );
+                        }
+                    }
+                }
+                // A provider with no key anywhere is a warning and not a
+                // refusal, because this file is not where keys live: a member
+                // or a project may attach one through the control plane's
+                // tiers, and this process cannot see that from here. Saying so
+                // at boot is what stops an operator finding out one turn at a
+                // time.
+                if env(&definition.auth.env).is_none() {
+                    tracing::warn!(
+                        %provider,
+                        var = %definition.auth.env,
+                        "this provider's catalog entry names an environment variable that is \
+                         not set; turns routed here will need a credential from the control \
+                         plane's project or member tier, or they will be refused before a \
+                         socket is opened"
+                    );
+                }
+                OpenAiResponsesClient::with_bases(&definition.base_url, &definition.base_url)?
+                    .with_responses_path(route)
+                    .with_extra_headers(
+                        definition
+                            .extra_headers
+                            .iter()
+                            .map(|(name, value)| (name.clone(), value.clone())),
+                    )?
+            }
+            // The implicit `openai` provider: the endpoints
+            // `ROUNDHOUSE_OPENAI_API_BASE` has always named. Every catalog
+            // written before M10.1 lands here, which is the whole of the
+            // backward-compatibility promise.
+            None => {
+                let api_base =
+                    env(OPENAI_API_BASE_VAR).unwrap_or_else(|| DEFAULT_API_BASE.to_string());
+                let pass_through_base = env(OPENAI_PASS_THROUGH_BASE_VAR)
+                    .unwrap_or_else(|| DEFAULT_PASS_THROUGH_BASE.to_string());
+                // The bases are logged and the credentials are not, which is
+                // the whole of what an operator needs to see here: which origin
+                // this process will talk to. A URL is configuration; a key is
+                // not.
+                tracing::info!(
+                    %api_base,
+                    %pass_through_base,
+                    "dispatching the built-in `openai` provider's turns over the OpenAI \
+                     Responses wire"
+                );
+                OpenAiResponsesClient::with_bases(api_base, pass_through_base)?
+            }
+        };
+        clients.insert(provider.to_string(), Arc::new(client));
+    }
+    Ok(FrontierClients::keyed(clients))
 }
 
 /// Prompt shape the startup cross-check quotes the catalog under.
@@ -241,6 +416,42 @@ fn boot_refusal(error: DirectoryError) -> anyhow::Error {
     }
 }
 
+/// Does any project on this plane route between tiers? (M10.2, S3)
+///
+/// The whole of the composition root's tier decision, named so it can be
+/// asserted: `serve` reads it once and wraps
+/// [`StagePolicy`](roundhouse_core::routing::StagePolicy) around the ordinary
+/// policy when it is true. Read through `configured_admissions` — the same
+/// accessor the fair-use boot flag uses, and for the same reason: the key
+/// table's layout has exactly one reader outside its own module and this is not
+/// going to be the second.
+///
+/// **Conditional composition, and the condition is not a micro-optimization.**
+/// `StagePolicy` delegates to its inner policy for every project with no recipe,
+/// and the target and rationale it produces there are pinned byte-identical to
+/// the inner policy's — but [`DecisionRecord::policy`] reports `stage`, because
+/// that is the object in force, and reporting `affinity` would make the audit
+/// trail name a router that did not serve the turn. Composing it unconditionally
+/// would therefore relabel every existing deployment's decisions on an upgrade
+/// that changed no routing at all. Composing it only where a recipe exists moves
+/// the field exactly when the router moved.
+///
+/// **The hole this leaves is a recipe added through the admin plane after boot**,
+/// which nothing here can see, and which would otherwise be the worst shape a
+/// config mistake can take: an operator's recipe re-routing nothing, with every
+/// surface reporting the configuration as fine. The engine warns once when a
+/// turn arrives carrying a recipe its policy cannot read — see
+/// `Engine::unread_recipe` — which states the same fact at the one moment it is
+/// knowable. `ControlPlane::Open` has no file to write a recipe in and answers
+/// `false` by construction.
+///
+/// [`DecisionRecord::policy`]: roundhouse_core::routing::DecisionRecord::policy
+fn composes_the_stage_router(plane: &ControlPlane) -> bool {
+    plane
+        .configured_admissions()
+        .any(|admission| admission.tiers.is_some())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -268,6 +479,17 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     let metrics_config = Arc::new(metrics_config);
+
+    // The registry, built here rather than inside `serve` because it is the
+    // third boot cross-check and boot checks belong together: an operator
+    // reading this log sees the catalog load, the providers resolve, and the
+    // control plane compile in the order a mistake in each would be found.
+    // See `frontier_clients` for what the three checks divide between them.
+    let providers = config
+        .as_ref()
+        .map(|config| config.providers.clone())
+        .unwrap_or_default();
+    let frontier = Arc::new(frontier_clients(&catalog, &providers, &process_env)?);
 
     // Same posture as the catalog, and for a sharper reason: a control plane
     // that was named but cannot be read stops the process, because starting
@@ -370,6 +592,19 @@ async fn main() -> anyhow::Result<()> {
         ),
     }
 
+    // Whether anything in this deployment is standing in front of a fair-use
+    // ceiling. Read here, from the same compiled plane every surface resolves
+    // against, so the warning below fires for the deployments it is about and
+    // is silent for the ones it is not — a caution about a gap nobody is
+    // standing in is noise, and noise is how a real warning gets ignored.
+    let fair_use_configured = directory
+        .plane(roundhouse_core::now_ms())
+        .configured_admissions()
+        .any(|admission| !admission.fair_use.is_empty());
+    if fair_use_configured {
+        tracing::info!("fair-use windows are configured; rolling ceilings are enforced");
+    }
+
     let addr: SocketAddr = std::env::var(ADDR_VAR)
         .unwrap_or_else(|_| DEFAULT_ADDR.to_string())
         .parse()?;
@@ -410,6 +645,24 @@ async fn main() -> anyhow::Result<()> {
             // rather than let an operator infer "durable" from the variable
             // name and be wrong about the half that matters when a project
             // gets archived and recreated.
+            // The same honesty the sentence below owes about tenancy, owed
+            // about the rolling counters: `ROUNDHOUSE_REDIS_URL` is the
+            // variable an operator sets when they mean "this is more than one
+            // process", and it is exactly then that a per-process fair-use
+            // ledger stops being the ceiling its configuration says it is.
+            if fair_use_configured {
+                tracing::warn!(
+                    var = REDIS_VAR,
+                    "sessions and committed spend just became durable in Redis, but \
+                     fair-use windows are counted in THIS PROCESS'S memory. Two nodes \
+                     serving one project therefore enforce two independent ceilings -- a \
+                     project capped at 2M tokens per 5 hours can draw 2M through each -- \
+                     and every counter resets on restart. Fair use across nodes is only \
+                     true with shared buckets; the Redis implementation is deferred by \
+                     name, and its unlock condition is written at \
+                     roundhouse_core::control::fair_use"
+                );
+            }
             if control_plane_file_configured {
                 tracing::warn!(
                     var = control_config::CONTROL_PLANE_VAR,
@@ -431,6 +684,7 @@ async fn main() -> anyhow::Result<()> {
                 Arc::new(spend),
                 Arc::clone(&directory),
                 catalog,
+                frontier,
                 judge,
                 reachable,
                 metrics_config,
@@ -449,6 +703,7 @@ async fn main() -> anyhow::Result<()> {
                 Arc::new(MemorySpendLedger::new()),
                 Arc::clone(&directory),
                 catalog,
+                frontier,
                 judge,
                 reachable,
                 metrics_config,
@@ -469,14 +724,21 @@ async fn main() -> anyhow::Result<()> {
 /// agree only until a client edited its own history. [`ControlStore`] is the
 /// node's control-plane state, and the engine and the control surface hold
 /// opposite ends of it: the surface writes an agent's overlay and the engine
-/// spends it at the start of the next turn, the engine deposits a steer's
-/// payload and the surface serves it to `fetch_steer`.
+/// spends it at the start of the next turn.
+///
+/// **The steer used to be the second half of that sentence and is not any
+/// more.** Until M10.0 the engine deposited a correction's payload here and the
+/// surface served it to `fetch_steer`; the correction is a conversation item now
+/// (`PLAN-frontier-selection.md` R1), so it lives in the session log with
+/// everything else and this store holds only overlays, intents, bindings and the
+/// advisory outcome an agent reports.
 #[allow(clippy::too_many_arguments)]
 async fn serve<S: SessionStore>(
     store: Arc<S>,
     spend: Arc<dyn SpendLedger>,
     directory: Arc<ControlDirectory>,
     catalog: StaticFrontierCatalog,
+    frontier: Arc<FrontierClients>,
     judge: Option<FrontierModelSpec>,
     reachable: Vec<Candidate>,
     metrics_config: Arc<MetricsConfig>,
@@ -484,7 +746,40 @@ async fn serve<S: SessionStore>(
 ) -> anyhow::Result<()> {
     let conversations = Arc::new(Conversations::new());
     let control = Arc::new(ControlStore::new());
-    let frontier = frontier_client()?;
+    // The judge's own transport, resolved from its own catalog entry's
+    // provider rather than from whatever client the engine happens to hold.
+    //
+    // **This is the seam the registry could break silently.** Until M10.1 there
+    // was one client and the judge shared it, which was correct because there
+    // was nothing else it could be. With a registry, a judge handed "the
+    // frontier client" would dispatch through whichever provider was first in
+    // a map — wrong base URL, wrong auth, wrong extra headers — and the
+    // symptom would be a validate loop that fails or, worse, one that quietly
+    // bills a different provider. Resolved by name, and a name the registry
+    // does not hold stops the process here beside the other boot checks.
+    //
+    // Unreachable through configuration on a booted deployment: `judge_spec`
+    // resolves the variable *against the catalog*, and every catalog provider
+    // has a client by the three cross-checks. It is spelled as a refusal
+    // anyway, because "unreachable by an argument someone has to re-derive" is
+    // exactly the shape that stops being true when a fourth way to build a
+    // registry arrives.
+    let judge_client = match &judge {
+        Some(spec) => Some(
+            frontier
+                .for_provider(&spec.provider)
+                .map(Arc::clone)
+                .with_context(|| {
+                    format!(
+                        "{JUDGE_MODEL_VAR} names `{}/{}`, and this process has no transport for \
+                         provider `{}`; the validate loop would dispatch its judge through some \
+                         other provider's client",
+                        spec.provider, spec.model, spec.provider
+                    )
+                })?,
+        ),
+        None => None,
+    };
     let engine_config = EngineConfig {
         // The salt reaches the engine and nowhere else: it is an input to the
         // stamp written at session creation, and every later reader — the
@@ -501,13 +796,28 @@ async fn serve<S: SessionStore>(
         ..EngineConfig::default()
     };
 
-    let mut engine = Engine::new(
+    let tiers_configured = composes_the_stage_router(&directory.plane(roundhouse_core::now_ms()));
+    if tiers_configured {
+        tracing::info!(
+            "a project configures a tier recipe; the stage router is composed over the \
+             ordinary policy, and projects with no recipe route through it unchanged"
+        );
+    }
+
+    let mut engine = Engine::with_provider_clients(
         Arc::clone(&store),
         ByteTokenizer,
         Arc::new(EchoLocalExecutor::new("local answer")),
         catalog,
         Arc::clone(&frontier),
-        Arc::new(AffinityPolicy::new()),
+        // The recipe reader wrapped around the ordinary policy, or the ordinary
+        // policy alone. See `tiers_configured` for why the wrapper is not
+        // composed unconditionally.
+        match tiers_configured {
+            true => Arc::new(StagePolicy::new(Box::new(AffinityPolicy::new())))
+                as Arc<dyn RoutingPolicy>,
+            false => Arc::new(AffinityPolicy::new()) as Arc<dyn RoutingPolicy>,
+        },
         engine_config.clone(),
     )
     .with_spend_ledger(Arc::clone(&spend))
@@ -519,9 +829,9 @@ async fn serve<S: SessionStore>(
     // and no enrolled project installs it too and it decides nothing: no
     // session is stamped, so the occupant's first question answers "not
     // enrolled" and no turn pays for a trigger.
-    if let Some(spec) = judge {
+    if let Some((spec, client)) = judge.zip(judge_client) {
         let fleet_judge = FleetJudge::new(
-            frontier,
+            client,
             spec,
             ByteTokenizer,
             engine_config.turn_deadline_ms,
@@ -625,6 +935,425 @@ mod tests {
         plane_with(policy, serde_json::Value::Null)
     }
 
+    // -----------------------------------------------------------------------
+    // The client registry (M10.1, P2)
+    // -----------------------------------------------------------------------
+
+    /// One catalog entry, parameterized on the two fields the registry reads.
+    fn entry(provider: &str, model: &str, wire_protocol: WireProtocol) -> FrontierModelSpec {
+        FrontierModelSpec {
+            provider: provider.into(),
+            model: model.into(),
+            wire_protocol,
+            cache_model: CacheModel::Deterministic { ttl_ms: 300_000 },
+            pricing: ProviderPricing::free(),
+            quality_prior: 0.5,
+            base_ttft_ms: 1.0,
+            ttft_ms_per_uncached_token: 0.0,
+        }
+    }
+
+    fn responses_provider(base_url: &str) -> ProviderConfig {
+        serde_json::from_value(serde_json::json!({
+            "base_url": base_url,
+            "routes": { "responses": "/responses" },
+            "auth": { "env": "A_PROVIDER_KEY" },
+        }))
+        .expect("the fixture definition must parse")
+    }
+
+    /// An environment naming a real upstream and nothing else — the shape
+    /// every assertion below is about, since an unset upstream short-circuits
+    /// to the echo stub before any check runs.
+    fn real_upstream(name: &str) -> Option<String> {
+        match name {
+            FRONTIER_UPSTREAM_VAR => Some("openai_responses".to_string()),
+            _ => None,
+        }
+    }
+
+    /// **P2's boot check, the registry half.**
+    ///
+    /// The catalog boundary refuses an entry naming an undefined provider when
+    /// the catalog came from a *file*. This is the other door: the built-in echo
+    /// catalog is not parsed, so nothing has cross-checked it, and a deployment
+    /// that named a real upstream while configuring no catalog would dispatch
+    /// real traffic under the stub's fabricated free prices — then report the
+    /// savings.
+    #[test]
+    fn an_unknown_provider_is_refused_at_boot_not_at_first_dispatch() {
+        let error = frontier_clients(&echo_catalog(), &HashMap::new(), &real_upstream)
+            .expect_err("a provider with no definition has no transport");
+        let message = error.to_string();
+        assert!(
+            message.contains("echo/echo") && message.contains(catalog_config::CATALOG_VAR),
+            "the refusal must name the entry and the file that would define it: {message}"
+        );
+
+        // CONTROL 1: the identical catalog with the identical environment,
+        // once the provider is defined. One map entry different, and it boots
+        // — which is what makes the refusal about the missing definition
+        // rather than about the echo catalog or about `openai_responses`.
+        let defined = HashMap::from([(
+            "echo".to_string(),
+            responses_provider("https://echo.test/v1"),
+        )]);
+        let mut echo_over_responses = echo_catalog().models().to_vec();
+        echo_over_responses[0].wire_protocol = WireProtocol::OpenAiResponses;
+        frontier_clients(
+            &StaticFrontierCatalog::new(echo_over_responses),
+            &defined,
+            &real_upstream,
+        )
+        .expect("a defined provider has a transport");
+
+        // CONTROL 2: the same undefined provider with *no* upstream named.
+        // That is the offline stub, which reaches nothing and bills nothing, so
+        // there is no wrong origin for a turn to land on and nothing to refuse.
+        frontier_clients(&echo_catalog(), &HashMap::new(), &|_| None)
+            .expect("the offline stub answers for every provider");
+    }
+
+    /// The third cross-check, and the one only this file can make: whether
+    /// *this build* has a transport that speaks the entry's dialect.
+    ///
+    /// Deliberately not asked at the config boundary. A catalog naming
+    /// `anthropic_messages` is a perfectly good catalog — it is this binary
+    /// that has one client — and a boundary that refused it would have to be
+    /// edited every time a client was added, on the wrong side of the
+    /// crate graph.
+    #[test]
+    fn a_dialect_this_build_cannot_speak_stops_the_boot_and_names_the_entry() {
+        let catalog = StaticFrontierCatalog::new(vec![entry(
+            "anthropic",
+            "claude",
+            WireProtocol::AnthropicMessages,
+        )]);
+        let providers = HashMap::from([(
+            "anthropic".to_string(),
+            serde_json::from_value::<ProviderConfig>(serde_json::json!({
+                "base_url": "https://api.anthropic.test/v1",
+                "routes": { "messages": "/messages" },
+                "auth": { "env": "ANTHROPIC_API_KEY" },
+            }))
+            .unwrap(),
+        )]);
+
+        let error = frontier_clients(&catalog, &providers, &real_upstream)
+            .expect_err("this build has no Anthropic Messages client");
+        let message = error.to_string();
+        assert!(
+            message.contains("anthropic/claude") && message.contains("anthropic_messages"),
+            "the refusal must name the entry and the dialect, because the remedy is to move \
+             one of them: {message}"
+        );
+
+        // CONTROL: the identical provider, identical environment, one entry
+        // whose dialect this build does speak.
+        let providers = HashMap::from([(
+            "anthropic".to_string(),
+            responses_provider("https://api.anthropic.test/v1"),
+        )]);
+        frontier_clients(
+            &StaticFrontierCatalog::new(vec![entry(
+                "anthropic",
+                "claude",
+                WireProtocol::OpenAiResponses,
+            )]),
+            &providers,
+            &real_upstream,
+        )
+        .expect("a dialect this build speaks is routable");
+    }
+
+    /// G08 (review finding): the file `examples/catalog.example.json` tells an
+    /// operator to copy it, and its own README calls it the starting point.
+    /// `tests/example_catalog.rs` only proves it survives `CatalogConfig::load`
+    /// — the config boundary's checks — never this file's third cross-check,
+    /// which only runs here because it is a fact about the binary, not the
+    /// file. The shipped `anthropic`/`anthropic_messages` entry is exactly the
+    /// shape `a_dialect_this_build_cannot_speak_stops_the_boot_and_names_the_entry`
+    /// exercises by hand above, so the desired property is that the shipped
+    /// example, loaded for real and pointed at a real upstream the way the
+    /// README instructs, boots the shipped binary rather than being refused
+    /// by a dialect this build has no client for.
+    ///
+    /// **Closed by moving the entry, not by adding a client.** The example now
+    /// keeps `providers.anthropic` as a definition nothing names — the same
+    /// treatment `dynamo-fleet` already had, and for the same reason — so the
+    /// shape stays documented while the file boots. The alternative, an
+    /// Anthropic Messages client, is a transport this milestone did not set out
+    /// to add and would have been added to satisfy a comment.
+    #[test]
+    fn the_shipped_example_catalog_boots_the_shipped_binary() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/catalog.example.json");
+        let config = roundhouse_server::CatalogConfig::load(&path)
+            .expect("tests/example_catalog.rs already pins that this file parses and validates");
+
+        frontier_clients(&config.catalog(), &config.providers, &real_upstream).expect(
+            "an operator who copies the README's own example and names a real upstream must \
+             get a booted process, not a boot-time refusal naming a dialect they never chose",
+        );
+    }
+
+    /// **P2: one client per provider, not one client for the catalog.**
+    ///
+    /// The property the whole registry exists for. Two entries whose providers
+    /// are two origins must resolve to two *different* transports — if they
+    /// resolved to one, a turn routed to the second would authenticate against
+    /// the first's base URL with the first's headers, and the only symptom
+    /// would be a 401 from an origin nobody meant to call.
+    #[test]
+    fn each_provider_resolves_to_its_own_client() {
+        let catalog = StaticFrontierCatalog::new(vec![
+            entry(
+                "openrouter",
+                "moonshotai/kimi-k3",
+                WireProtocol::OpenAiResponses,
+            ),
+            entry("openai", "gpt-5.6-sol", WireProtocol::OpenAiResponses),
+        ]);
+        let providers = HashMap::from([(
+            "openrouter".to_string(),
+            responses_provider("https://openrouter.ai/api/v1"),
+        )]);
+
+        let registry = frontier_clients(&catalog, &providers, &real_upstream).unwrap();
+        let openrouter = registry.for_provider("openrouter").unwrap();
+        let openai = registry.for_provider("openai").unwrap();
+        assert!(
+            !Arc::ptr_eq(openrouter, openai),
+            "two providers sharing one transport would send one's traffic to the other's \
+             origin under the other's headers"
+        );
+
+        // And a name nothing defined is an error rather than whichever client
+        // happened to be first. A keyed registry has no fallback on purpose:
+        // the alternative is an undefined provider quietly reaching a real
+        // origin.
+        assert!(
+            matches!(
+                registry.for_provider("anthropic"),
+                Err(roundhouse_fleet::FrontierError::UnknownProvider(name)) if name == "anthropic"
+            ),
+            "a keyed registry must not answer for a provider nobody defined"
+        );
+
+        // CONTROL: the uniform registry, which is what every pre-M10.1
+        // deployment and every echo-stub test is. It answers for every name,
+        // with one client — so the assertion above is about *keyed* registries
+        // and not about `for_provider` being strict everywhere.
+        let uniform = FrontierClients::uniform(Arc::new(EchoFrontierClient::new("x")));
+        assert!(Arc::ptr_eq(
+            uniform.for_provider("openrouter").unwrap(),
+            uniform.for_provider("anything-at-all").unwrap()
+        ));
+    }
+
+    /// Everything `tracing::warn!` wrote during one closure, as text.
+    ///
+    /// `frontier_clients` cannot refuse a provider with no key anywhere — it is
+    /// not where keys live, per its own doc comment — so a missing credential
+    /// has nowhere to go but a boot-time warning. Nothing else in this suite
+    /// reads what `tracing` emits, which is exactly why M10.1 refute's item 15
+    /// found this warning silenceable without turning a single test red: no
+    /// capture point existed. This is that point.
+    fn captured_warnings(f: impl FnOnce()) -> String {
+        use std::io;
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl io::Write for Buf {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for Buf {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        // **One capture at a time, and not for tidiness.** `with_default`
+        // installs a *thread-local* subscriber, and installing one makes
+        // `tracing` reconsider its callsite interest cache against the global
+        // dispatcher — which in a test binary is nobody. A reconsideration that
+        // lands while another test is mid-capture can cache "nothing is
+        // interested" for the very callsite that test is asserting on, and its
+        // warning silently never arrives: the guard goes red for a reason that
+        // has nothing to do with the code under test, on one run in some
+        // hundreds. Seen for real once G15 gave this helper a second caller.
+        // The cost is microseconds of serialized test time; the alternative is
+        // an intermittently green guard, which enforces nothing and gets
+        // re-diagnosed from scratch by whoever meets it next.
+        static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+        let _serialized = ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let buf = Buf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        // Rebuilding the interest cache *inside* the thread-local default is
+        // the second half of the serialization above. The merge that brought
+        // more uncaptured `frontier_clients` callers into this binary made the
+        // poisoned-cache case go from one-in-hundreds to two-in-three: a
+        // concurrent test evaluating the warn callsite under the no-op global
+        // dispatcher caches "never interested", and this capture then records
+        // the info line but not the warning it exists to assert on. Rebuilding
+        // while our subscriber is the active default re-evaluates every
+        // callsite against a dispatcher that wants them.
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            f()
+        });
+        String::from_utf8(buf.0.lock().unwrap().clone()).expect("tracing output is UTF-8")
+    }
+
+    /// **A provider with a definition and no key anywhere warns at boot.**
+    ///
+    /// The refute suite's item 15: silencing this line left every test in this
+    /// file green, because none of them looked at `tracing` output. The
+    /// production behavior it guards is real — an operator finds out here or
+    /// finds out from a tenant's failed turn later — so the gap was in the
+    /// test, not the code; this closes it the same way the fair-use ordering
+    /// gap was closed, by making the previously-unobserved effect observable
+    /// rather than by touching `frontier_clients` itself.
+    #[test]
+    fn a_defined_provider_with_no_key_anywhere_warns_at_boot() {
+        let catalog = StaticFrontierCatalog::new(vec![entry(
+            "openrouter",
+            "moonshotai/kimi-k3",
+            WireProtocol::OpenAiResponses,
+        )]);
+        let providers = HashMap::from([(
+            "openrouter".to_string(),
+            responses_provider("https://openrouter.ai/api/v1"),
+        )]);
+
+        let output = captured_warnings(|| {
+            frontier_clients(&catalog, &providers, &real_upstream)
+                .expect("a missing key is a warning, not a boot refusal");
+        });
+        assert!(
+            output.contains("A_PROVIDER_KEY") && output.contains("not set"),
+            "the warning must name the unset variable: {output}"
+        );
+
+        // CONTROL: the identical catalog and provider, with the env carrying
+        // the key `responses_provider` names. No warning is the only correct
+        // silence -- distinguishing it from the one above is what stops this
+        // test passing on a build that warns unconditionally.
+        let output = captured_warnings(|| {
+            frontier_clients(&catalog, &providers, &|name| {
+                (name == "A_PROVIDER_KEY" || name == FRONTIER_UPSTREAM_VAR)
+                    .then(|| real_upstream(name).unwrap_or_else(|| "present".to_string()))
+            })
+            .expect("a present key boots clean");
+        });
+        assert!(
+            !output.contains("A_PROVIDER_KEY"),
+            "a provider whose key is set must not warn about it: {output}"
+        );
+    }
+
+    /// **Thermo-nuclear review G15.** An explicit `providers.openai` entry
+    /// takes the `Some(definition)` arm and dispatches on `definition.base_url`
+    /// alone — the `None` arm is the only place `ROUNDHOUSE_OPENAI_API_BASE`
+    /// and `ROUNDHOUSE_OPENAI_PASS_THROUGH_BASE` are read at all. A deployment
+    /// behind a corporate egress proxy that sets the former, then adds an
+    /// `openai` provider entry to attach `extra_headers`, has the proxy
+    /// silently stop being used: the only boot output is an `info!` line
+    /// naming the definition's own base URL, worded exactly like the case
+    /// where no variable was ever set. This asserts the boot output says so by
+    /// naming each shadowed variable that is actually set.
+    ///
+    /// **Both variables, not just the one the finding exercised.** They address
+    /// different origins — a stored key's API base and a forwarded ChatGPT
+    /// seat's — and a deployment may well have set only the second, so a
+    /// warning wired for one of them would leave the other exactly as silent as
+    /// before.
+    #[test]
+    fn an_explicit_openai_definition_says_it_is_taking_over_from_the_variables() {
+        let catalog = StaticFrontierCatalog::new(vec![entry(
+            BUILT_IN_OPENAI,
+            "gpt-5.6-sol",
+            WireProtocol::OpenAiResponses,
+        )]);
+        let providers = HashMap::from([(
+            BUILT_IN_OPENAI.to_string(),
+            responses_provider("https://openai-relay.internal/v1"),
+        )]);
+        let env = |name: &str| match name {
+            FRONTIER_UPSTREAM_VAR => Some("openai_responses".to_string()),
+            OPENAI_API_BASE_VAR => Some("https://egress-proxy.internal/v1".to_string()),
+            OPENAI_PASS_THROUGH_BASE_VAR => Some("https://egress-proxy.internal/v1".to_string()),
+            "A_PROVIDER_KEY" => Some("present".to_string()),
+            _ => None,
+        };
+
+        let output = captured_warnings(|| {
+            frontier_clients(&catalog, &providers, &env)
+                .expect("an explicit openai definition with its key present boots clean");
+        });
+        for var in [OPENAI_API_BASE_VAR, OPENAI_PASS_THROUGH_BASE_VAR] {
+            assert!(
+                output.contains(var),
+                "an explicit `openai` provider definition silently overrides \
+                 {var}; the boot log must name the shadowed variable so an \
+                 operator who set it does not conclude their proxy is still in \
+                 the path from an info! line that reads identically either way: \
+                 {output}"
+            );
+        }
+        assert!(
+            output.contains("https://openai-relay.internal/v1"),
+            "and the origin that won, since the remedy is to choose between the \
+             two: {output}"
+        );
+
+        // CONTROL 1: the identical definition with neither variable set. This is
+        // the ordinary case — an operator who never had a proxy — and naming a
+        // variable they did not set would be the same noise in the other
+        // direction, which is how a real warning gets ignored.
+        let output = captured_warnings(|| {
+            frontier_clients(&catalog, &providers, &|name| match name {
+                FRONTIER_UPSTREAM_VAR => Some("openai_responses".to_string()),
+                "A_PROVIDER_KEY" => Some("present".to_string()),
+                _ => None,
+            })
+            .expect("a definition with no variables to shadow boots clean");
+        });
+        assert!(
+            !output.contains(OPENAI_API_BASE_VAR) && !output.contains(OPENAI_PASS_THROUGH_BASE_VAR),
+            "nothing was shadowed here, so nothing may be reported as shadowed: {output}"
+        );
+
+        // CONTROL 2: the same variables set with *no* explicit definition —
+        // the `None` arm, where they are read and honored. The warning is about
+        // a definition taking precedence, so the arm that obeys them must stay
+        // silent about it.
+        let output = captured_warnings(|| {
+            frontier_clients(&catalog, &HashMap::new(), &env)
+                .expect("the implicit provider reads the variables");
+        });
+        assert!(
+            !output.contains("takes precedence"),
+            "the implicit arm honors both variables; a shadowing warning there \
+             would send an operator to remove a definition they never wrote: {output}"
+        );
+    }
+
     /// A one-key plane carrying a policy, a budget, or both.
     ///
     /// Through the config file rather than by building the lookup table, so
@@ -646,6 +1375,68 @@ mod tests {
             ControlPlaneConfig::from_json(&json, "startup cross-check fixture")
                 .expect("the fixture config must validate"),
         )
+    }
+
+    /// The same one-key plane, plus a tier recipe on the project.
+    ///
+    /// Built by adding one field to `plane_with`'s output rather than by a
+    /// second constructor, so the probe below and its control differ in exactly
+    /// that field.
+    fn plane_with_tiers(tiers: serde_json::Value) -> ControlPlane {
+        let json = serde_json::json!({
+            "projects": [{ "id": "acme", "tiers": tiers }],
+            "users": [{ "id": "ada" }],
+            "keys": [{ "project": "acme", "user": "ada", "key_sha256": "a".repeat(64) }],
+        })
+        .to_string();
+        ControlPlane::configured(
+            ControlPlaneConfig::from_json(&json, "startup cross-check fixture")
+                .expect("the fixture config must validate"),
+        )
+    }
+
+    /// **M10.2, S3.** The stage router is composed for the deployments that
+    /// configured one and for no others.
+    ///
+    /// Both halves fail differently and both are silent. Composing it for a
+    /// deployment with no recipe relabels every decision in its log `stage` on
+    /// an upgrade that changed no routing; *not* composing it for one that has a
+    /// recipe leaves the recipe resolving to an `Admission` field nothing reads
+    /// — an operator's routing configuration doing nothing, with every surface
+    /// reporting the file as valid. See `composes_the_stage_router`.
+    #[test]
+    fn the_stage_router_is_composed_exactly_when_a_project_configures_tiers() {
+        assert!(
+            composes_the_stage_router(&plane_with_tiers(serde_json::json!({
+                "capable": ["anthropic/big"],
+                "efficient": ["local/small"],
+            }))),
+            "a project with a recipe must get the router that reads one"
+        );
+
+        // CONTROL: the same plane shape, the same key, no `tiers`. A recipe is
+        // the only thing that may move this answer -- not a policy, not a
+        // budget, both of which every one of these fixtures also carries.
+        for plane in [
+            plane_with_policy(serde_json::json!({ "min_quality": 0.5 })),
+            plane_with(
+                serde_json::json!({}),
+                serde_json::json!({
+                    "limit_usd": 10.0,
+                    "window": "total",
+                    "on_exhaustion": "degrade_to_local"
+                }),
+            ),
+        ] {
+            assert!(
+                !composes_the_stage_router(&plane),
+                "a project that configured no recipe must route through the \
+                 policy it always did, under the name it always had"
+            );
+        }
+
+        // And an unconfigured deployment has no file to write a recipe in.
+        assert!(!composes_the_stage_router(&ControlPlane::Open));
     }
 
     #[test]

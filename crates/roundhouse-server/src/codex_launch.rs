@@ -9,6 +9,13 @@
 //! else about the client changes — no wrapper, no patched binary, no forked
 //! provider — which is the whole of "transparently" in the product sentence.
 //!
+//! Since M10.1 there is an **optional** third output, in [`skills`]: files that
+//! tell the *model* what roundhouse's MCP tools are for. Optional because they
+//! add no capability — a client without them still reaches every tool — and
+//! separate because they are the only generated files whose audience is the
+//! model rather than the client. See that module for why they are skills and
+//! not the `prompts/` directory the plan named.
+//!
 //! **Which topology this is.** The *Direct* one — an agent pointed straight at
 //! roundhouse — and it is the reference by ruling rather than by default.
 //! `agent-docs/synergies/ecosystem-round-2.md`'s launch-surface dedup found
@@ -83,7 +90,11 @@
 //! into a hermetic `CODEX_HOME` and drives the real binary against a real
 //! roundhouse.
 
+pub mod skills;
+
 use std::path::Path;
+
+pub use skills::{GeneratedFile, SKILLS_DIR, namespaced_tool_name, skill_files};
 
 use crate::control_config::TURN_KEY_HEADER;
 use crate::dialect::DEFAULT_MCP_NAMESPACE;
@@ -514,6 +525,25 @@ impl CodexLaunch {
             // is silent about that; a written `false` is a line the copy has to
             // argue with.
             "supports_search_tool": false,
+            // Turned on for the surface [`skills`] emits, and stated even on a
+            // deployment that emits none — the field costs nothing when the
+            // `skills` directory is empty, because the whole block it gates is
+            // skipped when there are no skills to list
+            // (`core/src/session/mod.rs:3350-3380` @ `e363b08`).
+            //
+            // What it buys when there are: the listing the model always gets is
+            // `- {name}: {description} (file: {path})` and nothing more
+            // (`core-skills/src/render.rs:520-532`). With this `false` — which
+            // is the reader's `#[serde(default)]`,
+            // `protocol/src/openai_models.rs:392-393` — the model is handed
+            // three file paths and no instruction that reading one is how a
+            // skill is used, so the most likely outcome is that it treats the
+            // list as trivia. `true` appends codex's own "How to use skills"
+            // protocol, whose first rule is to read the `SKILL.md` completely
+            // before acting on it. Written here rather than left to the default
+            // for `supports_search_tool`'s reason one field up: an absent key
+            // is silent about a decision that was made.
+            "include_skills_usage_instructions": true,
         });
         serde_json::to_string_pretty(&serde_json::json!({ "models": [entry] }))
             .expect("a catalog built from literals encodes")
@@ -984,6 +1014,29 @@ mod tests {
             "the catalog must state `supports_search_tool: false` rather than leave it to \
              the reader's default: it is the only thing standing between a copied upstream \
              entry and a tool_search_call that 422s every turn it appears in:\n{entry:#}"
+        );
+    }
+
+    /// The catalog turns on the half of skills support that lives in model
+    /// metadata.
+    ///
+    /// Paired with [`skills::skill_files`]: without this field the generated
+    /// skills are still listed to the model, as three names with three file
+    /// paths and no statement that opening one is what a skill is for. The
+    /// reader defaults it `false`
+    /// (`protocol/src/openai_models.rs:392-393` @ `e363b08`), so this is a
+    /// deliberate overwrite in the same shape as `supports_search_tool` — and
+    /// in the opposite direction, which is why both are asserted rather than
+    /// one being taken as evidence for the other.
+    #[test]
+    fn the_catalog_tells_the_client_to_explain_skills_to_the_model() {
+        let catalog: serde_json::Value =
+            serde_json::from_str(&launch().model_catalog_json()).expect("the catalog is JSON");
+        assert_eq!(
+            catalog["models"][0].get("include_skills_usage_instructions"),
+            Some(&serde_json::Value::Bool(true)),
+            "the skills roundhouse generates are listed to the model either way; this is what \
+             tells it that reading one is how a skill is used"
         );
     }
 

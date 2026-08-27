@@ -58,7 +58,9 @@
 pub mod arm;
 pub mod brief;
 pub mod exchange;
+pub mod handoff;
 pub mod prompt;
+pub mod tool_signals;
 pub mod trigger;
 pub mod verdict;
 
@@ -78,32 +80,26 @@ use crate::item::Item;
 use crate::routing::Target;
 
 pub use arm::{Arm, ArmShares, placebo_intervenes};
-pub use brief::{BriefConfig, BriefStep, Objective, ValidationBrief};
-pub use exchange::{Exchange, exchanges};
+pub use brief::{BriefConfig, BriefStep, Objective, ValidationBrief, trailing_user_request};
+pub use exchange::{
+    CONTROL_TOOL_DELIMITER, CONTROL_TOOL_NAMESPACE, Exchange, exchanges, exec_exit_code,
+    is_control_call, task_exchanges, tool_output_body,
+};
+pub use handoff::{EXAMPLE_HANDOFF_NOTE, HANDOFF_MARKER, append_handoff_note};
 pub use prompt::judge_system_prompt;
+pub use tool_signals::{
+    CRITICAL, DEFAULT_RECENT_WINDOW, ERROR_SEVERITY_THRESHOLD, ErrorSeverity, HARD,
+    PURE_BASH_STREAK_LENGTH, PureBashStreak, ResultSeverity, SOFT, ToolSignals, classify_body,
+    classify_result, recent_severities,
+};
 pub use trigger::{
     CostAnomaly, Evidence, NoProgressRepeat, PingPong, Signal, SignalFired, SignalKind,
     ToolFailureStreak, Trigger, TriggerConfig, TriggerRecord, default_signals,
 };
 pub use verdict::{
-    ActionPolicy, Divergence, EscalationOverrides, SteerAction, SteerCapability, SteerChannel,
-    Verdict, VerdictParseError, map,
+    ActionPolicy, Divergence, EscalationOverrides, SteerAction, SteerChannel, Verdict,
+    VerdictParseError, map, render_steer_answer,
 };
-
-/// The tool an emitted steer names, in the log's neutral spelling.
-///
-/// The bare name, without a namespace: canonicalization ignores a namespace on
-/// the way in, so a namespaced resend and a flat one arrive as the same stored
-/// item and no dialect can fork a steered session. The namespace lives only in
-/// the wire projection.
-pub const STEER_TOOL: &str = "fetch_steer";
-
-/// The prefix every steer's `call_id` carries.
-///
-/// The id is minted from the turn's [`ResponseId`](crate::ids::ResponseId),
-/// which is what makes two concurrent steers unable to collide and a steer that
-/// no emitted call named impossible to fetch.
-pub const STEER_CALL_PREFIX: &str = "rhsteer_";
 
 /// What the judge answered, and what asking cost.
 #[derive(Debug, Clone, PartialEq)]
@@ -438,6 +434,21 @@ pub struct ValidationTerms {
     pub action: ActionPolicy,
     /// The fraction of fired triggers the placebo arm intervenes on.
     pub placebo_rate: f64,
+    /// What to say on the first turn served under a signal-driven escalation,
+    /// in the *forwarded request only*.
+    ///
+    /// `None` — the shipped answer — decorates nothing, which is what R2 means
+    /// by "neither is on by default". See [`handoff`] for the three properties
+    /// this rides under and for the wording an operator can start from.
+    ///
+    /// **Here rather than on [`ActionPolicy`]**, and the boundary is worth
+    /// keeping: `ActionPolicy` is documented as "the deployment-side inputs to
+    /// [`map`]", and [`map`] is a pure function of a verdict, a trigger and what
+    /// a membership permits. The note is an input to *dispatch* — it is read by
+    /// the engine, one layer below, on a turn the map has already been asked
+    /// about and possibly on a turn it was never asked about at all. Putting it
+    /// where `map` can see it would put a decoration in the deliberation.
+    pub handoff_note: Option<String>,
 }
 
 impl Default for ValidationTerms {
@@ -448,6 +459,8 @@ impl Default for ValidationTerms {
             shares: ArmShares::shadow_only(),
             action: ActionPolicy::default(),
             placebo_rate: DEFAULT_PLACEBO_RATE,
+            // R2 ships the second steering surface off, like the first.
+            handoff_note: None,
         }
     }
 }
@@ -584,26 +597,34 @@ impl Validator {
             SteerAction::Continue | SteerAction::Escalate { .. } => {
                 Interjection::Proceed { record }
             }
-            SteerAction::Steer { directive } => {
-                let call_id = format!("{STEER_CALL_PREFIX}{}", context.response_id);
-                // Minted once and stored in the item, never re-serialized, so
-                // the client's verbatim echo matches by construction.
-                let arguments = serde_json::json!({ "steer_id": call_id }).to_string();
-                Interjection::Complete {
-                    item: Item::tool_call(call_id, STEER_TOOL, arguments),
-                    usage: record.usage(),
-                    guidance: directive,
-                    record,
-                }
-            }
-            SteerAction::Halt { reason } => Interjection::Complete {
-                // Plain text, which ends the client's loop and hands control
-                // back to the human. Not a tool call, so no steer payload is
-                // deposited — there is nothing for an agent to fetch, and the
-                // engine's deposit is `None` for exactly this shape.
-                item: Item::assistant_text(reason.clone(), context.response_id.clone()),
+            // **Both outcomes are assistant text since M10.0.** Outcome B used
+            // to mint a synthetic `fetch_steer` call whose payload the agent
+            // fetched over MCP; the correction is the turn's answer now, so the
+            // agent reads it where it reads every other answer and decides with
+            // no round trip — and the whole cancelled-steer hazard class (a
+            // call declined at the approval prompt, a call whose turn was
+            // dropped) has nothing left to be about.
+            //
+            // What still separates them is what the answer *invites*. A steer
+            // restates the pending request, so the agent has the correction and
+            // the task in one place and its loop carries on; a halt does not,
+            // so the loop ends and a human picks it up.
+            SteerAction::Steer { directive } => Interjection::Complete {
+                item: Item::assistant_text(
+                    // Composed here rather than inside `map`, because the
+                    // request lives in the session and `map` is deliberately
+                    // pure over the judge's answer and this membership's terms.
+                    // The log books the directive alone — see
+                    // `SteerAction::Steer` — so the user's words appear once.
+                    render_steer_answer(&directive, trailing_user_request(&context.state.items)),
+                    context.response_id.clone(),
+                ),
                 usage: record.usage(),
-                guidance: reason,
+                record,
+            },
+            SteerAction::Halt { reason } => Interjection::Complete {
+                item: Item::assistant_text(reason, context.response_id.clone()),
+                usage: record.usage(),
                 record,
             },
         }
@@ -731,7 +752,6 @@ impl Validator {
             &verdict,
             fired,
             &terms.action,
-            context.capability,
             context.state.consecutive_interventions(),
         )
         .clamped_to(context.turn_policy);

@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::control::Principal;
 use crate::ids::{ResponseId, SessionId, SideCallId, TurnId, ValidationId};
 use crate::item::Item;
-use crate::routing::{DecisionRecord, Target};
+use crate::routing::{DecisionRecord, DispatchAttempt, Target};
 use crate::validate::{Arm, SteerAction, TriggerRecord, Verdict};
 
 /// Token accounting for one completed model call.
@@ -262,11 +262,61 @@ pub enum SessionEventKind {
     ResponseCompleted {
         response_id: ResponseId,
         usage: Usage,
+        /// What the provider itself said this call cost, in its own dollars.
+        ///
+        /// **A sidecar, never an addend.** It sits beside `usage` rather than
+        /// inside it because the two answer different questions: `usage` is
+        /// tokens this deployment prices from its own catalog, and this is the
+        /// other side of the reconciliation — the external bill our
+        /// `committed_usd` is to be checked against. Folded into `Usage` it
+        /// would put a number nobody derived from the rate card into the column
+        /// the savings claim is computed from, and the drift figure that exists
+        /// to surface the gap between the two would be computed against itself.
+        ///
+        /// Recorded here rather than on the `Routed` decision, and that is a
+        /// fact about ordering rather than a preference: `Routed` is written
+        /// before the dispatch is attempted, and the provider's price arrives
+        /// on the stream's final frame. An event is immutable once committed,
+        /// so the decision record cannot learn it. (Review finding G11: before
+        /// this field the value was parsed, carried to the engine, and spent on
+        /// a `tracing::debug!` the binary's own default `info` filter drops.)
+        ///
+        /// `None` for every provider that reports nothing, which is most of
+        /// them, and for every log written before this field existed. Skipped
+        /// on the wire when absent, so a deployment whose upstreams stay silent
+        /// writes the bytes it wrote before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_reported_cost_usd: Option<f64>,
     },
     ResponseIncomplete {
         response_id: ResponseId,
         reason: IncompleteReason,
         usage: Usage,
+        /// The dispatch that failed last, when this turn failed by exhausting
+        /// its targets.
+        ///
+        /// **The one attempt with no successor `Routed` to ride on.** Every
+        /// other failed dispatch of a turn is carried by
+        /// [`DecisionRecord::attempts`] on the record of the dispatch it caused;
+        /// the final one caused no further dispatch, so without this field it
+        /// reached no projection at all — and a single-provider deployment in
+        /// an outage reported *zero* failed attempts for as long as the outage
+        /// lasted, which is exactly inverted from when the number matters
+        /// (review finding G03).
+        ///
+        /// It is deliberately not merged into `usage`'s evidence rule. "Was
+        /// there a failed attempt to attribute" and "was there billable usage
+        /// to consume" are different questions, and the settle path's
+        /// `input_tokens > 0` gate — which correctly keeps a dispatch that
+        /// reached nobody out of the call-count denominator — was answering the
+        /// first with the second.
+        ///
+        /// `None` when the turn failed for a reason that names no target (a
+        /// refusal, a deadline before any dispatch, a body that died
+        /// mid-stream), and for every log written before this field existed.
+        /// Skipped on the wire when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        terminal_attempt: Option<DispatchAttempt>,
     },
     /// A turn was re-sent after reconnect and served from the existing result.
     TurnDeduplicated {
@@ -634,6 +684,7 @@ mod tests {
             kind: SessionEventKind::ResponseCompleted {
                 response_id: ResponseId::new("r"),
                 usage: Usage::default(),
+                provider_reported_cost_usd: None,
             },
         };
         assert!(done.is_terminal());
@@ -715,6 +766,7 @@ mod tests {
             response_id: ResponseId::new("resp_1"),
             reason: IncompleteReason::BudgetExhausted,
             usage: Usage::default(),
+            terminal_attempt: None,
         };
         assert_eq!(
             serde_json::from_str::<SessionEventKind>(&serde_json::to_string(&event).unwrap())

@@ -30,7 +30,10 @@ features — the first is what makes the second possible.
 > memberships, keys, per-key policy, budgets); the admin plane; the MCP
 > control surface; the validate/steer loop; real frontier provider clients;
 > a real `codex` binary driving all of it end to end behind a feature gate;
-> and emission of NeMo Relay's interchange formats from the same log.
+> emission of NeMo Relay's interchange formats from the same log; providers
+> as configuration behind a per-provider client registry; rolling fair-use
+> session windows; and two-tier model selection with per-dispatch failover,
+> steered by text rather than by a tool call.
 >
 > Not built: the WebSocket and gRPC transports, and resuming an interrupted
 > generation from the partial output already durable in the log. Metrics are
@@ -169,6 +172,24 @@ step, or concurrent grants under one membership jointly exceed the limit.
 lapses on its TTL, and the next open of the same session repairs a lost settle.
 Exhaustion **degrades to local** rather than failing the turn.
 
+**Fair-use session windows** cap a project's or a member's draw over a rolling
+`5h`, `24h` or `7d` window — the shape a frontier lab's own session limits use,
+not a calendar reset the way `budget` above is. Configure a `"fair_use":
+{"windows": [{"window": "5h", "max_tokens": ..., "max_usd": ...}]}` block at
+project level and, separately, on any key for a per-member ceiling on top of
+it (see `examples/control-plane.example.json`); each window needs at least one
+cap, or it is rejected at load for reading like a limit while enforcing
+nothing. A project's and a member's windows are two independent ceilings that
+both bind — the narrower one refuses first. A turn over its window gets HTTP
+429 `fair_use_exceeded` with `error.type: "usage_limit_reached"`, naming the
+scope, the window, the quantity that ran out, and `resets_at` rounded *up* to
+the earliest second the window could have room — retryable, and no grant is
+taken for a refused turn. Enforcement is single-node only in this milestone
+(the counters live in the process's memory), so a deployment that sets
+`ROUNDHOUSE_REDIS_URL` while also configuring `fair_use` gets a boot warning
+that two nodes serving one project enforce two independent ceilings rather
+than one shared one.
+
 **The admin plane** (`/v1/admin/...`) is the only surface that writes tenancy:
 projects, users, memberships, and key mint/revoke, plus one read that exists
 nowhere else. It refuses Open mode *before* it looks at a header — in a
@@ -229,11 +250,12 @@ narrow. That is not decoration: under `approval_policy = "never"`, which
 destructive and open-world and **cancels** the call, handing the agent a
 cancellation notice where the output should have been.
 
-`fetch_steer` is how a correction reaches the agent. It is a pure read that
-returns exactly the bytes written when the steering call was emitted — twice
-gives the same bytes and does no paid work — which is what lets the validate
-loop hand an agent a real tool call it can execute without the tool doing
-anything a turn could be billed for.
+`fetch_steer` is how a correction is *re-read*, not how it arrives — the
+correction itself is delivered in-band, as the text of the steered turn's own
+answer. The tool is a pure read of the most recent guidance in the caller's
+log: twice gives the same bytes and does no paid work, so an agent (or a
+human debugging one) can ask "what was I just told" without the asking being
+billable.
 
 ## The validate/steer loop
 
@@ -262,7 +284,10 @@ The last two are ported from Switchyard's `ToolSignals`, attributed at the
 module and pinned by a test. They are kept alongside `ToolFailureStreak` rather
 than folded into it because that one is anchored and needs a consecutive run,
 which is a different question from "did anything in the recent window fail
-badly".
+badly". Roundhouse's own control calls — the `mcp__roundhouse__*` surface
+above — are their own category and count toward none of these: an agent
+polling `status` or adjusting its preferences is talking to us, not stuck, and
+a genuinely unknown tool still counts as unrecognised.
 
 A signal states what it saw in the indicative and never suggests: "this call
 has produced identical output four times" is a fact the judge weighs, while
@@ -284,15 +309,25 @@ without which "tokens fell after we steered" is consistent with the steer
 having said anything at all, because the disruption itself changes the
 trajectory.
 
-**Outcome B is a synthetic tool call.** The held turn *completes* — never fails,
+**Outcome B is a text instruction.** The held turn *completes* — never fails,
 because only a completion registers as a completed turn and an incomplete one
-would re-enter the interjection on every retry — carrying a `function_call`
-under the client's namespace (`mcp__roundhouse`) naming `fetch_steer`, whose
-`call_id` *is* the steer id. Four frames and no text: `response.created` →
-`output_item.added` → `output_item.done` → `response.completed`. The log stores
-the bare neutral name, so a namespaced Codex resend and a flat resend from
-another client canonicalize to the same stored item and prefix admission cannot
-fork on a dialect.
+would re-enter the interjection on every retry — answered by an assistant
+message carrying the rendered directive and then the pending request restated
+as quotation, so the harness sees the guidance and the task in one place and
+nothing in the restated request can read as roundhouse's own voice. The
+guidance is an ordinary stored item: the next turn's resend admits it as
+prefix, which is also how fulfillment is known, and the turn that fulfils a
+steer is never itself validated. The steer used to be a synthetic tool call
+into the MCP surface; that channel is retired — a config that still says
+`channel = "tool_call"` is refused at load by name rather than silently
+remapped — because a tool call has two cooperation points that fail silently
+(the client must dispatch it, the model must heed the fetched output), and a
+real client demonstrated both. Text has neither, and works for any client
+with nothing but a provider stanza. A second, narrower surface exists for
+route escalations: a project that configures `handoff_note` gets one gated
+`[roundhouse-guidance]` sentence appended to the *forwarded request only* on
+the first turn of a signal-driven escalation — never the stored conversation,
+never accumulating, and never narrating a move no signal asked for.
 
 **What a steered turn reports is not what it books**, and the split is a ruling
 rather than an oversight (PLAN §10.2, decided on M9 evidence). Codex's
@@ -304,6 +339,86 @@ change approach. So `response.completed.usage` now reports the steered turn's
 own context contribution, while the log books what it always booked: the
 judge's usage on the turn record and the side call on its own model row, so the
 dashboard's pricing is unchanged.
+
+## Selecting the model
+
+**Two-tier selection.** A project's `"tiers"` block turns routing into a choice
+between two ordered lists — `"capable"` and `"efficient"`, each naming target
+identities (`provider/model`, or `local/model` for one of the fleet's own) —
+plus `"picker"` (`efficient_first`, the default and the only operating point
+anyone has calibrated, or `capable_first`, which the process warns about at
+boot) and `"confidence_threshold"` (`0.0..=1.0`, default `0.5`). Absent
+`"tiers"` is the shipped answer, and a project without one routes exactly as it
+did before this existed.
+
+What moves a turn between the tiers is the session's own recent tool results —
+error severity, whether the agent is producing work or spinning in place, how
+deep the session is — scored by a port of Switchyard's coding-agent scorer.
+**No model call is involved anywhere in the decision**: it is a `tanh` over four
+numbers read out of the log the fold already holds, so an agent that starts
+looping is moved up a tier and one that just made its tests pass is moved back
+down, at no latency and no cost. (The judge that *does* call a model lives in
+the validate loop, which is a different surface.)
+
+Four properties of the lists are worth knowing before writing one:
+
+- **Admission runs first and a tier can only narrow.** A target this key's
+  policy, quality floor, or credentials do not admit is skipped and never
+  resurrected; a tier that empties entirely falls to the other one, with the
+  decision's rationale saying so — and the degrade-to-local promise survives
+  any recipe: a spent cadence or budget still serves the local candidate even
+  when no tier names it, because that is the one promise the configuration
+  file itself makes.
+- **Order is the operator's, and it is also the failover order.** The first
+  admitted entry of the picked tier serves the turn and the rest of that same
+  tier are its ordered fallbacks. A fallback fires only on a hosted dispatch
+  that never reached a model — transport error, timeout, 408, 429, 5xx — under
+  the *same turn deadline* and the *same single budget grant*, so a flaky
+  provider cannot pyramid holds or spend N times the turn's allowance. A refusal
+  or a content filter is an *answer* and is not retried, and a local target does
+  not fail over at all.
+- **A target may not be named twice**, within a tier or across both. Rejected at
+  load rather than deduplicated: a repeat inside one tier is a retry of the model
+  that just failed wearing a failover's clothes, and a name in both tiers makes
+  the scorer's choice a no-op that still reads like a decision.
+- **A `local/` entry needs a fleet, and so does the shipped example.** The
+  binary in this repository attaches none — it quotes the catalog and nothing
+  else — so `examples/control-plane.example.json`, whose efficient tier names a
+  local model and whose cadence promises local service on a spent window,
+  describes a deployment that has one. Pointing `ROUNDHOUSE_CONTROL_PLANE` at it
+  from a fleetless process is refused at boot, naming the keys and the capacity
+  they do not have, rather than started with a cheap tier that is empty on every
+  turn while the rationale blames the key's admission for it.
+
+Two consequences that follow from the design and are easier to meet in the
+README than to rediscover in a log:
+
+- **A cadence counts attempts, not turns.** `frontier_cadence` is folded at each
+  `Routed`, and there is one `Routed` per *dispatch*, so a project at
+  `max_frontier: 1, per_turns: 3` that fell forward twice has spent two rations
+  on one turn. That is deliberate and conservative — a dispatch that failed on
+  the way out really did reach for a hosted model — and it means a provider
+  outage tightens the ration rather than loosening it.
+- **`DecisionRecord::policy` reads `stage` on a deployment that configured any
+  recipe**, including for its projects that configured none, because the stage
+  router is the object in force and reporting the inner policy's name would make
+  the audit trail credit the wrong router. Their target and rationale are
+  byte-identical to what the inner policy would have produced. The wrapper is
+  composed **only when some project has a recipe at boot**, precisely so that
+  this field does not move on a deployment whose routing did not; a recipe added
+  through the admin plane *after* boot therefore selects nothing until a
+  restart, and the process warns once, naming the router that could not read it.
+
+**The client's `model` field is recorded, never routed on.** `/v1/responses`
+accepts a `model` and has always ignored it — roundhouse chooses the target. It
+is now written verbatim onto the decision as the *declared baseline* and read by
+exactly one consumer: the dashboard's counterfactual, which prices a local turn
+against the model the client said it thought it was talking to rather than
+against one inferred from the catalog — and only **through the capability
+gate**: declared-and-gated prices on the `Declared` basis, declared-and-refused
+is `Unpriced` naming the model and the band, and an unresolvable value is
+recorded verbatim while pricing falls back to inference on the `Inferred`
+basis, never a silent upgrade. No line of routing reads it.
 
 ## Hooking up Codex
 
@@ -545,6 +660,54 @@ transport: unset serves the echo stub, `openai_responses` dispatches over the
 real OpenAI Responses wire, and an unrecognised name is refused rather than
 quietly demoted.
 
+**Providers are data, not one hardwired transport.** The same catalog file
+carries a `"providers"` section: `name -> { base_url, routes: { models?,
+chat_completions?, responses?, messages? }, auth: { env }, extra_headers? }`
+(see `examples/catalog.example.json`'s `openrouter` and `dynamo-fleet`
+entries). `main` builds one client per definition at boot — its own connection
+pool, base URL, and static headers — and every catalog entry's `provider` has
+to name a definition or the built-in `openai`, which is the implicit provider
+`ROUNDHOUSE_FRONTIER_UPSTREAM` / `ROUNDHOUSE_OPENAI_API_BASE` have always
+named; a catalog written before this section existed still loads unchanged.
+Two load-or-die cross-checks make the registry total rather than merely usual:
+every entry's `provider` is defined, and a defined provider declares a route
+for the dialect its entries speak — both refuse the boot, not the first turn
+that would have hit the gap. A rolling-pointer model id (OpenRouter's
+`~`-prefixed aliases) is refused at load for the same reason a duplicate
+identity is: it mis-prices every turn after the upstream re-points it. The key
+itself is never written here: `auth.env` only names the environment variable it
+is expected to arrive in, so a configured provider with no key anywhere is a
+boot warning rather than a surprise found one turn at a time — the credential a
+turn actually authenticates with is still resolved per turn from the control
+plane's deployment/project/member tiers.
+
+**Sourcing `quality_prior`.** `FrontierModelSpec::quality_prior` is
+configuration, not measurement, and `import-benchmarks` (a binary target in
+`roundhouse-fleet`, not linked into any shipped binary) is what lets that
+figure be sourced instead of guessed. It reads OpenRouter's
+`GET /api/v1/benchmarks` (`OPENROUTER_API_KEY`) and writes two files: a catalog
+fragment with each `quality_prior` normalized to `0.0..=1.0`, and a paired
+provenance record naming the index, its snapshot date, and the attribution
+OpenRouter requires when the data is republished. An entry it cannot attribute
+at all — neither a `meta.citation` nor the item's own `source` discriminator —
+is refused rather than emitted uncited; a null `meta.citation` is the ordinary
+multi-source response and is emitted with each entry's `source` beside it. It
+is configuration generation, never a runtime dependency: nothing in a shipped
+`roundhouse` binary calls OpenRouter, and its own tests run entirely offline
+against a committed response fixture.
+
+**Republishing an imported number means shipping its provenance file.** The
+catalog fragment carries model identity and `quality_prior` and nothing else —
+deliberately, since a catalog entry is `deny_unknown_fields` and an attribution
+field on it would be a schema this project invented for someone else's data.
+The attribution lives in the paired `quality-prior.provenance.json`, so keep
+the two files together: the server looks for that file *beside the file
+`ROUNDHOUSE_CATALOG` names* and, when it finds one, renders its citation under
+the dashboard's savings figure. No file, no line, and never a boot failure —
+the catalog is named by an operator and load-or-die, while this one is
+discovered, and a discovered file must not be able to stop a deployment
+starting.
+
 ### The same numbers, in NeMo Relay's formats
 
 Roundhouse's log is a better producer of Relay's interchange formats than Relay's
@@ -604,8 +767,21 @@ three times in one week of 2026-08. Behind the trait, it is an option rather
 than a dependency.
 
 What has been adopted is ideas, with attribution and a pinning test rather than
-a dependency edge: the two `ToolSignals`-derived trigger signals above, and the
-`caller_auth_kind` conditional that `codex_launch`'s two auth kinds mirror.
+a dependency edge: the two `ToolSignals`-derived trigger signals above, the
+`caller_auth_kind` conditional that `codex_launch`'s two auth kinds mirror, and
+— the part that does not move — the **coding-agent scorer** and its constants,
+ported into `roundhouse-core/src/routing/stage.rs` with the upstream revision
+named in the module's attribution and pinned by a test that reads the
+attribution text rather than its own literals. That is the asset: the table of
+error patterns and the calibration behind the thresholds are trace-mined rather
+than reasoned, so an editorial improvement made on the way across would be an
+unmeasured heuristic wearing a measured one's provenance. Every divergence is
+documented at the divergence: `compacted` has no input in this tree and so the
+hard escalate is severity-only; `turn_depth` is the exchange count rather than
+the message count; and upstream's `ConsultClassifier` outcome is folded away
+entirely, because routing here makes no model calls — an undecided turn lands
+on the picker's default tier and is marked as having got there by falling open,
+which is what stops the handoff note narrating it.
 
 ## Examples
 
@@ -724,9 +900,23 @@ explicitly, because each reaches something the default run must not assume:
   suite (`an_exhausted_frontier_budget_routes_local_instead_of_failing`); the
   member ceiling binds even when the project has room, a hold left by a killed
   turn expires, and a lost settle is repaired by the next open of the session.
-- **A steered turn does not fork the conversation** — the synthetic call emits
-  exactly four frames and no others, the resent call and its output *extend*
-  rather than fork, and a third turn after a steer still matches its prefix.
+- **A steered turn does not fork the conversation** — the guidance answer is an
+  ordinary stored item, the next turn's resend admits it as prefix, the turn
+  that fulfils a steer is never itself validated, and a config still naming the
+  retired `tool_call` channel is refused at load by name.
+- **The tier a turn lands on is read from the session, not asserted** — a
+  stalling session is driven through the real signal extractor as *items* and
+  comes out on the capable tier; a session that produced work and passed its
+  tests comes back down; a quiet one falls open; and roundhouse's own control
+  calls count toward none of it. Each has a control that varies only the
+  exchanges, so none of them is a test about the picker.
+- **A dead provider costs one attempt, not the turn** — a transport failure
+  advances to the next candidate of the same tier inside one turn, one deadline
+  and **one grant settled once**; the failover crosses transports as well as
+  targets (the second attempt goes out through the second provider's own
+  client); a refusal, a 401 and a 404 fail where they stand; an exhausted tier
+  fails with every attempt on the record — the terminal failure included — and
+  the degrade-to-local promise survives any recipe.
 - **A verdict never becomes a conversation item** — stored items are
   byte-identical around a validation, which is what stops every later turn
   forking; the side call books under its own model row and never reaches the
@@ -743,18 +933,24 @@ explicitly, because each reaches something the default run must not assume:
   cache TTL; the budget view reports committed and measured separately, and
   drift goes negative and stays visible when a settle is lost.
 - **A real `codex` binary drives all of it** — it completes the MCP handshake
-  against our mount, executes our synthetic tool call and returns its output,
-  resends the call and its output without forking the session, and the next
-  turn reflects the correction; a steered turn's reported usage is the context
-  it admitted, and a key revoked between runs stops the client.
+  against our mount, prints our steering directive as its own answer, admits
+  the guidance as prefix on a resumed run without forking the session, and the
+  fulfilling turn is never validated; a steered turn's reported usage is the
+  context it admitted, a key revoked between runs stops the client, and the
+  flat tool name codex resolves for a generated skill equals what
+  `codex_launch` renders.
 
 ## Not yet built
 
 Roundhouse does not have WebSocket and gRPC transports. It cannot resume an
 interrupted generation from its partial output, which is already durable in the
-log. One real provider transport is wired (`openai_responses`); a second is a
-value on `ROUNDHOUSE_FRONTIER_UPSTREAM` rather than a second variable, and it
-does not exist yet.
+log. One real provider *dialect* is wired (`openai_responses`, which OpenRouter's
+GA `/responses` route also speaks, one registry client per configured
+provider); a chat-completions or Anthropic-messages client is a new
+`WireProtocol` arm the compiler will force through every exhaustive match, and
+neither exists yet. Fair-use enforcement is single-node: the rolling window
+counters live in process memory, and the Redis implementation is deferred by
+name with a boot warning where it matters.
 
 The generated Codex launch config is a library function with no operator entry
 point — no CLI subcommand and no admin route produces it — and the MCP surface
@@ -774,5 +970,6 @@ also why the reconciliation view's `measured_usd` cannot be windowed and says so
 rather than pretending.
 
 The admin plane has no audit trail, no key rotation without a service gap, no
-per-key rate limiting (every ceiling today is dollar-shaped, so a local-only
-principal has no volume ceiling), no pagination, and no credential CRUD.
+pagination, and no credential CRUD. (Per-key *volume* ceilings exist now — a
+fair-use window with `max_tokens` is exactly that — but request-rate limiting
+still does not.)

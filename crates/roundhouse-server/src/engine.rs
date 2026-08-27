@@ -28,7 +28,8 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use roundhouse_core::context::{ContextAssembler, Tokenizer};
 use roundhouse_core::control::{
-    Billing, CredentialError, MemorySpendLedger, SpendError, SpendLedger, TurnPolicy,
+    Billing, CredentialError, FairUseError, FairUseLedger, MemoryFairUseLedger, MemorySpendLedger,
+    SpendError, SpendLedger, TurnCredential, TurnPolicy,
 };
 use roundhouse_core::event::{Accounting, IncompleteReason, SessionObserver, Usage};
 use roundhouse_core::ids::{ResponseId, SessionId, SideCallId, TurnId};
@@ -37,15 +38,16 @@ use roundhouse_core::item::Item;
 use roundhouse_core::metrics::MetricsRecorder;
 use roundhouse_core::now_ms;
 use roundhouse_core::routing::{
-    CacheLedger, Candidate, Decision, DecisionRecord, RoutingContext, RoutingError, RoutingPolicy,
-    Target,
+    AttemptClass, CacheLedger, Candidate, Decision, DecisionRecord, DecisionSource,
+    DispatchAttempt, RoutingContext, RoutingError, RoutingPolicy, Target, Tier, TierRecipe,
+    TurnSignals,
 };
-use roundhouse_core::session::{Session, SessionError, TurnAdmission};
+use roundhouse_core::session::{Session, SessionError, SessionState, TurnAdmission};
 use roundhouse_core::store::SessionStore;
-use roundhouse_core::validate::{SideCall, SteerCapability};
+use roundhouse_core::validate::{SideCall, exchanges};
 use roundhouse_fleet::{
-    FleetError, FleetQuery, FrontierChunk, FrontierClient, FrontierError, FrontierQuote,
-    FrontierStream, LocalFleet, LocalQuote, StaticFrontierCatalog,
+    FleetError, FleetQuery, FrontierChunk, FrontierClient, FrontierClients, FrontierError,
+    FrontierQuote, FrontierStream, LocalFleet, LocalQuote, StaticFrontierCatalog,
 };
 use roundhouse_mcp::ControlStore;
 use tokio::time::Instant;
@@ -53,6 +55,7 @@ use tokio::time::Instant;
 use crate::control_config::Admission;
 
 mod control;
+mod fair_use;
 pub(crate) mod spend;
 
 #[derive(Debug, thiserror::Error)]
@@ -67,6 +70,15 @@ pub enum EngineError {
     Frontier(#[from] FrontierError),
     #[error(transparent)]
     Spend(#[from] SpendError),
+    /// The fair-use ledger could not answer.
+    ///
+    /// Its own arm rather than folded into [`Self::Spend`]: the two are
+    /// different stores answering different questions, and an operator holding
+    /// a failure has to know which counter is down — the durable one that
+    /// decides whether money may be spent, or the rolling one that decides
+    /// whether a session has had its share.
+    #[error(transparent)]
+    FairUse(#[from] FairUseError),
     /// The project's budget is spent and it is configured to refuse.
     ///
     /// A decision this deployment made about this tenant, like
@@ -98,6 +110,137 @@ pub enum EngineError {
     UnresolvableTarget(Target),
     #[error("turn exceeded its deadline of {0} ms")]
     TurnDeadline(u64),
+}
+
+/// A dispatch that never opened a stream, and whether another target is worth
+/// trying.
+///
+/// The `Option` is the whole type: `Some` is an outage and `None` is an answer.
+/// Keeping the classification beside the error — rather than re-deriving it at
+/// the loop from an `EngineError` that has already flattened the variant — is
+/// what stops "should this fail over" from becoming a question about a
+/// formatted string.
+struct ConnectFailure {
+    error: EngineError,
+    class: Option<AttemptClass>,
+}
+
+impl ConnectFailure {
+    /// A failure no second target would survive: a refused credential, a
+    /// dialect nobody can serialize, a 404, a struck deadline.
+    fn terminal(error: impl Into<EngineError>) -> Self {
+        Self {
+            error: error.into(),
+            class: None,
+        }
+    }
+}
+
+/// Did this turn move the session onto the capable tier, and did a *signal* say
+/// so? (S6)
+///
+/// The tier half of the handoff gate, in one function because it is three
+/// conditions that only mean anything together — and written against the
+/// **targets in the recipe** rather than against a tier recorded on the
+/// decision, which is the shape a first draft had.
+///
+/// **Why membership and not a `tier` field.** Recording the served tier on the
+/// `Decision` and the `DecisionRecord` would answer the same question, at the
+/// cost of a field on the persisted record and a construction site in fifteen
+/// files — and it would put the load-bearing correctness on somebody remembering
+/// to set it to the tier that *served* rather than the tier the scorer *picked*.
+/// Those differ exactly when the picked tier is entirely inadmissible and
+/// `StagePolicy` falls to the other one: the capable model is not answering, and
+/// a note claiming the preceding steps are not to be trusted would be the
+/// best-effort-narrowing lie `validate::handoff` argues against at length.
+/// Asking "is the target that is about to be dispatched named in the capable
+/// list" cannot get that wrong — `tier_pool` sourced it from one list or the
+/// other, and `TierRecipe::new` refuses a target named in both, so membership is
+/// unambiguous.
+///
+/// **Why `last_decision` and not the `ActiveEscalation::decided_on_turn` shape**
+/// the validate loop's half uses. An escalation is a multi-turn narrowing with a
+/// life, so "the turn it began on" is a fact worth folding; a tier is re-decided
+/// from scratch every turn, so the only comparison that means anything is
+/// against the turn immediately before. There is no state to fold and none is
+/// added.
+///
+/// Three consequences, none of them clean, all of them cheaper than the
+/// alternative:
+///
+/// - **A recipe edited mid-session degrades wrong in one direction.** A capable
+///   target dropped from the list between turns reads as not-capable, so the
+///   next capable turn narrates a second time and tells the model the preceding
+///   steps came from something in trouble when they came from the same tier.
+///   Reachable only through a live admin edit. The `tier`-field shape has the
+///   mirror image — a recorded `Capable` from a recipe that no longer exists —
+///   so neither spelling is clean and this one costs no persisted state.
+/// - **A previous turn that exhausted its capable fallbacks and failed still
+///   counts as capable**, because its last `Routed` names a capable target. No
+///   note rides the turn after it. Defensible — the session was already on the
+///   capable tier and nothing escalated — and stated here so it is not
+///   rediscovered as a defect.
+/// - **The first routed turn of a session can narrate.** `last_decision` is
+///   `None`, so nothing was capable before, and an `Override` on turn one means
+///   the resent history a client brought with it carried a critical result.
+///   There are recent steps and they did show trouble; the note is true.
+fn opened_a_tier_escalation(
+    recipe: Option<&TierRecipe>,
+    decision: &Decision,
+    state: &SessionState,
+) -> bool {
+    // No recipe is every deployment that has not configured one, and it is the
+    // first check because it is the cheap one.
+    let Some(recipe) = recipe else {
+        return false;
+    };
+    // `is_signal_driven` and not "the tier changed": `DecisionSource::Ambiguous`
+    // reaches the capable tier on every turn of a `capable_first` project, and
+    // narrating that would tell the model the cheap tier had been stalling on a
+    // turn where nothing said it was. Upstream's `only_on_wrong_signal_escalation`,
+    // and the one place this tree spells it.
+    if !decision
+        .source
+        .is_some_and(DecisionSource::is_signal_driven)
+    {
+        return false;
+    }
+    let capable = recipe.list(Tier::Capable);
+    let names_capable = |target: &Target| capable.contains(&target.policy_identity());
+    names_capable(&decision.target)
+        && !state
+            .last_decision()
+            .is_some_and(|last| names_capable(&last.chosen))
+}
+
+/// One turn's input: the conversation, and what the client said it was talking
+/// to.
+///
+/// **A struct rather than a fifth argument on [`Engine::run_turn`]**, and the
+/// reason is the one the declared baseline exists to serve. `model` is a
+/// property of the *request*, exactly like the items are, and every caller that
+/// has one has the other; a separate parameter would let a surface pass the
+/// conversation and forget the baseline, which is a silent downgrade of every
+/// counterfactual that turn would have priced. `From<Vec<Item>>` keeps every
+/// caller that has nothing to declare — the whole test surface, and the MCP and
+/// admin paths — spelling exactly what it spelled before.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurnInput {
+    pub items: Vec<Item>,
+    /// The `model` the client named on the request, verbatim.
+    ///
+    /// Read by pricing and by nothing else — see
+    /// [`DecisionRecord::declared_baseline`](roundhouse_core::routing::DecisionRecord::declared_baseline).
+    pub declared_baseline: Option<String>,
+}
+
+impl From<Vec<Item>> for TurnInput {
+    fn from(items: Vec<Item>) -> Self {
+        Self {
+            items,
+            declared_baseline: None,
+        }
+    }
 }
 
 /// What a local worker produced.
@@ -229,6 +372,34 @@ struct Completed {
     text: String,
     usage: Usage,
     decision: Decision,
+    /// What the provider said this call cost, on the providers that say.
+    ///
+    /// Beside `usage` and never inside it: `usage` is what this deployment
+    /// prices from its own catalog, and this is the external bill that pricing
+    /// is later reconciled against. See
+    /// `SessionEventKind::ResponseCompleted::provider_reported_cost_usd`.
+    provider_reported_cost_usd: Option<f64>,
+}
+
+/// How [`Engine::plan`] failed, and the dead dispatch that explains it.
+///
+/// A struct rather than a bare [`EngineError`] because the failover loop knows
+/// one thing the error string does not: *which target* the client's error is
+/// about, and how it failed. Every path into `plan` that is not the loop
+/// converts through [`From`], so the ordinary `?` sites read exactly as they
+/// did and only the one place that has an attempt to carry says so.
+struct PlanFailure {
+    error: EngineError,
+    terminal_attempt: Option<DispatchAttempt>,
+}
+
+impl<E: Into<EngineError>> From<E> for PlanFailure {
+    fn from(error: E) -> Self {
+        Self {
+            error: error.into(),
+            terminal_attempt: None,
+        }
+    }
 }
 
 /// A dispatch that did not, and everything that survived it.
@@ -242,6 +413,16 @@ struct Failed {
     error: EngineError,
     partial: String,
     evidence: Usage,
+    /// The dispatch this failure *is*, when it came from a target.
+    ///
+    /// Carried out of [`Engine::plan`]'s failover loop rather than
+    /// reconstructed at the settle seam, because the seam cannot reconstruct
+    /// it: the target and the class live in the loop, and the error the loop
+    /// returns is a string by the time it crosses the boundary. Every earlier
+    /// attempt of the same turn rides the `Routed` of the dispatch it caused;
+    /// this is the one that caused none. See
+    /// `SessionEventKind::ResponseIncomplete::terminal_attempt`.
+    terminal_attempt: Option<DispatchAttempt>,
 }
 
 impl Failed {
@@ -251,11 +432,16 @@ impl Failed {
     /// provider and the empty usage keeps the ledger's reading of that target
     /// cold. Over-claiming warmth here is the mispricing the evidence rule on
     /// `SessionState`'s pending routings exists to prevent.
-    fn before_output(error: impl Into<EngineError>) -> Self {
+    fn before_output(failure: impl Into<PlanFailure>) -> Self {
+        let PlanFailure {
+            error,
+            terminal_attempt,
+        } = failure.into();
         Self {
-            error: error.into(),
+            error,
             partial: String::new(),
             evidence: Usage::default(),
+            terminal_attempt,
         }
     }
 
@@ -283,6 +469,11 @@ impl Failed {
             error: error.into(),
             partial,
             evidence,
+            // A body that died after the stream opened names no failed
+            // *dispatch*: the target answered, and a second attempt was never
+            // an option (see `plan`'s note on why the failover boundary is
+            // `execute` and not the stream).
+            terminal_attempt: None,
         }
     }
 
@@ -342,6 +533,15 @@ impl Failed {
             // decision with no price on it, which is a defect in this process
             // rather than anything a tenant did.
             | EngineError::Spend(_)
+            // And the fair-use ledger being unreachable is the same class as
+            // `Spend`: this deployment's own store, not a decision about the
+            // tenant. It is reachable *here* only in principle — the fair-use
+            // check runs at the transport's admission, above `run_turn`, and
+            // the draw after the turn is contained — which is why it is filed
+            // rather than given a reason of its own that no client would ever
+            // see. A refusal by a rolling window is a `429` and never a
+            // terminal log event; see `Engine::fair_use_refusal`.
+            | EngineError::FairUse(_)
             | EngineError::UnpricedSettlement(_)
             | EngineError::UnresolvableTarget(_)
             | EngineError::TurnDeadline(_) => IncompleteReason::UpstreamError,
@@ -370,7 +570,23 @@ pub struct Engine<S: SessionStore, T: Tokenizer + Clone> {
     fleet: Option<Arc<dyn LocalFleet>>,
     local_executor: Arc<dyn LocalExecutor>,
     frontier_catalog: StaticFrontierCatalog,
-    frontier_client: Arc<dyn FrontierClient>,
+    /// Every transport this process can dispatch through, keyed by the
+    /// `provider` on the chosen target's catalog entry.
+    ///
+    /// **A registry and not a client since M10.1.** One client for the whole
+    /// catalog was correct while a deployment addressed one origin, and it
+    /// stops being correct the moment a single turn's candidate list spans two
+    /// — a capable tier on OpenRouter and a fallback on OpenAI's own endpoint
+    /// is the shape this phase exists to serve, and it needs two base URLs, two
+    /// credentials and two connection pools resolved per dispatch rather than
+    /// per process.
+    ///
+    /// [`Engine::new`] still takes one client and wraps it in the uniform
+    /// registry, which is what every test and every pre-M10.1 deployment means
+    /// by "the frontier client"; [`Engine::with_provider_clients`] is what the
+    /// composition root replaces it with once a catalog has a `providers`
+    /// section.
+    frontier_clients: Arc<FrontierClients>,
     policy: Arc<dyn RoutingPolicy>,
     config: EngineConfig,
     /// Folds every event this node commits into the dashboard's aggregates.
@@ -394,6 +610,19 @@ pub struct Engine<S: SessionStore, T: Tokenizer + Clone> {
     /// together on purpose: a durable log beside a ledger that forgets would
     /// re-grant a month's budget on every restart.
     spend: Arc<dyn SpendLedger>,
+    /// This deployment's rolling fair-use counters.
+    ///
+    /// Defaulted rather than required, and — unlike [`Self::spend`] — the
+    /// default is the *only* implementation this milestone has. See
+    /// [`fair_use`](roundhouse_core::control::fair_use) for what a memory
+    /// ledger does not survive and for the unlock condition on the Redis one;
+    /// the composition root warns when a deployment has made its sessions
+    /// durable while these counters have not.
+    ///
+    /// A separate field from `spend` rather than a second method on it,
+    /// because they are separate stores with separate arithmetic — the whole
+    /// content of "fair use is not a `BudgetWindow` variant".
+    fair_use: Arc<dyn FairUseLedger>,
     /// What decides whether an admitted turn is dispatched or answered here.
     ///
     /// Never an `Option`. The default occupant
@@ -438,9 +667,35 @@ pub struct Engine<S: SessionStore, T: Tokenizer + Clone> {
     /// Entries are never removed — bounded by the sessions this process serves,
     /// which is acceptable for a single-process skeleton.
     turn_gates: Mutex<HashMap<SessionId, Arc<tokio::sync::Mutex<()>>>>,
+    /// Fires the "this recipe routes nothing" warning at most once. (M10.2, S3)
+    ///
+    /// **The hole conditional composition leaves, stated where it is knowable.**
+    /// `main.rs` wraps [`StagePolicy`](roundhouse_core::routing::StagePolicy)
+    /// only when some project already had a `tiers` block at boot — see
+    /// `tiers_configured` there for why unconditional composition was refused —
+    /// so a recipe *added through the admin plane afterwards* lands on a process
+    /// whose router cannot read it. The operator gets a config field that
+    /// re-routes nothing, with no error and, without this, no log line either.
+    ///
+    /// **Once per process rather than once per turn**, and the reason is that
+    /// the condition is a property of the *composition*, not of the traffic: it
+    /// is either true for every turn this process will ever serve or false for
+    /// all of them, so a per-turn `warn!` would emit one identical line per
+    /// request for the life of the deployment — a volume that trains an operator
+    /// to filter exactly the line they need. The remedy is a restart, and one
+    /// line survives to the next one.
+    unread_recipe: std::sync::Once,
 }
 
 impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
+    /// An engine whose whole catalog dispatches through one transport.
+    ///
+    /// The shape a test with an echo stub means, and the shape
+    /// `ROUNDHOUSE_FRONTIER_UPSTREAM` alone produced before M10.1. Kept as the
+    /// primary constructor rather than replaced, because a caller with one
+    /// client would otherwise have to spell out a registry of one — and because
+    /// "one transport for every provider" is a real deployment posture, not a
+    /// degenerate case of the registry.
     pub fn new(
         store: Arc<S>,
         tokenizer: T,
@@ -450,20 +705,54 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         policy: Arc<dyn RoutingPolicy>,
         config: EngineConfig,
     ) -> Self {
+        Self::with_provider_clients(
+            store,
+            tokenizer,
+            local_executor,
+            frontier_catalog,
+            Arc::new(FrontierClients::uniform(frontier_client)),
+            policy,
+            config,
+        )
+    }
+
+    /// An engine that dispatches each provider's traffic through its own
+    /// transport.
+    ///
+    /// **A constructor and not a builder on [`Self::new`], deliberately.** A
+    /// builder would mean an engine briefly held a client it was about to
+    /// discard, and a registry composed on top of a uniform fallback would
+    /// answer for a provider nobody defined — quietly sending an undefined
+    /// provider's turns to whichever origin happened to be the constructor's
+    /// argument, which is exactly what the catalog's boot cross-checks exist to
+    /// make impossible. Here the registry is the whole answer to "where does
+    /// this provider's traffic go", and a name it does not hold is an error.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_provider_clients(
+        store: Arc<S>,
+        tokenizer: T,
+        local_executor: Arc<dyn LocalExecutor>,
+        frontier_catalog: StaticFrontierCatalog,
+        frontier_clients: Arc<FrontierClients>,
+        policy: Arc<dyn RoutingPolicy>,
+        config: EngineConfig,
+    ) -> Self {
         Self {
             store,
             tokenizer,
             fleet: None,
             local_executor,
             frontier_catalog,
-            frontier_client,
+            frontier_clients,
             policy,
             config,
             metrics: Arc::new(MetricsRecorder::new()),
             spend: Arc::new(MemorySpendLedger::new()),
+            fair_use: Arc::new(MemoryFairUseLedger::new()),
             interjector: roundhouse_core::interject::production_default(),
             control: None,
             turn_gates: Mutex::new(HashMap::new()),
+            unread_recipe: std::sync::Once::new(),
         }
     }
 
@@ -496,6 +785,21 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
     /// default is honest rather than fail-open.
     pub fn with_spend_ledger(mut self, spend: Arc<dyn SpendLedger>) -> Self {
         self.spend = spend;
+        self
+    }
+
+    /// Count rolling fair-use draws in `fair_use` instead of this process's own
+    /// memory.
+    ///
+    /// A builder for [`Self::with_spend_ledger`]'s reason, and unused by the
+    /// shipped binary today: the memory ledger is the only implementation, so
+    /// the seam exists for the tests that need a recording one and for the
+    /// Redis implementation whose unlock condition is written at
+    /// [`FairUseLedger`]. Present now rather than added later because a trait
+    /// with exactly one implementation and no way to substitute it is a trait
+    /// nobody can prove is a seam.
+    pub fn with_fair_use_ledger(mut self, fair_use: Arc<dyn FairUseLedger>) -> Self {
+        self.fair_use = fair_use;
         self
     }
 
@@ -565,9 +869,13 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         &self,
         session_id: &SessionId,
         turn_id: TurnId,
-        input: Vec<Item>,
+        input: impl Into<TurnInput>,
         admission: &Admission,
     ) -> Result<TurnResult, EngineError> {
+        let TurnInput {
+            items: input,
+            declared_baseline,
+        } = input.into();
         // See `turn_gates`: within this node, one turn at a time per session.
         let gate = self.turn_gate(session_id);
         let _turn = gate.lock().await;
@@ -691,13 +999,6 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                 // log's own fallback where it declared nothing. See
                 // [`Self::objective`].
                 objective: self.objective(session_id, session.state()),
-                // Not yet detected. `Absent` is the honest value while nothing
-                // reads the request's tool list: under `SteerChannel::Auto` it
-                // degrades a correction to plain guidance, which is the safe
-                // direction, and the production default interjects on nothing
-                // regardless. Detection belongs at the wire layer against the
-                // tool list a request declared, which is §7's milestone.
-                capability: &SteerCapability::Absent,
                 // Who a check is billed to, under what key, and by what name.
                 // Not the candidate list, and never a price: an occupant may be
                 // told there is no room for a check and never what the turn it
@@ -770,15 +1071,14 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             // this comment the absence reads as a missing `record_routing`,
             // which is exactly the "fix" that would break it.
             //
-            // **The text is what the item says, and for a call that is
-            // nothing.** A caller that concatenated `text` into a transcript
-            // must not find a tool call in it — the call reaches a client as a
-            // wire item, not as prose — but a halt's item *is* prose, and it is
-            // the whole point of the halt: the guidance that ends the agent's
-            // loop and hands control back to a human. Returning the empty
-            // string for both would leave the degrade path with its correction
-            // in the log and nothing on the wire. See
-            // [`Item::spoken_text`](roundhouse_core::item::Item::spoken_text).
+            // **The text is what the item says**, and since M10.0 both seam
+            // answers say something: a steer carries the guidance and the
+            // restated request, a halt carries the guidance alone. Both are
+            // assistant text, so `spoken_text` is the whole projection — it
+            // still answers the empty string for a tool call, which is what
+            // keeps a caller concatenating `text` into a transcript from
+            // finding a call in it, but nothing this seam produces is one.
+            // See [`Item::spoken_text`](roundhouse_core::item::Item::spoken_text).
             //
             // **The usage booked here is the interjection's, and it is a
             // ledger number rather than a wire number.** Reporting
@@ -799,7 +1099,6 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             Interjection::Complete {
                 item,
                 usage,
-                guidance,
                 record,
             } => {
                 // The record goes in the same append batch as the item and the
@@ -810,13 +1109,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                     .complete_with_item(&response_id, item.clone(), usage.clone(), record)
                     .await;
                 committed
-                    .map(|()| {
-                        // Only once the log holds the call. See
-                        // [`Self::deposit_steer`] on why that ordering is the
-                        // load-bearing half.
-                        self.deposit_steer(session_id, &admission.principal, &item, guidance);
-                        (item.spoken_text().to_string(), usage, None)
-                    })
+                    .map(|()| (item.spoken_text().to_string(), usage, None))
                     .map_err(EngineError::from)
             }
             Interjection::Proceed { record } => {
@@ -852,13 +1145,29 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                 // neither — a budget is an admin's ceiling and not an axis an
                 // agent may move.
                 let admission = &self.narrowed_admission(session_id, admission);
-                match self.dispatch(&mut session, &response_id, admission).await {
+                match self
+                    .dispatch(
+                        &mut session,
+                        &response_id,
+                        admission,
+                        declared_baseline.as_deref(),
+                    )
+                    .await
+                {
                     Ok(Completed {
                         text,
                         usage,
                         decision,
+                        provider_reported_cost_usd,
                     }) => {
-                        let committed = session.complete(&response_id, &text, usage.clone()).await;
+                        let committed = session
+                            .complete(
+                                &response_id,
+                                &text,
+                                usage.clone(),
+                                provider_reported_cost_usd,
+                            )
+                            .await;
                         committed
                             .map(|()| (text, usage, Some(decision)))
                             .map_err(EngineError::from)
@@ -880,9 +1189,16 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                             error,
                             partial,
                             evidence,
+                            terminal_attempt,
                         } = failed;
                         let _ = session
-                            .mark_incomplete(&response_id, partial, reason, evidence)
+                            .mark_incomplete(
+                                &response_id,
+                                partial,
+                                reason,
+                                evidence,
+                                terminal_attempt,
+                            )
                             .await;
                         Err(error)
                     }
@@ -897,6 +1213,13 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         // temporal-first-failure rule `local_stream` settles a reservation
         // under.
         let spend = self.settle(&session, admission).await;
+        // The rolling counters, after the settle and **not inside it**.
+        // `settle` returns early for a membership with no budget, and a project
+        // with fair-use windows and no dollar ceiling is exactly the shape this
+        // phase ships — a draw hung off the settle would record nothing for the
+        // projects fair use actually governs. See `Engine::record_fair_use_draw`.
+        self.record_fair_use_draw(&session, &response_id, admission)
+            .await;
         let last_seq = session.last_seq();
         // Stop renewing before handing the lease back, so no renewal can land
         // after the release and re-own a session this node has finished with.
@@ -929,6 +1252,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         session: &mut Session<S>,
         response_id: &ResponseId,
         admission: &Admission,
+        declared_baseline: Option<&str>,
     ) -> Result<Completed, Failed> {
         // One deadline for every model await in this turn, taken before any of
         // them: a provider that hangs after accepting the request settles the
@@ -939,7 +1263,13 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         let deadline_at = Instant::now() + Duration::from_millis(self.config.turn_deadline_ms);
 
         let (mut stream, decision, isl_tokens) = self
-            .plan(session, response_id, deadline_at, admission)
+            .plan(
+                session,
+                response_id,
+                deadline_at,
+                admission,
+                declared_baseline,
+            )
             .await
             .map_err(Failed::before_output)?;
 
@@ -948,9 +1278,14 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         // what lets a successor resume a half-written answer, and what makes
         // TTFT a measured quantity — the first `OutputTextDelta.at_ms` in the
         // log minus the `Routed.at_ms` before it — instead of the model's own
-        // estimate of itself.
+        // estimate of itself. On a turn that fell forward, "the `Routed` before
+        // it" is the *last* one, which is the dispatch that answered: the right
+        // reading, since the time a dead provider took to fail is on that
+        // provider's own attempt row rather than charged to the model that
+        // eventually spoke.
         let mut text = String::new();
         let mut reported: Option<Usage> = None;
+        let mut reported_cost_usd: Option<f64> = None;
         loop {
             let chunk = match tokio::time::timeout_at(deadline_at, stream.next()).await {
                 Ok(Some(Ok(chunk))) => chunk,
@@ -980,7 +1315,22 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                     cached_input_tokens,
                     output_tokens,
                     reasoning_tokens,
+                    provider_reported_cost,
                 } => {
+                    // Recorded and not booked, deliberately. A provider's own
+                    // dollar figure is the *other* side of the reconciliation
+                    // view — the external bill our `committed_usd` is to be
+                    // checked against — and folding it into `Usage` here would
+                    // put a number nobody derived from the catalog into the
+                    // column the savings claim is computed from. It rides the
+                    // terminal event to the log instead, which is what makes it
+                    // survive the process that measured it; before review
+                    // finding G11 it was spent on a `tracing::debug!` that the
+                    // binary's own default `info` filter drops, so on any
+                    // deployment that did not set `RUST_LOG` the number existed
+                    // nowhere at all by the time the turn returned. See
+                    // `FrontierChunk::Done::provider_reported_cost`.
+                    reported_cost_usd = provider_reported_cost;
                     reported = Some(Usage {
                         input_tokens,
                         cached_input_tokens,
@@ -1006,6 +1356,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             text,
             usage,
             decision,
+            provider_reported_cost_usd: reported_cost_usd,
         })
     }
 
@@ -1123,12 +1474,30 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         response_id: &ResponseId,
         deadline_at: Instant,
         admission: &Admission,
-    ) -> Result<(FrontierStream, Decision, usize), EngineError> {
+        declared_baseline: Option<&str>,
+    ) -> Result<(FrontierStream, Decision, usize), PlanFailure> {
         // Rebuild the prompt from the committed log, so what we price is
         // exactly what a successor would reconstruct.
         let assembler = self.assembler_over(session.state().items.clone());
         let isl_tokens = assembler.buffer().isl_tokens();
         let turn_index = session.turn_index().saturating_sub(1);
+
+        // What the session's own tools have been doing, for the tier scorer.
+        //
+        // **Derived here rather than carried in state**, and that is the whole
+        // of S1: the extractor runs over the committed exchanges, which is the
+        // same projection `Evidence::of` hands the validate loop, so a
+        // successor that picks this session up scores the turn identically.
+        // Nothing is stored, nothing is asked of a model, and a deployment with
+        // no recipe pays one walk of the fold's item list for a value no policy
+        // reads.
+        //
+        // Computed unconditionally rather than behind `admission.tiers.is_some()`
+        // so there is one code path: an empty session yields the default
+        // signals, the scorer returns zero, and the picker's default takes the
+        // turn — which is exactly what `None` would have done, through the
+        // arithmetic instead of through a branch.
+        let signals = TurnSignals::from_exchanges(&exchanges(&session.state().items));
 
         // --- price every option -------------------------------------------
         let local_quote = match &self.fleet {
@@ -1181,6 +1550,46 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         );
         let admission = &escalated.admission;
         let turn_policy: &TurnPolicy = &admission.policy;
+
+        // --- and narrate a handoff, if this deployment asked us to (R2, S6) ---
+        //
+        // **Two things can now open a handoff, so the gate is resolved in two
+        // places rather than one, and this is the first half.** Until M10.2
+        // there was exactly one narrowing worth narrating — the validate loop's
+        // escalation, composed twenty lines up — and the whole gate sat here
+        // beside it. S6 adds the second: a tier escalation, which the *router*
+        // decides and which therefore cannot be known until `choose` returns.
+        // The two halves are joined ~150 lines below, immediately before the
+        // dispatch loop, and the `append` stays where it always was, at the
+        // frontier quote: that is a fact about one wire, and deciding it there
+        // is what stops the next transport growing its own copy of a rule that
+        // belongs to routing.
+        //
+        // Resolved here, then:
+        //
+        // - **the note itself**, which is the only config read in the whole
+        //   gate. Absent is the shipped answer, so this is `None` on every turn
+        //   of every deployment that has not opted in, and the entire
+        //   decoration path costs one `Option` check;
+        // - **the validate loop's half of the condition**: an escalation is in
+        //   force *and it began on this turn*. A note must ride once per switch
+        //   and never accumulate; `this_turn_opened_an_escalation` is folded
+        //   from the log, so a successor picking this session up mid-escalation
+        //   does not decorate a second time.
+        //
+        // What is deliberately *not* a further condition is `escalated.clamped`.
+        // A clamped escalation still narrowed routing, and an unclamped one
+        // whose floor the previous turn already met may have moved nothing — so
+        // the flag is both over- and under-inclusive as a proxy for "the target
+        // changed". The honest fix is in the wording rather than in the gate:
+        // `handoff::EXAMPLE_HANDOFF_NOTE` claims a review found trouble, which
+        // is exactly what is true here, and claims nothing about who is
+        // answering. See `validate::handoff`.
+        let configured_note = admission
+            .validation
+            .as_ref()
+            .and_then(|terms| terms.handoff_note.as_deref());
+        let validate_loop_escalated = session.state().this_turn_opened_an_escalation();
 
         // --- drop what this principal could never use ------------------------
         //
@@ -1277,7 +1686,8 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                 CredentialError::NoCredential {
                     provider: withheld_providers.join(", "),
                 },
-            )));
+            ))
+            .into());
         }
 
         // --- reserve what this turn may spend --------------------------------
@@ -1296,10 +1706,27 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             .open_grant(session, response_id, &candidates, admission)
             .await?;
         if budget.refuses() {
-            return Err(EngineError::BudgetRefused);
+            return Err(EngineError::BudgetRefused.into());
         }
 
         // --- choose --------------------------------------------------------
+        //
+        // One `Option::is_some` on the ordinary path, and a `Once` behind it.
+        // See `Engine::unread_recipe`: this is the one moment a process can
+        // observe that a project's recipe reaches a router that will not read
+        // it, because the recipe arrives on the admission and the router was
+        // chosen at boot.
+        if admission.tiers.is_some() && !self.policy.reads_tier_recipes() {
+            self.unread_recipe.call_once(|| {
+                tracing::warn!(
+                    policy = self.policy.name(),
+                    "a project configures a `tiers` recipe, but this process composed a router \
+                     that does not read one, so the recipe is selecting nothing; it was almost \
+                     certainly added through the admin plane after boot, and a restart composes \
+                     the stage router over it"
+                );
+            });
+        }
         let decision = self
             .bounded(
                 deadline_at,
@@ -1321,119 +1748,344 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                     // applied through, and produces the overflow state that
                     // exists nowhere upstream of it.
                     budget: &budget,
+                    // Derived above from the committed log. `Some` on every
+                    // turn including the first, whose signals are simply empty.
+                    signals: Some(&signals),
+                    // The project's recipe, resolved at admission beside the
+                    // policy. `None` on every project that configured none,
+                    // which is what makes the stage router a no-op for them.
+                    tiers: admission.tiers.as_deref(),
                 }),
             )
             .await?;
 
-        let chosen = candidates
-            .iter()
-            .find(|candidate| candidate.target == decision.target)
-            .cloned()
-            .ok_or_else(|| EngineError::UnresolvableTarget(decision.target.clone()))?;
+        // --- the handoff gate's second half (S6) ------------------------------
+        //
+        // **Bound here, before the dispatch loop, and that placement is
+        // load-bearing rather than tidy.** `opened_a_tier_escalation` asks what
+        // the *previous* turn was served by, and it asks it of
+        // `last_decision` — which, with one `Routed` per dispatch, this turn's
+        // own first attempt overwrites. Computed inside the loop, an escalating
+        // turn whose first capable target died would see its own record on the
+        // second pass, read `was_capable`, and silently drop the note on exactly
+        // the turns where a failover happened. One `let` above the loop is the
+        // whole fix, and `a_note_survives_a_failover_inside_the_escalating_turn`
+        // is what keeps it there.
+        //
+        // The two halves are `||` and not `&&`: either narrowing on its own is
+        // worth telling the answering model about, and a turn that did both
+        // still gets exactly one note, because what is gated is the `Option`
+        // and `append_handoff_note` is called once per dispatch with it.
+        let handoff_note = configured_note.filter(|_| {
+            validate_loop_escalated
+                || opened_a_tier_escalation(admission.tiers.as_deref(), &decision, session.state())
+        });
 
-        // The credential and the payer for what was actually chosen, resolved
-        // once and read twice — by the decision below and by the dispatch after
-        // it. `None` is not a state to fall back from: `reachable` above has
-        // already made an unreachable target unchoosable, so a `None` here is a
-        // caller that skipped the filter, and defaulting the payer would book
-        // somebody else's spend under the deployment's name.
-        let access = admission
-            .credentials
-            .access_for(&decision.target)
-            .ok_or_else(|| EngineError::UnresolvableTarget(decision.target.clone()))?;
+        // --- dispatch, falling forward while the decision has somewhere to go -
+        //
+        // **One grant and one settle, however many attempts — but one `Routed`
+        // per attempt.** The grant was opened above, before `choose`, and
+        // nothing in this loop reopens it: a failover is a second attempt at the
+        // *same* turn, so a second grant would let a flaky provider pyramid
+        // holds until the ledger refused a turn nobody had spent anything on.
+        // That is risk 3 in the plan, and this is the line that answers it.
+        //
+        // **Every dispatch is recorded before its request goes out**, which is
+        // why `record_routing` is inside this loop and not after it. That is the
+        // property `SessionState::pending_routings` states — a `Routed` "records
+        // an intent rather than a transmission" — and it is what stops a window
+        // in which a provider call is in flight, possibly billing, with nothing
+        // in the log saying any dispatch was attempted. Writing one record after
+        // the loop would have been tidier and would have opened exactly that
+        // window; an unexplained provider charge is meant to be a red test here,
+        // not an anecdote.
+        //
+        // Three things fall out of that placement, all of them right:
+        //
+        // - A turn with no fallbacks writes one `Routed`, in the position it has
+        //   always been written in, with an empty `attempts` that is skipped on
+        //   the wire — byte-identical to a pre-M10 log.
+        // - `frontier_history.record` fires once per attempt, which is exactly
+        //   what a cadence asks for: `SessionState::frontier_history` says a
+        //   dispatch that failed on the way out still counted as reaching for a
+        //   hosted model, and this makes that true without a second mechanism.
+        // - The fold's pending dispatch is keyed by response and last-wins, so
+        //   the terminal usage pairs with the target that actually transmitted,
+        //   and each record's own `rate_card` matches the request it describes.
+        //
+        // `attempts` therefore carries **one row: the failure this dispatch is a
+        // consequence of** — never the cumulative history. A cumulative list
+        // would be counted again by the metrics fold on every subsequent record,
+        // reporting one dead provider as four.
+        //
+        // **The boundary is `execute`, not the stream.** Everything the failover
+        // classes name — transport, timeout, 408/429/5xx — is decided before a
+        // single byte of the body has been decoded, so this loop can see all of
+        // them; a body that fails halfway through cannot be retried anywhere,
+        // because deltas are durable as they arrive and a second attempt would
+        // append a second answer to the same response. Upstream draws the line
+        // in the identical place ("streaming body failures happen after the
+        // retry boundary and are not retried", `client.rs:326` @ `053a61e`).
+        //
+        // **A local target does not fail over**, and that is this rung's stated
+        // scope rather than an oversight: local capacity fails for reasons a
+        // second worker shares (a saturated fleet, a missing quote), and the
+        // remedy there is the load axis the router already has.
+        let ordered: Vec<Target> = std::iter::once(decision.target.clone())
+            .chain(decision.fallbacks.iter().cloned())
+            .collect();
+        let mut opened: Option<FrontierStream> = None;
+        let mut failure: Option<EngineError> = None;
+        // The one attempt the next record will carry, if there is a next one.
+        let mut preceding: Option<DispatchAttempt> = None;
 
-        // Recorded before execution: a decision that led to a failure is still
-        // part of the audit trail.
-        session
-            .record_routing(
-                response_id,
-                DecisionRecord {
-                    chosen: decision.target.clone(),
-                    // Appended rather than woven in, exactly as the overflow
-                    // valve's note is: an ordinary decision's rationale stays
-                    // byte-identical to the one a deployment without the
-                    // validate loop writes, and the one turn in a session where
-                    // the floor served was not the floor asked for says so
-                    // where an operator reads it.
-                    rationale: match escalated.clamped {
-                        true => decision.rationale.clone() + control::ESCALATION_CLAMPED_NOTE,
-                        false => decision.rationale.clone(),
+        for target in ordered {
+            let chosen = candidates
+                .iter()
+                .find(|candidate| candidate.target == target)
+                .cloned()
+                .ok_or_else(|| EngineError::UnresolvableTarget(target.clone()))?;
+
+            // The credential and the payer for this dispatch, resolved once and
+            // read twice — by the record below and by the connect after it.
+            // `None` is not a state to fall back from: `reachable` above has
+            // already made an unreachable target unchoosable, so a `None` here
+            // is a caller that skipped the filter, and defaulting the payer
+            // would book somebody else's spend under the deployment's name.
+            // Resolved once per attempt rather than once per turn for the same
+            // reason it was ever resolved once: two `access_for` calls could
+            // straddle a key being attached, and the log would then name a payer
+            // the request did not use.
+            let access = admission
+                .credentials
+                .access_for(&target)
+                .ok_or_else(|| EngineError::UnresolvableTarget(target.clone()))?;
+
+            session
+                .record_routing(
+                    response_id,
+                    DecisionRecord {
+                        chosen: target.clone(),
+                        // Appended rather than woven in, exactly as the overflow
+                        // valve's note is: an ordinary decision's rationale stays
+                        // byte-identical to the one a deployment without the
+                        // validate loop writes, and the one turn in a session where
+                        // the floor served was not the floor asked for says so
+                        // where an operator reads it.
+                        rationale: match escalated.clamped {
+                            true => decision.rationale.clone() + control::ESCALATION_CLAMPED_NOTE,
+                            false => decision.rationale.clone(),
+                        },
+                        policy: self.policy.name().to_string(),
+                        isl_tokens: isl_tokens as u64,
+                        expected_prefill_tokens: chosen.expected_prefill_tokens,
+                        expected_cost_usd: chosen.expected_cost_usd,
+                        considered: candidates.clone(),
+                        turn_policy_digest: turn_policy.digest(),
+                        // The router's own answer, not re-derived here: it is the
+                        // one place `BudgetState::ExhaustedOverflow` is produced,
+                        // and reconstructing it from the grant would lose every
+                        // overflow.
+                        budget_state: decision.budget_state,
+                        // The price this turn is going to be settled at, written
+                        // down while the catalog that quoted it is still the one
+                        // in front of us. Every later reader of this event — this
+                        // process's own settle, and a successor's repair — prices
+                        // from here rather than from whatever catalog it booted
+                        // with, which is what makes the two agree by construction
+                        // and what stops an edited price list from re-pricing, or
+                        // failing to price at all, a turn that is already over.
+                        //
+                        // `None` for a local target, which `spec_for` answers by
+                        // construction: local capacity is billed in prefill
+                        // tokens, not dollars.
+                        //
+                        // Read off the target that *served*, not the one the policy
+                        // named: a turn that fell forward from kimi to sol is
+                        // settled at sol's card, and pricing it at the card of a
+                        // model that never answered would charge the turn for a
+                        // dispatch that produced nothing.
+                        //
+                        // Read off *this* dispatch's target rather than the policy's
+                        // first choice: a turn that fell forward from kimi to sol is
+                        // settled at sol's card, and pricing it at the card of a
+                        // model that never answered would charge the turn for a
+                        // dispatch that produced nothing.
+                        rate_card: self
+                            .frontier_catalog
+                            .spec_for(&target)
+                            .map(|spec| spec.pricing),
+                        // Whose credential this dispatch spends, and what the
+                        // credential filter took out. Both are decided above, in
+                        // the same pass that filtered the candidate set — which is
+                        // the whole argument for that placement: a payer resolved
+                        // in the connect branch is resolved after the record it
+                        // belongs on has been written, and a settle would then have
+                        // to guess.
+                        payer: access.payer,
+                        // And whether any of it is roundhouse's money to price,
+                        // decided here for the same reason and from the same
+                        // resolution. Asked of the *admission* rather than of
+                        // `access.credential`, which is the one place the two
+                        // differ: a local dispatch under a pass-through project
+                        // touches no credential, but the hosted call it displaced
+                        // would have been the caller's seat to pay for, so a saving
+                        // credited against it is the same invented number the seat
+                        // turn's price is. See `Billing::of`.
+                        billing: Billing::of(&admission.credentials),
+                        // And whether a budget was in force at all, taken from the
+                        // same admission the grant was opened against a few lines
+                        // up — so "a grant was opened for this turn" and "this turn
+                        // is charged" are one fact recorded once, rather than two
+                        // reads of a plane that an admin may edit in between. A
+                        // project that gains a budget after this turn is over does
+                        // not retroactively acquire one here, which is exactly what
+                        // a settle driven off the live plane used to believe.
+                        budget_draw: admission.budget.as_ref().map(|_| admission.budget_counts),
+                        // Empty on every ordinary turn, and skipped on the wire
+                        // when it is, so a pre-M7 log's decisions stay
+                        // byte-identical. Non-empty, it is the only place in the
+                        // log that a project whose credential variable was never
+                        // set is distinguishable from one that simply prefers its
+                        // own workers.
+                        withheld_providers: withheld_providers.clone(),
+                        // What the client said it was talking to. Written down and
+                        // read only by pricing — no line of routing above this one
+                        // has seen it, which is the property that keeps `model` an
+                        // accepted-*recorded*-never-routed-on field rather than a
+                        // back door onto target selection.
+                        declared_baseline: declared_baseline.map(str::to_string),
+                        // Exactly the failure this dispatch is a consequence of, and
+                        // nothing earlier: see the loop's own comment on why a
+                        // cumulative list would report one dead provider as four.
+                        attempts: preceding.take().into_iter().collect(),
                     },
-                    policy: self.policy.name().to_string(),
-                    isl_tokens: isl_tokens as u64,
-                    expected_prefill_tokens: chosen.expected_prefill_tokens,
-                    expected_cost_usd: chosen.expected_cost_usd,
-                    considered: candidates.clone(),
-                    turn_policy_digest: turn_policy.digest(),
-                    // The router's own answer, not re-derived here: it is the
-                    // one place `BudgetState::ExhaustedOverflow` is produced,
-                    // and reconstructing it from the grant would lose every
-                    // overflow.
-                    budget_state: decision.budget_state,
-                    // The price this turn is going to be settled at, written
-                    // down while the catalog that quoted it is still the one
-                    // in front of us. Every later reader of this event — this
-                    // process's own settle, and a successor's repair — prices
-                    // from here rather than from whatever catalog it booted
-                    // with, which is what makes the two agree by construction
-                    // and what stops an edited price list from re-pricing, or
-                    // failing to price at all, a turn that is already over.
-                    //
-                    // `None` for a local target, which `spec_for` answers by
-                    // construction: local capacity is billed in prefill
-                    // tokens, not dollars.
-                    rate_card: self
-                        .frontier_catalog
-                        .spec_for(&decision.target)
-                        .map(|spec| spec.pricing),
-                    // Whose credential this dispatch spends, and what the
-                    // credential filter took out. Both are decided above, in
-                    // the same pass that filtered the candidate set — which is
-                    // the whole argument for that placement: a payer resolved
-                    // in the connect branch is resolved after the record it
-                    // belongs on has been written, and a settle would then have
-                    // to guess.
-                    payer: access.payer,
-                    // And whether any of it is roundhouse's money to price,
-                    // decided here for the same reason and from the same
-                    // resolution. Asked of the *admission* rather than of
-                    // `access.credential`, which is the one place the two
-                    // differ: a local dispatch under a pass-through project
-                    // touches no credential, but the hosted call it displaced
-                    // would have been the caller's seat to pay for, so a saving
-                    // credited against it is the same invented number the seat
-                    // turn's price is. See `Billing::of`.
-                    billing: Billing::of(&admission.credentials),
-                    // And whether a budget was in force at all, taken from the
-                    // same admission the grant was opened against a few lines
-                    // up — so "a grant was opened for this turn" and "this turn
-                    // is charged" are one fact recorded once, rather than two
-                    // reads of a plane that an admin may edit in between. A
-                    // project that gains a budget after this turn is over does
-                    // not retroactively acquire one here, which is exactly what
-                    // a settle driven off the live plane used to believe.
-                    budget_draw: admission.budget.as_ref().map(|_| admission.budget_counts),
-                    // Empty on every ordinary turn, and skipped on the wire
-                    // when it is, so a pre-M7 log's decisions stay
-                    // byte-identical. Non-empty, it is the only place in the
-                    // log that a project whose credential variable was never
-                    // set is distinguishable from one that simply prefers its
-                    // own workers.
-                    withheld_providers,
-                },
-            )
-            .await?;
+                )
+                .await?;
 
-        // --- connect -------------------------------------------------------
-        let stream = match &decision.target {
+            let started = Instant::now();
+            match self
+                .connect(
+                    &target,
+                    &assembler,
+                    local_quote.as_ref(),
+                    &access.credential,
+                    handoff_note,
+                    session.session_id(),
+                    isl_tokens,
+                    deadline_at,
+                )
+                .await
+            {
+                Ok(stream) => {
+                    opened = Some(stream);
+                    break;
+                }
+                Err(ConnectFailure { error, class: None }) => {
+                    // The provider answered, or nobody could have: a second
+                    // target answers a 401 or an unserializable dialect exactly
+                    // the same way.
+                    //
+                    // **And `preceding` stays as it is, so this failure marks no
+                    // attempt.** `DispatchAttempt` carries a class, and there is
+                    // no honest class for "not a failover reason" — the three it
+                    // has are the three that justify trying somebody else. More
+                    // to the point, `failed_attempts` counts *dispatches that
+                    // were fallen forward from*, and a 401 or a dialect this
+                    // build cannot speak is this deployment's own
+                    // misconfiguration; booking it against the provider's row
+                    // would report a model as failing when what failed was our
+                    // key or our catalog. The boot-time cross-checks are where
+                    // those two are supposed to die, and they die there loudly.
+                    failure = Some(error);
+                    break;
+                }
+                Err(ConnectFailure {
+                    error,
+                    class: Some(class),
+                }) => {
+                    preceding = Some(DispatchAttempt {
+                        target,
+                        class,
+                        elapsed_ms: started.elapsed().as_millis() as u64,
+                    });
+                    failure = Some(error);
+                    // Under the *same* deadline, which is what makes a failover
+                    // bounded rather than a way to spend N times the turn's
+                    // budget. A provider that burned the whole allowance before
+                    // failing leaves nothing for the next one, and opening a
+                    // connection we know will be cut mid-handshake would add a
+                    // record describing our own impatience.
+                    if Instant::now() >= deadline_at {
+                        failure = Some(self.deadline_struck());
+                        break;
+                    }
+                }
+            }
+        }
+
+        match opened {
+            Some(stream) => Ok((stream, decision, isl_tokens)),
+            // **The last failure is the turn's failure, and that is where it is
+            // recorded.** Every attempt but the final one rides the record of
+            // the dispatch it caused; the final one has no successor to ride, so
+            // it arrives as this error and as the `ResponseIncomplete` the settle
+            // seam writes from it. Appending a duplicate `Routed` for the sole
+            // purpose of carrying one more row would put a second decision in the
+            // log for a dispatch that never happened.
+            //
+            // `unreachable` by construction: the loop leaves `opened` empty only
+            // through a branch that sets `failure` first, and `ordered` is never
+            // empty because it starts with the target the policy chose.
+            // The attempt rides out with the error, because this is the only
+            // frame that still has both. `preceding` holds it for the same
+            // reason it held every earlier one — it is set by the classified
+            // branch of the connect match — and the loop ended without a
+            // successor `Routed` to hand it to.
+            None => Err(PlanFailure {
+                error: failure.unwrap_or_else(|| {
+                    unreachable!("a loop that opened nothing recorded why on every path")
+                }),
+                terminal_attempt: preceding.take(),
+            }),
+        }
+    }
+
+    /// Open a stream to one target. Decides nothing, records nothing.
+    ///
+    /// Split out of [`Self::plan`] so the failover loop reads as a loop over
+    /// targets rather than as a loop wrapped around a two-armed match, and — the
+    /// load-bearing half — so that the one place a [`FrontierError`] is still
+    /// typed is the place that has to classify it. Once `EngineError::from`
+    /// swallows the variant, "was this worth another target" is a question about
+    /// a string.
+    #[allow(clippy::too_many_arguments)]
+    async fn connect(
+        &self,
+        target: &Target,
+        assembler: &ContextAssembler<T>,
+        local_quote: Option<&LocalQuote>,
+        // The credential the caller already resolved for this target, handed in
+        // rather than resolved again: two `access_for` calls could straddle a
+        // key being attached, and the decision already written would then name a
+        // payer this request did not use.
+        credential: &TurnCredential,
+        handoff_note: Option<&str>,
+        session_id: &SessionId,
+        isl_tokens: usize,
+        deadline_at: Instant,
+    ) -> Result<FrontierStream, ConnectFailure> {
+        match target {
+            // No failover arm, deliberately — see the loop in `plan`. A local
+            // failure is a fleet fact, and the router's load axis is where a
+            // second worker is chosen.
             Target::Local { .. } => {
-                let quote = local_quote
-                    .as_ref()
-                    .ok_or_else(|| EngineError::UnresolvableTarget(decision.target.clone()))?;
-                let fleet = self
-                    .fleet
-                    .as_ref()
-                    .ok_or_else(|| EngineError::UnresolvableTarget(decision.target.clone()))?;
+                let quote = local_quote.ok_or_else(|| {
+                    ConnectFailure::terminal(EngineError::UnresolvableTarget(target.clone()))
+                })?;
+                let fleet = self.fleet.as_ref().ok_or_else(|| {
+                    ConnectFailure::terminal(EngineError::UnresolvableTarget(target.clone()))
+                })?;
                 self.local_stream(
                     fleet,
                     quote,
@@ -1441,43 +2093,95 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                     isl_tokens,
                     deadline_at,
                 )
-                .await?
+                .await
+                .map_err(ConnectFailure::terminal)
             }
             Target::Frontier { .. } => {
                 // The dialect travels with the request. A client cannot ask the
-                // catalog itself — it holds one `Arc<dyn FrontierClient>` for
-                // providers whose transports have nothing in common — so
-                // whatever it needs to serialize correctly has to arrive in the
-                // quote or not at all.
-                let spec = self
-                    .frontier_catalog
-                    .spec_for(&decision.target)
-                    .ok_or_else(|| EngineError::UnresolvableTarget(decision.target.clone()))?;
+                // catalog itself — each one holds one transport and one
+                // serialization — so whatever it needs to serialize correctly
+                // has to arrive in the quote or not at all.
+                let spec = self.frontier_catalog.spec_for(target).ok_or_else(|| {
+                    ConnectFailure::terminal(EngineError::UnresolvableTarget(target.clone()))
+                })?;
                 let quote = FrontierQuote {
-                    target: decision.target.clone(),
+                    target: target.clone(),
                     wire_protocol: spec.wire_protocol,
-                    prompt: assembler.rendered(),
+                    // **The forwarded request, and only the forwarded request.**
+                    // `assembler.rendered()` is a projection of the log, not the
+                    // log — so decorating it here leaves the stored items, the
+                    // prefix hashes and everything a successor would rebuild
+                    // byte-identical whether a deployment configured a note or
+                    // not. That is R2's whole safety argument, and it is a
+                    // property of *where* this line is rather than of anything
+                    // the function does.
+                    //
+                    // `isl_tokens` above is deliberately the undecorated count:
+                    // it is what the pool was quoted against and what the
+                    // decision was recorded at, and re-deriving it here would
+                    // make the audit trail describe a prompt that never went
+                    // anywhere. The note is roundhouse's own paragraph on one
+                    // turn in a session, so the understatement is bounded and
+                    // one-sided — and a frontier settle prices from the
+                    // provider's own reported usage anyway.
+                    //
+                    // The local branch above takes the token *buffer* rather
+                    // than a string and is left undecorated: re-tokenizing a
+                    // decorated prompt would desynchronize the buffer from the
+                    // block hashes the fleet routes on, which is a real cost for
+                    // a narration. Named as a gap rather than hidden — a
+                    // deployment whose escalations land locally gets the
+                    // narrowing without the note.
+                    prompt: match handoff_note {
+                        Some(note) => roundhouse_core::validate::append_handoff_note(
+                            assembler.rendered(),
+                            note,
+                        ),
+                        None => assembler.rendered(),
+                    },
                     // Stable for the life of the session: providers use it to
                     // steer requests to the same cache node, so varying it
                     // would defeat the hit we just routed on.
-                    prompt_cache_key: session.session_id().to_string(),
+                    prompt_cache_key: session_id.to_string(),
                     expected_output_tokens: Some(self.config.expected_output_tokens),
                     // The credential travels here for the same reason the
                     // dialect above does: this is the only argument `execute`
-                    // receives, and the engine holds one client for every
-                    // provider. It is the *same* resolution the payer on the
+                    // receives. It is the *same* resolution the payer on the
                     // decision came from, read out of one `access_for` above —
                     // two calls could resolve two tiers if a key were attached
                     // between them, and the log would then name a payer the
                     // request did not use.
-                    credential: access.credential.clone(),
+                    credential: credential.clone(),
                 };
-                self.bounded(deadline_at, self.frontier_client.execute(&quote))
-                    .await?
+                // **The registry is resolved from the spec, not from the
+                // process.** `spec.provider` is the same string the catalog's
+                // boundary cross-checked against the `providers` section at
+                // load, which is what makes this lookup total on a booted
+                // deployment rather than a place a turn can discover a
+                // misconfiguration. Resolving it here rather than at `choose`
+                // keeps one rule: a client is picked by the target that was
+                // chosen, never by a target that might have been.
+                let client = self
+                    .frontier_clients
+                    .for_provider(&spec.provider)
+                    .map_err(|error| ConnectFailure::terminal(EngineError::from(error)))?;
+                // Not `bounded`, and that is the one line the whole failover
+                // rests on: `bounded` converts through `EngineError::from`,
+                // which erases the variant this classification reads. The
+                // deadline is applied here by hand so the `FrontierError`
+                // survives long enough to be asked whether it is worth another
+                // target — and a deadline strike is deliberately terminal, since
+                // there is by definition no time left to try anywhere else.
+                match tokio::time::timeout_at(deadline_at, client.execute(&quote)).await {
+                    Ok(Ok(stream)) => Ok(stream),
+                    Ok(Err(error)) => Err(ConnectFailure {
+                        class: error.failover_class(),
+                        error: EngineError::Frontier(error),
+                    }),
+                    Err(_) => Err(ConnectFailure::terminal(self.deadline_struck())),
+                }
             }
-        };
-
-        Ok((stream, decision, isl_tokens))
+        }
     }
 
     /// Run a local worker and present what it produced as a stream.
@@ -1616,6 +2320,8 @@ mod tests {
                 turn_policy,
                 frontier_history: &frontier_history,
                 budget: &TurnBudget::Unlimited,
+                signals: None,
+                tiers: None,
             })
             .await
             .expect_err("every case here empties the pool");

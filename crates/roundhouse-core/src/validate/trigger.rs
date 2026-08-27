@@ -50,7 +50,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::session::SessionState;
-use crate::validate::exchange::{Exchange, exchanges};
+use crate::validate::exchange::{Exchange, exchanges, task_exchanges};
+use crate::validate::tool_signals::{ErrorSeverity, PureBashStreak};
 
 /// Which of the trigger's observations fired.
 ///
@@ -68,6 +69,12 @@ pub enum SignalKind {
     ToolFailureStreak,
     /// A turn far outside this session's own trailing distribution.
     CostAnomaly,
+    /// A named failure in the recent tool output — a traceback, an import
+    /// error, a timeout — at or above a severity threshold.
+    ErrorSeverity,
+    /// Consecutive shell or unrecognised calls with nothing read, written or
+    /// edited between them.
+    PureBashStreak,
 }
 
 /// One observation, and the sentence that states it as a fact.
@@ -142,6 +149,25 @@ impl<'a> Evidence<'a> {
             turn_tokens: state.recent_turn_tokens(),
         }
     }
+
+    /// The exchanges that are the agent working on its task — every signal's
+    /// input (G04).
+    ///
+    /// A method on the shared read rather than a filter inside each signal, and
+    /// the difference is the finding: `NoProgressRepeat` was the limb that was
+    /// reported, but `PingPong` alternates just as happily between two control
+    /// tools, and a `fetch_steer` answered `NoGuidanceYet` reads as a failure to
+    /// [`reads_as_failure`](super::exchange::reads_as_failure) and feeds
+    /// [`ToolFailureStreak`]. Fixing the reported limb and leaving the others is
+    /// exactly what one shared read makes impossible.
+    ///
+    /// `exchanges` stays whole, because the brief still has to *render* what
+    /// happened: a judge reading a trajectory with our own calls silently
+    /// deleted would be shown a session that skips from one command to another
+    /// with no account of the gap.
+    pub fn task_exchanges(&self) -> Vec<&Exchange> {
+        task_exchanges(&self.exchanges)
+    }
 }
 
 /// One piece of evidence that a session is in trouble.
@@ -181,13 +207,8 @@ impl Signal for NoProgressRepeat {
     }
 
     fn detect(&self, evidence: &Evidence<'_>) -> Option<String> {
-        let window: Vec<&Exchange> = evidence
-            .exchanges
-            .iter()
-            .rev()
-            .take(self.window)
-            .rev()
-            .collect();
+        let task = evidence.task_exchanges();
+        let window = &task[task.len().saturating_sub(self.window)..];
         let latest = window.last()?;
         // An unanswered call is not a repeat of anything yet: the output is
         // half the comparison and it has not arrived.
@@ -225,10 +246,11 @@ impl Signal for PingPong {
 
     fn detect(&self, evidence: &Evidence<'_>) -> Option<String> {
         let span = self.cycles.checked_mul(2)?;
-        if span < 4 || evidence.exchanges.len() < span {
+        let task = evidence.task_exchanges();
+        if span < 4 || task.len() < span {
             return None;
         }
-        let names: Vec<&str> = evidence.exchanges[evidence.exchanges.len() - span..]
+        let names: Vec<&str> = task[task.len() - span..]
             .iter()
             .map(|call| call.name.as_str())
             .collect();
@@ -258,10 +280,11 @@ impl Signal for ToolFailureStreak {
     }
 
     fn detect(&self, evidence: &Evidence<'_>) -> Option<String> {
-        if self.length == 0 || evidence.exchanges.len() < self.length {
+        let task = evidence.task_exchanges();
+        if self.length == 0 || task.len() < self.length {
             return None;
         }
-        let tail = &evidence.exchanges[evidence.exchanges.len() - self.length..];
+        let tail = &task[task.len() - self.length..];
         // Answered *and* failed. An unanswered call is not a failure — the most
         // recent call of a turn still in flight would otherwise end every
         // streak in a fire.
@@ -343,6 +366,14 @@ pub fn default_signals() -> Vec<Box<dyn Signal>> {
             min_samples: 4,
             multiple: 3.0,
         }),
+        // The two ported ones, registered here rather than left opt-in for the
+        // reason the other four are: `with_signals` exists so a deployment can
+        // *narrow* the set, and a signal nobody enables is a signal nobody
+        // measures. Their thresholds are named constants beside their types
+        // rather than literals here, because unlike the four above they are
+        // upstream's numbers and the provenance travels with them.
+        Box::new(ErrorSeverity::default()),
+        Box::new(PureBashStreak::default()),
     ]
 }
 
@@ -440,7 +471,7 @@ impl Trigger {
         if state.turn_index <= 1 {
             return false;
         }
-        if state.this_turn_fulfilled_a_steer() {
+        if state.this_turn_fulfils_a_steer() {
             return false;
         }
         if state.consecutive_interventions() >= self.config.max_consecutive_interventions {
@@ -511,6 +542,52 @@ mod tests {
             exchanges: exchanges(items),
             turn_tokens,
         }
+    }
+
+    /// G04 (review finding): `NoProgressRepeat` matches on
+    /// `name + arguments + output_hash` alone, with no exception for
+    /// roundhouse's own control surface — and `fetch_steer`,
+    /// `explain_last_route`, and `status` are deliberately pure per
+    /// `roundhouse-mcp/src/surface.rs`'s `SteerResponse` doc ("every field is
+    /// a fold of the conversation's own log, so two calls produce identical
+    /// bytes"), which is exactly the shape this signal is built to catch. An
+    /// agent that calls `status` three times with nothing else changing (a
+    /// legitimate idempotent poll of its own budget) used to read as the same
+    /// stuck loop as three identical `pytest` failures. The signal reads
+    /// [`Evidence::task_exchanges`] now, and the control below is what proves
+    /// it still finds a real loop with our own calls sitting on top of it.
+    #[test]
+    fn three_identical_reads_of_our_own_surface_are_not_a_no_progress_repeat() {
+        let signal = NoProgressRepeat {
+            occurrences: 3,
+            window: 8,
+        };
+
+        let mut polling = Vec::new();
+        for n in 0..3 {
+            polling.push(call(&format!("s{n}"), "mcp__roundhouse__status", "{}"));
+            polling.push(result(&format!("s{n}"), r#"{"budget_remaining_usd":4.2}"#));
+        }
+        assert_eq!(
+            signal.detect(&evidence_of(&polling, &[])),
+            None,
+            "an idempotent poll of roundhouse's own control surface is not a no-progress repeat"
+        );
+
+        // Control, live: the same three polls with a real stuck loop *behind*
+        // them. The repeat is still found, which is what says the exemption
+        // dropped our calls from the walk rather than blinding the signal to
+        // whatever happens to sit at the end of it.
+        let mut mixed = Vec::new();
+        for n in 0..3 {
+            mixed.push(call(&format!("p{n}"), "pytest", r#"{"path":"tests/"}"#));
+            mixed.push(result(&format!("p{n}"), "ImportError: no module named app"));
+        }
+        mixed.extend(polling);
+        let fact = signal
+            .detect(&evidence_of(&mixed, &[]))
+            .expect("the pytest loop is still a loop with our own calls after it");
+        assert!(fact.contains("pytest"), "{fact}");
     }
 
     /// The sharpest of the four, and the one a naive implementation gets wrong.
@@ -655,6 +732,54 @@ mod tests {
         assert!(fact.contains("all returned failures"), "{fact}");
     }
 
+    /// The consequence of the exit-code claim, at the level where it costs
+    /// something.
+    ///
+    /// `exchange::reads_as_failure`'s own test pins the accessor; this one pins
+    /// what the accessor is *for*. Three `cargo test` runs that exited non-zero
+    /// and printed nothing to stdout is a session in trouble, and if the exit
+    /// code is invisible the streak signal is not merely quiet against codex
+    /// exec traffic — it is dead, the same way F04 killed it before the body
+    /// was anchored.
+    #[test]
+    fn a_streak_of_silent_nonzero_exits_still_fires() {
+        let streak = ToolFailureStreak { length: 3 };
+
+        let mut failing = Vec::new();
+        for n in 0..3 {
+            failing.push(call(
+                &format!("c{n}"),
+                "shell_command",
+                r#"{"command":"./ci"}"#,
+            ));
+            failing.push(result(
+                &format!("c{n}"),
+                &format!("Chunk ID: chunk-{n}\nWall time: 0.0{n}10 seconds\nProcess exited with code 1\nOutput:\n"),
+            ));
+        }
+        let fact = streak
+            .detect(&evidence_of(&failing, &[]))
+            .expect("three non-zero exits in a row is a failure streak whatever stdout said");
+        assert!(fact.contains("all returned failures"), "{fact}");
+
+        // The control that keeps this about the exit code and not about the
+        // header: the identical shape at exit 0 is three successes, and a
+        // streak that fired here would fire on every exec session there is.
+        let mut succeeding = Vec::new();
+        for n in 0..3 {
+            succeeding.push(call(
+                &format!("c{n}"),
+                "shell_command",
+                r#"{"command":"./ci"}"#,
+            ));
+            succeeding.push(result(
+                &format!("c{n}"),
+                &format!("Chunk ID: chunk-{n}\nWall time: 0.0{n}10 seconds\nProcess exited with code 0\nOutput:\nok\n"),
+            ));
+        }
+        assert_eq!(streak.detect(&evidence_of(&succeeding, &[])), None);
+    }
+
     #[test]
     fn the_other_three_signals_fire_on_their_pattern_and_are_quiet_otherwise() {
         // Ping-pong: strict alternation of two names, and nothing else.
@@ -755,14 +880,37 @@ mod tests {
         let fired = trigger
             .evaluate(&stuck)
             .expect("an open gate plus evidence is the one case that consults");
-        assert_eq!(fired.signals.len(), 1);
-        assert_eq!(fired.signals[0].kind, SignalKind::NoProgressRepeat);
+        // Named exhaustively rather than counted loosely, because *which*
+        // signals a fixture trips is the thing that silently changes when the
+        // default set grows. Four identical failing `pytest` runs are three
+        // separate observations, and each is about a different property of the
+        // same four exchanges: the same answer four times over (the repeat),
+        // `no module named ` in the body (a hard error in the window), and four
+        // consecutive calls to a tool none of the ported tables recognise with
+        // nothing read, written or edited between them (the build pit). The
+        // failure streak stays quiet — `ImportError:` is not one of
+        // `reads_as_failure`'s anchored markers — which is the disagreement
+        // `ErrorSeverity`'s doc says the two signals exist to have.
+        let kinds: Vec<SignalKind> = fired.signals.iter().map(|signal| signal.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                SignalKind::NoProgressRepeat,
+                SignalKind::ErrorSeverity,
+                SignalKind::PureBashStreak,
+            ]
+        );
         assert_eq!(fired.turn_index, stuck.turn_index);
     }
 
     /// The hysteresis, which is the difference between a validator and a loop.
+    ///
+    /// Renamed with M10.0: the correction is the previous turn's *answer* now,
+    /// not this turn's tool result, so the turn that fulfils a steer is the one
+    /// after the steered one. The two controls are what pin the off-by-one from
+    /// both sides.
     #[test]
-    fn a_turn_fulfilling_an_open_steer_never_fires() {
+    fn the_turn_after_a_steer_never_fires() {
         let trigger = Trigger::new(TriggerConfig::default(), default_signals());
 
         // A session that would fire on its own evidence.
@@ -773,20 +921,28 @@ mod tests {
              assertion about the steer and not about the evidence"
         );
 
-        // The same session, on the turn whose input answered the steer we
-        // emitted. Every signal still reads exactly as it did — the correction
-        // has not had a chance to change anything yet — so without this rule a
-        // steer re-triggers the validation that emitted it, forever.
+        // The same session, on the turn after the steered one. Every signal
+        // still reads exactly as it did — the correction has not had a chance to
+        // change anything yet — so without this rule a steer re-triggers the
+        // validation that emitted it, forever.
         let mut fulfilling = wide_open(stuck_items());
-        fulfilling.steer_fulfilled_on_turn = Some(fulfilling.turn_index);
-        assert!(fulfilling.this_turn_fulfilled_a_steer());
+        fulfilling.steered_on_turn = Some(fulfilling.turn_index - 1);
+        assert!(fulfilling.this_turn_fulfils_a_steer());
         assert_eq!(trigger.evaluate(&fulfilling), None);
 
-        // The control on the *other* side of the rule: a steer fulfilled on an
-        // earlier turn does not disable validation for the rest of the session.
+        // The control on the *other* side of the rule: a steer two turns back
+        // does not disable validation for the rest of the session.
         let mut earlier = wide_open(stuck_items());
-        earlier.steer_fulfilled_on_turn = Some(earlier.turn_index - 1);
+        earlier.steered_on_turn = Some(earlier.turn_index - 2);
         assert!(trigger.evaluate(&earlier).is_some());
+
+        // And the third position, which is the one a fold comparing against
+        // `turn_index` would get wrong: the turn that *emitted* the steer is
+        // already past this gate, so recording it as suppressed there would be
+        // invisible — and would shift the suppression onto the wrong turn.
+        let mut emitting = wide_open(stuck_items());
+        emitting.steered_on_turn = Some(emitting.turn_index);
+        assert!(trigger.evaluate(&emitting).is_some());
     }
 
     #[test]

@@ -17,6 +17,7 @@ use super::super::budget::{AllocationConfig, BudgetConfig};
 use super::super::config::{ControlPlaneError, PolicyConfig, ProjectEntry, UserEntry};
 use super::super::credentials::CredentialsConfig;
 use super::super::crosscheck::CrossCheckRefusal;
+use super::super::fair_use::FairUseConfig;
 use super::super::validate::ValidateConfig;
 use super::super::{MintError, MintedKey};
 use super::records::{EntityKind, MembershipRole};
@@ -62,6 +63,31 @@ pub struct ProjectPatch {
     pub policy: Option<Option<PolicyConfig>>,
     #[serde(default, deserialize_with = "keep_explicit_null")]
     pub budget: Option<Option<BudgetConfig>>,
+    /// This project's rolling fair-use windows.
+    ///
+    /// **No window-mutation hazard here, which is why this axis is patchable at
+    /// all while `budget.window` is refused.** A `BudgetWindow` change
+    /// reinterprets committed spend — a total read as a month — so the admin
+    /// plane declines it. Fair use has nothing committed to reinterpret: the
+    /// shipped ledger — `MemoryFairUseLedger`, the only implementation in this
+    /// milestone — buckets draws by wall-clock index under `(project, member)`
+    /// and nothing else, and `would_exceed` reads the configured span at
+    /// admission time. Narrowing a window therefore sums fewer of the same
+    /// buckets and widening one sums more, both over draws that really
+    /// happened; the pruning horizon is the widest window the module offers, so
+    /// widening 5h to 7d finds its history intact rather than zeroed. A change
+    /// takes effect on the next admitted turn and no counter moves.
+    ///
+    /// **That is a property of the ledger, not of the seam, and the Redis
+    /// implementation inherits it as a constraint.** `fair_use`'s module doc
+    /// leaves the Redis key layout explicitly undecided (bucket-per-key versus
+    /// hash-per-scope); a layout that keyed buckets *by window* would make a
+    /// window change reinterpret existing draws and would put this axis back
+    /// under the refusal `budget.window` is under. Whoever lands that store
+    /// keeps the keying independent of the configured window, or removes this
+    /// axis from the patch — not both quietly.
+    #[serde(default, deserialize_with = "keep_explicit_null")]
+    pub fair_use: Option<Option<FairUseConfig>>,
     #[serde(default, deserialize_with = "keep_explicit_null")]
     pub validate: Option<Option<ValidateConfig>>,
     #[serde(default, deserialize_with = "keep_explicit_null")]
@@ -95,6 +121,7 @@ impl ProjectPatch {
             ("name", nulled(&self.name)),
             ("policy", nulled(&self.policy)),
             ("budget", nulled(&self.budget)),
+            ("fair_use", nulled(&self.fair_use)),
             ("validate", nulled(&self.validate)),
             ("credentials", nulled(&self.credentials)),
         ]

@@ -329,6 +329,7 @@ pub async fn read_events_pages_oldest_first_and_reproduces_the_append<S: Session
                 reasoning_tokens: 1,
                 accounting: Accounting::Estimated,
             },
+            provider_reported_cost_usd: None,
         },
         text_event("tail"),
     ];

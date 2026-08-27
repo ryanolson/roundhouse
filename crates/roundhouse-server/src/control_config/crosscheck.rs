@@ -27,7 +27,7 @@
 
 use anyhow::Result;
 use roundhouse_core::control::TurnBudget;
-use roundhouse_core::routing::Candidate;
+use roundhouse_core::routing::{Candidate, Tier};
 use roundhouse_fleet::FrontierModelSpec;
 
 use super::{Admission, ControlPlane};
@@ -95,7 +95,7 @@ pub fn refuse_policies_that_admit_nothing(
 
 /// How a refusal names the key an operator has to go and edit.
 ///
-/// One spelling for both checks below. A digest tells an operator that two
+/// One spelling for every check below. A digest tells an operator that two
 /// keys differ and never which one they mistyped, so the patterns go in beside
 /// it.
 fn describe(admission: &Admission) -> String {
@@ -110,17 +110,47 @@ fn describe(admission: &Admission) -> String {
 
 /// What a [`FrontierCadence`] promises about a window it has spent.
 ///
+/// **Cause-neutral wording, and it has to be.** Two configurations can leave a
+/// spent window with nothing local to serve from — a deployment with no local
+/// capacity at all, and one whose `tiers` recipe names none of the capacity it
+/// has (M10 review G02) — and a sentence naming only the first would be false
+/// for the second. One word carries it: *this key* has no local capacity, not
+/// *this deployment*, because capacity a key's own recipe cannot select is
+/// capacity that key does not have. Which of the two files to edit is said by
+/// [`TIERS_NAME_NO_LOCAL_FALLBACK`], appended only when the recipe is the
+/// difference.
+///
 /// [`FrontierCadence`]: roundhouse_core::control::FrontierCadence
 const CADENCE_PROMISE: &str = "its frontier_cadence promises that a spent window serves locally \
-     instead of failing, and this deployment has no local capacity to serve it";
+     instead of failing, and this key has no local capacity to serve it";
 
 /// What a degrade-mode [`Budget`] with the overflow valve off promises about a
 /// limit it has spent.
 ///
 /// [`Budget`]: roundhouse_core::control::Budget
 const BUDGET_PROMISE: &str = "its budget degrades to local with overflow_when_local_saturated off, \
-     which promises that an exhausted budget serves locally instead of failing, and this \
-     deployment has no local capacity to serve it";
+     which promises that an exhausted budget serves locally instead of failing, and this key has \
+     no local capacity to serve it";
+
+/// Which of the two files a broken spent-allowance promise sends an operator
+/// to, when the answer is the recipe rather than the fleet.
+///
+/// Said as its own sentence rather than folded into the two constants above:
+/// the promise and its cause have different remedies — add local capacity, or
+/// name the capacity you have — and the module's whole argument for keeping
+/// [`refuse_policies_that_admit_nothing`] separate from
+/// [`refuse_promises_of_a_local_fallback`] is that an operator should never
+/// have to work out which sentence to go and edit.
+///
+/// **Opens with "its", like every other constant in this list**, because
+/// [`refuse_promises_of_a_local_fallback`] joins them with `"; and "` — a
+/// sentence starting with its own conjunction renders as "; and and". It also
+/// has to resolve what the sentence before it looks like a contradiction of:
+/// the key has no local capacity *it can select*, while the deployment does
+/// quote one.
+const TIERS_NAME_NO_LOCAL_FALLBACK: &str = "its `tiers` recipe is what took it away -- this \
+     deployment does quote a local target and neither tier of the recipe names it, so on exactly \
+     the turns the spent allowance produces, the recipe describes nothing that can run";
 
 /// What a *stored*-key credential mode promises about a member who has
 /// attached nothing.
@@ -239,12 +269,14 @@ fn unkeepable_promises(
     if admission.validation.is_some() && judge.is_none() {
         broken.push(VALIDATION_PROMISE);
     }
-    if admission.policy.frontier_cadence.is_some()
-        && !reachable
-            .iter()
-            .any(|candidate| admission.policy.admits_when_spent(candidate))
-    {
-        broken.push(CADENCE_PROMISE);
+    let mut spent_allowances = Vec::new();
+    if admission.policy.frontier_cadence.is_some() {
+        spent_allowances.extend(spent_allowance_promise(
+            CADENCE_PROMISE,
+            admission,
+            reachable,
+            |candidate| admission.policy.admits_when_spent(candidate),
+        ));
     }
     if let Some(terms) = &admission.budget {
         // Only one exhaustion setting promises local service at all: `Refuse`
@@ -252,15 +284,144 @@ fn unkeepable_promises(
         // `Exhaustion::promises_local_service`.
         if terms.budget.on_exhaustion.promises_local_service() {
             let spent = TurnBudget::exhausted(terms.budget.on_exhaustion);
-            if !reachable
-                .iter()
-                .any(|candidate| admission.policy.permits(candidate) && spent.admits(candidate))
-            {
-                broken.push(BUDGET_PROMISE);
-            }
+            spent_allowances.extend(spent_allowance_promise(
+                BUDGET_PROMISE,
+                admission,
+                reachable,
+                |candidate| admission.policy.permits(candidate) && spent.admits(candidate),
+            ));
+        }
+    }
+    // The recipe note is one fact about one line of one file, so a key that
+    // breaks both allowances on it reads it once. Deduplicating here rather
+    // than threading a "said already" flag through the helper keeps that
+    // helper answering one key's one allowance.
+    for promise in spent_allowances {
+        if !broken.contains(&promise) {
+            broken.push(promise);
         }
     }
     broken
+}
+
+/// Whether this key's `tiers` recipe could select `candidate` at all.
+///
+/// **A recipe narrows what a turn may be routed to, so a promise about what
+/// happens next has to be asked of the intersection.** `admits_when_spent` and
+/// the exhausted-budget predicate answer for the *policy*; neither has any
+/// notion of `admission.tiers`, so before this existed a local worker the
+/// policy permitted satisfied both while a hosted-only recipe made it
+/// unselectable at routing time (M10 review G02).
+///
+/// `None` — no recipe — is "every admissible candidate is selectable", which is
+/// what leaves a deployment that configured no tiers unaffected by this whole
+/// question.
+fn a_recipe_could_select(admission: &Admission, candidate: &Candidate) -> bool {
+    match &admission.tiers {
+        None => true,
+        Some(recipe) => recipe
+            .names()
+            .any(|named| named == candidate.target.policy_identity()),
+    }
+}
+
+/// One spent-allowance promise, asked of what the allowance leaves *and* of
+/// what the recipe could then select.
+///
+/// Both answers are needed because they carry different remedies: nothing
+/// survives at all is a fleet this deployment does not have, while something
+/// survives that the recipe does not name is a line in the control plane. The
+/// promise is broken either way — this returns which sentences say so.
+fn spent_allowance_promise(
+    promise: &'static str,
+    admission: &Admission,
+    reachable: &[Candidate],
+    survives_the_spent_allowance: impl Fn(&Candidate) -> bool,
+) -> Vec<&'static str> {
+    let survivors: Vec<&Candidate> = reachable
+        .iter()
+        .filter(|candidate| survives_the_spent_allowance(candidate))
+        .collect();
+    if survivors
+        .iter()
+        .any(|candidate| a_recipe_could_select(admission, candidate))
+    {
+        return Vec::new();
+    }
+    match survivors.is_empty() {
+        true => vec![promise],
+        false => vec![promise, TIERS_NAME_NO_LOCAL_FALLBACK],
+    }
+}
+
+/// Refuse a `tiers` recipe naming a hosted model this deployment cannot route
+/// to.
+///
+/// **The same question [`refuse_policies_that_admit_nothing`] asks of an
+/// `allow` filter, asked of the other list an operator writes target
+/// identities into.** `TierRecipe::new` validates the threshold, emptiness and
+/// repeats — everything a recipe can be judged on without a catalog — and the
+/// config loader that calls it has never seen one either, so a transposed
+/// digit in a model id sails through boot and through every admin-plane write.
+/// Its runtime symptom is not a failure but a *silent* one: the tier scores,
+/// finds nothing, and the turn is served by the other tier at another price
+/// (M10 review G09).
+///
+/// **Hosted names only, and the asymmetry is the fleet's.** `reachable` is
+/// quoted from the catalog by `main.rs::reachable_candidates`; a local worker
+/// joins through a different seam (`Engine::with_fleet`) and is not visible
+/// here at all, so asking this of `local/...` would refuse every recipe that
+/// names the fleet — including the shipped example's. What a `local/` entry
+/// promises is checked where it can be: [`unkeepable_promises`], against the
+/// allowance that would send a turn there.
+///
+/// Per key rather than per project for the reason
+/// [`refuse_policies_that_admit_nothing`] gives: a turn arrives on a key, and
+/// `configured_admissions` is the accessor that enumerates them.
+pub fn refuse_tier_recipes_naming_absent_targets(
+    plane: &ControlPlane,
+    reachable: &[Candidate],
+) -> anyhow::Result<()> {
+    let mut refused: Vec<String> = plane
+        .configured_admissions()
+        .filter_map(|admission| {
+            let recipe = admission.tiers.as_ref()?;
+            let absent: Vec<String> = [Tier::Capable, Tier::Efficient]
+                .into_iter()
+                .flat_map(|tier| recipe.list(tier).iter().map(move |named| (tier, named)))
+                .filter(|(_, named)| !named.starts_with("local/"))
+                .filter(|(_, named)| {
+                    !reachable
+                        .iter()
+                        .any(|candidate| &candidate.target.policy_identity() == *named)
+                })
+                // The *file's* word for the tier, not `Tier::label`'s. A label
+                // is the audit vocabulary ("strong"/"weak"), stable across
+                // deployments precisely because it does not name a config key;
+                // an operator sent to grep their control plane for "strong"
+                // finds nothing.
+                .map(|(tier, named)| {
+                    let field = match tier {
+                        Tier::Capable => "capable",
+                        Tier::Efficient => "efficient",
+                    };
+                    format!("`{named}` in {field}")
+                })
+                .collect();
+            (!absent.is_empty())
+                .then(|| format!("{} — tiers name {}", describe(admission), absent.join(", ")))
+        })
+        .collect();
+    refused.sort();
+    if !refused.is_empty() {
+        anyhow::bail!(
+            "these control-plane keys carry tier recipes naming hosted models this deployment \
+             cannot route to, so the tier would score, find nothing, and hand the turn to the \
+             other one at another price: {}",
+            refused.join(" | ")
+        );
+    }
+    Ok(())
 }
 
 /// Refuse to serve a key that promises a local fallback this deployment cannot
@@ -379,6 +540,316 @@ impl CrossChecks {
                 detail,
             });
         }
+        // Last, and not because it matters least: the three above are the
+        // refusals every deployment since M6 has met in this order, and a
+        // configuration broken in two ways must keep reporting the sentence it
+        // always reported first. A check that reordered them would change which
+        // `422` an unchanged admin request answers with.
+        refuse_tier_recipes_naming_absent_targets(plane, &self.reachable).map_err(|error| {
+            CrossCheckRefusal {
+                check: "refuse_tier_recipes_naming_absent_targets",
+                detail: error.to_string(),
+            }
+        })?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use roundhouse_core::control::{FrontierCadence, TurnPolicy};
+    use roundhouse_core::routing::{PickerMode, Target, TierRecipe};
+
+    use super::*;
+
+    fn candidate(target: Target, quality_prior: f64) -> Candidate {
+        Candidate {
+            target,
+            expected_prefill_tokens: 1_000.0,
+            matched_prefix_tokens: 0,
+            expected_ttft_ms: 100.0,
+            expected_cost_usd: 0.0,
+            quality_prior,
+            load: None,
+        }
+    }
+
+    fn frontier(provider: &str, model: &str) -> Target {
+        Target::Frontier {
+            provider: provider.into(),
+            model: model.into(),
+        }
+    }
+
+    fn local(model: &str) -> Target {
+        Target::Local {
+            worker_id: 7,
+            dp_rank: 0,
+            model: model.into(),
+        }
+    }
+
+    /// M10 review G02: a hosted-only tier recipe defeats the cadence's
+    /// degrade-to-local promise, and this boot check — the one written to
+    /// catch exactly a promise a deployment cannot keep — is blind to it.
+    ///
+    /// `unkeepable_promises` asks `admission.policy.admits_when_spent`, which
+    /// is a pure `TurnPolicy` question (allow filter, quality floor, is the
+    /// candidate local) with no notion of `admission.tiers` at all. A local
+    /// worker the policy permits satisfies it regardless of whether any tier
+    /// in the recipe names that worker, so a recipe that names only hosted
+    /// targets reads as a kept promise here even though `StagePolicy::choose`
+    /// (`routing/stage.rs`) will find `entitled == [local]`,
+    /// `tier_pool` empty for both tiers, and refuse the turn as
+    /// `NoViableCandidate` the moment the cadence is spent.
+    ///
+    /// CONTROL:
+    /// `the_boot_check_does_catch_a_cadence_promise_with_no_local_capacity_at_all`
+    /// below is the same check with no `tiers` axis in play at all, and it
+    /// does report `CADENCE_PROMISE` — proving the check's ordinary mechanism
+    /// works and it is specifically the tiers axis this check never reads.
+    #[test]
+    fn a_hosted_only_tier_recipe_breaks_the_cadence_promise_the_boot_check_misses() {
+        let policy = TurnPolicy {
+            frontier_cadence: Some(FrontierCadence {
+                max_frontier: 2,
+                per_turns: 10,
+            }),
+            ..TurnPolicy::unrestricted()
+        };
+        // Both tiers name only a hosted target -- the recipe the finding
+        // describes, where degrading to local has nothing to route to.
+        let recipe = TierRecipe::new(
+            vec!["openrouter/capable-m".to_string()],
+            vec!["openrouter/efficient-m".to_string()],
+            PickerMode::EfficientFirst,
+            roundhouse_core::routing::stage::DEFAULT_CONFIDENCE_THRESHOLD,
+        )
+        .expect("a two-tier recipe at the shipped threshold");
+
+        let admission = Admission {
+            policy: Arc::new(policy),
+            tiers: Some(Arc::new(recipe)),
+            ..Admission::open()
+        };
+
+        // The deployment is live: both the hosted target and a local worker
+        // are reachable, which is exactly what makes the cadence's promise
+        // ("a spent window serves locally") one this fleet *could* keep --
+        // if the recipe named the local worker.
+        let reachable = vec![
+            candidate(frontier("openrouter", "capable-m"), 0.9),
+            candidate(frontier("openrouter", "efficient-m"), 0.7),
+            candidate(local("llama"), 0.6),
+        ];
+
+        let broken = unkeepable_promises(&admission, &reachable, None);
+        assert!(
+            broken.contains(&CADENCE_PROMISE),
+            "the tier recipe names no local target, so a spent cadence has \
+             nothing to degrade to at runtime -- but `unkeepable_promises` \
+             never reads `admission.tiers` and reports this configuration \
+             clean: {broken:?}"
+        );
+    }
+
+    /// CONTROL for the ignored test above: the same cadence, no `tiers` at
+    /// all, and no local candidate anywhere in `reachable` -- the shape this
+    /// check was written for. It still reports `CADENCE_PROMISE`, which is
+    /// what proves the check's ordinary mechanism works and isolates the
+    /// finding to the one axis (`admission.tiers`) it never reads.
+    #[test]
+    fn the_boot_check_does_catch_a_cadence_promise_with_no_local_capacity_at_all() {
+        let policy = TurnPolicy {
+            frontier_cadence: Some(FrontierCadence {
+                max_frontier: 2,
+                per_turns: 10,
+            }),
+            ..TurnPolicy::unrestricted()
+        };
+        let admission = Admission {
+            policy: Arc::new(policy),
+            tiers: None,
+            ..Admission::open()
+        };
+        let reachable = vec![candidate(frontier("openrouter", "capable-m"), 0.9)];
+
+        let broken = unkeepable_promises(&admission, &reachable, None);
+        assert!(
+            broken.contains(&CADENCE_PROMISE),
+            "no local candidate is reachable at all, so the cadence's promise \
+             cannot be kept and the check exists precisely to catch this: \
+             {broken:?}"
+        );
+    }
+
+    /// A one-key plane whose project carries `tiers`.
+    ///
+    /// The same shape `main.rs`'s own cross-check fixtures use, kept here
+    /// rather than shared because these tests are about what a *recipe* says
+    /// and those are about what a policy does.
+    /// The same plane with a cadence on the policy and a hosted-only recipe:
+    /// the configuration G02 is about, built through the config file so the
+    /// fixture meets the same narrowing and validation a deployment does.
+    fn plane_with_tiers_and_cadence() -> ControlPlane {
+        let json = serde_json::json!({
+            "projects": [{
+                "id": "acme",
+                "policy": { "frontier_cadence": { "max_frontier": 2, "per_turns": 10 } },
+                "tiers": {
+                    "capable": ["openrouter/capable-m"],
+                    "efficient": ["openrouter/efficient-m"],
+                },
+            }],
+            "users": [{ "id": "ada" }],
+            "keys": [{ "project": "acme", "user": "ada", "key_sha256": "a".repeat(64) }],
+        })
+        .to_string();
+        ControlPlane::configured(
+            super::super::ControlPlaneConfig::from_json(&json, "tier cross-check fixture")
+                .expect("the fixture config must validate"),
+        )
+    }
+
+    fn plane_with_tiers(tiers: serde_json::Value) -> ControlPlane {
+        let json = serde_json::json!({
+            "projects": [{ "id": "acme", "tiers": tiers }],
+            "users": [{ "id": "ada" }],
+            "keys": [{ "project": "acme", "user": "ada", "key_sha256": "a".repeat(64) }],
+        })
+        .to_string();
+        ControlPlane::configured(
+            super::super::ControlPlaneConfig::from_json(&json, "tier cross-check fixture")
+                .expect("the fixture config must validate"),
+        )
+    }
+
+    /// **M10 review G09.** A transposed digit in a tier entry has no runtime
+    /// symptom an operator can see: the tier scores, `tier_pool` finds
+    /// nothing carrying that identity, and the turn is quietly served by the
+    /// other tier at another price. This is the one place both files are
+    /// loaded, so it is the one place the typo is visible.
+    #[test]
+    fn a_tier_recipe_naming_a_model_this_deployment_cannot_route_to_is_refused() {
+        let plane = plane_with_tiers(serde_json::json!({
+            "capable": ["openrouter/capable-m"],
+            "efficient": ["openrouter/efficient-typo"],
+        }));
+        let reachable = vec![
+            candidate(frontier("openrouter", "capable-m"), 0.9),
+            candidate(frontier("openrouter", "efficient-m"), 0.7),
+        ];
+
+        let error = refuse_tier_recipes_naming_absent_targets(&plane, &reachable)
+            .expect_err("a recipe entry no catalog holds must not boot");
+        let refusal = error.to_string();
+        assert!(
+            refusal.contains("openrouter/efficient-typo"),
+            "the refusal names the entry to edit, not just the key: {refusal}"
+        );
+        assert!(
+            refusal.contains("acme"),
+            "and the key whose recipe holds it: {refusal}"
+        );
+    }
+
+    /// CONTROL: the same recipe spelled correctly. A check that refused this
+    /// would refuse every deployment that configured tiers at all, which is
+    /// what makes the assertion above about the *typo*.
+    #[test]
+    fn a_tier_recipe_naming_only_reachable_models_boots() {
+        let plane = plane_with_tiers(serde_json::json!({
+            "capable": ["openrouter/capable-m"],
+            "efficient": ["openrouter/efficient-m"],
+        }));
+        let reachable = vec![
+            candidate(frontier("openrouter", "capable-m"), 0.9),
+            candidate(frontier("openrouter", "efficient-m"), 0.7),
+        ];
+        refuse_tier_recipes_naming_absent_targets(&plane, &reachable)
+            .expect("every entry is in the catalog");
+    }
+
+    /// The rendered refusal, which is the only artefact an operator ever sees.
+    ///
+    /// The tests above assert on the `Vec` [`unkeepable_promises`] returns, and
+    /// a vector is not a sentence: `refuse_promises_of_a_local_fallback` joins
+    /// its entries with `"; and "`, so a constant that opened with its own
+    /// conjunction rendered "; and and" — invisible to every assertion in this
+    /// module and visible in every boot log. Nothing else exercises a
+    /// two-element join, because `main.rs`'s live fixtures carry no `tiers`.
+    #[test]
+    fn the_recipe_case_renders_both_sentences_and_reads_as_one() {
+        let plane = plane_with_tiers_and_cadence();
+        let reachable = vec![
+            candidate(frontier("openrouter", "capable-m"), 0.9),
+            candidate(local("llama"), 0.6),
+        ];
+
+        let error = refuse_promises_of_a_local_fallback(&plane, &reachable, None)
+            .expect_err("a hosted-only recipe cannot keep this cadence's promise");
+        let message = error.to_string();
+        assert!(
+            message.contains("spent window serves locally"),
+            "the promise: {message}"
+        );
+        assert!(
+            message.contains("`tiers` recipe is what took it away"),
+            "and the cause, which is the half that says which file to edit: {message}"
+        );
+        assert!(
+            !message.contains("and and"),
+            "the joiner is `; and `, so a sentence may not open with one: {message}"
+        );
+    }
+
+    /// The same misconfiguration through the door every write also uses.
+    ///
+    /// [`CrossChecks::refuse`] is what makes a check a *boot* refusal and an
+    /// admin-plane `422` rather than a function nobody calls — and a check that
+    /// is only tested directly stays green when its call site is deleted.
+    /// Asserting the reported name also pins the append-last order this check
+    /// was deliberately given.
+    #[test]
+    fn the_absent_target_check_is_wired_into_the_one_list() {
+        let plane = plane_with_tiers(serde_json::json!({
+            "capable": ["openrouter/capable-m"],
+            "efficient": ["openrouter/efficient-typo"],
+        }));
+        let checks = CrossChecks::new(
+            vec![candidate(frontier("openrouter", "capable-m"), 0.9)],
+            None,
+        );
+
+        let refusal = checks
+            .refuse(&plane)
+            .expect_err("a boot and every admin write must ask this");
+        assert_eq!(refusal.check, "refuse_tier_recipes_naming_absent_targets");
+        assert!(
+            refusal
+                .detail
+                .contains("`openrouter/efficient-typo` in efficient"),
+            "and the detail names the entry and the tier field holding it: {}",
+            refusal.detail
+        );
+    }
+
+    /// CONTROL, and the asymmetry this check has to live with: `reachable` is
+    /// quoted from the *catalog*, and a local worker joins through a different
+    /// seam entirely. A `local/` entry is therefore absent from this list on
+    /// every deployment, including the ones that have a fleet — refusing over
+    /// it would refuse the shipped example, whose efficient tier is exactly
+    /// this shape.
+    #[test]
+    fn a_local_tier_entry_is_not_a_catalog_question_and_is_not_refused() {
+        let plane = plane_with_tiers(serde_json::json!({
+            "capable": ["openrouter/capable-m"],
+            "efficient": ["local/small"],
+        }));
+        let reachable = vec![candidate(frontier("openrouter", "capable-m"), 0.9)];
+        refuse_tier_recipes_naming_absent_targets(&plane, &reachable)
+            .expect("the fleet is not the catalog's to answer for");
     }
 }

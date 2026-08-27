@@ -392,6 +392,20 @@ impl<T: Tokenizer + Clone> FleetJudge<T> {
                     cached_input_tokens,
                     output_tokens,
                     reasoning_tokens,
+                    // A judge's side call is booked from the catalog like
+                    // every other dispatch. What the provider says it cost is
+                    // the reconciliation view's input, not the ledger's --
+                    // see `FrontierChunk::Done::provider_reported_cost`.
+                    //
+                    // Still discarded here after the main path learned to keep
+                    // it (review finding G11), and the asymmetry is structural
+                    // rather than an oversight: a side call terminates as
+                    // `SideCallCompleted`, which pairs with no `Routed` and
+                    // carries no settlement, so there is no terminal event with
+                    // a column to put a provider figure in. Widening that event
+                    // is a decision about what a side call is for, not a
+                    // consequence of this fix.
+                    provider_reported_cost: _,
                 }))) => {
                     reported = Some(Usage {
                         input_tokens,
@@ -459,11 +473,21 @@ impl<T: Tokenizer + Clone> FleetJudge<T> {
                 // report.
                 // A dialect the client cannot serialize joins them: it is a
                 // deployment mistake, and like the other two it means the
-                // request was never sent.
+                // request was never sent. So does a transport failure, which is
+                // the most literal reading of "nobody could reach it" the enum
+                // has — it earned its own variant for failover's sake, and the
+                // question this match asks is unchanged by that.
                 FrontierError::UnknownProvider(_)
                 | FrontierError::Credential(_)
-                | FrontierError::UnsupportedDialect { .. } => SideCallAbandonReason::Unreachable,
-                FrontierError::Upstream(_) => SideCallAbandonReason::Refused,
+                | FrontierError::UnsupportedDialect { .. }
+                | FrontierError::Transport { .. } => SideCallAbandonReason::Unreachable,
+                // The provider answered. A 503 and an unparseable body are both
+                // an answer this deployment could not use, which is what
+                // `Refused` has always meant here — a judge does not fail over,
+                // so the split that matters to routing does not matter to this.
+                FrontierError::Upstream(_) | FrontierError::Status { .. } => {
+                    SideCallAbandonReason::Refused
+                }
             },
         }
     }
@@ -613,6 +637,16 @@ mod tests {
                     expected,
                     got,
                     target: target.clone(),
+                }),
+                Some(FrontierError::Transport { message, timed_out }) => {
+                    Err(FrontierError::Transport {
+                        message: message.clone(),
+                        timed_out: *timed_out,
+                    })
+                }
+                Some(FrontierError::Status { status, message }) => Err(FrontierError::Status {
+                    status: *status,
+                    message: message.clone(),
                 }),
                 None => Ok(FrontierChunk::whole_response(
                     r#"{"on_track":true,"confidence":0.9,"divergence":null,"missing_context":null}"#

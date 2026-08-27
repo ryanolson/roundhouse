@@ -93,8 +93,10 @@ fn project(id: &str) -> ProjectEntry {
         name: None,
         policy: None,
         budget: None,
+        fair_use: None,
         validate: None,
         credentials: None,
+        tiers: None,
     }
 }
 
@@ -416,6 +418,9 @@ fn the_direct_archived_key_refusal_is_not_the_projects_exclusion_in_disguise() {
             provenance: Provenance::Admin,
             created_at_ms: Some(0),
             revoked_at_ms: None,
+            // An API-minted key never carries one: no route writes a member
+            // window. See `ApiKeyRecord::fair_use`.
+            fair_use: None,
         }],
     };
 
@@ -1364,6 +1369,9 @@ fn delete_membership_s_cascade_revokes_keys_inside_mutate_before_any_compile_run
             provenance: Provenance::Admin,
             created_at_ms: Some(0),
             revoked_at_ms: None,
+            // An API-minted key never carries one: no route writes a member
+            // window. See `ApiKeyRecord::fair_use`.
+            fair_use: None,
         }],
         ..DirectoryRecords::default()
     };

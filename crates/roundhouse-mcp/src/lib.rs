@@ -69,13 +69,38 @@
 //!   builds the namespace it dispatches on as `mcp__{server table key}`
 //!   (`codex-mcp/src/tools.rs:22,228-234`) and resolves a call on the exact
 //!   `(namespace, name)` pair (`core/src/tools/handlers/mcp.rs:29-66,121`).
-//!   Proved by `a_real_codex_binary_executes_our_synthetic_tool_call_and_returns_its_output`
+//!   Proved in M9 by `a_real_codex_binary_executes_our_synthetic_tool_call_and_returns_its_output`
 //!   and `a_real_codex_binary_resends_the_call_and_output_and_the_session_does_not_fork`:
 //!   the client dispatched a synthetic `fetch_steer` it had never been told
 //!   about, appended the result, and resent the call with its `arguments`
 //!   byte-identical and its `function_call_output` immediately after it —
 //!   *extending* the history rather than rebuilding it, so the session never
 //!   forked.
+//!
+//!   **Both tests were deleted by M10.0 T7, and this paragraph is now history
+//!   rather than a live citation.** R1 retires the tool-call steer channel and
+//!   T4 deletes the wire projection that emitted the synthetic call, so no turn
+//!   this deployment serves can ask a client to dispatch anything: the observed
+//!   fact stands (it was observed, at `e363b08`, and the runs are in M9's
+//!   evidence), but nothing in the tree re-observes it, and a reader should not
+//!   take the citation for a guard that would go red.
+//!
+//!   What survived the deletion, and is asserted today by
+//!   `the_next_turn_reflects_the_correction`, is the half that was never really
+//!   about tool calls: a real client *extends* its history rather than
+//!   rebuilding it, item for item, so an assistant message roundhouse committed
+//!   on one turn comes back as our prefix on the next and the session does not
+//!   fork. That is the property prefix admission depends on, and the correction
+//!   is an ordinary assistant message now, so it is tested where every other
+//!   item is.
+//!
+//!   The consequence worth stating plainly, because it is easy to read this
+//!   surface as more reachable than it is: **the MCP tools below are reachable
+//!   only if the agent's own model decides to call one.** Roundhouse's wire
+//!   emits assistant text and nothing else, so it cannot put a call in front of
+//!   a client the way it used to. The handshake and the tool listing are still
+//!   proved against the real binary; a dispatch through them is not, and cannot
+//!   be until a provider-emitted tool call is relayed through this wire.
 //!
 //! Two properties of the real client that the source reading did not predict,
 //! and that anything asserting on this path has to know. Codex renders an MCP
@@ -128,15 +153,23 @@
 //!
 //! **Nothing here reads it.** `ControlPlaneReads::resolve_session` resolves
 //! from the tool call's own `conversation` argument (qualified into the
-//! caller's namespace) or from `Conversations::latest`, and
-//! [`fetch_steer`](ControlSurface::fetch_steer) resolves from `steer_id`
-//! alone; today's isolation is therefore tenant-scoped — a `Principal` plus a
-//! qualified name — and not thread-id-based. Recorded because the block above
+//! caller's namespace) or from `Conversations::latest`, and since M10.0
+//! [`fetch_steer`](ControlSurface::fetch_steer) goes through that same door —
+//! it used to resolve from a `steer_id` and compare principals for itself.
+//! Today's isolation is therefore tenant-scoped throughout — a `Principal` plus
+//! a qualified name — and not thread-id-based. Recorded because the block above
 //! says what M9 proved about dispatch and resend, and a reader could take
-//! that for an audit of every field the client sends. It is not:
+//! that for an audit of every field the client sends. It is not.
+//!
 //! `codexs_meta_thread_id_rides_every_tools_call_and_is_never_read`
-//! (`crates/roundhouse-server/tests/codex_e2e.rs`) passes *today*, and its
-//! passing is the point.
+//! (`crates/roundhouse-server/tests/codex_e2e.rs`) used to pass *today*, and
+//! its passing was the point. **M10.0 T7 retired it**, for the reason the
+//! paragraph above gives: with the synthetic call gone there is no `tools/call`
+//! in any hermetic run to stamp, so the assertion had nothing to read. The
+//! observation is unchanged and the isolation argument does not depend on it —
+//! a correlator we never read cannot be a correctness risk — but it is now
+//! recorded in two comments rather than watched by a test, and the ruling that
+//! made it so is spelled out where the test used to stand.
 //!
 //! Wiring it in is deferred rather than pending. `_meta.threadId` is the
 //! codex-native shortcut and would bind this surface to one client's
@@ -175,7 +208,7 @@ pub use overlay::{ModeNarrowing, OverlayScope, PreferMode, SessionOverlay, Timed
 pub use plane::ControlPlaneSurface;
 pub use reads::{ControlReads, SessionFacts};
 pub use store::{
-    BindingId, ControlStore, IntentRecord, SessionBinding, SteerRecord, binding_ids_in_items,
+    BindingId, ControlStore, IntentRecord, OutcomeRecord, SessionBinding, binding_ids_in_items,
     binding_in_items,
 };
 pub use surface::{ControlSurface, SurfaceError, ToolOutcome};

@@ -216,6 +216,7 @@ async fn a_stored_key_arrives_as_a_bearer_and_nothing_else_secret_shaped_does() 
             cached_input_tokens: 100,
             output_tokens: 30,
             reasoning_tokens: 12,
+            provider_reported_cost: None,
         },
         "the cached count is the quantity the whole system exists to maximize"
     );

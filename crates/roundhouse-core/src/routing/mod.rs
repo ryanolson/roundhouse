@@ -33,9 +33,13 @@
 
 pub mod ledger;
 pub mod policy;
+pub mod stage;
 
 pub use ledger::{CacheLedger, CacheModel, LedgerEntry, ProviderPricing};
 pub use policy::{AffinityPolicy, EscalationPolicy};
+pub use stage::{
+    DecisionSource, PickerMode, StagePolicy, Tier, TierRecipe, TierRecipeError, TurnSignals,
+};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -190,6 +194,31 @@ pub struct RoutingContext<'a> {
     /// passes [`TurnBudget::Unlimited`], which is the value that makes the
     /// budget axis a no-op rather than a ceiling that happens to be large.
     pub budget: &'a TurnBudget,
+    /// What the session's recent tool traffic says, computed once per turn from
+    /// the fold the engine already holds.
+    ///
+    /// **Derived data, not new state.** The extractor runs over the committed
+    /// exchanges, so a successor picking this session up computes the same
+    /// numbers from the same log; nothing is stored and nothing is asked of a
+    /// model. `None` is the first turn of a session — no exchanges, nothing to
+    /// read — and it scores exactly as an empty [`TurnSignals`] does, through
+    /// the ordinary arithmetic rather than through a special case.
+    ///
+    /// Turn-resolved like [`Self::budget`] and deliberately not
+    /// admission-resolved like [`Self::turn_policy`]: the signals change on
+    /// every exchange, and a value fixed for the session would score the tenth
+    /// turn on the first one's evidence.
+    pub signals: Option<&'a TurnSignals>,
+    /// This project's tier recipe, or `None` where it configured none.
+    ///
+    /// A *second* field beside [`Self::turn_policy`] rather than a field inside
+    /// it, because the two answer different questions and only one of them is a
+    /// constraint. A policy says what this principal may reach and is
+    /// fingerprinted onto every decision as the audit trail's account of the
+    /// limits in force; a recipe says which of the reachable targets is
+    /// preferred, and folding a preference into that digest would move the
+    /// fingerprint of projects whose entitlements never changed.
+    pub tiers: Option<&'a TierRecipe>,
 }
 
 /// What the overflow valve appends to a rationale when it opens.
@@ -239,6 +268,52 @@ impl<'a> Admitted<'a> {
         Decision {
             target,
             rationale: self.annotate(rationale),
+            budget_state: self.budget_state,
+            fallbacks: Vec::new(),
+            source: None,
+        }
+    }
+
+    /// [`Self::decide`] for a policy that picked a *tier*: the same three
+    /// coupled fields, plus the ordered second choices and the typed reason the
+    /// tier was picked.
+    ///
+    /// A second constructor rather than two more arguments on `decide`, because
+    /// the two existing policies have neither answer to give — an
+    /// `EscalationPolicy` audit turn has no ordered runner-up and no
+    /// [`DecisionSource`], and making them pass `Vec::new()` and `None` would
+    /// be asking two callers to disclaim a concept they do not have.
+    ///
+    /// `fallbacks` is not checked against [`Self::pool`], for the same reason
+    /// `target` is not: the pool holds borrows into the caller's slice, and the
+    /// engine's `UnresolvableTarget` already catches a target that was never
+    /// offered — against the authoritative set, and now on every attempt rather
+    /// than only on the first.
+    pub fn decide_staged(
+        &self,
+        target: Target,
+        fallbacks: Vec<Target>,
+        source: DecisionSource,
+        rationale: String,
+    ) -> Decision {
+        Decision {
+            fallbacks,
+            source: Some(source),
+            ..self.decide(target, rationale)
+        }
+    }
+
+    /// The refusal for a pool that holds nothing this policy can use.
+    ///
+    /// **A minted error rather than a readable budget state**, and that is the
+    /// same argument [`Self::decide`] makes one method up: the state is private
+    /// so that no policy can assemble a `Decision` by hand with an invented one.
+    /// A policy that needs to refuse still needs the state to travel — it is
+    /// what tells an operator that an exhausted budget had already excluded
+    /// every hosted candidate — so the type hands out the *error*, which
+    /// carries it, rather than the field, which could be put anywhere.
+    pub fn refuse_no_viable(&self) -> RoutingError {
+        RoutingError::NoViableCandidate {
             budget_state: self.budget_state,
         }
     }
@@ -410,6 +485,31 @@ pub struct Decision {
     /// every future [`RoutingPolicy`] had to read into a thing the module
     /// boundary decides.
     pub budget_state: BudgetState,
+    /// Where this turn goes if the chosen target cannot be reached, in order.
+    ///
+    /// **The plan, not the history.** These are the targets a per-dispatch
+    /// failover may advance to; what was actually tried and how it failed is
+    /// [`DecisionRecord::attempts`], which is the half that gets persisted. Two
+    /// fields because they answer questions from opposite ends of the turn, and
+    /// one list meaning both would be a plan that rewrites itself as it runs.
+    ///
+    /// Empty for every policy that does not pick a tier, which is every policy
+    /// that shipped before M10: a decision with no fallbacks dispatches exactly
+    /// once, which is what the engine did unconditionally until this existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallbacks: Vec<Target>,
+    /// What decided the tier, when a tier was decided.
+    ///
+    /// Typed rather than left inside [`Self::rationale`], because the consumer
+    /// is a gate and not a reader: a handoff note may narrate a signal-driven
+    /// escalation and must not narrate a fall-open, and a gate that had to match
+    /// on English would be one prose edit away from telling a model the cheap
+    /// tier had been stalling when nothing said it had.
+    ///
+    /// `None` from a policy that answers a different question — the ordinary
+    /// scoring and audit policies pick a *candidate*, not a tier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<DecisionSource>,
 }
 
 /// The persisted form of a decision, written into the session event log.
@@ -551,6 +651,96 @@ pub struct DecisionRecord {
     /// decision bytes it wrote before this field existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub withheld_providers: Vec<String>,
+    /// The model the *client* named on the request, verbatim.
+    ///
+    /// **Recorded, never routed on**, and the two halves of that sentence are
+    /// both load-bearing. The compatibility surface has always accepted and
+    /// ignored `model`; ignoring it entirely also threw away the one thing the
+    /// caller said about what it expected to be talking to, which is exactly
+    /// the counterfactual a savings figure needs a name for. So it is written
+    /// down here and read only by the pricing seam — no routing code may
+    /// consult it, or a client would be able to choose its own target by
+    /// spelling one, which is the property that makes this a *transparent*
+    /// proxy rather than a passthrough with extra steps.
+    ///
+    /// Verbatim rather than canonicalised, and unresolvable values are kept
+    /// rather than dropped: a baseline naming a model this deployment has no
+    /// rate card for is a fact about what the client believed, and a log that
+    /// silently discarded it would leave nothing to explain why the
+    /// counterfactual was inferred instead of declared.
+    ///
+    /// `None` for a client that named nothing and for every log written before
+    /// this field existed. Skipped on the wire when absent, so a deployment
+    /// whose clients name no model writes the bytes it wrote before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_baseline: Option<String>,
+    /// Dispatches that failed before this decision reached a target that
+    /// answered, oldest first.
+    ///
+    /// **Marked, never free.** A provider that accepted a connection and then
+    /// 503'd cost this deployment latency and possibly money nobody can see, so
+    /// the attempt is a row in the log the way an abandoned side call is a
+    /// counter in the fold. What it deliberately does *not* carry is the
+    /// upstream's words: a redacted body is still an upstream's prose, and this
+    /// record is replayed, folded, and republished in places a body has no
+    /// business reaching. The class and the status are what a reader can act on.
+    ///
+    /// Empty on every turn that was served first time, and skipped on the wire
+    /// when it is, so a deployment that never fails over writes exactly the
+    /// decision bytes it wrote before failover existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attempts: Vec<DispatchAttempt>,
+}
+
+/// One dispatch that failed and was fallen forward from.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DispatchAttempt {
+    pub target: Target,
+    pub class: AttemptClass,
+    /// How long this attempt consumed of the turn's one deadline.
+    ///
+    /// The number that says whether a failover was cheap or whether the turn
+    /// spent most of its budget discovering that the first provider was down.
+    pub elapsed_ms: u64,
+}
+
+/// Why an attempt was fallen forward from.
+///
+/// **The whole taxonomy is "the request did not reach a model".** Upstream's
+/// retryable set is the same three shapes — transport, timeout, and the
+/// retryable HTTP statuses — and a model *refusal* is deliberately not among
+/// them: a refusal is an answer, the provider did its job, and trying a second
+/// model until one agrees is a way of shopping for a verdict rather than of
+/// surviving an outage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AttemptClass {
+    /// Nothing came back from the origin: DNS, connect, TLS, a reset.
+    Transport,
+    /// The origin took longer than the client was willing to wait.
+    Timeout,
+    /// The origin answered with a status that says "not now": 408, 429, or 5xx.
+    Status { status: u16 },
+}
+
+impl AttemptClass {
+    /// Upstream's `is_retryable_http_status`, verbatim
+    /// (`crates/libsy-llm-client/src/metrics.rs:41-43` @ `053a61e`).
+    ///
+    /// A free predicate rather than a match arm inside the client, because it
+    /// is the definition of the failover trigger and the one thing a reviewer
+    /// checking "does 404 fail over" needs to be able to find.
+    pub fn is_retryable_http_status(status: u16) -> bool {
+        status == 408 || status == 429 || (500..=599).contains(&status)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AttemptClass::Transport => "transport",
+            AttemptClass::Timeout => "timeout",
+            AttemptClass::Status { .. } => "status",
+        }
+    }
 }
 
 impl DecisionRecord {
@@ -643,6 +833,24 @@ pub enum RoutingError {
 pub trait RoutingPolicy: Send + Sync {
     /// Stable name, recorded in [`DecisionRecord::policy`].
     fn name(&self) -> &str;
+
+    /// Whether this policy reads [`RoutingContext::tiers`].
+    ///
+    /// **A typed predicate rather than `name() == "stage"`.** The one consumer
+    /// is the engine's boot-composition check: a project that configured a
+    /// `tiers` block on a process whose composition root did not wrap
+    /// [`StagePolicy`] gets an `Admission` field nothing reads — a recipe that
+    /// re-routes nothing, with no error and no log line, which is the worst
+    /// shape a configuration mistake can take. Asking the *type* is what stops
+    /// that check from being a string comparison one rename away from silently
+    /// answering "no" forever.
+    ///
+    /// `false` is right for every policy that picks a candidate rather than a
+    /// tier, which is every policy that shipped before M10, so the default is
+    /// the honest answer and not a convenience.
+    fn reads_tier_recipes(&self) -> bool {
+        false
+    }
 
     async fn choose(&self, ctx: &RoutingContext<'_>) -> Result<Decision, RoutingError>;
 }
@@ -786,6 +994,15 @@ mod tests {
             billing: Billing::AccountedNotBilled,
             budget_draw: Some(BudgetCounts::ProjectPaidOnly),
             withheld_providers: vec!["openai".into()],
+            declared_baseline: Some("gpt-5.6-sol".into()),
+            attempts: vec![DispatchAttempt {
+                target: Target::Frontier {
+                    provider: "openrouter".into(),
+                    model: "moonshotai/kimi-k3".into(),
+                },
+                class: AttemptClass::Status { status: 503 },
+                elapsed_ms: 412,
+            }],
         };
         let encoded = serde_json::to_string(&record).unwrap();
         assert!(
@@ -863,6 +1080,18 @@ mod tests {
              withhold on"
         );
         assert_eq!(
+            recovered.declared_baseline, None,
+            "and the client named no model, because there was no field to \
+             record one in -- which is why an absent baseline prices through \
+             inference rather than through a declaration nobody made"
+        );
+        assert!(
+            recovered.attempts.is_empty(),
+            "and it fell forward from nothing: a turn from before failover \
+             existed dispatched exactly once, which is a fact and not a \
+             missing value"
+        );
+        assert_eq!(
             recovered.budget_draw, None,
             "and it drew no budget, which is the one default that has to fail \
              in a particular direction: a turn from before this field existed \
@@ -877,6 +1106,8 @@ mod tests {
             payer: Payer::Deployment,
             budget_draw: None,
             withheld_providers: Vec::new(),
+            declared_baseline: None,
+            attempts: Vec::new(),
             ..record
         };
         let encoded = serde_json::to_string(&ordinary).unwrap();
@@ -887,6 +1118,61 @@ mod tests {
         assert!(
             !encoded.contains("budget_draw"),
             "and an unbudgeted turn's absent basis likewise: {encoded}"
+        );
+        assert!(
+            !encoded.contains("declared_baseline") && !encoded.contains("attempts"),
+            "and a turn whose client named nothing and which fell forward from \
+             nothing writes the bytes it wrote before either field existed: \
+             {encoded}"
+        );
+    }
+
+    #[test]
+    fn the_failover_trigger_is_the_three_shapes_that_never_reached_a_model() {
+        // The definition, pinned as a table rather than trusted to a match arm
+        // somewhere in a transport. 404 and 400 are the discriminating rows:
+        // both are the provider answering clearly, and falling forward from a
+        // clear answer is how a deployment turns one misconfiguration into
+        // three.
+        for retryable in [408u16, 429, 500, 502, 503, 599] {
+            assert!(
+                AttemptClass::is_retryable_http_status(retryable),
+                "{retryable} says `not now` and is worth another target"
+            );
+        }
+        for terminal in [400u16, 401, 403, 404, 413, 422, 600] {
+            assert!(
+                !AttemptClass::is_retryable_http_status(terminal),
+                "{terminal} is the provider answering, and a second provider \
+                 would answer it the same way"
+            );
+        }
+    }
+
+    #[test]
+    fn an_attempt_survives_the_round_trip_carrying_no_upstream_prose() {
+        // Both halves matter. The row has to replay, because a settle re-driven
+        // from this log must see the same history; and it has to carry no
+        // message, because a redacted body is still an upstream's words and
+        // this record is republished in places words do not belong.
+        let attempt = DispatchAttempt {
+            target: Target::Frontier {
+                provider: "openrouter".into(),
+                model: "moonshotai/kimi-k3".into(),
+            },
+            class: AttemptClass::Status { status: 429 },
+            elapsed_ms: 1_204,
+        };
+        let encoded = serde_json::to_string(&attempt).unwrap();
+        assert!(encoded.contains(r#""kind":"status""#), "{encoded}");
+        assert!(encoded.contains(r#""status":429"#), "{encoded}");
+        assert_eq!(
+            serde_json::from_str::<DispatchAttempt>(&encoded).unwrap(),
+            attempt
+        );
+        assert_eq!(
+            serde_json::to_string(&AttemptClass::Transport).unwrap(),
+            r#"{"kind":"transport"}"#
         );
     }
 }

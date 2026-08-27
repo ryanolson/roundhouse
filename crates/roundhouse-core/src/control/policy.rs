@@ -445,43 +445,78 @@ impl FrontierCadence {
     }
 }
 
-/// Frontier dispatches per routed turn, in log order.
+/// Frontier dispatches, grouped by the routed turn that made them.
 ///
 /// A projection of the session's [`Routed`] events rather than a counter
 /// incremented beside them: a successor process that replays a log has to
 /// arrive at the same window as the process it replaced, and a counter that
-/// lived anywhere but in the fold would not. One `bool` per routed turn, which
-/// is strictly smaller than the conversation item that turn already put in the
-/// same projection.
+/// lived anywhere but in the fold would not. Nothing here is serialized — the
+/// shape below is derived from the log on every open, so changing it costs no
+/// migration and breaks no stored bytes.
+///
+/// **One entry per routed *turn*, holding that turn's count of frontier
+/// reaches** — not one entry per dispatch, which is what review finding G05
+/// was. Since M10 a turn may write more than one `Routed` (a decision that fell
+/// forward to a fallback writes one per attempt), so a flat per-dispatch vector
+/// made `per_turns` mean "the last N dispatches": on any failover turn the
+/// vector grew faster than turns elapsed, the window walked *fewer* real turns
+/// into the past than the cadence promised, and an older hosted turn aged out
+/// early — relaxing the ration exactly on the sessions that had been failing
+/// over hardest. The numerator's per-dispatch counting is deliberate and
+/// survives here unchanged; only the window boundary moves.
 ///
 /// [`Routed`]: crate::event::SessionEventKind::Routed
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FrontierHistory {
-    dispatches: Vec<bool>,
+    turns: Vec<TurnReaches>,
+}
+
+/// One routed turn, and how many of its dispatches went to a hosted model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TurnReaches {
+    /// The session's own turn index, which is what makes grouping a fact about
+    /// the log rather than a guess: two `Routed` events belong to one turn
+    /// exactly when the fold's `turn_index` had not moved between them. Keyed
+    /// on equality with the previous entry rather than on a "new turn" signal,
+    /// so a log whose `TurnStarted` is missing degrades to one group rather
+    /// than to a panic.
+    turn_index: u64,
+    frontier: u32,
 }
 
 impl FrontierHistory {
-    /// Fold one routing decision in.
+    /// Fold one routing decision in, under the turn that made it.
     ///
     /// Crate-visible: the only honest producer is the session projection, and
     /// a history assembled by hand somewhere else would be a second answer to
     /// a question the log already answers.
-    pub(crate) fn record(&mut self, target: &Target) {
-        self.dispatches.push(!target.is_local());
+    pub(crate) fn record(&mut self, target: &Target, turn_index: u64) {
+        let reach = u32::from(!target.is_local());
+        match self.turns.last_mut() {
+            Some(last) if last.turn_index == turn_index => last.frontier += reach,
+            _ => self.turns.push(TurnReaches {
+                turn_index,
+                frontier: reach,
+            }),
+        }
     }
 
-    /// Frontier dispatches among the last `turns` routed turns.
+    /// Frontier dispatches made during the last `turns` routed turns.
     ///
     /// A window longer than the session simply sees the whole session, which
     /// is the right reading: a cadence of "two per twenty" on a session five
     /// turns old has spent whatever those five turns spent.
+    ///
+    /// A failover turn contributes every reach it made — two dead hosted
+    /// attempts are two reaches — but it occupies exactly one slot of the
+    /// window, because `per_turns` is a promise about turns.
     pub fn frontier_in_last(&self, turns: u32) -> u32 {
-        self.dispatches
+        self.turns
             .iter()
             .rev()
             .take(turns as usize)
-            .filter(|to_frontier| **to_frontier)
-            .count() as u32
+            .map(|turn| turn.frontier)
+            .sum()
     }
 }
 
@@ -864,14 +899,19 @@ mod tests {
         TargetFilter::parse(patterns.iter().copied()).expect("well-formed patterns")
     }
 
-    fn history(dispatches: &[bool]) -> FrontierHistory {
+    /// One dispatch per turn, which is what every caller of this helper means:
+    /// the failover case has its own test below and builds its history by hand.
+    fn history(turns: &[bool]) -> FrontierHistory {
         let mut history = FrontierHistory::default();
-        for &to_frontier in dispatches {
-            history.record(&if to_frontier {
-                frontier("anthropic", "claude")
-            } else {
-                local("llama")
-            });
+        for (turn_index, &to_frontier) in turns.iter().enumerate() {
+            history.record(
+                &if to_frontier {
+                    frontier("anthropic", "claude")
+                } else {
+                    local("llama")
+                },
+                turn_index as u64,
+            );
         }
         history
     }
@@ -1156,7 +1196,7 @@ mod tests {
         // the history is folded from `Routed`, which is written before the
         // dispatch is attempted.
         let mut failed = FrontierHistory::default();
-        failed.record(&frontier("anthropic", "claude"));
+        failed.record(&frontier("anthropic", "claude"), 0);
         assert!(
             !policy.admits(&hosted, &failed),
             "a failed frontier dispatch still spent the ration"
@@ -1166,6 +1206,63 @@ mod tests {
         assert!(
             TurnPolicy::unrestricted().admits(&hosted, &history(&[true, true, true])),
             "no cadence means no window"
+        );
+    }
+
+    /// M10 review G05: a turn that falls forward writes one `Routed` per
+    /// dispatch (`Session::fold`'s comment on `frontier_history` says so
+    /// explicitly), so `dispatches` can hold more entries than the session has
+    /// routed turns. `frontier_in_last` reads `turns` as an index into that
+    /// vector, one entry per element, with no notion of a turn boundary — so a
+    /// failover turn's extra entries eat into the window exactly as if they
+    /// were extra turns, and an older hosted turn ages out before `per_turns`
+    /// real turns have actually elapsed.
+    ///
+    /// Fixed by grouping the fold per turn: `record` now takes the session's
+    /// own `turn_index`, which is the only honest turn boundary available —
+    /// `Routed` carries no turn id, and the fold that writes it is the one
+    /// place the index is already known.
+    #[test]
+    fn a_failover_turn_does_not_shorten_the_cadence_window() {
+        let mut history = FrontierHistory::default();
+
+        // Turn 1: reaches the hosted model once.
+        history.record(&frontier("anthropic", "claude"), 1);
+        // Turn 2: local.
+        history.record(&local("llama"), 2);
+        // Turn 3: falls forward twice before landing locally — three
+        // `Routed` events folded from one routed turn.
+        history.record(&frontier("anthropic", "claude"), 3);
+        history.record(&frontier("openai", "gpt-5"), 3);
+        history.record(&local("llama"), 3);
+        // Turns 4 through 10: local. Ten routed turns total.
+        for turn in 4..=10 {
+            history.record(&local("llama"), turn);
+        }
+
+        // Ten real turns have elapsed, so a ten-turn trailing window spans
+        // the whole session and turn 1's hosted dispatch is still inside it:
+        // 1 reach from turn 1, plus the 2 frontier attempts turn 3 made
+        // before it landed locally.
+        assert_eq!(
+            history.frontier_in_last(10),
+            3,
+            "turn 1's reach must still be inside a ten-turn window when the \
+             session is exactly ten turns old; the per-dispatch fold treated \
+             each of turn 3's three dispatches as its own turn, so `take(10)` \
+             stopped two dispatches short of turn 1 and returned 2 — turn 1 \
+             had aged out three turns early"
+        );
+
+        // The other half of the same window, and the reason the fix is a
+        // grouping rather than a de-duplication: turn 3's two dead hosted
+        // attempts are still two reaches. A cadence rations reaching for a
+        // hosted model, and a dispatch that failed on the way out reached.
+        assert_eq!(
+            history.frontier_in_last(8),
+            2,
+            "an eight-turn window spans turns 3..=10, which made two reaches \
+             in one turn"
         );
     }
 

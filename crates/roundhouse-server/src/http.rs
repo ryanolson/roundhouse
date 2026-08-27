@@ -52,7 +52,9 @@ use roundhouse_core::item::{Item, Role};
 use roundhouse_core::now_ms;
 use roundhouse_core::store::{SessionStore, StoreError};
 
-use crate::control_config::{AuthError, ControlPlane, DirectoryError, PlaneSource, StoreFailure};
+use crate::control_config::{
+    Admission, AuthError, ControlPlane, DirectoryError, PlaneSource, StoreFailure,
+};
 use crate::engine::Engine;
 
 /// How long to wait before re-reading a log that had nothing new.
@@ -206,6 +208,14 @@ pub(crate) struct ApiError {
     status: StatusCode,
     code: &'static str,
     message: String,
+    /// Machine-readable fields merged into the error object beside `code` and
+    /// `message`.
+    ///
+    /// Empty for every refusal whose remedy is a person reading the message. It
+    /// exists for the one refusal whose remedy is a *client* acting on it: a
+    /// fair-use `429` carries a window and an earliest retry time, and an agent
+    /// that had to parse them out of English would parse them wrong.
+    detail: Option<Value>,
 }
 
 impl ApiError {
@@ -214,6 +224,7 @@ impl ApiError {
             status: StatusCode::NOT_FOUND,
             code: "session_not_found",
             message: format!("session `{session_id}` not found"),
+            detail: None,
         }
     }
 
@@ -222,6 +233,7 @@ impl ApiError {
             status: StatusCode::UNPROCESSABLE_ENTITY,
             code: "invalid_request",
             message: message.into(),
+            detail: None,
         }
     }
 
@@ -237,6 +249,7 @@ impl ApiError {
             status: StatusCode::UNPROCESSABLE_ENTITY,
             code,
             message: message.into(),
+            detail: None,
         }
     }
 
@@ -245,6 +258,7 @@ impl ApiError {
             status: StatusCode::BAD_REQUEST,
             code,
             message: message.into(),
+            detail: None,
         }
     }
 
@@ -259,6 +273,7 @@ impl ApiError {
             status: StatusCode::NOT_FOUND,
             code,
             message: message.into(),
+            detail: None,
         }
     }
 
@@ -268,6 +283,7 @@ impl ApiError {
             status: StatusCode::CONFLICT,
             code,
             message: message.into(),
+            detail: None,
         }
     }
 
@@ -278,6 +294,7 @@ impl ApiError {
             status: StatusCode::NOT_IMPLEMENTED,
             code,
             message: message.into(),
+            detail: None,
         }
     }
 
@@ -286,6 +303,7 @@ impl ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code,
             message: message.into(),
+            detail: None,
         }
     }
 }
@@ -381,6 +399,7 @@ impl From<AuthError> for ApiError {
             status: error.status(),
             code: error.code(),
             message: error.to_string(),
+            detail: None,
         }
     }
 }
@@ -412,9 +431,102 @@ pub(crate) fn in_namespace(
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let body = json!({ "error": { "code": self.code, "message": self.message } });
-        (self.status, axum::Json(body)).into_response()
+        let mut error = json!({ "code": self.code, "message": self.message });
+        // Merged into the error object rather than nested under a `detail` key,
+        // so a client reads `error.retry_at_ms` beside `error.code` the way
+        // every provider's own rate-limit envelope reads. Merged rather than
+        // overwriting: a detail that could displace `code` would let a future
+        // caller change what a refusal *is* by accident.
+        if let (Some(Value::Object(fields)), Some(error)) = (self.detail, error.as_object_mut()) {
+            for (name, value) in fields {
+                error.entry(name).or_insert(value);
+            }
+        }
+        (self.status, axum::Json(json!({ "error": error }))).into_response()
     }
+}
+
+/// Refuse a turn whose membership has spent a rolling fair-use window.
+///
+/// **Here, at the transport, and not inside the engine.** Both surfaces spawn
+/// `run_turn` into a task and answer with an SSE stream, so a refusal raised
+/// inside the turn becomes a terminal log event and the client gets `200` — and
+/// a rate limit a client cannot see the status of is a rate limit it will poll.
+/// This is the last point at which a status code is still expressible, and it
+/// is also *before* the session is bound and before any grant is opened, which
+/// is what makes "a refused turn took no grant and left no hold" a property of
+/// the control flow rather than a claim.
+///
+/// One function called from both routes rather than two copies, because the
+/// second copy is the one somebody forgets to add: a ceiling enforced on the
+/// Responses surface and not on the native one is not a ceiling.
+///
+/// A ledger that cannot answer fails the request rather than waving it through.
+/// The alternative is a fail-open on a limit, and this is the one place in the
+/// request path where refusing costs a client a retryable error rather than a
+/// turn's work.
+pub(crate) async fn refuse_over_fair_use<S, T>(
+    engine: &Engine<S, T>,
+    admission: &Admission,
+) -> Result<(), ApiError>
+where
+    S: SessionStore,
+    T: Tokenizer + Clone + Send + Sync + 'static,
+{
+    let refusal = engine
+        .fair_use_refusal(admission)
+        .await
+        .map_err(|error| ApiError::internal("fair_use_unavailable", error.to_string()))?;
+    let Some(refusal) = refusal else {
+        return Ok(());
+    };
+    Err(ApiError {
+        status: StatusCode::TOO_MANY_REQUESTS,
+        code: "fair_use_exceeded",
+        message: format!(
+            "this {} has drawn its fair-use limit for the last {} and may retry once the \
+             window has room; the limit is on {} and no work was started for this request",
+            refusal.scope.wire_name(),
+            refusal.window.wire_name(),
+            refusal.quantity.wire_name(),
+        ),
+        // The three fields a client acts on, machine-readable. `retry_at_ms` is
+        // named "earliest" in its own doc and is not a promise: draws that land
+        // in between push it out, and a client that treats it as a deadline
+        // rather than a floor will simply be refused again with a later one.
+        //
+        // `type` and `resets_at` are the *same* two facts spelled the way the
+        // one client this product exists to serve already reads them. codex
+        // (`codex-api::api_bridge::map_api_error`, pin `6344a655` and the box's
+        // `e363b08`) recognizes exactly one machine-readable `429`:
+        // `error.type == "usage_limit_reached"` with `error.resets_at` in unix
+        // *seconds*. Anything else — including this body before G10 — becomes
+        // `CodexErr::RetryLimit` ("exceeded retry limit"), which discards the
+        // window and the time and tells the operator the wrong story about a
+        // refusal the server considers scheduled and retryable. No
+        // `Retry-After` header rides along: codex's own backoff
+        // (`codex-client::retry::backoff`) takes no server-supplied time at
+        // all, and `retry_429` is hardcoded `false` at every construction site
+        // in the pinned tree, so a header would be dead weight aimed at a
+        // client that never reads it.
+        //
+        // Only this refusal is stamped `usage_limit_reached`. Putting it on the
+        // other refusals would tell codex that a spent budget or a rejected key
+        // is a ceiling that clears on its own, and it would wait for a reset
+        // that never comes.
+        detail: Some(json!({
+            "type": "usage_limit_reached",
+            "scope": refusal.scope.wire_name(),
+            "window": refusal.window.wire_name(),
+            "quantity": refusal.quantity.wire_name(),
+            "retry_at_ms": refusal.retry_at_ms,
+            // Rounded *up* to the next whole second, never truncated: the
+            // millisecond figure is a floor ("earliest"), and truncating would
+            // hand codex a time up to 999ms before the window has room — a
+            // retry that is refused again for no reason but our own rounding.
+            "resets_at": refusal.retry_at_ms.div_ceil(1_000),
+        })),
+    })
 }
 
 /// Classify a store failure raised before streaming began.
@@ -514,6 +626,10 @@ where
     let plane = state.planes.plane(now_ms());
     let admission = plane.turn_admission(&headers)?;
     in_namespace(&plane, &admission.principal, &session_id)?;
+    // Before the body is parsed and before the store is touched: a refused turn
+    // must cost this process a counter read and nothing else, and must leave
+    // nothing behind for a client to have to clean up.
+    refuse_over_fair_use(&*state.engine, &admission).await?;
     let request: CreateResponseBody = parse_body(&body)?;
     let input = request
         .input

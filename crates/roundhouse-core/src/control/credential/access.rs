@@ -492,6 +492,8 @@ mod tests {
             turn_policy: &UNRESTRICTED,
             frontier_history: &NO_HISTORY,
             budget: &TurnBudget::Unlimited,
+            signals: None,
+            tiers: None,
         }
     }
 

@@ -249,6 +249,8 @@ mod tests {
                         billing: Default::default(),
                         budget_draw: None,
                         withheld_providers: Vec::new(),
+                        declared_baseline: None,
+                        attempts: Vec::new(),
                     },
                 },
             },
@@ -265,6 +267,7 @@ mod tests {
                         reasoning_tokens: 100,
                         ..Default::default()
                     },
+                    provider_reported_cost_usd: None,
                 },
             },
         ]);

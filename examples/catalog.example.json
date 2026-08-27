@@ -5,25 +5,72 @@
     "current published rate for the model you are actually calling. Roundhouse",
     "reports savings against these numbers, so a stale rate card does not produce a",
     "slightly wrong dashboard -- it produces a confidently wrong one.",
-    "Point ROUNDHOUSE_CATALOG at your copy."
+    "Point ROUNDHOUSE_CATALOG at your copy.",
+    "\"providers\" says where each model's `provider` actually is: a base URL, the",
+    "path each dialect is served at, the environment variable its key arrives in,",
+    "and any static headers the gateway asks for. A model whose `provider` names",
+    "no entry here is refused at load -- with one exception, \"openai\", which this",
+    "build defines implicitly at the endpoint ROUNDHOUSE_OPENAI_API_BASE names, so",
+    "a catalog written before providers existed still loads unchanged. The key",
+    "itself is never in this file: `auth.env` names the variable, and the",
+    "credential a turn actually authenticates with is resolved per turn from the",
+    "control plane's three tiers (deployment, project, member).",
+    "\"openrouter\" below is a real, dispatchable definition: point OPENROUTER_API_KEY",
+    "at a real key and the three entries under it below are live. \"dynamo-fleet\" and",
+    "\"anthropic\" are not -- they are templates for the shape a self-hosted Dynamo",
+    "deployment or switchyard-server (base_url is your own frontend, serving",
+    "chat_completions) and an Anthropic account (serving messages) would use. Neither",
+    "dialect has a client in today's build, whose only transport is the OpenAI",
+    "Responses wire, and nothing in \"models\" names either provider, so both validate",
+    "without needing one. That absence is deliberate and this file is the reason:",
+    "a \"models\" entry speaking a dialect this build cannot serialize stops the boot",
+    "-- by design, since the alternative is failing one tenant's turn for a line in a",
+    "file -- and it stops it the moment ROUNDHOUSE_FRONTIER_UPSTREAM names a real",
+    "upstream, which is exactly what the README tells an operator to do next. An",
+    "example that cannot boot the binary it ships with teaches the format wrong.",
+    "Copy either definition, replace the placeholders, and add entries that name it",
+    "once your build carries a client for that dialect.",
+    "The three entries under \"openrouter\" spell out full, dated model ids rather",
+    "than a placeholder, because that is the point they demonstrate: an id with no",
+    "date suffix is not a rolling pointer to \"whatever is newest\" the way",
+    "\"~deepseek/deepseek-v4-flash-latest\" is -- deepseek/deepseek-v4-flash-0731 is",
+    "itself a frozen snapshot dated 2026-07-31, and the *bare* deepseek ids (no",
+    "-NNNN suffix at all, e.g. deepseek/deepseek-v4-flash) are frozen too, pinned to",
+    "an earlier snapshot rather than tracking forward. Write the full dated id you",
+    "mean; \"the latest DeepSeek\" is ambiguous and this catalog has no mechanism to",
+    "re-resolve it later -- which is why a \"~\"-prefixed id under \"openrouter\" is now",
+    "refused at load rather than only discouraged here: the rule was worth stating,",
+    "so it was worth enforcing where the ambiguity is still cheap to remove.",
+    "openai/gpt-5.6-sol shows the same model reachable through",
+    "two different `provider` entries -- directly as \"openai\", or, as written",
+    "here, through \"openrouter\" -- which the catalog treats as two independent",
+    "prices and two independent (provider, model) identities, never one deduplicated",
+    "against the other."
   ],
 
-  "models": [
-    {
-      "provider": "anthropic",
-      "model": "REPLACE-with-the-model-you-call",
-      "wire_protocol": "anthropic_messages",
-      "cache_model": { "kind": "deterministic", "ttl_ms": 300000 },
-      "pricing": {
-        "input_per_mtok_usd": 0.0,
-        "cached_input_per_mtok_usd": 0.0,
-        "cache_write_per_mtok_usd": 0.0,
-        "output_per_mtok_usd": 0.0
-      },
-      "quality_prior": 0.95,
-      "base_ttft_ms": 350.0,
-      "ttft_ms_per_uncached_token": 0.002
+  "providers": {
+    "anthropic": {
+      "base_url": "https://api.anthropic.com/v1",
+      "routes": { "models": "/models", "messages": "/messages" },
+      "auth": { "env": "ANTHROPIC_API_KEY" }
     },
+    "openrouter": {
+      "base_url": "https://openrouter.ai/api/v1",
+      "routes": { "models": "/models", "responses": "/responses" },
+      "auth": { "env": "OPENROUTER_API_KEY" },
+      "extra_headers": {
+        "HTTP-Referer": "https://REPLACE-with-your-deployments-url",
+        "X-OpenRouter-Title": "roundhouse"
+      }
+    },
+    "dynamo-fleet": {
+      "base_url": "https://REPLACE-with-your-dynamo-frontends-address",
+      "routes": { "chat_completions": "/v1/chat/completions" },
+      "auth": { "env": "REPLACE_WITH_YOUR_ENV_VAR" }
+    }
+  },
+
+  "models": [
     {
       "provider": "openai",
       "model": "REPLACE-with-the-model-you-call",
@@ -41,6 +88,66 @@
         "output_per_mtok_usd": 0.0
       },
       "quality_prior": 0.9,
+      "base_ttft_ms": 300.0,
+      "ttft_ms_per_uncached_token": 0.0015
+    },
+    {
+      "provider": "openrouter",
+      "model": "moonshotai/kimi-k3",
+      "wire_protocol": "openai_responses",
+      "cache_model": {
+        "kind": "inactivity_decay",
+        "half_life_ms": 300000,
+        "max_ttl_ms": 3600000,
+        "min_prefix_tokens": 1024
+      },
+      "pricing": {
+        "input_per_mtok_usd": 0.0,
+        "cached_input_per_mtok_usd": 0.0,
+        "cache_write_per_mtok_usd": 0.0,
+        "output_per_mtok_usd": 0.0
+      },
+      "quality_prior": 0.9,
+      "base_ttft_ms": 300.0,
+      "ttft_ms_per_uncached_token": 0.0015
+    },
+    {
+      "provider": "openrouter",
+      "model": "deepseek/deepseek-v4-flash-0731",
+      "wire_protocol": "openai_responses",
+      "cache_model": {
+        "kind": "inactivity_decay",
+        "half_life_ms": 300000,
+        "max_ttl_ms": 3600000,
+        "min_prefix_tokens": 1024
+      },
+      "pricing": {
+        "input_per_mtok_usd": 0.0,
+        "cached_input_per_mtok_usd": 0.0,
+        "cache_write_per_mtok_usd": 0.0,
+        "output_per_mtok_usd": 0.0
+      },
+      "quality_prior": 0.85,
+      "base_ttft_ms": 300.0,
+      "ttft_ms_per_uncached_token": 0.0015
+    },
+    {
+      "provider": "openrouter",
+      "model": "openai/gpt-5.6-sol",
+      "wire_protocol": "openai_responses",
+      "cache_model": {
+        "kind": "inactivity_decay",
+        "half_life_ms": 300000,
+        "max_ttl_ms": 3600000,
+        "min_prefix_tokens": 1024
+      },
+      "pricing": {
+        "input_per_mtok_usd": 0.0,
+        "cached_input_per_mtok_usd": 0.0,
+        "cache_write_per_mtok_usd": 0.0,
+        "output_per_mtok_usd": 0.0
+      },
+      "quality_prior": 0.92,
       "base_ttft_ms": 300.0,
       "ttft_ms_per_uncached_token": 0.0015
     }

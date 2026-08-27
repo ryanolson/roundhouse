@@ -141,6 +141,99 @@ pub(super) struct Counters {
     /// is *marked*: a validator that times out on every turn shows up as a
     /// number, not as a dashboard that looks its best when its judge is down.
     pub(super) abandoned_side_calls: u64,
+    /// Dispatches to this model that never opened a stream and were fallen
+    /// forward from.
+    ///
+    /// **Marked, never booked, and for [`Self::abandoned_side_calls`]'s exact
+    /// reason.** A failed attempt produced no tokens, so folding it as a call
+    /// would put a zero-token row on the dashboard — which reads as a free one,
+    /// and a provider that 503s every request would make itself look like the
+    /// cheapest model in the fleet. It is emphatically *not* added to
+    /// [`Self::calls`]: that number is the denominator of every rate here, and
+    /// a call that never happened does not belong in it.
+    ///
+    /// The one number that says a tier's first entry is unreachable while its
+    /// fallback quietly carries the traffic — which, without this, looks
+    /// identical to a recipe whose first entry was never picked.
+    pub(super) failed_attempts: u64,
+    /// Summed over this row's calls: what the providers themselves said those
+    /// calls cost.
+    ///
+    /// **Not a part of any dollar figure here and never added into one.** Every
+    /// other dollar in this struct is priced from the catalog, which is the
+    /// number a savings claim is computed from; this is the external bill that
+    /// claim is *checked against*. Summing them would make the reconciliation
+    /// view's drift a comparison of a number with itself, which is the one
+    /// thing that view exists not to do.
+    pub(super) provider_reported_usd: f64,
+    /// How many of [`Self::calls`] reported a price at all.
+    ///
+    /// The discriminator, and it is why the sum above is not published bare: a
+    /// row where no provider reported anything and a row where one reported
+    /// zero dollars are both `0.0`, and only the second is a figure. Most
+    /// providers report nothing, so without this the view would publish a
+    /// confident `$0.00` for almost every deployment.
+    pub(super) provider_reported_calls: u64,
+    /// What this row's turns declared they were talking to.
+    ///
+    /// Only meaningful on a local row, which is the only place a counterfactual
+    /// is priced. See [`DeclaredBaseline`] for why it is a three-state value
+    /// rather than a set or a last-write.
+    pub(super) declared_baseline: DeclaredBaseline,
+}
+
+/// The declared baselines one model row's turns named, collapsed.
+///
+/// **Three states, not a set and not a last-write**, and the middle option is
+/// the one that had to be refused. A row accumulates turns over the reporting
+/// window, so "the last baseline seen" would move the *basis* of a published
+/// saving as the window filled — and `ShadowPricing`'s own tie-break rule
+/// already forbids a correlary that changes between two reads with nothing in
+/// the log to explain it. A set would keep the information and then need this
+/// same rule to use it.
+///
+/// So: one distinct name prices the row, and disagreement falls back to
+/// inference. A conflicting row is not silently mispriced — the basis it
+/// publishes says `inferred`, which is the true statement that no single
+/// declaration governs it, and every raw baseline is still on its own decision
+/// in the log.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) enum DeclaredBaseline {
+    /// No turn on this row named one.
+    #[default]
+    Absent,
+    /// Every turn that named one named this.
+    One(String),
+    /// Two or more turns named different models.
+    Conflicting,
+}
+
+impl DeclaredBaseline {
+    fn observe(&mut self, named: &str) {
+        *self = match std::mem::take(self) {
+            DeclaredBaseline::Absent => DeclaredBaseline::One(named.to_string()),
+            DeclaredBaseline::One(seen) if seen == named => DeclaredBaseline::One(seen),
+            DeclaredBaseline::One(_) | DeclaredBaseline::Conflicting => {
+                DeclaredBaseline::Conflicting
+            }
+        };
+    }
+
+    fn absorb(&mut self, other: &DeclaredBaseline) {
+        match other {
+            DeclaredBaseline::Absent => {}
+            DeclaredBaseline::One(named) => self.observe(named),
+            DeclaredBaseline::Conflicting => *self = DeclaredBaseline::Conflicting,
+        }
+    }
+
+    /// The one name this row may be priced against, or `None`.
+    pub(super) fn resolved(&self) -> Option<&str> {
+        match self {
+            DeclaredBaseline::One(named) => Some(named),
+            DeclaredBaseline::Absent | DeclaredBaseline::Conflicting => None,
+        }
+    }
 }
 
 impl Counters {
@@ -185,6 +278,10 @@ impl Counters {
         self.quoted_alternative_usd += other.quoted_alternative_usd;
         self.side_calls += other.side_calls;
         self.abandoned_side_calls += other.abandoned_side_calls;
+        self.failed_attempts += other.failed_attempts;
+        self.provider_reported_usd += other.provider_reported_usd;
+        self.provider_reported_calls += other.provider_reported_calls;
+        self.declared_baseline.absorb(&other.declared_baseline);
     }
 }
 
@@ -502,6 +599,44 @@ impl MetricsFold {
                 response_id,
                 decision,
             } => {
+                // Every dispatch this decision made and abandoned, booked
+                // against the model it was made *to* rather than against the
+                // one that eventually served. A row for kimi that shows four
+                // failed attempts and no calls is the whole diagnosis; folding
+                // them under sol would say the fallback was flaky.
+                //
+                // Here rather than at the terminal event, unlike the dispatch
+                // itself: an attempt is complete the moment it is recorded, it
+                // waits for no usage, and holding it in `pending` would lose
+                // every attempt of a turn whose response never terminates.
+                for attempt in &decision.attempts {
+                    self.by_principal
+                        .entry(payer.clone())
+                        .or_default()
+                        .entry(ModelKey::from_target(&attempt.target))
+                        .or_default()
+                        .failed_attempts += 1;
+                }
+                // The counterfactual's name, kept on the row it will price.
+                //
+                // Local only, because a hosted row *is* the money and has no
+                // stand-in to price against — a client that names `sol` on a
+                // turn served by `sol` has declared nothing anyone needs. The
+                // fold learns it here, at the decision, rather than at the
+                // terminal event: a baseline is a fact about the request, and
+                // holding it in `pending` would lose it for every turn whose
+                // response never terminates.
+                if decision.chosen.is_local()
+                    && let Some(named) = &decision.declared_baseline
+                {
+                    self.by_principal
+                        .entry(payer.clone())
+                        .or_default()
+                        .entry(ModelKey::from_target(&decision.chosen))
+                        .or_default()
+                        .declared_baseline
+                        .observe(named);
+                }
                 self.pending.insert(
                     response_id.clone(),
                     Pending {
@@ -516,13 +651,64 @@ impl MetricsFold {
                     },
                 );
             }
-            SessionEventKind::ResponseCompleted { response_id, usage }
+            SessionEventKind::ResponseCompleted {
+                response_id, usage, ..
+            }
             | SessionEventKind::ResponseIncomplete {
                 response_id, usage, ..
             } => {
+                // The turn's own last dead dispatch, booked before anything
+                // else in this arm and outside every gate below it.
+                //
+                // **Unconditionally, and that is the whole of review finding
+                // G03.** Every other failed attempt arrives on the `Routed` of
+                // the dispatch it caused, above; this one caused none, so it
+                // rides the terminal event instead. Gating it on `pending` or
+                // on `consumed` — the two guards the settle path below needs —
+                // would drop exactly the attempts it exists for, since a
+                // dispatch that reached nobody has no usage and a turn whose
+                // recipe is exhausted is the case where the last target is the
+                // only one the client's error names. A single-provider
+                // deployment in an outage reported an empty `failed_attempts`
+                // for the whole outage: inverted at the moment it matters.
+                if let SessionEventKind::ResponseIncomplete {
+                    terminal_attempt: Some(attempt),
+                    ..
+                } = &event.kind
+                {
+                    self.by_principal
+                        .entry(payer.clone())
+                        .or_default()
+                        .entry(ModelKey::from_target(&attempt.target))
+                        .or_default()
+                        .failed_attempts += 1;
+                }
                 // Settled: this response is nobody's open turn any more.
                 if let Some(turn_id) = self.turn_of_response.remove(response_id) {
                     self.response_of_turn.remove(&turn_id);
+                }
+                // The provider's own figure for this call, accumulated on the
+                // row that made it and **never on the row's dollars**. It is
+                // the external bill the reconciliation view checks
+                // `frontier_spend_usd` against, so adding the two would be the
+                // view comparing a number with itself. Booked before the
+                // `consumed` gate for the same reason the attempt above is: a
+                // provider that reported a price reported one whatever this
+                // deployment's own evidence rule makes of the tokens.
+                if let SessionEventKind::ResponseCompleted {
+                    provider_reported_cost_usd: Some(cost_usd),
+                    ..
+                } = &event.kind
+                    && let Some(pending) = self.pending.get(response_id)
+                {
+                    let counters = self
+                        .by_principal
+                        .entry(payer.clone())
+                        .or_default()
+                        .entry(pending.key.clone())
+                        .or_default();
+                    counters.provider_reported_usd += cost_usd;
+                    counters.provider_reported_calls += 1;
                 }
                 let Some(pending) = self.pending.remove(response_id) else {
                     return true;
@@ -791,6 +977,27 @@ impl MetricsFold {
             })
     }
 
+    /// Dispatches abandoned before they opened a stream, per model, for one
+    /// scope.
+    ///
+    /// Per-model rather than summed, unlike [`Self::side_call_tally`], because
+    /// this question *is* a per-model one: "which target is failing" is the
+    /// whole of what it answers, and a total across the tier would say only
+    /// that something is.
+    pub fn failed_attempts(&self, scope: Scope<'_>) -> Vec<(ModelKey, u64)> {
+        let view = self.view(scope);
+        let mut rows: Vec<(ModelKey, u64)> = view
+            .rows
+            .iter()
+            .filter(|(_, counters)| counters.failed_attempts > 0)
+            .map(|(key, counters)| (key.clone(), counters.failed_attempts))
+            .collect();
+        // Stable across polls: a list that reordered between two reads of an
+        // unchanged fold would read as movement.
+        rows.sort_by(|a, b| (&a.0.provider, &a.0.model).cmp(&(&b.0.provider, &b.0.model)));
+        rows
+    }
+
     /// Turns admitted across the deployment.
     pub fn turns(&self) -> u64 {
         self.turns_of_principal.values().sum()
@@ -961,6 +1168,37 @@ pub(super) mod tests {
             )
         }
 
+        /// The same turn, on a provider that reports what it charged.
+        ///
+        /// A separate method for `seat_turn`'s reason: every fixture that
+        /// predates the sidecar is a fixture whose upstream said nothing, and
+        /// that is a statement about those logs rather than a defaulted
+        /// argument.
+        pub(crate) fn turn_costing(
+            &mut self,
+            response: &str,
+            target: Target,
+            usage: Usage,
+            provider_reported_cost_usd: f64,
+        ) -> &mut Self {
+            self.turn(response, target.clone(), Vec::new(), usage.clone());
+            // Rewrite the completion this just wrote rather than duplicating
+            // the whole builder: the only difference is the sidecar, and a
+            // second copy of the decision record is a second thing to keep in
+            // step with the first.
+            for event in self.events.iter_mut().rev() {
+                if let SessionEventKind::ResponseCompleted {
+                    provider_reported_cost_usd: slot,
+                    ..
+                } = &mut event.kind
+                {
+                    *slot = Some(provider_reported_cost_usd);
+                    break;
+                }
+            }
+            self
+        }
+
         fn turn_billed(
             &mut self,
             billing: Billing,
@@ -991,9 +1229,57 @@ pub(super) mod tests {
                     billing,
                     budget_draw: None,
                     withheld_providers: Vec::new(),
+                    declared_baseline: None,
+                    attempts: Vec::new(),
                 },
             });
-            self.push(SessionEventKind::ResponseCompleted { response_id, usage });
+            self.push(SessionEventKind::ResponseCompleted {
+                response_id,
+                usage,
+                provider_reported_cost_usd: None,
+            });
+            self
+        }
+
+        /// A local turn whose client named what it thought it was talking to.
+        fn turn_declaring(
+            &mut self,
+            response: &str,
+            target: Target,
+            declared: Option<&str>,
+            usage: Usage,
+        ) -> &mut Self {
+            let response_id = ResponseId::new(response);
+            self.push(SessionEventKind::TurnStarted {
+                turn_id: TurnId::new(format!("turn-{response}")),
+                response_id: response_id.clone(),
+            });
+            self.push(SessionEventKind::Routed {
+                response_id: response_id.clone(),
+                decision: DecisionRecord {
+                    chosen: target,
+                    rationale: "test".into(),
+                    policy: "test".into(),
+                    isl_tokens: usage.input_tokens,
+                    expected_prefill_tokens: 0.0,
+                    expected_cost_usd: 0.0,
+                    considered: Vec::new(),
+                    turn_policy_digest: String::new(),
+                    budget_state: Default::default(),
+                    rate_card: None,
+                    payer: Default::default(),
+                    billing: Billing::Billed,
+                    budget_draw: None,
+                    withheld_providers: Vec::new(),
+                    declared_baseline: declared.map(str::to_string),
+                    attempts: Vec::new(),
+                },
+            });
+            self.push(SessionEventKind::ResponseCompleted {
+                response_id,
+                usage,
+                provider_reported_cost_usd: None,
+            });
             self
         }
 
@@ -1100,6 +1386,7 @@ pub(super) mod tests {
             response_id: ResponseId::new("r2"),
             reason: IncompleteReason::UpstreamError,
             usage: Usage::default(),
+            terminal_attempt: None,
         });
 
         let mut fold = MetricsFold::new();
@@ -1716,6 +2003,80 @@ pub(super) mod tests {
                     .last_at_ms,
             "and never reaches the neighbouring project's, which would disclose \
              when another tenant was last active"
+        );
+    }
+    /// S4: a row prices against one declared baseline, and refuses to price
+    /// against two.
+    ///
+    /// The middle state is the one that had to be refused. A row accumulates
+    /// turns over the reporting window, so a last-write rule would move the
+    /// *basis* of a published saving as the window filled — which is the same
+    /// instability `ShadowPricing`'s tie-break already forbids.
+    #[test]
+    fn a_row_prices_against_one_declared_baseline_and_never_against_two() {
+        let key = ModelKey::from_target(&local("llama"));
+
+        // Agreement across turns is one declaration.
+        let mut log = LogBuilder::new("s1");
+        log.created(Some(Principal::new("acme", "ada")));
+        log.turn_declaring("r1", local("llama"), Some("big"), usage(1_000, 0, 100, 0));
+        log.turn_declaring("r2", local("llama"), Some("big"), usage(1_000, 0, 100, 0));
+        let mut fold = MetricsFold::new();
+        fold.extend(log.events());
+        assert_eq!(
+            fold.summed_rows(Scope::Deployment)[&key]
+                .declared_baseline
+                .resolved(),
+            Some("big")
+        );
+
+        // Disagreement is none, and the row prices through inference rather
+        // than against whichever turn happened to be last.
+        let mut log = LogBuilder::new("s2");
+        log.created(Some(Principal::new("acme", "ada")));
+        log.turn_declaring("r1", local("llama"), Some("big"), usage(1_000, 0, 100, 0));
+        log.turn_declaring("r2", local("llama"), Some("small"), usage(1_000, 0, 100, 0));
+        let mut fold = MetricsFold::new();
+        fold.extend(log.events());
+        assert_eq!(
+            fold.summed_rows(Scope::Deployment)[&key]
+                .declared_baseline
+                .resolved(),
+            None,
+            "two turns naming two models leave no single declaration to publish"
+        );
+
+        // A hosted row never carries one: it *is* the money, and there is no
+        // counterfactual to name.
+        let mut log = LogBuilder::new("s3");
+        log.created(Some(Principal::new("acme", "ada")));
+        log.turn_declaring(
+            "r1",
+            frontier("anthropic", "big"),
+            Some("big"),
+            usage(1_000, 0, 100, 0),
+        );
+        let mut fold = MetricsFold::new();
+        fold.extend(log.events());
+        assert_eq!(
+            fold.summed_rows(Scope::Deployment)
+                [&ModelKey::from_target(&frontier("anthropic", "big"))]
+                .declared_baseline
+                .resolved(),
+            None
+        );
+
+        // And the control: a client that named nothing declares nothing, which
+        // is what separates "inferred because nobody asked" from "inferred
+        // because two clients disagreed".
+        let mut log = LogBuilder::new("s4");
+        log.created(Some(Principal::new("acme", "ada")));
+        log.turn_declaring("r1", local("llama"), None, usage(1_000, 0, 100, 0));
+        let mut fold = MetricsFold::new();
+        fold.extend(log.events());
+        assert_eq!(
+            fold.summed_rows(Scope::Deployment)[&key].declared_baseline,
+            DeclaredBaseline::Absent
         );
     }
 }

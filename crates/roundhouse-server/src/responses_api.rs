@@ -59,15 +59,15 @@ use roundhouse_core::store::SessionStore;
 
 use crate::control_config::{ControlPlane, PlaneSource};
 use crate::conversations::Conversations;
-use crate::dialect::ClientDialect;
-use crate::engine::Engine;
-use crate::http::{ApiError, LogTail, POLL_INTERVAL, READ_BATCH, parse_body, store_error};
+use crate::engine::{Engine, TurnInput};
+use crate::http::{
+    ApiError, LogTail, POLL_INTERVAL, READ_BATCH, parse_body, refuse_over_fair_use, store_error,
+};
 
 mod wire;
 use wire::{
-    EmittedCall, canonicalize, completed_frame, created_frame, delta_frame, failed_frame,
-    incomplete_frame, item_added_frame, item_done_frame, tool_call_added_frame,
-    tool_call_done_frame, turn_id_for,
+    canonicalize, completed_frame, created_frame, delta_frame, failed_frame, incomplete_frame,
+    item_added_frame, item_done_frame, turn_id_for,
 };
 
 /// Engine and store handles, plus this node's cache-key bindings.
@@ -173,18 +173,32 @@ where
 
 /// The part of a Responses request this surface reads.
 ///
-/// Everything else a client sends — `model`, `tools`, `tool_choice`,
+/// Everything else a client sends — `tools`, `tool_choice`,
 /// `parallel_tool_calls`, `reasoning`, `text`, `include`, `store`,
 /// `client_metadata` — is accepted and ignored. Ignoring rather than rejecting
 /// is the point of a compatibility surface: v1 chooses its target by routing
 /// policy rather than by requested model and runs no tool loop, and a client
 /// that had to strip fields before talking to us would not be a client of the
 /// same API.
+///
+/// **`model` was on that list until M10 and is now accepted, *recorded*, and
+/// still never routed on.** The change is one word and it is the one word that
+/// matters: nothing below reads it to pick a target, and the router cannot —
+/// it never receives it. What it becomes is the turn's *declared baseline*, the
+/// name the savings figure prices its counterfactual against, which is a
+/// question only the client can answer and which ignoring the field threw away.
 #[derive(Debug, Deserialize)]
 struct ResponsesRequest {
     /// The system prompt, sent whole on every turn.
     #[serde(default)]
     instructions: String,
+    /// What the client believes it is talking to.
+    ///
+    /// Recorded verbatim on the decision and read only by pricing. A client
+    /// that names nothing is not a client that named the default: the
+    /// counterfactual is inferred for that turn, and the log says which.
+    #[serde(default)]
+    model: Option<String>,
     /// The conversation so far, this turn's new items included.
     ///
     /// Held as raw JSON so an unsupported item type can be named in the refusal
@@ -223,6 +237,13 @@ where
     // too, and two of them could disagree across a refresh.
     let plane = state.planes.plane(now_ms());
     let admission = plane.turn_admission(&headers)?;
+    // Immediately after the key lookup and before anything is parsed, bound or
+    // granted. A rolling fair-use window is the one refusal an *agent* rather
+    // than an operator acts on, so it has to arrive as a status code with a
+    // retry time — which this is the last point in the request able to produce,
+    // since everything below spawns the turn and answers with a stream. See
+    // `http::refuse_over_fair_use`.
+    refuse_over_fair_use(&*state.engine, &admission).await?;
     let request: ResponsesRequest = parse_body(&body)?;
     if !request.stream {
         return Err(ApiError::unprocessable(
@@ -269,9 +290,21 @@ where
         let session_id = session_id.clone();
         let turn_id = turn_id.clone();
         let admission = admission.clone();
+        // Empty is treated as absent. A client that sends `"model": ""` has
+        // named nothing, and recording the empty string would put a baseline
+        // in the log that no catalog can resolve and no reader can act on.
+        let declared_baseline = request.model.filter(|model| !model.trim().is_empty());
         async move {
             engine
-                .run_turn(&session_id, turn_id, input, &admission)
+                .run_turn(
+                    &session_id,
+                    turn_id,
+                    TurnInput {
+                        items: input,
+                        declared_baseline,
+                    },
+                    &admission,
+                )
                 .await
                 .map(|_| ())
                 .map_err(|error| error.to_string())
@@ -289,10 +322,6 @@ where
         queued: VecDeque::new(),
         item_open: false,
         text: String::new(),
-        // Read once and carried, rather than consulted per frame: a
-        // reconfiguration must not be able to change a namespace half way
-        // through a response the client is still reading.
-        dialect: plane.client_dialect().clone(),
         phase: Phase::Tailing,
     };
 
@@ -466,21 +495,6 @@ enum Step {
     End,
 }
 
-/// An item this response emitted, in the two shapes a response can emit one.
-///
-/// An enum rather than two predicates because the choice is exclusive and the
-/// exclusivity is load-bearing: an item is a call or a message, never both, and
-/// a stream that projected it twice would hand a client one answer in two
-/// shapes. Named here rather than in [`wire`] because what it decides is which
-/// frames to build, not how to build them.
-enum Emitted<'a> {
-    /// A synthetic tool call — the steered turn's outcome B.
-    Call(EmittedCall<'a>),
-    /// Assistant text committed whole, with no deltas behind it — the halted
-    /// turn's outcome C.
-    Message(&'a str),
-}
-
 /// Streams one turn as a Responses API response.
 ///
 /// The turn runs in a task this follower never aborts, for the reason
@@ -521,9 +535,6 @@ struct ResponsesFollower<S: SessionStore, T: Tokenizer + Clone> {
     item_open: bool,
     /// Deltas so far, which `response.output_item.done` repeats in full.
     text: String,
-    /// How an emitted tool call is spelled for this client, fixed for the life
-    /// of the response. See [`ClientDialect`].
-    dialect: ClientDialect,
     phase: Phase,
 }
 
@@ -669,44 +680,38 @@ impl<S: SessionStore, T: Tokenizer + Clone + Send + Sync + 'static> ResponsesFol
     /// may go out. An item a client sent never has a stamp at all, because
     /// canonicalization sets `None` on everything on the input path.
     ///
-    /// The two arms then differ in what else they have to be sure of:
+    /// Beyond provenance there is one further condition, and it is the whole of
+    /// the narrowing: `item_open` must be false. An ordinary dispatched turn
+    /// puts its answer on the wire through the delta path and *then* commits the
+    /// same text as an item, so claiming it here too would emit a second
+    /// `response.output_item.done` for one message — the answer arriving twice.
+    /// `item_open` is true exactly when a delta has already announced that item,
+    /// so the only message this arm ever claims is one no delta preceded: a
+    /// completion from the interjection seam, whose text is committed whole and
+    /// never streamed. Before this arm existed a halted turn streamed `created`
+    /// then `completed` with no text at all — the correction sat in the log and
+    /// the agent, whose loop the halt is meant to end, was handed an empty
+    /// answer.
     ///
-    /// - **A call** needs nothing more. Only a `ToolCall` has a `call_id`, a
-    ///   `name` and `arguments` to render, so the frame builders would not
-    ///   compile against anything else.
-    /// - **A message** needs `item_open` to be false, and that is the whole of
-    ///   the narrowing. An ordinary dispatched turn puts its answer on the wire
-    ///   through the delta path and *then* commits the same text as an item, so
-    ///   claiming it here too would emit a second
-    ///   `response.output_item.done` for one message — the answer arriving
-    ///   twice. `item_open` is true exactly when a delta has already announced
-    ///   that item, so the only message this arm ever claims is one no delta
-    ///   preceded: the validate loop's halt (outcome C), whose guidance text is
-    ///   committed whole and never streamed. Before this arm existed a halted
-    ///   turn streamed `created` then `completed` with no text at all — the
-    ///   correction sat in the log and the agent, whose loop the halt is meant
-    ///   to end, was handed an empty answer.
-    fn emitted<'a>(&'a self, item: &'a Item) -> Option<Emitted<'a>> {
+    /// **A second arm used to live here and is gone (M10.0, T4).** A `ToolCall`
+    /// bearing this response's id was projected as two `function_call` frames —
+    /// outcome B, the synthetic call an agent dispatched over MCP. No seam
+    /// produces one now, so the arm was unreachable rather than merely unused,
+    /// and an unreachable arm in the *one* predicate that decides what goes on
+    /// the wire is the kind of thing a later reader restores by accident. What
+    /// it means today is stronger and is asserted as such: an item carrying a
+    /// tool call can only have come from the client, so it is never projected —
+    /// see `a_clients_own_tool_call_is_not_projected_as_an_emitted_one`.
+    fn emitted<'a>(&'a self, item: &'a Item) -> Option<&'a str> {
         let response_id = item.response_id.as_ref()?;
         if self.response_id.as_ref() != Some(response_id) {
             return None;
         }
         match &item.content {
-            ItemContent::ToolCall {
-                call_id,
-                name,
-                arguments,
-            } => Some(Emitted::Call(EmittedCall {
-                dialect: &self.dialect,
-                response_id,
-                call_id,
-                name,
-                arguments,
-            })),
-            ItemContent::Text { text } if !self.item_open && !text.is_empty() => {
-                Some(Emitted::Message(text))
-            }
-            ItemContent::Text { .. } | ItemContent::ToolResult { .. } => None,
+            ItemContent::Text { text } if !self.item_open && !text.is_empty() => Some(text),
+            ItemContent::Text { .. }
+            | ItemContent::ToolCall { .. }
+            | ItemContent::ToolResult { .. } => None,
         }
     }
 
@@ -735,7 +740,9 @@ impl<S: SessionStore, T: Tokenizer + Clone + Send + Sync + 'static> ResponsesFol
                 self.queued.push_back(delta_frame(text));
                 Step::Continue
             }
-            SessionEventKind::ResponseCompleted { response_id, usage } => {
+            SessionEventKind::ResponseCompleted {
+                response_id, usage, ..
+            } => {
                 if self.item_open {
                     self.queued.push_back(item_done_frame(&self.text));
                 }
@@ -774,6 +781,7 @@ impl<S: SessionStore, T: Tokenizer + Clone + Send + Sync + 'static> ResponsesFol
                 // when there is some. Bound by name so a field added here
                 // cannot be dropped without someone reading this line.
                 usage: _,
+                ..
             } => {
                 let message = match reason {
                     IncompleteReason::BudgetExhausted => {
@@ -793,51 +801,38 @@ impl<S: SessionStore, T: Tokenizer + Clone + Send + Sync + 'static> ResponsesFol
                 // usage in this dialect, and the log is where the accounting
                 // for a truncated turn is read from.
                 usage: _,
+                ..
             } => {
                 self.queued.push_back(incomplete_frame(response_id, reason));
                 Step::End
             }
-            // A tool call this response emitted, which `concerns` has already
-            // narrowed to exactly that. Two frames, both carrying the whole
-            // item: the client dispatches off the `done`, and no argument
-            // deltas go out at all because the pinned parser traces and drops
-            // them — so anything not in these two frames is not on the wire.
+            // An answer this response produced at the interjection seam, which
+            // `concerns` has already narrowed to exactly that. Two frames, both
+            // carrying the whole message: it was committed whole rather than
+            // streamed, so there are no deltas for a client to assemble it from
+            // and anything not in these two frames is not on the wire.
             //
-            // `item_open` is deliberately untouched. It tracks the *message*
-            // item, whose `done` the completion below emits; a steered turn
-            // produces no deltas and so leaves it false, which is what makes
-            // the four-frame sequence four frames rather than five with an
-            // empty message on the end.
+            // `item_open` is deliberately untouched. It tracks the *streamed*
+            // message, whose `done` the completion below emits; a seam answer
+            // produces no deltas and so leaves it false, which is what makes the
+            // four-frame sequence four frames rather than five with an empty
+            // message on the end.
+            //
+            // **Both seam answers take this path since M10.0**, and that is the
+            // point of T5: a steer and a halt are one shape now — assistant text,
+            // nothing dispatched, the judge's usage booked — so the usage
+            // substitution below covers the steer by riding the seam the halt
+            // already rode, rather than by a second arm that could drift from it.
             SessionEventKind::ItemAppended { item } => {
                 // Built before either is queued, because the borrow is on this
-                // follower and the queue needs it back mutably. Each pair is
-                // built together for a second reason too: a client announced
-                // one item and handed another has no way to reconcile them.
-                // One `emitted` call yielding both, for the reason that
-                // predicate's own doc gives: a narrowing written twice has
-                // neither copy load-bearing, and a test that removed one would
-                // stay green. The contribution is *yielded* here and assigned
-                // below because `Emitted` borrows `self.dialect` — only the
-                // write has to wait for that borrow to end.
-                //
-                // Both seam answers, not only the steer. A halt is the same
-                // shape — nothing dispatched, the judge's usage booked — so the
-                // same substitution applies; that it ends the agent's loop makes
-                // the wrong number less consequential, not more correct.
+                // follower and the queue needs it back mutably. The pair is
+                // built together for a second reason too: a client announced one
+                // item and handed another has no way to reconcile them. One
+                // `emitted` call decides both, for the reason that predicate's
+                // own doc gives: a narrowing written twice has neither copy
+                // load-bearing, and a test that removed one would stay green.
                 let (frames, contribution) = match self.emitted(item) {
-                    Some(Emitted::Call(call)) => (
-                        Some([tool_call_added_frame(&call), tool_call_done_frame(&call)]),
-                        Some(
-                            self.engine
-                                .context_contribution(self.admitted_input_tokens, item),
-                        ),
-                    ),
-                    // A halt: guidance committed whole, with no deltas behind
-                    // it. `item_open` stays false — it tracks the *streamed*
-                    // message, whose `done` the completion below emits — so
-                    // the completion adds only its own frame and the sequence
-                    // is the same four a steered turn is.
-                    Some(Emitted::Message(text)) => (
+                    Some(text) => (
                         Some([item_added_frame(), item_done_frame(text)]),
                         Some(
                             self.engine

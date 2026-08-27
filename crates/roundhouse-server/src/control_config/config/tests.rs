@@ -7,6 +7,10 @@ use super::*;
 // and a test that borrowed its parent's imports would go on compiling only
 // until the production file stopped needing them.
 use roundhouse_core::control::Allocation;
+// The same argument, for M10.2's recipe assertions: the validator hands out an
+// `Arc<TierRecipe>` and never names `Tier`, `PickerMode` or `Target` itself.
+use roundhouse_core::routing::{PickerMode, Target, Tier};
+use std::sync::Arc;
 
 use crate::control_config::fixtures::{TURN_HASH, sample_config};
 
@@ -187,6 +191,207 @@ fn the_example_file_validates() {
         ceilings.contains(&Some(125.0f64.to_bits())),
         "the example must demonstrate a share key resolving to its ceiling \
          (25% of the $500 project limit): {ceilings:?}"
+    );
+
+    // M10.2's config addition, read off the **resolved** `turn_keys` table for
+    // the reason the ceilings above are: the shape parsing is the cheap half,
+    // and what an operator copying this file actually gets is what
+    // `TierRecipe::new` accepted and what every key of the project resolved to.
+    // A recipe that parsed and then failed to reach a membership would be an
+    // example that demonstrates nothing.
+    let recipes: Vec<_> = config
+        .turn_keys
+        .values()
+        .map(|admission| admission.tiers.as_ref().map(Arc::clone))
+        .collect();
+    assert!(
+        recipes.iter().all(Option::is_some),
+        "every key of the only project in the example belongs to a project with \
+         a recipe, so every membership must resolve to one: {recipes:?}"
+    );
+    let recipe = recipes[0].as_ref().expect("checked present above");
+    assert_eq!(
+        recipe.list(Tier::Capable).len(),
+        2,
+        "the example must demonstrate the within-tier fallback order, which \
+         needs a tier with somewhere to fall to"
+    );
+    assert_eq!(
+        recipe.picker(),
+        PickerMode::EfficientFirst,
+        "the shipped example must sit on the operating point that has been \
+         calibrated, not on the one the process warns about"
+    );
+
+    // And every identity the recipe names is one the project's own `allow`
+    // admits. A recipe can only narrow, so an entry the policy refuses is
+    // skipped in silence at routing time — which in a *worked example* would be
+    // a line an operator copies believing it does something.
+    let allow = &config
+        .turn_keys
+        .values()
+        .next()
+        .expect("the example ships keys")
+        .policy
+        .allow;
+    for tier in [Tier::Capable, Tier::Efficient] {
+        for named in recipe.list(tier) {
+            let target = match named.strip_prefix("local/") {
+                Some(model) => Target::Local {
+                    worker_id: 0,
+                    dp_rank: 0,
+                    model: model.to_string(),
+                },
+                None => {
+                    let (provider, model) = named
+                        .split_once('/')
+                        .unwrap_or_else(|| panic!("`{named}` is not a `provider/model` identity"));
+                    Target::Frontier {
+                        provider: provider.to_string(),
+                        model: model.to_string(),
+                    }
+                }
+            };
+            assert!(
+                allow.matches(&target),
+                "the example's recipe names `{named}`, which acme's own `allow` \
+                 does not admit: the entry would be skipped at routing time and \
+                 the example would be demonstrating nothing"
+            );
+        }
+    }
+}
+
+/// Review finding G07, ruled on a corrected mechanism — see
+/// `reports/m10-fix-C.md`, and the rename from
+/// `..._is_one_this_binary_could_quote`, which named a property the shipped
+/// binary cannot have.
+///
+/// **The finding's question.** The shipped `roundhouse` binary attaches no
+/// [`LocalFleet`], so `local/<model>` names nothing `reachable_candidates`
+/// (main.rs) ever quotes, and the check above only asks whether acme's `allow`
+/// *admits* each recipe entry — which `local/REPLACE-with-your-local-model`
+/// passes, the pattern being `local/*`. True, and its predicted consequence —
+/// every turn falling silently to the expensive tier — is not: the same file's
+/// `frontier_cadence` promises local service on a spent window, and
+/// [`refuse_promises_of_a_local_fallback`] refuses the whole plane at boot
+/// before a socket is opened. A fleetless operator meets a refusal naming the
+/// missing local capacity, not a quiet bill.
+///
+/// **What was actually broken, and what this test guards.** On the deployment
+/// these two files *describe* — one whose fleet serves the local model the
+/// catalog example declares in `local_quality` — ada's key was still refused,
+/// because her `min_quality: 0.8` override put that model's declared 0.62
+/// below her floor and so took her own cadence's fallback away. The shipped
+/// pair booted nothing at all, fleeted or fleetless, and nothing said so. Both
+/// halves are asserted here: the pair boots the deployment it describes, and
+/// the fleetless refusal is the documented one rather than silence.
+///
+/// The local candidate is built from the catalog example's own `local_quality`
+/// rather than hard-coded, so the two files' spelling of the local model is
+/// what is being compared. That is the shape the finding's silent-expensive-tier
+/// scenario really has: a typo between the files, on a deployment with a fleet.
+///
+/// [`LocalFleet`]: roundhouse_fleet::LocalFleet
+/// [`refuse_promises_of_a_local_fallback`]: crate::control_config::crosscheck::refuse_promises_of_a_local_fallback
+#[test]
+fn every_target_the_examples_recipe_names_is_one_the_deployment_it_describes_can_quote() {
+    let control_plane_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/control-plane.example.json");
+    let config = ControlPlaneConfig::load(&control_plane_path)
+        .unwrap_or_else(|error| panic!("the shipped example must validate: {error}"));
+
+    let catalog_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/catalog.example.json");
+    let catalog_config = crate::CatalogConfig::load(&catalog_path)
+        .unwrap_or_else(|error| panic!("the shipped catalog example must validate: {error}"));
+    let catalog = catalog_config.catalog();
+
+    // Same recipe for the same reason `the_example_file_validates` above
+    // handled multiplicity -- this milestone's example ships one project.
+    let recipe = config
+        .turn_keys
+        .values()
+        .next()
+        .and_then(|admission| admission.tiers.as_ref())
+        .expect("the example ships a key with a recipe")
+        .clone();
+    let plane = crate::ControlPlane::configured(config);
+
+    // `reachable_candidates` in main.rs, reproduced here rather than called:
+    // that function lives in the `roundhouse` binary crate and is not
+    // reachable from this lib crate's tests.
+    let mut ledger = roundhouse_core::routing::CacheLedger::new();
+    catalog.apply_to_ledger(&mut ledger);
+    let fleetless = catalog.quote(&ledger, roundhouse_core::now_ms(), 1_024, 256);
+
+    // The deployment the two files describe: the catalog's hosted entries plus
+    // a worker for every local model the catalog itself declares a quality for.
+    // Quoted at that declared prior, because the floor a key's override sets is
+    // compared against exactly this number and the whole defect lived in that
+    // comparison.
+    let mut described = fleetless.clone();
+    for (model, prior) in &catalog_config.local_quality {
+        described.push(roundhouse_core::routing::Candidate {
+            target: Target::Local {
+                worker_id: 1,
+                dp_rank: 0,
+                model: model.clone(),
+            },
+            expected_prefill_tokens: 1_024.0,
+            matched_prefix_tokens: 0,
+            expected_ttft_ms: 60.0,
+            expected_cost_usd: 0.0,
+            quality_prior: *prior,
+            load: Some(0.0),
+        });
+    }
+    let described_identities: HashSet<String> = described
+        .iter()
+        .map(|candidate| candidate.target.policy_identity())
+        .collect();
+
+    for tier in [Tier::Capable, Tier::Efficient] {
+        for named in recipe.list(tier) {
+            assert!(
+                described_identities.contains(named),
+                "the example's {tier:?} tier names `{named}`, which neither file's own \
+                 contents can produce a candidate for ({described_identities:?}): a hosted \
+                 entry the catalog does not price, or a local model it declares no quality \
+                 for, is a tier that is empty on every turn -- and an empty tier is not a \
+                 failure, it is the other tier serving the turn at another price"
+            );
+        }
+    }
+
+    // And the deployment described boots: every key, not just the project's,
+    // since a turn arrives on a key and ada's own narrowing is where this broke.
+    crate::control_config::crosscheck::CrossChecks::new(described, None)
+        .refuse(&plane)
+        .unwrap_or_else(|refusal| {
+            panic!(
+                "the two shipped examples must describe a deployment that starts: {} said {}",
+                refusal.check, refusal.detail
+            )
+        });
+
+    // CONTROL, and the half that makes the assertion above non-vacuous: the
+    // same plane on a *fleetless* process -- the shipped binary's own wiring --
+    // is refused, and refused by name. If this ever passed, the examples would
+    // be describing a deployment nobody can tell apart from the one they get,
+    // and the finding's silent-expensive-tier scenario would be back.
+    let refusal = crate::control_config::crosscheck::CrossChecks::new(fleetless, None)
+        .refuse(&plane)
+        .expect_err(
+            "the shipped control plane promises local service and the shipped binary \
+             attaches no fleet; a process that started here would serve the promise's \
+             opposite in silence",
+        );
+    assert!(
+        refusal.detail.contains("no local capacity") && refusal.detail.contains("project `acme`"),
+        "the fleetless refusal is what an operator copying both files actually meets, so \
+         it has to name the capacity and the keys rather than the tier that went empty: {}",
+        refusal.detail
     );
 }
 
@@ -1126,5 +1331,147 @@ fn an_ordinary_namespace_and_an_absent_one_both_load() {
         unnamed.mcp_namespace, None,
         "an absent field stays absent here; the default is applied once, at \
          `ControlPlane::client_dialect`"
+    );
+}
+
+/// M10.2 S3: a project's `tiers` block reaches the admission its keys resolve
+/// to, and a key inherits its project's recipe rather than carrying one.
+#[test]
+fn a_projects_tier_recipe_reaches_every_key_of_that_project() {
+    let json = format!(
+        r#"{{
+          "projects": [
+            {{
+              "id": "acme",
+              "tiers": {{
+                "capable": ["openrouter/moonshotai/kimi-k3", "openai/gpt-5.6-sol"],
+                "efficient": ["openai/gpt-5.6-luna"],
+                "picker": "capable_first",
+                "confidence_threshold": 0.4
+              }}
+            }},
+            {{ "id": "other" }}
+          ],
+          "users": [{{ "id": "ada" }}],
+          "keys": [
+            {{ "project": "acme", "user": "ada", "key_sha256": "{TURN_HASH}" }}
+          ]
+        }}"#
+    );
+    let config = ControlPlaneConfig::from_json(&json, "test").expect("a well-formed recipe loads");
+    let admission = config
+        .turn_keys
+        .get(TURN_HASH)
+        .expect("the key resolved to an admission");
+    let recipe = admission
+        .tiers
+        .as_ref()
+        .expect("the project declared a recipe");
+
+    assert_eq!(recipe.picker(), PickerMode::CapableFirst);
+    assert!((recipe.confidence_threshold() - 0.4).abs() < 1e-12);
+    assert_eq!(
+        recipe.list(roundhouse_core::routing::Tier::Capable),
+        [
+            "openrouter/moonshotai/kimi-k3".to_string(),
+            "openai/gpt-5.6-sol".to_string()
+        ],
+        "in the operator's order, which is what the failover walks"
+    );
+    assert_eq!(
+        recipe.list(roundhouse_core::routing::Tier::Efficient),
+        ["openai/gpt-5.6-luna".to_string()]
+    );
+
+    // The control, and it is the compatibility guarantee: a project that wrote
+    // no block resolves to no recipe, so its turns route exactly as they did
+    // before M10.
+    let json = format!(
+        r#"{{
+          "projects": [{{ "id": "acme" }}],
+          "users": [{{ "id": "ada" }}],
+          "keys": [
+            {{ "project": "acme", "user": "ada", "key_sha256": "{TURN_HASH}" }}
+          ]
+        }}"#
+    );
+    let config = ControlPlaneConfig::from_json(&json, "test").unwrap();
+    assert!(config.turn_keys.get(TURN_HASH).unwrap().tiers.is_none());
+}
+
+/// A threshold no confidence can reach stops the boot, naming the project.
+///
+/// Upstream refuses it at construction and so does this: an operator watching a
+/// start-up can fix a number, and a deployment that discovered it on turn four
+/// hundred would have spent four hundred turns on the picker's default with
+/// nothing saying why.
+#[test]
+fn a_tier_recipe_with_an_unreachable_threshold_stops_the_boot() {
+    for threshold in [-0.5, 1.5] {
+        let json = format!(
+            r#"{{
+              "projects": [
+                {{
+                  "id": "acme",
+                  "tiers": {{
+                    "capable": ["openai/sol"],
+                    "confidence_threshold": {threshold}
+                  }}
+                }}
+              ],
+              "users": []
+            }}"#
+        );
+        match ControlPlaneConfig::from_json(&json, "test").unwrap_err() {
+            ControlPlaneError::TierRecipeRejected { entry, source, .. } => {
+                assert_eq!(entry, "project `acme`");
+                assert!(
+                    matches!(
+                        source,
+                        roundhouse_core::routing::TierRecipeError::ThresholdOutOfRange { .. }
+                    ),
+                    "{source}"
+                );
+            }
+            other => panic!("expected TierRecipeRejected, got {other:?}"),
+        }
+    }
+
+    // A recipe that names nothing in either tier is refused too: there is
+    // nothing for the scorer to pick between, and an empty recipe would route
+    // every turn through the no-viable-candidate refusal.
+    let json = r#"{
+      "projects": [{ "id": "acme", "tiers": { "capable": [], "efficient": [] } }],
+      "users": []
+    }"#;
+    assert!(matches!(
+        ControlPlaneConfig::from_json(json, "test").unwrap_err(),
+        ControlPlaneError::TierRecipeRejected { .. }
+    ));
+
+    // Control: the bounds themselves are inside the interval, and one-sided
+    // recipes are legitimate.
+    let json = r#"{
+      "projects": [
+        { "id": "a", "tiers": { "capable": ["openai/sol"], "confidence_threshold": 0.0 } },
+        { "id": "b", "tiers": { "efficient": ["openai/luna"], "confidence_threshold": 1.0 } }
+      ],
+      "users": []
+    }"#;
+    ControlPlaneConfig::from_json(json, "test").expect("both bounds are valid thresholds");
+}
+
+/// A misspelt tier name is a boot refusal, not a tier that quietly routes
+/// nothing.
+#[test]
+fn a_misspelt_tier_field_is_refused_rather_than_dropped() {
+    let json = r#"{
+      "projects": [{ "id": "acme", "tiers": { "capible": ["openai/sol"] } }],
+      "users": []
+    }"#;
+    assert!(
+        ControlPlaneConfig::from_json(json, "test").is_err(),
+        "`capible` would have resolved to an empty capable tier, which is a \
+         legitimate one-sided recipe and therefore invisible afterwards"
     );
 }

@@ -136,10 +136,15 @@ pub fn descriptors() -> Vec<ToolDescriptor> {
     vec![
         ToolDescriptor {
             name: "status",
-            // Not "costs nothing": answering this reads the conversation's log,
-            // and a description that told a model the call was free would be
-            // inviting the loop the surface then has to absorb.
-            description: "What this key may be routed to right now: the effective policy fingerprint, the admissible model names, budget remaining, and any steer awaiting an answer. Changes nothing; it reads this conversation's log to answer, so it is cheap between turns and not free in a loop.",
+            // Still not "costs nothing", even though M10.0 removed the one
+            // field that needed the log replay: resolving the conversation and
+            // quoting the admissible catalog are both work, and a description
+            // that told a model the call was free would invite the loop the
+            // surface then has to absorb. The retired field was `open_steers`,
+            // which listed synthetic tool calls awaiting an answer — there are
+            // none now, and a permanently empty list in a model's context is a
+            // question it keeps asking and always gets `[]` to.
+            description: "What this key may be routed to right now: the effective policy fingerprint, the admissible model names, and budget remaining. Changes nothing; it resolves this conversation and quotes the catalog to answer, so it is cheap between turns and not free in a loop.",
             input_schema: json!({
                 "type": "object",
                 "properties": { "conversation": conversation_property() },
@@ -245,13 +250,10 @@ pub fn descriptors() -> Vec<ToolDescriptor> {
         },
         ToolDescriptor {
             name: "fetch_steer",
-            description: "Read the correction a roundhouse tool call named. Returns exactly what was written when the call was emitted; calling it twice returns the same bytes and does no work.",
+            description: "Re-read roundhouse's most recent correction for this conversation. It was already delivered as an assistant message; use this if you no longer have it. Calling it twice returns the same bytes and does no work.",
             input_schema: json!({
                 "type": "object",
-                "properties": {
-                    "steer_id": { "type": "string", "description": "The id the tool call named." }
-                },
-                "required": ["steer_id"],
+                "properties": { "conversation": conversation_property() },
                 "additionalProperties": false
             }),
             read_only_hint: true,
@@ -260,11 +262,11 @@ pub fn descriptors() -> Vec<ToolDescriptor> {
         },
         ToolDescriptor {
             name: "report_outcome",
-            description: "Say what you did about a steer. Advisory: not reporting is never an error and never blocks a turn.",
+            description: "Say what you did about roundhouse's correction for this conversation. Advisory: not reporting is never an error and never blocks a turn.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "steer_id": { "type": "string", "description": "The steer you are reporting on." },
+                    "conversation": conversation_property(),
                     "outcome": {
                         "type": "string",
                         "enum": ["applied", "rejected", "not_applicable"],
@@ -272,7 +274,7 @@ pub fn descriptors() -> Vec<ToolDescriptor> {
                     },
                     "note": { "type": "string", "description": "Anything worth recording alongside." }
                 },
-                "required": ["steer_id", "outcome"],
+                "required": ["outcome"],
                 "additionalProperties": false
             }),
             read_only_hint: false,

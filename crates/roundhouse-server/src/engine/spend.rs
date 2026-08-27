@@ -342,6 +342,9 @@ mod tests {
             billing: Billing::Billed,
             budget_draw: Some(BudgetCounts::AllFrontierSpend),
             usage: one_mtok_out(),
+            // Never an input to a settle, which is exactly what this fixture's
+            // subject is; see the field's own note on why it rides here at all.
+            provider_reported_cost_usd: None,
         }
     }
 
@@ -439,8 +442,8 @@ mod the_live_admission_cannot_move_a_finished_turns_charge {
     use roundhouse_core::context::ByteTokenizer;
     use roundhouse_core::control::{
         Allocation, Balance, BalanceQuery, Billing, Budget, BudgetCounts, BudgetTerms,
-        BudgetWindow, DEFAULT_WARN_AT, Exhaustion, Grant, Payer, Principal, Settled, SpendError,
-        SpendLedger, TurnCredentials, TurnPolicy,
+        BudgetWindow, DEFAULT_WARN_AT, Exhaustion, FairUseTerms, Grant, Payer, Principal, Settled,
+        SpendError, SpendLedger, TurnCredentials, TurnPolicy,
     };
     use roundhouse_core::event::{Accounting, Usage};
     use roundhouse_core::ids::{SessionId, TurnId};
@@ -520,9 +523,15 @@ mod the_live_admission_cannot_move_a_finished_turns_charge {
                 },
                 allocation: Allocation::Pooled,
             }),
+            // These tests are about the *settle*, which fair use does not
+            // touch: draws are recorded one seam out, in `run_turn`'s tail,
+            // precisely so that a project with windows and no budget is
+            // counted at all.
+            fair_use: Arc::new(FairUseTerms::default()),
             validation: None,
             credentials: TurnCredentials::unrestricted(),
             budget_counts,
+            tiers: None,
         }
     }
 
@@ -591,12 +600,14 @@ mod the_live_admission_cannot_move_a_finished_turns_charge {
                     billing: Billing::Billed,
                     budget_draw: logged,
                     withheld_providers: Vec::new(),
+                    declared_baseline: None,
+                    attempts: Vec::new(),
                 },
             )
             .await
             .unwrap();
         session
-            .complete(&response_id, "hi", frontier_usage())
+            .complete(&response_id, "hi", frontier_usage(), None)
             .await
             .unwrap();
 

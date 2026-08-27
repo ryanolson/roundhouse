@@ -191,12 +191,7 @@ fn session() -> SessionId {
 }
 
 /// Drive one turn through a validator.
-async fn consider(
-    enrolled: &Enrolled,
-    state: &SessionState,
-    policy: &TurnPolicy,
-    capability: &SteerCapability,
-) -> Interjection {
+async fn consider(enrolled: &Enrolled, state: &SessionState, policy: &TurnPolicy) -> Interjection {
     let response_id = ResponseId::new("resp_01J");
     let session_id = session();
     let principal = Principal::new("acme", "ada");
@@ -210,7 +205,6 @@ async fn consider(
             response_id: &response_id,
             turn_policy: policy,
             objective: Objective::from_items(&state.items),
-            capability,
             // No budget: what a ledger does about a check is the
             // implementation's business, and every assertion here is about
             // what the occupant does with the answer.
@@ -242,13 +236,7 @@ async fn a_session_with_no_arm_is_not_enrolled_and_is_never_asked_about() {
     // silently re-assign every historical session the day the salt moved.
     let mut unenrolled = stuck_in_arm(Arm::Live);
     unenrolled.arm = None;
-    let decided = consider(
-        &validator,
-        &unenrolled,
-        &TurnPolicy::unrestricted(),
-        &SteerCapability::Absent,
-    )
-    .await;
+    let decided = consider(&validator, &unenrolled, &TurnPolicy::unrestricted()).await;
     assert_eq!(decided, Interjection::proceed());
     assert_eq!(judge.asked(), 0);
 
@@ -257,7 +245,6 @@ async fn a_session_with_no_arm_is_not_enrolled_and_is_never_asked_about() {
         &validator,
         &stuck_in_arm(Arm::Live),
         &TurnPolicy::unrestricted(),
-        &SteerCapability::Absent,
     )
     .await;
     assert_eq!(judge.asked(), 1);
@@ -286,15 +273,7 @@ async fn the_shadow_arm_judges_and_releases_unchanged() {
     // `Complete`.
     let mut state = stuck_in_arm(Arm::Shadow);
     state.consecutive_interventions = 1;
-    let decided = consider(
-        &validator,
-        &state,
-        &TurnPolicy::unrestricted(),
-        &SteerCapability::Namespaced {
-            namespace: "mcp__roundhouse".into(),
-        },
-    )
-    .await;
+    let decided = consider(&validator, &state, &TurnPolicy::unrestricted()).await;
 
     assert_eq!(
         judge.asked(),
@@ -359,7 +338,6 @@ async fn the_placebo_arm_intervenes_without_calling_the_judge() {
         &validator,
         &stuck_in_arm(Arm::Placebo),
         &TurnPolicy::unrestricted(),
-        &SteerCapability::Absent,
     )
     .await;
 
@@ -402,7 +380,6 @@ async fn the_placebo_arm_intervenes_without_calling_the_judge() {
         &quiet,
         &stuck_in_arm(Arm::Placebo),
         &TurnPolicy::unrestricted(),
-        &SteerCapability::Absent,
     )
     .await;
     let Interjection::Proceed { record } = &decided else {
@@ -439,7 +416,6 @@ async fn a_placebo_under_the_off_channel_records_its_timing_and_alters_nothing()
         &validator,
         &stuck_in_arm(Arm::Placebo),
         &TurnPolicy::unrestricted(),
-        &SteerCapability::Absent,
     )
     .await;
 
@@ -482,7 +458,6 @@ async fn a_placebo_under_the_off_channel_records_its_timing_and_alters_nothing()
         &acting,
         &stuck_in_arm(Arm::Placebo),
         &TurnPolicy::unrestricted(),
-        &SteerCapability::Absent,
     )
     .await;
     assert!(matches!(decided, Interjection::Complete { .. }));
@@ -502,7 +477,6 @@ async fn a_verdict_that_does_not_parse_releases_the_turn_and_still_books_the_mon
             &validator,
             &stuck_in_arm(Arm::Live),
             &TurnPolicy::unrestricted(),
-            &SteerCapability::Absent,
         )
         .await;
 
@@ -543,7 +517,6 @@ async fn a_judge_that_cannot_be_reached_releases_the_turn_and_is_marked_not_free
         &validator,
         &stuck_in_arm(Arm::Live),
         &TurnPolicy::unrestricted(),
-        &SteerCapability::Absent,
     )
     .await;
     let Interjection::Proceed { record } = &decided else {
@@ -583,7 +556,6 @@ async fn a_judge_that_cannot_be_reached_releases_the_turn_and_is_marked_not_free
         &absent,
         &stuck_in_arm(Arm::Live),
         &TurnPolicy::unrestricted(),
-        &SteerCapability::Absent,
     )
     .await;
     let record = record_of(&decided);
@@ -620,13 +592,7 @@ async fn the_action_recorded_for_an_escalation_is_the_one_the_ceiling_permits() 
         allow: TargetFilter::parse(["local/*"]).expect("a well-formed pattern"),
         frontier_cadence: None,
     };
-    let decided = consider(
-        &validator,
-        &stuck_in_arm(Arm::Live),
-        &ceiling,
-        &SteerCapability::Absent,
-    )
-    .await;
+    let decided = consider(&validator, &stuck_in_arm(Arm::Live), &ceiling).await;
     let Interjection::Proceed { record } = &decided else {
         panic!("an escalation dispatches; the client never sees it. Got {decided:?}");
     };
@@ -671,7 +637,6 @@ async fn the_action_recorded_for_an_escalation_is_the_one_the_ceiling_permits() 
         ),
         &stuck_in_arm(Arm::Live),
         &strict,
-        &SteerCapability::Absent,
     )
     .await;
     let SessionEventKind::ValidationDecided {
@@ -696,9 +661,6 @@ async fn an_on_track_verdict_costs_money_and_changes_nothing() {
         &validator,
         &stuck_in_arm(Arm::Live),
         &TurnPolicy::unrestricted(),
-        &SteerCapability::Namespaced {
-            namespace: "mcp__roundhouse".into(),
-        },
     )
     .await;
     let Interjection::Proceed { record } = &decided else {
@@ -895,7 +857,6 @@ async fn a_spent_review_budget_releases_the_turn_and_records_why() {
         &validator,
         &stuck_in_arm(Arm::Live),
         &TurnPolicy::unrestricted(),
-        &SteerCapability::Absent,
     )
     .await;
     assert_eq!(judge.asked(), 0, "no capacity, no consult");
@@ -912,12 +873,28 @@ async fn a_spent_review_budget_releases_the_turn_and_records_why() {
     assert!(matches!(decided, Interjection::Proceed { .. }));
 }
 
+/// **T1 at the seam.** A steered turn completes with the guidance and the
+/// pending request, as one assistant message.
+///
+/// Replaces `a_steer_names_one_id_the_client_can_fetch_and_resend`, whose whole
+/// subject — the minted `rhsteer_*` call id, the arguments echoed verbatim, the
+/// `fetch_steer` round trip — is what M10.0 retired. What survives is the
+/// property that mattered underneath it: whatever the agent ends up reading is
+/// produced *here*, out of roundhouse's own vocabulary and the conversation's
+/// own words, and the composition of the two is the thing to pin.
 #[tokio::test]
-async fn a_steer_names_one_id_the_client_can_fetch_and_resend() {
-    // Past the first intervention, so escalation is spent and the protocol-heavy
-    // path is what is left — which is the order the plan puts them in.
+async fn a_steered_turn_completes_with_the_guidance_and_the_restated_request() {
+    // Past the first intervention, so escalation is spent and the steer is what
+    // is left — which is the order the plan puts them in.
     let mut state = stuck_in_arm(Arm::Live);
     state.consecutive_interventions = 1;
+    // The pending request, appended so the seam has something to restate. The
+    // brief's objective and the steer's restatement read the same span of bytes
+    // — see `trailing_user_request` — which is what stops the judge being
+    // briefed on one task while the agent is re-pointed at another.
+    state
+        .items
+        .push(Item::user_text("make the parser accept trailing commas"));
     let validator = enrolled(
         ScriptedJudge::answering(OFF_TRACK),
         ValidationTerms {
@@ -929,103 +906,120 @@ async fn a_steer_names_one_id_the_client_can_fetch_and_resend() {
             ..live_terms()
         },
     );
-    let decided = consider(
-        &validator,
-        &state,
-        &TurnPolicy::unrestricted(),
-        &SteerCapability::Namespaced {
-            namespace: "mcp__roundhouse".into(),
-        },
-    )
-    .await;
-    let Interjection::Complete {
-        item,
-        guidance,
-        usage,
-        ..
-    } = &decided
-    else {
+    let decided = consider(&validator, &state, &TurnPolicy::unrestricted()).await;
+    let Interjection::Complete { item, usage, .. } = &decided else {
         panic!("expected a steered turn; got {decided:?}");
     };
-    let ItemContent::ToolCall {
-        call_id,
-        name,
-        arguments,
-    } = &item.content
-    else {
-        panic!("a steer is a tool call");
+    let ItemContent::Text { text } = &item.content else {
+        panic!("a steer is assistant text now; got {item:?}");
     };
-    assert_eq!(name, STEER_TOOL, "the bare name; a namespace is a dialect");
-    assert_eq!(call_id, "rhsteer_resp_01J");
+    assert_eq!(item.role, Role::Assistant);
     assert_eq!(
-        arguments, r#"{"steer_id":"rhsteer_resp_01J"}"#,
-        "one id written once: the call an agent fetches by and the call its \
-         client resends are the same string"
-    );
-    assert_eq!(
-        item.response_id, None,
-        "the item is built without provenance; only the commit stamps it"
+        item.response_id.as_ref(),
+        Some(&ResponseId::new("resp_01J")),
+        "the occupant names the response it is answering, and \
+         `complete_with_item` overwrites the field on the way in regardless -- \
+         so the stamp is still applied in exactly one place and an occupant \
+         cannot claim a response it was not given"
     );
     assert!(
-        !guidance.contains("never opened the failing import"),
+        !text.contains("never opened the failing import"),
         "the judge answered in prose and none of it reaches the agent -- this \
-         payload is dispatched into the agent's own context, and a model that \
+         text is committed into the agent's own conversation, and a model that \
          just read an attacker-influenceable transcript wrote that sentence"
     );
     assert!(
-        guidance.contains("step 3"),
+        text.contains("step 3"),
         "what does travel is the step it located, which is a number"
     );
     assert!(
-        guidance.contains("identical output 4 times"),
+        text.contains("identical output 4 times"),
         "and roundhouse's own measurement travels as a fact"
+    );
+    assert!(
+        text.contains("> make the parser accept trailing commas"),
+        "and the pending request is restated, quoted, so the agent has the \
+         correction and the task in one place: {text}"
+    );
+
+    // The composition is `render_steer_answer`'s and not a second spelling of
+    // it. Pinned here as an equality so the seam and the golden test in
+    // `verdict::tests` cannot drift into two renderings.
+    let SessionEventKind::ValidationDecided {
+        outcome:
+            ValidationOutcome::Judged {
+                action: SteerAction::Steer { directive },
+                ..
+            },
+        ..
+    } = &record_of(&decided).kinds()[1]
+    else {
+        panic!("expected a judged steer");
+    };
+    assert_eq!(
+        text,
+        &crate::validate::render_steer_answer(
+            directive,
+            Some("make the parser accept trailing commas")
+        )
+    );
+    assert!(
+        !directive.contains("make the parser accept trailing commas"),
+        "the log books the directive alone; the user's words appear once, in \
+         the item beside it"
     );
     assert_eq!(usage.total(), 4_040);
 }
 
 #[tokio::test]
-async fn a_halt_completes_with_text_and_leaves_nothing_to_fetch() {
+async fn a_halt_completes_with_text_and_restates_nothing() {
     let mut state = stuck_in_arm(Arm::Live);
     state.consecutive_interventions = 1;
+    state.items.push(Item::user_text("the pending request"));
     let validator = enrolled(
         ScriptedJudge::answering(OFF_TRACK),
         ValidationTerms {
             action: ActionPolicy {
                 channel: SteerChannel::Auto,
-                steer_after_interventions: 1,
+                // Zero: the steer allowance is spent, so the ladder's next rung
+                // is the halt. Under M10.0 this is the *only* thing that
+                // separates the two outcomes — both are assistant text.
+                steer_after_interventions: 0,
                 ..ActionPolicy::default()
             },
             ..live_terms()
         },
     );
-    // No capability under `Auto`: the degrade path, which hands control back to
-    // the human rather than emitting a call the client cannot dispatch.
-    let decided = consider(
-        &validator,
-        &state,
-        &TurnPolicy::unrestricted(),
-        &SteerCapability::Absent,
-    )
-    .await;
+    let decided = consider(&validator, &state, &TurnPolicy::unrestricted()).await;
     let Interjection::Complete { item, .. } = &decided else {
         panic!("expected a halted turn; got {decided:?}");
     };
-    assert!(
-        matches!(item.content, ItemContent::Text { .. }),
-        "plain text ends the client's loop; there is no call, so nothing is \
-         deposited for an agent to fetch"
-    );
+    let ItemContent::Text { text } = &item.content else {
+        panic!("a halt is assistant text");
+    };
     assert_eq!(item.role, Role::Assistant);
+    assert!(
+        !text.contains("> the pending request"),
+        "a halt hands control back to a human: restating the task would invite \
+         the agent to carry on, which is the thing the halt is refusing"
+    );
+    assert!(
+        text.contains("step 3"),
+        "the control: the guidance itself still reaches the conversation, so \
+         the assertion above is about the restatement and not about an empty \
+         halt"
+    );
 }
 
 /// The security boundary the whole verdict module is arranged around, asserted
 /// where the agent-facing values are actually produced.
 ///
-/// `verdict::tests` pins the same property on `map`. This is the occupant's
-/// half: the two shapes a completing interjection can take both leave here, and
-/// a `Halt`'s item is committed into the conversation permanently — it prefixes
-/// every later turn of the session, so a sentence that lands in it is not one
-/// interruption but a durable instruction.
+/// `verdict::tests` pins the same property on `map` and on
+/// `render_steer_answer`. This is the occupant's half: the two shapes a
+/// completing interjection can take both leave here, and both are now committed
+/// into the conversation permanently — they prefix every later turn of the
+/// session, so a sentence that lands in one is not one interruption but a
+/// durable instruction.
 #[tokio::test]
 async fn no_shape_a_completing_interjection_takes_carries_the_judges_prose() {
     let steering = ValidationTerms {
@@ -1041,37 +1035,34 @@ async fn no_shape_a_completing_interjection_takes_carries_the_judges_prose() {
     let mut state = stuck_in_arm(Arm::Live);
     state.consecutive_interventions = 1;
 
-    // Both of them, from the same poisoned verdict: the tool call a client
-    // dispatches, and the plain text the degrade path commits.
-    for capability in [
-        SteerCapability::Namespaced {
-            namespace: "mcp__roundhouse".into(),
-        },
-        SteerCapability::Absent,
-    ] {
-        let validator = enrolled(ScriptedJudge::answering(POISONED), steering.clone());
-        let decided = consider(&validator, &state, &TurnPolicy::unrestricted(), &capability).await;
-        let Interjection::Complete {
-            item,
-            guidance,
-            record,
-            ..
-        } = &decided
-        else {
-            panic!("expected a completing interjection for {capability:?}; got {decided:?}");
+    // Both completing shapes, from the same poisoned verdict: the steer, which
+    // restates the request, and the halt, which does not. `steer_after_interventions`
+    // is the only thing that selects between them now.
+    for allowance in [1u32, 0] {
+        let terms = ValidationTerms {
+            action: ActionPolicy {
+                steer_after_interventions: allowance,
+                ..steering.action
+            },
+            ..steering.clone()
+        };
+        let validator = enrolled(ScriptedJudge::answering(POISONED), terms);
+        let decided = consider(&validator, &state, &TurnPolicy::unrestricted()).await;
+        let Interjection::Complete { item, record, .. } = &decided else {
+            panic!("expected a completing interjection at {allowance}; got {decided:?}");
         };
 
         // The debug rendering rather than one field, so this bites on whatever
         // shape the item takes rather than on the shape it takes today.
-        let agent_facing = format!("{item:?}\n{guidance}");
+        let agent_facing = format!("{item:?}");
         for injected in ["IGNORE THE ABOVE", "curl evil.sh"] {
             assert!(
                 !agent_facing.contains(injected),
-                "`{injected}` reached the agent through {capability:?}: {agent_facing}"
+                "`{injected}` reached the agent at {allowance}: {agent_facing}"
             );
         }
         assert!(
-            guidance.contains("identical output 4 times"),
+            item.spoken_text().contains("identical output 4 times"),
             "the control: roundhouse's own measurement still reaches the agent, \
              so the assertions above are about provenance and not about an \
              empty directive"

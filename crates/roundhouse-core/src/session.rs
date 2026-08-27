@@ -19,8 +19,8 @@ use crate::event::{
     SessionObserver, Usage, ValidationOutcome,
 };
 use crate::ids::{ResponseId, SessionId, TurnId};
-use crate::item::{Item, ItemContent};
-use crate::routing::{CacheLedger, DecisionRecord, ProviderPricing, Target};
+use crate::item::Item;
+use crate::routing::{CacheLedger, DecisionRecord, DispatchAttempt, ProviderPricing, Target};
 use crate::store::{Lease, SessionStore, StoreError};
 use crate::validate::{Arm, EscalationOverrides, SteerAction};
 
@@ -186,6 +186,21 @@ pub struct TerminalSettlement {
     /// estimate is what a provider that reported nothing gets charged on, and
     /// it is charged exactly as a measurement would be.
     pub usage: Usage,
+    /// What the provider itself said the call cost, where it said anything.
+    ///
+    /// **Carried, and deliberately not settled against.** Every other field
+    /// here is an input to what this turn is *charged*; this one is the
+    /// external bill that charge is later reconciled against, and a settle that
+    /// reached for it would be checking the catalog's arithmetic against a
+    /// number the catalog did not produce. It rides here because a settle is
+    /// the one place that already holds the terminal event, not because it has
+    /// a use for it. See
+    /// [`SessionEventKind::ResponseCompleted::provider_reported_cost_usd`].
+    ///
+    /// `None` for an incomplete response, which by construction never carried
+    /// one: the price arrives on the stream's final frame, and a response that
+    /// terminated without one never saw it.
+    pub provider_reported_cost_usd: Option<f64>,
 }
 
 /// State derived from the event log.
@@ -228,6 +243,17 @@ pub struct SessionState {
     /// that. Counting only successes would let a provider outage multiply the
     /// frontier traffic of every session retrying through it, at the moment
     /// the knob is most supposed to hold.
+    ///
+    /// Since M10 a turn may write more than one `Routed` — one per dispatch, on
+    /// a decision that fell forward to a fallback — and the *numerator* needs
+    /// no change to be right about it: a turn that reached for two hosted
+    /// models counted two reaches, which is the sentence above applied
+    /// literally rather than a special case bolted onto it. The **window** did
+    /// need one, and that was review finding G05: the projection groups its
+    /// entries by `turn_index` so a cadence's `per_turns` counts turns, not
+    /// dispatches. Ungrouped, a failover turn made the window shorter than the
+    /// operator wrote, aging an older hosted turn out early and relaxing the
+    /// ration on exactly the sessions that had been failing over.
     pub frontier_history: FrontierHistory,
     /// The most recent response to terminate, priced-ready.
     ///
@@ -243,28 +269,6 @@ pub struct SessionState {
     /// `None` until a response terminates, which is also the honest answer for
     /// a session whose only turns are still open.
     last_settlement: Option<TerminalSettlement>,
-    /// Steers this deployment emitted that no client has answered yet, keyed
-    /// by `call_id` and valued by the log timestamp of the `ItemAppended` that
-    /// opened each one.
-    ///
-    /// The timestamp is what makes fulfilment latency derivable from the
-    /// projection and the log alone — the closing item's own `at_ms` minus
-    /// this one — without a second table to keep in step with the first.
-    ///
-    /// Filled by an `ItemAppended` whose item is a `ToolCall` *bearing a
-    /// response id*, and cleared by an `ItemAppended` whose item is a
-    /// `ToolResult` naming the same call. Provenance rather than shape is what
-    /// selects the opening item: everything on the input path canonicalizes
-    /// with no response id, so a client cannot open a steer by sending a tool
-    /// call. One writer, one event kind, no second source of truth.
-    ///
-    /// `pub(crate)` rather than `pub` because its consumer is M6's trigger —
-    /// the open-steer exclusion that stops a steer re-triggering the
-    /// validation that emitted it. It ships with M4 anyway because it is a
-    /// fact about M4's items: the events that fill it are emitted here, and a
-    /// projection added later against an older log is a projection nobody has
-    /// replayed.
-    pub(crate) open_steers: HashMap<String, u64>,
     /// The most recent routing decision, whether or not its response has
     /// terminated.
     ///
@@ -341,14 +345,33 @@ pub struct SessionState {
     /// only grows, so charging a judge outage to it would close the trigger's
     /// gate for good on a session that never got a check.
     pub(crate) validations_run: u32,
-    /// The turn index at which a client's input last closed an open steer.
+    /// The turn index on which this deployment last answered with a steer.
     ///
-    /// The hysteresis rule's evidence. By the time the interjection seam runs,
-    /// the turn's input is already committed, so `open_steers` has *already*
-    /// been cleared by the fulfilling result — asking "is a steer open" would
-    /// answer no on exactly the turn the rule is about. Recording the turn it
-    /// closed on is what makes the question answerable at all.
-    pub(crate) steer_fulfilled_on_turn: Option<u64>,
+    /// The hysteresis rule's evidence, and it is a fold of `ValidationDecided`
+    /// rather than of the item the decision produced. **Two reasons, and the
+    /// first is the one that would otherwise be a defect:** since M10.0 a steer
+    /// is assistant text stamped with a response id, which is exactly the shape
+    /// of every dispatched turn's answer, so no property of the *item* can tell
+    /// them apart. `ValidationDecided` carries the action, so it can. The second
+    /// is that this keeps the prefix hashes byte-identical — the guidance item
+    /// is an ordinary item with no marker on it, and a resent history carrying
+    /// it admits as prefix with no exclusion rule anywhere.
+    ///
+    /// Read against `turn_index - 1`, never against `turn_index`: the decision
+    /// is committed on the turn it interrupts, and the turn that *fulfils* it is
+    /// the next one. See [`Self::this_turn_fulfils_a_steer`].
+    pub(crate) steered_on_turn: Option<u64>,
+    /// The most recent correction this deployment put in the conversation.
+    ///
+    /// Folded from the same event and for the same reason: the text is in the
+    /// log as an item, but nothing about the item says which one it is. Held so
+    /// the MCP surface can serve "the steer, re-readable" as a pure read of the
+    /// session rather than out of a node-local store that a restart empties.
+    ///
+    /// The *directive*, not the composed answer — the restated request is in the
+    /// conversation already, one item away, and a second copy here would be a
+    /// second copy of the user's own words.
+    pub(crate) last_guidance: Option<String>,
     /// Billable tokens per *dispatched* terminated turn, oldest first, bounded
     /// to [`TURN_TOKEN_WINDOW`].
     ///
@@ -379,6 +402,33 @@ pub struct ActiveEscalation {
     /// Turns still to be served under it, counting from and including the turn
     /// the escalation was decided on.
     pub turns_remaining: u32,
+    /// The turn the decision was committed on.
+    ///
+    /// Held so [`SessionState::this_turn_opened_an_escalation`] can answer "is
+    /// this the *first* turn under the narrowing", which is the gate the R2
+    /// handoff note rides. `turns_remaining` cannot answer it: the count the
+    /// escalation started at lives in the membership's `ActionPolicy` and never
+    /// enters the fold, so "3 remaining" says nothing about whether 3 was the
+    /// beginning or a deployment that configured four turns is one in.
+    ///
+    /// Recorded rather than derived for the same reason `steered_on_turn` is —
+    /// see the `ValidationDecided` arm — and it is deliberately the same
+    /// quantity: the turn index as the log's own fold counts it, so a successor
+    /// replaying this session decorates exactly the turn this process would
+    /// have, and no turn twice.
+    pub decided_on_turn: u64,
+}
+
+/// `Some(text)` for text somebody actually wrote, `None` for a marker.
+///
+/// Named once because two arms of the fold need it and both are about the same
+/// hazard: an action's text field is the *agent-facing* correction, and an
+/// empty one is a placeholder that would otherwise be re-readable as a
+/// correction that said nothing. Trimmed rather than merely length-checked, so
+/// a reason that is only whitespace answers the same way — a correction made of
+/// spaces is no more readable than one made of nothing.
+fn non_empty(text: String) -> Option<String> {
+    (!text.trim().is_empty()).then_some(text)
 }
 
 impl SessionState {
@@ -395,65 +445,28 @@ impl SessionState {
         self.last_event_at_ms = event.at_ms;
         match &event.kind {
             SessionEventKind::ItemAppended { item } => {
-                // The conversation itself is untouched by steering: an emitted
-                // tool call is an ordinary item arriving on the ordinary path,
-                // which is the whole reason this kind was reused rather than a
-                // second item-carrying kind added. A second kind would have
-                // given this fold, the wire layer's stored-items projection and
-                // the context assembler two sources for one conversation, and
-                // the first site to forget the second kind forks every steered
-                // session.
+                // The conversation itself is untouched by steering: the
+                // correction is an ordinary assistant message arriving on the
+                // ordinary path, which is the whole reason this kind was reused
+                // rather than a second item-carrying kind added. A second kind
+                // would have given this fold, the wire layer's stored-items
+                // projection and the context assembler two sources for one
+                // conversation, and the first site to forget the second kind
+                // forks every steered session.
+                //
+                // **Nothing else is folded from an item any more, and that is
+                // M10.0's discriminator problem stated as a comment.** Until
+                // M10.0 the steer was a `ToolCall` bearing a response id, and
+                // provenance was a free discriminator: everything on the input
+                // path canonicalizes with no response id, so a stamped tool call
+                // could only be ours. Text has no such luck — `Session::complete`
+                // stamps every dispatched turn's answer the same way — so a
+                // branch here keyed on "assistant text with a response id" would
+                // mark *every ordinary turn* as a steer and suppress validation
+                // for the life of the session. The fact is taken off
+                // `ValidationDecided` instead, which is the one event that says
+                // a steer happened.
                 self.items.push(item.clone());
-                // The projection beside it, folded from the same event. See
-                // `open_steers`.
-                match &item.content {
-                    ItemContent::ToolCall { call_id, .. } => {
-                        // Provenance, not shape. An item on the input path
-                        // canonicalizes with no response id, so this arm is
-                        // unreachable for anything a client sent — including
-                        // the client's own verbatim resend of the very call it
-                        // is about to answer, which must not re-open the steer
-                        // its output closes.
-                        if item.response_id.is_some() {
-                            self.open_steers.insert(call_id.clone(), event.at_ms);
-                        }
-                    }
-                    ItemContent::ToolResult { call_id, output } => {
-                        // Keyed on the call id and not on "a result arrived":
-                        // an agent runs its own tools between our turns, and
-                        // closing on any of those would report a steer
-                        // fulfilled that nobody answered.
-                        if self.open_steers.remove(call_id).is_some() {
-                            // Bookkeeping and hysteresis are two questions, and
-                            // a cancelled call answers them differently (F05).
-                            // The steer is closed either way — the call will
-                            // never be answered now, and leaving it open would
-                            // make an abandoned steer look permanently
-                            // in-flight. But the *hysteresis* exists to stop
-                            // the turn that delivers a correction re-triggering
-                            // the validation that emitted it, and codex's
-                            // cancellation notice delivered no correction: the
-                            // agent saw "user cancelled MCP tool call", not the
-                            // directive. Recording that turn as the fulfilling
-                            // one suppresses judging on the one turn where
-                            // nothing was fixed, and the dashboard reads a
-                            // healthy steer loop. Letting the trigger
-                            // re-evaluate instead costs at most a re-steer,
-                            // which `consecutive_interventions` and the Halt
-                            // ladder already bound.
-                            if !crate::validate::exchange::is_undelivered_tool_result(output) {
-                                // Which turn closed it, for the trigger's
-                                // hysteresis. The removal above is what the
-                                // question is really about, and asking `is a
-                                // steer open` at the seam would answer `no` on
-                                // exactly this turn — the input is committed
-                                // before the seam runs.
-                                self.steer_fulfilled_on_turn = Some(self.turn_index);
-                            }
-                        }
-                    }
-                    ItemContent::Text { .. } => {}
-                }
             }
             SessionEventKind::TurnStarted {
                 turn_id,
@@ -466,7 +479,14 @@ impl SessionState {
                 response_id,
                 decision,
             } => {
-                self.frontier_history.record(&decision.chosen);
+                // Under this turn's index, which is what makes the cadence's
+                // `per_turns` a promise about turns: a decision that falls
+                // forward writes one `Routed` per dispatch, and all of them
+                // share the index because `turn_index` moves only at
+                // `TurnStarted`. See `FrontierHistory` on what a flat
+                // per-dispatch vector cost (review finding G05).
+                self.frontier_history
+                    .record(&decision.chosen, self.turn_index);
                 self.last_decision = Some(decision.clone());
                 // Held rather than recorded; see `pending_routings`.
                 self.pending_routings.insert(
@@ -481,7 +501,9 @@ impl SessionState {
                     },
                 );
             }
-            SessionEventKind::ResponseCompleted { response_id, usage }
+            SessionEventKind::ResponseCompleted {
+                response_id, usage, ..
+            }
             | SessionEventKind::ResponseIncomplete {
                 response_id, usage, ..
             } => {
@@ -527,6 +549,16 @@ impl SessionState {
                     budget_draw: routing.as_ref().and_then(|routing| routing.budget_draw),
                     target: routing.map(|routing| routing.target),
                     usage: usage.clone(),
+                    // Off the completed event only. An incomplete response
+                    // never reached the frame the price rides on, so `None`
+                    // here is the true reading rather than a lost value.
+                    provider_reported_cost_usd: match &event.kind {
+                        SessionEventKind::ResponseCompleted {
+                            provider_reported_cost_usd,
+                            ..
+                        } => *provider_reported_cost_usd,
+                        _ => None,
+                    },
                 });
 
                 // A turn is only settled once its response terminates, which is
@@ -666,13 +698,64 @@ impl SessionState {
                     && let Some(action) = action
                 {
                     self.turn_intervened |= action.intervenes();
-                    if let SteerAction::Escalate { turns, overrides } = action
-                        && turns > 0
-                    {
-                        self.escalation = Some(ActiveEscalation {
-                            overrides,
-                            turns_remaining: turns,
-                        });
+                    match action {
+                        SteerAction::Escalate { turns, overrides } if turns > 0 => {
+                            self.escalation = Some(ActiveEscalation {
+                                overrides,
+                                turns_remaining: turns,
+                                // The turn this decision is committed on, which
+                                // is the turn it first applies to: the seam runs
+                                // after `TurnStarted`, so the narrowing reaches
+                                // `plan` on this same turn. A re-escalation
+                                // while one is already in force moves this
+                                // forward, which is the honest reading — it is a
+                                // new signal-driven decision, not the old one
+                                // continuing, and the note that narrates it is
+                                // narrating a switch that just happened.
+                                decided_on_turn: self.turn_index,
+                            });
+                        }
+                        // **The steer's only trace in the fold, and the only
+                        // place one can be taken from.** The item this decision
+                        // produces is assistant text indistinguishable from any
+                        // other answer, so `steered_on_turn` has to come off the
+                        // decision rather than off the item — see the field, and
+                        // see the `ItemAppended` arm for what a shape-based
+                        // discriminator would have cost.
+                        //
+                        // A halt is deliberately not one. It ends the agent's
+                        // loop and restates nothing, so there is no turn coming
+                        // that fulfils it; suppressing the next turn's
+                        // validation on that basis would suppress a turn a human
+                        // started.
+                        SteerAction::Steer { directive } => {
+                            self.steered_on_turn = Some(self.turn_index);
+                            self.last_guidance = non_empty(directive);
+                        }
+                        // **Empty is not a correction, and the placebo arm is
+                        // why that has to be said here.** A placebo
+                        // intervention consults no judge, so the fold above
+                        // represents it as a `Halt` with a deliberately empty
+                        // reason — a marker, not text. Nothing read a halt's
+                        // reason out of the fold before M10.0, so the marker
+                        // went nowhere; `last_guidance` gave it somewhere to
+                        // go, and `fetch_steer` would then serve
+                        // `{"guidance": ""}` — the exact payload
+                        // `SurfaceError::NoGuidanceYet` exists to refuse,
+                        // because an agent reads an empty correction as "there
+                        // was nothing to correct".
+                        //
+                        // Filtering here rather than at the tool, on the
+                        // one-writer argument this whole module rests on: the
+                        // fold is what claims a correction exists, so it is the
+                        // fold that must not claim one nobody wrote. A guard at
+                        // the surface would leave the projection asserting
+                        // something false and every future reader re-deriving
+                        // the same filter.
+                        SteerAction::Halt { reason } => {
+                            self.last_guidance = non_empty(reason);
+                        }
+                        SteerAction::Continue | SteerAction::Escalate { .. } => {}
                     }
                 }
             }
@@ -720,15 +803,36 @@ impl SessionState {
         self.validations_run
     }
 
-    /// Whether the input already committed for the turn in flight closed a
-    /// steer this deployment emitted.
+    /// Whether the turn in flight is the one that follows a steer.
     ///
-    /// The trigger's hysteresis rule, and the reason it is a question about a
-    /// *turn index* rather than about `open_steers`: the fulfilling result is
-    /// committed with the turn's input, before the interjection seam runs, so
-    /// the steer is already closed by the time anybody asks.
-    pub fn this_turn_fulfilled_a_steer(&self) -> bool {
-        self.steer_fulfilled_on_turn == Some(self.turn_index)
+    /// The trigger's hysteresis rule: the turn after a correction is the turn
+    /// that acts on it, and judging that turn would re-trigger the validation
+    /// that produced the correction before the agent has had a chance to comply.
+    ///
+    /// **`turn_index - 1`, and the off-by-one is the whole of it.** The steer is
+    /// decided and committed *during* turn N — the seam runs after that turn's
+    /// `TurnStarted`, so `turn_index` reads N when the decision folds — and the
+    /// agent reads it on turn N+1. Comparing against `turn_index` would suppress
+    /// the turn that emitted the steer (already past the gate) and judge the one
+    /// that answers it; comparing against `turn_index - 1` suppresses exactly
+    /// one turn, and turn N+2 is judged again.
+    ///
+    /// The predecessor of this rule asked a different question — "did this
+    /// turn's input close an open steer" — because the correction arrived as a
+    /// tool result, which is a fact about the *input*. The correction is the
+    /// previous turn's *answer* now, so the fact is about the previous turn.
+    pub fn this_turn_fulfils_a_steer(&self) -> bool {
+        self.steered_on_turn
+            .is_some_and(|steered| self.turn_index == steered.saturating_add(1))
+    }
+
+    /// The most recent correction this deployment put in this conversation.
+    ///
+    /// A pure read of the fold, which is what lets the MCP surface serve it back
+    /// without a node-local store: the guidance is in the log either way, and
+    /// this says which item it is.
+    pub fn last_guidance(&self) -> Option<&str> {
+        self.last_guidance.as_deref()
     }
 
     /// Billable tokens per dispatched terminated turn, oldest first. See
@@ -745,6 +849,25 @@ impl SessionState {
     /// would invite a second place that decides what an escalation means.
     pub fn active_escalation(&self) -> Option<EscalationOverrides> {
         self.escalation.map(|escalation| escalation.overrides)
+    }
+
+    /// Whether the turn in flight is the *first* one served under the escalation
+    /// now in force.
+    ///
+    /// The gate the R2 handoff note rides, and the reason it is a fold read
+    /// rather than a flag the engine keeps: the note must ride once per switch,
+    /// and "once" has to survive a successor picking the session up mid-turn.
+    /// Anything held in the engine would decorate a second time after a failover
+    /// — which is precisely the accumulation Switchyard's statelessness rule
+    /// exists to prevent (`stage.rs:436-438@053a61e`).
+    ///
+    /// `false` on every turn of a session that has never been escalated, on
+    /// every later turn of one that has, and — for the same reason
+    /// [`Self::active_escalation`] is `None` there — on every turn of a Shadow
+    /// arm, whose computed escalation the fold declines to take.
+    pub fn this_turn_opened_an_escalation(&self) -> bool {
+        self.escalation
+            .is_some_and(|escalation| escalation.decided_on_turn == self.turn_index)
     }
 
     pub fn completed_response_for(&self, turn_id: &TurnId) -> Option<&ResponseId> {
@@ -778,23 +901,6 @@ impl SessionState {
     /// accurate answer rather than an empty one.
     pub fn last_decision(&self) -> Option<&DecisionRecord> {
         self.last_decision.as_ref()
-    }
-
-    /// `call_id`s of steers this deployment emitted that no turn has answered.
-    ///
-    /// Sorted, so two reads of one projection are two identical answers: the
-    /// underlying map has no order, and this is rendered into an agent's
-    /// context by `status`, where a list that reshuffled between calls is a
-    /// list an agent reads as having changed.
-    ///
-    /// The accessor rather than the field: [`Self::open_steers`] stays private
-    /// because it is a fold this module owns, and its two consumers — M5's
-    /// `status` tool and M6's trigger — both want the ids and neither wants the
-    /// timestamps.
-    pub fn open_steer_ids(&self) -> Vec<String> {
-        let mut ids: Vec<String> = self.open_steers.keys().cloned().collect();
-        ids.sort();
-        ids
     }
 
     /// Rebuild a session's projection from its log, **taking no lease**.
@@ -1138,17 +1244,26 @@ impl<S: SessionStore> Session<S> {
     /// produced item and the terminal event in one append batch — is a property
     /// of *completing*, not of completing with a particular shape of item, and
     /// stating it twice is how the two spellings drift apart.
+    /// `provider_reported_cost_usd` is what the upstream said the call cost, on
+    /// the providers that say — see
+    /// [`SessionEventKind::ResponseCompleted::provider_reported_cost_usd`] for
+    /// why it is a sidecar rather than part of `usage`. It is a parameter here
+    /// and absent from [`Self::complete_with_item`] because only a *dispatched*
+    /// turn can have one: the other spelling completes a turn an interjector
+    /// answered, which reached no provider at all and so has no bill to report.
     pub async fn complete(
         &mut self,
         response_id: &ResponseId,
         text: impl Into<String>,
         usage: Usage,
+        provider_reported_cost_usd: Option<f64>,
     ) -> Result<(), SessionError> {
-        self.complete_with_item(
+        self.commit_completion(
             response_id,
             Item::assistant_text(text, response_id.clone()),
             usage,
             ControlRecord::default(),
+            provider_reported_cost_usd,
         )
         .await
     }
@@ -1205,6 +1320,24 @@ impl<S: SessionStore> Session<S> {
         usage: Usage,
         record: ControlRecord,
     ) -> Result<(), SessionError> {
+        // `None`, and it is a claim rather than a default: this spelling exists
+        // for the turn an interjector answered, which dispatched nothing, so
+        // there is no upstream to have reported a price. The dispatched turn's
+        // spelling one method up is the one that carries a figure.
+        self.commit_completion(response_id, item, usage, record, None)
+            .await
+    }
+
+    /// The one place a completion is committed, and the reason the two public
+    /// spellings cannot disagree about the batch they write.
+    async fn commit_completion(
+        &mut self,
+        response_id: &ResponseId,
+        item: Item,
+        usage: Usage,
+        record: ControlRecord,
+        provider_reported_cost_usd: Option<f64>,
+    ) -> Result<(), SessionError> {
         let item = Item {
             response_id: Some(response_id.clone()),
             ..item
@@ -1214,6 +1347,7 @@ impl<S: SessionStore> Session<S> {
         kinds.push(SessionEventKind::ResponseCompleted {
             response_id: response_id.clone(),
             usage,
+            provider_reported_cost_usd,
         });
         self.commit(kinds).await?;
         Ok(())
@@ -1243,12 +1377,20 @@ impl<S: SessionStore> Session<S> {
     /// The partial text is committed as an assistant item so the successor can
     /// resume from it. That partial is also, conveniently, a guaranteed cache
     /// hit on the target that produced it.
+    ///
+    /// `terminal_attempt` is the dispatch this failure *is*, when the failure
+    /// came from a target rather than from a refusal or a deadline — see
+    /// [`SessionEventKind::ResponseIncomplete::terminal_attempt`]. It is
+    /// carried here rather than derived from `usage` because a dispatch that
+    /// reached nobody has no usage to derive it from, which is precisely the
+    /// case it exists for.
     pub async fn mark_incomplete(
         &mut self,
         response_id: &ResponseId,
         partial: impl Into<String>,
         reason: IncompleteReason,
         usage: Usage,
+        terminal_attempt: Option<DispatchAttempt>,
     ) -> Result<(), SessionError> {
         let partial = partial.into();
         let mut kinds = Vec::with_capacity(2);
@@ -1261,6 +1403,7 @@ impl<S: SessionStore> Session<S> {
             response_id: response_id.clone(),
             reason,
             usage,
+            terminal_attempt,
         });
         self.commit(kinds).await?;
         Ok(())
