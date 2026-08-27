@@ -308,8 +308,12 @@ ephemeral env/argv injection, snapshot-and-restore persistent installs,
 dry-run plans, secret-env hygiene) and is used as-is there; it has **no TUI,
 no named profiles, and no vocabulary for models, routes, keys, or budgets**
 (its config model is four sections, none naming a model). So roundhouse ships
-the other half: a new workspace crate `roundhouse-launch` — its own binary,
-which is what keeps `main.rs`'s no-flag-parser rule intact — with plain
+the other half: a new workspace crate **`topham`** (binary `topham`; named
+2026-08-27 for Sir Topham Hatt, the Fat Controller — the one who decides
+which engine runs which route and dispatches them from the sheds, which is
+exactly what a launcher does at a roundhouse; runner-up was `knapford`, the
+departure station) — its own binary, which is what keeps `main.rs`'s
+no-flag-parser rule intact — with plain
 subcommands (scriptable, CI-able) and a `ratatui` TUI over them, that:
 creates and manages **named config profiles** (the thing Relay lacks);
 generates the codex launch files via the existing `codex_launch` library and
@@ -333,8 +337,18 @@ enumerates — the refusal-over-silently-wrong posture `codex_launch` set).
   "0.8.0 final is not out yet" parenthetical is corrected with a dated note
   in the same commit as this plan. The `uuid = "=1.18.1"` ceiling and its
   unlock condition are unchanged — 0.8.0 did not relax it.
-- The OpenAPI snapshot becomes a recorded pin (sha256 + source SDK rev +
-  refresh mechanism), per R1.
+- The OpenAPI snapshot becomes a recorded pin (`spec_pin.json`: URL, our own
+  body sha256, `.stats.yml`'s opaque hash, source SDK rev, fetch date,
+  vocabulary), per R1 — and the **`anthropic-spec-sync` skill**
+  (`.claude/skills/anthropic-spec-sync/`) is the rot-prevention loop that
+  keeps it honest: discover the current spec through the SDK's `.stats.yml`,
+  diff the pinned vocabulary structurally, update the pin, let the pinning
+  tests produce the worklist, fix breaks test-first, and record the move as a
+  dated addendum. It runs before any milestone touching the dialect and on
+  whatever recurring cadence the operator sets. (Building it same-day
+  corrected an evidence claim: the URL-embedded hash is an opaque Stainless
+  content address, not the body's sha256 — the pin records all three
+  identifiers so nobody re-conflates them.)
 - The Relay family cut five releases in seven days and `0.8.1-rc.1` shipped
   hours before Dive B's read; **M11.2 re-reads the then-current release
   before the chained-topology work**, per the synergy-vigilance rule.
@@ -371,7 +385,7 @@ cadence. Stage briefs carry §3 verbatim.
   credential the real client presents to a custom base URL under a
   subscription login (Relay's forwarding half is proven; the client half is
   a one-capture test).
-- **M11.3 — the launcher.** `roundhouse-launch`: subcommands, profiles, TUI,
+- **M11.3 — the launcher.** `topham`: subcommands, profiles, TUI,
   Relay handoff (R8). Ships last because it composes everything the earlier
   rungs made launchable, and because it is the only rung whose absence
   blocks no other.

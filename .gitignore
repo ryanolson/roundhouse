@@ -2,3 +2,4 @@ target/
 /target
 *.log
 /.redis-test/
+__pycache__/

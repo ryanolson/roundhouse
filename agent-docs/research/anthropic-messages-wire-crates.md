@@ -108,8 +108,15 @@ It covers precisely what roundhouse needs to serve and dispatch:
 
 **Two cautions on this artefact, both load-bearing.**
 
-1. **The URL is content-addressed, not stable.** The sha256 of the spec body is
-   embedded in the filename. It is therefore a *snapshot pin* — excellent for
+1. **The URL is content-addressed, not stable.** *[2026-08-27, same-day
+   correction from building the sync tooling: the 64-hex hash embedded in the
+   filename (`446ddab7…`) is **not** the sha256 of the spec body — the body
+   hashes to `942a1163…3d2ee87` (sha256) and `40dd485e…` (md5), and
+   `.stats.yml`'s 32-hex `openapi_spec_hash` (`f0593466…`) matches neither.
+   Both upstream hashes are opaque Stainless-internal content addresses. The
+   snapshot-pin property survives — a moved spec is a changed URL — but body
+   integrity is our own recorded sha256, checkable only against a re-download
+   of the same URL.]* It is a *snapshot pin* — excellent for
    this repo's pin-vigilance discipline (`CLAUDE.md`, "Synergy dependencies are
    watched, not just pinned"), because a moved pin is a changed URL and cannot
    drift silently. But there is **no `latest` alias**: refreshing means reading
