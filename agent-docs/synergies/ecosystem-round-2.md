@@ -395,3 +395,46 @@ with the exit-code accessor and the `reads_as_failure` finding ruled
 test-first in the same PR; the SLO headers, when they land, under the
 `x-llm-d-` spelling with aliases. Four evidence citations retired by Relay's
 deletion are bracketed, not rewritten.
+
+## Addendum (2026-08-27): the Messages-surface ruling is superseded, and Relay 0.8.0 published
+
+Recorded with the M11 research round (four new evidence documents:
+`../research/anthropic-messages-wire-crates.md`,
+`../research/nemo-relay-0.8.0-published-read.md`,
+`../research/claude-code-client-surface.md`,
+`../research/anthropic-messages-seam-map.md`; ruling:
+`../PLAN-anthropic-messages.md`). Where this addendum and the text above
+disagree, the addendum wins.
+
+**"The Messages surface: agentic-api is the incumbent" is superseded by
+product-owner direction (2026-08-27).** Roundhouse builds a native
+`/v1/messages` serve surface and an `anthropic_messages` dispatch client,
+because Claude Code traffic has materialized as a directive and the round-3
+addendum above already stated the reason the deferral cannot carry it: in
+every topology where the turn does not pass through roundhouse, roundhouse
+owns nothing about it — no session, no prefix admission, no pricing, no
+steering. Fronting agentic-api's Messages surface forfeits the turn, and
+Relay's `ANTHROPIC_BASE_URL` path is interception that still needs a
+Messages-speaking upstream. What survives of the old ruling: no server-side
+tool loop — the client runs its tools, exactly as `/v1/responses` works. The
+supersession's full reasoning and the design rulings live in
+`PLAN-anthropic-messages.md` §2–§3.
+
+**NeMo Relay 0.8.0 published to crates.io on 2026-08-26** (0.8.1-rc.1
+followed within a day — five releases in seven days). Three facts land on
+rulings above. The launch-surface dedup gains its Anthropic half: Relay's CLI
+remains the supported instrumented front end for Claude Code too (a
+first-class `anthropic_base_url` override on three layers; the client's
+`Authorization` forwarded verbatim), and the chained topology's guard list is
+re-instantiated for the Messages surface with three new Anthropic-specific
+hazards (alphabetizing body re-serialization, dropped SSE `id:` lines, the
+auth-header-clearing footgun) — `PLAN-anthropic-messages.md` R7.
+`nemo-relay-switchyard` alone stayed at 0.7.3 in the family's 0.8.0 release
+batch, corroborating the `88d1b1b` deletion from the publication side. And
+the ATIF structs are now *published* (inside `nemo-relay` 0.8.0's heavy
+core), which improves the port's citation but changes nothing about
+port-not-crate — the 28-dependency core is exactly what the dependency rule
+keeps out. The `=0.7.3` types pin holds: 0.8.0 is byte-identical on every
+item roundhouse imports and still pins `uuid = "=1.18.1"`, so the move stays
+zero-cost, reason-free, and untaken; the stale "0.8.0 final is not out yet"
+manifest parenthetical is corrected in place with a dated note.

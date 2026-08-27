@@ -54,7 +54,12 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 # **When 0.8 would be the move.** `MetricEnvelope`, `METRIC_DATA_SCHEMA_NAME`
 # and the rest of the metric-mark surface exist only from 0.8. Nothing here
 # emits one; the day something does, 0.7.3 cannot express it at all and this
-# line moves to `=0.8.0-rc.1` (or to 0.8.0 final, which is not out yet).
+# line moves to `=0.8.0` -- final, published 2026-08-26 [dated correction
+# 2026-08-27: an earlier version of this comment said 0.8.0 final "is not out
+# yet"]. The 2026-08-27 re-read (research/nemo-relay-0.8.0-published-read.md
+# §5) verified every item this crate imports is byte-identical at 0.8.0 and
+# that 0.8.0 still pins `uuid = "=1.18.1"`, so the move stays zero-cost, the
+# ceiling stays, and the trigger above is unchanged.
 #
 # `default-features = false` is cosmetic today (`default = []`) and states the
 # intent that `schema` stays off: we emit these types and never generate a
