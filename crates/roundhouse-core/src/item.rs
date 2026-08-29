@@ -10,6 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::ids::ResponseId;
 
@@ -160,14 +161,42 @@ impl ItemContent {
             ItemContent::RedactedThinking { data } => {
                 format!("<redacted_thinking>{data}</redacted_thinking>")
             }
-            // `Display` for a `Value` is compact JSON over a `BTreeMap`, so the
-            // key order is the sorted one for every value alike — which is what
-            // makes this deterministic without a canonicalizing serializer of
-            // our own. `block_type` is repeated in the tag rather than left to
-            // the JSON so two blocks whose bodies happen to match but whose
-            // types differ cannot render alike.
+            // **A digest of the block, never the block.** This is the one
+            // variant whose body is unbounded: a pasted screenshot arrives as a
+            // `source.data` of roughly 1.35 base64 characters per image byte,
+            // so rendering it verbatim put a megabyte of base64 into all three
+            // things this function feeds at once — the prompt the provider is
+            // sent, the string [`crate::context`] tokenizes and the turn is
+            // billed for, and the input to `turn_id_for`. A 1 MB paste was
+            // therefore quoted, priced and dispatched as ~1.35M tokens of prose
+            // that no model can read back as a picture (M11.1 review, F5).
+            //
+            // What the digest keeps is everything the three readers need:
+            // *deterministic*, because `Display` for a `Value` is compact JSON
+            // over a `BTreeMap`, so the key order is the sorted one for every
+            // value alike — which is also what makes it order-insensitive, and
+            // a body re-encoded by a chained Relay digests identically;
+            // *identity-preserving*, because a block that changes changes its
+            // digest, so turn ids and prefix admission still move when the
+            // block moves; and *honest about size*, which the verbatim render
+            // was not. What it drops is the payload, which no reader of this
+            // string could use — a typed content-block path from
+            // [`ItemContent`] through the dispatch is what would let a model
+            // actually see the image, and that is the future work R5 names.
+            //
+            // `block_type` stays in the tag rather than inside the digest so
+            // two blocks whose bodies match but whose types differ cannot
+            // render alike, and so a refusal or a log line still says *which*
+            // block this is without a second parse.
+            //
+            // **Safe to change here and only here**: `Opaque` is new in M11.1,
+            // so no production log carries a turn id derived from the old
+            // render, and the stored `Value` is untouched — serde is not on
+            // this path, and a session that replays gets the same items it
+            // always did.
             ItemContent::Opaque { block_type, block } => {
-                format!("<block type=\"{block_type}\">{block}</block>")
+                let digest = hex::encode(Sha256::digest(block.to_string().as_bytes()));
+                format!("<block type=\"{block_type}\" sha256=\"{digest}\">")
             }
         }
     }
@@ -522,6 +551,49 @@ mod tests {
             block(sent).render(),
             block(relayed).render(),
             "and the turn id is over the render, so it must agree too"
+        );
+    }
+
+    /// **An opaque block renders as a digest, never as its payload.**
+    ///
+    /// The guard for M11.1's F5. `render` is the prompt encoding, the
+    /// token-count encoding and the identity encoding at once, and an opaque
+    /// block is the only variant whose body has no bound — a pasted screenshot
+    /// is base64 in `source.data`. Rendering it verbatim billed and dispatched
+    /// the image as prose at roughly one token per base64 character.
+    ///
+    /// Three assertions, because the fix has to keep two properties while
+    /// dropping one: the payload is *gone* from the string, the string's length
+    /// does not move with the payload's, and the identity still does — a
+    /// digest that ignored the body would make every image in a conversation
+    /// the same block and hand a client somebody else's cached answer.
+    #[test]
+    fn an_opaque_block_renders_as_a_digest_rather_than_its_bytes() {
+        let image = |data: &str| ItemContent::Opaque {
+            block_type: "image".into(),
+            block: serde_json::json!({
+                "type": "image",
+                "source": { "type": "base64", "media_type": "image/png", "data": data },
+            }),
+        };
+        let payload = "A".repeat(4096);
+        let rendered = image(&payload).render();
+
+        assert!(
+            !rendered.contains(&payload),
+            "the payload is in the prompt, the token count and the turn id: {rendered}"
+        );
+        assert_eq!(
+            rendered.len(),
+            image("AA").render().len(),
+            "a render whose length moves with the payload is one the tokenizer \
+             bills for the payload: {rendered}"
+        );
+        assert_ne!(
+            rendered,
+            image(&format!("{payload}B")).render(),
+            "two different blocks must render differently, or prefix admission \
+             and `turn_id_for` stop moving when the block moves"
         );
     }
 

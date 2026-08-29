@@ -196,7 +196,7 @@ impl ValidationBrief {
             .collect();
         ValidationBrief {
             instructions: instructions_of(items)
-                .map(|text| truncate(text, config.instruction_chars)),
+                .map(|text| truncate(&text, config.instruction_chars)),
             objective: truncate_objective(objective, config.objective_chars),
             steps,
             facts,
@@ -336,14 +336,43 @@ fn compact(index: u32, call: &Exchange, head: usize) -> BriefStep {
     }
 }
 
-/// The first system or developer text in the session.
-fn instructions_of(items: &[Item]) -> Option<&str> {
-    items
+/// The session's instruction block: its **leading run** of system or developer
+/// text, oldest first.
+///
+/// **The run, not the first item of it** (M11.1 review, finding F4). A dialect
+/// whose clients send instructions as one string produces one item and this is
+/// unchanged for them. Anthropic's Messages clients send `system` as a *list of
+/// blocks*, and the shipping Claude Code puts a ~70-byte billing attribution
+/// pseudo-header in block 0, its own identity line in block 1, and the actual
+/// multi-KB system prompt in block 2 — so a reader that took the first item
+/// handed the judge billing metadata and called it the task. Every drift,
+/// no-progress and steer verdict for every such session was then decided
+/// against a header.
+///
+/// Concatenated rather than searched for the "real" one, and that is the
+/// client-agnostic reading: nothing here knows what an attribution header looks
+/// like, and a rule that did would be a rule that breaks the next time the
+/// client re-orders its blocks or another client ships a different preamble.
+/// The instruction budget the caller already applies does the bounding — the
+/// first blocks are small, so the budget spends almost all of itself on the
+/// prompt that matters.
+///
+/// The run stops at the first item that is not system/developer *text*, which
+/// is what keeps a mid-conversation system message — history, at a position the
+/// conversation agrees on — out of the instructions. It is the same boundary
+/// prefix admission draws (see
+/// [`is_turn_configuration`](crate::session::is_turn_configuration)), and it is
+/// drawn the same way here so the judge is briefed on exactly the block the
+/// session treats as its configuration.
+fn instructions_of(items: &[Item]) -> Option<String> {
+    let run: Vec<&str> = items
         .iter()
-        .find_map(|item| match (&item.role, &item.content) {
+        .map_while(|item| match (&item.role, &item.content) {
             (Role::System | Role::Developer, ItemContent::Text { text }) => Some(text.as_str()),
             _ => None,
         })
+        .collect();
+    (!run.is_empty()).then(|| run.join("\n"))
 }
 
 fn truncate_objective(objective: Objective, limit: usize) -> Objective {

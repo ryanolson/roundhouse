@@ -232,6 +232,23 @@ pub struct TurnInput {
     /// Read by pricing and by nothing else — see
     /// [`DecisionRecord::declared_baseline`](roundhouse_core::routing::DecisionRecord::declared_baseline).
     pub declared_baseline: Option<String>,
+    /// The output ceiling the client declared, when its dialect has one.
+    ///
+    /// **The same argument as the baseline above, and it arrived the same way.**
+    /// A ceiling is a property of the request that no projection of the log can
+    /// recover, so a surface that passed the conversation and dropped it would
+    /// silently substitute this deployment's own number for the client's — which
+    /// is exactly what happened until M11.1's F1, where a Messages request's
+    /// `max_tokens` was parsed, never read, and the router's 256-token *pricing
+    /// estimate* became the upstream ceiling on every turn.
+    ///
+    /// It reaches [`FrontierQuote::output_token_cap`] and nothing else: it is
+    /// not a routing input, not a pricing input, and deliberately not folded
+    /// into `expected_output_tokens`, whose doc says why. `None` for every
+    /// caller with nothing to declare — the MCP and admin paths, the test
+    /// surface, and the Responses surface, whose `max_output_tokens` this
+    /// milestone does not read.
+    pub output_token_cap: Option<u32>,
 }
 
 impl From<Vec<Item>> for TurnInput {
@@ -239,6 +256,7 @@ impl From<Vec<Item>> for TurnInput {
         Self {
             items,
             declared_baseline: None,
+            output_token_cap: None,
         }
     }
 }
@@ -877,6 +895,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         let TurnInput {
             items: input,
             declared_baseline,
+            output_token_cap,
         } = input.into();
         // See `turn_gates`: within this node, one turn at a time per session.
         let gate = self.turn_gate(session_id);
@@ -1153,6 +1172,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                         &response_id,
                         admission,
                         declared_baseline.as_deref(),
+                        output_token_cap,
                     )
                     .await
                 {
@@ -1255,6 +1275,10 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         response_id: &ResponseId,
         admission: &Admission,
         declared_baseline: Option<&str>,
+        // Carried through rather than read off the config, because it is the
+        // client's number and not this deployment's — see
+        // [`TurnInput::output_token_cap`].
+        output_token_cap: Option<u32>,
     ) -> Result<Completed, Failed> {
         // One deadline for every model await in this turn, taken before any of
         // them: a provider that hangs after accepting the request settles the
@@ -1271,6 +1295,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                 deadline_at,
                 admission,
                 declared_baseline,
+                output_token_cap,
             )
             .await
             .map_err(Failed::before_output)?;
@@ -1491,6 +1516,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         deadline_at: Instant,
         admission: &Admission,
         declared_baseline: Option<&str>,
+        output_token_cap: Option<u32>,
     ) -> Result<(FrontierStream, Decision, usize), PlanFailure> {
         // Rebuild the prompt from the committed log, so what we price is
         // exactly what a successor would reconstruct.
@@ -1990,6 +2016,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                     session.session_id(),
                     isl_tokens,
                     deadline_at,
+                    output_token_cap,
                 )
                 .await
             {
@@ -2090,6 +2117,11 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         session_id: &SessionId,
         isl_tokens: usize,
         deadline_at: Instant,
+        // The client's declared ceiling, for the dialects that can express one.
+        // Only the frontier arm carries it: a local worker is asked for
+        // `expected_output_tokens` because it is *our* capacity being reserved,
+        // and a caller's ceiling is not a reservation.
+        output_token_cap: Option<u32>,
     ) -> Result<FrontierStream, ConnectFailure> {
         match target {
             // No failover arm, deliberately — see the loop in `plan`. A local
@@ -2176,7 +2208,21 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                     // steer requests to the same cache node, so varying it
                     // would defeat the hit we just routed on.
                     prompt_cache_key: session_id.to_string(),
+                    // **This deployment's pricing estimate, and only that.** It
+                    // is what the candidates above were quoted with and what the
+                    // grant was opened against, so it must keep saying what the
+                    // *router* expected — never what the caller asked for.
                     expected_output_tokens: Some(self.config.expected_output_tokens),
+                    // **And this is the caller's ceiling, which is a different
+                    // number answering a different question.** The two shared
+                    // one field until M11.1's F1, which meant the shipped
+                    // 256-token estimate was also the `max_tokens` every
+                    // Anthropic dispatch carried, and every real answer was cut
+                    // off mid-sentence — reported to the client as an ordinary
+                    // `stop_reason` and to nobody as a defect. Threaded from
+                    // `TurnInput` rather than read off the config here, because
+                    // the config has no idea what the client asked for.
+                    output_token_cap,
                     // The credential travels here for the same reason the
                     // dialect above does: this is the only argument `execute`
                     // receives. It is the *same* resolution the payer on the

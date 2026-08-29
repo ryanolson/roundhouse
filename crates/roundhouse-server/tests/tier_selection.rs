@@ -1513,6 +1513,8 @@ async fn the_declared_baseline_is_recorded_and_changes_no_route() {
             TurnInput {
                 items: ask(),
                 declared_baseline: Some(format!("{THRIFTY}/m")),
+                // Nothing declared: this test is about the baseline.
+                output_token_cap: None,
             },
             &admission_with(PickerMode::CapableFirst),
         )
@@ -1543,6 +1545,8 @@ async fn the_declared_baseline_is_recorded_and_changes_no_route() {
             TurnInput {
                 items: ask(),
                 declared_baseline: Some("a-model-nobody-serves".into()),
+                // Nothing declared: this test is about the baseline.
+                output_token_cap: None,
             },
             &admission_with(PickerMode::CapableFirst),
         )

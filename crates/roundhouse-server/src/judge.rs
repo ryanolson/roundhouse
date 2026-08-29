@@ -589,6 +589,17 @@ impl<T: Tokenizer + Clone> FleetJudge<T> {
             // cool the hit the router priced for the next real turn.
             prompt_cache_key: format!("{}{VALIDATE_CACHE_SUFFIX}", side_call.session_id),
             expected_output_tokens: Some(self.config.expected_output_tokens),
+            // **The judge is its own client, so it declares its own ceiling**,
+            // and it is the same number as the estimate above by construction.
+            // [`JudgeConfig::expected_output_tokens`]'s doc says it is used
+            // twice for two things — sizing the budget question, and telling
+            // the provider what to expect — and M11.1's F1 split those two uses
+            // into two fields. Written out here rather than left `None` so the
+            // second use survives the split unchanged: a structured verdict is
+            // four fields, and a side call that inherited a dialect's generous
+            // default ceiling would be a checker free to spend more than the
+            // turn it is checking.
+            output_token_cap: Some(self.config.expected_output_tokens),
             // **Deliberately unresolved, and this is the honest state rather
             // than an oversight.** A side call is deployment work — it is not a
             // tenant's turn and must never spend a member's key — so the only

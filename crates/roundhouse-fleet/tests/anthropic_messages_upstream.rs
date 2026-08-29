@@ -241,6 +241,9 @@ fn quote(credential: TurnCredential) -> FrontierQuote {
         segment_boundaries: vec!["<|system|>be brief".len()],
         prompt_cache_key: "sess_anthropic_upstream".into(),
         expected_output_tokens: Some(512),
+        // No client declared a ceiling on these fixtures, which is what
+        // every internal caller looks like; see `output_token_cap`.
+        output_token_cap: None,
         credential,
     }
 }

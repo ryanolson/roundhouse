@@ -742,6 +742,75 @@ mod tests {
         );
     }
 
+    /// **F1's reporting half (M11.1 thermo-nuclear review), still open.** The
+    /// ceiling half is fixed — a dispatch now carries the client's own
+    /// `max_tokens` rather than the router's 256-token pricing estimate — which
+    /// makes a truncation here an honest one; this is the half that says nobody
+    /// downstream can tell it happened. The claim: `handle`'s
+    /// `"message_delta"` arm destructures `let StreamEvent::MessageDelta { usage, .. }`,
+    /// discarding `delta.stop_reason` via `..` even though `MessageDeltaBody`
+    /// carries it (`wire.rs`) and this module's own doc, two hundred-odd lines
+    /// up in the sibling file, names the exact upstream field a dispatch
+    /// ceiling produces (`anthropic_messages.rs`: "arrives at the client as
+    /// `stop_reason: max_tokens`"). [`FrontierChunk::Done`] — this decoder's
+    /// only output — has no field to carry a stop reason downstream at all, so
+    /// the loss is not a missed read but structural: nothing past this decoder
+    /// can ever learn a turn was cut short by the dispatch ceiling rather than
+    /// finishing on its own.
+    ///
+    /// PROBE: two streams differing in *only* `delta.stop_reason` — same
+    /// prelude, same text, same `output_tokens: 64` — must decode differently
+    /// if this information is ever to reach the engine. It does not: swapping
+    /// `max_tokens` for `end_turn` changes nothing about what comes out.
+    #[test]
+    #[ignore = "F1 REPORTING HALF (valid, still open): the message_delta arm destructures \
+                `let StreamEvent::MessageDelta { usage, .. }`, discarding delta.stop_reason, \
+                and FrontierChunk::Done has no field to carry one downstream at all -- a \
+                turn cut off at the dispatch ceiling (stop_reason: max_tokens) decodes \
+                identically to one that finished on its own (end_turn). F1's CEILING half is \
+                fixed (FrontierQuote::output_token_cap now carries the client's declared \
+                max_tokens and expected_output_tokens stays the router's pricing estimate; see \
+                f1_the_clients_max_tokens_is_the_dispatch_ceiling_and_not_the_estimate in \
+                roundhouse-server/tests/messages_api_surface.rs), so a truncation is now the \
+                client's own ceiling rather than a 256-token default nobody asked for -- but \
+                it still cannot be *reported* as one. Fixing this half is wiring stop_reason \
+                through FrontierChunk::Done, the engine's IncompleteReason classification and \
+                the emission's stop_reason, which crosses the durable event shape and both \
+                serve surfaces; deliberately out of the F1 fix's scope -- do not remove the \
+                ignore without doing that."]
+    fn f1_a_dispatch_ceiling_truncation_decodes_identically_to_a_natural_stop() {
+        let truncated = decode(&[
+            START,
+            &text(0, "cut off mid-sen"),
+            concat!(
+                "event: message_delta\n",
+                r#"data: {"type":"message_delta","delta":{"stop_reason":"max_tokens","#,
+                r#""stop_sequence":null},"usage":{"output_tokens":64}}"#,
+                "\n\n"
+            ),
+            STOP,
+        ])
+        .unwrap();
+
+        // CONTROL: the identical stream with `stop_reason` swapped back to
+        // `end_turn` and nothing else touched — same text, same
+        // `output_tokens: 64`. The two decodes disagree exactly the way they
+        // already disagree when `output_tokens` differs (see
+        // `the_two_usage_events_fold_into_one_done_in_roundhouse_axes` above),
+        // so this is not a vacuously-equal comparison — it isolates
+        // `stop_reason` as the one thing that does not survive the decode.
+        let natural = decode(&[START, &text(0, "cut off mid-sen"), DELTA, STOP]).unwrap();
+
+        assert_ne!(
+            truncated, natural,
+            "F1: a message_delta reporting stop_reason: max_tokens decoded to \
+             the exact same FrontierChunk sequence as one reporting stop_reason: \
+             end_turn — the truncation signal is destroyed here, before the \
+             engine ever sees it, so it can never surface to a client as \
+             stop_reason: max_tokens either"
+        );
+    }
+
     #[test]
     fn thinking_and_signature_deltas_are_consumed_and_never_spoken() {
         // PROBE: an extended-thinking turn. The thinking text must not reach the

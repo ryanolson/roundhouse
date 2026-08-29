@@ -238,7 +238,16 @@ impl OpenAiResponsesClient {
             // The whole point of the routing: providers use it to steer a
             // request to the node holding this session's prefix.
             "prompt_cache_key": quote.prompt_cache_key,
-            "max_output_tokens": quote.expected_output_tokens,
+            // The client's declared ceiling when it named one, and otherwise
+            // the router's estimate — which is the semantics this client
+            // shipped with and keeps deliberately. Unlike the Messages schema,
+            // `max_output_tokens` is optional here, so "let the model decide"
+            // would also have been expressible; it is not chosen, because a
+            // Responses turn with no ceiling at all can outrun the deadline
+            // this deployment prices and reserves against. The order matters
+            // and only the order: a declared cap outranks an estimate, never
+            // the other way round (M11.1, F1).
+            "max_output_tokens": quote.output_token_cap.or(quote.expected_output_tokens),
             // Roundhouse rebuilds every prompt from its own log, so server-side
             // conversation state would be a second history able to disagree
             // with the one the fold replays. Off, explicitly.
@@ -511,6 +520,9 @@ mod tests {
             segment_boundaries: vec![8, 20],
             prompt_cache_key: "sess_openai".into(),
             expected_output_tokens: Some(512),
+            // No client declared a ceiling on these fixtures, which is what
+            // every internal caller looks like; see `output_token_cap`.
+            output_token_cap: None,
             credential,
         }
     }
@@ -572,6 +584,34 @@ mod tests {
         // Completions it starts adding `stream_options.include_usage` rather
         // than silently reporting nothing.
         assert!(body.get("stream_options").is_none());
+    }
+
+    /// **A declared ceiling outranks the pricing estimate; absent one, the
+    /// estimate is kept.**
+    ///
+    /// The Responses half of M11.1's F1. This client's shipped semantics are
+    /// preserved on purpose — `max_output_tokens` still falls back to
+    /// `expected_output_tokens`, because a Responses turn with no ceiling at
+    /// all can outrun the deadline the deployment prices against, and no
+    /// Responses serve surface declares a cap today, so the fallback *is* the
+    /// production path. What changes is only the precedence, and the second
+    /// assertion is the one that would have been wrong before the split.
+    #[test]
+    fn a_declared_ceiling_outranks_the_pricing_estimate() {
+        let mut quote = quote(TurnCredential::Absent, SPOKEN);
+        assert_eq!(
+            OpenAiResponsesClient::body(&quote, "flagship")["max_output_tokens"],
+            json!(512),
+            "with no declared cap this client keeps the estimate it shipped with"
+        );
+
+        quote.output_token_cap = Some(64_000);
+        assert_eq!(
+            OpenAiResponsesClient::body(&quote, "flagship")["max_output_tokens"],
+            json!(64_000),
+            "the client asked for 64 000 tokens; a 512-token pricing estimate is \
+             not an answer to that question"
+        );
     }
 
     /// **P3: the outbound body names only fields OpenRouter's schema has.**

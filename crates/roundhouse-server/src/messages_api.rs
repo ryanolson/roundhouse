@@ -61,7 +61,7 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, FromRequest, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
@@ -124,6 +124,42 @@ const COUNT_TOKENS_PATH: &str = "messages/count_tokens";
 /// the abort — the abort is the failure we must never reach, not the one to
 /// aim at.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// The largest request body this surface will buffer.
+///
+/// **The platform's own number, and it is nearly sixteen times axum's.** The
+/// Messages and Token Counting APIs both cap a request at 32 MB and answer a
+/// larger one with `413 request_too_large` (`platform.claude.com/docs/en/api/errors`,
+/// quoted in `research/claude-code-client-surface.md` §3.6). Axum's `Bytes`
+/// extractor applies its own undisclosed 2 MiB default unless a route says
+/// otherwise, and 2 MiB is not a hypothetical ceiling for this dialect: an
+/// agentic client resends its entire history on every turn, this suite's own
+/// captured two-turn fixture is already 90 KB, and a single pasted screenshot
+/// is a megabyte of base64 in one block. A client that crossed the default got
+/// a turn refused for a limit nobody chose, in a plain-text envelope its parser
+/// cannot read (M11.1 review, F3).
+///
+/// Matching the platform rather than inventing a number is the whole point: a
+/// proxy that refuses what the upstream would have served is a proxy that
+/// changes the answer, and one that accepts what the upstream refuses just
+/// moves the refusal somewhere the client cannot act on it.
+///
+/// **What this is also the size of, stated because raising it made it bigger.**
+/// Axum runs extractors before the handler body, so the bytes are buffered
+/// before [`create_message`]'s admission check runs — this number is therefore
+/// what an *unauthenticated* caller can make this process hold, and it went
+/// from 2 MiB to 32 MB with the ceiling. Unchanged in kind (the ordering
+/// predates this constant) and matched to the upstream, which refuses at the
+/// same size in front of its own API; narrowing it would need admission to be
+/// a `FromRequestParts` extractor ahead of the body, which is a change to every
+/// surface rather than to this line.
+///
+/// `pub(crate)` because [`responses_api`](crate::responses_api) takes the same
+/// number: the two surfaces front the same log through the same buffering
+/// extractor, and two limits would mean one client's history was servable and
+/// the other's was not for no reason either client could see. One constant with
+/// one citation, read twice.
+pub(crate) const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 
 /// Serial number for anonymous session names, per process.
 static ANONYMOUS: AtomicU64 = AtomicU64::new(0);
@@ -206,12 +242,70 @@ where
             &format!("{API_PREFIX}/{COUNT_TOKENS_PATH}"),
             post(count_tokens::<S, T>),
         )
+        // On the router and not on each route, so a third route cannot be added
+        // under a limit nobody chose — which is exactly how the 2 MiB default
+        // got here. See [`MAX_REQUEST_BYTES`] for the number and
+        // [`RequestBody`] for what a request over it is answered with.
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .with_state(Messages {
             engine,
             store,
             planes,
             conversations,
         })
+}
+
+/// The raw request body, refused in *this dialect's* envelope.
+///
+/// **A newtype around [`Bytes`] rather than `Bytes` itself, and the difference
+/// is the only thing it exists for.** `Bytes`'s own rejection is rendered by
+/// axum, inside `FromRequest`, before a handler body — and therefore before
+/// [`MessagesError::into_response`] — ever runs: a plain-text `413` reading
+/// "Failed to buffer the request body: length limit exceeded", with no
+/// `"type":"error"`, no `error.type` from Anthropic's vocabulary and no
+/// `roundhouse_code`. Claude Code branches on that vocabulary, so a refusal
+/// outside it is a refusal it cannot classify; and `error_kind`'s own
+/// `PAYLOAD_TOO_LARGE => "request_too_large"` row was unreachable in production
+/// for exactly as long as nothing routed a 413 through this type (M11.1
+/// review, F3).
+///
+/// Every rejection is translated, not just the large one: whatever else can go
+/// wrong buffering a body (a connection that dies mid-request) is roundhouse's
+/// refusal to render too, and axum's status for it — a 400 — is kept, because
+/// this is a change of envelope and never of decision.
+struct RequestBody(Bytes);
+
+impl<S> FromRequest<S> for RequestBody
+where
+    S: Send + Sync,
+{
+    type Rejection = MessagesError;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match Bytes::from_request(request, state).await {
+            Ok(body) => Ok(Self(body)),
+            Err(rejection) => {
+                let status = rejection.status();
+                Err(if status == StatusCode::PAYLOAD_TOO_LARGE {
+                    // Our own sentence rather than axum's, because this is the
+                    // one rejection a client can act on: the number is what it
+                    // has to get under, and "length limit exceeded" does not
+                    // say what the limit is.
+                    ApiError::refused(
+                        status,
+                        "request_too_large",
+                        format!(
+                            "request body exceeds the {MAX_REQUEST_BYTES}-byte limit \
+                             this endpoint accepts"
+                        ),
+                    )
+                    .into()
+                } else {
+                    ApiError::refused(status, "unreadable_body", rejection.body_text()).into()
+                })
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -236,7 +330,7 @@ where
 async fn create_message<S, T>(
     State(state): State<Messages<S, T>>,
     headers: HeaderMap,
-    body: Bytes,
+    RequestBody(body): RequestBody,
 ) -> Result<Response, MessagesError>
 where
     S: SessionStore,
@@ -285,6 +379,31 @@ where
         .filter(|model| !model.is_empty())
         .map(str::to_string);
 
+    // **What the client will let this answer grow to**, threaded into the turn
+    // and out to the dispatch as [`FrontierQuote::output_token_cap`]. Until
+    // M11.1's F1 it was parsed here and read nowhere, so every dispatch carried
+    // this deployment's *pricing estimate* as its ceiling — 256 tokens by
+    // default — and every real answer was truncated mid-sentence while the
+    // client's own `max_tokens: 64000` said otherwise.
+    //
+    // Three narrowings, each of which is a request this surface must not turn
+    // into an upstream 400 of our own making:
+    //
+    // - `0` is treated as absent. The Messages schema's minimum is 1, so a zero
+    //   is a client mistake, and forwarding it would refuse a turn we could
+    //   otherwise serve. Ignoring it costs a ceiling nobody meant.
+    // - A value past `u32::MAX` saturates rather than wrapping, because
+    //   `as u32` on a `u64` here would turn "as much as you can" into a small
+    //   number chosen by arithmetic.
+    // - Nothing is clamped *down* to any model's real maximum. That belongs to
+    //   the provider, which knows its own models and answers with a message
+    //   naming the limit; a ceiling this file invented would refuse a request
+    //   the upstream would have served.
+    let output_token_cap = params
+        .max_tokens
+        .filter(|declared| *declared > 0)
+        .map(|declared| u32::try_from(declared).unwrap_or(u32::MAX));
+
     let turn = tokio::spawn({
         let engine = Arc::clone(&state.engine);
         let session_id = session_id.clone();
@@ -299,6 +418,7 @@ where
                     TurnInput {
                         items: input,
                         declared_baseline,
+                        output_token_cap,
                     },
                     &admission,
                 )
@@ -393,7 +513,7 @@ fn anonymous_key() -> String {
 async fn count_tokens<S, T>(
     State(state): State<Messages<S, T>>,
     headers: HeaderMap,
-    body: Bytes,
+    RequestBody(body): RequestBody,
 ) -> Result<Response, MessagesError>
 where
     S: SessionStore,
@@ -816,11 +936,32 @@ where
                 if let Some(reason) = &delta.stop_reason {
                     stop_reason = reason.clone();
                 }
-                // Merged the way the client's own accumulator merges it (§3.4):
-                // the terminal frame's counts replace the prelude's, and its
-                // absence leaves the prelude's standing. Reproducing the merge
-                // here rather than reading the log again is what keeps the two
-                // renderings one projection.
+                // NOT a field-by-field merge like the client's own
+                // accumulator (§3.4: a `> 0` guard per input-side counter,
+                // `??` on output_tokens -- both documented on `message_delta`
+                // above). This replaces the whole `Usage` object wholesale
+                // when the terminal frame carries one, and leaves the
+                // prelude's standing when it carries none.
+                //
+                // The two land on identical numbers today only because
+                // `emit::message_delta` never reports a partial terminal
+                // count: whenever `reported` is `Some`, every field in it is
+                // the complete, freshly measured total for the whole turn,
+                // not a delta to reconcile against the prelude. They would
+                // disagree on exactly one shape the review pinned: a terminal
+                // delta whose fresh input count (input minus cache read minus
+                // cache write) is genuinely zero. The client's `> 0` guard
+                // reads that zero as "not reported" and keeps the prelude's
+                // inflated, pre-cache-split count; this wholesale replace has
+                // no such guard and adopts the correct zero instead.
+                //
+                // Unreachable from our own dispatch today: a turn is only
+                // ever completed -- dispatched or seam-answered -- with
+                // content that was never itself part of an earlier cache read
+                // or write, so the terminal `Usage` this fold ever sees
+                // always has a nonzero fresh remainder. A dispatch path that
+                // could report an all-cached turn would need this to become a
+                // real field-by-field merge.
                 if reported.is_some() {
                     usage = reported.clone();
                 }
@@ -888,6 +1029,17 @@ fn mid_stream_failure(error: &WireError) -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // F9's fixtures only: a real `Engine` and a real `SessionId`/`TurnId` pair
+    // to build a real `MessagesFollower` from, none of which the rest of this
+    // module's tests need.
+    use roundhouse_core::context::ByteTokenizer;
+    use roundhouse_core::ids::{SessionId, TurnId};
+    use roundhouse_core::routing::AffinityPolicy;
+    use roundhouse_core::store::MemoryStore;
+    use roundhouse_fleet::{EchoFrontierClient, StaticFrontierCatalog};
+
+    use crate::engine::{EchoLocalExecutor, EngineConfig};
 
     #[test]
     fn the_two_routes_sit_under_the_prefix_the_client_appends() {
@@ -982,6 +1134,125 @@ mod tests {
         assert!(
             after >= Duration::from_secs(1),
             "and not so early that an ordinary turn is peppered with pings: {after:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // F9 (M11.1 thermo-nuclear review)
+    // -------------------------------------------------------------------
+    //
+    // The claim: the guard above and the fix stage's two SSE-framing tests
+    // all stop short of `idle()` (messages_api.rs:723-730) itself -- the
+    // async method that actually decides, on every quiet poll, whether to
+    // push a keepalive. Neither drives it: the guard above calls
+    // `keepalive_due` directly with no `MessagesFollower` in sight, and
+    // nothing in `messages_api_surface.rs` waits out (or fakes) the 15 real
+    // seconds of silence the branch needs, because every fixture there
+    // answers through a synchronous echo/scripted client with no stall. So
+    // deleting the `if` line below, inverting its comparison, or moving the
+    // `idle_polls = 0` reset before the check would all ship with the whole
+    // workspace green -- `messages_api_surface.rs` cannot even name
+    // `idle_polls`, `keepalive_due`, or `fn idle`, all private to this
+    // module, so no test outside this file could ever have noticed.
+    //
+    // `bare_follower` builds a real `MessagesFollower` and the two tests
+    // below call the real `.idle()` -- not a re-implementation of its logic
+    // -- so a mutation to that method is what they are sensitive to, not a
+    // mutation to `keepalive_due` (already guarded above) or to
+    // `keepalive()`'s payload (already guarded by the fix stage's framing
+    // tests). `idle_polls` is seeded directly to 599 in the second test
+    // rather than reached by calling `.idle()` 599 times in a row: the only
+    // per-call side effect of a not-yet-due poll besides the sleep is the
+    // increment, so seeding reproduces the state 599 real calls would leave
+    // without paying 599 * 25 ms for it -- which also shows that reaching
+    // this branch does not actually require the wait the module doc's "so a
+    // test can reach it without waiting" comment reserves for the pure
+    // predicate alone.
+
+    /// A follower over disposable fixtures nothing here reads: `.idle()`
+    /// touches only `idle_polls` and `queued`, so `tail` and `engine` exist
+    /// only because the struct's fields must all be initialized.
+    fn bare_follower() -> MessagesFollower<MemoryStore, ByteTokenizer> {
+        let store = Arc::new(MemoryStore::new());
+        MessagesFollower {
+            tail: LogTail::new(Arc::clone(&store), SessionId::new("f9-fixture"), 0),
+            engine: Arc::new(Engine::new(
+                store,
+                ByteTokenizer,
+                Arc::new(EchoLocalExecutor::new("local")),
+                StaticFrontierCatalog::new(vec![]),
+                Arc::new(EchoFrontierClient::new("frontier")),
+                Arc::new(AffinityPolicy::new()),
+                EngineConfig::default(),
+            )),
+            admitted_input_tokens: 0,
+            emission: MessageEmission::new(TurnId::new("turn_f9"), "claude-test", Usage::default()),
+            // Never finishes, so a mutated `idle()` reading
+            // `self.turn.is_finished()` (it does not, today) could not
+            // accidentally explain a passing test by routing through
+            // `fail_without_terminal` instead.
+            turn: tokio::spawn(std::future::pending::<Result<(), String>>()),
+            queued: VecDeque::new(),
+            idle_polls: 0,
+            phase: Phase::Tailing,
+        }
+    }
+
+    /// CONTROL, kept live. Pins today's real, verified `idle()` behavior on a
+    /// single not-yet-due poll: proves the fixture above is sound (it
+    /// constructs and the method runs) and that an ordinary quiet poll does
+    /// not queue anything, without relying on the 600-poll boundary the
+    /// probe below is actually about. On its own this does not close F9's
+    /// gap -- a mutated `idle()` that deletes the `if` block outright, or
+    /// pins `idle_polls` at some other constant, still increments once here
+    /// and still queues nothing, so this assertion cannot tell "no keepalive
+    /// mechanism exists" from "the mechanism has not fired yet."
+    #[tokio::test]
+    async fn f9_control_idle_does_not_queue_a_keepalive_before_the_window() {
+        let mut follower = bare_follower();
+        follower.idle().await;
+        assert_eq!(follower.idle_polls, 1, "one quiet poll, one increment");
+        assert!(
+            follower.queued.is_empty(),
+            "a single quiet poll is nowhere near the 15 s window and must not queue anything: \
+             {:?}",
+            follower.queued
+        );
+    }
+
+    /// PROBE: F9, fixed here. Seeds the boundary directly (see the module
+    /// comment above for why that is equivalent to 599 real quiet polls) and
+    /// calls the real `.idle()` once more, which must be the 600th and
+    /// therefore due.
+    ///
+    /// The gap this closes was established by direct reading/grep alone (a
+    /// claim about the *absence* of any reference to `idle_polls`,
+    /// `keepalive_due`, or `fn idle` outside this module), and this probe's
+    /// own correctness — that it compiles against the real signatures below
+    /// and actually exercises `idle()` rather than a re-implementation of it
+    /// — was left unconfirmed by a disk-exhaustion incident that stopped the
+    /// thermo-nuclear review from running cargo again. Confirmed now:
+    /// `cargo test -p roundhouse-server --lib messages_api -j 2` compiles and
+    /// passes this test and its control together, with neither ignored.
+    #[tokio::test]
+    async fn f9_idle_fires_the_keepalive_exactly_at_the_window_boundary() {
+        let mut follower = bare_follower();
+        follower.idle_polls = 599;
+        follower.idle().await;
+        assert_eq!(
+            follower.idle_polls, 0,
+            "the 600th consecutive empty poll must reset the counter"
+        );
+        assert_eq!(
+            follower.queued.len(),
+            1,
+            "and must queue exactly one keepalive frame: {:?}",
+            follower.queued
+        );
+        assert_eq!(
+            follower.queued.front(),
+            Some(&keepalive()),
+            "the queued frame must be the real ping payload"
         );
     }
 

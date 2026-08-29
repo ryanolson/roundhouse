@@ -324,7 +324,38 @@ pub struct FrontierQuote {
     /// Stable per-session key. Providers use it to steer requests to the same
     /// cache node, so it must not vary turn to turn.
     pub prompt_cache_key: String,
+    /// What the *router* expects this turn to produce, for pricing.
+    ///
+    /// An estimate, and never a ceiling. It is the number every candidate was
+    /// quoted against and the number the spend grant was opened for, so the
+    /// client's declared ceiling must not be written here: a client that
+    /// routinely declares `max_tokens: 64000` and answers in forty would
+    /// inflate every quote, every reservation and every projected saving by
+    /// three orders of magnitude, on every turn, while changing nothing about
+    /// what the model actually did.
+    ///
+    /// **Split from [`Self::output_token_cap`] by M11.1's F1**, where the two
+    /// meanings shared this one field and the estimate was therefore acting as
+    /// the dispatch ceiling — a 256-token default truncating every real answer.
+    /// Two fields because the two numbers are answers to different questions,
+    /// and because collapsing them makes one of the two wrong whichever value
+    /// wins.
     pub expected_output_tokens: Option<u32>,
+    /// The ceiling the *client* asked for, when the serve surface has one.
+    ///
+    /// This is what goes on the wire as `max_tokens` / `max_output_tokens`: a
+    /// hard limit on the answer, declared by the caller, that costs nothing
+    /// until the model reaches it. `None` means the client declared none —
+    /// every internal caller (the judge, the validate loop, an MCP turn) and
+    /// every dialect whose surface has no such field — and each client then
+    /// falls back to what its own dialect requires: the Anthropic client to its
+    /// `DEFAULT_MAX_TOKENS`, since the Messages schema requires the property,
+    /// and the Responses client to [`Self::expected_output_tokens`], which is
+    /// the semantics it shipped with.
+    ///
+    /// Additive, deliberately: a construction site that does not set it gets
+    /// `None` and the behaviour it had before the split.
+    pub output_token_cap: Option<u32>,
     /// What this request authenticates with.
     ///
     /// **Carried here for the same reason [`Self::wire_protocol`] is, and the
@@ -797,6 +828,7 @@ mod tests {
             segment_boundaries: Vec::new(),
             prompt_cache_key: "sess_x".into(),
             expected_output_tokens: None,
+            output_token_cap: None,
             credential,
         }
     }

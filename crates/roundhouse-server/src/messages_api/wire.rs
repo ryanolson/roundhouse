@@ -52,6 +52,40 @@ use crate::http::ApiError;
 /// id has to be dug out of.
 pub const SESSION_HEADER: &str = "x-claude-code-session-id";
 
+/// The header a Task-tool subagent identifies itself with.
+///
+/// A subagent runs inside the parent's process and inherits the parent's
+/// session id, so without this the two interleave their turns on one log — and
+/// because neither one's resent history contains the other's items, every
+/// alternating turn diverges and forks. Read here rather than guessed at from
+/// the body, and treated as *part of the name* rather than as a reason to open
+/// an anonymous session: a subagent is a conversation of its own that a later
+/// turn of the same subagent should continue.
+pub const AGENT_HEADER: &str = "x-claude-code-agent-id";
+
+/// The namespace every session name this surface derives lives in.
+///
+/// **Cross-dialect continuation is not a feature** (M11.1 review, F6). A
+/// Messages client names its conversation with a header or a `metadata.user_id`
+/// and a Responses client names its own with `prompt_cache_key`; both are
+/// arbitrary client-chosen strings, and
+/// [`ControlPlane::qualify`](crate::control_config::ControlPlane) puts them in
+/// one namespace per principal. Two clients of one principal that happen to
+/// choose the same string are then not two conversations but one contested one
+/// — and since their histories were never going to agree, *every* alternating
+/// turn looks like an edited resend and forks, dropping the control store's
+/// overlay, intent, steer and binding records for the generation it leaves
+/// behind each time.
+///
+/// A prefix rather than a second namespace argument on `qualify`, because this
+/// is a fact about *this dialect's* names and not about the principal: the
+/// Responses surface's keys are unchanged, so no session minted before this
+/// existed moves. The shared `turn_id_for` deliberately stays shared — a turn
+/// id is a content hash and two dialects hashing one conversation differently
+/// would each be idempotent alone and neither across a chained deployment that
+/// serves one and dispatches the other.
+const DIALECT_NAMESPACE: &str = "anthropic_messages";
+
 /// The separator in the *older* `metadata.user_id` shape.
 ///
 /// `user_<hex>_account_<uuid>_session_<uuid>`. Neither hex nor a UUID contains
@@ -67,10 +101,7 @@ const USER_ID_SESSION_MARKER: &str = "_session_";
 ///
 /// Everything else — `tools`, `tool_choice`, `thinking`, `temperature`,
 /// `context_management`, `output_config`, and whatever the next beta adds — is
-/// accepted and ignored, for the reason the module doc gives. `max_tokens` is
-/// required by the upstream schema and is read here only so a future ceiling
-/// can be honoured; v1 chooses its target by routing policy, so it constrains
-/// nothing yet.
+/// accepted and ignored, for the reason the module doc gives.
 #[derive(Debug, Default, Deserialize)]
 pub struct CreateMessageParams {
     /// What the client believes it is talking to.
@@ -94,6 +125,19 @@ pub struct CreateMessageParams {
     pub stream: bool,
     #[serde(default)]
     pub metadata: Option<Metadata>,
+    /// The ceiling the client will let this answer grow to.
+    ///
+    /// Required by the upstream schema, and — since M11.1's F1 — actually
+    /// honoured: `create_message` narrows it into
+    /// [`TurnInput::output_token_cap`](crate::engine::TurnInput) and it reaches
+    /// the provider as the dispatch's own `max_tokens`. It is emphatically not
+    /// a routing input: v1 still chooses its target by policy, and this
+    /// constrains what the chosen target may *produce*, nothing about which one
+    /// is chosen.
+    ///
+    /// `u64` rather than `u32` because it is the client's number and parsing is
+    /// not the place to refuse one — a value too large for the wire is narrowed
+    /// where it is read, with the reasoning written there.
     #[serde(default)]
     pub max_tokens: Option<u64>,
 }
@@ -143,14 +187,24 @@ pub struct Metadata {
 /// read sends `user_id` on every request, so the product path never reaches it.
 /// It is `None` rather than a 4xx because a client with no session is asking for
 /// one turn, and answering it costs nothing.
+///
+/// Every rung that *does* name something is scoped by
+/// [`DIALECT_NAMESPACE`] and by the calling agent, so a name is only ever
+/// shared with another turn of the same dialect and the same agent. See
+/// [`scoped`].
 pub fn session_key(headers: &HeaderMap, params: &CreateMessageParams) -> Option<String> {
+    let agent = headers
+        .get(AGENT_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     if let Some(named) = headers
         .get(SESSION_HEADER)
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        return Some(named.to_string());
+        return Some(scoped(named, agent));
     }
     params
         .metadata
@@ -158,7 +212,41 @@ pub fn session_key(headers: &HeaderMap, params: &CreateMessageParams) -> Option<
         .and_then(|metadata| metadata.user_id.as_deref())
         .map(str::trim)
         .filter(|user_id| !user_id.is_empty())
-        .map(session_component)
+        .map(|user_id| scoped(&session_component(user_id), agent))
+}
+
+/// A client-chosen name, in the namespace it is allowed to collide inside.
+///
+/// Two dimensions, and neither is decoration:
+///
+/// **The dialect**, for the reason [`DIALECT_NAMESPACE`] gives — a Messages
+/// session id and a Responses `prompt_cache_key` that read the same are not the
+/// same conversation.
+///
+/// **The agent**, because the Task tool runs a subagent inside the parent's own
+/// process, and the client-surface evidence has it inheriting the parent's
+/// session id. Two agents appending to one log interleave two conversations
+/// neither of them can then resend, so each turn diverges from what the other
+/// left and forks. Joining the agent id makes them siblings: the parent keeps
+/// `…/{session}` and each subagent gets `…/{session}/agent/{id}`, which is one
+/// conversation each and a name a later turn of the same subagent reaches
+/// again.
+///
+/// The parent's own name is deliberately *not* re-spelled when the header is
+/// absent, so a deployment whose clients never send it sees exactly the names
+/// it saw before — and the subagent's name keeps the parent's session id as a
+/// visible prefix, which is what makes the relationship readable in a store
+/// listing rather than only in this function.
+///
+/// `#` is avoided on purpose: [`Conversations`](crate::conversations) spells a
+/// fork generation `{key}#g{n}`, and a client-chosen name that could mint a
+/// string of that shape would let one conversation address another's
+/// generation.
+fn scoped(session: &str, agent: Option<&str>) -> String {
+    match agent {
+        Some(agent) => format!("{DIALECT_NAMESPACE}/{session}/agent/{agent}"),
+        None => format!("{DIALECT_NAMESPACE}/{session}"),
+    }
 }
 
 /// The session component of a `metadata.user_id`, in either shipped shape.
@@ -203,7 +291,47 @@ pub fn canonicalize(params: &CreateMessageParams) -> Result<Vec<Item>, ApiError>
     for message in &params.messages {
         message_items(message, &mut items)?;
     }
+    mark_turn_configuration(&mut items);
     Ok(items)
+}
+
+/// The leading run of system items is *turn configuration*; every system item
+/// after it is conversation history.
+///
+/// **This is where the M11.1 review's F7 ruling is pinned, and it is pinned by
+/// position — once, here — rather than re-derived by every later reader.** The
+/// leading run is what the client rebuilds from its own environment on each
+/// invocation (the date, the cwd, the git branch, whichever betas are on
+/// today), and admitting it strictly forks an ordinary `--continue` the first
+/// time any of that moves. An *interior* `{"role":"system"}` message — the
+/// `mid-conversation-system-2026-04-07` beta's, which the shipping client sends
+/// on every request — is something that happened in the conversation at a
+/// position both sides agree on, so it stays history and is admitted strictly
+/// like any other item.
+///
+/// The distinction is carried as [`Role::Developer`] rather than as a side
+/// table or an index, because a run of identically-shaped system items is not
+/// splittable by anything downstream: the session fold, the prefix check and
+/// the judge's brief would each have to guess where configuration ended, and
+/// the first one that guessed differently would fork every session. Developer
+/// is the role roundhouse already has for instructions-as-configuration (the
+/// Responses surface maps a `developer` message to it), so this is a
+/// vocabulary reuse and not an invention — and it means the Messages dialect
+/// never produces a Developer item that is *not* configuration, which is what
+/// makes [`is_turn_configuration`](roundhouse_core::session::is_turn_configuration)
+/// total.
+///
+/// Both sources of a leading system item are covered on purpose: the top-level
+/// `system` field, and — for a client that sends none — a `{"role":"system"}`
+/// message sitting at position zero. "Leading" is about where the item is, not
+/// about which field it arrived in.
+fn mark_turn_configuration(items: &mut [Item]) {
+    for item in items {
+        if item.role != Role::System {
+            break;
+        }
+        item.role = Role::Developer;
+    }
 }
 
 /// This conversation's turn id.
@@ -463,6 +591,21 @@ mod tests {
 
     use serde_json::json;
 
+    /// What a *leading* system block canonicalizes to.
+    ///
+    /// Spelled out here rather than reached for as `Item::system_text`, because
+    /// the difference is the F7 ruling: the leading run is turn configuration
+    /// and carries [`Role::Developer`], while an interior system message stays
+    /// a `System` item of the conversation. A test that could not tell the two
+    /// apart would pass whichever way the boundary moved.
+    fn developer_text(text: &str) -> Item {
+        Item {
+            role: Role::Developer,
+            content: ItemContent::Text { text: text.into() },
+            response_id: None,
+        }
+    }
+
     fn params(body: Value) -> CreateMessageParams {
         serde_json::from_value(body).expect("the fixture is a well-formed request")
     }
@@ -514,11 +657,11 @@ mod tests {
         assert_eq!(
             items,
             vec![
-                Item::system_text(
+                developer_text(
                     "x-anthropic-billing-header: cc_version=2.1.247.3b2; cc_entrypoint=cli;"
                 ),
-                Item::system_text("You are Claude Code."),
-                Item::system_text("<system-reminder>…</system-reminder>"),
+                developer_text("You are Claude Code."),
+                developer_text("<system-reminder>…</system-reminder>"),
                 Item::user_text("list the crates"),
                 Item {
                     role: Role::Assistant,
@@ -537,7 +680,8 @@ mod tests {
                 },
                 Item::user_text("and the tests?"),
             ],
-            "the attribution block is ordinary prefix and cache_control leaves no trace"
+            "the attribution block is ordinary prefix — turn configuration, per the \
+             leading run (F7) — and cache_control leaves no trace"
         );
     }
 
@@ -547,7 +691,7 @@ mod tests {
     fn a_system_string_is_one_item_and_an_empty_one_is_none() {
         assert_eq!(
             canonicalize(&params(json!({ "system": "be brief", "messages": [] }))).unwrap(),
-            vec![Item::system_text("be brief")]
+            vec![developer_text("be brief")]
         );
         assert_eq!(
             canonicalize(&params(json!({ "system": "", "messages": [] }))).unwrap(),
@@ -565,7 +709,7 @@ mod tests {
                 "messages": [],
             })))
             .unwrap(),
-            vec![Item::system_text(""), Item::system_text("b")]
+            vec![developer_text(""), developer_text("b")]
         );
     }
 
@@ -836,6 +980,76 @@ mod tests {
         assert_eq!(items, vec![Item::user_text("hi")]);
     }
 
+    /// **Where turn configuration ends is decided by position, once** (F7).
+    ///
+    /// The four shapes that matter, and each is a different way to get the
+    /// boundary wrong:
+    ///
+    /// - `system` blocks followed by messages: the run is the blocks.
+    /// - A `{"role":"system"}` message *after* a user message: history, because
+    ///   it happened at a position both sides agree on. Folding it into the
+    ///   configuration would take it out of what prefix admission compares and
+    ///   silently shorten every later claim.
+    /// - A `{"role":"system"}` message at position zero with no top-level
+    ///   `system`: configuration, because "leading" is about where an item sits
+    ///   and not about which field carried it.
+    /// - `system` blocks *and* an interior system message: the run stops at the
+    ///   first user message and does not resume.
+    #[test]
+    fn the_leading_system_run_is_configuration_and_an_interior_one_is_history() {
+        let leading_only = canonicalize(&params(json!({
+            "system": [{ "type": "text", "text": "a" }, { "type": "text", "text": "b" }],
+            "messages": [
+                { "role": "user", "content": "hello" },
+                { "role": "system", "content": "a reminder" },
+            ],
+        })))
+        .unwrap();
+        assert_eq!(
+            leading_only
+                .iter()
+                .map(|item| item.role)
+                .collect::<Vec<_>>(),
+            vec![
+                Role::Developer,
+                Role::Developer,
+                Role::User,
+                // Interior: history, and admitted strictly like any other item.
+                Role::System,
+            ],
+        );
+
+        // No `system` field at all: the first message is still the leading run.
+        let message_only = canonicalize(&params(json!({
+            "messages": [
+                { "role": "system", "content": "be brief" },
+                { "role": "user", "content": "hello" },
+            ],
+        })))
+        .unwrap();
+        assert_eq!(
+            message_only
+                .iter()
+                .map(|item| item.role)
+                .collect::<Vec<_>>(),
+            vec![Role::Developer, Role::User],
+        );
+
+        // And a conversation that opens with a user message has no
+        // configuration at all — not "the first system item it can find".
+        let none = canonicalize(&params(json!({
+            "messages": [
+                { "role": "user", "content": "hello" },
+                { "role": "system", "content": "a reminder" },
+            ],
+        })))
+        .unwrap();
+        assert_eq!(
+            none.iter().map(|item| item.role).collect::<Vec<_>>(),
+            vec![Role::User, Role::System],
+        );
+    }
+
     /// **The header wins, then either `user_id` shape, then the whole string.**
     ///
     /// One test for the whole order because the order *is* the ruling, and the
@@ -856,12 +1070,12 @@ mod tests {
                 &with_metadata(live_user_id)
             )
             .as_deref(),
-            Some("header-session")
+            Some("anthropic_messages/header-session")
         );
         // 2a. The 2.1.247 JSON-object shape.
         assert_eq!(
             session_key(&HeaderMap::new(), &with_metadata(live_user_id)).as_deref(),
-            Some("11111111-2222-3333-4444-555555555555")
+            Some("anthropic_messages/11111111-2222-3333-4444-555555555555")
         );
         // 2b. The older underscore shape, which the JSON parse does not reach.
         assert_eq!(
@@ -870,12 +1084,12 @@ mod tests {
                 &with_metadata("user_9f3a_account_c0ffee_session_deadbeef")
             )
             .as_deref(),
-            Some("deadbeef")
+            Some("anthropic_messages/deadbeef")
         );
         // 3. A shape neither rung recognises is still a name.
         assert_eq!(
             session_key(&HeaderMap::new(), &with_metadata("just-a-name")).as_deref(),
-            Some("just-a-name")
+            Some("anthropic_messages/just-a-name")
         );
         // 4. Nothing at all.
         assert_eq!(
@@ -914,7 +1128,7 @@ mod tests {
                 &params(json!({ "messages": [], "metadata": { "user_id": "from-body" } }))
             )
             .as_deref(),
-            Some("from-body")
+            Some("anthropic_messages/from-body")
         );
         assert_eq!(
             session_key(
@@ -922,6 +1136,64 @@ mod tests {
                 &params(json!({ "messages": [] }))
             ),
             None
+        );
+    }
+
+    /// **Every derived name carries its dialect, and its agent when there is
+    /// one** (M11.1 review, F6).
+    ///
+    /// Two collisions this closes, both of which forked a session on *every*
+    /// alternating turn rather than once: a Responses `prompt_cache_key` that
+    /// reads the same as a Messages session id under one principal, and a
+    /// Task-tool subagent that inherits its parent's session id. Neither is an
+    /// edited conversation; both were two conversations sharing a log, which is
+    /// the one thing prefix admission can never reconcile.
+    ///
+    /// The last assertion is the one that keeps this cheap: with no agent
+    /// header the parent's name gains nothing beyond the dialect, so a
+    /// deployment whose clients never send it is unaffected.
+    #[test]
+    fn a_derived_name_carries_its_dialect_and_its_agent() {
+        let body = params(json!({ "messages": [] }));
+
+        assert_eq!(
+            session_key(&headers(&[(SESSION_HEADER, "s1")]), &body).as_deref(),
+            Some("anthropic_messages/s1"),
+        );
+        assert_eq!(
+            session_key(
+                &headers(&[(SESSION_HEADER, "s1"), (AGENT_HEADER, "agent-7")]),
+                &body
+            )
+            .as_deref(),
+            Some("anthropic_messages/s1/agent/agent-7"),
+        );
+        // The agent joins a `user_id`-derived name too: the rung a name came
+        // from is not a reason to scope it differently.
+        assert_eq!(
+            session_key(
+                &headers(&[(AGENT_HEADER, "agent-7")]),
+                &params(json!({ "messages": [], "metadata": { "user_id": "from-body" } }))
+            )
+            .as_deref(),
+            Some("anthropic_messages/from-body/agent/agent-7"),
+        );
+        // A blank agent header is absent, not an agent named "": otherwise a
+        // client that sent the header empty would get a session of its own that
+        // no later turn could name again.
+        assert_eq!(
+            session_key(
+                &headers(&[(SESSION_HEADER, "s1"), (AGENT_HEADER, "  ")]),
+                &body
+            )
+            .as_deref(),
+            Some("anthropic_messages/s1"),
+        );
+        // A name a Responses client could choose can no longer reach a Messages
+        // session, whatever it spells.
+        assert_ne!(
+            session_key(&headers(&[(SESSION_HEADER, "shared")]), &body).as_deref(),
+            Some("shared"),
         );
     }
 
@@ -940,10 +1212,19 @@ mod tests {
         })))
         .unwrap();
         assert_eq!(turn_id_for(&items), turn_id_for(&items));
+        // One hash function over one canonical vocabulary, reached from the
+        // other module. What is *not* claimed is that the two dialects
+        // canonicalize a request the same way — this one maps a leading system
+        // run to `Developer` (F7) and the other maps `instructions` to
+        // `System`, and since F6 puts their sessions in different namespaces a
+        // turn id was never going to deduplicate across them anyway. What must
+        // stay single is the function: two spellings of FNV over `Item::render`
+        // would each be idempotent alone and neither across a chained
+        // roundhouse, which serves one surface and dispatches the other.
         assert_eq!(
             turn_id_for(&items),
             crate::responses_api::turn_id_for(&[
-                Item::system_text("be brief"),
+                developer_text("be brief"),
                 Item::user_text("hello"),
             ])
         );

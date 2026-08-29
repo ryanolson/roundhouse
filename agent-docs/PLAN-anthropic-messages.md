@@ -394,7 +394,12 @@ cadence. Stage briefs carry §3 verbatim.
   `tool_use` blocks on the dispatch decode, a tool-call chunk variant, the
   serve projection emitting `content_block` tool_use with `input_json_delta`
   and `stop_reason: tool_use`, and `tool_result` already canonicalizes on
-  the way back in.)* `claude_launch` (R8's
+  the way back in. The same `Done`/emit widening carries F1's deferred
+  reporting half from the M11.1 fix round: the dispatch decoder currently
+  discards the upstream `stop_reason`, so a max_tokens-truncated turn is
+  indistinguishable from `end_turn` in the log — the `#[ignore]`d evidence
+  test in `anthropic_messages/stream.rs` names it and un-ignoring it is the
+  first step of that change.)* `claude_launch` (R8's
   library half); the gated `e2e-claude` suite (R6 tier 2) driving Direct;
   the chained topology against `nemo-relay` at its then-current release with
   the seven guards of R7 as tests or documented refusals. This rung also

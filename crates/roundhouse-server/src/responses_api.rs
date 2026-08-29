@@ -33,13 +33,13 @@
 //! client, it drops what it does not recognize, and the terminal event closes
 //! the body before anything could follow it anyway.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::convert::Infallible;
 use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::HeaderMap;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -55,6 +55,7 @@ use roundhouse_core::event::{IncompleteReason, SessionEvent, SessionEventKind, U
 use roundhouse_core::ids::{ResponseId, SessionId, TurnId};
 use roundhouse_core::item::{Item, ItemContent};
 use roundhouse_core::now_ms;
+use roundhouse_core::session::{ConfigurationCursor, turn_configuration_len};
 use roundhouse_core::store::SessionStore;
 
 use crate::control_config::{ControlPlane, PlaneSource};
@@ -63,6 +64,7 @@ use crate::engine::{Engine, TurnInput};
 use crate::http::{
     ApiError, LogTail, POLL_INTERVAL, READ_BATCH, parse_body, refuse_over_fair_use, store_error,
 };
+use crate::messages_api::MAX_REQUEST_BYTES;
 
 mod wire;
 use wire::{
@@ -175,6 +177,14 @@ where
             &format!("{API_PREFIX}/responses"),
             post(create_response::<S, T>),
         )
+        // The same 32 MB ceiling the Messages surface takes from the platform,
+        // for the same reason and against the same axum default: a `Bytes`
+        // extractor with no layer caps every request at an undisclosed 2 MiB,
+        // and an agentic client resending its history crosses that long before
+        // any provider would refuse it (M11.1 review, F3). This surface keeps
+        // axum's own plain-text refusal shape — its clients read a status, not
+        // a dialect-specific error envelope — so only the limit moves here.
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .with_state(Compat {
             engine,
             store,
@@ -318,6 +328,14 @@ where
                     TurnInput {
                         items: input,
                         declared_baseline,
+                        // This surface reads no ceiling off the request. The
+                        // field exists because the Messages surface has one to
+                        // pass (M11.1, F1); `max_output_tokens` on a Responses
+                        // request stays accepted-and-ignored like the rest of
+                        // the fields this compatibility surface does not read,
+                        // and honouring it is a separate decision with its own
+                        // test.
+                        output_token_cap: None,
                     },
                     &admission,
                 )
@@ -417,7 +435,7 @@ where
     let key = plane.qualify(principal, cache_key);
     let session_id = conversations.bind(principal, &key);
     create_session(engine, &session_id).await?;
-    if let Some(delta) = suffix_after(&stored_items(store, &session_id).await?, &claimed) {
+    if let Some(delta) = admit(&stored_conversation(store, &session_id).await?, &claimed) {
         return Ok((session_id, delta));
     }
 
@@ -449,16 +467,79 @@ where
         .map_err(|error| ApiError::internal("engine_error", error.to_string()))
 }
 
+/// The session as prefix admission sees it: its turn configuration, then the
+/// history a client's claim is checked against.
+struct StoredConversation {
+    /// Configuration run first, then history — the same order and the same
+    /// placement rule [`SessionState`](roundhouse_core::session::SessionState)
+    /// folds with, because the two have to describe one session.
+    items: Vec<Item>,
+    configuration_len: usize,
+}
+
+impl StoredConversation {
+    fn configuration(&self) -> &[Item] {
+        &self.items[..self.configuration_len]
+    }
+
+    fn history(&self) -> &[Item] {
+        &self.items[self.configuration_len..]
+    }
+}
+
+/// One entry of the log that this projection cares about.
+///
+/// Turn starts are kept because the configuration run is a *per turn* fact —
+/// see [`ConfigurationCursor`] — so the projection cannot be a filter over
+/// items alone.
+enum Entry {
+    TurnStarted,
+    Item(Item),
+}
+
 /// The session's committed conversation, projected from the log.
 ///
 /// A projection rather than a [`Session`](roundhouse_core::session::Session):
 /// opening one takes the lease, and a read that took the lease would evict the
 /// turn it is about to start.
-async fn stored_items<S: SessionStore>(
+///
+/// Two things the raw item stream does not say are resolved here, and both are
+/// M11.1 review findings:
+///
+/// **A partial committed by a response that never completed is provisional**
+/// (F2). [`Session::mark_incomplete`](roundhouse_core::session::Session)
+/// commits the bytes a dying dispatch had already produced so a successor can
+/// resume from them — but the client's SSE layer threw that answer away the
+/// moment it read the `error` frame, so the history it resends next has a hole
+/// exactly where the partial sits. Compared strictly, the client's own honest
+/// retry disagrees with us at that item and forks the session it has been using
+/// all along, losing the routing history and the warm prefix on the turn a
+/// transient upstream failure already cost it once. So an item stamped by a
+/// response the log records as incomplete is left out of what a claim is
+/// checked against: the client may resend it, in which case it is re-admitted
+/// as ordinary unstamped history, or it may not, in which case the turn it
+/// belonged to is simply regenerated on the same session. Divergence anywhere
+/// else still forks, because a provisional item is the only item on the log
+/// this deployment knows the client may never have seen.
+///
+/// The rejected alternative was to drop the partial from the *session's own*
+/// fold as well, so the retry regenerates from a prompt that never saw it. That
+/// is a larger change than the finding: it contradicts `mark_incomplete`'s own
+/// documented reason for committing a partial at all, and it costs the
+/// guaranteed cache hit that partial represents on the target that produced it.
+/// What is written here is the admission half only — the retry still continues
+/// from the partial, and the *next* turn no longer forks over it.
+///
+/// **A turn's leading configuration run replaces the session's** (F7), through
+/// exactly the cursor [`SessionState`](roundhouse_core::session::SessionState)
+/// folds with, so the prompt the engine rebuilds and the prefix a claim is
+/// checked against cannot disagree about where the system prompt is.
+async fn stored_conversation<S: SessionStore>(
     store: &S,
     session_id: &SessionId,
-) -> Result<Vec<Item>, ApiError> {
-    let mut items = Vec::new();
+) -> Result<StoredConversation, ApiError> {
+    let mut entries: Vec<Entry> = Vec::new();
+    let mut provisional: HashSet<ResponseId> = HashSet::new();
     let mut cursor = 0u64;
     loop {
         let batch = store
@@ -467,12 +548,96 @@ async fn stored_items<S: SessionStore>(
             .map_err(|error| store_error(session_id, error))?;
         let Some(last) = batch.last() else { break };
         cursor = last.seq;
-        items.extend(batch.into_iter().filter_map(|event| match event.kind {
-            SessionEventKind::ItemAppended { item } => Some(item),
-            _ => None,
-        }));
+        for event in batch {
+            match event.kind {
+                SessionEventKind::ItemAppended { item } => entries.push(Entry::Item(item)),
+                SessionEventKind::TurnStarted { .. } => entries.push(Entry::TurnStarted),
+                SessionEventKind::ResponseIncomplete { response_id, .. } => {
+                    provisional.insert(response_id);
+                }
+                _ => {}
+            }
+        }
     }
-    Ok(items)
+
+    // Collected first and resolved second, because a response is only known to
+    // be incomplete by an event that arrives *after* the item it stamped: a
+    // single streaming pass would have to admit the partial before learning it
+    // was provisional.
+    let mut items = Vec::with_capacity(entries.len());
+    let mut configuration = ConfigurationCursor::default();
+    for entry in entries {
+        match entry {
+            Entry::TurnStarted => configuration.turn_started(),
+            Entry::Item(item) => {
+                if item
+                    .response_id
+                    .as_ref()
+                    .is_some_and(|id| provisional.contains(id))
+                {
+                    continue;
+                }
+                configuration.append(&mut items, item);
+            }
+        }
+    }
+    Ok(StoredConversation {
+        configuration_len: configuration.len(),
+        items,
+    })
+}
+
+/// What this turn may append, or `None` when the claim is not a continuation
+/// of this session at all.
+///
+/// **The configuration run and the history are admitted under different
+/// rules, and that asymmetry is finding F7's ruling** (M11.1 thermo-nuclear
+/// review). History is checked strictly and forks on any disagreement: it is a
+/// claim about what already happened, and two sides that disagree about that
+/// are not in one conversation. The leading configuration run is not a claim
+/// about what happened — it is the instruction block the client re-derives from
+/// its own environment on every single invocation, so it moves for reasons that
+/// have nothing to do with the conversation: the date rolls over, the user
+/// changes directory or branch, a beta flag drops out of the header, the client
+/// self-updates overnight. Forking on that defeats warm-prefix caching for
+/// every real session, on precisely the turn it would first have paid off —
+/// which is what the milestone's own captured `--continue` pair does today.
+///
+/// So a changed configuration run is *recorded*, never forked on: the new run
+/// is admitted as this turn's input and replaces the stored one at the head.
+/// Three consequences, taken deliberately:
+///
+/// - The turn id is still a hash of the whole canonicalized conversation, the
+///   new configuration included (it is computed by the handler, over the items
+///   passed in here). A byte-identical retry therefore still deduplicates onto
+///   the response it already paid for, and a turn whose system prompt changed
+///   is a new turn — which it is.
+/// - The provider-side cache the old configuration was holding is lost. That
+///   loss is the client's own doing and needs no compensation here: it rewrote
+///   the bytes at the front of its own prompt.
+/// - An *interior* system message is history, not configuration, and is
+///   compared strictly like everything else. Where the split is decided —
+///   once, at canonicalization, by position — is
+///   [`is_turn_configuration`](roundhouse_core::session::is_turn_configuration).
+///
+/// A claim carrying **no** configuration at all against a session that holds
+/// some leaves the stored run in place. That is "this request said nothing
+/// about the instructions", not "the instructions are now empty": an empty run
+/// has no items to append and so nothing to record, and forking over it would
+/// punish exactly the bare `curl` the anonymous arm exists to serve.
+fn admit(stored: &StoredConversation, claimed: &[Item]) -> Option<Vec<Item>> {
+    let claimed_configuration_len = turn_configuration_len(claimed);
+    let (claimed_configuration, claimed_history) = claimed.split_at(claimed_configuration_len);
+    let suffix = suffix_after(stored.history(), claimed_history)?;
+
+    let mut delta = Vec::with_capacity(claimed_configuration.len() + suffix.len());
+    if !claimed_configuration.is_empty()
+        && !same_items(stored.configuration(), claimed_configuration)
+    {
+        delta.extend_from_slice(claimed_configuration);
+    }
+    delta.extend(suffix);
+    Some(delta)
 }
 
 /// The part of `claimed` that `stored` does not already contain.
@@ -499,6 +664,15 @@ fn suffix_after(stored: &[Item], claimed: &[Item]) -> Option<Vec<Item>> {
 /// prefix check on every turn after the first.
 fn same_item(stored: &Item, claimed: &Item) -> bool {
     stored.role == claimed.role && stored.content == claimed.content
+}
+
+/// [`same_item`], run over two runs of the same length.
+///
+/// Stamp-blind for the same reason, and length-sensitive on purpose: a
+/// configuration run that gained or lost a block is a changed run, not a
+/// prefix-matching one.
+fn same_items(stored: &[Item], claimed: &[Item]) -> bool {
+    stored.len() == claimed.len() && stored.iter().zip(claimed).all(|(a, b)| same_item(a, b))
 }
 
 // ---------------------------------------------------------------------------
@@ -982,6 +1156,105 @@ mod tests {
     fn an_edited_history_is_refused_rather_than_appended() {
         let stored = vec![user("hello"), assistant("hi")];
         assert_eq!(suffix_after(&stored, &[user("goodbye")]), None);
+    }
+
+    fn configuration(text: &str) -> Item {
+        Item {
+            role: Role::Developer,
+            content: ItemContent::Text { text: text.into() },
+            response_id: None,
+        }
+    }
+
+    fn stored(items: Vec<Item>) -> StoredConversation {
+        let configuration_len = turn_configuration_len(&items);
+        StoredConversation {
+            items,
+            configuration_len,
+        }
+    }
+
+    /// **A rewritten configuration run is recorded, not forked on** (F7), and
+    /// the conversation underneath it is still admitted strictly.
+    ///
+    /// The four cases are the whole ruling. Note what the delta contains in the
+    /// second: the *new* run and only the genuinely new history — the run is
+    /// re-recorded because it changed, and the projection puts it at the head.
+    #[test]
+    fn a_changed_configuration_run_is_admitted_and_a_changed_history_is_not() {
+        let session = stored(vec![configuration("v1"), user("hello"), assistant("hi")]);
+        let history = [
+            user("hello"),
+            Item {
+                role: Role::Assistant,
+                content: ItemContent::Text { text: "hi".into() },
+                response_id: None,
+            },
+            user("again"),
+        ];
+
+        // Unchanged: nothing about the configuration is re-recorded.
+        let mut claimed = vec![configuration("v1")];
+        claimed.extend_from_slice(&history);
+        assert_eq!(admit(&session, &claimed), Some(vec![user("again")]));
+
+        // Rewritten: the new run leads the delta, ahead of the new history.
+        let mut claimed = vec![configuration("v2")];
+        claimed.extend_from_slice(&history);
+        assert_eq!(
+            admit(&session, &claimed),
+            Some(vec![configuration("v2"), user("again")]),
+        );
+
+        // A run that gained a block is a changed run, not a matching prefix.
+        let mut claimed = vec![configuration("v1"), configuration("extra")];
+        claimed.extend_from_slice(&history);
+        assert_eq!(
+            admit(&session, &claimed),
+            Some(vec![
+                configuration("v1"),
+                configuration("extra"),
+                user("again")
+            ]),
+        );
+
+        // And the history is still strict: rewriting *it* forks, whatever the
+        // configuration says. This is the assertion that keeps the tolerance
+        // narrow.
+        assert_eq!(
+            admit(&session, &[configuration("v1"), user("goodbye")]),
+            None
+        );
+        assert_eq!(
+            admit(&session, &[configuration("v2"), user("goodbye")]),
+            None
+        );
+    }
+
+    /// A claim with no configuration of its own says nothing about the
+    /// session's, rather than claiming it is now empty.
+    ///
+    /// An empty run has no items to append and so nothing to record; forking
+    /// over it would punish exactly the bare `curl` the anonymous arm exists to
+    /// serve.
+    #[test]
+    fn a_claim_carrying_no_configuration_leaves_the_stored_run_alone() {
+        let session = stored(vec![configuration("v1"), user("hello"), assistant("hi")]);
+        assert_eq!(
+            admit(
+                &session,
+                &[
+                    user("hello"),
+                    Item {
+                        role: Role::Assistant,
+                        content: ItemContent::Text { text: "hi".into() },
+                        response_id: None,
+                    },
+                    user("again"),
+                ]
+            ),
+            Some(vec![user("again")]),
+        );
     }
 
     #[test]

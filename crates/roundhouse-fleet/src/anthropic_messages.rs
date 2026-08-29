@@ -182,8 +182,13 @@ impl StoredAuthStyle {
 /// costs a whole turn's input to retry; too high asks for a ceiling some models
 /// reject outright as above their maximum. 8192 is the largest value every
 /// current Claude model accepts without an output-extension beta, which makes it
-/// the largest safe answer rather than the most generous one. A deployment that
-/// wants more sets `expected_output_tokens` on the quote.
+/// the largest safe answer rather than the most generous one.
+///
+/// **Reached only when the caller declared no ceiling** — see
+/// [`FrontierQuote::output_token_cap`]. Until M11.1's F1 this fell back to
+/// `expected_output_tokens` instead, which made the router's *pricing estimate*
+/// (256 by default) the upstream ceiling and truncated every real answer at
+/// roughly a paragraph.
 pub const DEFAULT_MAX_TOKENS: u32 = 8192;
 
 /// The dialect this client serializes. Anything else is refused rather than
@@ -371,8 +376,12 @@ impl AnthropicMessagesClient {
 
         let mut body = json!({
             "model": model,
-            // Required by the schema; see `DEFAULT_MAX_TOKENS`.
-            "max_tokens": quote.expected_output_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+            // Required by the schema; see `DEFAULT_MAX_TOKENS`. The client's
+            // declared ceiling and never the router's estimate — the two were
+            // one field until M11.1's F1, and reading the estimate here capped
+            // every answer at the 256 tokens the *pricing* default happened to
+            // be.
+            "max_tokens": quote.output_token_cap.unwrap_or(DEFAULT_MAX_TOKENS),
             "stream": true,
             // **One user message, several blocks.** Structural parity with the
             // Responses client, which also wraps the whole render in one user
@@ -705,6 +714,9 @@ mod tests {
             segment_boundaries: boundaries(),
             prompt_cache_key: "sess_anthropic".into(),
             expected_output_tokens: Some(512),
+            // No client declared a ceiling on these fixtures, which is what
+            // every internal caller looks like; see `output_token_cap`.
+            output_token_cap: None,
             credential,
         }
     }
@@ -757,7 +769,12 @@ mod tests {
 
         assert_eq!(body["model"], json!("claude-sonnet"));
         assert_eq!(body["stream"], json!(true));
-        assert_eq!(body["max_tokens"], json!(512));
+        // The fixture declares no client ceiling, so this is the client's own
+        // default rather than the quote's 512-token pricing estimate — which it
+        // was until M11.1's F1 split the two. Which number wins is pinned by
+        // `the_wire_ceiling_is_the_declared_cap_and_never_the_pricing_estimate`;
+        // here it is only asserted so this body stays fully described.
+        assert_eq!(body["max_tokens"], json!(DEFAULT_MAX_TOKENS));
 
         let content = body["messages"][0]["content"]
             .as_array()
@@ -905,12 +922,49 @@ mod tests {
     fn max_tokens_is_always_sent_because_the_schema_requires_it() {
         let mut quote = quote(TurnCredential::Absent, SPOKEN);
         quote.expected_output_tokens = None;
+        quote.output_token_cap = None;
         let body = AnthropicMessagesClient::body(&quote, "claude-sonnet").unwrap();
         assert_eq!(
             body["max_tokens"],
             json!(DEFAULT_MAX_TOKENS),
             "a Messages request without max_tokens is a 400, so there is no \
              `let the model decide` to fall back to"
+        );
+    }
+
+    /// **The ceiling on the wire is the client's, never the router's estimate.**
+    ///
+    /// M11.1's F1, on this side of the seam: `expected_output_tokens` is what
+    /// the turn was *priced* at (256 by default, and nothing overrides it), and
+    /// while it was also what this body sent, every answer this client
+    /// dispatched was cut off at roughly a paragraph — reported to the client
+    /// as an ordinary `stop_reason` and to nobody as a defect.
+    ///
+    /// The estimate is left set in both arms deliberately: an implementation
+    /// that reads it here passes an assertion that only sets the cap, so the
+    /// second arm — a large estimate that must *not* reach the wire — is the
+    /// one carrying the finding.
+    #[test]
+    fn the_wire_ceiling_is_the_declared_cap_and_never_the_pricing_estimate() {
+        let mut quote = quote(TurnCredential::Absent, SPOKEN);
+        quote.expected_output_tokens = Some(256);
+        quote.output_token_cap = Some(64_000);
+        let body = AnthropicMessagesClient::body(&quote, "claude-sonnet").unwrap();
+        assert_eq!(
+            body["max_tokens"],
+            json!(64_000),
+            "the client asked for 64 000 tokens and the router expected 256 of \
+             them; the ceiling sent upstream is the client's"
+        );
+
+        quote.output_token_cap = None;
+        quote.expected_output_tokens = Some(100_000);
+        let body = AnthropicMessagesClient::body(&quote, "claude-sonnet").unwrap();
+        assert_eq!(
+            body["max_tokens"],
+            json!(DEFAULT_MAX_TOKENS),
+            "with no declared cap the fallback is this client's own default — a \
+             pricing estimate is not a ceiling in either direction"
         );
     }
 

@@ -19,7 +19,7 @@ use crate::event::{
     SessionObserver, Usage, ValidationOutcome,
 };
 use crate::ids::{ResponseId, SessionId, TurnId};
-use crate::item::Item;
+use crate::item::{Item, Role};
 use crate::routing::{CacheLedger, DecisionRecord, DispatchAttempt, ProviderPricing, Target};
 use crate::store::{Lease, SessionStore, StoreError};
 use crate::validate::{Arm, EscalationOverrides, SteerAction};
@@ -203,9 +203,124 @@ pub struct TerminalSettlement {
     pub provider_reported_cost_usd: Option<f64>,
 }
 
+/// Whether one committed item is *turn configuration* rather than history.
+///
+/// The distinction M11.1's review forced into the model (finding F7). A client
+/// that resends its whole conversation every turn resends two different kinds
+/// of thing in one list: the conversation, which is what happened and which the
+/// server already holds, and the instruction block the client re-derives on
+/// every invocation from the date, the working directory, the git branch and
+/// whichever betas are enabled today. Treating the second as history means an
+/// ordinary `--continue` forks its own session the first time any of those
+/// moves, which is the one turn a warm prefix was supposed to pay off on.
+///
+/// **The role is the marker, and it is assigned once — at canonicalization —
+/// by position.** A dialect that has a leading system run maps that run to
+/// [`Role::Developer`] and leaves every *interior* system message a
+/// [`Role::System`] item of the conversation, so nothing downstream ever has to
+/// re-derive where configuration ended: a run of identical-looking system items
+/// is not splittable by any later reader, which is exactly the ambiguity this
+/// encoding removes. See `messages_api::wire::canonicalize`.
+///
+/// The stamp check is belt and braces rather than decoration: everything on the
+/// input path arrives unstamped, so a stamped item is one *this* deployment
+/// emitted, and no emitted item is ever a client's configuration.
+pub fn is_turn_configuration(item: &Item) -> bool {
+    item.role == Role::Developer && item.response_id.is_none()
+}
+
+/// How many leading items of `items` are turn configuration.
+pub fn turn_configuration_len(items: &[Item]) -> usize {
+    items
+        .iter()
+        .take_while(|item| is_turn_configuration(item))
+        .count()
+}
+
+/// Where a session's turn configuration ends, as items are folded in.
+///
+/// **One rule, two readers**, which is the whole reason this is a type and not
+/// two loops: the session's own projection ([`SessionState::items`], what the
+/// prompt is rebuilt from) and the serve surfaces' prefix-admission projection
+/// (`responses_api::bind_prefix`) have to agree byte for byte about what the
+/// session contains, or admission checks a conversation the model never sees.
+///
+/// The rule: a turn's input may open with a run of configuration items, and
+/// that run **replaces** whatever configuration the session was holding,
+/// in place at the head. Everything else is appended as history. So a session
+/// whose client rewrote one line of its system prompt ends up with one system
+/// prompt — the new one, at the front, where a prompt belongs — rather than two
+/// copies of it with the stale one first.
+///
+/// Append-only is preserved and that is the point of doing it here: nothing is
+/// rewritten in the log. The log holds both runs and the *projection* resolves
+/// them, exactly as it already resolves a `ResponseIncomplete` into "that
+/// partial was provisional". The alternative considered and rejected was a new
+/// `SessionEventKind` carrying the replacement: it would have given this fold,
+/// the wire layer's projection and the context assembler a second item-carrying
+/// kind to keep in agreement, which the `ItemAppended` arm below already
+/// explains is how a session starts forking on the first site that forgets one.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ConfigurationCursor {
+    len: usize,
+    /// Whether the item folded most recently was part of *this turn's* leading
+    /// configuration run.
+    ///
+    /// Reset by [`Self::turn_started`] rather than inferred from the items,
+    /// because two consecutive turns that each carry only configuration (a
+    /// client retrying with a rewritten system prompt and nothing new to say)
+    /// are otherwise indistinguishable from one turn carrying twice as much —
+    /// and the second reading appends the new run beside the old one instead of
+    /// over it.
+    in_run: bool,
+}
+
+impl ConfigurationCursor {
+    /// A turn's input is about to be folded in.
+    pub fn turn_started(&mut self) {
+        self.in_run = false;
+    }
+
+    /// Place one appended item into `items`.
+    pub fn append(&mut self, items: &mut Vec<Item>, item: Item) {
+        if !is_turn_configuration(&item) {
+            self.in_run = false;
+            items.push(item);
+            return;
+        }
+        if !self.in_run {
+            // The first configuration item of a turn retires the whole of the
+            // previous set. Retiring it item by item — keeping the ones that
+            // happen to match — would leave a session holding a prefix of one
+            // system prompt and a suffix of another, which is a prompt nobody
+            // wrote.
+            items.drain(..self.len);
+            self.len = 0;
+            self.in_run = true;
+        }
+        items.insert(self.len, item);
+        self.len += 1;
+    }
+
+    /// How many leading items of the folded list are configuration.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
 /// State derived from the event log.
 #[derive(Default)]
 pub struct SessionState {
+    /// The canonical conversation: this session's turn configuration, then its
+    /// history.
+    ///
+    /// Not simply "every appended item in log order" — see
+    /// [`ConfigurationCursor`] for why a turn's leading configuration run lands
+    /// at the head rather than where it was appended.
     pub items: Vec<Item>,
     pub ledger: CacheLedger,
     /// Number of turns started so far; the index the next turn will use.
@@ -214,6 +329,9 @@ pub struct SessionState {
     completed_turns: HashMap<TurnId, CompletedTurn>,
     /// Turn ids currently in flight.
     open_turns: HashMap<TurnId, ResponseId>,
+    /// Where [`Self::items`]'s configuration run ends. See
+    /// [`ConfigurationCursor`].
+    configuration: ConfigurationCursor,
     /// Routing facts of responses that have not terminated yet.
     ///
     /// `Routed` is committed before execution, so it records an intent rather
@@ -466,7 +584,12 @@ impl SessionState {
                 // for the life of the session. The fact is taken off
                 // `ValidationDecided` instead, which is the one event that says
                 // a steer happened.
-                self.items.push(item.clone());
+                //
+                // Placed through the cursor rather than pushed, which is the
+                // one thing that is *not* plain append order here: a turn's
+                // leading configuration run replaces the session's, at the
+                // head. See [`ConfigurationCursor`].
+                self.configuration.append(&mut self.items, item.clone());
             }
             SessionEventKind::TurnStarted {
                 turn_id,
@@ -474,6 +597,10 @@ impl SessionState {
             } => {
                 self.turn_index += 1;
                 self.open_turns.insert(turn_id.clone(), response_id.clone());
+                // The configuration run is per turn: the items about to be
+                // folded in are this turn's admitted input, and its leading
+                // configuration items — if it has any — are a replacement.
+                self.configuration.turn_started();
             }
             SessionEventKind::Routed {
                 response_id,

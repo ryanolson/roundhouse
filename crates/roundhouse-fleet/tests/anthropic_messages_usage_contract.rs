@@ -99,6 +99,9 @@ fn quote() -> FrontierQuote {
         segment_boundaries: Vec::new(),
         prompt_cache_key: "sess_usage_contract".into(),
         expected_output_tokens: Some(512),
+        // No client declared a ceiling on these fixtures, which is what
+        // every internal caller looks like; see `output_token_cap`.
+        output_token_cap: None,
         credential: TurnCredential::Stored(
             Secret::api_key("sk-ant-api03-ZZZQQQ-usage-contract").expect("an ordinary API key"),
         ),

@@ -76,6 +76,25 @@ getrandom = "0.3"
 # reader would otherwise "fix" it.
 hex = "0.4"
 serde = { version = "1", features = ["derive", "rc"] }
+# Default features, and one of the defaults is load-bearing: `preserve_order`
+# is OFF, so `serde_json::Map` is a `BTreeMap` and every `Value` renders in one
+# sorted key order. `ItemContent::Opaque` (`roundhouse-core/src/item.rs`) rests
+# on exactly that -- a content block this build does not model is stored as a
+# parsed `Value` and rendered as a digest of its canonical JSON, so two
+# encodings of the same block must digest alike. That is not a nicety: a
+# chained NeMo Relay re-serializes every intercepted body through an
+# alphabetizing map (synergy ruling S3, guard 1), so turn two of a conversation
+# arrives with its keys reordered, and a render that followed insertion order
+# would fork every session behind a Relay on its second turn -- silently, while
+# every turn still answered.
+# The guard is `an_opaque_block_is_insensitive_to_key_order`, whose second
+# assertion (the two renders agree) goes red the moment the order becomes
+# insertion order. Note that its *first* assertion would not: `IndexMap`'s
+# `PartialEq` ignores order, so `Value` equality alone would keep passing.
+# Unlock condition: anything in this graph turning `preserve_order` on --
+# Cargo features are unified crate-wide, so a transitive dependency enabling it
+# changes this crate's `Map` too. Re-check `ItemContent::render` and the prefix
+# admission it feeds before accepting such a dependency.
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2.0.17"
