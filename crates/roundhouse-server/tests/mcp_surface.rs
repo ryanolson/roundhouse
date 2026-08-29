@@ -276,6 +276,9 @@ impl Interjector for TestInterjector {
                 usage: Usage {
                     input_tokens: 96,
                     cached_input_tokens: 32,
+                    // Nothing was dispatched, so nothing was written into any
+                    // provider's cache.
+                    cache_write_tokens: 0,
                     output_tokens: 24,
                     reasoning_tokens: 8,
                     accounting: Accounting::Reported,

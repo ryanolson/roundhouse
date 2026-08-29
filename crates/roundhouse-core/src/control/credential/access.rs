@@ -715,8 +715,20 @@ mod tests {
 
         // A provider with no allowlist row is unreachable rather than reachable
         // anonymously -- the fail-closed direction, and the reason the table in
-        // `forwarded.rs` carries only rows somebody has tested.
-        assert!(forwarding.access("anthropic").is_none());
+        // `forwarded.rs` carries only rows somebody has tested. The fixture
+        // moved with M11.0: `anthropic` used to be the rowless provider and now
+        // has one, so the claim is made against a name no row will ever carry.
+        assert!(forwarding.access("some-new-vendor").is_none());
+
+        // And the row that landed with M11.0's client is reachable from here,
+        // which is the other half of the same claim: the table is what decides,
+        // not this module. Without this line the assertion above would still
+        // pass on a build whose narrowing had stopped working entirely.
+        assert!(
+            forwarding
+                .access("anthropic")
+                .is_some_and(|access| access.credential.is_forwarded())
+        );
 
         // No credential presented: every hosted provider goes and the turn
         // degrades, rather than reaching the upstream anonymously.

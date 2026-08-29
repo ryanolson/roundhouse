@@ -20,13 +20,18 @@ use crate::validate::{Arm, SteerAction, TriggerRecord, Verdict};
 
 /// Token accounting for one completed model call.
 ///
-/// Two of these four fields are *components* of the other two rather than
-/// additions to them: `cached_input_tokens` is part of `input_tokens`, and
-/// `reasoning_tokens` is part of `output_tokens`. Both providers Roundhouse
-/// targets report them that way — OpenAI nests them under
-/// `input_tokens_details` / `output_tokens_details`, and Anthropic bills
+/// Three of these five counts are *components* of the other two rather than
+/// additions to them: `cached_input_tokens` and `cache_write_tokens` are each
+/// part of `input_tokens`, and `reasoning_tokens` is part of `output_tokens`.
+/// Both providers Roundhouse targets report them that way — OpenAI nests them
+/// under `input_tokens_details` / `output_tokens_details`, and Anthropic bills
 /// thinking as ordinary output — so storing them as separate addends would
 /// double-count every total downstream, including the one billed to a client.
+///
+/// Anthropic is the exception that proves the rule and the reason
+/// `cache_write_tokens` exists: on *its* wire the three input counters are
+/// disjoint, and the client that speaks it converts them into these axes once,
+/// at the decoder. By the time a `Usage` exists the conversion has happened.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u64,
@@ -36,6 +41,24 @@ pub struct Usage {
     /// providers it is whatever the provider reports. It is the number the
     /// whole design exists to maximize.
     pub cached_input_tokens: u64,
+    /// Portion of `input_tokens` the provider *wrote* into its cache.
+    ///
+    /// **A measurement, and only ever a measurement.** Roundhouse already
+    /// *prices* every uncached input token at the cache-write rate — a
+    /// deliberate conservative approximation in `routing::ledger` — and three
+    /// separate surfaces document the gap this field closes: the Responses
+    /// wire's hardcoded `"cache_write_tokens": 0`, the relay summary's
+    /// deliberately-absent field whose doc says it awaits a measurement, and the
+    /// ledger's own note. A field named for a measurement must never be filled
+    /// from a pricing convention, so it stays zero on every dialect that does
+    /// not report one rather than being back-derived from `uncached_input`.
+    ///
+    /// `#[serde(default)]` because the durable log already holds entries written
+    /// before this field existed, and they must keep deserializing. Zero is also
+    /// the right reading for them: at the time they were written the only
+    /// routable dialects reported no cache write at all.
+    #[serde(default)]
+    pub cache_write_tokens: u64,
     pub output_tokens: u64,
     /// Portion of `output_tokens` spent on reasoning the client never sees.
     ///
@@ -108,6 +131,9 @@ impl Usage {
         self.cached_input_tokens = self
             .cached_input_tokens
             .saturating_add(other.cached_input_tokens);
+        self.cache_write_tokens = self
+            .cache_write_tokens
+            .saturating_add(other.cache_write_tokens);
         self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
         self.reasoning_tokens = self.reasoning_tokens.saturating_add(other.reasoning_tokens);
         // Provenance degrades on contact: a total that mixes reported and
@@ -734,6 +760,53 @@ mod tests {
                 arm: None,
             }
         );
+    }
+
+    /// **A usage record written before the cache-write count existed still
+    /// reads, and reads as zero.**
+    ///
+    /// The durable log is the source of truth and it is replayed, not migrated.
+    /// A `Usage` that refused to deserialize without the new field would take
+    /// every deployment's whole billing history with it on upgrade — and the
+    /// reading it gets has to be right as well as parseable: at the time these
+    /// entries were written the only routable dialects reported no cache write
+    /// at all, so "zero written" is what actually happened rather than a
+    /// placeholder.
+    #[test]
+    fn a_usage_written_before_the_cache_write_count_existed_still_reads() {
+        // Byte-for-byte what `Usage` serialized to before this widening.
+        let json = r#"{"input_tokens":9512,"cached_input_tokens":9000,"output_tokens":64,"reasoning_tokens":0,"accounting":"reported"}"#;
+        let usage: Usage = serde_json::from_str(json).unwrap();
+        assert_eq!(usage.input_tokens, 9_512);
+        assert_eq!(usage.cached_input_tokens, 9_000);
+        assert_eq!(usage.cache_write_tokens, 0);
+        assert_eq!(usage.accounting, Accounting::Reported);
+
+        // The count is a *component* of `input_tokens`, exactly as the cached
+        // count is, so widening changes no total anywhere.
+        let written = Usage {
+            cache_write_tokens: 500,
+            ..usage.clone()
+        };
+        assert_eq!(written.total(), usage.total());
+        assert_eq!(
+            written.uncached_input_tokens(),
+            usage.uncached_input_tokens(),
+            "a cache write is not a second kind of input token"
+        );
+
+        // And it folds like every other count: saturating, and additive across
+        // calls. A rollup that dropped it would report a fleet that never
+        // writes a cache while paying the write premium on every turn.
+        let mut total = written.clone();
+        total.add(&written);
+        assert_eq!(total.cache_write_tokens, 1_000);
+        let mut saturating = Usage {
+            cache_write_tokens: u64::MAX,
+            ..Usage::default()
+        };
+        saturating.add(&written);
+        assert_eq!(saturating.cache_write_tokens, u64::MAX);
     }
 
     #[test]

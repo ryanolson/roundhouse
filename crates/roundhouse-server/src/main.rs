@@ -50,8 +50,9 @@ use roundhouse_core::routing::{
 use roundhouse_core::store::{MemoryStore, SessionStore};
 use roundhouse_core::validate::{Validator, ValidatorConfig};
 use roundhouse_fleet::{
-    DEFAULT_API_BASE, DEFAULT_PASS_THROUGH_BASE, EchoFrontierClient, FrontierClient,
-    FrontierClients, FrontierModelSpec, OpenAiResponsesClient, StaticFrontierCatalog, WireProtocol,
+    AnthropicMessagesClient, DEFAULT_API_BASE, DEFAULT_PASS_THROUGH_BASE, EchoFrontierClient,
+    FrontierClient, FrontierClients, FrontierModelSpec, OpenAiResponsesClient,
+    StaticFrontierCatalog, WireProtocol,
 };
 use roundhouse_mcp::ControlStore;
 use roundhouse_server::catalog_config::{BUILT_IN_OPENAI, ProviderConfig};
@@ -104,13 +105,23 @@ const REDIS_VAR: &str = "ROUNDHOUSE_REDIS_URL";
 /// that question at boot and again after every admin write.
 const JUDGE_MODEL_VAR: &str = "ROUNDHOUSE_JUDGE_MODEL";
 
-/// Which real provider transport this deployment dispatches through.
+/// Whether this deployment dispatches to real providers at all.
 ///
 /// Absent means the offline echo stub, which is what every test and every
 /// pre-M7 deployment gets — a real client is opted into, never defaulted to,
-/// because composing one changes where a turn's tokens actually go. The one
-/// value today is `openai_responses`; a second transport adds a value here
-/// rather than a second variable.
+/// because composing one changes where a turn's tokens actually go.
+///
+/// **The name is historical and the value is a switch, not a dialect.** When
+/// M9 wrote it there was one client, so naming the transport and enabling it
+/// were the same act, and this doc said a second transport would add a value
+/// here. M10.1's provider registry superseded that: the dialect became a
+/// per-catalog-entry fact (`FrontierModelSpec::wire_protocol`) and each
+/// provider's client is built from it, so a per-dialect value here would be a
+/// second, coarser answer to a question the catalog already answers per entry —
+/// and the two could disagree. `openai_responses` therefore stays the one
+/// accepted value: it means "dispatch for real", and which wire each provider
+/// is dispatched over is read from the catalog. Renaming it would break every
+/// deployment's environment for a spelling.
 const FRONTIER_UPSTREAM_VAR: &str = "ROUNDHOUSE_FRONTIER_UPSTREAM";
 
 /// Where a stored key authenticates, overriding the published endpoint.
@@ -158,9 +169,16 @@ fn process_env(name: &str) -> Option<String> {
 /// file: every entry's provider is defined or is the built-in `openai`, and a
 /// defined provider declares a route for the dialect its entries speak. The
 /// third can only be asked here, because it is a fact about the *binary* — this
-/// build has one transport, `OpenAiResponsesClient`, so a provider whose entries
-/// speak anything else has nowhere to go, and a boundary that asked it would
-/// refuse a good catalog on a build with fewer clients compiled in.
+/// build compiles two transports, `OpenAiResponsesClient` and
+/// `AnthropicMessagesClient`, so a provider whose entries speak anything else
+/// has nowhere to go, and a boundary that asked it would refuse a good catalog
+/// on a build with fewer clients compiled in.
+///
+/// **M11.0 turned the dialect gate into an exhaustive `match`.** It used to be
+/// `!=` against one constant, which meant the second client could have landed
+/// with the gate still shut and nothing to say so. The `match` below has no
+/// catch-all, so a third dialect is a compile error on the line that decides
+/// which transport serves it.
 ///
 /// Together the three make [`FrontierClients::for_provider`] total on a booted
 /// process: the router cannot produce a provider name this registry does not
@@ -188,9 +206,11 @@ fn frontier_clients(
     };
     if named != "openai_responses" {
         anyhow::bail!(
-            "{FRONTIER_UPSTREAM_VAR} names `{named}`, which is not a transport this build has; \
-             the supported value is `openai_responses`, and leaving the variable unset serves \
-             the offline echo stub"
+            "{FRONTIER_UPSTREAM_VAR} names `{named}`, which is not a value this build accepts; \
+             the one accepted value is `openai_responses`, which means \"dispatch to real \
+             providers\" rather than naming a wire -- each provider's dialect is read from its \
+             catalog entries' `wire_protocol` -- and leaving the variable unset serves the \
+             offline echo stub"
         );
     }
 
@@ -225,124 +245,233 @@ fn frontier_clients(
             );
         }
 
-        // The one dialect this build serializes. Checked per *entry* rather
-        // than per provider so the message names a model: "openrouter speaks
-        // something we cannot" sends an operator to the wrong line when four of
-        // its five entries are fine.
-        for spec in &specs {
-            if spec.wire_protocol != WireProtocol::OpenAiResponses {
-                anyhow::bail!(
-                    "catalog entry `{provider}/{}` speaks `{}`, and this build has no client \
-                     for that dialect -- its only transport is `openai_responses`. Refused at \
-                     boot rather than at the turn that would dispatch it: a routing decision \
-                     naming this entry would fail one tenant's turn for a line in a file",
-                    spec.model,
-                    spec.wire_protocol.wire_name(),
+        // **One transport per provider, so a provider's entries must agree on
+        // one dialect.** The registry is keyed on the provider name alone,
+        // because that is all a routing decision carries — so a provider whose
+        // entries speak two wires has no single client it could be, and picking
+        // either would leave the other half of its traffic refused by
+        // `FrontierError::UnsupportedDialect` one turn at a time. The remedy is
+        // two definitions pointing at the same origin, which the registry
+        // already supports and which also keeps the two rate cards apart in the
+        // metrics rollup — so this is a boot refusal naming both entries rather
+        // than a coin flip. Unreachable before M11 because there was one client
+        // and the check below refused everything else.
+        let dialect = specs[0].wire_protocol;
+        if let Some(other) = specs.iter().find(|spec| spec.wire_protocol != dialect) {
+            anyhow::bail!(
+                "provider `{provider}` has catalog entries in two dialects -- `{}/{}` speaks \
+                 `{}` and `{provider}/{}` speaks `{}` -- and this registry holds one transport \
+                 per provider, so one of them would have nowhere to be dispatched. Define the \
+                 provider twice under two names pointing at the same base URL, one per dialect",
+                provider,
+                specs[0].model,
+                dialect.wire_name(),
+                other.model,
+                other.wire_protocol.wire_name(),
+            );
+        }
+
+        // Before the dialect is decided, because it is not a fact about one:
+        // `auth.env` names a variable this process cannot see, and that is as
+        // true of a Messages provider as of a Responses one. Spelled once here
+        // rather than inside each arm so a third arm cannot be written without
+        // it — which is exactly how the Anthropic arm nearly shipped silent.
+        if let Some(definition) = definition {
+            warn_if_no_key(provider, definition, env);
+        }
+
+        // **Exhaustive, and that is the whole point of the shape.** What this
+        // replaced was `spec.wire_protocol != WireProtocol::OpenAiResponses` —
+        // an `!=` against one constant, which M11's seam map listed first among
+        // the places that assume a single wire precisely because the compiler
+        // cannot point at it. A `match` with no catch-all makes the *next*
+        // dialect a compile error here, on the line that would otherwise have
+        // silently mis-dispatched it.
+        let client: Arc<dyn FrontierClient> = match dialect {
+            WireProtocol::OpenAiResponses => match definition {
+                Some(definition) => Arc::new(responses_client(provider, definition, &specs, env)?),
+                // The implicit `openai` provider: the endpoints
+                // `ROUNDHOUSE_OPENAI_API_BASE` has always named. Every catalog
+                // written before M10.1 lands here, which is the whole of the
+                // backward-compatibility promise.
+                None => Arc::new(implicit_openai_client(env)?),
+            },
+            WireProtocol::AnthropicMessages => match definition {
+                Some(definition) => Arc::new(messages_client(provider, definition, &specs)?),
+                // **There is no implicit `anthropic` provider, deliberately.**
+                // The implicit one exists only for `openai`, and only because
+                // catalogs predating the registry named it with no definition;
+                // no catalog can predate a dialect that had no client. Inventing
+                // one here would mean a typo'd `wire_protocol` on an `openai`
+                // entry silently opened a connection to `api.anthropic.com`.
+                None => anyhow::bail!(
+                    "catalog entry `{provider}/{}` speaks `anthropic_messages`, and \
+                     `{provider}` has no `\"providers\"` definition. Unlike `openai` there is \
+                     no implicit Anthropic provider -- add a definition naming its `base_url` \
+                     and a `\"messages\"` route to the file {} names",
+                    specs[0].model,
+                    catalog_config::CATALOG_VAR,
+                ),
+            },
+            // No client speaks this wire. An explicit arm rather than a
+            // catch-all so that whoever writes one is sent here by the compiler
+            // instead of discovering that a `_ =>` had been quietly refusing it.
+            WireProtocol::OpenAiChatCompletions => anyhow::bail!(
+                "catalog entry `{provider}/{}` speaks `{}`, and this build has no client for \
+                 that dialect -- it speaks `openai_responses` and `anthropic_messages`. \
+                 Refused at boot rather than at the turn that would dispatch it: a routing \
+                 decision naming this entry would fail one tenant's turn for a line in a file",
+                specs[0].model,
+                dialect.wire_name(),
+            ),
+        };
+        clients.insert(provider.to_string(), client);
+    }
+    Ok(FrontierClients::keyed(clients))
+}
+
+/// A provider with no key anywhere, said out loud at boot.
+///
+/// A warning and not a refusal, because this file is not where keys live: a
+/// member or a project may attach one through the control plane's tiers, and
+/// this process cannot see that from here. Saying so at boot is what stops an
+/// operator finding out one turn at a time.
+///
+/// Called from the loop above rather than from inside either dialect arm,
+/// because the fact it reports — `auth.env` names a variable this process cannot
+/// see — is a property of the definition and has nothing to do with which wire
+/// the provider speaks.
+fn warn_if_no_key(provider: &str, definition: &ProviderConfig, env: Env<'_>) {
+    if env(&definition.auth.env).is_none() {
+        tracing::warn!(
+            %provider,
+            var = %definition.auth.env,
+            "this provider's catalog entry names an environment variable that is not set; \
+             turns routed here will need a credential from the control plane's project or \
+             member tier, or they will be refused before a socket is opened"
+        );
+    }
+}
+
+/// The OpenAI Responses transport for one defined provider.
+fn responses_client(
+    provider: &str,
+    definition: &ProviderConfig,
+    specs: &[&FrontierModelSpec],
+    env: Env<'_>,
+) -> anyhow::Result<OpenAiResponsesClient> {
+    // Both bases are this provider's own origin. A pass-through credential is a
+    // ChatGPT device login and the header allowlist is per provider, so a
+    // forwarded seat cannot resolve for anything but `openai` anyway -- but
+    // pointing the forwarding client at the same origin rather than at
+    // chatgpt.com is what makes that a redundancy instead of a way for a seat to
+    // reach an origin nobody configured it for.
+    let route = definition
+        .routes
+        .for_dialect(WireProtocol::OpenAiResponses)
+        .expect("the catalog boundary refuses an entry whose dialect has no route");
+    tracing::info!(
+        %provider,
+        base_url = %definition.base_url,
+        %route,
+        entries = specs.len(),
+        "dispatching this provider's turns over the OpenAI Responses wire"
+    );
+    // **The built-in `openai` provider, explicitly redefined.** This arm reads
+    // `definition.base_url` for both bases and never reads the two variables,
+    // and that precedence is the intended design — an operator who writes the
+    // provider down has said where it is, and the comment above says why both
+    // bases come from the one origin. What was missing is that the line above
+    // reads identically whether or not those variables are set, so a deployment
+    // behind an egress proxy that added an `openai` definition to attach
+    // `extra_headers` had the proxy silently leave the path (M10 review G15). A
+    // warning rather than a refusal: the configuration is legitimate, and
+    // refusing it would make attaching a header impossible for anyone who had
+    // ever set the variable. Named per variable rather than in one line, because
+    // the two address different origins — stored key and forwarded seat — and a
+    // deployment may have set only one.
+    if provider == BUILT_IN_OPENAI {
+        for var in [OPENAI_API_BASE_VAR, OPENAI_PASS_THROUGH_BASE_VAR] {
+            if let Some(shadowed) = env(var) {
+                tracing::warn!(
+                    %provider,
+                    shadowed_var = var,
+                    shadowed_value = %shadowed,
+                    definition_base_url = %definition.base_url,
+                    "an explicit `openai` provider definition takes precedence over this \
+                     variable, which is not read while the definition stands; every turn of \
+                     this provider's is dispatched at the definition's base URL, not at the \
+                     one the variable names"
                 );
             }
         }
-
-        let client = match definition {
-            Some(definition) => {
-                // Both bases are this provider's own origin. A pass-through
-                // credential is a ChatGPT device login and the header allowlist
-                // is per provider, so a forwarded seat cannot resolve for
-                // anything but `openai` anyway -- but pointing the forwarding
-                // client at the same origin rather than at chatgpt.com is what
-                // makes that a redundancy instead of a way for a seat to reach
-                // an origin nobody configured it for.
-                let route = definition
-                    .routes
-                    .for_dialect(WireProtocol::OpenAiResponses)
-                    .expect("the catalog boundary refuses an entry whose dialect has no route");
-                tracing::info!(
-                    %provider,
-                    base_url = %definition.base_url,
-                    %route,
-                    entries = specs.len(),
-                    "dispatching this provider's turns over the OpenAI Responses wire"
-                );
-                // **The built-in `openai` provider, explicitly redefined.**
-                // This arm reads `definition.base_url` for both bases and never
-                // reads the two variables, and that precedence is the intended
-                // design — an operator who writes the provider down has said
-                // where it is, and the comment above says why both bases come
-                // from the one origin. What was missing is that the line above
-                // reads identically whether or not those variables are set, so
-                // a deployment behind an egress proxy that added an `openai`
-                // definition to attach `extra_headers` had the proxy silently
-                // leave the path (M10 review G15). A warning rather than a
-                // refusal: the configuration is legitimate, and refusing it
-                // would make attaching a header impossible for anyone who had
-                // ever set the variable. Named per variable rather than in one
-                // line, because the two address different origins — stored key
-                // and forwarded seat — and a deployment may have set only one.
-                if provider == BUILT_IN_OPENAI {
-                    for var in [OPENAI_API_BASE_VAR, OPENAI_PASS_THROUGH_BASE_VAR] {
-                        if let Some(shadowed) = env(var) {
-                            tracing::warn!(
-                                %provider,
-                                shadowed_var = var,
-                                shadowed_value = %shadowed,
-                                definition_base_url = %definition.base_url,
-                                "an explicit `openai` provider definition takes precedence over \
-                                 this variable, which is not read while the definition stands; \
-                                 every turn of this provider's is dispatched at the definition's \
-                                 base URL, not at the one the variable names"
-                            );
-                        }
-                    }
-                }
-                // A provider with no key anywhere is a warning and not a
-                // refusal, because this file is not where keys live: a member
-                // or a project may attach one through the control plane's
-                // tiers, and this process cannot see that from here. Saying so
-                // at boot is what stops an operator finding out one turn at a
-                // time.
-                if env(&definition.auth.env).is_none() {
-                    tracing::warn!(
-                        %provider,
-                        var = %definition.auth.env,
-                        "this provider's catalog entry names an environment variable that is \
-                         not set; turns routed here will need a credential from the control \
-                         plane's project or member tier, or they will be refused before a \
-                         socket is opened"
-                    );
-                }
-                OpenAiResponsesClient::with_bases(&definition.base_url, &definition.base_url)?
-                    .with_responses_path(route)
-                    .with_extra_headers(
-                        definition
-                            .extra_headers
-                            .iter()
-                            .map(|(name, value)| (name.clone(), value.clone())),
-                    )?
-            }
-            // The implicit `openai` provider: the endpoints
-            // `ROUNDHOUSE_OPENAI_API_BASE` has always named. Every catalog
-            // written before M10.1 lands here, which is the whole of the
-            // backward-compatibility promise.
-            None => {
-                let api_base =
-                    env(OPENAI_API_BASE_VAR).unwrap_or_else(|| DEFAULT_API_BASE.to_string());
-                let pass_through_base = env(OPENAI_PASS_THROUGH_BASE_VAR)
-                    .unwrap_or_else(|| DEFAULT_PASS_THROUGH_BASE.to_string());
-                // The bases are logged and the credentials are not, which is
-                // the whole of what an operator needs to see here: which origin
-                // this process will talk to. A URL is configuration; a key is
-                // not.
-                tracing::info!(
-                    %api_base,
-                    %pass_through_base,
-                    "dispatching the built-in `openai` provider's turns over the OpenAI \
-                     Responses wire"
-                );
-                OpenAiResponsesClient::with_bases(api_base, pass_through_base)?
-            }
-        };
-        clients.insert(provider.to_string(), Arc::new(client));
     }
-    Ok(FrontierClients::keyed(clients))
+    Ok(
+        OpenAiResponsesClient::with_bases(&definition.base_url, &definition.base_url)?
+            .with_responses_path(route)
+            .with_extra_headers(
+                definition
+                    .extra_headers
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone())),
+            )?,
+    )
+}
+
+/// The Anthropic Messages transport for one defined provider.
+///
+/// Built exactly the way a registry `openai_responses` provider is — one origin
+/// for both bases, the definition's own route, its static headers — and the
+/// sameness is deliberate. The one structural difference between the two
+/// clients — Anthropic's pass-through base is the same origin as its stored-key
+/// base, where a ChatGPT device login addresses a separate host — is a fact
+/// about the provider and belongs in the client's own constants, not in a second
+/// shape here.
+fn messages_client(
+    provider: &str,
+    definition: &ProviderConfig,
+    specs: &[&FrontierModelSpec],
+) -> anyhow::Result<AnthropicMessagesClient> {
+    let route = definition
+        .routes
+        .for_dialect(WireProtocol::AnthropicMessages)
+        .expect("the catalog boundary refuses an entry whose dialect has no route");
+    tracing::info!(
+        %provider,
+        base_url = %definition.base_url,
+        %route,
+        entries = specs.len(),
+        "dispatching this provider's turns over the Anthropic Messages wire"
+    );
+    Ok(
+        AnthropicMessagesClient::with_bases(&definition.base_url, &definition.base_url)?
+            .with_messages_path(route)
+            .with_extra_headers(
+                definition
+                    .extra_headers
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone())),
+            )?,
+    )
+}
+
+/// The implicit `openai` provider, at the endpoints the two variables name.
+fn implicit_openai_client(env: Env<'_>) -> anyhow::Result<OpenAiResponsesClient> {
+    let api_base = env(OPENAI_API_BASE_VAR).unwrap_or_else(|| DEFAULT_API_BASE.to_string());
+    let pass_through_base =
+        env(OPENAI_PASS_THROUGH_BASE_VAR).unwrap_or_else(|| DEFAULT_PASS_THROUGH_BASE.to_string());
+    // The bases are logged and the credentials are not, which is the whole of
+    // what an operator needs to see here: which origin this process will talk
+    // to. A URL is configuration; a key is not.
+    tracing::info!(
+        %api_base,
+        %pass_through_base,
+        "dispatching the built-in `openai` provider's turns over the OpenAI Responses wire"
+    );
+    Ok(OpenAiResponsesClient::with_bases(
+        api_base,
+        pass_through_base,
+    )?)
 }
 
 /// Prompt shape the startup cross-check quotes the catalog under.
@@ -1014,36 +1143,52 @@ mod tests {
             .expect("the offline stub answers for every provider");
     }
 
+    fn messages_provider(base_url: &str) -> ProviderConfig {
+        serde_json::from_value(serde_json::json!({
+            "base_url": base_url,
+            "routes": { "messages": "/messages" },
+            "auth": { "env": "A_PROVIDER_KEY" },
+        }))
+        .expect("the fixture definition must parse")
+    }
+
     /// The third cross-check, and the one only this file can make: whether
     /// *this build* has a transport that speaks the entry's dialect.
     ///
-    /// Deliberately not asked at the config boundary. A catalog naming
-    /// `anthropic_messages` is a perfectly good catalog — it is this binary
-    /// that has one client — and a boundary that refused it would have to be
-    /// edited every time a client was added, on the wrong side of the
+    /// Deliberately not asked at the config boundary. A catalog naming a dialect
+    /// this binary has no client for is a perfectly good catalog — it is this
+    /// binary that is short a transport — and a boundary that refused it would
+    /// have to be edited every time a client was added, on the wrong side of the
     /// crate graph.
+    ///
+    /// **The fixture moved with M11.0.** It used to be `anthropic_messages`,
+    /// which this build now speaks; the unspeakable dialect is
+    /// `openai_chat_completions`, which is the last `WireProtocol` arm with no
+    /// client. When one is written this test has nothing left to assert with and
+    /// should be deleted rather than kept alive on a fabricated variant — the
+    /// exhaustive `match` it guards is by then guarded by the compiler.
     #[test]
     fn a_dialect_this_build_cannot_speak_stops_the_boot_and_names_the_entry() {
         let catalog = StaticFrontierCatalog::new(vec![entry(
-            "anthropic",
-            "claude",
-            WireProtocol::AnthropicMessages,
+            "dynamo-fleet",
+            "llama",
+            WireProtocol::OpenAiChatCompletions,
         )]);
         let providers = HashMap::from([(
-            "anthropic".to_string(),
+            "dynamo-fleet".to_string(),
             serde_json::from_value::<ProviderConfig>(serde_json::json!({
-                "base_url": "https://api.anthropic.test/v1",
-                "routes": { "messages": "/messages" },
-                "auth": { "env": "ANTHROPIC_API_KEY" },
+                "base_url": "https://dynamo.test",
+                "routes": { "chat_completions": "/v1/chat/completions" },
+                "auth": { "env": "A_PROVIDER_KEY" },
             }))
             .unwrap(),
         )]);
 
         let error = frontier_clients(&catalog, &providers, &real_upstream)
-            .expect_err("this build has no Anthropic Messages client");
+            .expect_err("this build has no Chat Completions client");
         let message = error.to_string();
         assert!(
-            message.contains("anthropic/claude") && message.contains("anthropic_messages"),
+            message.contains("dynamo-fleet/llama") && message.contains("openai_chat_completions"),
             "the refusal must name the entry and the dialect, because the remedy is to move \
              one of them: {message}"
         );
@@ -1051,19 +1196,209 @@ mod tests {
         // CONTROL: the identical provider, identical environment, one entry
         // whose dialect this build does speak.
         let providers = HashMap::from([(
-            "anthropic".to_string(),
-            responses_provider("https://api.anthropic.test/v1"),
+            "dynamo-fleet".to_string(),
+            responses_provider("https://dynamo.test/v1"),
         )]);
         frontier_clients(
             &StaticFrontierCatalog::new(vec![entry(
-                "anthropic",
-                "claude",
+                "dynamo-fleet",
+                "llama",
                 WireProtocol::OpenAiResponses,
             )]),
             &providers,
             &real_upstream,
         )
         .expect("a dialect this build speaks is routable");
+    }
+
+    /// **M11.0's gate, from the other side: an `anthropic_messages` entry now
+    /// boots, and it boots into its own transport.**
+    ///
+    /// The twin of the test above, and neither is enough alone. That one says a
+    /// dialect with no client is refused; this one says a dialect *with* one is
+    /// not merely tolerated but resolved to a different client than the
+    /// Responses provider beside it. A registry that had opened the gate and
+    /// then built an `OpenAiResponsesClient` for both would pass every
+    /// pre-M11 test in this file and POST a Responses body to `/messages`.
+    #[tokio::test]
+    async fn an_anthropic_entry_boots_into_its_own_transport_beside_a_responses_one() {
+        let catalog = StaticFrontierCatalog::new(vec![
+            entry("anthropic", "claude-x", WireProtocol::AnthropicMessages),
+            entry("openrouter", "kimi", WireProtocol::OpenAiResponses),
+        ]);
+        let providers = HashMap::from([
+            (
+                "anthropic".to_string(),
+                messages_provider("https://api.anthropic.test/v1"),
+            ),
+            (
+                "openrouter".to_string(),
+                responses_provider("https://openrouter.test/api/v1"),
+            ),
+        ]);
+
+        let registry = frontier_clients(&catalog, &providers, &real_upstream)
+            .expect("both dialects have a client in this build");
+        let anthropic = registry.for_provider("anthropic").unwrap();
+        let openrouter = registry.for_provider("openrouter").unwrap();
+        assert!(!Arc::ptr_eq(anthropic, openrouter));
+
+        // And each really speaks its own wire. `Arc::ptr_eq` alone would pass on
+        // a registry that built two `OpenAiResponsesClient`s, which is exactly
+        // the mistake an opened gate makes — so the claim is asserted through
+        // the one seam that reveals a client's dialect: it refuses a quote in
+        // any other, before a socket is opened.
+        for (provider, spoken, refused) in [
+            (
+                "anthropic",
+                WireProtocol::AnthropicMessages,
+                WireProtocol::OpenAiResponses,
+            ),
+            (
+                "openrouter",
+                WireProtocol::OpenAiResponses,
+                WireProtocol::AnthropicMessages,
+            ),
+        ] {
+            let client = registry.for_provider(provider).unwrap();
+            let quote = |wire_protocol| roundhouse_fleet::FrontierQuote {
+                target: Target::Frontier {
+                    provider: provider.into(),
+                    model: "m".into(),
+                },
+                wire_protocol,
+                prompt: "hi".into(),
+                segment_boundaries: Vec::new(),
+                prompt_cache_key: "sess".into(),
+                expected_output_tokens: Some(16),
+                credential: roundhouse_core::control::TurnCredential::Absent,
+            };
+            let Err(error) = client.execute(&quote(refused)).await else {
+                panic!("a client must refuse a dialect it cannot serialize")
+            };
+            assert!(
+                matches!(
+                    &error,
+                    roundhouse_fleet::FrontierError::UnsupportedDialect { expected, .. }
+                        if *expected == spoken.wire_name()
+                ),
+                "provider `{provider}` was built with a transport speaking the wrong wire: \
+                 {error}"
+            );
+            // CONTROL: the same client on the dialect it does speak gets past
+            // the dialect check -- it fails on the absent credential instead,
+            // which is a later refusal and proves the assertion above is about
+            // the wire rather than about every quote being rejected.
+            let Err(error) = client.execute(&quote(spoken)).await else {
+                panic!("`TurnCredential::Absent` is refused before a socket")
+            };
+            assert!(
+                matches!(error, roundhouse_fleet::FrontierError::Credential(_)),
+                "{error}"
+            );
+        }
+    }
+
+    /// **One transport per provider, so its entries may not disagree about the
+    /// wire.**
+    ///
+    /// Unreachable before M11.0 — with one client every other dialect was
+    /// refused outright, so no catalog could reach the ambiguity — and it is
+    /// reachable now: OpenRouter genuinely serves both `/responses` and
+    /// `/messages`, so a catalog naming both under one provider is a mistake an
+    /// operator will actually make. The registry keys on the provider name, so
+    /// one of the two entries would be dispatched through a serializer that
+    /// refuses it, one tenant's turn at a time.
+    #[test]
+    fn a_provider_whose_entries_disagree_about_the_dialect_stops_the_boot() {
+        let both = StaticFrontierCatalog::new(vec![
+            entry("openrouter", "kimi", WireProtocol::OpenAiResponses),
+            entry("openrouter", "claude-x", WireProtocol::AnthropicMessages),
+        ]);
+        let providers = HashMap::from([(
+            "openrouter".to_string(),
+            serde_json::from_value::<ProviderConfig>(serde_json::json!({
+                "base_url": "https://openrouter.test/api/v1",
+                "routes": { "responses": "/responses", "messages": "/messages" },
+                "auth": { "env": "A_PROVIDER_KEY" },
+            }))
+            .unwrap(),
+        )]);
+
+        let error = frontier_clients(&both, &providers, &real_upstream)
+            .expect_err("one provider cannot hold two transports in this registry");
+        let message = error.to_string();
+        assert!(
+            message.contains("kimi") && message.contains("claude-x"),
+            "the refusal must name both entries, because the remedy is to split one of them \
+             out under its own provider name: {message}"
+        );
+
+        // CONTROL: the same two models, the same two dialects, split across two
+        // provider definitions pointing at the same origin. One map entry
+        // different and it boots -- which is what makes the refusal about the
+        // *provider* holding two dialects rather than about the catalog holding
+        // them.
+        let split = StaticFrontierCatalog::new(vec![
+            entry("openrouter", "kimi", WireProtocol::OpenAiResponses),
+            entry(
+                "openrouter-messages",
+                "claude-x",
+                WireProtocol::AnthropicMessages,
+            ),
+        ]);
+        let providers = HashMap::from([
+            (
+                "openrouter".to_string(),
+                responses_provider("https://openrouter.test/api/v1"),
+            ),
+            (
+                "openrouter-messages".to_string(),
+                messages_provider("https://openrouter.test/api/v1"),
+            ),
+        ]);
+        frontier_clients(&split, &providers, &real_upstream)
+            .expect("two definitions at one origin is the supported shape");
+    }
+
+    /// **There is no implicit `anthropic` provider.**
+    ///
+    /// `openai` is implicit because catalogs predating the registry named it
+    /// with no definition; nothing can predate a dialect that had no client, so
+    /// an `anthropic_messages` entry with no definition is a mistake rather than
+    /// a legacy shape. The refusal matters because the only provider that
+    /// *reaches* the undefined arm at all is `openai` itself: without this arm,
+    /// a `wire_protocol` typo'd onto an `openai` entry would build a client
+    /// pointed at `api.anthropic.com` from an environment variable named for
+    /// OpenAI.
+    #[test]
+    fn an_anthropic_entry_with_no_definition_is_refused_rather_than_defaulted() {
+        let catalog = StaticFrontierCatalog::new(vec![entry(
+            BUILT_IN_OPENAI,
+            "gpt-5.6-sol",
+            WireProtocol::AnthropicMessages,
+        )]);
+        let error = frontier_clients(&catalog, &HashMap::new(), &real_upstream)
+            .expect_err("there is no implicit Anthropic provider to fall back to");
+        let message = error.to_string();
+        assert!(
+            message.contains("gpt-5.6-sol") && message.contains("anthropic_messages"),
+            "the refusal must name the entry and its dialect: {message}"
+        );
+
+        // CONTROL: the identical entry on the dialect the implicit provider is
+        // for. One field different and it boots, so the refusal is about the
+        // missing definition rather than about `openai` entries in general.
+        frontier_clients(
+            &StaticFrontierCatalog::new(vec![entry(
+                BUILT_IN_OPENAI,
+                "gpt-5.6-sol",
+                WireProtocol::OpenAiResponses,
+            )]),
+            &HashMap::new(),
+            &real_upstream,
+        )
+        .expect("the implicit `openai` provider speaks the Responses wire");
     }
 
     /// G08 (review finding): the file `examples/catalog.example.json` tells an
@@ -1078,12 +1413,18 @@ mod tests {
     /// README instructs, boots the shipped binary rather than being refused
     /// by a dialect this build has no client for.
     ///
-    /// **Closed by moving the entry, not by adding a client.** The example now
-    /// keeps `providers.anthropic` as a definition nothing names — the same
-    /// treatment `dynamo-fleet` already had, and for the same reason — so the
-    /// shape stays documented while the file boots. The alternative, an
-    /// Anthropic Messages client, is a transport this milestone did not set out
-    /// to add and would have been added to satisfy a comment.
+    /// **M10 closed it by moving the entry; M11.0 closed it by adding the
+    /// client.** The example kept `providers.anthropic` as a definition nothing
+    /// named — the same treatment `dynamo-fleet` still has — because an
+    /// Anthropic Messages client was a transport that milestone had not set out
+    /// to add, and adding one to satisfy a comment is the wrong order. This
+    /// milestone did set out to add it, so the example now carries an
+    /// `anthropic_messages` **models** entry naming that definition, and this
+    /// test is what says the shipped file still boots the shipped binary with it
+    /// — which is a stronger claim than it was, because the entry now has to
+    /// resolve a route, a dialect *and* a transport rather than being skipped.
+    /// `dynamo-fleet` stays unnamed: `openai_chat_completions` still has no
+    /// client, and that is the case the twin test above covers.
     #[test]
     fn the_shipped_example_catalog_boots_the_shipped_binary() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1229,8 +1570,44 @@ mod tests {
     /// test, not the code; this closes it the same way the fair-use ordering
     /// gap was closed, by making the previously-unobserved effect observable
     /// rather than by touching `frontier_clients` itself.
+    ///
+    /// **Both dialects, since M11.0, and that is not symmetry for its own
+    /// sake.** The warning began life inside the one arm that existed; adding a
+    /// second arm is exactly the edit that leaves it behind, and a Messages
+    /// provider whose key is missing is *more* likely than a Responses one,
+    /// because `ANTHROPIC_API_KEY` is a variable a deployment adds later. The
+    /// loop-level call site is what makes this hold for a third arm too, and
+    /// this is the test that says so.
     #[test]
     fn a_defined_provider_with_no_key_anywhere_warns_at_boot() {
+        for (dialect, definition) in [
+            (
+                WireProtocol::OpenAiResponses,
+                responses_provider("https://openrouter.ai/api/v1"),
+            ),
+            (
+                WireProtocol::AnthropicMessages,
+                messages_provider("https://api.anthropic.test/v1"),
+            ),
+        ] {
+            let catalog = StaticFrontierCatalog::new(vec![entry(
+                "openrouter",
+                "moonshotai/kimi-k3",
+                dialect,
+            )]);
+            let providers = HashMap::from([("openrouter".to_string(), definition)]);
+
+            let output = captured_warnings(|| {
+                frontier_clients(&catalog, &providers, &real_upstream)
+                    .expect("a missing key is a warning, not a boot refusal");
+            });
+            assert!(
+                output.contains("A_PROVIDER_KEY") && output.contains("not set"),
+                "the warning must name the unset variable on the `{}` arm too: {output}",
+                dialect.wire_name()
+            );
+        }
+
         let catalog = StaticFrontierCatalog::new(vec![entry(
             "openrouter",
             "moonshotai/kimi-k3",
@@ -1240,15 +1617,6 @@ mod tests {
             "openrouter".to_string(),
             responses_provider("https://openrouter.ai/api/v1"),
         )]);
-
-        let output = captured_warnings(|| {
-            frontier_clients(&catalog, &providers, &real_upstream)
-                .expect("a missing key is a warning, not a boot refusal");
-        });
-        assert!(
-            output.contains("A_PROVIDER_KEY") && output.contains("not set"),
-            "the warning must name the unset variable: {output}"
-        );
 
         // CONTROL: the identical catalog and provider, with the env carrying
         // the key `responses_provider` names. No warning is the only correct

@@ -22,8 +22,8 @@
 //! recorder saw the turn would also pass on an engine that had exactly one
 //! client.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
@@ -442,6 +442,228 @@ async fn a_failover_onto_a_second_provider_uses_that_providers_transport() {
     assert_eq!(
         dispatched,
         vec!["beta/flagship".to_string(), "alpha/flagship".to_string()]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// M11.0 × M10.1: two providers, two *dialects*, and the entry still decides
+// ---------------------------------------------------------------------------
+
+/// A transport that speaks exactly one wire and refuses every other, the way a
+/// real client's `const SPOKEN` check does.
+///
+/// The refusal is what makes this different from [`Recorder`]. Before M11.0
+/// every registry held transports speaking one dialect, so "the right client was
+/// called" and "the client could serialize what it was handed" were the same
+/// question. They are two questions now: a registry that resolved the wrong
+/// client for a cross-dialect catalog would fail the turn with
+/// `UnsupportedDialect` rather than with a 401, and a test that only counted
+/// calls could not tell those apart from a turn that worked.
+struct DialectRecorder {
+    name: &'static str,
+    spoken: WireProtocol,
+    /// Every dialect this transport was handed, in order — including the ones
+    /// it refused, because "was asked to speak the wrong wire" is the finding.
+    seen: Mutex<Vec<WireProtocol>>,
+}
+
+impl DialectRecorder {
+    fn new(name: &'static str, spoken: WireProtocol) -> Arc<Self> {
+        Arc::new(Self {
+            name,
+            spoken,
+            seen: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn seen(&self) -> Vec<WireProtocol> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl FrontierClient for DialectRecorder {
+    async fn execute(&self, quote: &FrontierQuote) -> Result<FrontierStream, FrontierError> {
+        self.seen.lock().unwrap().push(quote.wire_protocol);
+        if quote.wire_protocol != self.spoken {
+            return Err(FrontierError::UnsupportedDialect {
+                expected: self.spoken.wire_name(),
+                got: quote.wire_protocol.wire_name(),
+                target: quote.target.policy_identity(),
+            });
+        }
+        Ok(FrontierChunk::whole_response(
+            self.name.to_string(),
+            quote.prompt.len() as u64,
+            0,
+            self.name.len() as u64,
+            0,
+        ))
+    }
+}
+
+/// Hosted entries on named providers, each declaring its own dialect.
+fn catalog_of_dialects(entries: [(&str, WireProtocol); 2]) -> StaticFrontierCatalog {
+    StaticFrontierCatalog::new(
+        entries
+            .into_iter()
+            .map(|(provider, wire_protocol)| FrontierModelSpec {
+                provider: provider.into(),
+                model: "flagship".into(),
+                wire_protocol,
+                cache_model: CacheModel::Deterministic { ttl_ms: 5 * MINUTE },
+                pricing: ProviderPricing::free(),
+                quality_prior: 0.9,
+                base_ttft_ms: 1.0,
+                ttft_ms_per_uncached_token: 0.0,
+            })
+            .collect(),
+    )
+}
+
+/// **The M11.0 join: a catalog spanning two dialects dispatches each entry
+/// through the client that speaks it.**
+///
+/// M10.1 proved the registry resolves a client from the chosen entry, on a
+/// catalog where every entry spoke one wire — so "resolved the right client" and
+/// "resolved *a* client" were indistinguishable in the one way that now matters.
+/// With a second dialect compiled in, resolving the wrong one is no longer a 401
+/// from an unexpected origin: it is a turn refused before a socket, on a catalog
+/// an operator wrote correctly.
+///
+/// The control swaps which provider speaks which wire, so the answer follows the
+/// catalog entry rather than one of these two recorders being special.
+#[tokio::test]
+async fn a_catalog_spanning_two_dialects_dispatches_each_entry_through_the_client_that_speaks_it() {
+    async fn run(
+        alpha_speaks: WireProtocol,
+        beta_speaks: WireProtocol,
+        chosen: &str,
+    ) -> (TurnResult, Vec<WireProtocol>, Vec<WireProtocol>) {
+        let alpha = DialectRecorder::new("alpha-served-this", alpha_speaks);
+        let beta = DialectRecorder::new("beta-served-this", beta_speaks);
+        let catalog = catalog_of_dialects([("alpha", alpha_speaks), ("beta", beta_speaks)]);
+        // One entry is removed rather than two kept, so the router has exactly
+        // one candidate and the assertion is never about scoring.
+        let only = StaticFrontierCatalog::new(
+            catalog
+                .models()
+                .iter()
+                .filter(|spec| spec.provider == chosen)
+                .cloned()
+                .collect(),
+        );
+        let engine = engine_over(
+            only,
+            FrontierClients::keyed(
+                [
+                    (
+                        "alpha".to_string(),
+                        Arc::clone(&alpha) as Arc<dyn FrontierClient>,
+                    ),
+                    (
+                        "beta".to_string(),
+                        Arc::clone(&beta) as Arc<dyn FrontierClient>,
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+        );
+        let result = one_turn(&engine).await;
+        (result, alpha.seen(), beta.seen())
+    }
+
+    // Alpha on the Responses wire, beta on the Messages wire.
+    let (result, alpha_seen, beta_seen) = run(
+        WireProtocol::OpenAiResponses,
+        WireProtocol::AnthropicMessages,
+        "beta",
+    )
+    .await;
+    assert_eq!(result.text, "beta-served-this");
+    assert_eq!(
+        (alpha_seen.as_slice(), beta_seen.as_slice()),
+        ([].as_slice(), [WireProtocol::AnthropicMessages].as_slice()),
+        "the Messages entry must reach the Messages transport carrying its own dialect; a \
+         registry that resolved the other client would have handed it `openai_responses` \
+         and been refused before a socket"
+    );
+
+    // CONTROL: the two dialects swapped, and the chosen provider swapped with
+    // them. Same two recorders, same registry shape — so the pair together say
+    // the dialect travels with the catalog entry rather than with the name.
+    let (result, alpha_seen, beta_seen) = run(
+        WireProtocol::AnthropicMessages,
+        WireProtocol::OpenAiResponses,
+        "alpha",
+    )
+    .await;
+    assert_eq!(result.text, "alpha-served-this");
+    assert_eq!(
+        (alpha_seen.as_slice(), beta_seen.as_slice()),
+        ([WireProtocol::AnthropicMessages].as_slice(), [].as_slice())
+    );
+}
+
+/// **A failover onto a second provider carries that provider's dialect, not the
+/// first one's.**
+///
+/// The narrowest thing M11.0 could break and the hardest to see. An engine that
+/// built the quote once per *turn* and re-aimed only the target would send the
+/// second attempt out under the first entry's `wire_protocol` — which, until
+/// this milestone, was invisible, because every entry in every catalog spoke the
+/// same wire. Here the second transport refuses a quote in the wrong dialect, so
+/// the turn fails outright instead of succeeding by coincidence.
+#[tokio::test]
+async fn a_failover_across_dialects_re_quotes_in_the_second_providers_wire() {
+    let dead = DeadRecorder::new();
+    let alive = DialectRecorder::new("the-survivor-served-this", WireProtocol::AnthropicMessages);
+    let store = Arc::new(MemoryStore::new());
+    let engine = Engine::with_provider_clients(
+        Arc::clone(&store),
+        ByteTokenizer,
+        Arc::new(EchoLocalExecutor::new("local answer")) as Arc<dyn LocalExecutor>,
+        catalog_of_dialects([
+            ("alpha", WireProtocol::OpenAiResponses),
+            ("beta", WireProtocol::AnthropicMessages),
+        ]),
+        Arc::new(FrontierClients::keyed(
+            [
+                (
+                    "alpha".to_string(),
+                    Arc::clone(&dead) as Arc<dyn FrontierClient>,
+                ),
+                (
+                    "beta".to_string(),
+                    Arc::clone(&alive) as Arc<dyn FrontierClient>,
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        )),
+        Arc::new(StagePolicy::new(Box::new(AffinityPolicy::new()))),
+        config(),
+    );
+
+    let session_id = SessionId::generate();
+    engine.create_session(&session_id).await.unwrap();
+    let result = engine
+        .run_turn(
+            &session_id,
+            TurnId::new("t1"),
+            vec![Item::user_text("which wire served this?")],
+            &recipe_over(["alpha", "beta"]),
+        )
+        .await
+        .expect("the second provider is alive and speaks its own wire, so the turn completes");
+
+    assert_eq!(result.text, "the-survivor-served-this");
+    assert_eq!(
+        (dead.calls(), alive.seen().as_slice()),
+        (1, [WireProtocol::AnthropicMessages].as_slice()),
+        "the fall-forward must re-quote in the second entry's dialect; carrying the first \
+         entry's would arrive at a transport that refuses it"
     );
 }
 

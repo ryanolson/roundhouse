@@ -1095,6 +1095,11 @@ pub(super) mod tests {
         Usage {
             input_tokens: input,
             cached_input_tokens: cached,
+            // Not a fifth parameter: no fold test asserts on a cache write yet,
+            // and widening this helper would make every existing call site read
+            // as a claim about a count none of them is about. A test that needs
+            // one writes the field.
+            cache_write_tokens: 0,
             output_tokens: output,
             reasoning_tokens: reasoning,
             accounting: Accounting::Reported,

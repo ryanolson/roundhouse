@@ -449,8 +449,9 @@ impl Failed {
     ///
     /// A delta cannot exist without a prefill, so a non-empty partial is proof
     /// the whole prompt was processed and the evidence bills it as input. The
-    /// output and cached counts stay zero: the provider never reported them,
-    /// and a fabricated count would be billed to a client as if measured.
+    /// output, cached and cache-write counts stay zero: the provider never
+    /// reported them, and a fabricated count would be billed to a client as if
+    /// measured.
     fn mid_stream(error: impl Into<EngineError>, partial: String, isl_tokens: u64) -> Self {
         let evidence = if partial.is_empty() {
             Usage::default()
@@ -458,6 +459,7 @@ impl Failed {
             Usage {
                 input_tokens: isl_tokens,
                 cached_input_tokens: 0,
+                cache_write_tokens: 0,
                 output_tokens: 0,
                 reasoning_tokens: 0,
                 // Inferred from the existence of a delta rather than counted
@@ -1313,6 +1315,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                 FrontierChunk::Done {
                     input_tokens,
                     cached_input_tokens,
+                    cache_write_tokens,
                     output_tokens,
                     reasoning_tokens,
                     provider_reported_cost,
@@ -1334,6 +1337,12 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                     reported = Some(Usage {
                         input_tokens,
                         cached_input_tokens,
+                        // Carried, not derived. The ledger already *prices*
+                        // every uncached input token at the cache-write rate;
+                        // this is the first time a dispatch tells it how many
+                        // were actually written, and the two must stay
+                        // distinguishable or the correction can never be made.
+                        cache_write_tokens,
                         output_tokens,
                         reasoning_tokens,
                         accounting: Accounting::Reported,
@@ -1434,6 +1443,9 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             // one: a cached count invented here would understate what the next
             // turn has to prefill.
             cached_input_tokens: 0,
+            // And nothing was written into one either, for the same reason:
+            // there was no provider call to write it.
+            cache_write_tokens: 0,
             // The prompt encoding, not the spoken text: a tool call says nothing
             // to a human but occupies context exactly as `plan` will count it
             // when the client resends it next turn.
@@ -1451,11 +1463,15 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
     /// estimate: our tokenizer over the text we received. Cached input stays
     /// zero because nothing observable here bears on what a remote cache did,
     /// and the conservative direction is the one that understates the saving
-    /// rather than inventing it.
+    /// rather than inventing it. The cache-*write* count stays zero for the
+    /// same reason and one stronger: it is a measurement by definition, so
+    /// filling it from anything but a provider's own report would put a guess
+    /// in the one column that exists to be checked against a bill.
     fn estimated_usage(&self, text: &str, isl_tokens: usize) -> Usage {
         Usage {
             input_tokens: isl_tokens as u64,
             cached_input_tokens: 0,
+            cache_write_tokens: 0,
             output_tokens: self.tokenizer.encode(text).len() as u64,
             // Thinking is not recoverable from the visible text: a provider
             // that withheld its accounting also withheld this.
@@ -2104,6 +2120,9 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                 let spec = self.frontier_catalog.spec_for(target).ok_or_else(|| {
                     ConnectFailure::terminal(EngineError::UnresolvableTarget(target.clone()))
                 })?;
+                // One call, so the offsets and the string they index into are
+                // the same render rather than two that could disagree.
+                let (rendered, segment_boundaries) = assembler.rendered_with_boundaries();
                 let quote = FrontierQuote {
                     target: target.clone(),
                     wire_protocol: spec.wire_protocol,
@@ -2133,12 +2152,26 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                     // deployment whose escalations land locally gets the
                     // narrowing without the note.
                     prompt: match handoff_note {
-                        Some(note) => roundhouse_core::validate::append_handoff_note(
-                            assembler.rendered(),
-                            note,
-                        ),
-                        None => assembler.rendered(),
+                        Some(note) => {
+                            roundhouse_core::validate::append_handoff_note(rendered, note)
+                        }
+                        None => rendered,
                     },
+                    // **Where a provider that caches only on demand is told the
+                    // prefix ends.** Passed through from the assembler rather
+                    // than derived here, so the offsets index the render above
+                    // and a client slicing on them sends the same bytes
+                    // `turn_id_for` hashed. Only the Anthropic client reads
+                    // them; every other dialect caches on the steering key
+                    // beside them and its request is byte-identical either way.
+                    //
+                    // A handoff note appended above does not invalidate one of
+                    // these: the note goes on the *end*, so every interior
+                    // offset still names the same item edge and the note lands
+                    // inside the final segment — which is where it belongs, as
+                    // the one part of this prompt that is new this turn and
+                    // must not be inside the block a breakpoint caches.
+                    segment_boundaries,
                     // Stable for the life of the session: providers use it to
                     // steer requests to the same cache node, so varying it
                     // would defeat the hit we just routed on.

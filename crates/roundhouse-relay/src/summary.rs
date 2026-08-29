@@ -283,13 +283,13 @@ pub fn for_decision(turn: &TurnRecord, baseline: &Baseline<'_>) -> Option<LlmOpt
             model: key.model.clone(),
             provider: Some(key.provider.clone()),
         }),
-        effective_usage: Some(relay_usage(&tokens)),
+        effective_usage: Some(relay_usage(&tokens, usage)),
         // The counterfactual is deliberately like-for-like — the *same* token
         // counts including the same cached fraction, at the reference model's
         // rates. It is not "what if we had sent this cold", which would assume
         // the hosted provider's cache never warmed and would roughly double the
         // figure on a long session. See `Correlary::shadow_cost_usd`.
-        baseline_usage: shadow_cost.map(|_| relay_usage(&tokens)),
+        baseline_usage: shadow_cost.map(|_| relay_usage(&tokens, usage)),
         tokens_saved: tokens_saved(local, billed, usage),
         baseline_cost: shadow_cost.map(|total| CostEstimate {
             total: Some(total),
@@ -508,7 +508,7 @@ fn contribution(
         }),
         token_impact: Some(LlmOptimizationTokenImpact {
             baseline: None,
-            effective: Some(relay_tokens(tokens)),
+            effective: Some(relay_tokens(tokens, &turn.usage)),
             saved: None,
             // Straight off the log's own provenance marker, which is the point
             // of that marker existing: an unreported call folded in as zero
@@ -534,34 +534,59 @@ fn contribution(
 
 /// A roundhouse token breakdown in Relay's `Usage` shape.
 ///
-/// `cache_write_tokens` is deliberately absent. Roundhouse prices uncached
-/// prompt tokens at the provider's cache-*write* rate, because that is what a
-/// provider charges for them — but it does not *measure* a cache write, and
-/// putting the uncached count in a field named for one would publish a pricing
-/// convention as an observation.
+/// `cache_write_tokens` was deliberately absent until M11.0, because roundhouse
+/// *priced* uncached prompt tokens at the provider's cache-write rate without
+/// *measuring* a cache write, and putting the uncached count in a field named
+/// for one would publish a pricing convention as an observation. The rule is
+/// unchanged; what changed is that a measurement now exists —
+/// `Usage::cache_write_tokens`, folded by the `anthropic_messages` client out of
+/// the `cache_creation_input_tokens` its upstream reports — so the field is
+/// emitted from that and from nothing else. See [`measured_cache_write`] for the
+/// one condition it is emitted under.
 ///
 /// `cost` is absent for the same reason on the other axis: this crate's costs
 /// live in `baseline_cost` and `actual_cost`, where their provenance travels
 /// with them, and a second copy here would be a number with no `CostSource`.
-fn relay_usage(tokens: &TokenBreakdown) -> RelayUsage {
+fn relay_usage(tokens: &TokenBreakdown, usage: &Usage) -> RelayUsage {
     RelayUsage {
         prompt_tokens: Some(tokens.input),
         completion_tokens: Some(tokens.output),
         total_tokens: Some(tokens.total),
         cache_read_tokens: Some(tokens.cached_input),
-        cache_write_tokens: None,
+        cache_write_tokens: measured_cache_write(usage),
         cost: None,
     }
 }
 
-fn relay_tokens(tokens: &TokenBreakdown) -> LlmOptimizationTokens {
+fn relay_tokens(tokens: &TokenBreakdown, usage: &Usage) -> LlmOptimizationTokens {
     LlmOptimizationTokens {
         prompt_tokens: Some(tokens.input),
         completion_tokens: Some(tokens.output),
         cache_read_tokens: Some(tokens.cached_input),
-        cache_write_tokens: None,
+        cache_write_tokens: measured_cache_write(usage),
         total_tokens: Some(tokens.total),
     }
+}
+
+/// The provider's own cache-write count, or `None` when nobody measured one.
+///
+/// **Two conditions, and the second is the one a reader will want to argue
+/// with.** The counts must be `Accounting::Reported` — our own tokenizer knows
+/// nothing about a remote cache, so an estimated turn has no business publishing
+/// a write count at all — *and* the count must be positive.
+///
+/// The positivity test is not a tidy-up. The log stores `0` for two different
+/// facts: "the provider reported zero cache writes on this turn" and "this
+/// dialect has no such counter, so nothing was ever asked". A Responses turn is
+/// the second and is `Reported` all the same, so emitting `Some(0)` for it would
+/// publish an observation nobody made — the exact failure this field spent three
+/// releases absent to avoid. The cost is that a genuine measured zero is
+/// published as "unknown" rather than as zero, which understates what we know
+/// and never overstates it; the alternative errs the other way, on the axis the
+/// savings figure is computed from.
+fn measured_cache_write(usage: &Usage) -> Option<u64> {
+    (matches!(usage.accounting, Accounting::Reported) && usage.cache_write_tokens > 0)
+        .then_some(usage.cache_write_tokens)
 }
 
 #[cfg(test)]
@@ -854,6 +879,65 @@ mod tests {
         );
         let billed = serde_json::to_string(&summaries(&keyed, &declared())[0]).unwrap();
         assert!(billed.contains("actual_cost"), "{billed}");
+    }
+
+    /// **`cache_write_tokens` is published from a measurement and from nothing
+    /// else.**
+    ///
+    /// The field was hardcoded `None` for three releases with a doc saying why:
+    /// roundhouse priced uncached tokens at the write rate without measuring a
+    /// write, and a field named for an observation must not carry a pricing
+    /// convention. M11.0's Anthropic client supplies the measurement, so the
+    /// field is now emitted — under two conditions, and each has its own arm
+    /// here because dropping either one re-opens the hole the `None` was
+    /// protecting.
+    #[test]
+    fn a_cache_write_is_published_only_when_a_provider_actually_measured_one() {
+        let anthropic_turn = |usage: Usage| {
+            let mut log = Log::new("s1");
+            log.created(None);
+            log.turn("t1", "r1", fixtures::frontier("anthropic", "claude"), usage);
+            summaries(&log, &declared())[0]
+                .effective_usage
+                .clone()
+                .expect("a dispatched turn publishes its usage")
+        };
+
+        // PROBE: a warm Anthropic turn — 10k prompt, 8k read from the provider's
+        // cache, 500 newly written. The write count is the provider's own.
+        let measured = anthropic_turn(Usage {
+            cache_write_tokens: 500,
+            ..fixtures::usage(10_000, 8_000, 100)
+        });
+        assert_eq!(measured.cache_write_tokens, Some(500));
+        assert_eq!(
+            measured.cache_read_tokens,
+            Some(8_000),
+            "and the read count is untouched: the two are separate observations"
+        );
+
+        // CONTROL 1: the same turn over a dialect with no such counter. `0` in
+        // the log means "nobody asked", not "the provider measured zero", so
+        // `Some(0)` here would publish an observation nobody made -- and every
+        // Responses turn roundhouse has ever served is this case.
+        assert_eq!(
+            anthropic_turn(fixtures::usage(10_000, 8_000, 100)).cache_write_tokens,
+            None
+        );
+
+        // CONTROL 2: a measured-looking count on a turn our own tokenizer
+        // counted. A local tokenizer knows nothing about a remote cache, so a
+        // write count on an estimated turn is arithmetic wearing a
+        // measurement's name -- and `estimation_method` beside it would then
+        // claim `roundhouse-tokenizer` produced a provider's counter.
+        assert_eq!(
+            anthropic_turn(fixtures::estimated(Usage {
+                cache_write_tokens: 500,
+                ..fixtures::usage(10_000, 8_000, 100)
+            }))
+            .cache_write_tokens,
+            None
+        );
     }
 
     #[test]

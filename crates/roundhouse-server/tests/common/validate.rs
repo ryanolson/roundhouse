@@ -82,6 +82,7 @@ pub fn judge_usage() -> Usage {
     Usage {
         input_tokens: 1_100,
         cached_input_tokens: 300,
+        cache_write_tokens: 130,
         output_tokens: 47,
         reasoning_tokens: 0,
         accounting: Accounting::Reported,

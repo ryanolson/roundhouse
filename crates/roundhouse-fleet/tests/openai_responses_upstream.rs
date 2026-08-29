@@ -128,6 +128,7 @@ fn quote(credential: TurnCredential) -> FrontierQuote {
         },
         wire_protocol: WireProtocol::OpenAiResponses,
         prompt: "how many tokens did that turn bill?".into(),
+        segment_boundaries: Vec::new(),
         prompt_cache_key: "sess_upstream".into(),
         expected_output_tokens: Some(512),
         credential,
@@ -214,6 +215,7 @@ async fn a_stored_key_arrives_as_a_bearer_and_nothing_else_secret_shaped_does() 
         FrontierChunk::Done {
             input_tokens: 120,
             cached_input_tokens: 100,
+            cache_write_tokens: 0,
             output_tokens: 30,
             reasoning_tokens: 12,
             provider_reported_cost: None,

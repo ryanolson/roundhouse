@@ -10,6 +10,11 @@
 //! provider supports explicit breakpoints, `cache_control` markers at the same
 //! prefix boundary each turn. Routing on a predicted cache hit and then
 //! prompting in a way that defeats it is the obvious failure mode.
+//!
+//! The breakpoint half of that promise is discharged by
+//! [`FrontierQuote::segment_boundaries`] and read by the Anthropic client, which
+//! is the only dialect roundhouse speaks where a cache exists but does nothing
+//! without one.
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -183,6 +188,18 @@ pub enum FrontierChunk {
     Done {
         input_tokens: u64,
         cached_input_tokens: u64,
+        /// Prompt tokens the provider wrote into its cache on this call.
+        ///
+        /// A *component* of `input_tokens`, exactly as `cached_input_tokens` is:
+        /// on the Anthropic wire the three counters are disjoint and the client
+        /// folds them into roundhouse's total, so adding this to `input_tokens`
+        /// downstream would double-count every cached prompt.
+        ///
+        /// Zero on a dialect that does not report one, which reads as "nothing
+        /// was written" — the honest answer on the Responses wire, where a cache
+        /// write is not a separately billed event at all. The dialect where the
+        /// distinction would matter is the one that reports the number.
+        cache_write_tokens: u64,
         output_tokens: u64,
         /// Thinking tokens, already counted inside `output_tokens`.
         ///
@@ -245,6 +262,12 @@ impl FrontierChunk {
             Ok(FrontierChunk::Done {
                 input_tokens,
                 cached_input_tokens,
+                // Not a parameter, so that the dozen call sites that adapt a
+                // non-streaming backend do not each have to answer a question
+                // none of them can: a backend handed token counts by its caller
+                // was told nothing about a remote cache write, and zero is what
+                // "nothing was written" reads as.
+                cache_write_tokens: 0,
                 output_tokens,
                 reasoning_tokens,
                 // A non-streaming backend adapted into a stream reports the
@@ -274,6 +297,30 @@ pub struct FrontierQuote {
     /// deployment.
     pub wire_protocol: WireProtocol,
     pub prompt: String,
+    /// Byte offsets into [`Self::prompt`] where one conversation item's render
+    /// ends and the next begins.
+    ///
+    /// **Additive, and it exists because Anthropic caches nothing without an
+    /// explicit breakpoint.** Every other dialect roundhouse speaks caches on a
+    /// steering key and needs no structure in the prompt at all, which is why
+    /// this stayed unwritten through M10 while `frontier.rs`'s own module doc
+    /// promised it. A client that sends the flat string to a Messages upstream
+    /// gets a 0% hit rate forever while the router keeps pricing that target on
+    /// a `CacheModel::Deterministic` prediction nothing can fulfil.
+    ///
+    /// **A slicing, never a second rendering.** These are offsets *into the
+    /// canonical render*, so the blocks a client cuts from them rejoin to
+    /// `prompt` byte-exactly and `turn_id_for`, the block hashes and
+    /// `ContextAssembler::rendered` stay one projection. Re-deriving roles or
+    /// items here would be a second projection able to disagree with the log —
+    /// the trade the seam map states both ways, resolved this way by R3.
+    ///
+    /// Empty means "no structure known", which every existing construction site
+    /// means and which [`Self::segments`] answers with the whole prompt as one
+    /// segment. Strictly increasing, each strictly inside `0..prompt.len()`, and
+    /// each on a UTF-8 character boundary; anything else is refused by
+    /// [`Self::segments`] rather than sliced.
+    pub segment_boundaries: Vec<usize>,
     /// Stable per-session key. Providers use it to steer requests to the same
     /// cache node, so it must not vary turn to turn.
     pub prompt_cache_key: String,
@@ -304,6 +351,54 @@ pub struct FrontierQuote {
     pub credential: TurnCredential,
 }
 
+impl FrontierQuote {
+    /// [`Self::prompt`], cut at [`Self::segment_boundaries`].
+    ///
+    /// **Fallible, and the refusal is the point.** Slicing a `String` at an
+    /// offset that is not a character boundary panics, and slicing at a
+    /// *plausible but wrong* offset does something worse: it sends the model a
+    /// differently-cut prompt than the one the turn was priced, hashed and
+    /// routed on, silently. So every way a boundary list can fail to describe
+    /// this prompt is refused here — past the end, out of order, repeated, at
+    /// either edge (which would produce an empty block that the Messages schema
+    /// rejects outright), or mid-codepoint.
+    ///
+    /// An empty boundary list is not a failure: it is a caller that knows
+    /// nothing about item structure, and the whole prompt as one segment is the
+    /// correct answer for it.
+    pub fn segments(&self) -> Result<Vec<&str>, FrontierError> {
+        if self.segment_boundaries.is_empty() {
+            return Ok(vec![&self.prompt]);
+        }
+        let mut previous = 0usize;
+        for &boundary in &self.segment_boundaries {
+            if boundary <= previous || boundary >= self.prompt.len() {
+                return Err(FrontierError::MalformedQuote(format!(
+                    "boundary {boundary} is not strictly inside \
+                     ({previous}, {}) for a {}-byte prompt",
+                    self.prompt.len(),
+                    self.prompt.len()
+                )));
+            }
+            if !self.prompt.is_char_boundary(boundary) {
+                return Err(FrontierError::MalformedQuote(format!(
+                    "boundary {boundary} falls inside a UTF-8 character"
+                )));
+            }
+            previous = boundary;
+        }
+
+        let mut segments = Vec::with_capacity(self.segment_boundaries.len() + 1);
+        let mut start = 0usize;
+        for &boundary in &self.segment_boundaries {
+            segments.push(&self.prompt[start..boundary]);
+            start = boundary;
+        }
+        segments.push(&self.prompt[start..]);
+        Ok(segments)
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum FrontierError {
     #[error("provider `{0}` is not configured")]
@@ -321,6 +416,20 @@ pub enum FrontierError {
     /// client unchanged.
     #[error(transparent)]
     Credential(#[from] CredentialError),
+    /// The quote's own structure does not describe the prompt it carries.
+    ///
+    /// Its own arm for the same reason [`Self::Credential`] and
+    /// [`Self::UnsupportedDialect`] have theirs: nothing reached an upstream,
+    /// and nothing should. This is not hostile input — a quote is built inside
+    /// this process — so it is a bug, and the two alternatives are both worse
+    /// than a loud failure. Slicing anyway panics on a mid-codepoint offset;
+    /// falling back to the flat prompt silently drops the cache breakpoints and
+    /// takes the provider discount with them, on every turn, with nothing said.
+    #[error(
+        "the quote's segment structure does not describe its prompt: {0}; refusing to \
+         slice a prompt at offsets that would change what the model is asked"
+    )]
+    MalformedQuote(String),
     /// A client was handed a quote in a dialect it does not speak.
     ///
     /// Its own arm for the same reason [`Self::Credential`] is: nothing reached
@@ -399,6 +508,7 @@ impl FrontierError {
             FrontierError::UnknownProvider(_)
             | FrontierError::Upstream(_)
             | FrontierError::Credential(_)
+            | FrontierError::MalformedQuote(_)
             | FrontierError::UnsupportedDialect { .. } => None,
         }
     }
@@ -540,7 +650,11 @@ impl FrontierClient for EchoFrontierClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use roundhouse_core::context::{ByteTokenizer, ContextAssembler};
     use roundhouse_core::control::Secret;
+    use roundhouse_core::ids::ResponseId;
+    use roundhouse_core::item::Item;
+    use roundhouse_core::validate::append_handoff_note;
 
     const MINUTE: u64 = 60_000;
 
@@ -591,6 +705,7 @@ mod tests {
             },
             FrontierError::UnknownProvider("moonshot".into()),
             FrontierError::Upstream("the upstream sent an unparseable event".into()),
+            FrontierError::MalformedQuote("boundary 9999 is past the end".into()),
             FrontierError::UnsupportedDialect {
                 expected: "openai_responses",
                 got: "anthropic_messages",
@@ -679,10 +794,137 @@ mod tests {
             },
             wire_protocol: WireProtocol::AnthropicMessages,
             prompt: "some prompt".into(),
+            segment_boundaries: Vec::new(),
             prompt_cache_key: "sess_x".into(),
             expected_output_tokens: None,
             credential,
         }
+    }
+
+    fn segmented(prompt: &str, boundaries: Vec<usize>) -> FrontierQuote {
+        FrontierQuote {
+            prompt: prompt.to_string(),
+            segment_boundaries: boundaries,
+            ..quote_with(TurnCredential::Absent)
+        }
+    }
+
+    /// **The invariant every cache breakpoint rests on: the segments rejoin to
+    /// the prompt byte-exactly.**
+    ///
+    /// If they did not, a client would send the model a differently-cut prompt
+    /// than the one `turn_id_for` hashed and the router priced — and it would do
+    /// it silently, because nothing downstream compares the two.
+    #[test]
+    fn segments_are_a_slicing_of_the_prompt_and_rejoin_to_it() {
+        // Offsets derived from the renders rather than typed: a hand-counted
+        // one that is off by a byte still slices, still rejoins, and quietly
+        // moves the cache breakpoint into the middle of an item -- which is
+        // exactly the class of mistake this seam exists to make impossible, so
+        // the test must not be able to make it either.
+        let renders = ["<|system|>be brief", "<|user|>hello", "<|assistant|>hi"];
+        let prompt = renders.concat();
+        let boundaries = vec![renders[0].len(), renders[0].len() + renders[1].len()];
+        let quote = segmented(&prompt, boundaries);
+        let segments = quote.segments().unwrap();
+
+        assert_eq!(segments, renders.to_vec());
+        assert_eq!(segments.concat(), prompt);
+
+        // No structure known is one segment, not zero and not an error: a
+        // caller that never learned the item boundaries still has a prompt.
+        let flat = segmented(&prompt, Vec::new());
+        assert_eq!(flat.segments().unwrap(), vec![prompt.as_str()]);
+        assert_eq!(flat.segments().unwrap().concat(), prompt);
+    }
+
+    /// **The producer and the consumer, joined: what `ContextAssembler` names
+    /// is what `segments()` accepts.**
+    ///
+    /// The two halves live in different crates and neither test above sees the
+    /// other, so a boundary convention that drifted — interior versus leading,
+    /// byte versus char, cumulative versus per-item — would leave both suites
+    /// green and every Anthropic dispatch refused at the seam. This is the test
+    /// that goes red for that.
+    #[test]
+    fn boundaries_the_assembler_produces_are_boundaries_the_quote_accepts() {
+        let items = [
+            Item::system_text("you are a careful assistant"),
+            Item::user_text("first question"),
+            Item::assistant_text("first answer", ResponseId::new("r1")),
+            // Multi-byte, because a convention that counted characters rather
+            // than bytes would agree with itself on ASCII forever.
+            Item::user_text("¿segunda pregunta?"),
+        ];
+        let mut assembler = ContextAssembler::new(ByteTokenizer, 16);
+        for item in items.clone() {
+            assembler.push(item);
+        }
+        let (rendered, segment_boundaries) = assembler.rendered_with_boundaries();
+
+        let quote = FrontierQuote {
+            prompt: rendered.clone(),
+            segment_boundaries,
+            ..quote_with(TurnCredential::Absent)
+        };
+        let segments = quote.segments().expect("the assembler's own boundaries");
+        assert_eq!(segments, items.iter().map(Item::render).collect::<Vec<_>>());
+        assert_eq!(segments.concat(), rendered);
+
+        // And the decoration the engine may append to this render does not
+        // invalidate them: the note goes on the *end*, so every interior offset
+        // still names the same item edge and the note lands inside the final
+        // segment — which is where it belongs, being the one part of the prompt
+        // that is new this turn and must not sit inside a cached block.
+        let decorated = FrontierQuote {
+            prompt: append_handoff_note(rendered.clone(), "narrow the search"),
+            ..quote.clone()
+        };
+        let decorated_segments = decorated
+            .segments()
+            .expect("a note is appended, not spliced");
+        assert_eq!(decorated_segments.concat(), decorated.prompt);
+        assert_eq!(
+            decorated_segments[..segments.len() - 1],
+            segments[..segments.len() - 1],
+            "only the final segment may differ, and it differs by the note"
+        );
+        assert!(
+            decorated_segments
+                .last()
+                .unwrap()
+                .contains("narrow the search")
+        );
+    }
+
+    #[test]
+    fn a_boundary_list_that_does_not_describe_the_prompt_is_refused_at_the_seam() {
+        let prompt = "<|user|>héllo<|assistant|>hi";
+        // PROBE: every shape of wrong. Each would otherwise either panic in the
+        // slice or produce a block the Messages schema rejects, and the fifth
+        // would do neither -- it would quietly send a different prompt.
+        for (bad, why) in [
+            (vec![prompt.len()], "at the end: an empty final block"),
+            (vec![0], "at the start: an empty first block"),
+            (vec![prompt.len() + 1], "past the end"),
+            (vec![8, 8], "repeated: an empty block between them"),
+            (vec![20, 8], "out of order"),
+            (vec![10], "mid-codepoint, which would panic the slice"),
+        ] {
+            let error = segmented(prompt, bad.clone())
+                .segments()
+                .expect_err(&format!("{bad:?} ({why}) must be refused"));
+            assert!(
+                matches!(error, FrontierError::MalformedQuote(_)),
+                "{error} for {bad:?} ({why})"
+            );
+        }
+
+        // CONTROL: the same prompt with boundaries that *do* describe it slices,
+        // so the assertions above are about the boundaries and not about the
+        // check refusing everything with a multi-byte character in it.
+        let good = segmented(prompt, vec![14]);
+        assert_eq!(good.segments().unwrap().concat(), prompt);
     }
 
     #[test]

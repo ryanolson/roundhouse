@@ -288,9 +288,18 @@ fn message_item(text: &str) -> Value {
 /// own accounting, and a completion it cannot parse is a turn it treats as
 /// failed. `cached_input_tokens` goes out as `input_tokens_details.cached_tokens`
 /// — the quantity this whole system exists to maximize, in the field a Responses
-/// client already reads. `cache_write_tokens` stays zero because no provider
-/// Roundhouse routes to reports it separately yet, and a number invented here
-/// would be billed as if it had been measured.
+/// client already reads.
+///
+/// `cache_write_tokens` is the log's own measurement now rather than the literal
+/// `0` this frame carried through M10. It is zero on every turn served over the
+/// Responses wire, because that dialect does not report a cache write at all —
+/// which is the honest reading, not a placeholder — and non-zero exactly when
+/// the turn was dispatched to an `anthropic_messages` provider that reported
+/// `cache_creation_input_tokens`. The field is read straight off [`Usage`] and
+/// never back-derived from `uncached_input_tokens()`: roundhouse *prices* every
+/// uncached token at the cache-write rate as a conservative approximation, and
+/// publishing that convention in a field named for a measurement is exactly the
+/// confusion the widened `Usage` exists to end.
 ///
 /// `reasoning_tokens` rides in `output_tokens_details` for the same reason it
 /// is stored that way: it is a component of `output_tokens`, not an addition
@@ -302,21 +311,33 @@ pub(super) fn completed_frame(response_id: &ResponseId, usage: &Usage) -> Event 
             "type": "response.completed",
             "response": {
                 "id": response_id,
-                "usage": {
-                    "input_tokens": usage.input_tokens,
-                    "input_tokens_details": {
-                        "cached_tokens": usage.cached_input_tokens,
-                        "cache_write_tokens": 0,
-                    },
-                    "output_tokens": usage.output_tokens,
-                    "output_tokens_details": {
-                        "reasoning_tokens": usage.reasoning_tokens,
-                    },
-                    "total_tokens": usage.total(),
-                },
+                "usage": completed_usage(usage),
             },
         }),
     )
+}
+
+/// The `usage` object of [`completed_frame`], as a value.
+///
+/// Split out because an [`Event`] is write-only — axum exposes no way to read a
+/// frame's payload back — so the projection from log axes to wire axes was only
+/// assertable through a whole turn over a socket, which is a test about six
+/// other things. Extracting it makes the one claim that matters here (each
+/// stored count lands in the field a Responses client reads, and none is
+/// invented) a unit test beside the code.
+fn completed_usage(usage: &Usage) -> Value {
+    json!({
+        "input_tokens": usage.input_tokens,
+        "input_tokens_details": {
+            "cached_tokens": usage.cached_input_tokens,
+            "cache_write_tokens": usage.cache_write_tokens,
+        },
+        "output_tokens": usage.output_tokens,
+        "output_tokens_details": {
+            "reasoning_tokens": usage.reasoning_tokens,
+        },
+        "total_tokens": usage.total(),
+    })
 }
 
 /// `response.incomplete`, which ends the stream.
@@ -367,6 +388,58 @@ mod tests {
 
     fn assistant(text: &str) -> Item {
         Item::assistant_text(text, ResponseId::new("resp_1"))
+    }
+
+    /// **A measured cache write reaches the wire; nothing else invents one.**
+    ///
+    /// This field was the literal `0` for the whole of M10, with a doc saying no
+    /// provider reported one — and it went out as zero on every turn including
+    /// the ones that would have reported it, had a client existed. M11.0 added
+    /// the client, so the literal is now a read. Two halves, and neither is the
+    /// claim alone: an Anthropic turn's write count must arrive, and a Responses
+    /// turn's must stay zero rather than being back-filled from the uncached
+    /// count that roundhouse *prices* at the write rate.
+    #[test]
+    fn a_measured_cache_write_reaches_the_wire_and_an_unmeasured_one_stays_zero() {
+        // PROBE: the shape an `anthropic_messages` turn folds to — the three
+        // input counters already summed into `input_tokens` by the client, with
+        // the write kept as its own component.
+        let anthropic = Usage {
+            input_tokens: 9_512,
+            cached_input_tokens: 9_000,
+            cache_write_tokens: 500,
+            output_tokens: 64,
+            reasoning_tokens: 0,
+            accounting: Default::default(),
+        };
+        let usage = completed_usage(&anthropic);
+        assert_eq!(
+            usage["input_tokens_details"]["cache_write_tokens"],
+            json!(500)
+        );
+        assert_eq!(usage["input_tokens_details"]["cached_tokens"], json!(9_000));
+        assert_eq!(
+            usage["input_tokens"],
+            json!(9_512),
+            "the two details are components of the input total, not addends — a client that \
+             checks the parts against the whole still balances"
+        );
+        assert_eq!(usage["total_tokens"], json!(9_512 + 64));
+
+        // CONTROL: the same prompt over the Responses wire, where 512 tokens
+        // were uncached and nothing reported a write. Zero is the honest answer
+        // and `uncached_input_tokens()` — 512 — is the number a well-meaning
+        // back-derivation would put here, which is why the assertion names it.
+        let responses = Usage {
+            cache_write_tokens: 0,
+            ..anthropic.clone()
+        };
+        assert_eq!(responses.uncached_input_tokens(), 512);
+        assert_eq!(
+            completed_usage(&responses)["input_tokens_details"]["cache_write_tokens"],
+            json!(0),
+            "a pricing convention must never be published in a field named for a measurement"
+        );
     }
 
     #[test]

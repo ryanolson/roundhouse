@@ -181,6 +181,10 @@ fn steer_usage() -> Usage {
     Usage {
         input_tokens: 96,
         cached_input_tokens: 32,
+        // The exception to "non-zero on every axis": an interjection is
+        // answered without dispatching, so nothing was written into any
+        // provider's cache and a non-zero count here would be fiction.
+        cache_write_tokens: 0,
         output_tokens: 24,
         reasoning_tokens: 8,
         accounting: Accounting::Reported,

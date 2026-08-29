@@ -325,6 +325,11 @@ pub async fn read_events_pages_oldest_first_and_reproduces_the_append<S: Session
             usage: Usage {
                 input_tokens: 10,
                 cached_input_tokens: 4,
+                // Non-zero for the same reason the principal above is
+                // populated: a backend that took the usage object apart and
+                // dropped the newest counter would still pass this round trip
+                // if the fixture left it at its default.
+                cache_write_tokens: 2,
                 output_tokens: 3,
                 reasoning_tokens: 1,
                 accounting: Accounting::Estimated,

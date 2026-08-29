@@ -203,6 +203,12 @@ fn usage_chunk(usage: &Value) -> FrontierChunk {
     FrontierChunk::Done {
         input_tokens: count(usage.get("input_tokens")),
         cached_input_tokens: count(usage.pointer("/input_tokens_details/cached_tokens")),
+        // Zero and not a read of `input_tokens_details.cache_write_tokens`,
+        // because no such field exists on this wire: the Responses API bills a
+        // cache write as ordinary uncached input and reports no separate count.
+        // Zero here therefore means "nothing was written", which is true, rather
+        // than "nobody said" — see `FrontierChunk::Done::cache_write_tokens`.
+        cache_write_tokens: 0,
         output_tokens: count(usage.get("output_tokens")),
         reasoning_tokens: count(usage.pointer("/output_tokens_details/reasoning_tokens")),
         // `cost` is an OpenRouter extension to the Responses usage object;
@@ -280,6 +286,7 @@ mod tests {
                 FrontierChunk::Done {
                     input_tokens: 120,
                     cached_input_tokens: 100,
+                    cache_write_tokens: 0,
                     output_tokens: 30,
                     reasoning_tokens: 12,
                     // OpenAI's own Responses usage object carries no `cost`,
@@ -419,6 +426,7 @@ mod tests {
                 FrontierChunk::Done {
                     input_tokens: 1200,
                     cached_input_tokens: 900,
+                    cache_write_tokens: 0,
                     output_tokens: 64,
                     reasoning_tokens: 8,
                     // The number the reconciliation rung will compare our
@@ -446,6 +454,7 @@ mod tests {
             vec![FrontierChunk::Done {
                 input_tokens: 120,
                 cached_input_tokens: 100,
+                cache_write_tokens: 0,
                 output_tokens: 30,
                 reasoning_tokens: 12,
                 provider_reported_cost: None,

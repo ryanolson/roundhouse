@@ -28,7 +28,8 @@ features — the first is what makes the second possible.
 > Dynamo selection, streaming turn engine, HTTP/SSE transport, Redis session
 > store and spend ledger; the control plane (principals, projects,
 > memberships, keys, per-key policy, budgets); the admin plane; the MCP
-> control surface; the validate/steer loop; real frontier provider clients;
+> control surface; the validate/steer loop; real frontier provider clients on
+> two wire dialects (OpenAI Responses and Anthropic Messages);
 > a real `codex` binary driving all of it end to end behind a feature gate;
 > emission of NeMo Relay's interchange formats from the same log; providers
 > as configuration behind a per-provider client registry; rolling fair-use
@@ -656,9 +657,13 @@ starting anyway would serve every turn under prices nobody chose.
 Without the variable the binary serves its offline echo stub, for which every
 price is zero — so the demo demonstrates the token breakdown, not the savings.
 `ROUNDHOUSE_FRONTIER_UPSTREAM` is the same load-or-die posture for the
-transport: unset serves the echo stub, `openai_responses` dispatches over the
-real OpenAI Responses wire, and an unrecognised name is refused rather than
-quietly demoted.
+transport: unset serves the echo stub, `openai_responses` dispatches to real
+providers, and an unrecognised name is refused rather than quietly demoted. Its
+name is historical — when it was written there was one client, so naming the
+wire and switching real dispatch on were the same act. The provider registry
+made the dialect a per-catalog-entry fact, so the value is now a switch and each
+provider's wire comes from its entries' `wire_protocol`; it keeps its spelling
+because renaming it would break every deployment's environment for cosmetics.
 
 **Providers are data, not one hardwired transport.** The same catalog file
 carries a `"providers"` section: `name -> { base_url, routes: { models?,
@@ -672,7 +677,13 @@ named; a catalog written before this section existed still loads unchanged.
 Two load-or-die cross-checks make the registry total rather than merely usual:
 every entry's `provider` is defined, and a defined provider declares a route
 for the dialect its entries speak — both refuse the boot, not the first turn
-that would have hit the gap. A rolling-pointer model id (OpenRouter's
+that would have hit the gap. A third is asked at the composition root, because
+it is a fact about the binary rather than about the file: the dialect each
+provider's entries declare has to be one this build compiled a client for, and
+a provider whose entries declare *two* is refused as well — the registry holds
+one transport per provider name, so a provider serving both wires (OpenRouter
+serves `/responses` and `/messages`) is written down twice, under two names
+pointing at the same base URL. A rolling-pointer model id (OpenRouter's
 `~`-prefixed aliases) is refused at load for the same reason a duplicate
 identity is: it mis-prices every turn after the upstream re-points it. The key
 itself is never written here: `auth.env` only names the environment variable it
@@ -944,11 +955,18 @@ explicitly, because each reaches something the default run must not assume:
 
 Roundhouse does not have WebSocket and gRPC transports. It cannot resume an
 interrupted generation from its partial output, which is already durable in the
-log. One real provider *dialect* is wired (`openai_responses`, which OpenRouter's
-GA `/responses` route also speaks, one registry client per configured
-provider); a chat-completions or Anthropic-messages client is a new
-`WireProtocol` arm the compiler will force through every exhaustive match, and
-neither exists yet. Fair-use enforcement is single-node: the rolling window
+log. Two real provider *dialects* are wired — `openai_responses`, which
+OpenRouter's GA `/responses` route also speaks, and `anthropic_messages`, which
+OpenRouter's GA `/messages` route also speaks — with one registry client per
+configured provider, and the dialect read from each catalog entry. A
+chat-completions client is the one remaining `WireProtocol` arm with no
+transport; the composition root's dialect gate is an exhaustive `match`, so
+writing that client is a compile error there rather than a silent
+mis-dispatch. What roundhouse does *not* yet do on the Anthropic wire is
+**serve** it: there is no `/v1/messages` surface over the session log, so a
+Claude Code client cannot point at roundhouse yet — only roundhouse's own turns
+can be dispatched to an Anthropic upstream. Fair-use enforcement is
+single-node: the rolling window
 counters live in process memory, and the Redis implementation is deferred by
 name with a boot warning where it matters.
 
@@ -958,7 +976,10 @@ ignores the `_meta.threadId` a Codex client sends on every `tools/call`, because
 `init_session` is the client-agnostic path and reading `_meta` is a
 codex-native shortcut deferred to a plan of its own. The forwarded-ChatGPT-login
 stanza is exercised with a crafted `auth.json`; no real login has been forwarded
-through this code.
+through this code. The same is true of the Anthropic pass-through row that
+landed with the Messages client: the four headers it admits are asserted against
+a mock upstream on a real socket, and no real Claude subscription seat has been
+forwarded through it.
 
 Metrics are per-process: the recorder folds what this node served plus whatever
 it replayed from the sessions it opened. A fleet-wide view means either scraping

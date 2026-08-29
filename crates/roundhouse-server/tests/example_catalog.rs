@@ -111,15 +111,35 @@ fn the_shipped_example_catalog_parses_and_validates() {
 /// distinguish "a placeholder" from "a real id shown for illustration", and a
 /// full id's `provider/model` slash is what tells the two apart without
 /// hard-coding a provider name here.
+///
+/// **All four rates, not just input (M11.0).** The file gained an
+/// `anthropic_messages` entry, and that is the first dialect on which
+/// `cache_write_per_mtok_usd` is a distinct published price rather than an unused
+/// field — so it is the first entry where a "helpfully" filled-in rate card could
+/// rot in a column this test was not looking at. Checking one of four was enough
+/// while three of them were structurally zero everywhere; it is not any more.
 #[test]
 fn the_example_prices_are_placeholders_not_a_rate_card() {
     let config = CatalogConfig::load(example_path()).unwrap();
     for spec in &config.models {
-        assert_eq!(
-            spec.pricing.input_per_mtok_usd, 0.0,
-            "`{}/{}` carries a non-zero price; the example must not ship a rate card",
-            spec.provider, spec.model
-        );
+        for (field, rate) in [
+            ("input_per_mtok_usd", spec.pricing.input_per_mtok_usd),
+            (
+                "cached_input_per_mtok_usd",
+                spec.pricing.cached_input_per_mtok_usd,
+            ),
+            (
+                "cache_write_per_mtok_usd",
+                spec.pricing.cache_write_per_mtok_usd,
+            ),
+            ("output_per_mtok_usd", spec.pricing.output_per_mtok_usd),
+        ] {
+            assert_eq!(
+                rate, 0.0,
+                "`{}/{}` carries a non-zero `{field}`; the example must not ship a rate card",
+                spec.provider, spec.model
+            );
+        }
         let is_a_real_pinned_id_shown_for_illustration = spec.model.contains('/');
         assert!(
             spec.model.contains("REPLACE") || is_a_real_pinned_id_shown_for_illustration,

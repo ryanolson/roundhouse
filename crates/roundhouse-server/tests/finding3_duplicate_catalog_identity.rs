@@ -90,6 +90,10 @@ fn one_mtok_of_uncached_input() -> Usage {
     Usage {
         input_tokens: 1_000_000,
         cached_input_tokens: 0,
+        // Zero so "uncached" in this fixture's name stays literally true: a
+        // cache write is uncached input the provider also kept, and this test
+        // reads a rate back out of a dollar figure.
+        cache_write_tokens: 0,
         output_tokens: 0,
         reasoning_tokens: 0,
         accounting: Accounting::Reported,

@@ -50,15 +50,49 @@ use super::secret::Secret;
 /// agreeing on the set, which is the strongest evidence available that it is
 /// the whole set.
 ///
-/// There is deliberately **no** Anthropic row yet. One would be easy to write
-/// from Switchyard's (`authorization`, `x-api-key`), and it would be a claim
-/// this repository has not tested against a real client: roundhouse's only
-/// pass-through client speaks the Responses wire. A row nothing exercises is a
-/// promise made to whoever reads the table, so the table says what is true.
-const ALLOWLIST: &[(&str, &[&str])] = &[(
-    "openai",
-    &["authorization", "chatgpt-account-id", "x-openai-fedramp"],
-)];
+/// The Anthropic row landed with the client that exercises it (M11.0), and the
+/// rule that kept it out until then is the same rule that admits it now: a row
+/// nothing exercises is a promise made to whoever reads the table, so the table
+/// says what is true. `roundhouse-fleet`'s `AnthropicMessagesClient` forwards
+/// exactly these four on its redirect-disabled client, so the table and the wire
+/// now agree.
+///
+/// Four names rather than Switchyard's two, and the extra pair is not
+/// decoration:
+///
+/// - `authorization` is a Claude Code subscription seat's OAuth bearer, and
+///   `x-api-key` is a caller bringing its own Anthropic key — Anthropic accepts
+///   either, on different header names, so a row carrying one of them makes half
+///   of the real callers unreachable.
+/// - `anthropic-beta` is required, not optional: stripping the
+///   `oauth-2025-04-20` beta from a subscription seat is a documented 401
+///   (`agent-docs/research/claude-code-client-surface.md` §1.2), so dropping it
+///   would turn every seat turn into an authentication failure that looks like a
+///   revoked login.
+/// - `anthropic-version` is forwardable so a caller pinned to a version can say
+///   so. The client stamps its own value *after* the forwarded headers anyway —
+///   it serialized the body, so it is the one that knows which version describes
+///   it — which makes this row entry inert on today's dispatch path and honest
+///   about what the edge is willing to carry.
+///
+/// What is deliberately *not* here: `x-api-key` is admitted for `anthropic` and
+/// for nobody else, so a caller's Anthropic key presented on an OpenAI-routed
+/// turn is still dropped at `for_provider`.
+const ALLOWLIST: &[(&str, &[&str])] = &[
+    (
+        "openai",
+        &["authorization", "chatgpt-account-id", "x-openai-fedramp"],
+    ),
+    (
+        "anthropic",
+        &[
+            "authorization",
+            "x-api-key",
+            "anthropic-beta",
+            "anthropic-version",
+        ],
+    ),
+];
 
 /// Every header name any provider's row admits.
 ///
@@ -244,6 +278,9 @@ mod tests {
     /// [`Secret::api_key`] refuses.
     const BEARER: &str = "Bearer eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJaWlpRUVEifQ.do-not-log-me";
     const ACCOUNT: &str = "acct-ZZZQQQ-0000";
+    /// A caller bringing its own Anthropic key. Unique for the same reason
+    /// [`BEARER`] is: a scan that finds this string found the real thing.
+    const ANTHROPIC_KEY: &str = "sk-ant-ZZZQQQ2222-not-ours";
 
     fn presented(pairs: &[(&str, &str)]) -> Option<PresentedCredential> {
         PresentedCredential::captured(|name| {
@@ -280,19 +317,44 @@ mod tests {
             ]
         );
 
-        // CONTROL: a header nobody's row names is not captured at all, so it
-        // cannot reach an upstream even by a later edit that forgot to filter.
+        // CONTROL, and M11.0 split it in two because the row it used to rest on
+        // moved. `x-api-key` was the negative control here until Anthropic got a
+        // row; it is now a *cross-provider* control, which is the stronger of
+        // the two claims and the one the two-type split exists to make:
+        //
+        // - `cookie` is on nobody's row, so it is never captured at all and has
+        //   nowhere to be stored — the filter is the type, not a later check.
+        // - `x-api-key` *is* captured, because Anthropic's row names it, and
+        //   `for_provider("openai")` drops it anyway. A capture that forwarded
+        //   everything it held to whichever provider won would send a caller's
+        //   Anthropic key to OpenAI, which is exactly the silent mistake
+        //   `PresentedCredential`/`ForwardedCredential` are two types to prevent.
         let with_extras = presented(&[
             ("authorization", BEARER),
             ("cookie", "session=zzzz"),
-            ("x-api-key", "sk-ant-not-ours"),
+            ("x-api-key", ANTHROPIC_KEY),
         ])
-        .expect("a bearer was presented")
-        .for_provider("openai")
-        .expect("openai has a row");
+        .expect("a bearer was presented");
         assert_eq!(
-            with_extras.headers().collect::<Vec<_>>(),
+            with_extras
+                .clone()
+                .for_provider("openai")
+                .expect("openai has a row")
+                .headers()
+                .collect::<Vec<_>>(),
             vec![("authorization", BEARER)]
+        );
+        // And the same capture narrowed to the provider whose row *does* name
+        // it. Without this half the assertion above would also pass on a build
+        // that had stopped capturing `x-api-key` at the edge entirely — which
+        // would make the Anthropic row unreachable rather than respected.
+        assert_eq!(
+            with_extras
+                .for_provider("anthropic")
+                .expect("anthropic has a row")
+                .headers()
+                .collect::<Vec<_>>(),
+            vec![("authorization", BEARER), ("x-api-key", ANTHROPIC_KEY)]
         );
 
         // A provider with no row forwards nothing, which makes it unreachable
@@ -308,6 +370,109 @@ mod tests {
             codex_headers().unwrap().covers("OpenAI"),
             "case-insensitive"
         );
+    }
+
+    /// **The Anthropic row, and the reason each of its four names is on it.**
+    ///
+    /// A Claude Code subscription seat presents an OAuth bearer *and* the
+    /// `oauth-2025-04-20` beta, and Anthropic answers 401 to the bearer without
+    /// the beta — so a row that carried only `authorization` would look correct,
+    /// forward a real credential, and fail every seat turn with an error that
+    /// says nothing about a stripped header. That is what makes this a
+    /// four-name row rather than Switchyard's two, and this test is where the
+    /// claim is written down.
+    #[test]
+    fn an_anthropic_seat_forwards_the_bearer_and_the_beta_that_makes_it_work() {
+        let seat = presented(&[
+            ("authorization", BEARER),
+            (
+                "anthropic-beta",
+                "oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14",
+            ),
+            ("anthropic-version", "2023-06-01"),
+        ])
+        .expect("a bearer was presented")
+        .for_provider("anthropic")
+        .expect("anthropic has a row");
+
+        assert_eq!(
+            seat.headers().collect::<Vec<_>>(),
+            vec![
+                (
+                    "anthropic-beta",
+                    "oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14"
+                ),
+                ("anthropic-version", "2023-06-01"),
+                ("authorization", BEARER),
+            ]
+        );
+
+        // A key alone is a credential on this provider's *other* auth mode, but
+        // `CREDENTIAL_HEADER` is `authorization` for every row — so a caller
+        // presenting only `x-api-key` is not a forwardable credential and the
+        // turn resolves through the deployment's own stored key instead of
+        // reaching an upstream as a half-authenticated request.
+        //
+        // Recorded rather than argued: it is a real limitation of the one-name
+        // credential rule, and the remedy if a BYO-key Claude client ever needs
+        // it is a second `CREDENTIAL_HEADER` per row, not a special case here.
+        assert!(presented(&[("x-api-key", ANTHROPIC_KEY)]).is_none());
+
+        // CONTROL: nothing on this row leaks to the other provider that also
+        // names `authorization`. The two rows share exactly one header name and
+        // the narrowing is what keeps them apart.
+        let leaked = presented(&[
+            ("authorization", BEARER),
+            ("anthropic-beta", "oauth-2025-04-20"),
+            ("x-api-key", ANTHROPIC_KEY),
+        ])
+        .unwrap()
+        .for_provider("openai")
+        .expect("openai has a row");
+        assert_eq!(
+            leaked.headers().collect::<Vec<_>>(),
+            vec![("authorization", BEARER)]
+        );
+    }
+
+    /// **Pins each row's exact contents, closing a gap every test above
+    /// leaves open.**
+    ///
+    /// Every test above drives a row through `PresentedCredential::captured`
+    /// / `for_provider`, and both only ever ask about the header names their
+    /// own fixture already lists (`authorization`, `x-api-key`,
+    /// `anthropic-beta`, `anthropic-version`, `chatgpt-account-id`,
+    /// `x-openai-fedramp`, plus the negative controls `cookie` and
+    /// `x-claude-code-session-id`). A name appended to a row that no fixture
+    /// ever presents is never looked up, so `captured` never gets the
+    /// opportunity to forward it — confirmed by appending a fifth,
+    /// never-asked-for entry to the anthropic row and watching every test in
+    /// this file pass unchanged. Reading `ALLOWLIST` through `allowlist_for`
+    /// directly, instead of through a capture, is what turns a widened (or
+    /// narrowed) row into a failing assertion here rather than a silent one
+    /// — the same promise-the-table-must-not-make-unexercised rule the
+    /// module doc (`:53-57`) already argues for a *new* row applies equally
+    /// to widening one that already exists.
+    #[test]
+    fn the_allowlist_names_exactly_these_headers_and_no_more() {
+        assert_eq!(
+            allowlist_for("openai").to_vec(),
+            vec!["authorization", "chatgpt-account-id", "x-openai-fedramp"]
+        );
+        assert_eq!(
+            allowlist_for("anthropic").to_vec(),
+            vec![
+                "authorization",
+                "x-api-key",
+                "anthropic-beta",
+                "anthropic-version",
+            ]
+        );
+
+        // CONTROL: a provider with no row admits nothing, so the assertions
+        // above are about these two rows' exact contents and not about
+        // `allowlist_for` returning something non-empty for anything asked.
+        assert!(allowlist_for("some-new-vendor").is_empty());
     }
 
     #[test]

@@ -62,6 +62,9 @@ fn quote_as_the_engine_builds_it(catalog: &StaticFrontierCatalog) -> FrontierQuo
         wire_protocol: spec.wire_protocol,
         target: candidate.target,
         prompt: "how many tokens did that turn bill?".into(),
+        // The engine fills these from `ContextAssembler::rendered_with_boundaries`;
+        // this fixture's prompt is one item, which is exactly the empty case.
+        segment_boundaries: Vec::new(),
         prompt_cache_key: "sess_finding1".into(),
         expected_output_tokens: Some(512),
         // This test is about the dialect the quote carries, not about

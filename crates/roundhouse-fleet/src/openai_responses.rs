@@ -467,6 +467,7 @@ fn redact_error(credential: &TurnCredential, error: FrontierError) -> FrontierEr
         },
         other @ (FrontierError::UnknownProvider(_)
         | FrontierError::Credential(_)
+        | FrontierError::MalformedQuote(_)
         | FrontierError::UnsupportedDialect { .. }
         | FrontierError::Transport { .. }) => other,
     }
@@ -505,6 +506,9 @@ mod tests {
             },
             wire_protocol,
             prompt: "how many tokens did that turn bill?".into(),
+            // Deliberately populated even though this client ignores it -- see
+            // `the_segment_structure_does_not_reach_the_responses_wire`.
+            segment_boundaries: vec![8, 20],
             prompt_cache_key: "sess_openai".into(),
             expected_output_tokens: Some(512),
             credential,
@@ -618,6 +622,36 @@ mod tests {
         // `const: false`, and a non-null `previous_response_id` is a 400.
         assert_eq!(body["store"], json!(false));
         assert!(body.get("previous_response_id").is_none());
+    }
+
+    /// **The control for R3: the quote grew a field and this client's wire
+    /// output did not move a byte.**
+    ///
+    /// `segment_boundaries` exists for one dialect — Anthropic, which caches
+    /// nothing without an explicit breakpoint. The Responses API caches on a
+    /// steering key instead, so re-blocking the prompt here would change what
+    /// this upstream is sent for no benefit at all, and would break the one
+    /// property every other target relies on: the prompt a provider receives is
+    /// the exact string `turn_id_for` hashed. An additive field that quietly
+    /// altered an existing client's request would be the worst possible way to
+    /// discover that.
+    #[test]
+    fn the_segment_structure_does_not_reach_the_responses_wire() {
+        let mut structured = quote(TurnCredential::Absent, SPOKEN);
+        structured.segment_boundaries = vec![4, 11, 26];
+        let mut flat = structured.clone();
+        flat.segment_boundaries.clear();
+
+        assert_eq!(
+            OpenAiResponsesClient::body(&structured, "flagship"),
+            OpenAiResponsesClient::body(&flat, "flagship"),
+            "the Responses body must be byte-identical whether or not the quote \
+             knows its item boundaries"
+        );
+        // And it is still one flat string in one message, not a block list.
+        let body = OpenAiResponsesClient::body(&structured, "flagship");
+        assert_eq!(body["input"][0]["content"].as_array().unwrap().len(), 1);
+        assert_eq!(body["input"][0]["content"][0]["text"], json!(flat.prompt));
     }
 
     #[test]

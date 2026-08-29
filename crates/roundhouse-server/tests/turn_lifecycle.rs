@@ -510,6 +510,10 @@ async fn deltas_are_durable_before_the_response_completes() {
         .send(Ok(FrontierChunk::Done {
             input_tokens: 40,
             cached_input_tokens: 0,
+            // Non-zero and distinct from every other count here, so the
+            // assertion below is about *this* field arriving rather than about
+            // a default that would have matched anyway.
+            cache_write_tokens: 12,
             output_tokens: 3,
             reasoning_tokens: 0,
             provider_reported_cost: None,
@@ -523,6 +527,19 @@ async fn deltas_are_durable_before_the_response_completes() {
     assert_eq!(
         result.usage.output_tokens, 3,
         "the terminating chunk carries the accounting"
+    );
+    // **Every count on the chunk reaches the log, including the newest one.**
+    // The cache-write count is the one field nothing prices yet, so a fold that
+    // dropped it would go unnoticed by every dollar assertion in this suite —
+    // and the correction it exists to enable (the ledger bills all uncached
+    // input at the write rate) would never become possible.
+    assert_eq!(
+        result.usage.cache_write_tokens, 12,
+        "a measured cache write must survive the fold from chunk to Usage"
+    );
+    assert_eq!(
+        result.usage.input_tokens, 40,
+        "and it is a component of the input total, never an addend beside it"
     );
 
     // TTFT is derivable from the log alone: first delta minus the routing that

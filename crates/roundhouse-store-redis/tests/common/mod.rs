@@ -207,6 +207,11 @@ pub fn every_event_kind() -> Vec<SessionEventKind> {
             usage: Usage {
                 input_tokens: 128,
                 cached_input_tokens: 112,
+                // Non-zero for the same reason every other count here is: a
+                // backend that took the usage object apart and dropped the
+                // newest counter would still pass a round trip whose fixture
+                // left it at its default.
+                cache_write_tokens: 9,
                 output_tokens: 5,
                 reasoning_tokens: 2,
                 accounting: Accounting::Reported,
