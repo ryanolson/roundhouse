@@ -578,7 +578,7 @@ impl MetricsSnapshot {
             // that rule can be kept for good is the value the rate card is
             // handed. See `Counters::seat`.
             let priceable = counters.billed.total();
-            let seat_tokens = TokenBreakdown::from_usage(&counters.seat.total());
+            let seat_tokens = TokenBreakdown::from_usage(counters.seat.total().tokens());
 
             let accounting = match key.mode {
                 ServingMode::Frontier => {
@@ -588,13 +588,23 @@ impl MetricsSnapshot {
                     // dashboard as a row that used tokens for free — the shape
                     // of a missing rate card rather than of a bargain.
                     let rate = config.rate_card(&key.provider, &key.model);
-                    // Priced per provenance, which costs nothing extra because
-                    // `price` is linear in tokens, and is the only way the two
-                    // parts can be reported apart afterwards.
+                    // Priced per provenance, which costs nothing extra because a
+                    // pot's price is linear in the axes `PooledUsage`
+                    // accumulates, and is the only way the two parts can be
+                    // reported apart afterwards.
+                    //
+                    // Through `price_pooled` and never `price` on a summed
+                    // `Usage`: each call's cache-write share was decided at fold
+                    // time, so this row's dollars are the sum of its turns'
+                    // dollars by construction. Pricing summed tokens instead
+                    // understated a row mixing measured and unmeasured writes,
+                    // and the understatement reappeared as `drift_usd` in the
+                    // reconciliation view (M11.0 review F2).
                     let billed = Billed {
-                        measured: rate.map_or(0.0, |r| r.pricing.price(&counters.billed.reported)),
+                        measured: rate
+                            .map_or(0.0, |r| r.pricing.price_pooled(&counters.billed.reported)),
                         estimated: rate
-                            .map_or(0.0, |r| r.pricing.price(&counters.billed.estimated)),
+                            .map_or(0.0, |r| r.pricing.price_pooled(&counters.billed.estimated)),
                     };
                     // Wholly measured: an unreported call carries
                     // `cached_input_tokens: 0`, so it contributes nothing here
@@ -603,8 +613,13 @@ impl MetricsSnapshot {
                         billed_usd: billed.total(),
                         billed_measured_usd: billed.measured,
                         billed_estimated_usd: billed.estimated,
+                        // Off the pot's tokens rather than through
+                        // `price_pooled`, and it needs no pooling of its own:
+                        // the discount is `cached_input_tokens` times a rate
+                        // gap, and cache reads are an ordinary additive count
+                        // with no per-call branch over them.
                         cache_savings_usd: rate
-                            .map_or(0.0, |r| r.pricing.cache_savings(&priceable)),
+                            .map_or(0.0, |r| r.pricing.cache_savings(priceable.tokens())),
                         seat_tokens,
                     }
                 }
@@ -629,7 +644,14 @@ impl MetricsSnapshot {
                         counters.declared_baseline.resolved(),
                     );
                     ModelAccounting::Local {
-                        shadow_usd: correlary.shadow_cost_usd(&priceable),
+                        // Pooled like a hosted row's, though today no local
+                        // dispatch reports a cache write and every one of them
+                        // takes the conservative branch. Pricing the pot keeps
+                        // the counterfactual additive by construction rather
+                        // than by that accident, so a serving plane that starts
+                        // reporting one does not quietly move a published
+                        // saving.
+                        shadow_usd: correlary.shadow_cost_pooled(&priceable),
                         correlary,
                         seat_tokens,
                     }

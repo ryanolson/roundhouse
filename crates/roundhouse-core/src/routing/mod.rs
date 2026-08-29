@@ -35,7 +35,7 @@ pub mod ledger;
 pub mod policy;
 pub mod stage;
 
-pub use ledger::{CacheLedger, CacheModel, LedgerEntry, ProviderPricing};
+pub use ledger::{CacheLedger, CacheModel, LedgerEntry, PooledUsage, ProviderPricing};
 pub use policy::{AffinityPolicy, EscalationPolicy};
 pub use stage::{
     DecisionSource, PickerMode, StagePolicy, Tier, TierRecipe, TierRecipeError, TurnSignals,

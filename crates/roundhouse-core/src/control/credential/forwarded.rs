@@ -38,7 +38,39 @@ use std::collections::BTreeMap;
 
 use super::secret::Secret;
 
-/// Header names one provider family will accept a forwarded credential in.
+/// What one allowlisted header carries, which is what decides whether an
+/// upstream quoting it back is a disclosure or a diagnosis.
+///
+/// **A marker on the entry, not a second list beside it.** The alternative —
+/// naming the secret-bearing headers somewhere else — is a table and a shadow
+/// table that agree until somebody adds a row to one of them, and the failure
+/// when they disagree is silent in both directions: a credential nobody scrubs,
+/// or an error message nobody can read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeaderKind {
+    /// Material that identifies or authenticates the caller. An upstream that
+    /// echoes it has disclosed it, so [`ForwardedCredential::redact`] takes it
+    /// out of anything a reader could reach.
+    ///
+    /// Wider than "a password on purpose": `chatgpt-account-id` proves nothing
+    /// and still names a person, and Switchyard's own `redact_forwarded_auth`
+    /// scrubs it for that reason. What this arm asks is what redaction owes the
+    /// value, not whether it would open a door.
+    Credential,
+    /// A public value the caller announces *about* its request — which beta
+    /// features it wants, which deployment tier to serve it from. Echoing one
+    /// discloses nothing, and echoing one is exactly what an upstream does when
+    /// it explains what was wrong with it ("`anthropic-beta: X` is not
+    /// supported"), so scrubbing it destroys the diagnosis and protects
+    /// nothing. Worse than nothing on a short value: `redact` is a literal
+    /// substring replace, so a caller announcing a one-character value turned
+    /// every occurrence of that character in the upstream's prose into a
+    /// redaction marker (M11.0 review finding F7).
+    Envelope,
+}
+
+/// Header names one provider family will accept a forwarded credential in, each
+/// marked with what it carries.
 ///
 /// Lowercase because HTTP header names are case-insensitive and a lookup that
 /// respected case would depend on which client capitalized what.
@@ -51,13 +83,13 @@ use super::secret::Secret;
 /// the whole set.
 ///
 /// The Anthropic row landed with the client that exercises it (M11.0), and the
-/// rule that kept it out until then is the same rule that admits it now: a row
+/// rule that kept it out until then is the same rule that shapes it now: a row
 /// nothing exercises is a promise made to whoever reads the table, so the table
 /// says what is true. `roundhouse-fleet`'s `AnthropicMessagesClient` forwards
-/// exactly these four on its redirect-disabled client, so the table and the wire
-/// now agree.
+/// exactly these three on its redirect-disabled client, so the table and the
+/// wire agree.
 ///
-/// Four names rather than Switchyard's two, and the extra pair is not
+/// Three names rather than Switchyard's two, and the extra one is not
 /// decoration:
 ///
 /// - `authorization` is a Claude Code subscription seat's OAuth bearer, and
@@ -69,27 +101,36 @@ use super::secret::Secret;
 ///   (`agent-docs/research/claude-code-client-surface.md` §1.2), so dropping it
 ///   would turn every seat turn into an authentication failure that looks like a
 ///   revoked login.
-/// - `anthropic-version` is forwardable so a caller pinned to a version can say
-///   so. The client stamps its own value *after* the forwarded headers anyway —
-///   it serialized the body, so it is the one that knows which version describes
-///   it — which makes this row entry inert on today's dispatch path and honest
-///   about what the edge is willing to carry.
+///
+/// **`anthropic-version` was here and was removed** (M11.0 review): the client
+/// stamps its own value *after* the forwarded headers — it serialized the body,
+/// so it is the one that knows which version describes it — which means a
+/// caller's value could never reach the wire whatever this table said. That is
+/// precisely the promise the note above forbids this table to make, and a row
+/// entry with no effect is worse than an absent one, because a reader budgeting
+/// for version pinning would believe it works.
 ///
 /// What is deliberately *not* here: `x-api-key` is admitted for `anthropic` and
 /// for nobody else, so a caller's Anthropic key presented on an OpenAI-routed
 /// turn is still dropped at `for_provider`.
-const ALLOWLIST: &[(&str, &[&str])] = &[
+const ALLOWLIST: &[(&str, &[(&str, HeaderKind)])] = &[
     (
         "openai",
-        &["authorization", "chatgpt-account-id", "x-openai-fedramp"],
+        &[
+            ("authorization", HeaderKind::Credential),
+            ("chatgpt-account-id", HeaderKind::Credential),
+            // A boolean tier selector, and marking it `Credential` was the
+            // amplifying half of F7: an OpenAI error body would have had every
+            // occurrence of the word `true` in it replaced.
+            ("x-openai-fedramp", HeaderKind::Envelope),
+        ],
     ),
     (
         "anthropic",
         &[
-            "authorization",
-            "x-api-key",
-            "anthropic-beta",
-            "anthropic-version",
+            ("authorization", HeaderKind::Credential),
+            ("x-api-key", HeaderKind::Credential),
+            ("anthropic-beta", HeaderKind::Envelope),
         ],
     ),
 ];
@@ -97,22 +138,30 @@ const ALLOWLIST: &[(&str, &[&str])] = &[
 /// Every header name any provider's row admits.
 ///
 /// What the request edge captures, because the edge runs before routing and
-/// cannot know which row will apply. Narrowing happens in
-/// [`PresentedCredential::for_provider`].
+/// cannot know which row will apply. The kind is deliberately dropped here: a
+/// name that sits on two rows could in principle be marked differently on each,
+/// so the capture stays kind-free and [`PresentedCredential::for_provider`]
+/// reads the marker off the one row that admitted the header.
 fn union_allowlist() -> impl Iterator<Item = &'static str> {
     ALLOWLIST
         .iter()
-        .flat_map(|(_, names)| names.iter().copied())
+        .flat_map(|(_, names)| names.iter().map(|(name, _)| *name))
 }
 
-/// The header names `provider` admits, empty for a provider with no row.
-fn allowlist_for(provider: &str) -> &'static [&'static str] {
+/// The header names `provider` admits and what each carries, empty for a
+/// provider with no row.
+fn allowlist_for(provider: &str) -> &'static [(&'static str, HeaderKind)] {
     let provider = provider.to_ascii_lowercase();
     ALLOWLIST
         .iter()
         .find(|(name, _)| *name == provider)
         .map(|(_, names)| *names)
         .unwrap_or(&[])
+}
+
+/// Whether a row names `header`.
+fn admits(row: &'static [(&'static str, HeaderKind)], header: &str) -> bool {
+    row.iter().any(|(name, _)| *name == header)
 }
 
 /// The header name that *is* the credential.
@@ -186,27 +235,47 @@ impl PresentedCredential {
     /// `bool`. Fewer live copies of a credential is the cheap half of not
     /// leaking one.
     pub fn covers(&self, provider: &str) -> bool {
-        allowlist_for(provider).contains(&CREDENTIAL_HEADER)
+        admits(allowlist_for(provider), CREDENTIAL_HEADER)
     }
 
     /// What this provider's row admits, or `None` when it has no row.
     ///
     /// The narrowing, and the only way to build a [`ForwardedCredential`].
+    ///
+    /// Walks the *row* rather than the capture, so each admitted header arrives
+    /// carrying the [`HeaderKind`] the row that admitted it gave it. Filtering
+    /// the capture instead would leave the kind to be looked up later, from a
+    /// value that no longer knows which provider it was narrowed for.
     pub fn for_provider(&self, provider: &str) -> Option<ForwardedCredential> {
         let admitted = allowlist_for(provider);
-        if !admitted.contains(&CREDENTIAL_HEADER) {
+        if !admits(admitted, CREDENTIAL_HEADER) {
             return None;
         }
-        let headers: BTreeMap<&'static str, Secret> = self
-            .headers
+        let headers: BTreeMap<&'static str, Held> = admitted
             .iter()
-            .filter(|(name, _)| admitted.contains(*name))
-            .map(|(name, secret)| (*name, secret.clone()))
+            .filter_map(|(name, kind)| {
+                self.headers.get(name).map(|secret| {
+                    (
+                        *name,
+                        Held {
+                            kind: *kind,
+                            value: secret.clone(),
+                        },
+                    )
+                })
+            })
             .collect();
         headers
             .contains_key(CREDENTIAL_HEADER)
             .then_some(ForwardedCredential { headers })
     }
+}
+
+/// One header a provider's row admitted, and what that row said it carries.
+#[derive(Debug, Clone)]
+struct Held {
+    kind: HeaderKind,
+    value: Secret,
 }
 
 /// One provider's share of the caller's credential, ready to go on the wire.
@@ -216,7 +285,7 @@ impl PresentedCredential {
 /// that skips one.
 #[derive(Debug, Clone)]
 pub struct ForwardedCredential {
-    headers: BTreeMap<&'static str, Secret>,
+    headers: BTreeMap<&'static str, Held>,
 }
 
 impl ForwardedCredential {
@@ -230,7 +299,7 @@ impl ForwardedCredential {
     pub fn headers(&self) -> impl Iterator<Item = (&'static str, &str)> {
         self.headers
             .iter()
-            .map(|(name, secret)| (*name, secret.reveal()))
+            .map(|(name, held)| (*name, held.value.reveal()))
     }
 
     /// Remove any echoed credential from an upstream's own words.
@@ -253,10 +322,26 @@ impl ForwardedCredential {
     /// it costs is that a body which happens to contain the token as a
     /// substring for some other reason is also redacted, which is the harmless
     /// direction.
+    ///
+    /// **Over [`HeaderKind::Credential`] values only, and the filter is the
+    /// whole of M11.0 review finding F7.** Folding over every captured value
+    /// scrubbed the envelope headers too, and an upstream quoting one of those
+    /// back is not leaking anything — it is naming what was wrong with the
+    /// request ("`anthropic-beta: oauth-2025-04-20` is not supported"), which is
+    /// the sentence the caller needs. A literal substring replace makes that
+    /// worse than a lost word: the blast radius scales inversely with the
+    /// value's length, and `is_forwardable` admits a single character, so one
+    /// caller-announced letter turned every occurrence of it in the upstream's
+    /// prose into a marker. Nothing is given up by the filter — an envelope
+    /// value is one the caller published to the upstream in the clear and would
+    /// have to know to send.
     pub fn redact(&self, body: String) -> String {
         self.headers
             .values()
-            .fold(body, |body, secret| body.replace(secret.reveal(), REDACTED))
+            .filter(|held| held.kind == HeaderKind::Credential)
+            .fold(body, |body, held| {
+                body.replace(held.value.reveal(), REDACTED)
+            })
     }
 }
 
@@ -372,15 +457,21 @@ mod tests {
         );
     }
 
-    /// **The Anthropic row, and the reason each of its four names is on it.**
+    /// **The Anthropic row, and the reason each of its three names is on it.**
     ///
     /// A Claude Code subscription seat presents an OAuth bearer *and* the
     /// `oauth-2025-04-20` beta, and Anthropic answers 401 to the bearer without
     /// the beta — so a row that carried only `authorization` would look correct,
     /// forward a real credential, and fail every seat turn with an error that
     /// says nothing about a stripped header. That is what makes this a
-    /// four-name row rather than Switchyard's two, and this test is where the
+    /// three-name row rather than Switchyard's two, and this test is where the
     /// claim is written down.
+    ///
+    /// The seat also presents `anthropic-version`, and it is *not* forwarded:
+    /// the M11.0 review took that name off the row because the client stamps
+    /// its own value over anything forwarded, so a row entry could never have
+    /// reached the wire. Asserted here as an absence rather than left to the
+    /// pinning test, because this is the fixture that presents one.
     #[test]
     fn an_anthropic_seat_forwards_the_bearer_and_the_beta_that_makes_it_work() {
         let seat = presented(&[
@@ -402,7 +493,6 @@ mod tests {
                     "anthropic-beta",
                     "oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14"
                 ),
-                ("anthropic-version", "2023-06-01"),
                 ("authorization", BEARER),
             ]
         );
@@ -435,39 +525,60 @@ mod tests {
         );
     }
 
-    /// **Pins each row's exact contents, closing a gap every test above
-    /// leaves open.**
+    /// **Pins each row's exact contents *and each entry's kind*, closing a gap
+    /// every test above leaves open.**
     ///
     /// Every test above drives a row through `PresentedCredential::captured`
     /// / `for_provider`, and both only ever ask about the header names their
     /// own fixture already lists (`authorization`, `x-api-key`,
-    /// `anthropic-beta`, `anthropic-version`, `chatgpt-account-id`,
-    /// `x-openai-fedramp`, plus the negative controls `cookie` and
+    /// `anthropic-beta`, `chatgpt-account-id`, `x-openai-fedramp`, plus the
+    /// negative controls `cookie`, `anthropic-version` and
     /// `x-claude-code-session-id`). A name appended to a row that no fixture
     /// ever presents is never looked up, so `captured` never gets the
-    /// opportunity to forward it — confirmed by appending a fifth,
+    /// opportunity to forward it — confirmed by appending a fourth,
     /// never-asked-for entry to the anthropic row and watching every test in
     /// this file pass unchanged. Reading `ALLOWLIST` through `allowlist_for`
     /// directly, instead of through a capture, is what turns a widened (or
     /// narrowed) row into a failing assertion here rather than a silent one
     /// — the same promise-the-table-must-not-make-unexercised rule the
-    /// module doc (`:53-57`) already argues for a *new* row applies equally
+    /// [`ALLOWLIST`]'s own note already argues for a *new* row applies equally
     /// to widening one that already exists.
+    ///
+    /// The kinds are pinned beside the names because they are the same kind of
+    /// claim and fail the same way if nobody looks: an entry silently marked
+    /// [`HeaderKind::Credential`] shreds the upstream's own error text, and one
+    /// silently marked [`HeaderKind::Envelope`] leaves a credential in it. A
+    /// name-only assertion would let either through.
     #[test]
     fn the_allowlist_names_exactly_these_headers_and_no_more() {
         assert_eq!(
             allowlist_for("openai").to_vec(),
-            vec!["authorization", "chatgpt-account-id", "x-openai-fedramp"]
+            vec![
+                ("authorization", HeaderKind::Credential),
+                ("chatgpt-account-id", HeaderKind::Credential),
+                ("x-openai-fedramp", HeaderKind::Envelope),
+            ]
         );
         assert_eq!(
             allowlist_for("anthropic").to_vec(),
             vec![
-                "authorization",
-                "x-api-key",
-                "anthropic-beta",
-                "anthropic-version",
+                ("authorization", HeaderKind::Credential),
+                ("x-api-key", HeaderKind::Credential),
+                ("anthropic-beta", HeaderKind::Envelope),
             ]
         );
+
+        // The credential header is the one name every row must carry and must
+        // never mark as envelope: `for_provider` refuses a row without it, and
+        // an envelope marking would leave the bearer itself in an echoed error
+        // body. Asserted over the table rather than per row, so a third
+        // provider inherits the check.
+        for (provider, row) in ALLOWLIST {
+            assert!(
+                row.contains(&(CREDENTIAL_HEADER, HeaderKind::Credential)),
+                "{provider}'s row must carry {CREDENTIAL_HEADER} as a credential"
+            );
+        }
 
         // CONTROL: a provider with no row admits nothing, so the assertions
         // above are about these two rows' exact contents and not about
@@ -538,5 +649,82 @@ mod tests {
         // the redaction is about the credential and not about rewriting errors.
         let clean = r#"{"error":{"message":"model overloaded"}}"#.to_string();
         assert_eq!(forwarded.redact(clean.clone()), clean);
+    }
+
+    /// F7 PROBE: `anthropic-beta` sits on the Anthropic row beside
+    /// `authorization`/`x-api-key`, but it is a public value a caller
+    /// announces, not a credential — and Anthropic's own error text routinely
+    /// echoes the offending value back ("`anthropic-beta: X` is not
+    /// supported"). `redact` used to fold over *every* captured header value
+    /// identically: a plain substring `.replace()` over the whole body, with no
+    /// distinction between the bearer and a beta flag. This asserts the one
+    /// sentence naming the actual problem survives redaction, the way the
+    /// sibling test above asserts "invalid token" survives the bearer being
+    /// scrubbed. [`HeaderKind`] is what tells the two apart.
+    #[test]
+    fn f7_a_non_secret_anthropic_beta_value_echoed_in_diagnostic_text_survives_redaction() {
+        let seat = presented(&[
+            ("authorization", BEARER),
+            ("anthropic-beta", "oauth-2025-04-20"),
+        ])
+        .unwrap()
+        .for_provider("anthropic")
+        .unwrap();
+
+        // The shape Anthropic's own 400 takes when it rejects an unrecognized
+        // beta flag: the value the caller sent, echoed back inside the
+        // sentence that explains what was wrong with it — and, because a real
+        // upstream is free to quote more than one thing, the seat's bearer
+        // beside it.
+        let upstream_says = format!(
+            r#"{{"error":{{"message":"anthropic-beta: oauth-2025-04-20 is not supported",{}}}}}"#,
+            format_args!(r#""token":"{BEARER}""#),
+        );
+        let redacted = seat.redact(upstream_says);
+
+        assert!(
+            redacted.contains("oauth-2025-04-20 is not supported"),
+            "a non-secret, caller-announced anthropic-beta value must not be \
+             redacted out of diagnostic text: {redacted}"
+        );
+
+        // CONTROL, and it is what makes the assertion above about *which*
+        // values are scrubbed rather than about scrubbing having been switched
+        // off: the bearer on the same row, in the same body, is still gone. A
+        // `redact` that returned its argument untouched would satisfy this
+        // test's headline claim and fail here.
+        assert!(!redacted.contains(BEARER), "{redacted}");
+        assert!(redacted.contains(REDACTED), "{redacted}");
+    }
+
+    /// F7 PROBE, the amplifying case: `is_forwardable` accepts any non-empty
+    /// visible-ASCII value, including a single character. A caller who presents
+    /// `anthropic-beta: e` (legal per that check) got every occurrence of the
+    /// letter `e` in that turn's error text scrubbed, not just an echo of the
+    /// value itself — the blast radius of a literal substring replace scales
+    /// with how short the forwarded value is.
+    ///
+    /// Aimed at `anthropic-beta` rather than the `anthropic-version` the probe
+    /// was written against, because the same M11.0 review ruling that split the
+    /// row by role took `anthropic-version` off it entirely. On a header the
+    /// table no longer captures this would pass without exercising anything;
+    /// on the envelope header that *is* still captured it is the assertion it
+    /// was meant to be.
+    #[test]
+    fn f7_a_single_character_envelope_value_shreds_unrelated_diagnostic_prose() {
+        let seat = presented(&[("authorization", BEARER), ("anthropic-beta", "e")])
+            .unwrap()
+            .for_provider("anthropic")
+            .unwrap();
+
+        let upstream_says =
+            r#"{"error":{"message":"the requested model does not exist"}}"#.to_string();
+        let redacted = seat.redact(upstream_says);
+
+        assert!(
+            !redacted.contains(REDACTED),
+            "a single-character, non-secret anthropic-beta value must not turn \
+             unrelated diagnostic prose into redaction markers: {redacted}"
+        );
     }
 }

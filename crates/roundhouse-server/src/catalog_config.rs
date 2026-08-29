@@ -339,6 +339,27 @@ pub enum CatalogError {
         provider: String,
         env: String,
     },
+    /// A spelling for a stored key that no client implements.
+    ///
+    /// Its own arm rather than a defaulted value, because the failure it
+    /// prevents is invisible from every read surface afterwards: a key sent in
+    /// the header its provider ignores authenticates as nobody, and the 401
+    /// that comes back reads as a bad key rather than as a wrong file. The
+    /// accepted set is rendered from the client's own enum, so a style added
+    /// there cannot leave this message naming an incomplete list.
+    #[error(
+        "catalog `{path}`: provider `{provider}` says its key is spelled `{style}` in \
+         `auth.style`, which is not a spelling this build sends; the accepted values are \
+         {accepted}, and omitting the field means `x_api_key` -- Anthropic's own convention, \
+         which is what a first-party Messages endpoint requires and what OpenRouter's \
+         `/messages` route refuses"
+    )]
+    ProviderAuthStyle {
+        path: String,
+        provider: String,
+        style: String,
+        accepted: String,
+    },
 }
 
 impl CatalogConfig {

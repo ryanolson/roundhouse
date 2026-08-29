@@ -204,26 +204,41 @@ async fn the_accounting_is_whole_only_when_both_usage_events_are_folded() {
     assert_eq!(delta_only, vec![FrontierChunk::OutputText("hi".into())]);
 
     // HALF TWO: the final delta withheld — an upstream that ended the turn
-    // without restating the output count. The input side is real and is kept;
-    // the output side is zero because zero is what was reported, and inventing
-    // one from the characters we received would be an estimate wearing a
-    // provider's authority.
+    // without ever reporting the output count. **Re-aimed by the F6 fix, and
+    // this is the finding's whole substance.** This assertion used to pin a
+    // `Done` carrying the real input side and `output_tokens: 0`, on the
+    // reasoning that the half that arrived should be recorded and the half that
+    // did not should be zero rather than guessed. That reasoning has a hole the
+    // engine falls straight through: a `Done` is booked as
+    // `Accounting::Reported` unconditionally, so the record did not say "half of
+    // this was never measured" — it said "the provider reported this turn's
+    // output as zero", which prices a real streamed answer on a hosted model at
+    // zero dollars and is indistinguishable on the dashboard from a saving.
+    //
+    // So the rule is now symmetric with HALF ONE: nothing reported is not
+    // written down as zero, on *either* axis, and the engine's
+    // estimated-and-marked path runs for the whole turn. The measured input
+    // counts are lost with it — the deliberate price, paid because an estimate
+    // is marked everywhere it is read and a fabricated zero is not.
     let start_only = dispatch(&[START, TEXT, STOP]).await;
     assert_eq!(
-        start_only.last(),
-        Some(&FrontierChunk::Done {
-            input_tokens: 9_512,
-            cached_input_tokens: 9_000,
-            cache_write_tokens: 500,
-            output_tokens: 0,
-            reasoning_tokens: 0,
-            provider_reported_cost: None,
-        }),
-        "the half that arrived is recorded; the half that did not is zero rather than guessed"
+        start_only,
+        vec![FrontierChunk::OutputText("hi".into())],
+        "a turn whose output count no frame ever reported must reach the engine \
+         unaccounted, not as a provider-reported zero"
     );
 
     // And the two halves really are different frames rather than one frame read
     // twice: the complete stream's `Done` differs from each partial one.
     assert_ne!(dispatch(&[START, TEXT, DELTA, STOP]).await, start_only);
     assert_ne!(dispatch(&[START, TEXT, DELTA, STOP]).await, delta_only);
+    // The symmetry itself, pinned: which half went missing does not change the
+    // answer. A rule that refused one direction and fabricated a zero in the
+    // other is exactly the shape F6 found, and it would read as reasonable in
+    // every place but the dashboard.
+    assert_eq!(
+        start_only, delta_only,
+        "a missing input count and a missing output count are the same fact -- \
+         nobody reported this turn -- and must produce the same record"
+    );
 }

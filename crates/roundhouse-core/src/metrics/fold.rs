@@ -35,23 +35,30 @@ use crate::event::{
 use crate::ids::{ResponseId, SessionId, TurnId};
 use crate::metrics::pricing::TokenShape;
 use crate::metrics::{ModelKey, ServingMode};
+use crate::routing::PooledUsage;
 use crate::validate::Arm;
 
 /// Tokens for one grouping, split by whether the provider counted them.
 ///
-/// Kept apart rather than summed, and this is the whole point: pricing is
-/// linear in tokens, so two accumulators can be priced independently at no
-/// cost, while one accumulator makes the split unrecoverable the instant the
-/// first estimated call lands. Merging first and reporting a call-weighted
-/// coverage ratio afterwards does not substitute — a 50%-of-calls ratio is
-/// consistent with 95% or 5% of the dollars being measured, because calls
-/// differ in size by orders of magnitude.
+/// Kept apart rather than summed, and this is the whole point: a pot's price is
+/// linear in the axes [`PooledUsage`] accumulates, so two accumulators can be
+/// priced independently and added at no cost, while one accumulator makes the
+/// split unrecoverable the instant the first estimated call lands. Merging first
+/// and reporting a call-weighted coverage ratio afterwards does not substitute —
+/// a 50%-of-calls ratio is consistent with 95% or 5% of the dollars being
+/// measured, because calls differ in size by orders of magnitude.
+///
+/// Both pots are [`PooledUsage`] rather than [`Usage`], and that is not a
+/// spelling: a bare `Usage` sum loses the per-call cache-write decision, so a
+/// row pooling one measured and one unmeasured turn priced for less than the two
+/// turns did — the rollup's `frontier_spend_usd` against the spend ledger's
+/// per-turn dollars, which is M11.0 review finding F2.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(super) struct Counted {
     /// Tokens the provider itself counted.
-    pub(super) reported: Usage,
+    pub(super) reported: PooledUsage,
     /// Tokens Roundhouse counted because the provider did not.
-    pub(super) estimated: Usage,
+    pub(super) estimated: PooledUsage,
 }
 
 impl Counted {
@@ -64,15 +71,15 @@ impl Counted {
     }
 
     fn absorb(&mut self, other: &Counted) {
-        self.reported.add(&other.reported);
-        self.estimated.add(&other.estimated);
+        self.reported.absorb(&other.reported);
+        self.estimated.absorb(&other.estimated);
     }
 
     /// Both provenances together, for the figures that are about volume rather
     /// than confidence.
-    pub(super) fn total(&self) -> Usage {
+    pub(super) fn total(&self) -> PooledUsage {
         let mut total = self.reported.clone();
-        total.add(&self.estimated);
+        total.absorb(&self.estimated);
         total
     }
 }
@@ -245,21 +252,21 @@ impl Counters {
     /// that have to know the difference.
     pub(super) fn total_usage(&self) -> Usage {
         let mut total = self.billed.total();
-        total.add(&self.seat.total());
-        total
+        total.absorb(&self.seat.total());
+        total.tokens().clone()
     }
 
     /// Tokens the provider counted, across both pots.
     pub(super) fn reported_usage(&self) -> Usage {
-        let mut total = self.billed.reported.clone();
-        total.add(&self.seat.reported);
+        let mut total = self.billed.reported.tokens().clone();
+        total.add(self.seat.reported.tokens());
         total
     }
 
     /// Tokens Roundhouse counted in a silent provider's place, across both.
     pub(super) fn estimated_usage(&self) -> Usage {
-        let mut total = self.billed.estimated.clone();
-        total.add(&self.seat.estimated);
+        let mut total = self.billed.estimated.tokens().clone();
+        total.add(self.seat.estimated.tokens());
         total
     }
 

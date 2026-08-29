@@ -15,12 +15,16 @@
 //! the mode wrongly fails *silently* in both directions — applies here
 //! unchanged.
 //!
-//! Four things genuinely differ from the Responses client, and each is a fact
+//! Five things genuinely differ from the Responses client, and each is a fact
 //! about this API rather than a preference:
 //!
-//! 1. **A stored key goes out as `x-api-key`, not as a bearer.** Anthropic's own
-//!    convention, and sending `Authorization: Bearer sk-ant-…` to
-//!    `api.anthropic.com` is a 401 with a message that does not say why.
+//! 1. **A stored key's spelling is per-provider configuration, defaulting to
+//!    `x-api-key`.** Anthropic's own convention is the bare `x-api-key` header,
+//!    and sending `Authorization: Bearer sk-ant-…` to `api.anthropic.com` is a
+//!    401 with a message that does not say why — but this dialect has a second
+//!    GA provider, OpenRouter's `/messages` route, which authenticates the other
+//!    way round. So the header is named by the provider definition and resolved
+//!    at boot: [`StoredAuthStyle`].
 //! 2. **`anthropic-version` is mandatory on every request** — see
 //!    [`ANTHROPIC_VERSION`].
 //! 3. **`max_tokens` is required by the schema**, so this client always sends
@@ -30,6 +34,11 @@
 //!    *nothing* without an explicit breakpoint, so flat-string parity with the
 //!    Responses client would zero the provider cache discount on every Anthropic
 //!    turn — against the sentence this product is built to satisfy. Ruling R3.
+//! 5. **No route here follows a redirect, the stored one included.** The
+//!    Responses client keeps an ordinary redirect-following transport for its
+//!    own key; that is safe only because a stored OpenAI key rides
+//!    `Authorization`, which `reqwest` strips when a 3xx crosses origins.
+//!    Nothing strips `x-api-key`. See [`AnthropicMessagesClient::with_bases`].
 //!
 //! **What is never logged.** As in the Responses client: no line here renders a
 //! credential, every upstream error body goes through [`TurnCredential::redact`]
@@ -103,6 +112,66 @@ const ANTHROPIC_VERSION_HEADER: HeaderName = HeaderName::from_static("anthropic-
 /// readable at the edge, and it lands with this client.
 const API_KEY_HEADER: HeaderName = HeaderName::from_static("x-api-key");
 
+/// How a *stored* key is spelled on the way out.
+///
+/// **The dialect does not decide this; the provider does.** Anthropic's own
+/// endpoint authenticates a key on [`API_KEY_HEADER`] and answers a bearer with
+/// a 401 whose message does not say why. OpenRouter's GA `/messages` route
+/// speaks the same dialect and authenticates only on `Authorization: Bearer` —
+/// probed live, an `x-api-key` there answers `"Missing Authentication header"`
+/// (`research/openrouter-api-surface.md`). So a client that hardcoded either
+/// spelling makes the other provider unreachable, which is what R3 asked for
+/// when it named OpenRouter's route the second `anthropic_messages`-speaking
+/// provider.
+///
+/// **Configuration resolved at boot, never a host sniff at dispatch.** The
+/// alternative — matching on the base URL, or on the provider name, inside
+/// `route()` — would put a routing decision in a `contains("anthropic.com")`,
+/// silently mis-authenticate every gateway and proxy that fronts either
+/// provider under a third hostname, and give an operator no line to edit when
+/// it got it wrong. A provider definition already says where its traffic goes
+/// and where its key lives; which header the key rides in is the same kind of
+/// fact and belongs beside them, so the boundary can refuse a spelling nobody
+/// implements instead of a turn failing 401 one tenant at a time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum StoredAuthStyle {
+    /// `x-api-key: <key>`, bare. Anthropic's first-party convention and the
+    /// default a definition gets by saying nothing.
+    #[default]
+    XApiKey,
+    /// `Authorization: Bearer <key>`. OpenRouter's `/messages` route.
+    Bearer,
+}
+
+impl StoredAuthStyle {
+    /// Every spelling a definition may name, in the order a refusal lists them.
+    pub const ALL: [StoredAuthStyle; 2] = [StoredAuthStyle::XApiKey, StoredAuthStyle::Bearer];
+
+    /// How a configuration file spells this style.
+    ///
+    /// Same argument [`WireProtocol::wire_name`] makes for itself: a refusal
+    /// should name the value the way the operator would write it, and `{:?}`
+    /// would say `XApiKey`, which appears in no file anyone can go and edit.
+    pub fn wire_name(&self) -> &'static str {
+        match self {
+            StoredAuthStyle::XApiKey => "x_api_key",
+            StoredAuthStyle::Bearer => "bearer",
+        }
+    }
+
+    /// The style a file named, or `None` for a spelling nothing implements.
+    ///
+    /// `None` rather than a default, so the config boundary refuses a typo at
+    /// load. Silently falling back to `x_api_key` would send a deployment's
+    /// OpenRouter key out in a header that provider ignores, and the symptom —
+    /// a 401 on every turn — names neither the file nor the field.
+    pub fn from_wire_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|style| style.wire_name() == name)
+    }
+}
+
 /// What this client asks for when the quote does not say.
 ///
 /// **Anthropic requires `max_tokens` on every request** — it is one of the three
@@ -123,12 +192,13 @@ const SPOKEN: WireProtocol = WireProtocol::AnthropicMessages;
 
 /// Executes turns against an Anthropic-Messages upstream.
 ///
-/// Two `reqwest::Client`s for the same reason the Responses client holds two:
-/// connection pools are per client, so a forwarded seat token never rides a
-/// redirect-following connection and never shares a pool with the deployment's
-/// own key.
+/// Two `reqwest::Client`s so that a forwarded seat token never shares a
+/// connection pool with the deployment's own key — pools are per client. What
+/// is *not* a difference between them is the redirect policy: **both refuse
+/// redirects**, which is the one place this client departs from the Responses
+/// client's arrangement rather than mirroring it.
 pub struct AnthropicMessagesClient {
-    /// For stored keys. Ordinary redirect policy.
+    /// For stored keys. Redirects disabled — see [`Self::with_bases`].
     direct: reqwest::Client,
     /// For forwarded credentials. Redirects disabled, so a credential cannot
     /// follow one to another origin.
@@ -143,6 +213,9 @@ pub struct AnthropicMessagesClient {
     /// [`Self::route`]. A definition that could overwrite `x-api-key` would be a
     /// file that is not the credential file deciding whose money a turn spends.
     extra_headers: HeaderMap,
+    /// Which header a stored key goes out in for this provider, decided at
+    /// boot. See [`StoredAuthStyle`].
+    stored_auth_style: StoredAuthStyle,
 }
 
 impl AnthropicMessagesClient {
@@ -152,30 +225,60 @@ impl AnthropicMessagesClient {
     }
 
     /// The same client against named base URLs.
+    ///
+    /// **Every credential-bearing route is built redirect-disabled here, and the
+    /// Responses client's split does not transfer.** That client keeps an
+    /// ordinary redirect-following transport for its stored key, on the argument
+    /// that roundhouse's own key following a 3xx is a smaller problem than a
+    /// user's session token doing so. The argument depends on a fact about the
+    /// *header*: a stored OpenAI key rides `Authorization`, which is one of the
+    /// five names `reqwest`'s cross-host redirect sanitizer strips — so on that
+    /// wire "follows a redirect" and "presents the key at the new origin" are
+    /// different things. On this wire they are the same thing. A stored
+    /// Anthropic key rides `x-api-key` and the allowlist row lets a forwarded
+    /// one ride it too; `reqwest` strips `Authorization`, `Cookie`, `Cookie2`,
+    /// `Proxy-Authorization` and `WWW-Authenticate`, and nothing else — so a
+    /// followed redirect hands the deployment's long-lived key to whatever
+    /// origin the `Location` names, bare, with nothing said. `anthropic-version`
+    /// would ride along too; it is not a secret, which is why the rule is stated
+    /// over credential-bearing *routes* rather than over one header name.
     pub fn with_bases(
         api_base: impl Into<String>,
         pass_through_base: impl Into<String>,
     ) -> Result<Self, FrontierError> {
-        let build = |builder: reqwest::ClientBuilder| {
-            builder.build().map_err(|source| {
-                FrontierError::Upstream(format!("could not build an HTTP client: {source}"))
-            })
+        let build = || {
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|source| {
+                    FrontierError::Upstream(format!("could not build an HTTP client: {source}"))
+                })
         };
         Ok(Self {
-            direct: build(reqwest::Client::builder())?,
-            forwarding: build(
-                reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()),
-            )?,
+            direct: build()?,
+            forwarding: build()?,
             api_base: trim_base(api_base.into()),
             pass_through_base: trim_base(pass_through_base.into()),
             messages_path: DEFAULT_MESSAGES_PATH.to_string(),
             extra_headers: HeaderMap::new(),
+            stored_auth_style: StoredAuthStyle::default(),
         })
     }
 
     /// Serve the Messages route at a path other than [`DEFAULT_MESSAGES_PATH`].
     pub fn with_messages_path(mut self, path: impl Into<String>) -> Self {
         self.messages_path = path.into();
+        self
+    }
+
+    /// Spell a stored key for this provider the way it authenticates.
+    ///
+    /// A builder rather than an argument to `route()`, because the answer is a
+    /// property of the provider this client was composed for and not of the turn
+    /// being dispatched — see [`StoredAuthStyle`] for why that distinction is
+    /// the whole fix. Absent a call, the first-party convention stands.
+    pub fn with_stored_auth_style(mut self, style: StoredAuthStyle) -> Self {
+        self.stored_auth_style = style;
         self
     }
 
@@ -287,10 +390,14 @@ impl AnthropicMessagesClient {
 
     /// The headers, the base URL and the HTTP client this credential implies.
     ///
-    /// One function, because the three answers must not be reachable separately:
-    /// a caller that picked the pass-through base and the ordinary client would
-    /// forward a user's seat token over a redirect-following connection, and
-    /// nothing would say so.
+    /// One function, because the three answers must not be reachable
+    /// separately: a caller that picked the pass-through base and the
+    /// stored-key transport would send a user's seat token down a connection
+    /// pool the deployment's own key shares, and nothing would say so. Since F1
+    /// the redirect policy is no longer one of the differences — both
+    /// transports refuse redirects — which makes the pool the whole of what
+    /// picking the wrong one costs, and it is still not a choice a caller
+    /// should be able to make one half of.
     fn route<'a>(
         &'a self,
         credential: &'a TurnCredential,
@@ -302,14 +409,25 @@ impl AnthropicMessagesClient {
                 // out: that is the one seam that yields plaintext.
                 let key = credential.require_api_key(provider)?;
                 let mut headers = self.extra_headers.clone();
+                // **The spelling was decided at boot, not here**, and the
+                // `match` is what keeps that true: there is no `provider`
+                // string, no base URL and no hostname in this arm, so a third
+                // provider gets a line in a catalog file rather than a branch
+                // in a dispatch path. `x-api-key` carries the key bare and the
+                // bearer carries it prefixed — the one detail a reader porting
+                // either client would get wrong in the other direction.
+                let (header, value) = match self.stored_auth_style {
+                    StoredAuthStyle::XApiKey => (API_KEY_HEADER, key.to_string()),
+                    StoredAuthStyle::Bearer => {
+                        (reqwest::header::AUTHORIZATION, format!("Bearer {key}"))
+                    }
+                };
                 // Seeded with the provider's static headers, then the credential
                 // on top: a definition cannot displace the one header that
-                // decides whose money this turn spends. And **no `Bearer`
-                // prefix** — `x-api-key` carries the key bare, which is the one
-                // detail a reader porting the Responses client would get wrong.
+                // decides whose money this turn spends.
                 headers.insert(
-                    API_KEY_HEADER,
-                    sensitive(key).ok_or_else(|| {
+                    header,
+                    sensitive(&value).ok_or_else(|| {
                         FrontierError::Upstream(
                             "the resolved key cannot be put in a header value".to_string(),
                         )
@@ -433,6 +551,30 @@ impl FrontierClient for AnthropicMessagesClient {
             })?;
 
         let status = response.status();
+        // **A redirect is refused by name rather than reported as a bare 3xx.**
+        // Both transports are redirect-disabled, so this arm is what the policy
+        // actually *does* — and a 3xx body is empty, which would otherwise leave
+        // an operator with "the upstream answered 307:" and nothing to act on.
+        // The `Location` is the diagnosis (a gateway pointing somewhere nobody
+        // configured), so it is named, through the same redaction every other
+        // upstream-supplied string in this module goes through.
+        if status.is_redirection() {
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| route.credential.redact(value.to_string()))
+                .unwrap_or_else(|| "an unnamed location".to_string());
+            return Err(FrontierError::Status {
+                status: status.as_u16(),
+                message: format!(
+                    "the upstream redirected to `{location}`, which this client refuses to \
+                     follow: every route here carries a credential in a header `reqwest` \
+                     does not strip on a cross-host redirect, so following one would \
+                     present it at an origin nobody configured"
+                ),
+            });
+        }
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
             return Err(FrontierError::Status {
@@ -796,6 +938,95 @@ mod tests {
         );
     }
 
+    /// F4 (thermo-nuclear review of d0821f9, **valid**): R3 names OpenRouter's
+    /// GA `/messages` route as the second `anthropic_messages`-speaking
+    /// provider, "stored-key only" (`PLAN-anthropic-messages.md:166-169`), and
+    /// `route()`'s `Stored` arm used to insert `API_KEY_HEADER` unconditionally
+    /// for every provider name — while OpenRouter's `/messages` route
+    /// authenticates only on `Authorization: Bearer`, never `x-api-key`
+    /// (`research/openrouter-api-surface.md:528`: probed live, `x-api-key:` +
+    /// `anthropic-version:` -> `"Missing Authentication header"`). So that
+    /// provider could not authenticate at all.
+    ///
+    /// **The remedy is configuration, not a host sniff**, which is why this
+    /// test builds the client the way the composition root builds an OpenRouter
+    /// definition rather than by pointing it at OpenRouter's hostname: a
+    /// `route()` that branched on the base URL would mis-authenticate every
+    /// gateway fronting either provider under a third name. The control below
+    /// is what proves the style is doing the work.
+    #[test]
+    fn a_stored_key_against_openrouters_messages_route_authenticates_with_a_bearer() {
+        let openrouter = AnthropicMessagesClient::with_bases(
+            "https://openrouter.ai/api/v1",
+            "https://openrouter.ai/api/v1",
+        )
+        .unwrap()
+        .with_messages_path("/messages")
+        .with_stored_auth_style(StoredAuthStyle::Bearer);
+        let stored = TurnCredential::Stored(Secret::api_key("sk-or-v1-ZZZZ").unwrap());
+        let route = openrouter.route(&stored, "openrouter").unwrap();
+
+        assert_eq!(
+            route.headers[reqwest::header::AUTHORIZATION],
+            "Bearer sk-or-v1-ZZZZ",
+            "OpenRouter's /messages route authenticates only on `Authorization: \
+             Bearer`, and it wants the scheme prefix; a bare key there answers \
+             \"Missing Authentication header\" on every attempt -- F4"
+        );
+        assert!(route.headers[reqwest::header::AUTHORIZATION].is_sensitive());
+        // The mirror negative, for the same reason the Anthropic test asserts no
+        // bearer: a client that sent the key both ways passes a `contains` and
+        // still leaks the key to a provider that had no business seeing it.
+        assert!(
+            route.headers.get("x-api-key").is_none(),
+            "{:?}",
+            route.headers
+        );
+        // The envelope is stamped on this provider too -- OpenRouter's Messages
+        // route requires the version header exactly as the first-party one does.
+        assert_eq!(route.headers["anthropic-version"], ANTHROPIC_VERSION);
+
+        // CONTROL: the same origin, the same key, no style configured. Still
+        // `x-api-key`, because the *definition* decides and the default is the
+        // first-party convention -- so the assertions above are about the
+        // configured style and not about this client having become a bearer
+        // client for everyone.
+        let default_style = AnthropicMessagesClient::with_bases(
+            "https://openrouter.ai/api/v1",
+            "https://openrouter.ai/api/v1",
+        )
+        .unwrap();
+        let route = default_style.route(&stored, "openrouter").unwrap();
+        assert_eq!(route.headers["x-api-key"], "sk-or-v1-ZZZZ");
+        assert!(route.headers.get(reqwest::header::AUTHORIZATION).is_none());
+    }
+
+    /// The spellings a catalog file may name, pinned the way `WireProtocol`'s
+    /// are.
+    ///
+    /// The config boundary refuses anything else, and it builds its refusal by
+    /// listing [`StoredAuthStyle::ALL`] — so a style added here without a
+    /// spelling an operator can write would produce a refusal naming a value
+    /// no file could contain.
+    #[test]
+    fn the_auth_styles_are_spelled_the_way_a_config_file_would_write_them() {
+        assert_eq!(StoredAuthStyle::default(), StoredAuthStyle::XApiKey);
+        for (style, spelling) in [
+            (StoredAuthStyle::XApiKey, "x_api_key"),
+            (StoredAuthStyle::Bearer, "bearer"),
+        ] {
+            assert_eq!(style.wire_name(), spelling);
+            assert_eq!(StoredAuthStyle::from_wire_name(spelling), Some(style));
+        }
+        // A spelling nothing implements is `None` rather than the default: the
+        // boundary turns that into a refusal naming the field, where a silent
+        // fallback would send an OpenRouter key out in a header that provider
+        // ignores and report it as a 401 forever.
+        assert_eq!(StoredAuthStyle::from_wire_name("x-api-key"), None);
+        assert_eq!(StoredAuthStyle::from_wire_name("Bearer"), None);
+        assert_eq!(StoredAuthStyle::ALL.len(), 2);
+    }
+
     #[test]
     fn a_provider_definition_moves_the_route_and_cannot_displace_the_credential() {
         let client = AnthropicMessagesClient::with_bases(
@@ -868,14 +1099,17 @@ mod tests {
         assert!(matches!(seat.credential, TurnCredential::Forwarded(_)));
 
         // The two routes are different `reqwest::Client`s, so a forwarded
-        // credential never rides a redirect-following connection and never
-        // shares a pool with the deployment's own key.
+        // credential never shares a connection pool with the deployment's own
+        // key. Redirects are refused on *both* since F1 — a stored `x-api-key`
+        // is no more strippable by `reqwest` than a seat's bearer is — so pool
+        // separation is now the whole of what two clients buy, and this is the
+        // assertion that says so.
         let stored = TurnCredential::Stored(Secret::api_key("sk-ant-api03-ZZZZ").unwrap());
         let byok = client.route(&stored, "anthropic").unwrap();
         assert_eq!(byok.base, "https://api.example.test");
         assert!(
             !std::ptr::eq(byok.client, seat.client),
-            "the forwarded route must not use the redirect-following client"
+            "a forwarded seat must not share a connection pool with a stored key"
         );
     }
 }

@@ -427,6 +427,13 @@ fn responses_client(
 /// base, where a ChatGPT device login addresses a separate host — is a fact
 /// about the provider and belongs in the client's own constants, not in a second
 /// shape here.
+///
+/// **One thing this arm reads that the Responses one does not: `auth.style`.**
+/// This dialect has two GA providers that authenticate a stored key in
+/// different headers, so the spelling is per-provider configuration resolved
+/// here, at boot, once — never sniffed from a hostname inside `route()`, where
+/// it would be a routing decision resting on a substring and would
+/// mis-authenticate every gateway fronting either provider under a third name.
 fn messages_client(
     provider: &str,
     definition: &ProviderConfig,
@@ -436,16 +443,26 @@ fn messages_client(
         .routes
         .for_dialect(WireProtocol::AnthropicMessages)
         .expect("the catalog boundary refuses an entry whose dialect has no route");
+    let auth_style = definition
+        .auth
+        .stored_auth_style()
+        .expect("the catalog boundary refuses a definition naming a style nothing sends");
     tracing::info!(
         %provider,
         base_url = %definition.base_url,
         %route,
+        // Logged because it is the difference between a provider that
+        // authenticates and one that answers 401 forever, and an operator
+        // debugging the second needs to see which spelling this process chose.
+        // The header *name* is configuration; the key is not, and is not here.
+        auth_style = auth_style.wire_name(),
         entries = specs.len(),
         "dispatching this provider's turns over the Anthropic Messages wire"
     );
     Ok(
         AnthropicMessagesClient::with_bases(&definition.base_url, &definition.base_url)?
             .with_messages_path(route)
+            .with_stored_auth_style(auth_style)
             .with_extra_headers(
                 definition
                     .extra_headers

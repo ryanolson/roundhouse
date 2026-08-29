@@ -94,11 +94,9 @@ impl SseDecoder {
 
     /// Consume every complete event in the buffer.
     fn drain(&mut self) -> Result<(), FrontierError> {
-        // `\n\n` is the separator; `\r\n\r\n` ends with it, so splitting on the
-        // shorter form handles both and leaves a stray `\r` that `trim` takes.
-        while let Some(end) = self.buffer.find("\n\n") {
-            let event = self.buffer[..end].to_string();
-            self.buffer.drain(..end + 2);
+        while let Some((ends, next)) = event_boundary(&self.buffer) {
+            let event = self.buffer[..ends].to_string();
+            self.buffer.drain(..next);
             self.decode_event(&event)?;
             if self.finished {
                 self.buffer.clear();
@@ -120,7 +118,7 @@ impl SseDecoder {
     /// dispatched on its own `type`.
     fn decode_event(&mut self, event: &str) -> Result<(), FrontierError> {
         let mut data = String::new();
-        for line in event.lines() {
+        for line in lines(event) {
             // A comment (`: keep-alive`) and every non-`data` field are skipped
             // rather than refused: the SSE grammar lets a server send both, and
             // a proxy that inserts heartbeats must not fail a turn.
@@ -190,6 +188,65 @@ impl SseDecoder {
             _ => Ok(()),
         }
     }
+}
+
+/// Where the blank line separating two events sits: the offset the event's own
+/// text ends at, and the offset the next event begins at.
+///
+/// **Not `find("\n\n")`.** SSE's line grammar accepts CR, LF *or* CRLF, so a
+/// CRLF-framed body separates events with `0D 0A 0D 0A`, which contains no
+/// `0A 0A` pair — a scan for the shorter form finds no boundary anywhere in such
+/// a stream, hands the whole body to one `decode_event` at `eof`, and fails the
+/// turn on the several `data:` payloads it then tries to parse as one. The
+/// comment that used to sit here claimed the shorter form covered both, which
+/// is how it survived: it is the kind of claim that reads as obviously true.
+///
+/// The twin of this function in `anthropic_messages::stream`, duplicated rather
+/// than shared for the same reason `MAX_EVENT_BYTES` is: the two decoders are
+/// deliberate mirrors, each meant to be readable alone.
+fn event_boundary(buffer: &str) -> Option<(usize, usize)> {
+    let bytes = buffer.as_bytes();
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte != b'\n' && *byte != b'\r' {
+            continue;
+        }
+        // Both terminator bytes are ASCII, so this index is a char boundary
+        // whatever multi-byte text surrounds it.
+        let rest = &buffer[index..];
+        let Some(first) = terminator(rest) else {
+            continue;
+        };
+        if let Some(second) = terminator(&rest[first..]) {
+            return Some((index, index + first + second));
+        }
+    }
+    None
+}
+
+/// The length of a line terminator at the head of `rest`, if one is there.
+///
+/// **CRLF is tested first and that ordering is load-bearing.** Reading the `\r`
+/// of a `\r\n` as a terminator on its own would make the `\n` after it look like
+/// a second one, so every ordinary CRLF-terminated line would read as a blank
+/// line and split its own event.
+fn terminator(rest: &str) -> Option<usize> {
+    if rest.starts_with("\r\n") {
+        Some(2)
+    } else if rest.starts_with('\n') || rest.starts_with('\r') {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+/// The lines of one event block, on any of the three terminators SSE allows.
+///
+/// `str::lines` splits on `\n` alone, which reads CR-only framing as one long
+/// line whose `data:` field is buried mid-string — the frame is then dropped as
+/// payload-less rather than refused. The empty strings a `\r\n` pair produces
+/// here match no field prefix and cost nothing.
+fn lines(event: &str) -> impl Iterator<Item = &str> {
+    event.split(['\r', '\n'])
 }
 
 /// The accounting frame, read out of a `usage` object.
@@ -329,6 +386,53 @@ mod tests {
             decoder.next_chunk(),
             Some(FrontierChunk::OutputText(text.into()))
         );
+    }
+
+    /// The same defect F5 found next door, in the file that decoder copied.
+    ///
+    /// No review finding named this one — the Anthropic decoder is where a CRLF
+    /// stream was caught — but `drain` here carried the identical
+    /// `find("\n\n")` scan under the identical comment claiming it handled CRLF,
+    /// and the two files are deliberate mirrors. The consequence is the same and
+    /// arrives on a wire roundhouse has been dispatching since M8: a legal
+    /// CRLF-framed body has no `\n\n` byte pair anywhere, so no boundary is ever
+    /// found, the whole body reaches `eof` as one event, and several `data:`
+    /// lines joined by newlines fail `serde_json` — one error, no output, no
+    /// accounting, for a turn the provider served correctly.
+    #[test]
+    fn crlf_and_cr_framed_events_are_split_by_drain_the_same_as_lf() {
+        let delta = "event: response.output_text.delta\n\
+                     data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n";
+        for (framing, reframe) in [
+            (
+                "CRLF",
+                (|s: &str| s.replace('\n', "\r\n")) as fn(&str) -> String,
+            ),
+            ("CR only", |s: &str| s.replace('\n', "\r")),
+            ("CRLF line, LF blank", |s: &str| s.replace("\n\n", "\r\n\n")),
+            ("LF line, CRLF blank", |s: &str| s.replace("\n\n", "\n\r\n")),
+            // CONTROL: the LF framing every other test here uses, through the
+            // same loop, so a scan that had stopped finding `\n\n` cannot pass.
+            ("LF", |s: &str| s.to_string()),
+        ] {
+            let chunks = decode(&[&reframe(delta), &reframe(COMPLETED)])
+                .unwrap_or_else(|error| panic!("{framing} framing must decode: {error}"));
+            assert_eq!(
+                chunks,
+                vec![
+                    FrontierChunk::OutputText("ok".into()),
+                    FrontierChunk::Done {
+                        input_tokens: 120,
+                        cached_input_tokens: 100,
+                        cache_write_tokens: 0,
+                        output_tokens: 30,
+                        reasoning_tokens: 12,
+                        provider_reported_cost: None,
+                    },
+                ],
+                "{framing} framing"
+            );
+        }
     }
 
     #[test]

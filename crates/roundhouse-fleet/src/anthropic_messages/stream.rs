@@ -36,7 +36,10 @@
 //! the Responses decoder, and the same reason: the engine substitutes
 //! `estimated_usage` and marks it, whereas a synthesized zero-token `Done` folds
 //! as zero tokens for zero dollars — indistinguishable from a saving, which is
-//! the one failure the metrics chapter is built against.
+//! the one failure the metrics chapter is built against. A stream that *reaches*
+//! `message_stop` having reported only one of the two halves of its bill is the
+//! same case wearing a terminal frame, and is answered the same way — see
+//! [`SseDecoder::emit_done`].
 //!
 //! [`Usage`]: roundhouse_core::event::Usage
 
@@ -116,6 +119,15 @@ pub(super) struct SseDecoder {
     /// stream without the prelude has told us nothing about what the prompt
     /// cost, and "nothing" must not be written down as "zero".
     saw_input: bool,
+    /// Whether any `message_delta` reported an output count.
+    ///
+    /// The output-side twin of [`Self::saw_input`], and it exists for the same
+    /// reason: `output_tokens` below is a `u64` that starts at Rust's zero, so
+    /// without this flag "no frame ever said" and "the provider said zero" are
+    /// the same value — and the first is an unaccounted turn while the second is
+    /// a free one. On this dialect the two frames carry different halves of the
+    /// bill, so each half needs its own answer to "did anyone actually say?".
+    saw_output: bool,
     input: InputSide,
     /// Cumulative output count, from the last `message_delta` that reported one.
     output_tokens: u64,
@@ -155,11 +167,9 @@ impl SseDecoder {
     }
 
     fn drain(&mut self) -> Result<(), FrontierError> {
-        // `\n\n` is the separator; `\r\n\r\n` ends with it, so splitting on the
-        // shorter form handles both and leaves a stray `\r` that `trim` takes.
-        while let Some(end) = self.buffer.find("\n\n") {
-            let event = self.buffer[..end].to_string();
-            self.buffer.drain(..end + 2);
+        while let Some((ends, next)) = event_boundary(&self.buffer) {
+            let event = self.buffer[..ends].to_string();
+            self.buffer.drain(..next);
             self.decode_event(&event)?;
             if self.finished {
                 self.buffer.clear();
@@ -181,7 +191,7 @@ impl SseDecoder {
     fn decode_event(&mut self, event: &str) -> Result<(), FrontierError> {
         let mut name: Option<&str> = None;
         let mut data = String::new();
-        for line in event.lines() {
+        for line in lines(event) {
             if let Some(rest) = line.strip_prefix("data:") {
                 if !data.is_empty() {
                     data.push('\n');
@@ -277,6 +287,16 @@ impl SseDecoder {
                 // as a short answer, exactly as `response.failed` does on the
                 // Responses wire. A turn that ended because the provider refused
                 // it must not look like a turn that simply produced little.
+                //
+                // **The asymmetry with a pre-stream 529 is deliberate.** The
+                // same `overloaded_error` arriving as an HTTP status before any
+                // bytes is retryable and fails over to another target; arriving
+                // here it is terminal, because deltas have already been emitted
+                // and handed downstream. Retrying from this point would have the
+                // second target restate output the client has already seen, so
+                // the turn's answer would contain the beginning twice. Refusing
+                // the turn costs one dispatch; duplicating it corrupts the
+                // transcript that the next turn's prefix admission is built on.
                 let error = self.parse(name, payload).map(|event| match event {
                     StreamEvent::Error { error, .. } => error,
                     _ => unreachable!("parsed as the name it was dispatched on"),
@@ -339,6 +359,15 @@ impl SseDecoder {
     }
 
     fn fold_message_delta(&mut self, usage: &Usage) {
+        // The output-side mirror of `fold_message_start`'s `reported_any_input`
+        // gate, and a count rather than the presence of the `usage` object for
+        // the same reason: a frame that carried an empty object told us nothing,
+        // and `Usage`'s fields all default to zero, so presence would let a
+        // proxy that stripped the counts but kept the braces book a real answer
+        // at nothing.
+        if usage.output_tokens > 0 {
+            self.saw_output = true;
+        }
         // Cumulative, per the API's own documentation, so a later frame can only
         // be greater than or equal to an earlier one. `max` rather than
         // assignment therefore loses nothing and makes a frame that omitted the
@@ -387,11 +416,29 @@ impl SseDecoder {
     }
 
     /// The one accounting frame this dialect's two usage events fold into.
+    ///
+    /// **Both halves or neither**, which is the F6 correction. A `Done` is the
+    /// engine's signal that the provider reported this turn — it books it as
+    /// `Accounting::Reported` unconditionally — so a `Done` assembled from one
+    /// measured half and one defaulted zero is not a partial record, it is a
+    /// fabricated one wearing the provider's authority. Zero output tokens on a
+    /// hosted model prices at zero dollars, and a zero-dollar frontier turn is
+    /// indistinguishable on the savings dashboard from a turn that was routed
+    /// locally — the one failure the metrics chapter is built against.
+    ///
+    /// The cost of the stricter gate, stated because it is real: a stream whose
+    /// final `message_delta` was stripped of its output count loses the *input*
+    /// counts it did measure, and the engine estimates the whole turn instead of
+    /// half of it. That trade is deliberate. An estimate is marked as an
+    /// estimate everywhere it is read, so the accounting stays honest and merely
+    /// less precise; the alternative writes a number nobody measured into the
+    /// column the whole product is judged on, and marks it measured.
     fn emit_done(&mut self) {
-        if !self.saw_input {
-            // No prelude, or a prelude that reported nothing. The engine
+        if !(self.saw_input && self.saw_output) {
+            // A missing prelude, a prelude that reported nothing, or a final
+            // `message_delta` that never carried an output count. The engine
             // substitutes its own estimate and marks it; a `Done` built here
-            // would carry a zero input count, which folds as zero tokens for
+            // would carry a zero on one axis, which folds as zero tokens for
             // zero dollars and reads as a saving.
             return;
         }
@@ -407,12 +454,89 @@ impl SseDecoder {
             // Thinking is billed as ordinary output here and reported by no
             // field this build reads — see `fold_delta`.
             reasoning_tokens: 0,
-            // Anthropic's usage object carries no price. `None` and not zero:
-            // "this provider reports no price" and "this call was free" are the
+            // **Not read, rather than not there** — a distinction M10.3's
+            // reconciliation reader needs, because it is only half true that
+            // this wire carries no price. `api.anthropic.com`'s usage object
+            // has no cost field at all. OpenRouter's `/messages` route speaks
+            // the same dialect and *does* attach `cost` and `cost_details`,
+            // which this build parses into `Usage::extra` and deliberately does
+            // not fold: a provider-reported dollar figure is a second pricing
+            // authority beside the catalog's rate card, and which of the two
+            // wins is a ruling nobody has made yet. `None` and not zero either
+            // way: "no price was read here" and "this call was free" are the
             // two readings a reconciliation view must never confuse.
             provider_reported_cost: None,
         });
     }
+}
+
+/// Where the blank line separating two events sits: the offset the event's own
+/// text ends at, and the offset the next event begins at.
+///
+/// **Not `find("\n\n")`, and the difference is a whole turn.** SSE's line
+/// grammar (`stream_format`) accepts CR, LF *or* CRLF as the terminator, so a
+/// CRLF-framed body separates events with `0D 0A 0D 0A` — which contains no
+/// `0A 0A` pair at all. A scan for the shorter form therefore finds no boundary
+/// anywhere in such a stream: every event stays in the buffer until `eof`, which
+/// hands the whole body to one `decode_event`, which joins several `data:` lines
+/// into one string and fails the turn on `trailing characters at line 2`. Not a
+/// truncated answer and not a mis-count — no output, no accounting, and no
+/// failover, because the failure arrives after the stream opened.
+///
+/// The two offsets are returned separately rather than one plus a fixed width
+/// because the width is not fixed: it is 2, 3 or 4 bytes depending on which
+/// terminators the server chose, and mixing that up either eats the first byte
+/// of the next event or leaves a stray one at the head of it.
+///
+/// Duplicated in `openai_responses::stream` rather than shared, exactly as
+/// `MAX_EVENT_BYTES` is: the two decoders are deliberate mirrors down to their
+/// buffering, and a shared module would be the first thing to join two files
+/// whose whole value is that each can be read alone.
+fn event_boundary(buffer: &str) -> Option<(usize, usize)> {
+    let bytes = buffer.as_bytes();
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte != b'\n' && *byte != b'\r' {
+            continue;
+        }
+        // Both terminator bytes are ASCII, so this index is a char boundary
+        // whatever multi-byte text surrounds it.
+        let rest = &buffer[index..];
+        let Some(first) = terminator(rest) else {
+            continue;
+        };
+        if let Some(second) = terminator(&rest[first..]) {
+            return Some((index, index + first + second));
+        }
+    }
+    None
+}
+
+/// The length of a line terminator at the head of `rest`, if one is there.
+///
+/// **CRLF is tested first and that ordering is load-bearing.** Reading the `\r`
+/// of a `\r\n` as a terminator on its own would make the `\n` after it look like
+/// a second one, and every ordinary CRLF-framed line would then read as a blank
+/// line — splitting each event into fragments that decode as nothing.
+fn terminator(rest: &str) -> Option<usize> {
+    if rest.starts_with("\r\n") {
+        Some(2)
+    } else if rest.starts_with('\n') || rest.starts_with('\r') {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+/// The lines of one event block, on any of the three terminators SSE allows.
+///
+/// `str::lines` splits on `\n` alone (tolerating a trailing `\r`), which is
+/// right for LF and CRLF framing and silently wrong for CR-only framing: the
+/// whole event arrives as one "line" that begins with `event:` and carries the
+/// `data:` payload inside it, so the frame is dropped as payload-less rather
+/// than refused. Splitting on either byte reads all three the same way; the
+/// empty strings a `\r\n` pair produces match no field prefix and cost nothing.
+fn lines(event: &str) -> impl Iterator<Item = &str> {
+    event.split(['\r', '\n'])
 }
 
 /// What an error frame said, or a stand-in naming the absence.
@@ -579,6 +703,42 @@ mod tests {
                 reasoning_tokens: 0,
                 provider_reported_cost: None,
             }]
+        );
+    }
+
+    #[test]
+    fn a_message_delta_that_never_reports_output_before_message_stop_is_unaccounted_rather_than_free()
+     {
+        // PROBE (F6, valid): the output-side mirror of the test just above.
+        // `usage` on `MessageDelta` is `Option<Usage>` specifically so "the
+        // frame reported no counts" and "the frame reported zero" are different
+        // facts (`wire.rs`'s own doc on `MessageDelta::usage`) — and `emit_done`
+        // used to gate on `saw_input` alone, with no output-side equivalent. A
+        // `message_delta` that carries `stop_reason` but omits `usage` entirely
+        // (a proxy that stripped it, or an upstream that never restates the
+        // count) left `output_tokens` at Rust's default `0`, and `message_stop`
+        // folded that into a `Done` the engine books as
+        // `Accounting::Reported` — real streamed output priced at zero dollars
+        // and labelled "the provider reported this" when no frame ever did.
+        // Symmetric with the rule above: nothing reported must not be written
+        // down as zero, on either axis.
+        let chunks = decode(&[
+            START,
+            &text(0, "half an answer"),
+            concat!(
+                "event: message_delta\n",
+                r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn","#,
+                r#""stop_sequence":null}}"#,
+                "\n\n"
+            ),
+            STOP,
+        ])
+        .unwrap();
+        assert_eq!(
+            chunks,
+            vec![FrontierChunk::OutputText("half an answer".into())],
+            "a Done was emitted carrying a fabricated output_tokens: 0 even \
+             though no frame ever reported the output count"
         );
     }
 
@@ -863,6 +1023,98 @@ mod tests {
         let big = "y".repeat(4096);
         let chunks = decode(&[&text(0, &big)]).unwrap();
         assert_eq!(chunks, vec![FrontierChunk::OutputText(big)]);
+    }
+
+    #[test]
+    fn crlf_framed_events_are_split_by_drain_the_same_as_lf() {
+        // PROBE (F5): SSE's line grammar accepts CR, LF, or CRLF as the line
+        // terminator, so a purely CRLF-framed body is legal on the wire — as are
+        // the mixed forms a lenient server produces by terminating a field line
+        // one way and the blank line the other. Each framing below is the same
+        // stream as `the_two_usage_events_fold_into_one_done_in_roundhouse_axes`
+        // above and must decode to the same chunks; before the fix, `drain`
+        // searched for `\n\n`, which does not occur in `\r\n\r\n` at all, so the
+        // whole body reached `eof` as one event and the turn failed with
+        // `trailing characters at line 2` — no output, no accounting, no
+        // failover.
+        for (framing, reframe) in [
+            (
+                "CRLF",
+                (|s: &str| s.replace('\n', "\r\n")) as fn(&str) -> String,
+            ),
+            ("CR only", |s: &str| s.replace('\n', "\r")),
+            ("CRLF line, LF blank", |s: &str| s.replace("\n\n", "\r\n\n")),
+            ("LF line, CRLF blank", |s: &str| s.replace("\n\n", "\n\r\n")),
+            // CONTROL: the LF framing every other test in this file uses, run
+            // through the same loop. Without it a boundary scan that had stopped
+            // finding `\n\n` would pass every assertion above.
+            ("LF", |s: &str| s.to_string()),
+        ] {
+            let chunks = decode(&[
+                &reframe(START),
+                &reframe(&text(0, "Hel")),
+                &reframe(&text(0, "lo")),
+                &reframe(DELTA),
+                &reframe(STOP),
+            ])
+            .unwrap_or_else(|error| {
+                panic!("a legal {framing}-framed stream must decode, not fail the turn: {error}")
+            });
+
+            assert_eq!(
+                chunks,
+                vec![
+                    FrontierChunk::OutputText("Hel".into()),
+                    FrontierChunk::OutputText("lo".into()),
+                    FrontierChunk::Done {
+                        input_tokens: 9_512,
+                        cached_input_tokens: 9_000,
+                        cache_write_tokens: 500,
+                        output_tokens: 64,
+                        reasoning_tokens: 0,
+                        provider_reported_cost: None,
+                    },
+                ],
+                "{framing} framing"
+            );
+        }
+    }
+
+    /// A `\r` and the `\n` that completes it, arriving in different reads.
+    ///
+    /// The one shape the boundary scan can get wrong in a way no whole-body test
+    /// sees: a chunk that ends on the `\r` of a `\r\n` line terminator. Treating
+    /// that `\r` as a complete terminator and the next chunk's `\n` as a second
+    /// one would split an ordinary line into a false event boundary, dropping
+    /// the `data:` line that followed it — silently, as an empty frame.
+    #[test]
+    fn a_line_terminator_split_across_two_reads_is_not_a_false_boundary() {
+        let whole = format!("{START}{}{DELTA}{STOP}", text(0, "ok")).replace('\n', "\r\n");
+        let mut decoder = SseDecoder::default();
+        let mut chunks = Vec::new();
+        // One byte at a time, so every `\r\n` in the body is split.
+        for byte in whole.as_bytes() {
+            decoder.feed(&[*byte]).unwrap();
+            while let Some(chunk) = decoder.next_chunk() {
+                chunks.push(chunk);
+            }
+        }
+        decoder.eof().unwrap();
+        while let Some(chunk) = decoder.next_chunk() {
+            chunks.push(chunk);
+        }
+        assert_eq!(chunks[0], FrontierChunk::OutputText("ok".into()));
+        assert!(
+            matches!(
+                chunks[1],
+                FrontierChunk::Done {
+                    input_tokens: 9_512,
+                    output_tokens: 64,
+                    ..
+                }
+            ),
+            "{chunks:?}"
+        );
     }
 
     #[test]

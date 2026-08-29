@@ -421,6 +421,53 @@ async fn a_forwarded_seat_never_follows_a_redirect_to_another_origin() {
     assert!(error.to_string().contains("307"), "{error}");
 }
 
+/// F1 (thermo-nuclear review of d0821f9, **valid**): the twin of the seat test
+/// above, for the *stored* route instead of the forwarded one.
+///
+/// `route()` put the stored key on `self.direct`, which `with_bases` built with
+/// reqwest's default redirect-following policy — the arrangement ported from
+/// the Responses client, where it is safe. It is not safe here, and the reason
+/// is one header name: reqwest's cross-host sanitizer
+/// (`redirect.rs::remove_sensitive_headers`) strips `Authorization`, `Cookie`,
+/// `Cookie2`, `Proxy-Authorization` and `WWW-Authenticate`, and nothing else.
+/// A stored Anthropic key rides `x-api-key`, so it followed the 307 to
+/// `elsewhere` bare — and this test, before the fix, printed it.
+///
+/// Both transports are `Policy::none()` now. The negative is asserted against a
+/// real socket rather than against the builder, because "which policy the client
+/// was constructed with" is not the claim; "what the second origin received" is,
+/// and every layer between the two is exactly where a leak of this kind lives.
+#[tokio::test]
+async fn a_stored_key_never_follows_a_redirect_to_another_origin() {
+    // The second origin, which must never see the deployment's own key.
+    let (elsewhere, elsewhere_upstream) = Upstream::spawn(Behaviour::Stream(SSE_BODY)).await;
+    let (base, _) = Upstream::spawn(Behaviour::RedirectTo(elsewhere.clone())).await;
+    let client = AnthropicMessagesClient::with_bases(&base, &base).unwrap();
+
+    // The leak is asserted first, and before the call's own outcome, for the
+    // same reason as the seat test: a client that followed the redirect and
+    // then succeeded must fail this test on the disclosure, not on the shape
+    // of its return value.
+    let outcome = client.execute(&quote(stored())).await;
+    let leaked = elsewhere_upstream.arrived();
+    assert!(
+        leaked.is_empty(),
+        "a stored key followed a redirect to another origin; that origin saw:\n{leaked}"
+    );
+
+    let Err(error) = outcome else {
+        panic!("a redirect is not a response this client accepts")
+    };
+    assert!(error.to_string().contains("307"), "{error}");
+    // The refusal names what it refused. A 3xx carries no body, so without this
+    // an operator whose gateway started redirecting reads `the upstream
+    // answered 307:` and has nothing to act on.
+    assert!(
+        error.to_string().contains("redirected to") && error.to_string().contains(&elsewhere),
+        "{error}"
+    );
+}
+
 #[tokio::test]
 async fn an_upstream_that_echoes_a_credential_is_redacted_before_anyone_reads_it() {
     for (credential, secret) in [(stored(), STORED_KEY), (seat(), SEAT_BEARER)] {

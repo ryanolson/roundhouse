@@ -47,7 +47,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::event::Usage;
-use crate::routing::ProviderPricing;
+use crate::routing::{PooledUsage, ProviderPricing};
 
 /// A hosted model that a local one can be priced against.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -336,8 +336,18 @@ impl Correlary {
     /// conversation — so carrying our measured cache ratio across is the
     /// defensible reading, and it is the conservative one.
     pub fn shadow_cost_usd(&self, usage: &Usage) -> f64 {
+        self.shadow_cost_pooled(&PooledUsage::of(usage))
+    }
+
+    /// The same counterfactual over many calls pooled by [`PooledUsage`].
+    ///
+    /// What the metrics rollup calls, because a row is many turns: pricing a
+    /// summed [`Usage`] would re-decide the cache-write split over the pot and
+    /// so report a saving that is not the sum of the per-turn savings. See
+    /// [`PooledUsage`] for why that decision cannot survive a sum.
+    pub fn shadow_cost_pooled(&self, pooled: &PooledUsage) -> f64 {
         match self {
-            Correlary::Priced { reference, .. } => reference.pricing.price(usage),
+            Correlary::Priced { reference, .. } => reference.pricing.price_pooled(pooled),
             // Not a zero that some branch remembered to return: there is no
             // rate card in this arm to price against.
             Correlary::Unpriced { .. } => 0.0,

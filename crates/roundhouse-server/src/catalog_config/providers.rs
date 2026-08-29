@@ -34,6 +34,7 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 
 use roundhouse_fleet::WireProtocol;
+use roundhouse_fleet::anthropic_messages::StoredAuthStyle;
 
 use super::CatalogError;
 
@@ -139,12 +140,47 @@ impl ProviderRoutes {
     }
 }
 
-/// Where this provider's key is expected to live.
+/// Where this provider's key is expected to live, and how it is spelled.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderAuth {
     /// An environment variable name, e.g. `OPENROUTER_API_KEY`.
     pub env: String,
+    /// Which header a stored key goes out in, for a provider serving the
+    /// `anthropic_messages` dialect.
+    ///
+    /// **Read only on that dialect, and optional there.** The two OpenAI wires
+    /// have one spelling each and have never had another, so there is nothing
+    /// for a file to say about them; `anthropic_messages` is the dialect with
+    /// two GA providers that disagree — `api.anthropic.com` authenticates on a
+    /// bare `x-api-key` and rejects a bearer, OpenRouter's `/messages` route
+    /// does the reverse. Absent, it is `x_api_key`: the first-party convention,
+    /// so the definition that needs no line is the common one.
+    ///
+    /// Held as a `String` and parsed by [`Self::stored_auth_style`] rather than
+    /// deserialized straight into the enum, because a typo here must produce a
+    /// refusal naming *this field and this provider* — serde's own "unknown
+    /// variant" error names neither, and the remedy is a one-word edit an
+    /// operator has to be pointed at.
+    #[serde(default)]
+    pub style: Option<String>,
+}
+
+impl ProviderAuth {
+    /// The spelling this definition names, or `None` for one nothing
+    /// implements.
+    ///
+    /// `None` is the refusal case, not a fallback — see
+    /// [`ProviderConfig::validate`]. A silent default on an unrecognised value
+    /// would send a deployment's OpenRouter key out in a header that provider
+    /// ignores, and the symptom, a 401 on every turn, names neither the file
+    /// nor the field.
+    pub fn stored_auth_style(&self) -> Option<StoredAuthStyle> {
+        match self.style.as_deref() {
+            None => Some(StoredAuthStyle::default()),
+            Some(style) => StoredAuthStyle::from_wire_name(style),
+        }
+    }
 }
 
 impl ProviderConfig {
@@ -198,6 +234,22 @@ impl ProviderConfig {
                 path: path.to_string(),
                 provider: name.to_string(),
                 env: env.clone(),
+            });
+        }
+        // A spelling no client implements. Refused here rather than defaulted,
+        // because every wrong answer to this question is a 401 on every turn of
+        // this provider's — and a 401 is the one upstream response an operator
+        // reads as "my key is bad" rather than as "my file is wrong".
+        if self.auth.stored_auth_style().is_none() {
+            return Err(CatalogError::ProviderAuthStyle {
+                path: path.to_string(),
+                provider: name.to_string(),
+                style: self.auth.style.clone().unwrap_or_default(),
+                accepted: StoredAuthStyle::ALL
+                    .iter()
+                    .map(|style| format!("`{}`", style.wire_name()))
+                    .collect::<Vec<_>>()
+                    .join(" or "),
             });
         }
         Ok(())
@@ -302,5 +354,89 @@ mod tests {
             .unwrap()
             .validate("test", "p")
             .unwrap();
+    }
+
+    /// **Which header a stored key rides in is a fact about the provider, and
+    /// the file is where it is stated.**
+    ///
+    /// Both GA providers on the `anthropic_messages` dialect are here, because
+    /// the pair is the whole reason the field exists: `api.anthropic.com`
+    /// authenticates a bare `x-api-key` and answers a bearer with a 401,
+    /// OpenRouter's `/messages` route answers an `x-api-key` with "Missing
+    /// Authentication header". A client that hardcoded either spelling makes
+    /// the other provider unreachable, which is F4.
+    #[test]
+    fn a_definition_names_the_header_its_stored_key_rides_in() {
+        let openrouter = provider(
+            r#"{
+              "base_url": "https://openrouter.ai/api/v1",
+              "routes": { "messages": "/messages" },
+              "auth": { "env": "OPENROUTER_API_KEY", "style": "bearer" }
+            }"#,
+        )
+        .unwrap();
+        openrouter.validate("test", "openrouter").unwrap();
+        assert_eq!(
+            openrouter.auth.stored_auth_style(),
+            Some(StoredAuthStyle::Bearer)
+        );
+
+        // The first-party convention is what a definition gets by saying
+        // nothing, so the common case needs no line and the uncommon one is
+        // written down where an operator can see it.
+        let anthropic = provider(
+            r#"{
+              "base_url": "https://api.anthropic.com/v1",
+              "routes": { "messages": "/messages" },
+              "auth": { "env": "ANTHROPIC_API_KEY" }
+            }"#,
+        )
+        .unwrap();
+        anthropic.validate("test", "anthropic").unwrap();
+        assert_eq!(
+            anthropic.auth.stored_auth_style(),
+            Some(StoredAuthStyle::XApiKey)
+        );
+    }
+
+    #[test]
+    fn an_auth_style_nothing_implements_is_a_refusal_naming_the_field() {
+        // PROBE: the spelling an operator reaches for first, and the one a
+        // reader of the HTTP header would write. Neither is what the file
+        // spells, and defaulting either to `x_api_key` would send an OpenRouter
+        // key out in a header that provider ignores -- a 401 on every turn,
+        // which reads as a bad key rather than as a wrong file.
+        for wrong in ["Bearer", "x-api-key", ""] {
+            let definition = provider(&format!(
+                r#"{{ "base_url": "https://x.test", "auth": {{ "env": "K", "style": "{wrong}" }} }}"#
+            ))
+            .unwrap();
+            let error = definition
+                .validate("test", "openrouter")
+                .expect_err(&format!("`{wrong}` must be refused"));
+            assert!(
+                matches!(&error, CatalogError::ProviderAuthStyle { provider, style, .. }
+                    if provider == "openrouter" && style == wrong),
+                "{error}"
+            );
+            // The refusal has to carry the remedy: the field, the value that
+            // was written, and what may be written instead.
+            let message = error.to_string();
+            assert!(message.contains("auth.style"), "{message}");
+            assert!(message.contains("`x_api_key`"), "{message}");
+            assert!(message.contains("`bearer`"), "{message}");
+        }
+
+        // CONTROL: both accepted spellings validate, so the refusals above are
+        // about the value and not about the field being unusable.
+        for accepted in StoredAuthStyle::ALL {
+            provider(&format!(
+                r#"{{ "base_url": "https://x.test", "auth": {{ "env": "K", "style": "{}" }} }}"#,
+                accepted.wire_name()
+            ))
+            .unwrap()
+            .validate("test", "p")
+            .unwrap();
+        }
     }
 }

@@ -41,6 +41,18 @@
     "name, so a provider whose \"models\" entries speak two wire_protocols stops the",
     "boot -- OpenRouter serves both /responses and /messages, so if you want both,",
     "define it twice under two names pointing at the same base_url.",
+    "\"openrouter-messages\" is that second definition, written out so the pattern is",
+    "not just described. It is also where auth.style lives, which matters on this",
+    "dialect and no other: a stored key is spelled \"x_api_key\" unless the definition",
+    "says otherwise -- Anthropic's own convention, and api.anthropic.com answers a",
+    "bearer with a 401 whose message does not say why -- while OpenRouter's /messages",
+    "route authenticates only on Authorization: Bearer and answers an x-api-key with",
+    "\"Missing Authentication header\". So set \"style\": \"bearer\" there and leave the",
+    "field off everywhere else. A spelling this build does not send is refused at",
+    "load, naming the provider and the field; getting it wrong the other way is a",
+    "401 on every turn, which reads like a bad key rather than a wrong file. Nothing",
+    "under \"models\" names openrouter-messages yet -- point a Claude model on",
+    "OpenRouter at it and it dispatches.",
     "The three entries under \"openrouter\" spell out full, dated model ids rather",
     "than a placeholder, because that is the point they demonstrate: an id with no",
     "date suffix is not a rolling pointer to \"whatever is newest\" the way",
@@ -69,6 +81,15 @@
       "base_url": "https://openrouter.ai/api/v1",
       "routes": { "models": "/models", "responses": "/responses" },
       "auth": { "env": "OPENROUTER_API_KEY" },
+      "extra_headers": {
+        "HTTP-Referer": "https://REPLACE-with-your-deployments-url",
+        "X-OpenRouter-Title": "roundhouse"
+      }
+    },
+    "openrouter-messages": {
+      "base_url": "https://openrouter.ai/api/v1",
+      "routes": { "models": "/models", "messages": "/messages" },
+      "auth": { "env": "OPENROUTER_API_KEY", "style": "bearer" },
       "extra_headers": {
         "HTTP-Referer": "https://REPLACE-with-your-deployments-url",
         "X-OpenRouter-Title": "roundhouse"
