@@ -385,7 +385,16 @@ cadence. Stage briefs carry §3 verbatim.
   an uncached block 0, and a `--continue` turn resends full history. The
   serve types accept the `BetaCreateMessageParams` property surface, and
   the conformance fixtures start from the captured bodies.
-- **M11.2 — the real client, both topologies.** `claude_launch` (R8's
+- **M11.2 — the tool loop, then the real client, both topologies.**
+  *(Re-scoped 2026-08-29 by M11.1's thermo review: the serve surface can only
+  answer in prose — `FrontierChunk` carries no tool-call variant anywhere in
+  the system, `stop_reason: tool_use` is unreachable, and Claude Code's
+  entire agent loop is tool calls — so the real-binary e2e would stall on its
+  first tool turn. M11.2 therefore begins with tool-use streaming end to end:
+  `tool_use` blocks on the dispatch decode, a tool-call chunk variant, the
+  serve projection emitting `content_block` tool_use with `input_json_delta`
+  and `stop_reason: tool_use`, and `tool_result` already canonicalizes on
+  the way back in.)* `claude_launch` (R8's
   library half); the gated `e2e-claude` suite (R6 tier 2) driving Direct;
   the chained topology against `nemo-relay` at its then-current release with
   the seven guards of R7 as tests or documented refusals. This rung also
