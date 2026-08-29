@@ -29,7 +29,9 @@ features — the first is what makes the second possible.
 > store and spend ledger; the control plane (principals, projects,
 > memberships, keys, per-key policy, budgets); the admin plane; the MCP
 > control surface; the validate/steer loop; real frontier provider clients on
-> two wire dialects (OpenAI Responses and Anthropic Messages);
+> two wire dialects (OpenAI Responses and Anthropic Messages) and serve
+> surfaces for both, so an unmodified Claude Code points at `/v1/messages` the
+> way an unmodified Codex points at `/v1/responses`;
 > a real `codex` binary driving all of it end to end behind a feature gate;
 > emission of NeMo Relay's interchange formats from the same log; providers
 > as configuration behind a per-provider client registry; rolling fair-use
@@ -64,7 +66,7 @@ crates.io, the pin becomes a plain version.
 | `roundhouse-mcp` | The control surface as an MCP server: eight tools, overlays that only narrow, and one file that knows what JSON-RPC is |
 | `roundhouse-relay` | NeMo Relay's published formats — ATOF events, ATIF v1.7 trajectories, `LlmOptimizationSummary` — produced from the same session log |
 | `roundhouse-store-redis` | Redis Streams `SessionStore` and spend ledger: entry id == seq, `PX` lease on the Redis clock, fenced appends via Lua. Selected by `ROUNDHOUSE_REDIS_URL`; absent means in-memory sessions and spend that die with the process |
-| `roundhouse-server` | Turn engine and six surfaces over one log — native HTTP/SSE, the OpenAI Responses API at `/v1/responses`, the MCP mount at `/mcp`, the admin REST plane under `/v1/admin`, `/v1/metrics` and its dashboard, and Relay's three session reads — plus `codex_launch`, which writes the config a client reads, and the binary |
+| `roundhouse-server` | Turn engine and seven surfaces over one log — native HTTP/SSE, the OpenAI Responses API at `/v1/responses`, the Anthropic Messages API at `/v1/messages`, the MCP mount at `/mcp`, the admin REST plane under `/v1/admin`, `/v1/metrics` and its dashboard, and Relay's three session reads — plus `codex_launch`, which writes the config a client reads, and the binary |
 
 ## Design
 
@@ -525,6 +527,45 @@ stateless client gets stateful routing, one accumulated warm prefix, and
 idempotent retries (the turn id is a content hash of the conversation) without
 knowing any of it is happening.
 
+## Hooking up Claude Code
+
+`POST /v1/messages` is the same idea in the other dialect: an Anthropic Messages
+surface over the same event log, same engine, same admission, same prefix
+check. There is no config file to generate — Claude Code takes
+`ANTHROPIC_BASE_URL` and `ANTHROPIC_CUSTOM_HEADERS`, so pointing it at a
+deployment is two environment variables — and `/v1/messages/count_tokens` is
+served from this deployment's own tokenizer, because the client's fallback when
+it is missing is a real one-token create against the routed model.
+
+Three things about this client shape the surface, and each is a cost rather than
+a preference:
+
+- **It has no field to name its session with.** There is no
+  `prompt_cache_key` on this wire, so the session is resolved from
+  `x-claude-code-session-id`, then from `metadata.user_id` — which has shipped
+  in two different spellings and is parsed in both, because a client upgrade
+  that re-keyed every session would silently cold-start every warm prefix.
+- **A malformed stream costs a whole extra turn, not an error.** Claude Code
+  dispatches SSE frames on the `event:` name and drops a frame that has none in
+  silence; a stream it cannot consume triggers a second, non-streaming request
+  for the same turn at full price. So the emission is shaped to make the
+  ordering mistakes its accumulator throws on unreachable rather than merely
+  untested, and every stream the suite produces is judged by a strict
+  conformance reader written from the pinned spec — the tier-1 oracle, which
+  exists because both official SDKs are deliberately non-validating and would
+  agree with anything we sent them.
+- **Its accounting axes are not ours.** Anthropic's three input counters are
+  disjoint and roundhouse's nest cached and written input inside the total, so
+  the projection subtracts rather than forwards. Getting that backwards reports
+  a warm turn as nearly two cold ones, in the direction that flatters the
+  savings figure.
+
+What is not here: no `/v1/models` (see the status note), and no gated
+real-binary suite yet — the evidence for the client's shape is two request
+bodies captured from the shipping 2.1.251 binary through a loopback mock, which
+live in `crates/roundhouse-server/tests/fixtures/` and are driven through the
+surface on every run.
+
 ## Metrics and the dashboard
 
 `GET /v1/metrics/dashboard` renders what the fleet has served; `GET /v1/metrics`
@@ -962,10 +1003,15 @@ configured provider, and the dialect read from each catalog entry. A
 chat-completions client is the one remaining `WireProtocol` arm with no
 transport; the composition root's dialect gate is an exhaustive `match`, so
 writing that client is a compile error there rather than a silent
-mis-dispatch. What roundhouse does *not* yet do on the Anthropic wire is
-**serve** it: there is no `/v1/messages` surface over the session log, so a
-Claude Code client cannot point at roundhouse yet — only roundhouse's own turns
-can be dispatched to an Anthropic upstream. Fair-use enforcement is
+mis-dispatch. On the Anthropic wire roundhouse now serves as well as
+dispatches, but two things about that surface are worth stating plainly. It has
+not yet been driven by a real `claude` binary end to end — the gated suite that
+does for Codex what `codex_e2e` does has no counterpart here yet, so the
+evidence is a conformance oracle plus two request bodies captured from the
+shipping client, not a live session. And `/v1/models` is deliberately not
+served, so a client with gateway model discovery enabled sees no catalog:
+exposing roundhouse's routes in a user's `/model` picker is a product decision
+that has been deferred rather than made. Fair-use enforcement is
 single-node: the rolling window
 counters live in process memory, and the Redis implementation is deferred by
 name with a boot warning where it matters.

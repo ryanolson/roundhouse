@@ -27,6 +27,14 @@
 //! adds no state either: a client's resent conversation is checked against the
 //! log as a prefix rather than remembered alongside it.
 //!
+//! [`messages_api`] is the third framing of that log, speaking the Anthropic
+//! Messages API so Claude Code drives Roundhouse unmodified. It is a sibling of
+//! [`responses_api`] rather than a layer on it — same prefix admission, same
+//! follower shape, a different vocabulary in each direction — and it carries
+//! the strictness that client's parser demands: an SSE frame without an
+//! `event:` line is dropped in silence, and a dropped stream costs a second
+//! full-price non-streaming turn.
+//!
 //! [`mcp_api`] is the fourth, and the only one an *agent* rather than a client
 //! drives: it mounts the control tools in [`roundhouse_mcp`] behind the same key
 //! resolution as the rest, so a model can read what it is being routed to and
@@ -65,6 +73,7 @@ pub mod engine;
 pub mod http;
 pub mod judge;
 pub mod mcp_api;
+pub mod messages_api;
 pub mod metrics_api;
 pub mod relay_api;
 pub mod responses_api;
@@ -87,6 +96,7 @@ pub use engine::{
 pub use http::router;
 pub use judge::{FleetJudge, JudgeConfig};
 pub use mcp_api::{ControlPlaneReads, describe_ambiguous_memberships, mcp_router};
+pub use messages_api::messages_router;
 pub use metrics_api::metrics_router;
 pub use relay_api::relay_router;
 pub use responses_api::{API_PREFIX, responses_router};

@@ -19,8 +19,16 @@
 //! file: it holds the judge and signal doubles that turn the validate/steer
 //! loop on, which neither stands behind the server nor in front of it — it
 //! occupies a seam inside it.
+//!
+//! [`anthropic`] is the fourth, and it is not a double at all: it is the tier-1
+//! conformance oracle — a strict Messages reader written from the pinned spec,
+//! deliberately the opposite polarity of the shipped types. It stands in front
+//! of the server like [`codex`] does, but it is a *judge* rather than a client,
+//! and the distinction is why it has its own file: nothing in it may be relaxed
+//! to make a test pass.
 #![allow(dead_code)]
 
+pub mod anthropic;
 pub mod codex;
 pub mod validate;
 

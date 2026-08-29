@@ -188,7 +188,7 @@ fn required_str(value: &Value, field: &str) -> Result<String, ApiError> {
 /// a new turn: a second answer, generated and billed, for a question already
 /// answered. Hashing the canonicalized conversation makes the retry identical to
 /// its original by construction, and the engine replays rather than regenerates.
-pub(super) fn turn_id_for(items: &[Item]) -> TurnId {
+pub(crate) fn turn_id_for(items: &[Item]) -> TurnId {
     // Renders concatenate unambiguously: `Item::render` prefixes `<|role|>`, so
     // every item is self-delimiting and no separator is needed to keep two
     // different conversations from hashing to one string. This is the same

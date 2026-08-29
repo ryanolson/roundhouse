@@ -859,6 +859,50 @@ records what moved against the v2.1.42 read above. Where they disagree,
    /v1/code/agent-proxy/ca-cert` probe (Bun user-agent, no auth) — CCR
    plumbing, not the Messages protocol.
 
+## 5.6 Addendum (2026-08-28): the binary self-updated to 2.1.251 overnight, and the re-capture caught a blocking change
+
+The M11.1 wiring stage re-ran §5.5's rig against the binary as it now stands
+(2.1.251 — it self-updates; §5.5 read 2.1.247 the day before). Fresh fixtures
+live in `crates/roundhouse-server/tests/fixtures/`. Where this addendum and
+§5.5 disagree, this one wins for the current line. The one-day drift:
+
+1. **NEW AND BLOCKING: `role: "system"` messages inside `messages`**, under
+   the new beta `mid-conversation-system-2026-04-07`, on **every** request
+   including the first. No prior read (v2.1.42 bundle, 2.1.247 capture, docs)
+   had this shape. A serve surface that refuses a system role inside
+   `messages` — the natural reading of every earlier source — refuses the
+   entire current client line. Sharper still: that message's content arrives
+   as a **one-block list on turn 1 and a bare string on the `--continue`
+   resend** (text byte-identical), so canonicalization must be
+   container-insensitive or every session forks at that item on turn two,
+   silently. Both facts are now pinned by serve-surface tests.
+2. **The beta set grew and reordered**: turn 1 sends `claude-code-20250219,
+   context-1m-2025-08-07, interleaved-thinking-2025-05-14,
+   thinking-token-count-2026-05-13, context-management-2025-06-27,
+   prompt-caching-scope-2026-01-05, mid-conversation-system-2026-04-07,
+   advisor-tool-2026-03-01, effort-2025-11-24, fallback-credit-2026-06-01`;
+   turn 2 is identical minus `context-1m-2025-08-07`. New since 2.1.247: the
+   last four plus `context-1m`; none of 2.1.247's five dropped.
+3. **`thinking` changed shape**: `{budget_tokens, display}` →
+   `{"type":"adaptive","display":"omitted"}` with no `budget_tokens` at all;
+   `output_config` is `{"effort":"high"}`; `max_tokens` 32000 → 64000; the
+   default model string is `claude-opus-5`.
+4. **Confirmed stable across the update** (§5.5's claims re-verified):
+   `metadata.user_id` still the JSON-object string with `session_id` equal to
+   the `X-Claude-Code-Session-Id` header and stable across `--continue`
+   (`account_uuid` empty under cleared-env API-key auth); the path still
+   `POST /v1/messages?beta=true` with betas header-only; `system` still three
+   blocks with the uncached attribution pseudo-header first (now
+   `cc_version=2.1.251.6bb`); `context_management` unchanged (`keep` still
+   undocumented); `count_tokens` still never called on single
+   non-interactive turns.
+
+The lesson is the cadence, not the details: **two captures one day apart
+disagreed on a shape that would have refused every request.** The
+`anthropic-spec-sync` skill's client-drift half (§7 of the skill) and the
+e2e suite's version print are not hygiene — they are what stands between
+this surface and a silent client-line refusal.
+
 ## 6. Open questions — decisions this evidence does not make
 
 1. **Key prefix admission on the header or on `metadata.user_id`?** The header is

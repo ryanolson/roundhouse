@@ -119,7 +119,24 @@ pub fn exchanges(items: &[Item]) -> Vec<Exchange> {
                     call.output = Some(output.clone());
                 }
             }
-            ItemContent::Text { .. } => {}
+            // Neither a call nor its result, so there is nothing to pair.
+            //
+            // The arm worth arguing about is [`ItemContent::Opaque`], because
+            // some of what rides through it *is* a tool exchange —
+            // `server_tool_use` and the six server-tool result blocks. It is
+            // deliberately not folded in: those calls are made and answered by
+            // the *provider*, inside one turn, with no agent loop in between.
+            // The signals reading these exchanges — repeat detection,
+            // no-progress, the failure streak — all ask "is the agent going in
+            // circles", and a search the model ran twice inside one answer is
+            // not that. Counting it would fire a steer at an agent that has no
+            // way to act on the advice. Should a later milestone want that
+            // signal, the change is a typed variant per server-tool shape and
+            // an arm here, not a peek inside the opaque JSON.
+            ItemContent::Text { .. }
+            | ItemContent::Thinking { .. }
+            | ItemContent::RedactedThinking { .. }
+            | ItemContent::Opaque { .. } => {}
         }
     }
     exchanges

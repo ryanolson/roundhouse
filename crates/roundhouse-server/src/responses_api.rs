@@ -67,8 +67,24 @@ use crate::http::{
 mod wire;
 use wire::{
     canonicalize, completed_frame, created_frame, delta_frame, failed_frame, incomplete_frame,
-    item_added_frame, item_done_frame, turn_id_for,
+    item_added_frame, item_done_frame,
 };
+
+/// The one answer to "what is this conversation's turn id".
+///
+/// Re-exported rather than left private because
+/// [`messages_api`](crate::messages_api) mints turn ids too, and a second FNV
+/// over `Item::render` would be a second answer: the id is what deduplicates a
+/// client's retry onto the response it already paid for, so two dialects that
+/// hashed differently would each be idempotent alone and neither across a
+/// client that switched — or across the chained topology, where a roundhouse
+/// serving this surface is a roundhouse dispatching the other.
+///
+/// It lives here because this is where it was written and because the pinned
+/// hash literal that guards it lives beside it. Its natural home is
+/// `roundhouse-core` beside `Item::render`, and the day a third dialect wants
+/// it, moving it there — with the pin — is the change to make.
+pub(crate) use wire::turn_id_for;
 
 /// Engine and store handles, plus this node's cache-key bindings.
 ///
@@ -334,16 +350,7 @@ where
 // Binding a cache key to a session
 // ---------------------------------------------------------------------------
 
-impl<S: SessionStore, T: Tokenizer + Clone> Compat<S, T> {
-    /// Resolve a cache key to the session holding its history, and to the part
-    /// of `claimed` that session does not have yet.
-    ///
-    /// The read is unleased and therefore a snapshot: a second request on the
-    /// same cache key arriving before the first has appended would compute its
-    /// delta against a prefix that is about to grow. Serializing turns within a
-    /// conversation is the client's job — this API has no other way to order
-    /// them, since a turn's input is defined by the one before it — and the
-    /// engine's per-session gate keeps the log itself consistent regardless.
+impl<S: SessionStore, T: Tokenizer + Clone + Send + Sync + 'static> Compat<S, T> {
     async fn bind(
         &self,
         plane: &ControlPlane,
@@ -351,89 +358,121 @@ impl<S: SessionStore, T: Tokenizer + Clone> Compat<S, T> {
         cache_key: &str,
         claimed: Vec<Item>,
     ) -> Result<(SessionId, Vec<Item>), ApiError> {
-        // Computed once and used for both the fork counter and the session id,
-        // so the two cannot key on different strings. See [`Conversations`].
-        let key = self.namespaced_key(plane, principal, cache_key);
-        let session_id = self.conversations.bind(principal, &key);
-        self.create(&session_id).await?;
-        if let Some(delta) = suffix_after(&self.stored_items(&session_id).await?, &claimed) {
-            return Ok((session_id, delta));
-        }
+        bind_prefix(
+            &self.engine,
+            &self.store,
+            &self.conversations,
+            plane,
+            principal,
+            cache_key,
+            claimed,
+        )
+        .await
+    }
+}
 
-        // The client's history disagrees with what we stored — it edited or
-        // compacted the conversation, so what it is asking for is not a
-        // continuation of this session and appending the difference would
-        // produce a conversation neither side believes in. It gets a fresh
-        // internal session, which is empty and so agrees trivially; no second
-        // check is needed.
-        //
-        // The honest cost: the new session starts with no history, so the
-        // routing ledger no longer knows any provider is warm for it and the
-        // next turn is priced cold. That is the conservative direction — a
-        // ledger that claimed a warm prefix for a conversation that just
-        // changed shape would be claiming a cache hit nobody can serve.
-        let session_id = self.conversations.fork(principal, &key);
-        self.create(&session_id).await?;
-        Ok((session_id, claimed))
+/// Resolve a cache key to the session holding its history, and to the part of
+/// `claimed` that session does not have yet.
+///
+/// The read is unleased and therefore a snapshot: a second request on the same
+/// cache key arriving before the first has appended would compute its delta
+/// against a prefix that is about to grow. Serializing turns within a
+/// conversation is the client's job — these APIs have no other way to order
+/// them, since a turn's input is defined by the one before it — and the
+/// engine's per-session gate keeps the log itself consistent regardless.
+///
+/// **A free function, `pub(crate)`, because prefix admission is what the two
+/// dialects share and not what distinguishes them.**
+/// [`messages_api`](crate::messages_api) resolves a *different* session name —
+/// a header or `metadata.user_id` rather than `prompt_cache_key` — and then
+/// asks exactly this question of it. A second copy would have been a second
+/// answer to "does the client's history still agree with ours", and the two
+/// would agree only until one of them learned something: the fork rule, the
+/// stamp-blind comparison in [`same_item`], and the retry-shaped empty suffix
+/// are each a decision that has to hold for a conversation *whichever* dialect
+/// it was opened on — a chained Relay serves one and dispatches the other.
+///
+/// The client's key is namespaced by [`ControlPlane::qualify`] rather than by a
+/// convention spelled here, because the id this mints is the id the native
+/// surface's namespace check will later be asked about: minting and checking
+/// are one function pair, and two spellings of the convention is how a
+/// namespace stops being one. The plane is the handler's snapshot rather than a
+/// fresh read: a session id minted under one compiled plane and checked under
+/// another is a session created and immediately unreachable.
+pub(crate) async fn bind_prefix<S, T>(
+    engine: &Engine<S, T>,
+    store: &S,
+    conversations: &Conversations,
+    plane: &ControlPlane,
+    principal: &Principal,
+    cache_key: &str,
+    claimed: Vec<Item>,
+) -> Result<(SessionId, Vec<Item>), ApiError>
+where
+    S: SessionStore,
+    T: Tokenizer + Clone + Send + Sync + 'static,
+{
+    // Computed once and used for both the fork counter and the session id, so
+    // the two cannot key on different strings. See [`Conversations`].
+    let key = plane.qualify(principal, cache_key);
+    let session_id = conversations.bind(principal, &key);
+    create_session(engine, &session_id).await?;
+    if let Some(delta) = suffix_after(&stored_items(store, &session_id).await?, &claimed) {
+        return Ok((session_id, delta));
     }
 
-    /// The client's cache key inside its caller's namespace.
-    ///
-    /// A cache key is chosen by the client and nothing stops two of them
-    /// choosing `main`. Before namespacing, both got the session called `main`:
-    /// one log, one lease, one warm prefix, and each tenant's conversation
-    /// visible in the other's prompt.
-    ///
-    /// Deferred to [`ControlPlane::qualify`] rather than spelled here, because
-    /// the id this mints is the id the native surface's namespace check will
-    /// later be asked about: minting and checking are one function pair, and
-    /// two spellings of the convention is how a namespace stops being one. The
-    /// prefix it produces is unambiguous because a project or user id may not
-    /// contain `/` — the config's slug rule is what buys that, and it is why
-    /// the rule is at the config boundary rather than here.
-    /// The plane is the handler's snapshot rather than a fresh read: a session
-    /// id minted under one compiled plane and checked under another is a
-    /// session created and immediately unreachable.
-    fn namespaced_key(
-        &self,
-        plane: &ControlPlane,
-        principal: &Principal,
-        cache_key: &str,
-    ) -> String {
-        plane.qualify(principal, cache_key)
-    }
+    // The client's history disagrees with what we stored — it edited or
+    // compacted the conversation, so what it is asking for is not a
+    // continuation of this session and appending the difference would produce a
+    // conversation neither side believes in. It gets a fresh internal session,
+    // which is empty and so agrees trivially; no second check is needed.
+    //
+    // The honest cost: the new session starts with no history, so the routing
+    // ledger no longer knows any provider is warm for it and the next turn is
+    // priced cold. That is the conservative direction — a ledger that claimed a
+    // warm prefix for a conversation that just changed shape would be claiming a
+    // cache hit nobody can serve.
+    let session_id = conversations.fork(principal, &key);
+    create_session(engine, &session_id).await?;
+    Ok((session_id, claimed))
+}
 
-    async fn create(&self, session_id: &SessionId) -> Result<(), ApiError> {
-        self.engine
-            .create_session(session_id)
+async fn create_session<S, T>(engine: &Engine<S, T>, session_id: &SessionId) -> Result<(), ApiError>
+where
+    S: SessionStore,
+    T: Tokenizer + Clone + Send + Sync + 'static,
+{
+    engine
+        .create_session(session_id)
+        .await
+        .map(|_| ())
+        .map_err(|error| ApiError::internal("engine_error", error.to_string()))
+}
+
+/// The session's committed conversation, projected from the log.
+///
+/// A projection rather than a [`Session`](roundhouse_core::session::Session):
+/// opening one takes the lease, and a read that took the lease would evict the
+/// turn it is about to start.
+async fn stored_items<S: SessionStore>(
+    store: &S,
+    session_id: &SessionId,
+) -> Result<Vec<Item>, ApiError> {
+    let mut items = Vec::new();
+    let mut cursor = 0u64;
+    loop {
+        let batch = store
+            .read_events(session_id, cursor, READ_BATCH)
             .await
-            .map(|_| ())
-            .map_err(|error| ApiError::internal("engine_error", error.to_string()))
+            .map_err(|error| store_error(session_id, error))?;
+        let Some(last) = batch.last() else { break };
+        cursor = last.seq;
+        items.extend(batch.into_iter().filter_map(|event| match event.kind {
+            SessionEventKind::ItemAppended { item } => Some(item),
+            _ => None,
+        }));
     }
-
-    /// The session's committed conversation, projected from the log.
-    ///
-    /// A projection rather than a [`Session`](roundhouse_core::session::Session):
-    /// opening one takes the lease, and a read that took the lease would evict
-    /// the turn it is about to start.
-    async fn stored_items(&self, session_id: &SessionId) -> Result<Vec<Item>, ApiError> {
-        let mut items = Vec::new();
-        let mut cursor = 0u64;
-        loop {
-            let batch = self
-                .store
-                .read_events(session_id, cursor, READ_BATCH)
-                .await
-                .map_err(|error| store_error(session_id, error))?;
-            let Some(last) = batch.last() else { break };
-            cursor = last.seq;
-            items.extend(batch.into_iter().filter_map(|event| match event.kind {
-                SessionEventKind::ItemAppended { item } => Some(item),
-                _ => None,
-            }));
-        }
-        Ok(items)
-    }
+    Ok(items)
 }
 
 /// The part of `claimed` that `stored` does not already contain.
@@ -709,9 +748,20 @@ impl<S: SessionStore, T: Tokenizer + Clone + Send + Sync + 'static> ResponsesFol
         }
         match &item.content {
             ItemContent::Text { text } if !self.item_open && !text.is_empty() => Some(text),
+            // The three M11.1 variants join the tool shapes here rather than
+            // getting arms of their own, and the reason is the same for all
+            // five: this dialect has no frame for them. A Responses client
+            // asked for `response.output_text`, and a thinking block relayed as
+            // one would put reasoning in the answer; relayed as anything else
+            // it would be an item type the client drops in silence. They can
+            // only reach a session through the Messages surface's
+            // canonicalization, and that surface is where they go back out.
             ItemContent::Text { .. }
             | ItemContent::ToolCall { .. }
-            | ItemContent::ToolResult { .. } => None,
+            | ItemContent::ToolResult { .. }
+            | ItemContent::Thinking { .. }
+            | ItemContent::RedactedThinking { .. }
+            | ItemContent::Opaque { .. } => None,
         }
     }
 

@@ -60,7 +60,7 @@ use roundhouse_server::control_config::crosscheck::CrossChecks;
 use roundhouse_server::{
     ControlDirectory, ControlPlane, ControlPlaneReads, Conversations, DirectoryError,
     EchoLocalExecutor, Engine, EngineConfig, FleetJudge, JudgeConfig, MemoryDirectoryStore,
-    admin_api, catalog_config, control_config, http, mcp_api, metrics_api, relay_api,
+    admin_api, catalog_config, control_config, http, mcp_api, messages_api, metrics_api, relay_api,
     responses_api,
 };
 use roundhouse_store_redis::{RedisSessionStore, RedisSpendLedger};
@@ -998,22 +998,23 @@ async fn serve<S: SessionStore>(
     }
     let engine = Arc::new(engine);
 
-    // Five surfaces, one process and one log: the native transport, which
+    // Seven surfaces, one process and one log: the native transport, which
     // exposes sessions and the log itself; the Responses API, which lets an
     // agent written against OpenAI drive the same sessions unmodified; the
-    // metrics surface, which reports on both by folding the same log; and the
-    // MCP control surface, which is the only one an agent rather than a client
-    // drives — it reads what the others did and lets the model ask to be routed
-    // to less than its key allows; and the admin plane, which is the only one
-    // that *writes* tenancy — and the reason every other router above holds the
-    // directory rather than a compiled plane, since a key revoked there has to
-    // stop working on all four.
-    // One control directory behind all five, not one each: a key that pays for
-    // a turn on one surface and is unknown to another would be a deployment
-    // with two answers to the same question.
-    // The same directory behind all five: the four read-only surfaces take it as
-    // a `PlaneSource` and re-resolve per request, and the admin plane takes it
-    // whole because it is the one that writes.
+    // Messages API, which does the same for Claude Code, whose native dialect
+    // that is; the Relay-format reads, which project the log into somebody
+    // else's document shapes; the metrics surface, which reports on all of them
+    // by folding the same log; the MCP control surface, which is the only one an
+    // agent rather than a client drives — it reads what the others did and lets
+    // the model ask to be routed to less than its key allows; and the admin
+    // plane, which is the only one that *writes* tenancy.
+    //
+    // One control directory behind all seven, not one each: a key that pays for
+    // a turn on one surface and is unknown to another would be a deployment with
+    // two answers to the same question. The six read-only surfaces take it as a
+    // `PlaneSource` and re-resolve per request — which is what makes a key
+    // revoked on the admin plane stop working on all of them, rather than only
+    // on whichever ones happened to be built after the revocation.
     let app = http::router(
         Arc::clone(&directory),
         Arc::clone(&engine),
@@ -1056,6 +1057,20 @@ async fn serve<S: SessionStore>(
         control,
     ))
     .merge(responses_api::responses_router(
+        Arc::clone(&directory),
+        Arc::clone(&engine),
+        Arc::clone(&store),
+        Arc::clone(&conversations),
+    ))
+    // The Messages API, which lets Claude Code drive the same sessions
+    // unmodified. Four arguments identical to the Responses surface's, and
+    // that sameness is the point: it is the same log under a second
+    // vocabulary, so the same directory revokes a key on it, the same engine
+    // runs its turns, and the same `Conversations` table answers "which
+    // session is this conversation" — an agent that narrowed its routing over
+    // MCP and then sent a turn on this surface has to reach the session the
+    // narrowing was installed against.
+    .merge(messages_api::messages_router(
         directory,
         engine,
         store,

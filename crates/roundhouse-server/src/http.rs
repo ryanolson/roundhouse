@@ -23,9 +23,20 @@
 //! not honor it.
 //!
 //! What a second transport needs is `pub(crate)` rather than private:
-//! [`responses_api`](crate::responses_api) follows the same log and answers the
-//! same pre-stream failures, and a second copy of the cursor or of the error
+//! [`responses_api`](crate::responses_api) and
+//! [`messages_api`](crate::messages_api) follow the same log and answer the same
+//! pre-stream failures, and a second copy of the cursor or of the error
 //! vocabulary would be a second thing to keep in agreement with this one.
+//!
+//! [`ApiError`] is the one exception and is `pub`. Not because anything outside
+//! the crate constructs one — its constructors and fields stay crate-private,
+//! so from outside it is a value you can render and nothing else — but because
+//! `messages_api`'s canonicalization is a *public pure function* that returns
+//! it. That module is public so the conformance oracle (plan R6 tier 1) can
+//! drive the projection directly from `tests/` rather than only over a socket,
+//! which is the same reason the dispatch side's wire module is public. The
+//! alternative was a second refusal type at that boundary, converted here,
+//! which is a type whose only job is to keep a `pub` off this one.
 
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
@@ -203,8 +214,11 @@ impl InputItem {
 /// Once a turn is admitted its failures are log events, and the stream carries
 /// them; this covers only what can go wrong first — a body we cannot read, a
 /// session that does not exist, a store that is down.
+/// Public, but only as a value: every constructor and every field below is
+/// crate-private, so the surface this exposes is `Debug` and `IntoResponse`.
+/// See the module doc for why it is public at all.
 #[derive(Debug)]
-pub(crate) struct ApiError {
+pub struct ApiError {
     status: StatusCode,
     code: &'static str,
     message: String,
@@ -305,6 +319,63 @@ impl ApiError {
             message: message.into(),
             detail: None,
         }
+    }
+
+    /// A refusal at a status the named constructors above do not cover.
+    ///
+    /// Deliberately last and deliberately awkward to reach: the constructors
+    /// above are named for *what was refused* precisely so that a status is
+    /// chosen once per kind of refusal rather than per call site. This exists
+    /// for the one caller that is inverting a refusal rather than making one —
+    /// [`messages_api`](crate::messages_api)'s non-streaming path, which has a
+    /// terminal wire error in hand and a status code still available to express
+    /// it — and reaching for it anywhere a named constructor fits would be how
+    /// two spellings of one refusal start.
+    pub(crate) fn refused(
+        status: StatusCode,
+        code: &'static str,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            status,
+            code,
+            message: message.into(),
+            detail: None,
+        }
+    }
+
+    /// The three parts, for a transport that renders refusals in someone else's
+    /// envelope.
+    ///
+    /// Readers rather than public fields, and readers rather than a second
+    /// error type. [`messages_api`](crate::messages_api) answers a pre-stream
+    /// refusal in Anthropic's `{"type":"error","error":{…}}` shape, which is a
+    /// *rendering* of the same refusal this type already carries — the status,
+    /// the code and the sentence are decided once, at the seam that refused,
+    /// and each surface spells them the way its own client parses. A parallel
+    /// error type would have made every refusal in `control_config` and
+    /// `http` exist twice, and the second copy is the one that drifts: a
+    /// deployment whose fair-use ceiling refused with a window on one surface
+    /// and without it on the other would be one ceiling reported as two.
+    ///
+    /// [`Self::detail`] is what carries the fair-use `429`'s machine-readable
+    /// fields, and it is why this is three readers and not just a message: an
+    /// agent acts on `resets_at`, and a renderer that could only reach the
+    /// English would drop the one part of that refusal a client can use.
+    pub(crate) fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    pub(crate) fn code(&self) -> &'static str {
+        self.code
+    }
+
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
+
+    pub(crate) fn detail(&self) -> Option<&Value> {
+        self.detail.as_ref()
     }
 }
 

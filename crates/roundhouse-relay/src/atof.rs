@@ -272,7 +272,19 @@ fn request_payload(turn: &TurnRecord) -> Option<Value> {
                 "tool_call_id": call_id,
                 "content": output,
             })),
-            ItemContent::ToolCall { .. } => None,
+            // Dropped, for the reason the tool-call arm above is dropped: ATOF's
+            // chat-completions shape has no field for any of them. The nearest
+            // fit would be an assistant message whose `content` is the
+            // reasoning, and that is worse than omission — it publishes the
+            // model's scratch space into an instrumentation feed *as the
+            // answer*, where a downstream consumer scoring response quality
+            // would read deliberation as output. An opaque block is a shape
+            // nobody here has interpreted, and inventing a message body for it
+            // would be interpreting it.
+            ItemContent::ToolCall { .. }
+            | ItemContent::Thinking { .. }
+            | ItemContent::RedactedThinking { .. }
+            | ItemContent::Opaque { .. } => None,
         })
         .collect();
     (!messages.is_empty()).then(|| json!({ "messages": messages }))
