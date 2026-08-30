@@ -46,14 +46,19 @@
 //! accumulator's. A `tool_use` block opens on `content_block_start` carrying its
 //! id and name, its arguments arrive as `input_json_delta` fragments that are
 //! not JSON on their own, and the call is only knowable at that block's
-//! `content_block_stop`. Three consequences, each a rule below: the index is the
+//! `content_block_stop`. Four consequences, each a rule below: the index is the
 //! discriminator, because a turn may interleave text and several tool blocks and
 //! nothing else distinguishes their fragments; a block that never closes emits
 //! nothing, the same discipline as the missing `Done` above and for the same
 //! reason — half a set of arguments is not a smaller tool call, it is one no
-//! consumer can parse; and the two lifecycle frames are read *leniently*, so a
-//! malformed one loses the call it described rather than failing a turn that had
-//! already been served.
+//! consumer can parse; a block that *does* close over fragments that still do
+//! not reassemble into JSON is answered the same way (F7, M11.2a review) — a
+//! `content_block_stop` proves the provider stopped sending, not that what it
+//! sent parses, and garbage is not a smaller call either, so nothing downstream
+//! of this file (the log commit, both serve projections) ever holds a
+//! `FrontierChunk::ToolCall` whose arguments do not parse; and the two lifecycle
+//! frames are read *leniently*, so a malformed one loses the call it described
+//! rather than failing a turn that had already been served.
 //!
 //! [`Usage`]: roundhouse_core::event::Usage
 
@@ -172,14 +177,34 @@ struct ToolBlock {
 }
 
 impl ToolBlock {
-    /// The completed call this block describes.
+    /// The completed call this block describes, or `None` if the reassembled
+    /// arguments do not parse as JSON.
     ///
     /// The `{}` fallback is the wire's own answer and not an invention: a tool
     /// that takes no arguments streams a `content_block_start` with `input: {}`
     /// and no fragments at all, so the empty object is what the provider said.
     /// The alternative — an empty `arguments` string — is not valid JSON, and
     /// every consumer downstream would have to special-case it.
-    fn into_chunk(self) -> FrontierChunk {
+    ///
+    /// **The parse gate is F7 (M11.2a thermo-nuclear review).** Before it, a
+    /// block that closed over an unparseable concatenation — a connection that
+    /// died one fragment early, still followed by a `content_block_stop` —
+    /// reached `FrontierChunk::ToolCall` anyway, and the two serve projections
+    /// each covered for it differently: `canonical_arguments` (`item.rs`) passes
+    /// a non-JSON string through unchanged, so the log committed it; streaming
+    /// forwarded those exact bytes as the block's one `input_json_delta`
+    /// fragment and Claude Code's own accumulator threw closing it, while
+    /// non-streaming silently substituted `{}` for the same call
+    /// (`messages_api.rs`'s `BlockAccumulator::close`) — one stored item, one
+    /// throw and one lie. This is the one seam that can tell "final and
+    /// well-formed" apart from "final and garbage": downstream of this function
+    /// neither serve path has any memory of whether the arguments it is holding
+    /// came from a stream that actually finished. Dropping the call here —
+    /// rather than downstream, and rather than repairing it — is this file's
+    /// existing answer to a block whose fragments describe less than a full
+    /// call, extended from "never closed" to "closed over the wrong bytes":
+    /// nothing, rather than something no consumer can check.
+    fn into_chunk(self) -> Option<FrontierChunk> {
         let arguments = match (self.fragments.is_empty(), self.seed) {
             (false, _) => self.fragments,
             // `input` defaults to `Value::Null` when the frame omitted it
@@ -189,11 +214,19 @@ impl ToolBlock {
             (true, Value::Null) => "{}".to_string(),
             (true, seed) => seed.to_string(),
         };
-        FrontierChunk::ToolCall {
+        // The two `seed`-only arms above always produce valid JSON (`{}`, or a
+        // `Value`'s own `to_string()`), so only the fragment-concatenation arm
+        // can fail this — but gating uniformly, rather than only on that arm,
+        // is what keeps this the one check every path through `arguments` has
+        // to clear, present tense or future.
+        if serde_json::from_str::<Value>(&arguments).is_err() {
+            return None;
+        }
+        Some(FrontierChunk::ToolCall {
             id: self.id,
             name: self.name,
             arguments,
-        }
+        })
     }
 }
 
@@ -459,8 +492,14 @@ impl SseDecoder {
                 else {
                     return Ok(());
                 };
-                if let Some(block) = self.tool_blocks.remove(&index) {
-                    self.pending.push_back(block.into_chunk());
+                // F7: `into_chunk` answers `None` for a block whose reassembled
+                // arguments do not parse, and that answer is "drop the call",
+                // not "queue nothing and fail the turn" — the turn was already
+                // served and every other frame in it still stands.
+                if let Some(block) = self.tool_blocks.remove(&index)
+                    && let Some(chunk) = block.into_chunk()
+                {
+                    self.pending.push_back(chunk);
                 }
                 Ok(())
             }
@@ -1333,6 +1372,64 @@ mod tests {
                 name: "Bash".into(),
                 arguments: r#"{"command":"ls"}"#.into(),
             }
+        );
+    }
+
+    /// **F7 (M11.2a thermo-nuclear review).** A `content_block_stop` whose
+    /// reassembled fragments do not parse as JSON drops the call — the same
+    /// answer this decoder gives a block that never closes at all — so nothing
+    /// downstream (the log commit, both serve projections) ever holds a
+    /// `FrontierChunk::ToolCall` with unparseable arguments.
+    ///
+    /// PROBE: a block that *does* receive its `content_block_stop`, but whose
+    /// one fragment is `{"command": "ls -la"` — a complete key/value pair with
+    /// no closing brace, exactly what a connection that died one fragment early
+    /// produces. Before the fix this reached the log, and the two serve
+    /// projections disagreed about the identical stored call — see
+    /// `messages_api.rs`'s own F7 evidence for the client-visible half of that.
+    #[test]
+    fn a_closed_block_whose_arguments_never_parse_emits_no_call() {
+        let chunks = decode(&[
+            START,
+            &block_start(
+                0,
+                r#"{"type":"tool_use","id":"toolu_01E","name":"Bash","input":{}}"#,
+            ),
+            &json_delta(0, r#"{\"command\": \"ls -la\""#),
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            &stop_because("tool_use"),
+            STOP,
+        ])
+        .unwrap();
+        assert_eq!(chunks.len(), 1, "only the accounting frame: {chunks:?}");
+        assert!(matches!(chunks[0], FrontierChunk::Done { .. }));
+
+        // CONTROL: a parseable-but-weird argument string — unusual whitespace,
+        // nothing a model would normally produce — still reaches the client
+        // verbatim. The gate above is "does this parse", never "does this look
+        // ordinary", and this is what proves the PROBE above failed for being
+        // invalid JSON and not merely for looking unfamiliar.
+        let weird = decode(&[
+            START,
+            &block_start(
+                0,
+                r#"{"type":"tool_use","id":"toolu_01F","name":"Bash","input":{}}"#,
+            ),
+            &json_delta(0, r#"{ \"command\" : \"ls -la\" }"#),
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            &stop_because("tool_use"),
+            STOP,
+        ])
+        .unwrap();
+        assert_eq!(
+            weird[0],
+            FrontierChunk::ToolCall {
+                id: "toolu_01F".into(),
+                name: "Bash".into(),
+                arguments: r#"{ "command" : "ls -la" }"#.into(),
+            },
+            "a parseable-but-unusual argument string must pass through \
+             untouched, not be refused or reformatted: {weird:?}"
         );
     }
 

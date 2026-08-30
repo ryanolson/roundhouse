@@ -288,6 +288,26 @@ impl SessionStore for RedisSessionStore {
             .await
     }
 
+    /// `EXISTS` on the lease key, which is the whole answer here.
+    ///
+    /// Expiry needs no arithmetic: the lease is a Redis key with a TTL, so a
+    /// tenure that stopped renewing has already stopped existing — the same
+    /// authority `acquire` runs on, rather than this process's clock compared
+    /// against a stored deadline. The session's own existence is checked
+    /// alongside it for the reason [`Self::last_seq`] checks it: a missing
+    /// session is a caller error, and answering "not leased" for one would let
+    /// it read as an ordinary idle session.
+    async fn is_leased(&self, session_id: &SessionId) -> Result<bool, StoreError> {
+        let (exists, leased): (bool, bool) = redis::pipe()
+            .exists(meta_key(session_id))
+            .exists(lease_key(session_id))
+            .query_async(&mut self.conn.clone())
+            .await
+            .map_err(backend)?;
+        Self::require_session(exists, session_id)?;
+        Ok(leased)
+    }
+
     async fn append_events(
         &self,
         lease: &Lease,

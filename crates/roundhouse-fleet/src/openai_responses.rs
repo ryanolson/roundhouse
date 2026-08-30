@@ -226,7 +226,15 @@ impl OpenAiResponsesClient {
     /// to the client rather than to the dialect that currently happens to need
     /// no help. A client that skipped it would be correct today and silently
     /// unaccounted the day its catalog entry moved to Chat Completions.
-    fn body(quote: &FrontierQuote, model: &str) -> Value {
+    ///
+    /// **Fallible since M11.2a's F1**, and only for one reason: a toolbox
+    /// declared on another dialect that cannot be honestly restated in this one
+    /// is refused here, before a socket, rather than posted and 400'd. Nothing
+    /// else in this function can fail.
+    fn body(quote: &FrontierQuote, model: &str) -> Result<Value, FrontierError> {
+        // Resolved first, because it can refuse -- see
+        // [`FrontierQuote::tools_for`].
+        let (tools, tool_choice) = quote.tools_for(SPOKEN)?;
         let mut body = json!({
             "model": model,
             "stream": true,
@@ -265,14 +273,20 @@ impl OpenAiResponsesClient {
         // 400 here; it is still not sent, because "the caller declared no tools"
         // and "the caller declared no tools *very explicitly*" are the same
         // fact, and one spelling is enough.
-        if let Some(tools) = &quote.tools {
-            body["tools"] = tools.clone();
+        //
+        // **"Verbatim" is a property of the pairing rather than of these two
+        // lines**, since M11.2a's F1: `tools_for` above hands back the client's
+        // own bytes when the declaring surface spoke this dialect, a faithful
+        // restatement of the plain function-tool core when it did not, and a
+        // refusal for anything it cannot restate.
+        if let Some(tools) = tools {
+            body["tools"] = tools;
         }
-        if let Some(tool_choice) = &quote.tool_choice {
-            body["tool_choice"] = tool_choice.clone();
+        if let Some(tool_choice) = tool_choice {
+            body["tool_choice"] = tool_choice;
         }
         quote.wire_protocol.enforce_usage_reporting(&mut body);
-        body
+        Ok(body)
     }
 
     /// The headers, the base URL and the HTTP client this credential implies.
@@ -383,12 +397,15 @@ impl FrontierClient for OpenAiResponsesClient {
             });
         }
 
+        // Before the route is resolved, so a toolbox this client cannot restate
+        // never reaches a credential, let alone a socket.
+        let body = Self::body(quote, model)?;
         let route = self.route(&quote.credential, provider)?;
         let response = route
             .client
             .post(format!("{}{}", route.base, self.responses_path))
             .headers(route.headers.clone())
-            .json(&Self::body(quote, model))
+            .json(&body)
             .send()
             .await
             .map_err(|source| {
@@ -495,6 +512,7 @@ fn redact_error(credential: &TurnCredential, error: FrontierError) -> FrontierEr
         other @ (FrontierError::UnknownProvider(_)
         | FrontierError::Credential(_)
         | FrontierError::MalformedQuote(_)
+        | FrontierError::UntranslatableTools { .. }
         | FrontierError::UnsupportedDialect { .. }
         | FrontierError::Transport { .. }) => other,
     }
@@ -545,7 +563,20 @@ mod tests {
             // control for "a quote with none sends no `tools` key".
             tools: None,
             tool_choice: None,
+            // And no dialect stamp, which is the honest answer for a quote with
+            // nothing to stamp — see `FrontierQuote::tools_dialect`.
+            tools_dialect: None,
             credential,
+        }
+    }
+
+    /// A quote whose toolbox was declared in `dialect`.
+    fn declaring(dialect: WireProtocol, tools: Value, tool_choice: Option<Value>) -> FrontierQuote {
+        FrontierQuote {
+            tools: Some(tools),
+            tool_choice,
+            tools_dialect: Some(dialect),
+            ..quote(TurnCredential::Absent, SPOKEN)
         }
     }
 
@@ -591,7 +622,8 @@ mod tests {
 
     #[test]
     fn the_body_carries_the_cache_key_and_the_usage_obligation_is_wired() {
-        let body = OpenAiResponsesClient::body(&quote(TurnCredential::Absent, SPOKEN), "flagship");
+        let body = OpenAiResponsesClient::body(&quote(TurnCredential::Absent, SPOKEN), "flagship")
+            .expect("a quote with no tools cannot refuse");
         assert_eq!(body["model"], json!("flagship"));
         assert_eq!(body["stream"], json!(true));
         assert_eq!(body["prompt_cache_key"], json!("sess_openai"));
@@ -622,14 +654,14 @@ mod tests {
     fn a_declared_ceiling_outranks_the_pricing_estimate() {
         let mut quote = quote(TurnCredential::Absent, SPOKEN);
         assert_eq!(
-            OpenAiResponsesClient::body(&quote, "flagship")["max_output_tokens"],
+            OpenAiResponsesClient::body(&quote, "flagship").unwrap()["max_output_tokens"],
             json!(512),
             "with no declared cap this client keeps the estimate it shipped with"
         );
 
         quote.output_token_cap = Some(64_000);
         assert_eq!(
-            OpenAiResponsesClient::body(&quote, "flagship")["max_output_tokens"],
+            OpenAiResponsesClient::body(&quote, "flagship").unwrap()["max_output_tokens"],
             json!(64_000),
             "the client asked for 64 000 tokens; a 512-token pricing estimate is \
              not an answer to that question"
@@ -656,18 +688,92 @@ mod tests {
         ]);
         let tool_choice = json!({ "type": "function", "name": "shell" });
 
-        let mut with_tools = quote(TurnCredential::Absent, SPOKEN);
-        with_tools.tools = Some(tools.clone());
-        with_tools.tool_choice = Some(tool_choice.clone());
-        let body = OpenAiResponsesClient::body(&with_tools, "flagship");
+        // Declared *in this dialect*, which is what makes "verbatim" the
+        // contract here: a surface that spoke another dialect gets a faithful
+        // restatement instead, pinned by
+        // `an_anthropic_shaped_toolbox_is_restated_in_this_dialect_before_it_is_sent`.
+        let with_tools = declaring(SPOKEN, tools.clone(), Some(tool_choice.clone()));
+        let body = OpenAiResponsesClient::body(&with_tools, "flagship")
+            .expect("a same-dialect toolbox is forwarded, never examined");
         assert_eq!(body["tools"], tools);
         assert_eq!(body["tool_choice"], tool_choice);
 
         // CONTROL: nothing declared, no key at all — which is what every
         // internal caller sends and what this client sent before M11.2.
-        let bare = OpenAiResponsesClient::body(&quote(TurnCredential::Absent, SPOKEN), "flagship");
+        let bare = OpenAiResponsesClient::body(&quote(TurnCredential::Absent, SPOKEN), "flagship")
+            .expect("no tools, nothing to refuse");
         assert!(bare.get("tools").is_none());
         assert!(bare.get("tool_choice").is_none());
+    }
+
+    /// **F1, this client's half: a toolbox declared on the *other* dialect is
+    /// restated before it is sent, never forwarded and never thinned.**
+    ///
+    /// The scenario the review found, in its shipped form: a Claude Code turn
+    /// arrives on the Messages surface with twenty-four
+    /// `{name, description, input_schema}` declarations, and routing sends it to
+    /// one of `catalog.example.json`'s four `openai_responses` entries because
+    /// that entry is cheaper. `plan` reads no dialect, `connect` copies the
+    /// client's raw JSON onto the quote, and this client used to put whatever
+    /// `tools` held under the wire body's `"tools"` key unexamined — so the
+    /// upstream got a tool array with no `type` and no `parameters`, 400'd, and
+    /// the failover repeated it on the next Responses candidate.
+    #[test]
+    fn an_anthropic_shaped_toolbox_is_restated_in_this_dialect_before_it_is_sent() {
+        let anthropic_shaped = json!([{
+            "name": "Grep",
+            "description": "search",
+            "input_schema": { "type": "object", "properties": { "pattern": { "type": "string" } } },
+        }]);
+        let body = OpenAiResponsesClient::body(
+            &declaring(
+                WireProtocol::AnthropicMessages,
+                anthropic_shaped.clone(),
+                Some(json!({ "type": "any" })),
+            ),
+            "flagship",
+        )
+        .expect("a plain function tool restates faithfully");
+
+        assert_eq!(
+            body["tools"],
+            json!([{
+                "type": "function",
+                "name": "Grep",
+                "description": "search",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "pattern": { "type": "string" } },
+                },
+            }]),
+            "the Responses wire requires `type: function` and spells the schema \
+             `parameters`; Anthropic's spelling is a 400 on every tool-using turn"
+        );
+        assert_eq!(body["tool_choice"], json!("required"));
+        assert_ne!(
+            body["tools"], anthropic_shaped,
+            "and it is emphatically not what the client sent"
+        );
+
+        // PROBE: an Anthropic server tool, which roundhouse cannot run on
+        // OpenAI's behalf and must not silently drop -- a model told about a
+        // smaller toolbox than the client declared is the failure nobody debugs.
+        let error = OpenAiResponsesClient::body(
+            &declaring(
+                WireProtocol::AnthropicMessages,
+                json!([{ "type": "web_search_20250305", "name": "web_search", "max_uses": 5 }]),
+                None,
+            ),
+            "flagship",
+        )
+        .expect_err("a server tool has no Responses spelling");
+        assert!(
+            matches!(&error, FrontierError::UntranslatableTools { tool, from, to }
+                if tool == "web_search"
+                    && *from == "anthropic_messages"
+                    && *to == "openai_responses"),
+            "{error}"
+        );
     }
 
     /// **P3: the outbound body names only fields OpenRouter's schema has.**
@@ -687,7 +793,8 @@ mod tests {
     /// while a third arrived.
     #[test]
     fn the_outbound_body_names_only_fields_both_responses_schemas_have() {
-        let body = OpenAiResponsesClient::body(&quote(TurnCredential::Absent, SPOKEN), "kimi-k3");
+        let body = OpenAiResponsesClient::body(&quote(TurnCredential::Absent, SPOKEN), "kimi-k3")
+            .expect("no tools, nothing to refuse");
         let sent: Vec<&str> = body
             .as_object()
             .expect("the body is an object")
@@ -739,13 +846,13 @@ mod tests {
         flat.segment_boundaries.clear();
 
         assert_eq!(
-            OpenAiResponsesClient::body(&structured, "flagship"),
-            OpenAiResponsesClient::body(&flat, "flagship"),
+            OpenAiResponsesClient::body(&structured, "flagship").unwrap(),
+            OpenAiResponsesClient::body(&flat, "flagship").unwrap(),
             "the Responses body must be byte-identical whether or not the quote \
              knows its item boundaries"
         );
         // And it is still one flat string in one message, not a block list.
-        let body = OpenAiResponsesClient::body(&structured, "flagship");
+        let body = OpenAiResponsesClient::body(&structured, "flagship").unwrap();
         assert_eq!(body["input"][0]["content"].as_array().unwrap().len(), 1);
         assert_eq!(body["input"][0]["content"][0]["text"], json!(flat.prompt));
     }

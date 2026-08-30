@@ -1517,6 +1517,7 @@ async fn the_declared_baseline_is_recorded_and_changes_no_route() {
                 output_token_cap: None,
                 tools: None,
                 tool_choice: None,
+                tools_dialect: None,
             },
             &admission_with(PickerMode::CapableFirst),
         )
@@ -1551,6 +1552,7 @@ async fn the_declared_baseline_is_recorded_and_changes_no_route() {
                 output_token_cap: None,
                 tools: None,
                 tool_choice: None,
+                tools_dialect: None,
             },
             &admission_with(PickerMode::CapableFirst),
         )

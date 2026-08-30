@@ -1308,6 +1308,7 @@ mod tests {
                 output_token_cap: None,
                 tools: None,
                 tool_choice: None,
+                tools_dialect: None,
                 credential: roundhouse_core::control::TurnCredential::Absent,
             };
             let Err(error) = client.execute(&quote(refused)).await else {

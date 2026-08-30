@@ -47,14 +47,15 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::ServiceExt;
 
 use roundhouse_core::context::ByteTokenizer;
-use roundhouse_core::event::SessionEventKind;
+use roundhouse_core::event::{SessionEvent, SessionEventKind};
 use roundhouse_core::ids::SessionId;
 use roundhouse_core::item::{Item, ItemContent, Role};
-use roundhouse_core::routing::AffinityPolicy;
-use roundhouse_core::store::{MemoryStore, SessionStore};
+use roundhouse_core::routing::{AffinityPolicy, CacheModel, ProviderPricing};
+use roundhouse_core::store::{Lease, MemoryStore, SessionStore, StoreError};
 use roundhouse_core::validate::{BriefConfig, Objective, ValidationBrief};
 use roundhouse_fleet::{
-    EchoFrontierClient, FrontierChunk, FrontierClient, FrontierError, FrontierQuote, FrontierStream,
+    EchoFrontierClient, FrontierChunk, FrontierClient, FrontierError, FrontierModelSpec,
+    FrontierQuote, FrontierStream, LocalFleet, StaticFrontierCatalog, WireProtocol,
 };
 use roundhouse_server::messages_api::wire::{CreateMessageParams, canonicalize, session_key};
 use roundhouse_server::{
@@ -63,12 +64,12 @@ use roundhouse_server::{
 
 mod common;
 use common::anthropic::{
-    Accumulated, AccumulatedCall, StrictBlock, StrictErrorKind, StrictStopReason, audit,
-    split_frames,
+    Accumulated, AccumulatedCall, StrictBlock, StrictErrorKind, StrictEvent, StrictStopReason,
+    audit, split_frames,
 };
 use common::{
-    Scripted, ScriptedFrontierClient, ToolCallingFrontierClient, config, frontier_catalog, key,
-    sha256_hex,
+    MINUTE, Scripted, ScriptedFrontierClient, ToolCallingFrontierClient, config, embedded_fleet,
+    frontier_catalog, key, sha256_hex,
 };
 
 /// What the echo provider answers with, and therefore what a turn says.
@@ -148,6 +149,120 @@ fn surface_scripted() -> (Router, Arc<MemoryStore>, Arc<ScriptedFrontierClient>)
         messages_router(
             ControlPlane::open(),
             engine_scripted(Arc::clone(&store), Arc::clone(&client)),
+            Arc::clone(&store),
+            Arc::new(Conversations::new()),
+        ),
+        store,
+        client,
+    )
+}
+
+/// F1: a catalog whose one entry speaks the Responses dialect — everything
+/// else copied from [`frontier_catalog`], so the only variable a test built on
+/// this changes is `wire_protocol`.
+///
+/// The point is what this is dispatched *against*: this suite's surface is
+/// `/v1/messages`, which parses Anthropic-shaped `tools`
+/// (`{name, description, input_schema}`) and threads them verbatim onto
+/// whatever the router picks (`ClientDeclarations` in `engine.rs`, no dialect
+/// read anywhere on that path). A deployment whose catalog names an
+/// `openai_responses` provider — `examples/catalog.example.json` ships four —
+/// makes this exact pairing reachable from a real client, not a hand-built one.
+fn cross_dialect_catalog() -> StaticFrontierCatalog {
+    StaticFrontierCatalog::new(vec![FrontierModelSpec {
+        provider: "openrouter".into(),
+        model: "cross-dialect-flagship".into(),
+        wire_protocol: WireProtocol::OpenAiResponses,
+        cache_model: CacheModel::Deterministic { ttl_ms: 5 * MINUTE },
+        pricing: ProviderPricing {
+            input_per_mtok_usd: 3.0,
+            cached_input_per_mtok_usd: 0.3,
+            cache_write_per_mtok_usd: 3.75,
+            output_per_mtok_usd: 15.0,
+        },
+        quality_prior: 0.95,
+        base_ttft_ms: 350.0,
+        ttft_ms_per_uncached_token: 0.002,
+    }])
+}
+
+/// As [`engine_scripted`], but over [`cross_dialect_catalog`] rather than
+/// [`frontier_catalog`] — the only difference from an ordinary scripted engine
+/// is which dialect the sole candidate is quoted as speaking.
+fn engine_scripted_cross_dialect(
+    store: Arc<MemoryStore>,
+    client: Arc<ScriptedFrontierClient>,
+) -> Arc<Engine<MemoryStore, ByteTokenizer>> {
+    Arc::new(Engine::new(
+        Arc::clone(&store),
+        ByteTokenizer,
+        Arc::new(EchoLocalExecutor::new("local answer")),
+        cross_dialect_catalog(),
+        client,
+        Arc::new(AffinityPolicy::new()),
+        config(),
+    ))
+}
+
+/// As [`surface_scripted`], but wired to [`engine_scripted_cross_dialect`] —
+/// the Anthropic Messages surface in front of a catalog that resolves to a
+/// Responses-dialect target.
+fn surface_scripted_cross_dialect() -> (Router, Arc<MemoryStore>, Arc<ScriptedFrontierClient>) {
+    let store = Arc::new(MemoryStore::new());
+    let client = Arc::new(ScriptedFrontierClient::new(ANSWER));
+    (
+        messages_router(
+            ControlPlane::open(),
+            engine_scripted_cross_dialect(Arc::clone(&store), Arc::clone(&client)),
+            Arc::clone(&store),
+            Arc::new(Conversations::new()),
+        ),
+        store,
+        client,
+    )
+}
+
+/// F2: an engine with a live local option, so a turn can actually land there.
+///
+/// Every other rig in this file wires `fleet: None` (`Engine::new`'s default),
+/// which makes `plan`'s `local_quote` unconditionally `None` and every request
+/// in this suite a frontier dispatch regardless of what it asks for — fine for
+/// the dialect and tool-shape questions this file otherwise answers, wrong for
+/// a claim about what a client loses *on the local path specifically*.
+/// [`common::embedded_fleet`] plus [`frontier_catalog`] is the same pairing
+/// `turn_lifecycle.rs` (`a_turn_longer_than_the_lease_ttl_still_commits`) and
+/// `tier_selection.rs` (`rig_with_fleet`) already prove routes local by
+/// default: one free registered worker beside one $3/$15-per-Mtok frontier
+/// candidate, so local wins on price with nothing else in play.
+async fn engine_scripted_with_fleet(
+    store: Arc<MemoryStore>,
+    client: Arc<ScriptedFrontierClient>,
+) -> Arc<Engine<MemoryStore, ByteTokenizer>> {
+    Arc::new(
+        Engine::new(
+            Arc::clone(&store),
+            ByteTokenizer,
+            Arc::new(EchoLocalExecutor::new("local answer")),
+            frontier_catalog(),
+            client,
+            Arc::new(AffinityPolicy::new()),
+            config(),
+        )
+        .with_fleet(embedded_fleet().await as Arc<dyn LocalFleet>),
+    )
+}
+
+/// As [`surface_scripted`], but wired to [`engine_scripted_with_fleet`] — same
+/// catalog, same config, same policy, plus the one difference the F2 finding is
+/// about: a local candidate that is actually reachable and, on price alone, the
+/// one `plan` prefers.
+async fn surface_scripted_with_fleet() -> (Router, Arc<MemoryStore>, Arc<ScriptedFrontierClient>) {
+    let store = Arc::new(MemoryStore::new());
+    let client = Arc::new(ScriptedFrontierClient::new(ANSWER));
+    (
+        messages_router(
+            ControlPlane::open(),
+            engine_scripted_with_fleet(Arc::clone(&store), Arc::clone(&client)).await,
             Arc::clone(&store),
             Arc::new(Conversations::new()),
         ),
@@ -288,6 +403,199 @@ impl FrontierClient for PartialThenFailClient {
 fn surface_partial_then_fail() -> (Router, Arc<MemoryStore>, Arc<PartialThenFailClient>) {
     let store = Arc::new(MemoryStore::new());
     let client = Arc::new(PartialThenFailClient::new());
+    let engine = Arc::new(Engine::new(
+        Arc::clone(&store),
+        ByteTokenizer,
+        Arc::new(EchoLocalExecutor::new("local answer")),
+        frontier_catalog(),
+        Arc::clone(&client) as Arc<dyn FrontierClient>,
+        Arc::new(AffinityPolicy::new()),
+        config(),
+    ));
+    (
+        messages_router(
+            ControlPlane::open(),
+            engine,
+            Arc::clone(&store),
+            Arc::new(Conversations::new()),
+        ),
+        store,
+        client,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// F3: a durable tool call whose response never terminates (review of
+// b8e8ddd)
+// ---------------------------------------------------------------------------
+
+/// F3's provider double: the first call streams one tool call and nothing
+/// else -- so `dispatch`'s `trailing` is `None` and `Session::complete`'s
+/// batch holds only the terminal event, never an item alongside it. Every
+/// later call answers in plain text, so a retry that lands on a fresh
+/// dispatch (see [`DropsFirstTerminalWrite`]: nothing ever marks the first
+/// response complete, so `begin_turn`'s dedup lookup misses and a fresh
+/// dispatch is exactly what happens) produces an ordinary, comparable reply
+/// rather than the same tool call a second time.
+const F3_RETRY_REPLY: &str = "a clean answer once the retry landed";
+
+struct ToolCallThenTextClient {
+    calls: AtomicUsize,
+}
+
+impl ToolCallThenTextClient {
+    fn new() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl FrontierClient for ToolCallThenTextClient {
+    async fn execute(&self, quote: &FrontierQuote) -> Result<FrontierStream, FrontierError> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Ok(futures::stream::iter([
+                Ok(FrontierChunk::ToolCall {
+                    id: "toolu_01".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: r#"{"path":"/tmp/x"}"#.to_string(),
+                }),
+                Ok(FrontierChunk::Done {
+                    input_tokens: quote.prompt.len() as u64,
+                    cached_input_tokens: 0,
+                    cache_write_tokens: 0,
+                    output_tokens: 8,
+                    reasoning_tokens: 0,
+                    provider_reported_cost: None,
+                    stop_reason: Some("tool_use".to_string()),
+                }),
+            ])
+            .boxed());
+        }
+        Ok(futures::stream::iter([
+            Ok(FrontierChunk::OutputText(F3_RETRY_REPLY.to_string())),
+            Ok(FrontierChunk::Done {
+                input_tokens: quote.prompt.len() as u64,
+                cached_input_tokens: 0,
+                cache_write_tokens: 0,
+                output_tokens: F3_RETRY_REPLY.len() as u64,
+                reasoning_tokens: 0,
+                provider_reported_cost: None,
+                stop_reason: Some("end_turn".to_string()),
+            }),
+        ])
+        .boxed())
+    }
+}
+
+/// F3's store double: drops exactly one terminal-event append -- the shape
+/// the finding names, "a lease renewal misses its window, or redis blips for
+/// the seconds the turn is mid-flight." Every other append succeeds
+/// normally, including the one `append_emitted` makes for the tool call
+/// immediately *before* the dropped one on the same lease -- so the durable
+/// orphan item and the missing terminal are the only two facts this fixture
+/// manufactures, nothing else about the turn is disturbed, and every later
+/// turn's own terminal write succeeds.
+struct DropsFirstTerminalWrite {
+    inner: MemoryStore,
+    terminal_writes_seen: AtomicUsize,
+}
+
+impl DropsFirstTerminalWrite {
+    fn new() -> Self {
+        Self {
+            inner: MemoryStore::new(),
+            terminal_writes_seen: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl SessionStore for DropsFirstTerminalWrite {
+    async fn create_session(
+        &self,
+        session_id: &SessionId,
+        model_policy: &str,
+    ) -> Result<bool, StoreError> {
+        self.inner.create_session(session_id, model_policy).await
+    }
+
+    async fn acquire_lease(
+        &self,
+        session_id: &SessionId,
+        node_id: &str,
+        ttl_ms: u64,
+    ) -> Result<Option<Lease>, StoreError> {
+        self.inner.acquire_lease(session_id, node_id, ttl_ms).await
+    }
+
+    async fn renew_lease(&self, lease: &Lease, ttl_ms: u64) -> Result<Option<Lease>, StoreError> {
+        self.inner.renew_lease(lease, ttl_ms).await
+    }
+
+    async fn release_lease(&self, lease: &Lease) -> Result<(), StoreError> {
+        self.inner.release_lease(lease).await
+    }
+
+    // Delegated like every other read, and it has to be: the trait's default
+    // answers "cannot prove this session is idle", which would leave the
+    // orphaned tool call unsupersedable for a reason that has nothing to do
+    // with what this double models. What it *does* model is one dropped
+    // terminal write; the lease is the real `MemoryStore`'s throughout, and by
+    // the time the retry arrives the failed turn has released it.
+    async fn is_leased(&self, session_id: &SessionId) -> Result<bool, StoreError> {
+        self.inner.is_leased(session_id).await
+    }
+
+    async fn append_events(
+        &self,
+        lease: &Lease,
+        kinds: Vec<SessionEventKind>,
+    ) -> Result<Vec<SessionEvent>, StoreError> {
+        let has_terminal = kinds.iter().any(|kind| {
+            matches!(
+                kind,
+                SessionEventKind::ResponseCompleted { .. }
+                    | SessionEventKind::ResponseIncomplete { .. }
+            )
+        });
+        if has_terminal && self.terminal_writes_seen.fetch_add(1, Ordering::SeqCst) == 0 {
+            // The one commit this fixture ever drops: `Session::complete`'s
+            // batch for the response that already durably committed its tool
+            // call via `append_emitted` -- a different, already-succeeded
+            // call on this same lease.
+            return Err(StoreError::LeaseLost {
+                session_id: lease.session_id.clone(),
+                node_id: lease.node_id.clone(),
+            });
+        }
+        self.inner.append_events(lease, kinds).await
+    }
+
+    async fn read_events(
+        &self,
+        session_id: &SessionId,
+        after_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<SessionEvent>, StoreError> {
+        self.inner.read_events(session_id, after_seq, limit).await
+    }
+
+    async fn last_seq(&self, session_id: &SessionId) -> Result<u64, StoreError> {
+        self.inner.last_seq(session_id).await
+    }
+}
+
+/// As [`surface`], but over [`ToolCallThenTextClient`] and
+/// [`DropsFirstTerminalWrite`] -- F3's rig.
+fn surface_orphaned_tool_call() -> (
+    Router,
+    Arc<DropsFirstTerminalWrite>,
+    Arc<ToolCallThenTextClient>,
+) {
+    let store = Arc::new(DropsFirstTerminalWrite::new());
+    let client = Arc::new(ToolCallThenTextClient::new());
     let engine = Arc::new(Engine::new(
         Arc::clone(&store),
         ByteTokenizer,
@@ -561,6 +869,157 @@ async fn the_clients_non_streaming_probe_gets_a_whole_message() {
     );
 }
 
+/// A provider double whose terminal `Done` reports realistic, non-zero cache
+/// figures — every count distinct from the others, and distinct in
+/// particular from the prelude's own estimate, whose cache fields are always
+/// zero at quote time (`messages_api.rs`'s `admitted` is built as
+/// `Usage { input_tokens: admitted_input_tokens, ..Default::default() }`,
+/// before any provider has answered). That distinctness is what the test
+/// below needs: a bug that left the prelude's zero cache counts standing
+/// would still show *some* non-zero usage, and only a comparison against
+/// numbers the prelude could not have guessed proves the terminal figure
+/// actually reached the client.
+struct CacheReportingFrontierClient;
+
+#[async_trait]
+impl FrontierClient for CacheReportingFrontierClient {
+    async fn execute(&self, _quote: &FrontierQuote) -> Result<FrontierStream, FrontierError> {
+        Ok(futures::stream::iter([
+            Ok(FrontierChunk::OutputText("noted.".to_string())),
+            Ok(FrontierChunk::Done {
+                input_tokens: 12_345,
+                cached_input_tokens: 9_000,
+                cache_write_tokens: 500,
+                output_tokens: 7,
+                reasoning_tokens: 0,
+                provider_reported_cost: None,
+                stop_reason: Some("end_turn".to_string()),
+            }),
+        ])
+        .boxed())
+    }
+}
+
+/// **Residue (M11.2a fix round).** `emit::message_body` was dead production
+/// code — nothing outside its own tests ever called it — whose doc claimed to
+/// be "the complete `Message` for a finished turn, for a `stream: false`
+/// request", but the actual non-streaming assembly is `messages_api.rs`'s
+/// `complete_message`/`BlockAccumulator`, which never called it either.
+/// Deleted, and its "two projections of one turn cannot disagree" assertion
+/// moved here, onto the path that is actually live.
+///
+/// **What the dead test was masking: the usage line.** `message_body` took a
+/// `roundhouse_core::event::Usage` and ran it through `wire_usage` itself, so
+/// its old test only ever proved that one conversion function converts
+/// correctly — already covered by `wire_usage`'s own unit tests in
+/// `messages_api/emit.rs`. `complete_message` does something narrower and
+/// easier to get wrong: it takes the terminal `message_delta`'s usage
+/// *wholesale* when one arrives, replacing the prelude's estimate rather than
+/// merging with it field by field (see the `MessageDelta` arm's own comment
+/// in `complete_message`). A bug that merged instead of replacing — or that
+/// left the prelude's estimate standing whenever the terminal restated a
+/// smaller or differently-shaped cache figure — would still satisfy "usage
+/// came back non-zero"; it would not satisfy "the non-streaming body's usage
+/// is the identical object the streaming terminal reported", which is the
+/// live path's actual rule and what this test checks, against
+/// [`CacheReportingFrontierClient`]'s deliberately prelude-distinguishing
+/// figures.
+#[tokio::test]
+async fn the_non_streaming_bodys_usage_is_the_same_object_the_streaming_terminal_reported() {
+    let store = Arc::new(MemoryStore::new());
+    let engine = Arc::new(Engine::new(
+        Arc::clone(&store),
+        ByteTokenizer,
+        Arc::new(EchoLocalExecutor::new("local answer")),
+        frontier_catalog(),
+        Arc::new(CacheReportingFrontierClient) as Arc<dyn FrontierClient>,
+        Arc::new(AffinityPolicy::new()),
+        config(),
+    ));
+    let app = messages_router(
+        ControlPlane::open(),
+        engine,
+        Arc::clone(&store),
+        Arc::new(Conversations::new()),
+    );
+
+    // --- Streaming half: read the terminal message_delta's own usage object,
+    // straight off the wire, the way the client itself would. ---------------
+    let mut stream_request = body("hi");
+    stream_request["stream"] = json!(true);
+    let (status, _, stream_text) = post(
+        &app,
+        "/v1/messages",
+        &[("x-claude-code-session-id", "sess-usage-stream")],
+        &stream_request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{stream_text}");
+    let terminal_usage = split_frames(&stream_text)
+        .into_iter()
+        .filter_map(|frame| {
+            let (name, data) = (frame.name?, frame.data?);
+            let event: StrictEvent = serde_json::from_str(&data).ok()?;
+            (event.wire_name() == name).then_some(event)
+        })
+        .find_map(|event| match event {
+            StrictEvent::MessageDelta {
+                usage: Some(usage), ..
+            } => Some(usage),
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            panic!("the terminal message_delta must carry a usage object: {stream_text}")
+        });
+
+    // Premise: the double's cache figures actually reached the wire, and are
+    // not the (always-zero) prelude estimate -- otherwise the comparison
+    // below would hold even for a `complete_message` that never looked past
+    // the prelude at all.
+    assert_eq!(
+        terminal_usage.cache_read_input_tokens,
+        Some(9_000),
+        "premise: the terminal frame must carry the double's real cache-read \
+         figure, not the prelude's zero: {stream_text}"
+    );
+    assert_eq!(
+        terminal_usage.cache_creation_input_tokens,
+        Some(500),
+        "premise: same, for the cache-write figure: {stream_text}"
+    );
+
+    // --- Non-streaming half: the live `complete_message` path ---------------
+    let mut complete_request = body("hi");
+    complete_request["stream"] = json!(false);
+    let (status, _, complete_text) = post(
+        &app,
+        "/v1/messages",
+        &[("x-claude-code-session-id", "sess-usage-complete")],
+        &complete_request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{complete_text}");
+    let message: Value = serde_json::from_str(&complete_text).expect("a JSON message");
+
+    // THE CLAIM: the non-streaming body's usage is the *same object* the
+    // streaming terminal reported for the identically-scripted turn -- not a
+    // re-derivation, not the prelude's estimate, not a field-by-field merge
+    // of the two.
+    assert_eq!(
+        message["usage"],
+        json!({
+            "input_tokens": terminal_usage.input_tokens,
+            "cache_creation_input_tokens": terminal_usage.cache_creation_input_tokens,
+            "cache_read_input_tokens": terminal_usage.cache_read_input_tokens,
+            "output_tokens": terminal_usage.output_tokens,
+        }),
+        "the live complete_message path's usage must be the streaming \
+         terminal's own usage object, wholesale: streaming reported \
+         {terminal_usage:?}, non-streaming answered {}",
+        message["usage"]
+    );
+}
+
 /// **F1 (M11.1 thermo-nuclear review), fixed and pinned.** The claim was that
 /// `CreateMessageParams::max_tokens` (`wire.rs`) is read and never used anywhere
 /// in `messages_api` — so the ceiling sent upstream was always
@@ -710,6 +1169,307 @@ async fn the_clients_tool_definitions_reach_the_dispatch_verbatim() {
     assert_eq!(quotes.len(), 2, "{quotes:?}");
     assert_eq!(quotes[1].tools, None);
     assert_eq!(quotes[1].tool_choice, None);
+}
+
+/// The control for the ignored F1 test below: [`surface_scripted_cross_dialect`]
+/// really does resolve an ordinary tool-declaring turn against a target that
+/// speaks the Responses dialect, and the fixture this suite reuses really is
+/// Anthropic-shaped. Neither fact is the contested behavior -- this is what
+/// proves the ignored test's failure is about a missing dialect-shape gate,
+/// and not about this harness failing to reach a cross-dialect route at all.
+///
+/// [`surface_scripted_cross_dialect`] is wired exactly like [`surface_scripted`]
+/// above — same engine, same policy, same config — except its one catalog
+/// entry is declared `WireProtocol::OpenAiResponses` rather than
+/// `AnthropicMessages`. That is a legitimate deployment shape and not a rigged
+/// one: `examples/catalog.example.json` ships four `openai_responses` entries
+/// beside one `anthropic_messages` entry, `main.rs` builds one
+/// `StaticFrontierCatalog` from every entry in a manifest like it (~config.rs
+/// `catalog()`), and its boot gate sanctions exactly this shape, in its own
+/// refusal text, as the fix for a provider that would otherwise speak two
+/// dialects itself ("define the provider twice under two names"). `plan` has
+/// nowhere else to send this turn, so with one candidate in the catalog it
+/// resolves there regardless of what the client declared -- there is no
+/// candidate-side dialect field for a policy to filter on either (`Candidate`
+/// carries only `target`, timing and price).
+#[tokio::test]
+async fn cross_dialect_routing_reaches_a_responses_target_with_anthropic_shaped_tools() {
+    let captured: Value = serde_json::from_str(TURN_ONE).expect("the fixture is JSON");
+    let tools = captured["tools"].clone();
+    assert_eq!(
+        tools.as_array().map(Vec::len),
+        Some(24),
+        "the fixture is the live capture; if its tool count moved this test is \
+         describing a different request"
+    );
+    let first_tool = &tools[0];
+    assert!(
+        first_tool.get("type").is_none(),
+        "the fixture must actually be Anthropic-shaped for the ignored test \
+         below to mean anything -- a `type` key on a tool here would make it \
+         already Responses-shaped, which is not the scenario"
+    );
+    assert!(
+        first_tool.get("input_schema").is_some() && first_tool.get("parameters").is_none(),
+        "same as above, for the schema key the two dialects spell differently \
+         -- Anthropic's `input_schema` vs. the Responses upstream's required \
+         `parameters`"
+    );
+
+    let (app, _store, client) = surface_scripted_cross_dialect();
+    let mut request = captured.clone();
+    request["stream"] = json!(false);
+    let (status, _, text) = post(
+        &app,
+        "/v1/messages",
+        &[("x-claude-code-session-id", "sess-cross-dialect-control")],
+        &request,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "today (before F1 is fixed) this turn is accepted and dispatched \
+         rather than refused -- see the ignored test below: {text}"
+    );
+    let quotes = client.quotes_seen();
+    assert_eq!(quotes.len(), 1, "one frontier dispatch: {quotes:?}");
+    assert_eq!(
+        quotes[0].wire_protocol,
+        WireProtocol::OpenAiResponses,
+        "the only entry in this catalog speaks Responses -- if the quote says \
+         otherwise this harness is not exercising the cross-dialect path it \
+         claims to"
+    );
+}
+
+/// **F1 (thermo-nuclear review of b8e8ddd), fixed: a toolbox and the target it
+/// is dispatched to may speak different dialects, and now something says so.**
+///
+/// Same request, same cross-dialect harness as the control above -- see its doc
+/// comment for why the scenario is real and reachable, not hand-rigged. What the
+/// control does not check, and what this test asserts must hold, is that the
+/// mismatch is *represented* and *reconciled* rather than passed through: before
+/// the fix, `plan` picked a candidate by price with no dialect read anywhere on
+/// that path, `connect` spliced the client's raw JSON onto the quote regardless
+/// of `spec.wire_protocol`, and `OpenAiResponsesClient::body` put whatever
+/// `tools` held under the wire body's `"tools"` key unexamined -- so a real
+/// dispatch POSTed an Anthropic-shaped array (no `type`, `input_schema` not
+/// `parameters`) to a Responses upstream, which 400s every tool-using turn, and
+/// `plan`'s failover landed on the next candidate in the same dialect and 400'd
+/// identically.
+///
+/// **Two assertions, because the fix has two halves and either alone is still
+/// the defect.** The quote now carries `tools_dialect` — the dialect of the
+/// *surface that accepted the toolbox*, which is a different fact from
+/// `wire_protocol`, the dialect of the *target the turn resolved to* — and
+/// `FrontierQuote::tools_for` is the seam every dispatch client reads a toolbox
+/// through, restating the plain function-tool core when the two differ and
+/// refusing before a socket what it cannot restate.
+///
+/// The scripted double this harness dispatches through does not serialize, so
+/// this test asserts the *seam*; the two clients' own suites assert that their
+/// bodies go through it
+/// (`openai_responses.rs`'s
+/// `an_anthropic_shaped_toolbox_is_restated_in_this_dialect_before_it_is_sent`
+/// and the Messages client's mirror of it), and `frontier.rs` pins the
+/// translation table and every refusal.
+#[tokio::test]
+async fn f1_cross_dialect_tools_must_not_reach_dispatch_unexamined() {
+    let captured: Value = serde_json::from_str(TURN_ONE).expect("the fixture is JSON");
+    let tools = captured["tools"].clone();
+
+    let (app, _store, client) = surface_scripted_cross_dialect();
+    let mut request = captured.clone();
+    request["stream"] = json!(false);
+    let (status, _, text) = post(
+        &app,
+        "/v1/messages",
+        &[("x-claude-code-session-id", "sess-cross-dialect-guard")],
+        &request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+
+    let quotes = client.quotes_seen();
+    assert_eq!(quotes.len(), 1, "one frontier dispatch: {quotes:?}");
+    let quote = &quotes[0];
+
+    // The first half: the two dialects are now two fields, and they disagree --
+    // which is the fact nothing in this system could represent before.
+    assert_eq!(
+        quote.wire_protocol,
+        WireProtocol::OpenAiResponses,
+        "the only entry in this catalog speaks Responses"
+    );
+    assert_eq!(
+        quote.tools_dialect,
+        Some(WireProtocol::AnthropicMessages),
+        "and the surface that accepted these twenty-four declarations speaks          Messages -- a quote that could not say so is a quote whose tools no          client can shape correctly"
+    );
+
+    // The second half: the seam every dispatch client reads a toolbox through
+    // restates them, rather than handing back the client's raw bytes.
+    let (shaped, _) = quote
+        .tools_for(quote.wire_protocol)
+        .expect("twenty-four plain function tools restate faithfully");
+    let shaped = shaped.expect("the client declared tools");
+    assert_ne!(
+        shaped, tools,
+        "F1: a Responses-dialect target received Anthropic-shaped tools verbatim"
+    );
+    let entries = shaped.as_array().expect("an array of tools");
+    assert_eq!(
+        entries.len(),
+        tools.as_array().map(Vec::len).unwrap_or(0),
+        "and not one of the client's tools was dropped on the way -- a thinned          toolbox is the failure mode a translation must never take"
+    );
+    for entry in entries {
+        assert_eq!(
+            entry["type"],
+            json!("function"),
+            "the Responses wire tags every tool: {entry}"
+        );
+        assert!(
+            entry.get("parameters").is_some() && entry.get("input_schema").is_none(),
+            "and spells the schema `parameters`: {entry}"
+        );
+    }
+}
+
+/// The control for the ignored F2 test below: [`surface_scripted_with_fleet`]
+/// really does route an ordinary, tool-free turn to the local worker by
+/// default -- the same "local is the cheap default" pairing
+/// `turn_lifecycle.rs` (`a_turn_longer_than_the_lease_ttl_still_commits`) and
+/// `tier_selection.rs` (`rig_with_fleet`) already prove, with one paid
+/// frontier candidate ($3/$15 per Mtok) beside one free registered worker.
+/// Neither fact is the contested behavior -- this is what proves the ignored
+/// test's failure is about tools specifically, and not about this harness
+/// failing to reach the local path at all.
+#[tokio::test]
+async fn f2_control_the_rig_routes_local_by_default_without_tools() {
+    let (app, _store, client) = surface_scripted_with_fleet().await;
+    let mut request = body("hello");
+    request["stream"] = json!(false);
+    let (status, _, text) = post(
+        &app,
+        "/v1/messages",
+        &[("x-claude-code-session-id", "sess-no-tools-local")],
+        &request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+
+    let message: Value = serde_json::from_str(&text).expect("a JSON message");
+    assert_eq!(
+        message["content"],
+        json!([{ "type": "text", "text": "local answer" }]),
+        "the local executor's canned reply -- this rig answers from the \
+         local path with nothing else in play: {text}"
+    );
+    assert!(
+        client.quotes_seen().is_empty(),
+        "the frontier candidate must not have been contacted -- if it was, \
+         this harness is not exercising the local-by-default path the F2 \
+         finding below is about"
+    );
+}
+
+/// **F2 (thermo-nuclear review of b8e8ddd), fixed: a tool-declaring turn is
+/// never routed to a worker that cannot be told about a toolbox.**
+///
+/// `connect`'s own doc comment named the gap on its `declarations` parameter:
+/// [`LocalExecutor::execute`] takes prompt token ids and an output cap, nothing
+/// else — "this build has no way to tell a locally served model about a toolbox
+/// at all" — and `LocalExecution::text` is a plain `String`, structurally
+/// incapable of carrying a call back. What that comment did not say, and what
+/// this test asserts must not hold, is that routing was blind to the gap it
+/// named: `plan` priced every candidate, local included, with no read of
+/// `declarations.tools` anywhere on that path, so a turn that declared tools was
+/// exactly as eligible for the cheap local candidate as a prose one — and the
+/// client got prose, `stop_reason: end_turn`, and no signal at all.
+///
+/// Same rig as the control above — see its doc comment for why the "local wins
+/// on price" setup is real and not contrived. Three assertions:
+///
+/// - the turn is served, and served by the *frontier* candidate, which is the
+///   one that can carry the client's twenty-four real tool definitions (the
+///   fixture is the live 2.1.251 capture, not a hand-written one);
+/// - the local worker's canned reply is nowhere in the answer, because "a
+///   frontier quote was also seen" would still pass if the turn had somehow
+///   answered locally too;
+/// - and the decision record *says why* local was skipped. Without that, the
+///   audit trail shows a frontier dispatch chosen over a cheaper local
+///   candidate that is simply absent, and the counterfactual reads as a router
+///   preference rather than a capability limit.
+#[tokio::test]
+async fn f2_a_tool_declaring_turn_routed_local_loses_its_toolbox_silently() {
+    let captured: Value = serde_json::from_str(TURN_ONE).expect("the fixture is JSON");
+    let tools = captured["tools"].clone();
+    assert_eq!(
+        tools.as_array().map(Vec::len),
+        Some(24),
+        "the fixture is the live capture; if its tool count moved this test is \
+         describing a different request"
+    );
+
+    let (app, store, client) = surface_scripted_with_fleet().await;
+    let mut request = captured.clone();
+    request["stream"] = json!(false);
+
+    let (status, _, text) = post(
+        &app,
+        "/v1/messages",
+        &[("x-claude-code-session-id", "sess-tools-local")],
+        &request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+
+    let quotes = client.quotes_seen();
+    assert_eq!(
+        quotes.len(),
+        1,
+        "F2: a tool-declaring turn must reach the one candidate that can carry \
+         a toolbox, not the one structurally unable to carry any of them: {text}"
+    );
+    assert_eq!(
+        quotes[0].tools.as_ref(),
+        Some(&tools),
+        "and it must arrive with the client's own twenty-four declarations"
+    );
+
+    let message: Value = serde_json::from_str(&text).expect("a JSON message");
+    assert_eq!(
+        message["content"],
+        json!([{ "type": "text", "text": ANSWER }]),
+        "the frontier answered; `local answer` here would mean the turn was \
+         served by the worker after all: {text}"
+    );
+
+    // And the audit trail says why the cheap candidate is missing.
+    let rationale = routing_rationale(&store, &named("sess-tools-local")).await;
+    assert!(
+        rationale.contains("the client declared tools, so local candidates were excluded"),
+        "F2: the decision record has to say why local was skipped, or the \
+         counterfactual reads as a router preference: {rationale}"
+    );
+}
+
+/// The rationale on this session's one routing decision.
+async fn routing_rationale(store: &MemoryStore, session_id: &str) -> String {
+    let decisions: Vec<String> = store
+        .read_events(&SessionId::new(session_id), 0, 1_000)
+        .await
+        .expect("an in-memory log reads")
+        .into_iter()
+        .filter_map(|event| match event.kind {
+            SessionEventKind::Routed { decision, .. } => Some(decision.rationale),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(decisions.len(), 1, "one dispatch: {decisions:?}");
+    decisions.into_iter().next().expect("checked above")
 }
 
 // ---------------------------------------------------------------------------
@@ -1187,6 +1947,57 @@ async fn count_tokens_answers_and_grows_with_the_conversation() {
     assert!(large > small, "{large} is not more than {small}");
 }
 
+/// **`count_tokens` counts the toolbox, because the toolbox is most of the
+/// request** (M11.2a's F4).
+///
+/// The client asks this question *before* sending a body whose tool
+/// declarations are 79% of its bytes — 65,835 of them in the captured 2.1.251
+/// turn this test drives. An answer that counted only the messages told an
+/// agent its context was a fifth as full as it really was, on the one endpoint
+/// that exists to keep it from having to guess; and since the same
+/// [`Engine::admitted_input_tokens`] is what `message_start` reports as
+/// `input_tokens`, the two answers for one body would have had to differ.
+///
+/// The probe is the live capture rather than a hand-written toolbox, and the
+/// two requests differ in exactly one key, so the delta measured is the tool
+/// preamble and nothing else.
+#[tokio::test]
+async fn count_tokens_counts_the_declared_toolbox() {
+    let (app, _store) = surface();
+    let captured: Value = serde_json::from_str(TURN_ONE).expect("the fixture is JSON");
+    let tools_bytes = serde_json::to_string(&captured["tools"])
+        .expect("the fixture's tools serialize")
+        .len();
+    assert!(
+        tools_bytes > 60_000,
+        "the fixture is the live capture; a toolbox this test can no longer \
+         call large is describing a different request: {tools_bytes} bytes"
+    );
+
+    let mut untooled = captured.clone();
+    untooled
+        .as_object_mut()
+        .expect("a JSON object")
+        .remove("tools")
+        .expect("the capture declares tools");
+
+    async fn count(app: &Router, request: &Value) -> u64 {
+        let (status, _, text) = post(app, "/v1/messages/count_tokens", &[], request).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        serde_json::from_str::<Value>(&text).expect("JSON")["input_tokens"]
+            .as_u64()
+            .expect("a count")
+    }
+
+    let bare = count(&app, &untooled).await;
+    let tooled = count(&app, &captured).await;
+    assert!(
+        tooled >= bare + 60_000,
+        "F4: the estimate must include the {tools_bytes}-byte toolbox the same \
+         request is about to send — bare={bare}, tooled={tooled}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The session across turns
 // ---------------------------------------------------------------------------
@@ -1535,6 +2346,224 @@ async fn f2_control_a_client_that_resends_the_partial_also_stays_on_one_session(
     assert!(
         no_such_session(&store, &named("sess-partial-kept#g1")).await,
         "a client that kept the partial must not fork either"
+    );
+}
+
+/// F3 (thermo-nuclear review of b8e8ddd): a durably-committed tool call can
+/// outlive its response's terminal event, and the client's honest
+/// retry-then-continue then forks the session -- the failure class M11.1's
+/// F2 fix exists to prevent, reopened by a new item class that fix does not
+/// cover.
+///
+/// `Session::append_emitted`'s own doc names the invariant directly: "What
+/// it must never leave behind is an emitted item and *no* terminal event."
+/// Nothing enforces it. `engine.rs`'s `Ok(Completed{..})` arm commits the
+/// terminal with `session.complete(..)` and maps a failure straight out with
+/// no fallback at all -- unlike the adjacent `Err(failed)` arm, which at
+/// least attempts `mark_incomplete` (best-effort, `let _ = ..`, because "the
+/// usual reason this append fails is a lost lease" -- the same class of
+/// failure that can also be why the surrounding dispatch failed).
+/// [`DropsFirstTerminalWrite`] models exactly that: the `append_emitted`
+/// commit for the tool call succeeds, and the very next append --
+/// `Session::complete`'s batch, holding only `ResponseCompleted` since a
+/// whole-answer-is-a-call turn commits no trailing item -- fails.
+///
+/// `stored_conversation`'s provisional-item tracking (`responses_api.rs`,
+/// the M11.1 F2 fix that `messages_api.rs` reuses via `bind_prefix`) keys
+/// exclusively on `SessionEventKind::ResponseIncomplete`. An item stamped by
+/// a response that never wrote *any* terminal event -- neither
+/// `ResponseCompleted` nor `ResponseIncomplete` -- is not provisional by
+/// that reading: it is ordinary, permanently confirmed history, compared
+/// strictly against a client that never saw it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_orphaned_tool_call_does_not_fork_the_session_on_the_next_turn() {
+    let (app, store, _client) = surface_orphaned_tool_call();
+    let headers = [("x-claude-code-session-id", "sess-f3-orphan")];
+
+    // Attempt 1: the tool call streams and is durably committed via
+    // `append_emitted`, then the store drops the terminal write. The client
+    // sees the block close and then an `error` frame with no `message_stop`
+    // -- a permanent fault (`api_error`, not `overloaded_error`), not one the
+    // SDK retries on its own (§3.2).
+    let first = stream(&app, &headers, &body("do it")).await;
+    let failure = first
+        .error
+        .clone()
+        .expect("dropping the terminal write must end the turn in an error event");
+    assert_eq!(
+        failure.kind,
+        StrictErrorKind::ApiError,
+        "a permanent fault, not a retry-me signal an agent could spend its \
+         whole retry budget on: {failure:?}"
+    );
+
+    // The premise, checked directly against the log rather than assumed: the
+    // tool call is durable, and genuinely nothing terminates its response --
+    // neither `ResponseCompleted` nor `ResponseIncomplete`.
+    let raw = store
+        .inner
+        .read_events(&SessionId::new(named("sess-f3-orphan")), 0, 4096)
+        .await
+        .expect("the session exists");
+    let orphan_response = raw
+        .iter()
+        .find_map(|event| {
+            let SessionEventKind::ItemAppended { item } = &event.kind else {
+                return None;
+            };
+            let ItemContent::ToolCall { call_id, .. } = &item.content else {
+                return None;
+            };
+            (call_id == "toolu_01")
+                .then(|| item.response_id.clone())
+                .flatten()
+        })
+        .unwrap_or_else(|| panic!("the tool call must have been durably committed: {raw:#?}"));
+    assert!(
+        raw.iter()
+            .filter(|event| event.is_terminal())
+            .all(|event| event.response_id() != Some(&orphan_response)),
+        "F3's premise: no terminal event may exist for the response that \
+         emitted the orphaned tool call, or this fixture is not modelling \
+         the finding: {raw:#?}"
+    );
+
+    // Attempt 2: the client's honest retry -- byte-for-byte the same
+    // request, unaware the tool call exists (its own stream threw before
+    // `message_stop`, exactly the discard M11.1's F2 fix already establishes
+    // for a partial *text* run -- see
+    // `a_retry_after_a_mid_stream_failure_keeps_the_conversation_on_one_session`
+    // above). The retry's turn id is unchanged (identical body);
+    // `begin_turn`'s dedup lookup finds no *completed* response for it --
+    // the orphan never reached one -- so it dispatches fresh rather than
+    // replaying or hanging.
+    let retry = stream(&app, &headers, &body("do it")).await;
+    assert_eq!(retry.error, None, "{:?}", retry.error);
+    assert_eq!(
+        retry.text, F3_RETRY_REPLY,
+        "a fresh dispatch answering in prose, exactly like F2's retry: {:?}",
+        retry.text
+    );
+
+    // Attempt 3: the client's own history now, carrying only what it
+    // actually received across the two attempts above -- no tool call,
+    // because it never saw one close before an `error` ended the turn.
+    let next_turn = json!({
+        "model": "claude-opus-5",
+        "max_tokens": 64000,
+        "stream": true,
+        "messages": [
+            { "role": "user", "content": "do it" },
+            { "role": "assistant", "content": [{ "type": "text", "text": F3_RETRY_REPLY }] },
+            { "role": "user", "content": "and then?" },
+        ],
+    });
+    let third = stream(&app, &headers, &next_turn).await;
+    assert_eq!(third.error, None, "{:?}", third.error);
+
+    // THE FINDING: the honest retry-then-continue must land on the session
+    // the client has been using all along -- exactly the invariant F2's own
+    // fix proves for a partial text run -- not fork away from it over an
+    // item the client could never have resent. `bind_prefix`'s own doc calls
+    // a fork "the conservative answer, at the price of a cold prefix" for a
+    // client that edited or compacted its history; this client did neither.
+    assert!(
+        no_such_session(&store.inner, &named("sess-f3-orphan#g1")).await,
+        "F3: the orphaned tool call forked the session on the next turn, \
+         losing the routing history and warm prefix on a turn a transient \
+         store failure already cost the client once"
+    );
+}
+
+/// **F3's liveness guard: an item with no terminal event is not an orphan
+/// while somebody is still writing the session.**
+///
+/// The A/B against the test above, and the reason the widened provisional set
+/// is safe at all. "No terminal event" is not only what a dead turn leaves
+/// behind — it is also exactly what a turn *mid-stream* looks like, one that
+/// has committed a tool call through `append_emitted` and has not reached
+/// `Session::complete` yet. A reading that did not consult the lease would let
+/// a second request arriving in that window treat a live turn's committed
+/// items as supersedable, admit a claim that contradicts them, and append the
+/// difference into a log another writer is still extending. That is not a
+/// fork; it is one session's log carrying two interleaved conversations,
+/// neither of which either client believes in — and unlike a fork, nothing
+/// downstream can tell afterwards that it happened.
+///
+/// So the same rig, the same orphaned tool call, the same honest retry — and
+/// one difference: another node holds the lease. The log is byte-identical to
+/// the one the test above supersedes over; only the answer to "is anybody
+/// writing this" has changed, which is what makes this an isolation of the
+/// guard rather than of anything else. The turn takes the conservative arm and
+/// forks, at the price of a cold prefix, which is precisely what
+/// `bind_prefix`'s own doc calls that outcome.
+///
+/// The lease is taken by a *different node id* on purpose: that is the real
+/// shape of the hazard. Within one process the engine's per-session turn gate
+/// already serializes turns, but it is taken inside `run_turn`, long after
+/// `bind_prefix` has read and admitted — and a second roundhouse serving the
+/// same store has no gate at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_orphan_is_left_standing_while_another_node_holds_the_lease() {
+    let (app, store, _client) = surface_orphaned_tool_call();
+    let headers = [("x-claude-code-session-id", "sess-f3-live")];
+
+    // Attempt 1, exactly as above: the tool call is durably committed through
+    // `append_emitted` and the terminal write for its response is dropped.
+    let first = stream(&app, &headers, &body("do it")).await;
+    assert!(
+        first.error.is_some(),
+        "the fixture must drop the terminal write"
+    );
+
+    // The one difference from the test above. A successor node picks this
+    // session up — mid-recovery, or simply because the fleet put the client's
+    // next turn on a different roundhouse — and holds the lease while our
+    // request is admitted.
+    let session = SessionId::new(named("sess-f3-live"));
+    store
+        .inner
+        .acquire_lease(&session, "another-node", 60_000)
+        .await
+        .expect("the session exists")
+        .expect("nothing else holds this lease");
+
+    // The client's next turn, carrying only what it actually received — the
+    // same shape the test above continues with, and the only shape that can
+    // tell the two readings apart. A *byte-identical retry* cannot: a claim
+    // shorter than the stored history is the ordinary retry and is admitted
+    // with an empty suffix whether or not the orphan was superseded. It takes
+    // a claim that reaches *past* the orphan's position to ask whether the
+    // orphan is still being compared against.
+    let next_turn = json!({
+        "model": "claude-opus-5",
+        "max_tokens": 64000,
+        "stream": true,
+        "messages": [
+            { "role": "user", "content": "do it" },
+            { "role": "user", "content": "and then?" },
+        ],
+    });
+    let (status, _, text) = post(&app, "/v1/messages", &headers, &next_turn).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+
+    assert!(
+        !no_such_session(&store.inner, &named("sess-f3-live#g1")).await,
+        "F3's guard: while another node holds the lease, an item with no \
+         terminal event may be a turn still in flight, so it must be compared \
+         strictly and the disagreeing claim must fork rather than supersede \
+         items a live writer is still producing"
+    );
+    let items = stored_items(&store.inner, &named("sess-f3-live")).await;
+    assert_eq!(
+        items
+            .iter()
+            .filter(|item| **item == Item::user_text("do it"))
+            .count(),
+        1,
+        "and nothing was appended into the leased session behind its writer — \
+         a superseded orphan would have re-admitted this question onto a log \
+         another node is holding: {items:#?}"
     );
 }
 

@@ -154,6 +154,17 @@ pub enum ItemContent {
 /// and the client's accumulator throws on fragments that do not parse — so this
 /// is the honest fallback for a corrupt log rather than a supported shape, and
 /// silently replacing it with `{}` would hide the corruption.
+///
+/// **Since M11.2a's F7, an ordinary Anthropic-dialect dispatch can no longer
+/// hand this function such a string.** The decoder that produces the argument
+/// string in the first place — `ToolBlock::into_chunk` in
+/// `roundhouse-fleet`'s `anthropic_messages::stream`, reached through the same
+/// `Item::tool_call(id, name, canonical_arguments(&arguments))` call this
+/// function's callers make — drops a tool call outright when its reassembled
+/// `input_json_delta` fragments do not parse, rather than emitting one for this
+/// function to fall back on. What remains reachable on the non-JSON arm here is
+/// a log written before that guarantee existed, a dialect whose decoder does
+/// not share it, or literal corruption — not a live turn on this one.
 pub fn canonical_arguments(raw: &str) -> String {
     match serde_json::from_str::<Value>(raw) {
         Ok(value) => value.to_string(),
@@ -293,13 +304,18 @@ impl Item {
     /// A tool call, with no provenance.
     ///
     /// `response_id` is deliberately `None`, and it is the constructor's whole
-    /// point: a call built here is just a call. Only
+    /// point: a call built here is just a call. Two sites stamp a response onto
+    /// one —
     /// [`Session::complete_with_item`](crate::session::Session::complete_with_item)
-    /// stamps a response onto one, which is what lets a stamped `ToolCall` in
-    /// the log mean "this deployment emitted it" rather than "somebody set a
-    /// field". The input path cannot produce a stamp — the wire layer's
-    /// canonicalization sets `None` on everything a client sends — so the
-    /// provenance marker is not something a client can forge.
+    /// for a turn answered at the interjection seam, and
+    /// [`Session::append_emitted`](crate::session::Session::append_emitted) for
+    /// an ordinary dispatched turn's tool calls, committed as each is produced
+    /// rather than held for the completion (M11.2) — and no third path exists,
+    /// which is what lets a stamped `ToolCall` in the log mean "this deployment
+    /// emitted it" rather than "somebody set a field". The input path cannot
+    /// produce a stamp — the wire layer's canonicalization sets `None` on
+    /// everything a client sends — so the provenance marker is not something a
+    /// client can forge.
     ///
     /// The name is the bare one. A namespace belongs to a client dialect and
     /// lives in the wire projection: canonicalization ignores it on the way

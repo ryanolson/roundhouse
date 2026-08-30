@@ -126,6 +126,13 @@ pub async fn unknown_sessions_are_not_found<S: SessionStore>(store: &S) {
         store.last_seq(&sid).await,
         Err(StoreError::SessionNotFound(_))
     ));
+    // Not-found rather than "idle": a session that was never created has no
+    // lease, but answering `false` would let a caller read a typo'd id as an
+    // ordinary quiet session and act on its empty history.
+    assert!(matches!(
+        store.is_leased(&sid).await,
+        Err(StoreError::SessionNotFound(_))
+    ));
     // Release alone is lenient. It is the cleanup path, and a shutdown racing
     // a session's disappearance should not turn into an error report.
     store.release_lease(&ghost).await.unwrap();
@@ -183,6 +190,54 @@ pub async fn an_expired_lease_is_takeable_and_the_loser_cannot_append<S: LeaseCo
         .await
         .expect_err("a displaced writer must not interleave with its successor");
     assert!(matches!(err, StoreError::LeaseLost { .. }));
+}
+
+/// **A lease reads as live exactly while somebody is writing under it.**
+///
+/// The property [`SessionStore::is_leased`] exists for, and every backend owes
+/// it the *dead* half as much as the live one: a reader asks this to tell a
+/// turn in flight from a turn whose writer died, and the two leave identical
+/// traces in the log. A backend that answered "leased" for a record its owner
+/// abandoned would freeze every such session's history as permanently
+/// unsupersedable; one that answered "idle" for a live turn would let a reader
+/// supersede items still being committed.
+pub async fn a_lease_reads_as_live_only_while_someone_holds_it<S: LeaseControl>(store: &S) {
+    let sid = fresh_session(store).await;
+    assert!(
+        !store.is_leased(&sid).await.unwrap(),
+        "nobody has claimed a fresh session"
+    );
+
+    store
+        .acquire_lease(&sid, "node-a", TTL_MS)
+        .await
+        .unwrap()
+        .expect("nothing contends for a fresh session's lease");
+    assert!(
+        store.is_leased(&sid).await.unwrap(),
+        "a held lease must be visible to a reader that is not the holder"
+    );
+
+    // A node that died rather than released: the record may survive, the
+    // tenure does not.
+    store.force_expire_lease(&sid).await;
+    assert!(
+        !store.is_leased(&sid).await.unwrap(),
+        "an expired tenure is nobody writing, which is what the caller asked"
+    );
+
+    let successor = store
+        .acquire_lease(&sid, "node-b", TTL_MS)
+        .await
+        .unwrap()
+        .expect("an expired lease must be takeable");
+    assert!(store.is_leased(&sid).await.unwrap());
+    store.release_lease(&successor).await.unwrap();
+    assert!(
+        !store.is_leased(&sid).await.unwrap(),
+        "release ends the tenure here too, or a finished turn would look live \
+         until its TTL lapsed"
+    );
 }
 
 pub async fn a_released_lease_is_gone_not_renewable<S: SessionStore>(store: &S) {
@@ -452,6 +507,7 @@ macro_rules! store_contract_suite {
             unknown_sessions_are_not_found,
             a_live_lease_blocks_others_and_retakes_with_a_fresh_fence,
             an_expired_lease_is_takeable_and_the_loser_cannot_append,
+            a_lease_reads_as_live_only_while_someone_holds_it,
             a_released_lease_is_gone_not_renewable,
             release_by_a_non_holder_leaves_the_lease_standing,
             a_stale_handle_works_while_the_record_is_live,

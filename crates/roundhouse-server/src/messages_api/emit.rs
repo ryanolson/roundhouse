@@ -455,45 +455,6 @@ fn error_frame(kind: &str, message: &str) -> Frame {
 }
 
 // ---------------------------------------------------------------------------
-// The non-streaming projection
-// ---------------------------------------------------------------------------
-
-/// The complete `Message` for a finished turn, for a `stream: false` request.
-///
-/// Served genuinely rather than refused, because Claude Code's auth and quota
-/// probes are one-token non-streaming creates (§3.6) and a surface that 500s or
-/// 422s on them fails before the first turn.
-///
-/// **`content` is the caller's blocks since M11.2, not a string this function
-/// wraps.** It used to take the answer's text and make one text block of it,
-/// which was true while a turn had exactly one block and became a silent
-/// truncation the moment a turn could also call tools. The non-streaming path
-/// reassembles the same blocks the streaming path emitted, and hands them here:
-/// two projections of one turn that disagreed about its content would be two
-/// answers to a question a client is entitled to ask either way. An empty answer
-/// is still one empty text block, for the same reason — that is what the stream
-/// sends.
-pub fn message_body(
-    response_id: &ResponseId,
-    model: &str,
-    content: Vec<ContentBlock>,
-    stop_reason: StopReason,
-    usage: &Usage,
-) -> Message {
-    Message {
-        kind: MESSAGE_TYPE.to_string(),
-        id: Some(response_id.to_string()),
-        role: Some(ASSISTANT.to_string()),
-        model: Some(model.to_string()),
-        content,
-        stop_reason: Some(stop_reason),
-        stop_sequence: None,
-        usage: wire_usage(usage, usage.output_tokens),
-        extra: Extra::new(),
-    }
-}
-
-// ---------------------------------------------------------------------------
 // The streaming projection
 // ---------------------------------------------------------------------------
 
@@ -1285,6 +1246,92 @@ mod tests {
         }
     }
 
+    /// **F6 (M11.2a thermo-nuclear round, partially valid).** The guard
+    /// directly above never drives an `ItemAppended{ToolCall}`, so
+    /// `tool_block_start`/`tool_block_delta` — the two frames
+    /// [`MessageEmission::tool_block`] emits, reachable from no other arm —
+    /// are never fed back through [`StreamEvent`]'s deserializer the way
+    /// every other frame shape is.
+    ///
+    /// A sibling test rather than an edit to the one above, so that test stays
+    /// a control proving this one is not tautological. This one passes today:
+    /// the finding is a coverage hole, not a live break — nothing here
+    /// currently proves a future change to `ContentBlock::ToolUse`'s serde
+    /// shape would still round-trip through the same decoder every other
+    /// variant is checked against.
+    ///
+    /// **Extended (M11.2a fix round) to the full tool sequence.** The block
+    /// itself was never the whole gap — `tool_block` closes what it opens in
+    /// one call (`content_block_start`, `tool_block_delta`,
+    /// `content_block_stop`, per its own doc), so start/delta/stop were
+    /// already all present in the first version of this test, unasserted
+    /// past "a start exists". What it never drove is the *terminal* frame a
+    /// tool-calling turn actually ends on: `stopped(StopReason::ToolUse, …)`,
+    /// the only path that produces a `message_delta` whose `stop_reason` is
+    /// `tool_use` — the value `completion_stop_reason` exists to guarantee
+    /// for exactly this shape of turn. Added below, with its own presence
+    /// asserted alongside the block's `stop`, so a future change to either
+    /// frame's serde shape fails this test rather than passing it by
+    /// omission.
+    #[test]
+    fn every_frame_this_surface_emits_including_a_tool_call_parses_back_through_the_dispatch_decoder()
+     {
+        let mut emission = emission();
+        let mut frames = Vec::new();
+        let (batch, _) = emission.project(&SessionEventKind::TurnStarted {
+            turn_id: turn(),
+            response_id: response(),
+        });
+        frames.extend(batch);
+        let (batch, _) = emission.project(&SessionEventKind::ItemAppended {
+            item: Item {
+                role: Role::Assistant,
+                content: ItemContent::ToolCall {
+                    call_id: "toolu_01".into(),
+                    name: "Grep".into(),
+                    arguments: r#"{"pattern":"fn main"}"#.into(),
+                },
+                response_id: Some(response()),
+            },
+        });
+        frames.extend(batch);
+        // The terminal a tool-calling turn actually ends on -- the frame the
+        // guard above never drove at all, tool call or not, and the half of
+        // "the full tool sequence" this test's first version left uncovered.
+        frames.extend(emission.stopped(StopReason::ToolUse, &Usage::default()));
+
+        assert!(
+            frames
+                .iter()
+                .any(|frame| frame.name() == "content_block_start"
+                    && frame.data()["content_block"]["type"] == json!("tool_use")),
+            "the fixture must actually drive a tool_use block, or this proves \
+             nothing: {frames:#?}"
+        );
+        assert!(
+            frames
+                .iter()
+                .any(|frame| frame.name() == "content_block_stop"),
+            "the tool block's own stop must be in the fixture too -- start \
+             and delta alone are not \"the full tool sequence\" this test is \
+             named for: {frames:#?}"
+        );
+        assert!(
+            frames.iter().any(|frame| frame.name() == "message_delta"
+                && frame.data()["delta"]["stop_reason"] == json!("tool_use")),
+            "the fixture must drive the terminal a tool-calling turn actually \
+             ends on, or the M11.2a fix-round extension this test carries \
+             proves nothing: {frames:#?}"
+        );
+
+        for frame in frames {
+            let data = frame.data();
+            let decoded: StreamEvent = serde_json::from_value(data.clone())
+                .unwrap_or_else(|error| panic!("our own client cannot read {data}: {error}"));
+            assert_eq!(&decoded, frame.event());
+        }
+    }
+
     /// Every incomplete reason ends the stream, and the retryable ones say so.
     ///
     /// The table is asserted as a whole rather than reason by reason because
@@ -1847,78 +1894,6 @@ mod tests {
         assert!(
             !comment_only.contains("data: "),
             "the control must actually be a bare comment: {comment_only}"
-        );
-    }
-
-    /// The non-streaming body is a complete `Message`, block and all.
-    #[test]
-    fn the_non_streaming_body_is_a_complete_message() {
-        let body = message_body(
-            &response(),
-            "claude-sonnet-4-5",
-            vec![ContentBlock::text("hello")],
-            StopReason::EndTurn,
-            &Usage {
-                input_tokens: 900,
-                cached_input_tokens: 800,
-                output_tokens: 12,
-                ..Default::default()
-            },
-        );
-        let data = serde_json::to_value(&body).expect("a Message serializes");
-        assert_eq!(data["type"], json!("message"));
-        assert_eq!(data["role"], json!("assistant"));
-        assert_eq!(data["stop_reason"], json!("end_turn"));
-        assert_eq!(
-            data["content"],
-            json!([{ "type": "text", "text": "hello" }])
-        );
-        assert_eq!(data["usage"]["input_tokens"], json!(100));
-        assert_eq!(data["usage"]["cache_read_input_tokens"], json!(800));
-        assert_eq!(data["usage"]["output_tokens"], json!(12));
-
-        // An empty answer still carries its block, so the two projections of one
-        // turn cannot disagree about whether there was content.
-        let empty = message_body(
-            &response(),
-            "m",
-            vec![ContentBlock::text("")],
-            StopReason::EndTurn,
-            &Usage::default(),
-        );
-        assert_eq!(
-            serde_json::to_value(&empty).unwrap()["content"],
-            json!([{ "type": "text", "text": "" }])
-        );
-
-        // And a tool-using turn's blocks reach `content` in order, which is the
-        // whole reason this takes blocks rather than a string: the streaming
-        // path emits them and this path must not flatten them away.
-        let calling = message_body(
-            &response(),
-            "m",
-            vec![
-                ContentBlock::text("let me look"),
-                ContentBlock::ToolUse {
-                    id: "toolu_01".into(),
-                    name: "Grep".into(),
-                    input: json!({ "pattern": "fn main" }),
-                    cache_control: None,
-                    extra: Extra::new(),
-                },
-            ],
-            StopReason::ToolUse,
-            &Usage::default(),
-        );
-        let data = serde_json::to_value(&calling).unwrap();
-        assert_eq!(data["stop_reason"], json!("tool_use"));
-        assert_eq!(
-            data["content"],
-            json!([
-                { "type": "text", "text": "let me look" },
-                { "type": "tool_use", "id": "toolu_01", "name": "Grep",
-                  "input": { "pattern": "fn main" } },
-            ])
         );
     }
 }

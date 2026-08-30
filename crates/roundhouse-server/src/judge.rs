@@ -508,9 +508,17 @@ impl<T: Tokenizer + Clone> FleetJudge<T> {
                 // and nothing was sent. Refusing it here rather than folding it
                 // into `Refused` keeps that word meaning "the provider
                 // answered", which is what an operator reads it as.
+                // And a toolbox no dispatch client can restate in the resolved
+                // target's dialect joins them too — unreachable in the same
+                // sense, refused inside this process before a socket. It is
+                // listed rather than left to a wildcard for the reason this
+                // whole match is spelled out, and it is *structurally*
+                // unreachable from here besides: a judge declares no tools, so
+                // its quote has nothing to translate.
                 FrontierError::UnknownProvider(_)
                 | FrontierError::Credential(_)
                 | FrontierError::MalformedQuote(_)
+                | FrontierError::UntranslatableTools { .. }
                 | FrontierError::UnsupportedDialect { .. }
                 | FrontierError::Transport { .. } => SideCallAbandonReason::Unreachable,
                 // The provider answered. A 503 and an unparseable body are both
@@ -619,11 +627,23 @@ impl<T: Tokenizer + Clone> FleetJudge<T> {
             // than a gap.** It is asked for a structured verdict about a
             // transcript, and a checker that could call the tools it is
             // reviewing would be acting inside the session it is meant to be
-            // standing outside of. The tools the turn under review declared are
-            // *material* to the judge, and they reach it — if at all — inside
-            // the brief, as text under the injection-defense line above.
+            // standing outside of. The tools the turn under review *declared*
+            // — the toolbox's names, descriptions and schemas — never reach
+            // the judge at all, inside the brief or anywhere else:
+            // `ValidationBrief` (`validate/brief.rs`) is built from items,
+            // hashes and sentences, and carries no field a declared toolbox
+            // could arrive through — the same structural argument that module
+            // makes for keeping prices and target names out. What the brief's
+            // "Recent steps" section does show is narrower and different: the
+            // *name* of a tool the turn actually called, plus a hash of its
+            // arguments, never the schema that told the model the call was
+            // available in the first place. A judge that has never seen the
+            // toolbox cannot be steered by a tool description crafted to read
+            // well to it.
             tools: None,
             tool_choice: None,
+            // Nothing to stamp a dialect on -- see `FrontierQuote::tools_dialect`.
+            tools_dialect: None,
             // **Deliberately unresolved, and this is the honest state rather
             // than an oversight.** A side call is deployment work — it is not a
             // tenant's turn and must never spend a member's key — so the only
@@ -703,6 +723,13 @@ mod tests {
                     got,
                     target: target.clone(),
                 }),
+                Some(FrontierError::UntranslatableTools { tool, from, to }) => {
+                    Err(FrontierError::UntranslatableTools {
+                        tool: tool.clone(),
+                        from,
+                        to,
+                    })
+                }
                 Some(FrontierError::Transport { message, timed_out }) => {
                     Err(FrontierError::Transport {
                         message: message.clone(),

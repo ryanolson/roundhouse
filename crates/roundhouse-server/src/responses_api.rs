@@ -58,6 +58,8 @@ use roundhouse_core::now_ms;
 use roundhouse_core::session::{ConfigurationCursor, turn_configuration_len};
 use roundhouse_core::store::SessionStore;
 
+use roundhouse_fleet::WireProtocol;
+
 use crate::control_config::{ControlPlane, PlaneSource};
 use crate::conversations::Conversations;
 use crate::engine::{Engine, TurnInput};
@@ -341,7 +343,15 @@ where
     // the interjection seam answers this turn; see
     // [`Engine::context_contribution`] for why the wire cannot just forward what
     // the log books.
-    let admitted_input_tokens = state.engine.admitted_input_tokens(&claimed);
+    // Borrowed rather than moved, because the same declarations are handed to
+    // the turn below: they are part of the request's size (M11.2a's F4) and
+    // reporting an input count that omitted them would understate the largest
+    // part of an agentic client's request.
+    let admitted_input_tokens = state.engine.admitted_input_tokens(
+        &claimed,
+        request.tools.as_ref(),
+        request.tool_choice.as_ref(),
+    );
     let (session_id, input) = state
         .bind(&plane, &admission.principal, cache_key, claimed)
         .await?;
@@ -392,6 +402,12 @@ where
                         // turn a prose turn.
                         tools,
                         tool_choice,
+                        // The mirror of the Messages surface's stamp: this
+                        // surface accepted Responses-shaped tools, so that is
+                        // what it declares, and a turn routed to an
+                        // `anthropic_messages` catalog entry is restated by the
+                        // dispatch client rather than posted as-is (M11.2a, F1).
+                        tools_dialect: Some(WireProtocol::OpenAiResponses),
                     },
                     &admission,
                 )
@@ -560,11 +576,11 @@ enum Entry {
 /// opening one takes the lease, and a read that took the lease would evict the
 /// turn it is about to start.
 ///
-/// Two things the raw item stream does not say are resolved here, and both are
-/// M11.1 review findings:
+/// Three things the raw item stream does not say are resolved here, and all
+/// three are review findings:
 ///
 /// **A partial committed by a response that never completed is provisional**
-/// (F2). [`Session::mark_incomplete`](roundhouse_core::session::Session)
+/// (M11.1's F2). [`Session::mark_incomplete`](roundhouse_core::session::Session)
 /// commits the bytes a dying dispatch had already produced so a successor can
 /// resume from them — but the client's SSE layer threw that answer away the
 /// moment it read the `error` frame, so the history it resends next has a hole
@@ -587,16 +603,59 @@ enum Entry {
 /// What is written here is the admission half only — the retry still continues
 /// from the partial, and the *next* turn no longer forks over it.
 ///
-/// **A turn's leading configuration run replaces the session's** (F7), through
-/// exactly the cursor [`SessionState`](roundhouse_core::session::SessionState)
-/// folds with, so the prompt the engine rebuilds and the prefix a claim is
-/// checked against cannot disagree about where the system prompt is.
+/// **An item stamped by a response that never terminated at all is
+/// provisional too, once the turn that stamped it is over** (M11.2a's F3).
+/// F2's rule reads the `ResponseIncomplete` beside a partial, and so covers
+/// exactly the failures that got as far as writing one. The failure that does
+/// not is the one `append_emitted`'s own doc calls the thing it "must never
+/// leave behind": an emitted item — a durably committed *tool call*, since
+/// M11.2 the only item a turn commits before its terminal — and no terminal
+/// event whatever, because the very append that would have written one is what
+/// failed. To a strict comparison that item is ordinary, permanently confirmed
+/// history; to the client it never existed, because its own stream threw before
+/// the block closed. The client's honest retry then disagrees with us at that
+/// item and forks the session a transient store failure already cost it once —
+/// the identical outcome F2 exists to prevent, reopened by a new item class
+/// that fix does not cover.
+///
+/// **The liveness guard is the whole of the difference between the two rules.**
+/// A `ResponseIncomplete` is proof the turn is over; "no terminal event" is not
+/// — it is also what a turn *in flight* looks like, one that has streamed a
+/// tool call and is still working. So the widened set applies only to a session
+/// nobody is writing: [`SessionStore::is_leased`] answers that, and it is asked
+/// after the read rather than before, with the log's tail re-checked for
+/// settlement, because the dangerous race is a terminal event landing between
+/// this projection's last batch and the question — a turn that finished
+/// normally, read as an orphan. A leased or still-growing session falls back to
+/// F2's rule exactly, which is the pre-M11.2a behaviour.
+///
+/// The two rejected alternatives, for the reader who would reopen this: giving
+/// `Session::complete`'s failure path a terminal fallback of its own is the fix
+/// closest to `append_emitted`'s stated invariant, but the reason that append
+/// failed is usually a lost lease, so the fallback would fail for the same
+/// reason and the orphan would survive it — an invariant enforced only when
+/// nothing went wrong. Reconciling orphans in a later turn (writing the missing
+/// `ResponseIncomplete` from a successor's lease) is a real repair rather than
+/// a reading, and it would put an event in the log describing a turn this
+/// process never ran; the append-only discipline F2's fix was careful to keep
+/// says a supersession is a *reading* of what was recorded.
+///
+/// **A turn's leading configuration run replaces the session's** (M11.1's F7),
+/// through exactly the cursor
+/// [`SessionState`](roundhouse_core::session::SessionState) folds with, so the
+/// prompt the engine rebuilds and the prefix a claim is checked against cannot
+/// disagree about where the system prompt is.
 async fn stored_conversation<S: SessionStore>(
     store: &S,
     session_id: &SessionId,
 ) -> Result<StoredConversation, ApiError> {
     let mut entries: Vec<Entry> = Vec::new();
     let mut provisional: HashSet<ResponseId> = HashSet::new();
+    // Every response the log mentions, and every response it *ends*. The
+    // difference between the two — over a settled, unleased session — is the
+    // orphan set F3 is about.
+    let mut stamped: HashSet<ResponseId> = HashSet::new();
+    let mut terminated: HashSet<ResponseId> = HashSet::new();
     let mut cursor = 0u64;
     loop {
         let batch = store
@@ -607,13 +666,55 @@ async fn stored_conversation<S: SessionStore>(
         cursor = last.seq;
         for event in batch {
             match event.kind {
-                SessionEventKind::ItemAppended { item } => entries.push(Entry::Item(item)),
+                SessionEventKind::ItemAppended { item } => {
+                    if let Some(response_id) = &item.response_id {
+                        stamped.insert(response_id.clone());
+                    }
+                    entries.push(Entry::Item(item));
+                }
                 SessionEventKind::TurnStarted { .. } => entries.push(Entry::TurnStarted),
                 SessionEventKind::ResponseIncomplete { response_id, .. } => {
+                    terminated.insert(response_id.clone());
                     provisional.insert(response_id);
+                }
+                SessionEventKind::ResponseCompleted { response_id, .. } => {
+                    terminated.insert(response_id);
                 }
                 _ => {}
             }
+        }
+    }
+
+    // **The orphan half of the rule, and both of its preconditions.**
+    //
+    // Asked only when there is something to ask about: a session all of whose
+    // responses terminated — every session, until one of them does not — has an
+    // empty orphan set, and this projection then costs exactly the reads it
+    // cost before F3 rather than two store round trips on every turn.
+    //
+    // The lease is asked first because it is the cheaper refusal, and the tail
+    // second because it closes the race the lease alone cannot: a turn whose
+    // terminal event landed after the loop above ended would answer "nobody is
+    // writing" truthfully and still have committed the very event that makes
+    // its items ordinary history. A log that grew under us is a log this
+    // projection has not finished reading, and superseding out of a stale
+    // snapshot is exactly the fork this rule exists to prevent — so the
+    // conservative arm keeps F2's narrower set and the next turn tries again
+    // against a settled log.
+    let orphans: Vec<ResponseId> = stamped.difference(&terminated).cloned().collect();
+    if !orphans.is_empty() {
+        let idle = !store
+            .is_leased(session_id)
+            .await
+            .map_err(|error| store_error(session_id, error))?;
+        if idle
+            && store
+                .last_seq(session_id)
+                .await
+                .map_err(|error| store_error(session_id, error))?
+                == cursor
+        {
+            provisional.extend(orphans);
         }
     }
 

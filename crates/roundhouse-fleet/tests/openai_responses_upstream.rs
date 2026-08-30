@@ -138,6 +138,9 @@ fn quote(credential: TurnCredential) -> FrontierQuote {
         output_token_cap: None,
         tools: None,
         tool_choice: None,
+        // And nothing to stamp a dialect on, which is what
+        // `tools_dialect: None` means -- see `FrontierQuote::tools_dialect`.
+        tools_dialect: None,
         credential,
     }
 }

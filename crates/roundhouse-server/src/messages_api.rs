@@ -75,6 +75,7 @@ use roundhouse_core::event::{SessionEvent, SessionEventKind, Usage};
 use roundhouse_core::now_ms;
 use roundhouse_core::store::SessionStore;
 
+use roundhouse_fleet::WireProtocol;
 use roundhouse_fleet::anthropic_messages::wire::{
     ApiError as WireError, BlockDelta, ContentBlock, Extra as WireExtra, Message, StopReason,
     StreamEvent,
@@ -344,7 +345,16 @@ where
 
     let claimed = canonicalize(&params)?;
     let turn_id = turn_id_for(&claimed);
-    let admitted_input_tokens = state.engine.admitted_input_tokens(&claimed);
+    // Read off `params` before the toolbox is taken out of it below, and
+    // *including* that toolbox: on this dialect it is the largest part of the
+    // request — 79% of a measured Claude Code turn's bytes — and the number this
+    // reports is what `message_start` tells the client it admitted (M11.2a's
+    // F4).
+    let admitted_input_tokens = state.engine.admitted_input_tokens(
+        &claimed,
+        params.tools.as_ref(),
+        params.tool_choice.as_ref(),
+    );
     // Resolved before `bind` consumes it, and named here rather than inside the
     // bind so the anonymous arm is visible at the site that decides what a turn
     // belongs to rather than buried in a helper.
@@ -442,6 +452,14 @@ where
                         // does not model, dropped where nobody sees it.
                         tools,
                         tool_choice,
+                        // **And the dialect they are written in, which this is
+                        // the only layer that knows** (M11.2a, F1). Routing
+                        // picks a target on price with no read of the surface
+                        // that accepted the turn, and a catalog may mix
+                        // dialects — the shipped example does — so without this
+                        // stamp an Anthropic-shaped tool array reaches a
+                        // Responses upstream and 400s every tool-using turn.
+                        tools_dialect: Some(WireProtocol::AnthropicMessages),
                     },
                     &admission,
                 )
@@ -547,7 +565,19 @@ where
     let params: CreateMessageParams = parse_body(&body)?;
     let claimed = canonicalize(&params)?;
     Ok(axum::Json(json!({
-        "input_tokens": state.engine.admitted_input_tokens(&claimed),
+        // Tools included, and that is what makes this answer usable at all
+        // (M11.2a's F4): the client asks this question *because* it is about to
+        // send its whole toolbox, which on a real Claude Code turn is 79% of the
+        // request. An answer counting only the messages would have told an agent
+        // its context was a fifth as full as it was — and it would have
+        // disagreed with the `input_tokens` the very next `message_start`
+        // reported for the same body, which is the drift one function exists to
+        // prevent.
+        "input_tokens": state.engine.admitted_input_tokens(
+            &claimed,
+            params.tools.as_ref(),
+            params.tool_choice.as_ref(),
+        ),
     }))
     .into_response())
 }

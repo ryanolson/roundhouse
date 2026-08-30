@@ -191,6 +191,18 @@ impl StoredAuthStyle {
 /// roughly a paragraph.
 pub const DEFAULT_MAX_TOKENS: u32 = 8192;
 
+/// How many `cache_control` breakpoints one Messages request may carry.
+///
+/// **Anthropic's documented cap, and a hard 400 on the fifth.** It matters here
+/// because roundhouse is not the only author of this request: the tool
+/// definitions are forwarded from the client with their own breakpoints intact
+/// — Claude Code marks its last tool, which is how it caches a
+/// twenty-four-entry preamble — and the block breakpoint this client adds is
+/// therefore never the request's only one. A constant rather than a literal so
+/// the number and the reason it exists sit together; if Anthropic raises it,
+/// this is the line that moves.
+const MAX_CACHE_BREAKPOINTS: usize = 4;
+
 /// The dialect this client serializes. Anything else is refused rather than
 /// mis-serialized — see [`FrontierError::UnsupportedDialect`].
 const SPOKEN: WireProtocol = WireProtocol::AnthropicMessages;
@@ -330,6 +342,29 @@ impl AnthropicMessagesClient {
     /// currently happens to need no help.
     fn body(quote: &FrontierQuote, model: &str) -> Result<Value, FrontierError> {
         let segments = quote.segments()?;
+        // **Resolved before anything is built, because it can refuse.** A
+        // toolbox this client cannot restate in its own dialect is a turn that
+        // must not reach a socket — see [`FrontierQuote::tools_for`] — and
+        // resolving it first is what keeps the refusal ahead of the work rather
+        // than beside it.
+        let (tools, tool_choice) = quote.tools_for(SPOKEN)?;
+        // **How many `cache_control` breakpoints are already riding this
+        // request before roundhouse adds its own.**
+        //
+        // Anthropic caps a request at four cache breakpoints and answers a
+        // fifth with a 400 — and the tools are the one part of this body
+        // roundhouse forwards rather than originates, so the client's own
+        // breakpoints ride along untouched. Claude Code sets one on its last
+        // tool; a client that sets four has spent the whole allowance, and the
+        // block breakpoint below would be the fifth. Counting rather than
+        // assuming, because "the client sends at most one" is a fact about one
+        // client at one version, and being wrong about it 400s every turn.
+        //
+        // The client's *item-level* breakpoints do not appear here: the serve
+        // surface strips those, since roundhouse rebuilds every prompt from its
+        // own log and a breakpoint from a different rendering names nothing in
+        // this one.
+        let riding = breakpoints_in(tools.as_ref());
         // **The breakpoint goes on the penultimate block, and nowhere else.**
         //
         // Anthropic caches nothing without an explicit `cache_control` marker —
@@ -350,7 +385,19 @@ impl AnthropicMessagesClient {
         //
         // Fewer than two segments means there is no stable prefix to name yet:
         // one block is the whole prompt, which is entirely this turn's input.
-        let breakpoint = segments.len().checked_sub(2);
+        //
+        // And no breakpoint at all when the forwarded tools have already spent
+        // the request's allowance. **Yielding is the right way round**: the
+        // tools' own breakpoint caches the client's twenty-four-tool preamble,
+        // which is the largest stable block in the request and is warm on the
+        // provider's side either way, while ours caches a prefix we could
+        // re-mark on the next turn. Dropping theirs to keep ours would trade a
+        // bigger discount for a smaller one; sending both is a 400 that costs
+        // the turn.
+        let breakpoint = match riding + 1 <= MAX_CACHE_BREAKPOINTS {
+            true => segments.len().checked_sub(2),
+            false => None,
+        };
         // Built out of [`wire::ContentBlock`] rather than hand-written JSON,
         // because this is the one place roundhouse *originates* this wire's
         // vocabulary and R1's rule is "typed where roundhouse reads or
@@ -413,11 +460,18 @@ impl AnthropicMessagesClient {
         // does not accept, and sending them would 400 every turn from an
         // internal caller that has no tools — the judge, the validate loop, an
         // MCP turn.
-        if let Some(tools) = &quote.tools {
-            body["tools"] = tools.clone();
+        //
+        // **"Verbatim" is now a property of the *pairing*, not of this line.**
+        // `tools_for` above hands back the client's own bytes whenever the
+        // declaring surface spoke this dialect — the ordinary path, and the one
+        // the paragraph above describes — and a faithful restatement of the
+        // plain function-tool core when it did not, having already refused
+        // anything it could not restate (M11.2a, F1).
+        if let Some(tools) = tools {
+            body["tools"] = tools;
         }
-        if let Some(tool_choice) = &quote.tool_choice {
-            body["tool_choice"] = tool_choice.clone();
+        if let Some(tool_choice) = tool_choice {
+            body["tool_choice"] = tool_choice;
         }
         quote.wire_protocol.enforce_usage_reporting(&mut body);
         Ok(body)
@@ -691,6 +745,7 @@ fn redact_error(credential: &TurnCredential, error: FrontierError) -> FrontierEr
         other @ (FrontierError::UnknownProvider(_)
         | FrontierError::Credential(_)
         | FrontierError::MalformedQuote(_)
+        | FrontierError::UntranslatableTools { .. }
         | FrontierError::UnsupportedDialect { .. }
         | FrontierError::Transport { .. }) => other,
     }
@@ -701,6 +756,33 @@ fn sensitive(value: &str) -> Option<HeaderValue> {
     let mut value = HeaderValue::from_str(value).ok()?;
     value.set_sensitive(true);
     Some(value)
+}
+
+/// How many `cache_control` breakpoints the forwarded tools already carry.
+///
+/// **Counted structurally rather than by scanning the JSON text**, because a
+/// tool whose *description* mentions `cache_control` is an ordinary tool and a
+/// text scan would read it as a breakpoint and silently drop roundhouse's own —
+/// costing the prefix discount on every turn for a substring in a doc string.
+///
+/// Only the array's top level is counted, which is where the wire puts them: a
+/// tool definition's `input_schema` is the tool's own argument schema and
+/// nothing inside it is a cache breakpoint, so descending would count a
+/// property a client happened to name `cache_control`.
+fn breakpoints_in(tools: Option<&Value>) -> usize {
+    tools
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter(|entry| {
+                    entry
+                        .get("cache_control")
+                        .is_some_and(|control| !control.is_null())
+                })
+                .count()
+        })
+        .unwrap_or(0)
 }
 
 /// A base URL with any trailing slash removed, so `{base}/v1/messages` is one
@@ -748,7 +830,20 @@ mod tests {
             // for "a quote with no tools sends no `tools` key".
             tools: None,
             tool_choice: None,
+            // And no dialect stamp, which is the honest answer for a quote with
+            // nothing to stamp — see `FrontierQuote::tools_dialect`.
+            tools_dialect: None,
             credential,
+        }
+    }
+
+    /// A quote whose toolbox was declared in `dialect`.
+    fn declaring(dialect: WireProtocol, tools: Value, tool_choice: Option<Value>) -> FrontierQuote {
+        FrontierQuote {
+            tools: Some(tools),
+            tool_choice,
+            tools_dialect: Some(dialect),
+            ..quote(TurnCredential::Absent, SPOKEN)
         }
     }
 
@@ -929,9 +1024,11 @@ mod tests {
         ]);
         let tool_choice = json!({ "type": "auto", "disable_parallel_tool_use": false });
 
-        let mut with_tools = quote(TurnCredential::Absent, SPOKEN);
-        with_tools.tools = Some(tools.clone());
-        with_tools.tool_choice = Some(tool_choice.clone());
+        // Declared *in this dialect*, which is what makes "verbatim" the
+        // contract here: a surface that spoke another dialect gets a faithful
+        // restatement instead, pinned by
+        // `a_responses_shaped_toolbox_is_restated_in_this_dialect_before_it_is_sent`.
+        let with_tools = declaring(SPOKEN, tools.clone(), Some(tool_choice.clone()));
         let body = AnthropicMessagesClient::body(&with_tools, "claude-sonnet").unwrap();
 
         assert_eq!(body["tools"], tools, "the client's bytes, unmodified");
@@ -965,11 +1062,164 @@ mod tests {
         // A choice without tools is forwarded as sent, not suppressed: the
         // upstream refuses it with a message naming the field, which is a better
         // answer than this client silently deciding the request was malformed.
-        let mut choice_only = quote(TurnCredential::Absent, SPOKEN);
-        choice_only.tool_choice = Some(tool_choice.clone());
+        let choice_only = FrontierQuote {
+            tool_choice: Some(tool_choice.clone()),
+            tools_dialect: Some(SPOKEN),
+            ..quote(TurnCredential::Absent, SPOKEN)
+        };
         let body = AnthropicMessagesClient::body(&choice_only, "claude-sonnet").unwrap();
         assert_eq!(body["tool_choice"], tool_choice);
         assert!(body.get("tools").is_none());
+    }
+
+    /// **F1, this client's half: a toolbox declared on the *other* dialect is
+    /// restated before it is sent, never forwarded and never thinned.**
+    ///
+    /// The scenario is a codex client — which speaks the Responses wire — on a
+    /// deployment whose cheapest capable target is an `anthropic_messages`
+    /// entry. Routing picks that target on price with no read of the declaring
+    /// surface, so the Responses spelling arrives here; `type: "function"` and
+    /// `parameters` are properties the Messages request schema does not have,
+    /// and its schema is closed (`additionalProperties: false`), so forwarding
+    /// them is a 400 on every tool-using turn.
+    ///
+    /// The whole seam is [`FrontierQuote::tools_for`], which has its own
+    /// exhaustive tests; what this asserts is that the *body* goes through it.
+    #[test]
+    fn a_responses_shaped_toolbox_is_restated_in_this_dialect_before_it_is_sent() {
+        let responses_shaped = json!([{
+            "type": "function",
+            "name": "Grep",
+            "description": "search",
+            "strict": true,
+            "parameters": { "type": "object", "properties": { "pattern": { "type": "string" } } },
+        }]);
+        let body = AnthropicMessagesClient::body(
+            &declaring(
+                WireProtocol::OpenAiResponses,
+                responses_shaped.clone(),
+                Some(json!("required")),
+            ),
+            "claude-sonnet",
+        )
+        .expect("a plain function tool restates faithfully");
+
+        assert_eq!(
+            body["tools"],
+            json!([{
+                "name": "Grep",
+                "description": "search",
+                "input_schema": {
+                    "type": "object",
+                    "properties": { "pattern": { "type": "string" } },
+                },
+            }]),
+            "the Messages schema is closed, so `type` and `parameters` are a 400 \
+             rather than fields an upstream ignores"
+        );
+        assert_eq!(body["tool_choice"], json!({ "type": "any" }));
+        assert_ne!(
+            body["tools"], responses_shaped,
+            "and it is emphatically not what the client sent"
+        );
+
+        // PROBE: a Responses tool with no Messages spelling at all. Refused
+        // here, before a socket, naming the tool and both dialects -- the
+        // alternatives being a 400 the client cannot read or a toolbox quietly
+        // one entry shorter than the one it declared.
+        let error = AnthropicMessagesClient::body(
+            &declaring(
+                WireProtocol::OpenAiResponses,
+                json!([{ "type": "custom", "name": "apply_patch",
+                         "format": { "type": "grammar" } }]),
+                None,
+            ),
+            "claude-sonnet",
+        )
+        .expect_err("a freeform tool has no Messages spelling");
+        assert!(
+            matches!(&error, FrontierError::UntranslatableTools { tool, from, to }
+                if tool == "apply_patch"
+                    && *from == "openai_responses"
+                    && *to == "anthropic_messages"),
+            "{error}"
+        );
+    }
+
+    /// **The forwarded tools' own breakpoints count against Anthropic's cap,
+    /// and this client yields rather than 400s.**
+    ///
+    /// Four `cache_control` markers is the documented maximum for one request.
+    /// The tools are forwarded verbatim *including* their breakpoints, so a
+    /// client that has spent the allowance leaves no room for the block
+    /// breakpoint this client adds — and a fifth marker is a 400 that costs the
+    /// whole turn, where skipping ours costs a prefix discount we can take again
+    /// next turn while the tools' own breakpoint still warms the provider cache.
+    #[test]
+    fn a_toolbox_that_has_spent_the_breakpoint_allowance_costs_the_prefix_marker_not_the_turn() {
+        let marked = |name: &str| {
+            json!({
+                "name": name,
+                "input_schema": { "type": "object" },
+                "cache_control": { "type": "ephemeral" },
+            })
+        };
+        let block_breakpoints = |body: &Value| {
+            body["messages"][0]["content"]
+                .as_array()
+                .expect("blocks")
+                .iter()
+                .filter(|block| block.get("cache_control").is_some())
+                .count()
+        };
+
+        // CONTROL: three of the four spent leaves room for ours, so the marker
+        // is still placed -- which is what proves the assertion below is about
+        // the count and not about tools suppressing the breakpoint at all.
+        let three = declaring(SPOKEN, json!([marked("A"), marked("B"), marked("C")]), None);
+        let body = AnthropicMessagesClient::body(&three, "claude-sonnet").unwrap();
+        assert_eq!(block_breakpoints(&body), 1);
+        assert_eq!(
+            body["tools"],
+            json!([marked("A"), marked("B"), marked("C")]),
+            "the client's breakpoints ride out untouched either way"
+        );
+
+        // PROBE: the fourth is the client's, so ours would be the fifth.
+        let four = declaring(
+            SPOKEN,
+            json!([marked("A"), marked("B"), marked("C"), marked("D")]),
+            None,
+        );
+        let body = AnthropicMessagesClient::body(&four, "claude-sonnet").unwrap();
+        assert_eq!(
+            block_breakpoints(&body),
+            0,
+            "a fifth `cache_control` in one request is a 400; the tools' four \
+             still warm the provider cache and ours can be taken next turn"
+        );
+        assert_eq!(
+            body["tools"],
+            json!([marked("A"), marked("B"), marked("C"), marked("D")]),
+            "yielding must not mean editing the client's toolbox"
+        );
+
+        // A tool whose *description* merely mentions the field is an ordinary
+        // tool: counting by text rather than by structure would drop the prefix
+        // marker on every turn for a substring in a doc string.
+        let prose = declaring(
+            SPOKEN,
+            json!([
+                marked("A"),
+                marked("B"),
+                marked("C"),
+                { "name": "D", "description": "set cache_control on the block",
+                  "input_schema": { "type": "object" } },
+            ]),
+            None,
+        );
+        let body = AnthropicMessagesClient::body(&prose, "claude-sonnet").unwrap();
+        assert_eq!(block_breakpoints(&body), 1);
     }
 
     #[test]

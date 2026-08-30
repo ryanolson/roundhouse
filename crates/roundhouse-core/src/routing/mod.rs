@@ -228,6 +228,33 @@ pub struct RoutingContext<'a> {
 /// every instance with one pattern.
 const OVERFLOW_NOTE: &str = "; budget exhausted and no local candidate could take the turn, so the frontier pool was re-admitted";
 
+/// What the engine appends to a rationale when a turn's toolbox put the local
+/// pool out of reach.
+///
+/// **The audit trail's answer to "why did this turn cost frontier money on a
+/// deployment with a free local worker".** A tool-declaring turn cannot be
+/// served locally at all — nothing in this build can tell a locally served model
+/// about a toolbox, and its answer is a plain `String` that cannot carry a call
+/// back — so the local candidates are dropped before the policy filter and never
+/// reach `considered`. Without this note the decision record shows a frontier
+/// dispatch chosen over a cheaper local candidate that is simply *not there*,
+/// and the counterfactual reads as a router preference rather than a capability
+/// limit.
+///
+/// Beside [`OVERFLOW_NOTE`] and spelled as one string for the same reason: an
+/// operator grepping the audit trail for it should find every instance with one
+/// pattern. Appended by the engine rather than by [`Admitted::annotate`],
+/// because the fact is the engine's — the router is never shown the toolbox at
+/// all, deliberately, since a turn's tools say nothing about which *hosted*
+/// model should answer it.
+///
+/// **This carves an honest exception out of degrade-to-local**, which every
+/// other part of this module promises unconditionally: a spent budget degrades
+/// to local, a withheld credential degrades to local, a load-shed frontier
+/// degrades to local. On a tool-declaring turn there is nothing to degrade to,
+/// and the turn fails instead — see `EngineError::NoToolCapableTarget`.
+pub const TOOL_TURN_EXCLUDES_LOCAL: &str = "; the client declared tools, so local candidates were excluded from this turn — this build cannot tell a locally served model about a toolbox";
+
 /// The candidates one turn may be dispatched to, and the budget fact its
 /// decision has to record.
 ///

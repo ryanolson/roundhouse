@@ -74,6 +74,9 @@ fn quote_as_the_engine_builds_it(catalog: &StaticFrontierCatalog) -> FrontierQuo
         output_token_cap: None,
         tools: None,
         tool_choice: None,
+        // And nothing to stamp a dialect on, which is what
+        // `tools_dialect: None` means -- see `FrontierQuote::tools_dialect`.
+        tools_dialect: None,
         // This test is about the dialect the quote carries, not about
         // authentication: the stub below never contacts a provider, so there is
         // nothing to authenticate to. `Absent` is the honest value, and a real

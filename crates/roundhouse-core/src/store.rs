@@ -99,6 +99,32 @@ pub trait SessionStore: Send + Sync + 'static {
 
     async fn release_lease(&self, lease: &Lease) -> Result<(), StoreError>;
 
+    /// Whether some live tenure currently holds this session's lease.
+    ///
+    /// **The one lease question a reader may ask**, and it exists because a
+    /// projection of the log cannot answer "is a turn writing this session
+    /// right now" from the log alone: a turn mid-flight and a turn whose writer
+    /// died leave byte-identical traces — items with no terminal event yet —
+    /// and only the lease distinguishes them. `responses_api`'s
+    /// `stored_conversation` reads it for exactly that (M11.2a's F3): items
+    /// stamped by a response that never terminated may be superseded, but only
+    /// once nobody is still producing them.
+    ///
+    /// Deliberately *not* an acquisition: the caller wants to know who is
+    /// writing, not to become the writer, and `acquire_lease` on a free session
+    /// would evict the very turn it is about to start.
+    ///
+    /// The default answers `true` — "this backend cannot prove the session is
+    /// idle" — because the caller's conservative direction is to leave history
+    /// alone: a backend that guessed `false` would let a reader supersede items
+    /// a live turn is still committing. Every real backend overrides it; the
+    /// default is for doubles that wrap one, and it costs them only the
+    /// supersession.
+    async fn is_leased(&self, session_id: &SessionId) -> Result<bool, StoreError> {
+        let _ = session_id;
+        Ok(true)
+    }
+
     /// Append events, assigning contiguous sequence numbers.
     ///
     /// Fails with [`StoreError::LeaseLost`] if `lease` is no longer valid, so a
@@ -264,6 +290,21 @@ impl SessionStore for MemoryStore {
             record.lease = None;
         }
         Ok(())
+    }
+
+    async fn is_leased(&self, session_id: &SessionId) -> Result<bool, StoreError> {
+        let sessions = self.sessions.read().await;
+        let record = sessions
+            .get(session_id)
+            .ok_or_else(|| StoreError::SessionNotFound(session_id.clone()))?;
+        // Expiry, not just presence: a record left behind by a node that died
+        // names a tenure nobody is writing under, which is precisely the state
+        // the caller is asking about. `expire_lease_now` above is the test hook
+        // that reaches it without waiting out a TTL.
+        Ok(record
+            .lease
+            .as_ref()
+            .is_some_and(|lease| !lease.is_expired_at(now_ms())))
     }
 
     async fn append_events(

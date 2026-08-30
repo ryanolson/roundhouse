@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use roundhouse_core::control::{CredentialError, TurnCredential};
 use roundhouse_core::metrics::{ReferenceModel, ShadowPricing};
@@ -455,16 +456,26 @@ pub struct FrontierQuote {
     /// whose tools mysteriously stop working, never as an error.
     ///
     /// So the dialects' shapes are *different* JSON and this field is whichever
-    /// one the surface that built the quote received. That is sound because the
-    /// serve surface and the dispatch client always speak the same dialect for a
-    /// pass-through turn, and it is the honest description of what this value is
-    /// either way: the caller's bytes, on their way to an upstream that defined
-    /// them.
+    /// one the surface that built the quote received — which is the honest
+    /// description of what this value is: the caller's bytes, on their way to an
+    /// upstream that may or may not have defined them.
+    ///
+    /// **The sentence that used to stand here — "the serve surface and the
+    /// dispatch client always speak the same dialect for a pass-through turn" —
+    /// was false, and it is M11.2a's F1.** Routing picks a target by price,
+    /// quality and TTFT with no read of the declaring surface, so an Anthropic
+    /// client's toolbox reaches a Responses target on any deployment whose
+    /// catalog mixes dialects — which the shipped example catalog does. The
+    /// premise is now a *field*, [`Self::tools_dialect`], and the seam that
+    /// reconciles the two is [`Self::tools_for`].
     ///
     /// `None` means the client declared no tools — every internal caller (the
     /// judge, the validate loop, an MCP turn) and any client that simply did not
     /// send any. Additive: a construction site that does not set it sends no
     /// `tools` key at all, which is what every dispatch did before M11.2.
+    ///
+    /// **Read through [`Self::tools_for`] and never directly**, because these
+    /// bytes are only meaningful beside [`Self::tools_dialect`] — see F1 below.
     pub tools: Option<serde_json::Value>,
     /// How the client wants the model to choose among [`Self::tools`], verbatim.
     ///
@@ -474,7 +485,34 @@ pub struct FrontierQuote {
     /// `tool_choice` without `tools` is a request the *upstream* should refuse
     /// with a message naming the field — not one this struct should make
     /// unrepresentable and thereby hide.
+    ///
+    /// Shaped in [`Self::tools_dialect`] like [`Self::tools`], and read through
+    /// [`Self::tools_for`] for the same reason.
     pub tool_choice: Option<serde_json::Value>,
+    /// The dialect [`Self::tools`] and [`Self::tool_choice`] are written in.
+    ///
+    /// **Stamped by the serve surface that accepted them, and it is not
+    /// [`Self::wire_protocol`].** That field is the dialect of the *target this
+    /// turn resolved to*; this one is the dialect of the *client that declared
+    /// the toolbox*, and M11.2a's F1 is the whole argument for why one field
+    /// cannot be both. `frontier.rs` used to assert the premise directly — "the
+    /// serve surface and the dispatch client always speak the same dialect for a
+    /// pass-through turn" — and the premise is false by construction: routing
+    /// picks a target by price, quality and TTFT with no read of the declaring
+    /// surface anywhere on that path, and the shipped example catalog pairs four
+    /// `openai_responses` entries with one `anthropic_messages` entry, so a
+    /// Claude Code turn crossing to a Responses target was posting
+    /// `{name, description, input_schema}` where the upstream requires
+    /// `{type: "function", …, parameters}` — a 400 on every tool-using turn,
+    /// which `plan`'s failover then repeated on the next same-dialect candidate.
+    ///
+    /// `None` means nothing declared a toolbox, which is every internal caller
+    /// (the judge, the validate loop, an MCP turn) and every client that sent no
+    /// tools. `None` *beside* a `Some` in either field above is a construction
+    /// bug and [`Self::tools_for`] refuses it as a [`FrontierError::MalformedQuote`]
+    /// rather than guessing a dialect: guessing wrong is exactly the silent
+    /// mis-serialization this field exists to end.
+    pub tools_dialect: Option<WireProtocol>,
     /// What this request authenticates with.
     ///
     /// **Carried here for the same reason [`Self::wire_protocol`] is, and the
@@ -547,6 +585,258 @@ impl FrontierQuote {
         segments.push(&self.prompt[start..]);
         Ok(segments)
     }
+
+    /// [`Self::tools`] and [`Self::tool_choice`], shaped for the dialect
+    /// `spoken` by the client about to serialize them.
+    ///
+    /// **The one seam a dispatch client reads a toolbox through, and the answer
+    /// to M11.2a's F1.** Three outcomes, and the third is the point:
+    ///
+    /// - **Verbatim** when the declaring surface and the dispatch client speak
+    ///   the same dialect, which is every same-dialect deployment and therefore
+    ///   the overwhelmingly common path. The client's bytes cross untouched —
+    ///   input schemas this build has never modelled, `cache_control`
+    ///   breakpoints, server tools and all — which is the property the existing
+    ///   thinning guards in both clients assert and which this function must not
+    ///   quietly weaken.
+    /// - **Translated** when they differ and the entry is a plain function tool.
+    ///   Anthropic's `{name, description, input_schema}` and the Responses
+    ///   wire's `{type: "function", name, description, parameters, strict?}`
+    ///   are the same declaration spelled twice — the Responses shape read from
+    ///   the pinned codex crates (`codex-rs/tools/src/responses_api.rs`
+    ///   @ `6344a65`), which are this tree's wire oracle — so restating one as
+    ///   the other loses nothing the model can act on.
+    /// - **Refused, before any socket**, for an entry that is *not* that core: a
+    ///   server tool (`web_search_20250305`, the Responses wire's `web_search`,
+    ///   `custom`, `namespace`), a shape carrying a key this translation does not
+    ///   understand, or a `tool_choice` spelling outside the four both dialects
+    ///   have. The error names the offending tool and both dialects, because the
+    ///   two alternatives are worse in the two ways this codebase cares about: a
+    ///   verbatim forward is a 400 the client cannot read, and a *thinned*
+    ///   toolbox — dropping what we cannot restate — tells the model about
+    ///   fewer tools than the client has and surfaces as tools that
+    ///   mysteriously stop working, never as an error.
+    ///
+    /// `cache_control` is the one key translated *away* rather than refused, and
+    /// the loss is priced rather than hidden: it is a caching directive with no
+    /// counterpart on the Responses wire, so dropping it costs the provider
+    /// discount on the tool preamble and costs the model nothing. Refusing the
+    /// turn over it would make a real Claude Code toolbox — which caches its
+    /// own preamble exactly this way — uncrossable for a reason that is about
+    /// money rather than capability.
+    pub fn tools_for(
+        &self,
+        spoken: WireProtocol,
+    ) -> Result<(Option<serde_json::Value>, Option<serde_json::Value>), FrontierError> {
+        if self.tools.is_none() && self.tool_choice.is_none() {
+            return Ok((None, None));
+        }
+        // A toolbox with no stamp is a quote this process built wrong, not
+        // hostile input — the same class as a segment structure that does not
+        // describe its prompt, and refused the same way. Guessing "probably the
+        // target's dialect" here would restore precisely the false premise F1
+        // found, and it would restore it invisibly.
+        let Some(declared) = self.tools_dialect else {
+            return Err(FrontierError::MalformedQuote(
+                "the quote carries tool declarations but no `tools_dialect`, so nothing knows \
+                 which dialect they are written in"
+                    .to_string(),
+            ));
+        };
+        if declared == spoken {
+            return Ok((self.tools.clone(), self.tool_choice.clone()));
+        }
+        let tools = self
+            .tools
+            .as_ref()
+            .map(|tools| translate_tools(tools, declared, spoken))
+            .transpose()?;
+        let tool_choice = self
+            .tool_choice
+            .as_ref()
+            .map(|choice| translate_tool_choice(choice, declared, spoken))
+            .transpose()?;
+        Ok((tools, tool_choice))
+    }
+}
+
+/// The refusal every untranslatable shape becomes, named the same way.
+fn untranslatable(tool: impl Into<String>, from: WireProtocol, to: WireProtocol) -> FrontierError {
+    FrontierError::UntranslatableTools {
+        tool: tool.into(),
+        from: from.wire_name(),
+        to: to.wire_name(),
+    }
+}
+
+/// Every entry of a `tools` array, restated in `to`.
+fn translate_tools(
+    tools: &serde_json::Value,
+    from: WireProtocol,
+    to: WireProtocol,
+) -> Result<serde_json::Value, FrontierError> {
+    let entries = tools
+        .as_array()
+        .ok_or_else(|| untranslatable("the `tools` payload, which is not an array", from, to))?;
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| translate_tool(entry, index, from, to))
+        .collect::<Result<Vec<_>, _>>()
+        .map(serde_json::Value::Array)
+}
+
+/// One tool declaration, restated in `to`.
+fn translate_tool(
+    entry: &serde_json::Value,
+    index: usize,
+    from: WireProtocol,
+    to: WireProtocol,
+) -> Result<serde_json::Value, FrontierError> {
+    // Named by the tool's own name where it has one, because that is the string
+    // an operator greps for in a client's config; positionally otherwise, since
+    // "some tool" would leave nobody anywhere to look.
+    let named = |object: Option<&serde_json::Map<String, serde_json::Value>>| {
+        object
+            .and_then(|object| object.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("tools[{index}]"))
+    };
+    let object = entry.as_object();
+    let name = named(object);
+    let object = object.ok_or_else(|| untranslatable(name.clone(), from, to))?;
+    let allowed = |keys: &[&str]| -> Result<(), FrontierError> {
+        match object.keys().all(|key| keys.contains(&key.as_str())) {
+            true => Ok(()),
+            false => Err(untranslatable(name.clone(), from, to)),
+        }
+    };
+
+    match (from, to) {
+        (WireProtocol::AnthropicMessages, WireProtocol::OpenAiResponses) => {
+            // `type` is absent on an Anthropic *function* tool and present on
+            // every server tool, so it is not on this list and a server tool
+            // refuses here — which is the whole intent: roundhouse cannot run
+            // Anthropic's server-side tools on OpenAI's behalf, and pretending
+            // otherwise would drop a capability the client declared.
+            allowed(&["name", "description", "input_schema", "cache_control"])?;
+            let schema = object
+                .get("input_schema")
+                .ok_or_else(|| untranslatable(name.clone(), from, to))?;
+            let mut out = serde_json::Map::new();
+            out.insert(
+                "type".to_string(),
+                serde_json::Value::String("function".into()),
+            );
+            out.insert("name".to_string(), serde_json::Value::String(name));
+            if let Some(description) = object.get("description") {
+                out.insert("description".to_string(), description.clone());
+            }
+            out.insert("parameters".to_string(), schema.clone());
+            Ok(serde_json::Value::Object(out))
+        }
+        (WireProtocol::OpenAiResponses, WireProtocol::AnthropicMessages) => {
+            // `strict` is accepted and dropped: Anthropic has no property for
+            // it, and it constrains how the *model* is decoded rather than what
+            // the tool is, so restating the tool without it still declares the
+            // same tool. `defer_loading` and `output_schema` are deliberately
+            // not on this list — the first changes when the model is told about
+            // the tool at all, and the second is a contract on the result.
+            allowed(&["type", "name", "description", "parameters", "strict"])?;
+            if object.get("type").and_then(serde_json::Value::as_str) != Some("function") {
+                return Err(untranslatable(name, from, to));
+            }
+            let parameters = object
+                .get("parameters")
+                .ok_or_else(|| untranslatable(name.clone(), from, to))?;
+            let mut out = serde_json::Map::new();
+            out.insert("name".to_string(), serde_json::Value::String(name));
+            if let Some(description) = object.get("description") {
+                out.insert("description".to_string(), description.clone());
+            }
+            out.insert("input_schema".to_string(), parameters.clone());
+            Ok(serde_json::Value::Object(out))
+        }
+        // Chat Completions spells tools a third way and no serve surface speaks
+        // it, so a quote claiming it is a configuration nobody has exercised.
+        // An arm rather than a wildcard: a fourth dialect is a compile error
+        // here, which is where the decision belongs.
+        (WireProtocol::OpenAiChatCompletions, _)
+        | (_, WireProtocol::OpenAiChatCompletions)
+        | (WireProtocol::AnthropicMessages, WireProtocol::AnthropicMessages)
+        | (WireProtocol::OpenAiResponses, WireProtocol::OpenAiResponses) => {
+            Err(untranslatable(name, from, to))
+        }
+    }
+}
+
+/// `tool_choice`, restated in `to`.
+///
+/// Four spellings both dialects have — auto, any/required, none, and one named
+/// tool — and nothing else. Anthropic's `disable_parallel_tool_use` is
+/// deliberately not among them: the Responses wire carries that fact in a
+/// *separate top-level* `parallel_tool_calls` property, so honouring it would
+/// mean this function editing a field it was not given, and dropping it would
+/// silently let a model fan out where the client asked it not to.
+fn translate_tool_choice(
+    choice: &serde_json::Value,
+    from: WireProtocol,
+    to: WireProtocol,
+) -> Result<serde_json::Value, FrontierError> {
+    let refuse = || untranslatable("tool_choice", from, to);
+    match (from, to) {
+        (WireProtocol::AnthropicMessages, WireProtocol::OpenAiResponses) => {
+            let object = choice.as_object().ok_or_else(refuse)?;
+            let kind = object
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(refuse)?;
+            match kind {
+                "auto" | "any" | "none" if object.len() == 1 => Ok(serde_json::Value::String(
+                    match kind {
+                        "auto" => "auto",
+                        "any" => "required",
+                        _ => "none",
+                    }
+                    .to_string(),
+                )),
+                "tool" if object.len() == 2 => {
+                    let name = object
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(refuse)?;
+                    Ok(json!({ "type": "function", "name": name }))
+                }
+                _ => Err(refuse()),
+            }
+        }
+        (WireProtocol::OpenAiResponses, WireProtocol::AnthropicMessages) => {
+            if let Some(mode) = choice.as_str() {
+                return match mode {
+                    "auto" => Ok(json!({ "type": "auto" })),
+                    "required" => Ok(json!({ "type": "any" })),
+                    "none" => Ok(json!({ "type": "none" })),
+                    _ => Err(refuse()),
+                };
+            }
+            let object = choice.as_object().ok_or_else(refuse)?;
+            if object.get("type").and_then(serde_json::Value::as_str) != Some("function")
+                || object.len() != 2
+            {
+                return Err(refuse());
+            }
+            let name = object
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(refuse)?;
+            Ok(json!({ "type": "tool", "name": name }))
+        }
+        (WireProtocol::OpenAiChatCompletions, _)
+        | (_, WireProtocol::OpenAiChatCompletions)
+        | (WireProtocol::AnthropicMessages, WireProtocol::AnthropicMessages)
+        | (WireProtocol::OpenAiResponses, WireProtocol::OpenAiResponses) => Err(refuse()),
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -580,6 +870,29 @@ pub enum FrontierError {
          slice a prompt at offsets that would change what the model is asked"
     )]
     MalformedQuote(String),
+    /// The client's toolbox is shaped for one dialect and this turn resolved to
+    /// a target speaking another, and one entry cannot be honestly restated.
+    ///
+    /// **Its own arm, and it refuses before a socket, for the reason
+    /// [`Self::UnsupportedDialect`] does — with a sharper edge.** Sending anyway
+    /// is a 400 the client cannot read, on every tool-using turn, which
+    /// `plan`'s failover then repeats against the next candidate in the same
+    /// dialect. Sending a *thinned* toolbox — dropping the entries that do not
+    /// translate — is worse: the model is told about fewer tools than the
+    /// client has, answers without them, and nothing anywhere reports a
+    /// failure. Naming the tool and both dialects is what makes the remedy
+    /// findable: either the deployment separates the two dialects' catalogs, or
+    /// the client stops declaring a tool no other dialect has.
+    #[error(
+        "the client declared tool `{tool}` in `{from}` and this turn resolved to a `{to}` \
+         target, which has no faithful spelling for it; refusing rather than sending a \
+         mis-shaped or thinned toolbox"
+    )]
+    UntranslatableTools {
+        tool: String,
+        from: &'static str,
+        to: &'static str,
+    },
     /// A client was handed a quote in a dialect it does not speak.
     ///
     /// Its own arm for the same reason [`Self::Credential`] is: nothing reached
@@ -659,6 +972,11 @@ impl FrontierError {
             | FrontierError::Upstream(_)
             | FrontierError::Credential(_)
             | FrontierError::MalformedQuote(_)
+            // A second target does not fix a toolbox nobody can restate: the
+            // failover candidates that share the chosen target's dialect fail
+            // identically, and the ones that do not are the reason this refusal
+            // exists. The remedy is a catalog or a client change, not a retry.
+            | FrontierError::UntranslatableTools { .. }
             | FrontierError::UnsupportedDialect { .. } => None,
         }
     }
@@ -856,6 +1174,11 @@ mod tests {
             FrontierError::UnknownProvider("moonshot".into()),
             FrontierError::Upstream("the upstream sent an unparseable event".into()),
             FrontierError::MalformedQuote("boundary 9999 is past the end".into()),
+            FrontierError::UntranslatableTools {
+                tool: "web_search".into(),
+                from: "anthropic_messages",
+                to: "openai_responses",
+            },
             FrontierError::UnsupportedDialect {
                 expected: "openai_responses",
                 got: "anthropic_messages",
@@ -950,6 +1273,7 @@ mod tests {
             output_token_cap: None,
             tools: None,
             tool_choice: None,
+            tools_dialect: None,
             credential,
         }
     }
@@ -1214,6 +1538,288 @@ mod tests {
             canonical_arguments(&canonical_arguments(ARGUMENTS)),
             canonical_arguments(ARGUMENTS)
         );
+    }
+
+    /// The two dialects' spellings of one plain function tool, and the payload
+    /// every cross-dialect assertion below is built from.
+    ///
+    /// The Anthropic side is the shape a real Claude Code turn sends (its live
+    /// capture's twenty-four entries are all exactly this: `name`,
+    /// `description`, `input_schema` and nothing else); the Responses side is
+    /// the shape the pinned codex crates serialize —
+    /// `codex-rs/tools/src/responses_api.rs` @ `6344a65`, `ResponsesApiTool`
+    /// under `#[serde(tag = "type")] ToolSpec::Function` — which is this tree's
+    /// oracle for that wire.
+    fn anthropic_tool() -> serde_json::Value {
+        json!({
+            "name": "Grep",
+            "description": "search the tree",
+            "input_schema": {
+                "type": "object",
+                "properties": { "pattern": { "type": "string" } },
+                "required": ["pattern"],
+            },
+        })
+    }
+
+    fn responses_tool() -> serde_json::Value {
+        json!({
+            "type": "function",
+            "name": "Grep",
+            "description": "search the tree",
+            "parameters": {
+                "type": "object",
+                "properties": { "pattern": { "type": "string" } },
+                "required": ["pattern"],
+            },
+        })
+    }
+
+    fn declaring(
+        tools: Option<serde_json::Value>,
+        tool_choice: Option<serde_json::Value>,
+        dialect: WireProtocol,
+    ) -> FrontierQuote {
+        FrontierQuote {
+            tools,
+            tool_choice,
+            tools_dialect: Some(dialect),
+            ..quote_with(TurnCredential::Absent)
+        }
+    }
+
+    /// **F1: a toolbox crossing dialects is restated, and a same-dialect one is
+    /// not touched at all.**
+    ///
+    /// The verbatim half is asserted first and is the load-bearing half of the
+    /// two: it is what says this translation cannot quietly become a
+    /// re-encoding on the ordinary path, where the client's bytes carry input
+    /// schemas, breakpoints and server tools this build models nowhere.
+    #[test]
+    fn a_toolbox_crosses_dialects_by_translation_and_stays_byte_identical_within_one() {
+        let anthropic = json!([anthropic_tool()]);
+        let responses = json!([responses_tool()]);
+
+        // CONTROL, and the property both clients' thinning guards rest on: same
+        // dialect in and out, the caller's exact bytes -- including the two
+        // shapes translation refuses, which is what proves "verbatim" is not
+        // "translated and happened to match".
+        let hostile = json!([
+            anthropic_tool(),
+            { "type": "web_search_20250305", "name": "web_search", "max_uses": 5 },
+            { "name": "Read", "input_schema": { "type": "object" },
+              "cache_control": { "type": "ephemeral" } },
+        ]);
+        let choice = json!({ "type": "auto", "disable_parallel_tool_use": false });
+        let same = declaring(
+            Some(hostile.clone()),
+            Some(choice.clone()),
+            WireProtocol::AnthropicMessages,
+        );
+        assert_eq!(
+            same.tools_for(WireProtocol::AnthropicMessages).unwrap(),
+            (Some(hostile), Some(choice))
+        );
+
+        // PROBE: Anthropic-declared, dispatched to a Responses target.
+        let crossing = declaring(
+            Some(anthropic.clone()),
+            Some(json!({ "type": "any" })),
+            WireProtocol::AnthropicMessages,
+        );
+        assert_eq!(
+            crossing.tools_for(WireProtocol::OpenAiResponses).unwrap(),
+            (Some(responses.clone()), Some(json!("required"))),
+            "the Responses wire requires `type: function` and spells the schema \
+             `parameters`; forwarding Anthropic's spelling is a 400 on every turn"
+        );
+
+        // And back the other way, because a Responses-speaking client (codex)
+        // routed to an Anthropic target is the same defect mirrored.
+        let returning = declaring(
+            Some(responses),
+            Some(json!({ "type": "function", "name": "Grep" })),
+            WireProtocol::OpenAiResponses,
+        );
+        assert_eq!(
+            returning
+                .tools_for(WireProtocol::AnthropicMessages)
+                .unwrap(),
+            (
+                Some(anthropic),
+                Some(json!({ "type": "tool", "name": "Grep" }))
+            )
+        );
+    }
+
+    /// Every `tool_choice` spelling both dialects have, in both directions.
+    ///
+    /// A table rather than four tests because the mapping is the claim: `any`
+    /// and `required` are the same instruction under two names, and a
+    /// translation that got one pair backwards would let a client that demanded
+    /// a tool call get a model free to answer in prose — which reads as a model
+    /// being unhelpful, never as a bug here.
+    #[test]
+    fn tool_choice_maps_across_both_spellings_in_both_directions() {
+        for (anthropic, responses) in [
+            (json!({ "type": "auto" }), json!("auto")),
+            (json!({ "type": "any" }), json!("required")),
+            (json!({ "type": "none" }), json!("none")),
+            (
+                json!({ "type": "tool", "name": "Bash" }),
+                json!({ "type": "function", "name": "Bash" }),
+            ),
+        ] {
+            let out = declaring(
+                None,
+                Some(anthropic.clone()),
+                WireProtocol::AnthropicMessages,
+            )
+            .tools_for(WireProtocol::OpenAiResponses)
+            .unwrap_or_else(|error| panic!("{anthropic} must translate: {error}"));
+            assert_eq!(out, (None, Some(responses.clone())));
+
+            let back = declaring(None, Some(responses.clone()), WireProtocol::OpenAiResponses)
+                .tools_for(WireProtocol::AnthropicMessages)
+                .unwrap_or_else(|error| panic!("{responses} must translate: {error}"));
+            assert_eq!(back, (None, Some(anthropic)));
+        }
+    }
+
+    /// **What cannot be restated is refused by name, never thinned and never
+    /// forwarded.**
+    ///
+    /// Each probe is a shape a real client sends: Anthropic's server tools, the
+    /// Responses wire's own `web_search`/`custom` variants (both in the pinned
+    /// `ToolSpec` enum), and the parallel-tool-use flag that lives in a
+    /// different property on the other wire. The assertion is on the *message*
+    /// as much as on the variant: an operator holding this has to be able to
+    /// find the tool in a client config and the pairing in a catalog file.
+    #[test]
+    fn a_tool_neither_dialect_can_restate_refuses_by_name_before_any_socket() {
+        let probes: Vec<(WireProtocol, WireProtocol, serde_json::Value, &str)> = vec![
+            (
+                WireProtocol::AnthropicMessages,
+                WireProtocol::OpenAiResponses,
+                json!([{ "type": "web_search_20250305", "name": "web_search", "max_uses": 5 }]),
+                "web_search",
+            ),
+            (
+                WireProtocol::AnthropicMessages,
+                WireProtocol::OpenAiResponses,
+                json!([{ "name": "Bash", "description": "run", "defer_loading": true }]),
+                "Bash",
+            ),
+            (
+                WireProtocol::AnthropicMessages,
+                WireProtocol::OpenAiResponses,
+                // No schema at all: Responses would then be told a tool takes
+                // no arguments, which is a claim the client never made.
+                json!([{ "name": "Read", "description": "read" }]),
+                "Read",
+            ),
+            (
+                WireProtocol::OpenAiResponses,
+                WireProtocol::AnthropicMessages,
+                json!([{ "type": "web_search" }]),
+                "tools[0]",
+            ),
+            (
+                WireProtocol::OpenAiResponses,
+                WireProtocol::AnthropicMessages,
+                json!([{ "type": "custom", "name": "patch", "format": { "type": "grammar" } }]),
+                "patch",
+            ),
+        ];
+        for (from, to, tools, named) in probes {
+            let error = declaring(Some(tools.clone()), None, from)
+                .tools_for(to)
+                .expect_err(&format!("{tools} must be refused"));
+            let FrontierError::UntranslatableTools {
+                tool,
+                from: f,
+                to: t,
+            } = &error
+            else {
+                panic!("{error} for {tools}")
+            };
+            assert_eq!(tool, named, "{error}");
+            assert_eq!((*f, *t), (from.wire_name(), to.wire_name()), "{error}");
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains(named)
+                    && rendered.contains(from.wire_name())
+                    && rendered.contains(to.wire_name()),
+                "the refusal has to name the tool and both dialects: {rendered}"
+            );
+        }
+
+        // `tool_choice` the same way, and `disable_parallel_tool_use` is the
+        // case worth spelling out: the Responses wire carries that fact in a
+        // separate top-level property, so there is no honest place to put it.
+        for (from, to, choice) in [
+            (
+                WireProtocol::AnthropicMessages,
+                WireProtocol::OpenAiResponses,
+                json!({ "type": "auto", "disable_parallel_tool_use": true }),
+            ),
+            (
+                WireProtocol::OpenAiResponses,
+                WireProtocol::AnthropicMessages,
+                json!("anything_else"),
+            ),
+        ] {
+            let error = declaring(None, Some(choice.clone()), from)
+                .tools_for(to)
+                .expect_err(&format!("{choice} must be refused"));
+            assert!(
+                matches!(&error, FrontierError::UntranslatableTools { tool, .. } if tool == "tool_choice"),
+                "{error}"
+            );
+        }
+
+        // CONTROL: the same call with a translatable payload succeeds, so the
+        // assertions above are about these shapes and not about the seam
+        // refusing every cross-dialect turn.
+        assert!(
+            declaring(
+                Some(json!([anthropic_tool()])),
+                Some(json!({ "type": "auto" })),
+                WireProtocol::AnthropicMessages
+            )
+            .tools_for(WireProtocol::OpenAiResponses)
+            .is_ok()
+        );
+    }
+
+    /// A toolbox with no dialect stamped is a quote this process built wrong,
+    /// and it is refused rather than guessed at.
+    ///
+    /// The guess that would be tempting — "assume the target's dialect" —
+    /// is exactly the false premise F1 found, and taking it would restore the
+    /// silent 400 while looking like a safe default. The no-tools control below
+    /// is what keeps the stamp from becoming mandatory for the judge, the
+    /// validate loop and every other internal caller that declares nothing.
+    #[test]
+    fn a_toolbox_with_no_dialect_stamped_is_refused_and_an_empty_one_is_not() {
+        let unstamped = FrontierQuote {
+            tools: Some(json!([anthropic_tool()])),
+            ..quote_with(TurnCredential::Absent)
+        };
+        assert!(matches!(
+            unstamped.tools_for(WireProtocol::AnthropicMessages),
+            Err(FrontierError::MalformedQuote(_))
+        ));
+
+        // CONTROL: nothing declared, no stamp needed, and both dialects answer
+        // the same nothing.
+        let bare = quote_with(TurnCredential::Absent);
+        for spoken in [
+            WireProtocol::AnthropicMessages,
+            WireProtocol::OpenAiResponses,
+        ] {
+            assert_eq!(bare.tools_for(spoken).unwrap(), (None, None));
+        }
     }
 
     #[tokio::test]

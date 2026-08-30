@@ -296,6 +296,9 @@ fn quote(credential: TurnCredential) -> FrontierQuote {
         output_token_cap: None,
         tools: None,
         tool_choice: None,
+        // And nothing to stamp a dialect on, which is what
+        // `tools_dialect: None` means -- see `FrontierQuote::tools_dialect`.
+        tools_dialect: None,
         credential,
     }
 }
@@ -435,6 +438,11 @@ async fn a_tool_using_turn_sends_the_clients_tools_and_yields_one_completed_call
     let mut quote = quote(stored());
     quote.tools = Some(tools.clone());
     quote.tool_choice = Some(tool_choice.clone());
+    // Declared on this same dialect, which is what makes the verbatim assertion
+    // below the contract: a toolbox stamped with another dialect is restated
+    // rather than forwarded, and one with no stamp at all is refused before a
+    // socket (M11.2a, F1 — `FrontierQuote::tools_for`).
+    quote.tools_dialect = Some(roundhouse_fleet::WireProtocol::AnthropicMessages);
 
     let chunks = drain(client.execute(&quote).await.unwrap()).await.unwrap();
 

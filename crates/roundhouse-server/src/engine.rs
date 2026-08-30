@@ -47,7 +47,7 @@ use roundhouse_core::store::SessionStore;
 use roundhouse_core::validate::{SideCall, exchanges};
 use roundhouse_fleet::{
     FleetError, FleetQuery, FrontierChunk, FrontierClient, FrontierClients, FrontierError,
-    FrontierQuote, FrontierStream, LocalFleet, LocalQuote, StaticFrontierCatalog,
+    FrontierQuote, FrontierStream, LocalFleet, LocalQuote, StaticFrontierCatalog, WireProtocol,
 };
 use roundhouse_mcp::ControlStore;
 use serde_json::Value;
@@ -107,6 +107,27 @@ pub enum EngineError {
     /// lists this model" — because a settle no longer asks a catalog anything.
     #[error("a frontier dispatch to `{0:?}` settled against a decision that recorded no rate card")]
     UnpricedSettlement(Target),
+    /// A tool-declaring turn with nowhere left that could carry the toolbox.
+    ///
+    /// **Loud rather than served, and that is the whole of M11.2a's F2.** A
+    /// local worker is told nothing about tools — [`LocalExecutor::execute`]
+    /// takes prompt token ids and an output cap — and [`LocalExecution::text`]
+    /// is a plain `String` that cannot carry a call back, so a tool turn routed
+    /// there comes out as prose reporting `end_turn`, which the client reads as
+    /// a model that chose not to use its tools. Nothing anywhere says otherwise.
+    /// A promptless-local tool turn is not a served turn; it is a wrong answer
+    /// wearing one, and the honest answer to "we have no capacity for this" is a
+    /// failure naming both halves.
+    ///
+    /// `why` carries the *reason nothing remained* — an all-local fleet, or a
+    /// spent budget that left only the local pool to degrade to — because the
+    /// two send an operator to different files.
+    #[error(
+        "this turn declares {tools} tool definition(s) and no candidate that can carry them \
+         remains: {why}; refusing rather than answering it in prose from a worker that \
+         cannot be told about a toolbox at all"
+    )]
+    NoToolCapableTarget { tools: usize, why: String },
     #[error("chosen target `{0:?}` had no matching quote")]
     UnresolvableTarget(Target),
     #[error("turn exceeded its deadline of {0} ms")]
@@ -265,12 +286,33 @@ pub struct TurnInput {
     /// wire module would be a third projection that silently drops what it does
     /// not model.
     ///
-    /// Reaches the quote and nothing else. Not a routing input: v1 chooses its
-    /// target by policy, and a turn's toolbox says nothing about which model
-    /// should answer it.
+    /// Reaches the quote, and — since M11.2a's F4 — the turn's input-side token
+    /// counts, through [`Engine::declaration_tokens`]. Still not a *selection*
+    /// input in the sense this note originally meant: v1 chooses its target by
+    /// policy, and a turn's toolbox says nothing about which model should answer
+    /// it. What it does say is how big the request is, and pretending otherwise
+    /// quoted, granted and reported a real Claude Code turn at a fifth of its
+    /// size. The arithmetic consequence is that a tool-heavy turn now prices a
+    /// frontier candidate above a local one that would not have received the
+    /// toolbox at all — which is the honest comparison of what each target
+    /// actually gets sent, not a preference this field expresses.
     pub tools: Option<Value>,
     /// How the client wants the model to choose among [`Self::tools`], verbatim.
     pub tool_choice: Option<Value>,
+    /// The dialect the two fields above are written in.
+    ///
+    /// **Stamped by the serve surface, because it is the only layer that knows,
+    /// and it is not the dialect of the target the turn resolves to.** M11.2a's
+    /// F1: routing picks a target by price, quality and TTFT with no read of the
+    /// declaring surface, and the shipped example catalog mixes dialects, so a
+    /// Claude Code toolbox reaching an `openai_responses` entry is an ordinary
+    /// deployment rather than a misconfiguration. Carried down to
+    /// [`FrontierQuote::tools_dialect`], where the dispatch client reconciles
+    /// the two or refuses.
+    ///
+    /// `None` where nothing was declared — every caller with no tools — and a
+    /// stamp beside a `None` toolbox names a dialect nobody reads.
+    pub tools_dialect: Option<WireProtocol>,
 }
 
 impl From<Vec<Item>> for TurnInput {
@@ -281,6 +323,7 @@ impl From<Vec<Item>> for TurnInput {
             output_token_cap: None,
             tools: None,
             tool_choice: None,
+            tools_dialect: None,
         }
     }
 }
@@ -303,6 +346,36 @@ struct ClientDeclarations {
     output_token_cap: Option<u32>,
     tools: Option<Value>,
     tool_choice: Option<Value>,
+    /// The dialect the two fields above are written in — see
+    /// [`TurnInput::tools_dialect`]. Part of this bundle rather than beside it
+    /// because it is meaningless without them and unreadable without it.
+    tools_dialect: Option<WireProtocol>,
+}
+
+impl ClientDeclarations {
+    /// Did the client declare a toolbox this turn?
+    ///
+    /// `tools` alone and not `tool_choice`: a choice without tools is a request
+    /// the *upstream* refuses with a message naming the field
+    /// (see [`FrontierQuote::tool_choice`]), and treating it as a tool turn here
+    /// would make a malformed request unroutable instead of answerable.
+    fn declares_tools(&self) -> bool {
+        self.tools.is_some()
+    }
+}
+
+/// How many tool definitions the client declared, for a refusal that has to say.
+///
+/// Zero for a `tools` value that is not an array, which is a client's malformed
+/// request rather than something to panic over: the count is diagnostic prose
+/// and the refusal it decorates is correct either way.
+fn declared_tool_count(declarations: &ClientDeclarations) -> usize {
+    declarations
+        .tools
+        .as_ref()
+        .and_then(|tools| tools.as_array())
+        .map(Vec::len)
+        .unwrap_or(0)
 }
 
 /// What a local worker produced.
@@ -641,6 +714,14 @@ impl Failed {
             | EngineError::FairUse(_)
             | EngineError::UnpricedSettlement(_)
             | EngineError::UnresolvableTarget(_)
+            // A tool turn with no tool-capable capacity is filed here rather
+            // than as a refusal, and the three-systems test is what decides it:
+            // no policy was consulted and no budget was spent — this deployment
+            // simply has nothing that can carry a toolbox, which is a fleet and
+            // catalog fact and sends an operator to the same place
+            // `NoCandidates` does. The turn's own error message names the
+            // toolbox, so nothing is lost by the reason being the general one.
+            | EngineError::NoToolCapableTarget { .. }
             | EngineError::TurnDeadline(_) => IncompleteReason::UpstreamError,
         }
     }
@@ -975,11 +1056,13 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             output_token_cap,
             tools,
             tool_choice,
+            tools_dialect,
         } = input.into();
         let declarations = ClientDeclarations {
             output_token_cap,
             tools,
             tool_choice,
+            tools_dialect,
         };
         // See `turn_gates`: within this node, one turn at a time per session.
         let gate = self.turn_gate(session_id);
@@ -1413,6 +1496,16 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         let mut reported: Option<Usage> = None;
         let mut reported_cost_usd: Option<f64> = None;
         let mut stop_reason: Option<String> = None;
+        // **F5 (M11.2a thermo-nuclear review).** `spoken` alone is what this
+        // turn *said*, and a turn whose whole answer is tool calls says nothing:
+        // `spoken` stays empty while two real calls dispatch and commit. Counted
+        // the same way `context_contribution` already counts a committed call
+        // for the *next* turn's context — the call's own `render()`, tokenized —
+        // "because a tool call says nothing to a human but occupies context
+        // exactly as `plan` will count it" (see that function). Summed here
+        // rather than recomputed from the log afterward, so `estimated_usage`
+        // never has to re-open the items it just watched this loop commit.
+        let mut tool_call_output_tokens: u64 = 0;
         loop {
             let chunk = match tokio::time::timeout_at(deadline_at, stream.next()).await {
                 Ok(Some(Ok(chunk))) => chunk,
@@ -1500,6 +1593,13 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                     // projections emit this same stored string, so the round
                     // trip closes. See `canonical_arguments`.
                     let call = Item::tool_call(id, name, canonical_arguments(&arguments));
+                    // F5: measured before the move below, on the same rendering
+                    // `context_contribution` uses for this item once it is a
+                    // resend rather than a fresh commit — so an unreported-usage
+                    // turn and a next-turn context estimate agree about what one
+                    // committed call is worth, rather than each inventing its own
+                    // answer.
+                    tool_call_output_tokens += self.tokenizer.encode(&call.render()).len() as u64;
                     if let Err(error) = session.append_emitted(response_id, call).await {
                         return Err(Failed::mid_stream(
                             error,
@@ -1564,7 +1664,8 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         // tokens for zero dollars, which on a frontier target is
         // indistinguishable from a saving — so the gap is filled from what we
         // do know and stamped as an estimate.
-        let usage = reported.unwrap_or_else(|| self.estimated_usage(&spoken, isl_tokens));
+        let usage = reported
+            .unwrap_or_else(|| self.estimated_usage(&spoken, tool_call_output_tokens, isl_tokens));
 
         // What the completion still owes the log. A turn that emitted nothing
         // at all still commits one (possibly empty) assistant item, because that
@@ -1584,17 +1685,28 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         })
     }
 
-    /// What this deployment's tokenizer makes of a conversation, as the input
+    /// What this deployment's tokenizer makes of a turn's input — the
+    /// conversation *and* what the client declared alongside it — as the input
     /// sequence length of the request that would carry it.
     ///
-    /// Public for one caller — the Responses surface, which needs this number
-    /// for a turn the interjection seam answers and therefore never dispatches.
-    /// It goes through [`ContextAssembler::rehydrate`] with *this engine's*
-    /// tokenizer and block size, which is the whole point of exposing it rather
-    /// than letting the surface tokenize for itself: [`Self::plan`] prices a
-    /// dispatched turn on exactly this quantity, so the number reported for a
-    /// steered turn and the number reported for the turn after it are produced
-    /// by one function and cannot drift into two conventions.
+    /// Public for the two serve surfaces: one needs this number for a turn the
+    /// interjection seam answers and therefore never dispatches, and both report
+    /// it to the client as the input they admitted. It goes through
+    /// [`ContextAssembler::rehydrate`] with *this engine's* tokenizer and block
+    /// size, which is the whole point of exposing it rather than letting the
+    /// surface tokenize for itself: [`Self::plan`] prices a dispatched turn on
+    /// exactly this quantity, so the number reported for a steered turn and the
+    /// number reported for the turn after it are produced by one function and
+    /// cannot drift into two conventions.
+    ///
+    /// **The declarations are parameters and not an afterthought for exactly
+    /// that reason** (M11.2a's F4). They are a real part of the request's size,
+    /// they are what `plan` adds to the conversation before quoting it, and a
+    /// caller that could omit them would silently report the smaller of two
+    /// numbers — which is the defect this signature closes: the compiler now
+    /// asks every surface what its client declared. See
+    /// [`Self::declaration_tokens`] for what is counted and what is deliberately
+    /// left unmodelled.
     ///
     /// Summed per item rather than built through [`Self::assembler_over`], so
     /// this can borrow. An assembler owns what it pushes, and cloning the whole
@@ -1606,11 +1718,101 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
     /// `the_admitted_input_count_is_what_the_assembler_would_buffer`, which goes
     /// red if that step ever stops being per-item and sends this back to
     /// building the assembler.
-    pub fn admitted_input_tokens(&self, items: &[Item]) -> u64 {
+    pub fn admitted_input_tokens(
+        &self,
+        items: &[Item],
+        tools: Option<&Value>,
+        tool_choice: Option<&Value>,
+    ) -> u64 {
         items
             .iter()
             .map(|item| self.tokenizer.encode(&item.render()).len() as u64)
-            .sum()
+            .sum::<u64>()
+            + self.declaration_tokens(tools, tool_choice)
+    }
+
+    /// **What a turn's declared toolbox adds to its input, in tokens.**
+    ///
+    /// The tool preamble is not conversation and never becomes an item — it is
+    /// re-declared verbatim on every request, so putting it in the log would put
+    /// a changing blob inside the prefix hash and fork every warm session whose
+    /// client edited its tool list. But it is unmistakably *input*: the
+    /// Anthropic client writes `body["tools"]` straight onto the wire, and a
+    /// real Claude Code turn measured on this box is 79% tool schemas by byte
+    /// (65,835 bytes, 24 tools). Until M11.2a's F4 that made the largest part of
+    /// a real request invisible to every number this engine produces — the
+    /// quote each candidate is priced with, the budget grant opened against it,
+    /// the recorded `expected_cost_usd`, the estimate a stream that reported no
+    /// usage falls back to, and the `count_tokens` answer the client plans its
+    /// own compaction with. A `refuse`-on-exhaustion project could therefore
+    /// spend 161% of its ceiling before the arm that refuses ever fired.
+    ///
+    /// So the toolbox is counted here and added to the input side, *without*
+    /// being counted anywhere the conversation's identity is decided: not an
+    /// item, not in the prefix admission check, not in a block hash. The
+    /// separation is what lets the number be honest about size while the
+    /// session stays honest about content.
+    ///
+    /// **Deliberately not modelled: what a provider's cache does with it.**
+    /// Anthropic orders a cached prompt `tools → system → messages`, so a
+    /// breakpoint set at the conversation's stable boundary caches the tool
+    /// preamble ahead of it too — meaning the second turn of a session very
+    /// likely pays for these tokens at the cached rate rather than the full one.
+    /// That is a claim about a provider's behaviour and this rung has no
+    /// measurement of it, so nothing here asserts it; the one consequence that
+    /// does follow is that the recorded decision's `isl_tokens` (which includes
+    /// this) becomes the cache ledger's prefix watermark for the next turn,
+    /// which is the same reading the ledger already takes of the conversation.
+    /// A later rung with real `cache_read_input_tokens` from a tooled turn can
+    /// replace the estimate with the measurement.
+    ///
+    /// The render is canonical by construction: `preserve_order` is off
+    /// workspace-wide (see the root manifest), so every `Value` renders in one
+    /// sorted key order and a client whose proxy alphabetized its JSON is
+    /// counted identically to one whose did not — the same property
+    /// `ItemContent::Opaque` rests on, and it matters here for the same reason:
+    /// a chained Relay re-serializes every body it intercepts.
+    pub fn declaration_tokens(&self, tools: Option<&Value>, tool_choice: Option<&Value>) -> u64 {
+        /// The two declarations in one render, in the order a canonical JSON
+        /// object would put them, so the count includes the field names the
+        /// wire really carries and never depends on which of the two arrived.
+        /// Borrowed rather than built into a `Map`: the tools are the largest
+        /// thing in the request and this runs on every turn.
+        #[derive(serde::Serialize)]
+        struct Declared<'a> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            tool_choice: Option<&'a Value>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            tools: Option<&'a Value>,
+        }
+
+        // **Charged for a turn that declares tools, and only for one.** The
+        // ruling's subject is a *tool-declaring* turn; `tool_choice` is counted
+        // because it rides with the toolbox, not on its own. A lone
+        // `tool_choice` does reach the wire — this client forwards one without
+        // tools deliberately, so the upstream can name the field it refuses —
+        // but it is twenty bytes of envelope, the size of the `model` and
+        // `stream` fields nothing here has ever counted either, and `isl_tokens`
+        // is the size of the prompt rather than of the HTTP body.
+        //
+        // The consequence is the property that makes this change safe to land:
+        // every turn that declares no tools is accounted for exactly as it was
+        // before F4. Counting the dangling choice instead would have re-priced
+        // every codex turn ever served — the Responses request type sends
+        // `"tool_choice": "auto"` unconditionally — moving quotes, grants and
+        // routing decisions for turns that have nothing to do with this finding.
+        let Some(tools) = tools else {
+            return 0;
+        };
+        let rendered = serde_json::to_string(&Declared {
+            tool_choice,
+            tools: Some(tools),
+        })
+        // Infallible: both fields are already-parsed `Value`s, which
+        // serialize without a fallible step. A count is not the place to
+        // fail a turn over it either way.
+        .unwrap_or_default();
+        self.tokenizer.encode(&rendered).len() as u64
     }
 
     /// The one place a conversation becomes a priced buffer for this engine.
@@ -1672,22 +1874,41 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
 
     /// Stand in for a provider that reported nothing.
     ///
-    /// Input is not really an estimate — it is the prompt this engine
-    /// tokenized, hashed, and routed on, so it is the same number the provider
+    /// Input is not really an estimate — it is the request this engine
+    /// tokenized and routed on: the prompt it hashed, plus the toolbox it
+    /// forwarded verbatim (M11.2a's F4), so it is the same number the provider
     /// would have counted barring a tokenizer mismatch. Output is a genuine
-    /// estimate: our tokenizer over the text we received. Cached input stays
-    /// zero because nothing observable here bears on what a remote cache did,
-    /// and the conservative direction is the one that understates the saving
-    /// rather than inventing it. The cache-*write* count stays zero for the
-    /// same reason and one stronger: it is a measurement by definition, so
-    /// filling it from anything but a provider's own report would put a guess
-    /// in the one column that exists to be checked against a bill.
-    fn estimated_usage(&self, text: &str, isl_tokens: usize) -> Usage {
+    /// estimate: our tokenizer over the text and the tool calls we received.
+    /// Cached input stays zero because nothing observable here bears on what a
+    /// remote cache did, and the conservative direction is the one that
+    /// understates the saving rather than inventing it. The cache-*write* count
+    /// stays zero for the same reason and one stronger: it is a measurement by
+    /// definition, so filling it from anything but a provider's own report
+    /// would put a guess in the one column that exists to be checked against a
+    /// bill.
+    ///
+    /// **`tool_call_output_tokens` is F5 (M11.2a thermo-nuclear review).**
+    /// `text` alone is what the turn *said*, and a turn whose whole answer is
+    /// tool calls says nothing — `text` is empty on exactly the turn shape
+    /// this fallback exists to survive, so a real, non-trivial dispatch used to
+    /// settle at `output_tokens: 0`: zero dollars for output on a hosted model,
+    /// indistinguishable on the savings dashboard from a saving that never
+    /// happened. The caller sums each committed call's own `render()`,
+    /// tokenized, the same measure [`Self::context_contribution`] already
+    /// applies to a committed call on the turn *after* this one; the two
+    /// functions now agree that a call is not silence just because nobody
+    /// speaks it.
+    fn estimated_usage(
+        &self,
+        text: &str,
+        tool_call_output_tokens: u64,
+        isl_tokens: usize,
+    ) -> Usage {
         Usage {
             input_tokens: isl_tokens as u64,
             cached_input_tokens: 0,
             cache_write_tokens: 0,
-            output_tokens: self.tokenizer.encode(text).len() as u64,
+            output_tokens: self.tokenizer.encode(text).len() as u64 + tool_call_output_tokens,
             // Thinking is not recoverable from the visible text: a provider
             // that withheld its accounting also withheld this.
             reasoning_tokens: 0,
@@ -1711,7 +1932,26 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         // Rebuild the prompt from the committed log, so what we price is
         // exactly what a successor would reconstruct.
         let assembler = self.assembler_over(session.state().items.clone());
-        let isl_tokens = assembler.buffer().isl_tokens();
+        // **Two counts, because two different things are being measured** (F4).
+        // `conversation_tokens` is the log's own projection — the prompt a
+        // successor rebuilds, the buffer the local fleet routes on, the bytes
+        // the block hashes cover. `isl_tokens` is the size of the *request*: the
+        // conversation plus the toolbox the client re-declares on every turn and
+        // that the frontier wire carries verbatim. Everything that prices,
+        // grants, records or estimates this turn reads the second; only the
+        // local path, which receives no toolbox at all, keeps the first.
+        //
+        // Adding rather than pushing into the assembler is the whole safety
+        // argument: the buffer, its blocks and their hashes stay byte-identical
+        // whether the client declared tools or not, so prefix admission and the
+        // cache ledger's block matching are untouched by a toolbox that changes
+        // from turn to turn.
+        let conversation_tokens = assembler.buffer().isl_tokens();
+        let isl_tokens = conversation_tokens
+            + self.declaration_tokens(
+                declarations.tools.as_ref(),
+                declarations.tool_choice.as_ref(),
+            ) as usize;
         let turn_index = session.turn_index().saturating_sub(1);
 
         // What the session's own tools have been doing, for the tier scorer.
@@ -1762,6 +2002,54 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             isl_tokens as u64,
             self.config.expected_output_tokens as u64,
         ));
+
+        // --- a tool-declaring turn cannot go to a local worker ---------------
+        //
+        // **M11.2a's F2, and it is a routing fact rather than a dispatch one.**
+        // [`LocalExecutor::execute`] takes prompt token ids and an output cap
+        // and nothing else — this build has no way to tell a locally served
+        // model about a toolbox at all — and [`LocalExecution::text`] is a plain
+        // `String`, structurally incapable of carrying a call back. So a turn
+        // that declares tools and lands local is answered in prose, reports
+        // `end_turn` as if it had finished normally, and signals the loss
+        // nowhere: the client's agent loop simply stops working, which is the
+        // one failure shape this codebase treats as worse than an error.
+        //
+        // Excluded *here*, before the policy filter, and that placement is the
+        // same argument the credential filter makes twenty lines down: a
+        // candidate that could never have served this turn must not sit in
+        // `considered` either, or the dashboard prices a counterfactual saving
+        // against a target the turn could not have used. It is a *reachability*
+        // exclusion in the sense `TurnPolicy::permits` means — the same answer
+        // on every tool-declaring turn of every session — not a this-turn one.
+        //
+        // The alternative deliberately not taken: rendering a textual toolbox
+        // into the local prompt and parsing calls back out of the model's prose.
+        // That is a real design with a real cost — a second, weaker tool
+        // protocol whose failures look like bad answers — and it belongs to
+        // whichever milestone decides local models should be agentic, not to a
+        // review fix.
+        let excluded_local = match declarations.declares_tools() {
+            true => {
+                let before = candidates.len();
+                candidates.retain(|candidate| !candidate.target.is_local());
+                before - candidates.len()
+            }
+            false => 0,
+        };
+        if excluded_local > 0 && candidates.is_empty() {
+            // Nothing hosted was quoted and local was all there was. Its own
+            // error rather than `NoCandidates` or a served prose turn, because
+            // the two things an operator needs are in it: that this turn
+            // declared tools, and that the only capacity this deployment has
+            // cannot carry them. A promptless-local tool turn is not a served
+            // turn; it is a wrong answer wearing one.
+            return Err(EngineError::NoToolCapableTarget {
+                tools: declared_tool_count(&declarations),
+                why: "every candidate this deployment quoted is a local worker".to_string(),
+            }
+            .into());
+        }
 
         // --- apply the judge's escalation, as far as the pool allows ---------
         //
@@ -1989,7 +2277,37 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                     tiers: admission.tiers.as_deref(),
                 }),
             )
-            .await?;
+            .await
+            // **The other half of F2, and the one that reads wrong without
+            // this.** With local excluded above, an exhausted budget leaves a
+            // tool-declaring turn nothing to degrade *to*: `NoViableCandidate`
+            // is what the router honestly reports, and it sends an operator
+            // straight to the spend ledger — where the real answer is that this
+            // deployment has no tool-capable capacity left, budget or no budget.
+            // Restated rather than replaced, so both facts survive.
+            .map_err(|error| match (excluded_local, &error) {
+                (1.., EngineError::Routing(RoutingError::NoViableCandidate { budget_state })) => {
+                    EngineError::NoToolCapableTarget {
+                        tools: declared_tool_count(&declarations),
+                        why: format!(
+                            "the local pool this turn would otherwise have degraded to cannot \
+                             carry a toolbox, and the budget state is {budget_state:?}"
+                        ),
+                    }
+                }
+                _ => error,
+            })?;
+        // Recorded in the audit trail rather than only in this function, because
+        // "why did a tool turn cost frontier money on a deployment with a free
+        // local worker" is exactly the question a decision record exists to
+        // answer, and the honest answer is not "the router preferred it".
+        let mut decision = decision;
+        if excluded_local > 0 {
+            decision
+                .rationale
+                .push_str(roundhouse_core::routing::TOOL_TURN_EXCLUDES_LOCAL);
+        }
+        let decision = decision;
 
         // --- the handoff gate's second half (S6) ------------------------------
         //
@@ -2204,7 +2522,12 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                     &access.credential,
                     handoff_note,
                     session.session_id(),
-                    isl_tokens,
+                    // The *conversation's* count, not the request's: the only
+                    // consumer below is the local path, which receives the
+                    // prompt buffer and no toolbox at all, so handing it the
+                    // tools-inclusive number would report input the worker never
+                    // saw and subtract a prefill it never did (F4).
+                    conversation_tokens,
                     deadline_at,
                     declarations,
                 )
@@ -2305,7 +2628,10 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         credential: &TurnCredential,
         handoff_note: Option<&str>,
         session_id: &SessionId,
-        isl_tokens: usize,
+        // The conversation's own token count — deliberately *not* the turn's
+        // tools-inclusive `isl_tokens`. Only the local arm reads it, and a local
+        // worker is sent the prompt buffer alone; see the call site (F4).
+        conversation_tokens: usize,
         deadline_at: Instant,
         // What the client declared, for the dialects that can express it.
         //
@@ -2314,9 +2640,16 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         // it is *our* capacity being reserved, and a caller's ceiling is not a
         // reservation. And `LocalExecutor::execute` takes prompt token ids and
         // nothing else — this build has no way to tell a locally served model
-        // about a toolbox at all — so a turn that declares tools and routes
-        // local is answered without them. A real gap, stated here rather than
-        // papered over by handing the local path a value it would ignore.
+        // about a toolbox at all.
+        //
+        // **That second gap is now closed at routing rather than tolerated
+        // here** (M11.2a, F2): `plan` drops every local candidate from a
+        // tool-declaring turn before the policy filter and fails the turn with
+        // `EngineError::NoToolCapableTarget` when nothing else remains, so the
+        // `Target::Local` arm below is unreachable with `declarations.tools`
+        // set. It stays unread rather than growing an assertion, because the
+        // invariant belongs to the routing decision and restating it as a panic
+        // here would put a second, weaker copy of it in the dispatch path.
         declarations: &ClientDeclarations,
     ) -> Result<FrontierStream, ConnectFailure> {
         match target {
@@ -2334,7 +2667,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                     fleet,
                     quote,
                     assembler.buffer().tokens(),
-                    isl_tokens,
+                    conversation_tokens,
                     deadline_at,
                 )
                 .await
@@ -2363,11 +2696,12 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                     // property of *where* this line is rather than of anything
                     // the function does.
                     //
-                    // `isl_tokens` above is deliberately the undecorated count:
-                    // it is what the pool was quoted against and what the
-                    // decision was recorded at, and re-deriving it here would
-                    // make the audit trail describe a prompt that never went
-                    // anywhere. The note is roundhouse's own paragraph on one
+                    // The turn's `isl_tokens` in `plan` is deliberately the
+                    // count of an *undecorated* prompt plus the declared
+                    // toolbox: it is what the pool was quoted against and what
+                    // the decision was recorded at, and re-deriving it here
+                    // would make the audit trail describe a prompt that never
+                    // went anywhere. The note is roundhouse's own paragraph on one
                     // turn in a session, so the understatement is bounded and
                     // one-sided — and a frontier settle prices from the
                     // provider's own reported usage anyway.
@@ -2429,6 +2763,16 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                     // define.
                     tools: declarations.tools.clone(),
                     tool_choice: declarations.tool_choice.clone(),
+                    // **And the dialect they were declared in, which is not
+                    // `spec.wire_protocol` above.** That one is the dialect of
+                    // the target this turn resolved to; this one is the dialect
+                    // of the surface that accepted the toolbox, and M11.2a's F1
+                    // is what happens when a single field is asked to be both:
+                    // an Anthropic-shaped tool array posted to a Responses
+                    // upstream, 400 on every tool-using turn, repeated by
+                    // failover on the next same-dialect candidate. The client
+                    // reconciles them or refuses — `FrontierQuote::tools_for`.
+                    tools_dialect: declarations.tools_dialect,
                     // The credential travels here for the same reason the
                     // dialect above does: this is the only argument `execute`
                     // receives. It is the *same* resolution the payer on the
