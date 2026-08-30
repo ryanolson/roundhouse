@@ -335,6 +335,10 @@ pub async fn read_events_pages_oldest_first_and_reproduces_the_append<S: Session
                 accounting: Accounting::Estimated,
             },
             provider_reported_cost_usd: None,
+            // Populated for the same reason the counters above are: a backend
+            // that dropped the newest field would still pass this round trip if
+            // the fixture left it at its default.
+            stop_reason: Some("tool_use".into()),
         },
         text_event("tail"),
     ];

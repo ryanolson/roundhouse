@@ -1249,6 +1249,7 @@ pub(super) mod tests {
                 response_id,
                 usage,
                 provider_reported_cost_usd: None,
+                stop_reason: None,
             });
             self
         }
@@ -1291,6 +1292,7 @@ pub(super) mod tests {
                 response_id,
                 usage,
                 provider_reported_cost_usd: None,
+                stop_reason: None,
             });
             self
         }

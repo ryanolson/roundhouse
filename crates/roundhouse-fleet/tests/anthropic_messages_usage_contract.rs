@@ -100,8 +100,12 @@ fn quote() -> FrontierQuote {
         prompt_cache_key: "sess_usage_contract".into(),
         expected_output_tokens: Some(512),
         // No client declared a ceiling on these fixtures, which is what
-        // every internal caller looks like; see `output_token_cap`.
+        // every internal caller looks like; see `output_token_cap`. Nor tools,
+        // so these dispatches are also the control for "a quote with none sends
+        // no `tools` key".
         output_token_cap: None,
+        tools: None,
+        tool_choice: None,
         credential: TurnCredential::Stored(
             Secret::api_key("sk-ant-api03-ZZZQQQ-usage-contract").expect("an ordinary API key"),
         ),
@@ -193,6 +197,7 @@ async fn the_accounting_is_whole_only_when_both_usage_events_are_folded() {
             output_tokens: 64,
             reasoning_tokens: 0,
             provider_reported_cost: None,
+            stop_reason: Some("end_turn".into()),
         })
     );
 

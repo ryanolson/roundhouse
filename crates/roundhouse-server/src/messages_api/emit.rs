@@ -15,23 +15,33 @@
 //! **What the client enforces, and how the shape here makes it unreachable.**
 //! A `content_block_delta` at an index with no prior `content_block_start`
 //! raises `RangeError("Content block not found")`; a `content_block_stop`
-//! before any `message_start` raises `Error("Message not found")`. Rather than
-//! check for those, [`MessageEmission::opening`] is called by *every* arm that
-//! emits anything, so the prelude and the one content block precede everything
-//! by construction and there is no ordering for the client to reject. The cost
-//! is one flag; the alternative is a family of ordering tests that can only
-//! ever sample the orderings someone thought of.
+//! before any `message_start` raises `Error("Message not found")`; a
+//! `text_delta` applied to a `tool_use` block raises `Error("Content block is
+//! not a text block")`. Rather than check for those,
+//! [`MessageEmission::opening`] is called by *every* arm that emits anything, so
+//! the prelude precedes everything by construction, and a block is opened by
+//! whatever fills it — so a delta can only ever land on a block of its own kind.
+//! There is no ordering for the client to reject. The cost is two fields; the
+//! alternative is a family of ordering tests that can only ever sample the
+//! orderings someone thought of.
 //!
-//! **The single content block at index 0** is this surface's whole content
-//! model for M11.1. Roundhouse's log has one text stream per response and no
-//! tool loop, so a second index would have nothing to carry. It is opened by
-//! the prelude rather than lazily by the first delta, which is a deliberate
-//! difference from the Responses follower's "announce the item on first delta":
-//! a stream that reaches `message_stop` having completed *no* content block is
-//! one of the two conditions that make Claude Code re-issue the whole turn
-//! non-streaming (§3.6), so a turn that produced no text would silently cost
-//! the upstream a second full-price answer. An empty text block says the same
-//! thing for free.
+//! **The content model is a real block sequence since M11.2, where M11.1 had one
+//! text block at index 0.** That single block was right while the log could only
+//! hold one text stream per response; a dispatched turn now commits its own tool
+//! calls as items, and a turn that speaks, calls, speaks and calls again is four
+//! blocks whose *order* the client resends as history. So blocks are allocated
+//! as content arrives and closed before the next one opens.
+//!
+//! Opening them lazily is a reversal, and the reason is a fork rather than a
+//! tidiness: an eagerly opened block 0 puts an empty text block ahead of the
+//! call on the ordinary agent turn — a model that is calling a tool usually says
+//! nothing first — and the client's resend does not contain one, so the stored
+//! history and the claim diverge at that item and the session forks. What the
+//! eager open bought is kept where it belongs: a stream that reaches
+//! `message_stop` having completed *no* content block is one of the two
+//! conditions that make Claude Code re-issue the whole turn non-streaming
+//! (§3.6), so [`MessageEmission::stopped`] emits an empty text block for a turn
+//! that produced nothing at all.
 //!
 //! **Usage crosses an axis change here and it is the most dangerous line in the
 //! file** — the exact mirror of the note at the top of the dispatch decoder.
@@ -54,8 +64,13 @@ use roundhouse_fleet::anthropic_messages::wire::{
     MessageDeltaBody, StopReason, StreamEvent, Usage as WireUsage,
 };
 
-/// The one content block a response of this surface has.
-pub const TEXT_BLOCK_INDEX: u64 = 0;
+/// The first content block index, which is the only one a prose turn uses.
+///
+/// Kept as a name rather than as a literal `0` because the tests that assert the
+/// prose shape are asserting *the first block*, not the number zero — and since
+/// M11.2 the numbers after it are handed out by
+/// [`MessageEmission::open_text_block`] rather than fixed.
+pub const FIRST_BLOCK_INDEX: u64 = 0;
 
 /// What `message_start` reports as the output count.
 ///
@@ -336,6 +351,40 @@ fn content_block_delta(index: u64, text: &str) -> Frame {
     })
 }
 
+/// A `tool_use` block opening, with the empty `input` the real API sends.
+///
+/// `input: {}` rather than the arguments, and it is not a placeholder we could
+/// helpfully fill: the client's accumulator *overwrites* this field with what it
+/// parses from the block's accumulated `input_json_delta` fragments at
+/// `content_block_stop`, so arguments put here are discarded. The empty object
+/// is what the upstream sends and what a strict reader expects; see
+/// [`MessageEmission::tool_block`].
+fn tool_block_start(index: u64, call_id: &str, name: &str) -> Frame {
+    frame(StreamEvent::ContentBlockStart {
+        index,
+        content_block: ContentBlock::ToolUse {
+            id: call_id.to_string(),
+            name: name.to_string(),
+            input: Value::Object(serde_json::Map::new()),
+            cache_control: None,
+            extra: Extra::new(),
+        },
+        extra: Extra::new(),
+    })
+}
+
+/// The whole of a tool call's arguments, as the one fragment this block has.
+fn tool_block_delta(index: u64, arguments: &str) -> Frame {
+    frame(StreamEvent::ContentBlockDelta {
+        index,
+        delta: BlockDelta::InputJsonDelta {
+            partial_json: arguments.to_string(),
+            extra: Extra::new(),
+        },
+        extra: Extra::new(),
+    })
+}
+
 fn content_block_stop(index: u64) -> Frame {
     frame(StreamEvent::ContentBlockStop {
         index,
@@ -413,15 +462,21 @@ fn error_frame(kind: &str, message: &str) -> Frame {
 ///
 /// Served genuinely rather than refused, because Claude Code's auth and quota
 /// probes are one-token non-streaming creates (§3.6) and a surface that 500s or
-/// 422s on them fails before the first turn. The content is one text block even
-/// when the answer is empty, matching what the streaming projection always
-/// emits: two projections of one turn that disagree about whether an empty
-/// answer has a block would be two answers to a question a client is entitled
-/// to ask either way.
+/// 422s on them fails before the first turn.
+///
+/// **`content` is the caller's blocks since M11.2, not a string this function
+/// wraps.** It used to take the answer's text and make one text block of it,
+/// which was true while a turn had exactly one block and became a silent
+/// truncation the moment a turn could also call tools. The non-streaming path
+/// reassembles the same blocks the streaming path emitted, and hands them here:
+/// two projections of one turn that disagreed about its content would be two
+/// answers to a question a client is entitled to ask either way. An empty answer
+/// is still one empty text block, for the same reason — that is what the stream
+/// sends.
 pub fn message_body(
     response_id: &ResponseId,
     model: &str,
-    text: &str,
+    content: Vec<ContentBlock>,
     stop_reason: StopReason,
     usage: &Usage,
 ) -> Message {
@@ -430,7 +485,7 @@ pub fn message_body(
         id: Some(response_id.to_string()),
         role: Some(ASSISTANT.to_string()),
         model: Some(model.to_string()),
-        content: vec![ContentBlock::text(text)],
+        content,
         stop_reason: Some(stop_reason),
         stop_sequence: None,
         usage: wire_usage(usage, usage.output_tokens),
@@ -474,17 +529,44 @@ pub struct MessageEmission {
     /// not known yet and is corrected by the terminal `message_delta`.
     admitted: Usage,
     response_id: Option<ResponseId>,
-    /// Whether the prelude and the content block have gone out.
+    /// Whether the prelude has gone out.
     started: bool,
     /// Whether any text has gone out.
     ///
-    /// Not "whether a block is open" — the block is opened by the prelude, so
-    /// that question has one answer. This one decides whether a committed
-    /// assistant item is *new* text or the same text a dispatched turn already
-    /// streamed as deltas, which is the same distinction the Responses
-    /// follower's `item_open` draws and the reason an interjection-seam answer
-    /// reaches the client at all.
+    /// Not "whether a block is open" — [`Self::open_text`] answers that. This
+    /// one decides whether a committed assistant item is *new* text or the same
+    /// text a dispatched turn already streamed as deltas, which is the same
+    /// distinction the Responses follower's `item_open` draws and the reason an
+    /// interjection-seam answer reaches the client at all.
     streamed: bool,
+    /// The next content block index to hand out.
+    ///
+    /// **Real since M11.2, where M11.1 had the constant zero.** A turn that
+    /// speaks and then calls two tools is four blocks, and the client's
+    /// accumulator keys every frame on this number: a delta at an index with no
+    /// prior start is `RangeError("Content block not found")`, which is a thrown
+    /// exception rather than a dropped frame, i.e. a lost turn. Monotonic and
+    /// never reused, which is the property that makes that impossible here.
+    next_index: u64,
+    /// The index of the open text block, when one is open.
+    ///
+    /// Text blocks are opened lazily by their first delta and closed by the next
+    /// tool call or by the terminal — a deliberate reversal of M11.1, where the
+    /// prelude opened block 0 eagerly. The reason is that an eager empty text
+    /// block is a block the *client* then resends as content: on a turn whose
+    /// whole answer is a tool call — the ordinary agent turn — the stored
+    /// history would hold an empty text item the resend does not, and the
+    /// session would fork on the very next turn. The property the eager open
+    /// bought (never reaching `message_stop` with no completed block, §3.6,
+    /// which costs a second full-price non-streaming turn) is kept by
+    /// [`Self::stopped`]'s empty-block fallback instead.
+    open_text: Option<u64>,
+    /// Whether this turn put a tool call on the wire.
+    ///
+    /// Read only by [`Self::completion_stop_reason`], and there it is the
+    /// stronger evidence: see that function for why the emitted content
+    /// out-ranks the provider's own word.
+    called_a_tool: bool,
     /// Reported at the terminal instead of what the log booked.
     ///
     /// The interjection seam's substitution: a turn answered at the seam books
@@ -504,6 +586,9 @@ impl MessageEmission {
             response_id: None,
             started: false,
             streamed: false,
+            next_index: 0,
+            open_text: None,
+            called_a_tool: false,
             reported: None,
         }
     }
@@ -554,28 +639,48 @@ impl MessageEmission {
             SessionEventKind::OutputTextDelta { response_id, text } if self.claims(response_id) => {
                 self.streamed = true;
                 let mut frames = self.opening();
-                frames.push(content_block_delta(TEXT_BLOCK_INDEX, text));
+                let index = self.open_text_block(&mut frames);
+                frames.push(content_block_delta(index, text));
                 (frames, Step::Continue)
             }
-            // An answer committed whole rather than streamed — the interjection
-            // seam's outcome, whose text never passes through a delta. One
-            // delta carrying the whole thing, because the block model here has
-            // no "here is a finished item" frame and does not need one: a
-            // client assembles text from deltas either way, and a single large
-            // delta is a shape the accumulator already handles.
-            SessionEventKind::ItemAppended { item } => match self.seam_answer(item) {
-                Some(text) => {
+            // Two shapes of committed item, and they are not variations of one
+            // thing: a seam answer is text that never passed through a delta,
+            // and a tool call is the turn's *other* content channel.
+            SessionEventKind::ItemAppended { item } => match self.emitted(item) {
+                // One delta carrying the whole thing, because the block model
+                // here has no "here is a finished item" frame and does not need
+                // one: a client assembles text from deltas either way, and a
+                // single large delta is a shape the accumulator already handles.
+                Some(Emitted::SeamText(text)) => {
                     let text = text.to_string();
                     self.streamed = true;
                     let mut frames = self.opening();
-                    frames.push(content_block_delta(TEXT_BLOCK_INDEX, &text));
+                    let index = self.open_text_block(&mut frames);
+                    frames.push(content_block_delta(index, &text));
+                    (frames, Step::Continue)
+                }
+                Some(Emitted::ToolCall {
+                    call_id,
+                    name,
+                    arguments,
+                }) => {
+                    let (call_id, name, arguments) =
+                        (call_id.to_string(), name.to_string(), arguments.to_string());
+                    let mut frames = self.opening();
+                    self.tool_block(&mut frames, &call_id, &name, &arguments);
                     (frames, Step::Continue)
                 }
                 None => (Vec::new(), Step::Continue),
             },
             SessionEventKind::ResponseCompleted {
-                response_id, usage, ..
-            } if self.claims(response_id) => (self.stopped(StopReason::EndTurn, usage), Step::End),
+                response_id,
+                usage,
+                stop_reason,
+                ..
+            } if self.claims(response_id) => {
+                let reason = self.completion_stop_reason(stop_reason.as_deref());
+                (self.stopped(reason, usage), Step::End)
+            }
             SessionEventKind::ResponseIncomplete {
                 response_id,
                 reason,
@@ -620,19 +725,19 @@ impl MessageEmission {
         // the log may not contain, which is the same thing the Responses
         // surface's `failed_frame` declines to invent.
         let mut frames = Vec::new();
-        if self.started {
-            frames.push(content_block_stop(TEXT_BLOCK_INDEX));
-        }
+        self.close_text_block(&mut frames);
         frames.push(error_frame(kind, message));
         frames
     }
 
-    /// The prelude and the one content block, at most once.
+    /// The prelude, at most once.
     ///
     /// Called by every arm that emits anything, which is what makes
-    /// "`message_start` first" and "no delta before its block's start" true by
-    /// construction rather than by ordering discipline. Both are throws in the
-    /// client's accumulator (§3.3), and a throw mid-stream is a lost turn.
+    /// "`message_start` first" true by construction rather than by ordering
+    /// discipline — a `content_block_stop` before one is `Error("Message not
+    /// found")` in the client's accumulator (§3.3), and a throw mid-stream is a
+    /// lost turn. The content block that used to ride along here is opened by
+    /// whatever fills it instead; see [`Self::open_text`].
     fn opening(&mut self) -> Vec<Frame> {
         if self.started {
             return Vec::new();
@@ -644,16 +749,79 @@ impl MessageEmission {
             return Vec::new();
         };
         self.started = true;
-        vec![
-            message_start(&response_id, &self.model, &self.admitted),
-            content_block_start(TEXT_BLOCK_INDEX),
-        ]
+        vec![message_start(&response_id, &self.model, &self.admitted)]
+    }
+
+    /// The index of a text block that is open and accepting deltas, opening one
+    /// if the last thing on the wire was a tool call or nothing at all.
+    ///
+    /// The allocator's read half. A `text_delta` aimed at a `tool_use` block is
+    /// `Error("Content block is not a text block")` in the client's accumulator
+    /// — the third of its three block-type throws — so text after a call has to
+    /// be a *new* block rather than a resumption of the one before it.
+    fn open_text_block(&mut self, frames: &mut Vec<Frame>) -> u64 {
+        if let Some(index) = self.open_text {
+            return index;
+        }
+        let index = self.next_index;
+        self.next_index += 1;
+        self.open_text = Some(index);
+        frames.push(content_block_start(index));
+        index
+    }
+
+    /// Close the open text block, if one is open.
+    fn close_text_block(&mut self, frames: &mut Vec<Frame>) {
+        if let Some(index) = self.open_text.take() {
+            frames.push(content_block_stop(index));
+        }
+    }
+
+    /// One completed tool call, as its own block.
+    ///
+    /// **Start, one `input_json_delta`, stop — never a start whose
+    /// `content_block` already carries the arguments.** The client's accumulator
+    /// applies `input_json_delta` fragments to the *partial JSON* it keeps per
+    /// block and parses the result at `content_block_stop`; the `input` on a
+    /// `tool_use` start frame is `{}` on the real API and is the field the
+    /// accumulator overwrites. Emitting the arguments only on the start frame
+    /// would therefore hand a strict reader a complete call and hand Claude Code
+    /// an empty one — the failure that looks like a model calling tools with no
+    /// arguments.
+    ///
+    /// One delta rather than fragments because the log holds the call whole: the
+    /// dispatch decoder already reassembled it, and re-splitting it here would
+    /// invent boundaries no upstream chose. A client that reassembles fragments
+    /// handles one fragment as a special case of many.
+    ///
+    /// The block is closed immediately. A tool call is complete when it is
+    /// committed — that is what `FrontierChunk::ToolCall` means — so there is
+    /// nothing further that could arrive for this index.
+    fn tool_block(&mut self, frames: &mut Vec<Frame>, call_id: &str, name: &str, arguments: &str) {
+        self.close_text_block(frames);
+        let index = self.next_index;
+        self.next_index += 1;
+        self.called_a_tool = true;
+        frames.push(tool_block_start(index, call_id, name));
+        frames.push(tool_block_delta(index, arguments));
+        frames.push(content_block_stop(index));
     }
 
     /// The ordinary terminal: close the block, report, stop.
     fn stopped(&mut self, stop_reason: StopReason, usage: &Usage) -> Vec<Frame> {
         let mut frames = self.opening();
-        frames.push(content_block_stop(TEXT_BLOCK_INDEX));
+        if self.next_index == 0 {
+            // **The empty-block fallback, and it is the whole reason blocks are
+            // lazy rather than free.** A stream that reaches `message_stop`
+            // having completed no content block is one of the two conditions
+            // that make Claude Code re-issue the entire turn non-streaming
+            // (§3.6), at full price. A turn that produced nothing — a refusal
+            // the seam answered with silence, an upstream that streamed no
+            // deltas — says so with an empty text block for free. Reached only
+            // when *nothing* was emitted, so a tool-only turn does not get one.
+            self.open_text_block(&mut frames);
+        }
+        self.close_text_block(&mut frames);
         // `unwrap_or` and not `expect`, for the reason the Responses follower
         // gives at the same seam: the emission and the completion land in one
         // append batch, so a completion with no emission before it is an
@@ -671,21 +839,32 @@ impl MessageEmission {
         self.response_id.as_ref() == Some(response_id)
     }
 
-    /// The text of an answer this response committed without streaming it.
+    /// What a committed item becomes on this wire, if anything.
     ///
-    /// Three conditions, and each rules out a different way the wrong text
-    /// reaches a client. The provenance stamp rules out the client's own resent
-    /// history, which canonicalizes with no stamp at all and so can never be
-    /// forged into an answer. [`Self::streamed`] rules out the ordinary
-    /// dispatched turn, which puts its answer out as deltas and *then* commits
-    /// the same text as an item — claiming it here too would deliver the answer
-    /// twice. And the content match rules out everything that is not prose: the
-    /// three M11.1 variants are listed by name rather than caught by a wildcard
-    /// because the default a wildcard would pick is the unsafe one, which is the
-    /// argument `Item::spoken_text` makes for itself.
+    /// The provenance stamp is the first condition for both shapes, and it is
+    /// what rules out the client's own resent history: canonicalization sets no
+    /// stamp on anything a client sends, so a client cannot forge an answer or a
+    /// call into this stream. A replay re-reads the whole log, so every item the
+    /// session ever held passes through here.
     ///
-    /// `pub` because the follower asks it too, *before* projecting: an item this
-    /// returns `Some` for is a turn answered at the interjection seam, whose
+    /// Beyond the stamp the two shapes ask opposite questions. Text is claimed
+    /// only when it was *not* streamed — a dispatched turn puts its answer out
+    /// as deltas and then commits the same text as an item, and claiming it here
+    /// too would deliver the answer twice; what survives that filter is the
+    /// interjection seam's answer, committed whole and never streamed. A tool
+    /// call is claimed unconditionally, because a call has no delta path at all:
+    /// the item *is* how it reaches this projection.
+    ///
+    /// The remaining variants are listed by name rather than caught by a
+    /// wildcard because the default a wildcard would pick is the unsafe one —
+    /// the argument `Item::spoken_text` makes for itself. A `ToolResult` is the
+    /// client's own work coming back and is never something this deployment
+    /// emitted; thinking and opaque blocks are stored so a resend round-trips,
+    /// and re-emitting one would put a block in an answer the model did not
+    /// produce this turn.
+    ///
+    /// `pub` because the follower asks it too, *before* projecting: a
+    /// [`Emitted::SeamText`] is a turn answered at the interjection seam, whose
     /// reported usage is the engine's `context_contribution` rather than what
     /// the log booked, and only the follower holds an engine to ask. One
     /// function called twice rather than the condition written twice — the
@@ -693,21 +872,93 @@ impl MessageEmission {
     /// narrowing, where neither copy is load-bearing and deleting one keeps the
     /// suite green. Here there is one copy and two callers, so a change to it
     /// moves both answers together.
-    pub fn seam_answer<'a>(&self, item: &'a Item) -> Option<&'a str> {
+    pub fn emitted<'a>(&self, item: &'a Item) -> Option<Emitted<'a>> {
         let response_id = item.response_id.as_ref()?;
         if !self.claims(response_id) {
             return None;
         }
         match &item.content {
-            ItemContent::Text { text } if !self.streamed && !text.is_empty() => Some(text),
+            ItemContent::Text { text } if !self.streamed && !text.is_empty() => {
+                Some(Emitted::SeamText(text))
+            }
+            ItemContent::ToolCall {
+                call_id,
+                name,
+                arguments,
+            } => Some(Emitted::ToolCall {
+                call_id,
+                name,
+                arguments,
+            }),
             ItemContent::Text { .. }
-            | ItemContent::ToolCall { .. }
             | ItemContent::ToolResult { .. }
             | ItemContent::Thinking { .. }
             | ItemContent::RedactedThinking { .. }
             | ItemContent::Opaque { .. } => None,
         }
     }
+
+    /// Why a *completed* turn stopped, in this dialect's closed vocabulary.
+    ///
+    /// **Two sources, and the emitted content wins.** A message whose content
+    /// carries `tool_use` blocks and whose `stop_reason` is anything but
+    /// `tool_use` is a shape the real API never produces and a shape an agent's
+    /// loop does not act on — it reads the reason to decide whether the turn is
+    /// waiting on it or over. The provider's own word cannot be trusted to
+    /// supply it, because roundhouse routes across dialects: a Claude Code turn
+    /// answered by an OpenAI model arrives through a wire that has no such word
+    /// at all, and forwarding its silence would hand the client a toolbox
+    /// request labelled "finished". So a turn that emitted a call says so.
+    ///
+    /// Otherwise the provider's word is *translated*, never forwarded: this
+    /// dialect's `stop_reason` is a closed set of seven, the neutral string is
+    /// whatever the answering wire spells, and an unrecognised value here is a
+    /// value the strict oracle — and a strict client — refuses.
+    ///
+    /// An unknown or absent reason becomes `end_turn`, which is the least-wrong
+    /// of the available lies: the turn did complete, the wire has no "the
+    /// provider said something we do not know" value, and inventing one is
+    /// exactly what makes a parser reject a whole message. The honest record of
+    /// what the provider actually said is in the log, on the terminal event.
+    fn completion_stop_reason(&self, provider_word: Option<&str>) -> StopReason {
+        if self.called_a_tool {
+            return StopReason::ToolUse;
+        }
+        match provider_word {
+            Some("tool_use") => StopReason::ToolUse,
+            Some("max_tokens") => StopReason::MaxTokens,
+            // The Responses wire's spelling of the same fact, from
+            // `incomplete_details.reason`. Translated rather than dropped
+            // because this is M11.1's F1 reporting half arriving through the
+            // other dialect: a turn cut off at the ceiling must not read as one
+            // that finished.
+            Some("max_output_tokens") => StopReason::MaxTokens,
+            Some("stop_sequence") => StopReason::StopSequence,
+            Some("refusal") => StopReason::Refusal,
+            Some("pause_turn") => StopReason::PauseTurn,
+            Some("model_context_window_exceeded") => StopReason::ModelContextWindowExceeded,
+            Some(_) | None => StopReason::EndTurn,
+        }
+    }
+}
+
+/// What a committed item is, on this wire.
+///
+/// Two shapes rather than an `Option<&str>` because a tool call is not text with
+/// a different tag: it opens its own block, it carries three fields, and it is
+/// the one thing here that a *dispatched* turn commits. Keeping them one type is
+/// what makes [`MessageEmission::emitted`] the single narrowing that both the
+/// follower and [`MessageEmission::project`] read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Emitted<'a> {
+    /// An answer committed whole, never streamed: the interjection seam's.
+    SeamText(&'a str),
+    /// A tool call this turn produced, for the client to run.
+    ToolCall {
+        call_id: &'a str,
+        name: &'a str,
+        arguments: &'a str,
+    },
 }
 
 #[cfg(test)]
@@ -783,6 +1034,7 @@ mod tests {
                     ..Default::default()
                 },
                 provider_reported_cost_usd: None,
+                stop_reason: None,
             },
         ] {
             let (batch, step) = emission.project(&kind);
@@ -817,7 +1069,7 @@ mod tests {
                 _ => None,
             };
             if let Some(index) = index {
-                assert_eq!(index, TEXT_BLOCK_INDEX);
+                assert_eq!(index, FIRST_BLOCK_INDEX);
             }
         }
     }
@@ -842,6 +1094,7 @@ mod tests {
             response_id: response(),
             usage: Usage::default(),
             provider_reported_cost_usd: None,
+            stop_reason: None,
         };
 
         for first in [delta, committed, completed] {
@@ -966,7 +1219,9 @@ mod tests {
             response_id: response(),
         });
         frames.extend([
-            content_block_delta(TEXT_BLOCK_INDEX, "hi"),
+            content_block_delta(FIRST_BLOCK_INDEX, "hi"),
+            tool_block_start(1, "toolu_01", "Grep"),
+            tool_block_delta(1, r#"{"pattern":"fn main"}"#),
             keepalive(),
             error_frame(OVERLOADED_ERROR, "try again"),
         ]);
@@ -1013,6 +1268,7 @@ mod tests {
                     ..Default::default()
                 },
                 provider_reported_cost_usd: None,
+                stop_reason: None,
             },
         ] {
             let (batch, _) = emission.project(&kind);
@@ -1094,15 +1350,38 @@ mod tests {
     }
 
     /// A refusal ends the stream with an error event, not with a stop reason.
+    ///
+    /// **And the block is closed only if one is open.** Since M11.2 blocks are
+    /// opened by their content rather than by the prelude, so a refusal that
+    /// arrives before any text has no block to close — and a
+    /// `content_block_stop` at an index the client never saw started is the
+    /// `RangeError` its accumulator throws on. Both shapes are asserted here
+    /// because a `failed` that always emitted a stop would pass the first and a
+    /// `failed` that never did would pass the second.
     #[test]
     fn a_refused_turn_ends_with_an_error_event_after_its_block_is_closed() {
-        let mut emission = started();
-        let (frames, step) = emission.project(&SessionEventKind::ResponseIncomplete {
+        let refusal = SessionEventKind::ResponseIncomplete {
             response_id: response(),
             reason: IncompleteReason::PolicyRefused,
             usage: Usage::default(),
             terminal_attempt: None,
+        };
+
+        let mut silent = started();
+        let (frames, step) = silent.project(&refusal);
+        assert_eq!(step, Step::End);
+        assert_eq!(
+            names(&frames),
+            ["error"],
+            "no block was opened, so there is none to close"
+        );
+
+        let mut emission = started();
+        emission.project(&SessionEventKind::OutputTextDelta {
+            response_id: response(),
+            text: "here is what I foun".into(),
         });
+        let (frames, step) = emission.project(&refusal);
         assert_eq!(step, Step::End);
         assert_eq!(names(&frames), ["content_block_stop", "error"]);
         let body = frames[1].data();
@@ -1138,9 +1417,12 @@ mod tests {
             item: Item::assistant_text("let me redirect you", response()),
         });
         assert_eq!(step, Step::Continue);
-        assert_eq!(names(&frames), ["content_block_delta"]);
         assert_eq!(
-            frames[0].data()["delta"]["text"],
+            names(&frames),
+            ["content_block_start", "content_block_delta"]
+        );
+        assert_eq!(
+            frames[1].data()["delta"]["text"],
             json!("let me redirect you")
         );
 
@@ -1247,7 +1529,8 @@ mod tests {
     /// "Stream completed with `message_start` but no content blocks completed"
     /// is one of the two conditions that make Claude Code re-issue the entire
     /// turn non-streaming (§3.6) — one malformed stream, one extra full-price
-    /// answer. Opening the block in the prelude is what buys this.
+    /// answer. The terminal's empty-block fallback is what buys this now that
+    /// the prelude no longer opens a block eagerly.
     #[test]
     fn an_empty_answer_still_completes_a_content_block() {
         let mut emission = started();
@@ -1255,10 +1538,231 @@ mod tests {
             response_id: response(),
             usage: Usage::default(),
             provider_reported_cost_usd: None,
+            stop_reason: None,
         });
         assert_eq!(
             names(&frames),
-            ["content_block_stop", "message_delta", "message_stop"]
+            [
+                "content_block_start",
+                "content_block_stop",
+                "message_delta",
+                "message_stop"
+            ]
+        );
+        assert_eq!(
+            frames[0].data()["content_block"],
+            json!({ "type": "text", "text": "" }),
+            "the block that stands in for silence is an empty text block"
+        );
+    }
+
+    /// **A tool-only turn gets no empty text block, and that is the fork this
+    /// milestone's lazy blocks exist to avoid.**
+    ///
+    /// The eager block-0 open of M11.1 would put `{"type":"text","text":""}`
+    /// ahead of the call in every agent turn — the ordinary shape, since a model
+    /// that is calling a tool usually says nothing first. The client resends the
+    /// content it was given; if it drops that empty block (and nothing in the
+    /// API's own traffic ever contains one) the resent history no longer matches
+    /// the stored items, and the session forks on its very next turn while every
+    /// turn still answers. So: exactly one block, and it is the call.
+    #[test]
+    fn a_turn_that_only_calls_a_tool_emits_no_text_block() {
+        let mut emission = started();
+        let (frames, step) = emission.project(&SessionEventKind::ItemAppended {
+            item: Item {
+                response_id: Some(response()),
+                ..Item::tool_call("toolu_01", "Grep", r#"{"pattern":"fn main"}"#)
+            },
+        });
+        assert_eq!(step, Step::Continue);
+        assert_eq!(
+            names(&frames),
+            [
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop"
+            ]
+        );
+        assert_eq!(frames[0].data()["index"], json!(0));
+        assert_eq!(
+            frames[0].data()["content_block"],
+            json!({ "type": "tool_use", "id": "toolu_01", "name": "Grep", "input": {} }),
+            "the start frame carries an empty input; the client overwrites it \
+             from the fragments"
+        );
+        assert_eq!(
+            frames[1].data()["delta"],
+            json!({ "type": "input_json_delta", "partial_json": r#"{"pattern":"fn main"}"# })
+        );
+
+        let (terminal, step) = emission.project(&SessionEventKind::ResponseCompleted {
+            response_id: response(),
+            usage: Usage {
+                output_tokens: 9,
+                ..Default::default()
+            },
+            provider_reported_cost_usd: None,
+            stop_reason: Some("tool_use".into()),
+        });
+        assert_eq!(step, Step::End);
+        assert_eq!(
+            names(&terminal),
+            ["message_delta", "message_stop"],
+            "a turn that completed a block gets no stand-in empty one"
+        );
+        assert_eq!(
+            terminal[0].data()["delta"]["stop_reason"],
+            json!("tool_use")
+        );
+    }
+
+    /// **Text and calls interleave by index, in the order the log holds them.**
+    ///
+    /// The whole content model of M11.2 in one sequence: text opens block 0, the
+    /// call closes it and takes block 1, and the text after the call is a *new*
+    /// block rather than a resumption — a `text_delta` aimed at a `tool_use`
+    /// block is the third of the client accumulator's block-type throws, and a
+    /// throw mid-stream is a lost turn.
+    #[test]
+    fn text_and_tool_calls_interleave_as_separate_indexed_blocks() {
+        let mut emission = started();
+        let mut frames = Vec::new();
+        for kind in [
+            SessionEventKind::OutputTextDelta {
+                response_id: response(),
+                text: "let me look".into(),
+            },
+            SessionEventKind::ItemAppended {
+                item: Item {
+                    response_id: Some(response()),
+                    ..Item::tool_call("toolu_01", "Grep", r#"{"q":"x"}"#)
+                },
+            },
+            SessionEventKind::OutputTextDelta {
+                response_id: response(),
+                text: " and also".into(),
+            },
+            SessionEventKind::ItemAppended {
+                item: Item {
+                    response_id: Some(response()),
+                    ..Item::tool_call("toolu_02", "Read", r#"{"path":"/a"}"#)
+                },
+            },
+            SessionEventKind::ResponseCompleted {
+                response_id: response(),
+                usage: Usage::default(),
+                provider_reported_cost_usd: None,
+                stop_reason: Some("tool_use".into()),
+            },
+        ] {
+            let (batch, _) = emission.project(&kind);
+            frames.extend(batch);
+        }
+
+        // Every block event, as (name, index) — the shape the client's
+        // accumulator is a state machine over.
+        let indexed: Vec<(&str, u64)> = frames
+            .iter()
+            .filter_map(|frame| match frame.event() {
+                StreamEvent::ContentBlockStart { index, .. }
+                | StreamEvent::ContentBlockDelta { index, .. }
+                | StreamEvent::ContentBlockStop { index, .. } => Some((frame.name(), *index)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            indexed,
+            [
+                ("content_block_start", 0),
+                ("content_block_delta", 0),
+                ("content_block_stop", 0),
+                ("content_block_start", 1),
+                ("content_block_delta", 1),
+                ("content_block_stop", 1),
+                ("content_block_start", 2),
+                ("content_block_delta", 2),
+                ("content_block_stop", 2),
+                ("content_block_start", 3),
+                ("content_block_delta", 3),
+                ("content_block_stop", 3),
+            ]
+        );
+
+        // Every index is started before it is used and stopped after, and no
+        // index is reused — the three orderings the client throws on.
+        let mut open: Option<u64> = None;
+        let mut seen = std::collections::BTreeSet::new();
+        for (name, index) in &indexed {
+            match *name {
+                "content_block_start" => {
+                    assert_eq!(open, None, "block {index} opened over an open one");
+                    assert!(seen.insert(*index), "index {index} was reused");
+                    open = Some(*index);
+                }
+                "content_block_delta" => assert_eq!(open, Some(*index)),
+                _ => {
+                    assert_eq!(open, Some(*index));
+                    open = None;
+                }
+            }
+        }
+        assert_eq!(open, None, "a block was left open at the terminal");
+    }
+
+    /// **The stop reason a client is told is translated, never forwarded — and
+    /// emitted tool calls out-rank whatever the provider said.**
+    ///
+    /// The table matters because this dialect's `stop_reason` is a closed set of
+    /// seven and the value arriving from the fold is whatever the *answering*
+    /// wire spells: routing a Claude Code turn to an OpenAI model brings
+    /// `max_output_tokens` back, and a turn a Responses-wire provider answered
+    /// with tool calls brings back nothing at all. Forwarding either verbatim
+    /// gives a strict reader a value it refuses and an agent a turn it will not
+    /// act on.
+    #[test]
+    fn the_stop_reason_is_translated_and_a_tool_call_overrides_it() {
+        let emission = started();
+        for (word, expected) in [
+            (Some("end_turn"), StopReason::EndTurn),
+            (Some("tool_use"), StopReason::ToolUse),
+            (Some("max_tokens"), StopReason::MaxTokens),
+            // The Responses wire's own spelling of the same fact.
+            (Some("max_output_tokens"), StopReason::MaxTokens),
+            (Some("stop_sequence"), StopReason::StopSequence),
+            (Some("refusal"), StopReason::Refusal),
+            (Some("pause_turn"), StopReason::PauseTurn),
+            (
+                Some("model_context_window_exceeded"),
+                StopReason::ModelContextWindowExceeded,
+            ),
+            // Neither a value this build knows nor one the wire has.
+            (Some("guardrail_intervened"), StopReason::EndTurn),
+            (None, StopReason::EndTurn),
+        ] {
+            assert_eq!(
+                emission.completion_stop_reason(word),
+                expected,
+                "{word:?} was mistranslated"
+            );
+        }
+
+        // And the override, which is what makes a cross-dialect tool turn
+        // usable: the same two inputs that gave `end_turn` above give
+        // `tool_use` once a call has gone out.
+        let mut called = started();
+        called.project(&SessionEventKind::ItemAppended {
+            item: Item {
+                response_id: Some(response()),
+                ..Item::tool_call("toolu_01", "Grep", "{}")
+            },
+        });
+        assert_eq!(called.completion_stop_reason(None), StopReason::ToolUse);
+        assert_eq!(
+            called.completion_stop_reason(Some("end_turn")),
+            StopReason::ToolUse,
+            "a message carrying tool_use blocks and saying end_turn is a shape \
+             the API never sends and an agent never acts on"
         );
     }
 
@@ -1279,6 +1783,7 @@ mod tests {
                 ..Default::default()
             },
             provider_reported_cost_usd: None,
+            stop_reason: None,
         });
         let delta = frames
             .iter()
@@ -1351,7 +1856,7 @@ mod tests {
         let body = message_body(
             &response(),
             "claude-sonnet-4-5",
-            "hello",
+            vec![ContentBlock::text("hello")],
             StopReason::EndTurn,
             &Usage {
                 input_tokens: 900,
@@ -1374,10 +1879,46 @@ mod tests {
 
         // An empty answer still carries its block, so the two projections of one
         // turn cannot disagree about whether there was content.
-        let empty = message_body(&response(), "m", "", StopReason::EndTurn, &Usage::default());
+        let empty = message_body(
+            &response(),
+            "m",
+            vec![ContentBlock::text("")],
+            StopReason::EndTurn,
+            &Usage::default(),
+        );
         assert_eq!(
             serde_json::to_value(&empty).unwrap()["content"],
             json!([{ "type": "text", "text": "" }])
+        );
+
+        // And a tool-using turn's blocks reach `content` in order, which is the
+        // whole reason this takes blocks rather than a string: the streaming
+        // path emits them and this path must not flatten them away.
+        let calling = message_body(
+            &response(),
+            "m",
+            vec![
+                ContentBlock::text("let me look"),
+                ContentBlock::ToolUse {
+                    id: "toolu_01".into(),
+                    name: "Grep".into(),
+                    input: json!({ "pattern": "fn main" }),
+                    cache_control: None,
+                    extra: Extra::new(),
+                },
+            ],
+            StopReason::ToolUse,
+            &Usage::default(),
+        );
+        let data = serde_json::to_value(&calling).unwrap();
+        assert_eq!(data["stop_reason"], json!("tool_use"));
+        assert_eq!(
+            data["content"],
+            json!([
+                { "type": "text", "text": "let me look" },
+                { "type": "tool_use", "id": "toolu_01", "name": "Grep",
+                  "input": { "pattern": "fn main" } },
+            ])
         );
     }
 }

@@ -41,15 +41,29 @@
 //! same case wearing a terminal frame, and is answered the same way — see
 //! [`SseDecoder::emit_done`].
 //!
+//! **Tool blocks are the one thing this decoder assembles across frames**, and
+//! since M11.2 the block lifecycle is therefore its business rather than an
+//! accumulator's. A `tool_use` block opens on `content_block_start` carrying its
+//! id and name, its arguments arrive as `input_json_delta` fragments that are
+//! not JSON on their own, and the call is only knowable at that block's
+//! `content_block_stop`. Three consequences, each a rule below: the index is the
+//! discriminator, because a turn may interleave text and several tool blocks and
+//! nothing else distinguishes their fragments; a block that never closes emits
+//! nothing, the same discipline as the missing `Done` above and for the same
+//! reason — half a set of arguments is not a smaller tool call, it is one no
+//! consumer can parse; and the two lifecycle frames are read *leniently*, so a
+//! malformed one loses the call it described rather than failing a turn that had
+//! already been served.
+//!
 //! [`Usage`]: roundhouse_core::event::Usage
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use serde_json::Value;
 
 use crate::frontier::{FrontierChunk, FrontierError};
 
-use super::wire::{ApiError, BlockDelta, Message, StreamEvent, Usage};
+use super::wire::{ApiError, BlockDelta, ContentBlock, Message, StreamEvent, Usage};
 
 /// How much of a single SSE event this will buffer before giving up.
 ///
@@ -58,6 +72,32 @@ use super::wire::{ApiError, BlockDelta, Message, StreamEvent, Usage};
 /// would otherwise grow this buffer until the process died. A `message_start`
 /// payload is a few hundred bytes and the largest text delta is far below this.
 const MAX_EVENT_BYTES: usize = 1 << 20;
+
+/// How many tool blocks may be open at once before the stream is abandoned.
+///
+/// **The same argument as [`MAX_EVENT_BYTES`], applied to the one thing this
+/// decoder accumulates *across* events.** That bound holds a single frame; a
+/// tool block spans many, so an upstream (or something pretending to be one)
+/// that opened a `content_block_start` per frame with a fresh index and never
+/// closed any would grow this map until the process died — with every
+/// individual frame comfortably legal.
+///
+/// Generous against real traffic: parallel tool use puts a handful of blocks in
+/// flight, and the largest turn anyone has captured opens three. A limit no real
+/// stream approaches is what makes crossing it evidence of a broken upstream
+/// rather than of an ambitious turn.
+const MAX_OPEN_TOOL_BLOCKS: usize = 64;
+
+/// How much argument JSON one tool block may accumulate before the stream is
+/// abandoned.
+///
+/// The other half of the bound above: a single open block whose
+/// `input_json_delta` fragments never stop. Each fragment is small and legal, so
+/// nothing else in this file catches it. One megabyte is far past any real tool
+/// call — the largest argument a coding agent sends is a file edit, measured in
+/// tens of kilobytes — and it is deliberately the same order as
+/// [`MAX_EVENT_BYTES`] so the two limits read as one policy.
+const MAX_TOOL_ARGUMENT_BYTES: usize = 1 << 20;
 
 /// Input-side counts as they accumulate, in *Anthropic's* axes.
 ///
@@ -103,6 +143,60 @@ impl InputSide {
     }
 }
 
+/// A `tool_use` block that has opened and not yet closed.
+///
+/// Held rather than emitted, for the reason [`InputSide`] is held: the facts
+/// arrive on three different frames and the consumer needs one value. The id and
+/// the name come from `content_block_start`, the arguments from every
+/// `input_json_delta` between there and `content_block_stop`, and only the stop
+/// frame proves the arguments are complete.
+#[derive(Debug, Clone)]
+struct ToolBlock {
+    id: String,
+    name: String,
+    /// The block's `input` as `content_block_start` carried it.
+    ///
+    /// `{}` on every streamed tool block the API documents — the object is
+    /// filled in by the fragments that follow. Kept anyway, because an upstream
+    /// or a proxy that sends a tool block whole (no fragments, a populated
+    /// `input`) is a shape this decoder can read for free and would otherwise
+    /// turn into a call with no arguments.
+    seed: Value,
+    /// Every `input_json_delta.partial_json` for this block, concatenated.
+    ///
+    /// A `String` and not a `Value`, because a fragment is not JSON: the first
+    /// one is routinely `{"pat` and parsing it alone fails. Concatenation is the
+    /// whole reconstruction, and it is also what keeps the bytes the ones the
+    /// provider chose — see `FrontierChunk::ToolCall::arguments`.
+    fragments: String,
+}
+
+impl ToolBlock {
+    /// The completed call this block describes.
+    ///
+    /// The `{}` fallback is the wire's own answer and not an invention: a tool
+    /// that takes no arguments streams a `content_block_start` with `input: {}`
+    /// and no fragments at all, so the empty object is what the provider said.
+    /// The alternative — an empty `arguments` string — is not valid JSON, and
+    /// every consumer downstream would have to special-case it.
+    fn into_chunk(self) -> FrontierChunk {
+        let arguments = match (self.fragments.is_empty(), self.seed) {
+            (false, _) => self.fragments,
+            // `input` defaults to `Value::Null` when the frame omitted it
+            // entirely, which is "nobody said" rather than "no arguments" —
+            // and on a block that also carried no fragments the two have the
+            // same answer, because there is nothing else this call could take.
+            (true, Value::Null) => "{}".to_string(),
+            (true, seed) => seed.to_string(),
+        };
+        FrontierChunk::ToolCall {
+            id: self.id,
+            name: self.name,
+            arguments,
+        }
+    }
+}
+
 /// Assembles SSE events out of arbitrary byte runs and decodes the ones that
 /// carry output or accounting.
 #[derive(Default)]
@@ -131,6 +225,35 @@ pub(super) struct SseDecoder {
     input: InputSide,
     /// Cumulative output count, from the last `message_delta` that reported one.
     output_tokens: u64,
+    /// The last `stop_reason` any `message_delta` reported, verbatim.
+    ///
+    /// **Set only from a frame that named one**, which is the same
+    /// non-retracting rule the counts above follow and it exists for the same
+    /// failure: the wire sends an explicit `"stop_reason": null` on every
+    /// non-final delta, so a plain assignment would let the last frame before
+    /// `message_stop` erase what the frame that actually ended the turn said.
+    ///
+    /// A `String` and not a [`StopReason`](super::wire::StopReason), because
+    /// what leaves this decoder is what the wire said — see
+    /// `FrontierChunk::Done::stop_reason`. The typed parse still happens on
+    /// the way in, so an eighth value arrives as `Other` and is carried rather
+    /// than failing the frame.
+    stop_reason: Option<String>,
+    /// Tool blocks that have opened and not yet closed, by block index.
+    ///
+    /// **Keyed on the index because the index is the only discriminator.** A
+    /// turn that says "I'll grep for that" and then calls two tools interleaves
+    /// a text block and two `tool_use` blocks, and every `input_json_delta`
+    /// names only its index — nothing in a fragment says which tool it belongs
+    /// to. A decoder that kept one "current" block would splice the second
+    /// call's arguments onto the first, producing one tool call with unparseable
+    /// arguments and losing the other entirely.
+    ///
+    /// A `BTreeMap` rather than a `Vec` indexed by position: the indices are the
+    /// provider's, this decoder does not get to assume they start at zero or
+    /// arrive in order, and a sparse map cannot be made to allocate by a
+    /// `content_block_start` claiming index 4 000 000 000.
+    tool_blocks: BTreeMap<u64, ToolBlock>,
 }
 
 impl SseDecoder {
@@ -258,18 +381,114 @@ impl SseDecoder {
                 self.fold_message_start(&message);
                 Ok(())
             }
+            // **Read leniently, and the asymmetry with `message_start` above is
+            // deliberate.** A `message_start` this build cannot read means the
+            // turn's input count is gone, which is an accounting hole worth
+            // failing for. A `content_block_start` this build cannot read means
+            // one tool call is lost — bad, but the turn was still served and its
+            // bill is still knowable, and failing it would convert a frame we
+            // merely did not understand into an unanswered request. So a parse
+            // failure here drops the frame, which for a `tool_use` block means
+            // no block opens, which by the rule below means nothing is emitted:
+            // the same "nothing rather than something fabricated" answer this
+            // decoder gives everywhere else.
+            //
+            // It also preserves a property the suite pins: novelty in a frame
+            // this client does not otherwise read must not be able to fail a
+            // deployment that already works.
+            "content_block_start" => {
+                let Ok(StreamEvent::ContentBlockStart {
+                    index,
+                    content_block,
+                    ..
+                }) = self.parse(name, payload)
+                else {
+                    return Ok(());
+                };
+                // Only `tool_use` is tracked. A text block needs no state — its
+                // deltas are emitted as they arrive — and a thinking block is
+                // consumed, so opening a record for either would be bookkeeping
+                // nothing reads.
+                // `name: tool` rather than binding `name`: the frame's own name
+                // is in scope here, and one identifier meaning both the event
+                // type and the tool being called is a line a reader has to
+                // re-check.
+                if let ContentBlock::ToolUse {
+                    id,
+                    name: tool,
+                    input,
+                    ..
+                } = content_block
+                {
+                    // Checked before the insert and against blocks that are
+                    // *open*, so a turn that legitimately calls a hundred tools
+                    // one after another is unaffected — each closes before the
+                    // next opens. What this refuses is a hundred at once and
+                    // none of them ever closing.
+                    if self.tool_blocks.len() >= MAX_OPEN_TOOL_BLOCKS
+                        && !self.tool_blocks.contains_key(&index)
+                    {
+                        return Err(FrontierError::Upstream(format!(
+                            "the upstream opened more than {MAX_OPEN_TOOL_BLOCKS} tool \
+                             blocks without closing any; abandoning the stream rather \
+                             than buffering them"
+                        )));
+                    }
+                    // An index reopened before its stop replaces the block
+                    // rather than merging with it: two starts on one index are
+                    // the upstream contradicting itself, and appending the
+                    // second call's fragments to the first would produce one
+                    // call with arguments belonging to neither.
+                    self.tool_blocks.insert(
+                        index,
+                        ToolBlock {
+                            id,
+                            name: tool,
+                            seed: input,
+                            fragments: String::new(),
+                        },
+                    );
+                }
+                Ok(())
+            }
+            // The frame that proves a tool call is complete, and the only place
+            // one is emitted. Before it, the arguments are a prefix of a JSON
+            // document; after it, they are the document.
+            "content_block_stop" => {
+                let Ok(StreamEvent::ContentBlockStop { index, .. }) = self.parse(name, payload)
+                else {
+                    return Ok(());
+                };
+                if let Some(block) = self.tool_blocks.remove(&index) {
+                    self.pending.push_back(block.into_chunk());
+                }
+                Ok(())
+            }
             "content_block_delta" => {
-                let StreamEvent::ContentBlockDelta { delta, .. } = self.parse(name, payload)?
+                let StreamEvent::ContentBlockDelta { index, delta, .. } =
+                    self.parse(name, payload)?
                 else {
                     unreachable!("parsed as the name it was dispatched on")
                 };
-                self.fold_delta(delta);
-                Ok(())
+                self.fold_delta(index, delta)
             }
             "message_delta" => {
-                let StreamEvent::MessageDelta { usage, .. } = self.parse(name, payload)? else {
+                let StreamEvent::MessageDelta { delta, usage, .. } = self.parse(name, payload)?
+                else {
                     unreachable!("parsed as the name it was dispatched on")
                 };
+                // **The reporting half of M11.1's F1.** Until M11.2 this arm
+                // destructured `{ usage, .. }` and the stop reason went into the
+                // `..`, which meant a turn cut off at the dispatch ceiling
+                // (`max_tokens`) decoded to byte-identical chunks as one that
+                // ended on its own — and `tool_use`, the signal that the turn is
+                // waiting on the client rather than finished, could not be
+                // spoken at all. Assigned only when the frame named one: the
+                // wire sends an explicit `null` on every non-final delta, and a
+                // plain assignment would let one of those erase the real answer.
+                if let Some(reason) = delta.stop_reason {
+                    self.stop_reason = Some(reason.as_wire().to_string());
+                }
                 if let Some(usage) = usage {
                     self.fold_message_delta(&usage);
                 }
@@ -277,6 +496,14 @@ impl SseDecoder {
             }
             "message_stop" => {
                 self.finished = true;
+                // Tool blocks still open at the terminal frame are *not* flushed
+                // here, and the omission is the rule rather than a gap. Their
+                // arguments are a prefix of a JSON document that the provider
+                // stopped sending, so emitting one would hand the client a call
+                // whose arguments do not parse — and a client that ran it anyway
+                // would act on truncated input. The same answer this decoder
+                // gives a stream that reports half its bill: nothing, rather than
+                // something plausible nobody can check.
                 self.emit_done();
                 Ok(())
             }
@@ -306,16 +533,19 @@ impl SseDecoder {
                     describe(error)
                 )))
             }
-            // `ping` is a keepalive with a payload and nothing else; the two
-            // block-lifecycle frames carry only index discipline, which is the
-            // *accumulator's* problem and not this decoder's — it reads text out
-            // of deltas and counts out of the two usage frames, and neither
-            // needs to know which block index they belong to. Everything else on
-            // this wire is a frame this client has no use for. All skipped
-            // rather than refused, and skipped *without parsing*: an event type
-            // added upstream must not be able to fail a deployment that already
-            // works, which is the openness R1 asks for and the reason the
-            // `StreamEvent` enum needs no catch-all arm.
+            // `ping` is a keepalive with a payload and nothing else, and
+            // everything else on this wire is a frame this client has no use
+            // for. Skipped rather than refused, and skipped *without parsing*:
+            // an event type added upstream must not be able to fail a deployment
+            // that already works, which is the openness R1 asks for and the
+            // reason the `StreamEvent` enum needs no catch-all arm.
+            //
+            // The two block-lifecycle frames used to be here, on the argument
+            // that index discipline was the *accumulator's* problem and not this
+            // decoder's. That was true while the only thing crossing this seam
+            // was prose. It stopped being true with `FrontierChunk::ToolCall`:
+            // the index is now the only thing that says which call a fragment
+            // belongs to, so the two frames moved into arms of their own above.
             _ => Ok(()),
         }
     }
@@ -383,7 +613,13 @@ impl SseDecoder {
         }
     }
 
-    fn fold_delta(&mut self, delta: BlockDelta) {
+    /// One `content_block_delta`, routed by what it carries.
+    ///
+    /// `index` is used by exactly one arm and passed to all of them, because the
+    /// alternative — reading it only where it is needed — would mean the caller
+    /// deciding which deltas are indexed, and the caller is the frame dispatcher
+    /// rather than the thing that knows what a delta means.
+    fn fold_delta(&mut self, index: u64, delta: BlockDelta) -> Result<(), FrontierError> {
         match delta {
             BlockDelta::TextDelta { text, .. } => {
                 if !text.is_empty() {
@@ -406,13 +642,38 @@ impl SseDecoder {
             // under a beta this build does not request — so the alternative
             // would be counting the characters we just declined to keep.
             BlockDelta::ThinkingDelta { .. } | BlockDelta::SignatureDelta { .. } => {}
-            // Tool arguments arrive as JSON fragments. `FrontierChunk` has no
-            // tool channel — the client runs its own tools, exactly as on the
-            // Responses surface — so these are consumed here and reconstructed
-            // by the serve surface from the log, not from this stream.
-            BlockDelta::InputJsonDelta { .. } => {}
+            // **Accumulated, never emitted one at a time.** A `partial_json` is
+            // a *prefix* of a JSON document — the first fragment of a real call
+            // is routinely `{"pat` — so a chunk per fragment would hand every
+            // consumer the same reassembly problem and let two of them disagree
+            // about it. The concatenation becomes one `ToolCall` at this block's
+            // `content_block_stop`.
+            //
+            // A fragment naming a block this decoder never saw open is dropped
+            // rather than starting one: with no `content_block_start` there is
+            // no id and no tool name, and a call with arguments but no name is
+            // not something a client can run. Silent for the same reason the
+            // unclosed block is — there is nothing here worth failing a served
+            // turn over.
+            BlockDelta::InputJsonDelta { partial_json, .. } => {
+                if let Some(block) = self.tool_blocks.get_mut(&index) {
+                    // Bounded for the reason `MAX_EVENT_BYTES` is, and this is
+                    // the only accumulation in this file that spans frames: each
+                    // fragment is small and legal, so an upstream that never
+                    // stops sending them is caught by nothing else.
+                    if block.fragments.len() + partial_json.len() > MAX_TOOL_ARGUMENT_BYTES {
+                        return Err(FrontierError::Upstream(format!(
+                            "the upstream sent more than {MAX_TOOL_ARGUMENT_BYTES} bytes of \
+                             arguments for one tool block; abandoning the stream rather \
+                             than buffering them"
+                        )));
+                    }
+                    block.fragments.push_str(&partial_json);
+                }
+            }
             BlockDelta::Other(_) => {}
         }
+        Ok(())
     }
 
     /// The one accounting frame this dialect's two usage events fold into.
@@ -466,6 +727,16 @@ impl SseDecoder {
             // way: "no price was read here" and "this call was free" are the
             // two readings a reconciliation view must never confuse.
             provider_reported_cost: None,
+            // **Verbatim, including a value this build has never seen.** The
+            // typed parse on the way in has an `Other(String)` arm precisely so
+            // an eighth stop reason is carried rather than refused, and
+            // `as_wire` gives that arm back its own spelling — so what reaches
+            // the log is what the provider said, and the emit layers decide what
+            // a client in *their* dialect is owed for it. `None` when no frame
+            // named one, which on a stream that reached `message_stop` means a
+            // proxy stripped the field: "nobody said" and "end_turn" are
+            // different facts, and only the first is true here.
+            stop_reason: self.stop_reason.clone(),
         });
     }
 }
@@ -607,6 +878,35 @@ mod tests {
         )
     }
 
+    /// A `content_block_start` frame carrying `block` verbatim as its
+    /// `content_block`.
+    fn block_start(index: u64, block: &str) -> String {
+        format!(
+            "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\
+             \"index\":{index},\"content_block\":{block}}}\n\n"
+        )
+    }
+
+    /// One `input_json_delta`. `fragment` is written already-escaped for JSON,
+    /// because that is what a fragment of tool arguments looks like inside the
+    /// frame that carries it.
+    fn json_delta(index: u64, fragment: &str) -> String {
+        format!(
+            "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\
+             \"index\":{index},\"delta\":{{\"type\":\"input_json_delta\",\
+             \"partial_json\":\"{fragment}\"}}}}\n\n"
+        )
+    }
+
+    /// A final `message_delta` reporting `reason` and the usual output count.
+    fn stop_because(reason: &str) -> String {
+        format!(
+            "event: message_delta\ndata: {{\"type\":\"message_delta\",\
+             \"delta\":{{\"stop_reason\":\"{reason}\",\"stop_sequence\":null}},\
+             \"usage\":{{\"output_tokens\":64}}}}\n\n"
+        )
+    }
+
     /// **The finding-1 analog for this dialect: both usage events fold into one
     /// `Done`, and the input side is converted out of Anthropic's axes.**
     ///
@@ -643,6 +943,9 @@ mod tests {
                     output_tokens: 64,
                     reasoning_tokens: 0,
                     provider_reported_cost: None,
+                    // `DELTA` says `end_turn`, and it reaches the log as the
+                    // word the wire used.
+                    stop_reason: Some("end_turn".into()),
                 },
             ]
         );
@@ -702,6 +1005,7 @@ mod tests {
                 output_tokens: 64,
                 reasoning_tokens: 0,
                 provider_reported_cost: None,
+                stop_reason: Some("end_turn".into()),
             }]
         );
     }
@@ -742,43 +1046,23 @@ mod tests {
         );
     }
 
-    /// **F1's reporting half (M11.1 thermo-nuclear review), still open.** The
-    /// ceiling half is fixed — a dispatch now carries the client's own
-    /// `max_tokens` rather than the router's 256-token pricing estimate — which
-    /// makes a truncation here an honest one; this is the half that says nobody
-    /// downstream can tell it happened. The claim: `handle`'s
-    /// `"message_delta"` arm destructures `let StreamEvent::MessageDelta { usage, .. }`,
-    /// discarding `delta.stop_reason` via `..` even though `MessageDeltaBody`
-    /// carries it (`wire.rs`) and this module's own doc, two hundred-odd lines
-    /// up in the sibling file, names the exact upstream field a dispatch
-    /// ceiling produces (`anthropic_messages.rs`: "arrives at the client as
-    /// `stop_reason: max_tokens`"). [`FrontierChunk::Done`] — this decoder's
-    /// only output — has no field to carry a stop reason downstream at all, so
-    /// the loss is not a missed read but structural: nothing past this decoder
-    /// can ever learn a turn was cut short by the dispatch ceiling rather than
-    /// finishing on its own.
+    /// **F1's reporting half, closed (M11.1 thermo-nuclear review → M11.2).**
+    ///
+    /// The ceiling half was fixed in M11.1: a dispatch carries the client's own
+    /// `max_tokens` rather than the router's 256-token pricing estimate, which
+    /// makes a truncation here an *honest* one. This was the half that said
+    /// nobody downstream can tell it happened — the `"message_delta"` arm
+    /// destructured `let StreamEvent::MessageDelta { usage, .. }` and
+    /// `delta.stop_reason` went into the `..`, while
+    /// [`FrontierChunk::Done`] had no field to carry one at all. The loss was
+    /// therefore structural rather than a missed read, and this test stood
+    /// `#[ignore]`d as its evidence until `Done::stop_reason` existed.
     ///
     /// PROBE: two streams differing in *only* `delta.stop_reason` — same
-    /// prelude, same text, same `output_tokens: 64` — must decode differently
-    /// if this information is ever to reach the engine. It does not: swapping
-    /// `max_tokens` for `end_turn` changes nothing about what comes out.
+    /// prelude, same text, same `output_tokens: 64`. They must decode
+    /// differently, and to the two words the wire actually used.
     #[test]
-    #[ignore = "F1 REPORTING HALF (valid, still open): the message_delta arm destructures \
-                `let StreamEvent::MessageDelta { usage, .. }`, discarding delta.stop_reason, \
-                and FrontierChunk::Done has no field to carry one downstream at all -- a \
-                turn cut off at the dispatch ceiling (stop_reason: max_tokens) decodes \
-                identically to one that finished on its own (end_turn). F1's CEILING half is \
-                fixed (FrontierQuote::output_token_cap now carries the client's declared \
-                max_tokens and expected_output_tokens stays the router's pricing estimate; see \
-                f1_the_clients_max_tokens_is_the_dispatch_ceiling_and_not_the_estimate in \
-                roundhouse-server/tests/messages_api_surface.rs), so a truncation is now the \
-                client's own ceiling rather than a 256-token default nobody asked for -- but \
-                it still cannot be *reported* as one. Fixing this half is wiring stop_reason \
-                through FrontierChunk::Done, the engine's IncompleteReason classification and \
-                the emission's stop_reason, which crosses the durable event shape and both \
-                serve surfaces; deliberately out of the F1 fix's scope -- do not remove the \
-                ignore without doing that."]
-    fn f1_a_dispatch_ceiling_truncation_decodes_identically_to_a_natural_stop() {
+    fn f1_a_dispatch_ceiling_truncation_is_distinguishable_from_a_natural_stop() {
         let truncated = decode(&[
             START,
             &text(0, "cut off mid-sen"),
@@ -794,20 +1078,349 @@ mod tests {
 
         // CONTROL: the identical stream with `stop_reason` swapped back to
         // `end_turn` and nothing else touched — same text, same
-        // `output_tokens: 64`. The two decodes disagree exactly the way they
-        // already disagree when `output_tokens` differs (see
-        // `the_two_usage_events_fold_into_one_done_in_roundhouse_axes` above),
-        // so this is not a vacuously-equal comparison — it isolates
-        // `stop_reason` as the one thing that does not survive the decode.
+        // `output_tokens: 64`. Without it the assertions below would pass for a
+        // decoder that stamped `max_tokens` on every turn.
         let natural = decode(&[START, &text(0, "cut off mid-sen"), DELTA, STOP]).unwrap();
 
         assert_ne!(
             truncated, natural,
-            "F1: a message_delta reporting stop_reason: max_tokens decoded to \
-             the exact same FrontierChunk sequence as one reporting stop_reason: \
-             end_turn — the truncation signal is destroyed here, before the \
-             engine ever sees it, so it can never surface to a client as \
-             stop_reason: max_tokens either"
+            "the truncation signal must survive the decode or it can never \
+             surface to a client as stop_reason: max_tokens either"
+        );
+        assert!(
+            matches!(
+                &truncated[1],
+                FrontierChunk::Done { stop_reason: Some(reason), .. } if reason == "max_tokens"
+            ),
+            "{truncated:?}"
+        );
+        assert!(
+            matches!(
+                &natural[1],
+                FrontierChunk::Done { stop_reason: Some(reason), .. } if reason == "end_turn"
+            ),
+            "{natural:?}"
+        );
+    }
+
+    /// A stop reason newer than this build reaches the log as the wire spelled
+    /// it.
+    ///
+    /// `StopReason` has an `Other(String)` arm for exactly this, and it would be
+    /// worth nothing if the decoder collapsed the arm into `None` or into a
+    /// nearest-neighbour guess on the way out. Two of the seven values Anthropic
+    /// ships today arrived after the crates that closed this enum shipped, so an
+    /// eighth is a scheduled event and not a hypothetical.
+    #[test]
+    fn a_stop_reason_this_build_has_never_seen_is_carried_verbatim() {
+        let chunks = decode(&[
+            START,
+            &text(0, "hm"),
+            concat!(
+                "event: message_delta\n",
+                r#"data: {"type":"message_delta","delta":{"stop_reason":"quantum_hesitation"},"#,
+                r#""usage":{"output_tokens":3}}"#,
+                "\n\n"
+            ),
+            STOP,
+        ])
+        .unwrap();
+        assert!(
+            matches!(
+                &chunks[1],
+                FrontierChunk::Done { stop_reason: Some(reason), .. }
+                    if reason == "quantum_hesitation"
+            ),
+            "{chunks:?}"
+        );
+    }
+
+    /// A later frame that omits `stop_reason` must not retract the one that
+    /// ended the turn.
+    ///
+    /// The wire sends an explicit `"stop_reason": null` on every non-final
+    /// delta, so a plain assignment reads the *last* frame rather than the one
+    /// that said something — and on a stream whose final `message_delta` is
+    /// followed by another restating only the counts, the reason vanishes.
+    /// Symmetric with the count-merge rule two tests below.
+    #[test]
+    fn a_message_delta_that_omits_a_stop_reason_cannot_retract_one() {
+        let chunks = decode(&[
+            START,
+            &text(0, "x"),
+            concat!(
+                "event: message_delta\n",
+                r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"#,
+                r#""usage":{"output_tokens":9}}"#,
+                "\n\n"
+            ),
+            // An explicit null, which is what the wire sends on a non-final
+            // delta, and then a frame with no `stop_reason` key at all.
+            concat!(
+                "event: message_delta\n",
+                r#"data: {"type":"message_delta","delta":{"stop_reason":null},"#,
+                r#""usage":{"output_tokens":11}}"#,
+                "\n\n"
+            ),
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{}}\n\n",
+            STOP,
+        ])
+        .unwrap();
+        assert!(
+            matches!(
+                &chunks[1],
+                FrontierChunk::Done { stop_reason: Some(reason), output_tokens: 11, .. }
+                    if reason == "tool_use"
+            ),
+            "{chunks:?}"
+        );
+    }
+
+    /// **The tool-call decode, on the shape a real agentic turn has.**
+    ///
+    /// Text first, then a tool block whose arguments arrive as fragments that
+    /// are not JSON on their own, then a second tool block — because a turn that
+    /// reads two files calls the tool twice, and the two calls' fragments are
+    /// distinguished by *nothing but the index*. A decoder that kept one
+    /// "current" block would splice the second call's arguments onto the first.
+    #[test]
+    fn interleaved_text_and_tool_blocks_decode_to_one_call_per_block() {
+        let chunks = decode(&[
+            START,
+            &block_start(0, r#"{"type":"text","text":""}"#),
+            &text(0, "Let me look."),
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            &block_start(
+                1,
+                r#"{"type":"tool_use","id":"toolu_01A","name":"Read","input":{}}"#,
+            ),
+            &json_delta(1, r#"{\"path\":"#),
+            &json_delta(1, r#"\"/etc/hosts\"}"#),
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            &block_start(
+                2,
+                r#"{"type":"tool_use","id":"toolu_01B","name":"Grep","input":{}}"#,
+            ),
+            &json_delta(2, r#"{\"pattern\":\"fn main\"}"#),
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":2}\n\n",
+            &stop_because("tool_use"),
+            STOP,
+        ])
+        .unwrap();
+
+        assert_eq!(
+            chunks,
+            vec![
+                FrontierChunk::OutputText("Let me look.".into()),
+                FrontierChunk::ToolCall {
+                    id: "toolu_01A".into(),
+                    name: "Read".into(),
+                    // Byte-exact reassembly of the two fragments, in order.
+                    arguments: r#"{"path":"/etc/hosts"}"#.into(),
+                },
+                FrontierChunk::ToolCall {
+                    id: "toolu_01B".into(),
+                    name: "Grep".into(),
+                    arguments: r#"{"pattern":"fn main"}"#.into(),
+                },
+                FrontierChunk::Done {
+                    input_tokens: 9_512,
+                    cached_input_tokens: 9_000,
+                    cache_write_tokens: 500,
+                    output_tokens: 64,
+                    reasoning_tokens: 0,
+                    provider_reported_cost: None,
+                    // The whole point of the turn: the client is being told to
+                    // run something and come back, not that the answer is over.
+                    stop_reason: Some("tool_use".into()),
+                },
+            ]
+        );
+    }
+
+    /// The reassembly must survive a socket, which is where it is actually done.
+    ///
+    /// A fragment boundary and a read boundary have nothing to do with each
+    /// other: the provider chooses the first and the network the second, and a
+    /// decoder that happened to work when each frame arrived whole would fail on
+    /// a real connection at a rate that looks like intermittent tool corruption.
+    #[test]
+    fn tool_arguments_reassemble_across_arbitrary_read_boundaries() {
+        let whole = format!(
+            "{START}{}{}{}{}{}{}{STOP}",
+            block_start(
+                0,
+                r#"{"type":"tool_use","id":"toolu_01C","name":"Bash","input":{}}"#
+            ),
+            json_delta(0, r#"{\"command\":\"cargo "#),
+            json_delta(0, r#"test --workspace\","#),
+            json_delta(0, r#"\"timeout\":900}"#),
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            stop_because("tool_use"),
+        );
+
+        let mut decoder = SseDecoder::default();
+        let mut chunks = Vec::new();
+        // One byte at a time: every fragment, every frame and every line
+        // terminator is split.
+        for byte in whole.as_bytes() {
+            decoder.feed(&[*byte]).unwrap();
+            while let Some(chunk) = decoder.next_chunk() {
+                chunks.push(chunk);
+            }
+        }
+        decoder.eof().unwrap();
+        while let Some(chunk) = decoder.next_chunk() {
+            chunks.push(chunk);
+        }
+
+        assert_eq!(
+            chunks[0],
+            FrontierChunk::ToolCall {
+                id: "toolu_01C".into(),
+                name: "Bash".into(),
+                arguments: r#"{"command":"cargo test --workspace","timeout":900}"#.into(),
+            }
+        );
+        assert!(matches!(chunks[1], FrontierChunk::Done { .. }));
+    }
+
+    /// **A tool block that never closes emits nothing**, the same discipline as
+    /// the missing `Done`.
+    ///
+    /// Its arguments are a *prefix* of a JSON document the provider stopped
+    /// sending. Emitting the prefix would hand a client a call it cannot parse,
+    /// and a client that ran it anyway would act on truncated input — a
+    /// `{"command":"rm -rf /tm` is not a smaller version of the command that was
+    /// being sent.
+    #[test]
+    fn a_tool_block_that_never_closes_emits_no_call() {
+        // PROBE: fragments arrive, the terminal frame arrives, the block's stop
+        // never does.
+        let chunks = decode(&[
+            START,
+            &block_start(
+                0,
+                r#"{"type":"tool_use","id":"toolu_01D","name":"Bash","input":{}}"#,
+            ),
+            &json_delta(0, r#"{\"command\":\"rm -rf /tm"#),
+            &stop_because("tool_use"),
+            STOP,
+        ])
+        .unwrap();
+        assert_eq!(chunks.len(), 1, "only the accounting frame: {chunks:?}");
+        assert!(matches!(chunks[0], FrontierChunk::Done { .. }));
+
+        // CONTROL: the identical stream with the block's own stop frame appended
+        // before the terminal one does emit the call, so the rule is "the block
+        // never closed" and not "tool blocks are dropped".
+        let closed = decode(&[
+            START,
+            &block_start(
+                0,
+                r#"{"type":"tool_use","id":"toolu_01D","name":"Bash","input":{}}"#,
+            ),
+            &json_delta(0, r#"{\"command\":\"ls\"}"#),
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            &stop_because("tool_use"),
+            STOP,
+        ])
+        .unwrap();
+        assert_eq!(
+            closed[0],
+            FrontierChunk::ToolCall {
+                id: "toolu_01D".into(),
+                name: "Bash".into(),
+                arguments: r#"{"command":"ls"}"#.into(),
+            }
+        );
+    }
+
+    /// A tool that takes no arguments is a call with `{}`, not a call with an
+    /// empty string.
+    ///
+    /// The wire's own answer: `content_block_start` carries `input: {}` and no
+    /// fragment ever follows. An empty `arguments` is not valid JSON, so every
+    /// consumer downstream would have to special-case it — and the one that
+    /// forgot would hand the client's tool runner a parse error for a call the
+    /// model made correctly.
+    #[test]
+    fn a_tool_block_with_no_argument_fragments_yields_the_empty_object() {
+        for (seed, expected, why) in [
+            (r#""input":{}"#, "{}", "the wire's own empty object"),
+            (r#""input":null"#, "{}", "a null input is nobody saying"),
+            // A whole `input` with no fragments: not what the streaming API
+            // documents, and exactly what a proxy that collapsed a block into
+            // its start frame would send. Read rather than discarded, because
+            // discarding it would turn a complete call into an argument-less one.
+            (
+                r#""input":{"a":1}"#,
+                r#"{"a":1}"#,
+                "a block sent whole on its start frame",
+            ),
+        ] {
+            let chunks = decode(&[
+                START,
+                &block_start(
+                    0,
+                    &format!(r#"{{"type":"tool_use","id":"t","name":"Now",{seed}}}"#),
+                ),
+                "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                &stop_because("tool_use"),
+                STOP,
+            ])
+            .unwrap_or_else(|error| panic!("{why}: {error}"));
+            assert_eq!(
+                chunks[0],
+                FrontierChunk::ToolCall {
+                    id: "t".into(),
+                    name: "Now".into(),
+                    arguments: expected.to_string(),
+                },
+                "{why}"
+            );
+        }
+    }
+
+    /// A fragment for a block nobody opened, and a lifecycle frame this build
+    /// cannot read, both cost the call and never the turn.
+    ///
+    /// The asymmetry with `message_start` is deliberate and stated in the
+    /// dispatcher: an unreadable prelude loses the turn's accounting, which is
+    /// worth failing for; an unreadable block frame loses one tool call from a
+    /// turn that was still served and still billed, and failing it would turn a
+    /// frame we merely did not understand into an unanswered request.
+    #[test]
+    fn an_unreadable_block_frame_loses_its_call_and_not_the_turn() {
+        let chunks = decode(&[
+            START,
+            // An index that is not a number: nothing opens.
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\
+             \"index\":\"one\",\"content_block\":{\"type\":\"tool_use\",\"id\":\"t\",\
+             \"name\":\"Read\",\"input\":{}}}\n\n",
+            // A fragment for a block that was never opened.
+            &json_delta(7, r#"{\"orphan\":true}"#),
+            // And a stop for one, which must not invent a call either.
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":7}\n\n",
+            &text(1, "answered anyway"),
+            DELTA,
+            STOP,
+        ])
+        .unwrap();
+        assert_eq!(
+            chunks,
+            vec![
+                FrontierChunk::OutputText("answered anyway".into()),
+                FrontierChunk::Done {
+                    input_tokens: 9_512,
+                    cached_input_tokens: 9_000,
+                    cache_write_tokens: 500,
+                    output_tokens: 64,
+                    reasoning_tokens: 0,
+                    provider_reported_cost: None,
+                    stop_reason: Some("end_turn".into()),
+                },
+            ]
         );
     }
 
@@ -974,6 +1587,10 @@ mod tests {
                 output_tokens: 2,
                 reasoning_tokens: 0,
                 provider_reported_cost: None,
+                // The `message_delta` here carries `"delta":{}` -- no stop
+                // reason at all -- and "nobody said" is `None` rather than a
+                // guessed `end_turn`.
+                stop_reason: None,
             }
         );
     }
@@ -1007,6 +1624,7 @@ mod tests {
                 output_tokens: 70,
                 reasoning_tokens: 0,
                 provider_reported_cost: None,
+                stop_reason: Some("end_turn".into()),
             }
         );
     }
@@ -1073,6 +1691,78 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    /// **The accumulation that spans frames is bounded too.**
+    ///
+    /// `MAX_EVENT_BYTES` holds one frame; a tool block spans many, so an
+    /// upstream whose every individual frame is small and legal can still grow
+    /// this decoder without limit — one `content_block_start` per index and
+    /// never a stop, or one open block fed fragments forever. Both are the same
+    /// hazard `MAX_EVENT_BYTES` exists for, arriving through the door M11.2
+    /// opened, and both are answered the same way: abandon the stream rather
+    /// than buffer it.
+    #[test]
+    fn an_upstream_that_opens_tool_blocks_without_end_is_abandoned() {
+        // PROBE 1: blocks opened and never closed, each frame tiny.
+        let mut decoder = SseDecoder::default();
+        decoder.feed(START.as_bytes()).unwrap();
+        let error = (0..)
+            .find_map(|index| {
+                let block =
+                    format!(r#"{{"type":"tool_use","id":"t{index}","name":"Read","input":{{}}}}"#);
+                decoder.feed(block_start(index, &block).as_bytes()).err()
+            })
+            .expect("an unbounded run of open blocks must be refused");
+        assert!(error.to_string().contains("tool blocks"), "{error}");
+
+        // PROBE 2: one block, fragments without end.
+        let mut decoder = SseDecoder::default();
+        decoder.feed(START.as_bytes()).unwrap();
+        decoder
+            .feed(
+                block_start(
+                    0,
+                    r#"{"type":"tool_use","id":"t","name":"Read","input":{}}"#,
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let filler = "x".repeat(64 * 1024);
+        let error = loop {
+            match decoder.feed(json_delta(0, &filler).as_bytes()) {
+                Ok(()) => continue,
+                Err(error) => break error,
+            }
+        };
+        assert!(error.to_string().contains("arguments"), "{error}");
+
+        // CONTROL: a turn that calls many tools *in sequence* is unaffected,
+        // because each block closes before the next opens — so the limit is
+        // about blocks left open, not about how much a turn may do. Well past
+        // `MAX_OPEN_TOOL_BLOCKS`, so a bound on the wrong quantity fails here.
+        let mut decoder = SseDecoder::default();
+        decoder.feed(START.as_bytes()).unwrap();
+        for index in 0..(MAX_OPEN_TOOL_BLOCKS as u64 * 3) {
+            let block =
+                format!(r#"{{"type":"tool_use","id":"t{index}","name":"Read","input":{{}}}}"#);
+            decoder.feed(block_start(index, &block).as_bytes()).unwrap();
+            decoder
+                .feed(
+                    format!(
+                        "event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\
+                         \"index\":{index}}}\n\n"
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+        }
+        let mut calls = 0;
+        while let Some(chunk) = decoder.next_chunk() {
+            assert!(matches!(chunk, FrontierChunk::ToolCall { .. }), "{chunk:?}");
+            calls += 1;
+        }
+        assert_eq!(calls, MAX_OPEN_TOOL_BLOCKS * 3);
     }
 
     #[test]
@@ -1142,6 +1832,7 @@ mod tests {
                         output_tokens: 64,
                         reasoning_tokens: 0,
                         provider_reported_cost: None,
+                        stop_reason: Some("end_turn".into()),
                     },
                 ],
                 "{framing} framing"

@@ -99,9 +99,9 @@ const USER_ID_SESSION_MARKER: &str = "_session_";
 
 /// The part of a Messages request this surface reads.
 ///
-/// Everything else — `tools`, `tool_choice`, `thinking`, `temperature`,
-/// `context_management`, `output_config`, and whatever the next beta adds — is
-/// accepted and ignored, for the reason the module doc gives.
+/// Everything else — `thinking`, `temperature`, `context_management`,
+/// `output_config`, and whatever the next beta adds — is accepted and ignored,
+/// for the reason the module doc gives.
 #[derive(Debug, Default, Deserialize)]
 pub struct CreateMessageParams {
     /// What the client believes it is talking to.
@@ -140,6 +140,33 @@ pub struct CreateMessageParams {
     /// where it is read, with the reasoning written there.
     #[serde(default)]
     pub max_tokens: Option<u64>,
+    /// What the client's own process can run.
+    ///
+    /// **Read since M11.2, and until then this was the field that made the
+    /// surface unable to answer an agentic client at all.** It was parsed by
+    /// nothing and dropped, so a Claude Code turn — twenty-four tool
+    /// definitions, every one of them the point of the request — reached the
+    /// model with no toolbox, could only reply in prose, and the client's loop
+    /// stalled on its first tool turn. It now rides the turn to
+    /// [`FrontierQuote::tools`](roundhouse_fleet::FrontierQuote) and out to the
+    /// upstream.
+    ///
+    /// Held as raw JSON and forwarded verbatim, which is a ruling and not
+    /// laziness: roundhouse defines none of these schemas and runs none of these
+    /// tools, so there is nothing here for it to be right about — while a typed
+    /// projection would silently drop the parts it did not model, including the
+    /// `cache_control` breakpoint Claude Code puts on its last tool to cache the
+    /// whole preamble.
+    #[serde(default)]
+    pub tools: Option<Value>,
+    /// How the client wants the model to choose among [`Self::tools`].
+    ///
+    /// A string on some requests and an object on others (`{"type":"auto",
+    /// "disable_parallel_tool_use":false}`), which is the second reason this is
+    /// `Value`: typing it would mean modelling a union whose arms this build
+    /// does not read.
+    #[serde(default)]
+    pub tool_choice: Option<Value>,
 }
 
 /// One turn of the resent conversation.
@@ -497,6 +524,16 @@ fn block_item(role: Role, block: &Value) -> Result<Item, ApiError> {
                 // gives one key order for any given object, so a body a chained
                 // Relay alphabetized canonicalizes to the same string as the
                 // one the client sent.
+                //
+                // **This expression *is*
+                // [`canonical_arguments`](roundhouse_core::item::canonical_arguments)**
+                // — the same rule reached from the other side, since that
+                // function parses and stringifies exactly this way. It is spelled
+                // out rather than called because there is nothing to parse here:
+                // the value already is one. The agreement is not left to the eye —
+                // `the_resend_of_an_emitted_call_canonicalizes_to_what_was_stored`
+                // asserts it, and it is what stops a tool-using session forking on
+                // its second turn.
                 arguments: input.to_string(),
             },
         ),
@@ -588,6 +625,8 @@ fn json_shape(value: &Value) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use roundhouse_core::item::canonical_arguments;
 
     use serde_json::json;
 
@@ -954,14 +993,23 @@ mod tests {
         );
     }
 
-    /// Properties the beta schema adds are accepted and ignored.
+    /// Properties the beta schema adds are accepted, and none of them becomes
+    /// an item.
     ///
     /// The exact property set the 2.1.247 capture carried (§5.5 ¶4). A closed
     /// request type would 4xx every turn of the shipping client, and the failure
     /// would arrive as "roundhouse is broken" rather than as "roundhouse is one
     /// beta behind".
+    ///
+    /// **`tools` and `tool_choice` are read since M11.2 and still do not appear
+    /// here**, which is the distinction this test now also pins: they are
+    /// properties of the *request* and travel to the dispatch on the turn, while
+    /// `canonicalize` produces the conversation's *items* — and a toolbox is not
+    /// a thing anyone said. Folding them into the items would put them in the
+    /// prefix hash, so a client that added one tool would fork every warm
+    /// session it owns.
     #[test]
-    fn the_beta_property_surface_is_accepted_and_ignored() {
+    fn the_beta_property_surface_is_accepted_and_never_becomes_an_item() {
         let items = canonicalize(&params(json!({
             "model": "claude-sonnet-4-5",
             "max_tokens": 32000,
@@ -1279,5 +1327,65 @@ mod tests {
             turn_id_for(&of(relayed)),
             "and the turn id must agree, or a chained retry is billed twice"
         );
+    }
+
+    /// **The other half of the tool loop's round trip: what this deployment
+    /// stored when it emitted a call is what the client's resend of that call
+    /// canonicalizes to.**
+    ///
+    /// The two ends are written in different places by different rules — the
+    /// engine stores
+    /// [`canonical_arguments`](roundhouse_core::item::canonical_arguments) of
+    /// whatever the model produced, and the function above stringifies the JSON
+    /// object the client sends back — so nothing but a test makes them one
+    /// answer. M11.2's wiring stage found them disagreeing: the model's own
+    /// spacing and key order survived into the log, the resend arrived sorted
+    /// and compact, and prefix admission forked every tool-using session on its
+    /// second turn while every turn still answered.
+    ///
+    /// The PROBE is a model spelling that is *not* canonical, so a
+    /// canonicalization that did nothing fails here rather than passing by
+    /// coincidence.
+    #[test]
+    fn the_resend_of_an_emitted_call_canonicalizes_to_what_was_stored() {
+        const MODEL_SPELLING: &str = r#"{"pattern": "fn main", "path": "src", "case": false}"#;
+        let stored = canonical_arguments(MODEL_SPELLING);
+        assert_ne!(
+            stored, MODEL_SPELLING,
+            "the fixture must be a spelling the canonicalization actually moves"
+        );
+
+        // What the serve projection puts on the wire is the stored string, and
+        // what the client accumulates from it is the parsed object it resends.
+        let resent = json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{ "role": "assistant", "content": [
+                { "type": "tool_use", "id": "toolu_1", "name": "Grep",
+                  "input": serde_json::from_str::<Value>(&stored).expect("the stored form is JSON") }
+            ]}]
+        });
+        let items = canonicalize(&params(resent)).expect("the resend is servable");
+        assert_eq!(
+            items,
+            vec![Item {
+                role: Role::Assistant,
+                content: ItemContent::ToolCall {
+                    call_id: "toolu_1".into(),
+                    name: "Grep".into(),
+                    arguments: stored.clone(),
+                },
+                response_id: None,
+            }],
+            "the resent call must canonicalize to the bytes the log already holds"
+        );
+
+        // And a Relay in the path cannot break it either: the alphabetized body
+        // is the same object, and the canonical form is defined by the object
+        // rather than by its spelling.
+        let relayed: Value = serde_json::from_str(
+            r#"{"messages":[{"content":[{"id":"toolu_1","input":{"case":false,"path":"src","pattern":"fn main"},"name":"Grep","type":"tool_use"}],"role":"assistant"}],"model":"claude-sonnet-4-5"}"#,
+        )
+        .expect("the fixture is JSON");
+        assert_eq!(canonicalize(&params(relayed)).expect("servable"), items);
     }
 }

@@ -391,6 +391,17 @@ impl<T: Tokenizer + Clone> FleetJudge<T> {
         loop {
             match tokio::time::timeout_at(deadline, stream.next()).await {
                 Ok(Some(Ok(FrontierChunk::OutputText(part)))) => raw.push_str(&part),
+                // **Discarded, and here that is the answer rather than a
+                // deferral.** The judge's quote carries `tools: None`, so a
+                // provider that produced a call did so unprompted; and what this
+                // function is collecting is a *verdict* — four JSON fields it
+                // parses below — not a turn to be continued. A model that
+                // reached for a tool instead of answering has failed to answer,
+                // which the parse then reports as an unusable verdict with the
+                // raw text attached. Contrast the engine's fold, where the same
+                // arm is a seam waiting on a durable item shape: a side call has
+                // no such shape and needs none.
+                Ok(Some(Ok(FrontierChunk::ToolCall { .. }))) => {}
                 Ok(Some(Ok(FrontierChunk::Done {
                     input_tokens,
                     cached_input_tokens,
@@ -411,6 +422,10 @@ impl<T: Tokenizer + Clone> FleetJudge<T> {
                     // is a decision about what a side call is for, not a
                     // consequence of this fix.
                     provider_reported_cost: _,
+                    // Likewise: a `SideCallCompleted` has nowhere to put one,
+                    // and a judge that stopped early is caught by the verdict
+                    // parse below rather than by a word from the provider.
+                    stop_reason: _,
                 }))) => {
                     reported = Some(Usage {
                         input_tokens,
@@ -600,6 +615,15 @@ impl<T: Tokenizer + Clone> FleetJudge<T> {
             // default ceiling would be a checker free to spend more than the
             // turn it is checking.
             output_token_cap: Some(self.config.expected_output_tokens),
+            // **A judge is handed no tools, and that is the isolation rather
+            // than a gap.** It is asked for a structured verdict about a
+            // transcript, and a checker that could call the tools it is
+            // reviewing would be acting inside the session it is meant to be
+            // standing outside of. The tools the turn under review declared are
+            // *material* to the judge, and they reach it — if at all — inside
+            // the brief, as text under the injection-defense line above.
+            tools: None,
+            tool_choice: None,
             // **Deliberately unresolved, and this is the honest state rather
             // than an oversight.** A side call is deployment work — it is not a
             // tenant's turn and must never spend a member's key — so the only

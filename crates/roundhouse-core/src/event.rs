@@ -311,8 +311,50 @@ pub enum SessionEventKind {
         /// them, and for every log written before this field existed. Skipped
         /// on the wire when absent, so a deployment whose upstreams stay silent
         /// writes the bytes it wrote before.
+        ///
+        /// `default` below is redundant for that last guarantee — see
+        /// `stop_reason`'s note on the identical attribute, the next field in
+        /// this variant, for why, and for why it stays anyway.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider_reported_cost_usd: Option<f64>,
+        /// Why the provider stopped, in the provider's own word.
+        ///
+        /// **The durable half of M11.1's F1, and the reason it is durable at
+        /// all is that only the log can carry it to the reader who needs it.**
+        /// A serve surface streams by tailing this log; the turn task that held
+        /// the dispatch's `FrontierChunk::Done` is a different task and is
+        /// already gone by the time the follower reaches the terminal event. So
+        /// a stop reason that stayed in the fold reached no client, and an
+        /// operator reading the log afterwards could not tell a turn cut off at
+        /// the dispatch ceiling from one that finished on its own — the two are
+        /// otherwise byte-identical here.
+        ///
+        /// An open string, not an enum, for the reason
+        /// [`FrontierChunk::Done::stop_reason`](https://docs.rs/roundhouse-fleet)
+        /// gives at length: this is the *provider's* vocabulary, Anthropic
+        /// added two values to it after the crates that closed the enum
+        /// shipped, and the Responses wire spells the same facts differently
+        /// again. Translating into whatever a client is owed belongs to the
+        /// emit layer that knows which dialect it is answering in.
+        ///
+        /// `None` means the provider named no reason — the ordinary answer on
+        /// a wire that has no such field for an ordinary completion, on every
+        /// turn answered at the interjection seam, and in every log written
+        /// before this field existed. It is emphatically not "it finished
+        /// normally". Skipped when absent, so a deployment whose upstreams stay
+        /// silent writes the bytes it wrote before.
+        ///
+        /// That last guarantee — an old log missing this key still reads —
+        /// is not what `default` buys below. `Option<T>` reads a missing key
+        /// as `None` on its own, attribute or not; mutation-testing this
+        /// field (M11.2 Stage 5) dropped `default` and replayed a
+        /// pre-M11.2-shaped event with the key entirely absent, and nothing
+        /// broke. It stays anyway as the marker this variant's fields carry
+        /// for "reads through an old log", so a reader would find its
+        /// absence a gap rather than the redundancy it actually is. (Same
+        /// attribute, same reasoning, on `provider_reported_cost_usd` above.)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stop_reason: Option<String>,
     },
     ResponseIncomplete {
         response_id: ResponseId,
@@ -711,6 +753,7 @@ mod tests {
                 response_id: ResponseId::new("r"),
                 usage: Usage::default(),
                 provider_reported_cost_usd: None,
+                stop_reason: None,
             },
         };
         assert!(done.is_terminal());

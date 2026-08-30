@@ -76,7 +76,8 @@ use roundhouse_core::now_ms;
 use roundhouse_core::store::SessionStore;
 
 use roundhouse_fleet::anthropic_messages::wire::{
-    ApiError as WireError, BlockDelta, ContentBlock, Message, StopReason, StreamEvent,
+    ApiError as WireError, BlockDelta, ContentBlock, Extra as WireExtra, Message, StopReason,
+    StreamEvent,
 };
 
 use crate::control_config::{AuthError, PlaneSource};
@@ -90,7 +91,7 @@ use crate::responses_api::{API_PREFIX, bind_prefix};
 pub mod emit;
 pub mod wire;
 
-use emit::{Frame, MessageEmission, Step, keepalive};
+use emit::{Emitted, Frame, MessageEmission, Step, keepalive};
 use wire::{CreateMessageParams, canonicalize, session_key, turn_id_for};
 
 /// The path the client posts a turn to.
@@ -339,7 +340,7 @@ where
     let plane = state.planes.plane(now_ms());
     let admission = plane.turn_admission(&headers)?;
     refuse_over_fair_use(&*state.engine, &admission).await?;
-    let params: CreateMessageParams = parse_body(&body)?;
+    let mut params: CreateMessageParams = parse_body(&body)?;
 
     let claimed = canonicalize(&params)?;
     let turn_id = turn_id_for(&claimed);
@@ -404,6 +405,16 @@ where
         .filter(|declared| *declared > 0)
         .map(|declared| u32::try_from(declared).unwrap_or(u32::MAX));
 
+    // **The client's toolbox, on its way to the model.** Taken rather than
+    // cloned: the definitions are the largest thing in a real Claude Code
+    // request — twenty-four schemas, several kilobytes — and nothing below reads
+    // them again. Read here for the first time in M11.2; before it they were
+    // parsed by nothing, so an agentic client's whole request reached the model
+    // as a transcript with no tools attached and the turn could only answer in
+    // prose.
+    let tools = params.tools.take();
+    let tool_choice = params.tool_choice.take();
+
     let turn = tokio::spawn({
         let engine = Arc::clone(&state.engine);
         let session_id = session_id.clone();
@@ -419,6 +430,18 @@ where
                         items: input,
                         declared_baseline,
                         output_token_cap,
+                        // **Verbatim, and not canonicalized.** Unlike the
+                        // messages above — which become log items and so must
+                        // pass through one canonical form — the tool
+                        // definitions are a property of *this request*, not of
+                        // the conversation: they are re-declared on every turn
+                        // by the client and are never replayed out of the log.
+                        // So there is nothing for a canonical form to buy here,
+                        // and one would cost the same thing it costs everywhere
+                        // else on this path: the parts of a schema this build
+                        // does not model, dropped where nobody sees it.
+                        tools,
+                        tool_choice,
                     },
                     &admission,
                 )
@@ -807,8 +830,15 @@ impl<S: SessionStore, T: Tokenizer + Clone + Send + Sync + 'static> MessagesFoll
             // answer was committed whole rather than dispatched, so what the log
             // booked for it is the judge's usage and not what this turn
             // contributed to the context — see `Engine::context_contribution`.
+            //
+            // Narrowed to the seam answer specifically, not to "anything the
+            // emission claims": a tool call is claimed too and is the product of
+            // an ordinary *dispatched* turn, whose booked usage is exactly what
+            // the client should be told. Substituting a context contribution
+            // there would replace a provider's measured counts with our
+            // tokenizer's estimate on the most ordinary turn an agent takes.
             if let SessionEventKind::ItemAppended { item } = &event.kind
-                && self.emission.seam_answer(item).is_some()
+                && matches!(self.emission.emitted(item), Some(Emitted::SeamText(_)))
             {
                 let contribution = self
                     .engine
@@ -895,6 +925,128 @@ impl<S: SessionStore, T: Tokenizer + Clone + Send + Sync + 'static> MessagesFoll
 // The non-streaming answer
 // ---------------------------------------------------------------------------
 
+/// Content blocks, reassembled from the block frames a stream would have sent.
+///
+/// **The client's own accumulator, on our side of the wire.** Since M11.2 a turn
+/// is not one text block: a tool-using answer interleaves text and `tool_use`
+/// blocks, and a non-streaming caller is owed the same `content` array a
+/// streaming one assembles. Concatenating every `text_delta` into a single block
+/// — what this path did while there was only ever one block — would drop every
+/// tool call on the floor, and the client would read a turn that asked for
+/// nothing as a turn that answered.
+///
+/// One block open at a time, and that is a property of the emitter rather than
+/// an assumption about the wire: [`MessageEmission`] closes each block before
+/// opening the next, so there is no interleaving to track. A frame sequence that
+/// violated it would build the blocks in a different order, which is a shape
+/// only our own emitter could produce and one its own ordering tests forbid.
+#[derive(Debug, Default)]
+struct BlockAccumulator {
+    done: Vec<ContentBlock>,
+    open: Option<OpenBlock>,
+}
+
+/// A block being filled, in the two shapes this surface emits.
+#[derive(Debug)]
+enum OpenBlock {
+    Text(String),
+    /// A tool call, whose arguments arrive as JSON *fragments* — see
+    /// [`BlockAccumulator::close`] for what is done with a fragment run that
+    /// does not parse.
+    Tool {
+        id: String,
+        name: String,
+        partial_json: String,
+    },
+}
+
+impl BlockAccumulator {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn open(&mut self, block: &ContentBlock) {
+        // Any previous block is closed by its own `content_block_stop`; this is
+        // belt and braces for a frame sequence that skipped one, and it keeps
+        // the content it had rather than discarding it.
+        self.close();
+        self.open = match block {
+            ContentBlock::Text { text, .. } => Some(OpenBlock::Text(text.clone())),
+            ContentBlock::ToolUse { id, name, .. } => Some(OpenBlock::Tool {
+                id: id.clone(),
+                name: name.clone(),
+                partial_json: String::new(),
+            }),
+            // Nothing else is emitted by this surface. Named rather than
+            // wildcarded, so the day it emits a `thinking` block this line is a
+            // compile error at the one site that decides what a non-streaming
+            // client sees — a wildcard would silently drop it instead, and
+            // dropping is the unsafe default here. Ignored rather than refused
+            // for now: this fold reads our own frames, so an unknown block is a
+            // bug in the emitter, and a refusal would turn it into a 500 for the
+            // client instead of a red test for us.
+            ContentBlock::ToolResult { .. }
+            | ContentBlock::Thinking { .. }
+            | ContentBlock::RedactedThinking { .. }
+            | ContentBlock::Opaque(_) => None,
+        };
+    }
+
+    fn push(&mut self, delta: &BlockDelta) {
+        match (&mut self.open, delta) {
+            (Some(OpenBlock::Text(text)), BlockDelta::TextDelta { text: chunk, .. }) => {
+                text.push_str(chunk);
+            }
+            (
+                Some(OpenBlock::Tool { partial_json, .. }),
+                BlockDelta::InputJsonDelta {
+                    partial_json: fragment,
+                    ..
+                },
+            ) => partial_json.push_str(fragment),
+            // A delta whose type does not match its block is exactly what the
+            // client's accumulator *throws* on, and it cannot happen against our
+            // own emitter. Dropped here for the same reason the unknown block is.
+            _ => {}
+        }
+    }
+
+    fn close(&mut self) {
+        let Some(open) = self.open.take() else {
+            return;
+        };
+        self.done.push(match open {
+            OpenBlock::Text(text) => ContentBlock::text(text),
+            OpenBlock::Tool {
+                id,
+                name,
+                partial_json,
+            } => ContentBlock::ToolUse {
+                id,
+                name,
+                // **Parsed here and only here.** `input` is a JSON *value* on
+                // this wire while the log holds the arguments as the byte string
+                // the model produced — the same asymmetry the streaming path
+                // resolves by sending fragments and letting the client parse.
+                // An unparseable run becomes `{}` rather than failing the turn:
+                // the arguments came out of a decoder that already reassembled
+                // them, so this is unreachable short of a corrupt log, and a
+                // whole turn refused over one malformed call is a worse answer
+                // than a call the client refuses for itself.
+                input: serde_json::from_str(&partial_json)
+                    .unwrap_or_else(|_| Value::Object(serde_json::Map::new())),
+                cache_control: None,
+                extra: WireExtra::new(),
+            },
+        });
+    }
+
+    fn finish(mut self) -> Vec<ContentBlock> {
+        self.close();
+        self.done
+    }
+}
+
 /// Run the follower to the end and answer one complete `Message`.
 ///
 /// **Assembled from the frames the streaming path would have emitted, not from
@@ -917,17 +1069,15 @@ where
     T: Tokenizer + Clone + Send + Sync + 'static,
 {
     let mut message: Option<Message> = None;
-    let mut text = String::new();
+    let mut content = BlockAccumulator::new();
     let mut stop_reason = StopReason::EndTurn;
     let mut usage = None;
     while let Some(frame) = follower.next_frame().await {
         match frame.event() {
             StreamEvent::MessageStart { message: start, .. } => message = Some(start.clone()),
-            StreamEvent::ContentBlockDelta { delta, .. } => {
-                if let BlockDelta::TextDelta { text: chunk, .. } = delta {
-                    text.push_str(chunk);
-                }
-            }
+            StreamEvent::ContentBlockStart { content_block, .. } => content.open(content_block),
+            StreamEvent::ContentBlockDelta { delta, .. } => content.push(delta),
+            StreamEvent::ContentBlockStop { .. } => content.close(),
             StreamEvent::MessageDelta {
                 delta,
                 usage: reported,
@@ -969,10 +1119,7 @@ where
             StreamEvent::Error { error, .. } => {
                 return Err(MessagesError(mid_stream_failure(error)));
             }
-            StreamEvent::ContentBlockStart { .. }
-            | StreamEvent::ContentBlockStop { .. }
-            | StreamEvent::MessageStop { .. }
-            | StreamEvent::Ping { .. } => {}
+            StreamEvent::MessageStop { .. } | StreamEvent::Ping { .. } => {}
         }
     }
 
@@ -985,7 +1132,7 @@ where
             "the turn produced no response to answer with",
         )));
     };
-    message.content = vec![ContentBlock::text(text)];
+    message.content = content.finish();
     message.stop_reason = Some(stop_reason);
     if let Some(usage) = usage {
         message.usage = usage;

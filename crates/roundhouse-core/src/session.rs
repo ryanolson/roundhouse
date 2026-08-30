@@ -1364,7 +1364,49 @@ impl<S: SessionStore> Session<S> {
             .ok_or_else(|| SessionError::ResponseNotOpen(response_id.clone()))
     }
 
-    /// Close a response successfully, committing the assistant item.
+    /// Commit something this response produced *before* it terminates.
+    ///
+    /// **The append that makes an interleaved answer possible, and it is a
+    /// deliberate weakening of the atomicity [`Self::complete_with_item`]
+    /// describes.** A turn that speaks and then calls two tools produces three
+    /// items whose *order* is the answer: a client resends exactly the blocks it
+    /// was given, and the prefix check compares that resend against what this
+    /// log holds — so items committed in a different order from the one they
+    /// were streamed in fork every tool-using session on its second turn.
+    /// Batching them into the completion cannot preserve that order on the wire,
+    /// because the text ahead of a call has already gone out as deltas by the
+    /// time the call arrives.
+    ///
+    /// So an emitted item lands when it is produced, exactly as
+    /// [`Self::append_output`]'s deltas do, and the same guarantee applies to
+    /// both: a response that dies mid-generation leaves durable output behind
+    /// and terminates through [`Self::mark_incomplete`]. What it must never
+    /// leave behind is an emitted item and *no* terminal event, which is why
+    /// this is reachable only between `begin_turn` and a terminal — and the
+    /// trailing run still rides the completion batch, so the ordinary prose
+    /// turn's atomicity is exactly what it was.
+    ///
+    /// The response id is stamped here rather than read off `item`, for the
+    /// reason [`Self::complete_with_item`] gives: a stamp is a claim that *this
+    /// deployment emitted this*, and a caller that had to supply it could forget
+    /// it — a forgotten stamp is an emitted call no projection can tell from a
+    /// client's own.
+    pub async fn append_emitted(
+        &mut self,
+        response_id: &ResponseId,
+        item: Item,
+    ) -> Result<(), SessionError> {
+        self.commit(vec![SessionEventKind::ItemAppended {
+            item: Item {
+                response_id: Some(response_id.clone()),
+                ..item
+            },
+        }])
+        .await?;
+        Ok(())
+    }
+
+    /// Close a response successfully, committing what it produced last.
     ///
     /// The dispatched turn's spelling of [`Session::complete_with_item`], and
     /// expressed in terms of it rather than beside it: the atomicity rule — the
@@ -1378,19 +1420,40 @@ impl<S: SessionStore> Session<S> {
     /// and absent from [`Self::complete_with_item`] because only a *dispatched*
     /// turn can have one: the other spelling completes a turn an interjector
     /// answered, which reached no provider at all and so has no bill to report.
+    /// `stop_reason` is the provider's own word for why it stopped, and travels
+    /// for the reason its field documents — nothing downstream of the fold can
+    /// recover it.
+    ///
+    /// **`trailing` is an [`Option`] since M11.2, and the `None` is
+    /// load-bearing.** A turn whose whole answer was tool calls has already
+    /// committed every item it produced through [`Self::append_emitted`], and
+    /// completing it with an empty assistant text item would put a block in the
+    /// log that was never on the wire — so the client's next resend would
+    /// diverge from the stored history at exactly that item and fork the
+    /// session. `Some("")` is still the right call for a turn that produced
+    /// *nothing*, because that is what the serve surfaces emit for one; the
+    /// distinction is the caller's and is made where the answer's shape is
+    /// known.
+    ///
+    /// Text rather than an `Item`, because the item a completion commits is
+    /// assistant text by construction: a tool call is complete when it is
+    /// produced and lands through [`Self::append_emitted`] at that moment, so it
+    /// can never be the thing a turn is still holding when it ends.
     pub async fn complete(
         &mut self,
         response_id: &ResponseId,
-        text: impl Into<String>,
+        trailing: Option<&str>,
         usage: Usage,
         provider_reported_cost_usd: Option<f64>,
+        stop_reason: Option<String>,
     ) -> Result<(), SessionError> {
         self.commit_completion(
             response_id,
-            Item::assistant_text(text, response_id.clone()),
+            trailing.map(|text| Item::assistant_text(text, response_id.clone())),
             usage,
             ControlRecord::default(),
             provider_reported_cost_usd,
+            stop_reason,
         )
         .await
     }
@@ -1406,10 +1469,12 @@ impl<S: SessionStore> Session<S> {
     /// **The response id is stamped here rather than read off the item.** That
     /// is what makes a committed item bearing a response id mean "this response
     /// emitted it": everything on the input path arrives through
-    /// [`Session::begin_turn`] carrying none, and this is the only method that
-    /// puts one on anything at all. A caller that had to supply the stamp
-    /// itself could forget it, and a forgotten stamp is an emitted call that no
-    /// projection can tell from a client's own.
+    /// [`Session::begin_turn`] carrying none, and the only methods that put one
+    /// on anything at all are this and [`Session::append_emitted`] — the two
+    /// spellings of *emitting*, both of which stamp rather than accept a stamp.
+    /// A caller that had to supply the stamp itself could forget it, and a
+    /// forgotten stamp is an emitted call that no projection can tell from a
+    /// client's own.
     ///
     /// **One append batch, never two.** The item and the completion are a
     /// decision and its realization. Committed separately, a process that died
@@ -1447,11 +1512,12 @@ impl<S: SessionStore> Session<S> {
         usage: Usage,
         record: ControlRecord,
     ) -> Result<(), SessionError> {
-        // `None`, and it is a claim rather than a default: this spelling exists
-        // for the turn an interjector answered, which dispatched nothing, so
-        // there is no upstream to have reported a price. The dispatched turn's
-        // spelling one method up is the one that carries a figure.
-        self.commit_completion(response_id, item, usage, record, None)
+        // `None` twice, and both are claims rather than defaults: this spelling
+        // exists for the turn an interjector answered, which dispatched nothing,
+        // so there is no upstream to have reported a price and none to have
+        // named a stop reason. The dispatched turn's spelling one method up is
+        // the one that carries either.
+        self.commit_completion(response_id, Some(item), usage, record, None, None)
             .await
     }
 
@@ -1460,21 +1526,26 @@ impl<S: SessionStore> Session<S> {
     async fn commit_completion(
         &mut self,
         response_id: &ResponseId,
-        item: Item,
+        item: Option<Item>,
         usage: Usage,
         record: ControlRecord,
         provider_reported_cost_usd: Option<f64>,
+        stop_reason: Option<String>,
     ) -> Result<(), SessionError> {
-        let item = Item {
-            response_id: Some(response_id.clone()),
-            ..item
-        };
         let mut kinds = record.into_kinds();
-        kinds.push(SessionEventKind::ItemAppended { item });
+        if let Some(item) = item {
+            kinds.push(SessionEventKind::ItemAppended {
+                item: Item {
+                    response_id: Some(response_id.clone()),
+                    ..item
+                },
+            });
+        }
         kinds.push(SessionEventKind::ResponseCompleted {
             response_id: response_id.clone(),
             usage,
             provider_reported_cost_usd,
+            stop_reason,
         });
         self.commit(kinds).await?;
         Ok(())

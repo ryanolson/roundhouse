@@ -620,7 +620,7 @@ mod the_live_admission_cannot_move_a_finished_turns_charge {
             .await
             .unwrap();
         session
-            .complete(&response_id, "hi", frontier_usage(), None)
+            .complete(&response_id, Some("hi"), frontier_usage(), None, None)
             .await
             .unwrap();
 

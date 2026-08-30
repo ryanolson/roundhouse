@@ -185,6 +185,57 @@ pub type FrontierStream = BoxStream<'static, Result<FrontierChunk, FrontierError
 #[derive(Debug, Clone, PartialEq)]
 pub enum FrontierChunk {
     OutputText(String),
+    /// The model asked for a tool to be run.
+    ///
+    /// **The variant that makes an agentic client usable through roundhouse at
+    /// all.** Until M11.2 this enum could carry only prose, so a Claude Code or
+    /// codex turn whose whole purpose is `Read`, `Bash` or `Grep` decoded to an
+    /// empty answer and the client's loop stalled on its first tool turn — the
+    /// finding that re-scoped this milestone. Roundhouse still runs no tool
+    /// itself: the client does, exactly as on the Responses surface, and this is
+    /// the channel that carries the *request* back out to it.
+    ///
+    /// Emitted once per completed tool block, never per fragment. Both wires
+    /// stream the arguments in pieces — Anthropic as `input_json_delta`
+    /// fragments between a `content_block_start` and its `content_block_stop`,
+    /// the Responses wire as `response.function_call_arguments.delta` — and a
+    /// fragment is not JSON on its own, so a per-fragment chunk would hand every
+    /// consumer the same reassembly problem and let two of them disagree about
+    /// it. A block that never completes emits nothing, which is the same rule as
+    /// [`Self::Done`] and for the same reason: half a tool call is not a smaller
+    /// tool call, it is a call to a tool with arguments nobody can parse.
+    ToolCall {
+        /// The provider's own id for this call, echoed back on the result.
+        ///
+        /// Anthropic's `tool_use.id`, the Responses wire's `call_id`. Verbatim
+        /// in both cases: it is an opaque token whose only job is to pair a
+        /// result with the call, and rewriting it breaks the pairing.
+        id: String,
+        name: String,
+        /// The accumulated argument JSON, as a *string*.
+        ///
+        /// Field-shaped to match
+        /// [`ItemContent::ToolCall::arguments`](roundhouse_core::item::ItemContent),
+        /// so the join to a durable item is a field-for-field one. A parsed
+        /// `Value` would have been the tempting choice and is the wrong one: the
+        /// Responses wire hands this over already-a-string (the codex oracle's
+        /// own `ResponseItem::FunctionCall::arguments` is a `String`, with a
+        /// comment saying why), and a fragment run that does not parse is
+        /// something a decoder must be able to carry rather than reject — a
+        /// `Value` here would make an unparseable call unrepresentable and turn
+        /// it into a lost turn instead of a call the client can refuse.
+        ///
+        /// **What this is *not* is the log's spelling.** M11.2's wiring stage
+        /// found that storing the model's own bytes forks every tool-using
+        /// session on its second turn, because the client resends the call as a
+        /// JSON object and canonicalizing that resend sorts the keys. The
+        /// durable form is
+        /// [`canonical_arguments`](roundhouse_core::item::canonical_arguments)
+        /// of this string, applied once where the chunk becomes an item; this
+        /// field stays what the upstream said, which is the only thing a
+        /// dispatch decoder can honestly report.
+        arguments: String,
+    },
     Done {
         input_tokens: u64,
         cached_input_tokens: u64,
@@ -238,6 +289,31 @@ pub enum FrontierChunk {
         ///
         /// [`Usage`]: roundhouse_core::event::Usage
         provider_reported_cost: Option<f64>,
+        /// Why the provider stopped, in the provider's own word.
+        ///
+        /// **An open string and deliberately not an enum.** This is what the
+        /// wire said, and the log's job is to record that rather than to
+        /// classify it: Anthropic ships seven values and added two of them after
+        /// the crates that closed the enum shipped, the Responses wire spells
+        /// the same facts differently again, and a dialect-neutral enum here
+        /// would have to invent a shared vocabulary that neither provider uses.
+        /// The mapping into whatever a *client* is owed belongs to the emit
+        /// layer that knows which dialect it is answering in — which is also the
+        /// only layer that could be right about it.
+        ///
+        /// `None` means the provider named no reason, which is the ordinary
+        /// answer on a wire that has no such field for an ordinary completion,
+        /// and is emphatically not the same as "it finished normally".
+        ///
+        /// **Why this is on `Done` rather than inferred downstream** (M11.1's
+        /// F1, reporting half): a turn cut off at the dispatch ceiling arrives
+        /// as `stop_reason: max_tokens` and is otherwise byte-identical to one
+        /// that finished on its own, so a decoder that discards this makes the
+        /// two indistinguishable *everywhere after it* — no client can be told,
+        /// and no operator reading the log can find out. `tool_use` is the same
+        /// fact for the agentic loop: it is how a client knows the turn is
+        /// waiting on it rather than over.
+        stop_reason: Option<String>,
     },
 }
 
@@ -276,6 +352,13 @@ impl FrontierChunk {
                 // from them would be exactly the rate-card-in-source mistake
                 // the catalog exists to prevent.
                 provider_reported_cost: None,
+                // And no stop reason, for the same reason and not as an
+                // oversight: a caller that handed this adapter a finished string
+                // told it nothing about *why* the model stopped, and
+                // synthesizing `end_turn` here would put a claim in the log that
+                // nobody made. `None` reads as "the provider named no reason",
+                // which is exactly what happened.
+                stop_reason: None,
             }),
         ])
         .boxed()
@@ -356,6 +439,42 @@ pub struct FrontierQuote {
     /// Additive, deliberately: a construction site that does not set it gets
     /// `None` and the behaviour it had before the split.
     pub output_token_cap: Option<u32>,
+    /// The tool definitions the client declared, as the client's own JSON.
+    ///
+    /// **Untyped on purpose, and it is the one field here where that is a
+    /// ruling rather than a shortcut.** The quote is *transport*: it carries a
+    /// turn from the engine to whichever client speaks the target's dialect, and
+    /// the wire modules own shape. A typed re-encoding here would be a third
+    /// projection of the same tool definitions — the client's bytes, this
+    /// struct's types, the dialect module's types — and three projections of one
+    /// thing is two chances to disagree. They disagree about exactly what
+    /// matters: a tool schema this build does not model (`cache_control` on the
+    /// last tool, a server-tool type, whatever the next beta adds) would be
+    /// silently dropped on the way through, and the model would then be told
+    /// about a smaller toolbox than the client has — which surfaces as a client
+    /// whose tools mysteriously stop working, never as an error.
+    ///
+    /// So the dialects' shapes are *different* JSON and this field is whichever
+    /// one the surface that built the quote received. That is sound because the
+    /// serve surface and the dispatch client always speak the same dialect for a
+    /// pass-through turn, and it is the honest description of what this value is
+    /// either way: the caller's bytes, on their way to an upstream that defined
+    /// them.
+    ///
+    /// `None` means the client declared no tools — every internal caller (the
+    /// judge, the validate loop, an MCP turn) and any client that simply did not
+    /// send any. Additive: a construction site that does not set it sends no
+    /// `tools` key at all, which is what every dispatch did before M11.2.
+    pub tools: Option<serde_json::Value>,
+    /// How the client wants the model to choose among [`Self::tools`], verbatim.
+    ///
+    /// Separate from `tools` rather than folded in beside it because the wire
+    /// keeps them separate on both dialects, and because they are independently
+    /// optional: a client may declare tools and say nothing about choosing, and
+    /// `tool_choice` without `tools` is a request the *upstream* should refuse
+    /// with a message naming the field — not one this struct should make
+    /// unrepresentable and thereby hide.
+    pub tool_choice: Option<serde_json::Value>,
     /// What this request authenticates with.
     ///
     /// **Carried here for the same reason [`Self::wire_protocol`] is, and the
@@ -684,7 +803,7 @@ mod tests {
     use roundhouse_core::context::{ByteTokenizer, ContextAssembler};
     use roundhouse_core::control::Secret;
     use roundhouse_core::ids::ResponseId;
-    use roundhouse_core::item::Item;
+    use roundhouse_core::item::{Item, ItemContent, canonical_arguments};
     use roundhouse_core::validate::append_handoff_note;
 
     const MINUTE: u64 = 60_000;
@@ -829,6 +948,8 @@ mod tests {
             prompt_cache_key: "sess_x".into(),
             expected_output_tokens: None,
             output_token_cap: None,
+            tools: None,
+            tool_choice: None,
             credential,
         }
     }
@@ -1021,6 +1142,78 @@ mod tests {
         ] {
             assert!(!rendered.contains("seat"), "{rendered}");
         }
+    }
+
+    /// **The join to a durable item, and the correction M11.2's wiring stage
+    /// made to it.**
+    ///
+    /// The variant exists so a decoder can hand a completed tool call to the
+    /// engine, and the engine's only durable home for one is
+    /// [`ItemContent::ToolCall`]: same three fields, same types, so the join is
+    /// a field-for-field mapping with nothing to invent.
+    ///
+    /// What the first reading of this test asserted — that the arguments cross
+    /// that join *byte-exactly* — was wrong, and wrong in the expensive
+    /// direction. The client resends the call as history on its next turn, the
+    /// Messages wire carries the arguments as a JSON **object**, and
+    /// canonicalizing that object serializes a `serde_json` value: compact,
+    /// key-sorted. So a log holding the model's own
+    /// `{"pattern": "fn main", "path": "/a"}` is compared against
+    /// `{"path":"/a","pattern":"fn main"}` and disagrees, and prefix admission
+    /// forks the conversation — silently, while every turn still answers. The
+    /// durable spelling is
+    /// [`canonical_arguments`](roundhouse_core::item::canonical_arguments), and
+    /// the serve projections put that same string back on the wire, which is
+    /// what closes the round trip.
+    ///
+    /// The payload's keys are deliberately *not* in sorted order and its spacing
+    /// is not `serde_json`'s, so a canonicalization that did nothing would fail
+    /// the first assertion rather than pass it by coincidence.
+    #[test]
+    fn a_tool_call_chunk_becomes_a_durable_item_in_its_canonical_spelling() {
+        const ARGUMENTS: &str = r#"{"pattern": "fn main", "path": "/a"}"#;
+        let chunk = FrontierChunk::ToolCall {
+            id: "toolu_01A".into(),
+            name: "Grep".into(),
+            arguments: ARGUMENTS.to_string(),
+        };
+
+        let FrontierChunk::ToolCall {
+            id,
+            name,
+            arguments,
+        } = chunk
+        else {
+            unreachable!("constructed as a tool call")
+        };
+        let item = Item::tool_call(id, name, canonical_arguments(&arguments));
+
+        assert_eq!(
+            item.content,
+            ItemContent::ToolCall {
+                call_id: "toolu_01A".into(),
+                name: "Grep".into(),
+                arguments: r#"{"path":"/a","pattern":"fn main"}"#.to_string(),
+            }
+        );
+
+        // CONTROL, and it is what makes the assertion above about *this*
+        // payload rather than about any string surviving: the model's spelling
+        // and the canonical one really do differ here. If that ever stops being
+        // true the assertion above stops proving anything, and this line goes
+        // red to say so.
+        assert_ne!(
+            canonical_arguments(ARGUMENTS),
+            ARGUMENTS,
+            "the fixture must be a payload the canonicalization actually moves"
+        );
+        // And it is a fixed point: what the log holds canonicalizes to itself,
+        // which is what makes the next turn's comparison stable rather than
+        // merely correct once.
+        assert_eq!(
+            canonical_arguments(&canonical_arguments(ARGUMENTS)),
+            canonical_arguments(ARGUMENTS)
+        );
     }
 
     #[tokio::test]

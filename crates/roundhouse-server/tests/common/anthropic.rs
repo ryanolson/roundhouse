@@ -59,7 +59,7 @@
 
 use std::collections::HashMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
 // The strict vocabulary
@@ -93,7 +93,15 @@ pub enum StrictRole {
 
 /// A content block, closed over the five shapes this deployment can produce or
 /// store.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+/// **`Serialize` as well as `Deserialize`, and only on this type.** The rest of
+/// the oracle reads and never writes, deliberately. A content block is the
+/// exception because the loop it takes part in is a round trip: the client
+/// assembles these blocks out of a stream and then *sends them back* as history
+/// on its next turn, and a test that rebuilt that history by hand would be
+/// asserting prefix admission against a resend nobody's client would make. Going
+/// through the strict shape is what makes the second turn's request the first
+/// turn's answer.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum StrictBlock {
     Text {
@@ -399,6 +407,31 @@ pub struct Accumulated {
     /// is one of the two conditions that make Claude Code re-issue the entire
     /// turn without streaming (§3.6).
     pub completed_blocks: usize,
+    /// Every completed block, in index order — the `content` array the client
+    /// assembles and then resends as history on its next turn.
+    ///
+    /// Kept whole rather than summarised because the thing M11.2 has to get
+    /// right is the *sequence*: a turn that spoke and then called two tools is
+    /// four blocks, and a projection that emitted them in another order, or
+    /// merged two text runs, would still produce the same `text` and the same
+    /// count.
+    pub blocks: Vec<StrictBlock>,
+    /// The tool calls the client would run, with their arguments parsed exactly
+    /// as its accumulator parses them: fragments concatenated per block and read
+    /// as JSON at `content_block_stop`.
+    pub tool_calls: Vec<AccumulatedCall>,
+}
+
+/// One `tool_use` block, assembled.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AccumulatedCall {
+    pub id: String,
+    pub name: String,
+    /// The parsed arguments. **Parsed, not the fragment string**, because that
+    /// is the step the client performs and the step that fails: a run of
+    /// `input_json_delta`s that does not parse is a thrown accumulator, and a
+    /// thrown accumulator is a lost turn.
+    pub input: serde_json::Value,
 }
 
 /// A strict consumer of one stream.
@@ -406,8 +439,26 @@ pub struct Accumulated {
 pub struct StreamOracle {
     started: Option<(String, String)>,
     open: HashMap<u64, StrictBlock>,
+    /// The JSON fragments accumulated for each open `tool_use` block.
+    ///
+    /// Separate from `open` because the block itself carries the `input` the
+    /// *start* frame declared, and the accumulator's rule is that the fragments
+    /// replace it rather than extend it.
+    partial_json: HashMap<u64, String>,
+    /// Completed blocks, keyed by index so the finished list can be read out in
+    /// index order rather than in arrival order — they are the same thing only
+    /// if the emitter got it right, which is the claim under test.
+    closed: Vec<(u64, StrictBlock)>,
     seen_indices: Vec<u64>,
     completed_blocks: usize,
+    /// The text streamed into each open text block, per index.
+    ///
+    /// Beside the whole-answer `text` rather than replacing it: a client shows
+    /// the concatenation to its user *and* keeps the blocks apart to resend
+    /// them, and the two are different questions once a turn has more than one
+    /// text block.
+    block_text: HashMap<u64, String>,
+    tool_calls: Vec<AccumulatedCall>,
     text: String,
     stop_reason: Option<StrictStopReason>,
     usage: MergedUsage,
@@ -527,8 +578,18 @@ impl StreamOracle {
                 block.wire_name()
             ));
         }
-        if let StrictDelta::TextDelta { text } = &delta {
-            self.text.push_str(text);
+        match &delta {
+            StrictDelta::TextDelta { text } => {
+                self.text.push_str(text);
+                self.block_text.entry(index).or_default().push_str(text);
+            }
+            StrictDelta::InputJsonDelta { partial_json } => {
+                self.partial_json
+                    .entry(index)
+                    .or_default()
+                    .push_str(partial_json);
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -539,11 +600,47 @@ impl StreamOracle {
                 "`content_block_stop` at index {index} before any `message_start`"
             ));
         }
-        if self.open.remove(&index).is_none() {
+        let Some(block) = self.open.remove(&index) else {
             return Err(format!(
                 "`content_block_stop` at index {index}, which is not an open block"
             ));
-        }
+        };
+        // The accumulator's finishing step, reproduced rather than approximated.
+        // A `tool_use` block's `input` is whatever its fragments parse to, and a
+        // run that does not parse throws — so an emitter that sent the arguments
+        // on the start frame and no fragments produces a call with *empty*
+        // arguments here, which is precisely the failure this reproduces rather
+        // than forgives.
+        let block = match block {
+            StrictBlock::ToolUse { id, name, .. } => {
+                let fragments = self.partial_json.remove(&index).unwrap_or_default();
+                let input: serde_json::Value = if fragments.is_empty() {
+                    serde_json::json!({})
+                } else {
+                    serde_json::from_str(&fragments).map_err(|error| {
+                        format!(
+                            "the `input_json_delta` fragments of the tool_use block at index \
+                             {index} do not parse as JSON ({error}); the client's accumulator \
+                             throws here and the turn is lost: {fragments}"
+                        )
+                    })?
+                };
+                self.tool_calls.push(AccumulatedCall {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input: input.clone(),
+                });
+                StrictBlock::ToolUse { id, name, input }
+            }
+            StrictBlock::Text { .. } => StrictBlock::Text {
+                // Rebuilt from the deltas: the start frame's seed must be empty
+                // (`open_block` refuses otherwise), so the block's content is
+                // exactly what was streamed into it.
+                text: self.block_text.remove(&index).unwrap_or_default(),
+            },
+            other => other,
+        };
+        self.closed.push((index, block));
         self.completed_blocks += 1;
         Ok(())
     }
@@ -613,6 +710,11 @@ impl StreamOracle {
                 return Err("the stream ended with no `stop_reason`".into());
             }
         }
+        // Sorted by index rather than trusted in arrival order: "the blocks
+        // came out in index order" is one of the claims, so reading them back in
+        // the order they arrived would make it unfalsifiable.
+        let mut closed = self.closed;
+        closed.sort_by_key(|(index, _)| *index);
         Ok(Accumulated {
             message_id,
             model,
@@ -621,6 +723,8 @@ impl StreamOracle {
             usage: self.usage,
             error: self.error,
             completed_blocks: self.completed_blocks,
+            blocks: closed.into_iter().map(|(_, block)| block).collect(),
+            tool_calls: self.tool_calls,
         })
     }
 }

@@ -253,6 +253,24 @@ impl OpenAiResponsesClient {
             // with the one the fold replays. Off, explicitly.
             "store": false,
         });
+        // **The client's own tool definitions, verbatim.** Same ruling as the
+        // Messages client's: the quote is transport, the client's bytes are the
+        // client's, and a typed re-encoding here would be a third projection
+        // that drops whatever it does not model — an `input_schema` shape this
+        // build has never seen, a server-tool `type`, a freeform tool — and
+        // leaves the model told about a smaller toolbox than the client has.
+        //
+        // Absent means no key rather than `null`. The Responses request schema
+        // is not closed the way the Messages one is, so a stray `null` would not
+        // 400 here; it is still not sent, because "the caller declared no tools"
+        // and "the caller declared no tools *very explicitly*" are the same
+        // fact, and one spelling is enough.
+        if let Some(tools) = &quote.tools {
+            body["tools"] = tools.clone();
+        }
+        if let Some(tool_choice) = &quote.tool_choice {
+            body["tool_choice"] = tool_choice.clone();
+        }
         quote.wire_protocol.enforce_usage_reporting(&mut body);
         body
     }
@@ -523,6 +541,10 @@ mod tests {
             // No client declared a ceiling on these fixtures, which is what
             // every internal caller looks like; see `output_token_cap`.
             output_token_cap: None,
+            // Nor tools, so every other body assertion in this module is also a
+            // control for "a quote with none sends no `tools` key".
+            tools: None,
+            tool_choice: None,
             credential,
         }
     }
@@ -612,6 +634,40 @@ mod tests {
             "the client asked for 64 000 tokens; a 512-token pricing estimate is \
              not an answer to that question"
         );
+    }
+
+    /// The client's tools ride out verbatim, and absent means no key.
+    ///
+    /// The Responses half of M11.2's tool-definition threading. Same ruling and
+    /// same reasoning as the Messages client's — the quote is transport, the
+    /// bytes are the client's — and the payload is chosen to be lossy under any
+    /// typed projection: a `freeform` tool with a grammar rather than a schema,
+    /// and a `tool_choice` naming a specific function rather than a bare string.
+    #[test]
+    fn the_clients_tools_and_tool_choice_travel_verbatim_or_not_at_all() {
+        let tools = json!([
+            {
+                "type": "function",
+                "name": "shell",
+                "parameters": { "type": "object", "properties": { "cmd": { "type": "string" } } },
+                "strict": false,
+            },
+            { "type": "custom", "name": "apply_patch", "format": { "type": "grammar" } },
+        ]);
+        let tool_choice = json!({ "type": "function", "name": "shell" });
+
+        let mut with_tools = quote(TurnCredential::Absent, SPOKEN);
+        with_tools.tools = Some(tools.clone());
+        with_tools.tool_choice = Some(tool_choice.clone());
+        let body = OpenAiResponsesClient::body(&with_tools, "flagship");
+        assert_eq!(body["tools"], tools);
+        assert_eq!(body["tool_choice"], tool_choice);
+
+        // CONTROL: nothing declared, no key at all — which is what every
+        // internal caller sends and what this client sent before M11.2.
+        let bare = OpenAiResponsesClient::body(&quote(TurnCredential::Absent, SPOKEN), "flagship");
+        assert!(bare.get("tools").is_none());
+        assert!(bare.get("tool_choice").is_none());
     }
 
     /// **P3: the outbound body names only fields OpenRouter's schema has.**

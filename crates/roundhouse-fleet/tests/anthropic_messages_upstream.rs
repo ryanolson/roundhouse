@@ -114,6 +114,54 @@ const SSE_CUT_SHORT: &str = concat!(
     "\n\n"
 );
 
+/// A tool-use turn: a sentence, then a `tool_use` block whose arguments arrive
+/// as fragments, then `stop_reason: tool_use`.
+///
+/// The shape of every turn in an agentic loop, and the one this dialect could
+/// not carry through roundhouse before M11.2. The fragments are split
+/// mid-token on purpose — `{"pat` is not JSON — because that is what the wire
+/// sends and it is the whole reason a decoder needs an accumulator here.
+const SSE_TOOL_USE: &str = concat!(
+    "event: message_start\n",
+    r#"data: {"type":"message_start","message":{"type":"message","id":"msg_ZZZ","#,
+    r#""role":"assistant","model":"claude-x","content":[],"stop_reason":null,"#,
+    r#""stop_sequence":null,"usage":{"input_tokens":12,"cache_read_input_tokens":9000,"#,
+    r#""cache_creation_input_tokens":500,"output_tokens":1}}}"#,
+    "\n\n",
+    "event: content_block_start\n",
+    r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+    "\n\n",
+    "event: content_block_delta\n",
+    r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","#,
+    r#""text":"Let me search."}}"#,
+    "\n\n",
+    "event: content_block_stop\n",
+    r#"data: {"type":"content_block_stop","index":0}"#,
+    "\n\n",
+    "event: content_block_start\n",
+    r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","#,
+    r#""id":"toolu_01ZZZ","name":"Grep","input":{}}}"#,
+    "\n\n",
+    "event: content_block_delta\n",
+    r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","#,
+    r#""partial_json":"{\"pat"}}"#,
+    "\n\n",
+    "event: content_block_delta\n",
+    r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","#,
+    r#""partial_json":"tern\":\"fn main\"}"}}"#,
+    "\n\n",
+    "event: content_block_stop\n",
+    r#"data: {"type":"content_block_stop","index":1}"#,
+    "\n\n",
+    "event: message_delta\n",
+    r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"#,
+    r#""usage":{"output_tokens":64}}"#,
+    "\n\n",
+    "event: message_stop\n",
+    r#"data: {"type":"message_stop"}"#,
+    "\n\n"
+);
+
 /// A stream that fails halfway, in the shape Anthropic actually sends.
 const SSE_MID_STREAM_ERROR: &str = concat!(
     "event: message_start\n",
@@ -242,8 +290,12 @@ fn quote(credential: TurnCredential) -> FrontierQuote {
         prompt_cache_key: "sess_anthropic_upstream".into(),
         expected_output_tokens: Some(512),
         // No client declared a ceiling on these fixtures, which is what
-        // every internal caller looks like; see `output_token_cap`.
+        // every internal caller looks like; see `output_token_cap`. Nor tools,
+        // so these dispatches are also the control for "a quote with none sends
+        // no `tools` key".
         output_token_cap: None,
+        tools: None,
+        tool_choice: None,
         credential,
     }
 }
@@ -342,10 +394,83 @@ async fn a_stored_key_arrives_bare_in_x_api_key_and_never_as_a_bearer() {
                 output_tokens: 64,
                 reasoning_tokens: 0,
                 provider_reported_cost: None,
+                // The fixture's final `message_delta` says `end_turn`, and the
+                // word survives the whole dispatch rather than only the
+                // decoder's unit tests.
+                stop_reason: Some("end_turn".into()),
             },
         ],
         "a client reading only `message_delta` reports zero input and no cache reads, \
          which is the one quantity this system exists to maximize"
+    );
+}
+
+/// **The agentic turn, end to end over a socket: tools out, a call back.**
+///
+/// The two halves of M11.2's core, joined at the only place they meet — the
+/// client's `tools` reach the upstream on the request, and the `tool_use` block
+/// the model answers with reaches the caller as one `FrontierChunk::ToolCall`.
+/// Each half is pinned by unit tests already; what nothing pinned is that they
+/// survive `reqwest`, a real body serialization and a real chunked SSE read
+/// together.
+#[tokio::test]
+async fn a_tool_using_turn_sends_the_clients_tools_and_yields_one_completed_call() {
+    let (base, upstream) = Upstream::spawn(Behaviour::Stream(SSE_TOOL_USE)).await;
+    let client = AnthropicMessagesClient::with_bases(&base, &base).unwrap();
+
+    let tools = serde_json::json!([{
+        "name": "Grep",
+        "description": "search the tree",
+        "input_schema": {
+            "type": "object",
+            "properties": { "pattern": { "type": "string" } },
+            "required": ["pattern"],
+        },
+        // The client's own breakpoint on its last tool. A typed re-encoding
+        // would have dropped it, and with it the discount on the largest stable
+        // block in the request.
+        "cache_control": { "type": "ephemeral" },
+    }]);
+    let tool_choice = serde_json::json!({ "type": "auto" });
+    let mut quote = quote(stored());
+    quote.tools = Some(tools.clone());
+    quote.tool_choice = Some(tool_choice.clone());
+
+    let chunks = drain(client.execute(&quote).await.unwrap()).await.unwrap();
+
+    // Half one: what the upstream received.
+    let body: serde_json::Value =
+        serde_json::from_str(&upstream.bodies.lock().unwrap()[0]).expect("the body is JSON");
+    assert_eq!(
+        body["tools"], tools,
+        "the model is told about exactly the toolbox the client declared: {body}"
+    );
+    assert_eq!(body["tool_choice"], tool_choice);
+
+    // Half two: what came back. One call, assembled from two fragments neither
+    // of which is JSON alone, with the text that preceded it still ordered
+    // before it.
+    assert_eq!(
+        chunks,
+        vec![
+            FrontierChunk::OutputText("Let me search.".into()),
+            FrontierChunk::ToolCall {
+                id: "toolu_01ZZZ".into(),
+                name: "Grep".into(),
+                arguments: r#"{"pattern":"fn main"}"#.into(),
+            },
+            FrontierChunk::Done {
+                input_tokens: 9_512,
+                cached_input_tokens: 9_000,
+                cache_write_tokens: 500,
+                output_tokens: 64,
+                reasoning_tokens: 0,
+                provider_reported_cost: None,
+                // The signal that the turn is waiting on the client rather than
+                // finished. Unreachable in this system before M11.2.
+                stop_reason: Some("tool_use".into()),
+            },
+        ],
     );
 }
 

@@ -125,6 +125,42 @@ pub enum ItemContent {
     },
 }
 
+/// The one spelling of a tool call's arguments in this log.
+///
+/// **A canonical form, and it is what stops every tool-using session forking on
+/// its second turn (M11.2).** The argument string reaches this log from two
+/// directions that do not agree byte for byte on their own:
+///
+/// - The *model* produces it, and produces whatever it likes — keys in the order
+///   it thought of them, spaces after the colons.
+/// - The *client* sends the same call back on the next turn as history, and the
+///   Messages wire carries it as a JSON **object**, so canonicalizing that
+///   resend means serializing a parsed value: `serde_json`'s map is a
+///   `BTreeMap`, so the result is compact and key-sorted. A chained NeMo Relay
+///   re-serializes intercepted bodies through the same alphabetizing map
+///   (synergy S3, guard 1), so nothing upstream of here can preserve the model's
+///   spacing anyway.
+///
+/// Storing the model's bytes and comparing them against that resend fails on the
+/// very first tool call with more than one key — `{"pattern": …, "path": …}`
+/// against `{"path":…,"pattern":…}` — and prefix admission then forks the
+/// conversation into a fresh session, silently, while every turn still answers.
+/// So an emitted call is stored in the form its own resend will canonicalize to,
+/// and the serve projections put *that* string on the wire, which is what makes
+/// the round trip closed rather than merely likely.
+///
+/// A string that is not JSON at all passes through unchanged. It is not
+/// representable on either dialect's wire — the Messages `input` is an object
+/// and the client's accumulator throws on fragments that do not parse — so this
+/// is the honest fallback for a corrupt log rather than a supported shape, and
+/// silently replacing it with `{}` would hide the corruption.
+pub fn canonical_arguments(raw: &str) -> String {
+    match serde_json::from_str::<Value>(raw) {
+        Ok(value) => value.to_string(),
+        Err(_) => raw.to_string(),
+    }
+}
+
 impl ItemContent {
     /// The text used for prompt rendering and token accounting.
     ///

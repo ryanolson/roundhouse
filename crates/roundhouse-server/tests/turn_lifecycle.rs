@@ -26,7 +26,7 @@ use futures::StreamExt;
 use roundhouse_core::context::ByteTokenizer;
 use roundhouse_core::event::{IncompleteReason, SessionEvent, SessionEventKind};
 use roundhouse_core::ids::{SessionId, TurnId};
-use roundhouse_core::item::{Item, Role};
+use roundhouse_core::item::{Item, ItemContent, Role};
 use roundhouse_core::routing::{AffinityPolicy, CacheLedger, Target};
 use roundhouse_core::session::{Session, SessionError};
 use roundhouse_core::store::{MemoryStore, SessionStore, StoreError};
@@ -517,6 +517,7 @@ async fn deltas_are_durable_before_the_response_completes() {
             output_tokens: 3,
             reasoning_tokens: 0,
             provider_reported_cost: None,
+            stop_reason: None,
         }))
         .await
         .unwrap();
@@ -647,5 +648,359 @@ async fn a_mid_stream_failure_commits_the_partial() {
     assert!(
         probe.ledger().state_for(&target).is_some(),
         "a delivered delta is evidence the provider held the prompt"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// What a tool-calling turn leaves behind (M11.2)
+// ---------------------------------------------------------------------------
+
+/// **The fold's ordering contract, asserted at the engine seam where it is
+/// decided.**
+///
+/// A turn that speaks, calls, speaks and calls again produces four items, and
+/// the order is not a nicety: the client resends the blocks it was handed and
+/// prefix admission compares them positionally, so items committed in any other
+/// order fork every tool-using session on its second turn while every turn still
+/// answers. The text ahead of a call is therefore committed *at the call*, not
+/// at the completion — by then it has already gone out as deltas and an item
+/// written afterwards would sit behind the call in the log and ahead of it on
+/// the wire.
+///
+/// Asserted over the raw event stream rather than over the projected items,
+/// because the interleaving is a fact about *when* each item was committed and a
+/// projection would flatten exactly that.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tool_calling_turn_commits_its_items_in_the_order_it_produced_them() {
+    let store = Arc::new(MemoryStore::new());
+    let (client, chunks) = PacedFrontierClient::new();
+    let engine = Arc::new(Engine::new(
+        store.clone(),
+        ByteTokenizer,
+        Arc::new(EchoLocalExecutor::new("local answer")),
+        frontier_catalog(),
+        Arc::new(client),
+        Arc::new(AffinityPolicy::new()),
+        config(),
+    ));
+    let session_id = SessionId::generate();
+    engine.create_session(&session_id).await.unwrap();
+
+    let running = tokio::spawn({
+        let engine = Arc::clone(&engine);
+        let session_id = session_id.clone();
+        async move {
+            engine
+                .run_turn(
+                    &session_id,
+                    TurnId::new("t0"),
+                    vec![Item::user_text("find main")],
+                    &Admission::open(),
+                )
+                .await
+        }
+    });
+
+    for chunk in [
+        FrontierChunk::OutputText("Let me look.".into()),
+        FrontierChunk::ToolCall {
+            id: "toolu_01".into(),
+            name: "Grep".into(),
+            // Not in canonical spelling: the engine stores the form the client's
+            // resend will canonicalize to, not the model's own bytes.
+            arguments: r#"{"pattern": "fn main", "path": "/src"}"#.into(),
+        },
+        FrontierChunk::OutputText(" And also:".into()),
+        FrontierChunk::ToolCall {
+            id: "toolu_02".into(),
+            name: "Read".into(),
+            arguments: r#"{"path": "/src/main.rs"}"#.into(),
+        },
+        FrontierChunk::Done {
+            input_tokens: 12,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            output_tokens: 20,
+            reasoning_tokens: 0,
+            provider_reported_cost: None,
+            stop_reason: Some("tool_use".into()),
+        },
+    ] {
+        chunks.send(Ok(chunk)).await.unwrap();
+    }
+    drop(chunks);
+
+    let result = running.await.unwrap().expect("the turn completes");
+    assert_eq!(
+        result.text, "Let me look. And also:",
+        "the caller is handed the whole spoken answer, calls excluded"
+    );
+
+    let probe = Session::open(store, session_id, "probe", 10_000, CacheLedger::new())
+        .await
+        .unwrap();
+    let events = probe.events_since(0, 1000).await.unwrap();
+    let emitted: Vec<&Item> = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            SessionEventKind::ItemAppended { item } if item.response_id.is_some() => Some(item),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        emitted
+            .iter()
+            .map(|item| item.content.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            ItemContent::Text {
+                text: "Let me look.".into()
+            },
+            ItemContent::ToolCall {
+                call_id: "toolu_01".into(),
+                name: "Grep".into(),
+                arguments: r#"{"path":"/src","pattern":"fn main"}"#.into(),
+            },
+            ItemContent::Text {
+                text: " And also:".into()
+            },
+            ItemContent::ToolCall {
+                call_id: "toolu_02".into(),
+                name: "Read".into(),
+                arguments: r#"{"path":"/src/main.rs"}"#.into(),
+            },
+        ],
+        "{emitted:#?}"
+    );
+
+    // The text ahead of the first call was committed *before* it, not batched
+    // into the completion — the property a projection over the finished items
+    // cannot see. Its sequence number is what says so.
+    let seq_of = |content: &ItemContent| {
+        events
+            .iter()
+            .find(|event| {
+                matches!(&event.kind, SessionEventKind::ItemAppended { item }
+                    if &item.content == content && item.response_id.is_some())
+            })
+            .expect("the item is in the log")
+            .seq
+    };
+    let completed = events
+        .iter()
+        .find(|event| matches!(event.kind, SessionEventKind::ResponseCompleted { .. }))
+        .expect("the turn completed");
+    assert!(
+        seq_of(&ItemContent::Text {
+            text: "Let me look.".into()
+        }) < completed.seq - 1,
+        "the run ahead of a call must be durable at the call, not at the end"
+    );
+
+    // And the provider's own word for why it stopped reached the terminal event,
+    // which is the only way a serve surface — a different task entirely — can
+    // read it. (M11.1's F1, reporting half.)
+    let SessionEventKind::ResponseCompleted { stop_reason, .. } = &completed.kind else {
+        unreachable!("filtered above")
+    };
+    assert_eq!(stop_reason.as_deref(), Some("tool_use"));
+}
+
+/// **A turn whose whole answer was a tool call commits no empty text item.**
+///
+/// The ordinary agent turn: a model that calls a tool usually says nothing
+/// first. Completing it with the empty trailing item every prose turn commits
+/// would put a block in the log that never went out on the wire, and the
+/// client's next resend — which has no empty block in it — would diverge at
+/// exactly that item and fork the session.
+///
+/// The CONTROL is the turn that genuinely produced nothing: *there* the empty
+/// item is right, because that is what both serve surfaces emit for an empty
+/// answer and because a response with no item at all is one a successor cannot
+/// resume from.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_call_only_turn_commits_no_empty_trailing_item() {
+    async fn emitted_items(script: Vec<Result<FrontierChunk, FrontierError>>) -> Vec<Item> {
+        let store = Arc::new(MemoryStore::new());
+        let (client, chunks) = PacedFrontierClient::new();
+        let engine = Arc::new(Engine::new(
+            store.clone(),
+            ByteTokenizer,
+            Arc::new(EchoLocalExecutor::new("local answer")),
+            frontier_catalog(),
+            Arc::new(client),
+            Arc::new(AffinityPolicy::new()),
+            config(),
+        ));
+        let session_id = SessionId::generate();
+        engine.create_session(&session_id).await.unwrap();
+        let running = tokio::spawn({
+            let engine = Arc::clone(&engine);
+            let session_id = session_id.clone();
+            async move {
+                engine
+                    .run_turn(
+                        &session_id,
+                        TurnId::new("t0"),
+                        vec![Item::user_text("go")],
+                        &Admission::open(),
+                    )
+                    .await
+            }
+        });
+        for chunk in script {
+            chunks.send(chunk).await.unwrap();
+        }
+        drop(chunks);
+        running.await.unwrap().expect("the turn completes");
+        let probe = Session::open(store, session_id, "probe", 10_000, CacheLedger::new())
+            .await
+            .unwrap();
+        probe
+            .state()
+            .items
+            .iter()
+            .filter(|item| item.response_id.is_some())
+            .cloned()
+            .collect()
+    }
+
+    let done = || {
+        Ok(FrontierChunk::Done {
+            input_tokens: 4,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            output_tokens: 4,
+            reasoning_tokens: 0,
+            provider_reported_cost: None,
+            stop_reason: None,
+        })
+    };
+
+    let call_only = emitted_items(vec![
+        Ok(FrontierChunk::ToolCall {
+            id: "toolu_01".into(),
+            name: "Bash".into(),
+            arguments: r#"{"command":"ls"}"#.into(),
+        }),
+        done(),
+    ])
+    .await;
+    assert_eq!(
+        call_only.len(),
+        1,
+        "the call is the whole answer; an empty text item beside it is a block \
+         no client will resend: {call_only:#?}"
+    );
+    assert!(matches!(call_only[0].content, ItemContent::ToolCall { .. }));
+
+    // CONTROL: nothing at all still commits the empty assistant item, so the
+    // assertion above is about tool calls rather than about empty text.
+    let silent = emitted_items(vec![done()]).await;
+    assert_eq!(
+        silent
+            .iter()
+            .map(|item| item.content.clone())
+            .collect::<Vec<_>>(),
+        vec![ItemContent::Text {
+            text: String::new()
+        }],
+        "a turn that produced nothing still says so with one empty item"
+    );
+}
+
+/// **A stream that dies after emitting a call is still evidence the provider
+/// held the prompt.**
+///
+/// The cache ledger reads that evidence to decide whether a target is warm, and
+/// before M11.2 it read it off the partial *text* alone. A turn that spoke,
+/// committed that run at a tool-call boundary and then died has an empty partial
+/// and every reason to count — inferring the evidence from the string would tell
+/// the ledger the prompt never arrived, and the next turn would be priced cold
+/// against a provider that is holding it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failure_after_a_committed_call_still_reads_as_a_warm_provider() {
+    let store = Arc::new(MemoryStore::new());
+    let (client, chunks) = PacedFrontierClient::new();
+    let engine = Arc::new(Engine::new(
+        store.clone(),
+        ByteTokenizer,
+        Arc::new(EchoLocalExecutor::new("local answer")),
+        frontier_catalog(),
+        Arc::new(client),
+        Arc::new(AffinityPolicy::new()),
+        config(),
+    ));
+    let session_id = SessionId::generate();
+    engine.create_session(&session_id).await.unwrap();
+
+    let running = tokio::spawn({
+        let engine = Arc::clone(&engine);
+        let session_id = session_id.clone();
+        async move {
+            engine
+                .run_turn(
+                    &session_id,
+                    TurnId::new("t0"),
+                    vec![Item::user_text("go")],
+                    &Admission::open(),
+                )
+                .await
+        }
+    });
+
+    // Text, then a call — which commits the text as an item and empties the
+    // pending run — and then the connection drops with nothing pending.
+    chunks
+        .send(Ok(FrontierChunk::OutputText("Looking.".into())))
+        .await
+        .unwrap();
+    chunks
+        .send(Ok(FrontierChunk::ToolCall {
+            id: "toolu_01".into(),
+            name: "Bash".into(),
+            arguments: r#"{"command":"ls"}"#.into(),
+        }))
+        .await
+        .unwrap();
+    chunks
+        .send(Err(FrontierError::Upstream("connection reset".into())))
+        .await
+        .unwrap();
+    drop(chunks);
+
+    running
+        .await
+        .unwrap()
+        .expect_err("a stream that failed must fail its turn");
+
+    let probe = Session::open(store, session_id, "probe", 10_000, CacheLedger::new())
+        .await
+        .unwrap();
+    let target = Target::Frontier {
+        provider: "anthropic".into(),
+        model: "claude".into(),
+    };
+    assert!(
+        probe.ledger().state_for(&target).is_some(),
+        "a committed call is as much proof of a prefill as a delivered delta"
+    );
+
+    // And nothing was committed twice: the text item written at the call is the
+    // only copy, not one the partial then repeated.
+    let assistant_text: Vec<String> = probe
+        .state()
+        .items
+        .iter()
+        .filter_map(|item| match &item.content {
+            ItemContent::Text { text } if item.role == Role::Assistant => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        assistant_text,
+        vec!["Looking.".to_string()],
+        "the run committed at the call must not be committed again as the \
+         partial: {assistant_text:#?}"
     );
 }

@@ -126,7 +126,7 @@ async fn replaying_a_completed_turn_id_does_not_generate_twice() {
         .unwrap();
     let response_id = first.response_id().clone();
     session
-        .complete(&response_id, "hi there", Usage::default(), None)
+        .complete(&response_id, Some("hi there"), Usage::default(), None, None)
         .await
         .unwrap();
 
@@ -209,7 +209,7 @@ async fn the_settlement_projection_names_the_last_terminal_event_and_where_it_we
         ..Usage::default()
     };
     session
-        .complete(&first_id, "hi", billed.clone(), None)
+        .complete(&first_id, Some("hi"), billed.clone(), None, None)
         .await
         .unwrap();
 
@@ -439,7 +439,13 @@ async fn a_successor_node_reconstructs_identical_state_from_the_log() {
         .await
         .unwrap();
     session
-        .complete(&response_id, "part one and two", Usage::default(), None)
+        .complete(
+            &response_id,
+            Some("part one and two"),
+            Usage::default(),
+            None,
+            None,
+        )
         .await
         .unwrap();
 
@@ -488,7 +494,7 @@ async fn the_frontier_window_is_a_projection_a_successor_reconstructs() {
         // still spent its ration: the window is folded from `Routed`.
         if turn != 3 {
             session
-                .complete(&response_id, "a", Usage::default(), None)
+                .complete(&response_id, Some("a"), Usage::default(), None, None)
                 .await
                 .unwrap();
         }
@@ -950,7 +956,13 @@ async fn a_completed_item_carries_the_response_stamp_and_a_steer_looks_like_any_
         .unwrap();
     let ordinary_id = admission.response_id().clone();
     session
-        .complete(&ordinary_id, "an ordinary answer", Usage::default(), None)
+        .complete(
+            &ordinary_id,
+            Some("an ordinary answer"),
+            Usage::default(),
+            None,
+            None,
+        )
         .await
         .unwrap();
     let ordinary = session.state().items.last().expect("committed").clone();
@@ -1056,7 +1068,7 @@ async fn routed_turn(session: &mut Session<MemoryStore>, turn: &str, tokens: u64
     };
     let billed = usage.total();
     session
-        .complete(&response_id, "done", usage, None)
+        .complete(&response_id, Some("done"), usage, None, None)
         .await
         .unwrap();
     billed
@@ -1194,11 +1206,12 @@ async fn the_trigger_reads_projections_of_the_log_and_not_counters_beside_it() {
     session
         .complete(
             &response_id,
-            "done",
+            Some("done"),
             Usage {
                 input_tokens: 100,
                 ..Usage::default()
             },
+            None,
             None,
         )
         .await
@@ -1480,11 +1493,12 @@ async fn only_the_turn_an_escalation_was_decided_on_reads_as_its_first() {
     session
         .complete(
             &response_id,
-            "done",
+            Some("done"),
             Usage {
                 input_tokens: 100,
                 ..Usage::default()
             },
+            None,
             None,
         )
         .await
@@ -1579,7 +1593,7 @@ async fn the_turn_after_a_steer_is_the_one_that_fulfils_it_and_only_that_turn() 
         .expect("t2 is open")
         .clone();
     session
-        .complete(&response_id, "done", Usage::default(), None)
+        .complete(&response_id, Some("done"), Usage::default(), None, None)
         .await
         .unwrap();
 
@@ -1703,8 +1717,9 @@ async fn a_shadow_arms_steer_suppresses_nothing() {
     session
         .complete(
             &response_id,
-            "the turn ran unchanged",
+            Some("the turn ran unchanged"),
             Usage::default(),
+            None,
             None,
         )
         .await

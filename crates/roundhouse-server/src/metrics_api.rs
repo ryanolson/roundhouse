@@ -268,6 +268,7 @@ mod tests {
                         ..Default::default()
                     },
                     provider_reported_cost_usd: None,
+                    stop_reason: None,
                 },
             },
         ]);

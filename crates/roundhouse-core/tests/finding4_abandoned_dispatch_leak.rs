@@ -156,6 +156,7 @@ impl Log {
             response_id: response.clone(),
             usage: usage(4_000, 300),
             provider_reported_cost_usd: None,
+            stop_reason: None,
         });
         response
     }

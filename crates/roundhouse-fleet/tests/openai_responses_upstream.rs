@@ -132,8 +132,12 @@ fn quote(credential: TurnCredential) -> FrontierQuote {
         prompt_cache_key: "sess_upstream".into(),
         expected_output_tokens: Some(512),
         // No client declared a ceiling on these fixtures, which is what
-        // every internal caller looks like; see `output_token_cap`.
+        // every internal caller looks like; see `output_token_cap`. Nor tools,
+        // so these dispatches are also the control for "a quote with none sends
+        // no `tools` key".
         output_token_cap: None,
+        tools: None,
+        tool_choice: None,
         credential,
     }
 }
@@ -222,6 +226,9 @@ async fn a_stored_key_arrives_as_a_bearer_and_nothing_else_secret_shaped_does() 
             output_tokens: 30,
             reasoning_tokens: 12,
             provider_reported_cost: None,
+            // This wire names no reason for a turn that ended normally; see
+            // `usage_chunk`.
+            stop_reason: None,
         },
         "the cached count is the quantity the whole system exists to maximize"
     );

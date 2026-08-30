@@ -34,7 +34,7 @@ use roundhouse_core::control::{
 use roundhouse_core::event::{Accounting, IncompleteReason, SessionObserver, Usage};
 use roundhouse_core::ids::{ResponseId, SessionId, SideCallId, TurnId};
 use roundhouse_core::interject::{Interjection, InterjectionContext, Interjector};
-use roundhouse_core::item::Item;
+use roundhouse_core::item::{Item, canonical_arguments};
 use roundhouse_core::metrics::MetricsRecorder;
 use roundhouse_core::now_ms;
 use roundhouse_core::routing::{
@@ -50,6 +50,7 @@ use roundhouse_fleet::{
     FrontierQuote, FrontierStream, LocalFleet, LocalQuote, StaticFrontierCatalog,
 };
 use roundhouse_mcp::ControlStore;
+use serde_json::Value;
 use tokio::time::Instant;
 
 use crate::control_config::Admission;
@@ -249,6 +250,27 @@ pub struct TurnInput {
     /// surface, and the Responses surface, whose `max_output_tokens` this
     /// milestone does not read.
     pub output_token_cap: Option<u32>,
+    /// The tools the client says its own process can run, as the client's JSON.
+    ///
+    /// **The turn is not agentic without this, and roundhouse still runs no tool
+    /// itself.** The client runs them — exactly as on the Responses surface —
+    /// and this is what tells the model they exist. Until M11.2 a serve surface
+    /// parsed the field and dropped it, so a Claude Code turn whose whole
+    /// purpose was `Read` or `Bash` reached the model with no toolbox at all and
+    /// could only answer in prose; the client's loop then stalled on the first
+    /// turn that needed a tool.
+    ///
+    /// Untyped for the reason [`FrontierQuote::tools`] gives at length: this is
+    /// transport, and a typed re-encoding between the client's bytes and the
+    /// wire module would be a third projection that silently drops what it does
+    /// not model.
+    ///
+    /// Reaches the quote and nothing else. Not a routing input: v1 chooses its
+    /// target by policy, and a turn's toolbox says nothing about which model
+    /// should answer it.
+    pub tools: Option<Value>,
+    /// How the client wants the model to choose among [`Self::tools`], verbatim.
+    pub tool_choice: Option<Value>,
 }
 
 impl From<Vec<Item>> for TurnInput {
@@ -257,8 +279,30 @@ impl From<Vec<Item>> for TurnInput {
             items,
             declared_baseline: None,
             output_token_cap: None,
+            tools: None,
+            tool_choice: None,
         }
     }
+}
+
+/// What the client said about this turn that only the *dispatch* reads.
+///
+/// **A bundle rather than three parameters, and the membership rule is what
+/// makes it one thing.** Every field here is a fact the client stated that no
+/// projection of the log can recover, that the router does not price on, and
+/// that exists solely to be written onto [`FrontierQuote`] — so they travel from
+/// [`Engine::run_turn`] down through `dispatch`, `plan` and `connect` together
+/// or not at all, and adding the fourth is one line rather than four signatures.
+///
+/// [`TurnInput::declared_baseline`] is deliberately *not* here despite being a
+/// client declaration too: it is read by pricing and never reaches a quote, so
+/// folding it in would make this a bag of "things the client said" rather than a
+/// set with one destination.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct ClientDeclarations {
+    output_token_cap: Option<u32>,
+    tools: Option<Value>,
+    tool_choice: Option<Value>,
 }
 
 /// What a local worker produced.
@@ -387,7 +431,22 @@ impl Default for EngineConfig {
 
 /// A dispatch that produced an answer.
 struct Completed {
+    /// Everything the model *said*, tool calls excluded.
+    ///
+    /// The whole spoken answer, including any run already committed as an item
+    /// at a tool-call boundary — this is what a non-streaming caller is handed
+    /// and what [`TurnResult::text`] carries, and both want the answer rather
+    /// than the last fragment of it. What still has to be *committed* is
+    /// [`Self::trailing`], which is a different question.
     text: String,
+    /// The run of text after the last tool call, if the completion still owes
+    /// the log one.
+    ///
+    /// `None` on a turn that ended on a tool call with nothing said after it:
+    /// every item is already durable, and committing an empty one would put a
+    /// block in the log that never went out on the wire. See
+    /// [`Session::complete`](roundhouse_core::session::Session::complete).
+    trailing: Option<String>,
     usage: Usage,
     decision: Decision,
     /// What the provider said this call cost, on the providers that say.
@@ -397,6 +456,12 @@ struct Completed {
     /// is later reconciled against. See
     /// `SessionEventKind::ResponseCompleted::provider_reported_cost_usd`.
     provider_reported_cost_usd: Option<f64>,
+    /// Why the provider said it stopped, in the provider's own word.
+    ///
+    /// Carried to the terminal event rather than read here, because the reader
+    /// is a serve surface tailing the log from another task entirely — see
+    /// `SessionEventKind::ResponseCompleted::stop_reason`.
+    stop_reason: Option<String>,
 }
 
 /// How [`Engine::plan`] failed, and the dead dispatch that explains it.
@@ -470,8 +535,20 @@ impl Failed {
     /// output, cached and cache-write counts stay zero: the provider never
     /// reported them, and a fabricated count would be billed to a client as if
     /// measured.
-    fn mid_stream(error: impl Into<EngineError>, partial: String, isl_tokens: u64) -> Self {
-        let evidence = if partial.is_empty() {
+    /// `produced` is whether *anything* reached the client, which is not the
+    /// same question as whether `partial` is non-empty and stopped being so in
+    /// M11.2. A turn that spoke, committed that run at a tool-call boundary, and
+    /// then died has an empty `partial` and every reason to be counted as a
+    /// dispatch the provider processed — and the cache ledger reads exactly this
+    /// evidence to decide whether the target is warm. Inferring it from the
+    /// string would have told the ledger the prompt never arrived.
+    fn mid_stream(
+        error: impl Into<EngineError>,
+        partial: String,
+        isl_tokens: u64,
+        produced: bool,
+    ) -> Self {
+        let evidence = if partial.is_empty() && !produced {
             Usage::default()
         } else {
             Usage {
@@ -896,7 +973,14 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             items: input,
             declared_baseline,
             output_token_cap,
+            tools,
+            tool_choice,
         } = input.into();
+        let declarations = ClientDeclarations {
+            output_token_cap,
+            tools,
+            tool_choice,
+        };
         // See `turn_gates`: within this node, one turn at a time per session.
         let gate = self.turn_gate(session_id);
         let _turn = gate.lock().await;
@@ -1172,22 +1256,25 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                         &response_id,
                         admission,
                         declared_baseline.as_deref(),
-                        output_token_cap,
+                        &declarations,
                     )
                     .await
                 {
                     Ok(Completed {
                         text,
+                        trailing,
                         usage,
                         decision,
                         provider_reported_cost_usd,
+                        stop_reason,
                     }) => {
                         let committed = session
                             .complete(
                                 &response_id,
-                                &text,
+                                trailing.as_deref(),
                                 usage.clone(),
                                 provider_reported_cost_usd,
+                                stop_reason,
                             )
                             .await;
                         committed
@@ -1275,10 +1362,10 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         response_id: &ResponseId,
         admission: &Admission,
         declared_baseline: Option<&str>,
-        // Carried through rather than read off the config, because it is the
-        // client's number and not this deployment's — see
-        // [`TurnInput::output_token_cap`].
-        output_token_cap: Option<u32>,
+        // Carried through rather than read off the config, because these are the
+        // client's facts and not this deployment's — see
+        // [`ClientDeclarations`].
+        declarations: &ClientDeclarations,
     ) -> Result<Completed, Failed> {
         // One deadline for every model await in this turn, taken before any of
         // them: a provider that hangs after accepting the request settles the
@@ -1295,7 +1382,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                 deadline_at,
                 admission,
                 declared_baseline,
-                output_token_cap,
+                declarations,
             )
             .await
             .map_err(Failed::before_output)?;
@@ -1310,21 +1397,40 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         // reading, since the time a dead provider took to fail is on that
         // provider's own attempt row rather than charged to the model that
         // eventually spoke.
-        let mut text = String::new();
+        // Everything said, for the caller; and the run not yet committed as an
+        // item, for the log. **Two accumulators rather than one**, because a
+        // tool call commits the run ahead of it and the two questions then have
+        // different answers: `spoken` is the whole answer a non-streaming caller
+        // is handed, `pending` is what the log still owes. Folding them back
+        // into one variable is how a turn's text gets committed twice.
+        let mut spoken = String::new();
+        let mut pending = String::new();
+        // Whether this response has already put an item in the log. Read at the
+        // completion — an emitted turn must not also commit an empty trailing
+        // item — and on the failure path, where it is the evidence that the
+        // prompt reached the provider even though `pending` is empty.
+        let mut emitted = false;
         let mut reported: Option<Usage> = None;
         let mut reported_cost_usd: Option<f64> = None;
+        let mut stop_reason: Option<String> = None;
         loop {
             let chunk = match tokio::time::timeout_at(deadline_at, stream.next()).await {
                 Ok(Some(Ok(chunk))) => chunk,
                 Ok(Some(Err(error))) => {
-                    return Err(Failed::mid_stream(error, text, isl_tokens as u64));
+                    return Err(Failed::mid_stream(
+                        error,
+                        pending,
+                        isl_tokens as u64,
+                        emitted,
+                    ));
                 }
                 Ok(None) => break,
                 Err(_) => {
                     return Err(Failed::mid_stream(
                         self.deadline_struck(),
-                        text,
+                        pending,
                         isl_tokens as u64,
+                        emitted,
                     ));
                 }
             };
@@ -1333,9 +1439,76 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                     // Durable before it is accumulated: what the client is told
                     // it received must never be ahead of what the log holds.
                     if let Err(error) = session.append_output(response_id, &part).await {
-                        return Err(Failed::mid_stream(error, text, isl_tokens as u64));
+                        return Err(Failed::mid_stream(
+                            error,
+                            pending,
+                            isl_tokens as u64,
+                            emitted,
+                        ));
                     }
-                    text.push_str(&part);
+                    spoken.push_str(&part);
+                    pending.push_str(&part);
+                }
+                // **The turn's answer stops being one item here, and the order
+                // is the whole contract.** A client resends exactly the blocks
+                // it was handed, prefix admission canonicalizes that resend back
+                // into items, and the comparison is positional — so the log has
+                // to hold what the model produced *in the order it produced it*,
+                // or every tool-using session forks on its second turn while
+                // every turn still answers.
+                //
+                // That is why the run of text ahead of a call is committed here
+                // rather than at the completion: by the time this chunk arrives
+                // the text has already gone out as deltas, so a text item
+                // committed afterwards would sit behind the call in the log and
+                // ahead of it on the wire. An empty run commits nothing — "the
+                // model said nothing before calling a tool" is the common case
+                // for an agent, and an empty text block between two calls is a
+                // block the client would not resend.
+                FrontierChunk::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                } => {
+                    if !pending.is_empty() {
+                        // Cleared only once the append has landed, which is why
+                        // the run is cloned rather than moved: an append that
+                        // failed left the log without this text, and a `pending`
+                        // emptied ahead of it would drop the partial the failure
+                        // path is about to commit.
+                        let flushed = Item::assistant_text(pending.clone(), response_id.clone());
+                        if let Err(error) = session.append_emitted(response_id, flushed).await {
+                            return Err(Failed::mid_stream(
+                                error,
+                                pending,
+                                isl_tokens as u64,
+                                emitted,
+                            ));
+                        }
+                        pending.clear();
+                        emitted = true;
+                    }
+                    // **Canonicalized here, and the direction is the opposite of
+                    // the obvious one.** Storing the model's own bytes looks
+                    // like the faithful choice and forks every tool-using
+                    // session on its second turn: the client sends the call back
+                    // as history with its arguments as a JSON *object*, and
+                    // canonicalizing that resend serializes a `serde_json`
+                    // value — compact, key-sorted — so the model's
+                    // `{"pattern": …, "path": …}` never equals the
+                    // `{"path":…,"pattern":…}` it comes back as. The serve
+                    // projections emit this same stored string, so the round
+                    // trip closes. See `canonical_arguments`.
+                    let call = Item::tool_call(id, name, canonical_arguments(&arguments));
+                    if let Err(error) = session.append_emitted(response_id, call).await {
+                        return Err(Failed::mid_stream(
+                            error,
+                            pending,
+                            isl_tokens as u64,
+                            emitted,
+                        ));
+                    }
+                    emitted = true;
                 }
                 FrontierChunk::Done {
                     input_tokens,
@@ -1344,6 +1517,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                     output_tokens,
                     reasoning_tokens,
                     provider_reported_cost,
+                    stop_reason: reason,
                 } => {
                     // Recorded and not booked, deliberately. A provider's own
                     // dollar figure is the *other* side of the reconciliation
@@ -1372,6 +1546,12 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                         reasoning_tokens,
                         accounting: Accounting::Reported,
                     });
+                    // Non-retracting, matching the dispatch decoders' own rule:
+                    // a later frame that names no reason cannot erase one an
+                    // earlier frame named. Only one `Done` is produced per
+                    // stream today, so this is a guard on a future decoder
+                    // rather than on a live shape.
+                    stop_reason = reason.or(stop_reason);
                 }
             }
         }
@@ -1384,13 +1564,23 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         // tokens for zero dollars, which on a frontier target is
         // indistinguishable from a saving — so the gap is filled from what we
         // do know and stamped as an estimate.
-        let usage = reported.unwrap_or_else(|| self.estimated_usage(&text, isl_tokens));
+        let usage = reported.unwrap_or_else(|| self.estimated_usage(&spoken, isl_tokens));
+
+        // What the completion still owes the log. A turn that emitted nothing
+        // at all still commits one (possibly empty) assistant item, because that
+        // is what every projection of an empty answer already emits and because
+        // an answer with no item is a response a successor cannot resume from;
+        // a turn that emitted items commits a trailing one only if there is
+        // something in it. See `Session::complete`.
+        let trailing = (!pending.is_empty() || !emitted).then_some(pending);
 
         Ok(Completed {
-            text,
+            text: spoken,
+            trailing,
             usage,
             decision,
             provider_reported_cost_usd: reported_cost_usd,
+            stop_reason,
         })
     }
 
@@ -1516,7 +1706,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         deadline_at: Instant,
         admission: &Admission,
         declared_baseline: Option<&str>,
-        output_token_cap: Option<u32>,
+        declarations: &ClientDeclarations,
     ) -> Result<(FrontierStream, Decision, usize), PlanFailure> {
         // Rebuild the prompt from the committed log, so what we price is
         // exactly what a successor would reconstruct.
@@ -2016,7 +2206,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                     session.session_id(),
                     isl_tokens,
                     deadline_at,
-                    output_token_cap,
+                    declarations,
                 )
                 .await
             {
@@ -2117,11 +2307,17 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         session_id: &SessionId,
         isl_tokens: usize,
         deadline_at: Instant,
-        // The client's declared ceiling, for the dialects that can express one.
-        // Only the frontier arm carries it: a local worker is asked for
-        // `expected_output_tokens` because it is *our* capacity being reserved,
-        // and a caller's ceiling is not a reservation.
-        output_token_cap: Option<u32>,
+        // What the client declared, for the dialects that can express it.
+        //
+        // **Only the frontier arm below reads it, and that is two separate
+        // facts.** A local worker is asked for `expected_output_tokens` because
+        // it is *our* capacity being reserved, and a caller's ceiling is not a
+        // reservation. And `LocalExecutor::execute` takes prompt token ids and
+        // nothing else — this build has no way to tell a locally served model
+        // about a toolbox at all — so a turn that declares tools and routes
+        // local is answered without them. A real gap, stated here rather than
+        // papered over by handing the local path a value it would ignore.
+        declarations: &ClientDeclarations,
     ) -> Result<FrontierStream, ConnectFailure> {
         match target {
             // No failover arm, deliberately — see the loop in `plan`. A local
@@ -2222,7 +2418,17 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                     // `stop_reason` and to nobody as a defect. Threaded from
                     // `TurnInput` rather than read off the config here, because
                     // the config has no idea what the client asked for.
-                    output_token_cap,
+                    output_token_cap: declarations.output_token_cap,
+                    // **What makes the turn agentic**, and cloned rather than
+                    // moved because `connect` may run more than once: a dispatch
+                    // that fails over to a second target has to send the same
+                    // toolbox, or the fallback answers a different question from
+                    // the one the client asked. Verbatim from the client, for
+                    // the reason `FrontierQuote::tools` gives — this layer has
+                    // nothing to be right about in a tool schema it did not
+                    // define.
+                    tools: declarations.tools.clone(),
+                    tool_choice: declarations.tool_choice.clone(),
                     // The credential travels here for the same reason the
                     // dialect above does: this is the only argument `execute`
                     // receives. It is the *same* resolution the payer on the

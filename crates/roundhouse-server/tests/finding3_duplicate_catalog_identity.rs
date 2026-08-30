@@ -143,6 +143,7 @@ fn one_frontier_call(usage: Usage) -> Vec<SessionEvent> {
                 response_id: response,
                 usage,
                 provider_reported_cost_usd: None,
+                stop_reason: None,
             },
         },
     ]

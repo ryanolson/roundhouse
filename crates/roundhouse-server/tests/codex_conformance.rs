@@ -45,8 +45,10 @@ use roundhouse_server::{
 };
 
 mod common;
-use common::codex::{NoAuth, RouterTransport, collect, frames, request, user_message};
-use common::frontier_catalog;
+use common::codex::{
+    NoAuth, RouterTransport, collect, frames, function_call_output_item, request, user_message,
+};
+use common::{Scripted, ToolCallingFrontierClient, frontier_catalog};
 
 /// What the echo provider answers with, and therefore what a turn's assistant
 /// item contains.
@@ -107,6 +109,36 @@ fn assistant_message(text: &str) -> ResponseItem {
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     }
+}
+
+/// As [`surface`], but dispatching through a frontier that calls tools.
+///
+/// The engine is otherwise identical, so a turn served here routes exactly as
+/// every other test's does: the only difference is what comes back off the
+/// stream, which is the point.
+fn surface_calling(script: Vec<Scripted>) -> (Router, Arc<MemoryStore>) {
+    let store = Arc::new(MemoryStore::new());
+    let engine = Arc::new(Engine::new(
+        Arc::clone(&store),
+        ByteTokenizer,
+        Arc::new(EchoLocalExecutor::new("local answer")),
+        frontier_catalog(),
+        // This wire names no stop reason for an ordinary completion, which is
+        // what the Responses dispatch decoder reports — so the double says the
+        // same thing rather than a convenient `tool_use`.
+        Arc::new(ToolCallingFrontierClient::new(script, None)),
+        Arc::new(AffinityPolicy::new()),
+        EngineConfig::default(),
+    ));
+    (
+        responses_router(
+            ControlPlane::open(),
+            engine,
+            Arc::clone(&store),
+            Arc::new(Conversations::new()),
+        ),
+        store,
+    )
 }
 
 /// Drive one turn through Codex's client and collect what it parsed.
@@ -263,6 +295,211 @@ async fn a_codex_client_parses_a_full_turn() {
         "total_tokens must be the sum the client would otherwise have to guess"
     );
     assert!(usage.input_tokens > 0);
+}
+
+/// **A tool-calling turn, read by the parser a real agent runs.**
+///
+/// The oracle is doing the load-bearing work here and it is worth naming what it
+/// rules out. `ResponseItem` has an `Other` variant: an item whose shape the
+/// client cannot deserialize becomes `Other` silently, and a turn made of those
+/// arrives looking empty rather than looking wrong. So the assertion is not that
+/// the frames are named right but that the *client* got a `FunctionCall` with
+/// the call id, the name and the arguments it needs to run the tool — which is
+/// the whole of what a codex agent does with our answer.
+///
+/// The pinned parser (`codex-api/src/sse/responses.rs` @ `6344a65`) reads the
+/// call off `response.output_item.done` and puts
+/// `response.function_call_arguments.delta` in its explicitly-unhandled arm, so
+/// the delta frame this surface also sends must be *ignorable*: it may not
+/// become an event, and it may not break the sequence around it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_codex_client_parses_a_tool_call_this_deployment_emitted() {
+    ensure_rustls_crypto_provider();
+    let (app, store) = surface_calling(vec![
+        Scripted::Text("looking"),
+        Scripted::Call {
+            id: "call_1",
+            name: "shell",
+            // Unsorted keys and loose spacing, so the canonical form the log
+            // stores is visibly not the model's own bytes.
+            arguments: r#"{"workdir": "/src", "command": ["ls"]}"#,
+        },
+    ]);
+
+    let events = drive(&app, request("sess-tool-call", vec![user_message("list")]))
+        .await
+        .expect("the client must parse the turn");
+
+    assert_eq!(
+        sequence(&events),
+        vec![
+            "response.created",
+            // The text item, announced by its first delta.
+            "response.output_item.added",
+            "response.output_text.delta",
+            // Closed by the call that follows it, *before* the call goes out:
+            // the client rebuilds its history in the order it was handed the
+            // items, and the log holds the text ahead of the call.
+            "response.output_item.done",
+            // The call: announced, its arguments streamed (a frame this parser
+            // ignores, and therefore no event), then handed over whole.
+            "response.output_item.added",
+            "response.output_item.done",
+            "response.completed",
+        ],
+        "{events:#?}"
+    );
+
+    // The message closed first, and it carries the text — so a client
+    // assembling items in `done` order gets `[message, call]`, which is the
+    // order the log holds them in and therefore the order its resend has to be
+    // admitted as a prefix.
+    let ResponseEvent::OutputItemDone(message) = &events[3] else {
+        panic!("expected the message's done item: {:?}", events[3]);
+    };
+    assert_eq!(message_text(message), Some("looking".to_string()));
+
+    let ResponseEvent::OutputItemDone(done) = &events[5] else {
+        panic!("expected the call's done item: {:?}", events[5]);
+    };
+    let ResponseItem::FunctionCall {
+        name,
+        arguments,
+        call_id,
+        ..
+    } = done
+    else {
+        panic!(
+            "the client parsed the call as {done:?} — an item it cannot read \
+             becomes `Other` and the turn arrives looking empty"
+        );
+    };
+    assert_eq!(name, "shell");
+    assert_eq!(call_id, "call_1");
+    assert_eq!(
+        arguments, r#"{"command":["ls"],"workdir":"/src"}"#,
+        "the arguments the client would run must be the ones the log holds"
+    );
+
+    // And the announcement is the same call, so a streaming consumer that
+    // renders on `added` and completes on `done` sees one call rather than two.
+    let ResponseEvent::OutputItemAdded(added) = &events[4] else {
+        panic!("expected the call's added item: {:?}", events[4]);
+    };
+    let ResponseItem::FunctionCall {
+        call_id: announced,
+        arguments: announced_arguments,
+        ..
+    } = added
+    else {
+        panic!("the announcement must parse as the same kind of item: {added:?}");
+    };
+    assert_eq!(announced, "call_1");
+    assert_eq!(
+        announced_arguments, "",
+        "the announcement carries no arguments; they arrive on the deltas and \
+         the done"
+    );
+
+    // The log holds the call, stamped as ours — which is what makes the frames
+    // above a projection of the session rather than a pass-through of the
+    // upstream's bytes.
+    let items = stored_items(&store, "sess-tool-call").await;
+    let call = items
+        .iter()
+        .find(|item| matches!(item.content, ItemContent::ToolCall { .. }))
+        .expect("the emitted call is durable");
+    assert!(
+        call.response_id.is_some(),
+        "an emitted call carries this response's stamp: {call:?}"
+    );
+    assert_eq!(
+        call.content,
+        ItemContent::ToolCall {
+            call_id: "call_1".into(),
+            name: "shell".into(),
+            arguments: r#"{"command":["ls"],"workdir":"/src"}"#.into(),
+        }
+    );
+}
+
+/// **The loop closes on this dialect too: the client runs the call and sends the
+/// output back as `function_call_output`.**
+///
+/// The resend is built from the item the client actually parsed, so this asserts
+/// prefix admission against a real round trip rather than a hand-written one — a
+/// re-encoding anywhere on the path would show up here as a second session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_codex_clients_tool_output_comes_back_onto_the_same_session() {
+    ensure_rustls_crypto_provider();
+    let session = "sess-tool-loop";
+    // Text *and* a call, because the interleaving is what the resend's order has
+    // to preserve: a turn whose only content is a call would pass this test even
+    // if the two items came back in the wrong order.
+    let (app, store) = surface_calling(vec![
+        Scripted::Text("looking"),
+        Scripted::Call {
+            id: "call_1",
+            name: "shell",
+            arguments: r#"{"workdir": "/src", "command": ["ls"]}"#,
+        },
+    ]);
+
+    let first = drive(&app, request(session, vec![user_message("list")]))
+        .await
+        .expect("the first turn completes");
+    // Every item the client was handed, in the order it was handed them — which
+    // is the order it will send them back in.
+    let handed: Vec<ResponseItem> = first
+        .iter()
+        .filter_map(|event| match event {
+            ResponseEvent::OutputItemDone(item) => Some(item.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        matches!(
+            handed.as_slice(),
+            [
+                ResponseItem::Message { .. },
+                ResponseItem::FunctionCall { .. }
+            ]
+        ),
+        "the client must be handed the message before the call, as the log holds \
+         them: {handed:#?}"
+    );
+    let after_first = stored_items(&store, session).await;
+
+    // Turn two as codex composes it: the request, the items it was handed
+    // *verbatim*, and the output of running the call.
+    let mut resent = vec![user_message("list")];
+    resent.extend(handed);
+    resent.push(function_call_output_item("call_1", "main.rs\n"));
+    let second = drive(&app, request(session, resent))
+        .await
+        .expect("the second turn completes");
+    assert!(matches!(
+        second.last(),
+        Some(ResponseEvent::Completed { .. })
+    ));
+
+    let after_second = stored_items(&store, session).await;
+    assert_eq!(
+        after_second[..after_first.len()],
+        after_first[..],
+        "the first turn's items must survive unchanged, or the session forked"
+    );
+    let appended: Vec<&ItemContent> = after_second[after_first.len()..]
+        .iter()
+        .map(|item| &item.content)
+        .collect();
+    assert!(
+        matches!(
+            appended.first(),
+            Some(ItemContent::ToolResult { call_id, .. }) if call_id == "call_1"
+        ),
+        "exactly the result should be new input: {appended:#?}"
+    );
 }
 
 /// A second turn re-sends the whole conversation; only the new part is appended.

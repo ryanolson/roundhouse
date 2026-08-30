@@ -297,7 +297,7 @@ mod tests {
         session
             .complete(
                 &response_id,
-                "hi",
+                Some("hi"),
                 Usage {
                     input_tokens: tokens,
                     cached_input_tokens: 0,
@@ -306,6 +306,7 @@ mod tests {
                     reasoning_tokens: 0,
                     accounting: Accounting::Reported,
                 },
+                None,
                 None,
             )
             .await

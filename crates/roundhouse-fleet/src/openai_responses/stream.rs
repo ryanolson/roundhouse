@@ -21,6 +21,19 @@
 //! indistinguishable from a saving — the exact failure
 //! [`crate::usage`] exists to prevent.
 //!
+//! **A tool call is read off `response.output_item.done`, and the argument
+//! deltas are ignored — which is the opposite of the Anthropic decoder next
+//! door, and the divergence is the wire's, not a preference.** The conformance
+//! oracle is the pinned `codex` tree (`codex-api/src/sse/responses.rs` @
+//! `6344a65`), and it settles this: `response.function_call_arguments.delta` and
+//! `.done` are both listed in that parser's explicitly-unhandled arm, while the
+//! finished `function_call` item — `call_id`, `name`, and `arguments` as a
+//! *complete* JSON string — arrives on `response.output_item.done`. So this wire
+//! hands over the whole call in one frame and needs no accumulator, where the
+//! Messages wire only ever hands over fragments and needs one. Reading the
+//! deltas here as well would be a second, independently-wrong path to the same
+//! value: the two would have to agree, and nothing would check that they did.
+//!
 //! [`Accounting`]: roundhouse_core::event::Accounting
 
 use std::collections::VecDeque;
@@ -153,13 +166,29 @@ impl SseDecoder {
                 }
                 Ok(())
             }
+            // **The whole tool call, in one frame.** See the module doc: on this
+            // wire the terminal item carries the complete `arguments` string, so
+            // there is nothing to assemble and the argument deltas are noise.
+            //
+            // `response.output_item.added` is *not* read, though it carries the
+            // same item type: at `added` the arguments are `""` and the call is
+            // a placeholder. Emitting there would hand the client a call with no
+            // arguments and then no way to correct it, since this enum has no
+            // amendment channel — one chunk per completed call is the contract.
+            Some("response.output_item.done") => {
+                if let Some(call) = function_call(payload.get("item")) {
+                    self.pending.push_back(call);
+                }
+                Ok(())
+            }
             Some("response.completed") => {
                 self.finished = true;
                 // A completion with no usage object is not an error: it is an
                 // unaccounted call, which the engine marks as estimated. What
                 // is *not* done here is inventing zeros — see the module doc.
                 if let Some(usage) = payload.pointer("/response/usage") {
-                    self.pending.push_back(usage_chunk(usage));
+                    self.pending
+                        .push_back(usage_chunk(usage, payload.pointer("/response")));
                 }
                 Ok(())
             }
@@ -249,13 +278,50 @@ fn lines(event: &str) -> impl Iterator<Item = &str> {
     event.split(['\r', '\n'])
 }
 
+/// The tool call an output item describes, or `None` for every other item.
+///
+/// Shapes read straight from the conformance oracle's own type
+/// (`codex-protocol`'s `ResponseItem::FunctionCall` @ `6344a65`): `call_id` and
+/// `name` are required there, and `arguments` is a `String` carrying JSON —
+/// which is why it is moved rather than parsed, and why
+/// `FrontierChunk::ToolCall::arguments` is a `String` too.
+///
+/// **Every field is required here and a missing one drops the item**, which is
+/// the same "nothing rather than something fabricated" rule the Anthropic
+/// decoder applies to an unclosed tool block. A call with no `call_id` cannot be
+/// paired with its result, and one with no `name` names no tool: a client handed
+/// either would fail at a place that says nothing about where the value went
+/// missing.
+///
+/// `namespace` — the oracle's optional MCP qualifier — is deliberately not read.
+/// [`ItemContent::ToolCall`](roundhouse_core::item::ItemContent) stores the bare
+/// name by its own ruling, because a namespace belongs to a client dialect and
+/// lives in the wire projection; folding one into `name` here would put a
+/// dialect's spelling into the log and make a namespaced call and a flat call to
+/// one tool two different tools.
+fn function_call(item: Option<&Value>) -> Option<FrontierChunk> {
+    let item = item?;
+    if item.get("type").and_then(Value::as_str) != Some("function_call") {
+        return None;
+    }
+    Some(FrontierChunk::ToolCall {
+        id: item.get("call_id").and_then(Value::as_str)?.to_string(),
+        name: item.get("name").and_then(Value::as_str)?.to_string(),
+        // `as_str` and not `to_string` on the value: this field is a JSON
+        // *string* on the wire, so a `Value::String` renders with its quotes and
+        // escapes if stringified whole, and the client would receive
+        // `"{\"path\":\"/a\"}"` where the model sent `{"path":"/a"}`.
+        arguments: item.get("arguments").and_then(Value::as_str)?.to_string(),
+    })
+}
+
 /// The accounting frame, read out of a `usage` object.
 ///
 /// Missing fields read as zero, which is right *here* and wrong in general: this
 /// function only runs when the provider sent a `usage` object, so an absent
 /// `reasoning_tokens` means a model that does not reason rather than an
 /// unaccounted call. The unaccounted case never reaches this function at all.
-fn usage_chunk(usage: &Value) -> FrontierChunk {
+fn usage_chunk(usage: &Value, response: Option<&Value>) -> FrontierChunk {
     let count = |value: Option<&Value>| value.and_then(Value::as_u64).unwrap_or(0);
     FrontierChunk::Done {
         input_tokens: count(usage.get("input_tokens")),
@@ -280,6 +346,31 @@ fn usage_chunk(usage: &Value) -> FrontierChunk {
         // answer to that -- refusing the whole stream over an accounting extra
         // would fail a turn that was served correctly.
         provider_reported_cost: usage.get("cost").and_then(Value::as_f64),
+        // **`None` is the ordinary answer on this wire, and that is a fact
+        // about the wire rather than a gap here.** The Responses API has no
+        // stop-reason field for a turn that ended normally — `response.status`
+        // is a lifecycle state ("completed"), not a reason, and putting it here
+        // would spell a *state* in the field every other dialect spells a reason
+        // in. The one place this wire does name a reason is
+        // `incomplete_details.reason`, which is read.
+        //
+        // The consequence, stated because it is real: a tool-use turn on this
+        // dialect reports no stop reason at all. The `ToolCall` chunk is the
+        // signal instead, which is the honest reading — the provider announced a
+        // call and never announced a reason — and it carries the same
+        // information a synthesized `tool_use` would have, minus the
+        // fabrication.
+        //
+        // A truncated turn arrives on this wire as a separate
+        // `response.incomplete` event rather than as a `response.completed`
+        // carrying details, and this decoder does not terminate on that event
+        // (the oracle treats it as a stream error). Reading the field on the
+        // completion frame is the cheap half; the incomplete frame is a named
+        // gap, not a claim that one cannot happen.
+        stop_reason: response
+            .and_then(|response| response.pointer("/incomplete_details/reason"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
     }
 }
 
@@ -350,6 +441,9 @@ mod tests {
                     // and absent is `None` rather than zero — see
                     // `usage_chunk`.
                     provider_reported_cost: None,
+                    // Nor a stop reason: this wire names one only when a turn
+                    // ended early, and `COMPLETED` did not.
+                    stop_reason: None,
                 },
             ],
             "the cached count is the quantity the whole system exists to \
@@ -428,6 +522,7 @@ mod tests {
                         output_tokens: 30,
                         reasoning_tokens: 12,
                         provider_reported_cost: None,
+                        stop_reason: None,
                     },
                 ],
                 "{framing} framing"
@@ -537,6 +632,7 @@ mod tests {
                     // token-priced figure against. Carried, never added to the
                     // counts beside it.
                     provider_reported_cost: Some(0.00421),
+                    stop_reason: None,
                 },
             ]
         );
@@ -562,8 +658,157 @@ mod tests {
                 output_tokens: 30,
                 reasoning_tokens: 12,
                 provider_reported_cost: None,
+                stop_reason: None,
             }]
         );
+    }
+
+    /// **The tool call, in the shape the conformance oracle builds it.**
+    ///
+    /// Copied structurally from codex's own test helper
+    /// (`core/tests/common/responses.rs::ev_function_call` @ `6344a65`): a
+    /// `response.output_item.done` whose item is a `function_call` with
+    /// `call_id`, `name` and a complete `arguments` string. The `added` frame
+    /// that precedes it in a real stream carries `"arguments": ""`, and the
+    /// argument deltas between them are what the oracle's parser explicitly does
+    /// not read — so both appear here, and neither may produce a chunk.
+    #[test]
+    fn a_function_call_is_read_once_from_the_done_item_and_not_from_its_deltas() {
+        let chunks = decode(&[
+            concat!(
+                r#"data: {"type":"response.output_item.added","item":{"#,
+                r#""type":"function_call","id":"fc_1","call_id":"call_1","#,
+                r#""name":"shell","arguments":"","status":"in_progress"}}"#,
+                "\n\n",
+            ),
+            concat!(
+                r#"data: {"type":"response.function_call_arguments.delta","#,
+                r#""item_id":"fc_1","delta":"{\"command\":"}"#,
+                "\n\n",
+            ),
+            concat!(
+                r#"data: {"type":"response.output_item.done","item":{"#,
+                r#""type":"function_call","call_id":"call_1","name":"shell","#,
+                r#""arguments":"{\"command\": [\"ls\", \"-l\"]}"}}"#,
+                "\n\n",
+            ),
+            COMPLETED,
+        ])
+        .expect("a function-call turn must decode");
+
+        assert_eq!(
+            chunks,
+            vec![
+                FrontierChunk::ToolCall {
+                    // `call_id`, not `id`: `id` names the *item*, `call_id`
+                    // names the call, and only the second is what a
+                    // `function_call_output` is paired on.
+                    id: "call_1".into(),
+                    name: "shell".into(),
+                    // The wire's own string, with its spacing, moved rather than
+                    // parsed — see `function_call`.
+                    arguments: r#"{"command": ["ls", "-l"]}"#.into(),
+                },
+                FrontierChunk::Done {
+                    input_tokens: 120,
+                    cached_input_tokens: 100,
+                    cache_write_tokens: 0,
+                    output_tokens: 30,
+                    reasoning_tokens: 12,
+                    provider_reported_cost: None,
+                    // This wire names no reason for a turn that ended normally,
+                    // and a tool-use turn is one of those: the call above is the
+                    // signal, not a synthesized word.
+                    stop_reason: None,
+                },
+            ],
+            "exactly one call: the `added` placeholder and the argument delta \
+             must not each produce one"
+        );
+    }
+
+    /// Output items that are not function calls, and function calls missing a
+    /// field a client would need, both yield nothing — and neither fails the
+    /// turn.
+    ///
+    /// A `message` item arrives on `response.output_item.done` on *every*
+    /// ordinary turn, so treating an unrecognised item as an error would fail
+    /// every turn this decoder has ever served. A call with no `call_id` cannot
+    /// be paired with its result and one with no `name` names no tool; handing
+    /// either to a client fails somewhere that says nothing about where the
+    /// value went missing.
+    #[test]
+    fn an_output_item_that_is_not_a_usable_function_call_yields_nothing() {
+        for (item, why) in [
+            (
+                r#"{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}"#,
+                "the ordinary assistant message every turn ends with",
+            ),
+            (
+                r#"{"type":"web_search_call","status":"completed"}"#,
+                "a server-side tool this build does not model",
+            ),
+            (
+                r#"{"type":"function_call","name":"shell","arguments":"{}"}"#,
+                "no call_id: nothing could pair the result",
+            ),
+            (
+                r#"{"type":"function_call","call_id":"c","arguments":"{}"}"#,
+                "no name: it names no tool",
+            ),
+            (
+                r#"{"type":"function_call","call_id":"c","name":"shell"}"#,
+                "no arguments at all",
+            ),
+            (
+                r#"{"type":"function_call","call_id":"c","name":"shell","arguments":{"a":1}}"#,
+                "arguments as an object rather than the wire's JSON string",
+            ),
+        ] {
+            let chunks = decode(&[
+                &format!("data: {{\"type\":\"response.output_item.done\",\"item\":{item}}}\n\n"),
+                COMPLETED,
+            ])
+            .unwrap_or_else(|error| panic!("{why} must not fail the turn: {error}"));
+            assert_eq!(chunks.len(), 1, "{why}: {chunks:?}");
+            assert!(matches!(chunks[0], FrontierChunk::Done { .. }), "{why}");
+        }
+    }
+
+    /// The one place this wire does name a reason, read.
+    ///
+    /// `incomplete_details.reason` is the Responses spelling of "the answer was
+    /// cut off", and it is the same fact the Messages wire spells
+    /// `stop_reason: max_tokens`. Without it a truncated turn is
+    /// indistinguishable from a complete one everywhere downstream — the defect
+    /// M11.1's F1 named on the other dialect.
+    #[test]
+    fn an_incomplete_reason_on_the_completion_frame_is_carried() {
+        let chunks = decode(&[concat!(
+            r#"data: {"type":"response.completed","response":{"#,
+            r#""incomplete_details":{"reason":"max_output_tokens"},"#,
+            r#""usage":{"input_tokens":10,"output_tokens":4}}}"#,
+            "\n\n",
+        )])
+        .unwrap();
+        assert!(
+            matches!(
+                &chunks[0],
+                FrontierChunk::Done { stop_reason: Some(reason), .. }
+                    if reason == "max_output_tokens"
+            ),
+            "{chunks:?}"
+        );
+
+        // CONTROL: the ordinary completion names none, so the assertion above is
+        // about the field being *read* rather than about a constant.
+        assert!(matches!(
+            decode(&[COMPLETED]).unwrap()[0],
+            FrontierChunk::Done {
+                stop_reason: None,
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -393,6 +393,32 @@ impl AnthropicMessagesClient {
             // to it byte-exactly.
             "messages": [{ "role": "user", "content": content }],
         });
+        // **The client's tool definitions, verbatim and untouched.**
+        //
+        // This is the one part of a Messages request roundhouse forwards rather
+        // than originates, and the asymmetry with the blocks above is the whole
+        // point of [`FrontierQuote::tools`] being JSON. The blocks are a slicing
+        // of roundhouse's own render, so they are typed and built here. The
+        // tools are the *client's* declaration of what its own process can run —
+        // twenty-four of them on a real Claude Code turn, several carrying
+        // input schemas this build has never modelled and one carrying the
+        // client's own `cache_control` breakpoint — and there is nothing for
+        // roundhouse to be right about in them. Re-encoding through a type would
+        // drop what it did not know, and the model would then be told about a
+        // smaller toolbox than the client has: a client whose tools silently
+        // stop working, never an error.
+        //
+        // Absent means absent: no key at all rather than `null`, because
+        // `"tools": null` and `"tool_choice": null` are properties the schema
+        // does not accept, and sending them would 400 every turn from an
+        // internal caller that has no tools — the judge, the validate loop, an
+        // MCP turn.
+        if let Some(tools) = &quote.tools {
+            body["tools"] = tools.clone();
+        }
+        if let Some(tool_choice) = &quote.tool_choice {
+            body["tool_choice"] = tool_choice.clone();
+        }
         quote.wire_protocol.enforce_usage_reporting(&mut body);
         Ok(body)
     }
@@ -717,6 +743,11 @@ mod tests {
             // No client declared a ceiling on these fixtures, which is what
             // every internal caller looks like; see `output_token_cap`.
             output_token_cap: None,
+            // Nor any tools, for the same reason. The tests that need them set
+            // them on a clone, so every other assertion here is also a control
+            // for "a quote with no tools sends no `tools` key".
+            tools: None,
+            tool_choice: None,
             credential,
         }
     }
@@ -859,6 +890,86 @@ mod tests {
         // is no session or cache-key property on this wire at all, so sending
         // one would be an unknown field on a closed schema.
         assert!(body.get("prompt_cache_key").is_none());
+    }
+
+    /// **The client's tools ride out byte-for-byte, and only when it sent
+    /// some.**
+    ///
+    /// The payload is deliberately hostile to a re-encoding: a nested
+    /// `input_schema` this build models nowhere, a `cache_control` breakpoint of
+    /// the client's own on the last tool (which is how Claude Code caches its
+    /// twenty-four-tool preamble — dropping it costs the discount on the largest
+    /// stable block in the request), a server-tool `type` this build has never
+    /// named, and a `tool_choice` that is an object rather than a string. A
+    /// typed projection would have quietly dropped at least the last two, and a
+    /// model told about a smaller toolbox than the client has fails in the one
+    /// way nobody debugs: the client's tools simply stop being offered.
+    #[test]
+    fn the_clients_tools_and_tool_choice_travel_verbatim_or_not_at_all() {
+        let tools = json!([
+            {
+                "name": "Grep",
+                "description": "search",
+                "input_schema": {
+                    "type": "object",
+                    "properties": { "pattern": { "type": "string" } },
+                    "required": ["pattern"],
+                },
+            },
+            // A server tool: named by `type`, carrying no schema, and modelled
+            // by nothing in this crate.
+            { "type": "web_search_20250305", "name": "web_search", "max_uses": 5 },
+            {
+                "name": "Read",
+                "input_schema": { "type": "object" },
+                // The client's own breakpoint, on the last tool: the boundary
+                // that caches the whole tool preamble.
+                "cache_control": { "type": "ephemeral" },
+            },
+        ]);
+        let tool_choice = json!({ "type": "auto", "disable_parallel_tool_use": false });
+
+        let mut with_tools = quote(TurnCredential::Absent, SPOKEN);
+        with_tools.tools = Some(tools.clone());
+        with_tools.tool_choice = Some(tool_choice.clone());
+        let body = AnthropicMessagesClient::body(&with_tools, "claude-sonnet").unwrap();
+
+        assert_eq!(body["tools"], tools, "the client's bytes, unmodified");
+        assert_eq!(body["tool_choice"], tool_choice);
+
+        // And they are properties the *pinned* schema allows, which is what says
+        // forwarding them cannot 400 on a closed request schema. Read from the
+        // pin rather than asserted from memory, so the day upstream renames one
+        // this goes red instead of every turn doing so.
+        let allowed = wire::pin::strings(
+            &wire::pin::spec_pin()["vocabulary"]["create_message_params"]["properties"],
+        );
+        for field in ["tools", "tool_choice"] {
+            assert!(
+                allowed.iter().any(|property| property == field),
+                "`{field}` is not a property of CreateMessageParams in the pinned \
+                 spec, so forwarding it is a 400 on every tool-using turn"
+            );
+        }
+
+        // CONTROL: a quote with nothing declared sends no key at all, rather
+        // than a `null`. `"tools": null` is not a value the closed schema
+        // accepts, so a defaulted `null` would 400 every internal turn — the
+        // judge, the validate loop, an MCP call — none of which has tools.
+        let bare =
+            AnthropicMessagesClient::body(&quote(TurnCredential::Absent, SPOKEN), "claude-sonnet")
+                .unwrap();
+        assert!(bare.get("tools").is_none());
+        assert!(bare.get("tool_choice").is_none());
+
+        // A choice without tools is forwarded as sent, not suppressed: the
+        // upstream refuses it with a message naming the field, which is a better
+        // answer than this client silently deciding the request was malformed.
+        let mut choice_only = quote(TurnCredential::Absent, SPOKEN);
+        choice_only.tool_choice = Some(tool_choice.clone());
+        let body = AnthropicMessagesClient::body(&choice_only, "claude-sonnet").unwrap();
+        assert_eq!(body["tool_choice"], tool_choice);
+        assert!(body.get("tools").is_none());
     }
 
     #[test]

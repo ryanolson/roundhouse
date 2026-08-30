@@ -62,8 +62,14 @@ use roundhouse_server::{
 };
 
 mod common;
-use common::anthropic::{Accumulated, StrictErrorKind, audit, split_frames};
-use common::{ScriptedFrontierClient, config, frontier_catalog, key, sha256_hex};
+use common::anthropic::{
+    Accumulated, AccumulatedCall, StrictBlock, StrictErrorKind, StrictStopReason, audit,
+    split_frames,
+};
+use common::{
+    Scripted, ScriptedFrontierClient, ToolCallingFrontierClient, config, frontier_catalog, key,
+    sha256_hex,
+};
 
 /// What the echo provider answers with, and therefore what a turn says.
 const ANSWER: &str = "frontier answer";
@@ -150,6 +156,74 @@ fn surface_scripted() -> (Router, Arc<MemoryStore>, Arc<ScriptedFrontierClient>)
     )
 }
 
+/// As [`surface`], but dispatching through a frontier that calls tools.
+///
+/// The engine is otherwise identical — same catalog, same config, same policy —
+/// so a turn served here routes exactly as every other test's does and the only
+/// difference is what comes back off the stream.
+fn surface_calling(
+    script: Vec<Scripted>,
+    stop_reason: Option<&str>,
+) -> (Router, Arc<MemoryStore>, Arc<ToolCallingFrontierClient>) {
+    let store = Arc::new(MemoryStore::new());
+    let client = Arc::new(ToolCallingFrontierClient::new(script, stop_reason));
+    let engine = Arc::new(Engine::new(
+        Arc::clone(&store),
+        ByteTokenizer,
+        Arc::new(EchoLocalExecutor::new("local answer")),
+        frontier_catalog(),
+        Arc::clone(&client) as Arc<dyn roundhouse_fleet::FrontierClient>,
+        Arc::new(AffinityPolicy::new()),
+        config(),
+    ));
+    (
+        messages_router(
+            ControlPlane::open(),
+            engine,
+            Arc::clone(&store),
+            Arc::new(Conversations::new()),
+        ),
+        store,
+        client,
+    )
+}
+
+/// The turn a model that speaks and then calls two tools produces.
+///
+/// Interleaved rather than "text then calls", because the interleaving is the
+/// part a projection can get wrong while still producing the right text and the
+/// right number of blocks.
+fn speaking_and_calling() -> Vec<Scripted> {
+    vec![
+        Scripted::Text("Let me look."),
+        Scripted::Call {
+            id: "toolu_01",
+            name: "Grep",
+            // Keys deliberately not in sorted order and spaced the way a model
+            // emits them: if anything on the path parsed and re-serialized this,
+            // the bytes would change and the client's resend would stop matching
+            // what the log holds.
+            arguments: r#"{"pattern": "fn main", "path": "/src"}"#,
+        },
+        Scripted::Text(" And also:"),
+        Scripted::Call {
+            id: "toolu_02",
+            name: "Read",
+            arguments: r#"{"path": "/src/main.rs"}"#,
+        },
+    ]
+}
+
+/// The assistant message a client rebuilds from a stream, as it resends it.
+///
+/// Built from the oracle's own accumulated blocks rather than written out by
+/// hand, so the second turn's request really is the first turn's answer — a
+/// hand-written resend would assert prefix admission against a history no client
+/// would ever send.
+fn resent_assistant(blocks: &[StrictBlock]) -> Value {
+    json!({ "role": "assistant", "content": blocks })
+}
+
 /// F2's provider double: the first call streams some text and then dies
 /// mid-answer (the shape that commits a partial and reports
 /// `overloaded_error`); every later call streams a distinct, independent reply
@@ -202,6 +276,8 @@ impl FrontierClient for PartialThenFailClient {
                 output_tokens: CONTINUATION.len() as u64,
                 reasoning_tokens: 0,
                 provider_reported_cost: None,
+                // A scripted stream, so no provider named a reason.
+                stop_reason: None,
             }),
         ])
         .boxed())
@@ -550,6 +626,444 @@ async fn f1_the_clients_max_tokens_is_the_dispatch_ceiling_and_not_the_estimate(
         "F1, the other half: the *estimate* is the router's and must not move \
          with what a client declared — a quote priced at a million tokens \
          reserves a million tokens of budget for a turn that answers in forty"
+    );
+}
+
+/// **The client's tools reach the dispatch, byte-for-byte** — the seam that
+/// makes an agentic turn possible at all.
+///
+/// The re-scoping finding for M11.2: `CreateMessageParams` did not name `tools`,
+/// so the twenty-four definitions in every Claude Code request were accepted,
+/// ignored, and never sent upstream. The model was then asked a coding question
+/// with no toolbox, could only answer in prose, and the client's loop stalled on
+/// the first turn that needed a tool. Nothing was red; the deployment simply
+/// could not do the thing it exists to do.
+///
+/// PROBE: the **captured 2.1.251 body**, not a hand-written one. Twenty-four
+/// real definitions with `$schema` keys, nested `anyOf`s, `additionalProperties`
+/// flags and description prose — the exact material a typed re-encoding would
+/// quietly thin out. The assertion is equality with the fixture's own value, so
+/// any normalisation at all fails it.
+///
+/// Asserted at the quote rather than at the wire because the finding was about
+/// the *seam*: `AnthropicMessagesClient::body`'s unit tests already pin what a
+/// quote's tools become on the wire, and what nothing pinned was that a client's
+/// tools reach the quote.
+#[tokio::test]
+async fn the_clients_tool_definitions_reach_the_dispatch_verbatim() {
+    let (app, _store, client) = surface_scripted();
+    let captured: Value = serde_json::from_str(TURN_ONE).expect("the fixture is JSON");
+    let tools = captured["tools"].clone();
+    assert_eq!(
+        tools.as_array().map(Vec::len),
+        Some(24),
+        "the fixture is the live capture; if its tool count moved, the \
+         assertions below are describing a different request"
+    );
+
+    let mut request = captured.clone();
+    // The capture streams; the scripted client answers either way, and a
+    // non-streaming turn keeps this test to one assertion about one thing.
+    request["stream"] = json!(false);
+    // The captured body carries no `tool_choice` (the client relies on the
+    // default), so one is added here: the field is independently optional and a
+    // surface that threaded only `tools` would pass every assertion above.
+    request["tool_choice"] = json!({ "type": "auto", "disable_parallel_tool_use": false });
+
+    let (status, _, text) = post(
+        &app,
+        "/v1/messages",
+        &[("x-claude-code-session-id", "sess-tools")],
+        &request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+
+    let quotes = client.quotes_seen();
+    assert_eq!(quotes.len(), 1, "one frontier dispatch: {quotes:?}");
+    assert_eq!(
+        quotes[0].tools.as_ref(),
+        Some(&tools),
+        "the dispatch must carry the client's own twenty-four definitions, \
+         unmodified — a model told about a smaller toolbox than the client has \
+         fails in the one way nobody debugs"
+    );
+    assert_eq!(
+        quotes[0].tool_choice,
+        Some(json!({ "type": "auto", "disable_parallel_tool_use": false }))
+    );
+
+    // CONTROL: a request that declares neither carries neither, so the
+    // assertions above are about threading rather than about a default that
+    // would have matched anything. `body()` is the minimal request this suite
+    // uses everywhere else, which is also what makes every other test here a
+    // control for the same thing.
+    let (status, _, text) = post(
+        &app,
+        "/v1/messages",
+        &[("x-claude-code-session-id", "sess-no-tools")],
+        &body("hello"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let quotes = client.quotes_seen();
+    assert_eq!(quotes.len(), 2, "{quotes:?}");
+    assert_eq!(quotes[1].tools, None);
+    assert_eq!(quotes[1].tool_choice, None);
+}
+
+// ---------------------------------------------------------------------------
+// The tool loop (M11.2)
+// ---------------------------------------------------------------------------
+
+/// **The whole of M11.2's serve half in one turn: a model that speaks, calls a
+/// tool, speaks again and calls another arrives as four indexed content blocks a
+/// client can act on.**
+///
+/// This is the turn Claude Code spends its entire life inside, and before this
+/// milestone the surface could not express it: `FrontierChunk` had no tool-call
+/// variant, so the same upstream stream reached the client as prose alone and
+/// the agent's loop stalled on its first `Read`.
+///
+/// Four claims, and each fails differently:
+///
+/// - The stream is conformant *to the strict oracle*, which is the tier-1 judge
+///   written from the pinned spec with its enums closed. A `tool_use` block it
+///   cannot read is a block the real client cannot read either.
+/// - The blocks come out interleaved, in the order the model produced them. A
+///   projection that emitted all the text first would produce the same `text`
+///   and the same block count while handing back an answer whose shape the
+///   client then resends — and the resend would no longer match the log.
+/// - Each call's arguments survive as the *bytes the model emitted*, reassembled
+///   by the oracle exactly as the client's accumulator reassembles them: the
+///   fragments, not the start frame's `input`.
+/// - `stop_reason` is `tool_use`, which is how the client knows the turn is
+///   waiting on it rather than finished.
+#[tokio::test]
+async fn a_tool_using_turn_streams_interleaved_blocks_the_client_can_run() {
+    let (app, store, client) = surface_calling(speaking_and_calling(), Some("tool_use"));
+
+    let accumulated = stream(
+        &app,
+        &[("x-claude-code-session-id", "sess-tools")],
+        &body("find main"),
+    )
+    .await;
+
+    assert_eq!(
+        accumulated.blocks,
+        vec![
+            StrictBlock::Text {
+                text: "Let me look.".into()
+            },
+            StrictBlock::ToolUse {
+                id: "toolu_01".into(),
+                name: "Grep".into(),
+                input: json!({ "pattern": "fn main", "path": "/src" }),
+            },
+            StrictBlock::Text {
+                text: " And also:".into()
+            },
+            StrictBlock::ToolUse {
+                id: "toolu_02".into(),
+                name: "Read".into(),
+                input: json!({ "path": "/src/main.rs" }),
+            },
+        ],
+        "the client's content array must be the model's own sequence"
+    );
+    assert_eq!(
+        accumulated.tool_calls,
+        vec![
+            AccumulatedCall {
+                id: "toolu_01".into(),
+                name: "Grep".into(),
+                input: json!({ "pattern": "fn main", "path": "/src" }),
+            },
+            AccumulatedCall {
+                id: "toolu_02".into(),
+                name: "Read".into(),
+                input: json!({ "path": "/src/main.rs" }),
+            },
+        ]
+    );
+    assert_eq!(
+        accumulated.stop_reason,
+        Some(StrictStopReason::ToolUse),
+        "a turn holding tool_use blocks and reporting anything else is a turn \
+         the agent does not act on"
+    );
+    assert_eq!(accumulated.text, "Let me look. And also:");
+
+    // And the log holds exactly what went out, in the same order — the property
+    // the next turn's prefix check depends on. The arguments are the *canonical*
+    // spelling rather than the model's own bytes, which is the correction M11.2
+    // made to its first reading: the client resends this call with its arguments
+    // as a JSON object, and canonicalizing that resend sorts the keys, so a log
+    // holding `{"pattern": …, "path": …}` would disagree with the resend and
+    // fork the session. See `canonical_arguments`; the round trip is closed by
+    // `the_clients_tool_results_come_back_onto_the_same_session`.
+    let items = stored_items(&store, &named("sess-tools")).await;
+    let emitted: Vec<&Item> = items
+        .iter()
+        .filter(|item| item.response_id.is_some())
+        .collect();
+    assert_eq!(
+        emitted
+            .iter()
+            .map(|item| item.content.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            ItemContent::Text {
+                text: "Let me look.".into()
+            },
+            ItemContent::ToolCall {
+                call_id: "toolu_01".into(),
+                name: "Grep".into(),
+                arguments: r#"{"path":"/src","pattern":"fn main"}"#.into(),
+            },
+            ItemContent::Text {
+                text: " And also:".into()
+            },
+            ItemContent::ToolCall {
+                call_id: "toolu_02".into(),
+                name: "Read".into(),
+                arguments: r#"{"path":"/src/main.rs"}"#.into(),
+            },
+        ],
+        "the log's items and the wire's blocks are one sequence: {items:#?}"
+    );
+    assert!(
+        emitted.iter().all(|item| item.role == Role::Assistant),
+        "everything a response emits is the assistant's: {emitted:#?}"
+    );
+
+    // The client's toolbox reached the dispatch on the way in; without it the
+    // upstream would have had nothing to call.
+    assert_eq!(client.quotes_seen().len(), 1);
+}
+
+/// **The loop closes: the client runs the tools, sends the results back, and the
+/// conversation stays on one session.**
+///
+/// The two-turn shape is the milestone. Turn one's history is turn one's
+/// *answer* — the blocks the oracle accumulated, serialized back exactly as the
+/// client would resend them — so this asserts prefix admission against a real
+/// resend rather than against a hand-written one. A single byte of drift
+/// anywhere on that round trip (a re-encoded argument object, a text run split
+/// differently, an empty block the emitter invented) forks the conversation into
+/// a second session, silently, while every turn still answers.
+#[tokio::test]
+async fn the_clients_tool_results_come_back_onto_the_same_session() {
+    let (app, store, _client) = surface_calling(
+        vec![
+            Scripted::Text("Checking."),
+            Scripted::Call {
+                id: "toolu_01",
+                name: "Grep",
+                arguments: r#"{"pattern": "fn main", "path": "/src"}"#,
+            },
+        ],
+        Some("tool_use"),
+    );
+    let headers = [("x-claude-code-session-id", "sess-loop")];
+
+    let first = stream(&app, &headers, &body("find main")).await;
+    assert_eq!(first.stop_reason, Some(StrictStopReason::ToolUse));
+    let after_first = stored_items(&store, &named("sess-loop")).await;
+
+    // Turn two, as the client composes it: the original request, the assistant
+    // message it just accumulated, and the result of the call it ran.
+    let second_request = json!({
+        "model": "claude-opus-5",
+        "max_tokens": 64000,
+        "stream": true,
+        "messages": [
+            { "role": "user", "content": "find main" },
+            resent_assistant(&first.blocks),
+            { "role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_01",
+                "content": "src/main.rs:1: fn main() {",
+            }] },
+        ],
+    });
+    let second = stream(&app, &headers, &second_request).await;
+    assert_eq!(second.stop_reason, Some(StrictStopReason::ToolUse));
+
+    // One session, and it is the one the first turn used. `Conversations::fork`
+    // names the second session `…#g1`, so its absence is the honest spelling of
+    // "did not fork" — an assertion on item counts alone would pass while a
+    // fork quietly served the second turn from an empty history.
+    assert!(
+        no_such_session(&store, &format!("{}#g1", named("sess-loop"))).await,
+        "the resent history forked instead of being admitted as a prefix"
+    );
+
+    let after_second = stored_items(&store, &named("sess-loop")).await;
+    assert_eq!(
+        after_second[..after_first.len()],
+        after_first[..],
+        "the first turn's items must survive the second turn unchanged"
+    );
+    let appended: Vec<ItemContent> = after_second[after_first.len()..]
+        .iter()
+        .map(|item| item.content.clone())
+        .collect();
+    assert_eq!(
+        appended,
+        vec![
+            // Exactly one new input item: the tool result. The whole assistant
+            // message was recognised as history we already hold.
+            ItemContent::ToolResult {
+                call_id: "toolu_01".into(),
+                output: "src/main.rs:1: fn main() {".into(),
+            },
+            // And the second turn's own answer, in the same shape as the first.
+            ItemContent::Text {
+                text: "Checking.".into()
+            },
+            ItemContent::ToolCall {
+                call_id: "toolu_01".into(),
+                name: "Grep".into(),
+                arguments: r#"{"path":"/src","pattern":"fn main"}"#.into(),
+            },
+        ],
+        "the second turn appended more than the result it was carrying: \
+         {after_second:#?}"
+    );
+
+    // The validate loop's extractor reads the whole log, and what it sees is a
+    // *paired* exchange: a call this deployment emitted, answered by the result
+    // the client brought back. That pairing is what the repeat and no-progress
+    // signals are computed over, and before M11.2 it could only ever come from a
+    // client that had made the call itself.
+    let exchanges = roundhouse_core::validate::exchanges(&after_second);
+    assert_eq!(exchanges.len(), 2, "{exchanges:#?}");
+    assert_eq!(exchanges[0].call_id, "toolu_01");
+    assert_eq!(
+        exchanges[0].output.as_deref(),
+        Some("src/main.rs:1: fn main() {"),
+        "roundhouse's own emitted call must pair with the client's result"
+    );
+    assert_eq!(
+        exchanges[1].output, None,
+        "the turn's newest call has not been answered yet"
+    );
+}
+
+/// A turn whose whole answer is a tool call carries it in a non-streaming body
+/// too.
+///
+/// Claude Code re-issues a turn non-streaming when it cannot parse the stream
+/// (§3.6), so the two projections answer the same question and must not
+/// disagree: a non-streaming path that flattened `content` to one text block
+/// would return, for the *same turn*, an answer that calls nothing.
+#[tokio::test]
+async fn the_non_streaming_body_carries_the_tool_use_blocks() {
+    let (app, _store, _client) = surface_calling(
+        vec![Scripted::Call {
+            id: "toolu_01",
+            name: "Bash",
+            arguments: r#"{"command": "ls -la"}"#,
+        }],
+        Some("tool_use"),
+    );
+
+    let mut request = body("list the files");
+    request["stream"] = json!(false);
+    let (status, _, text) = post(
+        &app,
+        "/v1/messages",
+        &[("x-claude-code-session-id", "sess-nonstream")],
+        &request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+
+    let message: Value = serde_json::from_str(&text).expect("a JSON message");
+    assert_eq!(
+        message["content"],
+        json!([{
+            "type": "tool_use",
+            "id": "toolu_01",
+            "name": "Bash",
+            "input": { "command": "ls -la" },
+        }]),
+        "the whole answer is the call, and no empty text block precedes it: {text}"
+    );
+    assert_eq!(message["stop_reason"], json!("tool_use"));
+}
+
+/// **A turn answered by a wire that has no word for `tool_use` still tells the
+/// client the turn is waiting on it.**
+///
+/// Routing across dialects is the point of this product: a Claude Code turn can
+/// be answered by an OpenAI-shaped upstream, whose stream names no stop reason
+/// at all for an ordinary completion. Forwarding that silence would hand the
+/// client `end_turn` beside a `tool_use` block — a message the real API never
+/// sends and an agent never acts on, so the loop ends on the turn that was
+/// supposed to start it.
+///
+/// The CONTROL is the same surface with no call in the script: *there* the
+/// absent reason really does mean the turn is over, and inventing `tool_use`
+/// would be the opposite bug.
+#[tokio::test]
+async fn a_call_from_a_wire_with_no_stop_reason_still_reports_tool_use() {
+    let (app, _store, _client) = surface_calling(
+        vec![Scripted::Call {
+            id: "call_1",
+            name: "shell",
+            arguments: r#"{"command":["ls"]}"#,
+        }],
+        None,
+    );
+    let accumulated = stream(
+        &app,
+        &[("x-claude-code-session-id", "sess-crossdialect")],
+        &body("list"),
+    )
+    .await;
+    assert_eq!(accumulated.stop_reason, Some(StrictStopReason::ToolUse));
+    assert_eq!(accumulated.tool_calls.len(), 1);
+
+    let (app, _store, _client) = surface_calling(vec![Scripted::Text("just an answer")], None);
+    let control = stream(
+        &app,
+        &[("x-claude-code-session-id", "sess-crossdialect-control")],
+        &body("say something"),
+    )
+    .await;
+    assert_eq!(
+        control.stop_reason,
+        Some(StrictStopReason::EndTurn),
+        "a turn with no calls and no reason named is a turn that finished"
+    );
+}
+
+/// **F1's reporting half, end to end: a turn cut off at the ceiling says so.**
+///
+/// M11.1 fixed the *dispatch* half — the client's `max_tokens` became the
+/// upstream ceiling — and left the reporting half with an `#[ignore]`d evidence
+/// test, because the decoder discarded the upstream's `stop_reason` and nothing
+/// downstream could tell a truncated answer from a finished one. Stage 1 carried
+/// it onto `Done`; this is the other end of that wire, where a client finally
+/// reads it.
+#[tokio::test]
+async fn f1_a_truncated_turn_reports_max_tokens_rather_than_end_turn() {
+    let (app, _store, _client) =
+        surface_calling(vec![Scripted::Text("as far as I got")], Some("max_tokens"));
+    let accumulated = stream(
+        &app,
+        &[("x-claude-code-session-id", "sess-truncated")],
+        &body("write an essay"),
+    )
+    .await;
+    assert_eq!(accumulated.stop_reason, Some(StrictStopReason::MaxTokens));
+    assert_ne!(
+        accumulated.stop_reason,
+        Some(StrictStopReason::EndTurn),
+        "a truncated answer that reads as a complete one is the defect F1 named"
     );
 }
 
@@ -1320,9 +1834,19 @@ async fn a_turn_with_nowhere_to_go_ends_the_stream_with_an_error_event() {
         "a transient upstream failure is the one case a retry clears: {failure:?}"
     );
     assert!(!failure.message.is_empty(), "{failure:?}");
+    // **Zero, and it changed from one in M11.2.** While the prelude opened a
+    // content block eagerly, a failed turn closed that block before its error
+    // and the count here was one. Blocks are opened by their content now — the
+    // change that stops an agent turn carrying an empty text block ahead of its
+    // tool call — so a turn that failed before saying anything opens none, which
+    // is also what the upstream API does: an `overloaded_error` mid-stream is
+    // `message_start` then `error`, with no content between them. The §3.6
+    // re-issue condition this does *not* trip is about a stream that *completes*
+    // with no block; an `error` event throws in the client's SSE layer before
+    // any of that is reached (§3.2).
     assert_eq!(
-        accumulated.completed_blocks, 1,
-        "the block the prelude opened must be closed before the error"
+        accumulated.completed_blocks, 0,
+        "a turn that produced nothing opens no block to close: {text}"
     );
 }
 

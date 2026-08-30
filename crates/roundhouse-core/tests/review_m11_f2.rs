@@ -163,6 +163,7 @@ fn log(calls: &[Usage]) -> Vec<SessionEvent> {
                 response_id,
                 usage: usage.clone(),
                 provider_reported_cost_usd: None,
+                stop_reason: None,
             },
         );
     }

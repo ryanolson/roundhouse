@@ -151,6 +151,7 @@ async fn store_with(
         });
         kinds.push(SessionEventKind::ResponseCompleted {
             provider_reported_cost_usd: None,
+            stop_reason: None,
             response_id,
             usage: Usage {
                 input_tokens: 1_000,

@@ -186,6 +186,7 @@ impl Log {
         });
         self.push(SessionEventKind::ResponseCompleted {
             provider_reported_cost_usd: None,
+            stop_reason: None,
             response_id: response,
             usage: u,
         })
@@ -285,6 +286,7 @@ impl Log {
         self.push(SessionEventKind::ItemAppended { item: call });
         self.push(SessionEventKind::ResponseCompleted {
             provider_reported_cost_usd: None,
+            stop_reason: None,
             response_id: response,
             usage: usage(1_000, 0, 40),
         })
@@ -326,6 +328,7 @@ impl Log {
         });
         self.push(SessionEventKind::ResponseCompleted {
             provider_reported_cost_usd: None,
+            stop_reason: None,
             response_id: response,
             usage: usage(2_000, 1_000, 20),
         })

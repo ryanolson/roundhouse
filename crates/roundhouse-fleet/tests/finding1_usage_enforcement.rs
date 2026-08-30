@@ -68,8 +68,12 @@ fn quote_as_the_engine_builds_it(catalog: &StaticFrontierCatalog) -> FrontierQuo
         prompt_cache_key: "sess_finding1".into(),
         expected_output_tokens: Some(512),
         // No client declared a ceiling on these fixtures, which is what
-        // every internal caller looks like; see `output_token_cap`.
+        // every internal caller looks like; see `output_token_cap`. Nor tools,
+        // so these dispatches are also the control for "a quote with none sends
+        // no `tools` key".
         output_token_cap: None,
+        tools: None,
+        tool_choice: None,
         // This test is about the dialect the quote carries, not about
         // authentication: the stub below never contacts a provider, so there is
         // nothing to authenticate to. `Absent` is the honest value, and a real

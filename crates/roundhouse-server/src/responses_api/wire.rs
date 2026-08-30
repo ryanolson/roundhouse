@@ -18,12 +18,20 @@ use roundhouse_core::item::{Item, ItemContent, Role};
 
 use crate::http::ApiError;
 
-/// The id of the one message item a response produces.
+/// The id of the `index`-th message item of a response, counting from zero.
 ///
-/// One assistant message per turn, so a fixed id is enough. The prefix is not
-/// decoration: a client discards an item id that has none, and an item it cannot
-/// name is an item it cannot attach deltas to.
-const MESSAGE_ITEM_ID: &str = "msg_1";
+/// **Per item rather than per response since M11.2**, where a fixed `msg_1` used
+/// to be enough: a turn that speaks, calls a tool and speaks again produces two
+/// message items, and two items sharing an id are two items a client cannot tell
+/// apart — it attaches deltas by this string.
+///
+/// The `msg_` prefix is not decoration: a client discards an item id that has
+/// none, and an item it cannot name is an item it cannot attach deltas to.
+/// Numbered from one on the wire so the first item keeps the `msg_1` every
+/// fixture in this repo already names.
+pub(super) fn message_item_id(index: usize) -> String {
+    format!("msg_{}", index + 1)
+}
 
 // ---------------------------------------------------------------------------
 // Canonicalizing a resent conversation
@@ -238,28 +246,28 @@ pub(super) fn created_frame(response_id: &ResponseId) -> Event {
     )
 }
 
-pub(super) fn item_added_frame() -> Event {
+pub(super) fn item_added_frame(id: &str) -> Event {
     frame(
         "response.output_item.added",
-        json!({ "type": "response.output_item.added", "item": message_item("") }),
+        json!({ "type": "response.output_item.added", "item": message_item(id, "") }),
     )
 }
 
-pub(super) fn delta_frame(text: &str) -> Event {
+pub(super) fn delta_frame(id: &str, text: &str) -> Event {
     frame(
         "response.output_text.delta",
         json!({
             "type": "response.output_text.delta",
-            "item_id": MESSAGE_ITEM_ID,
+            "item_id": id,
             "delta": text,
         }),
     )
 }
 
-pub(super) fn item_done_frame(text: &str) -> Event {
+pub(super) fn item_done_frame(id: &str, text: &str) -> Event {
     frame(
         "response.output_item.done",
-        json!({ "type": "response.output_item.done", "item": message_item(text) }),
+        json!({ "type": "response.output_item.done", "item": message_item(id, text) }),
     )
 }
 
@@ -269,11 +277,11 @@ pub(super) fn item_done_frame(text: &str) -> Event {
 /// because of how a client handles the difference: an item whose type it knows
 /// but whose shape it cannot parse is dropped in silence, so the turn arrives
 /// looking empty rather than looking wrong.
-fn message_item(text: &str) -> Value {
+fn message_item(id: &str, text: &str) -> Value {
     json!({
         "type": "message",
         "role": "assistant",
-        "id": MESSAGE_ITEM_ID,
+        "id": id,
         "content": [{ "type": "output_text", "text": text }],
     })
 }
@@ -281,6 +289,82 @@ fn message_item(text: &str) -> Value {
 // ---------------------------------------------------------------------------
 // A tool call this deployment emitted
 // ---------------------------------------------------------------------------
+
+/// The call, in the shape the pinned codex parser deserializes.
+///
+/// **Read from the oracle, not from the docs**: `ResponseItem::FunctionCall` at
+/// `6344a65` (`protocol/src/models.rs`) is `{type, name, arguments, call_id}`
+/// with an optional `id`, and `arguments` is a *string* holding JSON — its own
+/// comment says the Responses API returns it that way and that the client parses
+/// it later. That is also why [`ItemContent::ToolCall`] stores a string: the
+/// value crosses this boundary in both directions without a re-encoding, and a
+/// re-encoding would reorder an object's keys and stop matching what the client
+/// resends.
+///
+/// `id` is set to the call id rather than omitted, because a streaming consumer
+/// pairs `output_item.added` with its `done` on the item id, and two calls in
+/// one turn that shared one id would be indistinguishable.
+fn function_call_item(call_id: &str, name: &str, arguments: &str) -> Value {
+    json!({
+        "type": "function_call",
+        "id": call_id,
+        "call_id": call_id,
+        "name": name,
+        "arguments": arguments,
+    })
+}
+
+/// The call announced, with its arguments still empty.
+///
+/// Empty deliberately, mirroring the upstream wire: the arguments stream in
+/// afterwards, and a consumer that acted on this frame's `arguments` would act
+/// on an empty object. The pinned parser turns this into `OutputItemAdded` and
+/// waits for the `done`.
+pub(super) fn call_added_frame(call_id: &str, name: &str) -> Event {
+    frame(
+        "response.output_item.added",
+        json!({
+            "type": "response.output_item.added",
+            "item": function_call_item(call_id, name, ""),
+        }),
+    )
+}
+
+/// The whole of the call's arguments, as the one fragment this call has.
+///
+/// **The pinned codex parser ignores this event** — it sits in
+/// `process_responses_event`'s explicitly-unhandled arm at `6344a65` — so it is
+/// emitted for the other consumers of this dialect rather than for the oracle,
+/// and nothing downstream may depend on it. One fragment rather than several
+/// because the log holds the call whole: the dispatch decoder already
+/// reassembled it, and re-splitting it here would invent boundaries no upstream
+/// chose.
+pub(super) fn call_arguments_delta_frame(call_id: &str, arguments: &str) -> Event {
+    frame(
+        "response.function_call_arguments.delta",
+        json!({
+            "type": "response.function_call_arguments.delta",
+            "item_id": call_id,
+            "call_id": call_id,
+            "delta": arguments,
+        }),
+    )
+}
+
+/// The finished call. **This is the frame that makes it real.**
+///
+/// The pinned parser reads `ResponseItem` off `output_item.done` and only there;
+/// an item it cannot parse is dropped with a `debug!` and no error, so a turn
+/// whose call was malformed arrives looking like a turn that called nothing.
+pub(super) fn call_done_frame(call_id: &str, name: &str, arguments: &str) -> Event {
+    frame(
+        "response.output_item.done",
+        json!({
+            "type": "response.output_item.done",
+            "item": function_call_item(call_id, name, arguments),
+        }),
+    )
+}
 
 /// `response.completed`, which ends the stream.
 ///

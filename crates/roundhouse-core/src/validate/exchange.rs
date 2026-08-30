@@ -538,6 +538,76 @@ mod tests {
         );
     }
 
+    /// **A call *roundhouse* emitted is the agent's ordinary work, and pairs
+    /// like any other (M11.2).**
+    ///
+    /// Until this milestone every `ToolCall` in a log arrived as a client's
+    /// resent history: the model's calls reached no durable item at all, so the
+    /// signals reading these exchanges only ever saw work the agent had already
+    /// done elsewhere. A dispatched turn now commits its own calls as it
+    /// produces them, which puts three new shapes in front of this extractor —
+    /// a call stamped with a response id, a call interleaved with the assistant
+    /// text of the same turn, and a call that is *unanswered because the turn
+    /// that made it has only just ended*.
+    ///
+    /// The last one is the reason this is worth asserting rather than assuming.
+    /// `output: None` already meant "nothing has answered this", and the
+    /// repeat and no-progress signals are computed over answered exchanges — so
+    /// the freshly emitted call must read as pending rather than as a call that
+    /// failed, and the *previous* one must read as answered the moment the
+    /// client brings its result back.
+    #[test]
+    fn a_call_this_deployment_emitted_pairs_with_the_clients_result() {
+        let stamped = |call_id: &str, name: &str, arguments: &str| Item {
+            response_id: Some(ResponseId::new("resp_1")),
+            ..call(call_id, name, arguments)
+        };
+        // One agent turn, exactly as the log holds it: the answer's prose
+        // split around the call it made, then the client's result, then the
+        // next turn's call still in flight.
+        let items = vec![
+            Item::user_text("find main"),
+            Item::assistant_text("Let me look.", ResponseId::new("resp_1")),
+            stamped("toolu_01", "Grep", r#"{"pattern":"fn main"}"#),
+            result("toolu_01", "src/main.rs:1: fn main() {"),
+            Item {
+                response_id: Some(ResponseId::new("resp_2")),
+                ..call("toolu_02", "Read", r#"{"path":"src/main.rs"}"#)
+            },
+        ];
+
+        let paired = exchanges(&items);
+        assert_eq!(paired.len(), 2, "{paired:#?}");
+        assert_eq!(paired[0].call_id, "toolu_01");
+        assert_eq!(paired[0].name, "Grep");
+        assert_eq!(
+            paired[0].output.as_deref(),
+            Some("src/main.rs:1: fn main() {"),
+            "the client's unstamped result answers the stamped call it names"
+        );
+        assert!(!paired[0].failed);
+        assert_eq!(
+            paired[1].output, None,
+            "a call the client has not run yet is pending, not failed"
+        );
+        assert!(
+            !paired[1].failed,
+            "an unanswered call must not read as a failure, or a turn that has \
+             just emitted one starts a failure streak against itself"
+        );
+
+        // The assistant text around the call is neither a call nor a result,
+        // which is what keeps the interleaving invisible to these signals.
+        assert_eq!(
+            exchanges(&[Item::assistant_text(
+                "Let me look.",
+                ResponseId::new("resp_1")
+            )])
+            .len(),
+            0
+        );
+    }
+
     #[test]
     fn a_failure_is_read_from_a_marker_or_a_structured_field_and_not_from_a_mention() {
         for failure in [

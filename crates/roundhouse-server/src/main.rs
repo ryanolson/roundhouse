@@ -1303,8 +1303,11 @@ mod tests {
                 segment_boundaries: Vec::new(),
                 prompt_cache_key: "sess".into(),
                 expected_output_tokens: Some(16),
-                // No client in this test, so nothing declared a ceiling.
+                // No client in this test, so nothing declared a ceiling and
+                // nothing declared tools.
                 output_token_cap: None,
+                tools: None,
+                tool_choice: None,
                 credential: roundhouse_core::control::TurnCredential::Absent,
             };
             let Err(error) = client.execute(&quote(refused)).await else {

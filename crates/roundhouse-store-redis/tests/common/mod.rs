@@ -217,6 +217,7 @@ pub fn every_event_kind() -> Vec<SessionEventKind> {
                 accounting: Accounting::Reported,
             },
             provider_reported_cost_usd: None,
+            stop_reason: None,
         },
         SessionEventKind::ResponseIncomplete {
             response_id: response_id.clone(),

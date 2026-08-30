@@ -36,6 +36,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use futures::StreamExt;
 
 use roundhouse_core::routing::{CacheModel, ProviderPricing};
 use roundhouse_fleet::{
@@ -246,5 +247,102 @@ impl FrontierClient for ScriptedFrontierClient {
             reply.len() as u64,
             0,
         ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A frontier that calls tools (M11.2)
+// ---------------------------------------------------------------------------
+
+/// One thing a scripted upstream produces, in the order it produces it.
+///
+/// Text and calls both, because the whole of M11.2's content model is that a
+/// turn interleaves them: a double that could only answer one or the other
+/// would let a serve projection pass every test while emitting the two in an
+/// order no client can read.
+#[derive(Debug, Clone)]
+pub enum Scripted {
+    Text(&'static str),
+    Call {
+        id: &'static str,
+        name: &'static str,
+        arguments: &'static str,
+    },
+}
+
+/// A [`FrontierClient`] that streams a fixed script, tool calls included.
+///
+/// **The double the tool loop needs and [`ScriptedFrontierClient`] cannot be.**
+/// That one answers with one string, front-loaded as a whole response — which is
+/// exactly right for a turn whose only content is prose, and cannot express the
+/// thing under test here: a `FrontierChunk::ToolCall` arriving *between* two
+/// text deltas. The script is a list rather than a builder because the order is
+/// the assertion.
+///
+/// The `Done` carries a caller-chosen `stop_reason`, so a test can drive the
+/// cross-dialect case — a wire that answers with calls and names no reason at
+/// all — as easily as the Anthropic one.
+pub struct ToolCallingFrontierClient {
+    script: Vec<Scripted>,
+    stop_reason: Option<String>,
+    quotes_seen: Arc<Mutex<Vec<FrontierQuote>>>,
+}
+
+impl ToolCallingFrontierClient {
+    pub fn new(script: Vec<Scripted>, stop_reason: Option<&str>) -> Self {
+        Self {
+            script,
+            stop_reason: stop_reason.map(str::to_string),
+            quotes_seen: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    pub fn quotes_seen(&self) -> Vec<FrontierQuote> {
+        self.quotes_seen
+            .lock()
+            .expect("the recording mutex is never held across a panic in this harness")
+            .clone()
+    }
+}
+
+#[async_trait]
+impl FrontierClient for ToolCallingFrontierClient {
+    async fn execute(&self, quote: &FrontierQuote) -> Result<FrontierStream, FrontierError> {
+        self.quotes_seen
+            .lock()
+            .expect("the recording mutex is never held across a panic in this harness")
+            .push(quote.clone());
+        let mut chunks: Vec<Result<FrontierChunk, FrontierError>> = Vec::new();
+        let mut output_tokens = 0u64;
+        for step in &self.script {
+            match step {
+                Scripted::Text(text) => {
+                    output_tokens += text.len() as u64;
+                    chunks.push(Ok(FrontierChunk::OutputText((*text).to_string())));
+                }
+                Scripted::Call {
+                    id,
+                    name,
+                    arguments,
+                } => {
+                    output_tokens += arguments.len() as u64;
+                    chunks.push(Ok(FrontierChunk::ToolCall {
+                        id: (*id).to_string(),
+                        name: (*name).to_string(),
+                        arguments: (*arguments).to_string(),
+                    }));
+                }
+            }
+        }
+        chunks.push(Ok(FrontierChunk::Done {
+            input_tokens: quote.prompt.len() as u64,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            output_tokens,
+            reasoning_tokens: 0,
+            provider_reported_cost: None,
+            stop_reason: self.stop_reason.clone(),
+        }));
+        Ok(futures::stream::iter(chunks).boxed())
     }
 }
