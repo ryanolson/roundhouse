@@ -31,6 +31,20 @@
 //! special case: the block is stable per conversation (§4.4, confirmed at
 //! 2.1.247), so its stability is the client's to keep, and a server that
 //! stripped it would be guessing at which parts of a system prompt matter.
+//!
+//! **What the client rewrites per request is not a turn of the conversation**
+//! (R-A). One rule, drawn once, with three consequences already visible in this
+//! module: what the client resends byte-identical is history and is admitted
+//! strictly; what it rebuilds from its own environment *at the front* is turn
+//! configuration and is replaced in place ([`mark_turn_configuration`], F7); and
+//! what it regenerates per request *behind* the conversation is ephemeral and
+//! becomes no item at all ([`is_ephemeral_client_notice`]). The third arm exists
+//! because the current client line appends a remaining-budget notice after every
+//! `--continue`'s new question (§5.7, §5.7.1) — a counter, and the moment it
+//! counts down, a resend that disagreed with the stored copy would fork the
+//! session to a cold generation while every turn still answered. The leading-run
+//! mechanism cannot cover it: a configuration run is leading by construction and
+//! this item is trailing.
 
 use axum::http::HeaderMap;
 use serde::Deserialize;
@@ -316,10 +330,103 @@ pub fn canonicalize(params: &CreateMessageParams) -> Result<Vec<Item>, ApiError>
         system_items(system, &mut items)?;
     }
     for message in &params.messages {
+        if is_ephemeral_client_notice(message) {
+            continue;
+        }
         message_items(message, &mut items)?;
     }
     mark_turn_configuration(&mut items);
     Ok(items)
+}
+
+/// The tag the current client line wraps its remaining-budget notice in.
+///
+/// A literal rather than a pattern because it is the client's own spelling and
+/// there is nothing here to be clever about: if the tag changes, this stops
+/// matching and the notice becomes history again — which is a visible fork on a
+/// long session, not a silent corruption, and is what the pinned three-turn
+/// fixture is for.
+const BUDGET_NOTICE_OPEN: &str = "<total_tokens>";
+const BUDGET_NOTICE_CLOSE: &str = "</total_tokens>";
+
+/// Whether this message is an ephemeral client notice rather than a turn of the
+/// conversation.
+///
+/// **What the client rewrites per request must never become an item** (R-A).
+/// This is the same principle the leading-system run is admitted under (F7),
+/// applied where that mechanism cannot reach. Claude Code 2.1.257 appends a
+/// trailing `{"role":"system"}` message holding nothing but
+/// `<total_tokens>N tokens left</total_tokens>` after the new user turn of every
+/// `--continue`, with the cache breakpoint moved onto it; one turn later the
+/// same message is resent flattened to a bare string and a *fresh* one is
+/// appended behind the new question (evidence doc §5.7, §5.7.1, and the pinned
+/// `claude-2.1.257-turn-3-continue.json` capture).
+///
+/// **The failure avoided.** `N` is a counter the client recomputes from its own
+/// accounting. Admitted as history it is stored on turn two, resent on turn
+/// three, and agrees — until the counter moves, which is the only thing a
+/// counter does. Then the resend disagrees with the stored copy at a position no
+/// client can edit, the session forks to a cold generation, and every turn still
+/// answers: the exact silent failure prefix admission exists to prevent, on
+/// precisely the long sessions where a warm prefix is worth the most.
+///
+/// **Why not turn configuration, the other loose-admission mechanism.** A
+/// configuration run is the *leading* run by construction
+/// ([`mark_turn_configuration`], and
+/// [`is_turn_configuration`](roundhouse_core::session::is_turn_configuration)
+/// is total over `Developer` because of it); this item is trailing, and a
+/// trailing configuration item is not representable without giving the session
+/// fold and the prefix check a second boundary to guess at. Dropping it is the
+/// only mechanism that leaves one rule for one shape.
+///
+/// **What it costs, stated plainly.** The model no longer sees the client's
+/// budget figure. That is the right trade twice over: the number is the client's
+/// accounting against the model *it* thinks it is talking to, so forwarding it
+/// on a turn roundhouse routed elsewhere would be forwarding a false figure —
+/// and the same text is in the client's own environment block inside `system`,
+/// which is real configuration and is kept.
+///
+/// The match is deliberately narrow. A message whose text merely *contains* the
+/// tag is the environment block; a `user` message carrying it is a person
+/// quoting it. Both stay items, and both are pinned as negatives in
+/// `the_clients_remaining_budget_notice_never_becomes_an_item`.
+fn is_ephemeral_client_notice(message: &InputMessage) -> bool {
+    if message.role.as_deref() != Some("system") {
+        return false;
+    }
+    match message.content.as_ref() {
+        // The shape it is resent in once a later turn supersedes it as the cache
+        // boundary: a bare string, the breakpoint gone with the container.
+        Some(Value::String(text)) => is_budget_notice(text),
+        // The shape it is appended in: a one-block list carrying the breakpoint.
+        // More than one block is a message with something else in it, which is
+        // not this.
+        Some(Value::Array(blocks)) => match blocks.as_slice() {
+            [block] => {
+                block.get("type").and_then(Value::as_str) == Some("text")
+                    && block
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(is_budget_notice)
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Whether this text is the whole notice and nothing else.
+///
+/// Anchored at both ends and refusing any further markup between them, so the
+/// multi-KB environment block that *ends* with the same tag is not mistaken for
+/// it — deleting a client's system prompt would be a far worse bug than the one
+/// this avoids.
+fn is_budget_notice(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed
+        .strip_prefix(BUDGET_NOTICE_OPEN)
+        .and_then(|rest| rest.strip_suffix(BUDGET_NOTICE_CLOSE))
+        .is_some_and(|inner| !inner.contains('<'))
 }
 
 /// The leading run of system items is *turn configuration*; every system item
@@ -1026,6 +1133,102 @@ mod tests {
         })))
         .expect("an unknown property must not refuse the turn");
         assert_eq!(items, vec![Item::user_text("hi")]);
+    }
+
+    /// **The client's remaining-budget notice is ephemeral and never becomes an
+    /// item** (R-A; §5.7, §5.7.1).
+    ///
+    /// The three shapes the notice arrives in, and the two it must not be
+    /// confused with. A `--continue` on the current client line appends a
+    /// trailing `{"role":"system"}` message holding nothing but
+    /// `<total_tokens>N tokens left</total_tokens>`, carrying the cache
+    /// breakpoint; on the next turn the same message is resent flattened to a
+    /// bare string and a fresh one is appended behind the new question. If it
+    /// were history, the log would hold one copy per turn and — the moment `N`
+    /// moves, which is the only thing a budget counter does — the resent copy
+    /// would disagree with the stored one and fork the session.
+    ///
+    /// The two negatives are what keep this from being a text filter: a *user*
+    /// message quoting the notice is something a person said, and a system
+    /// message that merely *contains* the tag among other prose is the client's
+    /// environment block, which is real configuration.
+    #[test]
+    fn the_clients_remaining_budget_notice_never_becomes_an_item() {
+        const NOTICE: &str = "<total_tokens>15000000 tokens left</total_tokens>";
+        let turn = |notice: Value| {
+            json!({
+                "messages": [
+                    { "role": "user", "content": "say hi" },
+                    { "role": "assistant", "content": [{ "type": "text", "text": "hello" }] },
+                    { "role": "user", "content": "and again" },
+                    { "role": "system", "content": notice },
+                ],
+            })
+        };
+        let conversation = vec![
+            Item::user_text("say hi"),
+            // Unstamped: the client replays its own record of the reply, which
+            // carries no response id of ours.
+            Item {
+                role: Role::Assistant,
+                content: ItemContent::Text {
+                    text: "hello".into(),
+                },
+                response_id: None,
+            },
+            Item::user_text("and again"),
+        ];
+
+        // The shape it is appended in: a one-block list carrying the breakpoint.
+        assert_eq!(
+            canonicalize(&params(turn(json!([
+                { "type": "text", "text": NOTICE, "cache_control": { "type": "ephemeral" } }
+            ]))))
+            .expect("the current client line's `--continue` must be servable"),
+            conversation,
+            "the trailing notice is not a thing anyone said"
+        );
+        // The shape it is resent in one turn later, flattened.
+        assert_eq!(
+            canonicalize(&params(turn(json!(NOTICE))))
+                .expect("and so must the resend's flattened spelling"),
+            conversation,
+        );
+        // And with a different `N`, which is the failure the drop exists to
+        // avoid: two turns of one conversation must canonicalize to one prefix
+        // even though the client rewrote the number between them.
+        assert_eq!(
+            canonicalize(&params(turn(json!(
+                "<total_tokens>14812345 tokens left</total_tokens>"
+            ))))
+            .expect("a moved budget is still a servable turn"),
+            conversation,
+            "a session must not fork because the client counted down"
+        );
+
+        // NEGATIVE: the same text from a user is a thing a person said.
+        let quoted = canonicalize(&params(json!({
+            "messages": [{ "role": "user", "content": NOTICE }],
+        })))
+        .expect("a user message is a user message");
+        assert_eq!(quoted, vec![Item::user_text(NOTICE)]);
+
+        // NEGATIVE: the client's environment block ends with the same tag and is
+        // real configuration — a rule that matched on "contains" would delete a
+        // multi-KB system prompt.
+        let environment =
+            format!("You have been invoked in the following environment:\n\n{NOTICE}");
+        let kept = canonicalize(&params(json!({
+            "messages": [
+                { "role": "user", "content": "say hi" },
+                { "role": "system", "content": environment.clone() },
+            ],
+        })))
+        .expect("a system message with prose around the tag is history");
+        assert_eq!(
+            kept,
+            vec![Item::user_text("say hi"), Item::system_text(&environment)],
+        );
     }
 
     /// **Where turn configuration ends is decided by position, once** (F7).

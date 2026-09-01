@@ -176,6 +176,34 @@ pub fn config_from_env() -> Result<Option<(ControlPlaneConfig, String)>, Control
 /// client shouted rather than about what it sent.
 pub const TURN_KEY_HEADER: &str = "x-roundhouse-key";
 
+/// The value [`crate::claude_launch`] writes into a launched Claude client's
+/// `ANTHROPIC_API_KEY`.
+///
+/// **Declared here rather than beside the launcher, and the direction is the
+/// reason.** Two modules need one string: the launcher, which emits it, and
+/// this one, which is the only place a caller's credential is ever captured
+/// (see [`ControlPlane::turn_admission`]) and therefore the only place that can
+/// refuse to forward it. A constant owned by the launcher and imported here
+/// would point the admission boundary at the module whose output it exists to
+/// distrust; the dependency runs the other way for [`TURN_KEY_HEADER`] already.
+///
+/// **Why a launched client needs any value in that variable.** Claude Code
+/// suppresses a subscription login whenever an `ANTHROPIC_API_KEY` resolves
+/// (`agent-docs/research/claude-code-client-surface.md` §1.3, `VV()`), and that
+/// suppression is what makes a `RoundhouseKey` launch deterministic: with the
+/// variable empty, an ambient login's OAuth token is presented to roundhouse as
+/// though the operator had chosen to forward it. It is the exact analogue of
+/// `codex_launch` writing `env_key` beside `requires_openai_auth = false`.
+///
+/// **Why it is in [`KEY_NAMESPACE`] and is deliberately not key-shaped.** In the
+/// namespace, so a copy that ends up in `Authorization` is answered as
+/// `MalformedKey` naming a value the operator can trace back to the launcher,
+/// rather than falling through as "no key was presented" and sending them to
+/// look for a header that did arrive. Not `rh_turn_…`/`rh_admin_…`-shaped, so
+/// [`has_valid_key_shape`] refuses it and it can never resolve to a membership
+/// however it is presented.
+pub const ROUNDHOUSE_API_KEY_SENTINEL: &str = "rh_sentinel_not_a_credential";
+
 /// The dialect [`ControlPlane::Open`] answers with.
 ///
 /// A shared value rather than one built per call, because
@@ -400,6 +428,30 @@ impl From<KeyRefusal> for AuthError {
 /// in (see [`header_value`]).
 fn carries_a_roundhouse_secret(value: &str) -> bool {
     value.split_whitespace().any(has_valid_key_shape)
+}
+
+/// Whether a header value is one *roundhouse itself* put in the client's
+/// environment, and therefore never the caller's own credential.
+///
+/// Two shapes, one question, because the forwarding gate has one job: never put
+/// a value roundhouse generated onto an upstream request. A secret
+/// ([`carries_a_roundhouse_secret`]) is the dangerous half; the
+/// [`ROUNDHOUSE_API_KEY_SENTINEL`] is the *worthless* half, and it is refused
+/// for a different reason rather than for the same one. It authenticates
+/// nothing anywhere, so forwarding it discloses nothing — what it does is
+/// arrive at Anthropic as an `x-api-key` beside a real seat's bearer, where a
+/// rejected key is answered with a `401` an operator reads as a revoked login.
+/// A launcher that had to choose between "set the variable and risk that" and
+/// "leave it empty and let an ambient login be presented to roundhouse" would
+/// have no good answer; refusing the value here is what makes the sentinel free
+/// to set.
+///
+/// Compared whole and trimmed rather than tokenized the way a secret is: the
+/// sentinel is a single fixed literal with no scheme prefix a client could vary,
+/// and a substring rule would refuse a third-party credential that happened to
+/// contain it.
+fn is_roundhouse_own_value(value: &str) -> bool {
+    carries_a_roundhouse_secret(value) || value.trim() == ROUNDHOUSE_API_KEY_SENTINEL
 }
 
 /// A turn key as the request presented it.
@@ -875,10 +927,12 @@ impl ControlPlane {
     /// in `env_http_headers`, so "the key arrived in the dedicated header" is
     /// true of a request whose `Authorization` is also roundhouse's own key.
     /// The value is therefore checked as well as the header —
-    /// [`carries_a_roundhouse_secret`] — and a capture that would forward one
+    /// [`is_roundhouse_own_value`] — and a capture that would forward one
     /// of this deployment's own secrets is refused. The turn is still admitted;
     /// what it loses is the hosted half of its pool, which degrades to local
-    /// with a marker like any other unreachable provider.
+    /// with a marker like any other unreachable provider. The same value check
+    /// is what makes [`ROUNDHOUSE_API_KEY_SENTINEL`] safe for a launched Claude
+    /// client to carry on `x-api-key`, a header the Anthropic row admits.
     pub fn turn_admission(&self, headers: &HeaderMap) -> Result<Admission, AuthError> {
         let presented = self.presented_key(headers)?;
         let forwardable = presented.as_ref().is_some_and(|key| key.dedicated_header);
@@ -888,7 +942,7 @@ impl ControlPlane {
                     .then(|| {
                         PresentedCredential::captured(|name| {
                             header_value(headers, name)
-                                .filter(|value| !carries_a_roundhouse_secret(value))
+                                .filter(|value| !is_roundhouse_own_value(value))
                         })
                     })
                     .flatten(),
@@ -1517,13 +1571,123 @@ mod tests {
     /// a provider client reads: a value this returns is a value that would go
     /// on an upstream request.
     fn forwarded_authorization(plane: &ControlPlane, headers: &HeaderMap) -> Option<String> {
+        forwarded_header(plane, headers, "openai", "authorization")
+    }
+
+    /// What this request would forward to `provider` under `name`, if anything.
+    ///
+    /// The general form of [`forwarded_authorization`], added when the Anthropic
+    /// row made `x-api-key` a second credential-bearing name: a helper that
+    /// could only read `authorization` would have made the sentinel rule below
+    /// unassertable at the seam a provider client actually reads.
+    fn forwarded_header(
+        plane: &ControlPlane,
+        headers: &HeaderMap,
+        provider: &str,
+        name: &str,
+    ) -> Option<String> {
         let admission = plane.turn_admission(headers).expect("a known turn key");
-        let access = admission.credentials.access("openai")?;
+        let access = admission.credentials.access(provider)?;
         let forwarded = access.credential.forwarded()?;
         forwarded
             .headers()
-            .find(|(name, _)| *name == "authorization")
+            .find(|(header, _)| *header == name)
             .map(|(_, value)| value.to_string())
+    }
+
+    /// The turn key in its own header, plus whatever else the client sent.
+    fn headers_with(dedicated: &str, extra: &[(&str, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            TURN_KEY_HEADER,
+            dedicated.parse().expect("a valid header value"),
+        );
+        for (name, value) in extra {
+            headers.insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).expect("a header name"),
+                value.parse::<axum::http::HeaderValue>().expect("a value"),
+            );
+        }
+        headers
+    }
+
+    /// **The launcher's `ANTHROPIC_API_KEY` sentinel is inert at this
+    /// boundary**, which is what lets a `RoundhouseKey` launch set it at all.
+    ///
+    /// The variable has to hold *something* — an empty one lets an ambient login
+    /// present its OAuth token to roundhouse (§1.3), which is the failure the
+    /// sentinel exists to close — and a Claude client that resolves it sends the
+    /// value on `x-api-key`, a header the Anthropic allowlist row admits as a
+    /// credential. So without this rule the value roundhouse itself generated
+    /// would ride upstream beside a real seat, where Anthropic answers a bad
+    /// `x-api-key` next to a valid bearer with a `401` that reads exactly like a
+    /// revoked login.
+    ///
+    /// Asserted at the *value*, not at "the client would never send both": the
+    /// one-capture evidence says a subscription login nulls the API key
+    /// (§1.4, §5.7's header table), so today the two headers do not co-occur
+    /// from this client — which is precisely the kind of guarantee that belongs
+    /// to a client version rather than to roundhouse. Chained through a Relay
+    /// makes the pairing reachable without the client changing at all: Relay
+    /// forwards inbound `x-api-key` untouched
+    /// (`gateway/response.rs:59-72`, `nemo-relay-cli` 0.8.2) while injecting its
+    /// own configured `Authorization`.
+    #[test]
+    fn the_launchers_api_key_sentinel_is_never_forwarded_as_a_seat() {
+        let plane = pass_through_plane();
+        let seat = "Bearer sk-ant-oat01-a-real-subscription-seat";
+
+        // PROBE: the launched shape — the turn key in its own header, the
+        // sentinel where the client puts a resolved `ANTHROPIC_API_KEY`, beside
+        // an `Authorization` that really is somebody else's. The seat still
+        // forwards, because refusing it would be refusing pass-through itself.
+        let launched = headers_with(
+            TURN_SECRET,
+            &[
+                ("x-api-key", ROUNDHOUSE_API_KEY_SENTINEL),
+                ("authorization", seat),
+            ],
+        );
+        assert_eq!(
+            forwarded_header(&plane, &launched, "anthropic", "authorization"),
+            Some(seat.to_string()),
+            "a genuine seat beside the sentinel is still the caller's credential"
+        );
+        assert_eq!(
+            forwarded_header(&plane, &launched, "anthropic", "x-api-key"),
+            None,
+            "the sentinel roundhouse generated must never leave this process: \
+             Anthropic answers a bad `x-api-key` beside a valid bearer with a 401 \
+             that an operator reads as a revoked login"
+        );
+
+        // CONTROL, and it is what keeps the rule above from being "forward no
+        // `x-api-key`": a caller bringing its own Anthropic key is exactly the
+        // other half of the row R4 added, and it still forwards.
+        let byok = "sk-ant-api03-the-callers-own-anthropic-key";
+        let own_key = headers_with(TURN_SECRET, &[("x-api-key", byok), ("authorization", seat)]);
+        assert_eq!(
+            forwarded_header(&plane, &own_key, "anthropic", "x-api-key"),
+            Some(byok.to_string()),
+        );
+
+        // And the sentinel on its own is not a credential at all: with no
+        // `Authorization` beside it there is nothing to forward, so `anthropic`
+        // goes unreachable and the turn degrades to local with a marker — the
+        // same shape as a pass-through member who attached nothing. The turn is
+        // still *admitted* as the membership the turn key names, which is the
+        // half a "nothing is forwarded" assertion alone would not distinguish
+        // from a refusal.
+        let sentinel_only =
+            headers_with(TURN_SECRET, &[("x-api-key", ROUNDHOUSE_API_KEY_SENTINEL)]);
+        let admission = plane
+            .turn_admission(&sentinel_only)
+            .expect("the dedicated header authenticates the turn key");
+        assert_eq!(admission.principal, Principal::new("acme", "ada"));
+        assert!(
+            !admission.credentials.reaches("anthropic"),
+            "the sentinel must not make a provider reachable: it authenticates nothing"
+        );
     }
 
     #[test]

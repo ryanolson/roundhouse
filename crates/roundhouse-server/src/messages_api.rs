@@ -109,7 +109,13 @@ use wire::{CreateMessageParams, canonicalize, session_key, turn_id_for};
 /// the path alone, so the query is ignored — which is a claim tested rather than
 /// assumed, because a router that matched the full URL would 404 every request
 /// the shipping client makes.
-const MESSAGES_PATH: &str = "messages";
+///
+/// `pub` since M11.2b, for the reason [`API_PREFIX`] is read rather than
+/// retyped in `codex_launch`: [`crate::claude_launch`] renders the URL a
+/// launched client will assemble, and a second `"messages"` literal there would
+/// agree with this one today and part company on the edit that moved the route
+/// — silently, since the launcher's own tests would still pass.
+pub const MESSAGES_PATH: &str = "messages";
 
 /// The token-count estimate path.
 const COUNT_TOKENS_PATH: &str = "messages/count_tokens";

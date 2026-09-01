@@ -903,6 +903,245 @@ disagreed on a shape that would have refused every request.** The
 e2e suite's version print are not hygiene — they are what stands between
 this surface and a silent client-line refusal.
 
+## 5.7 Addendum (2026-09-01): 2.1.257 re-capture, and a second blocking shape change
+
+M11.2b re-ran §5.5/§5.6's rig against the binary as it stands four days later
+— `/opt/node22/bin/claude --version` prints **2.1.257** (§5.6 read 2.1.251).
+Rig: `mock_server.py` (stdlib `http.server`, records full headers + raw body
+per request, answers the same minimal SSE stream as §5.5/§5.6) on
+`127.0.0.1:8931`; two turns — `-p "say hi"`, then `--continue -p "and
+again"` — the same two prompts the 2.1.251 capture used, so this is an
+apples-to-apples replay, not a new script. Raw captures and the rig live in
+the session scratchpad (`capture/req-005.json`, `req-006.json`,
+`mock_server.py`); fixtures are committed at
+`crates/roundhouse-server/tests/fixtures/claude-2.1.257-{headers,turn-1,turn-2-continue}.json`,
+same shape and redaction convention as the 2.1.251 files (only
+`metadata.user_id`'s `device_id` edited to an all-zero placeholder).
+
+**Isolation note, itself evidence for §5.5 ¶8.** This box's own Claude Code
+session is a Claude Code Remote (CCR) container, and `CLAUDE_CODE_REMOTE=true`
+sits in the ambient environment. §1.3's `VV()` only lets an
+`ANTHROPIC_API_KEY` source suppress OAuth when `!CLAUDE_CODE_REMOTE` — so on
+this box, unsetting a handful of named variables while leaving the rest of
+the ambient environment intact is **not** sufficient to reach cleared-env
+API-key auth: the first attempt (env vars individually `unset`, not fully
+cleared) sent `Authorization: Bearer sk-ant-oat01-…` (the container's real
+managed-OAuth token, redacted here as it was locally), the full
+`oauth-2025-04-20` + `extended-cache-ttl-2025-04-11` beta pair, and two
+headers not in any prior read of this dialect —
+`x-claude-remote-container-id`, `x-claude-remote-session-id` — plus a `GET
+/v1/code/agent-proxy/ca-cert` probe before *every* turn (CCR plumbing, not
+Messages, as §5.5 ¶8 already read once). This is a live confirmation of
+§1.3's code reading from the outside, on a fifth variable §5.5 ¶8 did not
+yet have a name for. It reproduces on this box with `env -i` retained: only
+`HOME`, `CLAUDE_CONFIG_DIR`, `PATH`, `DISABLE_AUTOUPDATER=1`,
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`, `ANTHROPIC_BASE_URL`,
+`ANTHROPIC_API_KEY`. That run is the one this addendum's fixtures and
+findings are drawn from: it sent `x-api-key` (not `Authorization`), no
+`oauth-2025-04-20` / `extended-cache-ttl-2025-04-11`, no remote-container
+headers, and no `ca-cert` probe on either turn — the cleared-env shape §5.6
+fixtures were captured under. **Two auth surfaces are now on record for this
+dialect**: cleared-env API-key (`x-api-key`, this addendum's fixtures) and
+CCR-ambient managed-OAuth (`Authorization: Bearer sk-ant-oat…`, the two
+extra betas, the two remote headers) — a third, a bare non-CCR subscription
+login, is predicted by §1.3's read to land on the `Authorization` + OAuth-
+beta shape *without* the CCR-specific headers or probe, but was not
+attempted (no real login was touched, per the task's constraint).
+
+### Field-by-field drift vs. the 2.1.251 fixtures
+
+| field | 2.1.251 | 2.1.257 | blocking? |
+|---|---|---|---|
+| betas (turn 1) | `claude-code-20250219, context-1m-2025-08-07, interleaved-thinking-2025-05-14, thinking-token-count-2026-05-13, context-management-2025-06-27, prompt-caching-scope-2026-01-05, mid-conversation-system-2026-04-07, advisor-tool-2026-03-01, effort-2025-11-24, fallback-credit-2026-06-01` | identical minus `advisor-tool-2026-03-01`; order of the rest unchanged | No |
+| betas (turn 2) | same list minus `context-1m-2025-08-07` | same, also minus `advisor-tool-2026-03-01` | No |
+| `thinking` | `{"type":"adaptive","display":"omitted"}` | unchanged | No |
+| `output_config` | `{"effort":"high"}` | unchanged | No |
+| `max_tokens` | `64000` | unchanged | No |
+| model string | `claude-opus-5` | unchanged | No |
+| path + query | `POST /v1/messages?beta=true` | unchanged | No |
+| header set (cleared-env API-key) | 21 headers, `x-api-key` present, no `Authorization` | identical set and order | No |
+| header set (CCR-ambient) | not captured at 2.1.251 | `+x-claude-remote-container-id`, `+x-claude-remote-session-id`, `Authorization` replaces `x-api-key`, `+oauth-2025-04-20`, `+extended-cache-ttl-2025-04-11` | No — topology-conditional, not a version change; see isolation note |
+| `system` block structure | 3 blocks; block 0 uncached attribution (`cc_version=2.1.251.6bb`), blocks 1–2 cached | unchanged shape; `cc_version=2.1.257.1f2` (value only) | No |
+| model-identity line, turn 1→2 | `"...Opus 5 (1M context)."` → `"...Opus 5."` as `context-1m` drops between turns | same pattern, same trigger | No |
+| `messages` roles, turn 1 | `[user(list, 2 blocks), system(list, 1 block)]` | unchanged | No |
+| `messages` roles, turn 2 | `[user(list), system(str), assistant(list), user(list, 1 block w/ cache_control)]` — **4** items | `[user(list), system(str), assistant(list), user(str, no cache_control), system(list, 1 block, cache_control)]` — **5** items | **Yes** |
+| `metadata.user_id` | JSON-object string, `device_id`/`account_uuid`/`session_id`, `session_id` = header | unchanged shape and correspondence | No |
+| `context_management` | `{"edits":[{"type":"clear_thinking_20251015","keep":"all"}]}` | unchanged | No |
+| `count_tokens` calls | never, single non-interactive turns | still never (checked against `mock.log`: only `POST /v1/messages?beta=true` and, in the contaminated run only, `GET .../ca-cert`) | No |
+
+### The one blocking finding: a new trailing `system` message on `--continue`, and the cache breakpoint moved with it
+
+At 2.1.251, turn 2's new user turn (`"and again"`) was itself the last
+`messages` item: a one-block list carrying the `cache_control` breakpoint.
+At 2.1.257, replaying the **identical two prompts**, that user turn is a
+**bare string** (`"and again"`, no `cache_control` possible on a string
+container) and is followed by a **new, fifth message**:
+
+```json
+{
+  "role": "system",
+  "content": [
+    {
+      "type": "text",
+      "text": "<total_tokens>15000000 tokens left</total_tokens>",
+      "cache_control": { "type": "ephemeral" }
+    }
+  ]
+}
+```
+
+— i.e. the `cache_control` breakpoint moved off the user turn and onto this
+new trailing system-role message, under the same
+`mid-conversation-system-2026-04-07` beta the existing skills/agent-types
+reminder already used. `15000000` matches the default context-tracking
+budget this same CLI reports at the very start of a fresh session (confirmed
+by inspection, not asserted from a single coincidence: it is a per-CLI
+constant, not per-conversation state, since this subprocess's isolated
+`HOME`/`CLAUDE_CONFIG_DIR` had no prior history to derive a budget from).
+
+Driven through the real `wire::canonicalize` (never modified — the fixture
+files were swapped in place, tests run, then reverted; see below), this
+changes the canonicalized item count `the_shipping_clients_two_turns_are_
+one_conversation_but_for_the_prompt_it_changed` asserts on: the test expects
+`second.len() == first.len() + 2` ("the answer and the new question"); the
+captured 2.1.257 turn 2 yields `first.len() + 3` (`left: 9, right: 8`) —
+**the new trailing system message is a third new item**, not folded into
+either of the two the pinned test already accounts for. A serve surface
+built strictly to the 2.1.251 shape does not *refuse* this request (nothing
+here closes an enum or rejects an unknown field — the new item is still an
+ordinary `role: "system"` message, which M11.1's review already forced this
+surface to accept as `Role::System`), but it **silently miscounts** what a
+`--continue` turn appends: any accounting, budget, or prefix-verification
+logic written against "`--continue` always adds exactly two items" undercounts
+by one on every second-and-later turn of the current client line. That is
+the practical blocking-ness: not a 422, a silent drift in what "the new
+turn" means.
+
+Two readings of *why* are both consistent with this evidence and neither is
+settled by it: (a) genuinely new in 2.1.257 — the token-budget reminder was
+added as its own system-role message between .251 and .257; or (b) present
+already at 2.1.251 but conditioned on total context size or turn count in a
+way the .251 capture's shorter system prompt (24 tools vs. this rig's 21,
+see below) never crossed. The apples-to-apples prompts argue for (a), but
+this dive did not get a byte-identical-environment 2.1.251 binary to test
+against, so it cannot rule out (b).
+
+### Two confounds worth naming so they are never read as drift
+
+1. **Tool count, 21 vs. 24.** `count_tokens_counts_the_declared_toolbox`,
+   `the_clients_tool_definitions_reach_the_dispatch_verbatim`, and two others
+   fail on `left: Some(21), right: Some(24)`. Diffing the two fixtures' tool
+   name lists directly: the 2.1.257 capture is missing exactly `DesignSync`,
+   `Monitor`, `PushNotification` and has nothing the 2.1.251 list lacks —
+   these are Cowork/interactive-surface tools this rig's plain `-p`
+   invocation never declared, not tools the 2.1.257 binary dropped. Not
+   evidence of client drift.
+2. **Hardcoded session UUID in three F7 tests.** Substituting the fixture
+   files under the *same* 2.1.251 filenames necessarily changes the
+   `session_id` UUID inside them (this capture's is
+   `c0cb70b6-938b-4cbb-a8e8-1b8a60b7c4d8`, not `e13acbde-…`), but
+   `f7_the_live_continue_pair_continues_across_ordinary_system_volatility`,
+   its control, and `the_captured_client_body_is_served_as_a_conformant_
+   stream` all look up the store by the literal 2.1.251 session id compiled
+   into the test. Every one of those three fails `stored_items`'s
+   `.expect("the session exists")` with `SessionNotFound` — an artifact of
+   substituting fixture *content* under a test that also hardcodes a value
+   *from* that content, not a serve-surface refusal. A real fixture refresh
+   (editing the `.rs`, out of scope here) would update the literal.
+
+### Deliverable 3: running the pinning suite against the current line
+
+Per the task's method: backed up the three `claude-2.1.251-*.json` files,
+overwrote them in place with this addendum's 2.1.257 captures (same
+filenames — `messages_api_surface.rs`'s `include_str!` at
+`tests/messages_api_surface.rs:85-86` embeds by path, unedited), ran
+`timeout 300 cargo test -p roundhouse-server --test messages_api_surface`,
+then restored the originals from the scratchpad backup (`git diff --stat`
+on the three fixture paths and on the `.rs` file is empty afterward — the
+substitution left no trace).
+
+Result: **36 passed, 9 failed.** Of the 9: 1 is the real finding above
+(`the_shipping_clients_two_turns_are_one_conversation_but_for_the_prompt_it_
+changed`, `left: 9, right: 8`); 4 are the tool-count confound; 3 are the
+session-UUID confound (which two of them reach only via the cascading
+`SessionNotFound` inside `f7_the_live_continue_pair_…`'s own three-turn
+sequence, `f7_control_…`, and the F4-live stream test); 1
+(`the_shipping_clients_body_becomes_the_prefix_it_will_be_checked_against`)
+fails only on the test's literal `cc_version=2.1.251` prefix string — the
+attribution block's *shape* (block 0, uncached, first) is unchanged, only
+the version number in its text moved, exactly as expected. No test failed
+on a rejected request, a parse error, or a 422 — the serve surface's
+*acceptance* of the current client line is intact; only the one item-count
+assertion is stale, and only because the client's own shape moved.
+
+**No other addendum is warranted**: every field not named above (`thinking`,
+`output_config`, `max_tokens`, model string, path, `context_management`,
+`metadata.user_id`'s shape, the attribution block's position and cache
+policy, turn 1's message shape) re-verified identical to §5.6, four days and
+six patch versions later.
+
+### 5.7.1 Three-turn follow-up (2026-09-01)
+
+Extended the §5.7 rig to a third turn — `-p "say hi"`, `--continue -p "and
+again"`, `--continue -p "once more"` — under the same isolation (`env -i`
+with only `HOME`, `CLAUDE_CONFIG_DIR`, `PATH`, `DISABLE_AUTOUPDATER=1`,
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`, `ANTHROPIC_BASE_URL`,
+`ANTHROPIC_API_KEY`), same binary (2.1.257). Raw captures in the session
+scratchpad (`capture3/req-00{1,2,3}.json`); not committed as fixtures — this
+is a follow-up read, not a new pinning-suite input.
+
+**Turn 1:** two `messages` items (`user` list, `system` list — the
+skills/agent-types reminder), no trailing `<total_tokens>` notice at all.
+
+**Turn 2:** five items, as §5.7 already read — the notice is a trailing
+`role: "system"` message, `content` a one-block list, text
+`<total_tokens>15000000 tokens left</total_tokens>`, carrying the
+`cache_control: {"type":"ephemeral"}` breakpoint.
+
+**Turn 3:** eight items. Turn 2's notice **is** present in the resent
+history, at the same index (position 4, immediately after the resent
+`"and again"` user turn) and with byte-identical text — `15000000`
+unchanged. But its container is not byte-identical: it is re-serialized
+from a one-block list with `cache_control` down to a **bare string**
+(`content: "<total_tokens>15000000 tokens left</total_tokens>"`, no
+`cache_control` field at all — a string container cannot carry one). This
+is the same flattening §5.7 already documented for the *user* turn
+(turn 2's `"and again"` arrives at turn 3 as a bare string too, having been
+a one-block list with the breakpoint when it was the newest turn). A
+**fresh** trailing system message, identical in text and shape to turn 2's,
+is appended at the new end of the list (index 7) — list container, one text
+block, same text, the `cache_control` breakpoint moved onto it. So the
+pattern is not "notice dropped from history, new one appended" but "the
+previous turn's cache-breakpoint-bearing item (user turn or notice alike)
+is flattened to a plain string in place, and a new notice is appended
+carrying the breakpoint forward" — one new `messages` item per turn, not a
+history rewrite.
+
+**Value stability probe:** re-ran the same three turns against a modified
+rig that reports `usage.output_tokens: 5000` (vs. the default `1`) in turn
+2's `message_delta` SSE event, everything else unchanged
+(`capture3-variant/req-00{1,2,3}.json`). Turn 3's notice — both the resent
+turn-2 copy and the fresh trailing one — still reads `15000000`, byte-for-byte
+identical to the unmodified run. **N did not move.** This is consistent
+with §5.7's reading that `15000000` is a per-CLI constant (the context-
+tracking budget reported at the start of a fresh session) rather than a
+figure derived from the `usage` numbers a server reports back — at minimum,
+it does not track `message_delta.usage.output_tokens` the way a running
+context-consumption counter would have to. Not tested: whether it tracks
+`message_start.usage.input_tokens`, a locally-computed token count of the
+request body itself, or nothing at all within a single CLI process
+lifetime — only the one field the rig controls was varied.
+
+### 5.7.2 Ruling pointer (2026-09-01)
+
+The "undercounts by one" paragraph in §5.7 describes the surface *before*
+M11.2b. `../PLAN-anthropic-messages.md`'s 2026-09-01 addendum (R-A) rules
+the trailing notice an ephemeral client artifact that `wire::canonicalize`
+drops in either container, so a `--continue` contributes exactly two items
+on both client lines and nothing downstream ever counts the notice. §5.7.1's
+three-turn capture is the evidence that ruling rests on; the cleared-env
+isolation it insists on became the e2e suite's `env_clear` guard.
+
 ## 6. Open questions — decisions this evidence does not make
 
 1. **Key prefix admission on the header or on `metadata.user_id`?** The header is

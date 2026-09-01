@@ -788,3 +788,426 @@ better.
    establish is that "depend on Relay's Anthropic types" is not an option at
    all, because there are no such types: there is a codec in the heavy core, and
    the standing dependency rule already excludes it.
+
+---
+
+## Addendum (2026-09-01): 0.8.2 as published — the chained-topology re-read
+
+**Status: evidence base, re-read.** `agent-docs/PLAN-anthropic-messages.md` R9
+requires the then-current Relay release to be re-read before chained-topology
+work begins. This addendum re-derives R7's hazards 1–5 and the launcher/pin
+questions against the **published crates.io tarballs of Relay 0.8.2**, diffed
+byte-for-byte against the 0.8.0 tarballs §0–§6 above already established. Same
+discipline: evidence only, no rulings; where a call could go two ways it is
+stated both ways and stopped.
+
+**Sources, pinned.** NVIDIA's GitHub repos remain unreachable from this
+environment; `crates.io`'s JSON API also returned nothing over the configured
+proxy (empty body, no error) — only `static.crates.io` tarball downloads
+worked, so provenance below is `sha256` plus the CDN's `Last-Modified`
+response header rather than the registry API's `created_at` the 0.8.0 table
+used. Downloaded and extracted 2026-09-01 into
+`/tmp/claude-0/-home-user-roundhouse/d6addde3-2039-5f5e-8af5-d560d8c0b623/scratchpad/dl/`:
+
+| Crate | Version | `static.crates.io` `Last-Modified` | sha256 of tarball |
+|---|---|---|---|
+| `nemo-relay-cli` | 0.8.0 | Wed, 26 Aug 2026 22:49:22 GMT | `788335d0e0c0ef935b5618ad270de13916d88de4598bf2005f5277d7ca7174c6` |
+| `nemo-relay-cli` | 0.8.2 | Mon, 31 Aug 2026 20:42:29 GMT | `c7af6bac293a917cd7890b0b47eadfcdd62b8aeff58c4ce763db9ee681cec9ab` |
+| `nemo-relay` | 0.8.0 | Wed, 26 Aug 2026 22:49:11 GMT | `ada298ffbe51150d38eb8ee26a28b5b3c9d50dc69fa897ce6365a9e3396624e0` |
+| `nemo-relay` | 0.8.2 | Mon, 31 Aug 2026 20:42:17 GMT | `beb2f214f4cf08f54a3f78ec0e643b6746eb6dbd19af0c055ce41dd841048719` |
+| `nemo-relay-types` | 0.8.0 | Wed, 26 Aug 2026 22:49:01 GMT | `d72dc155be69eb9cc730441eed1dff1b326b51940bbf7feb1e788277d7b01f17` |
+| `nemo-relay-types` | 0.8.2 | Mon, 31 Aug 2026 20:42:06 GMT | `5f8b1e6d9cd664315dc441030fcc457cfd4c22ddf48b2e39c71be89f3be64008` |
+
+The 0.8.0 hashes match this document's original table exactly (§ header),
+confirming the same 0.8.0 artifact is the diff base. **0.8.2 is the newest
+published version of all three crates**: `static.crates.io` answers 200 for
+`nemo-relay-cli-0.8.1.crate`, `-0.8.1-rc.1.crate`, and `-0.8.2.crate`, and 403
+(the CDN's not-found status for this bucket, corroborated by
+`nemo-relay-switchyard-0.8.0.crate` also 403-ing against a crate independently
+known to be dead at 0.7.3, §5.4) for `-0.8.3.crate` and `-0.9.0.crate` — so
+there is no 0.8.3, no 0.8.1 final release note beyond what 0.8.2 carries, and
+no 0.9 line yet.
+
+Citations below are `<crate>-0.8.2/<path>:<line>` unless marked
+**[byte-identical to 0.8.0]**, in which case the 0.8.0 document's line numbers
+above apply unchanged (verified by `diff -u` returning empty output on the
+whole file, not just a hunk-free summary).
+
+### A.1 — Method: which files moved at all
+
+`diff -rq` of each crate's `src/` tree, 0.8.0 → 0.8.2:
+
+- **`nemo-relay-types`: zero files differ.** `diff -ru
+  nemo-relay-types-0.8.0/src nemo-relay-types-0.8.2/src` produces no output;
+  13 files both sides, same names. `Cargo.toml.orig` also diffs to nothing
+  except `version = "0.8.0"` → `"0.8.2"` (`diff -u
+  nemo-relay-types-{0.8.0,0.8.2}/Cargo.toml`, one line changed, no dependency
+  line touched).
+- **`nemo-relay` (core), 11 of ~140 files differ**: `config_editor.rs`,
+  `observability/{atif.rs,atof.rs,mod.rs,otel.rs,plugin_component.rs}` plus
+  two new files (`observability/confined_fs.rs`, `observability/private_file.rs`),
+  `plugin.rs`, `plugin/dynamic/{native.rs,worker.rs}`. **`src/codec/` — the
+  entire Anthropic codec directory — has zero diffs**: `diff -ru
+  nemo-relay-0.8.0/src/codec nemo-relay-0.8.2/src/codec` is empty, confirmed
+  file-by-file (`anthropic.rs`, `streaming.rs`, `mod.rs` each `diff -u` exit
+  0).
+- **`nemo-relay-cli`, 34 of ~110 files differ** (full list captured in the
+  scratchpad `diff -rq` output). Relevant to hazards 1–5: `gateway/mod.rs`,
+  `gateway/routes.rs`, `agents/claude/host.rs`, `agents/claude/mod.rs`,
+  `agents/codex/mod.rs`, `agents/codex/alignment.rs`, `process/launcher.rs`,
+  `process/prepared.rs`, `commands/serve.rs`, `commands/run.rs`,
+  `gateway/request.rs` — **all byte-identical** (`diff -u` exit 0 on each,
+  individually confirmed, not inferred from the `-rq` omission alone). What
+  *did* change in the cli crate: `configuration/mod.rs`, `provider_auth.rs`,
+  `agents/claude/launch.rs`, `agents/claude/adapter.rs`,
+  `agents/codex/adapter.rs`, `agents/mod.rs`, `agents/shared/{adapters,alignment}.rs`,
+  `bootstrap/{mod,state}.rs`, `commands/{diagnostics,install,logging,mod,root}.rs`
+  plus two new files (`commands/gateway.rs`, `commands/integrations.rs`),
+  `configuration/logging.rs`, `gateway/client.rs`, `hooks/delivery.rs`,
+  `installation/**`, `mcp/mod.rs`, `mcp_environment.rs`, `plugins/**`,
+  `server/mod.rs`, `sessions/**`.
+
+### A.2 — Hazard 1: the alphabetizing `serde_json::Map` re-encode
+
+**Unchanged.** `reencode_request_body` (`gateway/mod.rs:927-946`, function
+body identical to the 0.8.0 doc's `:926-946` citation — the file is
+byte-identical, confirmed by `diff -u nemo-relay-cli-0.8.0/src/gateway/mod.rs
+nemo-relay-cli-0.8.2/src/gateway/mod.rs` returning no output) still
+`serde_json::to_vec`-serializes `request.content` whenever an intercept
+produced non-null content. Both crates' `Cargo.toml` still declare
+`serde_json = "1"` with **no features** — `grep -n
+'serde_json\|preserve_order'` over `nemo-relay-0.8.2/Cargo.toml` and
+`nemo-relay-cli-0.8.2/Cargo.toml` shows only the bare `version = "1"` line
+each side, `preserve_order` absent, and a `diff -u` of the 0.8.0→0.8.2
+`Cargo.toml`s shows no change to either `serde_json` stanza. So `serde_json`'s
+default `Map` (`BTreeMap`-backed, alphabetizing) is still what a rewrite
+serializes through at 0.8.2. **[byte-identical to 0.8.0]**
+
+### A.3 — Hazard 2: the SSE re-encoder drops `id:` lines
+
+**Unchanged.** `nemo-relay-0.8.2/src/codec/streaming.rs` is byte-identical to
+0.8.0's (`diff -u`, exit 0) — the decoder comment *"Other lines (`id:`,
+`retry:`, comments starting with `:`) are ignored"* and the frame-drop-on-no-
+`data:` logic stand at the same lines the 0.8.0 document cites
+(`streaming.rs:182-198`, `:196-198`). `gateway/mod.rs`'s `sse_json_stream`
+(`:605-635`) and `encode_sse_frame` (`:780-793`) are likewise byte-identical.
+**[byte-identical to 0.8.0]**
+
+### A.4 — Hazard 3: `?beta=true` survival through `upstream_url` concatenation
+
+**Unchanged — and now traced end to end, not just at the concatenation
+site.** `nemo-relay-cli-0.8.2/src/gateway/routes.rs` is byte-identical to
+0.8.0's: `upstream_url` (`:111-126`) and `upstream_url_with_base`
+(`:141-151`) are the same functions at the same lines. `upstream_url_with_base`
+trims a trailing slash off `base` and, for the `_ =>` arm covering
+`AnthropicMessages | AnthropicCountTokens`, passes `path_and_query` through
+untouched (`routes.rs:143-149`) before `format!("{base}{path_and_query}")`
+(`:150`) — no query-string handling separate from the path at all; whatever
+Axum captured as `path_and_query()` is one string throughout. Upstream of
+that, `nemo-relay-cli-0.8.2/src/gateway/request.rs` is byte-identical to
+0.8.0's and calls `.path_and_query()` (`:60`) on the inbound `Uri` to build
+that string in the first place — so a client request to
+`/v1/messages?beta=true` produces `path_and_query = "/v1/messages?beta=true"`,
+which reaches `upstream_url_with_base` whole and is concatenated whole. Since
+`request.rs`, `routes.rs`, and the caller in `gateway/mod.rs` (`:1279` also
+calls `.path_and_query()`, likewise byte-identical) are all unchanged files,
+this was already true at 0.8.0 and remains true at 0.8.2, now confirmed by
+tracing the string from extraction to concatenation rather than reading the
+concatenation function alone. **[byte-identical to 0.8.0]**
+
+### A.5 — Hazard 4: `anthropic_auth_header` cleared on a layer-inconsistent base-URL change
+
+**Unchanged.** `configuration/mod.rs` *did* change between 0.8.0 and 0.8.2 (a
+123-line diff — new `NEMO_RELAY_TEST_SKIP_IMPLICIT_CONFIG_ENV`/`__skip-implicit-config`
+test-only config-search-path override, and a new `HOOK_CLIENT_TOKEN_*`
+HMAC-identity mechanism unrelated to upstream configuration), but the diff
+touches nothing in `replace_upstream_base_url` or `validate_auth_header`. The
+function itself, now at `nemo-relay-cli-0.8.2/src/configuration/mod.rs:1672-1681`
+(shifted from 0.8.0's `:1621-1630` by the unrelated additions earlier in the
+file), reads:
+
+```rust
+fn replace_upstream_base_url(
+    base_url: &mut String,
+    auth_header: &mut Option<String>,
+    replacement: String,
+) {
+    if *base_url != replacement {
+        *auth_header = None;
+    }
+    *base_url = replacement;
+}
+```
+
+— textually identical body to the 0.8.0 citation. Both the CLI-flag call site
+(`:1053-1056`, was `:1053-1055`ish at 0.8.0 lines cited generically) and the
+env-var call site (`:1647-1657`) still route through it; `validate_auth_header`
+(`:1683-1691`) is unchanged (trims, rejects empty, requires
+`HeaderValue::from_str`; still no base-URL validation of any kind). The
+top-level `--anthropic-base-url` flag's home files, `commands/serve.rs` and
+`commands/run.rs`, are byte-identical to 0.8.0. So: a chained deployment must
+still set `anthropic_base_url` and `anthropic_auth_header` in the same
+config layer at 0.8.2, unchanged from the 0.8.0 finding.
+
+### A.6 — Hazard 5: a plugin dispatch-override strips provider credentials before redirecting
+
+**Unchanged, and now paired with a new (unrelated) credential-identity
+helper.** `gateway/mod.rs` is byte-identical to 0.8.0: `INTERNAL_DISPATCH_URL_HEADER`
+/ `INTERNAL_DISPATCH_ROUTE_HEADER` still at `:51-52`, `effective_dispatch_request`
+still at `:874-908` clearing `TargetCredentialPolicy::ExplicitTarget` via
+`remove_provider_credentials(&mut headers)` (`:888-899`), `dispatch_overrides`
+still at `:965-984`. `provider_auth.rs` *did* change, but purely additively:
+a new `pub(crate) fn identity(&self) -> String` on `TransparentProxyCredential`
+and a new free function `credential_identity(value: &str) -> String` (SHA-256
+hex digest, prefixed `sha256:`) — `provider_auth.rs:44-47,115-125` in 0.8.2 —
+neither of which touches `consume`, `TRANSPARENT_PROXY_CREDENTIAL_ENV/HEADER`,
+or `PROVIDER_API_KEY_HEADERS`, all unchanged at their 0.8.0 lines. This new
+identity helper is consumed by `server/mod.rs`'s new `authorize_hook_request`
+(§A.8) for hook-owner attribution, not by the dispatch-override path — the
+credential the override strips is still stripped the same way. Also unchanged:
+`codex/alignment.rs` (byte-identical — `strip_chatgpt_auth_for_openai_route`,
+`is_openai_route`, and the "Anthropic routes use a different auth scheme"
+comment all stand), and `agents/shared/alignment.rs`'s `gateway_upstream_url_override`
+delegation (that file did change, but only to add `authenticated_owner` tracking
+to `SessionAlias`/`PendingSubagentStart` for the same hook-authorization work
+in §A.8 — the Codex-only redirect guard itself is untouched).
+
+### A.7 — The `nemo-relay claude` subcommand, its injected surface, and the version gate
+
+**Exists, unchanged in name and position.** `commands/root.rs`'s `Commands`
+enum still carries `Claude(ClaudeCommand)` mapped to the string `"claude"`
+(`root.rs:123` region, unchanged lines around the enum — the diff to this file
+only adds two *new* sibling subcommands, `Gateway(GatewayCommand)` and
+`Integrations(IntegrationsCommand)`, described below).
+
+**Injected environment — every var, unchanged names and value shapes:**
+
+| Var | Value shape | Citation | Status |
+|---|---|---|---|
+| `NEMO_RELAY_GATEWAY_URL` | gateway base URL string | `process/launcher.rs:490` (via `configuration::GATEWAY_URL_ENV`) | byte-identical file |
+| `NEMO_RELAY_TRANSPARENT_RUN` | literal `"1"` | `process/launcher.rs:493` | byte-identical file |
+| `PATH` | hook-dir-prepended `$PATH`, only when the current exe is resolvable | `process/launcher.rs:501` | byte-identical file |
+| `NEMO_RELAY_PROXY_CREDENTIAL` | `nrp_` + 64 hex chars, secret | `provider_auth.rs:28-38` (`TransparentProxyCredential::generate`, unchanged), wired at `process/launcher.rs:484` | generator unchanged; call site unchanged |
+| `ANTHROPIC_CUSTOM_HEADERS` | `x-nemo-relay-proxy-token: nrp_…`, merged not overwritten via `replace_custom_header`, secret | `agents/claude/launch.rs:19-31,113-127` | unchanged logic |
+| `ANTHROPIC_BASE_URL` | gateway URL, set on `launch.env` **and** deep-merged into the synthesized Claude `--settings` JSON's `env` key (`settings_overlay`, `launch.rs:129-150`) | `agents/claude/launch.rs:46-48,93-95,145-148` | unchanged logic, same double-write |
+
+**Injected argv — one real change.** At 0.8.0, `--plugin-dir <tmp> --settings
+<tmp>/settings.json` were spliced as one contiguous block immediately after
+the host token via `insert_after_host`. At 0.8.2
+(`agents/claude/launch.rs:33-45,83-92,100-111`), the two flags are split:
+`--plugin-dir <tmp>` still goes immediately after the host token via
+`insert_after_host`, but `--settings <path>` is now placed by a **new**
+function, `insert_before_argument_boundary`, which finds the first bare `--`
+token after the host index (or the end of argv if none) and splices
+`["--settings", path]` there instead:
+
+```rust
+fn insert_before_argument_boundary(
+    argv: &mut Vec<String>,
+    host_index: usize,
+    values: impl IntoIterator<Item = String>,
+) {
+    let boundary = argv
+        .iter()
+        .skip(host_index + 1)
+        .position(|argument| argument == "--")
+        .map_or(argv.len(), |offset| host_index + 1 + offset);
+    argv.splice(boundary..boundary, values);
+}
+```
+
+Net effect: if the launch argv carries user-supplied flags between the host
+token and a `--` separator (e.g. `nemo-relay claude --dry-run -- --resume`),
+`--settings` now lands *after* those flags rather than immediately after
+`--plugin-dir`, while `--plugin-dir` itself does not move. **Two readings,
+stated both ways and stopped:** this could be read as a bug fix (some
+Claude-Code-side flag ordering requirement `--plugin-dir` must satisfy that
+`--settings` need not, or vice versa) or as an unrelated refactor with no
+externally visible effect (both flags still land before any `--`-delimited
+Claude-Code-native argv either way, so a well-formed launch's resulting
+`ClaudeCode` invocation is unchanged; only a launch with unusual intervening
+flags between the host token and `--` would see a different flag order). No
+comment in `launch.rs` or `prepared.rs` explains the split, and CHANGELOG/git
+history are not visible from this environment (§ sources note). Not one of
+R7's five named hazards, but relevant to "every env var / flag it injects" and
+worth a design read before M11.2's chained topology work assumes flag order.
+
+**Version gate — unchanged.** `agents/claude/mod.rs` is byte-identical to
+0.8.0 (`minimum_version: (2, 1, 121)`, `claude/mod.rs:21`). The check itself,
+`AgentDescriptor::validate_version_output` (`agents/mod.rs:87-105` — this
+region of `agents/mod.rs` is unchanged even though the file overall differs;
+the diff is confined to a new `include_local_install` parameter on
+`installed_integrations`, unrelated to version gating), still: takes the first
+line of `claude --version` output, strips via `claude::parse_version` (which
+itself strips the `" (Claude Code)"` suffix — `claude/mod.rs:40+`, unchanged),
+rejects if `version < minimum_version()` **or** `!version.pre.is_empty()`
+(pre-releases rejected outright, `:97`). Codex's gate
+(`codex/mod.rs:22`, `(0, 143, 0)`) is likewise byte-identical.
+
+**Config keys that aim Relay's Anthropic upstream — unchanged, same three
+layers.** `[upstream] anthropic_base_url` / `anthropic_auth_header` in
+`config.toml` (`configuration/mod.rs:76-77` struct fields, `:1349-1358`
+application — file changed elsewhere but not here, see §A.5); env
+`NEMO_RELAY_ANTHROPIC_BASE_URL` / `NEMO_RELAY_ANTHROPIC_AUTH_HEADER`
+(`:1647-1657`); CLI flag `--anthropic-base-url` on both `ServerArgs`
+(`commands/serve.rs`, byte-identical file) and `run` (`commands/run.rs`,
+byte-identical file). `nemo-relay config edit`'s upstream-editing menu lives
+in `commands/configure/editor/prompt.rs`, not in the 34-file diff list, so
+unchanged.
+
+**New at 0.8.2, adjacent to but not overlapping this surface:** two new
+subcommands, `nemo-relay gateway` (`commands/gateway.rs`, new file —
+"Manage the persistent shared Relay gateway") and `nemo-relay integrations`
+(`commands/integrations.rs`, new file — "Refresh Relay-managed coding-agent
+integrations after upgrading Relay"), both wired into `root.rs`'s `Commands`
+enum alongside the unchanged `claude`/`codex`/`config`/etc. Neither touches
+the ephemeral `nemo-relay claude` launch path read above.
+
+### A.8 — Unrelated but load-bearing-looking: a new hook-request authorization gate
+
+Not asked for, but surfaced by the `server/mod.rs` diff and worth flagging
+because it changes what a chained deployment's hook traffic must present.
+0.8.2 adds `AppState::authorize_hook_request` (`server/mod.rs:583-632`),
+called from both `codex_hook` and `claude_code_hook` before payload
+processing. It rejects any hook request carrying an `Origin` header outright
+("browser-originated Relay hook requests are not accepted"), then requires
+either the transparent proxy credential header or a `BOOTSTRAP_CLIENT_TOKEN_HEADER`
+HMAC-verified via a **new** `HOOK_CLIENT_TOKEN_HEADER` / `hook_client_token`
+mechanism (`configuration/mod.rs:564-574`, new `HmacKey` methods) to resolve a
+stable `owner` identity string, which then flows into a new
+`apply_authenticated_events`/`authorize_tool_permission` path and a new
+`PermissionRequest` hook-event decision (allow/deny with reason) that 0.8.0
+did not have. This is orthogonal to R7 (it is about *which agent process* may
+call the hook endpoints, not about the Anthropic gateway route), but a
+chained-topology design that spawns `nemo-relay claude` and expects the same
+hook wire-shape as 0.8.0 should know the hook handlers now gate on identity
+and can return a `deny` decision Claude Code's `PermissionRequest` hook must
+handle. Evidence only — whether this affects the chained topology's guard
+tests is a design question, not settled here.
+
+### A.9 — `nemo-relay-types` 0.8.2 and the `=0.7.3` pin's unlock condition
+
+**The unlock condition is not met, and the gap to 0.8.2 is now stronger
+evidence of zero-cost than the 0.8.0 finding was.** `nemo-relay-types-0.8.2/Cargo.toml`
+(the generated, post-normalization file) requires:
+
+```toml
+[dependencies.uuid]
+version = "=1.18.1"
+features = ["v7", "serde"]
+
+[dependencies.chrono]
+version = "0.4"
+features = ["std", "serde", "now"]
+default-features = false
+```
+
+— `uuid = "=1.18.1"` **exact**, unchanged from both 0.7.3 and 0.8.0.
+`chrono = "0.4"` caret, unchanged. **`nemo-relay-types` declares no `tokio`
+dependency at all, at either 0.8.0 or 0.8.2** — `grep -n tokio
+nemo-relay-types-0.8.2/Cargo.toml.orig nemo-relay-types-0.8.2/Cargo.toml`
+returns zero hits (exit 1) on both files. (Roundhouse's own `tokio` req is
+independent of this crate; the pin comment's uuid-ceiling discussion is the
+relevant one here, not a tokio one — this crate simply never asks for tokio.)
+
+**Stronger than "byte-identical fields":** `diff -ru nemo-relay-types-0.8.0/src
+nemo-relay-types-0.8.2/src` is empty — **the entire `src/` tree is
+byte-identical**, not just the seven items roundhouse imports. `Cargo.toml.orig`
+differs by exactly one line (`version = "0.8.0"` → `"0.8.2"`); no dependency,
+no feature, no test target changed. So the roundhouse pin comment's framing
+("cost of moving: zero code change, zero new transitive dependency") is, if
+anything, more strongly supported at 0.8.2 than it was at 0.8.0 — there is
+categorically nothing in the diff for roundhouse's seven call sites
+(`atof.rs:63-65,138,165,207`, `wire.rs:22`, `summary.rs:71-77`) to react to,
+because there is no diff in the crate at all. **The unlock condition itself —
+"a `nemo-relay-types` release that relaxes its own `=1.18.1` to a caret" —
+remains unmet.** `nemo-relay` (core)'s own dependency on `nemo-relay-types` is
+still a caret (`nemo-relay-0.8.2/Cargo.toml:143-144`: `version = "0.8.2"`, no
+`=`), so the exact pin is a `nemo-relay-types`-crate decision, not something
+downstream crates in the family impose.
+
+One count against the pin comment's now-stale text: it currently reads (in
+`crates/roundhouse-relay/Cargo.toml:57-62`) that the 2026-08-27 re-read
+verified 0.8.0's byte-identity and "the move stays zero-cost, the ceiling
+stays, and the trigger above is unchanged" — that sentence is still accurate
+as written (it was a statement about 0.8.0, and remains true of 0.8.0), but a
+reader in 2026-09 would benefit from a dated note that 0.8.2 was independently
+checked and found the same, per this addendum, since the manifest's own
+2026-08-27 addendum only speaks to 0.8.0. Not fixed here — CLAUDE.md
+prohibits modifying source under `crates/` from a research-evidence task; this
+is a ruling document's job.
+
+### A.10 — What else moved that R7/R8 should know about (surprises)
+
+Evidence only, unranked:
+
+1. **A loopback bind requirement is now enforced.** `server/mod.rs:92-97`
+   (new): `run_server` now returns `CliError::Config` if `config.bind` is not
+   a loopback address, for "explicit Relay gateways". Relevant to any chained
+   deployment that was binding the gateway on a non-loopback interface
+   (e.g. a container-network address) to let roundhouse reach it as a
+   downstream client on a different host/container.
+2. **ATOF file-sink output now writes through `private_file`'s restrictive
+   permissions**, not raw `std::fs::OpenOptions` — new module
+   `observability/private_file.rs` (and `confined_fs.rs`), wired into
+   `atof.rs`'s `open_file`/`create_dir_all` call sites. `ATOF_VERSION` remains
+   `"0.1"` (`nemo-relay-types-0.8.2/src/api/event.rs:36`, unchanged) and
+   `ATIF_SCHEMA_VERSION` remains `"ATIF-v1.7"` (`nemo-relay-0.8.2/src/observability/atif.rs:55`,
+   unchanged) — the wire schema this crate emits is unaffected; only how the
+   bytes hit disk changed.
+3. **`atif.rs`'s per-turn LLM-request stash changed shape** (`PendingAgentStep`
+   gained an `llm_request: Option<Json>` finalize parameter and a
+   `pending_llm_requests: HashMap<Uuid, Json>` replacing a single
+   `stash_llm_request` call) — internal to ATIF trajectory assembly for
+   concurrent/subagent turns; the *emitted* struct set (`AtifStep`,
+   `AtifTrajectory`, etc.) is unchanged in the diff, so this reads as an
+   internal correctness fix for interleaved requests rather than a schema
+   change. Not independently verified beyond the diff read.
+4. **New Cargo features gated `__`-prefixed** (`__skip-implicit-config`,
+   `__test-cli-port-override`) are test-only surface (config-search-path and
+   port-override escape hatches), not part of the public CLI/config contract;
+   named here only so a reader of the Cargo.toml diff does not mistake them
+   for user-facing knobs.
+5. **`nemo-relay-switchyard` re-confirmed dead**, independent of the 0.8.0
+   read's crates.io-API-based finding: `static.crates.io` answers 403 (this
+   CDN's not-found status, corroborated against known-absent version probes)
+   for `nemo-relay-switchyard-0.8.0.crate` through `-0.8.2.crate` and
+   `-0.9.0.crate`, while `-0.7.3.crate` answers 200. Same conclusion as §5.4,
+   reached without the registry API.
+
+### A.11 — Summary against R7's guard list
+
+| R7 item | 0.8.0 finding | 0.8.2 status |
+|---|---|---|
+| 1. Alphabetizing `Map` re-encode | Present, `serde_json` no `preserve_order` | **Unchanged** (§A.2) |
+| 2. SSE re-encoder drops `id:` | Present | **Unchanged** (§A.3) |
+| 3. `?beta=true` survival | Survives (no query handling) | **Unchanged, now traced end-to-end** (§A.4) |
+| 4. Auth header cleared on layer-inconsistent base change | Present | **Unchanged, function body reproduced verbatim** (§A.5) |
+| 5. Dispatch-override strips credentials | Present | **Unchanged**; new adjacent identity helper does not touch it (§A.6) |
+| 6. S3 originals (routing, attribution, one log) | Roundhouse-side, not Relay-side | Out of scope for this crate re-read |
+
+None of the five Relay-side hazards R7 names changed between 0.8.0 and 0.8.2.
+The new material this addendum surfaces — the hook-authorization gate (§A.8),
+the loopback-bind requirement (§A.10.1), and the `--settings` argv-placement
+change (§A.7) — are not among R7's five, but each is close enough to the
+chained-topology surface that M11.2's guard-test design should read them
+before assuming 0.8.0's launch/hook mechanics apply unmodified.
+   the standing dependency rule already excludes it.
+### A.12 — Observed, not read: what the gateway adds to the dispatched request (2026-09-01)
+
+§A.7 enumerates what `nemo-relay claude` injects into the *client* (env,
+argv). M11.2b's chained e2e suite recorded, at roundhouse's edge, what the
+gateway adds to the request it *dispatches* — eight headers no Direct
+capture carries: `traceparent`, `x-nemo-relay-agent-kind: claude-code`,
+`x-nemo-relay-identity-quality: native`, `x-nemo-relay-parent-scope-id`,
+`x-nemo-relay-request-id` (`relay-request-<uuid>`),
+`x-nemo-relay-root-scope-id`, `x-nemo-relay-session-id` (equal to the
+client's `x-claude-code-session-id`), `x-nemo-relay-source: gateway`,
+`x-nemo-relay-turn-id` (`1` on a first turn). Observed on every chained turn
+of claude 2.1.257 through nemo-relay 0.8.2 (`tests/claude_e2e.rs`, which now
+uses `x-nemo-relay-source` as its proof of hop). Not traced to source lines
+here; a design read that wants to rely on any of them should find the
+emitter first. Two readings, stated and stopped: `session-id`/`turn-id` are
+a correlation key roundhouse could adopt for the chained topology, or they
+are observability metadata whose stability across Relay releases nobody has
+promised.

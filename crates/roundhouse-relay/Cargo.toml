@@ -61,6 +61,12 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 # that 0.8.0 still pins `uuid = "=1.18.1"`, so the move stays zero-cost, the
 # ceiling stays, and the trigger above is unchanged.
 #
+# [2026-09-01: the M11.2b re-read (research/nemo-relay-0.8.0-published-read.md
+# Addendum 2026-09-01) covered 0.8.2, the release the Chained e2e suite ran
+# against. `nemo-relay-types` at 0.8.2 is byte-identical to 0.8.0 -- still
+# `uuid = "=1.18.1"` -- so the ceiling and the unlock condition above are
+# unchanged; this line stays `=0.7.3` on zero new evidence to move it.]
+#
 # `default-features = false` is cosmetic today (`default = []`) and states the
 # intent that `schema` stays off: we emit these types and never generate a
 # JSON-Schema from them, so `schemars` has no business in this build.

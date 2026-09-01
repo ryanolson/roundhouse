@@ -71,6 +71,18 @@ test-support = []
 # already turns on. See `tests/codex_e2e.rs` for the invocation.
 e2e-codex = []
 
+# Compiles `tests/claude_e2e.rs`, which drives a **real `claude` binary** against
+# a loopback rig on the Direct topology. Off by default and, like `e2e-codex`,
+# deliberately not added to the self-dev-dependency below: the suite spawns
+# processes, and a developer without `claude` on PATH — or a runner that must not
+# spawn one — gets a test binary with nothing in it rather than a failure to
+# explain. A second feature rather than a shared `e2e` one because the two suites
+# need two different binaries present, and one flag would make a box holding
+# either of them unable to run the suite for the one it has. See
+# `tests/claude_e2e.rs` for the invocation and for why the isolation it builds is
+# not optional here.
+e2e-claude = []
+
 [dev-dependencies]
 # `test-support` is the fixed-plane `PlaneSource` above: it exists so the six
 # pre-M8 integration binaries keep mounting the routers with the planes they

@@ -430,3 +430,172 @@ cadence. Stage briefs carry §3 verbatim.
    response-header prefix set is closed with no generic opt-in; staying
    unlabelled versus asking upstream for a row is a relationship question,
    not a code one.
+
+
+## Addendum (2026-09-01): M11.2b — the real client, on both topologies
+
+M11.2 was split on 2026-08-29 (§4): M11.2a shipped the tool loop end to
+end; this addendum records M11.2b, which drove a **real `claude` binary**
+against the surface on both topologies and closed the rung's empirical
+unknowns. Three pre-flight reads preceded the design, per R9's vigilance
+rule, and each moved something:
+
+- **Relay is at 0.8.2** (0.8.0 was the Dive B read; 0.8.1-rc.1 and 0.8.2
+  landed after). The delta read (`research/nemo-relay-0.8.0-published-read.md`,
+  addendum 2026-09-01) finds all five R7 hazards **holding byte-for-byte**
+  — the files carrying them did not change — and two surprises a chained
+  deployment must know: the gateway now **refuses a non-loopback bind**
+  (`server/mod.rs:92-97`), and a new hook-request authorization gate sits
+  in front of the coding-agent hook endpoints (§A.8). Neither touches the
+  Anthropic route. `nemo-relay-types` 0.8.2 is byte-identical to 0.8.0 and
+  still pins `uuid = "=1.18.1"`, so the `=0.7.3` pin's unlock condition is
+  unmet and the pin stands (R9; a dated note joins the manifest).
+- **The client line moved again.** The binary self-updated to 2.1.257 and
+  the re-capture (`research/claude-code-client-surface.md` §5.7, §5.7.1)
+  caught a second blocking shape: on every `--continue`, the client appends
+  a trailing `role: "system"` message carrying
+  `<total_tokens>N tokens left</total_tokens>` with the cache breakpoint on
+  it, after the new user turn (itself now a bare string). A three-turn
+  capture settled the mechanism: the notice is a **client-side counter
+  regenerated per request** — the prior turn's copy is resent flattened to
+  a bare string and a fresh one is appended, so the raw `messages` list grows
+  by three per turn while the conversation grows by two. Under the surface as
+  M11.1 left it the notice became an ordinary `System` item, and a resend
+  whose `N` had moved **forked the session** — pinned by a failing test
+  before the fix.
+- **The spec pin moved additively**: three new open-enum beta values and one
+  new path; every other vocabulary category byte-identical. Synced per the
+  `anthropic-spec-sync` skill (`research/anthropic-messages-wire-crates.md`,
+  addendum 2026-09-01); the new betas flow to the open arm.
+
+### The rulings, as carried in the stage briefs
+
+**R-A — ephemeral client notices are not log items.** The principle,
+stated precisely (the first draft cited the attribution block as "dropped",
+which it is not — it becomes a Developer item *loosely admitted* through
+F7's leading-run replacement): a client-rewritten item is either loosely
+admitted, when it leads and a run can be replaced, or dropped, when it
+trails and nothing downstream can replace it. The budget notice trails,
+so `wire::canonicalize` drops a system message whose entire content is
+exactly the `<total_tokens>…</total_tokens>` tag, in either container,
+anchored at both ends so the same tag inside the client's environment block
+(configuration, kept, covered by F7) and a user message quoting it are
+untouched. Cost, argued in the module doc: the model no longer sees the
+client's budget figure. Both client lines stay pinned — the 2.1.251
+fixtures as the prior line, the 2.1.257 fixtures (three turns) as the
+current one — and the pinned tests are parameterized over both rather than
+duplicated. §5.7's "undercounts by one" paragraph describes the pre-fix
+surface; its §5.7.2 pointer says so.
+
+**R-B — `claude_launch`, a pure generator beside `codex_launch`.**
+`crates/roundhouse-server/src/claude_launch.rs` (R8's library half; the
+binary is M11.3's). Output is an **environment map, never a file** — the
+Direct surface for Claude Code is `ANTHROPIC_BASE_URL` plus
+`ANTHROPIC_CUSTOM_HEADERS` carrying `<TURN_KEY_HEADER>: <key>` in the exact
+syntax §1.6 says the client parses — and the turn key is a `Secret` that no
+`Debug`/`Display` renders. Two auth kinds mirror `CodexAuthKind`:
+`RoundhouseKey` also sets `ANTHROPIC_API_KEY` to a fixed sentinel
+(`ROUNDHOUSE_API_KEY_SENTINEL`), the analog of writing `env_key` beside
+`requires_openai_auth = false`: it makes the client's auth resolution
+deterministic (§1.3) so an ambient login is never silently presented as if
+the operator had chosen forwarding. That obligated a serve-side change:
+`x-api-key` *is* a captured Anthropic seat at the edge
+(`control/credential/forwarded.rs`), so the sentinel is made inert by name
+and a test proves it is neither forwarded nor captured. `ForwardedClaudeLogin`
+sets base URL and turn key only, refuses each of §1.3's five suppressors by
+name, and returns the `must_be_unset` list M11.3's launcher enforces. One
+addition beyond the brief, accepted: the three cloud-provider selectors are
+refused under **both** kinds (`RedirectDefeated`), because `I7()` picks the
+provider before any credential resolves and a non-first-party provider never
+reads `ANTHROPIC_BASE_URL` — the sentinel would do its job and the client
+would still never arrive. Two documented, unreconciled limits: interactive
+mode prompts once before the key overrides a login; `CLAUDE_CODE_REMOTE=true`
+defeats the suppression outright (§5.7 — this box's own container presented
+its managed OAuth token until the environment was fully cleared). MCP wiring
+for Claude Code is deferred with open question 3.
+
+**R-C — the `e2e-claude` suite, the codex_e2e discipline verbatim.**
+`tests/claude_e2e.rs` behind `--features e2e-claude`,
+`ROUNDHOUSE_TEST_CLAUDE_BIN`, `--test-threads=1`, `VERIFIED_VERSION =
+"2.1.257"` printed with a mismatch warning, a missing binary a loud failure,
+`Command::env_clear()` then exactly the generated map plus the isolation set
+(a no-binary guard asserts key-set equality and goes red on one leaked
+`CLAUDE_CODE_REMOTE`). Real: the binary, the socket, the router over a
+production `ControlDirectory` with a minted key, the log, the prefix check,
+the tool the client chose to run. Scripted: the frontier. Against 2.1.257 it
+closes four claims only prose carried: a real client completes a prose turn
+through roundhouse; **a real agent executes a `tool_use` turn and its
+`tool_result` resend rejoins the same session** (M11.2a's loop, first
+real-binary evidence); three `-p`/`--continue` processes are one session
+with the notice never an item; and the seat-chain evidence block —
+`x-roundhouse-key` beside the inert sentinel on `x-api-key`, no
+`authorization`. The forwarded-login half remains the one-capture §1.3
+predicts (a bearer beside the turn key); no login exists here and none may
+be created for a rig.
+
+**R-D — Direct is the reference; Chained is supported with the guards
+instantiated, and the carrier is the client's own environment.** The brief
+first ruled the turn key onto Relay's `[upstream] anthropic_auth_header`;
+Core-B's source read overturned it: Relay injects that header **only when
+the inbound request carries no credential** (`gateway/mod.rs:1070-1078`,
+`already_authed`), forwards `x-api-key` untouched, **merges** its proxy token
+into `ANTHROPIC_CUSTOM_HEADERS` rather than replacing it, and strips no
+unknown header. So the same `claude_launch` map launched through
+`nemo-relay run --agent claude`, with `[upstream] anthropic_base_url` aimed
+at the deployment root and no auth header configured, lands the turn key on
+the dedicated header with Direct's exact semantics — one generator, two
+topologies. The upstream-layer carrier (`"Bearer <key>"`, same layer as the
+base URL — hazard 4 — credential-less client only, key-authed only) is the
+documented fallback. Hazards 1–3 already had unit guards from M11.1
+(`wire.rs`'s Relay-alphabetized resend, `emit.rs`'s no-`data:`-frame rule,
+the route ignoring `?beta=true`); M11.2b makes them real end to end. Hazards
+4 and 5 are documented refusals; resumption is not offered in-band on this
+surface (open question 4, closed for this rung: the emitter carries no SSE
+id and hazard 2 caps what one could carry).
+
+### The chained topology, run for real
+
+Through `nemo-relay` 0.8.2 built from the published crate, with claude
+2.1.257: **nine real-binary tests green on both topologies**. The chained
+launch is the Direct launch wrapped — a `Topology` enum threads one
+`build_child_command`, and a no-binary guard asserts the client's argv is
+byte-identical across topologies and the chained environment is the Direct
+one plus exactly Relay's four XDG state variables. At roundhouse's edge on a
+chained turn: the turn key on `x-roundhouse-key` (Relay's merge preserved
+it); `x-nemo-relay-source: gateway` (the proof of hop that makes every
+negative beside it non-vacuous); no `x-nemo-relay-proxy-token`; `?beta=true`
+intact (hazard 3, now observed rather than argued from source); the sentinel
+on `x-api-key` and not captured as a seat. A `--continue` through the
+alphabetizing re-encoder lands in the same session (hazard 1, now on the
+wire). Two mutations proved the guards load-bearing — a trailing `/v1` on
+Relay's upstream base URL and a bypass of Relay both went red. One claim
+stays source-cited: that the client presented Relay's own token to Relay's
+gateway — nothing in-repo observes Relay's inbound side, and a recorder in
+front of Relay is a fourth process for one claim.
+
+Relay's gateway adds eight headers to the dispatched request that no Direct
+capture carries (`research/nemo-relay-0.8.0-published-read.md` §A.12):
+`traceparent` and `x-nemo-relay-{agent-kind, identity-quality,
+parent-scope-id, request-id, root-scope-id, session-id, source, turn-id}`,
+with `session-id` equal to the client's `x-claude-code-session-id`. That is
+a session and turn identity Relay asserts and roundhouse ignores — recorded
+as a correlation opportunity for a later rung, not acted on here.
+
+**The cadence, honestly.** The implementation workflow's Refute stage was
+blocked by disk exhaustion (the full-workspace build filled the box) and
+never mutated anything; the Fix stage freed the disk and re-ran every touched
+suite green with real binaries on both topologies. The eight-mutation
+adversarial pass was re-run as its own workflow before this commit, and its
+rulings are in the commit message.
+
+### What M11.2b leaves
+
+- **M11.3 (`topham`)** consumes `ClaudeEnv::vars()` and `must_be_unset`
+  verbatim; the launcher, not the generator, owns argv, the interactive
+  approval caveat, and the Relay handoff.
+- The forwarded-login capture on a real subscription (R4's UNVERIFIED link)
+  is now a one-command test on any operator box with a login; the suite's
+  evidence block is where it prints.
+- Whether `N` in the budget notice ever tracks server-reported usage is
+  under-determined (§5.7.1 varied only `output_tokens`); the drop rule is
+  indifferent to it, which is why it was not chased.

@@ -459,3 +459,69 @@ contradiction dissolves into a route-property hypothesis M7 tests
 (Switchyard's launcher sets it conditionally on auth mode); and a
 version-identity rule binds every pre-1.0 adoption to a git rev, never a
 version or tag.
+
+
+## Addendum (2026-09-01): Relay 0.8.2, and S3's chain guards instantiated for the Anthropic surface
+
+`PLAN-anthropic-messages.md`'s R9 requires the then-current Relay release to
+be re-read before any chained-topology work. Relay published 0.8.1-rc.1 on
+2026-08-27 and **0.8.2** since; the delta read against the 0.8.0 tarballs is
+`research/nemo-relay-0.8.0-published-read.md`'s 2026-09-01 addendum, and its
+findings map into this ruling as follows.
+
+**The five Anthropic hazards R7 pinned all hold at 0.8.2**, byte-for-byte:
+the alphabetizing `serde_json::Map` re-encode, the SSE re-encoder dropping
+`id:` lines, `?beta=true` passing through `upstream_url` untouched, a
+configured `anthropic_auth_header` cleared on a layer-inconsistent base-URL
+change, and the plugin dispatch-override stripping provider credentials. The
+files carrying them did not change; where a file did change, the function
+did not.
+
+**S3's four guards, instantiated for `/v1/messages` (M11.2b):**
+
+1. *Roundhouse as the upstream, no routing around us.* `[upstream]
+   anthropic_base_url` is the whole aim; the `alignment.rs` ChatGPT redirect
+   is OpenAI-route only and the Anthropic arm has no analog. The real-Relay
+   e2e asserts that the request Relay forwards arrives at roundhouse at all.
+2. *Which credential actually went upstream.* Settled differently from the
+   codex case, and the difference is the ruling: Relay's `already_authed`
+   short-circuit means a configured upstream auth header is injected only
+   for a credential-less client, and its proxy token is **merged** into the
+   client's `ANTHROPIC_CUSTOM_HEADERS`, not substituted for it. So the turn
+   key rides the client's own environment through Relay onto the dedicated
+   header, Relay's `x-nemo-relay-proxy-token` is consumed at its gateway and
+   never reaches roundhouse, and chained turns carry exactly Direct's
+   attribution. The upstream-layer carrier is the documented fallback for a
+   credential-less client and is key-authed only.
+3. *Prefix admission survives the re-encode.* M11.1's `wire.rs` guard
+   (a Relay-alphabetized resend canonicalizes to the same items) made it a
+   fact at the unit seam; M11.2b's `--continue` through a real Relay makes
+   it a fact on the wire.
+4. *One authoritative accounting log.* Unchanged; Relay's ATOF stream is
+   observability. Relay's SSE re-encoder drops `id:` lines, which is one of
+   the two reasons this surface offers no in-band resumption cursor.
+
+**Two 0.8.2 changes a chained deployment must know**, neither on the
+Anthropic route: the gateway **refuses a non-loopback bind**
+(`server/mod.rs:92-97`) — a Relay reached from another container cannot be
+stood up as 0.8.0 allowed — and a hook-request authorization gate now fronts
+the coding-agent hook endpoints (§A.8), which only matters to Relay's own
+hooks. One argv change (§A.7): `--settings` is now spliced before the first
+bare `--` rather than beside `--plugin-dir`; a well-formed launch is
+unaffected.
+
+**Pins.** `nemo-relay-types` 0.8.2 is byte-identical to 0.8.0 and still pins
+`uuid = "=1.18.1"`; the `=0.7.3` pin and its written unlock condition stand,
+with a dated note in the manifest. Moving would cost nothing and free
+nothing.
+
+**Run for real (M11.2b).** The chained suite drives claude 2.1.257 through
+a `nemo-relay` 0.8.2 built from the published crate and asserts at
+roundhouse's edge: turn key on the dedicated header, `x-nemo-relay-source:
+gateway`, no Relay proxy token, `?beta=true` intact, sentinel not a seat,
+and a `--continue` through the re-encoder in the same session. Guards 1–3
+above are therefore observed, not argued. One more fact for a later rung:
+Relay's gateway stamps eight identity headers onto the dispatched request
+(`traceparent`, `x-nemo-relay-{agent-kind, identity-quality,
+parent-scope-id, request-id, root-scope-id, session-id, source, turn-id}`);
+roundhouse ignores them today, and a correlation ruling would start there.

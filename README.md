@@ -41,8 +41,9 @@ features — the first is what makes the second possible.
 > Not built: the WebSocket and gRPC transports, and resuming an interrupted
 > generation from the partial output already durable in the log. Metrics are
 > per-process. Two things the M9 addendum defers by name: there is no
-> operator entry point that *produces* the generated Codex config (it is a
-> library function), and the MCP surface still ignores the `_meta.threadId`
+> operator entry point that *produces* the generated launch configuration for
+> either client (Codex's files and Claude Code's environment map are both
+> library functions), and the MCP surface still ignores the `_meta.threadId`
 > a Codex client sends on every `tools/call`.
 
 Roundhouse depends on Dynamo but is not part of it. It pins two Dynamo crates
@@ -66,7 +67,7 @@ crates.io, the pin becomes a plain version.
 | `roundhouse-mcp` | The control surface as an MCP server: eight tools, overlays that only narrow, and one file that knows what JSON-RPC is |
 | `roundhouse-relay` | NeMo Relay's published formats — ATOF events, ATIF v1.7 trajectories, `LlmOptimizationSummary` — produced from the same session log |
 | `roundhouse-store-redis` | Redis Streams `SessionStore` and spend ledger: entry id == seq, `PX` lease on the Redis clock, fenced appends via Lua. Selected by `ROUNDHOUSE_REDIS_URL`; absent means in-memory sessions and spend that die with the process |
-| `roundhouse-server` | Turn engine and seven surfaces over one log — native HTTP/SSE, the OpenAI Responses API at `/v1/responses`, the Anthropic Messages API at `/v1/messages`, the MCP mount at `/mcp`, the admin REST plane under `/v1/admin`, `/v1/metrics` and its dashboard, and Relay's three session reads — plus `codex_launch`, which writes the config a client reads, and the binary |
+| `roundhouse-server` | Turn engine and seven surfaces over one log — native HTTP/SSE, the OpenAI Responses API at `/v1/responses`, the Anthropic Messages API at `/v1/messages`, the MCP mount at `/mcp`, the admin REST plane under `/v1/admin`, `/v1/metrics` and its dashboard, and Relay's three session reads — plus `codex_launch` and `claude_launch`, which produce the configuration each client reads, and the binary |
 
 ## Design
 
@@ -529,6 +530,71 @@ knowing any of it is happening.
 
 ## Hooking up Claude Code
 
+`POST /v1/messages` is the Anthropic Messages surface over the same log, and
+`roundhouse_server::claude_launch` is `codex_launch`'s sibling for the client
+that speaks it. Two things about it are different, and both are facts about the
+client rather than choices:
+
+- **It writes no file.** Claude Code's whole redirect surface is environment —
+  `ANTHROPIC_BASE_URL`, read by its vendored SDK, and `ANTHROPIC_CUSTOM_HEADERS`,
+  a newline-separated `Name: Value` block merged *after* the SDK's own auth
+  headers — so the output is an environment map and there is no settings overlay
+  beside it.
+- **The base URL is the deployment root, not the API prefix.** The SDK appends
+  `/v1/messages` itself. A value that already carries the prefix is refused by
+  name, which is the exact inverse of the codex generator's refusal and for the
+  same reason: each client's constructor refuses the shape *its* client cannot
+  use.
+
+The turn key therefore rides the map rather than a variable *name* the way the
+codex config does, because `ANTHROPIC_CUSTOM_HEADERS` offers no indirection. The
+"secrets ride env only, never a file" rule is kept by the types instead: the key
+is held as a redacting `Secret`, the rendered map has no `Serialize` and no
+`Display`, and one documented seam yields plaintext to whatever spawns the
+process.
+
+- **`ClaudeAuthKind::RoundhouseKey`** sets `ANTHROPIC_API_KEY` to a roundhouse
+  sentinel, the analogue of writing `env_key` beside `requires_openai_auth =
+  false`. A subscription login is suppressed only when one of five inputs
+  resolves, and `ANTHROPIC_BASE_URL` is not one of them — so an empty variable
+  means a logged-in user's OAuth bearer is presented to *our* base URL, with no
+  host check anywhere on the client's inference path. Two limits are recorded
+  rather than reconciled: interactive mode prompts once before the key overrides
+  a subscription, and `CLAUDE_CODE_REMOTE=true` defeats the suppression entirely,
+  so a launch inside a Claude Code Remote container forwards a login whatever it
+  says on the tin. The sentinel is safe to set because the admission boundary
+  treats it as inert: it lives beside the forwarding gate that refuses to pass
+  it upstream, so it can never arrive at Anthropic as an `x-api-key` beside a
+  real seat — a `401` that reads exactly like a revoked login.
+- **`ClaudeAuthKind::ForwardedClaudeLogin`** sets no API key and **refuses** a
+  launch that also carries one of the five suppressing inputs, returning the same
+  list in the form a launcher can enforce. Each of the five leaves every request
+  valid, so the run looks healthy and the seat simply never arrives. The three
+  cloud-provider selectors are refused under *both* kinds and with their own
+  message, because they defeat the redirect rather than the login: the client
+  never reads the base URL, never reaches this deployment, and answers anyway.
+- **No MCP wiring, deliberately.** Claude Code spells an MCP tool
+  `mcp__server__tool` flat where codex nests the pair; the `ClientDialect` arm
+  for that spelling is owed with the MCP control surface, and registering a
+  server whose steers this surface cannot yet resolve would produce a client
+  whose every correction comes back unresolvable.
+- **Chained through NeMo Relay, the same map is what is handed to the client.**
+  Relay overwrites `ANTHROPIC_BASE_URL` with its own gateway and *merges* its
+  proxy token into `ANTHROPIC_CUSTOM_HEADERS` — a line-wise replacement of the
+  matching name only — then forwards headers it does not own untouched and
+  strips its own credential before the hop. So the turn key survives on its
+  dedicated header, a chained turn keeps the Direct semantics exactly, and one
+  generator serves both topologies; Relay is aimed at this deployment's root
+  through `[upstream] anthropic_base_url` with no auth header of its own. That
+  is asserted against a real Relay rather than argued from its source. The
+  module doc carries the runbook: the fallback wiring for a credential-less
+  client (where Relay carries the key in `Authorization` and the turn is
+  key-authed only), the two hazards that are documented refusals rather than
+  guards, and why resumption is not offered in band on this surface.
+
+Like the codex generator, this is a library function with no operator entry
+point; the `topham` launcher that will call both is deferred by name.
+
 `POST /v1/messages` is the same idea in the other dialect: an Anthropic Messages
 surface over the same event log, same engine, same admission, same prefix
 check. There is no config file to generate — Claude Code takes
@@ -560,11 +626,48 @@ a preference:
   a warm turn as nearly two cold ones, in the direction that flatters the
   savings figure.
 
-What is not here: no `/v1/models` (see the status note), and no gated
-real-binary suite yet — the evidence for the client's shape is two request
-bodies captured from the shipping 2.1.251 binary through a loopback mock, which
-live in `crates/roundhouse-server/tests/fixtures/` and are driven through the
-surface on every run.
+What is not here: no `/v1/models` (see the status note). The evidence for the
+client's shape is request bodies captured from the shipping binaries through a
+loopback mock, which live in `crates/roundhouse-server/tests/fixtures/` and are
+driven through the surface on every run. **Two client lines are pinned, not
+one** — 2.1.251 and 2.1.257 — and every fixture-driven test runs against both,
+because a suite pinned to one answers either "does this still serve the client
+it was written against" or "does it serve the client shipping today", never the
+question a mixed fleet actually asks. The one shape difference between them is
+what the current line appends after each `--continue`'s new question: a
+remaining-budget notice it rewrites per request, which is ephemeral and
+therefore never becomes a log item — a counter admitted as history forks the
+session the first time it counts down, and every turn still answers.
+
+### The real client, on both topologies
+
+`crates/roundhouse-server/tests/claude_e2e.rs` is `codex_e2e`'s sibling: it
+spawns the real `claude` binary against a loopback roundhouse with exactly the
+environment `claude_launch` generates, and doubles nothing on the client side.
+
+```bash
+timeout 300 cargo test -p roundhouse-server --features e2e-claude \
+    --test claude_e2e -- --include-ignored --test-threads=1 --nocapture
+```
+
+Real: the binary, the socket, the surface, the control directory and its minted
+turn key, the log, the prefix check, and the tool the client chose to run.
+Scripted: only the frontier, so the suite decides when a `tool_use` block is
+emitted rather than asking a model to decide. The child's environment is
+*cleared* and rebuilt from the generated map plus five named isolation
+variables, asserted on the constructed command as well as on the wire — inside a
+Claude Code Remote container the ambient `CLAUDE_CODE_REMOTE=true` would make
+the client present that container's managed OAuth token to whatever base URL it
+was handed, and a wire assertion cannot see a credential that was merely
+available.
+
+Two of its tests drive the **chained** topology through a real NeMo Relay
+(`ROUNDHOUSE_TEST_RELAY_BIN`, `nemo-relay run --agent claude`), and that is
+where the chained wiring stopped being an argument from Relay's source: the turn
+key arrives on its dedicated header, Relay's own proxy credential never leaves
+Relay's gateway, `?beta=true` survives the base-URL concatenation, and a
+`--continue` through Relay's alphabetizing re-encode extends the session rather
+than forking it.
 
 ## Metrics and the dashboard
 
@@ -1016,8 +1119,9 @@ single-node: the rolling window
 counters live in process memory, and the Redis implementation is deferred by
 name with a boot warning where it matters.
 
-The generated Codex launch config is a library function with no operator entry
-point — no CLI subcommand and no admin route produces it — and the MCP surface
+The generated launch configuration is a library function for both clients — the
+Codex files and Claude Code's environment map alike — with no operator entry
+point: no CLI subcommand and no admin route produces either. The MCP surface
 ignores the `_meta.threadId` a Codex client sends on every `tools/call`, because
 `init_session` is the client-agnostic path and reading `_meta` is a
 codex-native shortcut deferred to a plan of its own. The forwarded-ChatGPT-login

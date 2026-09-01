@@ -229,6 +229,37 @@ one place a "just generate it" plan silently under-delivers.
   Openness is expressed in the spec itself — a generator that honours it gets
   the forward-compatible `anthropic-beta` handling roundhouse wants for free.
 
+*[2026-09-01, `anthropic-spec-sync` re-run per CLAUDE.md's synergy-vigilance
+cadence, ruling R-E: the pinned spec moved.* `anthropic-sdk-typescript` HEAD
+advanced `7ba6a3fc…` → `4140e0ea…` (`4140e0eaa597c0ad35218ffb20b66ef7fce7f639`);
+its `.stats.yml` now names
+`anthropic-e50cf35b74cc0471a2b5af7ea03765aa81c035f82588e9a1ba1b29aeaa17d064.yml`,
+body sha256 `d1d189d7…9c4f55` (was `942a1163…3d2ee87`), `openapi_spec_hash`
+`e4ae88bd…9b8d` (was `f0593466…737c`) — three opaque identifiers, all moved
+together, none conflated, per the caution recorded above.
+
+Vocabulary diff (`spec_sync.py --diff-only`, structural comparison of both
+bodies): everything §3.2 pins by name — `StopReason`'s seven values, `Usage`'s
+nine properties, `CacheCreation`'s two fields, `Message`'s ten top-level
+properties, the twelve response `ContentBlock` members, the four delta
+variants, `CreateMessageParams`/`BetaCreateMessageParams`'s property sets and
+`additionalProperties: false`, `CacheControlEphemeral`'s `{1h, 5m}` — is
+**byte-identical to 2026-08-27**. The only movement is additive and inside the
+one deliberately-open vocabulary: three new named `AnthropicBeta` values
+(`mid-conversation-output-config-2026-07-01`,
+`mid-conversation-system-clear-at-2026-08-21`,
+`thinking-binding-controls-2026-08-01` — the enum's `anyOf [string, enum]`
+open shape itself did not close), plus `path_count` 139→140 and
+`beta_path_count` 123→124 (one new endpoint, mirrored beta-true per the
+existing convention). `roundhouse-fleet`'s 56 pinning tests
+(`timeout 300 cargo test -p roundhouse-fleet anthropic_messages`) stayed
+green against the new pin with no source change beyond
+`spec_pin.json` itself — three new open-enum values need no typed arm (per
+this skill's step-5 classification: "new beta value… nothing *parses*
+wrong… decide per field" — none of the three names a mid-conversation
+control roundhouse currently drives, so passthrough is correct as-is, not a
+gap). `spec_pin.json`'s `fetched` moved 2026-08-27 → 2026-09-01.]*
+
 ---
 
 ## 4. Enumeration and the discard tier

@@ -1,9 +1,9 @@
 {
-  "spec_url": "https://storage.googleapis.com/stainless-sdk-openapi-specs/anthropic/anthropic-446ddab751d9f0172400b17fc72736e9353d3b49780317f90c24aa98357fd39e.yml",
-  "spec_sha256": "942a11636c42720235a90d9524e839d15ab6f7e5a879e6e7a3be253a43d2ee87",
-  "openapi_spec_hash": "f05934667b8dd6e84a29590f11f8737c",
-  "source_sdk_rev": "7ba6a3fc3000f9bd1f6f9f45526cc66db3167e6b",
-  "fetched": "2026-08-27",
+  "spec_url": "https://storage.googleapis.com/stainless-sdk-openapi-specs/anthropic/anthropic-e50cf35b74cc0471a2b5af7ea03765aa81c035f82588e9a1ba1b29aeaa17d064.yml",
+  "spec_sha256": "d1d189d791d1b551b33edebe9a60d63836d167070863ef366969e0df1e9c4f55",
+  "openapi_spec_hash": "e4ae88bdd84c7e293dd46037a6769b8d",
+  "source_sdk_rev": "4140e0eaa597c0ad35218ffb20b66ef7fce7f639",
+  "fetched": "2026-09-01",
   "vocabulary": {
     "stop_reason": [
       "end_turn",
@@ -144,6 +144,8 @@
       "mcp-client-2025-11-20",
       "mcp-tunnels-2026-06-22",
       "message-batches-2024-09-24",
+      "mid-conversation-output-config-2026-07-01",
+      "mid-conversation-system-clear-at-2026-08-21",
       "mid-conversation-tool-changes-2026-07-01",
       "model-context-window-exceeded-2025-08-26",
       "output-128k-2025-02-19",
@@ -155,6 +157,7 @@
       "skills-2025-10-02",
       "structured-outputs-2025-11-13",
       "task-budgets-2026-03-13",
+      "thinking-binding-controls-2026-08-01",
       "thinking-display-updates-2026-08-18",
       "thinking-token-count-2026-05-13",
       "token-counting-2024-11-01",
@@ -175,7 +178,7 @@
       "type",
       "usage"
     ],
-    "path_count": 139,
-    "beta_path_count": 123
+    "path_count": 140,
+    "beta_path_count": 124
   }
 }

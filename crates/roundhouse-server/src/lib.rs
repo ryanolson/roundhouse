@@ -62,9 +62,15 @@
 //! unmodified Codex reads in order to point at this deployment. It is here
 //! because the stanza needs the bound address, the turn-key header name and the
 //! MCP mount path at once, and this crate is the only one that knows all three.
+//!
+//! [`claude_launch`] is its sibling for the other client, and the asymmetry
+//! between them is the client's rather than ours: Claude Code's whole redirect
+//! surface is environment, so that module writes no file at all and its output
+//! is a map a launcher hands the child process.
 
 pub mod admin_api;
 pub mod catalog_config;
+pub mod claude_launch;
 pub mod codex_launch;
 pub mod control_config;
 pub mod conversations;
@@ -81,6 +87,7 @@ pub mod tokenizer;
 
 pub use admin_api::admin_router;
 pub use catalog_config::{CatalogConfig, CatalogError};
+pub use claude_launch::{ClaudeAuthKind, ClaudeEnv, ClaudeLaunch, ClaudeLaunchError};
 pub use codex_launch::{CodexAuthKind, CodexLaunch};
 pub use control_config::{
     Admission, AuthError, ControlDirectory, ControlPlane, ControlPlaneConfig, ControlPlaneError,

@@ -23,14 +23,19 @@
 //! twice.
 //!
 //! **That it is the real client's shape** — asserted against
-//! `tests/fixtures/claude-2.1.251-*.json`, two request bodies captured from the
-//! native 2.1.251 binary on 2026-08-29 through a loopback mock (isolated
-//! `CLAUDE_CONFIG_DIR`, cleared environment, fake API key, `ANTHROPIC_BASE_URL`
-//! pointed at the mock). Only `metadata.user_id`'s `device_id` is edited, to a
-//! placeholder of the same shape; everything else is verbatim, tools and
-//! 9 KB system prompt included. Two of those bytes falsified a ruling made from
-//! reading alone — see
+//! `tests/fixtures/claude-2.1.2{51,57}-*.json`, request bodies captured from the
+//! native binaries through a loopback mock (isolated `CLAUDE_CONFIG_DIR`,
+//! cleared environment, fake API key, `ANTHROPIC_BASE_URL` pointed at the mock).
+//! Only `metadata.user_id`'s `device_id` is edited, to a placeholder of the same
+//! shape; everything else is verbatim, tools and 9 KB system prompt included.
+//! Two of those bytes falsified a ruling made from reading alone — see
 //! `the_shipping_clients_two_turns_are_one_conversation_but_for_the_prompt_it_changed`.
+//!
+//! **Two lines are pinned, not one, and every fixture-driven test runs against
+//! both** — see [`CapturedLine`]. 2.1.251 is the prior line and 2.1.257 the
+//! current one; the current line appends a trailing remaining-budget notice a
+//! `--continue` rewrites per request, which is the one shape difference between
+//! them and the reason R-A exists.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -57,6 +62,7 @@ use roundhouse_fleet::{
     EchoFrontierClient, FrontierChunk, FrontierClient, FrontierError, FrontierModelSpec,
     FrontierQuote, FrontierStream, LocalFleet, StaticFrontierCatalog, WireProtocol,
 };
+use roundhouse_server::claude_launch::ROUNDHOUSE_API_KEY_SENTINEL;
 use roundhouse_server::messages_api::wire::{CreateMessageParams, canonicalize, session_key};
 use roundhouse_server::{
     ControlPlane, ControlPlaneConfig, Conversations, EchoLocalExecutor, Engine, messages_router,
@@ -81,9 +87,74 @@ const PARTIAL: &str = "the first half of the answer, ";
 /// text, so a byte match with [`PARTIAL`] cannot happen by coincidence.
 const CONTINUATION: &str = "and only the second half.";
 
-/// The two captured bodies, verbatim but for the redacted device fingerprint.
-const TURN_ONE: &str = include_str!("fixtures/claude-2.1.251-turn-1.json");
-const TURN_TWO: &str = include_str!("fixtures/claude-2.1.251-turn-2-continue.json");
+/// One captured client line, and the facts that are properties *of the capture*
+/// rather than of the surface.
+///
+/// **Both lines stay pinned, and every fixture-driven test runs against both.**
+/// The prior line is what a deployment's older seats are still on; the current
+/// line is what a fresh install gets. A suite that pinned only one of them would
+/// answer "does the surface still serve the client it was written against" or
+/// "does it serve the client shipping today" — never both, which is the only
+/// question a mixed fleet asks.
+///
+/// The version and the session id are fields rather than literals inside the
+/// tests because they come *from* the capture: a test that spelled one would
+/// pass for one line and fail for the other with a `SessionNotFound` that looks
+/// like a serve-surface refusal and is not (§5.7's second confound). The tool
+/// count is not a field at all — it is read off each fixture's own toolbox,
+/// because the two rigs declared different toolboxes (24 vs. 21, §5.7's first
+/// confound) and an expected literal there would read client drift into a
+/// difference between two invocations.
+struct CapturedLine {
+    /// The client version the attribution pseudo-header names.
+    version: &'static str,
+    /// The session this capture's own `metadata.user_id` names.
+    session: &'static str,
+    turn_one: &'static str,
+    turn_two: &'static str,
+    /// The recorded header set of this line's two requests, as a JSON list of
+    /// `{path, headers}` — `x-api-key` redacted at capture time.
+    headers: &'static str,
+}
+
+impl CapturedLine {
+    /// The session id this line's turns actually resolve to on this surface.
+    fn named(&self) -> String {
+        named(self.session)
+    }
+}
+
+/// The prior line: 2.1.251, captured 2026-08-29 (§5.6).
+static LINE_PRIOR: CapturedLine = CapturedLine {
+    version: "2.1.251",
+    session: "e13acbde-ab70-46ff-b094-fd8ce95d286d",
+    turn_one: include_str!("fixtures/claude-2.1.251-turn-1.json"),
+    turn_two: include_str!("fixtures/claude-2.1.251-turn-2-continue.json"),
+    headers: include_str!("fixtures/claude-2.1.251-headers.json"),
+};
+
+/// The current line: 2.1.257, captured 2026-09-01 (§5.7).
+static LINE_CURRENT: CapturedLine = CapturedLine {
+    version: "2.1.257",
+    session: "c0cb70b6-938b-4cbb-a8e8-1b8a60b7c4d8",
+    turn_one: include_str!("fixtures/claude-2.1.257-turn-1.json"),
+    turn_two: include_str!("fixtures/claude-2.1.257-turn-2-continue.json"),
+    headers: include_str!("fixtures/claude-2.1.257-headers.json"),
+};
+
+/// Every pinned line, in the order they shipped.
+static LINES: [&CapturedLine; 2] = [&LINE_PRIOR, &LINE_CURRENT];
+
+/// The current line's *third* turn, captured by resuming the very session
+/// [`LINE_CURRENT`]'s two turns built (same isolated `HOME`, same
+/// `CLAUDE_CONFIG_DIR`, same cwd, same day), so its resent history is turn two's
+/// bytes and not a reconstruction of them.
+///
+/// It exists because turn three is the first turn on which the client's
+/// remaining-budget notice appears *twice* — once flattened in the history and
+/// once fresh at the end — and that is the shape R-A rules on (§5.7.1). There is
+/// no 2.1.251 counterpart because the prior line sends no notice at all.
+const TURN_THREE_CURRENT: &str = include_str!("fixtures/claude-2.1.257-turn-3-continue.json");
 
 // ---------------------------------------------------------------------------
 // The service under test
@@ -719,6 +790,36 @@ fn parse(fixture: &str) -> CreateMessageParams {
     serde_json::from_str(fixture).expect("a captured body is a well-formed request")
 }
 
+/// A captured body as JSON, for the tests that edit one before serving it.
+fn fixture(text: &str) -> Value {
+    serde_json::from_str(text).expect("the fixture is JSON")
+}
+
+/// The toolbox a capture declares, with the one check that keeps a fixture
+/// refresh from quietly turning these tests into assertions about a smaller
+/// request.
+///
+/// **The count is read, never expected.** The two rigs declared 24 and 21 tools
+/// — a difference in what a plain `-p` invocation offers, not client drift
+/// (§5.7's first confound) — so a literal here would have failed the current
+/// line for a reason that has nothing to do with the surface. What is asserted
+/// instead is the property the tests below actually rest on: that this really is
+/// a live capture's toolbox and not a hand-written stub.
+fn declared_tools(captured: &Value, line: &CapturedLine) -> Value {
+    let tools = captured["tools"].clone();
+    let declared = tools
+        .as_array()
+        .expect("every capture declares a toolbox")
+        .len();
+    assert!(
+        declared >= 20,
+        "{}: the fixture is the live capture; a toolbox of {declared} is \
+         describing a different request",
+        line.version
+    );
+    tools
+}
+
 // ---------------------------------------------------------------------------
 // Routing
 // ---------------------------------------------------------------------------
@@ -1110,65 +1211,63 @@ async fn f1_the_clients_max_tokens_is_the_dispatch_ceiling_and_not_the_estimate(
 /// tools reach the quote.
 #[tokio::test]
 async fn the_clients_tool_definitions_reach_the_dispatch_verbatim() {
-    let (app, _store, client) = surface_scripted();
-    let captured: Value = serde_json::from_str(TURN_ONE).expect("the fixture is JSON");
-    let tools = captured["tools"].clone();
-    assert_eq!(
-        tools.as_array().map(Vec::len),
-        Some(24),
-        "the fixture is the live capture; if its tool count moved, the \
-         assertions below are describing a different request"
-    );
+    for line in LINES {
+        let (app, _store, client) = surface_scripted();
+        let captured = fixture(line.turn_one);
+        let tools = declared_tools(&captured, line);
 
-    let mut request = captured.clone();
-    // The capture streams; the scripted client answers either way, and a
-    // non-streaming turn keeps this test to one assertion about one thing.
-    request["stream"] = json!(false);
-    // The captured body carries no `tool_choice` (the client relies on the
-    // default), so one is added here: the field is independently optional and a
-    // surface that threaded only `tools` would pass every assertion above.
-    request["tool_choice"] = json!({ "type": "auto", "disable_parallel_tool_use": false });
+        let mut request = captured.clone();
+        // The capture streams; the scripted client answers either way, and a
+        // non-streaming turn keeps this test to one assertion about one thing.
+        request["stream"] = json!(false);
+        // The captured body carries no `tool_choice` (the client relies on the
+        // default), so one is added here: the field is independently optional
+        // and a surface that threaded only `tools` would pass every assertion
+        // above.
+        request["tool_choice"] = json!({ "type": "auto", "disable_parallel_tool_use": false });
 
-    let (status, _, text) = post(
-        &app,
-        "/v1/messages",
-        &[("x-claude-code-session-id", "sess-tools")],
-        &request,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{text}");
+        let (status, _, text) = post(
+            &app,
+            "/v1/messages",
+            &[("x-claude-code-session-id", "sess-tools")],
+            &request,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}: {text}", line.version);
 
-    let quotes = client.quotes_seen();
-    assert_eq!(quotes.len(), 1, "one frontier dispatch: {quotes:?}");
-    assert_eq!(
-        quotes[0].tools.as_ref(),
-        Some(&tools),
-        "the dispatch must carry the client's own twenty-four definitions, \
-         unmodified — a model told about a smaller toolbox than the client has \
-         fails in the one way nobody debugs"
-    );
-    assert_eq!(
-        quotes[0].tool_choice,
-        Some(json!({ "type": "auto", "disable_parallel_tool_use": false }))
-    );
+        let quotes = client.quotes_seen();
+        assert_eq!(quotes.len(), 1, "one frontier dispatch: {quotes:?}");
+        assert_eq!(
+            quotes[0].tools.as_ref(),
+            Some(&tools),
+            "{}: the dispatch must carry every one of the client's own \
+             definitions, unmodified — a model told about a smaller toolbox \
+             than the client has fails in the one way nobody debugs",
+            line.version
+        );
+        assert_eq!(
+            quotes[0].tool_choice,
+            Some(json!({ "type": "auto", "disable_parallel_tool_use": false }))
+        );
 
-    // CONTROL: a request that declares neither carries neither, so the
-    // assertions above are about threading rather than about a default that
-    // would have matched anything. `body()` is the minimal request this suite
-    // uses everywhere else, which is also what makes every other test here a
-    // control for the same thing.
-    let (status, _, text) = post(
-        &app,
-        "/v1/messages",
-        &[("x-claude-code-session-id", "sess-no-tools")],
-        &body("hello"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{text}");
-    let quotes = client.quotes_seen();
-    assert_eq!(quotes.len(), 2, "{quotes:?}");
-    assert_eq!(quotes[1].tools, None);
-    assert_eq!(quotes[1].tool_choice, None);
+        // CONTROL: a request that declares neither carries neither, so the
+        // assertions above are about threading rather than about a default that
+        // would have matched anything. `body()` is the minimal request this
+        // suite uses everywhere else, which is also what makes every other test
+        // here a control for the same thing.
+        let (status, _, text) = post(
+            &app,
+            "/v1/messages",
+            &[("x-claude-code-session-id", "sess-no-tools")],
+            &body("hello"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let quotes = client.quotes_seen();
+        assert_eq!(quotes.len(), 2, "{quotes:?}");
+        assert_eq!(quotes[1].tools, None);
+        assert_eq!(quotes[1].tool_choice, None);
+    }
 }
 
 /// The control for the ignored F1 test below: [`surface_scripted_cross_dialect`]
@@ -1194,53 +1293,51 @@ async fn the_clients_tool_definitions_reach_the_dispatch_verbatim() {
 /// carries only `target`, timing and price).
 #[tokio::test]
 async fn cross_dialect_routing_reaches_a_responses_target_with_anthropic_shaped_tools() {
-    let captured: Value = serde_json::from_str(TURN_ONE).expect("the fixture is JSON");
-    let tools = captured["tools"].clone();
-    assert_eq!(
-        tools.as_array().map(Vec::len),
-        Some(24),
-        "the fixture is the live capture; if its tool count moved this test is \
-         describing a different request"
-    );
-    let first_tool = &tools[0];
-    assert!(
-        first_tool.get("type").is_none(),
-        "the fixture must actually be Anthropic-shaped for the ignored test \
-         below to mean anything -- a `type` key on a tool here would make it \
-         already Responses-shaped, which is not the scenario"
-    );
-    assert!(
-        first_tool.get("input_schema").is_some() && first_tool.get("parameters").is_none(),
-        "same as above, for the schema key the two dialects spell differently \
-         -- Anthropic's `input_schema` vs. the Responses upstream's required \
-         `parameters`"
-    );
+    for line in LINES {
+        let captured = fixture(line.turn_one);
+        let tools = declared_tools(&captured, line);
+        let first_tool = &tools[0];
+        assert!(
+            first_tool.get("type").is_none(),
+            "{}: the fixture must actually be Anthropic-shaped for the ignored \
+             test below to mean anything -- a `type` key on a tool here would \
+             make it already Responses-shaped, which is not the scenario",
+            line.version
+        );
+        assert!(
+            first_tool.get("input_schema").is_some() && first_tool.get("parameters").is_none(),
+            "{}: same as above, for the schema key the two dialects spell \
+             differently -- Anthropic's `input_schema` vs. the Responses \
+             upstream's required `parameters`",
+            line.version
+        );
 
-    let (app, _store, client) = surface_scripted_cross_dialect();
-    let mut request = captured.clone();
-    request["stream"] = json!(false);
-    let (status, _, text) = post(
-        &app,
-        "/v1/messages",
-        &[("x-claude-code-session-id", "sess-cross-dialect-control")],
-        &request,
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "today (before F1 is fixed) this turn is accepted and dispatched \
-         rather than refused -- see the ignored test below: {text}"
-    );
-    let quotes = client.quotes_seen();
-    assert_eq!(quotes.len(), 1, "one frontier dispatch: {quotes:?}");
-    assert_eq!(
-        quotes[0].wire_protocol,
-        WireProtocol::OpenAiResponses,
-        "the only entry in this catalog speaks Responses -- if the quote says \
-         otherwise this harness is not exercising the cross-dialect path it \
-         claims to"
-    );
+        let (app, _store, client) = surface_scripted_cross_dialect();
+        let mut request = captured.clone();
+        request["stream"] = json!(false);
+        let (status, _, text) = post(
+            &app,
+            "/v1/messages",
+            &[("x-claude-code-session-id", "sess-cross-dialect-control")],
+            &request,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "today (before F1 is fixed) this turn is accepted and dispatched \
+             rather than refused -- see the ignored test below: {text}"
+        );
+        let quotes = client.quotes_seen();
+        assert_eq!(quotes.len(), 1, "one frontier dispatch: {quotes:?}");
+        assert_eq!(
+            quotes[0].wire_protocol,
+            WireProtocol::OpenAiResponses,
+            "the only entry in this catalog speaks Responses -- if the quote \
+             says otherwise this harness is not exercising the cross-dialect \
+             path it claims to"
+        );
+    }
 }
 
 /// **F1 (thermo-nuclear review of b8e8ddd), fixed: a toolbox and the target it
@@ -1276,8 +1373,20 @@ async fn cross_dialect_routing_reaches_a_responses_target_with_anthropic_shaped_
 /// translation table and every refusal.
 #[tokio::test]
 async fn f1_cross_dialect_tools_must_not_reach_dispatch_unexamined() {
-    let captured: Value = serde_json::from_str(TURN_ONE).expect("the fixture is JSON");
-    let tools = captured["tools"].clone();
+    for line in LINES {
+        f1_one_line(line).await;
+    }
+}
+
+/// One captured line's worth of [`f1_cross_dialect_tools_must_not_reach_dispatch_unexamined`].
+///
+/// Split out rather than looped inline because the body is long and the failure
+/// messages have to name which line failed; an inner `async fn` keeps that name
+/// in one place instead of threading it through a dozen assertions.
+async fn f1_one_line(line: &CapturedLine) {
+    let captured = fixture(line.turn_one);
+    let tools = declared_tools(&captured, line);
+    let declared = tools.as_array().map(Vec::len).unwrap_or(0);
 
     let (app, _store, client) = surface_scripted_cross_dialect();
     let mut request = captured.clone();
@@ -1305,14 +1414,15 @@ async fn f1_cross_dialect_tools_must_not_reach_dispatch_unexamined() {
     assert_eq!(
         quote.tools_dialect,
         Some(WireProtocol::AnthropicMessages),
-        "and the surface that accepted these twenty-four declarations speaks          Messages -- a quote that could not say so is a quote whose tools no          client can shape correctly"
+        "{}: and the surface that accepted these {declared} declarations speaks          Messages -- a quote that could not say so is a quote whose tools no          client can shape correctly",
+        line.version
     );
 
     // The second half: the seam every dispatch client reads a toolbox through
     // restates them, rather than handing back the client's raw bytes.
     let (shaped, _) = quote
         .tools_for(quote.wire_protocol)
-        .expect("twenty-four plain function tools restate faithfully");
+        .expect("plain function tools restate faithfully");
     let shaped = shaped.expect("the client declared tools");
     assert_ne!(
         shaped, tools,
@@ -1321,7 +1431,7 @@ async fn f1_cross_dialect_tools_must_not_reach_dispatch_unexamined() {
     let entries = shaped.as_array().expect("an array of tools");
     assert_eq!(
         entries.len(),
-        tools.as_array().map(Vec::len).unwrap_or(0),
+        declared,
         "and not one of the client's tools was dropped on the way -- a thinned          toolbox is the failure mode a translation must never take"
     );
     for entry in entries {
@@ -1404,56 +1514,55 @@ async fn f2_control_the_rig_routes_local_by_default_without_tools() {
 ///   preference rather than a capability limit.
 #[tokio::test]
 async fn f2_a_tool_declaring_turn_routed_local_loses_its_toolbox_silently() {
-    let captured: Value = serde_json::from_str(TURN_ONE).expect("the fixture is JSON");
-    let tools = captured["tools"].clone();
-    assert_eq!(
-        tools.as_array().map(Vec::len),
-        Some(24),
-        "the fixture is the live capture; if its tool count moved this test is \
-         describing a different request"
-    );
+    for line in LINES {
+        let captured = fixture(line.turn_one);
+        let tools = declared_tools(&captured, line);
 
-    let (app, store, client) = surface_scripted_with_fleet().await;
-    let mut request = captured.clone();
-    request["stream"] = json!(false);
+        let (app, store, client) = surface_scripted_with_fleet().await;
+        let mut request = captured.clone();
+        request["stream"] = json!(false);
 
-    let (status, _, text) = post(
-        &app,
-        "/v1/messages",
-        &[("x-claude-code-session-id", "sess-tools-local")],
-        &request,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{text}");
+        let (status, _, text) = post(
+            &app,
+            "/v1/messages",
+            &[("x-claude-code-session-id", "sess-tools-local")],
+            &request,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}: {text}", line.version);
 
-    let quotes = client.quotes_seen();
-    assert_eq!(
-        quotes.len(),
-        1,
-        "F2: a tool-declaring turn must reach the one candidate that can carry \
-         a toolbox, not the one structurally unable to carry any of them: {text}"
-    );
-    assert_eq!(
-        quotes[0].tools.as_ref(),
-        Some(&tools),
-        "and it must arrive with the client's own twenty-four declarations"
-    );
+        let quotes = client.quotes_seen();
+        assert_eq!(
+            quotes.len(),
+            1,
+            "{}: F2: a tool-declaring turn must reach the one candidate that \
+             can carry a toolbox, not the one structurally unable to carry any \
+             of them: {text}",
+            line.version
+        );
+        assert_eq!(
+            quotes[0].tools.as_ref(),
+            Some(&tools),
+            "{}: and it must arrive with the client's own declarations",
+            line.version
+        );
 
-    let message: Value = serde_json::from_str(&text).expect("a JSON message");
-    assert_eq!(
-        message["content"],
-        json!([{ "type": "text", "text": ANSWER }]),
-        "the frontier answered; `local answer` here would mean the turn was \
-         served by the worker after all: {text}"
-    );
+        let message: Value = serde_json::from_str(&text).expect("a JSON message");
+        assert_eq!(
+            message["content"],
+            json!([{ "type": "text", "text": ANSWER }]),
+            "the frontier answered; `local answer` here would mean the turn was \
+             served by the worker after all: {text}"
+        );
 
-    // And the audit trail says why the cheap candidate is missing.
-    let rationale = routing_rationale(&store, &named("sess-tools-local")).await;
-    assert!(
-        rationale.contains("the client declared tools, so local candidates were excluded"),
-        "F2: the decision record has to say why local was skipped, or the \
-         counterfactual reads as a router preference: {rationale}"
-    );
+        // And the audit trail says why the cheap candidate is missing.
+        let rationale = routing_rationale(&store, &named("sess-tools-local")).await;
+        assert!(
+            rationale.contains("the client declared tools, so local candidates were excluded"),
+            "F2: the decision record has to say why local was skipped, or the \
+             counterfactual reads as a router preference: {rationale}"
+        );
+    }
 }
 
 /// The rationale on this session's one routing decision.
@@ -1951,51 +2060,57 @@ async fn count_tokens_answers_and_grows_with_the_conversation() {
 /// request** (M11.2a's F4).
 ///
 /// The client asks this question *before* sending a body whose tool
-/// declarations are 79% of its bytes — 65,835 of them in the captured 2.1.251
-/// turn this test drives. An answer that counted only the messages told an
-/// agent its context was a fifth as full as it really was, on the one endpoint
-/// that exists to keep it from having to guess; and since the same
+/// declarations are most of its bytes — 65,835 of them on the prior line, 47,278
+/// on the current one. An answer that counted only the messages told an agent
+/// its context was a fifth as full as it really was, on the one endpoint that
+/// exists to keep it from having to guess; and since the same
 /// [`Engine::admitted_input_tokens`] is what `message_start` reports as
 /// `input_tokens`, the two answers for one body would have had to differ.
 ///
 /// The probe is the live capture rather than a hand-written toolbox, and the
 /// two requests differ in exactly one key, so the delta measured is the tool
-/// preamble and nothing else.
+/// preamble and nothing else. **The floor is derived from each fixture's own
+/// toolbox** rather than written out: the two rigs declared different toolboxes,
+/// and a literal here would fail the smaller one for a reason that is about the
+/// invocation and not about the count.
 #[tokio::test]
 async fn count_tokens_counts_the_declared_toolbox() {
-    let (app, _store) = surface();
-    let captured: Value = serde_json::from_str(TURN_ONE).expect("the fixture is JSON");
-    let tools_bytes = serde_json::to_string(&captured["tools"])
-        .expect("the fixture's tools serialize")
-        .len();
-    assert!(
-        tools_bytes > 60_000,
-        "the fixture is the live capture; a toolbox this test can no longer \
-         call large is describing a different request: {tools_bytes} bytes"
-    );
+    for line in LINES {
+        let (app, _store) = surface();
+        let captured = fixture(line.turn_one);
+        declared_tools(&captured, line);
+        let tools_bytes = serde_json::to_string(&captured["tools"])
+            .expect("the fixture's tools serialize")
+            .len() as u64;
 
-    let mut untooled = captured.clone();
-    untooled
-        .as_object_mut()
-        .expect("a JSON object")
-        .remove("tools")
-        .expect("the capture declares tools");
+        let mut untooled = captured.clone();
+        untooled
+            .as_object_mut()
+            .expect("a JSON object")
+            .remove("tools")
+            .expect("the capture declares tools");
 
-    async fn count(app: &Router, request: &Value) -> u64 {
-        let (status, _, text) = post(app, "/v1/messages/count_tokens", &[], request).await;
-        assert_eq!(status, StatusCode::OK, "{text}");
-        serde_json::from_str::<Value>(&text).expect("JSON")["input_tokens"]
-            .as_u64()
-            .expect("a count")
+        async fn count(app: &Router, request: &Value) -> u64 {
+            let (status, _, text) = post(app, "/v1/messages/count_tokens", &[], request).await;
+            assert_eq!(status, StatusCode::OK, "{text}");
+            serde_json::from_str::<Value>(&text).expect("JSON")["input_tokens"]
+                .as_u64()
+                .expect("a count")
+        }
+
+        let bare = count(&app, &untooled).await;
+        let tooled = count(&app, &captured).await;
+        // Nine tenths rather than all of it: the estimator is a tokenizer, not a
+        // byte counter, and pinning it to the exact serialization would make
+        // this test fail the day the tokenizer improves — which is not the
+        // finding it exists to hold.
+        assert!(
+            tooled >= bare + tools_bytes * 9 / 10,
+            "{}: F4: the estimate must include the {tools_bytes}-byte toolbox \
+             the same request is about to send — bare={bare}, tooled={tooled}",
+            line.version
+        );
     }
-
-    let bare = count(&app, &untooled).await;
-    let tooled = count(&app, &captured).await;
-    assert!(
-        tooled >= bare + 60_000,
-        "F4: the estimate must include the {tools_bytes}-byte toolbox the same \
-         request is about to send — bare={bare}, tooled={tooled}"
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -3055,7 +3170,13 @@ fn a_seat_rides_only_beside_a_dedicated_turn_key() {
         .expect("the fixture config must validate"),
     );
 
-    let mut with_seat = client_headers();
+    for line in LINES {
+        a_seat_rides_only_beside_a_dedicated_turn_key_on(&plane, line);
+    }
+}
+
+fn a_seat_rides_only_beside_a_dedicated_turn_key_on(plane: &ControlPlane, line: &CapturedLine) {
+    let mut with_seat = client_headers(line);
     with_seat.insert(
         HeaderName::from_static("x-roundhouse-key"),
         HeaderValue::from_str(&key("seat")).expect("a header value"),
@@ -3080,7 +3201,7 @@ fn a_seat_rides_only_beside_a_dedicated_turn_key() {
     // The other direction: the same key in `Authorization` is the roundhouse
     // secret itself, and forwarding it upstream would send our own credential to
     // a provider.
-    let mut key_only = client_headers();
+    let mut key_only = client_headers(line);
     key_only.insert(
         AUTHORIZATION,
         HeaderValue::from_str(&format!("Bearer {}", key("seat"))).expect("a header value"),
@@ -3094,34 +3215,156 @@ fn a_seat_rides_only_beside_a_dedicated_turn_key() {
     );
 }
 
-/// The header set a 2.1.251 inference request actually carries.
+/// **The launcher's `ANTHROPIC_API_KEY` sentinel is served, and is inert.**
 ///
-/// Read off `tests/fixtures/claude-2.1.251-headers.json` in spirit and written
-/// out here so the assertion above is about *these* headers rather than about an
-/// empty map.
-fn client_headers() -> HeaderMap {
-    let mut headers = HeaderMap::new();
-    for (name, value) in [
-        ("anthropic-version", "2023-06-01"),
-        (
-            "anthropic-beta",
-            "claude-code-20250219,interleaved-thinking-2025-05-14,\
-             mid-conversation-system-2026-04-07",
-        ),
-        ("x-app", "cli"),
-        (
-            "x-claude-code-session-id",
-            "e13acbde-ab70-46ff-b094-fd8ce95d286d",
-        ),
-        ("x-stainless-lang", "js"),
-        ("x-stainless-retry-count", "0"),
-        ("user-agent", "claude-cli/2.1.251 (external, sdk-cli)"),
-    ] {
-        headers.insert(
-            HeaderName::from_static(name),
-            HeaderValue::from_static(value),
+/// R-B's serve-side half. `claude_launch` puts
+/// [`ROUNDHOUSE_API_KEY_SENTINEL`] in a launched client's `ANTHROPIC_API_KEY`
+/// so the client's auth resolution is a property of the launch rather than of
+/// whoever last ran `claude` on that machine (§1.3) — and a client that resolves
+/// that variable sends the value on `x-api-key`, which is a *credential* header
+/// on this dialect's allowlist row. So the sentinel is only safe to set if this
+/// surface both serves the turn and refuses to pass the value on.
+///
+/// Driven over the real captured header set rather than a hand-built map, for
+/// the reason [`client_headers`] gives one test up: the sentinel arrives among
+/// twenty other headers no other surface sees, and the capture is the only
+/// statement of what those are that cannot drift from the client.
+#[tokio::test]
+async fn the_launchers_api_key_sentinel_is_served_and_never_becomes_a_seat() {
+    let plane = Arc::new(ControlPlane::configured(
+        ControlPlaneConfig::from_json(
+            &json!({
+                "projects": [{ "id": "seat", "credentials": { "mode": "pass_through" } }],
+                "users": [{ "id": "ada" }],
+                "keys": [{
+                    "project": "seat", "user": "ada",
+                    "key_sha256": sha256_hex(&key("seat")),
+                }],
+            })
+            .to_string(),
+            "messages sentinel fixture",
+        )
+        .expect("the fixture config must validate"),
+    ));
+
+    // Served: the whole surface, not just the admission call. A rule that only
+    // held at `turn_admission` would still leave a launched client refused by
+    // the router for a header it was told to send.
+    let store = Arc::new(MemoryStore::new());
+    let app = messages_router(
+        Arc::clone(&plane),
+        engine(Arc::clone(&store)),
+        Arc::clone(&store),
+        Arc::new(Conversations::new()),
+    );
+    let launched = [
+        ("x-roundhouse-key", &*key("seat")),
+        ("x-api-key", ROUNDHOUSE_API_KEY_SENTINEL),
+    ];
+    let (status, _, text) = post(&app, "/v1/messages", &launched, &body("hello")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a launched client's own header set must be served: {text}"
+    );
+    audit(&text).unwrap_or_else(|error| panic!("the stream is not conformant: {error}\n\n{text}"));
+
+    for line in LINES {
+        // Inert, in both directions, against the real header set.
+        let mut with_sentinel = client_headers(line);
+        with_sentinel.insert(
+            HeaderName::from_static("x-roundhouse-key"),
+            HeaderValue::from_str(&key("seat")).expect("a header value"),
+        );
+        with_sentinel.insert(
+            HeaderName::from_static("x-api-key"),
+            HeaderValue::from_static(ROUNDHOUSE_API_KEY_SENTINEL),
+        );
+        let admitted = plane
+            .turn_admission(&with_sentinel)
+            .expect("the dedicated header authenticates the turn key");
+        assert!(
+            !admitted.credentials.reaches("anthropic"),
+            "{}: the sentinel authenticates nothing and must make no provider reachable",
+            line.version
+        );
+
+        // And the sharp case, which is what a chained Relay makes reachable
+        // without the client changing at all: Relay forwards an inbound
+        // `x-api-key` untouched while injecting its own `Authorization`, so the
+        // sentinel can arrive beside a real bearer. The bearer is the caller's
+        // credential and still forwards; the sentinel must not ride with it,
+        // because Anthropic answers a bad `x-api-key` next to a valid bearer
+        // with a `401` an operator reads as a revoked login.
+        let mut beside_a_seat = with_sentinel.clone();
+        beside_a_seat.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer sk-ant-oat01-not-a-real-seat"),
+        );
+        let admitted = plane
+            .turn_admission(&beside_a_seat)
+            .expect("the dedicated header authenticates the turn key");
+        let forwarded = admitted
+            .credentials
+            .access("anthropic")
+            .and_then(|access| access.credential.forwarded().cloned())
+            .expect("a real seat beside the sentinel is still a captured credential");
+        let names: Vec<&str> = forwarded.headers().map(|(name, _)| name).collect();
+        assert!(
+            names.contains(&"authorization"),
+            "{}: the caller's own bearer is still forwarded: {names:?}",
+            line.version
+        );
+        assert!(
+            !forwarded
+                .headers()
+                .any(|(_, value)| value == ROUNDHOUSE_API_KEY_SENTINEL),
+            "{}: a value roundhouse generated must never reach an upstream: {names:?}",
+            line.version
         );
     }
+}
+
+/// The header set an inference request of this line actually carries.
+///
+/// **Read out of the capture rather than transcribed from it.** The earlier
+/// spelling of this helper listed seven headers by hand "in spirit", which is
+/// the shape of assertion that keeps passing after the thing it describes has
+/// moved: the two captures' `anthropic-beta` lists differ by two values, and a
+/// hand-written map would have asserted the seat rule against a header set no
+/// client sends.
+fn client_headers(line: &CapturedLine) -> HeaderMap {
+    let recorded: Value = serde_json::from_str(line.headers).expect("the headers fixture is JSON");
+    let recorded = recorded[0]["headers"]
+        .as_object()
+        .expect("each record carries a header map");
+    let mut headers = HeaderMap::new();
+    for (name, value) in recorded {
+        // `content-length` and `host` belong to the hop that was captured, not
+        // to the client's own header set, and re-asserting them here would be
+        // asserting about the mock's socket.
+        //
+        // `x-api-key` is dropped for a different and sharper reason: it is a
+        // credential header Anthropic's row admits, and the capture holds a
+        // redaction placeholder in it. Leaving it in would hand every direction
+        // of the test below a third credential nobody put there, so both arms
+        // would pass on a seat the test never chose. What the client's own
+        // `x-api-key` should be under a roundhouse launch is R-B's question and
+        // is asserted where the launcher's own tests are.
+        if name == "content-length" || name == "host" || name == "x-api-key" {
+            continue;
+        }
+        headers.insert(
+            HeaderName::from_bytes(name.as_bytes()).expect("a captured header name"),
+            HeaderValue::from_str(value.as_str().expect("a captured header value"))
+                .expect("a captured header value"),
+        );
+    }
+    assert!(
+        headers.contains_key("anthropic-beta") && headers.contains_key("x-claude-code-session-id"),
+        "{}: the capture must actually carry this dialect's header set",
+        line.version
+    );
     headers
 }
 
@@ -3131,22 +3374,34 @@ fn client_headers() -> HeaderMap {
 
 /// **The shipping client's body canonicalizes, block by block.**
 ///
-/// The whole 84 KB request as 2.1.251 sends it: three system blocks, a
-/// two-block user message, a mid-conversation `system` message, twenty-four tool
-/// definitions, `context_management`, `thinking`, `output_config`. Everything
-/// but `system` and `messages` is accepted and ignored, and the assertion that
+/// The whole request as each line sends it: three system blocks, a two-block
+/// user message, a mid-conversation `system` message, the client's whole
+/// toolbox, `context_management`, `thinking`, `output_config`. Everything but
+/// `system` and `messages` is accepted and ignored, and the assertion that
 /// matters is the one about what a *stored prefix* looks like — because that is
 /// what every later turn is checked against.
+///
+/// Both pinned lines, and the version literal comes from the line rather than
+/// from the test: the attribution block's *shape* (block 0, uncached, first) is
+/// what this pins, and the only thing that moved between the two captures is the
+/// number inside it (§5.7).
 #[test]
 fn the_shipping_clients_body_becomes_the_prefix_it_will_be_checked_against() {
-    let params = parse(TURN_ONE);
+    for line in LINES {
+        the_shipping_clients_body_is_a_prefix(line);
+    }
+}
+
+fn the_shipping_clients_body_is_a_prefix(line: &CapturedLine) {
+    let params = parse(line.turn_one);
     let items = canonicalize(&params).expect("the live client's body must be servable");
 
     assert_eq!(
         items.len(),
         6,
-        "three system blocks, two user blocks and the mid-conversation system \
-         message: {:#?}",
+        "{}: three system blocks, two user blocks and the mid-conversation \
+         system message: {:#?}",
+        line.version,
         items.iter().map(|item| item.role).collect::<Vec<_>>()
     );
     // Block 0 of `system` is the attribution pseudo-header, stored as ordinary
@@ -3154,10 +3409,12 @@ fn the_shipping_clients_body_becomes_the_prefix_it_will_be_checked_against() {
     // its stability is the client's to keep and a server stripping it would be
     // guessing at which parts of a system prompt matter.
     assert_eq!(items[0].role, Role::Developer);
+    let attribution = format!("x-anthropic-billing-header: cc_version={}", line.version);
     assert!(
         matches!(&items[0].content, ItemContent::Text { text }
-            if text.starts_with("x-anthropic-billing-header: cc_version=2.1.251")),
-        "{:?}",
+            if text.starts_with(&attribution)),
+        "{}: {:?}",
+        line.version,
         items[0].content
     );
     // **The leading run of `system` blocks is turn configuration, and carries
@@ -3195,10 +3452,11 @@ fn the_shipping_clients_body_becomes_the_prefix_it_will_be_checked_against() {
     );
     // The session name the client gave, in the shape it gives it in.
     assert_eq!(
-        session_key(&HeaderMap::new(), &params).as_deref(),
-        Some("anthropic_messages/e13acbde-ab70-46ff-b094-fd8ce95d286d"),
-        "the 2.1.251 `metadata.user_id` is a JSON object string, and the name it \
-         yields lives in this dialect's own namespace (F6)"
+        session_key(&HeaderMap::new(), &params),
+        Some(line.named()),
+        "{}: the capture's `metadata.user_id` is a JSON object string, and the \
+         name it yields lives in this dialect's own namespace (F6)",
+        line.version
     );
 }
 
@@ -3217,52 +3475,71 @@ fn the_shipping_clients_body_becomes_the_prefix_it_will_be_checked_against() {
 /// header), so this pair really does fork. The fork is correct behaviour on a
 /// rewritten prompt; what would be wrong is forking for the *other* five items,
 /// and that is what the equality below rules out.
+///
+/// **Both lines, and the count means what it says** (R-A). The number two here
+/// is not a shape the client happens to have: it is *the answer and the new
+/// question*, the only two things a `--continue` adds to a conversation. The
+/// current line posts a third new `messages` item on every `--continue` — the
+/// remaining-budget notice, which it rewrites per request — and if that were
+/// admitted as history this assertion would read three for one line and two for
+/// the other, which is the shape §5.7 found and mistook for arithmetic. It is
+/// not arithmetic: an ephemeral notice is not a thing anyone said, so it never
+/// becomes an item, and the count is two on every line that ever ships.
 #[test]
 fn the_shipping_clients_two_turns_are_one_conversation_but_for_the_prompt_it_changed() {
-    let first = canonicalize(&parse(TURN_ONE)).expect("turn one is servable");
-    let second = canonicalize(&parse(TURN_TWO)).expect("turn two is servable");
+    for line in LINES {
+        let first = canonicalize(&parse(line.turn_one)).expect("turn one is servable");
+        let second = canonicalize(&parse(line.turn_two)).expect("turn two is servable");
 
-    assert_eq!(
-        second.len(),
-        first.len() + 2,
-        "the answer and the new question"
-    );
-    let diverged: Vec<usize> = first
-        .iter()
-        .zip(&second)
-        .enumerate()
-        .filter(|(_, (a, b))| a != b)
-        .map(|(index, _)| index)
-        .collect();
-    assert_eq!(
-        diverged,
-        vec![2],
-        "only the system prompt the client itself rewrote may differ: {diverged:?}"
-    );
-    assert_eq!(
-        first[5], second[5],
-        "the mid-conversation system message is a block list on turn one and a \
-         string on the resend; if those canonicalize differently, every second \
-         turn of every session forks and every turn still answers"
-    );
-    assert_eq!(
-        second[6],
-        Item {
-            role: Role::Assistant,
-            content: ItemContent::Text {
-                text: "MOCKED".to_string()
+        assert_eq!(
+            second.len(),
+            first.len() + 2,
+            "{}: the answer and the new question, and nothing else a \
+             `--continue` happens to carry: {second:#?}",
+            line.version
+        );
+        let diverged: Vec<usize> = first
+            .iter()
+            .zip(&second)
+            .enumerate()
+            .filter(|(_, (a, b))| a != b)
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(
+            diverged,
+            vec![2],
+            "{}: only the system prompt the client itself rewrote may differ: \
+             {diverged:?}",
+            line.version
+        );
+        assert_eq!(
+            first[5], second[5],
+            "{}: the mid-conversation system message is a block list on turn \
+             one and a string on the resend; if those canonicalize differently, \
+             every second turn of every session forks and every turn still \
+             answers",
+            line.version
+        );
+        assert_eq!(
+            second[6],
+            Item {
+                role: Role::Assistant,
+                content: ItemContent::Text {
+                    text: "MOCKED".to_string()
+                },
+                response_id: None,
             },
-            response_id: None,
-        },
-        "the client replays the assistant's reply verbatim, unstamped"
-    );
+            "{}: the client replays the assistant's reply verbatim, unstamped",
+            line.version
+        );
 
-    // And both turns name the same session, which is what makes the prefix check
-    // reach the same log at all.
-    assert_eq!(
-        session_key(&HeaderMap::new(), &parse(TURN_ONE)),
-        session_key(&HeaderMap::new(), &parse(TURN_TWO)),
-    );
+        // And both turns name the same session, which is what makes the prefix
+        // check reach the same log at all.
+        assert_eq!(
+            session_key(&HeaderMap::new(), &parse(line.turn_one)),
+            session_key(&HeaderMap::new(), &parse(line.turn_two)),
+        );
+    }
 }
 
 /// **F7: replaying the two live turns through the running server continues one
@@ -3303,6 +3580,12 @@ fn the_shipping_clients_two_turns_are_one_conversation_but_for_the_prompt_it_cha
 /// to agree with it.
 #[tokio::test]
 async fn f7_the_live_continue_pair_continues_across_ordinary_system_volatility() {
+    for line in LINES {
+        f7_one_line(line).await;
+    }
+}
+
+async fn f7_one_line(line: &CapturedLine) {
     let store = Arc::new(MemoryStore::new());
     let client = Arc::new(ScriptedFrontierClient::new("MOCKED"));
     let app = messages_router(
@@ -3312,19 +3595,22 @@ async fn f7_the_live_continue_pair_continues_across_ordinary_system_volatility()
         Arc::new(Conversations::new()),
     );
 
-    let mut turn_one: Value = serde_json::from_str(TURN_ONE).expect("the fixture is JSON");
+    let mut turn_one = fixture(line.turn_one);
     turn_one["stream"] = json!(true);
     stream(&app, &[], &turn_one).await;
 
-    const SESSION: &str = "anthropic_messages/e13acbde-ab70-46ff-b094-fd8ce95d286d";
-    let after_turn_one = stored_items(&store, SESSION).await;
+    let session = line.named();
+    let session = session.as_str();
+    let after_turn_one = stored_items(&store, session).await;
     assert_eq!(
         after_turn_one.len(),
         7,
-        "turn one's own six canonicalized items plus its answer: {after_turn_one:#?}"
+        "{}: turn one's own six canonicalized items plus its answer: \
+         {after_turn_one:#?}",
+        line.version
     );
 
-    let mut turn_two: Value = serde_json::from_str(TURN_TWO).expect("the fixture is JSON");
+    let mut turn_two = fixture(line.turn_two);
     turn_two["stream"] = json!(true);
     stream(&app, &[], &turn_two).await;
 
@@ -3337,15 +3623,16 @@ async fn f7_the_live_continue_pair_continues_across_ordinary_system_volatility()
     // replacement happens in the projection, not by rewriting what was
     // committed. The control below, where nothing about the configuration
     // moved, records nothing extra and lands on nine.
-    let continued = stored_items(&store, SESSION).await;
+    let continued = stored_items(&store, session).await;
     assert_eq!(
         continued.len(),
         12,
-        "turn two must extend the session it named, not silently orphan it: \
-         {continued:#?}"
+        "{}: turn two must extend the session it named, not silently orphan it: \
+         {continued:#?}",
+        line.version
     );
     assert!(
-        no_such_session(&store, &format!("{SESSION}#g1")).await,
+        no_such_session(&store, &format!("{session}#g1")).await,
         "and it must not have landed in a freshly forked generation instead"
     );
 
@@ -3362,15 +3649,16 @@ async fn f7_the_live_continue_pair_continues_across_ordinary_system_volatility()
     messages.push(json!({ "role": "user", "content": "and what about the other one?" }));
     stream(&app, &[], &turn_three).await;
 
-    let after_turn_three = stored_items(&store, SESSION).await;
+    let after_turn_three = stored_items(&store, session).await;
     assert_eq!(
         after_turn_three.len(),
         14,
-        "the new question and its answer, and nothing re-recorded: turn three's \
-         configuration is the one already stored: {after_turn_three:#?}"
+        "{}: the new question and its answer, and nothing re-recorded: turn \
+         three's configuration is the one already stored: {after_turn_three:#?}",
+        line.version
     );
     assert!(
-        no_such_session(&store, &format!("{SESSION}#g1")).await,
+        no_such_session(&store, &format!("{session}#g1")).await,
         "a replaced configuration run must be a stable projection, not a \
          tolerance that expires on the next turn"
     );
@@ -3400,6 +3688,117 @@ async fn f7_the_live_continue_pair_continues_across_ordinary_system_volatility()
 /// anyone trusts it.
 #[tokio::test]
 async fn f7_control_the_same_pair_does_not_fork_once_the_one_line_is_neutralized() {
+    for line in LINES {
+        let store = Arc::new(MemoryStore::new());
+        let client = Arc::new(ScriptedFrontierClient::new("MOCKED"));
+        let app = messages_router(
+            ControlPlane::open(),
+            engine_scripted(Arc::clone(&store), Arc::clone(&client)),
+            Arc::clone(&store),
+            Arc::new(Conversations::new()),
+        );
+
+        let mut turn_one = fixture(line.turn_one);
+        turn_one["stream"] = json!(true);
+        stream(&app, &[], &turn_one).await;
+
+        let mut turn_two = fixture(line.turn_two);
+        turn_two["stream"] = json!(true);
+        // The only edit: item 2 of `system` reset to turn one's own words, so
+        // every byte `suffix_after` compares now agrees.
+        turn_two["system"][2]["text"] = turn_one["system"][2]["text"].clone();
+        stream(&app, &[], &turn_two).await;
+
+        let continued = stored_items(&store, &line.named()).await;
+        assert_eq!(
+            continued.len(),
+            9,
+            "{}: with the one volatile line neutralized the configuration run \
+             is the one already stored, so nothing is re-recorded and the \
+             session grows by exactly the new question and its answer: \
+             {continued:#?}",
+            line.version
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// R-A: the current line's remaining-budget notice
+// ---------------------------------------------------------------------------
+
+/// CONTROL for R-A: the third captured turn really does carry the notice twice,
+/// in the two different shapes the ruling is about.
+///
+/// Without this, the two probes below could pass against a fixture that had
+/// quietly lost the notice — which is the one way "the session did not fork" is
+/// true for the wrong reason. Asserted on the raw fixture rather than on
+/// canonicalized items, because what it is checking is what the *client* sent.
+#[test]
+fn control_the_third_captured_turn_carries_the_budget_notice_twice() {
+    let turn_three = fixture(TURN_THREE_CURRENT);
+    let messages = turn_three["messages"]
+        .as_array()
+        .expect("the fixture's `messages` is a list");
+    assert_eq!(
+        messages.len(),
+        8,
+        "the capture is turn three of one conversation: {messages:#?}"
+    );
+
+    // Resent in history, flattened to a bare string — a string container cannot
+    // carry the `cache_control` breakpoint it had when it was the newest item.
+    assert_eq!(messages[4]["role"], json!("system"));
+    assert!(
+        messages[4]["content"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("<total_tokens>")),
+        "turn two's notice, resent flattened: {}",
+        messages[4]
+    );
+    // Appended fresh at the end, a one-block list carrying the breakpoint
+    // forward.
+    assert_eq!(messages[7]["role"], json!("system"));
+    assert_eq!(
+        messages[7]["content"][0]["cache_control"]["type"],
+        "ephemeral"
+    );
+    assert_eq!(
+        messages[4]["content"], messages[7]["content"][0]["text"],
+        "and the two spell the same budget, which is what makes the probe below \
+         about the *shape* rather than about a number that moved"
+    );
+
+    // And the prior line sends none at all, which is why R-A is a property of
+    // the current line and not of the dialect.
+    assert!(
+        !LINE_PRIOR.turn_two.contains("<total_tokens>"),
+        "the prior line's `--continue` carries no budget notice"
+    );
+}
+
+/// **R-A: three real turns of the current client line are one conversation, and
+/// the budget notice is not one of its items.**
+///
+/// The fixture is a genuine third turn — captured by resuming the very session
+/// [`LINE_CURRENT`]'s two turns built, so its resent history is turn two's bytes
+/// and not a reconstruction (§5.7.1). That matters because turn three is where
+/// the notice first appears twice: flattened in the history and fresh at the
+/// end.
+///
+/// **What would go wrong if it were history.** The notice is a counter the
+/// client recomputes per request. Admitted as an ordinary item it would be
+/// stored on turn two, resent on turn three, and agree — until `N` moved, which
+/// is the only thing a counter does; then the resend would disagree with the
+/// stored copy at a position no client can edit, the session would fork to a
+/// cold generation, and every turn would still answer. That is the same silent
+/// failure F7 was about, arriving through a message rather than through a system
+/// prompt — and it could not be fixed the same way, because turn configuration
+/// is the *leading* run by construction and this item is trailing.
+///
+/// Both the fork and the count are asserted, because either alone is passable by
+/// an implementation that has the other wrong.
+#[tokio::test]
+async fn r_a_three_real_turns_are_one_conversation_and_the_notice_is_not_an_item() {
     let store = Arc::new(MemoryStore::new());
     let client = Arc::new(ScriptedFrontierClient::new("MOCKED"));
     let app = messages_router(
@@ -3408,52 +3807,139 @@ async fn f7_control_the_same_pair_does_not_fork_once_the_one_line_is_neutralized
         Arc::clone(&store),
         Arc::new(Conversations::new()),
     );
+    let session = LINE_CURRENT.named();
 
-    let mut turn_one: Value = serde_json::from_str(TURN_ONE).expect("the fixture is JSON");
-    turn_one["stream"] = json!(true);
-    stream(&app, &[], &turn_one).await;
+    for (turn, body) in [
+        LINE_CURRENT.turn_one,
+        LINE_CURRENT.turn_two,
+        TURN_THREE_CURRENT,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut body = fixture(body);
+        body["stream"] = json!(true);
+        stream(&app, &[], &body).await;
+        assert!(
+            no_such_session(&store, &format!("{session}#g1")).await,
+            "turn {} forked the session: the notice is the only thing that \
+             moved between these three real turns",
+            turn + 1
+        );
+    }
 
-    let mut turn_two: Value = serde_json::from_str(TURN_TWO).expect("the fixture is JSON");
-    turn_two["stream"] = json!(true);
-    // The only edit: item 2 of `system` reset to turn one's own words, so
-    // every byte `suffix_after` compares now agrees.
-    turn_two["system"][2]["text"] = turn_one["system"][2]["text"].clone();
-    stream(&app, &[], &turn_two).await;
+    // Seven for turn one (six items and its answer), five more for turn two (the
+    // configuration run the client itself rewrote, re-recorded, plus the new
+    // question and its answer), and exactly two for turn three, whose
+    // configuration is the one already stored. The notice contributes nothing at
+    // any point, which is what "not a log item" means in the only place it can
+    // be observed.
+    let items = stored_items(&store, &session).await;
+    assert_eq!(items.len(), 14, "{items:#?}");
+    assert!(
+        !items.iter().any(|item| matches!(
+            &item.content,
+            ItemContent::Text { text } if text.contains("<total_tokens>") && text.len() < 200
+        )),
+        "no turn's budget notice may be in the log: {items:#?}"
+    );
 
-    let continued = stored_items(&store, &named("e13acbde-ab70-46ff-b094-fd8ce95d286d")).await;
+    // CONTROL for the assertion above: the *system prompt* ends with the same
+    // tag and is still in the log, because it is configuration and configuration
+    // is replaced rather than dropped. A rule that matched on the tag anywhere
+    // would have deleted a multi-KB system prompt and passed the line above.
+    assert!(
+        items.iter().any(|item| matches!(
+            &item.content,
+            ItemContent::Text { text }
+                if text.contains("<total_tokens>")
+                    && text.contains("interactive agent that helps users")
+        )),
+        "the client's own environment block quotes the same tag and is real \
+         configuration: {items:#?}"
+    );
+}
+
+/// **R-A's failure mode, made to happen: the budget moves and the session does
+/// not fork.**
+///
+/// The captures cannot show this on their own — the mock rig answers a constant
+/// `usage`, so `N` read 15000000 on every turn of every run, including the one
+/// that deliberately varied the reported output tokens (§5.7.1). A test that
+/// only replayed them would therefore be green against an implementation that
+/// stored the notice as history, and would go red in production on the first
+/// session long enough for the client's counter to move.
+///
+/// So the number is moved here, in both places turn three carries it — the
+/// flattened copy in the history and the fresh one at the end — leaving every
+/// other byte of the real capture alone. The session must still be one session,
+/// and must still grow by exactly the new question and its answer.
+#[tokio::test]
+async fn r_a_a_budget_that_counted_down_between_turns_does_not_fork_the_session() {
+    let store = Arc::new(MemoryStore::new());
+    let client = Arc::new(ScriptedFrontierClient::new("MOCKED"));
+    let app = messages_router(
+        ControlPlane::open(),
+        engine_scripted(Arc::clone(&store), Arc::clone(&client)),
+        Arc::clone(&store),
+        Arc::new(Conversations::new()),
+    );
+    let session = LINE_CURRENT.named();
+
+    for body in [LINE_CURRENT.turn_one, LINE_CURRENT.turn_two] {
+        let mut body = fixture(body);
+        body["stream"] = json!(true);
+        stream(&app, &[], &body).await;
+    }
+    let after_turn_two = stored_items(&store, &session).await.len();
+
+    let mut turn_three = fixture(TURN_THREE_CURRENT);
+    turn_three["stream"] = json!(true);
+    const SPENT: &str = "<total_tokens>14812345 tokens left</total_tokens>";
+    turn_three["messages"][4]["content"] = json!(SPENT);
+    turn_three["messages"][7]["content"][0]["text"] = json!(SPENT);
+    stream(&app, &[], &turn_three).await;
+
+    assert!(
+        no_such_session(&store, &format!("{session}#g1")).await,
+        "a client counting its own budget down must not fork the conversation \
+         it is counting"
+    );
+    let items = stored_items(&store, &session).await;
     assert_eq!(
-        continued.len(),
-        9,
-        "with the one volatile line neutralized the configuration run is the \
-         one already stored, so nothing is re-recorded and the session grows by \
-         exactly the new question and its answer: {continued:#?}"
+        items.len(),
+        after_turn_two + 2,
+        "the new question and its answer, and no re-recorded prefix: {items:#?}"
     );
 }
 
 /// The captured body, served — not just parsed.
 ///
 /// The unit above proves canonicalization; this proves the whole path handles
-/// 84 KB of real request, including twenty-four tool definitions this surface
-/// ignores and a `thinking` object whose shape changed between 2.1.247 and
-/// 2.1.251 (`budget_tokens` became `{"type":"adaptive"}`). An accepted-and-
-/// ignored field is only accepted if a request carrying it is answered.
+/// a whole real request, including every tool definition this surface ignores
+/// and a `thinking` object whose shape changed between 2.1.247 and 2.1.251
+/// (`budget_tokens` became `{"type":"adaptive"}`). An accepted-and-ignored
+/// field is only accepted if a request carrying it is answered.
 #[tokio::test]
 async fn the_captured_client_body_is_served_as_a_conformant_stream() {
-    let (app, store) = surface();
-    let mut body: Value = serde_json::from_str(TURN_ONE).expect("the fixture is JSON");
-    body["stream"] = json!(true);
+    for line in LINES {
+        let (app, store) = surface();
+        let mut body = fixture(line.turn_one);
+        body["stream"] = json!(true);
 
-    let accumulated = stream(&app, &[], &body).await;
-    assert_eq!(accumulated.text, ANSWER);
-    assert_eq!(accumulated.model, "claude-opus-5");
+        let accumulated = stream(&app, &[], &body).await;
+        assert_eq!(accumulated.text, ANSWER);
+        assert_eq!(accumulated.model, "claude-opus-5");
 
-    let items = stored_items(&store, &named("e13acbde-ab70-46ff-b094-fd8ce95d286d")).await;
-    assert_eq!(
-        items.len(),
-        7,
-        "the six canonicalized items plus the answer: {:#?}",
-        items.iter().map(|item| item.role).collect::<Vec<_>>()
-    );
+        let items = stored_items(&store, &line.named()).await;
+        assert_eq!(
+            items.len(),
+            7,
+            "{}: the six canonicalized items plus the answer: {:#?}",
+            line.version,
+            items.iter().map(|item| item.role).collect::<Vec<_>>()
+        );
+    }
 }
 
 /// CONTROL for F4, live: the captured body really does carry a real system
@@ -3467,22 +3953,27 @@ async fn the_captured_client_body_is_served_as_a_conformant_stream() {
 /// re-running.
 #[test]
 fn f4_control_the_captured_body_carries_a_real_system_prompt_past_the_header() {
-    let items = canonicalize(&parse(TURN_ONE)).expect("the live client's body must be servable");
+    for line in LINES {
+        let items =
+            canonicalize(&parse(line.turn_one)).expect("the live client's body must be servable");
 
-    assert_eq!(items[1].role, Role::Developer);
-    assert!(
-        matches!(&items[1].content, ItemContent::Text { text }
-            if text.contains("Claude Agent SDK")),
-        "control: item 1 should be the agent-SDK identity line: {:?}",
-        items[1].content
-    );
-    assert_eq!(items[2].role, Role::Developer);
-    assert!(
-        matches!(&items[2].content, ItemContent::Text { text }
-            if text.contains("interactive agent that helps users with software engineering")),
-        "control: item 2 should be the real system prompt: {:?}",
-        items[2].content
-    );
+        assert_eq!(items[1].role, Role::Developer);
+        assert!(
+            matches!(&items[1].content, ItemContent::Text { text }
+                if text.contains("Claude Agent SDK")),
+            "{}: control: item 1 should be the agent-SDK identity line: {:?}",
+            line.version,
+            items[1].content
+        );
+        assert_eq!(items[2].role, Role::Developer);
+        assert!(
+            matches!(&items[2].content, ItemContent::Text { text }
+                if text.contains("interactive agent that helps users with software engineering")),
+            "{}: control: item 2 should be the real system prompt: {:?}",
+            line.version,
+            items[2].content
+        );
+    }
 }
 
 /// **F4: the judge is briefed on the whole instruction block, not on its first
@@ -3504,14 +3995,21 @@ fn f4_control_the_captured_body_carries_a_real_system_prompt_past_the_header() {
 /// part of what the client sent, it is small, and it costs the budget almost
 /// nothing.
 ///
-/// Driven through the real `wire::canonicalize` on the real captured 2.1.251
+/// Driven through the real `wire::canonicalize` on each line's real captured
 /// body and the real `ValidationBrief::build`, matching
 /// `validate::mod::consult`'s call shape exactly (same items, same
 /// `Objective::from_items`, same `BriefConfig::default()`), because the
 /// finding was about those two functions meeting.
 #[test]
 fn f4_the_judge_is_briefed_on_the_whole_leading_instruction_run() {
-    let items = canonicalize(&parse(TURN_ONE)).expect("the live client's body must be servable");
+    for line in LINES {
+        f4_one_line(line);
+    }
+}
+
+fn f4_one_line(line: &CapturedLine) {
+    let items =
+        canonicalize(&parse(line.turn_one)).expect("the live client's body must be servable");
 
     let brief = ValidationBrief::build(
         &items,
