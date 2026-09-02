@@ -7,9 +7,10 @@
 //! can prove the wire format without turning storage internals into production
 //! API. This module only exists under the `test-support` feature.
 
-use roundhouse_core::control::ProjectId;
+use roundhouse_core::control::{Principal, ProjectId};
 use roundhouse_core::ids::SessionId;
 
+use crate::fair_use::{bucket_index, bucket_key, member_bucket_prefix, project_bucket_prefix};
 use crate::spend::holds_key as spend_holds_key_impl;
 use crate::{RedisSessionStore, lease_key as store_lease_key, log_key as store_log_key};
 
@@ -53,6 +54,26 @@ pub fn log_key(session_id: &SessionId) -> String {
 /// `the_project_and_member_keys_share_one_hash_tag` beside the real functions.
 pub fn spend_holds_key(project: &ProjectId) -> String {
     spend_holds_key_impl(project)
+}
+
+/// The two raw bucket keys one draw touches, for the tests that assert on the
+/// storage mechanism rather than only on the refusal derived from it.
+///
+/// Returned as a pair because that is the fact under test: `record_draw` takes
+/// one [`Principal`] and moves *both* scopes' counters, so a helper that
+/// handed back one key at a time would let a test assert half of it and look
+/// green. The bucket is derived from `at_ms` here exactly as the script
+/// derives it server-side; a test that computed the index itself would be
+/// pinning its own arithmetic rather than the ledger's.
+pub fn fair_use_bucket_keys(principal: &Principal, at_ms: u64) -> (String, String) {
+    let index = bucket_index(at_ms);
+    (
+        bucket_key(&project_bucket_prefix(&principal.project), index),
+        bucket_key(
+            &member_bucket_prefix(&principal.project, &principal.user),
+            index,
+        ),
+    )
 }
 
 /// The conformance suite's expiry lever. Deleting the key is exactly what

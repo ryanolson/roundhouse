@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Plan: the Anthropic Messages surface, the seat, and the launcher (M11)
 
-> **Status: shipped through M12 (2026-09-02).** The rulings in §3 stand
+> **Status: shipped through M13 (2026-09-02).** The rulings in §3 stand
 > as written; where an implementation round moved one, the dated addenda at
 > the end of this document record the move and its reason, and win over §3
 > for the current tree. Direction set by the product owner on
@@ -1147,3 +1147,96 @@ it, so the cost is a duplicated prefix, not a wrong session; and
 serves rather than one per key that forked, which is the honest price of
 "never bound" meaning something — the same growth profile the store already
 carries a log for, and process state the durable mapping replaces.
+
+## Addendum (2026-09-02): M13 — the Redis fair-use ledger, the rulings
+
+`control/fair_use.rs` deferred its Redis implementation by name with the
+unlock condition written down: fair use across nodes is only true with
+shared buckets, and the one undecided question was the key layout. This
+rung lands it. (Recorded in `PLAN-anthropic-messages.md` because the loop
+that drives this branch lives here; the frontier plan's 2026-08-24 addendum
+is the ruling it implements.)
+
+**R-F1 — one hash per (scope, bucket), expired by Redis, summed by Lua.**
+Bucket-per-key at `BUCKET_MS` (five minutes), keyed by scope (the project,
+and the member) and bucket index, holding two integer fields — tokens and
+micro-dollars, so `HINCRBY` stays exact and the f64 the trait speaks is
+converted once at the edge with the rounding stated. `PEXPIRE` at the
+widest window plus one bucket makes Redis the pruning pass the hash-per-scope
+layout would have needed and nothing owns; an idle scope costs nothing.
+`record_draw` is one script: two `HINCRBY` on each of the two scopes plus
+the expiry, one round trip. `would_exceed` is one script: the bucket keys
+for each window are built server-side from the caller's `now_ms` and
+`BUCKET_MS`, summed cheapest-window-first (5h, then 24h, then 7d) for both
+scopes, compared against the caps, and the narrowest refusing window and its
+earliest retry — the walk from the oldest bucket forward — returned exactly
+as the memory ledger computes them. The memory ledger's arithmetic is the
+specification; the two implementations pass one contract.
+
+**R-F2 — the clock is the caller's, as the spend ledger already ruled.**
+`at_ms`/`now_ms` stay caller-supplied (the trait says why: a window boundary
+must be reachable in a test without waiting for one); the scripts never read
+Redis `TIME`, matching `RedisSpendLedger`'s documented departure from the
+`scripts` module convention, for the same reason.
+
+**R-F3 — the composition root chooses by the same rule as sessions and
+spend.** With `ROUNDHOUSE_REDIS_URL` set and a `fair_use` block configured,
+the Redis ledger is wired and the single-node boot warning goes; without
+Redis the memory ledger and the warning stay — the honesty mechanism is not
+weakened, it is satisfied.
+
+**R-F4 — what proves it.** A shared contract suite the memory ledger already
+passes, run over the Redis ledger against a real Redis (gated on
+`ROUNDHOUSE_TEST_REDIS_URL` with `--include-ignored`, the store crate's
+discipline; a missing URL fails loudly). The unlock condition itself as a
+test: two ledger handles over one Redis, a draw through one refused by the
+other. Bucket boundaries, window roll-over, the retry time, expiry of a
+stale bucket, and the two-scope update from one call, each against the real
+server. The `redis` crate is a watched dependency: no version moves here.
+
+### What the implementation settled beyond the rulings (2026-09-02, M13)
+
+- **The contract is a macro both crates instantiate.** The memory ledger's
+  behavioural tests moved into `control/fair_use/contract.rs` as
+  `fair_use_ledger_contract_suite!`, in the spend-contract idiom; the
+  memory ledger runs it unchanged and the Redis ledger runs it against a
+  real server, gated on `ROUNDHOUSE_TEST_REDIS_URL` with a missing URL
+  failing loudly. One new assertion the memory ledger never had — the
+  retry time names the oldest bucket that has to age out — exists because
+  every other test records a single draw and would not tell a walk from
+  the newest bucket apart from one from the oldest.
+- **Both scopes hash to one slot.** The project's key is the cluster hash
+  tag for the member's, so one script touches one slot on a cluster, and a
+  unit test pins that two projects do not share one.
+- **Two divergences from the specification, documented rather than
+  hidden.** The script sums buckets from the window's first index through
+  `now_ms / BUCKET_MS`, where the memory ledger's range is open at the top;
+  the difference is reachable only when a draw is stamped after the
+  `now_ms` of a later check — a clock going backwards across nodes by more
+  than the remainder of a bucket — and closing it would narrow the memory
+  ledger, which is changing the specification to fit an implementation. The
+  Redis counters are `i64`, so a draw past `i64::MAX` tokens or
+  micro-dollars is refused where the memory ledger saturates; the contract
+  asserts the shared middle of the range and each end is asserted where it
+  belongs. Sub-micro-dollar draws round to zero, half away from zero, at
+  the edge — the only information this backend loses.
+- **The composition root's predicate is a function, not a condition.** The
+  refute pass found one mutation nothing caught: the boot warning's real
+  `if` in `main.rs` was never exercised, because the test that claimed to
+  cover it re-derived the predicate in a local closure. `fair_use_backend`
+  chooses the ledger and `fair_use_warning_owed` decides the warning; the
+  boot site calls both and the test calls the same functions.
+- **What is not covered, stated.** No integration test boots the binary
+  against Redis with a `fair_use` block — the composition-root choice is
+  covered by unit tests on the two predicates. One gated test sleeps 400 ms
+  through a test-support TTL seam, because key expiry is the one clock this
+  ledger does not own; the production TTL is asserted without sleeping via
+  `PTTL`. There may be only one `INFO commandstats` measuring loop per test
+  binary — two such tests are each other's competitor on a server-wide
+  counter — and the reason is written beside the one that exists.
+- **Refute by mutation against the real server**: nine mutations — drop the
+  expiry, sum one scope, the oldest bucket off by one in both directions,
+  widest window first, retry from the newest bucket, `TIME` instead of the
+  caller's clock, two handles with different prefixes, floor instead of
+  round at the edge, and the boot warning kept beside a wired Redis; eight
+  went red under a named guard and the ninth became the predicate above.

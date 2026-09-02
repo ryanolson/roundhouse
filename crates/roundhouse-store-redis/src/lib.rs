@@ -33,7 +33,7 @@
 //! durable as the Redis it lives in (AOF `appendfsync`, replication). This
 //! crate does not try to out-engineer the operator's persistence config.
 //!
-//! The write path lives in [`scripts`]: the lease is a TTL'd hash on the Redis
+//! The write path lives in `scripts`: the lease is a TTL'd hash on the Redis
 //! clock, and lease-check plus append is one atomic Lua script, which
 //! is what makes the fencing the trait promises actually hold under
 //! concurrent writers. Requires Redis ≥ 6.2 (exclusive `XRANGE` starts,
@@ -43,11 +43,13 @@
 //! by the same `store_contract_suite!` macro — and the binary selects it when
 //! `ROUNDHOUSE_REDIS_URL` is set (see `roundhouse-server`'s `main.rs`).
 
+pub mod fair_use;
 mod scripts;
 pub mod spend;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 
+pub use fair_use::RedisFairUseLedger;
 pub use spend::RedisSpendLedger;
 
 use redis::aio::ConnectionManager;

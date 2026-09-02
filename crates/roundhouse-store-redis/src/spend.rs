@@ -18,18 +18,18 @@
 //! | `rh:{<project_id>}:budget:holds` | hash | `response_id` → packed `user`/`amount`/`expires_at_ms`, one field per live grant |
 //! | `rh:{<project_id>}:budget:watermarks` | hash | `session_id` → highest settled `seq` |
 //!
-//! The write and read paths both live in [`spend::scripts`](scripts): every
+//! The write and read paths both live in `spend::scripts`: every
 //! trait method is exactly one Lua script, so a grant, a settle, and a
 //! balance read are each one round trip regardless of how many ceilings or
 //! holds they touch. See that module's doc for the two conventions worth
 //! reading before editing the Lua: dollar amounts cross as strings, never Lua
 //! numbers, and `now_ms` is client-supplied rather than read from
-//! `redis.call('TIME')` — a deliberate departure from [`crate::scripts`]'s
+//! `redis.call('TIME')` — a deliberate departure from `crate::scripts`'s
 //! convention, because the ledger's own contract (both here and in
 //! `roundhouse_core::control::spend`) requires a TTL lapse and a monthly
 //! reset to be reachable in a test without sleeping.
 //!
-//! Passes the same [`spend_ledger_contract_suite!`](roundhouse_core::spend_ledger_contract_suite)
+//! Passes the same `spend_ledger_contract_suite!`
 //! that judges `MemorySpendLedger`, instantiated ignore-gated in
 //! `tests/spend_contract.rs` exactly as `tests/contract.rs` does for the
 //! session store.

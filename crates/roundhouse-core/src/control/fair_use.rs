@@ -34,29 +34,39 @@
 //! rolling window clears on its own and telling a client *when* is the
 //! difference between a backoff and a poll.
 //!
-//! # What is deferred, and what would unblock it
+//! # Where the buckets live
 //!
-//! [`MemoryFairUseLedger`] is the only backing store in this milestone, which
-//! means the buckets live in one process and two nodes enforce two independent
-//! ceilings. That is honest for M10.1 — this phase's benchmark runs on one node
-//! — and it is the same shape as the M2 choice between
-//! [`MemoryStore`](crate::store::MemoryStore) and Redis, and as the admin
-//! directory's own deferral.
+//! Two backing stores, and the composition root picks between them by exactly
+//! the rule it picks a session store and a spend ledger by: with
+//! `ROUNDHOUSE_REDIS_URL` set *and* some membership configuring a `fair_use`
+//! block, `RedisFairUseLedger` in `roundhouse-store-redis` counts into buckets
+//! every node of the deployment shares; with either absent,
+//! [`MemoryFairUseLedger`] counts into this process's own memory and the boot
+//! warning that says so stays.
 //!
-//! **The unlock condition, so the next person does not have to re-derive it:**
-//! fair use across nodes is only true with *shared* buckets, so the Redis
-//! implementation is wanted the moment a second node serves the same project.
-//! The shape is already decided by this trait — `record_draw` is a
-//! read-modify-write on one bucket and `would_exceed` is a suffix sum over a
-//! bounded number of them, which is one Lua script each, the same way
-//! `RedisSpendLedger` expresses a grant. What is *not* decided is the key
-//! layout, and it is the only interesting question: bucket-per-key costs one
-//! `INCRBY` and a `MGET` of at most 2016 keys for the 7-day window, while a
-//! hash-per-scope costs one `HINCRBY` and one `HGETALL` but needs a pruning
-//! pass nothing currently owns. Until that lands, the boot warning at the
-//! composition root says single-node enforcement out loud — the same honesty
-//! mechanism the directory store uses, and for the same reason: a ceiling
-//! everyone believes in and nothing enforces is worse than no ceiling.
+//! **The key layout was the one question the M10.1 deferral left open, and it
+//! is answered in that crate rather than here** (M13): one hash per (scope,
+//! bucket) at [`BUCKET_MS`], two integer fields, expired by Redis at the widest
+//! window plus one bucket — which is what buys the pruning pass a
+//! hash-per-scope layout would have needed and nothing owns. The shape of the
+//! two operations was already decided by this trait, and it held:
+//! `record_draw` is one script and `would_exceed` is one script, the same way
+//! [`RedisSpendLedger`](super::spend::SpendLedger) expresses a grant.
+//!
+//! **What keeps the two honest is [`contract`]**: one list of behavioural
+//! assertions, run against both. The arithmetic below — the window sum, the
+//! narrowest-first check, the retry walk — is the specification, and a backend
+//! that cannot reproduce it is wrong rather than different.
+//!
+//! What is still true of the memory ledger, and is what the warning is about:
+//! its counters live in one process, so two nodes enforce two independent
+//! ceilings and every counter resets on restart. That is honest for a
+//! single-node deployment and not for any other, which is why the deployment
+//! that has said "this is more than one process" — by naming a Redis — is
+//! exactly the one that gets the shared buckets.
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod contract;
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -450,7 +460,8 @@ fn earliest_retry_ms(
 /// Rolling draw counters in this process's memory.
 ///
 /// Enforces every ceiling correctly for the scope it covers — one node — and
-/// says so at boot. See the module doc for the unlock condition.
+/// says so at boot. A deployment that wants one ceiling across nodes names a
+/// Redis; see the module doc for which store that selects and why.
 #[derive(Debug, Default)]
 pub struct MemoryFairUseLedger {
     scopes: Mutex<HashMap<(ProjectId, Option<UserId>), Buckets>>,
@@ -543,227 +554,19 @@ impl FairUseLedger for MemoryFairUseLedger {
 mod tests {
     use super::*;
 
-    const MINUTE: u64 = 60_000;
-    const HOUR: u64 = 60 * MINUTE;
-
-    fn ada() -> Principal {
-        Principal::new("acme", "ada")
-    }
-
-    fn bob() -> Principal {
-        Principal::new("acme", "bob")
-    }
-
-    fn tokens(window: FairUseWindow, max: u64) -> FairUseLimit {
-        FairUseLimit {
-            window,
-            max_tokens: Some(max),
-            max_usd: None,
-        }
-    }
-
-    fn project_only(limits: Vec<FairUseLimit>) -> FairUseTerms {
-        FairUseTerms {
-            project: limits,
-            member: Vec::new(),
-        }
-    }
-
-    async fn refused(
-        ledger: &MemoryFairUseLedger,
-        principal: &Principal,
-        terms: &FairUseTerms,
-        now_ms: u64,
-    ) -> Option<FairUseRefusal> {
-        ledger.would_exceed(principal, terms, now_ms).await.unwrap()
-    }
-
-    /// **The claim.** A turn over the 5-hour window is refused, and the refusal
-    /// carries a time a client can wait until.
-    #[tokio::test]
-    async fn a_turn_over_the_5h_window_is_refused_with_the_earliest_retry_time() {
-        let ledger = MemoryFairUseLedger::new();
-        let terms = project_only(vec![tokens(FairUseWindow::FiveHours, 1_000)]);
-
-        // One draw at t=0 that lands exactly on the cap.
-        ledger.record_draw(&ada(), 0, 1_000, 0.0).await.unwrap();
-
-        let hit = refused(&ledger, &ada(), &terms, HOUR)
-            .await
-            .expect("the window is spent");
-        assert_eq!(hit.window, FairUseWindow::FiveHours);
-        assert_eq!(hit.scope, FairUseScope::Project);
-        assert_eq!(hit.quantity, FairUseQuantity::Tokens);
-        // The draw sits in bucket 0, whose end is BUCKET_MS; it leaves a
-        // 5-hour window BUCKET_MS + 5h after the epoch.
-        assert_eq!(hit.retry_at_ms, BUCKET_MS + 5 * HOUR);
-
-        // CONTROL: the same ledger, the same draw, one turn earlier — under the
-        // cap, so nothing is refused. Without this, a `would_exceed` that
-        // refused unconditionally would pass the assertion above.
-        let generous = project_only(vec![tokens(FairUseWindow::FiveHours, 1_001)]);
-        assert_eq!(refused(&ledger, &ada(), &generous, HOUR).await, None);
-    }
-
-    /// The window rolls: a draw that has aged past the span stops counting, and
-    /// the identical request that was refused is served.
-    #[tokio::test]
-    async fn windows_roll_rather_than_reset() {
-        let ledger = MemoryFairUseLedger::new();
-        let terms = project_only(vec![tokens(FairUseWindow::FiveHours, 1_000)]);
-        ledger.record_draw(&ada(), 0, 1_000, 0.0).await.unwrap();
-
-        // Just inside: still refused. This is the assertion a *calendar* window
-        // would fail — a 5-hour window anchored to a clock boundary would have
-        // reset at some fixed hour regardless of when the draw landed.
-        assert!(refused(&ledger, &ada(), &terms, 5 * HOUR).await.is_some());
-
-        // Past the retry time the refusal named, and the same request is
-        // served. Asserting *at* the named time rather than at some later
-        // round number is what makes `retry_at_ms` a number rather than a
-        // gesture.
-        assert_eq!(
-            refused(&ledger, &ada(), &terms, BUCKET_MS + 5 * HOUR).await,
-            None
-        );
-    }
-
-    /// **The member ceiling binds even when the project has room.**
-    ///
-    /// The project here has *no* fair-use limit at all, so nothing about the
-    /// project's counters can be what refuses the turn — which is what stops
-    /// this passing for the wrong reason on a ledger that merged the two
-    /// scopes.
-    #[tokio::test]
-    async fn the_member_window_binds_even_when_the_projects_has_room() {
-        let ledger = MemoryFairUseLedger::new();
-        let terms = FairUseTerms {
-            project: vec![tokens(FairUseWindow::FiveHours, 1_000_000)],
-            member: vec![tokens(FairUseWindow::FiveHours, 100)],
-        };
-
-        ledger.record_draw(&ada(), 0, 100, 0.0).await.unwrap();
-
-        let hit = refused(&ledger, &ada(), &terms, HOUR)
-            .await
-            .expect("ada is over her own ceiling");
-        assert_eq!(hit.scope, FairUseScope::Member);
-        assert_eq!(
-            hit.window,
-            FairUseWindow::FiveHours,
-            "and the refusal names the member's window, because raising the \
-             project's would change nothing"
-        );
-
-        // CONTROL: the other member of the same project, under the identical
-        // terms, at the identical instant. `bob` has drawn nothing, so he is
-        // served — which is what makes the refusal above about `ada`'s own
-        // counters rather than about the project's.
-        assert_eq!(refused(&ledger, &bob(), &terms, HOUR).await, None);
-
-        // And the project's own counters really did move: `ada`'s draw is in
-        // the project total too, so the two scopes are two counters over one
-        // draw rather than one counter read twice.
-        let tight_project = project_only(vec![tokens(FairUseWindow::FiveHours, 100)]);
-        assert_eq!(
-            refused(&ledger, &bob(), &tight_project, HOUR)
-                .await
-                .map(|refusal| refusal.scope),
-            Some(FairUseScope::Project),
-            "bob has drawn nothing of his own and is still refused by the \
-             project's window, which ada filled"
-        );
-    }
-
-    /// **The narrowest window is checked first and is what the refusal names.**
-    ///
-    /// Every window is over its cap here, so the answer is entirely about
-    /// order. Naming the 7-day one would send an agent away for a week when the
-    /// 5-hour one clears first.
-    #[tokio::test]
-    async fn the_smallest_window_is_checked_first_and_named_in_the_refusal() {
-        let ledger = MemoryFairUseLedger::new();
-        let terms = project_only(vec![
-            tokens(FairUseWindow::SevenDays, 10),
-            tokens(FairUseWindow::TwentyFourHours, 10),
-            tokens(FairUseWindow::FiveHours, 10),
-        ]);
-        ledger.record_draw(&ada(), 0, 50, 0.0).await.unwrap();
-
-        let hit = refused(&ledger, &ada(), &terms, HOUR)
-            .await
-            .expect("every window is spent");
-        assert_eq!(hit.window, FairUseWindow::FiveHours);
-        assert!(hit.retry_at_ms < BUCKET_MS + 24 * HOUR);
-
-        // CONTROL: the 5-hour window rolled off, so the next-narrowest is what
-        // answers. Without this, a `would_exceed` that always returned the
-        // first element of a hard-coded list would satisfy the assertion above.
-        let hit = refused(&ledger, &ada(), &terms, BUCKET_MS + 6 * HOUR)
-            .await
-            .expect("the wider windows are still spent");
-        assert_eq!(hit.window, FairUseWindow::TwentyFourHours);
-    }
-
-    /// A dollar cap and a token cap on one window both bind.
-    #[tokio::test]
-    async fn either_cap_can_be_the_one_that_refuses() {
-        let ledger = MemoryFairUseLedger::new();
-        let terms = project_only(vec![FairUseLimit {
-            window: FairUseWindow::FiveHours,
-            max_tokens: Some(1_000_000),
-            max_usd: Some(5.0),
-        }]);
-        ledger.record_draw(&ada(), 0, 10, 5.0).await.unwrap();
-
-        assert_eq!(
-            refused(&ledger, &ada(), &terms, HOUR)
-                .await
-                .map(|refusal| refusal.quantity),
-            Some(FairUseQuantity::Usd),
-            "ten tokens is nowhere near the token cap; the dollars are what ran out"
-        );
-    }
-
-    /// A membership with no fair-use block reaches no counter and is never
-    /// refused — the shipped posture, and the one every project has until an
-    /// operator writes a window down.
-    #[tokio::test]
-    async fn a_membership_with_no_windows_is_never_refused() {
-        let ledger = MemoryFairUseLedger::new();
-        ledger
-            .record_draw(&ada(), 0, u64::MAX, 1_000_000.0)
-            .await
-            .unwrap();
-        assert_eq!(
-            refused(&ledger, &ada(), &FairUseTerms::default(), HOUR).await,
-            None
-        );
-    }
-
-    /// A `NaN` cannot enter the counters.
-    ///
-    /// It would not blow up: it would make every window sum `NaN`, which is
-    /// never `>=` any cap, and the ceiling would silently stop existing — the
-    /// same fail-open `SpendError::check_amount` exists to prevent one seam
-    /// over.
-    #[tokio::test]
-    async fn a_nonfinite_draw_is_refused_rather_than_silently_disabling_the_cap() {
-        let ledger = MemoryFairUseLedger::new();
-        assert!(ledger.record_draw(&ada(), 0, 1, f64::NAN).await.is_err());
-        assert!(ledger.record_draw(&ada(), 0, 1, -1.0).await.is_err());
-
-        // CONTROL, and it is the load-bearing half: the counters are untouched,
-        // so a refused draw is refused rather than half-applied.
-        let terms = project_only(vec![FairUseLimit {
-            window: FairUseWindow::FiveHours,
-            max_tokens: None,
-            max_usd: Some(0.01),
-        }]);
-        assert_eq!(refused(&ledger, &ada(), &terms, HOUR).await, None);
-    }
+    // The behavioural assertions live in `contract` now and are run from here
+    // by the macro below. They were this module's own unit tests until a
+    // second backend existed to run them; leaving them here would have meant
+    // the memory ledger was judged by one list and Redis by another, which is
+    // the exact drift the suite exists to make impossible.
+    crate::fair_use_ledger_contract_suite!(MemoryFairUseLedger::new());
 
     /// The file's spelling of a window and the refusal's are one string.
+    ///
+    /// Not in the contract: it asks nothing of a ledger. `serde` and
+    /// `wire_name` are properties of the vocabulary itself, so a backend
+    /// running this would be re-checking `roundhouse-core` against itself
+    /// through an unrelated dependency.
     #[test]
     fn window_names_are_what_a_config_file_would_write() {
         for (window, expected) in [
@@ -785,26 +588,38 @@ mod tests {
         assert!(spans.windows(2).all(|pair| pair[0] < pair[1]));
     }
 
-    /// The staircase error is bounded and one-sided: early, never late.
+    /// A draw past `u64::MAX` saturates rather than wrapping.
+    ///
+    /// Memory-only, and deliberately not in the contract: a backend counting
+    /// in Redis integers cannot saturate at `u64::MAX` and must refuse instead,
+    /// so this is a statement about *this* representation's range and belongs
+    /// beside it. What the contract asserts is the shared part — that a draw of
+    /// any plausible size reaches the counters at all.
     #[tokio::test]
-    async fn a_window_refuses_early_rather_than_late() {
+    async fn a_draw_that_would_overflow_the_counter_saturates() {
         let ledger = MemoryFairUseLedger::new();
-        let terms = project_only(vec![tokens(FairUseWindow::FiveHours, 10)]);
-        // A draw at the very start of a bucket. Its bucket is included until
-        // the bucket's *end* leaves the window, so it counts for up to one
-        // bucket width longer than a per-draw ledger would say.
-        ledger.record_draw(&ada(), 0, 10, 0.0).await.unwrap();
+        let ada = Principal::new("acme", "ada");
+        ledger.record_draw(&ada, 0, u64::MAX, 0.0).await.unwrap();
+        ledger.record_draw(&ada, 0, u64::MAX, 0.0).await.unwrap();
 
+        let terms = FairUseTerms {
+            project: vec![FairUseLimit {
+                window: FairUseWindow::FiveHours,
+                max_tokens: Some(u64::MAX),
+                max_usd: None,
+            }],
+            member: Vec::new(),
+        };
+        // Wrapping would have put the sum at `u64::MAX - 1`, under the cap and
+        // therefore served: the assertion is that the second draw did not
+        // *empty* the counter the first one filled.
         assert!(
-            refused(&ledger, &ada(), &terms, 5 * HOUR + BUCKET_MS - 1)
+            ledger
+                .would_exceed(&ada, &terms, 60_000)
                 .await
+                .unwrap()
                 .is_some(),
-            "still counted a whisker before the bucket ages out -- early"
-        );
-        assert_eq!(
-            refused(&ledger, &ada(), &terms, 5 * HOUR + BUCKET_MS).await,
-            None,
-            "and never later than one bucket width past the span"
+            "two saturating draws stay at the ceiling rather than wrapping past it"
         );
     }
 }

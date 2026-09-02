@@ -197,11 +197,10 @@ both bind — the narrower one refuses first. A turn over its window gets HTTP
 429 `fair_use_exceeded` with `error.type: "usage_limit_reached"`, naming the
 scope, the window, the quantity that ran out, and `resets_at` rounded *up* to
 the earliest second the window could have room — retryable, and no grant is
-taken for a refused turn. Enforcement is single-node only in this milestone
-(the counters live in the process's memory), so a deployment that sets
-`ROUNDHOUSE_REDIS_URL` while also configuring `fair_use` gets a boot warning
-that two nodes serving one project enforce two independent ceilings rather
-than one shared one.
+taken for a refused turn. Where `ROUNDHOUSE_REDIS_URL` is set the counters are
+rolling buckets in that Redis, so every node serving a project shares one
+ceiling; with no Redis they live in the process's memory, and a deployment that
+configures a window without one gets a boot warning saying so.
 
 **The admin plane** (`/v1/admin/...`) is the only surface that writes tenancy:
 projects, users, memberships, and key mint/revoke, plus one read that exists
@@ -1373,10 +1372,10 @@ what that surface still does not do is worth stating plainly. `/v1/models` is
 deliberately not served, so a client with gateway model discovery enabled sees
 no catalog:
 exposing roundhouse's routes in a user's `/model` picker is a product decision
-that has been deferred rather than made. Fair-use enforcement is
-single-node: the rolling window
-counters live in process memory, and the Redis implementation is deferred by
-name with a boot warning where it matters.
+that has been deferred rather than made. Fair-use enforcement is shared across
+nodes now — the rolling buckets live in Redis where one is configured, judged
+by the same contract suite as the in-memory ledger — but a deployment with no
+Redis still counts in process memory, and says so at boot.
 
 The generated launch configuration now has an operator entry point — `topham`,
 above — and a launched Claude Code now reaches the `/mcp` mount as well as the
