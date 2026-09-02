@@ -118,6 +118,39 @@ impl RoundhouseMcp {
             .collect()
     }
 
+    /// The `_meta` key Claude Code puts the id of the `tool_use` block it is
+    /// answering under.
+    ///
+    /// Spelled by the client, not by us: read off the 2.1.257 capture in
+    /// `roundhouse-server`'s `tests/fixtures/claude-2.1.257-mcp-wire.json`,
+    /// where a `tools/call` carries
+    /// `"_meta": {"claudecode/toolUseId": "toolu_…", "progressToken": 2}`.
+    /// A namespaced key like this one is exactly what MCP's `_meta` is for, so
+    /// nothing here is reaching into a field that was not offered.
+    const TOOL_USE_ID_META: &'static str = "claudecode/toolUseId";
+
+    /// The `tool_use` block this call is answering, if the client named one.
+    ///
+    /// **Read from the request *context* and not from `request.meta`.** `rmcp`
+    /// strips the wire's `params._meta` into the message envelope's extensions
+    /// during deserialization and its service loop moves it onto
+    /// [`RequestContext::meta`] before dispatch — the typed params' own `meta`
+    /// field stays empty on the way in. A reader that took `request.meta` would
+    /// compile, would be `None` on every real request, and would silently
+    /// return every MCP call to the pre-R-M2 `latest` guess.
+    ///
+    /// A non-string value is `None` rather than a refusal. This is a
+    /// correlation hint on a call the deployment can serve without it, so a
+    /// client that spells it oddly gets the fallback and its answer, not a
+    /// protocol error mid-turn.
+    fn tool_use_id(context: &RequestContext<RoleServer>) -> Option<String> {
+        context
+            .meta
+            .get(Self::TOOL_USE_ID_META)
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+    }
+
     /// Who is calling, from the extensions the HTTP layer filled in.
     ///
     /// `rmcp` injects the request's `http::request::Parts` into the tool
@@ -213,6 +246,7 @@ impl ServerHandler for RoundhouseMcp {
                 .arguments
                 .map(serde_json::Value::Object)
                 .unwrap_or(serde_json::Value::Null),
+            tool_use_id: Self::tool_use_id(&context),
         };
         let outcome = crate::tools::dispatch(self.surface.as_ref(), &principal, call).await;
         Ok(CallToolResponse::Complete(into_result(outcome)))

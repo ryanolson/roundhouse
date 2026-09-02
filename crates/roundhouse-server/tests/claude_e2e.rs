@@ -75,7 +75,17 @@
 //! gated on `ROUNDHOUSE_TEST_TOPHAM_BIN` on top of everything else, and what
 //! they add over the tests above is the one link those cannot reach: that
 //! something a person can run produces the map the rest of this file hands the
-//! client directly. See "The closure" below.
+//! client directly.
+//!
+//! [`a_real_client_reaches_the_control_surface_through_the_turn`] is the same
+//! kind and one rung further out (M12, R-M6): the launcher's generated argv
+//! registers this deployment's own `/mcp` mount, and the client answers a
+//! `tool_use` for a `mcp__roundhouse__*` tool by dispatching against it. It is
+//! the only test in the file where **both** of this deployment's routers are
+//! mounted on the socket the client talks to, and it is where the flat tool
+//! name, the turn key on a second protocol, the tool-use-id correlation, the
+//! prefix check and the validate fold's control-traffic exclusion are all one
+//! run.
 //!
 //! …and the Relay-only ones need no `claude` at all: they drive `nemo-relay run
 //! --dry-run` directly, which resolves configuration without spawning an agent.
@@ -89,9 +99,10 @@
 //! # What is real here, and what is scripted
 //!
 //! Real: the `claude` binary, the HTTP transport, the Messages surface, the
-//! control directory and its minted turn key, the session log, the prefix check,
-//! the tool the client chose to run, and [`ClaudeEnv`] — the launcher's output is
-//! consumed verbatim rather than re-spelled.
+//! MCP control surface beside it, the control directory and its minted turn
+//! key, the session log, the prefix check, the tool the client chose to run,
+//! and [`ClaudeEnv`] — the launcher's output is consumed verbatim rather than
+//! re-spelled.
 //!
 //! Scripted: the frontier. An in-process [`FrontierClient`] answers every
 //! dispatch, so this test decides when a `tool_use` block is emitted rather than
@@ -114,7 +125,7 @@
 //!
 //! `--features e2e-claude` compiles the file at all; `--include-ignored` opts
 //! into spawning processes. The chained tests additionally need
-//! `ROUNDHOUSE_TEST_RELAY_BIN`, and the two closure tests
+//! `ROUNDHOUSE_TEST_RELAY_BIN`, and the closure tests
 //! `ROUNDHOUSE_TEST_TOPHAM_BIN` naming a **freshly built** `target/debug/topham`
 //! (`cargo build -p topham`) — freshly, because a stale one reports green for
 //! code nobody compiled. `--test-threads=1` is not politeness: `claude
@@ -275,20 +286,27 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use axum::Router;
+use axum::body::Body;
+use axum::extract::{Request, State};
+use axum::middleware::Next;
+use axum::response::Response;
+use serde::Deserialize;
 use serde_json::Value;
 
 use roundhouse_core::context::ByteTokenizer;
-use roundhouse_core::control::Principal;
+use roundhouse_core::control::{MemorySpendLedger, Principal, SpendLedger};
 use roundhouse_core::ids::SessionId;
 use roundhouse_core::item::{Item, ItemContent, Role};
 use roundhouse_core::now_ms;
 use roundhouse_core::routing::AffinityPolicy;
-use roundhouse_core::store::MemoryStore;
+use roundhouse_core::store::{MemoryStore, SessionStore};
+use roundhouse_core::validate::{CONTROL_TOOL_NAMES, exchanges, is_control_call, task_exchanges};
 use roundhouse_fleet::FrontierClient;
+use roundhouse_mcp::ControlStore;
 use roundhouse_server::claude_launch::{
     API_KEY_ENV, BASE_URL_ENV, CUSTOM_HEADERS_ENV, ClaudeEnv, ClaudeLaunch,
     ROUNDHOUSE_API_KEY_SENTINEL,
@@ -304,9 +322,12 @@ use roundhouse_server::messages_api::{MESSAGES_PATH, wire};
 // template spelled here. `topham relay` consumes the same one, so a rig that
 // went green against a config the launcher does not produce is not a state this
 // file can reach.
+use roundhouse_server::dialect::mcp_server_name;
+use roundhouse_server::mcp_api::MCP_MOUNT_PATH;
 use roundhouse_server::relay_handoff::{RELAY_STATE_VARS, RelayAgent, RelayHandoff};
 use roundhouse_server::{
-    API_PREFIX, Conversations, EchoLocalExecutor, Engine, EngineConfig, messages_router,
+    API_PREFIX, ClientDialect, ControlPlaneReads, Conversations, EchoLocalExecutor, Engine,
+    EngineConfig, mcp_router, messages_router,
 };
 
 mod common;
@@ -315,8 +336,8 @@ mod common;
 // client inside, and were a line-for-line copy of it until the two drifted.
 use common::e2e::{
     Exchange, PROJECT, Recorder, TOPHAM_BIN_VAR, TOPHAM_PROFILE, USER, base_session, bootstrap,
-    clean, fork_probe, path_with, principal, probe_home, record, topham_binary, topham_version,
-    version_probe, write_profile, xdg,
+    clean, fork_probe, path_with, principal, probe_home, reachable, record, topham_binary,
+    topham_version, version_probe, write_profile, xdg,
 };
 use common::{Scripted, ScriptedTurns, ToolCallingFrontierClient, frontier_catalog};
 
@@ -348,6 +369,52 @@ const CANARY: &str = "the-canary-line-roundhouse-wrote";
 
 /// The file the scripted upstream asks the client to read.
 const CANARY_FILE: &str = "canary.txt";
+
+/// The `tool_use.id` the scripted upstream emits for its control call.
+///
+/// The whole of R-M2's correlation runs through this one string: roundhouse
+/// emits it, the log stores it as the call's `call_id`, the client quotes it
+/// back on `_meta["claudecode/toolUseId"]`, and the control surface resolves it
+/// to the conversation it was emitted into.
+const CONTROL_CALL_ID: &str = "toolu_e2e_mcp_01";
+
+/// One of roundhouse's own control tools, in both spellings a run of it needs.
+struct ControlTool {
+    /// What `roundhouse-mcp` serves it under, and what the client posts as
+    /// `params.name` once it has split the flat name apart (§5.8, request 6).
+    bare: &'static str,
+    /// What a Claude Code model spells — `mcp__roundhouse__<tool>` — and
+    /// therefore what `tools[]`, the `tool_use` block, `--allowedTools` and
+    /// this deployment's own log all carry (R-M1).
+    flat: String,
+}
+
+/// The control tool the closure run asks for.
+///
+/// **Neither spelling is written here.** The bare name is looked up in
+/// `CONTROL_TOOL_NAMES` — the single definition of the eight, which
+/// `roundhouse_mcp::tools::TOOL_NAMES` re-exports — so a rename in
+/// `roundhouse-mcp` turns this red rather than shipping a run that asks a real
+/// client for a tool this deployment does not serve. The flat one is
+/// [`ClientDialect::claude_messages`]'s own rendering, which is also what the
+/// generated `--mcp-config` registers and what the validate fold recognises: a
+/// fourth hand-joined copy is how a registration stops matching the tool it
+/// registers.
+///
+/// A `LazyLock` and not a `const` because the flat spelling is a `String`, and
+/// a `&'static str` borrowed from a `static` is what [`Scripted::Call`] needs —
+/// which is also why this file still contains no leak (see
+/// [`the_tool_loop_double_is_shared_and_needs_no_leaks`]).
+static CONTROL_TOOL: LazyLock<ControlTool> = LazyLock::new(|| {
+    let bare = CONTROL_TOOL_NAMES
+        .into_iter()
+        .find(|name| *name == "status")
+        .expect("roundhouse-mcp serves a `status` tool, and the signage points at it");
+    ControlTool {
+        bare,
+        flat: ClientDialect::claude_messages().stored_call_name(bare),
+    }
+});
 
 /// How long a single `claude -p` may take before the test kills it.
 ///
@@ -427,6 +494,33 @@ fn reading_upstream(path: &Path) -> Arc<ScriptedTurns> {
                     id: "toolu_e2e_01",
                     name: "Read",
                     arguments: serde_json::json!({ "file_path": path }).to_string(),
+                },
+            ],
+            Some("tool_use"),
+        )],
+        ANSWER,
+    ))
+}
+
+/// A frontier whose first turn speaks and then calls roundhouse's own `status`,
+/// then prose.
+///
+/// The call names the **flat** spelling, because that is what a Claude Code
+/// model has in front of it: the client flattens its MCP registration into
+/// every tool it declares, and a `tool_use` naming anything else is one the
+/// client answers with "no such tool" rather than dispatching. Its arguments
+/// are the empty object — no `conversation` — which is the case R-M2 is about:
+/// with nothing named, the surface has to work out which conversation the call
+/// came from.
+fn control_calling_upstream() -> Arc<ScriptedTurns> {
+    Arc::new(ScriptedTurns::then_answering(
+        vec![ToolCallingFrontierClient::new(
+            vec![
+                Scripted::Text(BEFORE_THE_CALL),
+                Scripted::Call {
+                    id: CONTROL_CALL_ID,
+                    name: CONTROL_TOOL.flat.as_str(),
+                    arguments: "{}".to_string(),
                 },
             ],
             Some("tool_use"),
@@ -598,6 +692,119 @@ impl Topology {
     }
 }
 
+/// Whether a rig opens a **rival conversation** for the same principal in
+/// front of every control call.
+///
+/// R-M6's negative is the whole reason this exists. An MCP call correlated by
+/// tool-use id and one resolved by "the principal's most recent conversation"
+/// give the *same* answer on an ordinary single-conversation run — the client
+/// makes its `tools/call` between the turn that emitted the call and the turn
+/// that answers it, and nothing else has moved `latest` in between. So an
+/// assertion that the id is what answered would pass on a deployment where the
+/// id is ignored entirely, which is a test that proves nothing.
+///
+/// [`ControlRace::RivalIsLatest`] removes that by *making* the guess wrong: a
+/// second conversation of the same principal's takes the `latest` slot
+/// immediately before each `/mcp` request is served. That is not a contrivance
+/// — it is the parent-and-subagent race R-M2 exists to remove, run
+/// deterministically rather than hoped for. The counterfactual half (the same
+/// call answered *without* the id resolves to the guess) is pinned at the seam
+/// by `mcp_api::tests::a_tool_use_id_resolves_the_conversation_that_emitted_it`;
+/// what this rig adds is that a real client really does send the id.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ControlRace {
+    /// None. `latest` and the tool-use id name one session.
+    None,
+    /// One, bound in front of every control call.
+    RivalIsLatest,
+}
+
+/// The rival conversation, and what it displaced each time it took the slot.
+struct Rival {
+    conversations: Arc<Conversations>,
+    principal: Principal,
+    /// The cache key the rival is bound under, and the session it resolves to.
+    key: String,
+    session: SessionId,
+    /// The JSON-RPC method of each control request, with `latest` as it stood
+    /// immediately *before* that request was served.
+    ///
+    /// The method is carried because the sequence matters and the entries are
+    /// not interchangeable: the handshake happens before the client's first
+    /// turn exists, so the only entry whose displaced value can be the client's
+    /// own conversation is the `tools/call` the tool loop makes. An assertion
+    /// over the list as a whole would pass on a client that never made the call
+    /// at all.
+    seen: Mutex<Vec<(String, Option<SessionId>)>>,
+}
+
+/// Take the `latest` slot, and record what was in it.
+///
+/// **Before `next.run`, which is what makes the claim exact**: every request the
+/// control surface serves under this layer is served with the rival as this
+/// principal's most recent conversation, so an answer naming anything else can
+/// only have come from the tool-use id.
+///
+/// The body is buffered and put back rather than peeked, for the reason
+/// `common::e2e::record` buffers: a JSON-RPC method is in the body and axum
+/// hands a layer the stream, not the bytes. The bound is small because a
+/// `tools/call` is a few hundred bytes — the turn bodies, which are tens of
+/// kilobytes, never reach this route.
+async fn take_the_latest_slot(
+    State(rival): State<Arc<Rival>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let (parts, body) = request.into_parts();
+    let bytes = axum::body::to_bytes(body, 1024 * 1024)
+        .await
+        .expect("a loopback control request body is readable");
+    let method = serde_json::from_slice::<Value>(&bytes)
+        .ok()
+        .and_then(|body| body["method"].as_str().map(str::to_string))
+        .unwrap_or_else(|| "<no jsonrpc method>".to_string());
+    rival
+        .seen
+        .lock()
+        .expect("recording")
+        .push((method, rival.conversations.latest(&rival.principal)));
+    rival.conversations.bind(&rival.principal, &rival.key);
+    next.run(Request::from_parts(parts, Body::from(bytes)))
+        .await
+}
+
+impl Rival {
+    /// What this principal's `latest` held immediately before the one control
+    /// request whose JSON-RPC method is `method`.
+    ///
+    /// Exactly one, and a panic printing the whole sequence otherwise. "The
+    /// client never made that call" and "the client made two" are different
+    /// defects, neither is legible from a missing `Option`, and the order of
+    /// the handshake against the turns is precisely what a reader needs when
+    /// the correlation assertion goes red.
+    fn displaced_before(&self, method: &str) -> Option<SessionId> {
+        let seen = self.seen.lock().expect("recording");
+        let matching: Vec<&(String, Option<SessionId>)> =
+            seen.iter().filter(|(seen, _)| seen == method).collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "exactly one `{method}` reaches the control surface in this run; it saw:\n{}",
+            seen.iter()
+                .map(|(method, displaced)| format!(
+                    "    {method} (latest before it: {})",
+                    displaced
+                        .as_ref()
+                        .map(SessionId::as_str)
+                        .unwrap_or("<none>")
+                ))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        matching[0].1.clone()
+    }
+}
+
 /// A live roundhouse, its filesystem, and everything needed to read it back.
 struct Rig {
     /// Where this run's `HOME`, `CLAUDE_CONFIG_DIR` and working directory live.
@@ -619,6 +826,9 @@ struct Rig {
     env: ClaudeEnv,
     store: Arc<MemoryStore>,
     conversations: Arc<Conversations>,
+    /// The rival conversation, when this rig was asked for one. See
+    /// [`ControlRace`].
+    rival: Option<Arc<Rival>>,
     recorder: Recorder,
     upstream: Arc<ScriptedTurns>,
     binary: String,
@@ -633,7 +843,13 @@ impl Rig {
     /// project `.claude/` and a git repository, so a run rooted in this checkout
     /// would launch carrying this repository as context.
     async fn start(label: &str, upstream: Arc<ScriptedTurns>) -> Self {
-        Self::start_at(Self::a_root_for(label), upstream, Wiring::Direct).await
+        Self::start_at(
+            Self::a_root_for(label),
+            upstream,
+            Wiring::Direct,
+            ControlRace::None,
+        )
+        .await
     }
 
     /// The same deployment, driven through a real `nemo-relay run --agent
@@ -687,7 +903,13 @@ impl Rig {
     /// binds — and `start_at` resolves it into a [`Topology`] at the one moment
     /// both halves are known.
     async fn start_chained(label: &str, upstream: Arc<ScriptedTurns>) -> Self {
-        Self::start_at(Self::a_root_for(label), upstream, Wiring::Chained).await
+        Self::start_at(
+            Self::a_root_for(label),
+            upstream,
+            Wiring::Chained,
+            ControlRace::None,
+        )
+        .await
     }
 
     /// Where a run of `label` puts its home and working directory.
@@ -708,7 +930,12 @@ impl Rig {
     /// `Arc<ControlDirectory>`, the one a shipped binary can name — rather than
     /// a file-declared one, for the reason the codex sibling gives: the point of
     /// the rung is that a real client authenticates the way a real tenant does.
-    async fn start_at(root: PathBuf, upstream: Arc<ScriptedTurns>, wiring: Wiring) -> Self {
+    async fn start_at(
+        root: PathBuf,
+        upstream: Arc<ScriptedTurns>,
+        wiring: Wiring,
+        race: ControlRace,
+    ) -> Self {
         assert!(
             claim_root(&root),
             "a Rig's root must be exclusive to it: {} already exists. Two rigs sharing one root \
@@ -740,27 +967,86 @@ impl Rig {
 
         let store = Arc::new(MemoryStore::new());
         let conversations = Arc::new(Conversations::new());
+        // One control store behind both routers, exactly as `main::serve`
+        // shares it: the surface writes an overlay and the engine reads it, and
+        // a second copy of either half is a control plane reporting on a
+        // deployment adjacent to the one serving turns.
+        let control = Arc::new(ControlStore::new());
+        let spend: Arc<dyn SpendLedger> = Arc::new(MemorySpendLedger::new());
         let arm_salt = directory.plane(now_ms()).arm_salt().to_string();
-        let engine = Arc::new(Engine::new(
-            Arc::clone(&store),
-            ByteTokenizer,
-            Arc::new(EchoLocalExecutor::new("local answer")),
-            frontier_catalog(),
-            Arc::clone(&upstream) as Arc<dyn FrontierClient>,
-            Arc::new(AffinityPolicy::new()),
-            EngineConfig {
-                arm_salt,
-                ..EngineConfig::default()
-            },
-        ));
+        let engine = Arc::new(
+            Engine::new(
+                Arc::clone(&store),
+                ByteTokenizer,
+                Arc::new(EchoLocalExecutor::new("local answer")),
+                frontier_catalog(),
+                Arc::clone(&upstream) as Arc<dyn FrontierClient>,
+                Arc::new(AffinityPolicy::new()),
+                EngineConfig {
+                    arm_salt,
+                    ..EngineConfig::default()
+                },
+            )
+            .with_control_store(Arc::clone(&control)),
+        );
+
+        // The rival, bound and *made real in the store* before anything is
+        // spawned. Real because the failure R-M2 removes is not a refusal: a
+        // surface that fell back to `latest` here would answer perfectly well,
+        // about the wrong conversation, and only the id in the answer would
+        // say so. A rival that existed only in the binding table would make
+        // that fallback fail loudly instead, which is a weaker claim than the
+        // one this rig is for.
+        let rival = match race {
+            ControlRace::None => None,
+            ControlRace::RivalIsLatest => {
+                let key = format!("{PROJECT}/{USER}/a-rival-conversation");
+                let session = conversations.bind(&principal(), &key);
+                store
+                    .create_session(&session, "rival")
+                    .await
+                    .expect("the rival conversation's own log");
+                Some(Arc::new(Rival {
+                    conversations: Arc::clone(&conversations),
+                    principal: principal(),
+                    key,
+                    session,
+                    seen: Mutex::new(Vec::new()),
+                }))
+            }
+        };
+
+        let mut mcp = mcp_router(
+            Arc::clone(&directory),
+            Arc::new(ControlPlaneReads::new(
+                Arc::clone(&directory),
+                Arc::clone(&store),
+                spend,
+                Arc::clone(&conversations),
+                reachable(),
+            )),
+            Arc::clone(&control),
+        );
+        if let Some(rival) = &rival {
+            mcp = mcp.layer(axum::middleware::from_fn_with_state(
+                Arc::clone(rival),
+                take_the_latest_slot,
+            ));
+        }
 
         let recorder = Recorder::default();
+        // Both routers behind one recorder, for the reason `mcp_surface`'s own
+        // rig merges them: the interleaving *is* the subject here — a turn that
+        // emits a control call, the client's `tools/call` against `/mcp`, and
+        // the resend that follows — and three recorders could not say what
+        // order those arrived in.
         let app: Router = messages_router(
             Arc::clone(&directory),
             engine,
             Arc::clone(&store),
             Arc::clone(&conversations),
         )
+        .merge(mcp)
         .layer(axum::middleware::from_fn_with_state(
             recorder.clone(),
             record,
@@ -818,6 +1104,7 @@ impl Rig {
             env,
             store,
             conversations,
+            rival,
             recorder,
             upstream,
             binary,
@@ -902,6 +1189,41 @@ impl Rig {
         self.recorder.to(&format!("{API_PREFIX}/{MESSAGES_PATH}"))
     }
 
+    /// Every `tools/call` this deployment's control surface served, in order.
+    ///
+    /// Filtered on the JSON-RPC method and not on the path: the client reaches
+    /// `/mcp` four times before it dispatches anything — `initialize`,
+    /// `notifications/initialized`, the optional `GET` stream this deployment
+    /// answers `405`, and `tools/list` (§5.8) — so a count of requests to the
+    /// path would be a claim about a client's startup sequence rather than
+    /// about its tool loop.
+    fn control_calls(&self) -> Vec<Exchange> {
+        self.recorder
+            .to(MCP_MOUNT_PATH)
+            .into_iter()
+            .filter(|exchange| {
+                exchange
+                    .body
+                    .as_ref()
+                    .and_then(|body| body["method"].as_str())
+                    == Some("tools/call")
+            })
+            .collect()
+    }
+
+    /// The rival conversation this rig was built with.
+    ///
+    /// A panic and not an `Option` at the call site: a claim about *which* of
+    /// two conversations answered a control call is vacuous on a rig that has
+    /// only one, and a test reaching for this on a [`ControlRace::None`] rig
+    /// has asked the wrong rig rather than found nothing.
+    fn rival(&self) -> &Rival {
+        self.rival.as_deref().expect(
+            "this rig was started with `ControlRace::None`, so `latest` and the tool-use id name \
+             one session and every claim about which of them answered would hold either way",
+        )
+    }
+
     /// The absolute path of the file the client is asked to read.
     fn canary_path(&self) -> PathBuf {
         self.root.join("wd").join(CANARY_FILE)
@@ -964,6 +1286,14 @@ impl Rig {
     /// the client is *asked* to do is identical, so any difference in what
     /// arrives at roundhouse's edge is `topham`'s doing.
     ///
+    /// `extra` is the operator's own tail, and it is the *only* place a flag
+    /// may be spelled: `topham` generates a leading argv of its own and refuses
+    /// a tail that repeats one of its flags (`LaunchError::ArgvCollidesWithGenerated`),
+    /// so a test that restated `--mcp-config` here would be refused before
+    /// anything spawned. What legitimately belongs in it is the client's own
+    /// permission grant — `--allowedTools`, which the launcher deliberately
+    /// does not decide (M12, R-M3; `topham plan`'s notes say so).
+    ///
     /// **The child's environment is cleared and rebuilt from a named set that
     /// contains no `ANTHROPIC_*` variable at all** — which is the difference
     /// between this and every other spawn in this file. The other tests hand
@@ -975,6 +1305,7 @@ impl Rig {
         &self,
         subcommand: &[&str],
         prompt: &str,
+        extra: &[&str],
         deadline: Duration,
     ) -> ClaudeRun {
         let topham = topham_binary();
@@ -984,7 +1315,7 @@ impl Rig {
         let mut command = tokio::process::Command::new(&topham);
         command.args(subcommand);
         command.arg("--");
-        command.args(claude_argv(prompt, &[], false));
+        command.args(claude_argv(prompt, extra, false));
         command.current_dir(self.root.join("wd"));
         command.kill_on_drop(true);
 
@@ -2193,7 +2524,13 @@ async fn a_tool_using_turn_is_run_by_the_real_client_and_its_result_rejoins_the_
     // itself. The assertion below is what keeps the two from drifting apart.
     let root = Rig::a_root_for("tools");
     let canary = root.join("wd").join(CANARY_FILE);
-    let rig = Rig::start_at(root, reading_upstream(&canary), Wiring::Direct).await;
+    let rig = Rig::start_at(
+        root,
+        reading_upstream(&canary),
+        Wiring::Direct,
+        ControlRace::None,
+    )
+    .await;
     assert_eq!(
         rig.canary_path(),
         canary,
@@ -2873,6 +3210,7 @@ async fn a_real_client_launched_through_topham_hooks_up_on_direct() {
         .through_topham(
             &["launch", TOPHAM_PROFILE],
             "Say the word alpha and stop.",
+            &[],
             CHILD_DEADLINE,
         )
         .await;
@@ -2959,6 +3297,391 @@ async fn a_real_client_launched_through_topham_hooks_up_on_direct() {
     rig.clean();
 }
 
+/// **R-M6, the closure: a real client, launched through a real `topham`,
+/// reaches roundhouse's own control surface from inside a turn — and the
+/// answer it gets back is about the conversation it asked from.**
+///
+/// Every rung under this one proved a piece of it against something that was
+/// not the whole: `mcp_surface` drives the tools with no client, `messages_api`
+/// drives the flat-name round trip with no socket, `claude_launch` proves the
+/// registration with nothing to register against, and the topham closure tests
+/// above prove a launch that has no control surface in it at all. This is the
+/// one run where a real `claude`, a real `topham` and both of this
+/// deployment's routers are in the same process tree, and it asserts at both
+/// edges:
+///
+/// 1. **The client hooked up to `/mcp` at all** — one `tools/call`, carrying
+///    the turn key on [`TURN_KEY_HEADER`], from a child whose environment holds
+///    no `ANTHROPIC_*` variable and whose argv the launcher wrote. Nothing here
+///    registers the server: `topham` does, from the profile, as inline argv.
+/// 2. **The name was split back apart on the MCP wire** — the model saw
+///    `mcp__roundhouse__status` and the surface was asked for `status`, which
+///    is §5.8's request 6 observed live rather than replayed from a fixture.
+/// 3. **The call was correlated by tool-use id and not guessed** (R-M2). This
+///    is the assertion the whole [`ControlRace`] apparatus exists for: a rival
+///    conversation of the same principal's holds the `latest` slot when the
+///    call is served, so an answer naming the client's own conversation can
+///    only have come from `_meta["claudecode/toolUseId"]`. The rival is a real
+///    session with a real log, so the failure this rules out is not a refusal —
+///    it is a green answer about the wrong conversation.
+/// 4. **The resend rejoined the session** — prefix-admitted, no `#g1`, with
+///    the client's own 64 KB of rebuilt history and a `tool_result` in it.
+/// 5. **The log holds one flat-named call and its result** (R-M1), and
+/// 6. **the validate fold counts none of it as the agent's work** (R-M0/G04).
+///
+/// **What it deliberately does not re-prove.** The counterfactual — the same
+/// call *without* the id resolving to the guess — is pinned at the seam by
+/// `mcp_api::tests::a_tool_use_id_resolves_the_conversation_that_emitted_it`,
+/// where it costs no process. Spawning a Node runtime to re-derive a branch a
+/// unit test already owns would make this run slower without making it say
+/// anything new.
+///
+/// Nor does it prove [`ClaudeLaunch::leading_argv`]'s signage reached the
+/// child at all (M12 fix-stage F2): the scripted upstream answers a `tool_use`
+/// it is told to emit regardless of what the model read, on purpose — a
+/// closure test whose pass/fail depended on a live model choosing to call a
+/// tool because it read a system prompt would not be deterministic. That claim
+/// is pinned where it can be, at the argv itself:
+/// `claude_launch::tests::the_generated_argv_is_two_flags_and_a_third_only_when_the_profile_asks`
+/// and `topham::plan::tests::a_claude_bring_your_own_key_launch_renders` /
+/// `a_claude_forwarded_login_launch_renders`. Do not read this test's green as
+/// evidence signage is present in what topham execs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs the real claude and topham binaries: --features e2e-claude -- --include-ignored; ROUNDHOUSE_TEST_CLAUDE_BIN overrides PATH and ROUNDHOUSE_TEST_TOPHAM_BIN names a built topham"]
+async fn a_real_client_reaches_the_control_surface_through_the_turn() {
+    let rig = Rig::start_at(
+        Rig::a_root_for("topham-control"),
+        control_calling_upstream(),
+        Wiring::Direct,
+        ControlRace::RivalIsLatest,
+    )
+    .await;
+    let profile = rig.write_profile("direct");
+    println!("    profile       : {}", profile.display());
+    println!("    control tool  : {}", CONTROL_TOOL.flat);
+    println!("    rival session : {}", rig.rival().session);
+
+    let run = rig
+        .through_topham(
+            &["launch", TOPHAM_PROFILE],
+            "Ask roundhouse for its status, then tell me what it said.",
+            // The one flag the operator owes, and the reason it is here rather
+            // than in the launcher: headless, this client synthesises a
+            // permission refusal for an `mcp__*` tool its own argv does not
+            // name — no `tools/call` reaches the surface at all — and
+            // `--dangerously-skip-permissions` is refused outright on a box
+            // running as root (§5.8). `topham plan` says as much in its notes;
+            // what it cannot do is decide a permission grant on an operator's
+            // behalf.
+            &["--allowedTools", &CONTROL_TOOL.flat],
+            CHILD_DEADLINE,
+        )
+        .await;
+    run.assert_completed("the control-tool turn launched through topham");
+    assert_eq!(
+        run.turns(),
+        2,
+        "the client must have dispatched the control call and come back for a second turn\n\
+         --- stdout\n{}",
+        run.stdout
+    );
+    assert_eq!(
+        run.text(),
+        ANSWER,
+        "the turn that closed the loop is the one this deployment answered with prose"
+    );
+
+    let turns = rig.turns();
+    assert_eq!(
+        turns.len(),
+        2,
+        "a control call and its result are two turns; the deployment saw:\n{}",
+        rig.recorder.transcript()
+    );
+    assert!(turns.iter().all(|turn| turn.status == 200));
+    assert_eq!(rig.upstream.dispatches(), 2, "two turns, two dispatches");
+
+    // ---- edge one: the MCP request, as it arrived -------------------------
+    let calls = rig.control_calls();
+    assert_eq!(
+        calls.len(),
+        1,
+        "the client must have dispatched exactly one control call; the deployment saw:\n{}",
+        rig.recorder.transcript()
+    );
+    let call = &calls[0];
+    assert_eq!(
+        call.status, 200,
+        "the control call was refused: {:?}",
+        call.response
+    );
+    println!("--- M12-CONTROL-EVIDENCE (topham launch, Direct)");
+    for (name, value) in call.redacted_headers() {
+        println!("    {name}: {value}");
+    }
+    // The turn key, on the header the *generated registration* named — read by
+    // the client out of the environment `topham` laid, expanded from the
+    // `${…}` the registration carries. No file, and no key in any argv.
+    assert_eq!(
+        call.header(TURN_KEY_HEADER),
+        Some(rig.secret.as_str()),
+        "the control call must carry the profile's `key-env` value on \
+         `{TURN_KEY_HEADER}`: {:?}",
+        call.redacted_headers()
+    );
+
+    let body = call
+        .body
+        .as_ref()
+        .unwrap_or_else(|| panic!("a `tools/call` has a JSON body: {call:?}"));
+    assert_eq!(
+        body["params"]["name"].as_str(),
+        Some(CONTROL_TOOL.bare),
+        "the model spelled `{}` and the client posts the bare tool, the server prefix stripped \
+         (§5.8, request 6): {body}",
+        CONTROL_TOOL.flat
+    );
+    assert_eq!(
+        body["params"]["_meta"]["claudecode/toolUseId"].as_str(),
+        Some(CONTROL_CALL_ID),
+        "the client must quote back the `tool_use.id` this deployment emitted — the whole of \
+         R-M2's correlation rides on this one key, and rmcp hands it to a tool through the \
+         request *context* rather than the typed params: {body}"
+    );
+
+    // ---- edge two: which conversation answered ----------------------------
+    //
+    // Named from `latest` rather than from the call table: the resend rebound
+    // the conversation after the control call was served, so by now `latest` is
+    // the client's own again — which is exactly why the rival had to record
+    // what it displaced at the moment the call arrived.
+    let session = rig.session();
+    let rival = rig.rival();
+    assert_ne!(
+        session, rival.session,
+        "the rival must be a different conversation, or there is no race to win"
+    );
+    assert_eq!(
+        rival.displaced_before("tools/call"),
+        Some(session.clone()),
+        "the rival must have taken the `latest` slot *from the client's own conversation* \
+         immediately before the control call was served; without that, the assertion below \
+         holds whether or not the tool-use id was read at all"
+    );
+
+    let served = call
+        .response
+        .as_ref()
+        .unwrap_or_else(|| panic!("the surface answered one JSON-RPC document: {call:?}"));
+    assert_eq!(
+        served["result"]["isError"],
+        Value::from(false),
+        "the control tool refused: {served}"
+    );
+    let answer: Value = serde_json::from_str(
+        served["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("`status` answers in one text block: {served}")),
+    )
+    .expect("every control tool renders its answer as JSON inside that block");
+    assert_eq!(
+        answer["conversation"].as_str(),
+        Some(session.as_str()),
+        "the call was correlated by tool-use id: `{}` held this principal's `latest` slot when \
+         this was served, so a surface that guessed would have answered — green — about the \
+         wrong conversation: {answer}",
+        rival.session
+    );
+
+    // ---- edge three: the log the resend rejoined --------------------------
+    rig.assert_never_forked().await;
+    let items = rig.items().await;
+    assert!(
+        items.iter().any(|item| matches!(
+            &item.content,
+            ItemContent::ToolCall { call_id, name, .. }
+                if call_id == CONTROL_CALL_ID && name == &CONTROL_TOOL.flat
+        )),
+        "R-M1: the log holds the call under the flat name the client spells, whole:\n{}",
+        log_shape(&items)
+    );
+    let output = items
+        .iter()
+        .find_map(|item| match &item.content {
+            ItemContent::ToolResult { call_id, output } if call_id == CONTROL_CALL_ID => {
+                Some(output.clone())
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "the resend must have carried what the control surface answered:\n{}",
+                log_shape(&items)
+            )
+        });
+    assert!(
+        output.contains(session.as_str()),
+        "the stored result is the answer this conversation was given: {output}"
+    );
+    assert!(
+        !output.contains(rival.session.as_str()),
+        "and it is not the rival's: {output}"
+    );
+
+    // ---- edge four: what the validate loop makes of it --------------------
+    //
+    // R-M0/G04. Every signal the trigger computes runs over `task_exchanges`,
+    // so a control call inside it is roundhouse's own chatter counted as the
+    // agent's work — which is how a session that did nothing wrong buys a judge
+    // side-call and a steer.
+    let folded = exchanges(&items);
+    assert_eq!(
+        folded.len(),
+        1,
+        "one call, one result, one exchange: {folded:?}"
+    );
+    assert!(
+        is_control_call(&folded[0].name),
+        "the fold must recognise `{}` as roundhouse's own control traffic",
+        folded[0].name
+    );
+    assert!(
+        task_exchanges(&folded).is_empty(),
+        "the agent asked roundhouse for its own status; the task view must hold nothing: {:?}",
+        task_exchanges(&folded)
+    );
+
+    rig.clean();
+}
+
+/// The client's own MCP configuration form, read strictly.
+///
+/// **A model of what `claude` accepts, not of what roundhouse emits**, which is
+/// the whole point of it: `deny_unknown_fields` and a `type`-tagged enum mean
+/// this parse fails on exactly the documents the client would misread — an
+/// extra key it ignores, or a shape it resolves to a different transport. The
+/// three variants are the ones the config form offers; only one of them is a
+/// server this deployment can be.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct McpConfigDocument {
+    #[serde(rename = "mcpServers")]
+    servers: BTreeMap<String, McpServer>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
+// The two variants below are never constructed and their fields are never read,
+// and that is what they are for: a `type` this deployment does not serve has to
+// be *parseable* for the match on `Http` to be a discrimination rather than the
+// only thing the reader can express. Deleting them would leave a reader that
+// accepts one shape and calls every other one malformed, which is the opposite
+// of the client's behaviour.
+#[allow(dead_code)]
+enum McpServer {
+    /// Streamable HTTP — JSON-RPC over `POST <url>`, which is what the 2.1.257
+    /// capture recorded against a server registered exactly this way (§5.8).
+    Http {
+        url: String,
+        #[serde(default)]
+        headers: BTreeMap<String, String>,
+    },
+    /// The older server-sent-events transport, which this deployment does not
+    /// serve. Modelled so that a registration drifting onto it fails here
+    /// rather than as a client that cannot open a stream.
+    Sse {
+        url: String,
+        #[serde(default)]
+        headers: BTreeMap<String, String>,
+    },
+    /// A child process. Modelled for the same reason: a document with a
+    /// `command` and no `url` parses perfectly and registers a server that is
+    /// not this deployment at all.
+    Stdio {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        env: BTreeMap<String, String>,
+    },
+}
+
+/// **The closure test's premise, proved without a binary: what the launcher
+/// hands the client is a document the client's own config reader resolves to
+/// this deployment's HTTP control surface, and to nothing else.**
+///
+/// `claude_launch`'s own suite already pins the registration as a string and
+/// checks its fields against the capture. What that cannot say — because it
+/// reads the document the way *we* wrote it, field by field off a
+/// `serde_json::Value` — is the thing a client does: resolve it to a
+/// *transport*. A registration that grew a `command` key, or lost its `type`,
+/// or spelled `url` under a name only our own reader knew, would pass a
+/// field-by-field check and produce a client that starts, runs every turn
+/// perfectly, and has no control tools at all.
+///
+/// So this parses it strictly, and the assertions are about what the parse
+/// resolved to rather than about which characters are in it.
+#[test]
+fn the_generated_mcp_registration_resolves_to_this_deployments_http_surface() {
+    const ROOT: &str = "http://127.0.0.1:8080";
+    let launch = ClaudeLaunch::new(ROOT, "rh_turn_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+        .expect("a deployment root with no API prefix and a key-shaped key");
+    let registration = launch.mcp_registration();
+
+    let document: McpConfigDocument = serde_json::from_str(&registration).unwrap_or_else(|error| {
+        panic!("the client reads this document strictly and would not: {registration}\n{error}")
+    });
+    assert_eq!(
+        document.servers.keys().collect::<Vec<_>>(),
+        vec![mcp_server_name()],
+        "one server, under the name that makes its tools come back as \
+         `{}__<tool>` — the namespace the validate fold recognises and the \
+         signage spells: {registration}",
+        launch.mcp_url()
+    );
+
+    let Some(McpServer::Http { url, headers }) = document.servers.get(mcp_server_name()) else {
+        panic!(
+            "the registration must resolve to the Streamable-HTTP transport this deployment \
+             serves; it resolved to {:?}",
+            document.servers.get(mcp_server_name())
+        );
+    };
+    assert_eq!(
+        url,
+        &launch.mcp_url(),
+        "the url the client will post to and `mcp_url` are one derivation"
+    );
+    assert_eq!(
+        url,
+        &format!("{ROOT}{MCP_MOUNT_PATH}"),
+        "and that derivation is this deployment's own mount, at the root beside the turn route"
+    );
+    assert_eq!(
+        headers,
+        &BTreeMap::from([(
+            TURN_KEY_HEADER.to_string(),
+            format!("${{{DEFAULT_KEY_ENV}}}")
+        )]),
+        "one header, and its value is the variable rather than the key: the client expands it \
+         out of the environment the same launch laid, so no rendering of this document — a \
+         process listing, a `topham plan`, a shell history — can hold the secret"
+    );
+
+    // And it survives being written down. The flag takes the JSON inline, but
+    // the same document is what a project `.mcp.json` holds (§5.8), so a
+    // rendering that only round-tripped in memory would be one an operator
+    // could not save.
+    let rewritten = serde_json::to_string(&serde_json::from_str::<Value>(&registration).unwrap())
+        .expect("the document re-serializes");
+    let reread: McpConfigDocument =
+        serde_json::from_str(&rewritten).expect("and re-reads as the same form");
+    assert_eq!(
+        reread.servers.keys().collect::<Vec<_>>(),
+        document.servers.keys().collect::<Vec<_>>()
+    );
+}
+
 /// **F3 (M11.3 review), now the guard on its own fix: a settings-file `env`
 /// block that would re-route the launch is refused, by name, before anything
 /// spawns.**
@@ -3006,6 +3729,7 @@ async fn f3_settings_file_env_block_overriding_topham_generated_base_url() {
         .through_topham(
             &["launch", TOPHAM_PROFILE],
             "Say the word alpha and stop.",
+            &[],
             CHILD_DEADLINE,
         )
         .await;
@@ -3060,6 +3784,7 @@ async fn f3_control_empty_settings_file_does_not_break_the_direct_launch() {
         .through_topham(
             &["launch", TOPHAM_PROFILE],
             "Say the word alpha and stop.",
+            &[],
             CHILD_DEADLINE,
         )
         .await;
@@ -3117,6 +3842,7 @@ async fn a_real_client_handed_to_relay_through_topham_hooks_up_chained() {
         .through_topham(
             &["relay", TOPHAM_PROFILE, "--relay", &relay],
             "Say the word alpha and stop.",
+            &[],
             CHAINED_DEADLINE,
         )
         .await;

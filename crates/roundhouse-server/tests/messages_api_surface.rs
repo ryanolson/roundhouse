@@ -72,7 +72,8 @@ use roundhouse_server::messages_api::wire::{
     CreateMessageParams, canonicalize, is_budget_notice, session_key,
 };
 use roundhouse_server::{
-    ControlPlane, ControlPlaneConfig, Conversations, EchoLocalExecutor, Engine, messages_router,
+    ControlPlane, ControlPlaneConfig, Conversations, DEFAULT_MCP_NAMESPACE, EchoLocalExecutor,
+    Engine, messages_router,
 };
 
 mod common;
@@ -81,8 +82,8 @@ use common::anthropic::{
     audit, split_frames,
 };
 use common::{
-    MINUTE, Scripted, ScriptedFrontierClient, ToolCallingFrontierClient, config, embedded_fleet,
-    frontier_catalog, key, sha256_hex,
+    MINUTE, Scripted, ScriptedFrontierClient, ScriptedTurns, ToolCallingFrontierClient, config,
+    embedded_fleet, frontier_catalog, key, sha256_hex,
 };
 
 /// What the echo provider answers with, and therefore what a turn says.
@@ -400,14 +401,49 @@ fn surface_calling(
     script: Vec<Scripted>,
     stop_reason: Option<&str>,
 ) -> (Router, Arc<MemoryStore>, Arc<ToolCallingFrontierClient>) {
-    let store = Arc::new(MemoryStore::new());
+    let (app, store, client, _) = surface_calling_sharing(script, stop_reason);
+    (app, store, client)
+}
+
+/// As [`surface_calling`], but handing back the conversation table too.
+///
+/// The composition root shares one [`Conversations`] between the turn surfaces
+/// and the MCP surface, and R-M2's binding is written into it as a tool call is
+/// streamed. A test that could not see the table would have to reach the
+/// binding through `/mcp` — a second router, a second key, and an assertion
+/// about two things at once.
+fn surface_calling_sharing(
+    script: Vec<Scripted>,
+    stop_reason: Option<&str>,
+) -> (
+    Router,
+    Arc<MemoryStore>,
+    Arc<ToolCallingFrontierClient>,
+    Arc<Conversations>,
+) {
     let client = Arc::new(ToolCallingFrontierClient::new(script, stop_reason));
+    let (app, store, conversations) =
+        surface_over(Arc::clone(&client) as Arc<dyn roundhouse_fleet::FrontierClient>);
+    (app, store, client, conversations)
+}
+
+/// The Messages surface over any upstream double, sharing one conversation
+/// table with the caller.
+///
+/// Extracted because a *tool loop* needs an upstream that terminates: a fixed
+/// script whose answer is a call answers the client's resend with the same call
+/// forever, which is the trap `ScriptedTurns` exists to avoid (M11.2b, F13).
+fn surface_over(
+    frontier: Arc<dyn roundhouse_fleet::FrontierClient>,
+) -> (Router, Arc<MemoryStore>, Arc<Conversations>) {
+    let store = Arc::new(MemoryStore::new());
+    let conversations = Arc::new(Conversations::new());
     let engine = Arc::new(Engine::new(
         Arc::clone(&store),
         ByteTokenizer,
         Arc::new(EchoLocalExecutor::new("local answer")),
         frontier_catalog(),
-        Arc::clone(&client) as Arc<dyn roundhouse_fleet::FrontierClient>,
+        frontier,
         Arc::new(AffinityPolicy::new()),
         config(),
     ));
@@ -416,10 +452,10 @@ fn surface_calling(
             ControlPlane::open(),
             engine,
             Arc::clone(&store),
-            Arc::new(Conversations::new()),
+            Arc::clone(&conversations),
         ),
         store,
-        client,
+        conversations,
     )
 }
 
@@ -4391,4 +4427,244 @@ fn dechunk(body: &str) -> String {
         rest = &tail[size + 2..];
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// M12 R-M1/R-M2: the control surface's own tool loop, on the captured bodies
+// ---------------------------------------------------------------------------
+
+/// The captured pair in which the client calls roundhouse's own MCP tool.
+///
+/// One conversation, two requests, taken from the same 2.1.257 run as the rest
+/// of this suite's fixtures (`research/claude-code-client-surface.md` §5.8):
+/// turn one declares `mcp__roundhouse__status` in its toolbox, turn two resends
+/// that turn's `tool_use` together with the `tool_result` the client got back
+/// from `/mcp`. They are the *bytes a real client sent*, which is the whole
+/// value: a hand-written pair would assert prefix admission against a history
+/// no client would ever produce.
+const MCP_TURN_ONE: &str = include_str!("fixtures/claude-2.1.257-mcp-turn-1.json");
+const MCP_TURN_TWO: &str = include_str!("fixtures/claude-2.1.257-mcp-turn-2-toolresult.json");
+
+/// The session the pair above names, through its own `metadata.user_id`.
+const MCP_SESSION: &str = "54269458-0325-4180-a52f-dfb60acbf63c";
+
+/// The `tool_use` id the capture carries, and therefore the one the client
+/// quotes back on `_meta["claudecode/toolUseId"]`.
+const MCP_CALL_ID: &str = "toolu_mock_001";
+
+/// R-M5 (M12): the client's own MCP tools are dispatched, and roundhouse adds
+/// none of its own.
+///
+/// **The temptation this refuses is a real one.** Roundhouse serves eight
+/// control tools and knows their schemas; injecting them into `tools[]` would
+/// make them reachable from a client that never registered the MCP server, and
+/// it is the obvious way to "make the control surface always available". It is
+/// also broken in a way nothing reports: the client's loop dispatches a
+/// `tool_use` by looking the name up among the tools *it* declared, and a name
+/// it never registered has no dispatcher — so the model calls it, the client
+/// synthesizes a permission or unknown-tool result, and the turn burns a round
+/// trip on a tool that could never have run. The registration on the argv is
+/// what makes these tools exist for a client; this surface's job is to pass on
+/// what the client declared, unchanged.
+///
+/// And the token count follows from the same rule: `admitted_input_tokens` is
+/// what `message_start` tells the client it admitted and what the turn is
+/// priced against, so a surface that added tools would bill a tenant for a
+/// toolbox they did not send.
+#[tokio::test]
+async fn the_clients_own_mcp_tools_are_dispatched_and_roundhouse_adds_none() {
+    let (app, _store, client) = surface_scripted();
+    let captured = fixture(MCP_TURN_ONE);
+    let declared = declared_tools(&captured);
+    let registered: Vec<&str> = declared
+        .as_array()
+        .expect("a toolbox")
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .filter(|name| name.starts_with(DEFAULT_MCP_NAMESPACE))
+        .collect();
+    assert_eq!(
+        registered,
+        vec!["mcp__roundhouse__declare_intent", "mcp__roundhouse__status"],
+        "the capture is a client that registered this deployment's MCP server: \
+         two of its tools are in the toolbox it sent"
+    );
+
+    let (status, _, body) = post(&app, "/v1/messages", &[], &captured).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let quotes = client.quotes_seen();
+    assert_eq!(quotes.len(), 1, "one frontier dispatch: {quotes:?}");
+    assert_eq!(
+        quotes[0].tools.as_ref(),
+        Some(&declared),
+        "the dispatch carries the client's toolbox and nothing else -- not one \
+         of the eight descriptors this deployment serves over MCP"
+    );
+    // Said the other way round, because the equality above would also hold if
+    // the fixture happened to declare every control tool: the *only* control
+    // names on the wire are the ones the client registered for itself.
+    let dispatched: Vec<&str> = quotes[0]
+        .tools
+        .as_ref()
+        .expect("the toolbox reached the dispatch")
+        .as_array()
+        .expect("a toolbox")
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .filter(|name| name.starts_with(DEFAULT_MCP_NAMESPACE))
+        .collect();
+    assert_eq!(dispatched, registered);
+
+    // And what the client is told it was admitted is a function of what the
+    // client declared. Recomputed from the captured body through an engine of
+    // this suite's own rather than compared against a literal: a number typed
+    // here would move with the tokenizer and say nothing about the toolbox.
+    let params = parse(MCP_TURN_ONE);
+    let expected = engine(Arc::new(MemoryStore::new())).admitted_input_tokens(
+        &canonicalize(&params).expect("the captured body canonicalizes"),
+        params.tools.as_ref(),
+        params.tool_choice.as_ref(),
+    );
+    // Read off `message_start` rather than off the accumulated usage, which is
+    // the *provider's* terminal figure by the end of the stream: what this
+    // ruling is about is the number the surface admitted, and that is the one
+    // frame that carries it.
+    let start = split_frames(&body)
+        .into_iter()
+        .find(|frame| frame.name.as_deref() == Some("message_start"))
+        .and_then(|frame| frame.data)
+        .expect("every stream opens with a message_start");
+    let start: Value = serde_json::from_str(&start).expect("the frame carries JSON");
+    assert_eq!(
+        start["message"]["usage"]["input_tokens"].as_u64(),
+        Some(expected),
+        "`admitted_input_tokens` is what the client declared -- an injected \
+         tool would bill this tenant for a toolbox they never sent"
+    );
+    // CONTROL: the toolbox is most of that number, so the assertion above is
+    // about the declaration rather than about a count the messages alone would
+    // have produced.
+    let without_tools = engine(Arc::new(MemoryStore::new())).admitted_input_tokens(
+        &canonicalize(&params).expect("the captured body canonicalizes"),
+        None,
+        None,
+    );
+    assert!(
+        without_tools < expected,
+        "the declaration is priced: {without_tools} vs {expected}"
+    );
+}
+
+/// R-M1 (M12): a call to roundhouse's own control surface round-trips flat.
+///
+/// **The whole loop, on captured bytes.** Turn one is answered with a
+/// `tool_use` for `mcp__roundhouse__status`; the log has to hold that name
+/// whole, because the classifier a crate below matches the flat prefix and
+/// because splitting it would move the `turn_id` of every stored tool-using
+/// session. Turn two is the client's own resend of that block plus the tool
+/// result — it has to be admitted as a *prefix*, or the conversation forks onto
+/// a cold generation and every overlay keyed to the old id is orphaned.
+///
+/// **And R-M2's binding, asserted in the same run** because it is written by
+/// the same streamed item: the id the client will quote back on its
+/// `tools/call` resolves to this session and to no other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_captured_mcp_tool_loop_stores_one_flat_call_and_rejoins_its_session() {
+    // Turn one answers with the call; turn two — the client's resend, which is
+    // an ordinary continuation as far as the model is concerned — answers in
+    // prose. An upstream whose fixed script *is* the call would answer the
+    // resend with a second copy of it, and the loop would never close.
+    let (app, store, conversations) = surface_over(Arc::new(ScriptedTurns::then_answering(
+        vec![ToolCallingFrontierClient::new(
+            vec![Scripted::Call {
+                id: MCP_CALL_ID,
+                name: "mcp__roundhouse__status",
+                // Exactly the `input` the capture's `tool_use` carries. A
+                // resend whose arguments canonicalized differently would fork
+                // on turn two and this test would report it as a prefix
+                // failure, which is what it is.
+                arguments: "{}".into(),
+            }],
+            Some("tool_use"),
+        )],
+        "status read; carrying on",
+    )));
+
+    let first = stream(&app, &[], &fixture(MCP_TURN_ONE)).await;
+    assert_eq!(first.error, None, "{:?}", first.error);
+    assert_eq!(
+        first.tool_calls.len(),
+        1,
+        "the turn answers with exactly one tool call: {:?}",
+        first.tool_calls
+    );
+    assert_eq!(first.tool_calls[0].name, "mcp__roundhouse__status");
+    assert_eq!(first.tool_calls[0].id, MCP_CALL_ID);
+
+    let session = named(MCP_SESSION);
+    let stored = stored_items(&store, &session).await;
+    let calls: Vec<_> = stored
+        .iter()
+        .filter_map(|item| match &item.content {
+            ItemContent::ToolCall { call_id, name, .. } => Some((call_id.as_str(), name.as_str())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        calls,
+        vec![(MCP_CALL_ID, "mcp__roundhouse__status")],
+        "the log holds one call, under the flat name the client spells"
+    );
+
+    // R-M2: the id the client is about to quote back names this session, for
+    // this principal, and it was recorded without moving `latest` off anything.
+    let principal = roundhouse_core::control::Principal::default_open();
+    assert_eq!(
+        conversations.session_of_call(&principal, MCP_CALL_ID),
+        Some(SessionId::new(&session)),
+        "the MCP call answering this block must resolve to the conversation \
+         that emitted it, not to whichever conversation opened a turn last"
+    );
+
+    // Turn two: the client's own resend, byte for byte, carrying the block it
+    // was handed and the result `/mcp` gave it.
+    let second = stream(&app, &[], &fixture(MCP_TURN_TWO)).await;
+    assert_eq!(second.error, None, "{:?}", second.error);
+    assert!(
+        no_such_session(&store, &format!("{session}#g1")).await,
+        "the resend of an emitted control call must be admitted as a prefix; a \
+         forked generation means the log and the client disagree about a name \
+         one of them spelled differently"
+    );
+
+    let after = stored_items(&store, &session).await;
+    let control: Vec<_> = after
+        .iter()
+        .filter_map(|item| match &item.content {
+            ItemContent::ToolCall { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        control,
+        vec!["mcp__roundhouse__status"],
+        "and the resend adds no second copy of the call: {after:#?}"
+    );
+    assert!(
+        after.iter().any(|item| matches!(
+            &item.content,
+            ItemContent::ToolResult { call_id, .. } if call_id == MCP_CALL_ID
+        )),
+        "the client's tool result joins the same conversation: {after:#?}"
+    );
+
+    // The point of storing it flat: the validate fold drops it, so an agent
+    // that asked roundhouse about itself is not credited with work on its task.
+    let exchanges = roundhouse_core::validate::exchanges(&after);
+    assert_eq!(exchanges.len(), 1, "{exchanges:#?}");
+    assert!(
+        roundhouse_core::validate::task_exchanges(&exchanges).is_empty(),
+        "G04: our own control traffic is not the agent's work"
+    );
 }

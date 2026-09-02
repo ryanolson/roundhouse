@@ -916,6 +916,71 @@ mod tests {
         );
     }
 
+    /// R-M1 (M12): a roundhouse control call keeps the flat name the client
+    /// spells, all the way into the log.
+    ///
+    /// **The blocks are the 2.1.257 capture's, verbatim** — see
+    /// `tests/fixtures/claude-2.1.257-mcp-turn-2-toolresult.json`, where the
+    /// client resends its own `tool_use` for `mcp__roundhouse__status` and the
+    /// `tool_result` carrying what `/mcp` answered. Claude Code folds the MCP
+    /// registration's server name into every tool name it declares, calls and
+    /// permits; there is no `namespace` field on this wire to put it in.
+    ///
+    /// **Two things are asserted and the second is the one with teeth.** That
+    /// the name survives whole is the round-trip property prefix admission
+    /// rests on. That it is *the string [`crate::dialect::ClientDialect`] says
+    /// this surface stores* is what stops this module and the classifier a
+    /// crate below from drifting: `is_control_call` reads the stored name, and
+    /// the day one of the two changed its mind about the spelling, the fold
+    /// would silently go back to counting roundhouse's own chatter as the
+    /// agent's work.
+    #[test]
+    fn a_control_call_keeps_the_flat_name_the_client_spells() {
+        let items = canonicalize(&params(json!({
+            "messages": [
+                { "role": "assistant", "content": [
+                    { "type": "tool_use", "id": "toolu_mock_001",
+                      "name": "mcp__roundhouse__status", "input": {} },
+                ]},
+                { "role": "user", "content": [
+                    { "type": "tool_result", "tool_use_id": "toolu_mock_001",
+                      "content": [{ "type": "text",
+                                    "text": "stub-result: tool=status args={}" }] },
+                ]},
+            ],
+        })))
+        .unwrap();
+
+        let ItemContent::ToolCall { name, call_id, .. } = &items[0].content else {
+            panic!("the client's `tool_use` is a tool call: {items:#?}");
+        };
+        assert_eq!(
+            name.as_str(),
+            crate::dialect::ClientDialect::claude_messages().stored_call_name("status"),
+            "the Messages surface stores what its own client spells, and the \
+             dialect is where that rule is stated"
+        );
+        assert_eq!(call_id, "toolu_mock_001");
+
+        // And therefore the fold excludes it. Asserted here, on the item this
+        // module produced, rather than on a name a test typed: it is the join
+        // between the two crates that R-M0 found broken on the other surface.
+        assert!(
+            roundhouse_core::validate::is_control_call(name),
+            "the agent asked roundhouse for its own status"
+        );
+        let exchanges = roundhouse_core::validate::exchanges(&items);
+        assert_eq!(
+            exchanges.len(),
+            1,
+            "the call and its result pair: {exchanges:#?}"
+        );
+        assert!(
+            roundhouse_core::validate::task_exchanges(&exchanges).is_empty(),
+            "roundhouse's own control traffic is not the agent's work on its task"
+        );
+    }
+
     /// A structured tool result keeps its JSON; an absent one is empty.
     #[test]
     fn a_structured_tool_result_keeps_its_encoding() {

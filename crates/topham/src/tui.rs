@@ -246,6 +246,7 @@ pub enum Field {
     Auth,
     KeyEnv,
     Topology,
+    StrictMcp,
     Model,
     CatalogPath,
 }
@@ -279,6 +280,16 @@ struct Spec {
     /// empty value it is and is refused there, rather than silently resolving
     /// to that field's serde default.
     absent_when_empty: bool,
+    /// Whether this field is a TOML boolean rather than a string.
+    ///
+    /// A flag on the row rather than a `Field` arm somewhere, for the reason
+    /// the row exists (F4): the editor holds every value as text, and the two
+    /// places that text meets the document — [`Editor::over`] reading it out
+    /// and [`Editor::compose`] writing it back — are the only ones that need to
+    /// know. Without it a `true` composes as the *string* `"true"`, which
+    /// `deny_unknown_fields` accepts as a key and serde then refuses as the
+    /// wrong type — an editor that cannot save a profile it just opened.
+    boolean: bool,
 }
 
 /// Every field, in the order the editor shows them.
@@ -292,13 +303,14 @@ struct Spec {
 /// this table invented would be refused by `from_toml` as an unknown variant
 /// rather than quietly stored. `every_table_row_round_trips_through_the_loader`
 /// is what checks that every row's key and values are real.
-static FIELDS: [Spec; 8] = [
+static FIELDS: [Spec; 9] = [
     Spec {
         field: Field::Name,
         label: "profile name",
         key: None,
         cycles: &[],
         absent_when_empty: false,
+        boolean: false,
     },
     Spec {
         field: Field::Agent,
@@ -306,6 +318,7 @@ static FIELDS: [Spec; 8] = [
         key: Some("agent"),
         cycles: &["claude", "codex"],
         absent_when_empty: false,
+        boolean: false,
     },
     Spec {
         field: Field::DeploymentRoot,
@@ -313,6 +326,7 @@ static FIELDS: [Spec; 8] = [
         key: Some("deployment-root"),
         cycles: &[],
         absent_when_empty: false,
+        boolean: false,
     },
     Spec {
         field: Field::Auth,
@@ -320,6 +334,7 @@ static FIELDS: [Spec; 8] = [
         key: Some("auth"),
         cycles: &["roundhouse-key", "forwarded-login"],
         absent_when_empty: false,
+        boolean: false,
     },
     Spec {
         field: Field::KeyEnv,
@@ -327,6 +342,7 @@ static FIELDS: [Spec; 8] = [
         key: Some("key-env"),
         cycles: &[],
         absent_when_empty: false,
+        boolean: false,
     },
     Spec {
         field: Field::Topology,
@@ -334,6 +350,15 @@ static FIELDS: [Spec; 8] = [
         key: Some("topology"),
         cycles: &["direct", "chained"],
         absent_when_empty: false,
+        boolean: false,
+    },
+    Spec {
+        field: Field::StrictMcp,
+        label: "strict mcp (claude)",
+        key: Some("strict-mcp"),
+        cycles: &["false", "true"],
+        absent_when_empty: false,
+        boolean: true,
     },
     Spec {
         field: Field::Model,
@@ -341,6 +366,7 @@ static FIELDS: [Spec; 8] = [
         key: Some("model"),
         cycles: &[],
         absent_when_empty: true,
+        boolean: false,
     },
     Spec {
         field: Field::CatalogPath,
@@ -348,6 +374,7 @@ static FIELDS: [Spec; 8] = [
         key: Some("model-catalog-path"),
         cycles: &[],
         absent_when_empty: true,
+        boolean: false,
     },
 ];
 
@@ -441,6 +468,14 @@ impl Editor {
                 // A key the document does not carry is an absent optional
                 // field, which is an empty row: the two are the same thing
                 // here, and turning one into the other is `compose`'s job.
+                // A boolean row reads back as the word, never as the empty
+                // string an absent one would otherwise become: `false` is a
+                // real value of this field and "unset" is the same thing.
+                Some(key) if spec.boolean => document
+                    .get(key)
+                    .and_then(toml::Value::as_bool)
+                    .unwrap_or_default()
+                    .to_string(),
                 Some(key) => document
                     .get(key)
                     .and_then(toml::Value::as_str)
@@ -514,6 +549,16 @@ impl Editor {
             let Some(key) = spec.key else { continue };
             let value = value.trim();
             if value.is_empty() && spec.absent_when_empty {
+                continue;
+            }
+            if spec.boolean {
+                // Written only when it is on, which is how the profile
+                // serializes it: a `false` in every file an operator saves
+                // would be a line saying nothing, and on a codex profile a line
+                // saying nothing about a field that agent does not have.
+                if value == "true" {
+                    document.insert(key.to_string(), toml::Value::Boolean(true));
+                }
                 continue;
             }
             document.insert(key.to_string(), toml::Value::String(value.to_string()));

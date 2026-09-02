@@ -17,6 +17,16 @@
 //! names *and* schema shape — and the pin is what a change to it has to argue
 //! with.
 //!
+//! **The pin has been paid once on purpose, and this is the entry** (M12,
+//! R-M4). Making the `conversation` argument dialect-neutral moved the digest,
+//! which re-primes the prompt cache of every session in a deployment at the
+//! moment it lands. That cost was accepted rather than deferred because the
+//! alternative is worse and does not expire: a second client now reads this
+//! list on every turn, the old sentence told it to pass a field its own API
+//! does not have, and a description that misdirects one of two clients costs a
+//! wrong argument on every call for as long as it stands. One cache miss per
+//! session, once, against a permanent misinstruction.
+//!
 //! # Schemas by hand
 //!
 //! The schemas below are written out rather than derived. A derive would make
@@ -67,19 +77,24 @@ use serde_json::{Value, json};
 
 use roundhouse_core::control::Principal;
 
-use crate::surface::{ControlSurface, SurfaceError, ToolOutcome};
+use crate::surface::{Caller, ControlSurface, SurfaceError, ToolOutcome};
 
 /// Every tool this surface serves, in the order it lists them.
-pub const TOOL_NAMES: [&str; 8] = [
-    "status",
-    "init_session",
-    "declare_intent",
-    "prefer",
-    "set_quality_floor",
-    "fetch_steer",
-    "report_outcome",
-    "explain_last_route",
-];
+///
+/// Re-exported from `roundhouse-core` rather than spelled here (M12, R-M0),
+/// for the reason [`roundhouse_core::validate::CONTROL_TOOL_NAMESPACE`] is:
+/// the validate fold has to *recognise* one of these names as roundhouse's own
+/// control traffic even when the wire has dropped the namespace that would
+/// have identified it, that fold lives a crate below this one, and two lists
+/// that must agree across a crate boundary is a rename that goes silently
+/// half-done — a tool added here alone would be counted as the agent's work
+/// forever, and nothing would be red.
+///
+/// [`descriptors`] is still the list that goes on the wire;
+/// `the_names_and_the_descriptors_are_one_list` holds the two together, and the
+/// transport's `the_adapter_lists_exactly_what_the_surface_declares` carries
+/// that agreement out to the wire.
+pub const TOOL_NAMES: [&str; 8] = roundhouse_core::validate::CONTROL_TOOL_NAMES;
 
 /// One entry of the tool list.
 #[derive(Debug, Clone, PartialEq)]
@@ -111,6 +126,18 @@ pub struct ToolCall {
     /// The raw arguments object. `Value::Null` for a call that sent none,
     /// which every tool with only optional fields accepts.
     pub arguments: Value,
+    /// `_meta["claudecode/toolUseId"]`, when the client sent one (M12, R-M2).
+    ///
+    /// **Beside the arguments and not inside them.** The arguments are what the
+    /// *model* wrote and are checked against a published schema; this is what
+    /// the *client* attached, naming the `tool_use` block roundhouse emitted
+    /// and is now being answered for. Folding it into `arguments` would put a
+    /// property in eight schemas that no model should ever fill in — and
+    /// `deny_unknown_fields` would refuse the honest client that sent it.
+    ///
+    /// `None` for every client that sends no such key, which is every client
+    /// but Claude Code.
+    pub tool_use_id: Option<String>,
 }
 
 /// The conversation property, repeated by every session-scoped tool.
@@ -118,10 +145,20 @@ pub struct ToolCall {
 /// One function rather than a copied literal: the description is the sentence
 /// that tells a model it may omit the field, and eight slightly different
 /// spellings of it is how a model learns that the field means eight things.
+///
+/// **Dialect-neutral, and it names no wire field** (M12, R-M4). It used to say
+/// "as the client's own `prompt_cache_key`", which is a Responses word: a
+/// Claude Code model reading it looks for a field its own API does not have,
+/// and the likeliest thing it then passes is a session id from a namespace this
+/// surface does not resolve — a `ForeignConversation` refusal in place of an
+/// answer the omitted argument would have got right. What replaces it says what
+/// the omission *does*, which is the same on both surfaces and is now the
+/// accurate order (R-M2): the tool call this call answers first, the key's most
+/// recent conversation second.
 fn conversation_property() -> Value {
     json!({
         "type": "string",
-        "description": "The conversation this concerns, as the client's own prompt_cache_key. Omit it and the most recent conversation on this key is used."
+        "description": "The conversation this concerns, spelled the way this client names a conversation to roundhouse. Omitting it is the ordinary case: the call is matched to the conversation whose tool call it is answering, and failing that to the most recent conversation on this key."
     })
 }
 
@@ -319,6 +356,12 @@ async fn dispatch_inner(
     principal: &Principal,
     call: ToolCall,
 ) -> Result<ToolOutcome, SurfaceError> {
+    // The two halves of "who is asking, about what" joined once, here, rather
+    // than at each of the eight arms below: a tool that forgot to carry the id
+    // would answer about the principal's most recent conversation instead of
+    // the one it was called from, and it would answer *plausibly* — which is
+    // the failure R-M2 exists to remove and the hardest kind to notice.
+    let caller = Caller::answering(principal.clone(), call.tool_use_id);
     // An absent arguments object and an empty one mean the same thing, and a
     // client is free to send either. Normalizing here rather than in eight
     // `#[serde(default)]`-shaped workarounds keeps the request types describing
@@ -328,44 +371,36 @@ async fn dispatch_inner(
         other => other,
     };
     match call.name.as_str() {
-        "status" => {
-            surface
-                .status(principal, decode("status", arguments)?)
-                .await
-        }
+        "status" => surface.status(&caller, decode("status", arguments)?).await,
         "init_session" => {
             surface
-                .init_session(principal, decode("init_session", arguments)?)
+                .init_session(&caller, decode("init_session", arguments)?)
                 .await
         }
         "declare_intent" => {
             surface
-                .declare_intent(principal, decode("declare_intent", arguments)?)
+                .declare_intent(&caller, decode("declare_intent", arguments)?)
                 .await
         }
-        "prefer" => {
-            surface
-                .prefer(principal, decode("prefer", arguments)?)
-                .await
-        }
+        "prefer" => surface.prefer(&caller, decode("prefer", arguments)?).await,
         "set_quality_floor" => {
             surface
-                .set_quality_floor(principal, decode("set_quality_floor", arguments)?)
+                .set_quality_floor(&caller, decode("set_quality_floor", arguments)?)
                 .await
         }
         "fetch_steer" => {
             surface
-                .fetch_steer(principal, decode("fetch_steer", arguments)?)
+                .fetch_steer(&caller, decode("fetch_steer", arguments)?)
                 .await
         }
         "report_outcome" => {
             surface
-                .report_outcome(principal, decode("report_outcome", arguments)?)
+                .report_outcome(&caller, decode("report_outcome", arguments)?)
                 .await
         }
         "explain_last_route" => {
             surface
-                .explain_last_route(principal, decode("explain_last_route", arguments)?)
+                .explain_last_route(&caller, decode("explain_last_route", arguments)?)
                 .await
         }
         unknown => Err(SurfaceError::UnknownTool(unknown.to_string())),
@@ -423,6 +458,9 @@ mod tests {
             let call = ToolCall {
                 name: tool.name.to_string(),
                 arguments: Value::Object(probe),
+                // The schemas are what a *model* fills in; the correlation id
+                // is not one of their properties and never should be.
+                tool_use_id: None,
             };
             let decoded = decode_probe(&call);
             assert!(
@@ -496,6 +534,7 @@ mod tests {
             let empty = ToolCall {
                 name: tool.name.to_string(),
                 arguments: json!({}),
+                tool_use_id: None,
             };
             assert_eq!(
                 decode_probe(&empty).is_err(),

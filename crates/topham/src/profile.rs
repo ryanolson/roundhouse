@@ -6,7 +6,8 @@
 //!
 //! A profile is a TOML file under `<config>/topham/profiles/<name>.toml`
 //! carrying names: which agent, which deployment, which of the two auth kinds,
-//! **the name of the variable** the turn key arrives in, which topology, and
+//! **the name of the variable** the turn key arrives in, which topology, for
+//! claude whether the generated MCP registration excludes every other one, and
 //! for codex a model slug and a catalog path. That is the whole vocabulary, and
 //! everything in this crate is a function of it plus the environment.
 //!
@@ -182,6 +183,22 @@ pub struct Profile {
     pub key_env: String,
     #[serde(default)]
     pub topology: Topology,
+    /// Whether the launched Claude Code client is told to ignore every MCP
+    /// configuration but the one this launcher generates.
+    ///
+    /// Off by default, and the default is the decision: `--strict-mcp-config`
+    /// excludes an operator's *own* servers wholesale — including ones whose
+    /// names collide with nothing — so a launcher that switched it on by
+    /// default would silently delete half of what an operator's client can do
+    /// in exchange for a collision they may never have had. On, it is the
+    /// answer for a deployment that means "exactly roundhouse's tools and
+    /// nothing else".
+    ///
+    /// Skipped when false so a profile file names it only when it is doing
+    /// something, and refused on a codex profile for the reason
+    /// [`ProfileError::NotAClaudeField`] gives.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub strict_mcp: bool,
     /// The model slug codex is configured with. `None` means
     /// [`DEFAULT_MODEL_SLUG`], and reading that default rather than writing a
     /// slug here is the point: the generator's doc explains why the slug is
@@ -206,6 +223,14 @@ pub struct Profile {
 
 fn default_key_env() -> String {
     DEFAULT_KEY_ENV.to_string()
+}
+
+/// `skip_serializing_if` for a `bool` that is only worth writing down when set.
+///
+/// A named function rather than `std::ops::Not::not`, which takes its receiver
+/// by value where serde hands a reference.
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Why a profile could not be read, written, or trusted.
@@ -251,6 +276,13 @@ pub enum ProfileError {
          kind of field an operator sets and then believes"
     )]
     NotACodexField { name: String, field: &'static str },
+    #[error(
+        "the profile `{name}` sets `{field}`, which only a claude profile has. Read on a `codex` \
+         profile it would be dropped in silence -- and it names something an operator switched on \
+         deliberately, so the launch would run without the behaviour they asked for and say \
+         nothing"
+    )]
+    NotAClaudeField { name: String, field: &'static str },
     #[error("`{path}` could not be read or written")]
     Io {
         path: PathBuf,
@@ -274,6 +306,7 @@ impl Profile {
             auth: AuthKind::default(),
             key_env: default_key_env(),
             topology: Topology::default(),
+            strict_mcp: false,
             model: None,
             model_catalog_path: None,
         }
@@ -336,6 +369,16 @@ impl Profile {
                     field: "model-catalog-path",
                 });
             }
+        }
+        // Only the `true` case, and only here: `strict-mcp = false` on a codex
+        // profile asks for the behaviour a codex launch already has, so there
+        // is nothing for an operator to believe wrongly. `true` is a request
+        // this agent's generated config has no way to honour.
+        if self.agent == Agent::Codex && self.strict_mcp {
+            return Err(ProfileError::NotAClaudeField {
+                name: name.to_string(),
+                field: "strict-mcp",
+            });
         }
         Ok(())
     }

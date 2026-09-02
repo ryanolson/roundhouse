@@ -211,5 +211,5 @@ pub use store::{
     BindingId, ControlStore, IntentRecord, OutcomeRecord, SessionBinding, binding_ids_in_items,
     binding_in_items,
 };
-pub use surface::{ControlSurface, SurfaceError, ToolOutcome};
+pub use surface::{Caller, ControlSurface, SurfaceError, ToolOutcome};
 pub use tools::{TOOL_NAMES, ToolCall, ToolDescriptor, descriptors, dispatch};

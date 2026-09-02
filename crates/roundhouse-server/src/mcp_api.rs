@@ -137,8 +137,28 @@ impl<S: SessionStore> ControlReads for ControlPlaneReads<S> {
         &self,
         principal: &Principal,
         conversation: Option<&str>,
+        tool_use_id: Option<&str>,
     ) -> Result<SessionId, SurfaceError> {
         let Some(named) = conversation else {
+            // **The tool-use id first, because it is the only exact answer**
+            // (M12, R-M2). It names a `tool_use` block this node emitted into
+            // one session, so a `status` call made from inside a subagent's
+            // tool loop resolves to the subagent's conversation rather than to
+            // whichever of the principal's turns opened most recently. Checked
+            // against the caller, and an id that is not this caller's is
+            // indistinguishable from one this node never emitted — see
+            // `Conversations::session_of_call`.
+            //
+            // No existence check on the way out, unlike the named path below.
+            // The binding is written at the moment the call was appended to
+            // that very log, so "the session exists" is not in question; a
+            // `last_seq` here would spend a store round trip to re-ask
+            // something this node observed itself.
+            if let Some(session) =
+                tool_use_id.and_then(|id| self.conversations.session_of_call(principal, id))
+            {
+                return Ok(session);
+            }
             // The principal's most recent conversation *on this node*. A
             // principal this node has served no turn for gets the error rather
             // than somebody else's session or an empty status.
@@ -662,13 +682,154 @@ mod tests {
     }
 
     fn reads_over<S: SessionStore>(plane: ControlPlane, store: Arc<S>) -> ControlPlaneReads<S> {
+        reads_sharing(plane, store, Arc::new(Conversations::new()))
+    }
+
+    /// As [`reads_over`], but over a conversation table the test also holds.
+    ///
+    /// The composition root shares one table between the turn surfaces and this
+    /// one; a test asserting how a tool-use id resolves has to write the binding
+    /// from the same side a turn would, or it is asserting against a table
+    /// nothing populates.
+    fn reads_sharing<S: SessionStore>(
+        plane: ControlPlane,
+        store: Arc<S>,
+        conversations: Arc<Conversations>,
+    ) -> ControlPlaneReads<S> {
         ControlPlaneReads::new(
             Arc::new(plane),
             store,
             Arc::new(MemorySpendLedger::new()),
-            Arc::new(Conversations::new()),
+            conversations,
             Vec::new(),
         )
+    }
+
+    /// A plane that authenticates two tenants, for the tenancy half of R-M2.
+    ///
+    /// Spelled out rather than reached through [`plane_with_keys`], which
+    /// declares one project and one user by construction — a second tenant is
+    /// exactly what this half needs and exactly what that helper cannot express.
+    fn two_tenant_plane() -> ControlPlane {
+        let json = serde_json::json!({
+            "projects": [
+                { "id": "acme", "policy": { "min_quality": 0.1 } },
+                { "id": "globex", "policy": { "min_quality": 0.1 } },
+            ],
+            "users": [{ "id": "ada" }, { "id": "bob" }],
+            "keys": [
+                { "project": "acme", "user": "ada", "key_sha256": hash('a') },
+                { "project": "globex", "user": "bob", "key_sha256": hash('b') },
+            ],
+        })
+        .to_string();
+        ControlPlane::configured(
+            ControlPlaneConfig::from_json(&json, "two-tenant fixture")
+                .expect("the fixture config must validate"),
+        )
+    }
+
+    /// R-M2 (M12): a tool-use id resolves the conversation that emitted it, and
+    /// it beats the `latest` guess.
+    ///
+    /// **The race this removes, made deterministic.** One principal drives two
+    /// conversations — a parent agent and the subagent it spawned. Both bind
+    /// through the same table, so `latest` names whichever opened a turn most
+    /// recently, and an MCP call from the *other* one reads and narrows the
+    /// wrong session. Here the parent's conversation is bound second, so
+    /// `latest` is the parent's and the subagent's id is the only thing that
+    /// can point at the subagent's log.
+    #[tokio::test]
+    async fn a_tool_use_id_resolves_the_conversation_that_emitted_it() {
+        let ada = Principal::new("acme", "ada");
+        let conversations = Arc::new(Conversations::new());
+        let subagent = conversations.bind(&ada, "acme/ada/sub");
+        let parent = conversations.bind(&ada, "acme/ada/main");
+        conversations.bind_call(&ada, "toolu_sub", subagent.clone());
+
+        let reads = reads_sharing(
+            two_tenant_plane(),
+            Arc::new(MemoryStore::new()),
+            Arc::clone(&conversations),
+        );
+
+        assert_eq!(
+            reads
+                .resolve_session(&ada, None, Some("toolu_sub"))
+                .await
+                .expect("an id this node emitted for this caller resolves"),
+            subagent,
+            "the call came from the subagent's tool loop; `latest` would have              answered with the parent's conversation"
+        );
+
+        // The control that proves the assertion above is about the id and not
+        // about the ordering: with no id, the guess is what is left.
+        assert_eq!(
+            reads
+                .resolve_session(&ada, None, None)
+                .await
+                .expect("a principal with a most recent conversation"),
+            parent,
+            "Codex sends no such key, and the surface must answer it exactly              as it did before R-M2"
+        );
+
+        // And an argument the *model* wrote outranks the id the *client*
+        // attached, because only one of the two is something the agent chose.
+        let store = Arc::new(MemoryStore::new());
+        store
+            .create_session(&parent, "gpt-4")
+            .await
+            .expect("a session for the named path to find");
+        let named = reads_sharing(two_tenant_plane(), store, Arc::clone(&conversations));
+        assert_eq!(
+            named
+                .resolve_session(&ada, Some("main"), Some("toolu_sub"))
+                .await
+                .expect("the named conversation exists"),
+            parent,
+        );
+    }
+
+    /// R-M2's tenancy half: another principal's id names nothing here.
+    ///
+    /// **Refused rather than answered when there is nothing else to answer
+    /// with**, and answered with the caller's *own* conversation when there is
+    /// — never with the conversation the id actually belongs to. The two are one
+    /// rule: an id that is not this caller's is treated exactly as an id this
+    /// node never emitted, so a probe learns nothing it did not already know.
+    #[tokio::test]
+    async fn another_principals_tool_use_id_never_resolves_to_that_principals_session() {
+        let ada = Principal::new("acme", "ada");
+        let bob = Principal::new("globex", "bob");
+        let conversations = Arc::new(Conversations::new());
+        let adas = conversations.bind(&ada, "acme/ada/main");
+        conversations.bind_call(&ada, "toolu_ada", adas.clone());
+
+        let reads = reads_sharing(
+            two_tenant_plane(),
+            Arc::new(MemoryStore::new()),
+            Arc::clone(&conversations),
+        );
+
+        let refused = reads
+            .resolve_session(&bob, None, Some("toolu_ada"))
+            .await
+            .expect_err("bob has no conversation of his own to fall back to");
+        assert!(
+            matches!(refused, SurfaceError::NoSession),
+            "an id belonging to another tenant is an id this deployment has              none of for *this* caller: {refused}"
+        );
+
+        // Once bob has one, he gets his own — never ada's, and with no hint
+        // that the id he presented meant anything to anybody.
+        let bobs = conversations.bind(&bob, "globex/bob/main");
+        assert_eq!(
+            reads
+                .resolve_session(&bob, None, Some("toolu_ada"))
+                .await
+                .expect("bob's own most recent conversation"),
+            bobs,
+        );
     }
 
     #[tokio::test]
@@ -687,7 +848,7 @@ mod tests {
         let reads = reads_over(plane, Arc::new(OutageStore));
 
         let error = reads
-            .resolve_session(&Principal::new("acme", "ada"), Some("main"))
+            .resolve_session(&Principal::new("acme", "ada"), Some("main"), None)
             .await
             .expect_err("a store that cannot answer has not answered");
         assert!(
@@ -712,7 +873,7 @@ mod tests {
             Arc::new(MemoryStore::new()),
         );
         let refused = closed
-            .resolve_session(&Principal::new("acme", "ada"), Some("main"))
+            .resolve_session(&Principal::new("acme", "ada"), Some("main"), None)
             .await
             .expect_err("a session nobody created is not this caller's");
         assert!(

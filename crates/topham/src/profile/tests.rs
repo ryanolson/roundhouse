@@ -42,6 +42,7 @@ fn codex_profile() -> Profile {
         auth: AuthKind::ForwardedLogin,
         key_env: "DEPLOYMENT_TURN_KEY".to_string(),
         topology: Topology::Chained,
+        strict_mcp: false,
         model: Some("roundhouse-local".to_string()),
         model_catalog_path: Some(PathBuf::from("/srv/roundhouse/catalog.json")),
     }
@@ -218,6 +219,61 @@ fn a_claude_profile_may_not_carry_the_codex_fields() {
             "{error:#?}"
         );
     }
+}
+
+/// The same, in the other direction: `strict-mcp` is the claude launch's, and
+/// a codex profile asking for it is asking for something no generated codex
+/// config can express.
+///
+/// **Only `true` is refused.** `strict-mcp = false` on a codex profile asks for
+/// what that launch already does, so there is nothing an operator could believe
+/// wrongly; refusing it would make a round trip of a serialized profile
+/// agent-dependent for a value that changes nothing.
+#[test]
+fn a_codex_profile_may_not_ask_for_the_claude_mcp_switch() {
+    let error = Profile::from_toml(
+        "agent = \"codex\"\ndeployment-root = \"http://x\"\nstrict-mcp = true\n",
+        "work",
+    )
+    .expect_err("codex registers its MCP server in a config file, not on the argv");
+    assert!(
+        matches!(&error, ProfileError::NotAClaudeField { field, .. } if *field == "strict-mcp"),
+        "{error:#?}"
+    );
+    assert!(
+        Profile::from_toml(
+            "agent = \"codex\"\ndeployment-root = \"http://x\"\nstrict-mcp = false\n",
+            "work",
+        )
+        .is_ok(),
+        "asking for the default is asking for nothing"
+    );
+}
+
+/// `strict-mcp` survives the file, and is written down only when it is on.
+///
+/// The round trip is what `plan::resolve` performs on every resolution, so a
+/// field that serialized and did not come back would be a switch an operator
+/// set, saw in the file, and never got.
+#[test]
+fn the_mcp_switch_round_trips_and_is_written_only_when_set() {
+    let strict = Profile {
+        strict_mcp: true,
+        ..Profile::new(Agent::Claude, "http://127.0.0.1:8080")
+    };
+    let text = strict.to_toml();
+    assert!(text.contains("strict-mcp = true"), "{text}");
+    assert_eq!(
+        Profile::from_toml(&text, "work").expect("what `save` writes is what `load` reads"),
+        strict
+    );
+
+    let ordinary = Profile::new(Agent::Claude, "http://127.0.0.1:8080");
+    assert!(
+        !ordinary.to_toml().contains("strict-mcp"),
+        "a profile names it only when it is doing something: {}",
+        ordinary.to_toml()
+    );
 }
 
 /// F1 (M11.3 thermo-nuclear review): a paste that fails to *parse* as TOML at

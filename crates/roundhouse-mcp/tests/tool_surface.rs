@@ -34,12 +34,29 @@ async fn call(
     name: &str,
     arguments: Value,
 ) -> ToolOutcome {
+    call_answering(surface, principal, name, arguments, None).await
+}
+
+/// The same, from inside a client's own tool loop.
+///
+/// `tool_use_id` is what Claude Code puts in `_meta["claudecode/toolUseId"]`
+/// on a `tools/call` — the id of the `tool_use` block roundhouse emitted and
+/// this call is answering (M12, R-M2). Every other client sends `None`, which
+/// is what [`call`] passes.
+async fn call_answering(
+    surface: &dyn ControlSurface,
+    principal: &Principal,
+    name: &str,
+    arguments: Value,
+    tool_use_id: Option<&str>,
+) -> ToolOutcome {
     dispatch(
         surface,
         principal,
         ToolCall {
             name: name.to_string(),
             arguments,
+            tool_use_id: tool_use_id.map(str::to_string),
         },
     )
     .await
@@ -114,7 +131,19 @@ fn the_tool_list_is_stable_and_golden_pinned() {
         // at eight**, and that is a decision rather than an accident: a surface
         // that shrank would re-prime every prompt cache in the deployment to
         // delete a read that still answers a real question.
-        "239288254d69f509bb7556197eebefeff7c3361b4142b62c46704569897a81a4",
+        //
+        // The third is **M12 (R-M4)**, and it is one sentence: the
+        // `conversation` argument's description, repeated by all eight tools,
+        // stopped naming `prompt_cache_key`. That word belongs to one of the
+        // two surfaces this deployment now serves, and a Claude Code model
+        // reading it goes looking for a field its own API does not have. The
+        // replacement names no wire field and states what omitting the argument
+        // does — which is also the half that had gone stale, since a call is
+        // now matched to the tool call it answers before falling back to the
+        // key's most recent conversation. Names, count and schema *shape* are
+        // untouched; `tools.rs`'s module doc carries why the cache miss was
+        // accepted rather than deferred.
+        "e1c17fd315c32d05417d76325d722caad56f4ffee8eb5e99de8c876557ab6174",
         "the published tool list changed; see this test's comment before editing the literal"
     );
 
@@ -567,8 +596,11 @@ impl roundhouse_mcp::reads::ControlReads for RacingReads {
         &self,
         principal: &Principal,
         conversation: Option<&str>,
+        tool_use_id: Option<&str>,
     ) -> Result<SessionId, roundhouse_mcp::SurfaceError> {
-        self.inner.resolve_session(principal, conversation).await
+        self.inner
+            .resolve_session(principal, conversation, tool_use_id)
+            .await
     }
 
     async fn ceiling_policy(
@@ -740,8 +772,11 @@ impl roundhouse_mcp::reads::ControlReads for MemoProbeReads {
         &self,
         principal: &Principal,
         conversation: Option<&str>,
+        tool_use_id: Option<&str>,
     ) -> Result<SessionId, roundhouse_mcp::SurfaceError> {
-        self.inner.resolve_session(principal, conversation).await
+        self.inner
+            .resolve_session(principal, conversation, tool_use_id)
+            .await
     }
 
     async fn ceiling_policy(
@@ -1627,4 +1662,85 @@ fn every_tool_states_what_it_does_to_a_client_that_was_handed_no_config() {
             tool.name
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// R-M2 (M12): which conversation a call is about
+// ---------------------------------------------------------------------------
+
+/// The tool-use id the client attaches reaches [`ControlReads::resolve_session`]
+/// and decides the answer.
+///
+/// **What this proves that the server's own unit tests do not.** The id enters
+/// at the transport, is carried on [`ToolCall`], is joined to the principal by
+/// `dispatch`, and is handed to the seam by *every* session-scoped tool. Any
+/// one of those four hops could drop it and the deployment would keep working —
+/// it would simply answer about the principal's most recent conversation
+/// instead of the one the agent is standing in, which is a plausible answer
+/// and therefore an invisible bug. Asserting through the dispatched tool's own
+/// output is what makes the whole chain load-bearing.
+#[tokio::test]
+async fn a_calls_tool_use_id_decides_which_conversation_the_answer_is_about() {
+    let subagent = SessionId::new("acme/ada/sess_subagent");
+    let mut deployment = FakeDeployment::default();
+    deployment
+        .tool_use_ids
+        .insert("toolu_sub".to_string(), (ada(), subagent.clone()));
+    let (surface, _store) = deployment.surface();
+
+    // `adas_session()` is the fake's "most recent", so an answer naming the
+    // subagent's log can only have come from the id.
+    let answered =
+        served(&call_answering(&surface, &ada(), "status", json!({}), Some("toolu_sub")).await);
+    assert_eq!(answered["conversation"], json!(subagent.as_str()));
+
+    // The control, which is also the Codex path: no id, the guess stands.
+    let guessed = served(&call(&surface, &ada(), "status", json!({})).await);
+    assert_eq!(guessed["conversation"], json!(adas_session().as_str()));
+
+    // And the id is a fallback for the *unnamed* case only: an argument the
+    // model wrote outranks metadata the client attached.
+    let named = served(
+        &call_answering(
+            &surface,
+            &ada(),
+            "status",
+            json!({ "conversation": "sess_1" }),
+            Some("toolu_sub"),
+        )
+        .await,
+    );
+    assert_eq!(named["conversation"], json!(adas_session().as_str()));
+}
+
+/// An id another tenant's session emitted is worth exactly as much as an id
+/// nobody emitted, and neither is worth another tenant's conversation.
+///
+/// The two are one assertion on purpose: an answer that distinguished them
+/// would make the `_meta` key an enumeration oracle for ids the caller does not
+/// hold, which is the same reasoning `fetch_steer`'s refusal is written under.
+#[tokio::test]
+async fn another_tenants_tool_use_id_is_worth_no_more_than_an_unknown_one() {
+    let adas = adas_session();
+    let mut deployment = FakeDeployment::default();
+    deployment
+        .tool_use_ids
+        .insert("toolu_ada".to_string(), (ada(), adas.clone()));
+    deployment
+        .sessions
+        .insert(bob(), SessionId::new("other/bob/sess_1"));
+    let (surface, _store) = deployment.surface();
+
+    let with_stolen_id =
+        served(&call_answering(&surface, &bob(), "status", json!({}), Some("toolu_ada")).await);
+    let with_unknown_id =
+        served(&call_answering(&surface, &bob(), "status", json!({}), Some("toolu_nobody")).await);
+
+    assert_eq!(with_stolen_id["conversation"], json!("other/bob/sess_1"));
+    assert_eq!(
+        with_stolen_id["conversation"], with_unknown_id["conversation"],
+        "an id belonging to somebody else must answer exactly as an id \
+         belonging to nobody, or the key becomes a probe"
+    );
+    assert_ne!(with_stolen_id["conversation"], json!(adas.as_str()));
 }

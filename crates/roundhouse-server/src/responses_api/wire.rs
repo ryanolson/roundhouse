@@ -611,10 +611,18 @@ mod tests {
     /// is what gets a future change waved through.
     ///
     /// Pinned as the divergence rather than deleted with the prose, because the
-    /// day a flat variant lands this is the assertion that has to be revisited
-    /// deliberately: making it pass means teaching `canonical_item` to split a
-    /// flat name apart, and that is a wire-layer change no dialect variant makes
-    /// the compiler ask for.
+    /// day a flat variant landed this was the assertion to revisit
+    /// deliberately.
+    ///
+    /// **It landed, and the answer was to leave this exactly as it is** (M12,
+    /// R-M1). `ClientDialect::ClaudeMessages` spells MCP tools flat, and the
+    /// Messages surface stores them flat — it does *not* split them here or
+    /// anywhere. The two spellings never meet: each is written by one client on
+    /// one surface, a session is written by one client, and what has to
+    /// recognise either is `is_control_call`, which now knows both. Teaching
+    /// this function to split would buy nothing and would move the `turn_id` of
+    /// every already-stored tool-using session. So the divergence below is the
+    /// shipped behaviour, not a debt.
     #[test]
     fn a_flat_spelling_is_a_different_canonical_call_until_the_wire_learns_to_split_it() {
         let namespaced = json!({
@@ -653,9 +661,136 @@ mod tests {
         assert_ne!(
             namespaced_item, flat_item,
             "if these ever agree, `canonical_item` has learned to split a flat \
-             name — which is the change a flat `ClientDialect` variant owes the \
-             input path, and `dialect.rs`'s module doc is the paragraph that has \
-             to be re-read when it lands"
+             name — which R-M1 ruled it must not do, because splitting moves \
+             the `turn_id` of every stored tool-using session and buys nothing \
+             now that `is_control_call` knows both spellings"
+        );
+    }
+
+    /// R-M0 (M12): what a Codex MCP call *is* on the Responses wire, asked of
+    /// codex's own type rather than of a fixture this repo wrote.
+    ///
+    /// The two tests above are hand-written JSON. They assert the right thing,
+    /// but they cannot answer the question M12 had to settle — which of the two
+    /// spellings a real Codex actually sends — because a fixture only ever
+    /// agrees with whoever typed it. This one builds the item with
+    /// [`codex_protocol::models::ResponseItem::FunctionCall`], serializes it
+    /// with codex's own `Serialize`, and feeds the bytes to [`canonicalize`].
+    /// If codex ever folds the namespace into `name`, the variant stops having a
+    /// `namespace` field and this stops compiling.
+    ///
+    /// **The determination, with its citations against the Cargo pin
+    /// `6344a65`.** Codex presents an MCP server to the model as one
+    /// *namespace* object, not as N flat functions:
+    /// `core/src/tools/handlers/mcp.rs:388-393` builds
+    /// `ToolSpec::Namespace { name: callable_namespace, tools: [...] }` and
+    /// `tools/src/responses_api.rs:117-123` puts each tool in it under
+    /// `tool_name.name` — the **bare** name, via `.renamed(tool_name.name)`.
+    /// The namespace string is `mcp__<server>` (`codex-mcp/src/tools.rs:139-146`
+    /// prefixing the sanitized server name, `:228-234`), which is exactly
+    /// [`crate::dialect::DEFAULT_MCP_NAMESPACE`]. The model's call therefore
+    /// comes back as bare `name` plus a separate `namespace`
+    /// (`protocol/src/models.rs:910-928`, and codex's own suite emits precisely
+    /// that JSON in `core/tests/common/responses.rs:929-945`), and dispatch is
+    /// an exact `ToolName { name, namespace }` registry lookup
+    /// (`core/src/tools/router.rs:154-170`), which is why a flat spelling
+    /// resolves against nothing (`core/src/tools/registry.rs:828`). The M9
+    /// suite already read the first half of this off a *real binary*:
+    /// `codex_e2e.rs`'s `the_delimiter_a_skill_spells_is_the_one_the_real_binary_namespaces_with`
+    /// finds `tool["type"] == "namespace"`, `tool["name"] ==
+    /// DEFAULT_MCP_NAMESPACE`, and `prefer` listed under it bare.
+    ///
+    /// **So the log stores the bare name**, and that is the fact this test
+    /// exists to make executable. It is not a defect of this module — dropping
+    /// the namespace is what makes a resend round-trip — but it is the premise
+    /// of a claim made a crate below, and `roundhouse-core`'s
+    /// `a_control_call_as_the_responses_wire_stores_it_is_recognised` is what
+    /// M12 turned that claim into: the classifier now knows the bare spelling
+    /// as well as the flat one.
+    #[test]
+    fn r_m0_a_codex_mcp_call_arrives_bare_with_a_separate_namespace() {
+        use codex_protocol::models::ResponseItem;
+
+        let call = ResponseItem::FunctionCall {
+            id: None,
+            name: "status".to_string(),
+            namespace: Some(crate::dialect::DEFAULT_MCP_NAMESPACE.to_string()),
+            arguments: "{}".to_string(),
+            encrypted_function_args: None,
+            call_id: "call_r_m0".to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        };
+        let wire = serde_json::to_value(&call).expect("codex serializes its own item");
+
+        // The wire shape itself, before anything of ours reads it. Spelled as
+        // three separate assertions rather than one whole-value comparison so a
+        // new optional field upstream does not read as a change of spelling.
+        assert_eq!(wire["type"], json!("function_call"));
+        assert_eq!(
+            wire["name"],
+            json!("status"),
+            "codex names an MCP tool by its bare name on the Responses wire: {wire:#?}"
+        );
+        assert_eq!(
+            wire["namespace"],
+            json!(crate::dialect::DEFAULT_MCP_NAMESPACE),
+            "the namespace is a separate wire field, not a prefix on `name`: {wire:#?}"
+        );
+
+        let stored = canonicalize("", &[wire]).expect("a client's own call is resendable");
+        assert_eq!(
+            stored,
+            vec![Item::tool_call("call_r_m0", "status", "{}")],
+            "the log keeps the bare name, so nothing downstream may match on a \
+             flat `mcp__roundhouse__` prefix without splitting it first"
+        );
+
+        // The consequence, asserted here because this is where the evidence
+        // is. R-M0 found this false — a bare stored name satisfied no
+        // classifier — which is the finding M12 closed by teaching
+        // `is_control_call` the bare spelling. Asserted through the *stored*
+        // item rather than against a literal, so a change to canonicalization
+        // that reintroduced the namespace would be caught here rather than
+        // agreeing with a string this test typed.
+        let Some(roundhouse_core::item::ItemContent::ToolCall { name, .. }) =
+            stored.first().map(|item| &item.content)
+        else {
+            panic!("the canonical item is a tool call: {stored:#?}");
+        };
+        assert!(
+            roundhouse_core::validate::is_control_call(name),
+            "an MCP control call made over the Responses wire has to be \
+             recognisable from what the log actually holds (`{name}`), or the \
+             fold counts roundhouse's own chatter as the agent's work"
+        );
+    }
+
+    /// M12 fix-stage finding F1: the assertion above exercises `is_control_call`
+    /// only on the *bare* name this surface actually stores (`"status"`), which
+    /// `CONTROL_TOOL_NAMES.contains` alone already recognises — so a refute-stage
+    /// mutation that deleted the flat-name half of the classifier
+    /// (`is_flat_control_call`) left the test above green. Nothing on this
+    /// surface exercised the flat half at all; only the Messages-side tests
+    /// (`a_flat_control_call_is_recognised_and_dropped_from_the_task_view`,
+    /// `both_spellings_of_every_control_tool_are_ours_and_the_near_misses_are_not`
+    /// in `roundhouse-core`) did. This test closes that gap from the Responses
+    /// side: a flat-spelled name is not a shape this wire ever produces, but
+    /// `is_control_call` is a shared classifier and this surface's own suite
+    /// should not depend on a sibling crate's tests to prove the half it does
+    /// not exercise is still there.
+    #[test]
+    fn a_flat_spelled_name_is_still_recognised_from_the_responses_surfaces_own_suite() {
+        let flat = format!(
+            "{}{}status",
+            roundhouse_core::validate::CONTROL_TOOL_NAMESPACE,
+            roundhouse_core::validate::CONTROL_TOOL_DELIMITER
+        );
+        assert!(
+            roundhouse_core::validate::is_control_call(&flat),
+            "the flat spelling `{flat}` must be recognised even though this \
+             wire never produces it itself — `is_control_call` is shared with \
+             the Messages surface and this suite should not rely solely on \
+             that sibling crate's tests to prove the flat half survives"
         );
     }
 

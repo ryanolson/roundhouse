@@ -136,6 +136,16 @@ pub enum Resolved {
         /// [`ClaudeLaunch::must_be_unset`] on the launch above, and a second
         /// home for a derived value is a second thing that can be stale (F16).
         settings: Vec<SettingsFile>,
+        /// The arguments this launcher puts before the operator's own — the
+        /// MCP registration and the signage (M12, R-M3/R-M4).
+        ///
+        /// **Resolved here rather than built in [`crate::launch`]**, for the
+        /// reason [`resolve`] exists at all: `plan`, `launch` and the screen
+        /// are three surfaces over one resolution, and an argv derived on the
+        /// launch path only would be one a dry run could not show. It is held
+        /// as the generator's own rendering rather than as its inputs so that
+        /// what is printed is what is passed.
+        leading_argv: Vec<String>,
     },
     Codex {
         launch: CodexLaunch,
@@ -224,7 +234,14 @@ pub fn resolve(env: &EnvMap, name: &str, profile: Profile) -> Result<Resolution,
 
     let resolved = match profile.agent {
         Agent::Claude => {
-            let mut launch = ClaudeLaunch::new(root, turn_key)?;
+            let mut launch = ClaudeLaunch::new(root, turn_key)?
+                // The profile's own variable, not the generator's default: the
+                // registration tells the client to expand `${…}` and the key is
+                // exported under whatever `key-env` names, so a mismatch here
+                // produces control calls carrying an empty key while every
+                // inference turn still answers.
+                .with_key_env(&profile.key_env)
+                .with_strict_mcp_config(profile.strict_mcp);
             if profile.auth == AuthKind::ForwardedLogin {
                 launch = launch.forwarding_claude_login();
             }
@@ -244,6 +261,7 @@ pub fn resolve(env: &EnvMap, name: &str, profile: Profile) -> Result<Resolution,
                 file.refuse_what_it_defeats(&launch)?;
             }
             Resolved::Claude {
+                leading_argv: launch.leading_argv(),
                 launch,
                 env: generated,
                 settings,
@@ -465,11 +483,15 @@ impl Resolution {
                 launch,
                 env,
                 settings,
+                leading_argv,
             } => {
                 field(&mut out, "messages url", &launch.messages_url());
                 out.push('\n');
                 out.push_str("environment handed to the client (the generator's own Debug):\n");
                 out.push_str(&indent(&format!("{env:#?}")));
+                out.push('\n');
+                out.push_str("argv prepended to the operator's own:\n");
+                out.push_str(&render_leading_argv(leading_argv));
                 out.push('\n');
                 out.push_str("must be unset when this launch runs:\n");
                 out.push_str(&render_suppressors(&launch.must_be_unset(), launch.auth()));
@@ -578,6 +600,20 @@ impl Resolution {
                 );
             }
         }
+        // The limit R-M3's registration cannot close, and the one an operator
+        // is likeliest to read as "the control surface is broken": the flag
+        // makes the tools *exist* for the client, and the client's own
+        // permission layer decides whether it may call one.
+        if matches!(self.resolved, Resolved::Claude { .. }) {
+            notes.push(
+                "the registration above is what makes roundhouse's control tools exist for this \
+                 client, not what makes it call one. Headless (`-p`), the client synthesises a \
+                 permission refusal for an `mcp__roundhouse__*` tool unless its own argv names it \
+                 -- `--allowedTools mcp__roundhouse__status` and so on; interactively it asks the \
+                 operator. Neither is something this launcher can decide for it."
+                    .to_string(),
+            );
+        }
         if let Resolved::Claude { launch, .. } = &self.resolved
             && launch
                 .must_be_unset()
@@ -620,6 +656,48 @@ impl Resolution {
         notes
     }
 }
+
+/// The generated argv, one argument per line, with the key variable
+/// **unexpanded**.
+///
+/// Unexpanded because that is what is passed: the `${…}` in the registration is
+/// the client's to expand, and a dry run that showed the key there would be
+/// showing something the launch never carries — as well as printing a
+/// credential on a screen an operator screen-shares.
+///
+/// **The signage is named and not printed**, which is the same call `topham
+/// plan` already makes about codex's generated `config.toml`: it is prose long
+/// enough to bury the six lines above it that are the actual decision, it is a
+/// pure function of the tool list, and `claude_launch::signage`'s own tests are
+/// what pin its contents. What an operator needs from a plan is *that* an
+/// appended system prompt is being passed and roughly how much of one; reading
+/// it is `topham plan | ...`'s job, and the argument itself is one flag away.
+fn render_leading_argv(argv: &[String]) -> String {
+    if argv.is_empty() {
+        return indent("(none)");
+    }
+    let mut lines = Vec::new();
+    let mut arguments = argv.iter();
+    while let Some(argument) = arguments.next() {
+        if argument == APPEND_SYSTEM_PROMPT {
+            let text = arguments.next().map(String::as_str).unwrap_or_default();
+            lines.push(format!(
+                "{argument} <the control-tool signage, {} characters>",
+                text.chars().count()
+            ));
+            continue;
+        }
+        lines.push(argument.clone());
+    }
+    indent(&lines.join("\n"))
+}
+
+/// The flag whose value this rendering summarises rather than prints.
+///
+/// Matched by value rather than by position because the argv is the generator's
+/// and may grow: a positional rule ("the last two") would silently start
+/// printing the whole signage the day an argument is added after it.
+const APPEND_SYSTEM_PROMPT: &str = "--append-system-prompt";
 
 /// The must-be-unset table, one line each, naming what each entry defeats.
 fn render_suppressors(suppressors: &[&'static OauthSuppressor], auth: ClaudeAuthKind) -> String {

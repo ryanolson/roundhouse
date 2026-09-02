@@ -80,8 +80,18 @@ pub struct LaunchPlan {
     /// The program name, resolved through `PATH` by the exec. See
     /// `Agent::program`.
     pub program: String,
-    /// Arguments *after* the program name — the operator's `-- <argv>`,
-    /// verbatim.
+    /// Arguments this launcher generated, ahead of the operator's own.
+    ///
+    /// **A field of its own rather than a prefix spliced into [`Self::argv`]**
+    /// (M12, R-M3), because the two are answerable to different people: this
+    /// one is derived from the profile and is the launcher's to change, and the
+    /// one below is the operator's text, which nothing may reorder or drop. A
+    /// single list would make "the operator's argv arrived verbatim" a claim
+    /// about a slice offset rather than a value a test can read.
+    ///
+    /// Empty for a codex launch, whose whole configuration is files.
+    pub generated_argv: Vec<String>,
+    /// Arguments after those — the operator's `-- <argv>`, verbatim.
     ///
     /// Empty by default, and no default arguments are invented: an agent
     /// launched with no argv opens its own interactive session, which is what
@@ -91,6 +101,21 @@ pub struct LaunchPlan {
     pub env: BTreeMap<String, String>,
     /// Files written before the exec, absolute.
     pub files: Vec<(PathBuf, String)>,
+}
+
+impl LaunchPlan {
+    /// Everything after the program name, in the order the child receives it.
+    ///
+    /// The one place the two argv fields are joined, so "generated first, the
+    /// operator's last" is a property of this type rather than a convention
+    /// each launcher re-implements.
+    pub fn full_argv(&self) -> Vec<String> {
+        self.generated_argv
+            .iter()
+            .chain(&self.argv)
+            .cloned()
+            .collect()
+    }
 }
 
 /// Why a launch could not be prepared or performed.
@@ -105,6 +130,15 @@ pub enum LaunchError {
          the profile names, instrumented by nothing. Use `topham relay {name}`"
     )]
     WrongTopology { name: String },
+    #[error(
+        "the argv after `--` sets `{flag}`, which this launch also generates. Whichever of the \
+         two the client applies second wins silently, and the two disagree about which MCP \
+         servers this session has or what its system prompt says -- a generated registration \
+         shadowed by the operator's own is a client whose control tools are simply absent, on a \
+         run where every turn still answers. Drop it from the argv, or turn the corresponding \
+         profile field off"
+    )]
+    ArgvCollidesWithGenerated { flag: String },
     #[error("could not write {path}")]
     Write {
         path: PathBuf,
@@ -143,13 +177,65 @@ pub fn plan(
         });
     }
 
+    let generated_argv = generated_argv(resolution);
+    refuse_collisions(&generated_argv, &argv)?;
     let (env, files) = layered(resolution, ambient);
     Ok(LaunchPlan {
         program: resolution.profile.agent.program().to_string(),
+        generated_argv,
         argv,
         env,
         files,
     })
+}
+
+/// The arguments this launcher generated for the *agent*, from the resolution
+/// that derived them.
+///
+/// A read and not a derivation: [`crate::plan::resolve`] built them, so a dry
+/// run and a launch cannot show different flags. Codex's is empty because that
+/// client is configured by the files beside it — a fact about the client and
+/// not an omission, which is why the arm says so rather than falling through a
+/// wildcard.
+pub(crate) fn generated_argv(resolution: &Resolution) -> Vec<String> {
+    match &resolution.resolved {
+        Resolved::Claude { leading_argv, .. } => leading_argv.clone(),
+        Resolved::Codex { .. } => Vec::new(),
+    }
+}
+
+/// Refuse an operator argv that names a flag this launch also generates.
+///
+/// **A refusal rather than a precedence rule**, for the reason
+/// `ClaudeLaunchError::CollidesWithGeneratedVar` gives about the environment:
+/// this launcher does not know which of two `--mcp-config`s the client applies,
+/// and both orders produce a session that runs. If the operator's wins, the
+/// control surface is silently absent; if the generated one wins, the servers
+/// the operator asked for are. Neither is reported by anything, and the
+/// operator's next move — drop one — is the same either way.
+///
+/// Compared on the flag *name* including an `=`-joined form, because
+/// `--mcp-config=x` and `--mcp-config x` are one flag to clap and two strings
+/// to a `contains`.
+///
+/// **Only the agent's own generated arguments are ever passed as `generated`.**
+/// The chained path builds a longer list whose first half is Relay's
+/// (`--agent`, `--config`), and codex takes a `--config` of its own — so
+/// checking that half against the operator's tail would refuse a legitimate
+/// agent flag for colliding with a flag the agent never sees.
+pub(crate) fn refuse_collisions(generated: &[String], argv: &[String]) -> Result<(), LaunchError> {
+    for flag in generated
+        .iter()
+        .filter(|argument| argument.starts_with("--") && !argument.contains(char::is_whitespace))
+    {
+        if argv
+            .iter()
+            .any(|argument| argument == flag || argument.starts_with(&format!("{flag}=")))
+        {
+            return Err(LaunchError::ArgvCollidesWithGenerated { flag: flag.clone() });
+        }
+    }
+    Ok(())
 }
 
 /// The child's environment and generated files, without deciding what program
@@ -293,7 +379,9 @@ impl Launcher for ExecLauncher {
         use std::os::unix::process::CommandExt;
 
         let mut command = std::process::Command::new(&plan.program);
-        command.args(&plan.argv);
+        // Generated first, the operator's last, through the one join on the
+        // type -- see `LaunchPlan::full_argv`.
+        command.args(plan.full_argv());
         // Cleared and rebuilt, so the child's environment is `plan.env` and
         // nothing else -- see the module doc.
         command.env_clear();

@@ -339,6 +339,11 @@ struct Rig {
     /// The one control store, shared with the engine. Held so a test can look
     /// at what the surface wrote without going back through the wire.
     control: Arc<ControlStore>,
+    /// The one conversation table, shared with both routers exactly as the
+    /// composition root shares it. Held so a test can write the binding a
+    /// dispatched turn writes (`Conversations::bind_call`) without needing the
+    /// Messages surface mounted here too.
+    conversations: Arc<Conversations>,
     /// A `Host` this deployment answers to, given its mode.
     ///
     /// Carried on the rig rather than fixed as one constant because the
@@ -419,13 +424,14 @@ async fn build(
         plane,
         Arc::clone(&engine),
         Arc::clone(&store),
-        conversations,
+        Arc::clone(&conversations),
     ));
 
     Rig {
         app,
         store,
         control,
+        conversations,
         host,
     }
 }
@@ -527,6 +533,29 @@ fn completed_items(sse: &str) -> Vec<Value> {
 /// admin key, a 405 for a stream nobody offers — and a client library's job is
 /// to turn those into one uniform outcome.
 async fn tools_call(rig: &Rig, secret: Option<&str>, tool: &str, arguments: Value) -> Value {
+    tools_call_answering(rig, secret, tool, arguments, None).await
+}
+
+/// The same, from inside a client's own tool loop.
+///
+/// `tool_use_id` goes on `params._meta` under the key Claude Code spells,
+/// exactly as the 2.1.257 capture shows it
+/// (`fixtures/claude-2.1.257-mcp-wire.json`, request 5). Sent as raw JSON-RPC
+/// so the assertion covers `rmcp`'s own `_meta` handling: the SDK strips
+/// `params._meta` into the message envelope on the way in and hands it to a
+/// tool through the request *context*, and a reader that took the typed
+/// params' `meta` field instead would compile and be empty forever.
+async fn tools_call_answering(
+    rig: &Rig,
+    secret: Option<&str>,
+    tool: &str,
+    arguments: Value,
+    tool_use_id: Option<&str>,
+) -> Value {
+    let mut params = json!({ "name": tool, "arguments": arguments });
+    if let Some(id) = tool_use_id {
+        params["_meta"] = json!({ "claudecode/toolUseId": id, "progressToken": 2 });
+    }
     let (status, text) = post(
         &rig.app,
         rig.host,
@@ -536,7 +565,7 @@ async fn tools_call(rig: &Rig, secret: Option<&str>, tool: &str, arguments: Valu
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/call",
-            "params": { "name": tool, "arguments": arguments },
+            "params": params,
         })
         .to_string(),
         "application/json",
@@ -1821,4 +1850,89 @@ async fn open_mode_refuses_a_tools_call_from_a_host_it_does_not_serve() {
     )
     .await;
     assert_eq!(unkeyed_status, StatusCode::UNAUTHORIZED);
+}
+
+/// R-M2 (M12): a `tools/call` carrying `_meta["claudecode/toolUseId"]` is
+/// answered about the conversation that emitted that block.
+///
+/// **Through the real adapter, because the `_meta` half is `rmcp`'s and not
+/// ours.** The SDK strips `params._meta` off the wire into the message
+/// envelope and hands it to a tool through the request *context*, leaving the
+/// typed params' own `meta` field empty; a transport that read the obvious
+/// field would compile, would find nothing on every real request, and would
+/// leave every MCP call on the pre-R-M2 guess. Only a request that actually
+/// travelled the transport can tell those apart, which is why this is here and
+/// not in `roundhouse-mcp`'s own suite.
+///
+/// **The race, made deterministic.** One principal, two conversations — the
+/// shape an agent running subagents produces. `other` drives a turn last, so
+/// `latest` names it; the id belongs to `main`. Without the correlation the
+/// answer is `other` and it is *plausible*, which is the failure worth a test.
+#[tokio::test]
+async fn a_tools_call_is_correlated_by_the_tool_use_id_the_client_quotes_back() {
+    let rig = rig(control_plane()).await;
+    let ada = Principal::new("acme", "ada");
+
+    let mut main = Conversation::new(&key("ada"), "main");
+    main.say(&rig, "start the parser").await;
+    let mut other = Conversation::new(&key("ada"), "other");
+    other.say(&rig, "start the linter").await;
+
+    // What a dispatched turn on `main` writes as it streams a tool call: the
+    // same call `Conversations::bind_call` records from the Messages
+    // follower. Written here rather than driven through a second surface
+    // because the claim under test is the *resolution*, and mounting a third
+    // router would make the failure ambiguous between the two halves.
+    let main_session = rig.conversations.resolve("acme/ada/main");
+    rig.conversations
+        .bind_call(&ada, "toolu_from_main", main_session.clone());
+
+    let answered = served(
+        &tools_call_answering(
+            &rig,
+            Some(&key("ada")),
+            "status",
+            json!({}),
+            Some("toolu_from_main"),
+        )
+        .await,
+    );
+    assert_eq!(
+        answered["conversation"],
+        json!(main_session.as_str()),
+        "the call answers the block it was made from"
+    );
+
+    // The control, and the Codex path: with no id the guess stands, and it is
+    // a different conversation — which is what makes the assertion above
+    // about the id rather than about there being only one answer available.
+    let guessed = served(&tools_call(&rig, Some(&key("ada")), "status", json!({})).await);
+    assert_eq!(
+        guessed["conversation"],
+        json!(rig.conversations.resolve("acme/ada/other").as_str()),
+    );
+
+    // And another tenant quoting the same id learns nothing from it: bob has
+    // driven no turn on this node, so the answer is the refusal he would have
+    // got with no id at all.
+    let refused = refused(
+        &tools_call_answering(
+            &rig,
+            Some(&key("bob")),
+            "status",
+            json!({}),
+            Some("toolu_from_main"),
+        )
+        .await,
+    );
+    assert!(
+        refused.contains("this key has no conversation yet"),
+        "another tenant's id must answer exactly as an id nobody emitted — the \
+         refusal a caller with no conversation of their own already gets: \
+         {refused}"
+    );
+    assert!(
+        !refused.contains("acme"),
+        "and it must not name the tenant that does own the id: {refused}"
+    );
 }

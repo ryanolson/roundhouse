@@ -19,6 +19,8 @@
 
 use roundhouse_core::control::Secret;
 
+use roundhouse_server::claude_launch::signage;
+
 use super::*;
 use crate::test_support::{ROOT, TURN_KEY, env, scratch};
 
@@ -27,6 +29,18 @@ fn redacted_key() -> String {
     Secret::api_key(TURN_KEY)
         .expect("the fixture key is api-key shaped")
         .to_string()
+}
+
+/// What the generated registration renders as, read from the generator rather
+/// than transcribed.
+///
+/// The JSON's own shape is pinned byte-for-byte in `claude_launch`'s suite,
+/// which is where a change to it should be argued with; what these snapshots
+/// are for is that the plan *shows* it, unexpanded, in the right place.
+fn registration() -> String {
+    ClaudeLaunch::new(ROOT, TURN_KEY)
+        .expect("the fixture key resolves")
+        .mcp_registration()
 }
 
 fn profile(agent: Agent, auth: AuthKind) -> Profile {
@@ -63,6 +77,11 @@ environment handed to the client (the generator's own Debug):
         }},
     }}
 
+argv prepended to the operator's own:
+    --mcp-config
+    {registration}
+    --append-system-prompt <the control-tool signage, {signage} characters>
+
 must be unset when this launch runs:
     CLAUDE_CODE_USE_BEDROCK (environment) -- the client goes to another cloud and never reads the base URL
     CLAUDE_CODE_USE_VERTEX (environment) -- the client goes to another cloud and never reads the base URL
@@ -81,9 +100,12 @@ files written by `topham launch`:
 
 notes:
     - an interactive session asks once. With `-p` the client always uses the API key; interactively it asks the user to approve it overriding their subscription, and until they do that session is on the subscription.
+    - the registration above is what makes roundhouse's control tools exist for this client, not what makes it call one. Headless (`-p`), the client synthesises a permission refusal for an `mcp__roundhouse__*` tool unless its own argv names it -- `--allowedTools mcp__roundhouse__status` and so on; interactively it asks the operator. Neither is something this launcher can decide for it.
     - one entry above lives in the client's settings file rather than the environment. The three files listed above are read and refused; an administrator's managed-policy file is not read, and outranks all of them, so that one layer is stated rather than enforced.
 ",
-        key = redacted_key()
+        key = redacted_key(),
+        registration = registration(),
+        signage = signage().chars().count(),
     );
     assert_eq!(render(Agent::Claude, AuthKind::RoundhouseKey), expected);
 }
@@ -108,6 +130,11 @@ environment handed to the client (the generator's own Debug):
         }},
     }}
 
+argv prepended to the operator's own:
+    --mcp-config
+    {registration}
+    --append-system-prompt <the control-tool signage, {signage} characters>
+
 must be unset when this launch runs:
     CLAUDE_CODE_USE_BEDROCK (environment) -- the client goes to another cloud and never reads the base URL
     CLAUDE_CODE_USE_VERTEX (environment) -- the client goes to another cloud and never reads the base URL
@@ -126,9 +153,12 @@ files written by `topham launch`:
 
 notes:
     - the precondition is a completed `claude` login, not this profile. Without one the client presents no credential and roundhouse degrades the turn to local-only, which nothing in the run reports.
+    - the registration above is what makes roundhouse's control tools exist for this client, not what makes it call one. Headless (`-p`), the client synthesises a permission refusal for an `mcp__roundhouse__*` tool unless its own argv names it -- `--allowedTools mcp__roundhouse__status` and so on; interactively it asks the operator. Neither is something this launcher can decide for it.
     - one entry above lives in the client's settings file rather than the environment. The three files listed above are read and refused; an administrator's managed-policy file is not read, and outranks all of them, so that one layer is stated rather than enforced.
 ",
-        key = redacted_key()
+        key = redacted_key(),
+        registration = registration(),
+        signage = signage().chars().count(),
     );
     assert_eq!(render(Agent::Claude, AuthKind::ForwardedLogin), expected);
 }
@@ -474,6 +504,7 @@ fn a_declared_non_suppressor_variable_is_redacted_in_the_rendered_environment() 
         name: "work".to_string(),
         profile: profile(Agent::Claude, AuthKind::RoundhouseKey),
         resolved: Resolved::Claude {
+            leading_argv: launch.leading_argv(),
             launch,
             env,
             settings: Vec::new(),

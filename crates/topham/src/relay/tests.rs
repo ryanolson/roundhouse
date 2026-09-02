@@ -53,8 +53,13 @@ fn planned(env: &EnvMap, profile: Profile, argv: &[&str]) -> RelayLaunch {
 fn the_chained_child_is_relay_running_the_agent_with_the_operators_argv_after_the_separator() {
     let launch = planned(&env(&[]), chained(Agent::Claude), &["-p", "hello"]);
     assert_eq!(launch.plan.program, RELAY_PROGRAM);
+    // The operator's own argv is its own field and arrives verbatim (M12,
+    // R-M3); what precedes it is Relay's invocation and then the client's
+    // generated arguments, which on this topology reach roundhouse's MCP
+    // surface directly rather than through the gateway.
+    assert_eq!(launch.plan.argv, ["-p", "hello"]);
     assert_eq!(
-        launch.plan.argv,
+        launch.plan.generated_argv[..6],
         [
             "run",
             "--agent",
@@ -62,9 +67,21 @@ fn the_chained_child_is_relay_running_the_agent_with_the_operators_argv_after_th
             "--config",
             &launch.config.display().to_string(),
             "--",
-            "-p",
-            "hello"
         ]
+    );
+    assert_eq!(
+        &launch.plan.generated_argv[6..],
+        crate::launch::generated_argv(
+            &resolve(&env(&[]), "work", chained(Agent::Claude)).expect("resolves")
+        ),
+        "the chained client is handed the same generated arguments the direct \
+         one is: one launch, two topologies"
+    );
+    assert_eq!(
+        launch.plan.full_argv().last().map(String::as_str),
+        Some("hello"),
+        "and the operator's argv is still last: {:?}",
+        launch.plan.full_argv()
     );
 }
 
@@ -117,7 +134,14 @@ fn the_config_written_is_the_shared_rendering_in_the_profiles_scratch() {
 #[test]
 fn a_chained_codex_profile_renders_the_prefixed_openai_upstream() {
     let launch = planned(&env(&[]), chained(Agent::Codex), &[]);
-    assert_eq!(launch.plan.argv[2], "codex");
+    assert_eq!(launch.plan.generated_argv[2], "codex");
+    assert_eq!(
+        launch.plan.generated_argv.len(),
+        6,
+        "codex is configured by the files below and generates no argv of its \
+         own: {:?}",
+        launch.plan.generated_argv
+    );
     let contents = &launch
         .plan
         .files
@@ -443,11 +467,12 @@ fn the_subcommand_writes_preflights_and_hands_the_launcher_the_relay_command() {
     assert_eq!(launched.len(), 1);
     assert_eq!(launched[0].program, double.display().to_string());
     assert_eq!(launched[0].argv, launch.plan.argv);
+    assert_eq!(launched[0].generated_argv, launch.plan.generated_argv);
     assert_eq!(
-        launched[0].argv.last().map(String::as_str),
+        launched[0].full_argv().last().map(String::as_str),
         Some("hello"),
         "{:?}",
-        launched[0].argv
+        launched[0].full_argv()
     );
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -511,7 +536,10 @@ fn a_chained_codex_plan_states_the_provider_override() {
 fn the_launch_argv_comes_from_the_shared_agent_form() {
     let launch = planned(&env(&[]), chained(Agent::Claude), &["-p", "x"]);
     let expected = RelayAgent::Claude.run_argv(&launch.config);
-    assert_eq!(&launch.plan.argv[..expected.len()], expected.as_slice());
+    assert_eq!(
+        &launch.plan.generated_argv[..expected.len()],
+        expected.as_slice()
+    );
 }
 
 /// F15's claim: `scratch_dir`'s `.parent().expect("codex_home is

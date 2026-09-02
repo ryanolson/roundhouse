@@ -234,17 +234,35 @@ fn the_suppressor_table_now_lives_in_its_own_module() {
     );
 }
 
-/// The finding's house-shape comparison: `codex_launch.rs` at 1080 lines.
+/// The finding's house-shape comparison: `codex_launch.rs` as the precedent
+/// for "one primary file beside its own submodule directory".
+///
 /// Read from the live working tree (not pinned) since the comparison is
-/// about the sibling file's current shape, not a frozen snapshot of it, and
-/// no refuter is mutating it.
+/// about the sibling file's current *shape*, not a frozen snapshot of it. The
+/// first version of this control pinned the exact line count the finding
+/// quoted (1080), and M12 moved two namespace helpers out of the file for a
+/// reason unrelated to F11 — which is precisely the kind of refactor a shape
+/// guard must not resist. So the pin is now the shape and a band wide enough
+/// to survive ordinary movement: still one primary file of the same order as
+/// the launcher it was compared against, still beside a `codex_launch/`
+/// submodule directory it declares.
 #[test]
 fn codex_launch_matches_the_cited_house_shape_precedent() {
-    let path = repo_root().join(CODEX_LAUNCH_RELATIVE_PATH);
+    let root = repo_root();
+    let path = root.join(CODEX_LAUNCH_RELATIVE_PATH);
     let source = std::fs::read_to_string(&path).expect("codex_launch.rs exists in the workspace");
     let line_count = source.lines().count();
-    assert_eq!(
-        line_count, 1080,
-        "F11 cites codex_launch.rs as 1080 lines, matching house shape"
+    assert!(
+        (600..=1300).contains(&line_count),
+        "F11's precedent is a primary file of the same order as the split it justified; \
+         codex_launch.rs is {line_count} lines, outside the band that keeps the comparison meaningful"
+    );
+    assert!(
+        source.contains("pub mod skills;"),
+        "the precedent's shape is a primary file that declares its submodule directory"
+    );
+    assert!(
+        std::fs::metadata(root.join("crates/roundhouse-server/src/codex_launch/skills.rs")).is_ok(),
+        "the precedent's submodule directory must exist beside the primary file"
     );
 }

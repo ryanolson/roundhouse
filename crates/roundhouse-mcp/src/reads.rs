@@ -58,18 +58,52 @@ pub struct SessionFacts {
 pub trait ControlReads: Send + Sync + 'static {
     /// Which conversation this call concerns.
     ///
-    /// `conversation` is the client's own `prompt_cache_key`, resolved through
-    /// the same namespacing the Responses surface uses. Omitted, the
-    /// principal's most recent session. Two failures are distinct and both are
-    /// errors rather than defaults: a principal with no session at all is
-    /// [`SurfaceError::NoSession`], and a named conversation outside the
-    /// caller's namespace is [`SurfaceError::ForeignConversation`] — never a
-    /// silent fall back to the caller's own most recent one, which would let a
-    /// probe for someone else's key read as an ordinary answer.
+    /// **Three answers in a fixed order, and the order is the ruling** (M12,
+    /// R-M2):
+    ///
+    /// 1. `conversation` — a name the model wrote, resolved through the same
+    ///    namespacing the Responses surface qualifies a `prompt_cache_key`
+    ///    with. First because it is the only one the *agent* chose: a tool call
+    ///    that names a conversation is asking about that conversation, and an
+    ///    id inferred from the transport must never overrule a name the model
+    ///    wrote.
+    ///
+    ///    **That namespacing is the Responses surface's, and a Messages client
+    ///    has no name that lands in it** (M12). A Messages session is keyed
+    ///    `anthropic_messages/<id>` (`messages_api::wire::session_key`), so a
+    ///    Claude Code model passing its own session id here resolves to
+    ///    nothing and is refused as foreign rather than answered. That is why
+    ///    (2) exists and why the tools' own `conversation` description no
+    ///    longer invites a client to fill this in: on the Messages surface the
+    ///    exact answer is the tool-use id, not a name. Left as it is rather
+    ///    than made to try both spellings — one qualification per call is what
+    ///    keeps a probe for another tenant's id indistinguishable from a
+    ///    typo — and recorded here because the next reader will ask.
+    /// 2. `tool_use_id` — the id of the `tool_use` block this call is
+    ///    answering, which is an id roundhouse emitted into exactly one
+    ///    session. Exact where the fallback below is a guess: a parent agent
+    ///    and its subagents share a principal and race for the same "most
+    ///    recent" slot, and the id is what tells them apart.
+    /// 3. Neither — the principal's most recent session.
+    ///
+    /// Two failures are distinct and both are errors rather than defaults: a
+    /// principal with no session at all is [`SurfaceError::NoSession`], and a
+    /// named conversation outside the caller's namespace is
+    /// [`SurfaceError::ForeignConversation`] — never a silent fall back to the
+    /// caller's own most recent one, which would let a probe for someone else's
+    /// key read as an ordinary answer.
+    ///
+    /// A `tool_use_id` that names no conversation *of this caller's* — unknown,
+    /// evicted, or another tenant's — falls through to (3) rather than
+    /// refusing. Unknown and foreign answer alike on purpose: telling them
+    /// apart would make the id an enumeration oracle for ids the caller does
+    /// not hold, and the caller has no use for another tenant's session either
+    /// way.
     async fn resolve_session(
         &self,
         principal: &Principal,
         conversation: Option<&str>,
+        tool_use_id: Option<&str>,
     ) -> Result<SessionId, SurfaceError>;
 
     /// The policy this principal's turns are admitted under, before any

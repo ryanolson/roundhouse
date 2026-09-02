@@ -114,6 +114,228 @@ fn the_argv_is_passed_through_and_the_program_is_the_agents() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// M12 R-M3/R-M4: the generated argv
+// ---------------------------------------------------------------------------
+
+/// The child gets the generated arguments first and the operator's last, and
+/// the two are separate values right up to the `exec`.
+///
+/// The order is the whole of what makes the operator's argv the last word: a
+/// client resolving two of anything takes them in the order it was handed them,
+/// and this launcher's own flags are the ones that should lose an argument
+/// nobody refused.
+#[test]
+fn the_generated_argv_leads_and_the_operators_follows() {
+    let plan = planned(
+        &env(&[]),
+        Agent::Claude,
+        AuthKind::RoundhouseKey,
+        &["-p", "hello"],
+    );
+    assert_eq!(plan.argv, vec!["-p", "hello"]);
+    assert_eq!(
+        plan.generated_argv,
+        resolve(
+            &env(&[]),
+            "work",
+            profile(Agent::Claude, AuthKind::RoundhouseKey)
+        )
+        .map(|resolution| match resolution.resolved {
+            Resolved::Claude { leading_argv, .. } => leading_argv,
+            Resolved::Codex { .. } => unreachable!("this fixture is a claude profile"),
+        })
+        .expect("the fixture resolves"),
+        "the argv a launch passes is the one the dry run resolved, not a second \
+         derivation"
+    );
+    assert_eq!(
+        plan.full_argv(),
+        [plan.generated_argv.clone(), plan.argv.clone()].concat()
+    );
+    assert_eq!(
+        plan.full_argv()[..2],
+        ["--mcp-config", &plan.generated_argv[1]],
+        "the registration leads: {:?}",
+        plan.full_argv()
+    );
+}
+
+/// A codex launch generates no argv, because that client is configured by the
+/// files beside it.
+#[test]
+fn a_codex_launch_generates_no_argv() {
+    let plan = planned(
+        &env(&[]),
+        Agent::Codex,
+        AuthKind::RoundhouseKey,
+        &["exec", "hello"],
+    );
+    assert!(plan.generated_argv.is_empty(), "{:?}", plan.generated_argv);
+    assert_eq!(plan.full_argv(), vec!["exec", "hello"]);
+}
+
+/// R-M3: the profile's switch is what puts `--strict-mcp-config` on the argv,
+/// and nothing else does.
+#[test]
+fn the_strict_switch_is_the_profiles_and_defaults_off() {
+    let ordinary = planned(&env(&[]), Agent::Claude, AuthKind::RoundhouseKey, &[]);
+    assert!(
+        !ordinary
+            .generated_argv
+            .iter()
+            .any(|a| a == "--strict-mcp-config"),
+        "an operator's own MCP servers survive a launch that did not ask to \
+         exclude them: {:?}",
+        ordinary.generated_argv
+    );
+
+    let env = env(&[]);
+    let strict = Profile {
+        strict_mcp: true,
+        ..profile(Agent::Claude, AuthKind::RoundhouseKey)
+    };
+    let resolution = resolve(&env, "work", strict).expect("the fixture resolves");
+    let plan = plan(&resolution, &env, Vec::new()).expect("the fixture plans");
+    assert_eq!(
+        plan.generated_argv
+            .iter()
+            .filter(|a| *a == "--strict-mcp-config")
+            .count(),
+        1,
+        "{:?}",
+        plan.generated_argv
+    );
+}
+
+/// The key is in the environment and in nothing else a launch produces.
+///
+/// **Both halves matter and they are opposite failures.** The argv is world-
+/// readable in a process listing, so a key there is a key every other user of
+/// the box has; the plan rendering is printed, pasted into issues and
+/// screen-shared. The registration's `${…}` is what buys both, and this is
+/// what would catch it being expanded here rather than by the client.
+#[test]
+fn the_key_variables_value_is_in_no_argv_and_no_rendering() {
+    let env = env(&[]);
+    let resolution = resolve(
+        &env,
+        "work",
+        profile(Agent::Claude, AuthKind::RoundhouseKey),
+    )
+    .expect("the fixture resolves");
+    let plan = plan(&resolution, &env, Vec::new()).expect("the fixture plans");
+    for argument in plan.full_argv() {
+        assert!(
+            !argument.contains(TURN_KEY),
+            "the turn key is in the child's argv, where every process listing \
+             on the box can read it: {argument}"
+        );
+    }
+    assert!(
+        !resolution.render().contains(TURN_KEY),
+        "{}",
+        resolution.render()
+    );
+    // The control: the registration does name the variable, unexpanded, in
+    // both places -- so the assertions above are about the value and not about
+    // the registration having quietly gone missing.
+    let variable = format!("${{{}}}", resolution.profile.key_env);
+    assert!(
+        plan.full_argv().iter().any(|a| a.contains(&variable)),
+        "{:?}",
+        plan.full_argv()
+    );
+    assert!(resolution.render().contains(&variable));
+    // And the value really is somewhere: in the environment, which is the one
+    // place both the header block and the registration read it from.
+    assert!(
+        plan.env
+            .get("ANTHROPIC_CUSTOM_HEADERS")
+            .is_some_and(|value| value.contains(TURN_KEY))
+    );
+}
+
+/// The registration is refused along with everything else when the key
+/// variable is not exported.
+///
+/// This is what closes R-M3's one hazard: an unexported variable would make the
+/// client send the literal `${…}` as a turn key, and every control call would
+/// come back `401` on a run whose inference turns all answered. The refusal
+/// that already existed covers it, and this is the test that says so — if
+/// resolution ever stopped requiring the key, the registration would be the
+/// thing that failed silently.
+#[test]
+fn an_unexported_key_variable_refuses_the_launch_that_would_carry_a_literal() {
+    let launcher = RecordingLauncher::new();
+    let without = EnvMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
+    let error = run(
+        &without,
+        "work",
+        profile(Agent::Claude, AuthKind::RoundhouseKey),
+        Vec::new(),
+        &launcher,
+    )
+    .expect_err("a launch with no key exported is refused before anything is spawned");
+    assert!(
+        error.to_string().contains("ROUNDHOUSE_API_KEY"),
+        "the refusal names the variable the registration would have read: {error}"
+    );
+    assert!(launcher.launched().is_empty());
+}
+
+/// An operator argv naming a flag this launch generates is refused, not
+/// silently outranked.
+#[test]
+fn an_operator_flag_this_launch_also_generates_is_refused() {
+    for argument in [
+        "--mcp-config",
+        "--mcp-config={\"mcpServers\":{}}",
+        "--append-system-prompt",
+    ] {
+        let env = env(&[]);
+        let resolution = resolve(
+            &env,
+            "work",
+            profile(Agent::Claude, AuthKind::RoundhouseKey),
+        )
+        .expect("the fixture resolves");
+        let error = plan(&resolution, &env, vec![argument.to_string()])
+            .expect_err("two answers to one question is a refusal");
+        assert!(
+            matches!(error, LaunchError::ArgvCollidesWithGenerated { .. }),
+            "{error:?}"
+        );
+        assert!(
+            error.to_string().contains("--mcp-config")
+                || error.to_string().contains("--append-system-prompt"),
+            "the refusal names the flag to drop: {error}"
+        );
+    }
+
+    // CONTROL: an ordinary flag of the client's own is not refused, and a flag
+    // that merely *contains* a generated one's name is not either -- the check
+    // is on the flag, not on a substring.
+    let env = env(&[]);
+    let resolution = resolve(
+        &env,
+        "work",
+        profile(Agent::Claude, AuthKind::RoundhouseKey),
+    )
+    .expect("the fixture resolves");
+    let planned = plan(
+        &resolution,
+        &env,
+        vec![
+            "--allowedTools".to_string(),
+            "mcp__roundhouse__status".to_string(),
+            "--mcp-config-is-not-a-flag".to_string(),
+        ],
+    )
+    .expect("an unrelated flag is the operator's business");
+    assert_eq!(planned.argv.len(), 3);
+}
+
 /// R-T4: the refusal happens before anything is spawned or written.
 ///
 /// The launcher is asserted *not* to have been called, which is the assertion

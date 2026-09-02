@@ -97,7 +97,7 @@ use std::path::Path;
 pub use skills::{GeneratedFile, SKILLS_DIR, namespaced_tool_name, skill_files};
 
 use crate::control_config::TURN_KEY_HEADER;
-use crate::dialect::DEFAULT_MCP_NAMESPACE;
+use crate::dialect::{DEFAULT_MCP_NAMESPACE, MCP_NAMESPACE_PREFIX, mcp_server_name};
 use crate::mcp_api::MCP_MOUNT_PATH;
 use crate::responses_api::API_PREFIX;
 
@@ -121,16 +121,6 @@ pub const DEFAULT_MODEL_SLUG: &str = "roundhouse-local";
 /// pair that disagreed would fail at startup with a message about an unknown
 /// provider rather than about a typo.
 const PROVIDER_KEY: &str = "roundhouse";
-
-/// The prefix codex puts in front of an MCP server's table key to build the
-/// tool namespace it dispatches on (`mcp__{key}`).
-///
-/// Here rather than in [`crate::dialect`] because it is a fact about the
-/// *client*: this crate's [`DEFAULT_MCP_NAMESPACE`] is the whole namespace, and
-/// the server table key is what has to be written so codex reconstructs it. The
-/// unit test below pins the two together, which is the only place the
-/// reconstruction is checkable without a running agent.
-const MCP_NAMESPACE_PREFIX: &str = "mcp__";
 
 /// What `[mcp_servers.<key>].default_tools_approval_mode` is set to, and the
 /// home of the ruling on why it is server-wide rather than per tool.
@@ -371,7 +361,7 @@ impl CodexLaunch {
         let key_env = quote(&self.key_env);
         let header = quote(TURN_KEY_HEADER);
         let mcp_url = quote(&self.mcp_url());
-        let server_key = mcp_server_key();
+        let server_key = mcp_server_name();
 
         // `requires_openai_auth` and `env_key` move together, which is why they
         // are formatted as one block rather than two lines with an `if` around
@@ -587,19 +577,6 @@ fn deployment_root<'a>(base_url: &'a str, api_prefix: &str) -> &'a str {
         .trim_end_matches('/')
 }
 
-/// The `[mcp_servers.*]` table key codex must see to rebuild
-/// [`DEFAULT_MCP_NAMESPACE`].
-///
-/// Derived rather than written, so renaming the namespace renames the table key
-/// in the same edit. The `expect` is unreachable for any namespace the
-/// constant can hold and is a louder failure than emitting a config whose steer
-/// calls resolve against nothing.
-fn mcp_server_key() -> &'static str {
-    DEFAULT_MCP_NAMESPACE
-        .strip_prefix(MCP_NAMESPACE_PREFIX)
-        .expect("the MCP namespace is `mcp__` plus the server's config table key")
-}
-
 /// One free string, quoted the way TOML wants it.
 ///
 /// Through `toml` rather than `format!("\"{s}\"")` because a path or a base URL
@@ -679,7 +656,7 @@ mod tests {
             Some("MY_KEY")
         );
         assert_eq!(
-            config["mcp_servers"][mcp_server_key()]["bearer_token_env_var"].as_str(),
+            config["mcp_servers"][mcp_server_name()]["bearer_token_env_var"].as_str(),
             Some("MY_KEY")
         );
     }
@@ -800,7 +777,7 @@ mod tests {
     fn the_client_is_told_to_trust_the_deployments_own_control_tools() {
         let config = parsed(&launch());
         assert_eq!(
-            config["mcp_servers"][mcp_server_key()]["default_tools_approval_mode"].as_str(),
+            config["mcp_servers"][mcp_server_name()]["default_tools_approval_mode"].as_str(),
             Some("approve")
         );
     }
@@ -876,7 +853,7 @@ mod tests {
         // And the generated file agrees with the function.
         let config = parsed(&launch());
         assert_eq!(
-            config["mcp_servers"][mcp_server_key()]["url"].as_str(),
+            config["mcp_servers"][mcp_server_name()]["url"].as_str(),
             Some("http://127.0.0.1:8080/mcp")
         );
     }

@@ -40,17 +40,74 @@ use roundhouse_core::control::Principal;
 
 use crate::overlay::{OverlayScope, PreferMode};
 
+/// Who is calling, and from where in their own conversation.
+///
+/// **Two facts that arrive together and are needed together.** The principal is
+/// resolved by the transport from the same `Authorization: Bearer rh_turn_…`
+/// header the turn surfaces use, so a tool can never be called without one and
+/// never has to ask whose deployment it is looking at. The tool-use id is the
+/// other half of the same question: *which* of that principal's conversations
+/// this call belongs to.
+///
+/// **Why the id is not a tool argument** (M12, R-M2). It is not something the
+/// model chose to say — it is protocol metadata the client attaches
+/// (`_meta["claudecode/toolUseId"]`), naming the `tool_use` block roundhouse
+/// itself emitted and is now being answered for. Putting it in the arguments
+/// schema would invite a model to invent one, and `deny_unknown_fields` would
+/// then refuse the call of a client that sent it honestly.
+///
+/// It is `Option` because it is a client's courtesy and not a protocol
+/// requirement: Codex sends no such key, and the surface must serve it exactly
+/// as it did before.
+#[derive(Debug, Clone)]
+pub struct Caller {
+    principal: Principal,
+    tool_use_id: Option<String>,
+}
+
+impl Caller {
+    /// A caller who named no tool-use id — every client but Claude Code, and
+    /// Claude Code on a call it did not make from inside a `tool_use`.
+    pub fn new(principal: Principal) -> Self {
+        Self {
+            principal,
+            tool_use_id: None,
+        }
+    }
+
+    /// A caller answering a specific `tool_use` block.
+    pub fn answering(principal: Principal, tool_use_id: Option<String>) -> Self {
+        Self {
+            // An empty string is not an id, and it is what a client sending the
+            // key with nothing in it would otherwise resolve *by*: an empty
+            // lookup key can only miss, but it would have looked deliberate in
+            // a trace. Normalised to absence at the one door it enters by.
+            tool_use_id: tool_use_id.filter(|id| !id.is_empty()),
+            ..Self::new(principal)
+        }
+    }
+
+    pub fn principal(&self) -> &Principal {
+        &self.principal
+    }
+
+    pub fn tool_use_id(&self) -> Option<&str> {
+        self.tool_use_id.as_deref()
+    }
+}
+
 /// Everything an MCP client can ask of a roundhouse deployment.
 ///
-/// `principal` is resolved by the transport from the same `Authorization:
-/// Bearer rh_turn_…` header the turn surfaces use, so a tool can never be
-/// called without one and never has to ask whose deployment it is looking at.
+/// Every method takes a [`Caller`] rather than a bare `Principal`: which
+/// conversation a session-scoped tool concerns is answered from *both* halves
+/// of it, and a signature that carried only the principal is what made
+/// `latest` the only answer available (R-M2).
 #[async_trait]
 pub trait ControlSurface: Send + Sync + 'static {
     /// What this key may be routed to right now, and what is left to spend.
     async fn status(
         &self,
-        principal: &Principal,
+        caller: &Caller,
         request: StatusRequest,
     ) -> Result<ToolOutcome, SurfaceError>;
 
@@ -60,49 +117,49 @@ pub trait ControlSurface: Send + Sync + 'static {
     /// asked to keep rather than a header.
     async fn init_session(
         &self,
-        principal: &Principal,
+        caller: &Caller,
         request: InitSessionRequest,
     ) -> Result<ToolOutcome, SurfaceError>;
 
     /// Record what the agent is trying to do. Changes no routing.
     async fn declare_intent(
         &self,
-        principal: &Principal,
+        caller: &Caller,
         request: DeclareIntentRequest,
     ) -> Result<ToolOutcome, SurfaceError>;
 
     /// Ask for local, frontier, or neither, for a while.
     async fn prefer(
         &self,
-        principal: &Principal,
+        caller: &Caller,
         request: PreferRequest,
     ) -> Result<ToolOutcome, SurfaceError>;
 
     /// Raise the quality floor this session's turns are routed under.
     async fn set_quality_floor(
         &self,
-        principal: &Principal,
+        caller: &Caller,
         request: SetQualityFloorRequest,
     ) -> Result<ToolOutcome, SurfaceError>;
 
     /// Re-read the correction roundhouse last put in this conversation.
     async fn fetch_steer(
         &self,
-        principal: &Principal,
+        caller: &Caller,
         request: FetchSteerRequest,
     ) -> Result<ToolOutcome, SurfaceError>;
 
     /// Say what happened to a steer. Advisory; never blocks anything.
     async fn report_outcome(
         &self,
-        principal: &Principal,
+        caller: &Caller,
         request: ReportOutcomeRequest,
     ) -> Result<ToolOutcome, SurfaceError>;
 
     /// The last routing decision for this conversation, agent-readable.
     async fn explain_last_route(
         &self,
-        principal: &Principal,
+        caller: &Caller,
         request: ExplainLastRouteRequest,
     ) -> Result<ToolOutcome, SurfaceError>;
 }

@@ -234,8 +234,23 @@ pub fn plan(
     let (env, mut files) = crate::launch::layered(resolution, ambient);
     files.push((config.clone(), handoff.config_toml()));
 
-    let mut child_argv = handoff.run_argv(&config);
-    child_argv.extend(argv);
+    // Relay's own arguments and the agent's generated ones are one list, and it
+    // is the launcher's: `run --agent <x> --config <f> --` ends with the
+    // separator, so everything after it is the *client's* argv, and the MCP
+    // registration and signage belong there ahead of the operator's own.
+    //
+    // **The chained client is registered against the deployment directly**,
+    // which is the one thing the chained runbook does not carry through Relay:
+    // Relay proxies the Anthropic route and nothing else, so the `url` in the
+    // generated registration reaches roundhouse's `/mcp` without a hop. Stated
+    // rather than proven — the plan's own "left open" — and it is here rather
+    // than absent because a chained launch that silently had no control surface
+    // would be the same client as a direct one in every respect an operator can
+    // see.
+    let agent_argv = crate::launch::generated_argv(resolution);
+    crate::launch::refuse_collisions(&agent_argv, &argv)?;
+    let mut generated_argv = handoff.run_argv(&config);
+    generated_argv.extend(agent_argv);
 
     Ok(RelayLaunch {
         handoff,
@@ -243,7 +258,8 @@ pub fn plan(
         preflight_home,
         plan: LaunchPlan {
             program: relay_program.to_string(),
-            argv: child_argv,
+            generated_argv,
+            argv,
             env,
             files,
         },

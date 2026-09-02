@@ -71,7 +71,9 @@ use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 
 use roundhouse_core::context::Tokenizer;
+use roundhouse_core::control::Principal;
 use roundhouse_core::event::{SessionEvent, SessionEventKind, Usage};
+use roundhouse_core::ids::SessionId;
 use roundhouse_core::now_ms;
 use roundhouse_core::store::SessionStore;
 
@@ -466,6 +468,19 @@ where
                         // stamp an Anthropic-shaped tool array reaches a
                         // Responses upstream and 400s every tool-using turn.
                         tools_dialect: Some(WireProtocol::AnthropicMessages),
+                        // **And the sibling stamp, which is deliberately not
+                        // a field here** (M12, R-M1). The *client* dialect of
+                        // this surface — how a client of it spells a call to
+                        // one of roundhouse's own MCP tools — is
+                        // [`ClientDialect::claude_messages`], named for the
+                        // surface rather than read from the deployment-wide
+                        // `mcp_namespace`: one deployment serves both clients
+                        // at once, so a single configured answer would be wrong
+                        // for one of them on every turn. It is not carried on
+                        // `TurnInput` because nothing downstream *renders* a
+                        // tool call any more (R-M0 looked); what reads it is
+                        // canonicalization's contract, pinned by
+                        // `wire::tests::a_control_call_keeps_the_flat_name_the_client_spells`.
                     },
                     &admission,
                 )
@@ -476,7 +491,10 @@ where
     });
 
     let follower = MessagesFollower {
-        tail: LogTail::new(Arc::clone(&state.store), session_id, start),
+        tail: LogTail::new(Arc::clone(&state.store), session_id.clone(), start),
+        conversations: Arc::clone(&state.conversations),
+        principal: admission.principal.clone(),
+        session_id,
         engine: Arc::clone(&state.engine),
         admitted_input_tokens,
         emission: MessageEmission::new(
@@ -768,6 +786,22 @@ enum Phase {
 /// Claude Code throws on and hoping it is right.
 struct MessagesFollower<S: SessionStore, T: Tokenizer + Clone> {
     tail: LogTail<S>,
+    /// Where a tool call this turn emits is recorded, so the MCP surface can
+    /// find the conversation it came from (M12, R-M2).
+    ///
+    /// Carried on the follower rather than reached for at the handler, because
+    /// the id is not knowable until the model produces it: the binding can only
+    /// be written by whatever is watching the log as the call is committed, and
+    /// that is this type.
+    conversations: Arc<Conversations>,
+    /// Whose calls these are. Held for the binding above and for nothing else —
+    /// a tool-use id is unique on its own, and this is the check that keeps one
+    /// tenant's id from resolving in another tenant's hands.
+    principal: Principal,
+    /// The session the binding above points at. A copy of what [`Self::tail`]
+    /// follows, because a binding written against a different id would resolve
+    /// an MCP call to a log this turn never touched.
+    session_id: SessionId,
     /// Only ever asked what this deployment's tokenizer makes of an item; the
     /// turn itself runs in the task below.
     engine: Arc<Engine<S, T>>,
@@ -873,13 +907,38 @@ impl<S: SessionStore, T: Tokenizer + Clone + Send + Sync + 'static> MessagesFoll
             // the client should be told. Substituting a context contribution
             // there would replace a provider's measured counts with our
             // tokenizer's estimate on the most ordinary turn an agent takes.
-            if let SessionEventKind::ItemAppended { item } = &event.kind
-                && matches!(self.emission.emitted(item), Some(Emitted::SeamText(_)))
-            {
-                let contribution = self
-                    .engine
-                    .context_contribution(self.admitted_input_tokens, item);
-                self.emission.report_instead(contribution);
+            if let SessionEventKind::ItemAppended { item } = &event.kind {
+                match self.emission.emitted(item) {
+                    Some(Emitted::SeamText(_)) => {
+                        let contribution = self
+                            .engine
+                            .context_contribution(self.admitted_input_tokens, item);
+                        self.emission.report_instead(contribution);
+                    }
+                    // **R-M2's binding, written here and nowhere else.** This
+                    // is the one moment both halves of the correlation are in
+                    // one place: the id the client is about to be handed, and
+                    // the session it was emitted into. Claude Code quotes it
+                    // back on the `tools/call` it makes for this block
+                    // (`_meta["claudecode/toolUseId"]`), and without the
+                    // binding that call falls back to the principal's most
+                    // recent conversation — which, for an agent running
+                    // subagents, is a coin toss between logs.
+                    //
+                    // Written from the *emitted* narrowing rather than from
+                    // every `ToolCall` item in the window, so the binding is
+                    // for a call this response actually announced to this
+                    // client and not for one a concurrent replay walked past.
+                    Some(Emitted::ToolCall { call_id, .. }) => {
+                        let call_id = call_id.to_string();
+                        self.conversations.bind_call(
+                            &self.principal,
+                            &call_id,
+                            self.session_id.clone(),
+                        );
+                    }
+                    None => {}
+                }
             }
             let (frames, step) = self.emission.project(&event.kind);
             self.queued.extend(frames);
@@ -1359,6 +1418,9 @@ mod tests {
         let store = Arc::new(MemoryStore::new());
         MessagesFollower {
             tail: LogTail::new(Arc::clone(&store), SessionId::new("f9-fixture"), 0),
+            conversations: Arc::new(Conversations::new()),
+            principal: Principal::new("acme", "ada"),
+            session_id: SessionId::new("f9-fixture"),
             engine: Arc::new(Engine::new(
                 store,
                 ByteTokenizer,

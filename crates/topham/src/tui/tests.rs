@@ -376,6 +376,25 @@ fn every_table_row_round_trips_through_the_loader() {
     }
 }
 
+/// M12: the claude-only switch survives an edit of an unrelated field.
+///
+/// The round trip above cannot cover it — its fixture is a codex profile, and
+/// `strict-mcp` on one of those is refused — and the failure it guards is the
+/// silent one: an editor whose table did not carry the field would compose a
+/// document without it, and an operator who opened a strict profile to fix a
+/// typo would save a profile that had quietly stopped being strict.
+#[test]
+fn the_mcp_switch_survives_an_edit_of_something_else() {
+    let profile = Profile {
+        strict_mcp: true,
+        ..Profile::new(Agent::Claude, ROOT)
+    };
+    let editor = Editor::over("work", &profile, None);
+    assert_eq!(editor.value(Field::StrictMcp), "true");
+    let (_, composed) = editor.compose().expect("what it was opened on composes");
+    assert_eq!(composed, profile);
+}
+
 #[test]
 fn esc_discards_the_edit_and_writes_nothing() {
     let model = keys(listed(), [press(KeyCode::Char('e'))]);
@@ -433,8 +452,8 @@ fn a_codex_field_on_a_claude_profile_is_refused() {
     events.push(press(KeyCode::Tab)); // agent (claude)
     events.push(press(KeyCode::Tab)); // deployment root
     events.extend(typed(ROOT));
-    for _ in 0..4 {
-        events.push(press(KeyCode::Tab)); // auth, key-env, topology, model
+    for _ in 0..5 {
+        events.push(press(KeyCode::Tab)); // auth, key-env, topology, strict mcp, model
     }
     events.extend(typed("gpt-5"));
     events.push(press(KeyCode::Enter));

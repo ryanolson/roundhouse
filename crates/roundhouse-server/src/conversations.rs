@@ -14,14 +14,19 @@
 //! agent narrows the routing of a session no turn will ever run in. Two maps
 //! would agree only while nothing had forked; one map cannot disagree at all.
 //!
-//! # Two questions, one table, and why they belong together
+//! # Three questions, one table, and why they belong together
 //!
-//! A client names a conversation in one of two ways, and both are answered from
-//! the same node-local state:
+//! A client names a conversation in one of three ways, and all three are
+//! answered from the same node-local state:
 //!
 //! - **By cache key.** `{project}/{user}/{key}` at generation zero, plus a
 //!   `#g{n}` suffix once a client has edited its own history out from under a
 //!   session. Only this table knows what `n` is.
+//! - **By the tool-use id of the call it is answering** (M12, R-M2). Claude
+//!   Code puts `_meta["claudecode/toolUseId"]` on every `tools/call` it makes,
+//!   and that id is one *roundhouse emitted* — so the session that emitted it is
+//!   knowable exactly, with no guess and no race. See
+//!   [`Conversations::bind_call`].
 //! - **Not at all.** The MCP surface's `conversation` argument is optional, and
 //!   omitted it means the principal's most recent conversation — which is only
 //!   knowable by having watched the turns go past, which is what
@@ -39,11 +44,22 @@
 //! guessing. Both are refusals or re-derivations, never a wrong session served
 //! quietly.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
 use roundhouse_core::control::Principal;
 use roundhouse_core::ids::SessionId;
+
+/// How many emitted tool calls this node remembers the session of.
+///
+/// A cap and not a policy. Every tool call a dispatched turn emits lands here,
+/// so an uncapped map is a leak proportional to traffic — unlike `latest`,
+/// which is bounded by the number of principals. What losing an entry costs is
+/// exactly one MCP call falling back to the principal's most recent
+/// conversation, which is the answer it got before R-M2 existed; the window
+/// that matters is a single turn's tool loop, and four thousand calls is far
+/// more than any turn emits.
+const REMEMBERED_CALLS: usize = 4096;
 
 /// This node's binding from a client's names to the sessions holding them.
 #[derive(Debug, Default)]
@@ -69,6 +85,23 @@ struct Inner {
     generations: HashMap<String, u32>,
     /// The session each principal most recently drove a turn on.
     latest: HashMap<Principal, SessionId>,
+    /// Which session emitted each tool call this node has served, and to whom.
+    ///
+    /// The principal is stored beside the session rather than folded into the
+    /// key because it is a *check*, not part of the name: a tool-use id is
+    /// unique on its own, and keying by `(Principal, id)` would make a lookup
+    /// with the wrong principal read as "never seen" — which is the same answer
+    /// as an evicted binding and would hide the thing worth noticing.
+    calls: HashMap<String, CallSite>,
+    /// Insertion order of [`Inner::calls`], so the cap evicts the oldest.
+    call_order: VecDeque<String>,
+}
+
+/// Where one emitted tool call came from.
+#[derive(Debug, Clone)]
+struct CallSite {
+    principal: Principal,
+    session: SessionId,
 }
 
 impl Conversations {
@@ -147,6 +180,60 @@ impl Conversations {
         self.lock().latest.get(principal).cloned()
     }
 
+    /// Remember that `session` emitted the tool call `call_id`, for `principal`.
+    ///
+    /// **Recorded at the moment the call is streamed to the client**, because
+    /// that is the only moment both halves are in one place: the surface knows
+    /// which session it is following, and the item it is about to project
+    /// carries the id the client will quote back. A later reconstruction —
+    /// scanning logs for a `call_id` — would need to know which log to scan,
+    /// which is the question this answers.
+    ///
+    /// Deliberately *not* a claim that the principal is now working in this
+    /// conversation: [`Self::latest`] is unmoved. An agent whose subagent runs a
+    /// tool must not thereby redirect its parent's next unnamed MCP call, which
+    /// is the very race R-M2 exists to remove.
+    pub fn bind_call(&self, principal: &Principal, call_id: &str, session: SessionId) {
+        let mut inner = self.lock();
+        if inner
+            .calls
+            .insert(
+                call_id.to_string(),
+                CallSite {
+                    principal: principal.clone(),
+                    session,
+                },
+            )
+            .is_none()
+        {
+            inner.call_order.push_back(call_id.to_string());
+        }
+        while inner.call_order.len() > REMEMBERED_CALLS {
+            let Some(oldest) = inner.call_order.pop_front() else {
+                break;
+            };
+            inner.calls.remove(&oldest);
+        }
+    }
+
+    /// The session that emitted `call_id`, if this node emitted it *for this
+    /// principal*.
+    ///
+    /// **A foreign id and an unknown one answer the same way, and that is the
+    /// decision.** Returning something distinguishable for "this id exists but
+    /// is somebody else's" would make the argument an enumeration oracle — the
+    /// reasoning `mcp_api::resolve_session` already collapses a foreign cache
+    /// key under — and it would buy nothing: the caller has no use for another
+    /// tenant's session, so both answers lead to the same next step, which is
+    /// to fall back to the caller's own most recent conversation.
+    pub fn session_of_call(&self, principal: &Principal, call_id: &str) -> Option<SessionId> {
+        self.lock()
+            .calls
+            .get(call_id)
+            .filter(|site| &site.principal == principal)
+            .map(|site| site.session.clone())
+    }
+
     /// The lock, in one place.
     ///
     /// Recovering a poisoned guard rather than propagating the panic: every
@@ -204,6 +291,84 @@ mod tests {
              generation zero would narrow a session no turn will run in"
         );
         assert_eq!(conversations.bind(&ada(), key), forked);
+    }
+
+    /// R-M2 (M12): a tool-use id names one session exactly, and only for the
+    /// principal it was emitted for.
+    ///
+    /// The three cases that matter are one test because they are one rule: a
+    /// binding answers its own caller, and answers *nothing* — indistinguishably
+    /// — to anyone else or for any id this node never emitted.
+    #[test]
+    fn an_emitted_tool_call_names_its_session_and_only_for_the_caller_it_was_emitted_for() {
+        let conversations = Conversations::new();
+        let subagent = conversations.bind(&ada(), "acme/ada/sub");
+        let parent = conversations.bind(&ada(), "acme/ada/main");
+        conversations.bind_call(&ada(), "toolu_sub", subagent.clone());
+
+        assert_eq!(
+            conversations.session_of_call(&ada(), "toolu_sub"),
+            Some(subagent),
+            "the session that emitted the call is the session the answer to it \
+             concerns, whatever else the principal has been doing since"
+        );
+        assert_eq!(
+            conversations.session_of_call(&bob(), "toolu_sub"),
+            None,
+            "another tenant presenting the id learns nothing from it"
+        );
+        assert_eq!(
+            conversations.session_of_call(&ada(), "toolu_never_emitted"),
+            None,
+            "and an id this node never emitted answers exactly as a foreign \
+             one does"
+        );
+
+        // Binding a call is not a claim that the principal is now working in
+        // that conversation — the very race this exists to remove would come
+        // straight back if a subagent's tool call moved its parent's `latest`.
+        assert_eq!(conversations.latest(&ada()), Some(parent));
+    }
+
+    /// The remembered-calls cap evicts oldest-first, and the fallback is what
+    /// an evicted binding costs.
+    ///
+    /// Asserted because the failure it prevents is not a wrong answer but an
+    /// unbounded map: every tool call of every turn lands here, so a cap that
+    /// silently stopped evicting would be a leak proportional to traffic, and
+    /// nothing else in the process would notice.
+    #[test]
+    fn the_call_table_is_capped_and_forgets_its_oldest_bindings_first() {
+        let conversations = Conversations::new();
+        let session = conversations.bind(&ada(), "acme/ada/main");
+        for n in 0..=REMEMBERED_CALLS {
+            conversations.bind_call(&ada(), &format!("toolu_{n}"), session.clone());
+        }
+
+        assert_eq!(
+            conversations.session_of_call(&ada(), "toolu_0"),
+            None,
+            "the oldest binding is the one the cap gives up"
+        );
+        assert_eq!(
+            conversations.session_of_call(&ada(), &format!("toolu_{REMEMBERED_CALLS}")),
+            Some(session),
+            "and the newest is kept, which is the one a live tool loop is \
+             about to answer"
+        );
+        assert_eq!(conversations.lock().call_order.len(), REMEMBERED_CALLS);
+
+        // Re-binding an id already held must not grow the order queue past the
+        // map, or the cap evicts a key that is still live and the two halves
+        // drift apart.
+        let other = conversations.bind(&ada(), "acme/ada/other");
+        conversations.bind_call(&ada(), "toolu_1", other);
+        // Two reads of one lock, taken one at a time: the guards are temporaries
+        // that live to the end of the statement, and `Mutex` is not reentrant —
+        // a single `assert_eq!` over both would hang here rather than fail.
+        let ordered = conversations.lock().call_order.len();
+        let held = conversations.lock().calls.len();
+        assert_eq!(ordered, held);
     }
 
     #[test]

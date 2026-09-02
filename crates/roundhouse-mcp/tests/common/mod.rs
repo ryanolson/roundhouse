@@ -145,6 +145,9 @@ pub struct FakeDeployment {
     pub balance: Option<Balance>,
     /// The most recent session per principal.
     pub sessions: HashMap<Principal, SessionId>,
+    /// The session each emitted tool-use id was emitted into, and for whom —
+    /// the fake's stand-in for `Conversations`' call table (M12, R-M2).
+    pub tool_use_ids: HashMap<String, (Principal, SessionId)>,
     pub facts: HashMap<SessionId, SessionFacts>,
     pub now_ms: u64,
 }
@@ -165,6 +168,7 @@ impl Default for FakeDeployment {
                 state: LedgerState::Unconstrained,
             }),
             sessions,
+            tool_use_ids: HashMap::new(),
             facts: HashMap::new(),
             now_ms: 1_700_000_000_000,
         }
@@ -206,12 +210,21 @@ impl ControlReads for FakeDeployment {
         &self,
         principal: &Principal,
         conversation: Option<&str>,
+        tool_use_id: Option<&str>,
     ) -> Result<SessionId, SurfaceError> {
         match conversation {
-            None => self
-                .sessions
-                .get(principal)
-                .cloned()
+            // The fake's stand-in for the server's node-local call table: a
+            // tool-use id names the session it was emitted into, checked
+            // against the caller, and falls through to the "most recent"
+            // answer when it names none of this caller's. Reproduced rather
+            // than stubbed out because the *order* is what the surface depends
+            // on, and a fake that ignored the id would let a handler forget to
+            // pass it with every test still green.
+            None => tool_use_id
+                .and_then(|id| self.tool_use_ids.get(id))
+                .filter(|(owner, _)| owner == principal)
+                .map(|(_, session)| session.clone())
+                .or_else(|| self.sessions.get(principal).cloned())
                 .ok_or(SurfaceError::NoSession),
             Some(named) => {
                 // The server resolves this through the same `bound_session`
@@ -311,9 +324,12 @@ impl<R: ControlReads> ControlReads for CountingReads<R> {
         &self,
         principal: &Principal,
         conversation: Option<&str>,
+        tool_use_id: Option<&str>,
     ) -> Result<SessionId, SurfaceError> {
         self.resolve_session_calls.fetch_add(1, Ordering::SeqCst);
-        self.inner.resolve_session(principal, conversation).await
+        self.inner
+            .resolve_session(principal, conversation, tool_use_id)
+            .await
     }
 
     async fn ceiling_policy(&self, principal: &Principal) -> Result<TurnPolicy, SurfaceError> {

@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Plan: the Anthropic Messages surface, the seat, and the launcher (M11)
 
-> **Status: shipped through M11.3 (2026-09-02).** The rulings in §3 stand
+> **Status: shipped through M12 (2026-09-02).** The rulings in §3 stand
 > as written; where an implementation round moved one, the dated addenda at
 > the end of this document record the move and its reason, and win over §3
 > for the current tree. Direction set by the product owner on
@@ -779,3 +779,178 @@ without them:
   operator could not read. `topham --version` names the commit it was
   built from, and the suite warns when that is not HEAD — the stale-binary
   hazard the README named is now detected rather than described.
+
+## Addendum (2026-09-02): M12 — the MCP control surface for Claude Code
+
+Open question 3 is answered by capture (`research/claude-code-client-surface.md`
+§5.8; `research/anthropic-messages-seam-map.md` §6), and the answer changes
+the shape of the rung the question anticipated. The product sentence's
+"through it, take advantage of NeMo Relay and Switchyard" is, for Claude Code,
+still false after M11: a launched client reaches `/v1/messages` and never
+`/mcp`, so the validate/steer loop, `declare_intent`, `status` and the
+routing overlays are unreachable from the one agent this phase brought in.
+M12 closes that.
+
+**What the client does (2.1.257, observed).** An HTTP MCP server is taken
+from `--mcp-config` (inline JSON or a file) or a project `.mcp.json`;
+`settings.json`'s `mcpServers` is inert; `--mcp-config` wins outright over
+`.mcp.json` and `--strict-mcp-config` ignores every other source. A
+`headers` map is honoured on every MCP request, and a value spelled
+`${VAR}` is expanded from the client's own environment — unset, it is sent
+as the literal string with no warning. In the Messages request the tools
+are spelled flat, `mcp__<server>__<tool>`, `inputSchema` renamed
+`input_schema`, description verbatim. On `tools/call` the client sends the
+bare `<tool>` with `_meta.{"claudecode/toolUseId": <the tool_use.id>,
+"progressToken"}`, and the JSON-RPC result flows into the resend's
+`tool_result.content` byte for byte. In `-p` mode a tool is called only when
+`--allowedTools` names its flat name; `--permission-mode dontAsk` denies,
+and `--dangerously-skip-permissions` is refused under root. Correlation at
+the transport level is only the server-issued `Mcp-Session-Id`, which
+roundhouse's stateless MCP does not issue.
+
+### The rulings
+
+**R-M0 — the log's "bare neutral name" is verified before it is relied on.**
+`dialect.rs` rules that the log stores a bare tool name and applies the
+spelling on the way out, and owes the flat arm a reverse split on the way
+in. But `is_control_call` matches the *flat* `mcp__roundhouse__` prefix on
+the *stored* name, the validate suites use only flat names, and the seam
+read could not find a runtime rendering site the enum forces. Either Codex
+sends flat names on the Responses wire — in which case the log already
+stores flat names, the separate-`namespace` handling is dead, and the
+"neutral name" is a doctrine the code never enacted — or it sends bare
+names with a `namespace` field, in which case control-traffic exclusion has
+been silently inert on the Responses path since M10. M12's first stage
+settles which, from the pinned codex source (`6344a65`) and the M9 harness
+captures, and writes the answer into `dialect.rs`'s own doc. The rest of
+this addendum is written for both outcomes and says which branch each
+ruling takes.
+
+**R-M1 — the Messages surface stores the flat name the client spells; the
+dialect is per surface, not per deployment.** A `ClientDialect` arm for
+Claude Code (`ClaudeMessages`) whose inbound canonicalization keeps
+`mcp__<server>__<tool>` whole. Reasons: nothing renders a tool call
+outbound any more (the steer is text), so the only consumer of the stored
+name is `is_control_call`, which wants the flat prefix; splitting would move
+`turn_id` hashes for every tool-using session already stored; and a session
+is written by one client — the cross-dialect resumption `dialect.rs`
+guarded against is not a scenario this product has. If R-M0 finds Codex
+also spells flat on the wire, the same rule is simply made explicit for
+both surfaces and the dead `namespace` handling is retired with a test; if
+Codex spells bare, the Responses arm keeps its behaviour and
+`is_control_call` gains a Responses-side recognizer (bare name plus the
+namespace the deployment configured) with the failing test that proves it
+was inert. The dialect is stamped where the Messages handler already stamps
+one for tools (`messages_api.rs`), never read from the deployment-wide
+`mcp_namespace`, which cannot serve two clients at once.
+
+**R-M2 — MCP calls from Claude Code are correlated by the tool-use id, and
+`latest` is the fallback, never the rule.** The `tool_use.id` in
+`_meta["claudecode/toolUseId"]` is an id roundhouse itself emitted and
+stored as the call's `call_id`; a `tools/call` carrying it resolves to
+exactly the session and turn that asked, with no race between a parent and
+its subagents over the principal's `latest` slot and no node-locality. The
+MCP surface reads it on every call; absent (Codex, which sends no such
+key), the existing `latest` path stands.
+
+**R-M3 — the launcher injects the MCP registration as inline argv, and the
+key rides `${VAR}`.** `topham launch` for a Claude profile prepends
+`--mcp-config '{"mcpServers":{"roundhouse":{"type":"http","url":"<root>/mcp",
+"headers":{"x-roundhouse-key":"${<key variable>}"}}}}'` to the operator's
+argv; no file is written and the secret appears in neither argv nor file —
+the client expands the variable from the environment `topham` already
+laid. `--strict-mcp-config` is a profile switch (default off: an operator's
+own servers coexist). `topham plan` shows the registration with the
+variable unexpanded. The unexpanded-literal hazard is closed by the refusal
+that already exists: an unexported key variable refuses the launch before
+anything is spawned. This adds the argv seam `LaunchPlan` lacks — a
+generated leading argv, distinct from the operator's verbatim tail — which
+signage (R-M4) uses too.
+
+**R-M4 — signage rides `--append-system-prompt`, not a file.** Of the three
+places text can land (an appended system block → loosely admitted
+Developer configuration; `$CLAUDE_CONFIG_DIR/skills` → a strictly admitted
+interior system message that forks a session when it changes, and owning
+the config dir evicts a forwarded login; `CLAUDE.md` → the first user
+message, in the operator's repo), only the first is safe. `claude_launch`
+renders the Claude analogue of `codex_launch::skills` as one text — the
+eight control tools, when to reach for each, spelled flat — and `topham`
+appends it. The tool descriptors' `conversation` wording, which speaks
+Responses vocabulary (`prompt_cache_key`), is made dialect-neutral once;
+the golden pin moves with it and the prompt-cache cost is accepted.
+
+**R-M5 — the Messages surface accepts the client's own MCP tools and adds
+none of its own.** `tools[]` is taken verbatim today and stays so; roundhouse
+never injects a tool the client's loop has no dispatcher for, and
+`admitted_input_tokens` therefore stays what the client declared.
+
+**R-M6 — what proves it.** Unit and surface: the flat name round-trips
+through `canonicalize` and back out of the log unchanged on the Messages
+side, with the captured `mcp-turn-1` / `mcp-turn-2-toolresult` fixtures as
+the pins; the `is_control_call` outcome for a flat Claude call and for
+whatever R-M0 found on the Responses side, each with the failing test that
+motivated it; the MCP surface resolving a `tools/call` by tool-use id, and
+falling back to `latest` without one; `topham plan` snapshots carrying the
+registration and the signage. Closure: a real claude 2.1.257 launched
+through `topham launch` with `--allowedTools mcp__roundhouse__status`, a
+scripted upstream answering a `tool_use` for that tool, and assertions at
+both edges — the MCP call arrived at `/mcp` with the turn key and was
+correlated to the session by tool-use id; the resend rejoined the same
+session; the log holds one flat-named call and its result; the validate
+fold counted no control call.
+
+**Left open, on purpose.** Chained MCP through Relay (Relay proxies only
+the Anthropic route; an MCP server behind it is reached directly — stated,
+not tested); `/v1/models`; the interactive-approval limit.
+
+### What the implementation settled beyond the rulings (2026-09-02, M12)
+
+- **R-M0 settled as bare-with-namespace, and it was a defect.** At codex pin
+  `6344a65` an MCP server reaches the model as one `namespace` object
+  (`mcp__roundhouse`) whose tools carry bare names, the model's call comes
+  back as two wire fields (`name: "status"`, `namespace: "mcp__roundhouse"`),
+  and dispatch is an exact `ToolName{name, namespace}` lookup — a flat
+  spelling is unresolvable, not merely unused. The log therefore stores
+  `status`, and `is_control_call`, which matched only the flat prefix, had
+  been inert on the Responses path since it was written: the validate fold
+  counted roundhouse's own control traffic as agent work (the G04 failure)
+  and every fixture hand-wrote flat names, which is why nothing was red. A
+  premise of `dialect.rs` fell with it: nothing renders a tool call
+  outbound (`ControlPlane::client_dialect()` has had no caller since
+  M10.0), so "the spelling is applied on the way out" described a rendering
+  that does not happen; the doc now says so.
+- **The Responses-side recognizer is an exact match on the control tool
+  names, not "bare name plus configured namespace" as ruled**, because the
+  namespace is not in the stored record and there is nothing to compare a
+  configured value against. One list (`CONTROL_TOOL_NAMES` in core,
+  re-exported as the MCP surface's `TOOL_NAMES`) serves the fold and the
+  surface. The cost is pinned by a test rather than hidden: a third party's
+  MCP tool literally named `status` arriving bare over the Responses wire is
+  exempted from the task view with ours — an under-count of a call or two,
+  against G04's over-count of all our chatter. Closing it properly means
+  keeping the namespace in the stored record, which moves the `turn_id` of
+  every stored tool-using session; deferred as a migration question, with
+  the test named to delete when it lands.
+- **A foreign or unknown tool-use id falls through to the caller's own
+  `latest`**, never the other tenant's session and never a distinguishable
+  refusal — the same anti-oracle reasoning `resolve_session` already applies
+  to a foreign conversation name. The binding is written by the Messages
+  follower only (Codex sends no such key); the call table is node-local and
+  capped, and an evicted binding costs one call falling back to `latest`.
+- **The `${VAR}` expansion the registration relies on is observed, not
+  assumed**: the seam read captured an expanded header value at a loopback
+  MCP server, and the closure test asserts the minted key — not the literal
+  — arriving at `/mcp` from a real client launched by a real `topham`.
+- **The tools' `conversation` argument cannot resolve on the Messages
+  surface**: the MCP surface qualifies a named conversation through the
+  Responses namespacing, while a Messages session is keyed
+  `anthropic_messages/<id>`. Moot for Claude Code because the tool-use id
+  answers the question and the descriptors now steer away from the field;
+  left open with two remedies (qualify both spellings, or carry the caller's
+  dialect into the MCP surface) for a later rung.
+- **The closure test proves the loop, not the signage.** Its scripted
+  upstream emits the `tool_use` directly, so removing `--append-system-prompt`
+  leaves it green by design; the signage is pinned by the generator's own
+  argv tests and the plan snapshots. Chained MCP through Relay stays stated,
+  not tested. Every rig in the gated suite now mounts the MCP router beside
+  the Messages router.
