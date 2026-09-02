@@ -49,7 +49,10 @@ features — the first is what makes the second possible.
 > the `_meta.threadId` a Codex client stamps on every `tools/call` and the
 > `_meta["claudecode/toolUseId"]` Claude Code sends — but only the second
 > has been observed arriving from a real binary; a control call chained
-> through NeMo Relay is likewise stated rather than tested.
+> through NeMo Relay is likewise stated rather than tested. Both correlators
+> are exact only on the node that served the turn they name: the tables
+> behind them are per-process, so a call landing elsewhere falls back to a
+> guess.
 
 Roundhouse depends on Dynamo but is not part of it. It pins two Dynamo crates
 (`dynamo-kv-router` with the `standalone-selection` feature, and `dynamo-tokens`)
@@ -1396,13 +1399,25 @@ same gate that makes an interactive run ask before it will call an
 solved.
 
 The MCP surface reads the `_meta.threadId` a Codex client stamps on every
-`tools/call` — the value is that turn's `prompt_cache_key`, so it resolves as a
-*name* through the same namespace qualification the `conversation` argument goes
-through, and a thread id naming no conversation of the caller's falls through to
-the next correlator rather than reaching anyone else's session. Its Claude Code
-counterpart, `_meta["claudecode/toolUseId"]`, is read too and is a slightly
-different bargain: it carries an id *roundhouse emitted*, so it needs no
-cooperation from the model at all. What is unobserved is the Codex half's last
+`tools/call`. It resolves against a binding the Responses ingest wrote when it
+served that thread's own turn: codex carries the turn's thread id in its
+`x-codex-turn-metadata` header, so the session a thread is in is known exactly,
+per thread, and stays known across every fork of the cache key underneath it.
+That indirection is the correction M12.1's review forced. The value was first
+read as a `prompt_cache_key`, which it is — for a codex *root* thread and for
+nothing else: a root and every subagent it spawns share one session id and
+therefore one cache key, while each stamps its own thread id, so reading the id
+as a name missed exactly the subagents the feature exists for and answered them
+about their parent. The named path is still there behind the binding, as the
+route a root thread takes on a node that recorded none, and a thread id naming
+no conversation of the caller's falls through to the next correlator rather than
+reaching anyone else's session. What is *not* exact: a thread whose turns
+another node served, one whose binding this node's bounded table has evicted, or
+a client that sends no such header — each of those lands on the `latest` guess,
+as it did before. Its Claude Code counterpart,
+`_meta["claudecode/toolUseId"]`, is read too and is a slightly different
+bargain: it carries an id *roundhouse emitted*, so it needs no cooperation from
+the model at all. What is unobserved is the Codex half's last
 mile: no run in this tree has yet seen a real `codex` dispatch a `tools/call`,
 because nothing here emits a tool call a codex client would route to MCP, so the
 threadId path is proved hermetically against a captured `_meta` shape rather

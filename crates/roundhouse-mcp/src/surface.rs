@@ -47,7 +47,9 @@ use crate::overlay::{OverlayScope, PreferMode};
 /// `Authorization: Bearer rh_turn_…` header the turn surfaces use, so a tool can
 /// never be called without one and never has to ask whose deployment it is
 /// looking at. The correlators are the other half of the same question: *which*
-/// of that principal's conversations this call belongs to.
+/// of that principal's conversations this call belongs to — weighed by
+/// [`ControlReads::resolve_session`](crate::reads::ControlReads::resolve_session),
+/// which is where that ruling lives and the only place it is stated.
 ///
 /// **Why neither correlator is a tool argument** (M12, R-M2; M12.1, R-M7).
 /// Neither is something the model chose to say — both are protocol metadata the
@@ -56,16 +58,10 @@ use crate::overlay::{OverlayScope, PreferMode};
 /// the client is running (`threadId`). Putting either in the arguments schema
 /// would invite a model to invent one, and `deny_unknown_fields` would then
 /// refuse the call of a client that sent it honestly.
-///
-/// Both are `Option` because each is one client's courtesy and not a protocol
-/// requirement: Codex sends `threadId` and no tool-use id, Claude Code sends the
-/// tool-use id and no `threadId`, and a client sending neither must be served
-/// exactly as it was before either existed.
 #[derive(Debug, Clone)]
 pub struct Caller {
     principal: Principal,
-    thread_id: Option<String>,
-    tool_use_id: Option<String>,
+    correlators: Correlators,
 }
 
 impl Caller {
@@ -74,35 +70,23 @@ impl Caller {
     pub fn new(principal: Principal) -> Self {
         Self {
             principal,
-            thread_id: None,
-            tool_use_id: None,
+            correlators: Correlators::default(),
         }
     }
 
-    /// A caller naming the thread it is running in (`_meta.threadId`).
+    /// A caller carrying whichever correlators its client attached.
     ///
-    /// A **builder taking one correlator at a time**, and the same below for
-    /// the tool-use id, rather than one constructor taking both. Two adjacent
-    /// `Option<String>` parameters are a swap nothing catches: the correlators
-    /// are weighed in a fixed order (R-M7), so transposing them at the door
-    /// would compile, would type-check, and would silently invert the ruling
-    /// for every client that sends both.
-    pub fn in_thread(self, thread_id: Option<String>) -> Self {
+    /// **One [`Correlators`] rather than a builder taking one at a time**
+    /// (M12.1 review, F5). The builder existed to stop two adjacent
+    /// `Option<String>` parameters being transposed — the correlators are
+    /// weighed in a fixed order, so a swap at the door would compile and
+    /// silently invert the ruling — and a struct with named fields makes that
+    /// swap unspellable for the same reason, without a second vocabulary for
+    /// one pair of strings.
+    pub fn correlated(principal: Principal, correlators: Correlators) -> Self {
         Self {
-            // An empty string is not an id, and it is what a client sending the
-            // key with nothing in it would otherwise resolve *by*: an empty
-            // lookup key can only miss, but it would have looked deliberate in
-            // a trace. Normalised to absence at the one door it enters by.
-            thread_id: thread_id.filter(|id| !id.is_empty()),
-            ..self
-        }
-    }
-
-    /// A caller answering a specific `tool_use` block.
-    pub fn answering(self, tool_use_id: Option<String>) -> Self {
-        Self {
-            tool_use_id: tool_use_id.filter(|id| !id.is_empty()),
-            ..self
+            principal,
+            correlators,
         }
     }
 
@@ -110,45 +94,34 @@ impl Caller {
         &self.principal
     }
 
-    pub fn thread_id(&self) -> Option<&str> {
-        self.thread_id.as_deref()
-    }
-
-    pub fn tool_use_id(&self) -> Option<&str> {
-        self.tool_use_id.as_deref()
-    }
-
-    /// Both correlators, in the shape the resolution seam takes them.
-    pub fn correlators(&self) -> Correlators<'_> {
-        Correlators {
-            thread_id: self.thread_id(),
-            tool_use_id: self.tool_use_id(),
-        }
+    pub fn correlators(&self) -> &Correlators {
+        &self.correlators
     }
 }
 
 /// The correlators a client attached to a `tools/call`, before anything has
 /// been looked up.
 ///
-/// **A struct and not two parameters** on
-/// [`resolve_session`](crate::reads::ControlReads::resolve_session). The seam
-/// would otherwise take three adjacent `Option<&str>` — a name, a thread and a
-/// call — which is three ways to transpose an argument into a different ruling
-/// with nothing red. Named fields make the transposition unspellable.
+/// **One struct, carried from [`crate::tools::ToolCall`] through [`Caller`] to
+/// the seam, and not two parameters at each hop.** The seam would otherwise
+/// take three adjacent `Option<&str>` — a name, a thread and a call — which is
+/// three ways to transpose an argument into a different ruling with nothing
+/// red. Named fields make the transposition unspellable.
 ///
-/// Borrowed rather than owned because every implementor only reads them, and a
-/// [`Caller`] outlives the call it is resolving.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Correlators<'a> {
+/// Owned rather than borrowed: this is what the transport read off the wire and
+/// what every hop after it carries, so a lifetime here would buy one avoided
+/// clone per tool call and cost a parameter on four types.
+#[derive(Debug, Clone, Default)]
+pub struct Correlators {
     /// `_meta.threadId` — the conversation the *client* says it is running
     /// (M12.1, R-M7). Codex stamps it on every `tools/call` and it is the
     /// turn's `prompt_cache_key`, so it resolves as a **name** through the
     /// caller's own namespace.
-    pub thread_id: Option<&'a str>,
+    pub thread_id: Option<String>,
     /// `_meta["claudecode/toolUseId"]` — the `tool_use` block this call is
     /// answering (M12, R-M2). It resolves as a **call**, through the table of
     /// ids this node emitted.
-    pub tool_use_id: Option<&'a str>,
+    pub tool_use_id: Option<String>,
 }
 
 /// Everything an MCP client can ask of a roundhouse deployment.
@@ -631,20 +604,10 @@ pub enum SurfaceError {
     ForeignConversation(String),
     /// The caller's own two inputs name two different conversations.
     ///
-    /// **A refusal and never a precedence rule** (M12.1, R-M7). The
-    /// `conversation` argument is what the *model* wrote; the correlator is what
-    /// the *client* attached on `_meta`. When they agree, either would do; when
-    /// they disagree, one of them is wrong and nothing here can say which — the
-    /// model may have carried a name over from an older turn, or the client may
-    /// be dispatching from a thread the model does not know it is in.
-    ///
-    /// Picking a winner is the tempting alternative and it is the dangerous
-    /// one: whichever side loses, the tool then answers about a conversation the
-    /// caller did not ask about, with a 200 on it. Worse, a rule that let the
-    /// argument win would make the argument a way to *steer past* the client's
-    /// own correlator, which is precisely the tenancy claim the correlator
-    /// exists to make. A caller contradicting itself is not a tenancy oracle, so
-    /// both conversations are named back and neither is served.
+    /// **A refusal and never a precedence rule** (M12.1, R-M7); why, and why
+    /// both conversations are named back, is stated once on
+    /// [`ControlReads::resolve_session`](crate::reads::ControlReads::resolve_session),
+    /// the code that raises this.
     #[error(
         "this call names conversation `{named}` but the client correlated it to `{correlated}`; \
          roundhouse will not choose between a caller's own contradictory inputs -- send one or \
@@ -660,5 +623,60 @@ pub enum SurfaceError {
 impl From<anyhow::Error> for SurfaceError {
     fn from(error: anyhow::Error) -> Self {
         SurfaceError::Internal(error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod review_m12_1_f5 {
+    /// This file's own source, so the guard below reads what a reader would
+    /// read rather than a constant that could drift from what it checks.
+    const FULL_SOURCE: &str = include_str!("surface.rs");
+
+    /// [`FULL_SOURCE`] up to (not including) this test module. Reading the
+    /// whole file would be a tautology here: this module's own doc comments
+    /// quote the very patterns they check for, so a naive `.matches(...)`
+    /// would count its own prose. Slicing before `mod review_m12_1_f5` is the
+    /// same fix `lib.rs`'s guard module uses for the identical self-reference
+    /// problem.
+    fn source() -> &'static str {
+        FULL_SOURCE
+            .split("\n#[cfg(test)]\nmod review_m12_1_f5")
+            .next()
+            .unwrap()
+    }
+
+    /// M12.1 review, F5: `ToolCall`, `Caller` and `Correlators` were three
+    /// spellings of one pair of correlator fields, joined by a builder whose
+    /// two methods carried the identical empty-string filter.
+    ///
+    /// The finding's own `how_to_prove` recipe (`grep -c 'tool_use_id:
+    /// Option'` "drops from 3 to 1") was retired rather than kept: run
+    /// literally it counted 4, because the pattern also matched `answering`'s
+    /// parameter declaration. What survives is the claim the recipe was
+    /// reaching for — one struct spells the pair, and the empty-string filter
+    /// is applied once, at the transport door where `_meta` is read, rather
+    /// than once per correlator.
+    #[test]
+    fn the_correlator_pair_is_spelled_once_and_filtered_once() {
+        assert_eq!(
+            source().matches("tool_use_id: Option").count(),
+            1,
+            "`Correlators` is meant to be the only struct in this file \
+             spelling the correlator pair; a second one is F5 growing back"
+        );
+        let filter = ".filter(|id| !id.is_empty())";
+        assert_eq!(
+            source().matches(filter).count() + include_str!("tools.rs").matches(filter).count(),
+            0,
+            "the empty-string normalisation belongs at the one door the ids \
+             enter by; a copy here or on the dispatch path is the duplication \
+             F5 found"
+        );
+        assert_eq!(
+            include_str!("transport.rs").matches(filter).count(),
+            1,
+            "and it has to still be applied there, once, or an empty `_meta` \
+             value becomes a lookup key that can only miss"
+        );
     }
 }

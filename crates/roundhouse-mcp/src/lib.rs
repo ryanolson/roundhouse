@@ -147,42 +147,43 @@
 //! Codex stamps `params._meta.threadId` on **every** `tools/call` it
 //! dispatches — `with_mcp_tool_call_thread_id_meta`
 //! (`core/src/mcp_tool_call.rs:1198-1220` @ `e363b08`, called at line 442
-//! with no conditional guard) inserts `sess.thread_id`, and captured traffic
-//! shows it byte-identical to the `prompt_cache_key` on the same turn's
-//! `/v1/responses` bodies. It rides a `_meta` object that also carries
-//! `x-codex-turn-metadata.session_id`.
+//! with no conditional guard) inserts `sess.thread_id`. It rides a `_meta`
+//! object that also carries `x-codex-turn-metadata.session_id`.
 //!
 //! **The transport reads it, beside `claudecode/toolUseId`, and hands it to
-//! [`ControlReads::resolve_session`] as a *named* conversation** (M12.1,
-//! R-M7). Three sentences carry the whole ruling:
+//! [`ControlReads::resolve_session`]** (M12.1, R-M7). Why the value outranks
+//! the `latest` guess, what happens when it disagrees with the model's own
+//! `conversation` argument, and how it is resolved are one ruling with one
+//! home: the doc on [`ControlReads::resolve_session`], which is the code that
+//! decides. It used to be restated here in full, which is how two copies of a
+//! ruling come to disagree (M12.1 review, F4).
 //!
-//! *Why a name and not a third kind of id.* The value **is** the
-//! `prompt_cache_key`, and a `prompt_cache_key` is precisely the string the
-//! Responses surface qualifies into a session id. So there is no new
-//! vocabulary to invent and no new tenancy path to audit: the thread id goes
-//! through the same `qualify`-then-check door the model's own `conversation`
-//! argument goes through, which means a threadId naming another tenant's
-//! conversation resolves to nothing exactly as a typo does. What it is *not*
-//! is a bearer token — it is a hint the client volunteers, so a thread id that
-//! resolves to nothing falls through to the next correlator and then to
-//! `latest`, where the model's own argument would have refused.
+//! **What M12.1 review corrected, and it is a fact about the oracle rather
+//! than about us** (F2, R-M9). R-M7 read the value purely as a
+//! `prompt_cache_key`, on a capture where the two were byte-identical. That
+//! identity holds for a codex *root* thread and for nothing else: at the
+//! pinned checkout (`6344a65`) `AgentControl`'s session id "is shared by the
+//! whole agent control session ... every sub-agents from a common root share
+//! the same session ID" (`core/src/agent/control.rs:104-110`, taken by any
+//! non-root source at `core/src/session/session.rs:671-676`), and that shared
+//! id is what becomes `prompt_cache_key` (`core/src/client.rs`), while
+//! `_meta.threadId` stays each member's own. So the whole family names one
+//! cache key, and a subagent's thread id — the case the rung exists for — is
+//! nobody's. The per-thread marker is on the wire anyway: every turn carries
+//! `x-codex-turn-metadata`, whose `thread_id`
+//! (`core/src/responses_metadata.rs:281`, from
+//! `core/src/session/turn_context.rs:618-622`) is that turn's own. The
+//! Responses ingest binds it to the session it decided, per principal, and
+//! `resolve_session` reads that binding before falling back to the name.
 //!
-//! *Why disagreement refuses.* An argument is what the **model** wrote and a
-//! correlator is what the **client** attached; when the two name different
-//! conversations, one of them is wrong and nothing in this crate can say
-//! which. Letting the argument win would make it a way to talk past the
-//! client's own correlator, which is the tenancy claim the correlator exists
-//! to make; letting the correlator win would silently answer a question the
-//! model did not ask. Both are named back in
-//! [`SurfaceError::ContradictoryConversation`] and neither is served — a
-//! caller contradicting itself is not a tenancy oracle.
-//!
-//! *Why `latest` is still there.* Neither correlator is a protocol
-//! requirement, and a client sending neither — or sending one this node has
-//! never seen — must be served exactly as it was before either existed. The
-//! guess is last for the reason it always was: it is the only step that can be
-//! wrong about a principal driving two conversations at once, which is the
-//! whole failure mode R-M2 and R-M7 remove one client at a time.
+//! **What is exact and what still falls through**, since an agent reading this
+//! should know which: a thread this deployment served a turn of, on this node,
+//! resolves exactly — through every fork of the cache key underneath it. A
+//! thread whose turns a *different* node served, or whose binding this node's
+//! bounded table has since evicted, resolves as any unknown correlator does:
+//! down the R-M7 named path (which answers a root thread and nothing else) and
+//! then to `latest`, which is a guess. A client that sends no
+//! `x-codex-turn-metadata` header is in that second case on every call.
 //!
 //! `init_session` remains the client-agnostic path and this does not replace
 //! it; see the section below for what is still write-only about it. What
@@ -228,7 +229,7 @@ mod plane;
 
 pub use overlay::{ModeNarrowing, OverlayScope, PreferMode, SessionOverlay, TimedOverlay};
 pub use plane::ControlPlaneSurface;
-pub use reads::{ControlReads, Correlated, SessionFacts, session_this_call_is_about};
+pub use reads::{ControlReads, SessionFacts};
 pub use store::{
     BindingId, ControlStore, IntentRecord, OutcomeRecord, SessionBinding, binding_ids_in_items,
     binding_in_items,
@@ -238,20 +239,31 @@ pub use tools::{TOOL_NAMES, ToolCall, ToolDescriptor, descriptor, descriptors, d
 
 #[cfg(test)]
 mod tests {
-    /// The module's own source, so the guard reads what a reader would read
+    /// This module's own source, so the guard reads what a reader would read
     /// rather than a constant that could be deleted along with the paragraph
     /// it is meant to protect.
     const SOURCE: &str = include_str!("lib.rs");
 
-    /// [`SOURCE`] up to (not including) `mod tests`.
+    /// The *deciding* site's source (M12.1 review, F4). The R-M7 rationale
+    /// lives on `ControlReads::resolve_session`, in `reads.rs`; a guard
+    /// spelled `include_str!("lib.rs")` alone watches the narrative copy and
+    /// leaves the copy beside the code that decides free to drift.
+    const DECISION_SITE: &str = include_str!("reads.rs");
+
+    /// A file up to (not including) its own `#[cfg(test)]` module.
     ///
-    /// The whole-file version is a tautology — this module's own assertions
+    /// The whole-file version is a tautology — a guard module's assertions
     /// retype the markers they check for, so `SOURCE.contains(...)` would find
     /// its own literal however the doc comment above was mutated.
     /// `routing::stage` learned that the expensive way; the slice is the fix,
     /// copied from there rather than rediscovered.
-    fn doc_and_code() -> &'static str {
-        SOURCE.split("\n#[cfg(test)]").next().unwrap()
+    fn before_tests(source: &'static str) -> &'static str {
+        source.split("\n#[cfg(test)]").next().unwrap()
+    }
+
+    /// Everything the R-M7 contract is written across, guarded together.
+    fn doc_and_code() -> String {
+        format!("{}\n{}", before_tests(SOURCE), before_tests(DECISION_SITE))
     }
 
     /// M12.1 review, F3: the R-M7/R-M8 contract paragraph above had nothing
@@ -261,11 +273,17 @@ mod tests {
     /// make the paragraph *true* (nothing short of the resolver's own tests
     /// does that); it only makes it a defect to delete silently, the way
     /// `routing::stage`'s attribution guard does for its own module doc.
+    ///
+    /// M12.1 review, F4: and it now reads `reads.rs` too. The rationale has
+    /// one home — the doc on `ControlReads::resolve_session`, which is the
+    /// code that decides — so a guard that watched only this file's pointer
+    /// to it was watching the copy that matters least.
     #[test]
     fn the_r_m7_contract_paragraph_survives() {
         let doc_and_code = doc_and_code();
         assert!(
-            doc_and_code.contains("A third property, and since M12.1 it is read: codex names the"),
+            before_tests(SOURCE)
+                .contains("A third property, and since M12.1 it is read: codex names the"),
             "the section heading introducing the current _meta.threadId \
              contract is gone"
         );
@@ -274,11 +292,15 @@ mod tests {
             "with_mcp_tool_call_thread_id_meta",
             "core/src/mcp_tool_call.rs:1198-1220",
             "prompt_cache_key",
+            // The upstream fact that *corrected* it (M12.1 review, F2): the
+            // thread id is not the cache key for anyone but a root thread,
+            // and the per-thread marker rides the turn header instead.
+            "core/src/agent/control.rs:104-110",
+            "core/src/responses_metadata.rs:281",
+            "x-codex-turn-metadata",
             // The ruling itself, R-M7.
             "ControlReads::resolve_session",
             "ContradictoryConversation",
-            // Why the fallback survives R-M7.
-            "`latest` is still there",
             // What proves it, R-M8, and where.
             "codexs_meta_thread_id_rides_every_tools_call_and_is_never_read",
             "a_real_codex_binary_is_correlated_by_the_thread_id_it_stamps",
@@ -292,5 +314,57 @@ mod tests {
                  tests actually do"
             );
         }
+        for marker in [
+            // The refusal, stated where it is raised.
+            "ContradictoryConversation",
+            // The swallow that is *not* the refusal, and its one exception.
+            "Only `ForeignConversation` is swallowed",
+            // What R-M7 costs, and the one call that pays nothing (F8).
+            "detecting a contradiction means resolving the client's",
+            "*same string*",
+            // R-M9's order within the thread step (F2).
+            "session_of_thread",
+        ] {
+            assert!(
+                before_tests(DECISION_SITE).contains(marker),
+                "the deciding site's own copy of the R-M7 rationale is \
+                 missing `{marker}` — an implementor reads that doc and not \
+                 this file's pointer to it"
+            );
+        }
+    }
+
+    /// M12.1 review, F4: the guard directly above used to pin only this
+    /// module's prose copy of the R-M7 rationale, while the decision it
+    /// narrates is made in `reads.rs`. `SOURCE` was `include_str!("lib.rs")`
+    /// — one file, this one — so editing, garbling or deleting the decision
+    /// site's own copy could not fail any test in this crate.
+    ///
+    /// This is the assertion that says the guard's *reach* is right rather
+    /// than its contents: a marker unique to `reads.rs` must be covered by
+    /// whatever `doc_and_code()` watches.
+    #[test]
+    fn the_decision_sites_own_copy_of_the_rationale_is_guarded_too() {
+        // Unique to `reads.rs`'s doc on `resolve_session` (R-M7's paragraph on
+        // why the correlators can't stay lazy) — present in the decision-site
+        // file, absent from `lib.rs`. Asserted first so a failure below is
+        // never mistaken for this marker having drifted out of `reads.rs`
+        // instead.
+        let decision_site_marker = "detecting a contradiction means resolving the client's";
+        assert!(
+            DECISION_SITE.contains(decision_site_marker),
+            "fixture marker missing from reads.rs — this test does not reach \
+             F4's claim; re-anchor the marker to whatever now carries the \
+             R-M7 rationale beside the deciding function"
+        );
+
+        assert!(
+            doc_and_code().contains(decision_site_marker),
+            "F4: `the_r_m7_contract_paragraph_survives` guards only this \
+             file's module doc — reads.rs's own copy of the R-M7 rationale, \
+             sitting beside the function that actually makes the decision, is \
+             unguarded and can drift or be deleted without failing any test \
+             in this crate"
+        );
     }
 }

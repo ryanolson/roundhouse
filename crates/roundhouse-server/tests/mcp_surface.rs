@@ -454,6 +454,15 @@ async fn build(
 struct Conversation {
     secret: String,
     cache_key: String,
+    /// The thread this client says its turns come from, stamped on every
+    /// request as codex's `x-codex-turn-metadata` header.
+    ///
+    /// Separate from [`Self::cache_key`] because that is exactly what the
+    /// oracle makes it (M12.1 review, F2): an agent family shares one
+    /// `prompt_cache_key` and stamps a different `thread_id` per member, so a
+    /// fixture that derived one from the other could only ever re-prove the
+    /// root-thread case.
+    thread_id: Option<String>,
     history: Vec<Value>,
 }
 
@@ -462,7 +471,16 @@ impl Conversation {
         Self {
             secret: secret.to_string(),
             cache_key: cache_key.to_string(),
+            thread_id: None,
             history: Vec::new(),
+        }
+    }
+
+    /// The same, from a codex thread that declares itself on every turn.
+    fn from_thread(secret: &str, cache_key: &str, thread_id: &str) -> Self {
+        Self {
+            thread_id: Some(thread_id.to_string()),
+            ..Self::new(secret, cache_key)
         }
     }
 
@@ -481,13 +499,36 @@ impl Conversation {
     async fn send(&mut self, rig: &Rig) -> String {
         let mut body = request_value(&self.cache_key);
         body["input"] = Value::Array(self.history.clone());
-        let (status, text) = post(
+        // The whole header codex sends, not just the field under test: the
+        // payload carries `session_id` (the family's, and the cache key)
+        // beside `thread_id` (this member's own), so a reader that took the
+        // wrong one would resolve every subagent to its parent and this
+        // fixture would not notice.
+        let metadata = self.thread_id.as_ref().map(|thread_id| {
+            json!({
+                "session_id": self.cache_key,
+                "thread_id": thread_id,
+                "turn_id": "0199a0f0-0000-7000-8000-00000000turn",
+            })
+            .to_string()
+        });
+        let extra: Vec<(HeaderName, &str)> = metadata
+            .iter()
+            .map(|json| {
+                (
+                    HeaderName::from_static("x-codex-turn-metadata"),
+                    json.as_str(),
+                )
+            })
+            .collect();
+        let (status, _headers, text) = post_with_extra_headers(
             &rig.app,
             rig.host,
             "/v1/responses",
             Some(&self.secret),
             &body.to_string(),
             "application/json",
+            &extra,
         )
         .await;
         assert_eq!(status, StatusCode::OK, "the turn must be admitted: {text}");
@@ -740,6 +781,20 @@ async fn post_with_extra_headers(
 // ---------------------------------------------------------------------------
 // Reading the log
 // ---------------------------------------------------------------------------
+
+/// The session this node has bound `key` to, which a turn must already have
+/// established.
+///
+/// `Conversations::resolve` answers `Option` since M12.1 review F9 — a node
+/// that bound nothing says so rather than minting the generation-zero id
+/// another node's first turn would have minted. Every call site here follows a
+/// turn on that key, so the `None` is a fixture mistake and worth naming as
+/// one.
+fn bound(rig: &Rig, key: &str) -> SessionId {
+    rig.conversations
+        .resolve(key)
+        .unwrap_or_else(|| panic!("a turn on `{key}` must have bound it before this read"))
+}
 
 async fn events(store: &MemoryStore, session: &str) -> Vec<roundhouse_core::event::SessionEvent> {
     store
@@ -1931,7 +1986,7 @@ async fn a_tools_call_is_correlated_by_the_tool_use_id_the_client_quotes_back() 
     // follower. Written here rather than driven through a second surface
     // because the claim under test is the *resolution*, and mounting a third
     // router would make the failure ambiguous between the two halves.
-    let main_session = rig.conversations.resolve("acme/ada/main");
+    let main_session = bound(&rig, "acme/ada/main");
     rig.conversations
         .bind_call(&ada, "toolu_from_main", main_session.clone());
 
@@ -1957,7 +2012,7 @@ async fn a_tools_call_is_correlated_by_the_tool_use_id_the_client_quotes_back() 
     let guessed = served(&tools_call(&rig, Some(&key("ada")), "status", json!({})).await);
     assert_eq!(
         guessed["conversation"],
-        json!(rig.conversations.resolve("acme/ada/other").as_str()),
+        json!(bound(&rig, "acme/ada/other").as_str()),
     );
 
     // And another tenant quoting the same id learns nothing from it: bob has
@@ -2009,7 +2064,7 @@ async fn a_tools_call_is_correlated_by_the_thread_id_a_codex_client_stamps() {
     let mut other = Conversation::new(&key("ada"), "other");
     other.say(&rig, "start the linter").await;
 
-    let main_session = rig.conversations.resolve("acme/ada/main");
+    let main_session = bound(&rig, "acme/ada/main");
     // The thread id codex sends is the turn's own `prompt_cache_key`, which is
     // the *unqualified* name — the qualification into `acme/ada/…` is
     // roundhouse's, and doing it here would test the fixture rather than the
@@ -2028,7 +2083,7 @@ async fn a_tools_call_is_correlated_by_the_thread_id_a_codex_client_stamps() {
     let guessed = served(&tools_call(&rig, Some(&key("ada")), "status", json!({})).await);
     assert_eq!(
         guessed["conversation"],
-        json!(rig.conversations.resolve("acme/ada/other").as_str()),
+        json!(bound(&rig, "acme/ada/other").as_str()),
     );
 
     // An unknown thread id falls through to that same guess rather than
@@ -2063,6 +2118,105 @@ async fn a_tools_call_is_correlated_by_the_thread_id_a_codex_client_stamps() {
     );
 }
 
+/// F2 (M12.1 review), R-M9: an agent family sharing one `prompt_cache_key`
+/// is told apart by the per-thread header its turns carry, end to end.
+///
+/// **Why the previous test is not this test.** The one above pins the
+/// root-thread case, where `_meta.threadId` and the turn's
+/// `prompt_cache_key` are the same string — and that identity is the whole of
+/// what R-M7 assumed. At the pinned oracle it holds for a root thread and
+/// nothing else: `AgentControl`'s session id "is shared by the whole agent
+/// control session ... every sub-agents from a common root share the same
+/// session ID" (`core/src/agent/control.rs:104-110`), it is what becomes
+/// `prompt_cache_key` (`core/src/client.rs`), and the per-member id rides the
+/// turn separately as `x-codex-turn-metadata`'s `thread_id`
+/// (`core/src/responses_metadata.rs:281`, built from
+/// `core/src/session/turn_context.rs:618-622`). So the topology this drives is
+/// the one the rung exists for and the one every M12.1 fixture missed.
+///
+/// **The whole path, not the resolver's half.** Three turns arrive on the
+/// Responses router under one cache key, each carrying its own thread header;
+/// the header is what the ingest binds, and the `tools/call` arrives on the
+/// MCP router afterwards. `f2_a_subagents_thread_id_resolves_its_own_fork_and_not_the_parents`
+/// (`src/mcp_api.rs`) is the resolver-level twin, and it would keep passing if
+/// nothing on the wire ever wrote the binding — which is exactly what this
+/// covers.
+///
+/// **Made deterministic.** Two histories under one cache key is, to
+/// roundhouse, a client rewriting its own history, so each alternation forks:
+/// the parent's first turn takes generation 0, the subagent's forks to 1, and
+/// the parent's next forks to 2 — moving `latest` off the subagent while its
+/// tool loop is still in flight. Without the binding the subagent's call is
+/// answered about the parent's newest fork, plausibly and wrongly.
+#[tokio::test]
+async fn a_codex_subagents_thread_id_resolves_its_own_fork() {
+    let rig = rig(control_plane()).await;
+
+    // One `prompt_cache_key` for the whole family, one thread id each.
+    let mut parent = Conversation::from_thread(&key("ada"), "main", "thread-parent");
+    parent.say(&rig, "plan the refactor").await;
+    let mut subagent = Conversation::from_thread(&key("ada"), "main", "thread-child");
+    subagent.say(&rig, "grep for the callers").await;
+    parent.say(&rig, "and now write it up").await;
+
+    let latest = bound(&rig, "acme/ada/main");
+    assert_eq!(
+        latest.as_str(),
+        "acme/ada/main#g2",
+        "the fixture must really have alternated the shared key through three \
+         generations, or the assertions below are about one session"
+    );
+
+    let subagents_call = served(
+        &tools_call_in_thread(&rig, Some(&key("ada")), "status", json!({}), "thread-child").await,
+    );
+    assert_eq!(
+        subagents_call["conversation"],
+        json!("acme/ada/main#g1"),
+        "the subagent's tools/call must reach the fork its own turn produced, \
+         not the parent's newest one ({latest:?})"
+    );
+
+    // The parent's own call still reaches the parent, so the thread table is
+    // telling two threads apart rather than merely preferring an older fork.
+    let parents_call = served(
+        &tools_call_in_thread(
+            &rig,
+            Some(&key("ada")),
+            "status",
+            json!({}),
+            "thread-parent",
+        )
+        .await,
+    );
+    assert_eq!(parents_call["conversation"], json!(latest.as_str()));
+
+    // The control: with no `_meta` at all the guess stands, and it is the
+    // parent's fork — so the first assertion is about the thread id carrying
+    // information and not about there being one answer available.
+    let guessed = served(&tools_call(&rig, Some(&key("ada")), "status", json!({})).await);
+    assert_eq!(guessed["conversation"], json!(latest.as_str()));
+
+    // And the second control, which is why the thread table had to exist: the
+    // subagent's thread id is not a name. A model passing it as the
+    // `conversation` argument is refused, because it was never anyone's cache
+    // key -- the R-M7 named path could not have answered the call above.
+    let refused = refused(
+        &tools_call(
+            &rig,
+            Some(&key("ada")),
+            "status",
+            json!({ "conversation": "thread-child" }),
+        )
+        .await,
+    );
+    assert!(
+        refused.contains("does not belong to this key"),
+        "a subagent's thread id names no conversation of this deployment's; \
+         only the binding its own turn wrote can answer for it: {refused}"
+    );
+}
+
 /// R-M7's refusal, over the real adapter: the model named one conversation and
 /// the client correlated the call to another.
 ///
@@ -2080,8 +2234,8 @@ async fn a_tools_call_whose_argument_fights_its_own_meta_is_refused_naming_both(
     let mut other = Conversation::new(&key("ada"), "other");
     other.say(&rig, "start the linter").await;
 
-    let main_session = rig.conversations.resolve("acme/ada/main");
-    let other_session = rig.conversations.resolve("acme/ada/other");
+    let main_session = bound(&rig, "acme/ada/main");
+    let other_session = bound(&rig, "acme/ada/other");
     rig.conversations
         .bind_call(&ada, "toolu_from_main", main_session.clone());
 

@@ -1063,3 +1063,87 @@ say what exists.
   argument would have decided. Recorded where the order lives; `latest` stays
   lazy. `Caller` became a builder so two adjacent optional correlators cannot
   be transposed, and one reader serves both `_meta` keys.
+
+### What the review round changed (2026-09-02, M12.1)
+
+Nine findings from two lenses, eight valid and one partially valid, every
+one ruled test-first and every fix re-broken. Two of them moved a ruling.
+
+**R-M9 — the thread id is bound where the turn is served, so subagents
+resolve exactly.** R-M7's premise — `_meta.threadId` is byte-identical to
+the turn's `prompt_cache_key` — holds only for a codex *root* thread. At
+the pinned checkout a subagent's turn sends the root's `session_id` as
+`prompt_cache_key` (`agent/control.rs:104-110`, `session.rs:671-676`) while
+stamping its *own* thread id on every `tools/call`, so under R-M7 alone a
+subagent's thread id named nothing and fell through to `latest` — the race
+the rung claimed to close, untouched for the topology that motivated it
+(review F2). The marker that closes it is already on the wire: every codex
+turn carries `x-codex-turn-metadata`, a JSON object whose `thread_id` is the
+turn's own (`responses_metadata.rs:281`, `turn_context.rs:618-622`). The
+Responses ingest binds that id to the session the turn was bound or forked
+to, per principal, in a thread table on `Conversations` — bounded per
+principal like the call table, but with rebinding as the normal case and no
+ambiguous state, because a thread's session legitimately moves on every
+fork. The binding is written in the Responses surface's own `bind`, after
+`bind_prefix` has decided the session, rather than inside `bind_prefix`,
+which the Messages surface shares: a codex header is one dialect's
+vocabulary and does not belong in the one function both dialects must agree
+in. `ControlReads::session_of_thread` is a defaulted read, like
+`session_cursor`, so a deployment without the table is one that never
+binds a thread. The thread arm of the resolver
+reads the table first (exact, no store round trip), then R-M7's named path
+(a root thread's id is its cache key, and a client without the header still
+gets it), then falls through as before. What still falls through, stated:
+a node that never served the thread, and an evicted binding. The header is
+untrusted input — bounded, parsed leniently, used only as a lookup key
+partitioned by principal, never for tenancy.
+
+**A key this node never bound is refused, not guessed at generation zero**
+(F9). `Conversations::resolve` used to answer generation zero for any key
+it had no entry for, which on a node that served none of the conversation's
+turns served a stale pre-fork session with `isError: false` — the quiet
+wrong answer the module doc promised never to give. Never-bound now refuses
+with the same shape as unknown and foreign (the anti-oracle collapse), and
+the doc's "a restart is survivable" paragraph says what it now costs: a
+named call outside any served turn refuses after a restart, exactly as
+`latest` already did.
+
+**The resolver is one provided method** (F1, F4, F5, F8). The order, the
+`ForeignConversation`-only swallow on the thread arm, the contradiction
+refusal and the `NoSession` fallback were spelled in the real reads and
+re-spelled, differently, in both test doubles (`.ok()` swallowed a store
+outage too). `ControlReads` now requires only the table reads and provides
+`resolve_session`; the rationale has one home, in that method's doc, and
+the guard pins it there. An argument and a thread id that are the same
+string resolve once. The correlator pair is one owned `Correlators` type
+carried from the transport to the resolver — the builder M12.1 introduced
+answered a transposition risk that named fields already answer.
+
+**Open, recorded rather than left in an ignored test** (F6): the codex
+real-binary counterpart of R-M8 left `codex_e2e.rs`'s test pool — its
+assertions stay in the file as a plain function, so they are compiled and
+not run. It had been ignored
+for two reasons with a bespoke reason string, so on a box with a codex
+binary the suite's sanctioned `--include-ignored` run failed it by design.
+Unlock conditions, both still true: a scripted upstream that emits the
+namespaced `function_call` codex routes to MCP, and a `Rig` constructor
+that accepts an upstream at all. A guard now pins that every ignore in that
+suite carries the one uniform reason.
+
+Housekeeping: `mcp_api.rs`'s test module moved to a sibling file as the
+crate's other large modules do (F3); the test fake models a store set and a
+`latest` map as two tables rather than a union, and can stage a store
+outage (F7, F1); R-M7's text above named `session_without_a_name`, which
+was the M12 name for what is now the provided `resolve_session`, and the
+"`Caller` became a builder" note above is superseded by F5.
+
+Two things confirmed in passing and handed to the D1/M8 design round rather
+than widened here: after a restart, `bind` re-derives generation zero, a
+client history that disagrees with that log forks to a re-derived `#g1`,
+and the fork arm appends the claimed history whole on the premise that a
+fresh session is empty — false when a pre-restart `#g1` log already holds
+it, so the cost is a duplicated prefix, not a wrong session; and
+`Conversations::generations` now holds one entry per cache key this node
+serves rather than one per key that forked, which is the honest price of
+"never bound" meaning something — the same growth profile the store already
+carries a log for, and process state the durable mapping replaces.

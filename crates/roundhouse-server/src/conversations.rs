@@ -27,6 +27,12 @@
 //!   and that id is one *roundhouse emitted* — so the session that emitted it is
 //!   knowable exactly, with no guess and no race, for as long as one session
 //!   claims it. See [`Conversations::bind_call`] and [`CallTable`].
+//! - **By the thread the client says the call belongs to** (M12.1 review,
+//!   R-M9). Codex stamps `_meta.threadId` on every `tools/call`, and the same
+//!   id rides the turn that opened the thread in the `x-codex-turn-metadata`
+//!   header — so the session a thread is in is knowable exactly, and knowable
+//!   *per thread* where the cache key is shared by a whole agent family. See
+//!   [`Conversations::bind_thread`] and [`ThreadTable`].
 //! - **Not at all.** The MCP surface's `conversation` argument is optional, and
 //!   omitted it means the principal's most recent conversation — which is only
 //!   knowable by having watched the turns go past, which is what
@@ -39,10 +45,22 @@
 //! the Redis store will own (M8). What the choice costs, said plainly: a client
 //! that reconnects to another node keeps its cache key and loses its generation,
 //! which re-derives on the first request that disagrees with the log; and an MCP
-//! call that omits `conversation` on a node that has served none of this
-//! principal's turns is refused as [`SurfaceError::NoSession`] rather than
-//! guessing. Both are refusals or re-derivations, never a wrong session served
+//! call on a node that has served none of this principal's turns is refused
+//! rather than answered — whether it named a conversation, correlated one, or
+//! omitted both. Refusals and re-derivations, never a wrong session served
 //! quietly.
+//!
+//! **That last clause used to be false for a name** (M12.1 review, F9).
+//! [`Conversations::resolve`] answered generation zero for a key this node had
+//! never bound, and a generation-zero id *exists in the shared store* whenever
+//! any node ever created it — so a call landing on a fresh node was served the
+//! pre-fork log with a 200 on it while another node held the conversation the
+//! client was actually in. A key this node holds no binding for is `None` now,
+//! and the surface refuses it exactly as it refuses an unknown or a foreign
+//! name. What survives a restart is a *turn* re-binding its own cache key —
+//! [`Conversations::bind`] still defaults an unknown key to generation zero, so
+//! the common never-forked conversation re-binds to the same log — not a reader
+//! guessing at one on a node that has served it nothing.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
@@ -59,7 +77,15 @@ pub struct Conversations {
 #[derive(Debug, Default)]
 struct Inner {
     /// How many times each *namespaced* cache key's history has failed the
-    /// prefix check.
+    /// prefix check, for every key this node has bound.
+    ///
+    /// **Presence is load-bearing and not merely a counter's storage** (M12.1
+    /// review, F9): an entry means "this node bound this key", which is the
+    /// question [`Conversations::resolve`] refuses on. That is why
+    /// [`Conversations::bind`] writes a zero rather than reading past a
+    /// missing entry — a node serving a never-forked conversation's turns
+    /// would otherwise look, to its own reader, exactly like a node that had
+    /// never heard of it.
     ///
     /// Keyed by the whole namespaced string — `{project}/{user}/{cache_key}`
     /// where there is a namespace, the bare cache key where there is not —
@@ -77,6 +103,9 @@ struct Inner {
     /// Which session emitted each tool call this node has served, per
     /// principal. See [`CallTable`].
     calls: CallTable,
+    /// Which session each client-declared thread is in, per principal. See
+    /// [`ThreadTable`].
+    threads: ThreadTable,
 }
 
 /// Which session emitted each tool call this node has served, remembered per
@@ -210,6 +239,117 @@ impl PrincipalCalls {
     }
 }
 
+/// Which session each client-declared thread is in, remembered per principal
+/// and bounded per principal.
+///
+/// # Why this exists at all when a cache key is already a name
+///
+/// R-M7 read `_meta.threadId` as a `prompt_cache_key`, on a capture where the
+/// two were byte-identical. They are identical only for a codex **root**
+/// thread. At the pinned oracle (`6344a65`) a non-root agent takes its
+/// `session_id` — and therefore its `prompt_cache_key` — from the shared
+/// `AgentControl` (`core/src/agent/control.rs:104-110`, whose own comment says
+/// "every sub-agents from a common root share the same session ID";
+/// `core/src/session/session.rs:671-676` picks it for any non-root source),
+/// while `_meta.threadId` is that agent's *own* `thread_id`
+/// (`core/src/session/turn_context.rs:618-622`). So the whole family names one
+/// cache key and each member names a different thread, and resolving a thread
+/// id as a cache key finds nothing for exactly the callers R-M7 existed to
+/// serve (M12.1 review, F2).
+///
+/// The per-thread marker is on the wire regardless: every turn carries
+/// `x-codex-turn-metadata`, whose `thread_id` field
+/// (`core/src/responses_metadata.rs:281`, `THREAD_ID_KEY`) is that turn's own
+/// thread. The ingest binds it to the session it just decided, and this table
+/// is where that binding lives.
+///
+/// # Why rebinding is the normal case here, where [`CallTable`] calls it a
+/// collision
+///
+/// A tool-call id names one emission for ever, so a second session claiming
+/// one is two callers claiming one name and neither may be answered. A thread
+/// id names a *conversation*, and a conversation legitimately moves: every
+/// fork mints a new session for the same thread, and the turn that forked is
+/// the one the client is in. Remembering an `Ambiguous` state here would
+/// un-answer every thread the moment its client compacted — which is the
+/// ordinary case, not the pathological one — so the latest binding wins and
+/// there is no ambiguous state to reach.
+#[derive(Debug, Default)]
+struct ThreadTable {
+    per_principal: HashMap<Principal, PrincipalThreads>,
+}
+
+/// One principal's remembered threads, oldest-first.
+#[derive(Debug, Default)]
+struct PrincipalThreads {
+    sessions: HashMap<String, SessionId>,
+    /// Insertion order of [`PrincipalThreads::sessions`], so the cap evicts
+    /// the oldest. Exactly one entry per thread, which is this type's
+    /// invariant — a rebinding must not push a second one, or the cap drops a
+    /// key that is still live.
+    order: VecDeque<String>,
+}
+
+impl ThreadTable {
+    /// How many client threads this node remembers the session of, per
+    /// principal.
+    ///
+    /// A cap for [`CallTable::REMEMBERED_CALLS`]' reason — this is written on
+    /// every turn a header rides, so uncapped it is a leak proportional to
+    /// traffic — but an order of magnitude smaller, because the thing counted
+    /// is different: a tool loop emits many calls per conversation, where a
+    /// client has one thread id per conversation and rebinds it in place. What
+    /// losing an entry costs is one MCP call falling back to the R-M7 named
+    /// path and then to `latest`, which is the answer it got before this table
+    /// existed.
+    const REMEMBERED_THREADS: usize = 1024;
+
+    fn bind(&mut self, principal: &Principal, thread_id: &str, session: SessionId) {
+        self.per_principal
+            .entry(principal.clone())
+            .or_default()
+            .bind(thread_id, session);
+    }
+
+    fn session_of(&self, principal: &Principal, thread_id: &str) -> Option<SessionId> {
+        self.per_principal
+            .get(principal)?
+            .sessions
+            .get(thread_id)
+            .cloned()
+    }
+
+    /// How many bindings this table holds for `principal`, and how long its
+    /// eviction queue is. See [`CallTable::sizes`] for why this is one call on
+    /// the owning type rather than two accessors reached through the lock.
+    #[cfg(test)]
+    fn sizes(&self, principal: &Principal) -> (usize, usize) {
+        self.per_principal
+            .get(principal)
+            .map(|threads| (threads.sessions.len(), threads.order.len()))
+            .unwrap_or_default()
+    }
+}
+
+impl PrincipalThreads {
+    fn bind(&mut self, thread_id: &str, session: SessionId) {
+        if let Some(held) = self.sessions.get_mut(thread_id) {
+            // The fork case, and the resend case, and they are the same
+            // write: this thread's newest turn decided this session.
+            *held = session;
+            return;
+        }
+        self.sessions.insert(thread_id.to_string(), session);
+        self.order.push_back(thread_id.to_string());
+        while self.order.len() > ThreadTable::REMEMBERED_THREADS {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.sessions.remove(&oldest);
+        }
+    }
+}
+
 impl Conversations {
     pub fn new() -> Self {
         Self::default()
@@ -223,7 +363,15 @@ impl Conversations {
     /// turn is working in it whether or not the turn went on to succeed.
     pub fn bind(&self, principal: &Principal, key: &str) -> SessionId {
         let mut inner = self.lock();
-        let generation = inner.generations.get(key).copied().unwrap_or(0);
+        // Written rather than read-with-a-default, because the entry's
+        // *presence* is what tells a reader this node bound the key at all
+        // (M12.1 review, F9). A `get(..).unwrap_or(0)` here would leave every
+        // never-forked conversation indistinguishable — to `resolve`, on the
+        // very node serving its turns — from a key this process has never
+        // heard of. The cost is one entry per distinct cache key served
+        // instead of one per key that forked; both are the process state M8's
+        // durable mapping replaces.
+        let generation = *inner.generations.entry(key.to_string()).or_insert(0);
         let session = bound_session(key, generation);
         inner.latest.insert(principal.clone(), session.clone());
         session
@@ -262,7 +410,8 @@ impl Conversations {
         session
     }
 
-    /// The session `key` names now, without claiming to be using it.
+    /// The session `key` names now, without claiming to be using it, or `None`
+    /// for a key this node holds no binding for.
     ///
     /// What a *reader* asks — the MCP surface resolving an explicit
     /// `conversation` argument. Distinct from [`Self::bind`] because an agent
@@ -271,14 +420,18 @@ impl Conversations {
     /// and the tool that omits it would then disagree about what "most recent"
     /// means, in an order the agent chose.
     ///
-    /// Generation zero for a key this node has never bound, which is the same
-    /// answer [`Self::bind`] would give and the reason a restart is survivable:
-    /// the common case is a conversation that never forked, and it re-binds to
-    /// the same log.
-    pub fn resolve(&self, key: &str) -> SessionId {
+    /// **`None` and not generation zero for an unbound key** (M12.1 review,
+    /// F9). Zero is what [`Self::bind`] would mint, but a reader minting it is
+    /// not the same act as a turn minting it: the store is shared across
+    /// nodes, so a generation-zero id exists there whenever *any* node ever
+    /// created it, and answering with one on a node that bound nothing hands
+    /// the caller a superseded log that another node has already forked away
+    /// from — quietly, with a 200 on it. A reader that does not know refuses;
+    /// see the module doc.
+    pub fn resolve(&self, key: &str) -> Option<SessionId> {
         let inner = self.lock();
-        let generation = inner.generations.get(key).copied().unwrap_or(0);
-        bound_session(key, generation)
+        let generation = *inner.generations.get(key)?;
+        Some(bound_session(key, generation))
     }
 
     /// The last session this principal drove a turn on, on this node.
@@ -323,6 +476,39 @@ impl Conversations {
     /// than the fallback.
     pub fn session_of_call(&self, principal: &Principal, call_id: &str) -> Option<SessionId> {
         self.lock().calls.session_of(principal, call_id)
+    }
+
+    /// Remember that `principal`'s thread `thread_id` is in `session`.
+    ///
+    /// **Written by the turn ingest, from the client's own header**, because
+    /// that is the one moment both halves are in one place: the surface has
+    /// just decided which session this turn's history belongs to, and the
+    /// request that carried the history also carried the thread it came from.
+    /// Nothing later can reconstruct the pairing — the thread id is not in the
+    /// log, and the cache key that is in it is the whole agent family's rather
+    /// than this thread's (see [`ThreadTable`]).
+    ///
+    /// Rebinding is ordinary and the latest write wins: a fork moves a thread
+    /// to a new session, and the thread is then in the new one.
+    ///
+    /// Deliberately *not* a claim about [`Self::latest`], for
+    /// [`Self::bind_call`]'s reason turned around: the ingest that calls this
+    /// has already moved `latest` for the turn it is serving, and moving it a
+    /// second time from a subagent's header is how the parent's next unnamed
+    /// call gets redirected.
+    pub fn bind_thread(&self, principal: &Principal, thread_id: &str, session: SessionId) {
+        self.lock().threads.bind(principal, thread_id, session);
+    }
+
+    /// The session `principal`'s thread `thread_id` is in, if this node served
+    /// a turn of it.
+    ///
+    /// A foreign thread id and an unknown one answer alike, for the reason
+    /// [`Self::session_of_call`] spells out at length: the caller has no use
+    /// for another tenant's session, so distinguishing the two would buy an
+    /// enumeration oracle and nothing else.
+    pub fn session_of_thread(&self, principal: &Principal, thread_id: &str) -> Option<SessionId> {
+        self.lock().threads.session_of(principal, thread_id)
     }
 
     /// The lock, in one place.
@@ -371,13 +557,26 @@ mod tests {
         let conversations = Conversations::new();
         let key = "acme/ada/main";
 
-        assert_eq!(conversations.bind(&ada(), key), conversations.resolve(key));
+        // F9 (M12.1 review): before a turn has bound it, the key names nothing
+        // *here* — not generation zero, which is a real session id in the
+        // shared store the moment any node mints it.
+        assert_eq!(
+            conversations.resolve(key),
+            None,
+            "a reader on a node that has bound nothing must say so rather \
+             than mint the id another node's first turn would have minted"
+        );
+
+        assert_eq!(
+            Some(conversations.bind(&ada(), key)),
+            conversations.resolve(key)
+        );
 
         let forked = conversations.fork(&ada(), key);
         assert_eq!(forked.as_str(), "acme/ada/main#g1");
         assert_eq!(
             conversations.resolve(key),
-            forked,
+            Some(forked.clone()),
             "a rebound key stays rebound: a reader that kept answering \
              generation zero would narrow a session no turn will run in"
         );
@@ -505,7 +704,11 @@ mod tests {
         );
 
         conversations.bind(&ada(), "acme/ada/main");
-        conversations.resolve("acme/ada/other");
+        assert_eq!(
+            conversations.resolve("acme/ada/other"),
+            None,
+            "and a read of a key nothing has bound is a read all the same"
+        );
         assert_eq!(
             conversations.latest(&ada()).unwrap().as_str(),
             "acme/ada/main",
@@ -578,5 +781,100 @@ mod tests {
              is still exactly right"
         );
         assert_eq!(conversations.lock().calls.sizes(&ada()), (1, 1));
+    }
+
+    /// R-M9 (M12.1 review, F2): a thread is in the session its own latest turn
+    /// decided, and the thread's family sharing one cache key does not change
+    /// that.
+    ///
+    /// The topology is the oracle's: parent and subagent send one
+    /// `prompt_cache_key` and two `thread_id`s, so the cache key forks under
+    /// them while each thread stays pinned to the fork its own turn produced.
+    #[test]
+    fn a_thread_is_in_the_session_its_own_latest_turn_decided() {
+        let conversations = Conversations::new();
+        let key = "acme/ada/main";
+
+        let parent_g0 = conversations.bind(&ada(), key);
+        conversations.bind_thread(&ada(), "thread-parent", parent_g0.clone());
+        let child_g1 = conversations.fork(&ada(), key);
+        conversations.bind_thread(&ada(), "thread-child", child_g1.clone());
+        let parent_g2 = conversations.fork(&ada(), key);
+        conversations.bind_thread(&ada(), "thread-parent", parent_g2.clone());
+
+        assert_eq!(
+            conversations.session_of_thread(&ada(), "thread-child"),
+            Some(child_g1),
+            "the subagent's thread stays in the fork its own turn produced, \
+             however far the shared cache key has moved since — this is the \
+             whole of F2"
+        );
+        assert_eq!(
+            conversations.session_of_thread(&ada(), "thread-parent"),
+            Some(parent_g2.clone()),
+            "and a thread that forked is in the session it forked *to*: the \
+             latest binding wins, where a colliding call id is refused"
+        );
+        assert_eq!(
+            conversations.session_of_thread(&bob(), "thread-child"),
+            None,
+            "another tenant presenting the id learns nothing from it"
+        );
+        assert_eq!(
+            conversations.session_of_thread(&ada(), "thread-never-seen"),
+            None,
+            "and a thread this node never served answers exactly as a foreign \
+             one does"
+        );
+
+        // Binding a thread is not a claim about who is working where: the
+        // ingest has already moved `latest` for the turn it is serving.
+        assert_eq!(conversations.latest(&ada()), Some(parent_g2));
+    }
+
+    /// The thread cap evicts oldest-first, and a rebinding does not spend a
+    /// queue slot.
+    ///
+    /// The second half is the one with teeth: rebinding is the *ordinary* case
+    /// here (every fork rebinds), so a `bind` that pushed a second order entry
+    /// would evict live threads at a rate set by how often clients compact.
+    #[test]
+    fn the_thread_table_is_capped_and_a_rebinding_does_not_grow_its_queue() {
+        let conversations = Conversations::new();
+        let session = conversations.bind(&ada(), "acme/ada/main");
+        for n in 0..=ThreadTable::REMEMBERED_THREADS {
+            conversations.bind_thread(&ada(), &format!("thread-{n}"), session.clone());
+        }
+
+        assert_eq!(
+            conversations.session_of_thread(&ada(), "thread-0"),
+            None,
+            "the oldest binding is the one the cap gives up"
+        );
+        assert_eq!(
+            conversations.session_of_thread(
+                &ada(),
+                &format!("thread-{}", ThreadTable::REMEMBERED_THREADS)
+            ),
+            Some(session),
+            "and the newest is kept, which is the thread a live tool loop is \
+             about to answer"
+        );
+        assert_eq!(
+            conversations.lock().threads.sizes(&ada()),
+            (
+                ThreadTable::REMEMBERED_THREADS,
+                ThreadTable::REMEMBERED_THREADS
+            )
+        );
+
+        let forked = conversations.fork(&ada(), "acme/ada/main");
+        conversations.bind_thread(&ada(), "thread-1", forked.clone());
+        let (held, ordered) = conversations.lock().threads.sizes(&ada());
+        assert_eq!(ordered, held);
+        assert_eq!(
+            conversations.session_of_thread(&ada(), "thread-1"),
+            Some(forked)
+        );
     }
 }

@@ -77,7 +77,7 @@ use serde_json::{Value, json};
 
 use roundhouse_core::control::Principal;
 
-use crate::surface::{Caller, ControlSurface, SurfaceError, ToolOutcome};
+use crate::surface::{Caller, ControlSurface, Correlators, SurfaceError, ToolOutcome};
 
 /// Every tool this surface serves, in the order it lists them.
 ///
@@ -126,27 +126,17 @@ pub struct ToolCall {
     /// The raw arguments object. `Value::Null` for a call that sent none,
     /// which every tool with only optional fields accepts.
     pub arguments: Value,
-    /// `_meta.threadId`, when the client sent one (M12.1, R-M7).
+    /// Whatever the client attached on `params._meta` (M12, R-M2; M12.1,
+    /// R-M7).
     ///
-    /// The conversation the *client* says this call is in — Codex stamps it on
-    /// every `tools/call` and it is that turn's `prompt_cache_key`, so it
-    /// resolves as a name through the caller's own namespace. `None` for a
-    /// client that sends no such key, which is Claude Code.
-    pub thread_id: Option<String>,
-    /// `_meta["claudecode/toolUseId"]`, when the client sent one (M12, R-M2).
-    ///
-    /// **Beside the arguments and not inside them**, and the same goes for
-    /// [`Self::thread_id`]. The arguments are what the *model* wrote and are
-    /// checked against a published schema; these are what the *client*
-    /// attached, one naming the `tool_use` block roundhouse emitted and is now
-    /// being answered for, one naming the thread it is running. Folding either
-    /// into `arguments` would put a property in eight schemas that no model
-    /// should ever fill in — and `deny_unknown_fields` would refuse the honest
-    /// client that sent it.
-    ///
-    /// `None` for every client that sends no such key, which is every client
-    /// but Claude Code.
-    pub tool_use_id: Option<String>,
+    /// **Beside the arguments and not inside them.** The arguments are what
+    /// the *model* wrote and are checked against a published schema; these are
+    /// what the *client* attached, one naming the `tool_use` block roundhouse
+    /// emitted and is now being answered for, one naming the thread it is
+    /// running. Folding either into `arguments` would put a property in eight
+    /// schemas that no model should ever fill in — and `deny_unknown_fields`
+    /// would refuse the honest client that sent it.
+    pub correlators: Correlators,
 }
 
 /// The conversation property, repeated by every session-scoped tool.
@@ -392,9 +382,7 @@ async fn dispatch_inner(
     // would answer about the principal's most recent conversation instead of
     // the one it was called from, and it would answer *plausibly* — which is
     // the failure R-M2 exists to remove and the hardest kind to notice.
-    let caller = Caller::new(principal.clone())
-        .in_thread(call.thread_id)
-        .answering(call.tool_use_id);
+    let caller = Caller::correlated(principal.clone(), call.correlators);
     // An absent arguments object and an empty one mean the same thing, and a
     // client is free to send either. Normalizing here rather than in eight
     // `#[serde(default)]`-shaped workarounds keeps the request types describing
@@ -493,8 +481,7 @@ mod tests {
                 arguments: Value::Object(probe),
                 // The schemas are what a *model* fills in; the correlation ids
                 // are not among their properties and never should be.
-                thread_id: None,
-                tool_use_id: None,
+                correlators: Correlators::default(),
             };
             let decoded = decode_probe(&call);
             assert!(
@@ -568,8 +555,7 @@ mod tests {
             let empty = ToolCall {
                 name: tool.name.to_string(),
                 arguments: json!({}),
-                thread_id: None,
-                tool_use_id: None,
+                correlators: Correlators::default(),
             };
             assert_eq!(
                 decode_probe(&empty).is_err(),

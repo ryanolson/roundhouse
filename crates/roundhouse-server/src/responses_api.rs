@@ -353,7 +353,13 @@ where
         request.tool_choice.as_ref(),
     );
     let (session_id, input) = state
-        .bind(&plane, &admission.principal, cache_key, claimed)
+        .bind(
+            &plane,
+            &admission.principal,
+            cache_key,
+            codex_thread_id(&headers).as_deref(),
+            claimed,
+        )
         .await?;
 
     // Read before the spawn, for the reason `http` gives: an event appended
@@ -447,9 +453,10 @@ impl<S: SessionStore, T: Tokenizer + Clone + Send + Sync + 'static> Compat<S, T>
         plane: &ControlPlane,
         principal: &Principal,
         cache_key: &str,
+        thread_id: Option<&str>,
         claimed: Vec<Item>,
     ) -> Result<(SessionId, Vec<Item>), ApiError> {
-        bind_prefix(
+        let (session_id, delta) = bind_prefix(
             &self.engine,
             &self.store,
             &self.conversations,
@@ -458,8 +465,77 @@ impl<S: SessionStore, T: Tokenizer + Clone + Send + Sync + 'static> Compat<S, T>
             cache_key,
             claimed,
         )
-        .await
+        .await?;
+        // R-M9 (M12.1 review, F2): the one moment the client's thread and the
+        // session it is in are both in hand. `bind_prefix` has just decided
+        // which session this turn's history belongs to — including the fork,
+        // which is what makes recording it here rather than before the call
+        // load-bearing — and the request that carried the history also carried
+        // the thread it came from.
+        //
+        // Here rather than inside `bind_prefix`, which the Messages surface
+        // shares: a thread id is a *codex* correlator arriving on a codex
+        // header, and the other dialect's clients correlate by the tool-use id
+        // this deployment emitted. Threading an always-`None` argument through
+        // the shared prefix-admission function would put one dialect's
+        // vocabulary in the one place both dialects have to agree.
+        if let Some(thread_id) = thread_id {
+            self.conversations
+                .bind_thread(principal, thread_id, session_id.clone());
+        }
+        Ok((session_id, delta))
     }
+}
+
+/// The header codex carries its per-turn metadata in.
+const CODEX_TURN_METADATA_HEADER: &str = "x-codex-turn-metadata";
+
+/// The largest turn-metadata header this surface will parse.
+///
+/// Untrusted input: anything may set this header, so the work of parsing it is
+/// work an unauthenticated-shaped request could ask for repeatedly. Real ones
+/// are well under this — codex omits its unbounded tool inventory from the
+/// header form precisely to keep it bounded
+/// (`core/src/responses_metadata.rs::compatibility_headers` @ `6344a65`) — and
+/// what a client loses by exceeding it is one exact correlation, falling back
+/// to the R-M7 name path and then to `latest`.
+const MAX_TURN_METADATA_BYTES: usize = 16 * 1024;
+
+/// The longest thread id worth remembering. Codex's are UUIDs; this is a bound
+/// on what a caller can make this node store as a map key, not a format check.
+const MAX_THREAD_ID_BYTES: usize = 256;
+
+/// The thread this turn belongs to, as codex declares it.
+///
+/// **Why a header rather than the body's `prompt_cache_key`** (M12.1 review,
+/// F2, R-M9). At the pinned oracle (`6344a65`) the cache key is
+/// `responses_metadata.session_id` (`core/src/client.rs`'s `prompt_cache_key`),
+/// and every subagent of an agent family shares the root's — `AgentControl`'s
+/// own comment says so (`core/src/agent/control.rs:104-110`), and
+/// `core/src/session/session.rs:671-676` is where a non-root source takes it.
+/// The per-thread id rides the turn separately: `THREAD_ID_KEY` puts
+/// `self.thread_id` into the `x-codex-turn-metadata` payload
+/// (`core/src/responses_metadata.rs:281`, built from the per-session
+/// `TurnMetadataState` at `core/src/session/turn_context.rs:618-622`). So this
+/// header is the only thing on the wire that tells a subagent's turn from its
+/// parent's, and it is exactly what `_meta.threadId` will later quote back.
+///
+/// **Read leniently and used only as a lookup key.** Absent, non-UTF-8,
+/// oversized, not JSON, no `thread_id`, or a `thread_id` that is not a
+/// non-empty bounded string all mean the same thing — bind nothing — because
+/// this is an optimization over a fall-back that already works, and a turn
+/// must never be refused over metadata it did not have to send. It is never a
+/// tenancy claim and never part of a session id: the binding it makes is
+/// partitioned by the principal the *bearer key* resolved to, so a forged
+/// header can only name a thread inside its own sender's namespace.
+fn codex_thread_id(headers: &HeaderMap) -> Option<String> {
+    let raw = headers.get(CODEX_TURN_METADATA_HEADER)?.to_str().ok()?;
+    if raw.len() > MAX_TURN_METADATA_BYTES {
+        return None;
+    }
+    let metadata: Value = serde_json::from_str(raw).ok()?;
+    let thread_id = metadata.get("thread_id")?.as_str()?;
+    (!thread_id.is_empty() && thread_id.len() <= MAX_THREAD_ID_BYTES).then(|| thread_id.to_string())
 }
 
 /// Resolve a cache key to the session holding its history, and to the part of
@@ -1367,9 +1443,99 @@ impl<S: SessionStore, T: Tokenizer + Clone + Send + Sync + 'static> ResponsesFol
 
 #[cfg(test)]
 mod tests {
+    use axum::http::HeaderValue;
     use roundhouse_core::item::Role;
 
     use super::*;
+
+    fn turn_metadata(raw: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CODEX_TURN_METADATA_HEADER,
+            HeaderValue::from_str(raw).expect("a header value fixture"),
+        );
+        headers
+    }
+
+    /// R-M9 (M12.1 review, F2): the ingest reads the turn's *own* thread out of
+    /// codex's header, and reads nothing else out of it.
+    ///
+    /// The first assertion is the one with teeth. The payload carries
+    /// `session_id` — the whole agent family's, and the string that becomes
+    /// `prompt_cache_key` — right beside `thread_id`, so a reader that took
+    /// the wrong field would bind every subagent to its parent and F2 would be
+    /// re-openable with everything green.
+    #[test]
+    fn the_turn_metadata_header_yields_this_turns_own_thread_and_only_that() {
+        let headers = turn_metadata(
+            &serde_json::json!({
+                "session_id": "shared-family-session",
+                "thread_id": "this-agents-thread",
+                "turn_id": "t1",
+            })
+            .to_string(),
+        );
+        assert_eq!(
+            codex_thread_id(&headers).as_deref(),
+            Some("this-agents-thread"),
+            "the per-thread field, never the family-wide `session_id` sitting \
+             next to it"
+        );
+    }
+
+    /// The same header, read leniently: everything malformed binds nothing,
+    /// and nothing refuses a turn.
+    ///
+    /// **Untrusted input, and the cost of getting it wrong is asymmetric.**
+    /// The binding is an optimization over a fall-back that already works, so
+    /// a header this function cannot make sense of must cost the client its
+    /// exactness and never its turn. Each case below is a way an attacker — or
+    /// a future codex — could send one.
+    #[test]
+    fn a_turn_metadata_header_this_surface_cannot_read_binds_nothing_and_refuses_nothing() {
+        assert_eq!(codex_thread_id(&HeaderMap::new()), None, "absent");
+        assert_eq!(codex_thread_id(&turn_metadata("not json")), None);
+        assert_eq!(
+            codex_thread_id(&turn_metadata(r#"{"session_id":"s"}"#)),
+            None,
+            "a payload with no `thread_id` at all"
+        );
+        assert_eq!(
+            codex_thread_id(&turn_metadata(r#"{"thread_id":42}"#)),
+            None,
+            "a `thread_id` that is not a string"
+        );
+        assert_eq!(
+            codex_thread_id(&turn_metadata(r#"{"thread_id":""}"#)),
+            None,
+            "an empty one, which would otherwise be a name every client shares"
+        );
+        assert_eq!(
+            codex_thread_id(&turn_metadata(
+                &serde_json::json!({ "thread_id": "t".repeat(MAX_THREAD_ID_BYTES + 1) })
+                    .to_string()
+            )),
+            None,
+            "and one longer than this node will store as a map key"
+        );
+
+        // The oversized-payload arm, which is the one that bounds *work* rather
+        // than storage: a caller must not be able to make this surface parse
+        // an arbitrarily large JSON document per turn.
+        let bloat = serde_json::json!({
+            "thread_id": "real-thread",
+            "workspaces": "w".repeat(MAX_TURN_METADATA_BYTES),
+        })
+        .to_string();
+        assert!(bloat.len() > MAX_TURN_METADATA_BYTES);
+        assert_eq!(
+            codex_thread_id(&turn_metadata(&bloat)),
+            None,
+            "over the cap the header is not parsed at all, even though a valid \
+             `thread_id` is in there — the client loses one exact correlation \
+             and keeps its turn"
+        );
+    }
 
     fn user(text: &str) -> Item {
         Item::user_text(text)

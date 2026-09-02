@@ -1533,16 +1533,15 @@ async fn a_key_revoked_between_runs_fails_the_next_turn_and_leaves_no_half_writt
 /// **R-M7's real-binary counterpart: a real codex stamps `_meta.threadId`, and
 /// roundhouse answers the conversation it names.**
 ///
-/// **Ignored, and for two reasons rather than one.** The first is this box:
-/// there is no codex binary on it, so every test in this suite is ignored by
-/// default. The second is the T7 ruling above and it does not lift with a
-/// binary — a run of this rig produces no `tools/call` at all, because the
-/// upstream double is [`EchoFrontierClient`] and this deployment's
-/// `/v1/responses` stream carries assistant text and nothing else, so no turn
-/// it serves can ask a model to call a tool. **Both** conditions have to
-/// change before this can go green:
+/// **Not a `#[test]`, and for two reasons rather than one (M12.1 review, F6).**
+/// The first is this box: there is no codex binary on it. The second is the T7
+/// ruling above and it does not lift with a binary — a run of this rig
+/// produces no `tools/call` at all, because the upstream double is
+/// [`EchoFrontierClient`] and this deployment's `/v1/responses` stream carries
+/// assistant text and nothing else, so no turn it serves can ask a model to
+/// call a tool. **Three** things have to exist before this can run for real:
 ///
-/// 1. a real `codex` on `PATH` or `ROUNDHOUSE_TEST_CODEX_BIN`, and
+/// 1. a real `codex` on `PATH` or `ROUNDHOUSE_TEST_CODEX_BIN`;
 /// 2. an upstream that emits a tool call this client will dispatch — which for
 ///    codex means a *namespaced* one, because `namespace_tools` defaults on and
 ///    the tools reach the model under the `mcp{DELIMITER}roundhouse` namespace
@@ -1551,25 +1550,40 @@ async fn a_key_revoked_between_runs_fails_the_next_turn_and_leaves_no_half_writt
 ///    for the citations). `common::ScriptedTurns` is the double that would do
 ///    it; what nothing in this tree has yet established is the exact wire shape
 ///    of a namespaced `function_call` that codex 0.146.0 will route to MCP, and
-///    guessing it here would produce an ignored test that is confidently wrong.
+///    guessing it here would produce a test that is confidently wrong; and
+/// 3. a way to hand that upstream to [`Rig`] — `Rig::start`/`Rig::start_as`
+///    hard-code `Arc::new(EchoFrontierClient::new(ANSWER))` with no parameter
+///    or constructor to swap it (F6's refuter isolated this: the finding's own
+///    text named condition 2 as the gap, but no seam through which a finished
+///    `ScriptedTurns` could reach this rig exists either).
 ///
-/// Written now rather than when both land because the *assertions* are what the
-/// milestone owes: this is the one claim only a real binary can make — that the
-/// key R-M7 reads is a key the client actually sends, on the call it actually
-/// makes, with the value we believe it has. Until then the claim is pinned
+/// **Why this is a plain function and not `#[ignore]`.** Every other ignored
+/// test in this file shares one reason ("needs the real codex binary") and
+/// goes green the moment a binary is on `PATH`; `--include-ignored` is this
+/// suite's sanctioned invocation and is meant to report "N pass" once that
+/// binary exists. This function fails *even with* a real binary, for the two
+/// reasons above, so leaving it live under a bespoke `#[ignore]` reason would
+/// turn that sanctioned run into "N pass, one fails by design" the day someone
+/// finally supplies a codex — the false pass count F6 named. The assertions
+/// stay, uncalled, because they are the one claim only a real binary can make
+/// (that the key R-M7 reads is a key the client actually sends, on the call it
+/// actually makes, with the value we believe it has); they return the moment
+/// conditions (2) and (3) both land. Until then the claim is pinned
 /// hermetically at three seams, none of which can see a real client:
 /// `roundhouse_mcp::reads`'s unit tests hold the order,
 /// `roundhouse-mcp/tests/tool_surface.rs` holds the dispatch chain, and
 /// `roundhouse-server/tests/mcp_surface.rs` holds `rmcp`'s `_meta` stripping
 /// against a Codex-shaped envelope this file's F09 capture supplied.
-///
-/// **It fails loudly rather than passing vacuously** if condition (2) is unmet:
-/// the first assertion is that exactly one `tools/call` reached the surface, so
-/// a run against the echo upstream reports "no tool call was dispatched" rather
-/// than finding nothing and agreeing with itself.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs the real codex binary AND an upstream that emits a namespaced tool call; \
-            see the doc comment -- neither exists on this box, so this cannot run here"]
+/// `review_m12_1_f6.rs` guards that every `#[ignore]` left in this file keeps
+/// the one uniform reason, so a function like this one cannot quietly grow an
+/// `#[ignore]` of its own again.
+#[allow(
+    dead_code,
+    reason = "F6: kept uncalled until conditions (2) and (3) \
+    above exist; deleting it would lose the one claim only a real binary can \
+    make, and re-adding `#[ignore]` is exactly the false-pass-count shape F6 \
+    found"
+)]
 async fn a_real_codex_binary_is_correlated_by_the_thread_id_it_stamps() {
     let rig = Rig::start("thread-id").await;
     let run = rig

@@ -59,7 +59,7 @@ use rmcp::{RoleServer, ServerHandler};
 
 use roundhouse_core::control::Principal;
 
-use crate::surface::{ControlSurface, ToolOutcome};
+use crate::surface::{ControlSurface, Correlators, ToolOutcome};
 use crate::tools::{ToolCall, descriptors};
 
 /// The MCP endpoint, bound to one [`ControlSurface`].
@@ -144,10 +144,9 @@ impl RoundhouseMcp {
     /// A bare key rather than a namespaced one is worth noting, not fixing:
     /// MCP's `_meta` reserves namespaced keys for the sender's own use, and an
     /// unnamespaced one is a name any client could collide with. Reading it is
-    /// safe regardless because what it resolves *through* is the caller's own
-    /// namespace — a client that meant something else by `threadId` names a
-    /// conversation this caller does not hold, and falls through as an unknown
-    /// correlator rather than reaching another tenant's session.
+    /// safe regardless, for the reason
+    /// [`ControlReads::resolve_session`](crate::reads::ControlReads::resolve_session)
+    /// states about a correlator that names nothing of this caller's.
     const THREAD_ID_META: &'static str = "threadId";
 
     /// The `tool_use` block this call is answering, if the client named one.
@@ -186,12 +185,20 @@ impl RoundhouseMcp {
     /// `context.meta` and the other `request.meta`, which is exactly the
     /// mistake the doc above exists to warn about and which no test on either
     /// key alone would catch.
+    ///
+    /// **The empty-string normalisation is here and nowhere else** (M12.1
+    /// review, F5). An empty value is not an id, and it is what a client
+    /// sending the key with nothing in it would otherwise resolve *by*: an
+    /// empty lookup key can only miss, but it would have looked deliberate in
+    /// a trace. Normalised to absence at the one door these ids enter by,
+    /// rather than once per correlator further in.
     fn meta_string(context: &RequestContext<RoleServer>, key: &str) -> Option<String> {
         context
             .meta
             .get(key)
             .and_then(|value| value.as_str())
             .map(str::to_string)
+            .filter(|id| !id.is_empty())
     }
 
     /// Who is calling, from the extensions the HTTP layer filled in.
@@ -289,8 +296,10 @@ impl ServerHandler for RoundhouseMcp {
                 .arguments
                 .map(serde_json::Value::Object)
                 .unwrap_or(serde_json::Value::Null),
-            thread_id: Self::thread_id(&context),
-            tool_use_id: Self::tool_use_id(&context),
+            correlators: Correlators {
+                thread_id: Self::thread_id(&context),
+                tool_use_id: Self::tool_use_id(&context),
+            },
         };
         let outcome = crate::tools::dispatch(self.surface.as_ref(), &principal, call).await;
         Ok(CallToolResponse::Complete(into_result(outcome)))
