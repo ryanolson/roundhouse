@@ -105,15 +105,18 @@ pub enum LaunchError {
          the profile names, instrumented by nothing. Use `topham relay {name}`"
     )]
     WrongTopology { name: String },
-    #[error("could not write {path}: {source}")]
+    #[error("could not write {path}")]
     Write {
         path: PathBuf,
+        /// The cause rather than part of the sentence above: a message that
+        /// inlines its own source prints it twice through
+        /// [`crate::cli::error_chain`], which is the stutter F5 is about.
         #[source]
         source: std::io::Error,
     },
     #[error(
-        "could not execute `{program}`: {source}. Nothing was launched -- the generated files, if \
-         any, are already written and are what the next attempt will overwrite"
+        "could not execute `{program}`. Nothing was launched -- the generated files, if any, are \
+         already written and are what the next attempt will overwrite"
     )]
     Exec {
         program: String,
@@ -207,6 +210,17 @@ pub(crate) fn layered(
 /// launch, so an edit made to the file instead of to the profile lasts exactly
 /// one run. The alternative — refusing to overwrite — would make the second
 /// launch of every profile fail.
+///
+/// # Written beside and renamed over, never truncated in place
+///
+/// Two launches of one profile write the same paths, and the first one's client
+/// is by then an `exec`'d process that may still be opening its `config.toml`
+/// (F21). A plain write truncates the inode that reader holds, so the client
+/// reads a half-file or an empty one — and codex answers an empty config by
+/// falling back to a *default openai provider*, in a child that was handed the
+/// whole ambient environment, `OPENAI_API_KEY` included. A rename within a
+/// directory is atomic, so the reader either has the old file whole or opens
+/// the new one; nobody sees a torn one.
 pub fn write_files(plan: &LaunchPlan) -> Result<(), LaunchError> {
     for (path, contents) in &plan.files {
         if let Some(parent) = path.parent() {
@@ -215,12 +229,43 @@ pub fn write_files(plan: &LaunchPlan) -> Result<(), LaunchError> {
                 source,
             })?;
         }
-        std::fs::write(path, contents).map_err(|source| LaunchError::Write {
+        let failed = |source| LaunchError::Write {
             path: path.clone(),
             source,
-        })?;
+        };
+        // Beside the target rather than in the system temp directory: `rename`
+        // is only atomic within one filesystem, and a scratch root on a
+        // different mount would turn this back into a copy-and-truncate.
+        let staged = staging_path(path);
+        std::fs::write(&staged, contents).map_err(failed)?;
+        if let Err(source) = std::fs::rename(&staged, path) {
+            let _ = std::fs::remove_file(&staged);
+            return Err(failed(source));
+        }
     }
     Ok(())
+}
+
+/// A name beside `path` that no concurrent launch is using.
+///
+/// The process id distinguishes two launches racing on one profile, and the
+/// counter distinguishes the files within one launch — together they are what
+/// keeps the staging file of one launch from being renamed over by another
+/// before its own rename lands.
+fn staging_path(path: &std::path::Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let staged = format!(
+        ".{name}.{}.{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    );
+    match path.parent() {
+        Some(parent) => parent.join(staged),
+        None => PathBuf::from(staged),
+    }
 }
 
 /// What actually starts the child.

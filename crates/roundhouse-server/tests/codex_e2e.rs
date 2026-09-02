@@ -202,8 +202,9 @@ mod common;
 // `claude_e2e.rs` when that suite was written, and the copies drifted inside one
 // milestone. One rig, two clients.
 use common::e2e::{
-    Exchange, PROJECT, Recorder, USER, bootstrap, clean, fork_probe, reachable, record,
-    version_probe,
+    Exchange, PROJECT, Recorder, TOPHAM_BIN_VAR, TOPHAM_PROFILE, USER, bootstrap, clean,
+    fork_probe, path_with, reachable, record, topham_binary, topham_version, version_probe,
+    write_profile, xdg,
 };
 use common::frontier_catalog;
 use common::validate::{AlwaysFires, OFF_TRACK, ScriptedJudge, judge_spec, open_trigger};
@@ -262,15 +263,6 @@ const CHILD_DEADLINE: Duration = Duration::from_secs(60);
 
 /// The environment variable that overrides which binary is driven.
 const CODEX_BIN_VAR: &str = "ROUNDHOUSE_TEST_CODEX_BIN";
-
-/// The environment variable naming the built `topham` the closure test drives.
-const TOPHAM_BIN_VAR: &str = "ROUNDHOUSE_TEST_TOPHAM_BIN";
-
-/// The profile name the closure test writes and resolves.
-///
-/// One name is enough because each test owns a rig, and therefore an isolated
-/// `XDG_CONFIG_HOME`: two tests holding this name mean two different files.
-const TOPHAM_PROFILE: &str = "e2e";
 
 /// The refusal a revoked turn key earns, in both of the shapes F15 asserts on.
 ///
@@ -837,50 +829,26 @@ impl Rig {
         .await
     }
 
-    /// One of this run's isolated XDG directories, created.
-    ///
-    /// `topham` resolves its profiles from `XDG_CONFIG_HOME` and its
-    /// per-profile `CODEX_HOME` from `XDG_DATA_HOME`, so a run that inherited
-    /// either would read a developer's profiles and write a generated
-    /// `config.toml` into their real data directory.
+    /// One of this run's isolated XDG directories, created — [`xdg`] under the
+    /// rig's own root, which is the only part of it a rig supplies.
     fn xdg(&self, what: &str) -> PathBuf {
-        let path = self.root.join("xdg").join(what);
-        std::fs::create_dir_all(&path).expect("the run's XDG directory");
-        path
+        xdg(&self.root, what)
     }
 
-    /// Write the launch profile a `topham` child resolves, and answer with its
-    /// path.
+    /// This rig's deployment, as the profile vocabulary spells it — the file
+    /// written and its path answered by [`write_profile`], the one copy both
+    /// real-binary suites now share (M11.3 review F18).
     ///
-    /// **Hand-written TOML rather than `Profile::to_toml`**: `topham`'s own
-    /// suite proves that what its `save` writes its `load` reads, which is two
-    /// functions agreeing. What only this file can claim is that the file *an
-    /// operator types*, from the vocabulary the README documents, resolves into
-    /// a launch a real client hooks up with — and a fixture built by the
-    /// serializer would agree with a renamed field on both sides and say
-    /// nothing.
-    ///
-    /// The `deployment-root` is the **root**, with no `/v1`: the launcher
-    /// derives codex's prefixed `base_url` from it, the same derivation
-    /// [`CodexLaunch::new`] refuses to have skipped. The absence of any key is
-    /// as load-bearing as anything present.
+    /// The `deployment-root` handed over is the **root**, with no `/v1`: the
+    /// launcher derives codex's prefixed `base_url` from it, the same
+    /// derivation [`CodexLaunch::new`] refuses to have skipped.
     fn write_profile(&self) -> PathBuf {
-        let directory = self.xdg("config").join("topham").join("profiles");
-        std::fs::create_dir_all(&directory).expect("the run's profiles directory");
-        let path = directory.join(format!("{TOPHAM_PROFILE}.toml"));
-        std::fs::write(
-            &path,
-            format!(
-                "agent = \"codex\"\n\
-                 deployment-root = \"{}\"\n\
-                 auth = \"roundhouse-key\"\n\
-                 key-env = \"{DEFAULT_KEY_ENV}\"\n\
-                 topology = \"direct\"\n",
-                self.deployment_root
-            ),
+        write_profile(
+            &self.xdg("config"),
+            "codex",
+            &self.deployment_root,
+            "direct",
         )
-        .expect("the run's launch profile");
-        path
     }
 
     /// Drive the real client through a real `topham launch`, and answer with
@@ -1051,66 +1019,6 @@ async fn drive_child(
         stderr,
         success: output.status.success(),
         last_message: std::fs::read_to_string(last_message).unwrap_or_default(),
-    }
-}
-
-/// The built `topham` the closure test drives, or a loud panic naming the
-/// variable that would have said where it is.
-///
-/// No `PATH` fallback, unlike [`CODEX_BIN_VAR`]: `topham` is this workspace's
-/// own binary and is installed nowhere, so a bare name would resolve to
-/// whatever a developer happened to have. The failure most likely to be caused
-/// here is forgetting to *rebuild* the launcher, and a test that silently ran a
-/// stale build would report green for code nobody compiled.
-fn topham_binary() -> String {
-    std::env::var(TOPHAM_BIN_VAR).unwrap_or_else(|_| {
-        panic!(
-            "the closure test drives this workspace's own launcher: set {TOPHAM_BIN_VAR} to a \
-             freshly built `target/debug/topham` (`cargo build -p topham`), or run without \
-             --include-ignored"
-        )
-    })
-}
-
-/// What `topham --version` prints, or a loud panic naming the override.
-///
-/// Isolated the way every other probe here is (M11.2b review F18), plus one
-/// reason of its own: `topham` reads profiles out of `XDG_CONFIG_HOME`, so a
-/// probe that inherited the developer's would resolve against configuration
-/// this suite never wrote.
-fn topham_version(binary: &str) -> String {
-    let home = std::env::temp_dir().join(format!(
-        "roundhouse-topham-version-{}",
-        uuid::Uuid::new_v4()
-    ));
-    std::fs::create_dir_all(&home).expect("the probe's isolated home");
-    let version = version_probe(
-        binary,
-        &[
-            ("HOME", home.clone().into_os_string()),
-            ("XDG_CONFIG_HOME", home.join("config").into_os_string()),
-            ("XDG_DATA_HOME", home.join("data").into_os_string()),
-        ],
-        TOPHAM_BIN_VAR,
-    );
-    let _ = std::fs::remove_dir_all(&home);
-    version
-}
-
-/// The ambient `PATH` with `binary`'s own directory in front of it.
-///
-/// What a `topham` child needs and no other child here does: the launcher
-/// resolves the client from the **bare name** its profile's agent implies, so
-/// the only way to point a launched client at [`CODEX_BIN_VAR`]'s binary is to
-/// make the `PATH` answer be this rig's.
-fn path_with(binary: &str) -> String {
-    let ambient = std::env::var("PATH").unwrap_or_default();
-    match std::path::Path::new(binary)
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        Some(parent) => format!("{}:{ambient}", parent.display()),
-        None => ambient,
     }
 }
 

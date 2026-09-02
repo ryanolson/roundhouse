@@ -24,10 +24,16 @@
 //! What deliberately stays per-suite: the client's own argv and launch
 //! generator, the topology, and every assertion. This file holds what stands
 //! *around* a real client, never what a suite claims about one.
+//!
+//! The `topham` closure helpers at the bottom arrived the same way and for the
+//! same reason (M11.3 review F18): both suites grew their own copy of the
+//! launcher's binary override, profile name, version probe and `PATH` splice in
+//! one milestone, and the copies had already drifted in how they built an
+//! isolated home before anyone read them side by side.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
@@ -44,6 +50,11 @@ use roundhouse_core::now_ms;
 use roundhouse_core::routing::{Candidate, Target};
 use roundhouse_core::store::{MemoryStore, SessionStore};
 use roundhouse_fleet::FrontierModelSpec;
+// The name a profile's `key-env` defaults to, read from the generator that
+// defines it rather than spelled here: a fixture that named its own variable
+// would keep passing after the default moved and prove nothing about the file
+// an operator types.
+use roundhouse_server::codex_launch::DEFAULT_KEY_ENV;
 use roundhouse_server::control_config::{MembershipRole, MintedKey, TURN_KEY_HEADER};
 use roundhouse_server::{
     ControlDirectory, Conversations, CrossChecks, DirectoryMutation, MemoryDirectoryStore,
@@ -490,6 +501,16 @@ pub fn clean(root: &Path) {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// A scratch home for a version probe, thrown away as soon as it answers.
+///
+/// A probe cannot borrow the rig's root: the Relay probes run from tests that
+/// have no rig at all, and the client probe runs before a root is fully
+/// furnished. Its own directory per call is what lets one isolation rule cover
+/// every process these suites spawn.
+pub fn probe_home() -> PathBuf {
+    std::env::temp_dir().join(format!("roundhouse-version-probe-{}", uuid::Uuid::new_v4()))
+}
+
 /// What `<binary> --version` prints, or a loud panic naming `override_var`.
 ///
 /// **Spawned under isolation like every other process these suites start**
@@ -522,4 +543,174 @@ pub fn version_probe(binary: &str, isolation: &[(&str, OsString)], override_var:
         )
     });
     String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+// ---------------------------------------------------------------------------
+// The `topham` closure tests
+// ---------------------------------------------------------------------------
+
+/// The environment variable naming the built `topham` a closure test drives.
+///
+/// No `PATH` fallback, unlike the two client binaries' overrides: `topham` is
+/// this workspace's own binary and is installed nowhere, so a bare name would
+/// resolve to whatever a developer happened to have — an older build, or
+/// something else entirely. The variable is the only honest way to say "this
+/// tree's `target/debug/topham`", and a missing one under `--include-ignored`
+/// is the same loud panic a missing client is.
+pub const TOPHAM_BIN_VAR: &str = "ROUNDHOUSE_TEST_TOPHAM_BIN";
+
+/// The profile name every `topham` closure test writes and resolves.
+///
+/// One name for both agents and both topologies because each test owns its own
+/// rig, and therefore its own isolated configuration directory: two tests can
+/// hold this name and mean two different files, which is what a per-rig
+/// `XDG_CONFIG_HOME` is for.
+pub const TOPHAM_PROFILE: &str = "e2e";
+
+/// The built `topham` a closure test drives, or a loud panic naming the
+/// variable that would have said where it is.
+///
+/// A panic and never a fallback: see [`TOPHAM_BIN_VAR`]. The failure an
+/// operator of these suites is most likely to cause is forgetting to *rebuild*
+/// the launcher after changing it, and a test that silently ran the last build
+/// would report green for code nobody compiled.
+pub fn topham_binary() -> String {
+    std::env::var(TOPHAM_BIN_VAR).unwrap_or_else(|_| {
+        panic!(
+            "the closure tests drive this workspace's own launcher: set {TOPHAM_BIN_VAR} to a \
+             freshly built `target/debug/topham` (`cargo build -p topham`), or run without \
+             --include-ignored"
+        )
+    })
+}
+
+/// What `topham --version` prints, or a loud panic naming the override.
+///
+/// Isolated the way every other probe in these suites is (M11.2b review F18),
+/// and with one extra reason of its own: `topham` reads profiles out of
+/// `XDG_CONFIG_HOME`, so a probe that inherited the developer's would resolve —
+/// and, if a future `--version` grew a diagnostic, print — profiles no suite
+/// here ever wrote.
+///
+/// **The banner is checked against this checkout's HEAD** (M11.3 review F23),
+/// which is the `VERIFIED_*` discipline the `claude` and `nemo-relay` probes
+/// already follow, aimed at the drift that a binary built here rather than
+/// downloaded actually has: `topham` is not a version anybody pinned, it is
+/// *this tree*, so the only way a green closure run lies about it is by having
+/// driven a `target/debug/topham` nobody rebuilt. A printed warning rather than
+/// a panic, because a working tree with uncommitted changes legitimately
+/// differs from HEAD and a launcher rebuilt from it is the normal state of a
+/// fix stage — the thing worth catching is the build from *another* commit.
+pub fn topham_version(binary: &str) -> String {
+    let home = probe_home();
+    std::fs::create_dir_all(&home).expect("the probe's isolated home");
+    let version = version_probe(
+        binary,
+        &[
+            ("HOME", home.clone().into_os_string()),
+            ("XDG_CONFIG_HOME", home.join("config").into_os_string()),
+            ("XDG_DATA_HOME", home.join("data").into_os_string()),
+        ],
+        TOPHAM_BIN_VAR,
+    );
+    let _ = std::fs::remove_dir_all(&home);
+    if let Some(head) = head_commit()
+        && !version.contains(&head)
+    {
+        println!(
+            "    WARNING: `topham --version` says {version:?}, which does not name this \
+             checkout's HEAD ({head}). The binary {TOPHAM_BIN_VAR} points at was built from a \
+             different tree: rebuild it (`cargo build -p topham`) before trusting a green run."
+        );
+    }
+    version
+}
+
+/// This checkout's HEAD, abbreviated exactly the way `topham`'s build script
+/// abbreviates it, or `None` where there is no checkout to read.
+///
+/// Truncated from the full object name rather than asked of `git rev-parse
+/// --short`, because that flag answers with the shortest *unambiguous* prefix
+/// and would disagree with the build script's fixed width the first time a
+/// seven-character prefix collided — a mismatch warning about nothing.
+fn head_commit() -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (commit.len() >= 7).then(|| commit[..7].to_string())
+}
+
+/// The ambient `PATH` with `binary`'s own directory in front of it.
+///
+/// What a `topham` child needs and what no other child in these suites does:
+/// the launcher resolves the client from the **bare name** its profile's agent
+/// implies, deliberately — an operator with two `claude` binaries has already
+/// answered which one they mean, in their `PATH`. So the only way to point a
+/// launched client at the binary under test is to make that answer be the
+/// rig's, which is what this does. A bare name that resolved to some other
+/// build would leave the version banner naming a binary the run never used.
+pub fn path_with(binary: &str) -> String {
+    let ambient = std::env::var("PATH").unwrap_or_default();
+    match Path::new(binary)
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        Some(parent) => format!("{}:{ambient}", parent.display()),
+        None => ambient,
+    }
+}
+
+/// One of a run's isolated XDG directories, under its own root, created.
+///
+/// `topham` resolves its profiles from `XDG_CONFIG_HOME` and its per-profile
+/// `CODEX_HOME` or scratch from `XDG_DATA_HOME`, so a run that inherited either
+/// would read a developer's profiles and write generated files into their real
+/// data directory.
+pub fn xdg(root: &Path, what: &str) -> PathBuf {
+    let path = root.join("xdg").join(what);
+    std::fs::create_dir_all(&path).expect("the run's XDG directory");
+    path
+}
+
+/// Write the launch profile a `topham` child resolves, into `config_home`, and
+/// answer with its path.
+///
+/// **Hand-written TOML rather than `Profile::to_toml`**, and that is the point
+/// of the closure tests. `topham`'s own suite proves the round trip — that what
+/// `save` writes is what `load` reads — which is a claim about two functions
+/// agreeing with each other. What no test in that crate can make is the claim
+/// these files need: that the file *an operator types*, from the vocabulary the
+/// README documents, resolves into a launch a real client hooks up with. A
+/// fixture built by the serializer would agree with a renamed field on both
+/// sides and say nothing.
+///
+/// The absence here is as load-bearing as the presence: **no key**. The turn
+/// key reaches the child on its environment, under [`DEFAULT_KEY_ENV`], which
+/// is R-T2's whole rule. `deployment_root` is likewise the **root** the profile
+/// vocabulary names, with no version or Responses prefix: each generator
+/// derives its own, and the absence of a prefix here is what proves it.
+pub fn write_profile(
+    config_home: &Path,
+    agent: &str,
+    deployment_root: &str,
+    topology: &str,
+) -> PathBuf {
+    let directory = config_home.join("topham").join("profiles");
+    std::fs::create_dir_all(&directory).expect("the run's profiles directory");
+    let path = directory.join(format!("{TOPHAM_PROFILE}.toml"));
+    std::fs::write(
+        &path,
+        format!(
+            "agent = \"{agent}\"\n\
+             deployment-root = \"{deployment_root}\"\n\
+             auth = \"roundhouse-key\"\n\
+             key-env = \"{DEFAULT_KEY_ENV}\"\n\
+             topology = \"{topology}\"\n"
+        ),
+    )
+    .expect("the run's launch profile");
+    path
 }

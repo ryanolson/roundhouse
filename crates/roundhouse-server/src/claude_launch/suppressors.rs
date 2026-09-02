@@ -76,6 +76,28 @@ pub struct OauthSuppressor {
     pub site: SuppressorSite,
     /// What it defeats, and therefore which launch refuses it. See [`Defeats`].
     pub defeats: Defeats,
+    /// Whether a [`ClaudeAuthKind::RoundhouseKey`] launch refuses it *as well*,
+    /// which is a second question about the same row rather than another answer
+    /// to [`Self::defeats`].
+    ///
+    /// Three of these inputs resolve to a bearer credential of the operator's
+    /// own, and the sentinel does not stand between one and the wire: §1.3's
+    /// `VV()` decides what the [`API_KEY_ENV`] arm resolves to, so an
+    /// `ANTHROPIC_AUTH_TOKEN`, the contents of a key file descriptor or an
+    /// `apiKeyHelper`'s output still reaches `Authorization`, and roundhouse's
+    /// edge captures it as the forwarded seat (F2). The kind that promises "a
+    /// turn key and nothing else" then spends a subscription, and every turn
+    /// answers, so nothing reports it.
+    ///
+    /// A per-row flag rather than a fourth [`Defeats`] arm, because what these
+    /// rows defeat is *not* the same thing under the two kinds — a forwarded
+    /// login loses the login it forwards, a bring-your-own-key launch loses the
+    /// exclusivity of its turn key — and one arm would have to name one of them
+    /// and mislead about the other. [`API_KEY_ENV`] is the row this flag is
+    /// `false` on and the reason it is a flag at all: the generated map writes
+    /// the sentinel over that variable, so refusing it under this kind would be
+    /// refusing the generator's own output.
+    pub refused_beside_the_sentinel: bool,
 }
 
 impl OauthSuppressor {
@@ -88,6 +110,9 @@ impl OauthSuppressor {
     /// the enforcement list and the refusal agreed only because every entry
     /// happened to belong to the same two buckets.
     pub fn refused_under(&self, auth: ClaudeAuthKind) -> bool {
+        if self.refused_beside_the_sentinel && auth == ClaudeAuthKind::RoundhouseKey {
+            return true;
+        }
         match self.defeats {
             Defeats::TheRedirect => true,
             Defeats::TheSubscriptionLogin => auth == ClaudeAuthKind::ForwardedClaudeLogin,
@@ -120,31 +145,37 @@ pub const OAUTH_SUPPRESSORS: &[OauthSuppressor] = &[
         name: "CLAUDE_CODE_USE_BEDROCK",
         site: SuppressorSite::EnvVar,
         defeats: Defeats::TheRedirect,
+        refused_beside_the_sentinel: false,
     },
     OauthSuppressor {
         name: "CLAUDE_CODE_USE_VERTEX",
         site: SuppressorSite::EnvVar,
         defeats: Defeats::TheRedirect,
+        refused_beside_the_sentinel: false,
     },
     OauthSuppressor {
         name: "CLAUDE_CODE_USE_FOUNDRY",
         site: SuppressorSite::EnvVar,
         defeats: Defeats::TheRedirect,
+        refused_beside_the_sentinel: false,
     },
     OauthSuppressor {
         name: "ANTHROPIC_AUTH_TOKEN",
         site: SuppressorSite::EnvVar,
         defeats: Defeats::TheSubscriptionLogin,
+        refused_beside_the_sentinel: true,
     },
     OauthSuppressor {
         name: "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
         site: SuppressorSite::EnvVar,
         defeats: Defeats::TheSubscriptionLogin,
+        refused_beside_the_sentinel: true,
     },
     OauthSuppressor {
         name: API_KEY_ENV,
         site: SuppressorSite::EnvVar,
         defeats: Defeats::TheSubscriptionLogin,
+        refused_beside_the_sentinel: false,
     },
     // Read immediately after `API_KEY_ENV` because it is the guard on that
     // arm and on no other: it is not a suppressor of the login but of *our
@@ -154,11 +185,13 @@ pub const OAUTH_SUPPRESSORS: &[OauthSuppressor] = &[
         name: "CLAUDE_CODE_REMOTE",
         site: SuppressorSite::EnvVar,
         defeats: Defeats::TheApiKeySentinel,
+        refused_beside_the_sentinel: false,
     },
     OauthSuppressor {
         name: "apiKeyHelper",
         site: SuppressorSite::SettingsKey,
         defeats: Defeats::TheSubscriptionLogin,
+        refused_beside_the_sentinel: true,
     },
 ];
 

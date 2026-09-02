@@ -120,7 +120,7 @@ fn a_profile_carrying_a_key_shaped_value_is_refused_by_field() {
         "the fixture must be a key this deployment would actually accept"
     );
 
-    let cases: [(&str, String, &str); 5] = [
+    let cases: [(&str, String, &str); 6] = [
         (
             "the variable's field, holding a value instead of a name",
             format!(
@@ -148,6 +148,14 @@ fn a_profile_carrying_a_key_shaped_value_is_refused_by_field() {
             "agent = \"claude\"\ndeployment-root = \"http://x\"\nnote = \"rh_turn_abc\"\n"
                 .to_string(),
             "note",
+        ),
+        (
+            "a key rather than a value, which cannot be echoed to name itself",
+            format!(
+                "agent = \"claude\"\ndeployment-root = \"http://x\"\n\n[secrets]\n{well_formed} = \
+                 \"whatever\"\n"
+            ),
+            "secrets.<a key>",
         ),
         (
             "the launch sentinel, which is in the key namespace on purpose",
@@ -210,6 +218,86 @@ fn a_claude_profile_may_not_carry_the_codex_fields() {
             "{error:#?}"
         );
     }
+}
+
+/// F1 (M11.3 thermo-nuclear review): a paste that fails to *parse* as TOML at
+/// all — a bare secret, a `.env` line, or a `topham mint` export line — must
+/// not echo the pasted value back through [`ProfileError::Malformed`]. The
+/// scan in [`find_secret`] only runs after `toml::from_str` succeeds
+/// (`from_toml`, above), so these three shapes never reach it; the parser's
+/// own error is what a caller sees, and `toml`'s `Display` inlines the
+/// offending source line under a caret.
+///
+/// `error_chain` is `pub(crate)` reachable via `crate::cli`, and is exactly
+/// what `main.rs` and the TUI print — the same text this test inspects.
+///
+/// **The refusal is `CarriesSecret`, not `Malformed`**, which is a correction
+/// to the shape this test asserted when it was written to fail: the scan now
+/// runs on the raw text, so none of these three pastes reaches the parser at
+/// all. Refusing them as parse failures with a sanitised message would have
+/// left the leak one unanticipated paste shape away — the message would have
+/// to keep being right about text nobody has seen yet — where refusing them as
+/// what they are means no parse error is ever constructed from a document
+/// carrying a key.
+#[test]
+fn a_paste_that_fails_to_parse_does_not_echo_the_secret() {
+    let secret = format!("rh_turn_{:A<43}", "live");
+    assert!(
+        roundhouse_server::has_valid_key_shape(&secret),
+        "the fixture must be a key this deployment would actually accept"
+    );
+
+    let pastes: [(&str, String); 3] = [
+        ("a bare key pasted with no `=` at all", secret.clone()),
+        (
+            "a `.env`-style line",
+            format!("DEPLOYMENT_TURN_KEY={secret}"),
+        ),
+        (
+            "a `topham mint` export line, pasted whole",
+            format!("export DEPLOYMENT_TURN_KEY={secret}"),
+        ),
+    ];
+
+    for (what, text) in pastes {
+        let error = Profile::from_toml(&text, "work").expect_err(&format!("{what} is not TOML"));
+        assert!(
+            matches!(error, ProfileError::CarriesSecret { .. }),
+            "{what}: a paste carrying a key is refused as the secret it is, before the parser \
+             sees it, got {error:#?}"
+        );
+        let chain = crate::cli::error_chain(&error).join("\n");
+        assert!(
+            !chain.contains(&secret),
+            "{what}: the parse-failure message must never echo the pasted secret:\n{chain}"
+        );
+    }
+}
+
+/// F1's second half, and the one that outlives the scan: a parse failure
+/// reports *what* the parser objected to and *where*, and never the text it
+/// objected to.
+///
+/// The scan above is what refuses a paste this crate can recognise; this is
+/// what a paste shape nobody has thought of yet costs. Without it the guard is
+/// only as good as the three prefixes [`looks_like_a_secret`] knows.
+#[test]
+fn a_parse_failure_reports_the_position_and_not_the_line() {
+    let error = Profile::from_toml(
+        "agent = \"claude\"\ndeployment-root = whatever-the-operator-pasted\n",
+        "work",
+    )
+    .expect_err("a bare word is not a TOML value");
+    let chain = crate::cli::error_chain(&error).join("\n");
+    assert!(
+        !chain.contains("whatever-the-operator-pasted"),
+        "the offending line must not be quoted back -- that excerpt is how a pasted credential \
+         got out (F1):\n{chain}"
+    );
+    assert!(
+        chain.contains("line 2, column 19"),
+        "and the position must survive, or the message sends nobody anywhere:\n{chain}"
+    );
 }
 
 /// A profile name becomes one path segment, so the ones that would not are
@@ -294,4 +382,66 @@ fn the_codex_home_is_per_profile_and_under_the_data_directory() {
         Profile::codex_home(&env, "other").unwrap(),
         "two profiles sharing one CODEX_HOME would share the auth.json a `codex login` writes"
     );
+}
+
+/// F6 (M11.3 thermo-nuclear review): `looks_like_a_secret` only checks
+/// `starts_with` the minted prefix (or exact sentinel equality) on the
+/// *trimmed whole value*, so a key embedded partway through a larger string
+/// -- exactly the `export ROUNDHOUSE_API_KEY=rh_turn_...` line `topham mint`
+/// tells operators to paste -- never matches `starts_with` and sails through
+/// `find_secret` untouched. The module doc at :27-32 promises "anything
+/// wearing a minted prefix is refused"; this is a live key that does, and is
+/// not.
+///
+/// It failed on the finding — `from_toml` returned `Ok`, not
+/// `Err(CarriesSecret)` — and is live now that the scan reads the whole value
+/// rather than only its front.
+#[test]
+fn a_key_embedded_in_a_larger_value_is_still_refused() {
+    let key = format!("rh_turn_{:A<43}", "live");
+    assert!(
+        roundhouse_server::has_valid_key_shape(&key),
+        "the fixture must be a key this deployment would actually accept"
+    );
+
+    // Exactly what `topham mint` tells an operator to paste, pasted into the
+    // field that documents itself as naming a variable, not holding one.
+    let text = format!(
+        "agent = \"claude\"\ndeployment-root = \"http://x\"\nkey-env = \"export \
+         ROUNDHOUSE_API_KEY={key}\"\n"
+    );
+    let error = Profile::from_toml(&text, "work")
+        .expect_err("an export line carrying a live key is still a secret in the file");
+    assert!(
+        matches!(&error, ProfileError::CarriesSecret { field, .. } if field == "key-env"),
+        "{error:#?}"
+    );
+}
+
+/// F15 (M11.3 review): the per-profile root is a *named* accessor, and both
+/// generated directories are joins onto it.
+///
+/// The finding was that `relay::scratch_dir` reached the root by walking up
+/// from `codex_home` with `.parent().expect(..)`. The refutation showed the
+/// panic is unreachable through this crate's validated inputs — and that this
+/// is the worse half: a change to the codex layout leaves `.parent()` returning
+/// `Some` of the *wrong* directory, so two profiles could quietly come to share
+/// one Relay upstream with nothing going red. Deriving both from one accessor
+/// makes that disagreement unrepresentable rather than merely unlikely.
+#[test]
+fn the_scratch_root_is_the_one_place_the_per_profile_directory_is_spelled() {
+    let root = scratch("scratch-root");
+    let env = env_at(&root);
+    assert_eq!(
+        Profile::scratch_root(&env, "work").unwrap(),
+        root.join("data/topham/work")
+    );
+    assert_eq!(
+        Profile::codex_home(&env, "work").unwrap().parent(),
+        Some(Profile::scratch_root(&env, "work").unwrap().as_path()),
+        "the codex home is a join onto the root, not a directory that happens to sit near it"
+    );
+    // The name check belongs to the root, so a traversal cannot reach a
+    // directory outside it through either derived path.
+    assert!(Profile::scratch_root(&env, "../elsewhere").is_err());
 }

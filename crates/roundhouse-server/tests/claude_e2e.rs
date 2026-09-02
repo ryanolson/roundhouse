@@ -314,8 +314,9 @@ mod common;
 // fork probe and version probe are the same rig the codex sibling stands its
 // client inside, and were a line-for-line copy of it until the two drifted.
 use common::e2e::{
-    Exchange, PROJECT, Recorder, USER, base_session, bootstrap, clean, fork_probe, principal,
-    record, version_probe,
+    Exchange, PROJECT, Recorder, TOPHAM_BIN_VAR, TOPHAM_PROFILE, USER, base_session, bootstrap,
+    clean, fork_probe, path_with, principal, probe_home, record, topham_binary, topham_version,
+    version_probe, write_profile, xdg,
 };
 use common::{Scripted, ScriptedTurns, ToolCallingFrontierClient, frontier_catalog};
 
@@ -387,24 +388,6 @@ const RELAY_BIN_VAR: &str = "ROUNDHOUSE_TEST_RELAY_BIN";
 /// `agent-docs/research/nemo-relay-0.8.0-published-read.md`'s 2026-09-01
 /// addendum, which re-derived every hazard below against exactly this tarball.
 const VERIFIED_RELAY_VERSION: &str = "0.8.2";
-
-/// The environment variable naming the built `topham` the closure tests drive.
-///
-/// No `PATH` fallback, unlike [`CLAUDE_BIN_VAR`] and [`RELAY_BIN_VAR`]: `topham`
-/// is this workspace's own binary and is not installed anywhere, so a bare name
-/// would resolve to whatever a developer happened to have on their path — an
-/// older build, or something else entirely. The variable is the only honest way
-/// to say "this tree's `target/debug/topham`", and a missing one under
-/// `--include-ignored` is the same loud panic a missing client is.
-const TOPHAM_BIN_VAR: &str = "ROUNDHOUSE_TEST_TOPHAM_BIN";
-
-/// The profile name every `topham` closure test writes and resolves.
-///
-/// One name for both topologies because each test owns its own rig, and
-/// therefore its own isolated configuration directory: two tests can hold the
-/// same profile name and mean two different files, which is exactly what a
-/// per-rig `XDG_CONFIG_HOME` is for.
-const TOPHAM_PROFILE: &str = "e2e";
 
 /// The header Relay's transparent-run credential rides on
 /// (`provider_auth.rs`'s `TRANSPARENT_PROXY_CREDENTIAL_HEADER`).
@@ -957,51 +940,19 @@ impl Rig {
         self.spawn(prompt, &[], true).await
     }
 
-    /// Write the launch profile a `topham` child will resolve, into this run's
-    /// isolated configuration directory, and answer with its path.
-    ///
-    /// **Hand-written TOML rather than `Profile::to_toml`**, and that is the
-    /// point of the closure tests. `topham`'s own suite proves the round trip —
-    /// that what `save` writes is what `load` reads — which is a claim about
-    /// two functions agreeing with each other. What no test in that crate can
-    /// make is the claim this file needs: that the file *an operator types*,
-    /// from the vocabulary the README documents, resolves into a launch a real
-    /// client hooks up with. A fixture built by the serializer would agree with
-    /// a renamed field on both sides and say nothing.
-    ///
-    /// The absence here is as load-bearing as the presence: **no key**. The
-    /// turn key reaches the child on its environment, under the name this file
-    /// names, which is R-T2's whole rule.
+    /// This rig's deployment, as the profile vocabulary spells it — the file
+    /// written and its path answered by [`write_profile`], the one copy both
+    /// real-binary suites now share (M11.3 review F18). What is this rig's own
+    /// is the two values below: the loopback root it is serving on, and which
+    /// topology the profile should name.
     fn write_profile(&self, topology: &str) -> PathBuf {
-        let directory = self.xdg("config").join("topham").join("profiles");
-        std::fs::create_dir_all(&directory).expect("the run's profiles directory");
-        let path = directory.join(format!("{TOPHAM_PROFILE}.toml"));
-        std::fs::write(
-            &path,
-            format!(
-                "agent = \"claude\"\n\
-                 deployment-root = \"{}\"\n\
-                 auth = \"roundhouse-key\"\n\
-                 key-env = \"{DEFAULT_KEY_ENV}\"\n\
-                 topology = \"{topology}\"\n",
-                self.base_url
-            ),
-        )
-        .expect("the run's launch profile");
-        path
+        write_profile(&self.xdg("config"), "claude", &self.base_url, topology)
     }
 
-    /// One of this run's isolated XDG directories, created.
-    ///
-    /// Under the rig's own root like everything else it writes: `topham`
-    /// resolves its profiles from `XDG_CONFIG_HOME` and its per-profile scratch
-    /// from `XDG_DATA_HOME`, so a run that inherited either would read a
-    /// developer's profiles and write a chained config into their real data
-    /// directory.
+    /// One of this run's isolated XDG directories, created — [`xdg`] under the
+    /// rig's own root, which is the only part of it a rig supplies.
     fn xdg(&self, what: &str) -> PathBuf {
-        let path = self.root.join("xdg").join(what);
-        std::fs::create_dir_all(&path).expect("the run's XDG directory");
-        path
+        xdg(&self.root, what)
     }
 
     /// Drive the real client through a real `topham`, and answer with what the
@@ -1349,16 +1300,6 @@ fn claude_argv(prompt: &str, extra: &[&str], resume: bool) -> Vec<String> {
     argv
 }
 
-/// A scratch home for a version probe, thrown away as soon as it answers.
-///
-/// A probe cannot borrow the rig's root: the Relay probes run from tests that
-/// have no rig at all, and the client probe runs inside `start_at` before the
-/// root is fully furnished. Its own directory per call is what lets one
-/// isolation rule cover every process this file spawns.
-fn probe_home() -> PathBuf {
-    std::env::temp_dir().join(format!("roundhouse-version-probe-{}", uuid::Uuid::new_v4()))
-}
-
 /// What `claude --version` prints, or a loud panic naming the override.
 ///
 /// Isolated exactly as [`build_child_command`] isolates a real run (M11.2b
@@ -1408,64 +1349,54 @@ fn relay_version(binary: &str) -> String {
     version
 }
 
-/// The built `topham` the closure tests drive, or a loud panic naming the
-/// variable that would have said where it is.
+/// **F23 (M11.3 review), now the guard on its own fix: `topham --version` must
+/// name the commit it was built from.**
 ///
-/// A panic and never a fallback: see [`TOPHAM_BIN_VAR`]. The failure an operator
-/// of this suite is most likely to cause is forgetting to *rebuild* the
-/// launcher after changing it, and a test that silently ran the last build
-/// would report green for code nobody compiled.
-fn topham_binary() -> String {
-    std::env::var(TOPHAM_BIN_VAR).unwrap_or_else(|_| {
-        panic!(
-            "the closure tests drive this workspace's own launcher: set {TOPHAM_BIN_VAR} to a \
-             freshly built `target/debug/topham` (`cargo build -p topham`), or run without \
-             --include-ignored"
-        )
-    })
-}
+/// Every other real-binary probe in this file is checked against a
+/// `VERIFIED_*` constant pinned to the version the suite's assertions were
+/// written against (`VERIFIED_VERSION` for `claude`, `VERIFIED_RELAY_VERSION`
+/// for `nemo-relay`) — a mismatch prints a loud warning naming the drift.
+/// `topham` had nothing to compare, because clap's bare `version` renders
+/// `CARGO_PKG_VERSION` alone: the workspace version, identical in every build
+/// of every commit that does not touch `Cargo.toml`. The banner this suite
+/// prints for every closure run could not distinguish today's `topham` from
+/// one built last week, and the stale one is exactly the binary that reports
+/// green for code nobody compiled.
+///
+/// A commit hash rather than a `VERIFIED_TOPHAM_VERSION` constant, because
+/// `topham` is not a dependency this suite pins to a release — it is *this
+/// tree*, and the only drift worth naming is "built somewhere else". The
+/// identifier comes from `crates/topham/build.rs`; `topham_version`'s own
+/// HEAD comparison is what turns it into the warning the other two probes
+/// print, and this is the assertion that the identifier is there to compare at
+/// all.
+///
+/// Compared against HEAD and not against the working tree: a build from
+/// uncommitted changes still names the commit it was cut from, which is the
+/// most a hash can say and enough to catch the checkout that never moved.
+#[test]
+#[ignore = "F23: needs the real topham binary: --features e2e-claude -- --include-ignored; \
+            ROUNDHOUSE_TEST_TOPHAM_BIN names a built topham"]
+fn topham_version_names_the_commit_it_was_built_from() {
+    let topham = topham_binary();
+    let version = topham_version(&topham);
 
-/// What `topham --version` prints, or a loud panic naming the override.
-///
-/// Isolated the way every other probe in this file is (M11.2b review F18), and
-/// with one extra reason of its own: `topham` reads profiles out of
-/// `XDG_CONFIG_HOME`, so a probe that inherited the developer's would list —
-/// and, if a future `--version` grew a diagnostic, print — profiles this suite
-/// never wrote.
-fn topham_version(binary: &str) -> String {
-    let home = probe_home();
-    std::fs::create_dir_all(&home).expect("the probe's isolated home");
-    let version = version_probe(
-        binary,
-        &[
-            ("HOME", home.clone().into_os_string()),
-            ("XDG_CONFIG_HOME", home.join("config").into_os_string()),
-            ("XDG_DATA_HOME", home.join("data").into_os_string()),
-        ],
-        TOPHAM_BIN_VAR,
+    let commit = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("git is available in this environment");
+    assert!(commit.status.success(), "git rev-parse HEAD failed");
+    let commit = String::from_utf8_lossy(&commit.stdout).trim().to_string();
+    let short = &commit[..7.min(commit.len())];
+
+    assert!(
+        version.contains(short),
+        "F23: `topham --version` prints {version:?}, which names no build identifier at all — \
+         not even a short commit hash ({short}) for the tree it was built from. A binary built \
+         from a stale checkout prints the exact same banner as one built from HEAD, so nothing \
+         in this suite's own preflight (the version line `through_topham` already prints) can \
+         tell the two apart."
     );
-    let _ = std::fs::remove_dir_all(&home);
-    version
-}
-
-/// The ambient `PATH` with `binary`'s own directory in front of it.
-///
-/// What a `topham` child needs and what no other child in this file does: the
-/// launcher resolves the client from the **bare name** its profile's agent
-/// implies, deliberately — an operator with two `claude` binaries has already
-/// answered which one they mean, in their `PATH`. So the only way to point a
-/// launched client at [`CLAUDE_BIN_VAR`]'s binary is to make that answer be
-/// this rig's, which is what this does. A bare name that resolved to some other
-/// build would leave the version banner naming a binary the run never used.
-fn path_with(binary: &str) -> String {
-    let ambient = std::env::var("PATH").unwrap_or_default();
-    match Path::new(binary)
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        Some(parent) => format!("{}:{ambient}", parent.display()),
-        None => ambient,
-    }
 }
 
 /// `nemo-relay run --agent claude --config <toml> [extra] --dry-run`, and what
@@ -3028,6 +2959,124 @@ async fn a_real_client_launched_through_topham_hooks_up_on_direct() {
     rig.clean();
 }
 
+/// **F3 (M11.3 review), now the guard on its own fix: a settings-file `env`
+/// block that would re-route the launch is refused, by name, before anything
+/// spawns.**
+///
+/// Claude Code applies a settings file's `env` block by *replacing* the value
+/// it inherited, so a `CLAUDE_CONFIG_DIR/settings.json` left behind by
+/// something else — nemo-relay's persistent install writes exactly this,
+/// `env.ANTHROPIC_BASE_URL` pointed at its gateway
+/// (`agent-docs/research/nemo-relay-0.8.0-published-read.md`'s Finding 2.2) —
+/// outranks the environment `topham` generated. When this was first run live
+/// the launch went through and the client hung: zero turns at roundhouse's
+/// edge, no refusal anywhere, and no way for an operator to tell a re-routed
+/// session from a slow one.
+///
+/// What is asserted now is the refusal `plan.rs` makes, read the way an
+/// operator meets it: a non-zero exit, and a message naming *the file to edit*
+/// and *the key in it*. A refusal that said only "this launch is unsafe" would
+/// leave them hunting three search paths, which is why the path is asserted
+/// and not merely the failure.
+///
+/// The recorder is checked too, and for something the exit status cannot say:
+/// that the refusal happened **instead of** a launch and not after one. A
+/// `topham` that spawned the client and then failed would exit non-zero with a
+/// turn already served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs the real claude and topham binaries: --features e2e-claude -- --include-ignored; ROUNDHOUSE_TEST_CLAUDE_BIN overrides PATH and ROUNDHOUSE_TEST_TOPHAM_BIN names a built topham"]
+async fn f3_settings_file_env_block_overriding_topham_generated_base_url() {
+    let rig = Rig::start("topham-settings-env", prose_upstream()).await;
+    let profile = rig.write_profile("direct");
+    println!("    profile       : {}", profile.display());
+
+    // Planted exactly the way nemo-relay's persistent install leaves one
+    // behind: `env.ANTHROPIC_BASE_URL` pointed at an address nothing serves.
+    // The address is deliberately dead — if the refusal ever regressed, this
+    // test fails on the assertions below rather than on a turn that quietly
+    // went somewhere real.
+    let settings_path = rig.root.join("home/.claude").join("settings.json");
+    std::fs::write(
+        &settings_path,
+        serde_json::json!({ "env": { "ANTHROPIC_BASE_URL": "http://127.0.0.1:1" } }).to_string(),
+    )
+    .expect("the settings file this test plants");
+
+    let run = rig
+        .through_topham(
+            &["launch", TOPHAM_PROFILE],
+            "Say the word alpha and stop.",
+            CHILD_DEADLINE,
+        )
+        .await;
+
+    let refusal = format!("{}\n{}", run.stdout, run.stderr);
+    assert!(
+        !run.success
+            && refusal.contains(&settings_path.display().to_string())
+            && refusal.contains("env.ANTHROPIC_BASE_URL"),
+        "F3: a settings-file `env.ANTHROPIC_BASE_URL` must be refused before the launch, naming \
+         the file ({}) and the key; `topham launch` exited ok: {}\n--- stdout\n{}\n--- stderr\n{}",
+        settings_path.display(),
+        run.success,
+        run.stdout,
+        run.stderr
+    );
+
+    let turns = rig.turns();
+    assert!(
+        turns.is_empty(),
+        "F3: the refusal must stand *instead of* the launch — roundhouse's edge recorded {} \
+         turn(s), so a client was started before or despite it. Recorder:\n{}",
+        turns.len(),
+        rig.recorder.transcript()
+    );
+
+    rig.clean();
+}
+
+/// **F3's negative control: an empty settings file, same isolation, same
+/// profile.**
+///
+/// Rules out the reading of the sibling that would make the fix worthless: that
+/// `topham` refuses whenever a `CLAUDE_CONFIG_DIR/settings.json` exists at all,
+/// rather than when its `env` block names something that defeats the launch. A
+/// launcher that refused on presence would pass the sibling and be unusable —
+/// most operators have a settings file. This one turn reaching roundhouse the
+/// way the plain Direct closure test's does is what makes the sibling's refusal
+/// specifically about the `env` block's content.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "F3 control: needs the real claude and topham binaries: --features e2e-claude -- --include-ignored; ROUNDHOUSE_TEST_CLAUDE_BIN overrides PATH and ROUNDHOUSE_TEST_TOPHAM_BIN names a built topham"]
+async fn f3_control_empty_settings_file_does_not_break_the_direct_launch() {
+    let rig = Rig::start("topham-settings-env-control", prose_upstream()).await;
+    let profile = rig.write_profile("direct");
+    println!("    profile       : {}", profile.display());
+
+    let settings_path = rig.root.join("home/.claude").join("settings.json");
+    std::fs::write(&settings_path, serde_json::json!({}).to_string())
+        .expect("the empty settings file this control plants");
+
+    let run = rig
+        .through_topham(
+            &["launch", TOPHAM_PROFILE],
+            "Say the word alpha and stop.",
+            CHILD_DEADLINE,
+        )
+        .await;
+    run.assert_completed("the prose turn launched through topham with an empty settings file");
+
+    let turns = rig.turns();
+    assert_eq!(
+        turns.len(),
+        1,
+        "F3 control: an empty settings file must not itself change what reaches roundhouse; \
+         recorder:\n{}",
+        rig.recorder.transcript()
+    );
+
+    rig.clean();
+}
+
 /// **The chained half: `topham relay` writes the wiring, runs the preflight,
 /// and hands the same launch to a real Relay.**
 ///
@@ -3828,6 +3877,58 @@ fn the_module_doc_does_not_enumerate_a_count_of_real_binary_tests() {
         "F10: Relay source is cited by file and line in this file; cite the evidence document's \
          section instead (see the module doc's \"Where Relay evidence §x points\"):\n{}",
         offenders.join("\n")
+    );
+}
+
+/// **F18 (M11.3 review), now the guard on its own fix: the topham closure-test
+/// helpers live once, in `tests/common/e2e.rs`, and not as near-verbatim twins
+/// of [`codex_e2e`](../codex_e2e.rs)'s.**
+///
+/// [`version_probe`] already lived in the common module and was what
+/// `topham_version` wrapped in both suites — proof the seam existed and was
+/// simply not used for the rest, while the two copies had already drifted in
+/// how each built its isolated probe home.
+///
+/// Textual, not behavioral, and deliberately so: duplication is a fact about
+/// the source, not something a passing binary can disprove, so this re-derives
+/// F18's own shell-diff proof as an assertion rather than trusting it stays
+/// read. It is the only test here that needs no binary at all, which is why it
+/// carries no `#[ignore]`: a copy-paste reappearing should fail an ordinary run
+/// of this suite, not wait for the gated one.
+///
+/// **Each needle is assembled from two halves rather than written whole**, and
+/// that is not decoration. This test's own source *is* `claude_src`, so a
+/// needle spelled verbatim in the array below would make `claude_src.contains`
+/// true forever — leaving a guard that only ever asks about the other file, and
+/// that a copy re-landing in this one would sail straight past. Split, the
+/// literal the scan looks for exists nowhere in either file except where a
+/// definition actually puts it.
+#[test]
+fn topham_closure_helpers_are_not_copy_pasted_across_the_two_e2e_suites() {
+    let claude_src = include_str!("claude_e2e.rs");
+    let codex_src = include_str!("codex_e2e.rs");
+
+    let shared_verbatim = [
+        [
+            "const TOPHAM_BIN_VAR",
+            ": &str = \"ROUNDHOUSE_TEST_TOPHAM_BIN\";",
+        ],
+        ["const TOPHAM_PROFILE", ": &str = \"e2e\";"],
+        ["fn topham_binary()", " -> String {"],
+        ["fn path_with(binary: &str)", " -> String {"],
+    ];
+    let duplicated: Vec<String> = shared_verbatim
+        .iter()
+        .map(|halves| halves.concat())
+        .filter(|needle| claude_src.contains(needle) && codex_src.contains(needle))
+        .collect();
+    assert!(
+        duplicated.is_empty(),
+        "F18: these topham closure-test helpers are defined independently in both \
+         claude_e2e.rs and codex_e2e.rs instead of once in tests/common/e2e.rs, even though \
+         tests/common/e2e.rs already holds version_probe (the function topham_version wraps in \
+         both suites):\n{}",
+        duplicated.join("\n")
     );
 }
 

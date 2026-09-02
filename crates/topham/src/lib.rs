@@ -109,5 +109,9 @@ pub mod profile;
 pub mod relay;
 pub mod tui;
 
+/// Fixtures shared by the suites, compiled only under `cfg(test)`.
+#[cfg(test)]
+mod test_support;
+
 pub use env::EnvMap;
 pub use profile::{Agent, AuthKind, Profile, ProfileError, Topology};

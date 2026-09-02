@@ -14,7 +14,10 @@
 //!
 //! [`Profile::from_toml`] refuses a file carrying anything that looks like a
 //! roundhouse key — in any field, including one whose name suggests it should
-//! hold one — and names the field it found it in.
+//! hold one — and names the field it found it in. It refuses *before the
+//! parser runs*, and on a key found anywhere in a value rather than only at the
+//! front of one, because a paste that is not valid TOML at all is the shape a
+//! credential most often arrives in.
 //!
 //! The rule is not this module's invention: `codex_launch` states it ("the
 //! secret is never in the file") and `claude_launch` enforces it by making
@@ -25,11 +28,11 @@
 //! screen-share — will treat as a string.
 //!
 //! **The check is coarser than `has_valid_key_shape`, deliberately.** Anything
-//! wearing a minted prefix is refused, well-formed or not, and so is the launch
-//! sentinel. A truncated paste is not a usable key and *is* still a secret in a
-//! file; refusing only the well-formed ones would admit the copy that was cut
-//! short by a terminal width, which is the likeliest way one gets in here at
-//! all.
+//! wearing a minted prefix is refused, well-formed or not, wherever in the text
+//! it sits, and so is the launch sentinel. A truncated paste is not a usable
+//! key and *is* still a secret in a file; refusing only the well-formed ones
+//! would admit the copy that was cut short by a terminal width, which is the
+//! likeliest way one gets in here at all.
 //!
 //! # What a profile does not carry, and why
 //!
@@ -225,17 +228,22 @@ pub enum ProfileError {
     UnusableName { name: String },
     #[error("no profile `{name}` at {path}")]
     NotFound { name: String, path: PathBuf },
-    #[error("the profile `{name}` at {path} is not valid TOML: {source}")]
+    #[error("the profile `{name}` at {path} is not valid TOML: {why}")]
     Malformed {
         name: String,
         path: PathBuf,
-        /// Boxed, and the reason is every *other* variant. A `toml::de::Error`
-        /// carries its own span table and is over a hundred bytes on its own,
-        /// which would make every `Result<_, ProfileError>` in this crate — the
-        /// path resolvers, the name check, the listing — that wide on the
-        /// success path too.
-        #[source]
-        source: Box<toml::de::Error>,
+        /// The parser's complaint and where it stopped, **rendered without the
+        /// line it stopped on** — see [`why_it_did_not_parse`].
+        ///
+        /// A rendered `String` rather than the `toml::de::Error` itself, and
+        /// not carried as a `#[source]` either: that type's `Display` quotes
+        /// the offending source line back under a caret, so a pasted key that
+        /// never parsed rode out through every surface that prints an error
+        /// (F1). Keeping the error as a cause would put the excerpt back one
+        /// link down the chain, where `cli::error_chain` prints it. What is
+        /// lost is the caret; what is kept is the position, which is the half
+        /// an operator navigates by.
+        why: String,
     },
     #[error(
         "the profile `{name}` sets `{field}`, which only a codex profile has. Read on a `claude` \
@@ -243,9 +251,13 @@ pub enum ProfileError {
          kind of field an operator sets and then believes"
     )]
     NotACodexField { name: String, field: &'static str },
-    #[error("{path}: {source}")]
+    #[error("`{path}` could not be read or written")]
     Io {
         path: PathBuf,
+        /// The cause rather than part of the sentence (F5): a message that
+        /// inlined its own source printed it twice through
+        /// [`crate::cli::error_chain`], once as this layer's whole text and
+        /// again as the link below it.
         #[source]
         source: std::io::Error,
     },
@@ -274,29 +286,35 @@ impl Profile {
 
     /// Parse a profile, refusing a file that carries a secret.
     ///
-    /// Two passes over one document, and the order matters: the scan runs
-    /// against the raw TOML **before** deserialization, so a secret in a field
-    /// this struct does not have is still found. `deny_unknown_fields` would
-    /// otherwise reject that file with a message about a spelling mistake,
-    /// leaving the operator to fix the name of the field their key is sitting
-    /// in.
+    /// **The scan runs on the raw text, before the parser sees it**, and that
+    /// order is the refusal rather than an optimisation of it. A paste that is
+    /// not TOML at all — a bare key, a `.env` line, the `export …` line
+    /// `topham mint` prints — would otherwise reach `toml::from_str`, whose
+    /// error quotes the offending source line back, and the value would ride
+    /// out through every surface that renders an error (F1). Scanning first
+    /// also keeps the older reason it ran before deserialization: a secret in a
+    /// field this struct does not have is still found, where
+    /// `deny_unknown_fields` would have rejected the file with a message about
+    /// a spelling mistake and left the operator renaming the field their key is
+    /// sitting in.
     pub fn from_toml(text: &str, name: &str) -> Result<Self, ProfileError> {
-        let document: toml::Value =
-            toml::from_str(text).map_err(|source| ProfileError::Malformed {
-                name: name.to_string(),
-                path: PathBuf::from(format!("{name}.toml")),
-                source: Box::new(source),
-            })?;
-        if let Some(field) = find_secret(&document, "") {
+        if looks_like_a_secret(text) {
+            // Which field, when the document parses; a paste that does not
+            // parse has no field to name. Either way the *value* is never in
+            // the message.
+            let field = toml::from_str::<toml::Value>(text)
+                .ok()
+                .and_then(|document| find_secret(&document, ""))
+                .unwrap_or_else(|| THE_TEXT_ITSELF.to_string());
             return Err(ProfileError::CarriesSecret {
                 name: name.to_string(),
                 field,
             });
         }
-        let profile: Profile = toml::from_str(text).map_err(|source| ProfileError::Malformed {
+        let profile: Profile = toml::from_str(text).map_err(|error| ProfileError::Malformed {
             name: name.to_string(),
             path: PathBuf::from(format!("{name}.toml")),
-            source: Box::new(source),
+            why: why_it_did_not_parse(&error, text),
         })?;
         profile.validate(name)?;
         Ok(profile)
@@ -360,8 +378,8 @@ impl Profile {
             // because `from_toml` is also the seam a test and the TUI editor
             // use on text that never was a file. Restated here, where there is
             // one.
-            ProfileError::Malformed { name, source, .. } => {
-                ProfileError::Malformed { name, path, source }
+            ProfileError::Malformed { name, why, .. } => {
+                ProfileError::Malformed { name, path, why }
             }
             other => other,
         })
@@ -421,20 +439,30 @@ impl Profile {
         Ok(Self::directory(env)?.join(format!("{name}.toml")))
     }
 
+    /// `<data>/topham/<name>` — everything this launcher generates for one
+    /// profile, and the one place that layout is spelled.
+    ///
+    /// Per profile rather than per machine, and that is the isolation the codex
+    /// stanza and the chained scratch both depend on: two profiles sharing one
+    /// root would share the `auth.json` a `codex login` writes and the Relay
+    /// config a chained launch resolves, and the preflight would agree with
+    /// itself both times.
+    ///
+    /// **Named rather than walked up to** (M11.3 review F15). The chained
+    /// scratch used to reach this directory as `codex_home().parent()`, which
+    /// does not panic when the codex layout moves — it returns `Some` of the
+    /// *wrong* directory, silently, which is the failure a per-profile root
+    /// exists to prevent. Deriving both siblings from here makes the two
+    /// unable to disagree.
+    pub fn scratch_root(env: &EnvMap, name: &str) -> Result<PathBuf, ProfileError> {
+        check_name(name)?;
+        Ok(env::data_home(env)?.join(TOPHAM_DIR).join(name))
+    }
+
     /// `<data>/topham/<name>/codex-home` — the `CODEX_HOME` a codex launch
     /// writes into and points the client at.
-    ///
-    /// Per profile rather than per machine, and that is the isolation the whole
-    /// codex stanza depends on: `auth.json` lives in a `CODEX_HOME`, so two
-    /// profiles sharing one directory would share a login, and a
-    /// `ForwardedLogin` profile would silently pick up whichever login the
-    /// other profile's `codex login` last wrote.
     pub fn codex_home(env: &EnvMap, name: &str) -> Result<PathBuf, ProfileError> {
-        check_name(name)?;
-        Ok(env::data_home(env)?
-            .join(TOPHAM_DIR)
-            .join(name)
-            .join("codex-home"))
+        Ok(Self::scratch_root(env, name)?.join("codex-home"))
     }
 }
 
@@ -460,6 +488,23 @@ fn check_name(name: &str) -> Result<(), ProfileError> {
     }
 }
 
+/// What [`ProfileError::CarriesSecret`] names when the refused text never
+/// parsed, so there is no field to name.
+///
+/// A sentence rather than a dotted path, because the two cases send an operator
+/// to different places: a field name says "edit this line", and a paste that is
+/// not TOML says "this whole file is the paste".
+const THE_TEXT_ITSELF: &str = "the file text, which is not TOML at all";
+
+/// The path segment a refusal uses when the secret is the *key* rather than the
+/// value.
+///
+/// A placeholder rather than the key, because naming the field is exactly what
+/// would echo the credential in this one case — the whole reason
+/// [`find_secret`] returns paths and not values. The table around it is still
+/// named, which is what an operator needs to find the line.
+const A_KEY_HERE: &str = "<a key>";
+
 /// The first field holding something that looks like a roundhouse secret, as a
 /// dotted path.
 ///
@@ -468,6 +513,12 @@ fn check_name(name: &str) -> Result<(), ProfileError> {
 /// still found. The *path* is returned and the value never is: an error message
 /// is the last place a credential should be copied to, which is the rule
 /// `ClaudeLaunchError::NotATurnKey` states for the same reason.
+///
+/// Table *keys* are scanned as well as values (F6). A paste lands in a file as
+/// often on the left of the `=` as on the right — `rh_turn_… = "x"` is what a
+/// bare key pasted above an existing line becomes — and a key is written to
+/// disk and read back by exactly the same tools a value is. Such a key is
+/// reported as [`A_KEY_HERE`], never as itself.
 fn find_secret(value: &toml::Value, path: &str) -> Option<String> {
     let join = |key: &str| match path.is_empty() {
         true => key.to_string(),
@@ -475,9 +526,10 @@ fn find_secret(value: &toml::Value, path: &str) -> Option<String> {
     };
     match value {
         toml::Value::String(text) => looks_like_a_secret(text).then(|| path.to_string()),
-        toml::Value::Table(table) => table
-            .iter()
-            .find_map(|(key, value)| find_secret(value, &join(key))),
+        toml::Value::Table(table) => table.iter().find_map(|(key, value)| match key {
+            key if looks_like_a_secret(key) => Some(join(A_KEY_HERE)),
+            key => find_secret(value, &join(key)),
+        }),
         toml::Value::Array(items) => items
             .iter()
             .enumerate()
@@ -486,17 +538,47 @@ fn find_secret(value: &toml::Value, path: &str) -> Option<String> {
     }
 }
 
-/// Whether a string is a roundhouse secret, or close enough that it is one.
+/// Whether a string *contains* a roundhouse secret.
 ///
-/// Prefix rather than [`has_valid_key_shape`], plus the launch sentinel — see
-/// the module doc for why the coarse question is the right one here.
+/// Substring rather than prefix, and that is F6: a key gets into a file inside
+/// a larger string at least as often as alone in one — the `export
+/// ROUNDHOUSE_API_KEY=rh_turn_…` line `topham mint` prints, a
+/// `https://rh_turn_…@host` root, a note an operator left themselves. Each of
+/// those is a live credential in a configuration directory, which is the only
+/// thing the module doc's promise is about, and a `starts_with` admitted every
+/// one of them.
+///
+/// Coarser than [`has_valid_key_shape`] in the other direction too, deliberately
+/// — see the module doc on why a truncated paste is refused as well.
 ///
 /// [`has_valid_key_shape`]: roundhouse_server::has_valid_key_shape
 fn looks_like_a_secret(value: &str) -> bool {
-    let value = value.trim();
-    value == ROUNDHOUSE_API_KEY_SENTINEL
-        || value.starts_with(KeyKind::Turn.prefix())
-        || value.starts_with(KeyKind::Admin.prefix())
+    value.contains(ROUNDHOUSE_API_KEY_SENTINEL)
+        || value.contains(KeyKind::Turn.prefix())
+        || value.contains(KeyKind::Admin.prefix())
+}
+
+/// Why the parser stopped, and where — never *what it stopped on*.
+///
+/// `toml::de::Error`'s `Display` renders the offending source line under a
+/// caret, which is a good error message everywhere except here: the likeliest
+/// unparseable profile is a pasted credential, and this text reaches stderr and
+/// the TUI. What `message()` returns is the parser's own complaint and carries
+/// no source text; the position is derived from the span, so the caret's one
+/// useful half survives.
+fn why_it_did_not_parse(error: &toml::de::Error, text: &str) -> String {
+    // A span that does not land on a character boundary of this text is not
+    // worth a panic in the path that renders an error: the complaint alone is
+    // still a true answer, where an index panic replaces it with none.
+    let Some(before) = error.span().and_then(|span| text.get(..span.start)) else {
+        return error.message().to_string();
+    };
+    let line = before.matches('\n').count() + 1;
+    let column = match before.rfind('\n') {
+        Some(newline) => before[newline + 1..].chars().count() + 1,
+        None => before.chars().count() + 1,
+    };
+    format!("{} (line {line}, column {column})", error.message())
 }
 
 /// Every profile on this machine, in name order, each with the profile or the

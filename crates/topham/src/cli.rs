@@ -10,11 +10,13 @@
 //! `fn main` that did this work could only be tested by spawning it.
 //!
 //! Every subcommand here is one function in another module — `plan` renders a
-//! [`Resolution`](crate::plan::Resolution), `launch` calls
-//! [`launch::run`], `mint` calls [`mint::mint`] — because
-//! R-T6's rule (the TUI is a front end over the subcommands, never a second
+//! [`Resolution`](crate::plan::Resolution), `launch` calls [`launch::run`],
+//! `relay` calls [`relay::run`], `mint` calls [`mint::run`] — because R-T6's
+//! rule (the TUI is a front end over the subcommands, never a second
 //! implementation) is only enforceable if the subcommands are not
-//! implementations either.
+//! implementations either. `mint` was the arm that broke it, holding the admin
+//! key's environment read and its two output lines inline until F19; the load
+//! of the profile is all that is left here, and it is what every arm does.
 
 use std::io::Write;
 
@@ -22,7 +24,7 @@ use clap::{Parser, Subcommand};
 
 use crate::env::EnvMap;
 use crate::launch::{self, ExecLauncher, LaunchError};
-use crate::mint::{self, ADMIN_KEY_ENV, MintError};
+use crate::mint::{self, MintError};
 use crate::plan::{self, PlanError};
 use crate::profile::{Profile, ProfileError};
 use crate::relay::{self, RelayError};
@@ -94,19 +96,23 @@ pub enum CliError {
     Relay(#[from] RelayError),
     #[error(transparent)]
     Mint(#[from] MintError),
-    #[error("could not write the output: {0}")]
+    #[error("could not write the output")]
     Output(#[from] std::io::Error),
     #[error(transparent)]
     Tui(#[from] TuiError),
 }
 
-/// Every distinct message in an error's `source` chain, outermost first.
+/// Every message in an error's `source` chain, outermost first.
 ///
-/// **Deduplicated as the chain is walked**, which is the whole reason this is a
-/// function rather than a loop at each printing site: half of this crate's
-/// errors are `#[error(transparent)]`, which is one message and two links, so a
-/// naive walk yields the same sentence three times and reads as a stutter rather
-/// than as a cause.
+/// **A plain walk, and no deduplication.** It had one, for a stutter
+/// `#[error(transparent)]` cannot produce: a transparent wrapper forwards both
+/// its `Display` *and* its `source()`, so it adds no link at all and there is
+/// nothing to collapse (F5). The stutter that did exist came from the other
+/// direction — a variant that carries a `#[source]` and *also* inlines
+/// `{source}` in its own message, so the outer text contains the inner rather
+/// than equalling it, which an equality check can never catch. That is fixed at
+/// the variants, where the duplication is: a message here says what this layer
+/// knows, and the layer below says its own.
 ///
 /// Here rather than in `main.rs` because the TUI needs the same chain: a status
 /// line that showed only the outermost message would reduce "this launch
@@ -116,10 +122,7 @@ pub fn error_chain(error: &dyn std::error::Error) -> Vec<String> {
     let mut messages = vec![error.to_string()];
     let mut source = error.source();
     while let Some(inner) = source {
-        let message = inner.to_string();
-        if messages.last() != Some(&message) {
-            messages.push(message);
-        }
+        messages.push(inner.to_string());
         source = inner.source();
     }
     messages
@@ -176,28 +179,14 @@ pub fn run(cli: Cli, env: &EnvMap, out: &mut dyn Write) -> Result<(), CliError> 
             user,
         }) => {
             let loaded = Profile::load(env, &profile)?;
-            let admin_key = env
-                .get(ADMIN_KEY_ENV)
-                .filter(|value| !value.trim().is_empty())
-                .ok_or(MintError::AdminKeyMissing)?;
-            let minted = mint::mint(
-                &loaded.deployment_root,
+            Ok(mint::run(
+                env,
+                &loaded,
                 &project,
                 &user,
-                admin_key,
                 &mint::HttpTransport,
-            )?;
-            // The id and tail first, on their own line: the export line is what
-            // gets copied, and a comment on the same line would be copied with
-            // it into a shell that would then treat `#` as part of the value in
-            // a `.env` file.
-            writeln!(out, "# minted {} (…{})", minted.id, minted.display_tail)?;
-            writeln!(
                 out,
-                "{}",
-                mint::export_line(&loaded.key_env, &minted.secret)
-            )?;
-            Ok(())
+            )?)
         }
     }
 }

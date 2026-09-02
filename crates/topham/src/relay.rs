@@ -138,15 +138,38 @@ pub enum RelayError {
         wanted: String,
     },
     #[error(
-        "could not run the preflight `{program}`: {source}. Nothing was launched. Set `--relay` to \
-         a real nemo-relay binary, or put one on PATH"
+        "could not run the preflight `{program}`. Nothing was launched. Set `--relay` to a real \
+         nemo-relay binary, or put one on PATH"
     )]
     PreflightSpawn {
         program: String,
+        /// The cause rather than part of the sentence: a message that inlined
+        /// its own source printed it twice through
+        /// [`crate::cli::error_chain`], which is the stutter F5 is about.
         #[source]
         source: std::io::Error,
     },
-    #[error("preflight: {0}")]
+    #[error(
+        "the preflight `{program}` refused this launch ({status}) and produced no report, so what \
+         Relay would have resolved is unknown. Nothing was launched. Relay's own diagnostic:\n\
+         {diagnostic}"
+    )]
+    PreflightRefused {
+        program: String,
+        /// How it exited, spelled the way the platform spells it.
+        status: String,
+        /// What Relay wrote to stderr, which is the only account of *why* it
+        /// refused — and is a `String` rather than a cause because Relay's
+        /// words are not an error type this crate can hold.
+        diagnostic: String,
+    },
+    /// Transparent, so the report Relay resolved is the whole message.
+    ///
+    /// It carried a `"preflight: "` prefix until F5: the prefix made this
+    /// link's `Display` a *superset* of its source's rather than equal to it,
+    /// which is the one shape [`crate::cli::error_chain`] cannot collapse, so
+    /// the re-aim paragraph printed twice.
+    #[error(transparent)]
     ReAimed(#[from] UpstreamReAimed),
 }
 
@@ -233,11 +256,13 @@ pub fn plan(
 /// the reason that root exists: two profiles sharing one Relay config would be
 /// one profile's upstream silently applied to the other's launch, and the
 /// preflight would agree with itself both times.
+///
+/// A join onto [`Profile::scratch_root`] rather than a walk up from
+/// `codex_home` (M11.3 review F15): the walk's `.parent()` keeps returning
+/// `Some` when the codex layout moves, just of the wrong directory, so the one
+/// thing it could not catch is the drift it was standing in for.
 pub fn scratch_dir(env: &EnvMap, name: &str) -> Result<PathBuf, ProfileError> {
-    Ok(Profile::codex_home(env, name)?
-        .parent()
-        .expect("codex_home is <data>/topham/<name>/codex-home")
-        .join("relay"))
+    Ok(Profile::scratch_root(env, name)?.join("relay"))
 }
 
 /// Ask Relay what it resolved, with the ambient environment cleared.
@@ -248,6 +273,17 @@ pub fn scratch_dir(env: &EnvMap, name: &str) -> Result<PathBuf, ProfileError> {
 ///
 /// **`--dry-run` spawns no agent**, which is what makes this affordable before
 /// every launch rather than a thing an operator remembers to do.
+///
+/// # A Relay that failed is not a Relay that re-aimed
+///
+/// The exit status is checked before the report is read (F11). A Relay that
+/// refuses outright — a config it will not load, a `--dry-run` this version
+/// does not have, a version refusal — prints nothing on stdout, and a
+/// stdout-only reading of that is indistinguishable from a healthy report with
+/// the upstream line missing: the operator is told a system
+/// `/etc/nemo-relay/config.toml` re-aimed their run, while Relay's actual
+/// complaint, which was on stderr, is thrown away. So the re-aim diagnosis is
+/// made **only** on a zero exit, and a non-zero one carries Relay's own words.
 pub fn preflight(
     program: &str,
     handoff: &RelayHandoff,
@@ -267,12 +303,71 @@ pub fn preflight(
             program: program.to_string(),
             source,
         })?;
+    if !output.status.success() {
+        let diagnostic = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(RelayError::PreflightRefused {
+            program: program.to_string(),
+            status: output.status.to_string(),
+            diagnostic: match diagnostic.is_empty() {
+                // Said rather than left blank: "it failed and said nothing" is
+                // a different next step from "it failed and said this".
+                true => "(nothing on stderr)".to_string(),
+                false => diagnostic,
+            },
+        });
+    }
     let report = String::from_utf8_lossy(&output.stdout).into_owned();
     handoff.verify_resolved(&report)?;
     Ok(report)
 }
 
-/// The whole subcommand: resolve, refuse, write, preflight, exec.
+/// Everything a chained launch does **except** become the client: resolve,
+/// refuse, write the config, and ask Relay what it resolved.
+///
+/// Every refusal `topham relay` owns lives in here — the topology, the ambient
+/// upstream override, the unexported key and the settings files `plan::resolve`
+/// reads, a Relay that cannot be spawned, and a system config layer that
+/// re-aimed the run. What is left outside is the banner and the `exec`.
+///
+/// **It is a function because there are two callers, and they must not
+/// diverge** (M11.3 review F22). The interactive screen has to run these
+/// refusals *before* it tears the terminal down, so it composed the same five
+/// steps itself — and two hand-written compositions can each be correct and
+/// still answer differently: a different order, a preflight home somewhere
+/// else, one side passing `--relay` and the other the bare name. A screen
+/// refusal that is merely plausible is one nobody can tell is wrong, so the
+/// screen calls this instead.
+///
+/// Returning the report as well as the launch is what lets [`run`] print the
+/// banner without asking Relay twice.
+pub fn dry_run(
+    ambient: &EnvMap,
+    name: &str,
+    profile: Profile,
+    relay_program: &str,
+    argv: Vec<String>,
+) -> Result<(RelayLaunch, String), RelayError> {
+    let resolution = crate::plan::resolve(ambient, name, profile)?;
+    let launch = plan(&resolution, ambient, relay_program, argv)?;
+
+    crate::launch::write_files(&launch.plan)?;
+    std::fs::create_dir_all(&launch.preflight_home).map_err(|source| LaunchError::Write {
+        path: launch.preflight_home.clone(),
+        source,
+    })?;
+
+    let path = ambient.get("PATH").cloned().unwrap_or_default();
+    let report = preflight(
+        relay_program,
+        &launch.handoff,
+        &launch.config,
+        &launch.preflight_home,
+        &path,
+    )?;
+    Ok((launch, report))
+}
+
+/// The whole subcommand: [`dry_run`], then the banner, then the exec.
 ///
 /// The order is the one [`crate::launch::run`] uses and for the same reason,
 /// with the preflight inserted where it can still refuse: after the config
@@ -300,23 +395,7 @@ pub fn run(
     launcher: &dyn Launcher,
     diagnostics: &mut dyn std::io::Write,
 ) -> Result<RelayLaunch, RelayError> {
-    let resolution = crate::plan::resolve(ambient, name, profile)?;
-    let launch = plan(&resolution, ambient, relay_program, argv)?;
-
-    crate::launch::write_files(&launch.plan)?;
-    std::fs::create_dir_all(&launch.preflight_home).map_err(|source| LaunchError::Write {
-        path: launch.preflight_home.clone(),
-        source,
-    })?;
-
-    let path = ambient.get("PATH").cloned().unwrap_or_default();
-    let report = preflight(
-        relay_program,
-        &launch.handoff,
-        &launch.config,
-        &launch.preflight_home,
-        &path,
-    )?;
+    let (launch, report) = dry_run(ambient, name, profile, relay_program, argv)?;
 
     // Printed **before** the exec, because after it this process is gone and
     // Relay's own output owns the terminal. An operator who later wonders which

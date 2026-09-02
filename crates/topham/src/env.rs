@@ -23,12 +23,14 @@
 //! add: an operator running both tools should not have to learn that their two
 //! launchers disagree about where a profile lives.
 //!
-//! An *empty* variable is treated as unset rather than as the current
-//! directory. That is the XDG specification's own rule for a value that is not
-//! an absolute path, and the failure it avoids is specific: a login shell that
-//! exports `XDG_CONFIG_HOME=` would otherwise put a deployment's profiles in
-//! whatever directory the operator happened to be standing in when they ran
-//! `topham`.
+//! A value that is not an **absolute path** — empty or merely relative — is
+//! treated as unset, which is the XDG specification's own rule and applies to
+//! `HOME` here as well. The failure it avoids is specific: a login shell that
+//! exports `XDG_CONFIG_HOME=` or `XDG_CONFIG_HOME=config` would otherwise put a
+//! deployment's profiles, and a codex profile's generated `auth.json` with
+//! them, in whatever directory the operator happened to be standing in when
+//! they ran `topham` — a different directory on the next run, so the profile
+//! that vanished is indistinguishable from one that was never saved.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -92,11 +94,16 @@ fn resolve(
     fallback: &str,
     what: &'static str,
 ) -> Result<PathBuf, NoHome> {
-    if let Some(value) = env.get(xdg).filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(value));
+    let absolute = |name: &str| {
+        env.get(name)
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+    };
+    if let Some(value) = absolute(xdg) {
+        return Ok(value);
     }
-    match env.get("HOME").filter(|value| !value.is_empty()) {
-        Some(home) => Ok(PathBuf::from(home).join(fallback)),
+    match absolute("HOME") {
+        Some(home) => Ok(home.join(fallback)),
         None => Err(NoHome { what, xdg }),
     }
 }
@@ -149,5 +156,52 @@ mod tests {
         assert_eq!(error.xdg, "XDG_CONFIG_HOME");
         assert!(error.to_string().contains("XDG_CONFIG_HOME"), "{error}");
         assert_eq!(data_home(&EnvMap::new()).unwrap_err().xdg, "XDG_DATA_HOME");
+    }
+
+    /// F7: the XDG spec (cited in this module's own doc comment) says a
+    /// relative value for an XDG variable must be treated as if it were
+    /// unset. `resolve` returned a non-empty value verbatim regardless of
+    /// whether it was absolute, so a relative `XDG_CONFIG_HOME` scattered
+    /// profiles -- and, through `codex_home`, a generated `auth.json` --
+    /// under whatever directory `topham` happened to be invoked from.
+    ///
+    /// One case per variable, because each is read by a different resolver
+    /// and a fix applied to one of them would leave the others silent.
+    #[test]
+    fn a_relative_xdg_variable_falls_back_to_home() {
+        let config = env(&[("XDG_CONFIG_HOME", "relative/config"), ("HOME", "/home/op")]);
+        assert_eq!(
+            config_home(&config).unwrap(),
+            PathBuf::from("/home/op/.config")
+        );
+
+        let data = env(&[("XDG_DATA_HOME", "relative/data"), ("HOME", "/home/op")]);
+        assert_eq!(
+            data_home(&data).unwrap(),
+            PathBuf::from("/home/op/.local/share")
+        );
+    }
+
+    /// F7's other half: `HOME` is the fallback, so a relative one is a
+    /// fallback to nowhere. Joining it would put the same files under the
+    /// invocation directory by the longer route, so it is the error that
+    /// names the variable an operator can set instead.
+    #[test]
+    fn a_relative_home_is_no_home_at_all() {
+        let env = env(&[("HOME", "op")]);
+        assert_eq!(
+            config_home(&env).unwrap_err(),
+            NoHome {
+                what: "config",
+                xdg: "XDG_CONFIG_HOME"
+            }
+        );
+        assert_eq!(
+            data_home(&env).unwrap_err(),
+            NoHome {
+                what: "data",
+                xdg: "XDG_DATA_HOME"
+            }
+        );
     }
 }

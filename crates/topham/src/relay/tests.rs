@@ -20,28 +20,9 @@ use super::*;
 use crate::launch::RecordingLauncher;
 use crate::plan::resolve;
 use crate::profile::{Agent, Topology};
-
-const TURN_KEY: &str = "rh_turn_liveAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-const ROOT: &str = "http://127.0.0.1:8080";
-
-fn scratch(tag: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!("topham-{tag}-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&root).expect("a scratch directory");
-    root
-}
-
-fn env(extra: &[(&str, &str)]) -> EnvMap {
-    let mut env = EnvMap::from([
-        ("ROUNDHOUSE_API_KEY".to_string(), TURN_KEY.to_string()),
-        ("XDG_CONFIG_HOME".to_string(), "/op/config".to_string()),
-        ("XDG_DATA_HOME".to_string(), "/op/data".to_string()),
-        ("PATH".to_string(), "/usr/bin:/bin".to_string()),
-    ]);
-    for (name, value) in extra {
-        env.insert((*name).to_string(), (*value).to_string());
-    }
-    env
-}
+use crate::test_support::{
+    AIMED_HERE, RE_AIMED, ROOT, dry_run_double, env, past_text_file_busy, scratch,
+};
 
 fn chained(agent: Agent) -> Profile {
     Profile {
@@ -219,78 +200,6 @@ fn a_codex_profile_watches_the_openai_upstream_variable() {
 // The preflight, against a dry-run double
 // ---------------------------------------------------------------------------
 
-/// A shell script standing in for `nemo-relay run --dry-run`.
-///
-/// It prints `report` and exits, which is the whole of the contract the
-/// preflight depends on. Two things it also does, and they are the point:
-/// it echoes back the argv it was given and every variable it can see, so a
-/// preflight that forgot `--dry-run` or that leaked the operator's environment
-/// is visible in the output rather than only in a behaviour nobody checks.
-fn dry_run_double(dir: &Path, report: &str) -> PathBuf {
-    let path = dir.join("nemo-relay-double.sh");
-    let mut file = std::fs::File::create(&path).expect("the double");
-    write!(
-        file,
-        "#!/bin/sh\nprintf '%s' \"$*\" > \"$(dirname \"$0\")/argv\"\nenv > \
-         \"$(dirname \"$0\")/env\"\ncat <<'REPORT'\n{report}REPORT\n"
-    )
-    .expect("the double's body");
-    drop(file);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-            .expect("the double is executable");
-    }
-    path
-}
-
-/// Run something that spawns the double, retrying past `ETXTBSY`.
-///
-/// **Not a flaky-test papering-over; a property of writing an executable in a
-/// multi-threaded harness.** `File::create` gives this thread a write handle to
-/// the double, and any *other* test thread that forks in the window before it is
-/// dropped inherits that handle — so until that unrelated child reaches its own
-/// `exec`, the kernel refuses to execute the file with "Text file busy".
-/// Reproduced at roughly one run in eight of this file's suite.
-///
-/// Retried rather than avoided because the alternatives are worse: running the
-/// double through `sh <script>` would stop testing the program string
-/// `--relay` actually passes, and bending [`preflight`]'s signature to accept an
-/// interpreter would be production API shaped by a test. Every other error is
-/// returned untouched, so a real refusal is never retried into a pass.
-fn past_text_file_busy<T>(
-    mut attempt: impl FnMut() -> Result<T, RelayError>,
-) -> Result<T, RelayError> {
-    for _ in 0..1_000 {
-        match attempt() {
-            Err(RelayError::PreflightSpawn { source, .. })
-                if source.kind() == std::io::ErrorKind::ExecutableFileBusy =>
-            {
-                std::thread::yield_now();
-            }
-            outcome => return outcome,
-        }
-    }
-    panic!("the double stayed `Text file busy` for a thousand attempts, which is not the race");
-}
-
-const AIMED_HERE: &str = "\
-agent = claude
-gateway_url = http://127.0.0.1:45169
-openai_base_url = https://api.openai.com/v1
-anthropic_base_url = http://127.0.0.1:8080
-anthropic_auth = unset
-";
-
-const RE_AIMED: &str = "\
-agent = claude
-gateway_url = http://127.0.0.1:45169
-openai_base_url = https://api.openai.com/v1
-anthropic_base_url = http://10.0.0.9:8080
-anthropic_auth = unset
-";
-
 /// The control: a double that reports this launch's own upstream is accepted,
 /// and the argv it saw is the `--dry-run` form.
 ///
@@ -410,6 +319,87 @@ fn the_preflight_child_sees_only_path_home_and_the_four_xdg_variables() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A double standing in for a Relay that refuses to run at all: bad config,
+/// an unrecognized `--dry-run`, a version refusal. It writes its diagnostic to
+/// stderr — the way a real CLI failure would — and exits non-zero, printing
+/// nothing on stdout.
+fn failing_dry_run_double(dir: &Path, stderr_message: &str, exit_code: i32) -> PathBuf {
+    let path = dir.join("nemo-relay-failing.sh");
+    let mut file = std::fs::File::create(&path).expect("the double");
+    write!(
+        file,
+        "#!/bin/sh\necho '{stderr_message}' >&2\nexit {exit_code}\n"
+    )
+    .expect("the double's body");
+    drop(file);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("the double is executable");
+    }
+    path
+}
+
+/// F11: a Relay that fails outright — non-zero exit, its diagnostic on
+/// stderr, nothing on stdout — must not be reported as a system layer
+/// re-aiming the run, and Relay's own words must reach the operator.
+///
+/// `preflight` reads only `output.stdout` and never inspects `output.status`,
+/// so an empty stdout here reads exactly like a healthy Relay whose
+/// `--dry-run` report happened to omit the upstream line: `verify_resolved`
+/// returns `UpstreamReAimed { resolved: "(absent)", .. }`, the system-config
+/// paragraph is printed, and the actual failure (this double's stderr) is
+/// thrown away entirely.
+///
+/// The second assertion pins a compounding defect in the same code path:
+/// `RelayError::ReAimed`'s own Display is `"preflight: {0}"`, which is a
+/// *different* string from the source `UpstreamReAimed`'s Display even
+/// though both carry the same underlying report — so `cli::error_chain`'s
+/// consecutive-dedupe (`messages.last() != Some(&message)`) does not
+/// collapse them, and the misreported message prints twice.
+#[test]
+fn a_failing_relay_reports_its_own_diagnostic_not_a_system_reaim() {
+    let dir = scratch("preflight-failing");
+    let stderr_message = "nemo-relay: unrecognized argument --dry-run";
+    let double = failing_dry_run_double(&dir, stderr_message, 2);
+    let handoff = RelayHandoff::for_claude(ROOT, "claude").unwrap();
+    let config = dir.join("relay-config.toml");
+    std::fs::write(&config, handoff.config_toml()).expect("the config");
+
+    let error = past_text_file_busy(|| {
+        preflight(
+            &double.display().to_string(),
+            &handoff,
+            &config,
+            &dir,
+            "/usr/bin:/bin",
+        )
+    })
+    .unwrap_err();
+
+    assert!(
+        !matches!(error, RelayError::ReAimed(_)),
+        "F11: a Relay that exited non-zero with empty stdout is misreported as a system \
+         Relay layer re-aiming the run: {error:?}"
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains(stderr_message),
+        "F11: Relay's own diagnostic on stderr was discarded -- got: {message}"
+    );
+
+    let chain = crate::cli::error_chain(&error);
+    assert_eq!(
+        chain.len(),
+        1,
+        "F11: RelayError::ReAimed's 'preflight: {{0}}' prefix defeats error_chain's \
+         consecutive dedupe, so the misreported message prints twice: {chain:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The whole subcommand against the double: the config lands, the preflight
 /// runs, the banner names both, and the recorded plan is what would have been
 /// exec'd.
@@ -522,4 +512,70 @@ fn the_launch_argv_comes_from_the_shared_agent_form() {
     let launch = planned(&env(&[]), chained(Agent::Claude), &["-p", "x"]);
     let expected = RelayAgent::Claude.run_argv(&launch.config);
     assert_eq!(&launch.plan.argv[..expected.len()], expected.as_slice());
+}
+
+/// F15's claim: `scratch_dir`'s `.parent().expect("codex_home is
+/// <data>/topham/<name>/codex-home")` is the only thing standing between a
+/// `profile.rs` layout change and a caught defect, so that change is "caught
+/// by nothing except the panic at relay.rs:239".
+///
+/// It is not reachable at all through this crate's own API, which is the
+/// correction: `Profile::codex_home` is `data_home().join("topham").join(name)
+/// .join("codex-home")` — three non-empty `.join()`s onto a base
+/// `check_name` and `env::data_home` never let through empty — so the
+/// resulting path always has at least four components and `.parent()` always
+/// returns `Some`. This drives `XDG_DATA_HOME` and the profile name down to
+/// the shortest strings the crate's own validation still accepts (`"/"`,
+/// `"a"`) and shows the `.expect()` still does not fire — a real layout
+/// change (say, `codex_home` dropping the `<name>` segment) would not trip
+/// this panic either; `.parent()` would still return `Some`, just of the
+/// *wrong* directory, silently. The panic path F15 points at is not what
+/// would catch that drift.
+///
+/// The walk itself is gone now — `scratch_dir` joins onto
+/// [`Profile::scratch_root`] — so what this test still holds is the shortest
+/// input the crate accepts resolving to a whole path and not to a panic or a
+/// bare root, which is the property the removed `.expect()` was standing in for.
+#[test]
+fn scratch_dir_does_not_panic_even_at_the_shortest_path_the_crate_accepts() {
+    let env = EnvMap::from([("XDG_DATA_HOME".to_string(), "/".to_string())]);
+    let outcome = std::panic::catch_unwind(|| scratch_dir(&env, "a"));
+    let dir = outcome
+        .expect(
+            "F15: resolving the chained scratch panicked on the shortest data home \
+                 and profile name this crate's own validation can produce",
+        )
+        .expect("scratch_dir resolves data_home");
+    assert_eq!(dir, PathBuf::from("/topham/a/relay"));
+}
+
+/// The relationship the `.expect()` string only *describes*: the chained
+/// scratch and the generated `CODEX_HOME` are siblings under one per-profile
+/// root, so two profiles can never share a Relay config.
+///
+/// This is what F15's refutation showed was actually at risk. The panic the
+/// finding pointed at is unreachable through the crate's own validated inputs;
+/// what a change to `Profile::codex_home`'s layout really does is leave
+/// `.parent()` returning `Some` of the *wrong* directory, silently. The
+/// remaining half of the fix — [`Profile::scratch_root`], a named per-profile
+/// root both sides now derive from, so the two cannot disagree by construction
+/// — has landed; this is what goes red if either side is ever re-derived by
+/// hand instead.
+#[test]
+fn the_relay_scratch_is_a_sibling_of_the_codex_home_under_one_profile_root() {
+    let env = env(&[]);
+    let codex_home = Profile::codex_home(&env, "work").expect("the fixture resolves a data home");
+    let relay = scratch_dir(&env, "work").expect("and the scratch beside it");
+
+    assert_eq!(
+        relay.parent(),
+        codex_home.parent(),
+        "one profile, one root: the chained scratch and the codex home are siblings"
+    );
+    assert_eq!(
+        relay.parent().and_then(|root| root.file_name()),
+        Some(std::ffi::OsStr::new("work")),
+        "and that root is named for the profile, which is what keeps two profiles from \
+         sharing one Relay upstream"
+    );
 }

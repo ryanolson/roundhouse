@@ -37,10 +37,11 @@
 //! inheriting a terminal still in raw mode with the alternate screen active
 //! would draw over the screen it did not open and leave the operator's shell
 //! wrecked when it exits. So [`apply`] does the part of each subcommand that can
-//! still refuse — [`launch::plan`] and [`relay::plan`], which write nothing and
-//! spawn nothing — and only on success marks the model as
-//! [`leaving`](Model::leaving). The loop returns, ratatui restores the terminal,
-//! and *then* the real subcommand runs.
+//! still refuse — [`launch::plan`], and for a relay the plan *and* the isolated
+//! `--dry-run` preflight, because two of that subcommand's refusals do not
+//! exist until Relay itself has been asked — and only on success marks the
+//! model as [`leaving`](Model::leaving). The loop returns, ratatui restores the
+//! terminal, and *then* the real subcommand runs.
 //!
 //! That ordering is also what makes a refusal readable: a chained profile
 //! launched with `l` says so in the status line, on the screen, rather than
@@ -55,7 +56,7 @@
 //! this module that leaves a terminal in raw mode: not a return, not a read
 //! error, not a panic.
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -66,7 +67,7 @@ use crate::cli::error_chain;
 use crate::env::EnvMap;
 use crate::launch::{self, ExecLauncher, LaunchError};
 use crate::plan;
-use crate::profile::{self, Agent, AuthKind, Profile, ProfileError, Topology};
+use crate::profile::{self, Agent, Profile, ProfileError};
 use crate::relay::{self, RELAY_PROGRAM, RelayError};
 
 /// Why the interactive screen could not run, or could not finish what it was
@@ -74,9 +75,15 @@ use crate::relay::{self, RELAY_PROGRAM, RelayError};
 #[derive(Debug, thiserror::Error)]
 pub enum TuiError {
     #[error(
-        "the interactive screen needs a terminal: {0}. Every action it offers is a subcommand -- \
-         run `topham plan`, `topham launch`, `topham relay` or `topham mint` directly"
+        "the interactive screen needs a terminal. Every action it offers is a subcommand -- run \
+         `topham plan`, `topham launch`, `topham relay` or `topham mint` directly"
     )]
+    /// The reason the terminal was refused is the `#[source]` and not part of
+    /// the sentence (F5). It was `{0}` inline, which [`crate::cli::error_chain`]
+    /// then printed a second time as the link below -- and the two readings are
+    /// far apart here: "stdout is redirected" and a raw-mode `ioctl` failure
+    /// call for different next steps, so the cause is worth its own line rather
+    /// than worth saying twice.
     Terminal(#[source] std::io::Error),
     #[error(transparent)]
     Profile(#[from] ProfileError),
@@ -134,6 +141,35 @@ pub enum Action {
     Relay,
 }
 
+/// Which of the two subcommands that `exec` a precheck is for.
+///
+/// Two variants rather than the whole [`Action`], because `precheck` took an
+/// `Action` until F10 and a five-variant parameter forced a wildcard: `Show`,
+/// `Save` and `Reload` were all prechecked *as relays* and then stamped onto
+/// [`Model::leaving`], whose own doc promised only the two that `exec`. That
+/// promise was kept by two call sites rather than by a type; now it is the
+/// type's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Exec {
+    Launch,
+    Relay,
+}
+
+/// What the loop restores the terminal and leaves for, with everything the
+/// subcommand needs already resolved.
+///
+/// The name and the profile ride along rather than being looked up again from
+/// `entries[selected]` after the loop returns: `precheck` resolved them
+/// through [`Model::actionable`] in order to decide it could leave at all, and
+/// a second lookup was a fourth spelling of that accessor carrying two
+/// hand-written "unreachable" returns for cases it could no longer reach (F10).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Leaving {
+    pub exec: Exec,
+    pub name: String,
+    pub profile: Profile,
+}
+
 /// Everything on the screen, and nothing else.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Model {
@@ -153,13 +189,13 @@ pub struct Model {
     pub status: String,
     /// What the last key asked for. Taken by the loop, never performed here.
     pub pending: Option<Action>,
-    /// The action the loop must restore the terminal and leave for — one of
-    /// the two that `exec`, [`Action::Launch`] or [`Action::Relay`], and never
-    /// any of the others.
+    /// What the loop must restore the terminal and leave for — see
+    /// [`Leaving`], whose type is what makes "one of the two that `exec`, and
+    /// never any of the others" a thing this field cannot hold otherwise.
     ///
     /// Set by [`apply`] only after the subcommand's own refusals have all had
     /// their chance, so an operator never watches the screen close on an error.
-    pub leaving: Option<Action>,
+    pub leaving: Option<Leaving>,
     pub exit: bool,
 }
 
@@ -214,73 +250,162 @@ pub enum Field {
     CatalogPath,
 }
 
+/// One field, described once.
+///
+/// **The table is the editor** (F4). Adding a field used to mean six edits the
+/// compiler forced — the ordering array, `label`, `over`, `value`, `text_mut`,
+/// and the struct literal `compose` built — which had to agree with each other,
+/// and two more it did *not*: `is_text` and `cycle` were exception lists that
+/// defaulted, so a new field arrived silently text-editable and non-cycling
+/// whether or not that was true of it, which is the worse half. Here the row
+/// carries what is actually different between fields and everything else reads
+/// it, so a field is a row plus its variant.
+#[derive(Debug, Clone, Copy)]
+struct Spec {
+    field: Field,
+    label: &'static str,
+    /// The key this field is in a profile document, and `None` for the profile
+    /// *name*, which is the filename rather than anything inside the file.
+    key: Option<&'static str>,
+    /// The values this field cycles through. **Empty means typing edits it** —
+    /// the kind is the list, rather than a second column that could disagree
+    /// with it.
+    cycles: &'static [&'static str],
+    /// Whether an empty value means an absent key rather than an empty one.
+    ///
+    /// True for exactly the two `Option` fields on [`Profile`]: an empty text
+    /// field and an absent one are the same thing to a person typing. False
+    /// elsewhere, so that clearing a required field reaches the loader as the
+    /// empty value it is and is refused there, rather than silently resolving
+    /// to that field's serde default.
+    absent_when_empty: bool,
+}
+
+/// Every field, in the order the editor shows them.
+///
+/// `static` rather than `const` so a row can be borrowed for `'static`, and one
+/// list rather than one per direction: the cursor's `next`/`previous` are index
+/// arithmetic over it, so a field with a row is a field the cursor reaches.
+///
+/// The cycle values are spelled the way the profile spells them — they are
+/// written into the document [`Editor::compose`] hands the loader, so a value
+/// this table invented would be refused by `from_toml` as an unknown variant
+/// rather than quietly stored. `every_table_row_round_trips_through_the_loader`
+/// is what checks that every row's key and values are real.
+static FIELDS: [Spec; 8] = [
+    Spec {
+        field: Field::Name,
+        label: "profile name",
+        key: None,
+        cycles: &[],
+        absent_when_empty: false,
+    },
+    Spec {
+        field: Field::Agent,
+        label: "agent",
+        key: Some("agent"),
+        cycles: &["claude", "codex"],
+        absent_when_empty: false,
+    },
+    Spec {
+        field: Field::DeploymentRoot,
+        label: "deployment root",
+        key: Some("deployment-root"),
+        cycles: &[],
+        absent_when_empty: false,
+    },
+    Spec {
+        field: Field::Auth,
+        label: "auth",
+        key: Some("auth"),
+        cycles: &["roundhouse-key", "forwarded-login"],
+        absent_when_empty: false,
+    },
+    Spec {
+        field: Field::KeyEnv,
+        label: "key-env",
+        key: Some("key-env"),
+        cycles: &[],
+        absent_when_empty: false,
+    },
+    Spec {
+        field: Field::Topology,
+        label: "topology",
+        key: Some("topology"),
+        cycles: &["direct", "chained"],
+        absent_when_empty: false,
+    },
+    Spec {
+        field: Field::Model,
+        label: "model (codex)",
+        key: Some("model"),
+        cycles: &[],
+        absent_when_empty: true,
+    },
+    Spec {
+        field: Field::CatalogPath,
+        label: "catalog path (codex)",
+        key: Some("model-catalog-path"),
+        cycles: &[],
+        absent_when_empty: true,
+    },
+];
+
 impl Field {
     /// Every field, in the order the editor shows them.
-    ///
-    /// One array rather than a `match` per direction: `next` and `previous` are
-    /// derived from it, so a field added to the enum and to this list is a
-    /// field the cursor reaches — the failure mode being an editor with a row
-    /// nothing can focus.
-    pub const ALL: [Field; 8] = [
-        Field::Name,
-        Field::Agent,
-        Field::DeploymentRoot,
-        Field::Auth,
-        Field::KeyEnv,
-        Field::Topology,
-        Field::Model,
-        Field::CatalogPath,
-    ];
+    pub fn all() -> impl Iterator<Item = Field> {
+        FIELDS.iter().map(|spec| spec.field)
+    }
+
+    fn spec(self) -> &'static Spec {
+        &FIELDS[self.index()]
+    }
+
+    fn index(self) -> usize {
+        FIELDS
+            .iter()
+            .position(|spec| spec.field == self)
+            .expect("every field has a row in FIELDS")
+    }
 
     pub fn label(self) -> &'static str {
-        match self {
-            Field::Name => "profile name",
-            Field::Agent => "agent",
-            Field::DeploymentRoot => "deployment root",
-            Field::Auth => "auth",
-            Field::KeyEnv => "key-env",
-            Field::Topology => "topology",
-            Field::Model => "model (codex)",
-            Field::CatalogPath => "catalog path (codex)",
-        }
+        self.spec().label
     }
 
     /// Whether typing edits this field, or cycles it.
     pub fn is_text(self) -> bool {
-        !matches!(self, Field::Agent | Field::Auth | Field::Topology)
-    }
-
-    fn index(self) -> usize {
-        Self::ALL
-            .iter()
-            .position(|field| *field == self)
-            .expect("every field is in ALL")
+        self.spec().cycles.is_empty()
     }
 
     pub fn next(self) -> Self {
-        Self::ALL[(self.index() + 1) % Self::ALL.len()]
+        FIELDS[(self.index() + 1) % FIELDS.len()].field
     }
 
     pub fn previous(self) -> Self {
-        Self::ALL[(self.index() + Self::ALL.len() - 1) % Self::ALL.len()]
+        FIELDS[(self.index() + FIELDS.len() - 1) % FIELDS.len()].field
     }
 }
 
 /// One profile's fields, mid-edit.
 ///
-/// Strings for the optional fields rather than `Option<String>`: an empty text
-/// field and an absent one are the same thing to a person typing, and the
-/// conversion happens once, in [`Editor::compose`], where the profile is built.
+/// **Values keyed by [`Field`], not a second copy of [`Profile`]'s shape.**
+/// Mirroring the profile field for field is what forced the per-field arms F4
+/// is about; here the editor is what it looks like on the screen — a row per
+/// `FIELDS` entry and a cursor — and being a profile again is [`compose`]'s
+/// job, done once, through the loader.
+///
+/// Strings throughout, including for the fields that cycle and the two that are
+/// optional: an empty text field and an absent one are the same thing to a
+/// person typing, and a half-typed enum is not an enum at all. Every conversion
+/// happens in one place, where the document is handed to `Profile::from_toml`.
+///
+/// [`compose`]: Editor::compose
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Editor {
-    pub name: String,
-    pub agent: Agent,
-    pub deployment_root: String,
-    pub auth: AuthKind,
-    pub key_env: String,
-    pub topology: Topology,
-    pub model: String,
-    pub catalog_path: String,
+    /// One value per [`FIELDS`] row, in that order — the invariant every
+    /// accessor below relies on, and the reason nothing constructs an `Editor`
+    /// but [`Editor::over`].
+    values: Vec<String>,
     pub field: Field,
     /// The name this editor was opened on, if it was opened on a saved profile.
     ///
@@ -301,20 +426,30 @@ impl Editor {
     }
 
     /// An editor over a saved profile.
+    ///
+    /// Filled from the profile's **own rendering** rather than field by field:
+    /// `to_toml` is what a saved file is, so what the editor shows is what the
+    /// loader would read back, and a field added to [`Profile`] needs no arm
+    /// here — only its row in `FIELDS`.
     pub fn over(name: &str, profile: &Profile, opened_as: Option<String>) -> Self {
+        let document: toml::Table = toml::from_str(&profile.to_toml())
+            .expect("a profile renders as a flat table of strings");
+        let values = FIELDS
+            .iter()
+            .map(|spec| match spec.key {
+                None => name.to_string(),
+                // A key the document does not carry is an absent optional
+                // field, which is an empty row: the two are the same thing
+                // here, and turning one into the other is `compose`'s job.
+                Some(key) => document
+                    .get(key)
+                    .and_then(toml::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            })
+            .collect();
         Self {
-            name: name.to_string(),
-            agent: profile.agent,
-            deployment_root: profile.deployment_root.clone(),
-            auth: profile.auth,
-            key_env: profile.key_env.clone(),
-            topology: profile.topology,
-            model: profile.model.clone().unwrap_or_default(),
-            catalog_path: profile
-                .model_catalog_path
-                .as_ref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_default(),
+            values,
             field: Field::Name,
             opened_as,
         }
@@ -322,52 +457,33 @@ impl Editor {
 
     /// What one field currently reads as, for the view and for a test.
     pub fn value(&self, field: Field) -> String {
-        match field {
-            Field::Name => self.name.clone(),
-            Field::Agent => self.agent.as_str().to_string(),
-            Field::DeploymentRoot => self.deployment_root.clone(),
-            Field::Auth => self.auth.as_str().to_string(),
-            Field::KeyEnv => self.key_env.clone(),
-            Field::Topology => self.topology.as_str().to_string(),
-            Field::Model => self.model.clone(),
-            Field::CatalogPath => self.catalog_path.clone(),
-        }
+        self.values[field.index()].clone()
     }
 
     fn text_mut(&mut self, field: Field) -> Option<&mut String> {
-        match field {
-            Field::Name => Some(&mut self.name),
-            Field::DeploymentRoot => Some(&mut self.deployment_root),
-            Field::KeyEnv => Some(&mut self.key_env),
-            Field::Model => Some(&mut self.model),
-            Field::CatalogPath => Some(&mut self.catalog_path),
-            Field::Agent | Field::Auth | Field::Topology => None,
+        match field.is_text() {
+            true => Some(&mut self.values[field.index()]),
+            false => None,
         }
     }
 
-    /// Cycle the focused field's value, if it is one of the three that cycle.
+    /// Move the focused field to the next of the values its row lists.
+    ///
+    /// A field whose row lists none is left alone, which is what a text field
+    /// under an arrow key should do. A value that is in no list starts the walk
+    /// over — unreachable from [`Editor::over`], since what it read came out of
+    /// a profile that parsed, and cheaper than a panic on a screen.
     fn cycle(&mut self) {
-        match self.field {
-            Field::Agent => {
-                self.agent = match self.agent {
-                    Agent::Claude => Agent::Codex,
-                    Agent::Codex => Agent::Claude,
-                }
-            }
-            Field::Auth => {
-                self.auth = match self.auth {
-                    AuthKind::RoundhouseKey => AuthKind::ForwardedLogin,
-                    AuthKind::ForwardedLogin => AuthKind::RoundhouseKey,
-                }
-            }
-            Field::Topology => {
-                self.topology = match self.topology {
-                    Topology::Direct => Topology::Chained,
-                    Topology::Chained => Topology::Direct,
-                }
-            }
-            _ => {}
+        let cycles = self.field.spec().cycles;
+        let Some(first) = cycles.first() else {
+            return;
+        };
+        let slot = &mut self.values[self.field.index()];
+        *slot = match cycles.iter().position(|value| value == slot) {
+            Some(index) => cycles[(index + 1) % cycles.len()],
+            None => first,
         }
+        .to_string();
     }
 
     /// The profile these fields describe, or why they do not describe one.
@@ -379,7 +495,7 @@ impl Editor {
     /// words, because it is the same function. A second set of checks written
     /// against the same rules is the thing that eventually disagrees.
     pub fn compose(&self) -> Result<(String, Profile), String> {
-        let name = self.name.trim().to_string();
+        let name = self.value(Field::Name).trim().to_string();
         if name.is_empty() {
             return Err(
                 "a profile needs a name: it is the filename `topham <cmd> <name>` \
@@ -387,27 +503,25 @@ impl Editor {
                     .to_string(),
             );
         }
-        let drafted = Profile {
-            agent: self.agent,
-            deployment_root: self.deployment_root.trim().to_string(),
-            auth: self.auth,
-            key_env: self.key_env.trim().to_string(),
-            topology: self.topology,
-            model: some_if_set(&self.model),
-            model_catalog_path: some_if_set(&self.catalog_path).map(Into::into),
-        };
-        let profile = Profile::from_toml(&drafted.to_toml(), &name)
-            .map_err(|error| error_chain(&error).join(" — "))?;
+        // Built as a document rather than as a struct literal, which is what
+        // makes a new field a table row and nothing else (F4). Through
+        // `toml`'s own serializer rather than a `format!`, because a value with
+        // a quote in it would otherwise close the string and the rest of what
+        // was typed would be read as further keys -- a field an operator never
+        // touched, set by a stray character in one they did.
+        let mut document = toml::Table::new();
+        for (spec, value) in FIELDS.iter().zip(&self.values) {
+            let Some(key) = spec.key else { continue };
+            let value = value.trim();
+            if value.is_empty() && spec.absent_when_empty {
+                continue;
+            }
+            document.insert(key.to_string(), toml::Value::String(value.to_string()));
+        }
+        let text = toml::to_string(&document).expect("a flat table of strings serializes");
+        let profile =
+            Profile::from_toml(&text, &name).map_err(|error| error_chain(&error).join(" — "))?;
         Ok((name, profile))
-    }
-}
-
-/// An empty field is an absent one. See [`Editor`].
-fn some_if_set(value: &str) -> Option<String> {
-    let value = value.trim();
-    match value.is_empty() {
-        true => None,
-        false => Some(value.to_string()),
     }
 }
 
@@ -426,6 +540,22 @@ pub fn update(mut model: Model, key: KeyEvent) -> Model {
     // One key, at most one action. Left set, a `Show` that the loop performed
     // would be performed again on the next arrow key.
     model.pending = None;
+
+    // ^C, answered before any screen's own bindings and on every screen.
+    //
+    // Raw mode turns off `ISIG`, so the terminal never raises `SIGINT` and no
+    // handler anywhere in this process will ever see one: ^C arrives here as an
+    // ordinary key. Left to the per-screen matches it was two different silent
+    // wrongs -- nothing at all on the list, where an operator who opened the
+    // screen by accident had no keyboard way out of it, and a literal `'c'`
+    // appended to whatever field had the cursor in the editor, which a
+    // `Backspace` reflex does not catch because ^C leaves no visible keystroke
+    // to undo. Exiting is what an operator means by it, and it is the one
+    // meaning that is the same on all three screens.
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        model.exit = true;
+        return model;
+    }
 
     match model.screen {
         Screen::List => update_list(model, key),
@@ -614,21 +744,22 @@ pub fn apply(mut model: Model, action: Action, env: &EnvMap) -> Model {
             },
             Err(why) => model.status = why,
         },
-        // Both arms run the subcommand's own pure prefix, which is where every
+        // Both arms run the subcommand's own prefix, which is where every
         // refusal either one owns already lives -- `launch::plan` refuses a
         // chained profile, `relay::plan` refuses a direct one and an ambient
-        // upstream override, and `plan::resolve` under both refuses an
+        // upstream override, the relay preflight refuses a missing Relay and a
+        // re-aimed upstream, and `plan::resolve` under both refuses an
         // unexported key and a suppressor. What is left for after the terminal
-        // is restored is the writing and the exec.
-        Action::Launch => model = precheck(model, env, Action::Launch),
-        Action::Relay => model = precheck(model, env, Action::Relay),
+        // is restored is the exec.
+        Action::Launch => model = precheck(model, env, Exec::Launch),
+        Action::Relay => model = precheck(model, env, Exec::Relay),
     }
     model
 }
 
 /// Everything a launch or a relay can refuse before a terminal has to be
 /// restored, run as the subcommand's own functions.
-fn precheck(mut model: Model, env: &EnvMap, action: Action) -> Model {
+fn precheck(mut model: Model, env: &EnvMap, exec: Exec) -> Model {
     let (name, profile) = match model.actionable() {
         Ok((name, profile)) => (name.to_string(), profile.clone()),
         Err(why) => {
@@ -643,17 +774,57 @@ fn precheck(mut model: Model, env: &EnvMap, action: Action) -> Model {
             return model;
         }
     };
-    let refused = match action {
-        Action::Launch => launch::plan(&resolution, env, Vec::new())
+    let refused = match exec {
+        Exec::Launch => launch::plan(&resolution, env, Vec::new())
             .err()
             .map(|error| error_chain(&error).join(" — ")),
-        _ => relay::plan(&resolution, env, RELAY_PROGRAM, Vec::new())
-            .err()
-            .map(|error| error_chain(&error).join(" — ")),
+        // **The subcommand's own prefix, called rather than re-composed**
+        // (F22): `relay::plan` alone was not the whole precheck. It is pure, so
+        // a missing `nemo-relay` and a system Relay layer that re-aims the
+        // upstream both fired later, inside `relay::run` -- which the loop
+        // calls only after the screen has been torn down, so the operator
+        // watched the screen close and then read the refusal on a restored
+        // terminal, which is exactly the ordering `Model::leaving` exists to
+        // prevent. `relay::dry_run` is everything `relay::run` does short of
+        // the banner and the exec, spawn included; asking Relay what it
+        // resolved is the only way to learn either answer.
+        //
+        // The cost is the generated config written here and one spawn repeated
+        // when the launch does go ahead -- the same rendering of the same
+        // profile into the place `relay::run` writes it, so the launch's own
+        // write is the same bytes again. No profile is touched: a precheck is
+        // not a save.
+        //
+        // `--relay` stays a flag on the subcommand and is not offered here: it
+        // names *this box's* binary, and a profile names a deployment (R-T2). A
+        // box with no `nemo-relay` on `PATH` now gets a refusal on the screen
+        // that says so, and `topham relay <name> --relay <path>` answers it.
+        //
+        // It resolves a second time, which is deliberate: the value of calling
+        // the subcommand's entry point is that the screen runs *it* and not a
+        // variant of it, and a `dry_run` taking an already-resolved profile
+        // would be a second entry point to keep in step with the first. The
+        // resolve is pure apart from reading the settings files, and the
+        // profile handed back is the one the first resolve already round-tripped.
+        Exec::Relay => relay::dry_run(
+            env,
+            &resolution.name,
+            resolution.profile.clone(),
+            RELAY_PROGRAM,
+            Vec::new(),
+        )
+        .err()
+        .map(|error| error_chain(&error).join(" — ")),
     };
     match refused {
         Some(why) => model.status = why,
-        None => model.leaving = Some(action),
+        None => {
+            model.leaving = Some(Leaving {
+                exec,
+                name: resolution.name,
+                profile: resolution.profile,
+            })
+        }
     }
     model
 }
@@ -794,10 +965,9 @@ fn view_edit(model: &Model, frame: &mut Frame, area: Rect) {
     let Some(editor) = model.editor.as_ref() else {
         return;
     };
-    let rows: Vec<Line> = Field::ALL
-        .iter()
+    let rows: Vec<Line> = Field::all()
         .map(|field| {
-            let focused = *field == editor.field;
+            let focused = field == editor.field;
             let marker = match focused {
                 true => ">",
                 false => " ",
@@ -814,7 +984,7 @@ fn view_edit(model: &Model, frame: &mut Frame, area: Rect) {
                 format!(
                     "{marker} {:<22}: {}{cursor}",
                     field.label(),
-                    editor.value(*field)
+                    editor.value(field)
                 ),
                 style,
             )
@@ -866,6 +1036,22 @@ fn view_plan(model: &Model, frame: &mut Frame, area: Rect) {
 /// instead. The restore is then ours to place, which is why every path out of
 /// this function passes through one.
 pub fn run(env: &EnvMap) -> Result<(), TuiError> {
+    // **The piped refusal, asked of stdout rather than left to `try_init`.**
+    //
+    // crossterm answers "is there a terminal" by opening `/dev/tty`, so a
+    // `topham > out.txt` run from a shell still had one: `try_init` succeeded
+    // and the whole screen was drawn into the file, 47 bytes of
+    // alternate-screen escape sequence first (F25). The contract this launcher
+    // documents is the stronger one -- a piped `topham` refuses, names the
+    // subcommands, and writes nothing to stdout -- and stdout is the stream the
+    // screen draws into, so stdout is what has to be a terminal for the screen
+    // to be a screen.
+    if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        return Err(TuiError::Terminal(std::io::Error::other(
+            "stdout is redirected, and the screen draws into stdout",
+        )));
+    }
+
     let (entries, status) = listing(env);
     let mut model = Model::new(entries);
     model.status = status;
@@ -875,11 +1061,12 @@ pub fn run(env: &EnvMap) -> Result<(), TuiError> {
         // so a failure of the second step leaves the first applied. Undone
         // here -- but with `disable_raw_mode` alone rather than
         // `ratatui::restore`, which also writes a leave-alternate-screen
-        // sequence to stdout. The commonest way to arrive here is a piped
-        // `topham`, and a launcher that failed to open a screen and then
+        // sequence to stdout. A launcher that failed to open a screen and then
         // injected an escape sequence into whatever was reading its stdout
         // would have corrupted the output on its way to reporting that it did
-        // nothing. Raw mode is a terminal attribute and costs no bytes.
+        // nothing -- and while the redirected case is refused above, a terminal
+        // that refuses raw mode still reaches here. Raw mode is a terminal
+        // attribute and costs no bytes.
         let _ = crossterm::terminal::disable_raw_mode();
         TuiError::Terminal(error)
     })?;
@@ -887,31 +1074,31 @@ pub fn run(env: &EnvMap) -> Result<(), TuiError> {
     // Before the `?`, so a read error still hands the operator their terminal
     // back. `restore` reports its own failures to stderr and does not panic,
     // which is the right shape for a teardown running on an error path.
+    show_cursor(&mut terminal);
     ratatui::restore();
     let model = outcome.map_err(TuiError::Terminal)?;
 
-    let Some(action) = model.leaving else {
+    // Carried on the value rather than looked up again from
+    // `entries[selected]`: the precheck resolved this name and this profile in
+    // order to decide it could leave at all, and re-deriving them here was a
+    // fourth spelling of `actionable()` with two hand-written "unreachable"
+    // returns for the empty list and the unparseable file it could no longer
+    // be handed (F10).
+    let Some(Leaving {
+        exec,
+        name,
+        profile,
+    }) = model.leaving
+    else {
         return Ok(());
-    };
-    // Answered again rather than carried on the action, and handled rather
-    // than asserted: `leaving` is only ever set after `actionable()` answered,
-    // so a missing selection here is unreachable -- and a launcher that
-    // panicked on the unreachable branch would do it *after* the terminal was
-    // restored, where it reads as a crash on exit rather than as a bug.
-    let (name, profile) = match model.entries.get(model.selected) {
-        Some(entry) => match &entry.profile {
-            Ok(profile) => (entry.name.clone(), profile.clone()),
-            Err(_) => return Ok(()),
-        },
-        None => return Ok(()),
     };
     // The whole subcommands, the same functions `topham launch` and `topham
     // relay` call. Neither returns on success.
-    match action {
-        Action::Launch => {
+    match exec {
+        Exec::Launch => {
             launch::run(env, &name, profile, Vec::new(), &ExecLauncher)?;
         }
-        Action::Relay => {
+        Exec::Relay => {
             // stderr for the reason `relay::run`'s doc gives, and with one more
             // of its own here: the screen has just been torn down, and the
             // banner is the last thing the operator reads before Relay's own
@@ -926,9 +1113,31 @@ pub fn run(env: &EnvMap) -> Result<(), TuiError> {
                 &mut std::io::stderr(),
             )?;
         }
-        _ => {}
     }
     Ok(())
+}
+
+/// Make the cursor visible again, which nothing else on the way out does.
+///
+/// Every `draw` hides the cursor, `ratatui::restore()` disables raw mode and
+/// leaves the alternate screen and writes no cursor byte at all, and the one
+/// place in ratatui that shows it again is `Terminal`'s own `Drop` — which
+/// [`run`] never reaches, because both subcommands below end in `execve` and
+/// that replaces the process image without unwinding the stack. So a launcher
+/// that left this to the destructor handed the operator a shell with an
+/// invisible cursor for the rest of its life, and only for the child processes
+/// that did not happen to manage the cursor themselves: a Relay failing its own
+/// version gate, a client failing at startup, any `-p`-style run (F12).
+///
+/// Generic over the backend rather than taking a [`ratatui::DefaultTerminal`]
+/// so the byte stream this writes is observable by a test over a sink — the
+/// sequence is the whole of the behaviour, and `TestBackend` buffers cells
+/// rather than bytes.
+fn show_cursor<B: ratatui::backend::Backend>(terminal: &mut ratatui::Terminal<B>) {
+    // Ignored for the reason `restore` ignores its own: this runs on the way
+    // out, including the error path, and a teardown that failed loudly would
+    // replace the operator's real error with its own.
+    let _ = terminal.show_cursor();
 }
 
 /// Draw, read one key, fold it in, perform what it asked for. The untested

@@ -14,22 +14,17 @@
 //! and that the pane it draws is the plan's own rendering — see
 //! [`the_plan_pane_is_the_subcommands_own_rendering`].
 
-use std::path::PathBuf;
-
 use super::*;
-
-/// A well-shaped turn key, the house fixture form.
-const TURN_KEY: &str = "rh_turn_liveAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-const ROOT: &str = "http://127.0.0.1:8080";
-
-/// A scratch directory, per the house pattern: the temp dir plus a UUID.
-fn scratch(tag: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!("topham-tui-{tag}-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&root).expect("a scratch directory");
-    root
-}
+// Named here rather than inherited through `super::*`: the editor holds its
+// values as text now, so `tui.rs` itself has no use for the enum.
+use crate::profile::{AuthKind, Topology};
+use crate::test_support::{AIMED_HERE, RE_AIMED, ROOT, TURN_KEY, relay_double_on_path, scratch};
 
 /// An environment with the turn key exported and both homes under `root`.
+///
+/// Not [`crate::test_support::env`]: that one fixes the two homes at literals
+/// because resolution touches no filesystem, and every case here either writes
+/// a profile or lets a precheck write a generated config.
 fn env_at(root: &std::path::Path) -> EnvMap {
     EnvMap::from([
         ("ROUNDHOUSE_API_KEY".to_string(), TURN_KEY.to_string()),
@@ -58,6 +53,26 @@ fn keys(mut model: Model, events: impl IntoIterator<Item = KeyEvent>) -> Model {
         model = update(model, event);
     }
     model
+}
+
+/// `apply`, retried past the `ETXTBSY` window the double opens.
+///
+/// Not a flaky test papered over but a property of writing an executable in a
+/// multi-threaded harness, and the same retry `relay::tests` documents at
+/// length: another test thread that forks while this one still holds a write
+/// handle to the script inherits it, and the kernel refuses to execute the file
+/// until that unrelated child reaches its own `exec`. Every other outcome is
+/// returned untouched, so a real refusal is never retried into a pass.
+fn apply_past_text_file_busy(model: Model, action: Action, env: &EnvMap) -> Model {
+    for _ in 0..1_000 {
+        let attempted = apply(model.clone(), action.clone(), env);
+        if attempted.status.contains("Text file busy") {
+            std::thread::yield_now();
+            continue;
+        }
+        return attempted;
+    }
+    panic!("the double stayed `Text file busy` for a thousand attempts, which is not the race");
 }
 
 fn entry(name: &str, profile: Profile) -> Entry {
@@ -195,9 +210,9 @@ fn e_opens_the_editor_over_the_selected_profiles_saved_fields() {
     let model = keys(listed(), [press(KeyCode::Down), press(KeyCode::Char('e'))]);
     assert_eq!(model.screen, Screen::Edit);
     let editor = model.editor.expect("the editor is open");
-    assert_eq!(editor.name, "chained");
-    assert_eq!(editor.topology, Topology::Chained);
-    assert_eq!(editor.deployment_root, ROOT);
+    assert_eq!(editor.value(Field::Name), "chained");
+    assert_eq!(editor.value(Field::Topology), "chained");
+    assert_eq!(editor.value(Field::DeploymentRoot), ROOT);
     assert_eq!(editor.opened_as.as_deref(), Some("chained"));
     assert_eq!(editor.field, Field::Name);
 }
@@ -209,7 +224,7 @@ fn typing_edits_the_focused_text_field_and_backspace_undoes_it() {
     events.push(press(KeyCode::Backspace));
     let model = keys(model, events);
     let editor = model.editor.expect("the editor is open");
-    assert_eq!(editor.name, "wor");
+    assert_eq!(editor.value(Field::Name), "wor");
 }
 
 /// The three enum fields cycle and never take a character.
@@ -221,12 +236,22 @@ fn an_enum_field_cycles_and_ignores_typing() {
     let model = keys(model, typed("zzz"));
     let editor = model.editor.clone().expect("the editor is open");
     assert_eq!(editor.field, Field::Agent);
-    assert_eq!(editor.agent, Agent::Claude, "typing must not edit an enum");
+    assert_eq!(
+        editor.value(Field::Agent),
+        Agent::Claude.as_str(),
+        "typing must not edit an enum"
+    );
 
     let model = keys(model, [press(KeyCode::Right)]);
-    assert_eq!(model.editor.clone().unwrap().agent, Agent::Codex);
+    assert_eq!(
+        model.editor.clone().unwrap().value(Field::Agent),
+        Agent::Codex.as_str()
+    );
     let model = keys(model, [press(KeyCode::Char(' '))]);
-    assert_eq!(model.editor.unwrap().agent, Agent::Claude);
+    assert_eq!(
+        model.editor.unwrap().value(Field::Agent),
+        Agent::Claude.as_str()
+    );
 }
 
 /// The cursor reaches every field, in both directions, and wraps.
@@ -235,16 +260,120 @@ fn the_cursor_walks_every_field() {
     let model = keys(listed(), [press(KeyCode::Char('n'))]);
     let mut seen = vec![model.editor.clone().unwrap().field];
     let mut walking = model;
-    for _ in 1..Field::ALL.len() {
+    for _ in 1..Field::all().count() {
         walking = keys(walking, [press(KeyCode::Tab)]);
         seen.push(walking.editor.clone().unwrap().field);
     }
-    assert_eq!(seen, Field::ALL.to_vec(), "tab must reach every field");
+    assert_eq!(
+        seen,
+        Field::all().collect::<Vec<_>>(),
+        "tab must reach every field"
+    );
     // One more wraps to the first, and BackTab walks back.
     walking = keys(walking, [press(KeyCode::Tab)]);
     assert_eq!(walking.editor.clone().unwrap().field, Field::Name);
     walking = keys(walking, [press(KeyCode::BackTab)]);
     assert_eq!(walking.editor.unwrap().field, Field::CatalogPath);
+}
+
+/// F4: which fields are typed into and which are cycled is now one column of
+/// the table rather than two exception lists the compiler never forced anyone
+/// to update — a new field used to arrive silently text-editable and
+/// non-cycling whether or not that was true of it.
+///
+/// The property is that `is_text` *is* "this row lists no values", so the two
+/// halves can no longer disagree: a field with values cycles and takes no
+/// characters, a field without them is typed into and an arrow key leaves it
+/// alone.
+#[test]
+fn the_table_row_decides_whether_a_field_is_typed_or_cycled() {
+    for field in Field::all() {
+        assert_eq!(
+            field.is_text(),
+            field.spec().cycles.is_empty(),
+            "{field:?}: whether it is text is the row's value list, and nothing else"
+        );
+    }
+
+    // Driven through the editor, because `cycle` is keyed off the focused
+    // field rather than an argument. A text field is left alone by an arrow
+    // key; the cycling one beside it is not.
+    let model = keys(listed(), [press(KeyCode::Char('n'))]);
+    let before = model.editor.clone().unwrap().value(Field::Name);
+    let model = keys(model, [press(KeyCode::Right)]);
+    assert_eq!(
+        model.editor.clone().unwrap().value(Field::Name),
+        before,
+        "a field whose row lists no values has nothing to cycle to"
+    );
+    let model = keys(model, [press(KeyCode::Tab), press(KeyCode::Right)]);
+    assert_eq!(
+        model.editor.unwrap().value(Field::Agent),
+        Agent::Codex.as_str(),
+        "and one whose row lists values moves through them"
+    );
+}
+
+/// The table's own claims, checked against the loader rather than asserted.
+///
+/// Two ways a row can be quietly wrong, and neither is a compile error: the
+/// `key` it names is not the key [`Profile`] serializes (so the editor opens
+/// blank and a save drops the field), and a value in `cycles` is not one the
+/// profile vocabulary has (so composing is refused as an unknown variant, on a
+/// value the operator can only have reached by pressing an arrow key). A full
+/// round trip catches both at once: every field reads something out of a
+/// profile that has every field set, and composing it again is the identity.
+#[test]
+fn every_table_row_round_trips_through_the_loader() {
+    let profile = Profile {
+        auth: AuthKind::ForwardedLogin,
+        key_env: "MY_TURN_KEY".to_string(),
+        topology: Topology::Chained,
+        model: Some("a-slug".to_string()),
+        model_catalog_path: Some("/op/catalog.json".into()),
+        ..Profile::new(Agent::Codex, ROOT)
+    };
+    let editor = Editor::over("work", &profile, None);
+    for field in Field::all() {
+        assert!(
+            !editor.value(field).is_empty(),
+            "{field:?} read nothing out of a profile that sets every field -- its row's \
+             key is not the one `Profile` serializes"
+        );
+    }
+
+    let (name, composed) = editor.compose().expect("what it was opened on composes");
+    assert_eq!(name, "work");
+    assert_eq!(
+        composed, profile,
+        "an open-and-compose round trip must be the identity"
+    );
+
+    // And every value an arrow key can reach is one the loader accepts. Over a
+    // bare profile rather than the one above, because cycling the agent to
+    // `claude` while a codex-only slug is set is refused by a cross-field rule
+    // that has nothing to do with the table.
+    let bare = Editor::over("work", &Profile::new(Agent::Claude, ROOT), None);
+    for field in Field::all().filter(|field| !field.is_text()) {
+        let mut walking = bare.clone();
+        walking.field = field;
+        for _ in 0..=field.spec().cycles.len() {
+            walking.cycle();
+            let reached = walking.value(field);
+            let (_, composed) = walking.compose().unwrap_or_else(|why| {
+                panic!(
+                    "`{}` cycled to `{reached}`, which the loader refuses: {why}",
+                    field.label()
+                )
+            });
+            assert_eq!(
+                Editor::over("work", &composed, None).value(field),
+                reached,
+                "`{}` cycled to `{reached}` and the profile came back saying otherwise",
+                field.label()
+            );
+        }
+    }
 }
 
 #[test]
@@ -350,6 +479,35 @@ fn enter_raises_the_write_with_the_composed_profile() {
     }
 }
 
+/// F9: raw-mode crossterm reports ^C as `KeyEvent{Char('c'), CONTROL}`, not a
+/// signal. `update_edit`'s `Char(c)` arm ignores `key.modifiers`, so a
+/// reflexive ^C mid-edit must not be typed as a literal `'c'` into the
+/// focused field — that would be corruption a `Backspace` habit does not
+/// catch, since ^C does not look like a keystroke on the screen.
+#[test]
+fn ctrl_c_does_not_type_a_literal_c_into_the_focused_field() {
+    let model = keys(listed(), [press(KeyCode::Char('n'))]);
+    let model = keys(model, typed("abc"));
+    let ctrl_c = KeyEvent::new(KeyCode::Char('c'), crossterm::event::KeyModifiers::CONTROL);
+    let model = update(model, ctrl_c);
+    let editor = model.editor.expect("the editor is open");
+    assert_eq!(
+        editor.value(Field::Name),
+        "abc",
+        "ctrl-c must not be appended as a literal 'c'"
+    );
+}
+
+/// F9's control: on the list screen there is no keyboard way to interrupt the
+/// TUI at all — `update_list` has no `CONTROL` arm, so ^C falls into the
+/// wildcard and does nothing, unlike `q`/`Esc`.
+#[test]
+fn ctrl_c_exits_the_list_screen_like_q_does() {
+    let ctrl_c = KeyEvent::new(KeyCode::Char('c'), crossterm::event::KeyModifiers::CONTROL);
+    let model = update(listed(), ctrl_c);
+    assert!(model.exit, "ctrl-c must exit the TUI like q does");
+}
+
 // ---------------------------------------------------------------------------
 // The plan pane
 // ---------------------------------------------------------------------------
@@ -430,7 +588,16 @@ fn a_direct_profile_leaves_the_screen_to_launch() {
     let root = scratch("launch-ok");
     let env = env_at(&root);
     let model = apply(listed(), Action::Launch, &env);
-    assert_eq!(model.leaving, Some(Action::Launch));
+    // The resolved name and profile ride on `leaving` rather than being looked
+    // up again after the loop (F10), so they are what this asserts.
+    assert_eq!(
+        model.leaving,
+        Some(Leaving {
+            exec: Exec::Launch,
+            name: "work".to_string(),
+            profile: Profile::new(Agent::Claude, ROOT),
+        })
+    );
     assert!(model.status.is_empty(), "{}", model.status);
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -472,20 +639,44 @@ fn a_direct_profile_refuses_to_relay_without_leaving_the_screen() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// The chained profile relays, and nothing is written or spawned to find that
-/// out: the precheck is `relay::plan`, which is pure but for two path joins.
+/// The chained profile relays — and the precheck got there by writing the
+/// generated config and asking a real Relay about it.
+///
+/// The write is the F22 fix's own cost, and it is bounded: the config the
+/// preflight resolves, in the place `relay::run` writes it, and nothing else.
+/// No profile is touched, because a precheck is not a save.
 #[test]
 fn a_chained_profile_leaves_the_screen_to_relay() {
     let root = scratch("relay-ok");
-    let env = env_at(&root);
+    let mut env = env_at(&root);
+    relay_double_on_path(&mut env, &root, AIMED_HERE);
     let mut model = listed();
     model.selected = 1;
-    let model = apply(model, Action::Relay, &env);
+    let model = apply_past_text_file_busy(model, Action::Relay, &env);
 
-    assert_eq!(model.leaving, Some(Action::Relay));
+    assert_eq!(
+        model.leaving,
+        Some(Leaving {
+            exec: Exec::Relay,
+            name: "chained".to_string(),
+            profile: Profile {
+                topology: Topology::Chained,
+                ..Profile::new(Agent::Claude, ROOT)
+            },
+        }),
+        "{}",
+        model.status
+    );
     assert!(
-        !root.join("data").exists(),
-        "the precheck must write nothing: `relay::plan` renders, it does not save"
+        relay::scratch_dir(&env, "chained")
+            .expect("the chained scratch resolves")
+            .join("relay-config.toml")
+            .exists(),
+        "the preflight resolves the generated config, so the precheck writes it"
+    );
+    assert!(
+        !root.join("config").exists(),
+        "a precheck writes no profile: the profiles directory is untouched"
     );
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -510,6 +701,146 @@ fn an_ambient_relay_upstream_override_refuses_on_the_screen() {
         "{}",
         model.status
     );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// F22: `precheck` ran only `relay::plan`, which builds the handoff and checks
+/// the topology and the upstream-override env var -- it never spawns anything.
+/// The preflight spawn that fails with `RelayError::PreflightSpawn` (no
+/// `nemo-relay` on `PATH`, or a bad `--relay`) lived only in `relay::run`,
+/// called after `ratatui::restore()` had already torn the screen down. So a box
+/// with no `nemo-relay` anywhere on `PATH` sailed through with
+/// `leaving = Some(Relay)` and the screen closed on a refusal it was never
+/// asked to check for -- contradicting [`Model::leaving`]'s own doc, that the
+/// screen only closes once a subcommand's refusals have all had their chance.
+#[test]
+fn precheck_refuses_a_missing_relay_binary_on_path() {
+    let root = scratch("precheck-missing-relay");
+    let mut env = env_at(&root);
+    // An empty directory on `PATH`: nowhere the preflight spawn could find
+    // `nemo-relay`, matching the finding's own repro (no nemo-relay on PATH).
+    let empty_path = scratch("precheck-missing-relay-path");
+    env.insert("PATH".to_string(), empty_path.display().to_string());
+
+    let mut model = listed();
+    model.selected = 1; // "chained": what `relay::plan` accepts.
+    let model = apply(model, Action::Relay, &env);
+
+    assert!(
+        model.leaving.is_none(),
+        "precheck let a missing nemo-relay binary through unrefused -- it only \
+         ran relay::plan, which never spawns anything and so never sees \
+         RelayError::PreflightSpawn: leaving = {:?}",
+        model.leaving
+    );
+    assert!(
+        model.status.contains("nemo-relay"),
+        "the screen should have refused before closing, naming nemo-relay: {}",
+        model.status
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&empty_path);
+}
+
+/// F22's other half: the screen's precheck and `relay::run` are the *same
+/// function* now, so what an operator reads on the screen is what the
+/// subcommand would have printed — byte for byte, not merely "similar".
+///
+/// The re-aimed upstream is the case that pins it. It is the refusal only the
+/// spawn can produce, it is composed from the handoff and Relay's own report
+/// rather than from a constant, and it was the one the screen would have
+/// silently skipped: two hand-written compositions of plan/write/preflight can
+/// each be correct on their own and still answer differently — a different
+/// order, a preflight home somewhere else, one side passing `--relay` and the
+/// other the bare name — and nothing about a screen refusal that is merely
+/// *plausible* would ever look wrong.
+#[test]
+fn the_screens_relay_precheck_refuses_exactly_as_the_subcommand_does() {
+    let root = scratch("precheck-parity");
+    let mut env = env_at(&root);
+    relay_double_on_path(&mut env, &root, RE_AIMED);
+
+    let mut model = listed();
+    model.selected = 1; // "chained": what `relay::plan` accepts.
+    let model = apply_past_text_file_busy(model, Action::Relay, &env);
+    assert_eq!(model.leaving, None, "{}", model.status);
+
+    let chained = Profile {
+        topology: Topology::Chained,
+        ..Profile::new(Agent::Claude, ROOT)
+    };
+    let launcher = crate::launch::RecordingLauncher::new();
+    let refusal = crate::test_support::past_text_file_busy(|| {
+        relay::run(
+            &env,
+            "chained",
+            chained.clone(),
+            RELAY_PROGRAM,
+            Vec::new(),
+            &launcher,
+            &mut std::io::sink(),
+        )
+    })
+    .expect_err("the double reports an upstream this launch did not ask for");
+
+    assert_eq!(
+        model.status,
+        error_chain(&refusal).join(" — "),
+        "the screen refused differently from the subcommand it fronts"
+    );
+    assert!(
+        model.status.contains("10.0.0.9"),
+        "and the refusal is the re-aim, not something both sides get wrong the same way: {}",
+        model.status
+    );
+    assert!(
+        launcher.launched().is_empty(),
+        "a refused preflight execs nothing"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// F10: `leaving` promised "one of the two that `exec`, and never any of the
+/// others", and `precheck`'s parameter was the whole [`Action`] enum — so
+/// `precheck(model, &env, Action::Reload)` compiled, ran *relay's* precheck
+/// through the `_ =>` wildcard, and on success stamped `leaving` with `Reload`.
+/// Only the two call sites in [`apply`] kept the promise.
+///
+/// **The half that was failing is now a compile error**, which is the fix: the
+/// parameter is [`Exec`] and the field is a [`Leaving`], and neither can be
+/// handed a non-exec action at all. What is left to assert at run time is the
+/// other half of the same invariant — that the actions which are *not* execs
+/// reach no precheck and leave the screen open — and that a precheck which does
+/// leave carries the resolved values `run` uses rather than a bare marker.
+#[test]
+fn only_an_exec_action_ever_sets_leaving() {
+    let root = scratch("precheck-wildcard");
+    let mut env = env_at(&root);
+    relay_double_on_path(&mut env, &root, AIMED_HERE);
+    let mut model = listed();
+    model.selected = 1; // "chained": what `relay::plan` accepts.
+
+    for action in [Action::Show, Action::Reload] {
+        let after = apply(model.clone(), action.clone(), &env);
+        assert_eq!(
+            after.leaving, None,
+            "{action:?} is not an exec and must never leave the screen"
+        );
+    }
+
+    let model = apply_past_text_file_busy(model, Action::Relay, &env);
+    match model.leaving {
+        Some(Leaving { exec, name, .. }) => {
+            assert_eq!(exec, Exec::Relay);
+            assert_eq!(name, "chained", "the resolved name rides along");
+        }
+        None => panic!(
+            "the chained profile should have left for a relay: {}",
+            model.status
+        ),
+    }
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -707,4 +1038,162 @@ fn an_empty_list_draws() {
     terminal
         .draw(|frame| view(&model, frame))
         .expect("an empty list draws");
+}
+
+// ---------------------------------------------------------------------------
+// F12: the cursor across exec
+// ---------------------------------------------------------------------------
+
+/// A `Write` sink `Rc`-shared with the test, so the bytes a `CrosstermBackend`
+/// wrote survive even a `terminal` the test deliberately never drops.
+/// `TestBackend` (used above) buffers cells, not the ANSI byte stream, so it
+/// cannot see a cursor-visibility escape code at all -- F12 is about exactly
+/// those bytes, which only a real `CrosstermBackend` writes.
+#[derive(Clone, Default)]
+struct SharedBytes(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+
+impl std::io::Write for SharedBytes {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.borrow_mut().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// F12's control: `Terminal`'s own `Drop` is what writes the show-cursor
+/// sequence, and nothing else in the sequence `tui::run` follows does.
+///
+/// This pins the mechanism the finding rests on, using the exact pinned
+/// `ratatui`/`ratatui-core` (0.30.2 / 0.1.2): a `draw` hides the cursor
+/// (`ESC[?25l`), and the module's `restore()` -- disabling raw mode and
+/// leaving the alternate screen, modeled here as the byte-relevant half,
+/// `LeaveAlternateScreen` -- writes no cursor-visibility byte at all. Only
+/// once `terminal` actually drops does `ESC[?25h` appear. If this test ever
+/// goes red, the ignored test below is asserting a mechanism that no longer
+/// holds and both need a second look.
+#[test]
+fn f12_control_terminal_drop_is_the_only_thing_that_shows_the_cursor() {
+    let sink = SharedBytes::default();
+    let backend = ratatui::backend::CrosstermBackend::new(sink.clone());
+    {
+        let mut terminal = ratatui::Terminal::new(backend).expect("a crossterm-backed terminal");
+        terminal
+            .draw(|_frame| {})
+            .expect("a draw that hides the cursor");
+        crossterm::execute!(
+            terminal.backend_mut(),
+            crossterm::terminal::LeaveAlternateScreen
+        )
+        .expect("the leave-alternate-screen half of ratatui::restore()");
+        // `terminal` drops here, at the end of this block -- unlike in
+        // `tui::run`, where it stays in scope across the exec below.
+    }
+    let written = String::from_utf8_lossy(&sink.0.borrow()).into_owned();
+    assert!(
+        written.contains("\u{1b}[?25l"),
+        "the draw must hide the cursor or this test proves nothing: {written:?}"
+    );
+    assert!(
+        written.contains("\u{1b}[?25h"),
+        "Terminal::drop must show the cursor once hidden_cursor is set: {written:?}"
+    );
+}
+
+/// F12: `ratatui::restore()` (`tui.rs:890`) only disables raw mode and leaves
+/// the alternate screen -- per the control above, cursor visibility is
+/// restored nowhere but `Terminal`'s `Drop`. But `tui::run`'s `terminal`
+/// local is still in scope when it calls `launch::run`/`relay::run`, and
+/// those `exec` via `std::os::unix::process::CommandExt::exec` --
+/// `launch.rs`'s own doc: "`execve` does not return on success". `execve`
+/// replaces the process image without unwinding the stack, so no local's
+/// destructor runs; `mem::forget` is the standard in-process stand-in for
+/// exactly that -- a value whose destructor is skipped rather than run.
+///
+/// So this drives `run`'s own teardown byte-for-byte over a sink with the
+/// destructor deliberately skipped: draw, [`show_cursor`], the
+/// leave-alternate-screen half of `restore()`, no drop. The fix is that
+/// `ESC[?25h` is in the stream before the forget rather than only in a
+/// destructor an `execve` never runs.
+#[test]
+fn f12_the_cursor_is_shown_before_an_exec_that_skips_the_terminals_drop() {
+    let sink = SharedBytes::default();
+    let backend = ratatui::backend::CrosstermBackend::new(sink.clone());
+    let mut terminal = ratatui::Terminal::new(backend).expect("a crossterm-backed terminal");
+    terminal
+        .draw(|_frame| {})
+        .expect("a draw that hides the cursor");
+    // The production teardown, the same call in the same place `run` makes it
+    // -- which is what this test is here to pin.
+    show_cursor(&mut terminal);
+    crossterm::execute!(
+        terminal.backend_mut(),
+        crossterm::terminal::LeaveAlternateScreen
+    )
+    .expect("the leave-alternate-screen half of ratatui::restore()");
+    // Stands in for `tui::run` calling `launch::run`/`relay::run` while
+    // `terminal` is still alive: the real `execve` skips this destructor
+    // exactly as `mem::forget` does, for the same reason (no unwind).
+    std::mem::forget(terminal);
+
+    let written = String::from_utf8_lossy(&sink.0.borrow()).into_owned();
+    assert!(
+        written.contains("\u{1b}[?25l"),
+        "the draw must hide the cursor or this test proves nothing: {written:?}"
+    );
+    // The cursor must be visible again before the operator gets a shell back.
+    // Drop the `show_cursor` call above -- or `run`'s -- and this goes red with
+    // the byte stream the finding captured from the built binary.
+    assert!(
+        written.contains("\u{1b}[?25h"),
+        "the cursor was left hidden: nothing between the draw and the exec ever showed it again: {written:?}"
+    );
+
+    // And the call site, which the sequence above cannot reach: `run` opens a
+    // real terminal and blocks on `event::read`, so no test in this crate calls
+    // it, and a `show_cursor` that nothing on the way out invokes restores
+    // nobody's cursor. Scanned as source, in the order the two lines have to be
+    // in -- `restore` leaves the alternate screen, and a cursor shown after
+    // that is one shown into the wrong screen.
+    let source = include_str!("../tui.rs");
+    assert!(
+        source.contains("show_cursor(&mut terminal);\n    ratatui::restore();"),
+        "`run` must show the cursor immediately before it restores the terminal"
+    );
+}
+
+/// F13: README.md:72 and :698 described the interactive screen as fronting
+/// "the same four" subcommands — plan, launch, relay, and **mint** — but
+/// [`Action`] has no `Mint` variant: the screen's own [`TuiError::Terminal`]
+/// message names `mint` as one of the subcommands to run *instead of* the
+/// screen, precisely because the screen cannot do it.
+///
+/// Pinned in both directions, because either half can drift into the lie: the
+/// README must not go back to claiming four, and `Action` must not grow the
+/// missing variant without those sentences being rewritten with it. The source
+/// scan is a substring rather than a parse, so the second assertion is also
+/// tripped by a *comment* mentioning the variant — deliberately, since a
+/// comment about a `Mint` action is itself a claim this test exists to keep
+/// honest.
+#[test]
+fn readme_names_the_three_subcommands_the_screen_fronts() {
+    let readme = include_str!("../../../../README.md");
+    let source = include_str!("../tui.rs");
+
+    assert!(
+        !source.contains("Mint"),
+        "`Action` grew a mint variant: the README sentences about the screen \
+         now undercount what it fronts"
+    );
+    assert!(
+        !readme.contains("the same four"),
+        "README claims the screen fronts four subcommands, but `Action` is \
+         Show/Save/Reload/Launch/Relay -- mint takes the tenancy arguments a \
+         profile does not carry, so the screen has no business holding it"
+    );
+    assert!(
+        readme.contains("plan, launch and relay, on a screen"),
+        "the walkthrough must name what the screen actually fronts"
+    );
 }

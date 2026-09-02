@@ -69,7 +69,7 @@ crates.io, the pin becomes a plain version.
 | `roundhouse-relay` | NeMo Relay's published formats — ATOF events, ATIF v1.7 trajectories, `LlmOptimizationSummary` — produced from the same session log |
 | `roundhouse-store-redis` | Redis Streams `SessionStore` and spend ledger: entry id == seq, `PX` lease on the Redis clock, fenced appends via Lua. Selected by `ROUNDHOUSE_REDIS_URL`; absent means in-memory sessions and spend that die with the process |
 | `roundhouse-server` | Turn engine and seven surfaces over one log — native HTTP/SSE, the OpenAI Responses API at `/v1/responses`, the Anthropic Messages API at `/v1/messages`, the MCP mount at `/mcp`, the admin REST plane under `/v1/admin`, `/v1/metrics` and its dashboard, and Relay's three session reads — plus `codex_launch`, `claude_launch` and `relay_handoff`, which produce the configuration each client and a chained Relay read, and the binary |
-| `topham` | The operator entry point, and the one crate that depends *upwards* on `roundhouse-server`: profiles, `plan`, `launch`, `relay`, `mint`, and an interactive screen over the same four. It reads the generators rather than restating them, which is what keeps `roundhouse-server/src/main.rs` free of a flag parser |
+| `topham` | The operator entry point, and the one crate that depends *upwards* on `roundhouse-server`: profiles, `plan`, `launch`, `relay`, `mint`, and an interactive screen over the first three of those — `mint` takes the tenancy arguments (`--project`, `--user`) a profile deliberately does not carry, so it stays a subcommand. It reads the generators rather than restating them, which is what keeps `roundhouse-server/src/main.rs` free of a flag parser |
 
 ## Design
 
@@ -695,7 +695,7 @@ export ROUNDHOUSE_API_KEY=rh_turn_…                    # the key rides the env
 topham plan work                                       # what it resolves to; spawns nothing
 topham launch work -- -p "hello"                       # becomes the client
 topham relay chained -- -p "hello"                     # becomes nemo-relay running the client
-topham                                                 # the same four, on a screen
+topham                                                 # plan, launch and relay, on a screen
 ```
 
 **A profile names things and never holds a secret.** It is TOML under
@@ -740,7 +740,16 @@ fails by *running*:
   the upstream — the system layer is folded in *after* an explicit `--config`
   and wins — and it refuses an ambient `NEMO_RELAY_ANTHROPIC_BASE_URL`
   separately, because that layer sits above `--config` and the preflight
-  deliberately clears it.
+  deliberately clears it;
+- `topham launch` and `topham plan` also read the settings files the client
+  itself will load — `$CLAUDE_CONFIG_DIR/settings.json` (else
+  `$HOME/.claude/settings.json`), `./.claude/settings.json` and
+  `./.claude/settings.local.json` — and refuse one whose `env` block would
+  override a generated variable or set a suppressor, naming the file and the
+  key. An administrator's managed-settings file is deliberately *not* read: it
+  is outside the operator's control and its path is platform-specific in a way
+  nothing here verified, so that one layer is stated in the plan's notes rather
+  than enforced.
 
 **`topham plan` prints the whole resolution with every secret redacted**, and
 the redaction is the generators' own `Debug` rather than this launcher's: the
@@ -786,7 +795,10 @@ ROUNDHOUSE_TEST_CLAUDE_BIN=… ROUNDHOUSE_TEST_RELAY_BIN=… \
 
 A missing `ROUNDHOUSE_TEST_TOPHAM_BIN` under `--include-ignored` is a loud panic
 naming it, never a silent skip — and it names a *freshly built* binary on
-purpose, because a stale one reports green for code nobody compiled.
+purpose, because a stale one reports green for code nobody compiled. That is now
+visible rather than merely warned about: `topham --version` prints the commit
+the binary was built from, and the suite compares it against `HEAD` and warns
+when the two disagree.
 
 ## Metrics and the dashboard
 

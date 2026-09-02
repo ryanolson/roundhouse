@@ -13,34 +13,10 @@
 //! suite off the single-threaded `unsafe` discipline `claude_e2e.rs` has to
 //! observe to mutate a real one.
 
-use std::path::PathBuf;
-
 use super::*;
 use crate::plan::resolve;
 use crate::profile::{Agent, AuthKind};
-
-const TURN_KEY: &str = "rh_turn_liveAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-const ROOT: &str = "http://127.0.0.1:8080";
-
-fn scratch(tag: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!("topham-{tag}-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&root).expect("a scratch directory");
-    root
-}
-
-/// An ambient environment with the key exported, plus whatever the case adds.
-fn env(extra: &[(&str, &str)]) -> EnvMap {
-    let mut env = EnvMap::from([
-        ("ROUNDHOUSE_API_KEY".to_string(), TURN_KEY.to_string()),
-        ("XDG_CONFIG_HOME".to_string(), "/op/config".to_string()),
-        ("XDG_DATA_HOME".to_string(), "/op/data".to_string()),
-        ("PATH".to_string(), "/usr/bin".to_string()),
-    ]);
-    for (name, value) in extra {
-        env.insert((*name).to_string(), (*value).to_string());
-    }
-    env
-}
+use crate::test_support::{ROOT, TURN_KEY, env, scratch};
 
 fn profile(agent: Agent, auth: AuthKind) -> Profile {
     Profile {
@@ -83,7 +59,10 @@ fn a_generated_variable_wins_and_an_unrelated_ambient_one_survives() {
         "the generated map is layered over the ambient one, not under it"
     );
     assert_eq!(plan.env.get("EDITOR").map(String::as_str), Some("vi"));
-    assert_eq!(plan.env.get("PATH").map(String::as_str), Some("/usr/bin"));
+    assert_eq!(
+        plan.env.get("PATH").map(String::as_str),
+        Some("/usr/bin:/bin")
+    );
     assert_eq!(
         plan.env.get("ANTHROPIC_API_KEY").map(String::as_str),
         Some(roundhouse_server::claude_launch::ROUNDHOUSE_API_KEY_SENTINEL),
@@ -265,6 +244,57 @@ fn a_second_launch_overwrites_what_the_first_one_generated() {
     assert!(
         config.contains("[model_providers.roundhouse]"),
         "an edit to a generated file lasts one run: the profile is what is edited instead"
+    );
+}
+
+/// F21: a concurrent second launch must not truncate a `config.toml` a
+/// just-exec'd client may still have open. An atomic write-then-rename
+/// replaces the inode; an in-place `O_TRUNC` write keeps it. Two sequential
+/// `run()`s stand in for the race here -- the property under test is what
+/// `write_files` *does* to the file, not the interleaving -- and is enough to
+/// tell the two mechanisms apart.
+#[test]
+fn a_second_launch_replaces_the_config_file_rather_than_truncating_it_in_place() {
+    use std::os::unix::fs::MetadataExt;
+
+    let root = scratch("codex-inode");
+    let mut env = env(&[]);
+    env.insert(
+        "XDG_DATA_HOME".to_string(),
+        root.join("data").display().to_string(),
+    );
+    let home = root.join("data/topham/work/codex-home");
+    let launcher = RecordingLauncher::new();
+
+    run(
+        &env,
+        "work",
+        profile(Agent::Codex, AuthKind::RoundhouseKey),
+        Vec::new(),
+        &launcher,
+    )
+    .unwrap();
+    let first_ino = std::fs::metadata(home.join("config.toml"))
+        .expect("the first launch's config")
+        .ino();
+
+    run(
+        &env,
+        "work",
+        profile(Agent::Codex, AuthKind::RoundhouseKey),
+        Vec::new(),
+        &launcher,
+    )
+    .unwrap();
+    let second_ino = std::fs::metadata(home.join("config.toml"))
+        .expect("the second launch's config")
+        .ino();
+
+    assert_ne!(
+        first_ino, second_ino,
+        "an atomic write-then-rename replaces the inode a concurrent reader's fd points at; an \
+         in-place O_TRUNC write leaves the first launch's just-exec'd client reading a file that \
+         is being truncated out from under it"
     );
 }
 

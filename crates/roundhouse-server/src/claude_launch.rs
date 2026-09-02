@@ -82,8 +82,8 @@
 //! path), so roundhouse receives a real subscription seat from an operator who
 //! chose the bring-your-own-roundhouse-key stanza and never said so.
 //!
-//! **Two limits of that suppression, recorded rather than reconciled**, because
-//! a launcher cannot lie about the environment it runs in:
+//! **Three limits of that suppression, recorded rather than reconciled**,
+//! because a launcher cannot lie about the environment it runs in:
 //!
 //! 1. **Interactive mode prompts once.** The documented behaviour
 //!    (`code.claude.com/docs/en/env-vars`, quoted at §1.3) is that in
@@ -105,6 +105,14 @@
 //!    [`ClaudeAuthKind::ForwardedClaudeLogin`] the same variable is harmless and
 //!    is not refused — it is [`OAUTH_SUPPRESSORS`]' one entry whose refusal
 //!    belongs to the *other* kind.
+//! 3. **It covers one arm of `VV()`, not the wire.** The sentinel decides what
+//!    the *API-key* arm resolves to and nothing else, so an ambient
+//!    `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR` or
+//!    `apiKeyHelper` still puts a credential of the operator's own on
+//!    `Authorization`, which roundhouse's edge records as the forwarded seat —
+//!    a bring-your-own-key launch spending a subscription it never mentioned
+//!    (F2). Refused under **both** kinds, for reasons that differ by kind; see
+//!    [`OauthSuppressor::refused_beside_the_sentinel`].
 //!
 //! The sentinel is safe to set because the serve side treats it as inert:
 //! [`ROUNDHOUSE_API_KEY_SENTINEL`] lives with the admission boundary that
@@ -309,9 +317,10 @@ pub enum ClaudeAuthKind {
 
 /// Why a launch could not be built from the inputs it was given.
 ///
-/// Four refusals rather than one, because the four failures they prevent look
-/// nothing alike from the operator's chair. Each names what the *client* does
-/// with the bad input, not what this module wanted instead.
+/// A refusal per failure rather than one bucket, because the failures they
+/// prevent look nothing alike from the operator's chair — and the operator's
+/// next move differs with them. Each names what the *client* does with the bad
+/// input, not what this module wanted instead.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ClaudeLaunchError {
     #[error(
@@ -369,6 +378,23 @@ pub enum ClaudeLaunchError {
         if .suppressors.len() == 1 { "es" } else { "" },
     )]
     OauthSuppressorsPresent {
+        suppressors: Vec<&'static OauthSuppressor>,
+    },
+    /// The same inputs as [`Self::OauthSuppressorsPresent`], under the other
+    /// kind and costing something else — which is why it is a second variant
+    /// and not a second reading of the first. There the operator has two
+    /// credentials and must choose; here they have one they did not know was in
+    /// play, and the remedy is to unset it rather than to decide between them.
+    #[error(
+        "this launch also sets {}, which put{} a credential of the operator's own on the wire \
+         beside the `{API_KEY_ENV}` sentinel. The sentinel decides what the client's API-key arm \
+         resolves to and nothing else, so that credential is presented on `Authorization` and \
+         roundhouse records it as the forwarded seat -- a `RoundhouseKey` launch promises a turn \
+         key and nothing else, and this one spends a subscription while every turn still answers",
+        quoted_names(.suppressors),
+        if .suppressors.len() == 1 { "s" } else { "" },
+    )]
+    CredentialBesideTheSentinel {
         suppressors: Vec<&'static OauthSuppressor>,
     },
     #[error(
@@ -555,10 +581,12 @@ impl ClaudeLaunch {
     /// Kind-dependent, and the asymmetry is the point — but it is an asymmetry
     /// and not a subset. [`ClaudeAuthKind::ForwardedClaudeLogin`] owes every
     /// input that turns the forwarding off while leaving the run looking
-    /// healthy; [`ClaudeAuthKind::RoundhouseKey`] owes the three that defeat the
-    /// *redirect* and the one that defeats its own sentinel, and owes none of
-    /// the rest because it deliberately sets one of them itself — listing
-    /// [`API_KEY_ENV`] here would be asking a launcher to unset the variable the
+    /// healthy; [`ClaudeAuthKind::RoundhouseKey`] owes everything except
+    /// [`API_KEY_ENV`] — the three that defeat the *redirect*, the one that
+    /// defeats its own sentinel, and the three that put a second credential on
+    /// the wire beside it ([`OauthSuppressor::refused_beside_the_sentinel`]) —
+    /// and owes that one exception because it deliberately sets the variable
+    /// itself: listing it here would be asking a launcher to unset what the
     /// generator is about to write. Which side each input falls on is
     /// [`OauthSuppressor::refused_under`], read from the table.
     pub fn must_be_unset(&self) -> Vec<&'static OauthSuppressor> {
@@ -598,6 +626,7 @@ impl ClaudeLaunch {
         }
 
         let mut offending: Vec<&'static OauthSuppressor> = Vec::new();
+        let mut beside_the_sentinel: Vec<&'static OauthSuppressor> = Vec::new();
         for suppressor in self.must_be_unset() {
             let present = match suppressor.site {
                 SuppressorSite::EnvVar => self.also.contains_key(suppressor.name),
@@ -625,8 +654,23 @@ impl ClaudeLaunch {
                         name: suppressor.name,
                     });
                 }
+                // The one input class whose cost depends on the kind rather
+                // than on the input: under a forwarded login it replaces the
+                // login being forwarded, and under a roundhouse key it adds a
+                // credential beside the sentinel that the edge then reads as
+                // the seat. Same rows, two sentences, because the operator's
+                // next move is "choose one" in the first case and "unset the
+                // one you did not know was set" in the second.
+                Defeats::TheSubscriptionLogin if self.auth == ClaudeAuthKind::RoundhouseKey => {
+                    beside_the_sentinel.push(suppressor)
+                }
                 Defeats::TheSubscriptionLogin => offending.push(suppressor),
             }
+        }
+        if !beside_the_sentinel.is_empty() {
+            return Err(ClaudeLaunchError::CredentialBesideTheSentinel {
+                suppressors: beside_the_sentinel,
+            });
         }
         if !offending.is_empty() {
             return Err(ClaudeLaunchError::OauthSuppressorsPresent {
@@ -677,7 +721,12 @@ impl LaunchValue {
 
 /// What a redacted value renders as: enough to see the variable is set, and
 /// nothing about what it is set to.
-const REDACTED_VALUE: &str = "<set>";
+///
+/// `pub` because `topham` renders the same redaction in its own plan output and
+/// had restated the literal to do it (F14). One spelling, so the two cannot
+/// come to disagree about what "redacted" looks like on a screen an operator
+/// reads as one page.
+pub const REDACTED_VALUE: &str = "<set>";
 
 impl fmt::Debug for LaunchValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

@@ -742,3 +742,40 @@ One observation for a later rung: `LaunchValue::Declared` is unreachable on
 a successful `topham` resolution (the generator refuses every declared
 suppressor), so its redaction is exercised only by `claude_launch`'s own
 tests; an operator-supplied pass-through variable would make it live.
+
+### What the review round changed about the launcher's contract (2026-09-02)
+
+The M11.3 thermo-nuclear review (twenty-five findings, all valid or
+partially valid; rulings in the commit message) moved four things an
+operator would notice, recorded here because R-T2/R-T4 read differently
+without them:
+
+- **Settings files are read, and can refuse a launch.** The client applies
+  a settings-file `env` block over the process environment, so a block left
+  by another tool (Relay's persistent install writes `env.ANTHROPIC_BASE_URL`)
+  silently re-aimed a Direct launch with nothing reporting it. `topham
+  plan`/`launch` now read `$CLAUDE_CONFIG_DIR/settings.json`,
+  `./.claude/settings.json` and `./.claude/settings.local.json` and refuse,
+  naming the file and key, when an `env` block would override a generated
+  variable or set a suppressor; managed settings are not read, and the doc
+  says so. This is the launcher's first ambient read below the environment.
+- **A credential beside the sentinel is refused under both kinds.** R-B
+  refused the five OAuth suppressors only under the forwarded login; a
+  `RoundhouseKey` launch beside an ambient `ANTHROPIC_AUTH_TOKEN` was
+  admitted, the client put it on `Authorization`, and the edge captured it
+  as the caller's seat — the profile promised a turn key and nothing else
+  and delivered the operator's gateway token upstream. The suppressor
+  table now carries a per-row "refused beside the sentinel" flag
+  (`ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`,
+  `apiKeyHelper`); `ANTHROPIC_API_KEY` stays admitted because the
+  generated sentinel overrides it.
+- **A profile is scanned before it is parsed.** A paste that was not TOML
+  echoed the pasted key through the parse error; the scan now runs on the
+  raw text, over keys and values, as a substring test, and a parse error
+  renders position only.
+- **The screen's relay action runs the real preflight before it closes**,
+  which costs writing the Relay config before the operator commits and a
+  second `nemo-relay` spawn on launch; the alternative was a refusal the
+  operator could not read. `topham --version` names the commit it was
+  built from, and the suite warns when that is not HEAD — the stale-binary
+  hazard the README named is now detected rather than described.

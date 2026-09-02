@@ -258,47 +258,103 @@ fn a_cloud_provider_selector_is_refused_even_under_a_roundhouse_key() {
             ClaudeLaunchError::RedirectDefeated { name }
         );
     }
-    // CONTROL: the *login* suppressors are not refused here, because this
-    // kind sets one of them on purpose. A rule that refused them under both
-    // kinds would refuse the generator's own output.
+    // CONTROL: an input this table does not name is not refused under this
+    // kind either. Without it the rule above is indistinguishable from
+    // "refuse every extra variable", which would make the type useless to a
+    // launcher that has to set `PATH`. The *credential* inputs are refused
+    // here too, for a reason of their own — see
+    // [`a_credential_input_is_refused_beside_the_sentinel_too`].
     assert!(
         launch()
-            .also_launching_with("ANTHROPIC_AUTH_TOKEN", "sk-ant-something")
+            .also_launching_with("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
             .env()
             .is_ok(),
-        "a bring-your-own-key launch has no subscription login to protect"
+        "a variable that suppresses nothing is not a suppressor under either kind"
+    );
+}
+
+/// F2: the three inputs that resolve to a credential of the operator's own are
+/// refused beside the sentinel, not only beside a forwarded login.
+///
+/// The sentinel decides what §1.3's `VV()` resolves for the *API-key* arm and
+/// nothing else, so each of these still reaches `Authorization` — and
+/// roundhouse's edge records what arrives there as the forwarded seat. A
+/// `RoundhouseKey` launch next to one of them is a forwarded-login launch in
+/// fact, on a credential the operator never chose to hand over, and every turn
+/// answers while it happens.
+#[test]
+fn a_credential_input_is_refused_beside_the_sentinel_too() {
+    for name in [
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+    ] {
+        let error = launch()
+            .also_launching_with(name, "anything")
+            .env()
+            .expect_err("an operator credential rides past the sentinel onto the wire");
+        // By identity in the carried list rather than by substring, for the
+        // reason F9 gives one variant up.
+        assert!(
+            matches!(&error, ClaudeLaunchError::CredentialBesideTheSentinel { suppressors }
+                if suppressors.iter().any(|s| s.name == name)),
+            "`{name}` must be refused by name under RoundhouseKey, got: {error}"
+        );
+    }
+    let error = launch()
+        .with_settings_api_key_helper()
+        .env()
+        .expect_err("the helper's output is presented exactly like the token is");
+    assert!(
+        matches!(&error, ClaudeLaunchError::CredentialBesideTheSentinel { suppressors }
+            if suppressors.iter().any(|s| s.name == "apiKeyHelper")),
+        "the settings key must be refused under this kind too, got: {error}"
+    );
+
+    // CONTROL, and the row that makes this a per-input rule rather than
+    // "every credential input": `API_KEY_ENV` is the one the generated map
+    // writes the sentinel over, so it is refused as a collision with what the
+    // launch itself sets and never as an operator credential riding past it.
+    assert_eq!(
+        launch()
+            .also_launching_with(API_KEY_ENV, "sk-ant-something")
+            .env()
+            .expect_err("the generator writes that variable itself"),
+        ClaudeLaunchError::CollidesWithGeneratedVar {
+            name: API_KEY_ENV.to_string()
+        }
     );
 }
 
 /// F16: no `also_launching_with` value reaches a `Debug`, on either type.
 ///
 /// The turn key was the only value the redaction covered, and it is the one
-/// value this module *knows* is a secret. `ANTHROPIC_AUTH_TOKEN` beside a
-/// `RoundhouseKey` launch is admitted (the control test right above this
-/// one) and is just as much a credential; a launcher that prints either type
-/// while debugging — which this module's own doc invites — put it in the
-/// log. The name still shows, because "which variables did the launch set"
-/// is what a `Debug` is read for.
+/// value this module *knows* is a secret. A launcher passes variables this
+/// module cannot classify — a proxy URL with credentials in it is the
+/// ordinary case, and every suppressing input this module *does* know is now
+/// refused rather than carried — and a launcher that prints either type while
+/// debugging, which this module's own doc invites, put that value in the log.
+/// The name still shows, because "which variables did the launch set" is what
+/// a `Debug` is read for.
 #[test]
 fn no_declared_value_survives_a_debug_of_the_launch_or_its_environment() {
-    let secret = "sk-ant-api03-operator-secret";
-    let launch = launch().also_launching_with("ANTHROPIC_AUTH_TOKEN", secret);
+    let secret = "http://op:hunter2@proxy.internal:3128";
+    let launch = launch().also_launching_with("HTTPS_PROXY", secret);
     let env = launch
         .env()
-        .expect("a bring-your-own-key launch has no subscription login to protect");
+        .expect("a variable this module does not classify is carried, not refused");
     for rendered in [format!("{env:?}"), format!("{launch:?}")] {
         assert!(
             !rendered.contains(secret),
             "a Debug printed the also_launching_with credential in plaintext: {rendered:?}"
         );
         assert!(
-            rendered.contains("ANTHROPIC_AUTH_TOKEN"),
+            rendered.contains("HTTPS_PROXY"),
             "the redaction must keep the variable name: {rendered:?}"
         );
     }
     // The seam that does yield it, so the above is a redaction rather than a
     // value the launch quietly dropped.
-    assert_eq!(env.get("ANTHROPIC_AUTH_TOKEN"), Some(secret.to_string()));
+    assert_eq!(env.get("HTTPS_PROXY"), Some(secret.to_string()));
 }
 
 /// The list a launcher enforces matches the refusals the generator makes.
@@ -334,11 +390,20 @@ fn must_be_unset_names_what_the_generator_would_refuse() {
             "CLAUDE_CODE_USE_BEDROCK",
             "CLAUDE_CODE_USE_VERTEX",
             "CLAUDE_CODE_USE_FOUNDRY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
             "CLAUDE_CODE_REMOTE",
+            "apiKeyHelper",
         ],
         "a bring-your-own-key launch must not ask a launcher to unset the \
          variable the generator is about to write -- but must ask for the one \
-         that turns that variable off"
+         that turns that variable off, and for the three that put a second \
+         credential on the wire beside it (F2)"
+    );
+    assert!(
+        !byok.contains(&API_KEY_ENV),
+        "the sentinel's own variable is the one exception, and it is the whole \
+         reason this list is per-input"
     );
     // And every name a launcher is asked to unset is one it *can*: the
     // settings key is the exception, and it is marked rather than mixed in.

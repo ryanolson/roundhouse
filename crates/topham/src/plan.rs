@@ -30,12 +30,45 @@
 //! module therefore does not implement redaction — it *borrows* it, which is
 //! what keeps a future field added to either generator from being printed in
 //! the clear by a launcher that had its own copy of the rules.
+//!
+//! # Why the client's settings files are read
+//!
+//! Claude Code applies a settings file's `env` block by **replacing** the value
+//! it inherited, so a `settings.json` left behind by something else — a
+//! persistent NeMo Relay install writes exactly this, `env.ANTHROPIC_BASE_URL`
+//! pointed at its gateway — silently outranks the environment this launcher
+//! generated, and the client that starts is not the launch the profile names.
+//! An ambient-only sweep cannot see that (F3), so [`resolve`] reads the three
+//! files the client's own search would find and refuses one that names a
+//! generated variable or a suppressor.
+//!
+//! **The administrator's managed-policy file is not among them.** It is
+//! deliberately outside the operator's control — a refusal naming it would tell
+//! them to edit a file they may not write — and its path is platform-specific
+//! in a way no capture in this phase verified, so a launcher that guessed at it
+//! would refuse against a file that does not exist there. Its layer is stated
+//! in the plan's notes rather than enforced, the same way a settings key was
+//! before this launcher read any file at all.
+//!
+//! # What a profile may hold, and where that is checked
+//!
+//! A profile reaching [`resolve`] has not necessarily been through
+//! [`Profile::from_toml`] — the TUI's editor, a test and any future constructor
+//! all build one in process — and the Claude arm reads neither of the two
+//! fields only a codex profile has. So resolution validates the profile it is
+//! handed, through the file boundary's own code rather than a second copy of
+//! its rules (F20). The structural fix, an agent-shaped enum in which a Claude
+//! profile cannot hold a slug at all, is deferred: it changes the profile
+//! file's schema and every reader of it, which is a larger change than the
+//! defect.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use roundhouse_server::claude_launch::{OauthSuppressor, SuppressorSite};
+use roundhouse_server::claude_launch::{OauthSuppressor, REDACTED_VALUE, SuppressorSite};
 use roundhouse_server::codex_launch::{CodexLaunchError, GeneratedFile};
-use roundhouse_server::{API_PREFIX, ClaudeEnv, ClaudeLaunch, ClaudeLaunchError, CodexLaunch};
+use roundhouse_server::{
+    API_PREFIX, ClaudeAuthKind, ClaudeEnv, ClaudeLaunch, ClaudeLaunchError, CodexLaunch,
+};
 
 use crate::env::EnvMap;
 use crate::profile::{Agent, AuthKind, Profile, ProfileError, Topology};
@@ -51,14 +84,25 @@ const CODEX_CONFIG_FILE: &str = "config.toml";
 /// time is what lets an operator diff a generated config against the last one.
 const CODEX_CATALOG_FILE: &str = "model-catalog.json";
 
-/// What a redacted value renders as, matching the generator's own spelling.
+/// The client's settings file, in each of the directories it searches.
+const SETTINGS_FILE: &str = "settings.json";
+
+/// The project-local override beside it, which the client reads after
+/// [`SETTINGS_FILE`] and which is the one a `.gitignore` usually covers — so it
+/// is the copy an operator is least likely to remember is there.
+const SETTINGS_LOCAL_FILE: &str = "settings.local.json";
+
+/// The directory both project-local settings files live in, relative to the
+/// directory the client is started in.
+const PROJECT_SETTINGS_DIR: &str = ".claude";
+
+/// What a settings `env` entry is declared to the generator as.
 ///
-/// Restated rather than imported because `claude_launch`'s copy is private to
-/// the enum whose `Debug` prints it. Deliberately the *same* string: a plan
-/// pane that spelled a redaction two ways would read as two different states of
-/// the same variable, which is the one thing an operator scanning this output
-/// is looking for.
-const REDACTED_VALUE: &str = "<set>";
+/// The generator is asked whether a *name* is admissible; none of its refusals
+/// read the value, and holding the real one would put an operator's
+/// `ANTHROPIC_AUTH_TOKEN` — which is exactly what a settings `env` block is
+/// used for — inside a struct this module prints. See [`SettingsFile::env`].
+const A_SETTINGS_VALUE: &str = "<from the settings file>";
 
 /// A profile, resolved against an environment into the launch it names.
 #[derive(Debug)]
@@ -81,9 +125,17 @@ pub enum Resolved {
     Claude {
         launch: ClaudeLaunch,
         env: ClaudeEnv,
-        /// What must not be set when this launch runs, from the generator's own
-        /// table.
-        must_be_unset: Vec<&'static OauthSuppressor>,
+        /// The settings files the launched client will read, as this launcher
+        /// found them.
+        ///
+        /// Held because the rendering shows them: an operator whose launch was
+        /// refused by one of these files needs to know which files were
+        /// searched at all, and an operator whose launch was *not* refused
+        /// needs to know that the search happened. What must not be set when
+        /// this launch runs is not held beside it — that is
+        /// [`ClaudeLaunch::must_be_unset`] on the launch above, and a second
+        /// home for a derived value is a second thing that can be stale (F16).
+        settings: Vec<SettingsFile>,
     },
     Codex {
         launch: CodexLaunch,
@@ -106,6 +158,33 @@ pub enum PlanError {
          (`topham mint --profile ...`) and export it"
     )]
     TurnKeyMissing { key_env: String },
+    #[error(
+        "the settings file {path} sets `{what}`, and the launched client reads that file for \
+         itself: an `env` entry there *replaces* the value this launcher exports, and an \
+         `apiKeyHelper` resolves a credential the generated environment cannot suppress. So the \
+         client that started would not be the launch this profile names, and every turn would \
+         still answer. Remove that key, or point the profile at what the file already says"
+    )]
+    SettingsDefeats {
+        path: PathBuf,
+        /// The key as the file spells it — `env.<NAME>` or `apiKeyHelper`.
+        what: String,
+        /// The generator's own account of what that name does to this launch,
+        /// as the cause rather than inlined: see [`crate::cli::error_chain`].
+        #[source]
+        source: ClaudeLaunchError,
+    },
+    #[error(
+        "could not read the settings file {path}, which the launched client will read for itself: \
+         {why}. Refused rather than skipped: a file this launcher cannot parse is one whose `env` \
+         block it cannot check, and that block silently outranks everything this launch exports"
+    )]
+    SettingsUnreadable {
+        path: PathBuf,
+        /// Rendered rather than kept as a cause, so nothing here can quote the
+        /// file's own text back — a settings file is where a credential lives.
+        why: String,
+    },
     #[error(transparent)]
     Claude(#[from] ClaudeLaunchError),
     #[error(transparent)]
@@ -126,6 +205,15 @@ pub enum PlanError {
 /// upstream is enforced here the day it lands rather than the day somebody
 /// remembers to copy it.
 pub fn resolve(env: &EnvMap, name: &str, profile: Profile) -> Result<Resolution, PlanError> {
+    // **Through the file boundary's own code**, rather than a second copy of
+    // its cross-field rules here (F20, and the module doc): a profile built in
+    // process has never been through `from_toml`, and the Claude arm below
+    // reads neither of the fields only a codex profile has, so an unvalidated
+    // one is dropped in silence where a loaded one is refused by name. The
+    // round trip costs a serialize and a parse of six short fields, and buys
+    // there being exactly one place that knows which field belongs to which
+    // agent.
+    let profile = Profile::from_toml(&profile.to_toml(), name)?;
     let turn_key = env
         .get(&profile.key_env)
         .filter(|value| !value.trim().is_empty())
@@ -140,8 +228,7 @@ pub fn resolve(env: &EnvMap, name: &str, profile: Profile) -> Result<Resolution,
             if profile.auth == AuthKind::ForwardedLogin {
                 launch = launch.forwarding_claude_login();
             }
-            let must_be_unset = launch.must_be_unset();
-            for suppressor in &must_be_unset {
+            for suppressor in launch.must_be_unset() {
                 if suppressor.site != SuppressorSite::EnvVar {
                     continue;
                 }
@@ -149,11 +236,17 @@ pub fn resolve(env: &EnvMap, name: &str, profile: Profile) -> Result<Resolution,
                     launch = launch.also_launching_with(suppressor.name, value);
                 }
             }
+            // The ambient refusal first, so that a settings file is only ever
+            // blamed for something a launch this environment already admits.
             let generated = launch.env()?;
+            let settings = read_settings(env, working_directory().as_deref())?;
+            for file in &settings {
+                file.refuse_what_it_defeats(&launch)?;
+            }
             Resolved::Claude {
                 launch,
                 env: generated,
-                must_be_unset,
+                settings,
             }
         }
         Agent::Codex => {
@@ -172,16 +265,21 @@ pub fn resolve(env: &EnvMap, name: &str, profile: Profile) -> Result<Resolution,
             if profile.auth == AuthKind::ForwardedLogin {
                 launch = launch.forwarding_openai_login();
             }
-            let files = vec![
-                GeneratedFile {
-                    relative_path: CODEX_CONFIG_FILE.to_string(),
-                    contents: launch.config_toml(),
-                },
-                GeneratedFile {
+            let mut files = vec![GeneratedFile {
+                relative_path: CODEX_CONFIG_FILE.to_string(),
+                contents: launch.config_toml(),
+            }];
+            // **Only when the profile did not name a catalog of its own** (F8).
+            // The config above points at `catalog`, so generating a second file
+            // under the default name when that path is somewhere else writes a
+            // catalog nothing reads -- and reports it as one of the files this
+            // launch wrote, which is the half that misleads.
+            if profile.model_catalog_path.is_none() {
+                files.push(GeneratedFile {
                     relative_path: CODEX_CATALOG_FILE.to_string(),
                     contents: launch.model_catalog_json(),
-                },
-            ];
+                });
+            }
             Resolved::Codex {
                 launch,
                 codex_home,
@@ -195,6 +293,147 @@ pub fn resolve(env: &EnvMap, name: &str, profile: Profile) -> Result<Resolution,
         profile,
         resolved,
     })
+}
+
+/// One of the client's settings files, as far as a launch depends on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingsFile {
+    /// Where it was found, so a refusal can name the file to edit.
+    pub path: PathBuf,
+    /// The **names** in the file's `env` block, never the values.
+    ///
+    /// A settings `env` block is the usual home of an operator's
+    /// `ANTHROPIC_AUTH_TOKEN`, and this struct is printed by `topham plan` and
+    /// by the screen's plan pane. Every refusal below is a question about a
+    /// name, so the values are read and dropped rather than carried into a type
+    /// whose next field would be the one that leaks — the argument
+    /// `ClaudeLaunch` makes for its own private fields.
+    pub env: Vec<String>,
+    /// Whether the file defines `apiKeyHelper`, which resolves a credential no
+    /// generated environment can suppress.
+    pub api_key_helper: bool,
+}
+
+impl SettingsFile {
+    /// Refuse this launch if this file would change what it means.
+    ///
+    /// The question is put to the **generator**, by declaring each key the way
+    /// an ambient variable is declared and reading its answer, so the table of
+    /// what defeats what stays in the one place that owns it: a name this
+    /// launch already writes comes back as a collision, and a suppressor comes
+    /// back with the sentence describing what it costs this auth kind.
+    fn refuse_what_it_defeats(&self, launch: &ClaudeLaunch) -> Result<(), PlanError> {
+        let defeated = |what: String, source: ClaudeLaunchError| PlanError::SettingsDefeats {
+            path: self.path.clone(),
+            what,
+            source,
+        };
+        for name in &self.env {
+            if let Err(source) = launch
+                .clone()
+                .also_launching_with(name, A_SETTINGS_VALUE)
+                .env()
+            {
+                return Err(defeated(format!("env.{name}"), source));
+            }
+        }
+        if self.api_key_helper
+            && let Err(source) = launch.clone().with_settings_api_key_helper().env()
+        {
+            return Err(defeated("apiKeyHelper".to_string(), source));
+        }
+        Ok(())
+    }
+}
+
+/// The directory the client will be started in, for the project-local settings
+/// files that are resolved against it.
+///
+/// The one ambient read in this crate that is not a variable, and it is here
+/// rather than in [`crate::env`] for the reason that module exists: it is read
+/// once, at the top of a resolution, and handed on as a value. `None` when the
+/// directory cannot be read at all (deleted out from under the process), which
+/// is treated as "no project settings" rather than as a refusal — the client
+/// started there would have the same problem, and about that this launcher has
+/// nothing to add.
+fn working_directory() -> Option<PathBuf> {
+    std::env::current_dir().ok()
+}
+
+/// The settings files the launched client will read, in the order it reads
+/// them.
+///
+/// `CLAUDE_CONFIG_DIR` relocates the user file wholesale — the same rule the
+/// e2e rig relies on to keep a run out of an operator's real one — and
+/// `$HOME/.claude` is where it lands otherwise. The two project-local files sit
+/// under the directory the client is started in, which is this process's own:
+/// `exec` does not change it.
+fn settings_paths(env: &EnvMap, working_directory: Option<&Path>) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let absolute = |name: &str| {
+        env.get(name)
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+    };
+    let user = absolute("CLAUDE_CONFIG_DIR")
+        .or_else(|| absolute("HOME").map(|home| home.join(PROJECT_SETTINGS_DIR)));
+    if let Some(directory) = user {
+        paths.push(directory.join(SETTINGS_FILE));
+    }
+    if let Some(directory) = working_directory {
+        paths.push(directory.join(PROJECT_SETTINGS_DIR).join(SETTINGS_FILE));
+        paths.push(
+            directory
+                .join(PROJECT_SETTINGS_DIR)
+                .join(SETTINGS_LOCAL_FILE),
+        );
+    }
+    paths
+}
+
+/// Read every settings file that exists, skipping the ones that do not.
+fn read_settings(
+    env: &EnvMap,
+    working_directory: Option<&Path>,
+) -> Result<Vec<SettingsFile>, PlanError> {
+    settings_paths(env, working_directory)
+        .into_iter()
+        .filter_map(|path| read_settings_file(&path).transpose())
+        .collect()
+}
+
+/// One file: absent, readable, or a refusal.
+///
+/// A missing file is the ordinary case and not an error — most launches have
+/// none of the three. Anything else is refused, including a file whose JSON
+/// does not parse: the client applies what it can read out of that file, and a
+/// launcher that shrugged at a parse failure would be admitting exactly the
+/// `env` block it cannot see.
+fn read_settings_file(path: &Path) -> Result<Option<SettingsFile>, PlanError> {
+    let unreadable = |why: String| PlanError::SettingsUnreadable {
+        path: path.to_path_buf(),
+        why,
+    };
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(unreadable(error.to_string())),
+    };
+    let document: serde_json::Value =
+        serde_json::from_str(&text).map_err(|error| unreadable(error.to_string()))?;
+    Ok(Some(SettingsFile {
+        path: path.to_path_buf(),
+        env: document
+            .get("env")
+            .and_then(serde_json::Value::as_object)
+            .map(|block| block.keys().cloned().collect())
+            .unwrap_or_default(),
+        // Present *and* not null: a settings file that writes `"apiKeyHelper":
+        // null` to turn an inherited one off is not a file that defines one.
+        api_key_helper: document
+            .get("apiKeyHelper")
+            .is_some_and(|value| !value.is_null()),
+    }))
 }
 
 impl Resolution {
@@ -225,7 +464,7 @@ impl Resolution {
             Resolved::Claude {
                 launch,
                 env,
-                must_be_unset,
+                settings,
             } => {
                 field(&mut out, "messages url", &launch.messages_url());
                 out.push('\n');
@@ -233,7 +472,10 @@ impl Resolution {
                 out.push_str(&indent(&format!("{env:#?}")));
                 out.push('\n');
                 out.push_str("must be unset when this launch runs:\n");
-                out.push_str(&render_suppressors(must_be_unset));
+                out.push_str(&render_suppressors(&launch.must_be_unset(), launch.auth()));
+                out.push('\n');
+                out.push_str("settings files the client will read:\n");
+                out.push_str(&render_settings(settings));
                 out.push('\n');
                 out.push_str("files written by `topham launch`:\n");
                 out.push_str(&indent(
@@ -336,15 +578,17 @@ impl Resolution {
                 );
             }
         }
-        if let Resolved::Claude { must_be_unset, .. } = &self.resolved
-            && must_be_unset
+        if let Resolved::Claude { launch, .. } = &self.resolved
+            && launch
+                .must_be_unset()
                 .iter()
                 .any(|suppressor| suppressor.site == SuppressorSite::SettingsKey)
         {
             notes.push(
                 "one entry above lives in the client's settings file rather than the \
-                 environment. This launcher reads no settings file -- which one the client \
-                 resolves is its own layered search -- so that entry is stated, not enforced."
+                 environment. The three files listed above are read and refused; an \
+                 administrator's managed-policy file is not read, and outranks all of them, so \
+                 that one layer is stated rather than enforced."
                     .to_string(),
             );
         }
@@ -378,7 +622,7 @@ impl Resolution {
 }
 
 /// The must-be-unset table, one line each, naming what each entry defeats.
-fn render_suppressors(suppressors: &[&'static OauthSuppressor]) -> String {
+fn render_suppressors(suppressors: &[&'static OauthSuppressor], auth: ClaudeAuthKind) -> String {
     if suppressors.is_empty() {
         return indent("(none)");
     }
@@ -390,7 +634,11 @@ fn render_suppressors(suppressors: &[&'static OauthSuppressor]) -> String {
                     SuppressorSite::EnvVar => "environment",
                     SuppressorSite::SettingsKey => "settings key",
                 };
-                format!("{} ({site}) -- {}", suppressor.name, defeats(suppressor))
+                format!(
+                    "{} ({site}) -- {}",
+                    suppressor.name,
+                    defeats(suppressor, auth)
+                )
             })
             .collect::<Vec<_>>()
             .join("\n"),
@@ -404,17 +652,63 @@ fn render_suppressors(suppressors: &[&'static OauthSuppressor]) -> String {
 /// each entry's consequence is different — one sends the client to another
 /// cloud, one un-suppresses a subscription login, one turns off the forwarding
 /// the profile exists for.
-fn defeats(suppressor: &OauthSuppressor) -> &'static str {
+///
+/// One arm needs the auth kind as well as the row, and it is the same asymmetry
+/// the generator splits two errors over: a row that resolves to a bearer
+/// credential *replaces* the login a forwarding profile exists to forward, and
+/// *joins* the turn key a bring-your-own-key profile promised was the only one.
+/// Printing the forwarding sentence beside a `RoundhouseKey` launch would
+/// describe a login that launch does not have.
+fn defeats(suppressor: &OauthSuppressor, auth: ClaudeAuthKind) -> &'static str {
     use roundhouse_server::claude_launch::Defeats;
     match suppressor.defeats {
         Defeats::TheRedirect => "the client goes to another cloud and never reads the base URL",
         Defeats::TheApiKeySentinel => {
             "an ambient login stops being suppressed and reaches this deployment"
         }
+        Defeats::TheSubscriptionLogin if auth == ClaudeAuthKind::RoundhouseKey => {
+            "a second credential rides beside the sentinel and the edge reads it as the seat"
+        }
         Defeats::TheSubscriptionLogin => {
             "the login this profile forwards is suppressed; every request still answers"
         }
     }
+}
+
+/// The settings files, one line each, naming what in them a launch depends on.
+///
+/// Names and never values — see [`SettingsFile::env`] — and the files that were
+/// *searched* rather than only the ones that exist would be the friendlier
+/// output and the wrong one: a plan that listed three paths an operator has
+/// never created reads as three things to go and check.
+fn render_settings(settings: &[SettingsFile]) -> String {
+    if settings.is_empty() {
+        return indent(
+            "(none found) -- an administrator's managed-policy file is not among the three \
+             searched;\nsee the notes",
+        );
+    }
+    indent(
+        &settings
+            .iter()
+            .map(|file| {
+                let mut keys = file
+                    .env
+                    .iter()
+                    .map(|name| format!("env.{name}"))
+                    .collect::<Vec<_>>();
+                if file.api_key_helper {
+                    keys.push("apiKeyHelper".to_string());
+                }
+                let keys = match keys.is_empty() {
+                    true => "nothing this launch depends on".to_string(),
+                    false => keys.join(", "),
+                };
+                format!("{} -- {keys}", file.path.display())
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
 }
 
 /// Four spaces on every line, including the blank ones a `{:#?}` leaves.

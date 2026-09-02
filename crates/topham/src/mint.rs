@@ -28,8 +28,13 @@
 //! wrong the first time somebody moved a member between projects — silently, in
 //! a file whose whole job is to be believed.
 
+use std::io::Write;
+
 use roundhouse_server::API_PREFIX;
 use serde::Deserialize;
+
+use crate::env::EnvMap;
+use crate::profile::Profile;
 
 /// Where the admin key is read from.
 ///
@@ -54,7 +59,7 @@ pub enum MintError {
          about a member who exists"
     )]
     UnusableSegment { what: &'static str, value: String },
-    #[error("could not reach {url}: {source}")]
+    #[error("could not reach {url}")]
     Unreachable {
         url: String,
         #[source]
@@ -70,8 +75,8 @@ pub enum MintError {
     Refused { status: u16, body: String },
     #[error(
         "the deployment answered {status} with a body this launcher could not read as a minted \
-         key: {source}. The secret is returned exactly once, so if that response did carry one it \
-         is already gone -- check `GET /v1/admin/keys` for a key that now exists and revoke it \
+         key. The secret is returned exactly once, so if that response did carry one it is \
+         already gone -- check `GET /v1/admin/keys` for a key that now exists and revoke it \
          before retrying"
     )]
     Unreadable {
@@ -79,6 +84,8 @@ pub enum MintError {
         #[source]
         source: serde_json::Error,
     },
+    #[error("could not write the minted key's export line")]
+    Output(#[from] std::io::Error),
 }
 
 /// The half of the admin response this launcher reads.
@@ -212,6 +219,49 @@ pub fn mint(
         return Err(MintError::Refused { status, body });
     }
     serde_json::from_str(&body).map_err(|source| MintError::Unreadable { status, source })
+}
+
+/// The whole subcommand: read the admin key, mint, print the two lines.
+///
+/// **Here rather than in the dispatch** (F19). `cli::run`'s rule is that every
+/// arm is one call into another module, so that the screen and the subcommand
+/// cannot be two implementations of the same action — and the `mint` arm was
+/// the one that broke it, holding the `ADMIN_KEY_ENV` read, the emptiness check
+/// and the print order in the dispatch where the only way to drive them was to
+/// assemble a whole `Cli`. That contract belongs to the module that knows what
+/// a minted key is.
+///
+/// The transport is a parameter for the reason [`AdminTransport`] exists at
+/// all; both real callers pass [`HttpTransport`].
+pub fn run(
+    env: &EnvMap,
+    profile: &Profile,
+    project: &str,
+    user: &str,
+    transport: &dyn AdminTransport,
+    out: &mut dyn Write,
+) -> Result<(), MintError> {
+    // Empty is missing, not "an admin key that happens to be blank": an
+    // exported-but-unset variable is what a shell leaves behind when the
+    // command that was supposed to fill it failed, and sending it would ask the
+    // deployment to answer 401 about a secret nobody has.
+    let admin_key = env
+        .get(ADMIN_KEY_ENV)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(MintError::AdminKeyMissing)?;
+    let minted = mint(
+        &profile.deployment_root,
+        project,
+        user,
+        admin_key,
+        transport,
+    )?;
+    // The id and tail first, on their own line: the export line is what gets
+    // copied, and a comment on the same line would be copied with it into a
+    // shell that would then treat `#` as part of the value in a `.env` file.
+    writeln!(out, "# minted {} (…{})", minted.id, minted.display_tail)?;
+    writeln!(out, "{}", export_line(&profile.key_env, &minted.secret))?;
+    Ok(())
 }
 
 #[cfg(test)]
