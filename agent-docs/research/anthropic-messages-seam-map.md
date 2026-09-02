@@ -639,3 +639,334 @@ either.
    "x-api-key"])` is one line, and `forwarded.rs:53-57` says explicitly that
    writing it before a client exercises it is a promise the table should not
    make.
+
+---
+
+## 6. Addendum (2026-09-02): the flat-name arm and the MCP mount, as the tree stands after M11.3
+
+Evidence-only, per CLAUDE.md's "validating a claim" order: nothing here is ruled,
+and every place the call could go two ways is stated as two ways. Tree state:
+`566dd26` ("M11.3: topham, the launcher"). Live captures were taken against
+`claude-cli 2.1.257` under `env -i` with a scratch `HOME`/`CLAUDE_CONFIG_DIR`, a
+loopback mock at `ANTHROPIC_BASE_URL`, and `ANTHROPIC_API_KEY=sk-ant-capture-dummy`
+— never the container's own credential (client-surface §5.7).
+
+### 6.1 What the client actually spells (captured, not inferred)
+
+Captured request to the mock at `POST /v1/messages?beta=true`, with one MCP server
+registered by `--mcp-config`:
+
+- The MCP tool arrives as an **ordinary top-level entry of `tools[]`**, flat-named
+  and with no namespace field and no `mcp_servers` key anywhere in the body:
+  `{"name":"mcp__roundhouse__ping","description":"p","input_schema":{"type":"object"}}`.
+  The other 21 entries are the client's own built-ins (`Bash`, `Read`, `Skill`, …).
+- The assistant's call comes back on the resend as
+  `{"type":"tool_use","id":"toolu_cap1","name":"mcp__roundhouse__ping","input":{}}`
+  inside an `assistant` message, and its answer as
+  `{"tool_use_id":"toolu_cap1","type":"tool_result","content":"(mcp__roundhouse__ping completed with no output)"}`
+  inside a **`user`** message — which is the transport convention
+  `messages_api/wire.rs:585-591` already unwraps to `Role::Tool`.
+
+So on this dialect there is nothing for a *namespace* field to be read from: the
+flat spelling is the only spelling, on the way in and on the way out.
+
+### 6.2 Inbound: what canonicalization owes, and where
+
+`messages_api::wire::block_item` (`crates/roundhouse-server/src/messages_api/wire.rs:632-656`)
+maps `ContentBlock::ToolUse { id, name, input }` to
+`ItemContent::ToolCall { call_id: id, name, arguments: input.to_string() }` — `name`
+verbatim, exactly as `responses_api::wire::canonical_item`
+(`crates/roundhouse-server/src/responses_api/wire.rs:94-102`) takes `required_str(value,"name")`
+verbatim. **Two sites, not one**, and only the Responses one is named by
+`dialect.rs:73-77`'s F10 exception. The M11 Messages surface added the second and
+nothing pins it.
+
+The behaviour is pinned today by
+`a_flat_spelling_is_a_different_canonical_call_until_the_wire_learns_to_split_it`
+(`responses_api/wire.rs:618-660`), whose `assert_ne!` is the assertion that has to
+go the other way when the arm lands; the namespaced control is
+`a_clients_namespaced_call_canonicalizes_to_the_bare_stored_item`
+(`responses_api/wire.rs:576-598`). There is **no Messages-side equivalent** of
+either — `messages_api/wire.rs:875-920` asserts a `Grep` call round-trips, and no
+test in that file names `mcp__`.
+
+### 6.3 The collision the reverse split walks into
+
+`roundhouse_core::validate::is_control_call` (`crates/roundhouse-core/src/validate/exchange.rs:194-198`)
+recognises roundhouse's own control traffic by matching `CONTROL_TOOL_NAMESPACE`
+(`"mcp__roundhouse"`, `exchange.rs:169`) plus `CONTROL_TOOL_DELIMITER` (`"__"`,
+`exchange.rs:184`) against `Exchange.name`, and `Exchange.name` is the **stored
+canonical** name (`exchange.rs:92-106`, `name: name.clone()` off `ItemContent::ToolCall`).
+`task_exchanges` (`exchange.rs:215-220`) drops those from every signal the trigger
+computes.
+
+Two consequences, both load-bearing for the arm:
+
+1. **On the Responses path the exemption is already inert.** Canonicalization
+   stores the bare `status`, and `is_control_call("status")` is false. The validate
+   suites exercise it only with flat names — `tool_signals.rs:1163-1168` uses
+   `"mcp__roundhouse__status"`, `trigger.rs:568` the same — so no test distinguishes
+   the two.
+2. **The flat arm makes it live, and the reverse split would kill it again.** A
+   Claude Code control call arrives as `mcp__roundhouse__status`, which
+   `is_control_call` matches. Teaching `block_item` to split the flat name back to
+   `status` — which is precisely what `dialect.rs:31-37` says the arm owes — makes
+   it stop matching, and roundhouse's own control calls re-enter the streaks,
+   windows and depth the steer trigger is computed over. That is the failure G04
+   named (`exchange.rs:202-214`: four calls made because our own generated skill
+   said to make them bought a judge side-call the session did not need).
+
+Three ways out, stated and not ruled:
+
+- **Split inbound, and re-key recognition off the bare tool names** (e.g. against
+  `roundhouse_mcp::tools::TOOL_NAMES`, `crates/roundhouse-mcp/src/tools.rs:73-82`).
+  Cost: an agent's own tool called `status` is then exempted from every signal,
+  and there is no namespace left to tell them apart.
+- **Split inbound, and thread the dialect into the fold.** `exchange.rs:159-168`
+  already writes the unlock condition down: a `SignalContext` carrying the
+  dialect, passed everywhere `ToolSignals::from_exchanges` is called. It also
+  states the cost — deployment configuration inside the one part of the validate
+  loop that is a function of the session log alone.
+- **Do not split; store the flat name.** Contradicts `dialect.rs:14-21`'s
+  neutral-stored-name argument directly, and forks any session that ever changes
+  dialect.
+
+### 6.4 Outbound: what the enum forces today
+
+`grep -rn 'ClientDialect::'` over the workspace returns five sites, all in
+`control_config/mod.rs` (`:213` the `OPEN_DIALECT` static, `:660-661` the
+compile-from-config, `:2040`/`:2059` tests) plus `dialect.rs` itself.
+`ControlPlane::client_dialect` (`control_config/mod.rs:855-862`) has **no production
+caller** — every reference is in `control_config/mod.rs:2039-2072`'s tests. That is
+consistent with `responses_api/wire.rs:558-562`: "the outbound half is gone — no
+response projects a `function_call` frame any more, so `EmittedCall` and its two
+builders were deleted with the steer they existed for".
+
+So **the arm forces zero run-time rendering sites**. The namespace is spelled
+outbound in exactly two generation-time places, neither of which reads the dialect:
+
+- `codex_launch::mcp_server_key` (`codex_launch.rs:597-601`), which strips
+  `MCP_NAMESPACE_PREFIX` off `DEFAULT_MCP_NAMESPACE` to get the `[mcp_servers.<key>]`
+  table key;
+- `codex_launch::skills::namespaced_tool_name` (`codex_launch/skills.rs:246-248`),
+  `format!("{DEFAULT_MCP_NAMESPACE}{MCP_TOOL_NAME_DELIMITER}{tool}")`.
+
+The one site F10 named that the compiler cannot name is therefore the *inbound*
+one, and §6.2 above says it is now two sites rather than one.
+
+### 6.5 How a deployment picks its dialect today
+
+Per deployment, from the control-plane file, and nowhere else. `mcp_namespace` is
+an `Option<String>` on the config (`control_config/config.rs:428`), validated at
+load (`config.rs:1188-1195`; refused empty or whitespace-carrying,
+`BadMcpNamespace` at `config.rs:550-554`), and compiled once into
+`ControlPlane::Configured { dialect, .. }` (`control_config/mod.rs:589-590`,
+`:659-661`). `ControlPlane::Open` answers a `LazyLock` default
+(`mod.rs:207-213`). It is **not per key** (`mod.rs:1087-1092` says so out loud:
+"the key decides who a key is; the dialect decides how a call is spelled") and
+**not per request path** — nothing on either turn surface reads it.
+
+That is the seam M12 has to decide at: a deployment that serves both
+`/v1/responses` (codex) and `/v1/messages` (Claude Code) has one `ClientDialect`
+value and two clients that spell a call differently. Either the dialect stops
+being a deployment-wide value and becomes a property of the accepting surface —
+which the Messages handler already does for tools (`messages_api.rs:461-468`
+stamps `tools_dialect: Some(WireProtocol::AnthropicMessages)` because "this is the
+only layer that knows") — or the enum stays deployment-wide and one of the two
+clients is served a spelling it cannot dispatch.
+
+### 6.6 The MCP mount, and how a Claude call would reach a session
+
+**Mount and auth.** `MCP_MOUNT_PATH = "/mcp"` (`mcp_api.rs:311`), mounted
+`post_service` so every other method is 405 (`mcp_api.rs:359-365`), behind
+`auth_layer` (`mcp_api.rs:375-390`) which calls `ControlPlane::scope` on the request
+headers, refuses `KeyScope::Admin`, and inserts the resolved `Principal` into the
+request extensions. `RoundhouseMcp::caller` (`roundhouse-mcp/src/transport.rs:128-140`)
+reads it back out of the `http::request::Parts`; a request with no principal is a
+protocol error, not a default tenant. `TURN_KEY_HEADER = "x-roundhouse-key"`
+(`control_config/mod.rs:177`) is the header, and `scope` also accepts
+`Authorization: Bearer` (`mod.rs:1026`, `:897`).
+
+**Protocol.** Stateless: `NeverSessionManager` + `legacy_session_mode = false` +
+`json_response = true` (`transport.rs:255-277`), so no `Mcp-Session-Id` is issued
+and there is no server-side session to hang a conversation on. Captured
+handshake: the client offers `protocolVersion "2025-11-25"` and, once the server
+answers `V_2025_06_18` (`transport.rs:164`), stamps `mcp-protocol-version: 2025-06-18`
+on every later POST — negotiation works against the pinned version.
+
+**What `init_session` binds.** `ControlStore::bind_session`
+(`roundhouse-mcp/src/store.rs:429-454`) mints an `rhb_…` `BindingId` for
+`(principal, session)`, idempotently. The read side is `binding_in_log`
+(`store.rs:495-509`), which scans the *rendered text of every item*
+(`binding_ids_in_items`, `store.rs:542-553`) and applies a tenancy check on both
+halves. `store.rs:487-494` states plainly that it has **no production caller**:
+`mcp_api::resolve_session` answers from the cache key and from
+`Conversations::latest`, never from a binding.
+
+**How the correlation would have to work for Claude Code.** `tools/call` carries
+`{name, arguments}` and nothing else that this stack reads —
+`transport.rs:210-216` builds `ToolCall` from `request.name` and
+`request.arguments` only, so an `_meta` a client sent would be discarded before
+`crate::tools::dispatch` ever sees it. The headers are **static per config file**
+(captured: the same three headers on `initialize`, `notifications/initialized`
+and `tools/list`), so there is no per-conversation header a client could set.
+That leaves exactly two paths, and both are already in the tree:
+
+1. **Omit `conversation`** → `ControlPlaneReads::resolve_session`
+   (`mcp_api.rs:141-148`) answers `Conversations::latest(principal)`
+   (`conversations.rs:146-148`), which every Messages turn sets through
+   `bind_prefix` (`messages_api.rs:368-377` → `responses_api.rs:493`). Works for
+   one agent, one conversation, one node. Fails silently for a Claude Code
+   *subagent*, whose session is a sibling name `anthropic_messages/{session}/agent/{id}`
+   (`messages_api/wire.rs:286-291`) racing the parent for `latest`; and across
+   nodes, where `latest` is node-local.
+2. **Pass `conversation`** = the client's own cache key. On this dialect that key
+   is `anthropic_messages/{session_id}` (`DIALECT_NAMESPACE`, `wire.rs:101`;
+   `scoped`, `wire.rs:286-291`), built from `metadata.user_id`'s `session_id`
+   (captured: `{"device_id":"…","account_uuid":"","session_id":"8e124bec-…"}`) or
+   the session header. **The model cannot know that string** — it never appears in
+   the model's context — so this path needs either `init_session` returning it,
+   or the `binding_in_log` join at `store.rs:495` finally acquiring a caller.
+
+The tool descriptions currently tell a model the argument is "the client's own
+prompt_cache_key" (`tools.rs:121-126`), which is Responses vocabulary; on this
+dialect there is no `prompt_cache_key` field at all.
+
+### 6.7 MCP config generation: where it belongs and what it carries
+
+`claude_launch.rs:58-65` defers this by name — "No MCP wiring… Deferred with the
+MCP control surface" — and `claude_launch.rs:10-19` states the module's whole
+shape: *nothing here writes a file*. An `--mcp-config` JSON **is** a file, so the
+deferral and the module's shape are the same decision.
+
+**The secret tension, and the captured way out.** `codex_launch` can keep the key
+out of its own hands because codex's config names a *variable*
+(`bearer_token_env_var = {key_env}`, `codex_launch.rs:450`); `claude_launch.rs:21-32`
+records that Claude Code offers no such indirection for
+`ANTHROPIC_CUSTOM_HEADERS`, which is parsed as literal `Name: Value` lines. **For
+`--mcp-config` that is not true.** Captured against 2.1.257: a header value of
+`"${RH_TURN_KEY}"` in an `--mcp-config` file arrived at the server as
+`x-roundhouse-turn-key: rh_turn_EXPANDED_SECRET_VALUE_…`. So the codex precedent
+carries over exactly — the file names a variable, the launcher never writes a
+secret to disk, and `topham` already guarantees the variable is exported
+(`plan.rs:129-134` refuses to resolve at all when `profile.key_env` is unset, and
+`launch.rs:166` starts the child map from the ambient environment, so `key_env` is
+present in the child on the Claude arm too).
+
+**The hazard that comes with it, also captured.** With the variable *unset*, the
+client sends the header **literally** as `${RH_TURN_KEY}` — no warning, no
+refusal, no failure to start. Against a `Configured` plane that is a rejected
+handshake; against `ControlPlane::Open` (`mod.rs:1076`) every request resolves to
+`Principal::default_open` regardless, so the mis-launch is invisible. The
+short-lived-0600-file alternative is therefore a fallback rather than the
+reference: it is only needed where the launcher cannot guarantee the variable
+reaches the child, and it costs a secret on disk plus a deletion that an `exec`
+(`launch.rs:246-261` — this process is gone) cannot perform.
+
+**Where the generation would hang in `topham`.** `Resolved::Claude`
+(`plan.rs:81-87`) carries `launch`, `env`, `must_be_unset` and no files;
+`plan.rs:238-241` prints "files written by `topham launch`: (none) -- Claude
+Code's whole redirect surface is environment". `launch::layered`
+(`launch.rs:169-180`) populates `files` only on the Codex arm, though
+`LaunchPlan.files` (`launch.rs:93`) is already `Vec<(PathBuf, String)>` and
+`write_files` (`launch.rs:210-224`) is agent-agnostic. So the file half is a
+`Resolved::Claude` field plus one `push` in `layered`.
+
+The **argv half has no seam at all**: `LaunchPlan.argv` (`launch.rs:85-89`) is
+"the operator's `-- <argv>`, verbatim… no default arguments are invented", and
+`plan()` (`launch.rs:132-150`) passes it through untouched. `--mcp-config <path>`
+(and, if the deployment wants the client to ignore the operator's own servers,
+`--strict-mcp-config`) has to be injected somewhere, and today nothing injects
+argv. Two ways: a generated-argv prefix on `LaunchPlan` that the operator's argv
+is appended to, or a `.mcp.json` in the working directory, which needs no argv and
+is project-scoped — and which the client marks "Pending approval" until a person
+approves it (`claude mcp list --help`), so it does not connect on the first launch.
+
+### 6.8 Signage: the Claude analogue of `codex_launch::skills`
+
+Three surfaces, all captured against 2.1.257 by reading where the text lands in
+the request the client then sends:
+
+| Surface | Where the text lands | Admission |
+|---|---|---|
+| `--append-system-prompt <text>` | appended to the **leading `system` blocks** (captured: block `[2]` of three) | `mark_turn_configuration` (`messages_api/wire.rs:472-479`) makes the leading system run `Role::Developer` — **loosely admitted turn configuration** |
+| `$CLAUDE_CONFIG_DIR/skills/<name>/SKILL.md` | an **interior `{"role":"system"}` message**, as `- {name}: {description}` beside the agent-type listing, carrying a cache breakpoint | `wire.rs:449-454` rules an interior system message **history, admitted strictly** |
+| `CLAUDE.md` in the working directory | inside the `<system-reminder>` **text block of the first `user` message** | an ordinary `Role::User` item, **admitted strictly** |
+
+Two facts worth pinning:
+
+- **`CLAUDE_CONFIG_DIR`, not `HOME`, governs the user-scope skills root.** With
+  `HOME=<a>` holding `.claude/skills/rh-status` and `CLAUDE_CONFIG_DIR=<b>` holding
+  `skills/rh-alt`, only `rh-alt` was listed to the model. That makes
+  `$CLAUDE_CONFIG_DIR/skills` the exact analogue of `$CODEX_HOME/skills`
+  (`codex_launch/skills.rs:84-94`) — and the same hermeticity argument applies.
+- **Owning `CLAUDE_CONFIG_DIR` is not free the way owning `CODEX_HOME` is.** It
+  moves the client's whole config, including its login. Under
+  `ClaudeAuthKind::ForwardedClaudeLogin` (`claude_launch.rs:300-307`: "the
+  precondition is a completed `claude` login") a fresh config dir means no login,
+  which roundhouse *admits* and degrades to local-only — the exact silent failure
+  that variant exists to prevent.
+
+`--append-system-prompt` is therefore the least invasive of the three: no file
+written anywhere the operator owns, no config dir moved, and the text lands in the
+one run this surface already admits loosely. Its cost is stated in the client's own
+help: passing it "turns off [`--system-prompt-snapshot`] so the given text applies
+fresh each launch", i.e. the leading run is re-rendered per launch rather than
+recorded once — which is precisely the drift `mark_turn_configuration` absorbs, and
+precisely what would fork the session if the same text were put in an interior
+system message or in `CLAUDE.md` instead.
+
+### 6.9 What the Messages surface would have to accept in `tools[]` that it does not today
+
+Nothing, for a client-registered MCP server: `params.tools` is taken verbatim
+(`messages_api.rs:431`, `:449-459` — "verbatim, and not canonicalized… never
+replayed out of the log") and forwarded with a `tools_dialect` stamp. The flat
+`mcp__roundhouse__*` entries ride through as ordinary client tools.
+
+What *would* be new is roundhouse **adding** its own control tools to a toolbox the
+client did not declare — the Codex topology never needs this, because codex
+registers the MCP server itself and the tools reach the model through that
+registration. On this dialect the same is true (captured), so the question only
+arises for a deployment that wants the control surface present without an
+`--mcp-config`. That would mean appending to `tools[]` on the way to the target,
+which changes `admitted_input_tokens` (`messages_api.rs:359-363`, the figure
+`message_start` reports) and puts a tool in the model's context the client's own
+loop has no dispatcher for — the client would emit a `tool_use` it cannot execute.
+
+### 6.10 Risk list
+
+1. **Two inbound sites, one pinned.** `responses_api::wire::canonical_item:94-102`
+   and `messages_api::wire::block_item:632-656` both take `name` verbatim; only the
+   first has a test naming the flat spelling. An arm that fixes one and not the
+   other forks Messages sessions on their second turn and nothing goes red.
+2. **The reverse split un-recognises control traffic.** §6.3. Silent: the trigger
+   simply starts counting roundhouse's own calls as agent trouble.
+3. **A changed stored name is a changed `turn_id`.** `turn_id_for` hashes the
+   canonical items (`responses_api/wire.rs:199-201`), and
+   `the_turn_id_of_a_fixed_conversation_is_pinned` (`wire.rs:672-680`) exists
+   because moving historical hashes orphans every in-flight retry. Splitting names
+   inbound moves them for every tool-using session already in the store.
+4. **A deployment-wide `ClientDialect` cannot serve two dialects at once.** §6.5.
+5. **`${VAR}` that does not expand is sent literally.** §6.7. On
+   `ControlPlane::Open` the mis-launch is completely invisible.
+6. **A 0600 file the launcher writes is a file nothing deletes.** `ExecLauncher`
+   replaces the process (`launch.rs:246-261`), so any "write then delete" scheme
+   needs a supervisor topham deliberately does not have.
+7. **`latest`-based correlation forks under subagents.** §6.6. Claude Code's Task
+   tool gives a subagent a sibling session name (`wire.rs:286-291`); two of them
+   plus a parent race one `latest` slot per principal, and the loser reads
+   another conversation's status.
+8. **`conversation` is documented in Responses vocabulary.** `tools.rs:121-126`
+   tells a Claude Code model to pass "the client's own prompt_cache_key", a field
+   this dialect does not have. Every tool schema repeats it (eight descriptors),
+   and the descriptors are golden-pinned and prompt-cache-relevant
+   (`tools.rs:12-18`), so correcting the wording invalidates prompt caches
+   deployment-wide.
+9. **`--mcp-config` widens what a turn key reaches.** The same key authenticates
+   the turn surface and `/mcp`; a config file handed to a client is a durable
+   grant of eight tools, two of which write overlays, on whatever conversation
+   `latest` resolves to.
+10. **Signage placed wrong forks sessions.** §6.8: a skill listing lives in a
+    strictly-admitted interior system message, so adding or removing one
+    mid-session forks it — the same class as the budget notice that
+    `is_ephemeral_client_notice` (`wire.rs:393-416`) exists to drop.

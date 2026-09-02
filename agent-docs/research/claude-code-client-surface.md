@@ -1142,6 +1142,216 @@ on both client lines and nothing downstream ever counts the notice. §5.7.1's
 three-turn capture is the evidence that ruling rests on; the cleared-env
 isolation it insists on became the e2e suite's `env_clear` guard.
 
+## 5.8 Addendum (2026-09-02): MCP over HTTP as the current client speaks it
+
+M12 preflight: extended the §5.5-§5.7 rig with a second loopback stub — a
+minimal Streamable-HTTP MCP server (`mcp_stub_server.py`, stdlib
+`http.server`, JSON-RPC over POST at `/mcp`, two tools `status` and
+`declare_intent`) — and taught the Messages mock to answer a `tool_use`
+block naming an MCP tool so the real 2.1.257 binary calls the stub and
+resends the `tool_result`. Rig and raw captures live in the session
+scratchpad (`mcp_capture/{mock_server_mcp.py,mcp_stub_server.py,
+build_mcp_fixtures.py}`, `mcp_capture/run1b/`, `.../run2*/`,
+`.../run3*/`); redacted fixtures are committed at
+`crates/roundhouse-server/tests/fixtures/claude-2.1.257-mcp-{headers,
+turn-1,turn-2-toolresult,wire}.json`, same convention as §5.7's fixtures
+(only the `device_id` hex substituted; the task's own dummy header value
+is not a credential and is left verbatim). Isolation per the task's
+`env -i` allowlist throughout; every run is one `-p` turn under `timeout
+40`. **First-attempt caution for whoever re-runs this rig**: background
+the two stub servers with `disown`, and kill strays only by exact PID
+matched from `/proc/*/cmdline` — a `pkill -f` pattern loose enough to
+match this box's own supervising process ended one shell mid-command
+with no output at all (exit 144) during this dive; narrowing to exact
+PIDs recovered cleanly.
+
+### The config forms, and which ones the client honours
+
+`claude mcp add-json <name> '{"type":"http","url":...,"headers":{...}}'
+-s <scope>` writes the *same* JSON shape for every scope, letting each
+scope's own file be read directly rather than guessed:
+
+| Scope | Where it lands | Honoured for a real turn? |
+|---|---|---|
+| `--mcp-config '<json>'` (CLI flag, a `{"mcpServers":{...}}` object or file path) | nowhere on disk — process args only | **Yes** |
+| project (`.mcp.json` in cwd, `-s project`) | `<cwd>/.mcp.json`, top-level `mcpServers` | **Yes**, and in `-p` mode with **no approval step** — see below |
+| local (`-s local`, the default) | `~/.claude.json` → `projects["<cwd>"].mcpServers` (per-directory, not shared) | Yes (not separately re-verified this dive; same reader as project scope) |
+| user (`-s user`) | `~/.claude.json` top-level `mcpServers` (`CLAUDE_CONFIG_DIR` relocates the file) | Yes (not separately re-verified this dive; same reader as project scope) |
+| `settings.json`'s own `mcpServers` key (either `--settings <file>` or `.claude/settings.json` in cwd) | the file as given | **No — confirmed inert.** `claude mcp list` reports "No MCP servers configured", `claude doctor` raises no schema warning about the key (it is silently ignored, not rejected), and a live `-p` turn against a mock declaring 21 built-in tools shows **zero** `mcp__*` entries in `tools[]` when the server is defined only here. The task brief's premise that settings.json's `mcpServers` is a working config form does **not** hold at 2.1.257. |
+
+The custom header (`x-roundhouse-key: capture-dummy-turn-key`, this
+task's own value) was verified present on **every** MCP request —
+`initialize` through `tools/call` — under both forms that actually
+worked: `--mcp-config` and project `.mcp.json`. There is no form where
+the header reaches the config but not the wire; the two live where the
+JSON reaches the wire at all.
+
+**Precedence, same server name, `--mcp-config` vs. project `.mcp.json`,
+no `--strict-mcp-config`:** `--mcp-config`'s definition wins outright.
+Two stub servers were configured under the identical name `"roundhouse"`
+— one via `.mcp.json` (`x-roundhouse-key: from-dot-mcp-json`), one via
+`--mcp-config` (`x-roundhouse-key: from-cli-flag`) — and the `.mcp.json`
+stub received **zero** requests (`mcplogA` count 0) while the
+`--mcp-config` stub received the full five-request sequence (`mcplogB`
+count 5). This is CLI-flag-shadows-project-file, not merge-by-name with
+project winning.
+
+**`--strict-mcp-config` excludes `.mcp.json` even under a distinct
+name**, not just a colliding one: with `--mcp-config` naming `cliserver`
+and `.mcp.json` (same cwd) separately naming `projserver`, `tools[]`
+carried only `mcp__cliserver__*` and `projserver`'s stub received zero
+requests — its MCP server was never even initialized, matching
+`--help`'s "ignoring all other MCP configurations" literally, not just
+at the tool-selection step.
+
+**Project-scope servers need no approval in `-p` mode.** `--help`
+already says the workspace trust dialog is skipped non-interactively;
+this extends to MCP server approval specifically. A fresh, empty
+`CLAUDE_CONFIG_DIR` with a project-only `.mcp.json` (no `--mcp-config`,
+no `--strict-mcp-config`) ran the tool to completion in one shot — no
+prompt, no `⏸ Pending approval` state, exit 0 — and the post-run
+`~/.claude.json` carried **no `projects` key at all**, i.e. `-p` mode
+didn't even persist a trust decision to skip on a second run; it simply
+never gated the first one. (`get`/`list`'s "⏸ Pending approval" state,
+per `--help`, is an interactive-mode concept this rig never exercised.)
+
+### `--allowedTools` naming the MCP tool vs. not, and what else does or doesn't unblock it
+
+Without `--allowedTools` naming `mcp__roundhouse__status`, in `-p` mode
+the client does **not** call the tool. It still completes `initialize`,
+`notifications/initialized`, the optional `GET` SSE open, and
+`tools/list` against the stub (so schema discovery for `tools[]` on the
+Messages request is unconditional and permission-independent), but
+`tools/call` is never sent. Instead the client synthesizes its own
+`tool_result` and resends it to the model without asking the server
+anything:
+
+```json
+{"type":"tool_result","is_error":true,"tool_use_id":"toolu_mock_001",
+ "content":"Claude requested permissions to use mcp__roundhouse__status, but you haven't granted it yet."}
+```
+
+With `--allowedTools "mcp__roundhouse__status"` (naming the flat
+`mcp__<server>__<tool>` form), the same run instead sends the real
+`tools/call` and the round trip completes — reproduced identically
+across three independent runs (`run1b`, `run1b-rep2`, `run1b-rep3`: same
+exit 0, same 2 Messages requests, same 5 MCP requests each time).
+
+Two other unblock paths were tried and both failed to help, for
+different reasons, worth recording so nobody re-derives them by surprise:
+
+- `--permission-mode bypassPermissions` (`--dangerously-skip-permissions`'s
+  equivalent) refused outright before any network I/O — zero Messages
+  requests, zero MCP requests, exit 1, stderr:
+  `--dangerously-skip-permissions cannot be used with root/sudo
+  privileges for security reasons`. This is an environment fact (this
+  rig runs as root), not an MCP-specific finding, but it means this dive
+  could not observe the fully-auto-approved shape and had to rely on
+  `--allowedTools` for the clean capture.
+- `--permission-mode dontAsk` **denies** rather than auto-approves an
+  MCP tool call absent `--allowedTools` — its name is directional
+  ("don't ask [before denying]"), not permissive. The synthesized
+  `tool_result` differs from the no-flag case, confirming a distinct
+  code path rather than a no-op:
+  `"Permission to use mcp__roundhouse__status has been denied because
+  Claude Code is running in don't ask mode. IMPORTANT: You *may*
+  attempt to accomplish this action using other tools..."` — again zero
+  `tools/call` requests reached the stub.
+
+So for a headless `roundhouse`-fronted client, `--allowedTools` naming
+the flat tool name (or a server-level wildcard, not itself tested this
+dive) is the confirmed unblock; the task's other candidate,
+`--permission-mode`, does not substitute for it at any setting tried.
+
+### The MCP wire itself: initialize through tools/call, in order
+
+Captured verbatim in `claude-2.1.257-mcp-wire.json` (five requests,
+`initialize` → `notifications/initialized` → `GET` → `tools/list` →
+`tools/call`). Load-bearing shapes:
+
+1. **Transport is Streamable HTTP**, JSON-RPC 2.0 over `POST /mcp`
+   (the path from `--mcp-config`'s `url`), `Accept: application/json,
+   text/event-stream`, `Content-Type: application/json`,
+   `Accept-Encoding: identity` (no compression negotiated for MCP,
+   unlike the Messages side's `gzip, deflate, br, zstd`).
+   `User-Agent: claude-code/2.1.257 (sdk-cli)` — note this differs in
+   form from the Messages client's `claude-cli/2.1.257 (external,
+   sdk-cli)` (§2.2): two different HTTP clients inside the one process.
+2. **`initialize`** (`id: 0`) requests `protocolVersion: "2025-11-25"`,
+   `capabilities: {roots:{listChanged:true}, elicitation:{}}`, and a full
+   `clientInfo` block (`name`, `title`, `version`, `description`,
+   `websiteUrl`) — richer than the bare name/version the 2025-03-26 spec
+   requires. The stub's response carries a fresh `Mcp-Session-Id`
+   header; from the *next* request on, the client echoes it back
+   verbatim on `Mcp-Session-Id` and additionally sends
+   `Mcp-Protocol-Version: 2025-11-25` on every subsequent request
+   (`notifications/initialized`, `GET`, `tools/list`, `tools/call`) —
+   session binding plus protocol-version pinning are both header-level,
+   not body-level, after the handshake.
+3. **`notifications/initialized`** is a bodyless-result JSON-RPC
+   notification (no `id` key at all) — the stub answered bare `202` with
+   no body, which the client accepted without complaint.
+4. **The optional server→client `GET /mcp` SSE stream is opened**
+   (`Accept: text/event-stream` only, same session/protocol headers, no
+   body) even though this single-turn, single-tool-call flow never
+   needed a server-initiated message. Whether a longer session ever
+   closes and reopens it, or relies on one long-lived GET for the whole
+   process lifetime, is unobserved — this rig's turns each spawn a fresh
+   process.
+5. **`tools/list`** (`id: 1`) takes no params; the response's two tools
+   flow into the Messages `tools[]` array with the flat
+   `mcp__<server>__<tool>` name prepended and the `description` /
+   `inputSchema` passed through as `input_schema` **verbatim** — same
+   key name change (`inputSchema` → `input_schema`) as Anthropic's own
+   tool-schema convention, everything else (`type`, `properties`,
+   `required`, `additionalProperties: false`) byte-identical. No
+   `strict` or `defer_loading` field is added for an MCP-sourced tool
+   (those are the built-in-tool-schema features §5 pitfall 6 names).
+6. **`tools/call`** (`id: 2`) is where the flat name gets **split back
+   apart**: `params.name` is the bare `"status"` (server prefix
+   stripped), `params.arguments` is the parsed JSON object the model's
+   `input_json_delta`s accumulated, and `params._meta` carries
+   `{"claudecode/toolUseId": "toolu_mock_001", "progressToken": 2}` — the
+   Anthropic `tool_use.id` riding through as a **namespaced `_meta` key**
+   (`claudecode/` prefix) rather than a bare field, plus a numeric
+   `progressToken` for the (unused, in this stub) progress-notification
+   channel. This directly resolves `PLAN-anthropic-messages.md` §5 open
+   question 3's "owed" item: the reverse split for
+   `ClientDialect`'s flat-tool-name arm is `mcp__<server>__<tool>` →
+   `(server, tool)` by splitting on the first two `__` occurrences (the
+   tool name itself may contain further underscores), and the
+   `_meta["claudecode/toolUseId"]` field — not any envelope-level
+   field — is what a serve surface must thread back to the Anthropic
+   `tool_use.id` when relaying the result.
+7. **The tool's `content` array flows straight into `tool_result.content`
+   unmodified** — the stub returned
+   `{"content":[{"type":"text","text":"stub-result: tool=status
+   args={}"}],"isError":false}` and the resent Messages body's
+   `tool_result.content` is that same one-block array, byte for byte.
+   `isError` was not exercised as `true` this dive (the denial paths in
+   the previous section are client-synthesized, not server-signalled,
+   so they don't test MCP's own `isError` field).
+
+### What this leaves for the M12 design, unresolved by this evidence
+
+- The `_meta["claudecode/toolUseId"]` key is confirmed as the join
+  point for *this* binary; whether it is a documented, versioned contract
+  or an implementation detail that could rename between releases (the
+  way `metadata.user_id`'s shape moved between §5.5 and later reads) is
+  not knowable from one client line's capture — the spec-sync discipline
+  in `CLAUDE.md` applies here as much as to the Messages surface itself.
+- User- and local-scope config files were read (via `claude mcp add-json
+  -s user`/`-s local`) but not independently re-run through a live turn
+  this dive — the assumption that they share project-scope's reader (and
+  therefore project-scope's "no approval needed in `-p` mode" finding)
+  rests on the identical on-disk shape, not a second live capture.
+- Server-level tool wildcards for `--allowedTools` (e.g. `mcp__roundhouse`
+  admitting every tool the server declares) were not tried; only the
+  fully-qualified single-tool name was.
+- `isError: true` from the MCP server's own `tools/call` response — as
+  opposed to a client-synthesized permission denial — was not captured
+  and may shape `tool_result.is_error` differently.
+
 ## 6. Open questions — decisions this evidence does not make
 
 1. **Key prefix admission on the header or on `metadata.user_id`?** The header is

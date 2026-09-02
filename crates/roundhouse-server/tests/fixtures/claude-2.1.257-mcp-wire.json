@@ -1,0 +1,127 @@
+[
+ {
+  "n": 1,
+  "method": "POST",
+  "path": "/mcp",
+  "headers": {
+   "accept": "application/json, text/event-stream",
+   "accept-encoding": "identity",
+   "content-type": "application/json",
+   "user-agent": "claude-code/2.1.257 (sdk-cli)",
+   "x-roundhouse-key": "capture-dummy-turn-key",
+   "connection": "keep-alive",
+   "host": "127.0.0.1:8954",
+   "content-length": "323"
+  },
+  "body": {
+   "method": "initialize",
+   "params": {
+    "protocolVersion": "2025-11-25",
+    "capabilities": {
+     "roots": {
+      "listChanged": true
+     },
+     "elicitation": {}
+    },
+    "clientInfo": {
+     "name": "claude-code",
+     "title": "Claude Code",
+     "version": "2.1.257",
+     "description": "Anthropic's agentic coding tool",
+     "websiteUrl": "https://claude.com/claude-code"
+    }
+   },
+   "jsonrpc": "2.0",
+   "id": 0
+  }
+ },
+ {
+  "n": 2,
+  "method": "POST",
+  "path": "/mcp",
+  "headers": {
+   "accept": "application/json, text/event-stream",
+   "accept-encoding": "identity",
+   "content-type": "application/json",
+   "user-agent": "claude-code/2.1.257 (sdk-cli)",
+   "mcp-protocol-version": "2025-11-25",
+   "mcp-session-id": "6e6eb29f00474958bd4571e1c2f0314c",
+   "x-roundhouse-key": "capture-dummy-turn-key",
+   "connection": "keep-alive",
+   "host": "127.0.0.1:8954",
+   "content-length": "54"
+  },
+  "body": {
+   "method": "notifications/initialized",
+   "jsonrpc": "2.0"
+  }
+ },
+ {
+  "n": 3,
+  "method": "GET",
+  "path": "/mcp",
+  "headers": {
+   "accept": "text/event-stream",
+   "accept-encoding": "identity",
+   "user-agent": "claude-code/2.1.257 (sdk-cli)",
+   "mcp-protocol-version": "2025-11-25",
+   "mcp-session-id": "6e6eb29f00474958bd4571e1c2f0314c",
+   "x-roundhouse-key": "capture-dummy-turn-key",
+   "connection": "keep-alive",
+   "host": "127.0.0.1:8954"
+  },
+  "body": null
+ },
+ {
+  "n": 4,
+  "method": "POST",
+  "path": "/mcp",
+  "headers": {
+   "accept": "application/json, text/event-stream",
+   "accept-encoding": "identity",
+   "content-type": "application/json",
+   "user-agent": "claude-code/2.1.257 (sdk-cli)",
+   "mcp-protocol-version": "2025-11-25",
+   "mcp-session-id": "6e6eb29f00474958bd4571e1c2f0314c",
+   "x-roundhouse-key": "capture-dummy-turn-key",
+   "connection": "keep-alive",
+   "host": "127.0.0.1:8954",
+   "content-length": "46"
+  },
+  "body": {
+   "method": "tools/list",
+   "jsonrpc": "2.0",
+   "id": 1
+  }
+ },
+ {
+  "n": 5,
+  "method": "POST",
+  "path": "/mcp",
+  "headers": {
+   "accept": "application/json, text/event-stream",
+   "accept-encoding": "identity",
+   "content-type": "application/json",
+   "user-agent": "claude-code/2.1.257 (sdk-cli)",
+   "mcp-protocol-version": "2025-11-25",
+   "mcp-session-id": "6e6eb29f00474958bd4571e1c2f0314c",
+   "x-roundhouse-key": "capture-dummy-turn-key",
+   "connection": "keep-alive",
+   "host": "127.0.0.1:8954",
+   "content-length": "156"
+  },
+  "body": {
+   "method": "tools/call",
+   "params": {
+    "name": "status",
+    "arguments": {},
+    "_meta": {
+     "claudecode/toolUseId": "toolu_mock_001",
+     "progressToken": 2
+    }
+   },
+   "jsonrpc": "2.0",
+   "id": 2
+  }
+ }
+]
