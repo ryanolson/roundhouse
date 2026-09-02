@@ -81,7 +81,8 @@
 
 use serde_json::Value;
 
-use crate::validate::exchange::{Exchange, exec_exit_code, task_exchanges, tool_output_body};
+use crate::validate::control_call::{ControlCallDialect, task_exchanges_on};
+use crate::validate::exchange::{Exchange, exec_exit_code, tool_output_body};
 use crate::validate::trigger::{Evidence, Signal, SignalKind};
 
 // ─── severity constants ──────────────────────────────────────────────────────
@@ -326,14 +327,14 @@ pub struct ToolSignals {
 
 impl ToolSignals {
     /// The signals over a session's exchanges, at [`DEFAULT_RECENT_WINDOW`].
-    pub fn from_exchanges(exchanges: &[Exchange]) -> Self {
-        Self::with_window(exchanges, DEFAULT_RECENT_WINDOW)
+    pub fn from_exchanges(exchanges: &[Exchange], dialect: ControlCallDialect) -> Self {
+        Self::with_window(exchanges, DEFAULT_RECENT_WINDOW, dialect)
     }
 
     /// The signals over a session's exchanges, at an explicit window.
-    pub fn with_window(exchanges: &[Exchange], window: usize) -> Self {
+    pub fn with_window(exchanges: &[Exchange], window: usize, dialect: ControlCallDialect) -> Self {
         // G04: roundhouse's own control calls are dropped before a single
-        // count is taken — see [`task_exchanges`]. Filtering *here* rather than
+        // count is taken — see [`task_exchanges_on`]. Filtering *here* rather than
         // asking every caller to filter is what stops the one caller that does
         // not go through [`Evidence`] (`routing::stage::TurnSignals`, on the
         // turn path) from reading the unfiltered list; the same function is
@@ -341,7 +342,7 @@ impl ToolSignals {
         // exchanges themselves, and applying it twice costs a pass and changes
         // nothing, because whether a call is ours does not depend on its
         // neighbours.
-        let exchanges = task_exchanges(exchanges);
+        let exchanges = task_exchanges_on(exchanges, dialect);
         let exchanges = exchanges.as_slice();
         // Results and calls are two different sequences and are windowed
         // separately, which is upstream's shape: a call still in flight has no
@@ -406,8 +407,12 @@ pub struct ResultSeverity {
 
 /// The per-result severities over the last `window` answered tool calls,
 /// oldest first.
-pub fn recent_severities(exchanges: &[Exchange], window: usize) -> Vec<ResultSeverity> {
-    severities_of(&task_exchanges(exchanges), window)
+pub fn recent_severities(
+    exchanges: &[Exchange],
+    window: usize,
+    dialect: ControlCallDialect,
+) -> Vec<ResultSeverity> {
+    severities_of(&task_exchanges_on(exchanges, dialect), window)
 }
 
 /// [`recent_severities`] over an already-filtered view.
@@ -693,7 +698,7 @@ impl Signal for ErrorSeverity {
         // The same derivation `ToolSignals::severity` is the maximum of, called
         // directly rather than through the struct: the sentence has to name
         // *what* was seen, and a single `f32` cannot say "traceback".
-        let recent = recent_severities(&evidence.exchanges, self.window);
+        let recent = recent_severities(&evidence.exchanges, self.window, evidence.dialect);
         if recent.is_empty() {
             return None;
         }
@@ -761,7 +766,8 @@ impl Signal for PureBashStreak {
         // classifier. The cost is bounded on both sides — signals run only past
         // a gate that needs 20k billed tokens, and the walk is one pass with a
         // JSON parse per call over a session's exchanges.
-        let streak = ToolSignals::from_exchanges(&evidence.exchanges).pure_bash_streak as usize;
+        let streak = ToolSignals::from_exchanges(&evidence.exchanges, evidence.dialect)
+            .pure_bash_streak as usize;
         (streak >= self.length).then(|| {
             format!(
                 "the last {streak} tool calls were shell or unrecognised tools, with no file \
@@ -995,10 +1001,19 @@ mod tests {
             ("read", "{}", Some("ok")),
             ("read", "{}", Some("ok")),
         ]);
-        assert_eq!(ToolSignals::with_window(&calls, 3).severity, 0.0);
-        assert_eq!(ToolSignals::with_window(&calls, 5).severity, CRITICAL);
+        assert_eq!(
+            ToolSignals::with_window(&calls, 3, ControlCallDialect::ClaudeMessages).severity,
+            0.0
+        );
+        assert_eq!(
+            ToolSignals::with_window(&calls, 5, ControlCallDialect::ClaudeMessages).severity,
+            CRITICAL
+        );
         // The streak counts back from the most recent and is not windowed.
-        assert_eq!(ToolSignals::with_window(&calls, 3).no_error_streak, 3);
+        assert_eq!(
+            ToolSignals::with_window(&calls, 3, ControlCallDialect::ClaudeMessages).no_error_streak,
+            3
+        );
 
         // Totals count everything; the recent counts see only the tail.
         let mixed = session(&[
@@ -1008,7 +1023,7 @@ mod tests {
             ("read", "{}", Some("ok")),
             ("update_plan", "{}", Some("ok")),
         ]);
-        let signals = ToolSignals::with_window(&mixed, 3);
+        let signals = ToolSignals::with_window(&mixed, 3, ControlCallDialect::ClaudeMessages);
         assert_eq!((signals.edit_count, signals.recent_edit_count), (2, 0));
         assert_eq!((signals.write_count, signals.recent_write_count), (1, 1));
         assert_eq!((signals.read_count, signals.recent_read_count), (1, 1));
@@ -1018,14 +1033,21 @@ mod tests {
         );
         // The default is the window the fields are documented against.
         assert_eq!(
-            ToolSignals::from_exchanges(&mixed),
-            ToolSignals::with_window(&mixed, DEFAULT_RECENT_WINDOW)
+            ToolSignals::from_exchanges(&mixed, ControlCallDialect::ClaudeMessages),
+            ToolSignals::with_window(
+                &mixed,
+                DEFAULT_RECENT_WINDOW,
+                ControlCallDialect::ClaudeMessages
+            )
         );
         assert_eq!(DEFAULT_RECENT_WINDOW, 3);
 
         // Nothing at all is all zeroes rather than a panic, which is what lets
         // a caller read the fields unconditionally.
-        assert_eq!(ToolSignals::from_exchanges(&[]), ToolSignals::default());
+        assert_eq!(
+            ToolSignals::from_exchanges(&[], ControlCallDialect::ClaudeMessages),
+            ToolSignals::default()
+        );
     }
 
     /// Every tool-name table and every bash pattern list, with a positive each.
@@ -1051,7 +1073,10 @@ mod tests {
             ("bash", &shell("cat <<'EOF'")),
             ("bash", &shell("cat << EOF")),
         ] {
-            let signals = ToolSignals::from_exchanges(&session(&[(name, arguments, Some("ok"))]));
+            let signals = ToolSignals::from_exchanges(
+                &session(&[(name, arguments, Some("ok"))]),
+                ControlCallDialect::ClaudeMessages,
+            );
             assert_eq!(signals.write_count, 1, "`{name}` {arguments} is a write");
         }
 
@@ -1073,7 +1098,10 @@ mod tests {
             ("bash", &shell("perl -p -i -e s/a/b/ f")),
             ("bash", &shell("perl -pi -e s/a/b/ f")),
         ] {
-            let signals = ToolSignals::from_exchanges(&session(&[(name, arguments, Some("ok"))]));
+            let signals = ToolSignals::from_exchanges(
+                &session(&[(name, arguments, Some("ok"))]),
+                ControlCallDialect::ClaudeMessages,
+            );
             assert_eq!(signals.edit_count, 1, "`{name}` {arguments} is an edit");
         }
 
@@ -1102,28 +1130,32 @@ mod tests {
             ("bash", &shell("less f")),
             ("bash", &shell("more f")),
         ] {
-            let signals = ToolSignals::from_exchanges(&session(&[(name, arguments, Some("ok"))]));
+            let signals = ToolSignals::from_exchanges(
+                &session(&[(name, arguments, Some("ok"))]),
+                ControlCallDialect::ClaudeMessages,
+            );
             assert_eq!(signals.read_count, 1, "`{name}` {arguments} is a read");
         }
 
         for name in ["todowrite", "todo_write", "todo", "update_plan"] {
-            let signals = ToolSignals::from_exchanges(&session(&[(name, "{}", Some("ok"))]));
+            let signals = ToolSignals::from_exchanges(
+                &session(&[(name, "{}", Some("ok"))]),
+                ControlCallDialect::ClaudeMessages,
+            );
             assert_eq!(signals.todowrite_count, 1, "`{name}` is planning");
         }
 
         // First match wins, and the order is the ruling: redirection beats the
         // read-like operand, so `grep … > out` is a write and not a read.
-        let redirecting = ToolSignals::from_exchanges(&session(&[(
-            "bash",
-            &shell("grep x f > /tmp/o"),
-            Some("ok"),
-        )]));
+        let redirecting = ToolSignals::from_exchanges(
+            &session(&[("bash", &shell("grep x f > /tmp/o"), Some("ok"))]),
+            ControlCallDialect::ClaudeMessages,
+        );
         assert_eq!((redirecting.write_count, redirecting.read_count), (1, 0));
-        let in_place = ToolSignals::from_exchanges(&session(&[(
-            "bash",
-            &shell("sed -i s/a/b/ f; ls"),
-            Some("ok"),
-        )]));
+        let in_place = ToolSignals::from_exchanges(
+            &session(&[("bash", &shell("sed -i s/a/b/ f; ls"), Some("ok"))]),
+            ControlCallDialect::ClaudeMessages,
+        );
         assert_eq!((in_place.edit_count, in_place.read_count), (1, 0));
 
         // Everything else is `Other`: an unrecognised tool, a shell call whose
@@ -1135,7 +1167,10 @@ mod tests {
             ("bash", "not json"),
             ("bash", r#"{"cmd":"ls"}"#),
         ] {
-            let signals = ToolSignals::from_exchanges(&session(&[(name, arguments, Some("ok"))]));
+            let signals = ToolSignals::from_exchanges(
+                &session(&[(name, arguments, Some("ok"))]),
+                ControlCallDialect::ClaudeMessages,
+            );
             assert_eq!(
                 (
                     signals.write_count,
@@ -1170,7 +1205,8 @@ mod tests {
             ),
         ]);
         assert_eq!(
-            ToolSignals::from_exchanges(&control_only).pure_bash_streak,
+            ToolSignals::from_exchanges(&control_only, ControlCallDialect::ClaudeMessages)
+                .pure_bash_streak,
             0,
             "roundhouse's own control traffic must not read as an agent build pit"
         );
@@ -1184,7 +1220,11 @@ mod tests {
             ("bash", &shell("cargo build"), Some("err")),
             ("bash", &shell("cargo build"), Some("err")),
         ]);
-        assert_eq!(ToolSignals::from_exchanges(&shell_pit).pure_bash_streak, 4);
+        assert_eq!(
+            ToolSignals::from_exchanges(&shell_pit, ControlCallDialect::ClaudeMessages)
+                .pure_bash_streak,
+            4
+        );
 
         // Control, and the one that keeps the exemption honest: *somebody
         // else's* MCP server is still an unrecognised tool. The exemption is
@@ -1198,7 +1238,8 @@ mod tests {
             ("mcp__other__query", "{}", Some("ok")),
         ]);
         assert_eq!(
-            ToolSignals::from_exchanges(&other_server).pure_bash_streak,
+            ToolSignals::from_exchanges(&other_server, ControlCallDialect::ClaudeMessages)
+                .pure_bash_streak,
             4,
             "another deployment's MCP tools are the agent's work, not our control plane"
         );
@@ -1207,7 +1248,8 @@ mod tests {
         // different server, and the delimiter is what tells them apart.
         let neighbour = session(&[("mcp__roundhouse_extra__query", "{}", Some("ok"))]);
         assert_eq!(
-            ToolSignals::from_exchanges(&neighbour).pure_bash_streak,
+            ToolSignals::from_exchanges(&neighbour, ControlCallDialect::ClaudeMessages)
+                .pure_bash_streak,
             1,
             "a server whose name merely starts with ours is not ours"
         );
@@ -1224,7 +1266,10 @@ mod tests {
             ("bash", &shell("cargo build"), Some("err")),
             ("bash", &shell("cargo build"), Some("err")),
         ]);
-        assert_eq!(ToolSignals::from_exchanges(&pit).pure_bash_streak, 4);
+        assert_eq!(
+            ToolSignals::from_exchanges(&pit, ControlCallDialect::ClaudeMessages).pure_bash_streak,
+            4
+        );
 
         // One edit at the end and the streak is zero: the agent is producing
         // again, which is the whole distinction.
@@ -1236,7 +1281,11 @@ mod tests {
             output: Some("ok".into()),
             failed: false,
         });
-        assert_eq!(ToolSignals::from_exchanges(&working).pure_bash_streak, 0);
+        assert_eq!(
+            ToolSignals::from_exchanges(&working, ControlCallDialect::ClaudeMessages)
+                .pure_bash_streak,
+            0
+        );
 
         // An edit in the middle bounds it rather than clearing it.
         let interrupted = session(&[
@@ -1246,7 +1295,8 @@ mod tests {
             ("bash", &shell("cargo build"), Some("err")),
         ]);
         assert_eq!(
-            ToolSignals::from_exchanges(&interrupted).pure_bash_streak,
+            ToolSignals::from_exchanges(&interrupted, ControlCallDialect::ClaudeMessages)
+                .pure_bash_streak,
             2
         );
 
@@ -1256,7 +1306,11 @@ mod tests {
             ("bash", &shell("cargo build"), Some("err")),
             ("bash", &shell("cargo build"), None),
         ]);
-        assert_eq!(ToolSignals::from_exchanges(&in_flight).pure_bash_streak, 2);
+        assert_eq!(
+            ToolSignals::from_exchanges(&in_flight, ControlCallDialect::ClaudeMessages)
+                .pure_bash_streak,
+            2
+        );
     }
 
     /// `tests_passed`, including the whitespace rule that keeps `0 failed` from
@@ -1280,7 +1334,8 @@ mod tests {
         ] {
             let calls = session(&[("bash", &shell("cargo test"), Some(passing))]);
             assert!(
-                ToolSignals::from_exchanges(&calls).tests_passed,
+                ToolSignals::from_exchanges(&calls, ControlCallDialect::ClaudeMessages)
+                    .tests_passed,
                 "`{passing}` is a passing run"
             );
         }
@@ -1297,7 +1352,8 @@ mod tests {
         ] {
             let calls = session(&[("bash", &shell("cargo test"), Some(not_passing))]);
             assert!(
-                !ToolSignals::from_exchanges(&calls).tests_passed,
+                !ToolSignals::from_exchanges(&calls, ControlCallDialect::ClaudeMessages)
+                    .tests_passed,
                 "`{not_passing}` is not a clean run"
             );
         }
@@ -1318,6 +1374,7 @@ mod tests {
         Evidence {
             exchanges,
             turn_tokens: &[],
+            dialect: ControlCallDialect::ClaudeMessages,
         }
     }
 
@@ -1431,10 +1488,17 @@ mod tests {
             ]),
             session(&[("read", "{}", Some("ok"))]),
         ] {
-            let windowed = recent_severities(&calls, DEFAULT_RECENT_WINDOW)
-                .iter()
-                .fold(0.0f32, |worst, result| worst.max(result.severity));
-            assert_eq!(ToolSignals::from_exchanges(&calls).severity, windowed);
+            let windowed = recent_severities(
+                &calls,
+                DEFAULT_RECENT_WINDOW,
+                ControlCallDialect::ClaudeMessages,
+            )
+            .iter()
+            .fold(0.0f32, |worst, result| worst.max(result.severity));
+            assert_eq!(
+                ToolSignals::from_exchanges(&calls, ControlCallDialect::ClaudeMessages).severity,
+                windowed
+            );
             assert_eq!(
                 ErrorSeverity::default().detect(&evidence(calls)).is_some(),
                 windowed >= ERROR_SEVERITY_THRESHOLD
@@ -1509,13 +1573,21 @@ mod tests {
             ("edit", "{}", Some("ok")),
             ("bash", &shell("cargo build"), Some("Finished dev profile")),
         ]);
-        assert_eq!(ToolSignals::from_exchanges(&recovering).no_error_streak, 2);
+        assert_eq!(
+            ToolSignals::from_exchanges(&recovering, ControlCallDialect::ClaudeMessages)
+                .no_error_streak,
+            2
+        );
 
         let broken = session(&[
             ("edit", "{}", Some("ok")),
             ("bash", &shell("cargo build"), Some("SyntaxError: bad")),
         ]);
-        assert_eq!(ToolSignals::from_exchanges(&broken).no_error_streak, 0);
+        assert_eq!(
+            ToolSignals::from_exchanges(&broken, ControlCallDialect::ClaudeMessages)
+                .no_error_streak,
+            0
+        );
 
         // An unanswered call is skipped rather than counted or breaking, which
         // is the one place this deviates from upstream — upstream walks result
@@ -1527,7 +1599,11 @@ mod tests {
             ("edit", "{}", Some("ok")),
             ("bash", &shell("cargo build"), None),
         ]);
-        assert_eq!(ToolSignals::from_exchanges(&in_flight).no_error_streak, 2);
+        assert_eq!(
+            ToolSignals::from_exchanges(&in_flight, ControlCallDialect::ClaudeMessages)
+                .no_error_streak,
+            2
+        );
 
         // A soft exit is severity too: the streak is "nothing at all went
         // wrong", not "nothing serious went wrong".
@@ -1536,6 +1612,9 @@ mod tests {
             &shell("./ci"),
             Some("Chunk ID: 1\nWall time: 0.1000 seconds\nProcess exited with code 1\nOutput:\n"),
         )]);
-        assert_eq!(ToolSignals::from_exchanges(&soft).no_error_streak, 0);
+        assert_eq!(
+            ToolSignals::from_exchanges(&soft, ControlCallDialect::ClaudeMessages).no_error_streak,
+            0
+        );
     }
 }

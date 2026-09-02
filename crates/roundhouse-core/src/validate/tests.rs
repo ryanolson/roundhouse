@@ -216,6 +216,7 @@ async fn consider(enrolled: &Enrolled, state: &SessionState, policy: &TurnPolicy
                 budget: None,
             },
             validation: Some(&enrolled.terms),
+            dialect: ControlCallDialect::ClaudeMessages,
         })
         .await
 }

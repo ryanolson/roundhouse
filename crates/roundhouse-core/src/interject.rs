@@ -73,7 +73,7 @@ use crate::event::{ControlRecord, Usage};
 use crate::ids::ResponseId;
 use crate::item::Item;
 use crate::session::SessionState;
-use crate::validate::{Objective, SideCall, ValidationTerms};
+use crate::validate::{ControlCallDialect, Objective, SideCall, ValidationTerms};
 
 /// What the engine is to do with a turn it has already admitted.
 #[derive(Debug, Clone, PartialEq)]
@@ -213,6 +213,16 @@ pub struct InterjectionContext<'a> {
     /// that follow are not validated, whatever their sessions were stamped
     /// with — see [`Validator::consider`](crate::validate::Validator).
     pub validation: Option<&'a ValidationTerms>,
+    /// Which client's dialect this session's log is written in.
+    ///
+    /// Supplied rather than derived for the same reason [`Self::objective`] is:
+    /// it is a fact about the *surface the turn arrived on*, and a
+    /// [`SessionState`] is a fold of the log alone — the session key that names
+    /// the surface is held by the engine, one layer out (M12 review, F8).
+    /// Without it the fold has to accept both surfaces' spellings of a control
+    /// call at once, which drops a Messages client's own bare-named tool from
+    /// the task view along with roundhouse's own chatter.
+    pub dialect: ControlCallDialect,
 }
 
 /// Consulted once per admitted turn, under the contract in the module docs.
@@ -291,6 +301,7 @@ mod tests {
                 // deployment is: the assertions below are that no *state*
                 // makes it interject, and enrolment is not state.
                 validation: None,
+                dialect: ControlCallDialect::CodexResponses,
             }
         }
 

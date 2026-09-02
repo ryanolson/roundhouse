@@ -57,6 +57,7 @@
 
 pub mod arm;
 pub mod brief;
+pub mod control_call;
 pub mod exchange;
 pub mod handoff;
 pub mod prompt;
@@ -81,10 +82,11 @@ use crate::routing::Target;
 
 pub use arm::{Arm, ArmShares, placebo_intervenes};
 pub use brief::{BriefConfig, BriefStep, Objective, ValidationBrief, trailing_user_request};
-pub use exchange::{
-    CONTROL_TOOL_DELIMITER, CONTROL_TOOL_NAMES, CONTROL_TOOL_NAMESPACE, Exchange, exchanges,
-    exec_exit_code, is_control_call, task_exchanges, tool_output_body,
+pub use control_call::{
+    CONTROL_TOOL_DELIMITER, CONTROL_TOOL_NAMES, CONTROL_TOOL_NAMESPACE, ControlCallDialect,
+    flat_control_call_name, is_control_call_on, is_flat_control_call, task_exchanges_on,
 };
+pub use exchange::{Exchange, exchanges, exec_exit_code, tool_output_body};
 pub use handoff::{EXAMPLE_HANDOFF_NOTE, HANDOFF_MARKER, append_handoff_note};
 pub use prompt::judge_system_prompt;
 pub use tool_signals::{
@@ -799,7 +801,7 @@ impl Interjector for Validator {
         let Some(terms) = context.validation else {
             return Interjection::proceed();
         };
-        let Some(fired) = self.trigger.evaluate(context.state) else {
+        let Some(fired) = self.trigger.evaluate(context.state, context.dialect) else {
             return Interjection::proceed();
         };
         self.decide(context, terms, fired, arm).await

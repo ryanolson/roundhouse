@@ -744,8 +744,20 @@ mod tests {
     use super::*;
 
     use roundhouse_core::item::canonical_arguments;
+    use roundhouse_core::validate::ControlCallDialect;
 
     use serde_json::json;
+
+    /// The dialect a session written through *this* surface is folded under.
+    ///
+    /// Named once rather than spelled at each assertion, and pinned to the keys
+    /// this module actually mints by
+    /// [`the_session_key_this_surface_mints_folds_under_the_messages_dialect`]
+    /// — which is the join the fold depends on: the engine reads the dialect
+    /// off the session key, so a key shape this module changed without telling
+    /// `ControlCallDialect::of_session_key` would silently put every Messages
+    /// session back on the other surface's recognizer (M12 review, F8).
+    const MESSAGES_DIALECT: ControlCallDialect = ControlCallDialect::ClaudeMessages;
 
     /// What a *leading* system block canonicalizes to.
     ///
@@ -930,7 +942,7 @@ mod tests {
     /// the name survives whole is the round-trip property prefix admission
     /// rests on. That it is *the string [`crate::dialect::ClientDialect`] says
     /// this surface stores* is what stops this module and the classifier a
-    /// crate below from drifting: `is_control_call` reads the stored name, and
+    /// crate below from drifting: `is_control_call_on` reads the stored name, and
     /// the day one of the two changed its mind about the spelling, the fold
     /// would silently go back to counting roundhouse's own chatter as the
     /// agent's work.
@@ -966,7 +978,7 @@ mod tests {
         // module produced, rather than on a name a test typed: it is the join
         // between the two crates that R-M0 found broken on the other surface.
         assert!(
-            roundhouse_core::validate::is_control_call(name),
+            roundhouse_core::validate::is_control_call_on(name, MESSAGES_DIALECT),
             "the agent asked roundhouse for its own status"
         );
         let exchanges = roundhouse_core::validate::exchanges(&items);
@@ -976,8 +988,110 @@ mod tests {
             "the call and its result pair: {exchanges:#?}"
         );
         assert!(
-            roundhouse_core::validate::task_exchanges(&exchanges).is_empty(),
+            roundhouse_core::validate::task_exchanges_on(&exchanges, MESSAGES_DIALECT).is_empty(),
             "roundhouse's own control traffic is not the agent's work on its task"
+        );
+    }
+
+    /// M12 review F8: on the Messages surface the namespace is never dropped
+    /// (see `a_control_call_keeps_the_flat_name_the_client_spells` above), so a
+    /// client tool that merely happens to be *named* `status` should not be
+    /// mistaken for roundhouse's own — there is no reason for the bare-name
+    /// exemption (`CONTROL_TOOL_NAMES`, meant for the Responses wire's
+    /// namespace-dropping canonicalization) to fire here at all.
+    ///
+    /// It landed red and `#[ignore]`d — `task_exchanges` returned empty, i.e.
+    /// it dropped the client's own `status` call from the task view exactly as
+    /// it would drop roundhouse's — and the ignore came off when the recognizer
+    /// learned which surface it was reading. The control alongside it (flat
+    /// `mcp__roundhouse__status`) passed throughout and stays live, which is
+    /// what proves this assertion is not tautological.
+    #[test]
+    fn a_clients_own_bare_named_tool_is_not_mistaken_for_a_control_call() {
+        let items = canonicalize(&params(json!({
+            "messages": [
+                { "role": "assistant", "content": [
+                    { "type": "tool_use", "id": "toolu_client_1",
+                      "name": "status", "input": {} },
+                ]},
+                { "role": "user", "content": [
+                    { "type": "tool_result", "tool_use_id": "toolu_client_1",
+                      "content": [{ "type": "text", "text": "client's own status check" }] },
+                ]},
+            ],
+        })))
+        .unwrap();
+
+        let exchanges = roundhouse_core::validate::exchanges(&items);
+        assert_eq!(
+            roundhouse_core::validate::task_exchanges_on(&exchanges, MESSAGES_DIALECT).len(),
+            1,
+            "a client tool literally named `status` is not roundhouse's own call \
+             on a surface that never drops the namespace: {exchanges:#?}"
+        );
+    }
+
+    /// The engine reads a session's dialect off its key, and this is where the
+    /// two meet (M12 review, F8).
+    ///
+    /// Asserted over every key shape [`session_key`] can mint — the header
+    /// form, both `user_id` forms, the body form, and each of those with an
+    /// agent tail — rather than over one sample, because the fold's correctness
+    /// rests on *all* of them being recognisable and a sampled test would pass
+    /// while one shape quietly resolved to the Responses recognizer.
+    #[test]
+    fn the_session_key_this_surface_mints_folds_under_the_messages_dialect() {
+        let keys = [
+            session_key(
+                &headers(&[(SESSION_HEADER, "header-session")]),
+                &params(json!({ "messages": [] })),
+            ),
+            session_key(
+                &headers(&[(SESSION_HEADER, "s1"), (AGENT_HEADER, "agent-7")]),
+                &params(json!({ "messages": [] })),
+            ),
+            session_key(
+                &HeaderMap::new(),
+                &params(json!({
+                    "messages": [],
+                    "metadata": { "user_id": "user_9f3a_account_c0ffee_session_deadbeef" }
+                })),
+            ),
+        ];
+        for key in keys {
+            let key = key.expect("each of these names a session");
+            assert_eq!(
+                ControlCallDialect::of_session_key(&key),
+                MESSAGES_DIALECT,
+                "`{key}` is a key this surface mints, so the fold must read it \
+                 as the Messages surface"
+            );
+        }
+    }
+
+    /// Control for the above: the flat-namespaced spelling of the same tool
+    /// must still be excluded — this is the case the bare-name arm exists for
+    /// on the *other* wire, and must keep working regardless of what F8 finds.
+    #[test]
+    fn a_namespaced_control_call_is_still_excluded_control() {
+        let items = canonicalize(&params(json!({
+            "messages": [
+                { "role": "assistant", "content": [
+                    { "type": "tool_use", "id": "toolu_control_1",
+                      "name": "mcp__roundhouse__status", "input": {} },
+                ]},
+                { "role": "user", "content": [
+                    { "type": "tool_result", "tool_use_id": "toolu_control_1",
+                      "content": [{ "type": "text", "text": "stub-result" }] },
+                ]},
+            ],
+        })))
+        .unwrap();
+
+        let exchanges = roundhouse_core::validate::exchanges(&items);
+        assert!(
+            roundhouse_core::validate::task_exchanges_on(&exchanges, MESSAGES_DIALECT).is_empty(),
+            "the namespaced spelling is unambiguously roundhouse's own: {exchanges:#?}"
         );
     }
 

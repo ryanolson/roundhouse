@@ -64,13 +64,16 @@
 
 use std::path::{Path, PathBuf};
 
-use roundhouse_server::claude_launch::{OauthSuppressor, REDACTED_VALUE, SuppressorSite};
+use roundhouse_server::claude_launch::{
+    APPEND_SYSTEM_PROMPT_FLAG, GeneratedArg, OauthSuppressor, REDACTED_VALUE, SuppressorSite,
+};
 use roundhouse_server::codex_launch::{CodexLaunchError, GeneratedFile};
 use roundhouse_server::{
     API_PREFIX, ClaudeAuthKind, ClaudeEnv, ClaudeLaunch, ClaudeLaunchError, CodexLaunch,
 };
 
 use crate::env::EnvMap;
+use crate::launch::CLAUDE_DEPLOYMENT_POLICY;
 use crate::profile::{Agent, AuthKind, Profile, ProfileError, Topology};
 
 /// The generated codex config, as codex reads it out of its `CODEX_HOME`.
@@ -135,17 +138,10 @@ pub enum Resolved {
         /// this launch runs is not held beside it — that is
         /// [`ClaudeLaunch::must_be_unset`] on the launch above, and a second
         /// home for a derived value is a second thing that can be stale (F16).
+        /// The generated argv was held here for one milestone and is not any
+        /// more, for that same reason (F6): `plan`, `launch` and the screen
+        /// still show one answer, because all three ask the launch.
         settings: Vec<SettingsFile>,
-        /// The arguments this launcher puts before the operator's own — the
-        /// MCP registration and the signage (M12, R-M3/R-M4).
-        ///
-        /// **Resolved here rather than built in [`crate::launch`]**, for the
-        /// reason [`resolve`] exists at all: `plan`, `launch` and the screen
-        /// are three surfaces over one resolution, and an argv derived on the
-        /// launch path only would be one a dry run could not show. It is held
-        /// as the generator's own rendering rather than as its inputs so that
-        /// what is printed is what is passed.
-        leading_argv: Vec<String>,
     },
     Codex {
         launch: CodexLaunch,
@@ -168,6 +164,17 @@ pub enum PlanError {
          (`topham mint --profile ...`) and export it"
     )]
     TurnKeyMissing { key_env: String },
+    #[error(
+        "this profile reads the turn key from `{key_env}`, and that is a variable this launch \
+         writes into the client's environment itself. The generated value is applied over the \
+         ambient one, so the `${{{key_env}}}` the generated MCP registration tells the client to \
+         expand resolves to *that* -- the API-key sentinel, the base URL, the header block or a \
+         deployment-policy flag -- and never to the key. Inference would still answer, because \
+         the key rides the header block; every `mcp__roundhouse__*` control call would present \
+         the wrong value and be refused, and nothing on either side reports it. Export the key \
+         under a name of this deployment's own and point `key-env` at that"
+    )]
+    KeyEnvIsGenerated { key_env: String },
     #[error(
         "the settings file {path} sets `{what}`, and the launched client reads that file for \
          itself: an `env` entry there *replaces* the value this launcher exports, and an \
@@ -256,12 +263,29 @@ pub fn resolve(env: &EnvMap, name: &str, profile: Profile) -> Result<Resolution,
             // The ambient refusal first, so that a settings file is only ever
             // blamed for something a launch this environment already admits.
             let generated = launch.env()?;
+            // **The key variable may not be one this launch writes itself**
+            // (F9). `crate::launch::layered` builds the child environment as
+            // the ambient one with the generated map and the deployment policy
+            // applied *over* it, and the registration above tells the client to
+            // expand `${<key-env>}` out of exactly that environment — so a
+            // profile naming one of those two sets sends the client whatever
+            // the launcher wrote, not the key it read here. Checked against the
+            // generator's own map rather than a list of names restated here, so
+            // a variable added to that map is covered the day it lands.
+            if let Some(collision) = generated
+                .names()
+                .chain(CLAUDE_DEPLOYMENT_POLICY.iter().map(|(name, _)| *name))
+                .find(|written| *written == profile.key_env)
+            {
+                return Err(PlanError::KeyEnvIsGenerated {
+                    key_env: collision.to_string(),
+                });
+            }
             let settings = read_settings(env, working_directory().as_deref())?;
             for file in &settings {
                 file.refuse_what_it_defeats(&launch)?;
             }
             Resolved::Claude {
-                leading_argv: launch.leading_argv(),
                 launch,
                 env: generated,
                 settings,
@@ -483,7 +507,6 @@ impl Resolution {
                 launch,
                 env,
                 settings,
-                leading_argv,
             } => {
                 field(&mut out, "messages url", &launch.messages_url());
                 out.push('\n');
@@ -491,7 +514,7 @@ impl Resolution {
                 out.push_str(&indent(&format!("{env:#?}")));
                 out.push('\n');
                 out.push_str("argv prepended to the operator's own:\n");
-                out.push_str(&render_leading_argv(leading_argv));
+                out.push_str(&render_leading_argv(&launch.leading_argv()));
                 out.push('\n');
                 out.push_str("must be unset when this launch runs:\n");
                 out.push_str(&render_suppressors(&launch.must_be_unset(), launch.auth()));
@@ -604,7 +627,7 @@ impl Resolution {
         // is likeliest to read as "the control surface is broken": the flag
         // makes the tools *exist* for the client, and the client's own
         // permission layer decides whether it may call one.
-        if matches!(self.resolved, Resolved::Claude { .. }) {
+        if let Resolved::Claude { launch, .. } = &self.resolved {
             notes.push(
                 "the registration above is what makes roundhouse's control tools exist for this \
                  client, not what makes it call one. Headless (`-p`), the client synthesises a \
@@ -613,20 +636,19 @@ impl Resolution {
                  operator. Neither is something this launcher can decide for it."
                     .to_string(),
             );
-        }
-        if let Resolved::Claude { launch, .. } = &self.resolved
-            && launch
+            if launch
                 .must_be_unset()
                 .iter()
                 .any(|suppressor| suppressor.site == SuppressorSite::SettingsKey)
-        {
-            notes.push(
-                "one entry above lives in the client's settings file rather than the \
-                 environment. The three files listed above are read and refused; an \
-                 administrator's managed-policy file is not read, and outranks all of them, so \
-                 that one layer is stated rather than enforced."
-                    .to_string(),
-            );
+            {
+                notes.push(
+                    "one entry above lives in the client's settings file rather than the \
+                     environment. The three files listed above are read and refused; an \
+                     administrator's managed-policy file is not read, and outranks all of them, \
+                     so that one layer is stated rather than enforced."
+                        .to_string(),
+                );
+            }
         }
         if self.profile.topology == Topology::Chained {
             notes.push(
@@ -672,32 +694,32 @@ impl Resolution {
 /// what pin its contents. What an operator needs from a plan is *that* an
 /// appended system prompt is being passed and roughly how much of one; reading
 /// it is `topham plan | ...`'s job, and the argument itself is one flag away.
-fn render_leading_argv(argv: &[String]) -> String {
+fn render_leading_argv(argv: &[GeneratedArg]) -> String {
     if argv.is_empty() {
         return indent("(none)");
     }
     let mut lines = Vec::new();
-    let mut arguments = argv.iter();
-    while let Some(argument) = arguments.next() {
-        if argument == APPEND_SYSTEM_PROMPT {
-            let text = arguments.next().map(String::as_str).unwrap_or_default();
-            lines.push(format!(
-                "{argument} <the control-tool signage, {} characters>",
+    for argument in argv {
+        // Matched by flag name rather than by position because the argv is the
+        // generator's and may grow: a positional rule ("the last two") would
+        // silently start printing the whole signage the day an argument is
+        // added after it. The name is the generator's own constant, not a
+        // second spelling of it (F5).
+        match argument.value() {
+            Some(text) if argument.flag() == APPEND_SYSTEM_PROMPT_FLAG => lines.push(format!(
+                "{} <the control-tool signage, {} characters>",
+                argument.flag(),
                 text.chars().count()
-            ));
-            continue;
+            )),
+            Some(text) => {
+                lines.push(argument.flag().to_string());
+                lines.push(text.to_string());
+            }
+            None => lines.push(argument.flag().to_string()),
         }
-        lines.push(argument.clone());
     }
     indent(&lines.join("\n"))
 }
-
-/// The flag whose value this rendering summarises rather than prints.
-///
-/// Matched by value rather than by position because the argv is the generator's
-/// and may grow: a positional rule ("the last two") would silently start
-/// printing the whole signage the day an argument is added after it.
-const APPEND_SYSTEM_PROMPT: &str = "--append-system-prompt";
 
 /// The must-be-unset table, one line each, naming what each entry defeats.
 fn render_suppressors(suppressors: &[&'static OauthSuppressor], auth: ClaudeAuthKind) -> String {

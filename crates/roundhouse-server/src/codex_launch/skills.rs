@@ -77,9 +77,7 @@
 //!
 //! [`CodexLaunch`]: super::CodexLaunch
 
-use roundhouse_mcp::tools::{ToolDescriptor, descriptors};
-
-use crate::dialect::DEFAULT_MCP_NAMESPACE;
+use roundhouse_mcp::tools::{ToolDescriptor, descriptor};
 
 /// Where a generated skill goes, relative to the client's `CODEX_HOME`.
 ///
@@ -96,25 +94,6 @@ pub const SKILLS_DIR: &str = "skills";
 /// The file name codex looks for inside a skill directory
 /// (`core-skills/src/loader.rs:139` @ `e363b08`).
 const SKILL_FILE: &str = "SKILL.md";
-
-/// What codex puts between an MCP server's namespace and a tool's own name to
-/// build the name a model calls.
-///
-/// `codex-mcp/src/mcp/mod.rs:78-81` @ `e363b08` builds the namespace as
-/// `mcp__{server}__` and `core/src/tools/handlers/mcp.rs:53` joins
-/// `{namespace}{DELIMITER}{name}`; [`DEFAULT_MCP_NAMESPACE`] is the `mcp__{server}`
-/// half without the trailing delimiter, which is the form codex advertises the
-/// namespace tool itself under. A skill that named a tool codex cannot resolve
-/// is the failure this whole module is downstream of, and it is silent: the
-/// model calls a name, gets "no such tool", and moves on.
-///
-/// Re-exported from `roundhouse-core` (G04/G16), where the citations above are
-/// repeated beside the definition: this module *renders* the join and the
-/// validate loop's signal fold has to *recognise* it, and a second literal
-/// would let the two drift with nothing red on either side.
-/// `the_delimiter_a_skill_spells_is_the_one_the_real_binary_namespaces_with`
-/// in the gated e2e suite is what ties the value itself to the binary.
-const MCP_TOOL_NAME_DELIMITER: &str = roundhouse_core::validate::CONTROL_TOOL_DELIMITER;
 
 /// One file a client will find, as the client will find it.
 ///
@@ -138,7 +117,8 @@ pub struct GeneratedFile {
 /// One skill, as this crate declares it.
 ///
 /// The tool *names* are `&'static str` here and are then resolved against
-/// [`descriptors`] before any text is rendered — see [`descriptor`]. A literal
+/// [`descriptor`], `roundhouse-mcp`'s own lookup over the served list (M12
+/// review, F12: one list, one accessor, no launcher-private scan). A literal
 /// that does not resolve panics rather than producing a file, so the "derived,
 /// never retyped" rule holds where it matters: every sentence about what a tool
 /// does is the descriptor's own, and the only thing this table contributes is
@@ -240,32 +220,17 @@ pub fn skill_files() -> Vec<GeneratedFile> {
 /// The name a model calls a roundhouse tool by, once codex has namespaced it.
 ///
 /// Public because the e2e rig asserts on it and because an operator writing
-/// their own skill file needs the same construction — one that is derived from
-/// [`DEFAULT_MCP_NAMESPACE`] rather than typed out is one that survives a
-/// namespace rename.
-pub fn namespaced_tool_name(tool: &str) -> String {
-    format!("{DEFAULT_MCP_NAMESPACE}{MCP_TOOL_NAME_DELIMITER}{tool}")
-}
-
-/// The descriptor a template names, or a panic naming what is missing.
+/// their own skill file needs the same construction.
 ///
-/// A panic and not an `Option`, because there is no useful degraded output: a
-/// skill file that omitted the one tool it exists to point at would still be a
-/// valid file, would still be listed to the model, and would waste the model's
-/// attention every session forever. The unreachable-by-construction claim is
-/// held up by `every_generated_skill_names_a_tool_this_deployment_serves`
-/// below, which is what turns a rename in `roundhouse-mcp` into a red test
-/// here rather than a panic on somebody's deployment.
-fn descriptor(tool: &str) -> ToolDescriptor {
-    descriptors()
-        .into_iter()
-        .find(|candidate| candidate.name == tool)
-        .unwrap_or_else(|| {
-            panic!(
-                "`{tool}` is not in roundhouse-mcp's tool list, so a skill pointing at it \
-                 would send the model to a name codex cannot resolve"
-            )
-        })
+/// **Delegated rather than composed** (M12 review, F7). This module used to
+/// build `{namespace}{delimiter}{tool}` with its own `format!`, as did
+/// `dialect::ClientDialect::stored_call_name` and the Claude signage — three
+/// renderers of one format string, each kept green by its own suite, with
+/// nothing asserting they agreed. A mutation of any one of them left the other
+/// two's tests passing, which is precisely how a generated skill ends up naming
+/// a tool the client cannot resolve.
+pub fn namespaced_tool_name(tool: &str) -> String {
+    roundhouse_core::validate::flat_control_call_name(tool)
 }
 
 /// The arguments a tool's schema says are required, as the schema spells them.
@@ -308,7 +273,20 @@ fn render(skill: &SkillTemplate) -> String {
     out.push_str("\n\n## What to call\n");
 
     for tool in skill.tools {
-        let descriptor = descriptor(tool);
+        // A panic and not an `Option`, because there is no useful degraded
+        // output: a skill file that omitted the one tool it exists to point at
+        // would still be a valid file, would still be listed to the model, and
+        // would waste the model's attention every session forever. The
+        // unreachable-by-construction claim is held up by
+        // `every_generated_skill_names_a_tool_this_deployment_serves` below,
+        // which is what turns a rename in `roundhouse-mcp` into a red test here
+        // rather than a panic on somebody's deployment.
+        let descriptor = descriptor(tool).unwrap_or_else(|| {
+            panic!(
+                "`{tool}` is not in roundhouse-mcp's tool list, so a skill pointing at it \
+                 would send the model to a name codex cannot resolve"
+            )
+        });
         out.push_str(&format!("\n### `{}`\n\n", namespaced_tool_name(tool)));
         // The descriptor's own sentence, quoted verbatim. This module states
         // *when*; `roundhouse-mcp` states *what*, and it states it to every
@@ -357,6 +335,9 @@ fn yaml_scalar(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::dialect::DEFAULT_MCP_NAMESPACE;
+    use roundhouse_core::validate::CONTROL_TOOL_DELIMITER;
     use roundhouse_mcp::tools::TOOL_NAMES;
 
     /// The frontmatter block of a generated file, as codex's
@@ -404,7 +385,7 @@ mod tests {
     /// would be invisible to a check that only looked at the table.
     #[test]
     fn every_generated_skill_names_a_tool_this_deployment_serves() {
-        let prefix = format!("{DEFAULT_MCP_NAMESPACE}{MCP_TOOL_NAME_DELIMITER}");
+        let prefix = format!("{DEFAULT_MCP_NAMESPACE}{CONTROL_TOOL_DELIMITER}");
         let mut found = 0usize;
         for file in skill_files() {
             for occurrence in file.contents.match_indices(&prefix) {
@@ -508,7 +489,9 @@ mod tests {
     fn a_skill_quotes_the_descriptors_own_sentence_rather_than_paraphrasing_it() {
         for (file, skill) in skill_files().iter().zip(SKILLS) {
             for tool in skill.tools {
-                let described = descriptor(tool).description;
+                let described = descriptor(tool)
+                    .expect("a shipped skill names a served tool")
+                    .description;
                 assert!(
                     file.contents.contains(described),
                     "`{}` must carry `{tool}`'s own description verbatim, not a second \
@@ -533,7 +516,7 @@ mod tests {
             .into_iter()
             .find(|file| file.relative_path.contains("rh-prefer"))
             .expect("rh-prefer is shipped");
-        let required = required_arguments(&descriptor("prefer"));
+        let required = required_arguments(&descriptor("prefer").expect("`prefer` is served"));
         assert_eq!(
             required,
             vec!["mode", "scope", "reason"],
@@ -605,5 +588,39 @@ mod tests {
             quoted.starts_with('"') && quoted.ends_with('"'),
             "the scalar must be quoted, or YAML reads the colon as a mapping: {quoted}"
         );
+    }
+
+    /// M12 review finding F7: [`namespaced_tool_name`] and
+    /// `ClientDialect::claude_messages().stored_call_name` (`dialect.rs`) each
+    /// spell `{namespace}{delimiter}{tool}` with their own `format!` call, and
+    /// nothing before this test asserted the two outputs actually agree.
+    ///
+    /// Confirmed by mutation, not by reading: changing this module's own
+    /// `format!` in [`namespaced_tool_name`] to a literal `"::"` turned this
+    /// module's tests red (as expected) while leaving `dialect.rs`'s,
+    /// `claude_launch::signage.rs`'s and `roundhouse-core`'s suites entirely
+    /// green -- three sites that knew this shape, tested by three suites that
+    /// never cross-checked it.
+    ///
+    /// **Closed by deletion rather than by this test alone** (M12 review, F7).
+    /// There is now one renderer, `validate::flat_control_call_name`, and both
+    /// this module and `stored_call_name` delegate to it, so the mutation above
+    /// no longer has two places to disagree from. The assertion stays live
+    /// because delegation is a thing a later edit can undo, and this is what
+    /// would notice.
+    #[test]
+    fn the_codex_side_spelling_agrees_with_the_claude_side_spelling() {
+        use crate::dialect::ClientDialect;
+
+        for tool in TOOL_NAMES {
+            let codex_side = namespaced_tool_name(tool);
+            let claude_side = ClientDialect::claude_messages().stored_call_name(tool);
+            assert_eq!(
+                codex_side, claude_side,
+                "`namespaced_tool_name` (skills.rs) and `stored_call_name` \
+                 (dialect.rs) disagree on `{tool}` -- the two renderers have \
+                 drifted apart with nothing red to say so"
+            );
+        }
     }
 }

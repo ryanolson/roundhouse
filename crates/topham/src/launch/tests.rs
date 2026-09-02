@@ -142,7 +142,7 @@ fn the_generated_argv_leads_and_the_operators_follows() {
             profile(Agent::Claude, AuthKind::RoundhouseKey)
         )
         .map(|resolution| match resolution.resolved {
-            Resolved::Claude { leading_argv, .. } => leading_argv,
+            Resolved::Claude { launch, .. } => flatten_argv(&launch.leading_argv()),
             Resolved::Codex { .. } => unreachable!("this fixture is a claude profile"),
         })
         .expect("the fixture resolves"),
@@ -334,6 +334,47 @@ fn an_operator_flag_this_launch_also_generates_is_refused() {
     )
     .expect("an unrelated flag is the operator's business");
     assert_eq!(planned.argv.len(), 3);
+}
+
+/// F5, closed: a generated *value* that looks like a flag is not a flag.
+///
+/// The check used to be a heuristic over a flat `Vec<String>`
+/// (`starts_with("--") && !contains(whitespace)`), because flattening
+/// `leading_argv` at the crate boundary left nothing else to go on. It read the
+/// value half of a pair as a flag name and refused the operator's identical
+/// bare argument, naming a flag this launch does not pass. `GeneratedArg`
+/// carries the split instead, so the case below cannot be misread rather than
+/// being merely unreachable today.
+///
+/// Unreachable is what it is today — the signage's prose has spaces in it — and
+/// that is exactly why the structure matters: the guard would have gone quiet
+/// again the first time a generated value was a single token.
+#[test]
+fn refuse_collisions_reads_a_flag_shaped_generated_value_as_a_value() {
+    let generated = vec![GeneratedArg::pair("--append-system-prompt", "--x")];
+    let argv = vec!["--x".to_string()];
+
+    refuse_collisions(&generated, &argv).expect(
+        "`--x` is the value paired with `--append-system-prompt`, not a flag this launch \
+         generates, so an operator passing `--x` collides with nothing",
+    );
+
+    // The control, and the half that must stay refused: the *flag* of that same
+    // pair is a real collision, and an `=`-joined spelling of it is the same
+    // flag to the client.
+    for operator in [
+        vec!["--append-system-prompt".to_string()],
+        vec!["--append-system-prompt=mine".to_string()],
+    ] {
+        let error = refuse_collisions(&generated, &operator)
+            .expect_err("two answers to one question is the refusal this check exists for");
+        match &error {
+            LaunchError::ArgvCollidesWithGenerated { flag } => {
+                assert_eq!(flag, "--append-system-prompt")
+            }
+            other => panic!("expected ArgvCollidesWithGenerated, got {other:?}"),
+        }
+    }
 }
 
 /// R-T4: the refusal happens before anything is spawned or written.

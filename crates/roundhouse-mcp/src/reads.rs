@@ -54,6 +54,42 @@ pub struct SessionFacts {
     pub last_decision: Option<DecisionRecord>,
 }
 
+/// Steps (2) and (3) of [`ControlReads::resolve_session`]'s order, in the one
+/// place that decides them.
+///
+/// **A function taking lookups rather than a rule each implementor re-types**
+/// (M12 review, F4). The order used to live only in the doc comment above,
+/// which meant `roundhouse-server`'s `ControlPlaneReads` and this crate's own
+/// test double each encoded it separately, with nothing — not the trait, not
+/// the surface, not a shared test — holding the two together. An implementor
+/// that tried its "most recent session" before the tool-use id compiled,
+/// satisfied the trait, ran unmodified through `ControlPlaneSurface`, and
+/// answered a subagent's `status` about its parent's conversation: a wrong
+/// answer with a 200 on it, which is the failure R-M2 exists to remove.
+/// Lookups differ per deployment; the order does not, so the order is what
+/// moves here.
+///
+/// The caller supplies the two reads and this applies R-M2: the id the client
+/// attached is exact, so it decides; the principal's most recent conversation
+/// is a guess, so it is only ever the fallback; and neither is
+/// [`SurfaceError::NoSession`], which is a refusal rather than a default
+/// because a node that has served this principal no turn has nothing to
+/// answer about.
+///
+/// Both lookups are `FnOnce` and lazy: `latest` is not consulted at all when
+/// the id resolves, which is what keeps a hot path from paying for the answer
+/// it did not use.
+pub fn session_without_a_name(
+    tool_use_id: Option<&str>,
+    session_of_call: impl FnOnce(&str) -> Option<SessionId>,
+    latest: impl FnOnce() -> Option<SessionId>,
+) -> Result<SessionId, SurfaceError> {
+    tool_use_id
+        .and_then(session_of_call)
+        .or_else(latest)
+        .ok_or(SurfaceError::NoSession)
+}
+
 #[async_trait]
 pub trait ControlReads: Send + Sync + 'static {
     /// Which conversation this call concerns.
@@ -99,6 +135,11 @@ pub trait ControlReads: Send + Sync + 'static {
     /// apart would make the id an enumeration oracle for ids the caller does
     /// not hold, and the caller has no use for another tenant's session either
     /// way.
+    ///
+    /// The unnamed half of that order — steps (2) and (3), the two an
+    /// implementor answers from its own tables — is
+    /// [`session_without_a_name`], and an implementor is expected to call it
+    /// rather than re-encode it.
     async fn resolve_session(
         &self,
         principal: &Principal,
@@ -189,4 +230,54 @@ pub trait ControlReads: Send + Sync + 'static {
     /// separate `Clock` trait would be a second thing every implementor and
     /// every test double has to supply for one integer.
     fn now_ms(&self) -> u64;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn subagent() -> SessionId {
+        SessionId::new("acme/ada/sub")
+    }
+
+    fn most_recent() -> SessionId {
+        SessionId::new("acme/ada/main")
+    }
+
+    /// R-M2's two unnamed steps, asserted where they are decided rather than
+    /// through a surface — this is the function F4 moved them into, and the
+    /// one an implementor is free to get wrong only by not calling it.
+    #[test]
+    fn the_tool_use_id_decides_and_the_most_recent_conversation_only_catches() {
+        assert_eq!(
+            session_without_a_name(
+                Some("toolu_sub"),
+                |_| Some(subagent()),
+                || Some(most_recent())
+            )
+            .ok(),
+            Some(subagent()),
+            "an id the node emitted is exact, so it outranks a guess"
+        );
+        assert_eq!(
+            session_without_a_name(Some("toolu_foreign"), |_| None, || Some(most_recent())).ok(),
+            Some(most_recent()),
+            "an id that names none of this caller's sessions falls through \
+             rather than refusing — unknown, evicted, ambiguous and foreign \
+             all answer alike"
+        );
+        assert_eq!(
+            session_without_a_name(None, |_| Some(subagent()), || Some(most_recent())).ok(),
+            Some(most_recent()),
+            "and with no id at all the fallback is the whole answer"
+        );
+        assert!(
+            matches!(
+                session_without_a_name(None, |_| Some(subagent()), || None),
+                Err(SurfaceError::NoSession)
+            ),
+            "a node that has served this principal no turn refuses rather \
+             than inventing a conversation"
+        );
+    }
 }

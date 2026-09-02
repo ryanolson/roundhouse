@@ -51,7 +51,7 @@
 //! description says what `prefer` does; nothing in the tool list says that "use
 //! the local models" is a request to call it.
 
-use roundhouse_mcp::tools::descriptors;
+use roundhouse_mcp::tools::descriptor;
 
 use crate::dialect::ClientDialect;
 
@@ -153,11 +153,25 @@ pub fn signage() -> String {
     let mut out = String::from(PREAMBLE);
     out.push_str("\n\n");
     for sign in SIGNS {
-        // Resolved, not merely spelled: `descriptor` panics on a name this
-        // deployment does not serve, which is what stops a rename in
-        // `roundhouse-mcp` from shipping a block that sends the model to a tool
-        // the client will answer `no such tool` for.
-        let name = dialect.stored_call_name(descriptor(sign.tool).name);
+        // Resolved, not merely spelled. The name that comes back is the name
+        // it was looked up by, so what the lookup buys is the panic below on a
+        // tool this deployment no longer serves — which is what stops a rename
+        // in `roundhouse-mcp` from shipping a block that sends the model to a
+        // tool the client will answer `no such tool` for. A panic and not an
+        // `Option` for `codex_launch::skills`'s reason: the degraded output — a
+        // block that silently omits one tool — is still a valid block, is still
+        // read on every turn, and costs the fleet context forever.
+        // `every_sign_names_a_tool_this_deployment_serves` is what turns a
+        // rename into a red test here rather than a panic on somebody's
+        // deployment.
+        let served = descriptor(sign.tool).unwrap_or_else(|| {
+            panic!(
+                "`{}` is not in roundhouse-mcp's tool list, so signage pointing at it would send \
+                 the model to a name this deployment cannot resolve",
+                sign.tool
+            )
+        });
+        let name = dialect.stored_call_name(served.name);
         out.push_str(&format!("- `{name}`: use it when {}.\n", sign.when));
     }
     out.push('\n');
@@ -166,30 +180,11 @@ pub fn signage() -> String {
     out
 }
 
-/// The descriptor a sign names, or a panic naming what is missing.
-///
-/// A panic and not an `Option` for the reason `codex_launch::skills` gives: the
-/// degraded output — a block that silently omits one tool — is still a valid
-/// block, is still read on every turn, and costs the fleet context forever.
-/// `every_sign_names_a_tool_this_deployment_serves` is what turns a rename into
-/// a red test here rather than a panic on somebody's deployment.
-fn descriptor(tool: &'static str) -> roundhouse_mcp::tools::ToolDescriptor {
-    descriptors()
-        .into_iter()
-        .find(|candidate| candidate.name == tool)
-        .unwrap_or_else(|| {
-            panic!(
-                "`{tool}` is not in roundhouse-mcp's tool list, so signage pointing at it would \
-                 send the model to a name this deployment cannot resolve"
-            )
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use roundhouse_mcp::tools::TOOL_NAMES;
+    use roundhouse_mcp::tools::{TOOL_NAMES, descriptors};
 
     use crate::dialect::DEFAULT_MCP_NAMESPACE;
 
@@ -278,6 +273,39 @@ mod tests {
                 descriptor.name
             );
         }
+    }
+
+    /// F12: the descriptor lookup in [`signage`] is an existence check and
+    /// nothing more — the name it returns is the name it was looked up by, so
+    /// substituting `dialect.stored_call_name(sign.tool)` and skipping the
+    /// lookup entirely reproduces [`signage`]'s output byte for byte.
+    ///
+    /// Kept live after the fix, which moved the lookup itself into
+    /// `roundhouse_mcp::tools::descriptor` rather than removing it: what this
+    /// pins is that the check contributes no *text*, so a future edit that
+    /// started rendering something out of the descriptor here would be
+    /// restating, on every turn, what the client already carries in `tools[]`
+    /// — which is what
+    /// `the_signage_does_not_restate_the_descriptors_the_client_already_carries`
+    /// above refuses.
+    #[test]
+    fn descriptor_lookup_is_redundant_with_dialect_stored_call_name() {
+        let dialect = ClientDialect::claude_messages();
+        let mut expected = String::from(PREAMBLE);
+        expected.push_str("\n\n");
+        for sign in SIGNS {
+            let name = dialect.stored_call_name(sign.tool);
+            expected.push_str(&format!("- `{name}`: use it when {}.\n", sign.when));
+        }
+        expected.push('\n');
+        expected.push_str(CLOSING);
+        expected.push('\n');
+        assert_eq!(
+            signage(),
+            expected,
+            "F12: the full descriptor() lookup at signage.rs:160 should be replaceable by \
+             dialect.stored_call_name(sign.tool) with no change to signage()'s output"
+        );
     }
 
     /// Nothing here is a secret, and nothing here can become one.

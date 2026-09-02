@@ -62,45 +62,10 @@
 //!   else". They belong to whoever spawns the process — M11.3's launcher, and
 //!   the gated e2e suite, both of which set them explicitly.
 //! - **No MCP wiring in the map, because it is not environment.** The
-//!   registration and the signage are *argv* — [`ClaudeLaunch::leading_argv`],
-//!   below — and they are still no file: `--mcp-config` takes the JSON inline
+//!   registration and the signage are *argv* — [`ClaudeLaunch::leading_argv`]
+//!   — and they are still no file: `--mcp-config` takes the JSON inline
 //!   and `--append-system-prompt` takes the text inline (M12, R-M3 and R-M4).
-//!   See [the control surface](#the-control-surface).
-//!
-//! # The control surface
-//!
-//! Two arguments, generated and passed *before* the operator's own, which is
-//! everything a client needs to reach roundhouse's own MCP tools and to know
-//! when to call one.
-//!
-//! **`--mcp-config <json>`, and the key rides `${VAR}`.** Of the config forms
-//! the 2.1.257 capture found (§5.8), three work and one does not: the CLI flag,
-//! a project `.mcp.json` and the per-directory entries in `~/.claude.json` are
-//! honoured, and a `settings.json` `mcpServers` key is silently inert. The flag
-//! is the only one of the three that writes nothing — a `.mcp.json` lands in
-//! the operator's repository the same way a `CLAUDE.md` would — and it
-//! *shadows* a project file of the same server name outright, so a generated
-//! registration cannot be half-overridden by one an operator forgot about.
-//!
-//! The header value is the literal `${<key variable>}`, which the client
-//! expands from the environment this module's own map already carries the key
-//! in. So the secret is in neither the argv nor any file, and this is the one
-//! place Claude Code offers the indirection `codex_launch` gets from
-//! `env_http_headers`. **The hazard is the unexpanded literal** — an unset
-//! variable would put `${…}` on the wire as a turn key and every control call
-//! would come back `401` — and it is closed upstream rather than here:
-//! `topham` refuses a launch whose key variable is not exported, before
-//! anything is spawned, which is the same refusal that stops a keyless client
-//! reaching the deployment at all.
-//!
-//! **`--strict-mcp-config` is off by default.** It excludes *every* other MCP
-//! configuration, not merely a colliding one (§5.8: a project server under a
-//! distinct name was never even initialised), so switching it on means an
-//! operator's own servers stop existing for that launch. A deployment that
-//! wants exactly roundhouse's tools and nothing else says so in the profile.
-//!
-//! **`--append-system-prompt <text>`** carries [`signage`], and the two other
-//! places that text could have gone are refused in [`signage`]'s own doc.
+//!   See [`control_surface`].
 //!
 //! # The two auth kinds
 //!
@@ -282,6 +247,12 @@ pub mod suppressors;
 /// rather than mechanism of ours, and it moves when the tool list moves.
 pub mod signage;
 
+/// The argv half: the registration that reaches this deployment's MCP tools,
+/// and the flag the signage rides. Split out for [`suppressors`]'s reason one
+/// surface over — it is the launch's *other* output, and it moves when the
+/// client's config forms move rather than when its environment does.
+pub mod control_surface;
+
 #[cfg(test)]
 mod tests;
 
@@ -292,8 +263,6 @@ use roundhouse_core::control::{CredentialError, Secret};
 
 use crate::codex_launch::DEFAULT_KEY_ENV;
 use crate::control_config::{KeyKind, TURN_KEY_HEADER, has_valid_key_shape};
-use crate::dialect::mcp_server_name;
-use crate::mcp_api::MCP_MOUNT_PATH;
 use crate::messages_api::MESSAGES_PATH;
 use crate::responses_api::API_PREFIX;
 pub use signage::signage;
@@ -305,6 +274,11 @@ pub use crate::control_config::ROUNDHOUSE_API_KEY_SENTINEL;
 /// for it by that path, and a move that renames a public path is a change to the
 /// hook-up surface rather than to this file's shape.
 pub use suppressors::{Defeats, OAUTH_SUPPRESSORS, OauthSuppressor, SuppressorSite};
+
+/// Re-exported for [`OAUTH_SUPPRESSORS`]'s reason: `topham` and the e2e suites
+/// name these by `claude_launch::…`, so the split has to be invisible from
+/// outside the crate to be the behaviour-preserving move it claims to be.
+pub use control_surface::{APPEND_SYSTEM_PROMPT_FLAG, GeneratedArg, flatten_argv};
 
 /// Where the client's vendored SDK reads the deployment address.
 ///
@@ -670,84 +644,6 @@ impl ClaudeLaunch {
     /// parameter: two literals agree today and part company silently.
     pub fn messages_url(&self) -> String {
         format!("{}{API_PREFIX}/{MESSAGES_PATH}", self.base_url)
-    }
-
-    /// Where this deployment serves the MCP control surface, as the generated
-    /// registration names it.
-    ///
-    /// A join onto the deployment root and *not* onto [`Self::messages_url`]:
-    /// the two routes are siblings, mounted at the root beside each other, and
-    /// a registration carrying [`API_PREFIX`] would point at a path nothing
-    /// serves. The failure is the one `codex_launch::mcp_endpoint`'s doc names
-    /// — a client that starts, runs turns perfectly, and cannot resolve a
-    /// single control call — and it is why [`MCP_MOUNT_PATH`] is read from the
-    /// module that mounts the route rather than spelled here.
-    ///
-    /// Simpler than the codex sibling because this launch's `base_url` already
-    /// *is* the root: that client's SDK appends the version segment itself, so
-    /// there is nothing to strip.
-    pub fn mcp_url(&self) -> String {
-        format!("{}{MCP_MOUNT_PATH}", self.base_url)
-    }
-
-    /// The `--mcp-config` value: one inline JSON object registering this
-    /// deployment's control surface.
-    ///
-    /// **No secret is in it and none can get in**: the header value is the
-    /// literal `${<key variable>}`, expanded by the client out of the
-    /// environment [`Self::env`] put the key in. See the module doc's *The
-    /// control surface* for why the flag rather than a file, and for what
-    /// closes the unexpanded-literal hazard.
-    ///
-    /// The server *name* is [`mcp_server_name`] — derived from the namespace
-    /// this deployment's tools come back under, never typed here. A
-    /// registration under any other name produces a client whose every control
-    /// tool is called `mcp__<that name>__…`, which the validate fold does not
-    /// recognise as roundhouse's own traffic and which no steer resolves
-    /// against.
-    ///
-    /// Rendered through `serde_json` rather than `format!` for the reason
-    /// `codex_launch::quote` gives about TOML: a base URL containing a quote or
-    /// a backslash would otherwise produce a document that fails inside the
-    /// *client*, where the error names a column in a string nobody wrote by
-    /// hand.
-    pub fn mcp_registration(&self) -> String {
-        serde_json::json!({
-            "mcpServers": {
-                mcp_server_name(): {
-                    // `http` and not `sse`: the surface is Streamable HTTP, and
-                    // the 2.1.257 capture (§5.8) shows the client speaking
-                    // JSON-RPC over `POST {url}` under exactly this type.
-                    "type": "http",
-                    "url": self.mcp_url(),
-                    "headers": { TURN_KEY_HEADER: format!("${{{}}}", self.key_env) }
-                }
-            }
-        })
-        .to_string()
-    }
-
-    /// The arguments a launcher puts *before* the operator's own.
-    ///
-    /// **Generated, and separate from the operator's verbatim tail**, which is
-    /// the seam a launcher needs and the reason this returns a `Vec` rather
-    /// than a string a caller splits: an argument containing a space — the
-    /// signage contains thousands — is one argv element, and a launcher that
-    /// rebuilt this by splitting text would hand the client a hundred flags it
-    /// does not know.
-    ///
-    /// Leading rather than trailing so that the operator's own argv is the last
-    /// word on anything both name. A launcher that lets both spell
-    /// `--mcp-config` has two answers to one question and should refuse; this
-    /// module cannot see the operator's tail and so cannot be the one to.
-    pub fn leading_argv(&self) -> Vec<String> {
-        let mut argv = vec!["--mcp-config".to_string(), self.mcp_registration()];
-        if self.strict_mcp {
-            argv.push("--strict-mcp-config".to_string());
-        }
-        argv.push("--append-system-prompt".to_string());
-        argv.push(signage());
-        argv
     }
 
     /// The inputs that must not be set when this launch runs, in the form a

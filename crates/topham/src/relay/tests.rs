@@ -71,9 +71,9 @@ fn the_chained_child_is_relay_running_the_agent_with_the_operators_argv_after_th
     );
     assert_eq!(
         &launch.plan.generated_argv[6..],
-        crate::launch::generated_argv(
+        crate::launch::flatten_argv(&crate::launch::generated_args(
             &resolve(&env(&[]), "work", chained(Agent::Claude)).expect("resolves")
-        ),
+        )),
         "the chained client is handed the same generated arguments the direct \
          one is: one launch, two topologies"
     );

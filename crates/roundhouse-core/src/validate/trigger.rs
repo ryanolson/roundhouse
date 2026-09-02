@@ -50,7 +50,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::session::SessionState;
-use crate::validate::exchange::{Exchange, exchanges, task_exchanges};
+use crate::validate::control_call::{ControlCallDialect, task_exchanges_on};
+use crate::validate::exchange::{Exchange, exchanges};
 use crate::validate::tool_signals::{ErrorSeverity, PureBashStreak};
 
 /// Which of the trigger's observations fired.
@@ -140,13 +141,21 @@ pub struct Evidence<'a> {
     pub exchanges: Vec<Exchange>,
     /// Billable tokens per completed turn, oldest first.
     pub turn_tokens: &'a [u64],
+    /// Which client wrote this session, and therefore how one of roundhouse's
+    /// own control calls is spelled in it (M12 review, F8).
+    ///
+    /// Carried on the shared read rather than asked of each signal for the same
+    /// reason [`Self::task_exchanges`] is a method: one answer per session, so
+    /// two signals cannot disagree about whose call a name belongs to.
+    pub dialect: ControlCallDialect,
 }
 
 impl<'a> Evidence<'a> {
-    pub fn of(state: &'a SessionState) -> Self {
+    pub fn of(state: &'a SessionState, dialect: ControlCallDialect) -> Self {
         Self {
             exchanges: exchanges(&state.items),
             turn_tokens: state.recent_turn_tokens(),
+            dialect,
         }
     }
 
@@ -166,7 +175,7 @@ impl<'a> Evidence<'a> {
     /// deleted would be shown a session that skips from one command to another
     /// with no account of the gap.
     pub fn task_exchanges(&self) -> Vec<&Exchange> {
-        task_exchanges(&self.exchanges)
+        task_exchanges_on(&self.exchanges, self.dialect)
     }
 }
 
@@ -435,11 +444,15 @@ impl Trigger {
     /// interjection seam makes about supplying a field before an occupant
     /// consults it. The policy's real consumer is the action map, which needs
     /// it as the ceiling every narrowing composes through.
-    pub fn evaluate(&self, state: &SessionState) -> Option<TriggerRecord> {
+    pub fn evaluate(
+        &self,
+        state: &SessionState,
+        dialect: ControlCallDialect,
+    ) -> Option<TriggerRecord> {
         if !self.gate_open(state) {
             return None;
         }
-        let evidence = Evidence::of(state);
+        let evidence = Evidence::of(state, dialect);
         let signals: Vec<SignalFired> = self
             .signals
             .iter()
@@ -541,6 +554,7 @@ mod tests {
         Evidence {
             exchanges: exchanges(items),
             turn_tokens,
+            dialect: ControlCallDialect::ClaudeMessages,
         }
     }
 
@@ -866,7 +880,7 @@ mod tests {
         }
         let healthy = wide_open(healthy_items.clone());
         assert_eq!(
-            trigger.evaluate(&healthy),
+            trigger.evaluate(&healthy, ControlCallDialect::ClaudeMessages),
             None,
             "a cadence that has come due is permission to ask, never a reason to"
         );
@@ -878,7 +892,7 @@ mod tests {
         items.extend(stuck_items());
         let stuck = wide_open(items);
         let fired = trigger
-            .evaluate(&stuck)
+            .evaluate(&stuck, ControlCallDialect::ClaudeMessages)
             .expect("an open gate plus evidence is the one case that consults");
         // Named exhaustively rather than counted loosely, because *which*
         // signals a fixture trips is the thing that silently changes when the
@@ -916,7 +930,9 @@ mod tests {
         // A session that would fire on its own evidence.
         let stuck = wide_open(stuck_items());
         assert!(
-            trigger.evaluate(&stuck).is_some(),
+            trigger
+                .evaluate(&stuck, ControlCallDialect::ClaudeMessages)
+                .is_some(),
             "the control: this session's evidence is what makes the next \
              assertion about the steer and not about the evidence"
         );
@@ -928,13 +944,20 @@ mod tests {
         let mut fulfilling = wide_open(stuck_items());
         fulfilling.steered_on_turn = Some(fulfilling.turn_index - 1);
         assert!(fulfilling.this_turn_fulfils_a_steer());
-        assert_eq!(trigger.evaluate(&fulfilling), None);
+        assert_eq!(
+            trigger.evaluate(&fulfilling, ControlCallDialect::ClaudeMessages),
+            None
+        );
 
         // The control on the *other* side of the rule: a steer two turns back
         // does not disable validation for the rest of the session.
         let mut earlier = wide_open(stuck_items());
         earlier.steered_on_turn = Some(earlier.turn_index - 2);
-        assert!(trigger.evaluate(&earlier).is_some());
+        assert!(
+            trigger
+                .evaluate(&earlier, ControlCallDialect::ClaudeMessages)
+                .is_some()
+        );
 
         // And the third position, which is the one a fold comparing against
         // `turn_index` would get wrong: the turn that *emitted* the steer is
@@ -942,7 +965,11 @@ mod tests {
         // invisible — and would shift the suppression onto the wrong turn.
         let mut emitting = wide_open(stuck_items());
         emitting.steered_on_turn = Some(emitting.turn_index);
-        assert!(trigger.evaluate(&emitting).is_some());
+        assert!(
+            trigger
+                .evaluate(&emitting, ControlCallDialect::ClaudeMessages)
+                .is_some()
+        );
     }
 
     #[test]
@@ -951,7 +978,14 @@ mod tests {
         let config = TriggerConfig::default();
 
         // The base case: open, with evidence.
-        assert!(trigger.evaluate(&wide_open(stuck_items())).is_some());
+        assert!(
+            trigger
+                .evaluate(
+                    &wide_open(stuck_items()),
+                    ControlCallDialect::ClaudeMessages
+                )
+                .is_some()
+        );
 
         // Turn 0 and turn 1: there is no trajectory to judge before there is a
         // trajectory.
@@ -959,7 +993,7 @@ mod tests {
             let mut early = wide_open(stuck_items());
             early.turn_index = index;
             assert_eq!(
-                trigger.evaluate(&early),
+                trigger.evaluate(&early, ControlCallDialect::ClaudeMessages),
                 None,
                 "turn {index} has no history"
             );
@@ -974,7 +1008,13 @@ mod tests {
         ] {
             let mut state = wide_open(stuck_items());
             state.tokens_since_last_validation = tokens;
-            assert_eq!(trigger.evaluate(&state).is_some(), open, "{tokens} tokens");
+            assert_eq!(
+                trigger
+                    .evaluate(&state, ControlCallDialect::ClaudeMessages)
+                    .is_some(),
+                open,
+                "{tokens} tokens"
+            );
         }
 
         // The cooldown, measured on the log's own timestamps rather than on a
@@ -984,7 +1024,9 @@ mod tests {
             state.last_validation_at_ms = Some(1_000_000);
             state.last_event_at_ms = 1_000_000 + elapsed;
             assert_eq!(
-                trigger.evaluate(&state).is_some(),
+                trigger
+                    .evaluate(&state, ControlCallDialect::ClaudeMessages)
+                    .is_some(),
                 open,
                 "{elapsed}ms elapsed"
             );
@@ -998,7 +1040,12 @@ mod tests {
         ] {
             let mut state = wide_open(stuck_items());
             state.consecutive_interventions = interventions;
-            assert_eq!(trigger.evaluate(&state).is_some(), open);
+            assert_eq!(
+                trigger
+                    .evaluate(&state, ControlCallDialect::ClaudeMessages)
+                    .is_some(),
+                open
+            );
         }
 
         // The per-session review cap: the log-derived half of the review
@@ -1009,7 +1056,12 @@ mod tests {
         ] {
             let mut state = wide_open(stuck_items());
             state.validations_run = run;
-            assert_eq!(trigger.evaluate(&state).is_some(), open);
+            assert_eq!(
+                trigger
+                    .evaluate(&state, ControlCallDialect::ClaudeMessages)
+                    .is_some(),
+                open
+            );
         }
     }
 }

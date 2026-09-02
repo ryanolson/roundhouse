@@ -46,6 +46,12 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use roundhouse_server::claude_launch::GeneratedArg;
+// Re-exported so `crate::relay`, which builds one argv out of Relay's own
+// arguments and the agent's, flattens the pairs through the same seam this
+// module does rather than reaching past it.
+pub(crate) use roundhouse_server::claude_launch::flatten_argv;
+
 use crate::env::EnvMap;
 use crate::plan::{PlanError, Resolution, Resolved};
 use crate::profile::{Profile, Topology};
@@ -68,7 +74,7 @@ pub const CODEX_HOME_ENV: &str = "CODEX_HOME";
 /// layered *under* nothing, so an explicit ambient value of either name is
 /// overwritten; an operator who means the opposite says so in the profile's
 /// argv or turns off the launcher.
-const CLAUDE_DEPLOYMENT_POLICY: &[(&str, &str)] = &[
+pub(crate) const CLAUDE_DEPLOYMENT_POLICY: &[(&str, &str)] = &[
     ("DISABLE_AUTOUPDATER", "1"),
     ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
 ];
@@ -177,29 +183,30 @@ pub fn plan(
         });
     }
 
-    let generated_argv = generated_argv(resolution);
-    refuse_collisions(&generated_argv, &argv)?;
+    let generated = generated_args(resolution);
+    refuse_collisions(&generated, &argv)?;
     let (env, files) = layered(resolution, ambient);
     Ok(LaunchPlan {
         program: resolution.profile.agent.program().to_string(),
-        generated_argv,
+        generated_argv: flatten_argv(&generated),
         argv,
         env,
         files,
     })
 }
 
-/// The arguments this launcher generated for the *agent*, from the resolution
-/// that derived them.
+/// The arguments this launcher generated for the *agent*, as flag/value pairs.
 ///
-/// A read and not a derivation: [`crate::plan::resolve`] built them, so a dry
-/// run and a launch cannot show different flags. Codex's is empty because that
-/// client is configured by the files beside it — a fact about the client and
-/// not an omission, which is why the arm says so rather than falling through a
-/// wildcard.
-pub(crate) fn generated_argv(resolution: &Resolution) -> Vec<String> {
+/// Asked of the launch rather than read from a copy beside it (F6): `topham
+/// plan`, `topham launch` and the screen all derive it from the one
+/// [`ClaudeLaunch`](roundhouse_server::ClaudeLaunch), so a dry run and a launch
+/// cannot show different flags — which a cached second copy made true only by
+/// construction. Codex's is empty because that client is configured by the
+/// files beside it — a fact about the client and not an omission, which is why
+/// the arm says so rather than falling through a wildcard.
+pub(crate) fn generated_args(resolution: &Resolution) -> Vec<GeneratedArg> {
     match &resolution.resolved {
-        Resolved::Claude { leading_argv, .. } => leading_argv.clone(),
+        Resolved::Claude { launch, .. } => launch.leading_argv(),
         Resolved::Codex { .. } => Vec::new(),
     }
 }
@@ -218,21 +225,29 @@ pub(crate) fn generated_argv(resolution: &Resolution) -> Vec<String> {
 /// `--mcp-config=x` and `--mcp-config x` are one flag to clap and two strings
 /// to a `contains`.
 ///
+/// **Which entries are flags is read off the structure, never guessed from the
+/// text** (F5). This took a flat argv and treated any `--`-prefixed entry
+/// without whitespace as a flag it generates, which refused an operator's
+/// `--x` for colliding with the *value* half of a generated pair — a refusal
+/// naming a flag this launch does not pass, for a launch that would have run.
+///
 /// **Only the agent's own generated arguments are ever passed as `generated`.**
 /// The chained path builds a longer list whose first half is Relay's
 /// (`--agent`, `--config`), and codex takes a `--config` of its own — so
 /// checking that half against the operator's tail would refuse a legitimate
 /// agent flag for colliding with a flag the agent never sees.
-pub(crate) fn refuse_collisions(generated: &[String], argv: &[String]) -> Result<(), LaunchError> {
-    for flag in generated
-        .iter()
-        .filter(|argument| argument.starts_with("--") && !argument.contains(char::is_whitespace))
-    {
+pub(crate) fn refuse_collisions(
+    generated: &[GeneratedArg],
+    argv: &[String],
+) -> Result<(), LaunchError> {
+    for flag in generated.iter().map(GeneratedArg::flag) {
         if argv
             .iter()
             .any(|argument| argument == flag || argument.starts_with(&format!("{flag}=")))
         {
-            return Err(LaunchError::ArgvCollidesWithGenerated { flag: flag.clone() });
+            return Err(LaunchError::ArgvCollidesWithGenerated {
+                flag: flag.to_string(),
+            });
         }
     }
     Ok(())

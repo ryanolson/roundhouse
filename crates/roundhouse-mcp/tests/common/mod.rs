@@ -215,17 +215,22 @@ impl ControlReads for FakeDeployment {
         match conversation {
             // The fake's stand-in for the server's node-local call table: a
             // tool-use id names the session it was emitted into, checked
-            // against the caller, and falls through to the "most recent"
-            // answer when it names none of this caller's. Reproduced rather
-            // than stubbed out because the *order* is what the surface depends
-            // on, and a fake that ignored the id would let a handler forget to
-            // pass it with every test still green.
-            None => tool_use_id
-                .and_then(|id| self.tool_use_ids.get(id))
-                .filter(|(owner, _)| owner == principal)
-                .map(|(_, session)| session.clone())
-                .or_else(|| self.sessions.get(principal).cloned())
-                .ok_or(SurfaceError::NoSession),
+            // against the caller. Only the *lookups* are the fake's; the order
+            // they are weighed in comes from `session_without_a_name`, which
+            // is the same function the real `ControlPlaneReads` calls. Two
+            // hand-written orders is what F4 found — a fake free to disagree
+            // with the deployment turns the surface's tests into tests of the
+            // fake.
+            None => roundhouse_mcp::session_without_a_name(
+                tool_use_id,
+                |id| {
+                    self.tool_use_ids
+                        .get(id)
+                        .filter(|(owner, _)| owner == principal)
+                        .map(|(_, session)| session.clone())
+                },
+                || self.sessions.get(principal).cloned(),
+            ),
             Some(named) => {
                 // The server resolves this through the same `bound_session`
                 // namespacing the Responses surface uses; the fake reproduces

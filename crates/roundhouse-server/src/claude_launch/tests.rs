@@ -8,15 +8,20 @@
 
 use super::*;
 
-const TURN_KEY: &str = "rh_turn_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+// `pub(super)` on the four fixtures below, so `control_surface`'s own tests
+// share them rather than restating them: a second `launch()` built from a
+// second key and a second root would let the two files disagree about what the
+// documented-correct launch is, and the disagreement would show up as one of
+// them testing a shape nobody generates.
+pub(super) const TURN_KEY: &str = "rh_turn_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const ADMIN_KEY: &str = "rh_admin_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-const ROOT: &str = "http://127.0.0.1:8080";
+pub(super) const ROOT: &str = "http://127.0.0.1:8080";
 
-fn launch() -> ClaudeLaunch {
+pub(super) fn launch() -> ClaudeLaunch {
     ClaudeLaunch::new(ROOT, TURN_KEY).expect("the documented-correct shape constructs")
 }
 
-fn env_of(launch: &ClaudeLaunch) -> BTreeMap<String, String> {
+pub(super) fn env_of(launch: &ClaudeLaunch) -> BTreeMap<String, String> {
     launch
         .env()
         .expect("the documented-correct shape renders")
@@ -596,198 +601,5 @@ fn the_api_key_sentinel_is_namespaced_and_is_not_key_shaped() {
     assert!(
         !ROUNDHOUSE_API_KEY_SENTINEL.is_empty(),
         "an empty value resolves no source"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// M12 R-M3: the control surface's registration, and the signage beside it
-// ---------------------------------------------------------------------------
-
-/// The MCP half of the same 2.1.257 capture the fixtures above come from
-/// (§5.8): five requests, `initialize` through `tools/call`, made by the real
-/// client against a stub registered exactly the way this module generates one.
-///
-/// Read by the test below rather than transcribed, because the two facts it is
-/// consulted for — the path the client posts to and the header name that
-/// survives to the wire — are the two a generated registration can get wrong
-/// while still parsing.
-const MCP_WIRE: &str = include_str!("../../tests/fixtures/claude-2.1.257-mcp-wire.json");
-
-/// R-M3: the generated registration is the config form the captured client
-/// honoured, and it carries a variable rather than a key.
-///
-/// **Pinned as a whole string *and* read field by field**, because the two fail
-/// differently: the byte pin catches a shape change nobody meant, and the field
-/// assertions say which field a deliberate change moved. The whole-string pin
-/// is what a launcher's snapshot then renders, so it moving is a change to what
-/// an operator reads in a dry run as much as to what the client is handed.
-#[test]
-fn the_mcp_registration_is_the_config_form_the_captured_client_honoured() {
-    let registration = launch().mcp_registration();
-    assert_eq!(
-        registration,
-        r#"{"mcpServers":{"roundhouse":{"headers":{"x-roundhouse-key":"${ROUNDHOUSE_API_KEY}"},"type":"http","url":"http://127.0.0.1:8080/mcp"}}}"#
-    );
-
-    let parsed: serde_json::Value =
-        serde_json::from_str(&registration).expect("the registration is JSON the client parses");
-    let servers = parsed["mcpServers"]
-        .as_object()
-        .expect("a `mcpServers` object");
-    assert_eq!(
-        servers.keys().collect::<Vec<_>>(),
-        vec![mcp_server_name()],
-        "one server, named so its tools come back under this deployment's own \
-         namespace: {registration}"
-    );
-    let server = &servers[mcp_server_name()];
-    assert_eq!(server["type"].as_str(), Some("http"));
-    assert_eq!(
-        server["url"].as_str(),
-        Some(launch().mcp_url().as_str()),
-        "the registration and `mcp_url` are one derivation"
-    );
-    assert_eq!(
-        server["headers"]
-            .as_object()
-            .expect("a headers object")
-            .len(),
-        1,
-        "one header: every additional one is a name that overrides whatever the \
-         client would otherwise send under it"
-    );
-    assert_eq!(
-        server["headers"][TURN_KEY_HEADER].as_str(),
-        Some(format!("${{{DEFAULT_KEY_ENV}}}").as_str()),
-        "the key rides `${{VAR}}`, which the client expands out of the \
-         environment this module's own map put the key in"
-    );
-
-    // The two facts the capture settles, against the capture. A registration
-    // that named the wrong path or the wrong header parses perfectly and
-    // produces a client that reaches nothing.
-    let wire: serde_json::Value = serde_json::from_str(MCP_WIRE).expect("the capture is JSON");
-    let requests = wire.as_array().expect("a list of requests");
-    assert!(
-        requests.len() >= 5,
-        "the capture is the whole handshake: {}",
-        requests.len()
-    );
-    for request in requests {
-        assert_eq!(
-            request["path"].as_str(),
-            Some(MCP_MOUNT_PATH),
-            "the real client posted every MCP request to the path this \
-             registration has to name"
-        );
-        assert!(
-            request["headers"][TURN_KEY_HEADER].is_string(),
-            "the header the registration declares reached the wire on request \
-             {}: {request}",
-            request["n"]
-        );
-    }
-}
-
-/// The registration names a variable, so no rendering of it can hold the key.
-///
-/// Asserted over the whole generated argv rather than over the JSON alone: the
-/// signage is in there too, and the argv is what a launcher prints, logs and
-/// puts in a process listing that any other user of the box can read.
-#[test]
-fn no_generated_argument_carries_the_turn_key() {
-    let launch = launch();
-    for argument in launch.leading_argv() {
-        assert!(
-            !argument.contains(TURN_KEY),
-            "the turn key is in the generated argv: {argument}"
-        );
-    }
-    // The control: the key *is* somewhere, and it is the one place the module
-    // doc says it is.
-    assert!(
-        env_of(&launch)[CUSTOM_HEADERS_ENV].contains(TURN_KEY),
-        "the header block is where the key rides"
-    );
-}
-
-/// The variable named is the launcher's own, and naming another moves nothing
-/// else.
-///
-/// The failure this prevents is silent and total: a launcher that exports the
-/// key under one name while the registration reads another generates `${…}`
-/// expanding to nothing, and every control call arrives with an empty turn key
-/// — a `401` on the control surface only, while every inference turn keeps
-/// answering.
-#[test]
-fn the_registration_reads_the_variable_the_launcher_exports() {
-    let renamed = launch().with_key_env("DEPLOY_TURN_KEY");
-    assert_eq!(renamed.key_env(), "DEPLOY_TURN_KEY");
-    assert_eq!(
-        renamed.mcp_registration(),
-        launch()
-            .mcp_registration()
-            .replace(DEFAULT_KEY_ENV, "DEPLOY_TURN_KEY"),
-        "the variable is the only thing that moves"
-    );
-    // And the environment map is untouched by it: the header block holds the
-    // key itself, because that variable is not expanded (§1.6).
-    assert_eq!(env_of(&renamed), env_of(&launch()));
-}
-
-/// R-M3: the generated argv is the registration, the signage, and — only when
-/// asked — the strict flag.
-#[test]
-fn the_generated_argv_is_two_flags_and_a_third_only_when_the_profile_asks() {
-    let launch = launch();
-    assert_eq!(
-        launch.leading_argv(),
-        vec![
-            "--mcp-config".to_string(),
-            launch.mcp_registration(),
-            "--append-system-prompt".to_string(),
-            signage(),
-        ],
-        "off by default: `--strict-mcp-config` drops an operator's own servers \
-         wholesale, which is a deployment decision rather than part of hooking up"
-    );
-
-    let strict = launch.clone().with_strict_mcp_config(true);
-    assert_eq!(
-        strict.leading_argv(),
-        vec![
-            "--mcp-config".to_string(),
-            strict.mcp_registration(),
-            "--strict-mcp-config".to_string(),
-            "--append-system-prompt".to_string(),
-            signage(),
-        ]
-    );
-    assert_eq!(
-        launch.clone().with_strict_mcp_config(false).leading_argv(),
-        launch.leading_argv(),
-        "and asking for it off is asking for the default"
-    );
-}
-
-/// The MCP route is a sibling of the turn route, not a child of it.
-///
-/// A registration carrying [`API_PREFIX`] points at a path nothing serves, and
-/// the client reports that as a server it could not reach rather than as a
-/// configuration mistake — the failure `codex_launch::mcp_endpoint` exists to
-/// prevent on the other client, reached here from the other direction because
-/// this launch's `base_url` is already the root.
-#[test]
-fn the_mcp_url_is_mounted_at_the_root_beside_the_turn_route() {
-    let launch = launch();
-    assert_eq!(launch.mcp_url(), format!("{ROOT}{MCP_MOUNT_PATH}"));
-    assert_eq!(
-        launch.messages_url(),
-        format!("{ROOT}{API_PREFIX}/messages")
-    );
-    assert!(
-        !launch.mcp_url().contains(API_PREFIX),
-        "{}",
-        launch.mcp_url()
     );
 }

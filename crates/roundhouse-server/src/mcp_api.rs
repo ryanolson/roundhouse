@@ -154,18 +154,19 @@ impl<S: SessionStore> ControlReads for ControlPlaneReads<S> {
             // that very log, so "the session exists" is not in question; a
             // `last_seq` here would spend a store round trip to re-ask
             // something this node observed itself.
-            if let Some(session) =
-                tool_use_id.and_then(|id| self.conversations.session_of_call(principal, id))
-            {
-                return Ok(session);
-            }
-            // The principal's most recent conversation *on this node*. A
-            // principal this node has served no turn for gets the error rather
-            // than somebody else's session or an empty status.
-            return self
-                .conversations
-                .latest(principal)
-                .ok_or(SurfaceError::NoSession);
+            //
+            // The *order* is not spelled here: `session_without_a_name` is
+            // where R-M2 lives, and this supplies the two lookups it weighs.
+            // The alternative — this arm encoding the order itself, as it did
+            // — put a second copy of the ruling beside the test double's, with
+            // nothing red when they disagreed (M12 review, F4). A principal
+            // this node has served no turn for gets the refusal rather than
+            // somebody else's session or an empty status.
+            return roundhouse_mcp::session_without_a_name(
+                tool_use_id,
+                |id| self.conversations.session_of_call(principal, id),
+                || self.conversations.latest(principal),
+            );
         };
 
         // Through `qualify`, so the id an agent's `conversation` argument

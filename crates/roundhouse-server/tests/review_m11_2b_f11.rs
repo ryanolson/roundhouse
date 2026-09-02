@@ -192,6 +192,12 @@ fn finding_f11_cited_mod_tests_line_is_off_by_one() {
 /// extraction was that the table is a *self-contained* unit, so what is checked
 /// is that it moved somewhere whole and that the primary file is under the
 /// boundary it crossed.
+///
+/// The control-surface block is checked from here rather than from a guard of
+/// its own because it is the *same* boundary: M12 added the MCP registration
+/// and the signage argv to the primary file and crossed 1000 lines again, and
+/// the remedy was F11's remedy. One test means the line-count assertion above
+/// and the extractions that keep it true cannot pass in separate runs.
 #[test]
 fn the_suppressor_table_now_lives_in_its_own_module() {
     let root = repo_root();
@@ -231,6 +237,36 @@ fn the_suppressor_table_now_lives_in_its_own_module() {
     assert!(
         std::fs::metadata(root.join("crates/roundhouse-server/src/claude_launch/tests.rs")).is_ok(),
         "F11's other half: the unit tests move beside the table"
+    );
+
+    // M12's control surface, extracted for the same reason and guarded the same
+    // way: the unit whole in one place, absent from the primary, and reachable
+    // by its old public path.
+    let control_surface = std::fs::read_to_string(
+        root.join("crates/roundhouse-server/src/claude_launch/control_surface.rs"),
+    )
+    .expect("M12's extraction target exists");
+    for item in [
+        "pub const APPEND_SYSTEM_PROMPT_FLAG",
+        "pub struct GeneratedArg",
+        "pub fn flatten_argv",
+        "pub fn mcp_url",
+        "pub fn mcp_registration",
+        "pub fn leading_argv",
+    ] {
+        assert!(
+            control_surface.contains(item),
+            "the extracted module must define {item} -- the unit only stays \
+             self-contained if all of it moved"
+        );
+        assert!(
+            !primary.contains(item),
+            "{item} must not also be defined in the primary file"
+        );
+    }
+    assert!(
+        primary.contains("pub use control_surface::"),
+        "the argv types must still be nameable as `claude_launch::GeneratedArg`"
     );
 }
 

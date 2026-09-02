@@ -1278,17 +1278,16 @@ fn an_override_wider_than_the_project_policy_is_rejected_naming_both() {
         .expect("an override that only raises the floor narrows and must validate");
 }
 
-/// A namespace no agent could dispatch against fails to load.
+/// M12 review F2: the retired `mcp_namespace` knob is refused, whatever it says.
 ///
-/// At the boundary rather than trimmed or defaulted at the projection, and the
-/// distinction is the whole point of the rule: a call rendered under an empty
-/// or whitespace-bearing namespace still *serves* — the turn completes, four
-/// frames go out, the client parses them — and then resolves against nothing,
-/// so the steer silently does nothing at all. An operator-authored name that
-/// means nothing must fail to load rather than fail to work.
+/// Every shape an operator could write, including the one that used to be
+/// accepted (`mcp__acme`, well-formed and dispatchable), because the finding is
+/// not that some namespaces are bad — it is that *no* configured namespace ever
+/// reached a launcher, the signage or the fold, and a config that loads while
+/// meaning nothing is how an operator loses an afternoon.
 #[test]
-fn a_namespace_no_agent_could_dispatch_against_is_rejected_at_load() {
-    for namespace in ["", "mcp roundhouse", "mcp__roundhouse\n"] {
+fn the_retired_mcp_namespace_knob_is_refused_at_load() {
+    for namespace in ["mcp__acme", "", "mcp roundhouse", "mcp__roundhouse"] {
         let json = format!(
             r#"{{
               "projects": [{{ "id": "acme" }}],
@@ -1298,39 +1297,26 @@ fn a_namespace_no_agent_could_dispatch_against_is_rejected_at_load() {
         );
         let error = ControlPlaneConfig::from_json(&json, "test").unwrap_err();
         match error {
-            ControlPlaneError::BadMcpNamespace {
+            ControlPlaneError::RetiredMcpNamespace {
                 namespace: rejected,
                 ..
             } => assert_eq!(rejected, namespace),
-            other => panic!("namespace {namespace:?} should have been rejected, got {other:?}"),
+            other => panic!("namespace {namespace:?} should have been refused, got {other:?}"),
         }
     }
 }
 
-/// The control for the rule above: an ordinary namespace loads, and so does a
-/// file that names none.
+/// The control for the rule above: a file that names no namespace still loads.
 ///
-/// Without it, a validator that rejected *every* namespace would leave the
-/// test above green while making the field unusable.
+/// Without it, a boundary that refused every config would leave the test above
+/// green while making the whole file unusable.
 #[test]
-fn an_ordinary_namespace_and_an_absent_one_both_load() {
-    let named = ControlPlaneConfig::from_json(
-        r#"{
-          "projects": [{ "id": "acme" }],
-          "users": [{ "id": "ada" }],
-          "mcp_namespace": "mcp__acme"
-        }"#,
-        "test",
-    )
-    .expect("a well-formed namespace loads");
-    assert_eq!(named.mcp_namespace.as_deref(), Some("mcp__acme"));
-
+fn a_config_that_names_no_namespace_still_loads() {
     let unnamed =
         ControlPlaneConfig::from_json(sample_config(), "test").expect("the sample config loads");
     assert_eq!(
         unnamed.mcp_namespace, None,
-        "an absent field stays absent here; the default is applied once, at \
-         `ControlPlane::client_dialect`"
+        "the field survives only so the refusal can name it"
     );
 }
 

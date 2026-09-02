@@ -217,10 +217,13 @@ pub struct TurnSignals {
 }
 
 impl TurnSignals {
-    /// The signals over a session's exchanges.
-    pub fn from_exchanges(exchanges: &[crate::validate::Exchange]) -> Self {
+    /// The signals over a session's exchanges, as `dialect`'s client wrote them.
+    pub fn from_exchanges(
+        exchanges: &[crate::validate::Exchange],
+        dialect: crate::validate::ControlCallDialect,
+    ) -> Self {
         Self {
-            tools: ToolSignals::from_exchanges(exchanges),
+            tools: ToolSignals::from_exchanges(exchanges, dialect),
             turn_depth: exchanges.len() as u32,
         }
     }
@@ -751,6 +754,7 @@ mod tests {
     use crate::ids::SessionId;
     use crate::routing::CacheLedger;
     use crate::routing::policy::AffinityPolicy;
+    use crate::validate::ControlCallDialect;
 
     /// The module's own source, so the attribution test reads what a reader
     /// would read rather than a constant that could be deleted with it.
@@ -901,7 +905,7 @@ mod tests {
         ));
         assert_eq!(exchanges.len(), 10);
 
-        let signals = TurnSignals::from_exchanges(&exchanges);
+        let signals = TurnSignals::from_exchanges(&exchanges, ControlCallDialect::ClaudeMessages);
         assert_eq!(signals.turn_depth, 10);
         let dims = dimensions_from_signal(&signals);
         assert_eq!(
@@ -924,14 +928,15 @@ mod tests {
         // tool make the same session deep enough, and the window behind the
         // gate is unchanged because those three are dropped from it.
         //
-        // Closing it is one line here — `task_exchanges(exchanges).len()` —
+        // Closing it is one line here — `task_exchanges_on(exchanges,
+        // dialect).len()` —
         // and it is a non-test `routing/stage.rs` change, which M10's fix
         // clusters assign elsewhere; see reports/m10-fix-D.md for the ruling
         // asked for and the default taken.
         let shallow_pit: Vec<Exchange> = (0..5)
             .map(|n| control_call(&format!("b{n}"), "cargo", "{}"))
             .collect();
-        let alone = TurnSignals::from_exchanges(&shallow_pit);
+        let alone = TurnSignals::from_exchanges(&shallow_pit, ControlCallDialect::ClaudeMessages);
         assert_eq!(
             (alone.turn_depth, dimensions_from_signal(&alone).spinning),
             (5, 0.0),
@@ -942,7 +947,8 @@ mod tests {
         with_control.extend(
             (0..3).map(|n| control_call(&format!("c{n}"), "mcp__roundhouse__status", "{}")),
         );
-        let inflated = TurnSignals::from_exchanges(&with_control);
+        let inflated =
+            TurnSignals::from_exchanges(&with_control, ControlCallDialect::ClaudeMessages);
         let dims = dimensions_from_signal(&inflated);
         assert_eq!(
             (inflated.turn_depth, dims.spinning),

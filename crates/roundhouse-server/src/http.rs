@@ -839,6 +839,19 @@ impl<S: SessionStore> LogTail<S> {
         }
     }
 
+    /// The session this cursor follows.
+    ///
+    /// Exposed so a follower that needs the id for something else — the
+    /// Messages follower writes an MCP tool-use binding against it — reads it
+    /// from the tail rather than keeping a second copy beside one (M12 review,
+    /// F11). Two fields set from one constructor argument can only ever drift
+    /// apart, and the drift is unobservable: a binding written against a
+    /// session the tail does not follow resolves a later control call to a log
+    /// this turn never touched.
+    pub(crate) fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
     /// One batch after `after_seq`, leaving the follow cursor alone.
     pub(crate) async fn read(&self, after_seq: u64) -> Result<Vec<SessionEvent>, StoreError> {
         self.store

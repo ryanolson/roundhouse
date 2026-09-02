@@ -25,8 +25,8 @@
 //! - **By the tool-use id of the call it is answering** (M12, R-M2). Claude
 //!   Code puts `_meta["claudecode/toolUseId"]` on every `tools/call` it makes,
 //!   and that id is one *roundhouse emitted* — so the session that emitted it is
-//!   knowable exactly, with no guess and no race. See
-//!   [`Conversations::bind_call`].
+//!   knowable exactly, with no guess and no race, for as long as one session
+//!   claims it. See [`Conversations::bind_call`] and [`CallTable`].
 //! - **Not at all.** The MCP surface's `conversation` argument is optional, and
 //!   omitted it means the principal's most recent conversation — which is only
 //!   knowable by having watched the turns go past, which is what
@@ -49,17 +49,6 @@ use std::sync::Mutex;
 
 use roundhouse_core::control::Principal;
 use roundhouse_core::ids::SessionId;
-
-/// How many emitted tool calls this node remembers the session of.
-///
-/// A cap and not a policy. Every tool call a dispatched turn emits lands here,
-/// so an uncapped map is a leak proportional to traffic — unlike `latest`,
-/// which is bounded by the number of principals. What losing an entry costs is
-/// exactly one MCP call falling back to the principal's most recent
-/// conversation, which is the answer it got before R-M2 existed; the window
-/// that matters is a single turn's tool loop, and four thousand calls is far
-/// more than any turn emits.
-const REMEMBERED_CALLS: usize = 4096;
 
 /// This node's binding from a client's names to the sessions holding them.
 #[derive(Debug, Default)]
@@ -85,23 +74,140 @@ struct Inner {
     generations: HashMap<String, u32>,
     /// The session each principal most recently drove a turn on.
     latest: HashMap<Principal, SessionId>,
-    /// Which session emitted each tool call this node has served, and to whom.
-    ///
-    /// The principal is stored beside the session rather than folded into the
-    /// key because it is a *check*, not part of the name: a tool-use id is
-    /// unique on its own, and keying by `(Principal, id)` would make a lookup
-    /// with the wrong principal read as "never seen" — which is the same answer
-    /// as an evicted binding and would hide the thing worth noticing.
-    calls: HashMap<String, CallSite>,
-    /// Insertion order of [`Inner::calls`], so the cap evicts the oldest.
-    call_order: VecDeque<String>,
+    /// Which session emitted each tool call this node has served, per
+    /// principal. See [`CallTable`].
+    calls: CallTable,
 }
 
-/// Where one emitted tool call came from.
+/// Which session emitted each tool call this node has served, remembered per
+/// principal and bounded per principal.
+///
+/// # Why a type and not three more fields of [`Inner`]
+///
+/// [`Conversations`] holds this behind the same lock as `generations` and
+/// `latest`, but not for their reason: [`Conversations::bind_call`] touches
+/// neither of the other two, so the module doc's "one map cannot disagree"
+/// argument — which is about a reader and a turn agreeing on one generation —
+/// never covered this table. What it has instead is an invariant of its own,
+/// one queue entry per binding, and that is what makes the cap a bound rather
+/// than an occasional tidy-up. Kept inline in one method's body, an invariant
+/// like that is one the next edit to that method breaks with nothing red
+/// (M12 review, F13).
+///
+/// # Why the partition is by principal and not by id
+///
+/// Because a tool-call id is a name only within one tenant, and only for as
+/// long as one of that tenant's sessions claims it. Anthropic and OpenAI mint
+/// globally unique ids, but a local backend that numbers calls within a
+/// response (`call_0`, `call_1`) hands the same string to every conversation
+/// it serves, so two concurrent conversations of one principal can claim one
+/// id — which a plain `insert` resolves in favour of whoever wrote last, and
+/// answers the *other* conversation's `tools/call` with a confident 200 about
+/// a session it never asked about (F14). Separately, one node-wide eviction
+/// queue spends a quiet tenant's remembered calls on a busy co-tenant's
+/// traffic, costing it exactly the exact answer R-M2 exists to give (F15).
+#[derive(Debug, Default)]
+struct CallTable {
+    per_principal: HashMap<Principal, PrincipalCalls>,
+}
+
+/// One principal's remembered calls, oldest-first.
+#[derive(Debug, Default)]
+struct PrincipalCalls {
+    sites: HashMap<String, CallSite>,
+    /// Insertion order of [`PrincipalCalls::sites`], so the cap evicts the
+    /// oldest. Exactly one entry per site, which is this type's invariant.
+    order: VecDeque<String>,
+}
+
+/// What one remembered call id names, if anything.
 #[derive(Debug, Clone)]
-struct CallSite {
-    principal: Principal,
-    session: SessionId,
+enum CallSite {
+    /// The single session that emitted it.
+    Bound(SessionId),
+    /// Two of this principal's sessions bound it, so it names neither.
+    ///
+    /// Remembered as ambiguous rather than forgotten: an id dropped from the
+    /// table reads as never-seen, so the *next* binding of the same colliding
+    /// id would look like a first one and start answering confidently again —
+    /// which is the defect, one turn later.
+    Ambiguous,
+}
+
+impl CallTable {
+    /// How many emitted tool calls this node remembers the session of, per
+    /// principal.
+    ///
+    /// A cap and not a policy. Every tool call a dispatched turn emits lands
+    /// here, so an uncapped map is a leak proportional to traffic — unlike
+    /// `latest`, which is bounded by the number of principals. What losing an
+    /// entry costs is exactly one MCP call falling back to the principal's most
+    /// recent conversation, which is the answer it got before R-M2 existed; the
+    /// window that matters is a single turn's tool loop, and four thousand
+    /// calls is far more than any turn emits.
+    ///
+    /// Per principal, so the node's worst case is this times the number of
+    /// principals it has served rather than this outright. That is the same
+    /// factor `latest` already carries, and it is the right trade: a tenant
+    /// count is something an operator knows and provisions for, where "whose
+    /// traffic happened to arrive first" is not.
+    const REMEMBERED_CALLS: usize = 4096;
+
+    fn bind(&mut self, principal: &Principal, call_id: &str, session: SessionId) {
+        self.per_principal
+            .entry(principal.clone())
+            .or_default()
+            .bind(call_id, session);
+    }
+
+    fn session_of(&self, principal: &Principal, call_id: &str) -> Option<SessionId> {
+        self.per_principal.get(principal)?.session_of(call_id)
+    }
+
+    /// How many bindings this table holds for `principal`, and how long its
+    /// eviction queue is.
+    ///
+    /// One call returning both rather than two accessors, so a test asserts
+    /// the invariant on the type that owns it instead of reaching through
+    /// `Conversations`' lock into private fields — which is what F13 named.
+    #[cfg(test)]
+    fn sizes(&self, principal: &Principal) -> (usize, usize) {
+        self.per_principal
+            .get(principal)
+            .map(|calls| (calls.sites.len(), calls.order.len()))
+            .unwrap_or_default()
+    }
+}
+
+impl PrincipalCalls {
+    fn bind(&mut self, call_id: &str, session: SessionId) {
+        match self.sites.get_mut(call_id) {
+            // A resend or a dedup replay re-binds an id this node already holds
+            // to the session that already holds it. That is one call seen
+            // twice, not two calls, and treating it as a collision would throw
+            // away a binding that is still exactly right.
+            Some(CallSite::Bound(held)) if *held == session => {}
+            Some(site) => *site = CallSite::Ambiguous,
+            None => {
+                self.sites
+                    .insert(call_id.to_string(), CallSite::Bound(session));
+                self.order.push_back(call_id.to_string());
+            }
+        }
+        while self.order.len() > CallTable::REMEMBERED_CALLS {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.sites.remove(&oldest);
+        }
+    }
+
+    fn session_of(&self, call_id: &str) -> Option<SessionId> {
+        match self.sites.get(call_id)? {
+            CallSite::Bound(session) => Some(session.clone()),
+            CallSite::Ambiguous => None,
+        }
+    }
 }
 
 impl Conversations {
@@ -193,45 +299,30 @@ impl Conversations {
     /// conversation: [`Self::latest`] is unmoved. An agent whose subagent runs a
     /// tool must not thereby redirect its parent's next unnamed MCP call, which
     /// is the very race R-M2 exists to remove.
+    ///
+    /// An id two of this principal's sessions have bound is remembered as
+    /// *ambiguous* rather than resolved in favour of the later writer — see
+    /// [`CallTable`] for why an id is not a name on every backend.
     pub fn bind_call(&self, principal: &Principal, call_id: &str, session: SessionId) {
-        let mut inner = self.lock();
-        if inner
-            .calls
-            .insert(
-                call_id.to_string(),
-                CallSite {
-                    principal: principal.clone(),
-                    session,
-                },
-            )
-            .is_none()
-        {
-            inner.call_order.push_back(call_id.to_string());
-        }
-        while inner.call_order.len() > REMEMBERED_CALLS {
-            let Some(oldest) = inner.call_order.pop_front() else {
-                break;
-            };
-            inner.calls.remove(&oldest);
-        }
+        self.lock().calls.bind(principal, call_id, session);
     }
 
     /// The session that emitted `call_id`, if this node emitted it *for this
     /// principal*.
     ///
-    /// **A foreign id and an unknown one answer the same way, and that is the
-    /// decision.** Returning something distinguishable for "this id exists but
-    /// is somebody else's" would make the argument an enumeration oracle — the
-    /// reasoning `mcp_api::resolve_session` already collapses a foreign cache
-    /// key under — and it would buy nothing: the caller has no use for another
-    /// tenant's session, so both answers lead to the same next step, which is
-    /// to fall back to the caller's own most recent conversation.
+    /// **A foreign id, an unknown one and an ambiguous one all answer the same
+    /// way, and that is the decision.** Returning something distinguishable for
+    /// "this id exists but is somebody else's" would make the argument an
+    /// enumeration oracle — the reasoning `mcp_api::resolve_session` already
+    /// collapses a foreign cache key under — and it would buy nothing: the
+    /// caller has no use for another tenant's session, so both answers lead to
+    /// the same next step, which is to fall back to the caller's own most
+    /// recent conversation. An ambiguous id joins them for the same reason
+    /// turned around: nothing distinguishes *which* of the two claiming
+    /// sessions the caller meant, so there is no answer to give that is better
+    /// than the fallback.
     pub fn session_of_call(&self, principal: &Principal, call_id: &str) -> Option<SessionId> {
-        self.lock()
-            .calls
-            .get(call_id)
-            .filter(|site| &site.principal == principal)
-            .map(|site| site.session.clone())
+        self.lock().calls.session_of(principal, call_id)
     }
 
     /// The lock, in one place.
@@ -341,7 +432,7 @@ mod tests {
     fn the_call_table_is_capped_and_forgets_its_oldest_bindings_first() {
         let conversations = Conversations::new();
         let session = conversations.bind(&ada(), "acme/ada/main");
-        for n in 0..=REMEMBERED_CALLS {
+        for n in 0..=CallTable::REMEMBERED_CALLS {
             conversations.bind_call(&ada(), &format!("toolu_{n}"), session.clone());
         }
 
@@ -351,24 +442,56 @@ mod tests {
             "the oldest binding is the one the cap gives up"
         );
         assert_eq!(
-            conversations.session_of_call(&ada(), &format!("toolu_{REMEMBERED_CALLS}")),
+            conversations
+                .session_of_call(&ada(), &format!("toolu_{}", CallTable::REMEMBERED_CALLS)),
             Some(session),
             "and the newest is kept, which is the one a live tool loop is \
              about to answer"
         );
-        assert_eq!(conversations.lock().call_order.len(), REMEMBERED_CALLS);
+        assert_eq!(
+            conversations.lock().calls.sizes(&ada()),
+            (CallTable::REMEMBERED_CALLS, CallTable::REMEMBERED_CALLS)
+        );
 
         // Re-binding an id already held must not grow the order queue past the
         // map, or the cap evicts a key that is still live and the two halves
-        // drift apart.
+        // drift apart. Asserted on `CallTable`'s own accessor rather than by
+        // reading `Inner`'s fields through the lock: the invariant belongs to
+        // the type that keeps it (F13).
         let other = conversations.bind(&ada(), "acme/ada/other");
         conversations.bind_call(&ada(), "toolu_1", other);
-        // Two reads of one lock, taken one at a time: the guards are temporaries
-        // that live to the end of the statement, and `Mutex` is not reentrant —
-        // a single `assert_eq!` over both would hang here rather than fail.
-        let ordered = conversations.lock().call_order.len();
-        let held = conversations.lock().calls.len();
+        let (held, ordered) = conversations.lock().calls.sizes(&ada());
         assert_eq!(ordered, held);
+    }
+
+    /// F14: a colliding call id from two sessions of one principal must not
+    /// resolve confidently to whichever session bound it last.
+    ///
+    /// A frontier backend's tool-call ids are globally unique, so this never
+    /// happens on the routes M12 was built against. A local/Dynamo backend
+    /// that numbers calls per response (`call_0`, `call_1`, ...) can hand the
+    /// same id to two concurrent conversations of one principal, and
+    /// `bind_call`'s plain `insert` makes the second binding silently replace
+    /// the first — with no record that the id was ever ambiguous.
+    #[test]
+    fn a_colliding_call_id_from_two_sessions_of_one_principal_does_not_resolve_confidently() {
+        let conversations = Conversations::new();
+        let first = conversations.bind(&ada(), "acme/ada/first");
+        let second = conversations.bind(&ada(), "acme/ada/second");
+
+        conversations.bind_call(&ada(), "call_0", first.clone());
+        conversations.bind_call(&ada(), "call_0", second);
+
+        assert_eq!(
+            conversations.session_of_call(&ada(), "call_0"),
+            None,
+            "an id this node has bound to two different sessions of one \
+             principal no longer names either unambiguously, so it must \
+             answer exactly as an unknown id does — a fall back to latest — \
+             rather than confidently resolving to the second conversation's \
+             session while the first conversation's tools/call is still \
+             answering it"
+        );
     }
 
     #[test]
@@ -398,5 +521,62 @@ mod tests {
         );
         // And one principal's turns are not another's.
         assert_eq!(conversations.latest(&bob()), None);
+    }
+
+    /// F15: the remembered-calls cap is per principal, so a co-tenant's tool
+    /// traffic cannot evict a *different* principal's binding — which is the
+    /// half `the_call_table_is_capped_and_forgets_its_oldest_bindings_first`
+    /// above does not cover, that one being the control that a tenant still
+    /// ages out its *own* oldest entry.
+    ///
+    /// Bind one call for Ada's subagent, then drive
+    /// `CallTable::REMEMBERED_CALLS` insertions for Bob alone. Under one
+    /// node-wide queue Ada's binding is its oldest entry and is gone, and
+    /// `session_of_call` falls through to `None` — indistinguishable from Ada
+    /// presenting an id this node never emitted at all, on a table that had
+    /// room for it.
+    #[test]
+    fn a_co_tenants_call_traffic_does_not_evict_another_principals_call_binding() {
+        let conversations = Conversations::new();
+        let subagent = conversations.bind(&ada(), "acme/ada/sub");
+        conversations.bind_call(&ada(), "toolu_ada_sub", subagent.clone());
+
+        let bob_session = conversations.bind(&bob(), "globex/bob/main");
+        for n in 0..CallTable::REMEMBERED_CALLS {
+            conversations.bind_call(&bob(), &format!("toolu_bob_{n}"), bob_session.clone());
+        }
+
+        assert_eq!(
+            conversations.session_of_call(&ada(), "toolu_ada_sub"),
+            Some(subagent),
+            "a principal's own call binding must survive another tenant's \
+             tool traffic; a node-wide cap makes it fall through to the same \
+             None a foreign id would answer with"
+        );
+    }
+
+    /// The control F14's ruling turns on: only a *different* session claiming a
+    /// held id makes it ambiguous.
+    ///
+    /// Without this, the cheapest way to satisfy F14 — treat every re-bind as a
+    /// collision — would silently un-answer every id a resend or a dedup replay
+    /// binds twice, which is the ordinary case rather than the pathological
+    /// one. The queue length is asserted for the same reason it is in the cap
+    /// test: a repeat that pushed a second entry would evict a live binding.
+    #[test]
+    fn re_binding_one_id_to_the_session_that_already_holds_it_changes_nothing() {
+        let conversations = Conversations::new();
+        let session = conversations.bind(&ada(), "acme/ada/main");
+
+        conversations.bind_call(&ada(), "toolu_replayed", session.clone());
+        conversations.bind_call(&ada(), "toolu_replayed", session.clone());
+
+        assert_eq!(
+            conversations.session_of_call(&ada(), "toolu_replayed"),
+            Some(session),
+            "one call seen twice is one call, and the binding it already had \
+             is still exactly right"
+        );
+        assert_eq!(conversations.lock().calls.sizes(&ada()), (1, 1));
     }
 }

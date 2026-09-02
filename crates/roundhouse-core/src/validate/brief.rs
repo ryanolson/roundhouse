@@ -502,6 +502,7 @@ mod tests {
         let evidence = crate::validate::Evidence {
             exchanges: crate::validate::exchanges(&items),
             turn_tokens: &[],
+            dialect: crate::validate::ControlCallDialect::ClaudeMessages,
         };
         let facts: Vec<String> = crate::validate::default_signals()
             .iter()

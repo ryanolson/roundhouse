@@ -504,7 +504,6 @@ fn a_declared_non_suppressor_variable_is_redacted_in_the_rendered_environment() 
         name: "work".to_string(),
         profile: profile(Agent::Claude, AuthKind::RoundhouseKey),
         resolved: Resolved::Claude {
-            leading_argv: launch.leading_argv(),
             launch,
             env,
             settings: Vec::new(),
@@ -671,6 +670,161 @@ fn f20_an_in_process_claude_profile_with_a_codex_model_field_is_refused() {
     assert!(
         error.to_string().contains("`model`"),
         "and the refusal names the field, as the file boundary's does: {error}"
+    );
+}
+
+/// F6 (M12 thermo-nuclear review), closed: `render()` derives the leading argv
+/// from `launch`, and `Resolved::Claude` no longer holds a copy of it.
+///
+/// The field it held was a pure derivation of its sibling — exactly the "second
+/// home for a derived value is a second thing that can be stale" the `settings`
+/// field's own doc two lines above it refuses under F16 — and a `Resolution`
+/// built with the two out of sync rendered `(none)` while the launch's own
+/// answer was four arguments long. That construction is now unspellable, which
+/// is the fix: this test builds the resolution the same way the redaction test
+/// above does and asserts the rendering is the launch's.
+#[test]
+fn f6_render_must_derive_leading_argv_from_launch_not_a_separately_held_copy() {
+    let launch = ClaudeLaunch::new(ROOT, TURN_KEY).expect("the fixture key resolves");
+    let env = launch
+        .env()
+        .expect("the fixture launch is not refused by its own environment");
+    let true_leading_argv = launch.leading_argv();
+    assert!(
+        !true_leading_argv.is_empty(),
+        "the launch's own derivation is non-empty for this fixture, so an empty cached copy is \
+         visibly wrong and not just a different valid rendering"
+    );
+    let resolution = Resolution {
+        name: "work".to_string(),
+        profile: profile(Agent::Claude, AuthKind::RoundhouseKey),
+        resolved: Resolved::Claude {
+            launch,
+            env,
+            settings: Vec::new(),
+        },
+    };
+    let rendered = resolution.render();
+    assert!(
+        rendered.contains("--mcp-config"),
+        "render() must show what `launch` actually derives ({true_leading_argv:?}): {rendered}"
+    );
+}
+
+/// F9 (M12 thermo-nuclear review): a `key-env` that names a variable the
+/// launcher itself writes into the child environment.
+///
+/// `resolve` reads the turn key out of `env[profile.key_env]` and stamps the
+/// registration with `.with_key_env(&profile.key_env)` (plan.rs), so the
+/// generated `--mcp-config` tells the client to expand `${ANTHROPIC_API_KEY}`.
+/// Nothing checks that name against the three variables
+/// [`ClaudeLaunch::env`] itself is about to write (`ANTHROPIC_BASE_URL`,
+/// `ANTHROPIC_CUSTOM_HEADERS`, `ANTHROPIC_API_KEY` under a roundhouse-key
+/// launch) -- `CollidesWithGeneratedVar` only fires for names declared through
+/// `also_launching_with`. If admitted, the child's `ANTHROPIC_API_KEY` is
+/// last written by the `RoundhouseKey` sentinel (`launch::layered` overlays
+/// `generated.vars()` over `ambient.clone()`), so the value the ambient
+/// environment held -- the real turn key `resolve` itself read as
+/// `turn_key` -- is gone from the map `plan` renders and `topham launch`
+/// would hand the child.
+#[test]
+fn f9_key_env_naming_a_generated_variable_is_admitted_and_the_sentinel_wins() {
+    let ambient = env(&[("ANTHROPIC_API_KEY", TURN_KEY)]);
+    let profile = Profile {
+        key_env: "ANTHROPIC_API_KEY".to_string(),
+        ..profile(Agent::Claude, AuthKind::RoundhouseKey)
+    };
+    match resolve(&ambient, "work", profile) {
+        Err(error) => {
+            // The defect would also be closed by a refusal at resolve time --
+            // `plan`, and therefore `topham launch`, never producing a
+            // control surface that 401s. Either remedy is acceptable; this
+            // arm exists so the test still means something if the fix takes
+            // this shape instead of the other.
+            let message = error.to_string();
+            assert!(
+                message.contains("ANTHROPIC_API_KEY"),
+                "a refusal here should name the colliding variable, the way \
+                 CollidesWithGeneratedVar does for an also_launching_with clash: {message}"
+            );
+        }
+        Ok(resolution) => {
+            let Resolved::Claude { env: generated, .. } = &resolution.resolved else {
+                panic!("a Claude profile resolves to Resolved::Claude");
+            };
+            assert_eq!(
+                generated.get("ANTHROPIC_API_KEY").as_deref(),
+                Some(TURN_KEY),
+                "resolve admitted a key-env that collides with a generated variable, and the \
+                 plan's own environment now holds the RoundhouseKey sentinel instead of the real \
+                 turn key `resolve` read from the ambient environment -- every mcp__roundhouse__* \
+                 control call the launched client makes will present the sentinel and be rejected \
+                 as MalformedKey, while the plan renders this profile as healthy"
+            );
+        }
+    }
+
+    // The launcher's own two, which are not in the generator's map at all but
+    // are written over the ambient environment just the same
+    // (`launch::CLAUDE_DEPLOYMENT_POLICY`): the same silent failure, one layer
+    // out.
+    let policy = Profile {
+        key_env: "DISABLE_AUTOUPDATER".to_string(),
+        auth: AuthKind::RoundhouseKey,
+        ..Profile::new(Agent::Claude, ROOT)
+    };
+    let error = resolve(&env(&[("DISABLE_AUTOUPDATER", TURN_KEY)]), "work", policy).expect_err(
+        "the launcher overwrites this one too, so `${DISABLE_AUTOUPDATER}` expands to `1`",
+    );
+    assert!(error.to_string().contains("DISABLE_AUTOUPDATER"), "{error}");
+
+    // The control: a name this launch does not write resolves, so what is
+    // refused above is the collision and not `key-env` being honoured at all.
+    let ordinary = Profile {
+        key_env: "DEPLOY_TURN_KEY".to_string(),
+        auth: AuthKind::RoundhouseKey,
+        ..Profile::new(Agent::Claude, ROOT)
+    };
+    resolve(&env(&[("DEPLOY_TURN_KEY", TURN_KEY)]), "work", ordinary)
+        .expect("a key variable of this deployment's own is what the profile is for");
+}
+
+/// F10 (M12 thermo-nuclear review): `notes()` dispatches on
+/// `Resolved::Claude` in four separate patterns across three constructs --
+/// two arms of the leading `match (&self.resolved, self.profile.auth)`, a
+/// standalone `if matches!(self.resolved, Resolved::Claude { .. })` that
+/// binds nothing from the variant, and the `if let Resolved::Claude { launch,
+/// .. }` that immediately follows it. The standalone `if` could fold into
+/// that `if let`, leaving three patterns instead of four.
+///
+/// This is a structural claim about `notes()`'s source, not about what it
+/// returns -- folding the `if` into the `if let` changes no observable
+/// output, so a behavioral test on `notes()` cannot fail for this reason.
+/// The finding's own `how_to_prove` says as much: a grep count plus the
+/// existing render snapshots is the whole proof. This test is that grep
+/// count, made an assertion: it locates `notes()`'s body in the checked-in
+/// source and counts `Resolved::Claude` occurrences in it.
+#[test]
+fn f10_notes_folds_the_standalone_claude_check_into_the_if_let_after_it() {
+    let source = include_str!("../plan.rs");
+    let start = source
+        .find("pub fn notes(&self) -> Vec<String> {")
+        .expect("notes() is still declared in plan.rs under this signature");
+    let body = &source[start..];
+    let end = body
+        .find("\n        notes\n    }\n}")
+        .expect("notes()'s body still ends by returning the accumulated `notes` vec");
+    let body = &body[..end];
+
+    let claude_patterns = body.matches("Resolved::Claude").count();
+    assert_eq!(
+        claude_patterns, 3,
+        "notes() matches on Resolved::Claude {claude_patterns} times; folding the standalone \
+         `if matches!(self.resolved, Resolved::Claude {{ .. }})` block into the `if let \
+         Resolved::Claude {{ launch, .. }}` that immediately follows it -- which binds nothing \
+         the standalone check needs and would still gate the same two notes on the same two \
+         conditions -- would bring this to 3 (the two AuthKind match arms plus one merged `if \
+         let`), not the 4 found today"
     );
 }
 

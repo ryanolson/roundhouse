@@ -32,9 +32,22 @@
 //! bootstrap, fork probe, version probe. It exists because the second such suite
 //! was written by copying the first, and the copies drifted inside one milestone
 //! (M11.2b review F1).
+//!
+//! [`claude_rig`] is the sixth, and it is the half of that rig [`e2e`]'s own doc
+//! reserves for each suite: the topologies, the deployment and the child command
+//! that make a run *this* client's. It is here rather than in `claude_e2e.rs`
+//! because that file had grown past 4 700 lines around it (M12 review F11), and
+//! not in [`e2e`] because a per-suite rig shared between the two suites is the
+//! copy-drift F1 removed, re-created.
 #![allow(dead_code)]
 
 pub mod anthropic;
+// The `claude` half of [`e2e`]'s per-suite remainder, behind the same feature
+// gate as the suite that drives it: nothing but `claude_e2e` stands a real
+// `claude` up, and compiling its deployment into the other thirty test binaries
+// would be build time every one of them pays for a rig it cannot use.
+#[cfg(feature = "e2e-claude")]
+pub mod claude_rig;
 pub mod codex;
 pub mod e2e;
 pub mod validate;

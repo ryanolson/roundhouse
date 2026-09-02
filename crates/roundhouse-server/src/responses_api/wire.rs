@@ -619,9 +619,10 @@ mod tests {
     /// Messages surface stores them flat — it does *not* split them here or
     /// anywhere. The two spellings never meet: each is written by one client on
     /// one surface, a session is written by one client, and what has to
-    /// recognise either is `is_control_call`, which now knows both. Teaching
-    /// this function to split would buy nothing and would move the `turn_id` of
-    /// every already-stored tool-using session. So the divergence below is the
+    /// recognise either is `is_control_call_on`, which takes the surface and
+    /// so needs no reconciliation here. Teaching this function to split would
+    /// buy nothing and would move the `turn_id` of every already-stored
+    /// tool-using session. So the divergence below is the
     /// shipped behaviour, not a debt.
     #[test]
     fn a_flat_spelling_is_a_different_canonical_call_until_the_wire_learns_to_split_it() {
@@ -663,7 +664,7 @@ mod tests {
             "if these ever agree, `canonical_item` has learned to split a flat \
              name — which R-M1 ruled it must not do, because splitting moves \
              the `turn_id` of every stored tool-using session and buys nothing \
-             now that `is_control_call` knows both spellings"
+             now that the recognizer is told which surface it is reading"
         );
     }
 
@@ -748,7 +749,7 @@ mod tests {
         // The consequence, asserted here because this is where the evidence
         // is. R-M0 found this false — a bare stored name satisfied no
         // classifier — which is the finding M12 closed by teaching
-        // `is_control_call` the bare spelling. Asserted through the *stored*
+        // the recognizer the bare spelling. Asserted through the *stored*
         // item rather than against a literal, so a change to canonicalization
         // that reintroduced the namespace would be caught here rather than
         // agreeing with a string this test typed.
@@ -758,14 +759,17 @@ mod tests {
             panic!("the canonical item is a tool call: {stored:#?}");
         };
         assert!(
-            roundhouse_core::validate::is_control_call(name),
+            roundhouse_core::validate::is_control_call_on(
+                name,
+                roundhouse_core::validate::ControlCallDialect::CodexResponses
+            ),
             "an MCP control call made over the Responses wire has to be \
              recognisable from what the log actually holds (`{name}`), or the \
              fold counts roundhouse's own chatter as the agent's work"
         );
     }
 
-    /// M12 fix-stage finding F1: the assertion above exercises `is_control_call`
+    /// M12 fix-stage finding F1: the assertion above exercises the recognizer
     /// only on the *bare* name this surface actually stores (`"status"`), which
     /// `CONTROL_TOOL_NAMES.contains` alone already recognises — so a refute-stage
     /// mutation that deleted the flat-name half of the classifier
@@ -775,22 +779,40 @@ mod tests {
     /// `both_spellings_of_every_control_tool_are_ours_and_the_near_misses_are_not`
     /// in `roundhouse-core`) did. This test closes that gap from the Responses
     /// side: a flat-spelled name is not a shape this wire ever produces, but
-    /// `is_control_call` is a shared classifier and this surface's own suite
+    /// the recognizer is a shared classifier and this surface's own suite
     /// should not depend on a sibling crate's tests to prove the half it does
     /// not exercise is still there.
+    ///
+    /// **Rewritten by M12 review finding F8, and the rewrite is the finding.**
+    /// The classifier is no longer one function that says yes to both
+    /// spellings: it takes the surface, because a bare name means opposite
+    /// things on the two wires. So the assertion this test was reaching for —
+    /// "the flat half is still there" — is now a statement about the *Messages*
+    /// dialect, and the honest thing for this surface's suite to pin beside it
+    /// is that its own dialect says **no** to a flat name. That negative is the
+    /// half that would go silently wrong here: a Responses recognizer that
+    /// accepted the flat spelling would swallow a codex client's genuinely
+    /// flat-named tool from another server.
     #[test]
-    fn a_flat_spelled_name_is_still_recognised_from_the_responses_surfaces_own_suite() {
-        let flat = format!(
-            "{}{}status",
-            roundhouse_core::validate::CONTROL_TOOL_NAMESPACE,
-            roundhouse_core::validate::CONTROL_TOOL_DELIMITER
+    fn a_flat_spelled_name_belongs_to_the_other_surfaces_dialect() {
+        use roundhouse_core::validate::ControlCallDialect;
+
+        let flat = roundhouse_core::validate::flat_control_call_name("status");
+        assert!(
+            roundhouse_core::validate::is_control_call_on(
+                &flat,
+                ControlCallDialect::ClaudeMessages
+            ),
+            "the flat spelling `{flat}` is what the Messages surface stores"
         );
         assert!(
-            roundhouse_core::validate::is_control_call(&flat),
-            "the flat spelling `{flat}` must be recognised even though this \
-             wire never produces it itself — `is_control_call` is shared with \
-             the Messages surface and this suite should not rely solely on \
-             that sibling crate's tests to prove the flat half survives"
+            !roundhouse_core::validate::is_control_call_on(
+                &flat,
+                ControlCallDialect::CodexResponses
+            ),
+            "this wire cannot produce `{flat}` — codex dispatches on an exact \
+             `ToolName {{ name, namespace }}` lookup — so a Responses fold that \
+             recognised it would be exempting somebody else's tool"
         );
     }
 

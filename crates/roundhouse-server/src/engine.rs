@@ -44,7 +44,7 @@ use roundhouse_core::routing::{
 };
 use roundhouse_core::session::{Session, SessionError, SessionState, TurnAdmission};
 use roundhouse_core::store::SessionStore;
-use roundhouse_core::validate::{SideCall, exchanges};
+use roundhouse_core::validate::{ControlCallDialect, SideCall, exchanges};
 use roundhouse_fleet::{
     FleetError, FleetQuery, FrontierChunk, FrontierClient, FrontierClients, FrontierError,
     FrontierQuote, FrontierStream, LocalFleet, LocalQuote, StaticFrontierCatalog, WireProtocol,
@@ -1215,6 +1215,14 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                 // surely as an unstamped session does — see
                 // `Validator::consider`, which asks both.
                 validation: admission.validation.as_ref(),
+                // Which client wrote this session, read off the one thing that
+                // still names the surface this far in: the session key (M12
+                // review, F8). A `SessionState` is a fold of the log alone and
+                // carries no surface, so a fold handed only the state has to
+                // accept both spellings of a control call at once — which drops
+                // a Messages client's own bare-named tool from the task view
+                // along with roundhouse's own chatter.
+                dialect: ControlCallDialect::of_session_key(session_id.as_str()),
             })
             .await;
         // The one settle seam. Every admitted turn terminates its response and
@@ -1969,7 +1977,10 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         // signals, the scorer returns zero, and the picker's default takes the
         // turn — which is exactly what `None` would have done, through the
         // arithmetic instead of through a branch.
-        let signals = TurnSignals::from_exchanges(&exchanges(&session.state().items));
+        let signals = TurnSignals::from_exchanges(
+            &exchanges(&session.state().items),
+            ControlCallDialect::of_session_key(session.session_id().as_str()),
+        );
 
         // --- price every option -------------------------------------------
         let local_quote = match &self.fleet {

@@ -15,6 +15,16 @@
 //! [`roundhouse_server::claude_launch`] generates, and lets the real client
 //! decide what to send, which tool to run, and what to send back.
 //!
+//! **The rig is not here; the claims are** (M12 review F11). The deployment,
+//! the two topologies, the child command and everything that spawns a process
+//! live in [`common::claude_rig`](common/claude_rig.rs); this file scripts the
+//! upstream, drives that rig, and says what must be true of what came back.
+//! Three consecutive milestones had each added to one file, and the seam was
+//! already named — so the split is along it rather than at a line number.
+//! What did *not* move is the structural guards that read source: they now scan
+//! the module, because a guard living beside the code it guards is a file
+//! checking itself.
+//!
 //! # What the suite is the closure of
 //!
 //! **Kinds of test, not a count of them.** An earlier draft of this doc opened
@@ -224,7 +234,8 @@
 //! under `--include-ignored` is the same loud panic naming the variable that a
 //! missing client is.
 //!
-//! **Where "Relay evidence §x" points.** Every claim below about what Relay
+//! **Where "Relay evidence §x" points.** Every claim here or in the rig module
+//! about what Relay
 //! does is read from one document —
 //! `agent-docs/research/nemo-relay-0.8.0-published-read.md`, whose 2026-09-01
 //! addendum re-derived each of them against the 0.8.2 tarball this suite drives
@@ -283,63 +294,51 @@
 //! is nothing to lose today and a documented reason not to add one tomorrow.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
-use axum::Router;
-use axum::body::Body;
-use axum::extract::{Request, State};
-use axum::middleware::Next;
-use axum::response::Response;
 use serde::Deserialize;
 use serde_json::Value;
 
-use roundhouse_core::context::ByteTokenizer;
-use roundhouse_core::control::{MemorySpendLedger, Principal, SpendLedger};
 use roundhouse_core::ids::SessionId;
 use roundhouse_core::item::{Item, ItemContent, Role};
 use roundhouse_core::now_ms;
-use roundhouse_core::routing::AffinityPolicy;
-use roundhouse_core::store::{MemoryStore, SessionStore};
-use roundhouse_core::validate::{CONTROL_TOOL_NAMES, exchanges, is_control_call, task_exchanges};
-use roundhouse_fleet::FrontierClient;
-use roundhouse_mcp::ControlStore;
+use roundhouse_core::validate::{
+    CONTROL_TOOL_NAMES, ControlCallDialect, exchanges, is_control_call_on, task_exchanges_on,
+};
 use roundhouse_server::claude_launch::{
-    API_KEY_ENV, BASE_URL_ENV, CUSTOM_HEADERS_ENV, ClaudeEnv, ClaudeLaunch,
-    ROUNDHOUSE_API_KEY_SENTINEL,
+    API_KEY_ENV, BASE_URL_ENV, CUSTOM_HEADERS_ENV, ClaudeLaunch, ROUNDHOUSE_API_KEY_SENTINEL,
 };
 // The variable the launch profiles below name as where the turn key is read
 // from, read from the generator that defines it rather than spelled here: a
 // profile that named a variable nothing exports resolves to a launch with no
 // credential, which roundhouse admits and degrades to local-only.
+use roundhouse_server::ClientDialect;
 use roundhouse_server::codex_launch::DEFAULT_KEY_ENV;
 use roundhouse_server::control_config::TURN_KEY_HEADER;
-use roundhouse_server::messages_api::{MESSAGES_PATH, wire};
-// R-T5: the chained wiring this rig writes is a rendering in the library, not a
-// template spelled here. `topham relay` consumes the same one, so a rig that
-// went green against a config the launcher does not produce is not a state this
-// file can reach.
 use roundhouse_server::dialect::mcp_server_name;
 use roundhouse_server::mcp_api::MCP_MOUNT_PATH;
-use roundhouse_server::relay_handoff::{RELAY_STATE_VARS, RelayAgent, RelayHandoff};
-use roundhouse_server::{
-    API_PREFIX, ClientDialect, ControlPlaneReads, Conversations, EchoLocalExecutor, Engine,
-    EngineConfig, mcp_router, messages_router,
-};
+use roundhouse_server::messages_api::wire;
+use roundhouse_server::relay_handoff::{RELAY_STATE_VARS, RelayHandoff};
 
 mod common;
 // The harness itself is `common::e2e` (M11.2b review F1): recorder, bootstrap,
 // fork probe and version probe are the same rig the codex sibling stands its
 // client inside, and were a line-for-line copy of it until the two drifted.
 use common::e2e::{
-    Exchange, PROJECT, Recorder, TOPHAM_BIN_VAR, TOPHAM_PROFILE, USER, base_session, bootstrap,
-    clean, fork_probe, path_with, principal, probe_home, reachable, record, topham_binary,
-    topham_version, version_probe, write_profile, xdg,
+    Exchange, PROJECT, TOPHAM_PROFILE, USER, base_session, clean, fork_probe, topham_binary,
+    topham_version,
 };
-use common::{Scripted, ScriptedTurns, ToolCallingFrontierClient, frontier_catalog};
+// And the *claude* half of it is `common::claude_rig` (M12 review F11): the
+// deployment, the topologies, and the child command — everything that stands a
+// real client up, as opposed to what this file claims about one.
+use common::claude_rig::{
+    CANARY, CANARY_FILE, CHAINED_DEADLINE, CHILD_DEADLINE, ControlRace, RELAY_BIN_VAR, Rig,
+    Topology, Wiring, build_child_command, claim_root, claude_argv, claude_version,
+    interrupt_then_kill, relay_dry_run, relay_version,
+};
+use common::{Scripted, ScriptedTurns, ToolCallingFrontierClient};
 
 // ---------------------------------------------------------------------------
 // What this deployment is
@@ -358,17 +357,6 @@ const ANSWER: &str = "roundhouse answered this turn";
 /// from the turn that closes the loop — two identical strings would make "the
 /// client came back" indistinguishable from "the client repeated itself".
 const BEFORE_THE_CALL: &str = "Let me look at that file.";
-
-/// What the file the client is asked to read contains.
-///
-/// Nothing else in this rig, in the client, or in either prompt can produce this
-/// string, so finding it in the request body that arrives *after* the tool call
-/// is evidence that the real client opened the real file — not that it guessed,
-/// and not that it echoed the prompt.
-const CANARY: &str = "the-canary-line-roundhouse-wrote";
-
-/// The file the scripted upstream asks the client to read.
-const CANARY_FILE: &str = "canary.txt";
 
 /// The `tool_use.id` the scripted upstream emits for its control call.
 ///
@@ -417,44 +405,6 @@ static CONTROL_TOOL: LazyLock<ControlTool> = LazyLock::new(|| {
 });
 
 /// How long a single `claude -p` may take before the test kills it.
-///
-/// Generous against a measured baseline of about a second: the child starts a
-/// Node runtime, resolves its settings, and runs one or two turns against a
-/// loopback socket. A deadline of its own rather than only the suite's outer
-/// `timeout` because the outer one reports "the suite hung" and this one reports
-/// which run hung, with that run's stderr and the `HOME` to inspect.
-const CHILD_DEADLINE: Duration = Duration::from_secs(90);
-
-/// The environment variable that overrides which binary is driven.
-const CLAUDE_BIN_VAR: &str = "ROUNDHOUSE_TEST_CLAUDE_BIN";
-
-/// The version this suite's assertions were written against.
-///
-/// Compared against the first whitespace-delimited token of `claude --version`,
-/// which at this line prints `2.1.257 (Claude Code)`.
-const VERIFIED_VERSION: &str = "2.1.257";
-
-/// How long a chained `nemo-relay run --agent claude` may take.
-///
-/// Longer than [`CHILD_DEADLINE`] because the chain is three processes rather
-/// than two: Relay resolves its configuration, binds an ephemeral loopback
-/// gateway, runs `claude --version` for its own minimum-version gate
-/// (Relay evidence §A.7), writes a temporary plugin
-/// directory and a synthesized `--settings` document, and only then spawns the
-/// client this suite is actually about.
-const CHAINED_DEADLINE: Duration = Duration::from_secs(180);
-
-/// The environment variable that names the Relay binary the chained tests drive.
-const RELAY_BIN_VAR: &str = "ROUNDHOUSE_TEST_RELAY_BIN";
-
-/// The Relay release the chained assertions were written against.
-///
-/// Compared against the last whitespace-delimited token of
-/// `nemo-relay --version`, which at this line prints `nemo-relay 0.8.2`. The
-/// evidence the chained tests rest on is
-/// `agent-docs/research/nemo-relay-0.8.0-published-read.md`'s 2026-09-01
-/// addendum, which re-derived every hazard below against exactly this tarball.
-const VERIFIED_RELAY_VERSION: &str = "0.8.2";
 
 /// The header Relay's transparent-run credential rides on
 /// (`provider_auth.rs`'s `TRANSPARENT_PROXY_CREDENTIAL_HEADER`).
@@ -571,1115 +521,6 @@ fn the_tool_loop_double_is_shared_and_needs_no_leaks() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// The deployment
-// ---------------------------------------------------------------------------
-
-/// Which of the two topologies a run drives.
-///
-/// R-D: **Direct is the reference and Chained is the same launch through one
-/// more process.** The value of modelling them as one enum rather than two
-/// harnesses is exactly that claim: [`build_child_command`] takes this, and
-/// every other input it takes — the generated [`ClaudeEnv`], the isolation set,
-/// the client's own argv — is shared by construction. A second harness would
-/// let the two drift, and the interesting failure ("Relay changed what the
-/// client presents") would be indistinguishable from "the chained harness spells
-/// the launch differently".
-/// Which topology a caller is *asking* for, before the deployment exists.
-///
-/// Distinct from [`Topology`] for one reason, and only for that reason: a
-/// chained rig's Relay configuration names this deployment's own base URL, which
-/// nobody knows until the listener is bound. The request can be stated before
-/// `start_at` runs; the resolved topology can only be built during it. Collapsing
-/// the two would put the config write back *after* construction, which is the
-/// post-construction mutation M11.2b review F2 ruled out.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Wiring {
-    Direct,
-    Chained,
-}
-
-enum Topology {
-    /// The client is spawned directly, pointed at roundhouse.
-    Direct,
-    /// The client is spawned by `nemo-relay run --agent claude`, which points it
-    /// at Relay's own loopback gateway and forwards to roundhouse.
-    Chained {
-        /// The Relay binary, from [`RELAY_BIN_VAR`].
-        relay: String,
-        /// The `config.toml` aiming Relay's Anthropic upstream at roundhouse.
-        config: PathBuf,
-        /// The rendering that wrote it, and the source of the argv below.
-        ///
-        /// Kept rather than discarded after the write so that this rig's
-        /// `--agent`, its `--config` placement and its trailing `--` come from
-        /// the same value `topham relay` execs with — the argv is as much part
-        /// of the shared seam as the four lines of TOML are.
-        handoff: RelayHandoff,
-    },
-}
-
-/// Everything that differs between the two topologies, answered together.
-///
-/// **One dispatch site, and that is the point** (M11.2b review F2). The
-/// difference used to be branched at four places across two types — a `deadline`
-/// method, a `label` method, `build_child_command`'s `match` for program and
-/// argv, and a `matches!` twenty-four lines later for Relay's XDG state — so
-/// adding a third topology, or changing what a chained run needs, meant finding
-/// four sites that nothing held together. What it cost to leave that alone was
-/// not a wrong answer today; it was that any of the four could have been updated
-/// without the others and nothing would have said so.
-struct Launch {
-    /// The program actually spawned.
-    program: String,
-    /// Whatever must precede the client's own argv, `--` included.
-    leading: Vec<String>,
-    /// Environment this topology's own process needs, beyond the launch map and
-    /// the client's isolation set.
-    extra_env: Vec<(&'static str, PathBuf)>,
-    /// How long one run of this topology may take.
-    deadline: Duration,
-    label: &'static str,
-}
-
-impl Topology {
-    fn plan(&self, binary: &str, root: &Path) -> Launch {
-        match self {
-            Self::Direct => Launch {
-                program: binary.to_string(),
-                leading: Vec::new(),
-                extra_env: Vec::new(),
-                deadline: CHILD_DEADLINE,
-                label: "Direct",
-            },
-            // The `run … --` argv comes from the handoff rather than being
-            // spelled here (R-T5): why it is `run` and not the bare `claude`
-            // shortcut, and why the trailing `--` is not optional, are facts
-            // about Relay that `topham relay` needs to be right about too, so
-            // they live with the rendering in `relay_handoff` and not in a test.
-            Self::Chained {
-                relay,
-                config,
-                handoff,
-            } => Launch {
-                program: relay.clone(),
-                leading: handoff.run_argv(config),
-                // Relay's own state, isolated the same way and for the same
-                // reason the client's is. `--config` replaces only the *user*
-                // config layer (`nemo-relay --help`: "system config still
-                // applies"), and Relay reads an XDG user config layer and writes
-                // its bootstrap/marketplace state under XDG data and state — all
-                // of which would otherwise land in whatever `HOME` this box's
-                // developer happens to have, and be read back by the next run as
-                // configuration this test never wrote.
-                //
-                // The earlier spelling of this comment justified the four
-                // variables with "Relay writes a session store and a
-                // resolved-config cache", which M11.2b review F14 found is not
-                // what 0.8.2's `run` mode persists: neither exists on that path,
-                // and what the isolation actually covers is the bootstrap state
-                // file and the marketplace state beside it. The variables stay —
-                // the isolation is right — but the reason had to stop naming
-                // artefacts nobody writes.
-                extra_env: RELAY_STATE_VARS
-                    .iter()
-                    .map(|name| (*name, root.join("relay")))
-                    .collect(),
-                deadline: CHAINED_DEADLINE,
-                label: "Chained",
-            },
-        }
-    }
-}
-
-/// Whether a rig opens a **rival conversation** for the same principal in
-/// front of every control call.
-///
-/// R-M6's negative is the whole reason this exists. An MCP call correlated by
-/// tool-use id and one resolved by "the principal's most recent conversation"
-/// give the *same* answer on an ordinary single-conversation run — the client
-/// makes its `tools/call` between the turn that emitted the call and the turn
-/// that answers it, and nothing else has moved `latest` in between. So an
-/// assertion that the id is what answered would pass on a deployment where the
-/// id is ignored entirely, which is a test that proves nothing.
-///
-/// [`ControlRace::RivalIsLatest`] removes that by *making* the guess wrong: a
-/// second conversation of the same principal's takes the `latest` slot
-/// immediately before each `/mcp` request is served. That is not a contrivance
-/// — it is the parent-and-subagent race R-M2 exists to remove, run
-/// deterministically rather than hoped for. The counterfactual half (the same
-/// call answered *without* the id resolves to the guess) is pinned at the seam
-/// by `mcp_api::tests::a_tool_use_id_resolves_the_conversation_that_emitted_it`;
-/// what this rig adds is that a real client really does send the id.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ControlRace {
-    /// None. `latest` and the tool-use id name one session.
-    None,
-    /// One, bound in front of every control call.
-    RivalIsLatest,
-}
-
-/// The rival conversation, and what it displaced each time it took the slot.
-struct Rival {
-    conversations: Arc<Conversations>,
-    principal: Principal,
-    /// The cache key the rival is bound under, and the session it resolves to.
-    key: String,
-    session: SessionId,
-    /// The JSON-RPC method of each control request, with `latest` as it stood
-    /// immediately *before* that request was served.
-    ///
-    /// The method is carried because the sequence matters and the entries are
-    /// not interchangeable: the handshake happens before the client's first
-    /// turn exists, so the only entry whose displaced value can be the client's
-    /// own conversation is the `tools/call` the tool loop makes. An assertion
-    /// over the list as a whole would pass on a client that never made the call
-    /// at all.
-    seen: Mutex<Vec<(String, Option<SessionId>)>>,
-}
-
-/// Take the `latest` slot, and record what was in it.
-///
-/// **Before `next.run`, which is what makes the claim exact**: every request the
-/// control surface serves under this layer is served with the rival as this
-/// principal's most recent conversation, so an answer naming anything else can
-/// only have come from the tool-use id.
-///
-/// The body is buffered and put back rather than peeked, for the reason
-/// `common::e2e::record` buffers: a JSON-RPC method is in the body and axum
-/// hands a layer the stream, not the bytes. The bound is small because a
-/// `tools/call` is a few hundred bytes — the turn bodies, which are tens of
-/// kilobytes, never reach this route.
-async fn take_the_latest_slot(
-    State(rival): State<Arc<Rival>>,
-    request: Request,
-    next: Next,
-) -> Response {
-    let (parts, body) = request.into_parts();
-    let bytes = axum::body::to_bytes(body, 1024 * 1024)
-        .await
-        .expect("a loopback control request body is readable");
-    let method = serde_json::from_slice::<Value>(&bytes)
-        .ok()
-        .and_then(|body| body["method"].as_str().map(str::to_string))
-        .unwrap_or_else(|| "<no jsonrpc method>".to_string());
-    rival
-        .seen
-        .lock()
-        .expect("recording")
-        .push((method, rival.conversations.latest(&rival.principal)));
-    rival.conversations.bind(&rival.principal, &rival.key);
-    next.run(Request::from_parts(parts, Body::from(bytes)))
-        .await
-}
-
-impl Rival {
-    /// What this principal's `latest` held immediately before the one control
-    /// request whose JSON-RPC method is `method`.
-    ///
-    /// Exactly one, and a panic printing the whole sequence otherwise. "The
-    /// client never made that call" and "the client made two" are different
-    /// defects, neither is legible from a missing `Option`, and the order of
-    /// the handshake against the turns is precisely what a reader needs when
-    /// the correlation assertion goes red.
-    fn displaced_before(&self, method: &str) -> Option<SessionId> {
-        let seen = self.seen.lock().expect("recording");
-        let matching: Vec<&(String, Option<SessionId>)> =
-            seen.iter().filter(|(seen, _)| seen == method).collect();
-        assert_eq!(
-            matching.len(),
-            1,
-            "exactly one `{method}` reaches the control surface in this run; it saw:\n{}",
-            seen.iter()
-                .map(|(method, displaced)| format!(
-                    "    {method} (latest before it: {})",
-                    displaced
-                        .as_ref()
-                        .map(SessionId::as_str)
-                        .unwrap_or("<none>")
-                ))
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-        matching[0].1.clone()
-    }
-}
-
-/// A live roundhouse, its filesystem, and everything needed to read it back.
-struct Rig {
-    /// Where this run's `HOME`, `CLAUDE_CONFIG_DIR` and working directory live.
-    root: PathBuf,
-    /// The minted turn key, in plaintext — the value the generated environment
-    /// carries into [`TURN_KEY_HEADER`], and the only place it exists outside
-    /// the directory's hash.
-    secret: String,
-    /// This deployment's **root**, with no [`API_PREFIX`].
-    ///
-    /// Kept rather than recovered from [`Self::env`] because the `topham` tests
-    /// need it as a *profile field*, which is a string an operator types — and
-    /// reading it back out of the generated map would make the profile a
-    /// restatement of the launch it is supposed to produce.
-    base_url: String,
-    /// The environment a launched client is given, generated rather than
-    /// re-spelled. Consuming [`ClaudeLaunch`]'s own output is what makes this
-    /// suite evidence about the launcher and not only about the surface.
-    env: ClaudeEnv,
-    store: Arc<MemoryStore>,
-    conversations: Arc<Conversations>,
-    /// The rival conversation, when this rig was asked for one. See
-    /// [`ControlRace`].
-    rival: Option<Arc<Rival>>,
-    recorder: Recorder,
-    upstream: Arc<ScriptedTurns>,
-    binary: String,
-    topology: Topology,
-}
-
-impl Rig {
-    /// A run rooted wherever this deployment's own convention puts it.
-    ///
-    /// Under the system temp directory, never under `target/`. See the module
-    /// doc: this client walks up from its working directory for a CLAUDE.md, a
-    /// project `.claude/` and a git repository, so a run rooted in this checkout
-    /// would launch carrying this repository as context.
-    async fn start(label: &str, upstream: Arc<ScriptedTurns>) -> Self {
-        Self::start_at(
-            Self::a_root_for(label),
-            upstream,
-            Wiring::Direct,
-            ControlRace::None,
-        )
-        .await
-    }
-
-    /// The same deployment, driven through a real `nemo-relay run --agent
-    /// claude` (R-D, R-D′).
-    ///
-    /// **The client's environment is the same [`ClaudeEnv`] the Direct tests
-    /// use, and that is the ruling this constructor exists to instantiate.**
-    /// Relay overwrites `ANTHROPIC_BASE_URL` with its own gateway and *merges*
-    /// its proxy token into `ANTHROPIC_CUSTOM_HEADERS` rather than replacing the
-    /// block (Relay evidence §A.7 — `replace_custom_header`
-    /// drops only a line whose name matches), so the turn key survives the hop
-    /// on [`TURN_KEY_HEADER`] and a chained turn keeps exactly Direct's
-    /// semantics. One generator, two topologies.
-    ///
-    /// The config written here is the whole chained contract, and each line is a
-    /// ruling:
-    ///
-    /// - `[upstream] anthropic_base_url` is this deployment's **root**. Relay
-    ///   concatenates the inbound `path_and_query` onto it whole
-    ///   (Relay evidence §A.4), so a value carrying `/v1` would send
-    ///   `/v1/v1/messages`.
-    /// - **No `anthropic_auth_header`.** Relay injects one only when the inbound
-    ///   request carries none of `authorization` / `x-api-key` / `api-key` /
-    ///   `anthropic-api-key` (Relay evidence §2.3, the `already_authed`
-    ///   short circuit), and a client launched with [`ClaudeAuthKind::RoundhouseKey`]
-    ///   always carries the sentinel on `x-api-key`. Configuring one here would
-    ///   therefore be dead configuration that silently becomes live the day the
-    ///   sentinel is dropped — see the chained runbook for the fallback where it
-    ///   is the *only* carrier.
-    /// - `[agents.claude] command` names the binary under test, so Relay drives
-    ///   the same client [`CLAUDE_BIN_VAR`] names rather than whatever `claude`
-    ///   resolves to on `PATH`.
-    ///
-    /// The bind address is deliberately **not** configured: `run` picks an
-    /// ephemeral loopback port, and 0.8.2 refuses a non-loopback bind outright
-    /// (Relay evidence §A.10.1, new at this release), so naming one here could
-    /// only make the run fail in a way the evidence already predicts.
-    ///
-    /// **Constructed chained, never mutated into it** (M11.2b review F2). This
-    /// used to build a Direct rig and overwrite `rig.topology` once `start_at`
-    /// had returned, which left a window — short, and never read from — in which
-    /// the value was a `Direct` rig wearing a chained label. Nothing behaved
-    /// wrongly because of it; what it cost is that "what topology is this rig"
-    /// had two answers depending on when you asked, and the second one was not
-    /// in the type.
-    ///
-    /// The reason it was written that way is real and is handled rather than
-    /// ignored: Relay's configuration names *this deployment's own base URL*,
-    /// which does not exist until the listener is bound inside `start_at`. So
-    /// the caller states a [`Wiring`] — a request, decidable before anything
-    /// binds — and `start_at` resolves it into a [`Topology`] at the one moment
-    /// both halves are known.
-    async fn start_chained(label: &str, upstream: Arc<ScriptedTurns>) -> Self {
-        Self::start_at(
-            Self::a_root_for(label),
-            upstream,
-            Wiring::Chained,
-            ControlRace::None,
-        )
-        .await
-    }
-
-    /// Where a run of `label` puts its home and working directory.
-    ///
-    /// Public to the file rather than inlined into [`Self::start`] because one
-    /// test needs the path *before* the rig exists: the scripted upstream names
-    /// the file the client will read, and it has to be scripted before the rig
-    /// that writes it is built.
-    fn a_root_for(label: &str) -> PathBuf {
-        std::env::temp_dir()
-            .join("roundhouse-claude-e2e")
-            .join(format!("{label}-{}", uuid::Uuid::new_v4()))
-    }
-
-    /// Bind, serve, mint, and generate the client's environment.
-    ///
-    /// A *minted* key against the production `PlaneSource` — an
-    /// `Arc<ControlDirectory>`, the one a shipped binary can name — rather than
-    /// a file-declared one, for the reason the codex sibling gives: the point of
-    /// the rung is that a real client authenticates the way a real tenant does.
-    async fn start_at(
-        root: PathBuf,
-        upstream: Arc<ScriptedTurns>,
-        wiring: Wiring,
-        race: ControlRace,
-    ) -> Self {
-        assert!(
-            claim_root(&root),
-            "a Rig's root must be exclusive to it: {} already exists. Two rigs sharing one root \
-             race `claude --continue`'s \"most recent conversation\" resolution onto each other's \
-             sessions — see claim_root's doc comment for the reproduction.",
-            root.display()
-        );
-        let label = root
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        std::fs::create_dir_all(root.join("home/.claude")).expect("the run's CLAUDE_CONFIG_DIR");
-        std::fs::create_dir_all(root.join("wd")).expect("the run's working directory");
-        std::fs::write(root.join("wd").join(CANARY_FILE), format!("{CANARY}\n"))
-            .expect("the file the client is asked to read");
-
-        // No judge in the cross-checks and no `validate` block on the project:
-        // nothing here enrols its sessions in validation, and promising a judge
-        // the cross-check would then have to find would be fixture state this
-        // suite makes no claim about.
-        let deployment = bootstrap(
-            "claude-e2e bootstrap",
-            "m11-claude-e2e",
-            serde_json::json!({ "id": PROJECT }),
-            None,
-        );
-        let directory = deployment.directory;
-        let minted = deployment.minted;
-
-        let store = Arc::new(MemoryStore::new());
-        let conversations = Arc::new(Conversations::new());
-        // One control store behind both routers, exactly as `main::serve`
-        // shares it: the surface writes an overlay and the engine reads it, and
-        // a second copy of either half is a control plane reporting on a
-        // deployment adjacent to the one serving turns.
-        let control = Arc::new(ControlStore::new());
-        let spend: Arc<dyn SpendLedger> = Arc::new(MemorySpendLedger::new());
-        let arm_salt = directory.plane(now_ms()).arm_salt().to_string();
-        let engine = Arc::new(
-            Engine::new(
-                Arc::clone(&store),
-                ByteTokenizer,
-                Arc::new(EchoLocalExecutor::new("local answer")),
-                frontier_catalog(),
-                Arc::clone(&upstream) as Arc<dyn FrontierClient>,
-                Arc::new(AffinityPolicy::new()),
-                EngineConfig {
-                    arm_salt,
-                    ..EngineConfig::default()
-                },
-            )
-            .with_control_store(Arc::clone(&control)),
-        );
-
-        // The rival, bound and *made real in the store* before anything is
-        // spawned. Real because the failure R-M2 removes is not a refusal: a
-        // surface that fell back to `latest` here would answer perfectly well,
-        // about the wrong conversation, and only the id in the answer would
-        // say so. A rival that existed only in the binding table would make
-        // that fallback fail loudly instead, which is a weaker claim than the
-        // one this rig is for.
-        let rival = match race {
-            ControlRace::None => None,
-            ControlRace::RivalIsLatest => {
-                let key = format!("{PROJECT}/{USER}/a-rival-conversation");
-                let session = conversations.bind(&principal(), &key);
-                store
-                    .create_session(&session, "rival")
-                    .await
-                    .expect("the rival conversation's own log");
-                Some(Arc::new(Rival {
-                    conversations: Arc::clone(&conversations),
-                    principal: principal(),
-                    key,
-                    session,
-                    seen: Mutex::new(Vec::new()),
-                }))
-            }
-        };
-
-        let mut mcp = mcp_router(
-            Arc::clone(&directory),
-            Arc::new(ControlPlaneReads::new(
-                Arc::clone(&directory),
-                Arc::clone(&store),
-                spend,
-                Arc::clone(&conversations),
-                reachable(),
-            )),
-            Arc::clone(&control),
-        );
-        if let Some(rival) = &rival {
-            mcp = mcp.layer(axum::middleware::from_fn_with_state(
-                Arc::clone(rival),
-                take_the_latest_slot,
-            ));
-        }
-
-        let recorder = Recorder::default();
-        // Both routers behind one recorder, for the reason `mcp_surface`'s own
-        // rig merges them: the interleaving *is* the subject here — a turn that
-        // emits a control call, the client's `tools/call` against `/mcp`, and
-        // the resend that follows — and three recorders could not say what
-        // order those arrived in.
-        let app: Router = messages_router(
-            Arc::clone(&directory),
-            engine,
-            Arc::clone(&store),
-            Arc::clone(&conversations),
-        )
-        .merge(mcp)
-        .layer(axum::middleware::from_fn_with_state(
-            recorder.clone(),
-            record,
-        ));
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("a loopback port");
-        let addr = listener.local_addr().expect("the bound address");
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-
-        // The **deployment root**, with no `{API_PREFIX}`: the client's vendored
-        // SDK appends the version segment itself, and `ClaudeLaunch::new` refuses
-        // a base URL that already carries one. Handing it the same string the
-        // codex sibling hands `CodexLaunch` would be refused by name — which is
-        // the refusal existing so that this line is right.
-        let base_url = format!("http://{addr}");
-        let env = ClaudeLaunch::new(&base_url, &minted.secret)
-            .expect("the rig's own base URL and minted key are the correct shape")
-            .env()
-            .expect("a bring-your-own-key launch with no other variables renders");
-
-        let binary = std::env::var(CLAUDE_BIN_VAR).unwrap_or_else(|_| "claude".to_string());
-        let version = claude_version(&binary);
-        println!("--- {label}");
-        println!("    claude binary : {binary}");
-        println!("    version       : {version}");
-        if version.split_whitespace().next() != Some(VERIFIED_VERSION) {
-            println!(
-                "    WARNING: this suite's assertions were written against {VERIFIED_VERSION}. \
-                 CLAUDE.md's synergy-vigilance rule applies: re-read what changed upstream \
-                 before trusting a green run against a different binary."
-            );
-        }
-        println!("    roundhouse    : {base_url}");
-        println!("    HOME          : {}", root.join("home").display());
-        println!(
-            "    launch env    : {}",
-            env.names().collect::<Vec<_>>().join(", ")
-        );
-
-        // The one place the requested wiring becomes a resolved topology, and
-        // the only place it is decided at all (M11.2b review F2).
-        let topology = match wiring {
-            Wiring::Direct => Topology::Direct,
-            Wiring::Chained => Self::wire_relay(&root, &base_url, &binary),
-        };
-
-        Self {
-            root,
-            secret: minted.secret,
-            base_url,
-            env,
-            store,
-            conversations,
-            rival,
-            recorder,
-            upstream,
-            binary,
-            topology,
-        }
-    }
-
-    /// Write this run's Relay configuration, and refuse to spawn anything until
-    /// Relay agrees it resolved to *this* deployment.
-    ///
-    /// **Neither the configuration nor the check is written here any more**
-    /// (R-T5). [`RelayHandoff`] renders the four lines and rules on the
-    /// `--dry-run` report; this function's job is the two things only a rig has
-    /// — a scratch root and a version banner — plus the panic that turns a
-    /// refusal into a test failure.
-    ///
-    /// **The preflight is M11.2b review F8, and it exists because the layering
-    /// cannot be excluded.** `--config` replaces the *user* layer only; Relay
-    /// then folds `/etc/nemo-relay/config.toml` in after it, and a leaf that
-    /// appears in both wins from the system file (Relay evidence §2.4). The
-    /// switch that would turn that off, `skip_implicit_config`, is behind a
-    /// test-only cargo feature and is not in the published binary. So an
-    /// operator box with a system Relay install could re-aim a chained turn —
-    /// this rig's minted turn key and its launch sentinel — at whatever that
-    /// file names, and every assertion downstream would be about a foreign
-    /// upstream while reading perfectly green.
-    ///
-    /// Verifying instead of assuming costs one extra `--dry-run`, which resolves
-    /// configuration and exits without spawning the agent. What it buys is that
-    /// the failure names the file: a chained rig that silently pointed somewhere
-    /// else is exactly the kind of drift a green suite cannot report.
-    fn wire_relay(root: &Path, base_url: &str, binary: &str) -> Topology {
-        let relay = std::env::var(RELAY_BIN_VAR).unwrap_or_else(|_| {
-            panic!(
-                "the chained topology needs a real Relay binary: set {RELAY_BIN_VAR}, or run \
-                 without --include-ignored"
-            )
-        });
-        let version = relay_version(&relay);
-        let handoff = RelayHandoff::for_claude(base_url, binary)
-            .expect("the rig's own deployment root and binary are the correct shape");
-        let config = root.join("relay-config.toml");
-        std::fs::write(&config, handoff.config_toml()).expect("the run's Relay configuration");
-        std::fs::create_dir_all(root.join("relay")).expect("the run's Relay state directory");
-
-        println!("    relay binary  : {relay}");
-        println!("    relay version : {version}");
-        if version.split_whitespace().last() != Some(VERIFIED_RELAY_VERSION) {
-            println!(
-                "    WARNING: the chained assertions were written against nemo-relay \
-                 {VERIFIED_RELAY_VERSION}. CLAUDE.md's synergy-vigilance rule applies: Relay is \
-                 the other half of this product, so re-read what changed upstream before trusting \
-                 a green run against a different build."
-            );
-        }
-        println!("    relay config  : {}", config.display());
-
-        let resolved = relay_dry_run(&relay, root, &config, &[]);
-        if let Err(re_aimed) = handoff.verify_resolved(&resolved) {
-            panic!("F8: {re_aimed}");
-        }
-
-        Topology::Chained {
-            relay,
-            config,
-            handoff,
-        }
-    }
-
-    /// The principal every request below resolves to.
-    fn principal(&self) -> Principal {
-        principal()
-    }
-
-    /// Every turn request, in arrival order.
-    ///
-    /// Matched on the path alone: the client appends `?beta=true`, which axum
-    /// routes past and this filter must too — a comparison against the whole URI
-    /// would find nothing and every assertion below would fail as "the client
-    /// never sent a turn".
-    fn turns(&self) -> Vec<Exchange> {
-        self.recorder.to(&format!("{API_PREFIX}/{MESSAGES_PATH}"))
-    }
-
-    /// Every `tools/call` this deployment's control surface served, in order.
-    ///
-    /// Filtered on the JSON-RPC method and not on the path: the client reaches
-    /// `/mcp` four times before it dispatches anything — `initialize`,
-    /// `notifications/initialized`, the optional `GET` stream this deployment
-    /// answers `405`, and `tools/list` (§5.8) — so a count of requests to the
-    /// path would be a claim about a client's startup sequence rather than
-    /// about its tool loop.
-    fn control_calls(&self) -> Vec<Exchange> {
-        self.recorder
-            .to(MCP_MOUNT_PATH)
-            .into_iter()
-            .filter(|exchange| {
-                exchange
-                    .body
-                    .as_ref()
-                    .and_then(|body| body["method"].as_str())
-                    == Some("tools/call")
-            })
-            .collect()
-    }
-
-    /// The rival conversation this rig was built with.
-    ///
-    /// A panic and not an `Option` at the call site: a claim about *which* of
-    /// two conversations answered a control call is vacuous on a rig that has
-    /// only one, and a test reaching for this on a [`ControlRace::None`] rig
-    /// has asked the wrong rig rather than found nothing.
-    fn rival(&self) -> &Rival {
-        self.rival.as_deref().expect(
-            "this rig was started with `ControlRace::None`, so `latest` and the tool-use id name \
-             one session and every claim about which of them answered would hold either way",
-        )
-    }
-
-    /// The absolute path of the file the client is asked to read.
-    fn canary_path(&self) -> PathBuf {
-        self.root.join("wd").join(CANARY_FILE)
-    }
-
-    /// The session the client drove, discovered rather than predicted.
-    ///
-    /// The test cannot know the client's session UUID in advance — it is minted
-    /// inside the child — and a Configured deployment qualifies the name by
-    /// principal on top of that. This is the production accessor for "the last
-    /// session this principal drove a turn on, on this node", reading the same
-    /// `Arc<Conversations>` the router was handed.
-    fn session(&self) -> SessionId {
-        common::e2e::session(&self.conversations)
-    }
-
-    /// The session's committed items, in log order.
-    async fn items(&self) -> Vec<Item> {
-        common::e2e::items(&self.store, &self.session()).await
-    }
-
-    /// A fork is silent from the client's side, so the only way to catch one is
-    /// to ask the store whether generation one exists at all.
-    async fn assert_never_forked(&self) {
-        common::e2e::assert_never_forked(&self.store, &self.session()).await;
-    }
-
-    /// A first `claude -p` in this run's isolated home.
-    async fn print(&self, prompt: &str, extra: &[&str]) -> ClaudeRun {
-        self.spawn(prompt, extra, false).await
-    }
-
-    /// A `claude --continue -p`, extending the conversation the previous run
-    /// left in this home for this working directory.
-    async fn continued(&self, prompt: &str) -> ClaudeRun {
-        self.spawn(prompt, &[], true).await
-    }
-
-    /// This rig's deployment, as the profile vocabulary spells it — the file
-    /// written and its path answered by [`write_profile`], the one copy both
-    /// real-binary suites now share (M11.3 review F18). What is this rig's own
-    /// is the two values below: the loopback root it is serving on, and which
-    /// topology the profile should name.
-    fn write_profile(&self, topology: &str) -> PathBuf {
-        write_profile(&self.xdg("config"), "claude", &self.base_url, topology)
-    }
-
-    /// One of this run's isolated XDG directories, created — [`xdg`] under the
-    /// rig's own root, which is the only part of it a rig supplies.
-    fn xdg(&self, what: &str) -> PathBuf {
-        xdg(&self.root, what)
-    }
-
-    /// Drive the real client through a real `topham`, and answer with what the
-    /// client printed.
-    ///
-    /// `subcommand` is `topham`'s own argv up to the `--`; everything after it
-    /// is [`claude_argv`], the same vector the Direct and Chained tests hand the
-    /// client. That split is what makes these tests about the launcher: what
-    /// the client is *asked* to do is identical, so any difference in what
-    /// arrives at roundhouse's edge is `topham`'s doing.
-    ///
-    /// `extra` is the operator's own tail, and it is the *only* place a flag
-    /// may be spelled: `topham` generates a leading argv of its own and refuses
-    /// a tail that repeats one of its flags (`LaunchError::ArgvCollidesWithGenerated`),
-    /// so a test that restated `--mcp-config` here would be refused before
-    /// anything spawned. What legitimately belongs in it is the client's own
-    /// permission grant — `--allowedTools`, which the launcher deliberately
-    /// does not decide (M12, R-M3; `topham plan`'s notes say so).
-    ///
-    /// **The child's environment is cleared and rebuilt from a named set that
-    /// contains no `ANTHROPIC_*` variable at all** — which is the difference
-    /// between this and every other spawn in this file. The other tests hand
-    /// the client [`ClaudeEnv`] directly; here the child is handed a turn key,
-    /// two homes and a `PATH`, and `topham` is what has to produce the rest. A
-    /// leaked `ANTHROPIC_BASE_URL` would make a broken launcher look like a
-    /// working one.
-    async fn through_topham(
-        &self,
-        subcommand: &[&str],
-        prompt: &str,
-        extra: &[&str],
-        deadline: Duration,
-    ) -> ClaudeRun {
-        let topham = topham_binary();
-        println!("    topham binary : {topham}");
-        println!("    topham version: {}", topham_version(&topham));
-
-        let mut command = tokio::process::Command::new(&topham);
-        command.args(subcommand);
-        command.arg("--");
-        command.args(claude_argv(prompt, extra, false));
-        command.current_dir(self.root.join("wd"));
-        command.kill_on_drop(true);
-
-        command.env_clear();
-        // The client's own binary is resolved by `topham` through `PATH`, from
-        // the bare name the profile's agent implies — so the directory holding
-        // the binary under test goes first. Without this the launcher would
-        // find whatever `claude` the box has, or none, and the test would be
-        // about a different binary than the one the version banner printed.
-        command.env("PATH", path_with(&self.binary));
-        command.env("HOME", self.root.join("home"));
-        command.env("CLAUDE_CONFIG_DIR", self.root.join("home/.claude"));
-        command.env("XDG_CONFIG_HOME", self.xdg("config"));
-        command.env("XDG_DATA_HOME", self.xdg("data"));
-        command.env("XDG_STATE_HOME", self.xdg("state"));
-        command.env("XDG_CACHE_HOME", self.xdg("cache"));
-        // The one credential, under the name the profile names — never as a
-        // generated `ANTHROPIC_*` variable, which is what `topham` is here to
-        // produce.
-        command.env(DEFAULT_KEY_ENV, &self.secret);
-
-        command.stdin(Stdio::null());
-        command.stdout(Stdio::piped());
-        command.stderr(Stdio::piped());
-
-        drive_child(
-            command,
-            deadline,
-            &topham,
-            TOPHAM_BIN_VAR,
-            &format!("a `topham {}`", subcommand.join(" ")),
-            &self.root,
-        )
-        .await
-    }
-
-    /// One `claude -p` on this rig's topology, bounded by [`drive_child`] —
-    /// which is where the deadline, the interrupt-then-kill and the reasoning
-    /// behind both now live, because a `topham` child needs exactly the same
-    /// treatment.
-    async fn spawn(&self, prompt: &str, extra: &[&str], resume: bool) -> ClaudeRun {
-        let command = build_child_command(
-            &self.binary,
-            &self.topology,
-            &self.env,
-            &self.root,
-            prompt,
-            extra,
-            resume,
-        );
-        let plan = self.topology.plan(&self.binary, &self.root);
-        drive_child(
-            command,
-            plan.deadline,
-            &plan.program,
-            CLAUDE_BIN_VAR,
-            &format!("a {} `{} -p`", plan.label, self.binary),
-            &self.root,
-        )
-        .await
-    }
-
-    /// Remove this run's directory.
-    fn clean(&self) {
-        clean(&self.root);
-    }
-}
-
-/// Run one child to completion, or kill its whole tree at `deadline`.
-///
-/// A free function rather than a method on [`Rig`] because there are now two
-/// kinds of child a run of this suite starts: the client (or Relay) the rig
-/// builds itself, and a `topham` that resolves a profile and *becomes* one of
-/// those. Both have to be bounded, both have to be killed the same way, and
-/// both produce the same one JSON document — so a second copy of the watchdog
-/// beside the second spawn would be the place the two quietly stopped agreeing
-/// about what a hung run does.
-///
-/// **The deadline used to leak the very processes it exists to stop** (M11.2b
-/// review F4). Three things close it, in the order they fire:
-///
-/// 1. `SIGINT` to the direct child. Under Chained that child is Relay, which
-///    puts the client in a process group of its own and tears it down — plus
-///    its plugin temp dir — on interrupt or normal exit. A `SIGKILL` first
-///    would skip both.
-/// 2. A short grace period, then `SIGKILL` for whatever ignored the interrupt —
-///    pinned by [`an_expired_deadline_ends_a_child_that_ignores_the_interrupt`],
-///    which traps the interrupt on purpose so a harness that only interrupted
-///    would hang there rather than here.
-/// 3. `kill_on_drop(true)` on the command itself, as the backstop for every
-///    path out of this function that is not this one — a panic between spawn
-///    and wait included.
-async fn drive_child(
-    mut command: tokio::process::Command,
-    deadline: Duration,
-    program: &str,
-    override_var: &str,
-    what: &str,
-    root: &Path,
-) -> ClaudeRun {
-    let child = command.spawn().unwrap_or_else(|error| {
-        panic!(
-            "could not run `{program}`: {error}. Set {override_var} to a real binary, or drop \
-             --include-ignored."
-        )
-    });
-    // A watchdog beside the child rather than a `timeout` around it: a
-    // `timeout` that expires drops the future holding the `Child`, and a
-    // dropped `Child` is killed outright by `kill_on_drop` — which is the
-    // backstop, not the shutdown. Signalling from beside it lets the interrupt
-    // land while the child is still ours to wait on, so Relay takes its own
-    // client and its plugin temp dir down with it.
-    let pid = child.id();
-    let watchdog = tokio::spawn(async move {
-        tokio::time::sleep(deadline).await;
-        if let Some(pid) = pid {
-            interrupt_then_kill(pid).await;
-        }
-    });
-    let started = std::time::Instant::now();
-    let output = child
-        .wait_with_output()
-        .await
-        .expect("a spawned child's pipes are readable");
-    watchdog.abort();
-    assert!(
-        started.elapsed() < deadline,
-        "{what} did not finish within {deadline:?} and was interrupted, then killed. HOME: {}",
-        root.join("home").display()
-    );
-
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    ClaudeRun {
-        // `--output-format json` prints exactly one document. Parsed leniently
-        // so a client that printed something else fails on the assertion that
-        // names what was missing rather than on a panic here.
-        result: serde_json::from_str::<Value>(stdout.trim()).ok(),
-        stdout,
-        stderr,
-        success: output.status.success(),
-    }
-}
-
-/// Take a hung child's tree down the way its own shutdown path expects, then
-/// make sure it is down.
-///
-/// `SIGINT` first because under Chained the child is Relay: it restores the
-/// temporary plugin directory it wrote and terminates the client it spawned into
-/// a separate process group only on a normal exit or an interrupt, so killing it
-/// outright leaves both behind. The grace period is short because nothing here
-/// is meant to survive it — this path runs only after a deadline has already
-/// expired, and the panic that follows is the diagnosis.
-///
-/// `kill(1)` rather than a signalling crate: sending a signal from Rust needs a
-/// libc binding this test tree does not otherwise carry, and adding a dependency
-/// to the workspace manifest to interrupt a test child is a larger change than
-/// the defect. A missing `kill` degrades to the `SIGKILL` below, which is what
-/// the previous behaviour would have been anyway.
-async fn interrupt_then_kill(pid: u32) {
-    let _ = std::process::Command::new("kill")
-        .args(["-INT", &pid.to_string()])
-        .status();
-    tokio::time::sleep(KILL_GRACE).await;
-    let _ = std::process::Command::new("kill")
-        .args(["-KILL", &pid.to_string()])
-        .status();
-}
-
-/// How long an interrupted child gets to unwind before it is killed outright.
-const KILL_GRACE: Duration = Duration::from_secs(3);
-
-/// Claims `root` for exclusive use by one [`Rig`], or reports that something
-/// else already holds it.
-///
-/// [`Rig::a_root_for`] mints a fresh UUID per call, so no two of *this file's*
-/// own tests ever collide — but nothing previously stopped a caller from
-/// pointing [`Rig::start_at`] at a hand-picked or reused root, and two rigs
-/// sharing one root silently share one `claude --continue` history: `claude
-/// --continue` resolves "the most recent conversation" from the session store
-/// under the shared `HOME`, keyed by working directory, so rig A's continued
-/// turn can extend rig B's conversation instead of its own (reproduced
-/// directly: two `Rig::start_at` calls pointed at one root, driven
-/// concurrently, and rig A's `--continue` came back with rig B's session id).
-///
-/// A separate, synchronous, no-process function — rather than inlined into
-/// `start_at` — so the property this closes is checkable on its own: see
-/// [`a_rigs_root_cannot_be_claimed_twice`] below. `std::fs::create_dir` is the
-/// enforcement, not the assertion in `start_at` that reads it: `mkdir` is one
-/// atomic syscall, so of two concurrent claims on the same path exactly one
-/// succeeds, which is what makes this safe under real concurrency and not only
-/// under the sequential case the guard test exercises.
-fn claim_root(root: &Path) -> bool {
-    if let Some(parent) = root.parent() {
-        std::fs::create_dir_all(parent).expect("the root's parent directory");
-    }
-    std::fs::create_dir(root).is_ok()
-}
-
-/// Build the exact `claude` child command [`Rig::spawn`] runs, without running
-/// it.
-///
-/// Pulled out as its own function — rather than left inline — so the module
-/// doc's isolation claim has a guard that needs no process. A check on what
-/// *arrived* structurally cannot see a credential that was merely *available*:
-/// under `RoundhouseKey` an ambient `ANTHROPIC_AUTH_TOKEN` would be resolved
-/// ahead of the sentinel and change which credential the client presents, while
-/// an ambient `CLAUDE_CODE_REMOTE` would change it without adding any header a
-/// naive assertion looks for. A check on construction sees the second case —
-/// *if* `env_clear()` ran — via `Command::get_envs()` on the object this
-/// returns.
-///
-/// **What that check cannot see: whether `env_clear()` itself ran.**
-/// `Command::get_envs()` reports only the explicit `env()`/`env_remove()` diff,
-/// identically whether or not the environment was cleared first — an ambient
-/// variable that was never named in an `env()` call is invisible to it either
-/// way, so a dropped `env_clear()` produces the exact same `get_envs()` output
-/// as a correct one (verified directly: `the_get_envs_diff_cannot_see_a_dropped_env_clear`
-/// below). The only thing that actually observes a leaked ambient credential is
-/// [`the_seat_chain_a_launched_client_presents`], reading the real wire under
-/// `--include-ignored` — see the module doc's ordering of guards 2 and 3.
-///
-/// One function used by both the real harness and its own test, rather than a
-/// second copy that mirrors it: a copy is a fixture that can drift from what
-/// actually spawns, which is exactly the gap this closes.
-fn build_child_command(
-    binary: &str,
-    topology: &Topology,
-    env: &ClaudeEnv,
-    root: &Path,
-    prompt: &str,
-    extra: &[&str],
-    resume: bool,
-) -> tokio::process::Command {
-    let plan = topology.plan(binary, root);
-    let mut command = tokio::process::Command::new(&plan.program);
-    command.args(&plan.leading);
-    command.args(claude_argv(prompt, extra, resume));
-    command.current_dir(root.join("wd"));
-
-    // The backstop under [`Rig::spawn`]'s watchdog, and the reason F4 was a
-    // defect rather than a style note: tokio's default is `false`, so before
-    // this line every path out of `spawn` that dropped the `Child` — the
-    // deadline above all — left the child running. Set here rather than in
-    // `spawn` so the guard that reads it needs no process
-    // ([`build_child_command_kills_on_drop`]).
-    command.kill_on_drop(true);
-
-    // Cleared and rebuilt from the generated map plus a named isolation set, not
-    // inherited. `CLAUDE_CODE_REMOTE=true` — the ambient value inside the
-    // container this repository's own sessions run in — makes the client present
-    // that container's managed OAuth token to whatever `ANTHROPIC_BASE_URL`
-    // names (§5.7), which here is a socket that records every header. The
-    // allowlist below is the one
-    // `the_childs_environment_is_the_generated_map_plus_the_isolation_vars`
-    // checks against; change one without the other and that test goes red.
-    command.env_clear();
-    for (name, value) in env.vars() {
-        command.env(name, value);
-    }
-    // Deliberately *not* in the generated map — see `claude_launch`'s "What this
-    // deliberately does not set": they are deployment policy and process
-    // isolation, not part of what makes a client reach roundhouse. Whoever
-    // spawns the process owns them, and here that is this function.
-    command.env("PATH", std::env::var("PATH").unwrap_or_default());
-    command.env("HOME", root.join("home"));
-    command.env("CLAUDE_CONFIG_DIR", root.join("home/.claude"));
-    command.env("DISABLE_AUTOUPDATER", "1");
-    command.env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
-    // Whatever else this topology's own process needs — for Chained, Relay's
-    // isolated XDG state. Decided in [`Topology::plan`] with the program and the
-    // argv, not branched on a second time here.
-    for (name, value) in &plan.extra_env {
-        command.env(name, value);
-    }
-
-    // Without this the child waits three seconds for piped input and says so on
-    // stderr before proceeding — harmless, and exactly the kind of noise that
-    // gets read as "the newest test hangs" under a bounded suite.
-    command.stdin(Stdio::null());
-    command.stdout(Stdio::piped());
-    command.stderr(Stdio::piped());
-
-    command
-}
-
-/// The client's own argv, identical on both topologies.
-///
-/// The point of the split: under Chained this vector is handed to Relay after a
-/// `--` and Relay splices its own `--plugin-dir` and `--settings` into it
-/// (Relay evidence §A.7), so what the client is *asked* to
-/// do is by construction the same thing on both paths and any difference in
-/// outcome is Relay's doing rather than the harness's.
-fn claude_argv(prompt: &str, extra: &[&str], resume: bool) -> Vec<String> {
-    let mut argv: Vec<String> = Vec::new();
-    if resume {
-        // "The most recent conversation in the current directory", which is why
-        // `current_dir` is set on every run and not only on this one.
-        argv.push("--continue".into());
-    }
-    // `-p` is what makes this non-interactive, and non-interactive is what makes
-    // the sentinel deterministic: §1.3's documented behaviour is that a resolved
-    // API key is used without asking in print mode, and merely *offered* to
-    // override a subscription in interactive mode.
-    argv.extend(["-p", "--output-format", "json"].map(String::from));
-    // **The prompt goes before `extra`, not after it.** `--allowedTools` is
-    // variadic (`<tools...>`), so a prompt following it is parsed as one more
-    // tool name and the run dies with "Input must be provided either through
-    // stdin or as a prompt argument" — a message that reads like a harness that
-    // forgot to pass a prompt, when the prompt was passed and eaten.
-    argv.push(prompt.into());
-    argv.extend(extra.iter().copied().map(String::from));
-    argv
-}
-
-/// What `claude --version` prints, or a loud panic naming the override.
-///
-/// Isolated exactly as [`build_child_command`] isolates a real run (M11.2b
-/// review F18): cleared, then `PATH`, a scratch `HOME`, an isolated
-/// `CLAUDE_CONFIG_DIR`, and the two variables that stop a probe reaching the
-/// network on its way to printing a number.
-fn claude_version(binary: &str) -> String {
-    let home = probe_home();
-    std::fs::create_dir_all(home.join(".claude")).expect("the probe's isolated config directory");
-    let version = version_probe(
-        binary,
-        &[
-            ("HOME", home.clone().into_os_string()),
-            ("CLAUDE_CONFIG_DIR", home.join(".claude").into_os_string()),
-            ("DISABLE_AUTOUPDATER", OsString::from("1")),
-            (
-                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
-                OsString::from("1"),
-            ),
-        ],
-        CLAUDE_BIN_VAR,
-    );
-    let _ = std::fs::remove_dir_all(&home);
-    version
-}
-
-/// What `nemo-relay --version` prints, or a loud panic naming the override.
-///
-/// A missing Relay under `--include-ignored` is a hard failure and never a
-/// silent skip, for the reason the whole suite is gated this way: a chained test
-/// that quietly does not run reports "green" for the topology nobody checked.
-///
-/// Isolated for F18's reason and for one of its own: a probe that read the
-/// developer's XDG configuration could print a version resolved under
-/// configuration this test never wrote.
-fn relay_version(binary: &str) -> String {
-    let home = probe_home();
-    std::fs::create_dir_all(&home).expect("the probe's isolated home");
-    let mut isolation = vec![("HOME", home.clone().into_os_string())];
-    isolation.extend(
-        RELAY_STATE_VARS
-            .iter()
-            .map(|name| (*name, home.clone().into_os_string())),
-    );
-    let version = version_probe(binary, &isolation, RELAY_BIN_VAR);
-    let _ = std::fs::remove_dir_all(&home);
-    version
-}
-
 /// **F23 (M11.3 review), now the guard on its own fix: `topham --version` must
 /// name the commit it was built from.**
 ///
@@ -1728,115 +569,6 @@ fn topham_version_names_the_commit_it_was_built_from() {
          in this suite's own preflight (the version line `through_topham` already prints) can \
          tell the two apart."
     );
-}
-
-/// `nemo-relay run --agent claude --config <toml> [extra] --dry-run`, and what
-/// it printed.
-///
-/// **Spawned with the ambient environment cleared** (M11.2b review F7). Relay
-/// applies its `NEMO_RELAY_*` environment layer *above* the explicit `--config`
-/// file, and a differing `NEMO_RELAY_ANTHROPIC_BASE_URL` also clears any
-/// configured auth header — so a probe that inherited the operator's environment
-/// could fail its own control assertion and read as Relay drift. The one thing
-/// preserved is `PATH`, because the binary has to be able to find its loader.
-///
-/// `--dry-run` resolves configuration and exits without spawning the agent,
-/// which is what makes every caller here need Relay and nothing else.
-///
-/// Both the argv and the isolation come from
-/// [`relay_handoff`](roundhouse_server::relay_handoff) (R-T5), so this rig's
-/// preflight and `topham relay`'s are the same experiment rather than two that
-/// agree today. What stays here is the `extra` slot — the hazard-4 guards below
-/// need a *second* configuration layer, which is not a thing a launcher ever
-/// wants.
-fn relay_dry_run(relay: &str, home: &Path, config: &Path, extra: &[&str]) -> String {
-    let mut command = std::process::Command::new(relay);
-    command.args(RelayAgent::Claude.preflight_argv(config));
-    command.args(extra);
-    command.args(["--", "-p", "probe"]);
-    command.env_clear();
-    for (name, value) in
-        RelayHandoff::preflight_env(home, &std::env::var("PATH").unwrap_or_default())
-    {
-        command.env(name, value);
-    }
-    let output = command.output().unwrap_or_else(|error| {
-        panic!(
-            "could not run `{relay}`: {error}. Set {RELAY_BIN_VAR} to a real Relay binary, or \
-             drop --include-ignored."
-        )
-    });
-    String::from_utf8_lossy(&output.stdout).into_owned()
-}
-
-// ---------------------------------------------------------------------------
-// What one `claude -p` produced
-// ---------------------------------------------------------------------------
-
-struct ClaudeRun {
-    /// The one JSON document `--output-format json` prints.
-    result: Option<Value>,
-    stdout: String,
-    stderr: String,
-    success: bool,
-}
-
-impl ClaudeRun {
-    /// Fail unless the client completed the turn without an error.
-    ///
-    /// Three signals rather than the exit status alone: a non-zero exit, an
-    /// `is_error` document, and a `permission_denials` entry all mean the run
-    /// proved nothing, and each is diagnosed differently — the third in
-    /// particular is what a client that started asking about `Read` would show.
-    fn assert_completed(&self, what: &str) {
-        let denials = self
-            .result
-            .as_ref()
-            .and_then(|result| result["permission_denials"].as_array())
-            .cloned()
-            .unwrap_or_default();
-        let errored = self
-            .result
-            .as_ref()
-            .is_some_and(|result| result["is_error"] == Value::Bool(true));
-        assert!(
-            self.success && self.result.is_some() && !errored && denials.is_empty(),
-            "{what}: the client did not complete the turn (exit ok: {}, is_error: {errored}, \
-             permission denials: {denials:?})\n--- stdout\n{}\n--- stderr\n{}",
-            self.success,
-            self.stdout,
-            self.stderr
-        );
-    }
-
-    fn field(&self, name: &str) -> Value {
-        self.result
-            .as_ref()
-            .map(|result| result[name].clone())
-            .unwrap_or(Value::Null)
-    }
-
-    /// The final assistant text, which is what `-p` exists to print.
-    fn text(&self) -> String {
-        self.field("result")
-            .as_str()
-            .unwrap_or_default()
-            .to_string()
-    }
-
-    /// The client's own session UUID, minted inside the child.
-    fn session_id(&self) -> String {
-        self.field("session_id")
-            .as_str()
-            .unwrap_or_default()
-            .to_string()
-    }
-
-    /// How many assistant turns the client ran inside one invocation — two when
-    /// it dispatched a tool and came back.
-    fn turns(&self) -> u64 {
-        self.field("num_turns").as_u64().unwrap_or_default()
-    }
 }
 
 /// The text blocks of a resent message, in order.
@@ -3530,8 +2262,8 @@ async fn a_real_client_reaches_the_control_surface_through_the_turn() {
 
     // ---- edge four: what the validate loop makes of it --------------------
     //
-    // R-M0/G04. Every signal the trigger computes runs over `task_exchanges`,
-    // so a control call inside it is roundhouse's own chatter counted as the
+    // R-M0/G04. Every signal the trigger computes runs over the task view, so
+    // a control call inside it is roundhouse's own chatter counted as the
     // agent's work — which is how a session that did nothing wrong buys a judge
     // side-call and a steer.
     let folded = exchanges(&items);
@@ -3541,14 +2273,23 @@ async fn a_real_client_reaches_the_control_surface_through_the_turn() {
         "one call, one result, one exchange: {folded:?}"
     );
     assert!(
-        is_control_call(&folded[0].name),
+        is_control_call_on(&folded[0].name, ControlCallDialect::ClaudeMessages),
         "the fold must recognise `{}` as roundhouse's own control traffic",
         folded[0].name
     );
     assert!(
-        task_exchanges(&folded).is_empty(),
+        task_exchanges_on(&folded, ControlCallDialect::ClaudeMessages).is_empty(),
         "the agent asked roundhouse for its own status; the task view must hold nothing: {:?}",
-        task_exchanges(&folded)
+        task_exchanges_on(&folded, ControlCallDialect::ClaudeMessages)
+    );
+    // And the dialect is what did the excluding, not the name. The *Responses*
+    // recogniser reads a bare `status` and this call arrived flat, so the same
+    // fold under that surface keeps it — which is why a session's surface has
+    // to reach the fold rather than being guessed at it (M12 review, F8).
+    assert_eq!(
+        task_exchanges_on(&folded, ControlCallDialect::CodexResponses).len(),
+        1,
+        "the flat spelling is the Messages surface's; the Responses recogniser          must not claim it"
     );
 
     rig.clean();
@@ -4333,12 +3074,18 @@ fn forwarded_claude_login_never_writes_the_api_key_env() {
 /// it survived a milestone. What it cost is that a fifth site could be added, or
 /// one of four updated alone, and no assertion anywhere would notice.
 ///
-/// A structural claim gets a structural test, read from this file's own source,
-/// counted the way the finding counted it. One site is [`Topology::plan`],
-/// which answers program, argv, environment, deadline and label together.
+/// A structural claim gets a structural test, counted the way the finding
+/// counted it. One site is [`Topology::plan`], which answers program, argv,
+/// environment, deadline and label together.
+///
+/// **Read from `common/claude_rig.rs` since M12 review F11**, which is where
+/// the dispatch now lives. The guard stayed in the suite rather than moving
+/// with the code it guards: a file that scans itself for the shape of its own
+/// contents is a check with no independent reader, and this one exists
+/// precisely to be the reader.
 #[test]
 fn topology_is_dispatched_on_at_one_site() {
-    let source = include_str!("claude_e2e.rs");
+    let source = include_str!("common/claude_rig.rs");
 
     let impl_topology_body = {
         let start = source
@@ -4394,9 +3141,11 @@ fn topology_is_dispatched_on_at_one_site() {
 /// handled rather than removed: Relay's config names the deployment's own base
 /// URL, so the caller states a [`Wiring`] and `start_at` resolves it once both
 /// halves exist.
+///
+/// Read from `common/claude_rig.rs` for the same reason as the guard above.
 #[test]
 fn a_chained_rigs_topology_is_not_a_post_construction_mutation() {
-    let source = include_str!("claude_e2e.rs");
+    let source = include_str!("common/claude_rig.rs");
 
     let start_chained_body = {
         let start = source
@@ -4468,6 +3217,106 @@ fn build_child_command_kills_on_drop() {
     }
 }
 
+/// **F11 (M12 thermo-nuclear review), now the guard on its own fix: the rig
+/// left this file, and the guards that read it followed it.**
+///
+/// F11 claimed the extraction was "a line count plus a mechanical extraction",
+/// and the refuter proved that half wrong: this file carried two structural
+/// guards ([`topology_is_dispatched_on_at_one_site`],
+/// [`a_chained_rigs_topology_is_not_a_post_construction_mutation`]) that read
+/// their own source and located `impl Topology`, `build_child_command` and
+/// `start_chained` by scanning *this file's* text for exact anchors. Moving
+/// those items to `common/claude_rig.rs` without porting the guards would have
+/// left two `.expect("... exists")` calls panicking — an extraction whose
+/// "identical pass set" was two failures.
+///
+/// So the property worth guarding is not "this file never scans itself" — it
+/// legitimately still does, three times, about facts that really are about this
+/// file (its module doc, its own leak-free scripts, its half of the
+/// copy-paste check). It is the narrower one the port established: **the rig's
+/// definitions live in `claude_rig.rs`, and this file's structural guards read
+/// them there.** Both halves are asserted, because either alone is satisfiable
+/// by an extraction that silently stopped guarding anything: a definition that
+/// came back here would go unnoticed by a guard still pointed at the module,
+/// and a guard pointed back here would `.expect()`-panic rather than pass, but
+/// only once someone ran it.
+///
+/// The needles are assembled at run time for the reason the other textual
+/// guards in this file assemble theirs: this test's own source *is*
+/// `this_file`, so a needle spelled whole below would find itself and report a
+/// definition that is only this assertion.
+#[test]
+fn the_rig_lives_in_its_own_module_and_the_guards_read_it_there() {
+    let this_file = include_str!("claude_e2e.rs");
+    let rig = include_str!("common/claude_rig.rs");
+
+    let definitions = [
+        ["impl Topo", "logy {"],
+        ["fn build_child_", "command("],
+        ["fn claude_", "argv("],
+        ["async fn start_", "chained("],
+    ];
+    // A *definition* opens a line; the same spelling inside a `.find("…")`
+    // anchor does not, and the two guards below legitimately carry three of
+    // those. Matching on `contains` would have found the anchors and reported
+    // this file as still holding the rig.
+    let defines = |source: &str, needle: &str| {
+        source.lines().map(str::trim_start).any(|line| {
+            line.starts_with(needle)
+                || line
+                    .strip_prefix("pub ")
+                    .is_some_and(|rest| rest.starts_with(needle))
+        })
+    };
+    for halves in definitions {
+        let needle = halves.concat();
+        assert!(
+            defines(rig, &needle),
+            "F11: `{needle}` is not defined in common/claude_rig.rs — the two structural guards \
+             below locate it by scanning that file, and a `.expect(\"... exists\")` there panics \
+             rather than reporting what moved"
+        );
+        assert!(
+            !defines(this_file, &needle),
+            "F11: `{needle}` is defined in claude_e2e.rs again. The deployment, the topologies \
+             and the child command are common/claude_rig.rs's; a second definition here is the \
+             accretion that put this file past 4 700 lines, and the guards that scan the module \
+             would not see it"
+        );
+    }
+
+    // And the two guards really do read the module rather than this file:
+    // repointing one `include_str!` back is the single edit that satisfies
+    // every assertion above while quietly guarding nothing at all. Checked per
+    // guard rather than by counting scans of the module across the file, so
+    // that a *new* guard reading it neither satisfies this nor breaks it.
+    let scan = format!("include_str!(\"common/{}\")", "claude_rig.rs");
+    for guard in [
+        "fn topology_is_dispatched_on_at_one_site()",
+        "fn a_chained_rigs_topology_is_not_a_post_construction_mutation()",
+    ] {
+        let body = {
+            let start = this_file.find(guard).unwrap_or_else(|| {
+                panic!(
+                    "F11: `{guard}` is this suite's guard on the rig's \
+                     structure and must still exist to be pointed anywhere"
+                )
+            });
+            let after = &this_file[start..];
+            &after[..after
+                .find("\n}\n")
+                .expect("a guard is a function with an end")]
+        };
+        assert!(
+            body.contains(scan.as_str()),
+            "F11: `{guard}` no longer reads common/claude_rig.rs. It locates `impl Topology` / \
+             `build_child_command` / `start_chained` by scanning source for exact anchors, so \
+             pointed at this file it does not report the rig moved back — it panics in \
+             `.expect(\"... exists\")`, and only for whoever next runs it."
+        );
+    }
+}
+
 /// **F4, second half: the deadline's shutdown really does end the child, even
 /// one that ignores the interrupt.**
 ///
@@ -4484,12 +3333,45 @@ fn build_child_command_kills_on_drop() {
 /// a zombie answers `kill -0` exactly as a live process does — so "is it gone"
 /// asked that way would pass whether or not anything worked. The exit status is
 /// the unambiguous form of the question.
+///
+/// **Two timing hazards, closed here rather than tolerated as a flake.** Both
+/// were seen: the test failed once in a `--test-threads=1` run and passed on
+/// every other.
+///
+/// The first is the interrupt racing the trap. `Command::spawn` returns as soon
+/// as the fork has a pid — before `/bin/sh` has been exec'd, let alone before it
+/// has run `trap '' INT` — so a `SIGINT` sent on the next line can land on a
+/// process whose disposition for it is still the default. The child then dies of
+/// signal 2 and the assertion below reads it as a shutdown that never reached
+/// `SIGKILL`, which is the opposite of what happened. So the stub announces the
+/// trap by creating a marker file *after* installing it, and nothing is signalled
+/// until that file exists: the deadline is armed against a child that is
+/// provably already ignoring interrupts.
+///
+/// The second is asserting on the exit at a fixed instant. Reaping is the
+/// kernel's to schedule, not ours, and a loaded box can leave a killed child
+/// unreaped for longer than any single `wait` we would care to hard-code. The
+/// exit is polled to a generous deadline instead — which weakens nothing, since
+/// the assertions are still `SIGKILL` exactly and a deadline that expires is
+/// still a failure naming what was still running.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_expired_deadline_ends_a_child_that_ignores_the_interrupt() {
     let root = std::env::temp_dir().join(format!("f4-deadline-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(root.join("wd")).expect("the stub run's working directory");
     let stub = root.join("ignores-sigint.sh");
-    std::fs::write(&stub, "#!/bin/sh\ntrap '' INT\nsleep 300\n").expect("the stub script writes");
+    // The marker is written *after* the trap is installed and before the sleep,
+    // so its existence is the stub's own statement that a `SIGINT` from here on
+    // will be ignored. Ordering inside a shell script is what makes that a fact
+    // rather than an estimate of how long an exec takes.
+    let trapped = root.join("sigint-trapped");
+    std::fs::write(
+        &stub,
+        format!(
+            "#!/bin/sh\ntrap '' INT\n: > \"{}\"\nsleep 300\n",
+            trapped.display()
+        ),
+    )
+    .expect("the stub script writes");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -4516,11 +3398,36 @@ async fn an_expired_deadline_ends_a_child_that_ignores_the_interrupt() {
     let mut child = command.spawn().expect("the stub script spawns");
     let pid = child.id().expect("a freshly spawned child has a pid");
 
+    // Arm the deadline only once the child says it is ignoring interrupts.
+    let armed = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !trapped.exists() {
+        assert!(
+            tokio::time::Instant::now() < armed,
+            "F4: the stub never installed its `SIGINT` trap, so this run would have proved \
+             nothing about a child that ignores the interrupt"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
     interrupt_then_kill(pid).await;
-    let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
-        .await
-        .expect("the killed child must be reapable rather than still running")
-        .expect("waiting on a spawned child succeeds");
+    // Polled rather than waited on at one instant: reaping is the kernel's to
+    // schedule, and a deadline that expires still fails, naming the child that
+    // outlived it.
+    let reaped = tokio::time::Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        match child
+            .try_wait()
+            .expect("waiting on a spawned child succeeds")
+        {
+            Some(status) => break status,
+            None => assert!(
+                tokio::time::Instant::now() < reaped,
+                "F4: pid {pid} was interrupted and then killed and is still running; the \
+                 deadline's shutdown does not end a child that ignores the interrupt"
+            ),
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
 
     assert!(
         !status.success(),
@@ -4578,6 +3485,11 @@ fn the_module_doc_does_not_enumerate_a_count_of_real_binary_tests() {
     // Relay's source belongs in the evidence document, cited by section. A
     // `file.rs:1070-1078` here is a claim about a pinned tree with no path back
     // to the tree it was read from.
+    //
+    // Scanned across `common/claude_rig.rs` too since M12 review F11: the
+    // chained wiring, and with it most of this suite's Relay citations, moved
+    // there. A scan left pointing at this file alone would have reported green
+    // about a habit that had simply relocated.
     let relay_files = [
         "gateway/mod.rs",
         "gateway/routes.rs",
@@ -4591,6 +3503,7 @@ fn the_module_doc_does_not_enumerate_a_count_of_real_binary_tests() {
     ];
     let offenders: Vec<&str> = source
         .lines()
+        .chain(include_str!("common/claude_rig.rs").lines())
         .filter(|line| line.trim_start().starts_with("//"))
         .filter(|line| {
             relay_files
@@ -4600,8 +3513,9 @@ fn the_module_doc_does_not_enumerate_a_count_of_real_binary_tests() {
         .collect();
     assert!(
         offenders.is_empty(),
-        "F10: Relay source is cited by file and line in this file; cite the evidence document's \
-         section instead (see the module doc's \"Where Relay evidence §x points\"):\n{}",
+        "F10: Relay source is cited by file and line in this suite or its rig module; cite the \
+         evidence document's section instead (see the module doc's \"Where Relay evidence §x \
+         points\"):\n{}",
         offenders.join("\n")
     );
 }
@@ -4631,7 +3545,15 @@ fn the_module_doc_does_not_enumerate_a_count_of_real_binary_tests() {
 /// definition actually puts it.
 #[test]
 fn topham_closure_helpers_are_not_copy_pasted_across_the_two_e2e_suites() {
-    let claude_src = include_str!("claude_e2e.rs");
+    // Both halves of the claude side, because the `topham` closure runs the
+    // helpers serve are driven from `Rig::through_topham` — which is in the rig
+    // module since M12 review F11, and is therefore where a fresh copy would
+    // now land.
+    let claude_src = format!(
+        "{}{}",
+        include_str!("claude_e2e.rs"),
+        include_str!("common/claude_rig.rs")
+    );
     let codex_src = include_str!("codex_e2e.rs");
 
     let shared_verbatim = [
@@ -4646,12 +3568,13 @@ fn topham_closure_helpers_are_not_copy_pasted_across_the_two_e2e_suites() {
     let duplicated: Vec<String> = shared_verbatim
         .iter()
         .map(|halves| halves.concat())
-        .filter(|needle| claude_src.contains(needle) && codex_src.contains(needle))
+        .filter(|needle| claude_src.contains(needle.as_str()) && codex_src.contains(needle))
         .collect();
     assert!(
         duplicated.is_empty(),
-        "F18: these topham closure-test helpers are defined independently in both \
-         claude_e2e.rs and codex_e2e.rs instead of once in tests/common/e2e.rs, even though \
+        "F18: these topham closure-test helpers are defined independently in both the claude \
+         suite (or its rig module) and codex_e2e.rs instead of once in tests/common/e2e.rs, \
+         even though \
          tests/common/e2e.rs already holds version_probe (the function topham_version wraps in \
          both suites):\n{}",
         duplicated.join("\n")

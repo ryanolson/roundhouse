@@ -4664,7 +4664,11 @@ async fn the_captured_mcp_tool_loop_stores_one_flat_call_and_rejoins_its_session
     let exchanges = roundhouse_core::validate::exchanges(&after);
     assert_eq!(exchanges.len(), 1, "{exchanges:#?}");
     assert!(
-        roundhouse_core::validate::task_exchanges(&exchanges).is_empty(),
+        roundhouse_core::validate::task_exchanges_on(
+            &exchanges,
+            roundhouse_core::validate::ControlCallDialect::ClaudeMessages,
+        )
+        .is_empty(),
         "G04: our own control traffic is not the agent's work"
     );
 }

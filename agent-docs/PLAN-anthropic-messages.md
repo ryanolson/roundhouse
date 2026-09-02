@@ -954,3 +954,48 @@ not tested); `/v1/models`; the interactive-approval limit.
   argv tests and the plan snapshots. Chained MCP through Relay stays stated,
   not tested. Every rig in the gated suite now mounts the MCP router beside
   the Messages router.
+
+### What the review round changed (2026-09-02, M12)
+
+The M12 thermo-nuclear review (fifteen findings, thirteen valid and two
+partially valid; rulings in the commit message) moved four things the
+rulings above state differently, recorded here so R-M1 and R-M2 read
+correctly for the current tree:
+
+- **The control-call recogniser is parameterised by surface, and the fold
+  learns the surface from the session it folds.** R-M1's Responses-side
+  recognizer was an exact match on the control tool names *regardless of
+  surface*, so a Messages client's own tool literally named `status` was
+  folded out of the task view with roundhouse's (F8). `ControlCallDialect
+  ::{CodexResponses, ClaudeMessages}` now gates the recogniser
+  (`is_control_call_on`, `task_exchanges_on`): the Messages dialect accepts
+  only the flat spelling and the Responses dialect only the bare names, and
+  the session key (`anthropic_messages/…` versus the Responses namespacing)
+  tells the engine which to hand the validate fold. The third-party-`status`
+  cost R-M1 pinned is therefore narrowed to the Responses surface, where the
+  namespace is genuinely not in the stored record.
+- **The `mcp_namespace` knob is retired, not stamped.** It was validated and
+  documented and read by no runtime path — every spelling is
+  `mcp__roundhouse` by construction, shared by both launchers, the signage
+  and the fold (F2). A control-plane config naming it is refused at load,
+  `ClientDialect` is a fieldless enum, and `ControlPlane::client_dialect()`
+  is gone; R-M1's "stamped where the Messages handler already stamps one"
+  and R-M0's note about that function's missing caller are both moot.
+- **The call table is per principal and keyed by principal.** A colliding
+  upstream call id across two sessions of one principal (a local backend
+  numbering calls per response) answered the later writer confidently
+  (F14); a second binding of one id to a different session now marks it
+  ambiguous, which resolves exactly as an unknown id does — the caller's own
+  `latest`. The remembered-calls cap was one node-wide queue a co-tenant
+  could exhaust (F15); it is per principal, which raises the node's bound to
+  the cap times the principals served and never reaps a quiet principal —
+  stated, and left with M8's durable-mapping question. The resolution order
+  (named > tool-use id > latest) lives in one shared function the real
+  reads and the test fake both call (F4).
+- **A key variable naming a generator-written variable is refused** (F9):
+  `${ANTHROPIC_API_KEY}` under a roundhouse key expanded to the sentinel,
+  every control call was rejected, and inference kept working, so nothing
+  said why. `PlanError::KeyEnvIsGenerated` names it at resolve. The
+  generated flags are structured pairs rather than literals (F5), so the
+  launcher's collision refusal no longer guesses which argv entries are
+  flags.

@@ -3,146 +3,43 @@
 
 //! How this deployment's clients spell a tool call.
 //!
-//! A deployment stores one canonical conversation and serves it to whatever
-//! agent is in front of it. Most of that conversation is dialect-free — a
-//! question is a question — but a *tool call* is not: the same call is spelled
-//! one way by an agent that names MCP tools with a separate `namespace` field
-//! and another way by an agent that flattens the namespace into the tool's own
-//! name. Each surface stores what its own client spells — see the two
-//! addenda below, which replace the paragraph that used to stand here claiming
-//! one neutral stored form rendered outward.
+//! Most of a conversation is dialect-free — a question is a question — but a
+//! *tool call* is not: an agent that names MCP tools with a separate
+//! `namespace` field and one that folds the namespace into the tool's own name
+//! spell the same call two ways. The contract is one paragraph:
 //!
-//! **Why that direction and not the other.** Storing the namespace would make
-//! two spellings of one call two different stored items, and there is no seam
-//! that could ever reconcile them: the prefix check would disagree with itself
-//! the first time a client changed dialect, and every steered session would
-//! silently fork onto a cold generation. A neutral stored name is the one form
-//! both spellings can be mapped onto, which is what buys a second agent surface
-//! later without forking the sessions the first one wrote.
+//! - **Each wire module stores the name its own client sent, verbatim.**
+//!   Neither reads this type at run time; [`ClientDialect::stored_call_name`]
+//!   is the *statement* of what each one stores, and a test per surface asserts
+//!   the canonical form equals it.
+//! - **[`ClientDialect::CodexResponses`]** — the namespace travels in its own
+//!   wire field, canonicalization drops it, and the log holds `status`.
+//!   **[`ClientDialect::ClaudeMessages`]** — Claude Code flattens the
+//!   registration into every tool name it declares, calls and permits, so the
+//!   log holds `mcp__roundhouse__status`.
+//! - **`roundhouse_core::validate::is_control_call_on` must accept each
+//!   surface's spelling and only that one.** It is the sole consumer of a
+//!   stored tool name, and it takes the surface as a parameter for the reason
+//!   the two bullets above give: a bare name is ours on one wire and the
+//!   client's own on the other.
+//! - **Nothing renders a tool call outbound.** The steer is assistant text, so
+//!   there is no projection this type feeds and no replay hazard from a name
+//!   applied on the way out.
+//! - **The namespace is `mcp__roundhouse` by construction**, shared by both
+//!   launchers' registrations, the signage and the fold. There is no
+//!   per-deployment rename; the control plane refuses a config that asks for
+//!   one.
 //!
-//! **What the wire layer does and does not already do for that** (F10, review;
-//! pinned by `responses_api::wire`'s
-//! `a_flat_spelling_is_a_different_canonical_call_until_the_wire_learns_to_split_it`).
-//! `canonical_item` ignores a *separate* `namespace` field and the item `id` on
-//! the way in, which is exactly what makes [`ClientDialect::CodexResponses`]'s
-//! own resend round-trip to the bare stored name — the property the whole
-//! steering choreography rests on. It does **not** split a namespace folded
-//! into `name` itself, and nothing here should be read as claiming it does: a
-//! flat `mcp__roundhouse__fetch_steer` with no `namespace` key canonicalizes to
-//! that whole string and would fork the session on the next turn. So the day a
-//! flat variant lands, its arm owes canonicalization the *reverse* mapping —
-//! splitting the flat name back apart on the way in — as well as the rendering
-//! on the way out. Keeping the namespace out of the log makes that
-//! reconciliation possible; it does not make it already true, and an earlier
-//! draft of this paragraph claimed it did.
-//!
-//! *(Superseded in part by the R-M1 addendum below: the flat variant landed and
-//! owes canonicalization no reverse mapping. Splitting would move the `turn_id`
-//! of every stored tool-using session, and the two spellings never have to be
-//! reconciled because a session is written by one client.)*
-//!
-//! **A replay renders today's namespace.** The dialect is read when a frame is
-//! built, not when the item was committed, so replaying an old response after
-//! an operator renamed the namespace renders the *new* name. That is the same
-//! class of edge as a rate-card change re-pricing a snapshot, and it is
-//! deliberately not solved by stamping the namespace into the item — see the
-//! paragraph above for what that would cost. It is harmless in the direction
-//! that matters: a client that dispatches the renamed call reaches the same
-//! server, and a client holding the old name is holding a call it already ran.
-//!
-//! # Addendum (2026-09-02): R-M0 — the first paragraph is half right
-//!
-//! Everything above was written before a wire could be read for it. M12's R-M0
-//! read one, from codex's own types at the Cargo pin `6344a65` and from the M9
-//! suite against a real binary, and the answer splits three ways.
-//!
-//! **Confirmed: the log stores a bare name, and the namespace is a separate
-//! wire field.** Codex advertises an MCP server to the model as a single
-//! `namespace` object and lists each tool inside it under its *bare* name
-//! (`core/src/tools/handlers/mcp.rs:388-393` building
-//! `ToolSpec::Namespace { name: callable_namespace, .. }`;
-//! `tools/src/responses_api.rs:117-123` renaming each tool to
-//! `tool_name.name`), where `callable_namespace` is `mcp__<server>`
-//! (`codex-mcp/src/tools.rs:139-146`, `:228-234`) — this constant. So the call
-//! comes back as `{"name":"status","namespace":"mcp__roundhouse"}`
-//! (`protocol/src/models.rs:910-928`), dispatch is an exact
-//! `ToolName { name, namespace }` lookup (`core/src/tools/router.rs:154-170`),
-//! and a flat spelling would resolve against nothing
-//! (`core/src/tools/registry.rs:828`) — which is what
-//! [`ClientDialect::CodexResponses`]'s own doc already says, now with the line
-//! numbers behind it. `codex_e2e.rs`'s
-//! `the_delimiter_a_skill_spells_is_the_one_the_real_binary_namespaces_with`
-//! read the same shape off a live binary, and
-//! `responses_api::wire`'s `r_m0_a_codex_mcp_call_arrives_bare_with_a_separate_namespace`
-//! now pins it end to end, built from `codex_protocol`'s own `ResponseItem`
-//! rather than from a fixture this repo typed.
-//!
-//! **Wrong: "the spelling is applied on the way out, from here."** Nothing
-//! applies it. `ControlPlane::client_dialect` has no caller outside its own
-//! unit tests, because M10.0 (T4) deleted the outbound `function_call`
-//! projection along with the synthetic steer it existed for. This enum is a
-//! *description* of what a client sends, not a renderer of what we send, and
-//! the paragraph on replay below describes a rendering that does not happen —
-//! it is about a hazard that would return the day something renders again, not
-//! one that is live.
-//!
-//! **The cost of the confirmed half, which the first paragraph did not
-//! reckon.** Storing the bare name is right for prefix admission and wrong for
-//! everything that has to *recognise* one of our own calls: the log holds
-//! `status`, and `roundhouse_core::validate::is_control_call` matches the flat
-//! `mcp__roundhouse__` prefix, so it has never fired on this surface. Control
-//! traffic an agent makes because our own generated skill told it to is folded
-//! into `task_exchanges` as work on the task — the exact failure G04 was
-//! written to close. `roundhouse-core`'s
-//! `a_control_call_as_the_responses_wire_stores_it_is_recognised` is that
-//! finding — it landed red and `#[ignore]`d, with its live control beside it,
-//! and R-M1 below is where the ignore came off. Nothing in *this file* changed
-//! behaviour.
-//!
-//! # Addendum (2026-09-02): R-M1 — one enum, two surfaces, and what it is for
-//!
-//! R-M0 left this type describing a rendering nothing performs. M12 gives it
-//! the job it can honestly hold: **it says how the log of a session written by
-//! that client spells one of roundhouse's own control tools**, which is the one
-//! question anything downstream actually asks of a stored tool name.
-//!
-//! - [`ClientDialect::CodexResponses`] — the namespace travels in its own wire
-//!   field, canonicalization drops it, and the log holds `status`.
-//! - [`ClientDialect::ClaudeMessages`] — Claude Code flattens the registration
-//!   into every tool name it declares and every `tool_use` it emits
-//!   (`mcp__roundhouse__status`, captured at 2.1.257 in
-//!   `tests/fixtures/claude-2.1.257-mcp-turn-2-toolresult.json`), so the log
-//!   holds that whole string.
-//!
-//! [`ClientDialect::stored_call_name`] is that statement, and each surface's
-//! wire module is pinned to it by a test rather than by a reader's eye.
-//!
-//! **The dialect is a property of the surface, not of the deployment.** The
-//! Messages handler names [`ClientDialect::claude_messages`] as a constant of
-//! itself, exactly as it names `WireProtocol::AnthropicMessages` for the
-//! toolbox it forwards. It must never be read from the deployment-wide
-//! `mcp_namespace` the control plane compiles: one deployment serves both
-//! clients at once, and a single configured answer would be wrong for one of
-//! them on every turn.
-//!
-//! **Why the Messages surface stores flat rather than splitting.** Nothing
-//! renders a tool call outbound (R-M0), so the only consumer of a stored tool
-//! name is `roundhouse_core::validate::is_control_call` — which wants the flat
-//! prefix. Splitting on the way in would move the `turn_id` of every stored
-//! tool-using session, and the cross-dialect resumption the original paragraph
-//! guarded against is not a scenario this product has: a session is written by
-//! one client from its first turn to its last.
-//!
-//! **What R-M1 could not do as ruled, recorded because the next reader will
-//! ask.** The ruling asked for a Responses-side recognizer built from "a bare
-//! name plus the deployment's configured namespace". There is no such
-//! recognizer: the namespace is not in the stored record, so a configured
-//! value has nothing to be compared against. The fix that landed matches a bare
-//! name against `roundhouse_core::validate::CONTROL_TOOL_NAMES` instead, and
-//! that function's doc states what the substitution costs.
+//! The history behind that — R-M0's reading of codex at pin `6344a65`, why the
+//! original "neutral stored name rendered outward" paragraph was half right,
+//! and what the bare-name recognizer costs — is in
+//! `agent-docs/PLAN-anthropic-messages.md`, addendum "M12 — the MCP control
+//! surface for Claude Code" and its "What the implementation settled" section.
+//! It is recorded there rather than here because that is where dated addenda
+//! belong; this module states the code as it is.
 
-/// The namespace an unconfigured deployment renders, and the name a client's
-/// MCP registration is expected to use.
+/// The namespace this deployment serves under, and the name a client's MCP
+/// registration has to use.
 ///
 /// `mcp__<server-name>` is Codex's own construction (`core/src/tools/…`
 /// builds the namespace object from the server's configured name), so this
@@ -153,8 +50,7 @@
 /// validate loop's signal fold has to *recognise* a call under this namespace
 /// as roundhouse's own control traffic, it lives a crate below this one, and
 /// two literals that must agree in two crates is a rename that goes silently
-/// half-done. The core definition carries the note about what an operator
-/// renaming [`ClientDialect::namespace`] gets instead.
+/// half-done.
 pub const DEFAULT_MCP_NAMESPACE: &str = roundhouse_core::validate::CONTROL_TOOL_NAMESPACE;
 
 /// What every client of this deployment puts in front of an MCP server's
@@ -207,7 +103,7 @@ pub enum ClientDialect {
     /// tree splits a flat `mcp__server__tool` back apart, so a call whose
     /// namespace is folded into its name resolves against nothing and comes
     /// back to the model as `unsupported call: …`.
-    CodexResponses { namespace: String },
+    CodexResponses,
     /// Claude Code over the Anthropic Messages API: the namespace is folded
     /// into the tool's own name and there is no second field.
     ///
@@ -217,46 +113,36 @@ pub enum ClientDialect {
     /// (`--allowedTools`) is `mcp__<server>__<tool>` — one string, everywhere.
     /// A `namespace` field on this wire would be a field the API has no place
     /// for.
-    ClaudeMessages { namespace: String },
+    ClaudeMessages,
 }
 
 impl ClientDialect {
     /// What a client of the Anthropic Messages surface writes in.
     ///
-    /// A constructor rather than a literal at the call site so the namespace
-    /// has one origin: [`DEFAULT_MCP_NAMESPACE`], which is also what
-    /// `topham`'s generated `--mcp-config` names the server and what the
-    /// validate fold recognises. Three spellings of one name is how a
-    /// registration stops matching the tool it registers.
+    /// A named constructor rather than the bare variant so the call sites read
+    /// as "the surface this is", and so that the day a Messages arm needs
+    /// carrying something the compiler names one place to add it.
     pub fn claude_messages() -> Self {
-        Self::ClaudeMessages {
-            namespace: DEFAULT_MCP_NAMESPACE.to_string(),
-        }
-    }
-
-    /// The namespace this dialect's tools live under, however it spells them.
-    pub fn namespace(&self) -> &str {
-        match self {
-            Self::CodexResponses { namespace } | Self::ClaudeMessages { namespace } => namespace,
-        }
+        Self::ClaudeMessages
     }
 
     /// How `tool` appears in the log of a session written by this client.
     ///
     /// The one behaviour this type has, and the reason it is not documentation.
-    /// `roundhouse_core::validate::is_control_call` has to recognise whatever
-    /// comes back, and *both* of these are things it must say yes to — which is
-    /// exactly what the per-arm tests below assert, rather than trusting two
-    /// modules to keep agreeing by hand.
+    /// `roundhouse_core::validate::is_control_call_on` has to recognise
+    /// whatever comes back *under this same surface* — which is exactly what
+    /// the per-arm tests below assert, rather than trusting two modules to keep
+    /// agreeing by hand.
     pub fn stored_call_name(&self, tool: &str) -> String {
         match self {
             // The namespace rides its own wire field and canonicalization drops
             // it, so what reaches the log is the bare name and nothing else.
-            Self::CodexResponses { .. } => tool.to_string(),
-            Self::ClaudeMessages { namespace } => format!(
-                "{namespace}{delimiter}{tool}",
-                delimiter = roundhouse_core::validate::CONTROL_TOOL_DELIMITER
-            ),
+            Self::CodexResponses => tool.to_string(),
+            // The one renderer, shared with `codex_launch::skills` and the
+            // Claude signage (M12 review, F7): three `format!` calls composing
+            // the same two constants could drift in silence, and the drift
+            // shows up as a skill naming a tool the client cannot resolve.
+            Self::ClaudeMessages => roundhouse_core::validate::flat_control_call_name(tool),
         }
     }
 }
@@ -269,9 +155,7 @@ impl Default for ClientDialect {
     /// `Option` here would put a `None` case on the projection whose only
     /// possible behavior would be to emit a call that cannot resolve.
     fn default() -> Self {
-        Self::CodexResponses {
-            namespace: DEFAULT_MCP_NAMESPACE.to_string(),
-        }
+        Self::CodexResponses
     }
 }
 
@@ -279,10 +163,24 @@ impl Default for ClientDialect {
 mod tests {
     use super::*;
 
-    use roundhouse_core::validate::{CONTROL_TOOL_NAMES, is_control_call};
+    use roundhouse_core::validate::{CONTROL_TOOL_NAMES, ControlCallDialect, is_control_call_on};
+
+    /// The surface each arm describes, as the fold's own recognizer names it.
+    ///
+    /// One function rather than a `match` at each assertion, because the pairing
+    /// *is* the contract: this type says what a surface stores and the fold's
+    /// dialect says what that surface's spelling is, and the two enums are only
+    /// useful while they mean the same thing.
+    fn recognizer(dialect: &ClientDialect) -> ControlCallDialect {
+        match dialect {
+            ClientDialect::CodexResponses => ControlCallDialect::CodexResponses,
+            ClientDialect::ClaudeMessages => ControlCallDialect::ClaudeMessages,
+        }
+    }
 
     /// The whole contract this type carries: whatever a client's dialect leaves
-    /// in the log, the fold that has to spot roundhouse's own traffic spots it.
+    /// in the log, the fold that has to spot roundhouse's own traffic spots it
+    /// *on that surface*.
     ///
     /// Walked over every tool and both arms rather than sampled, because the
     /// two arms fail in opposite directions and each failure is silent. A flat
@@ -295,62 +193,64 @@ mod tests {
             for tool in CONTROL_TOOL_NAMES {
                 let stored = dialect.stored_call_name(tool);
                 assert!(
-                    is_control_call(&stored),
+                    is_control_call_on(&stored, recognizer(&dialect)),
                     "`{stored}` is what {dialect:?} leaves in the log for `{tool}`"
                 );
             }
         }
     }
 
-    /// The two arms really are two spellings, not one with a different label.
+    /// The two arms really are two spellings, and each is the *other* surface's
+    /// blind spot (M12 review, F8).
     ///
     /// Worth asserting on its own: a `stored_call_name` that had quietly become
     /// the same string on both arms would pass the test above and would mean
-    /// one of the two surfaces had stopped matching its own client.
+    /// one of the two surfaces had stopped matching its own client. The
+    /// negatives are the half F8 added — a recognizer that accepted both
+    /// spellings everywhere passes the positives and still folds a Messages
+    /// client's own `status` tool out of the task view.
     #[test]
     fn the_two_surfaces_spell_one_call_two_ways() {
-        assert_eq!(
-            ClientDialect::default().stored_call_name("status"),
-            "status"
-        );
-        assert_eq!(
-            ClientDialect::claude_messages().stored_call_name("status"),
-            "mcp__roundhouse__status"
-        );
-        assert_eq!(
-            ClientDialect::claude_messages().namespace(),
-            ClientDialect::default().namespace(),
-            "one deployment, one server name: the surfaces differ in how they \
-             spell it, never in what it is"
-        );
+        let bare = ClientDialect::default().stored_call_name("status");
+        let flat = ClientDialect::claude_messages().stored_call_name("status");
+        assert_eq!(bare, "status");
+        assert_eq!(flat, "mcp__roundhouse__status");
+
+        assert!(!is_control_call_on(
+            &bare,
+            ControlCallDialect::ClaudeMessages
+        ));
+        assert!(!is_control_call_on(
+            &flat,
+            ControlCallDialect::CodexResponses
+        ));
     }
 
-    /// An operator's renamed namespace reaches the flat spelling, and reaches
-    /// the bare one by definition — there is nothing to rename in `status`.
+    /// F3 (M12 thermo-nuclear review): the module doc states the current
+    /// contract, not the addenda that got it there.
     ///
-    /// The asymmetry is the point, and it is why `is_control_call`'s bare arm
-    /// cannot consult a configured namespace: the record it reads never carried
-    /// one.
+    /// It landed red at 139 `//!` lines — an original paragraph marked half
+    /// right, a replay paragraph kept while saying it described a rendering
+    /// that does not happen, a "Superseded in part" aside, and two dated
+    /// addenda — and came live when the history moved to
+    /// `agent-docs/PLAN-anthropic-messages.md`, which is where CLAUDE.md
+    /// assigns dated addenda and which already carried this same R-M0
+    /// archaeology with the codex `6344a65` citations.
+    ///
+    /// A budget rather than an exact count, and set well above the contract's
+    /// own length: the failure being guarded against is the doc growing back
+    /// into a changelog, not a paragraph gaining a sentence.
     #[test]
-    fn a_renamed_namespace_moves_the_flat_spelling_and_cannot_move_the_bare_one() {
-        let renamed = ClientDialect::ClaudeMessages {
-            namespace: "mcp__yard".to_string(),
-        };
-        assert_eq!(renamed.stored_call_name("status"), "mcp__yard__status");
+    fn module_doc_states_the_current_contract_not_its_history() {
+        let doc_lines = include_str!("dialect.rs")
+            .lines()
+            .filter(|line| line.starts_with("//!"))
+            .count();
         assert!(
-            !is_control_call(&renamed.stored_call_name("status")),
-            "a renamed deployment loses the flat exemption, exactly as \
-             `CONTROL_TOOL_NAMESPACE` says it does"
-        );
-
-        let renamed_responses = ClientDialect::CodexResponses {
-            namespace: "mcp__yard".to_string(),
-        };
-        assert_eq!(renamed_responses.stored_call_name("status"), "status");
-        assert!(
-            is_control_call(&renamed_responses.stored_call_name("status")),
-            "the bare spelling never carried the namespace, so renaming it \
-             costs the bare arm nothing"
+            doc_lines <= 60,
+            "module doc is {doc_lines} `//!` lines; CLAUDE.md assigns dated \
+             addenda to agent-docs and says module docs describe the code as \
+             it is, not the addenda that got it there"
         );
     }
 }

@@ -95,7 +95,7 @@ pub mod fair_use;
 pub mod validate;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use axum::http::HeaderMap;
 use axum::http::header::AUTHORIZATION;
@@ -108,8 +108,6 @@ use roundhouse_core::control::{
 use roundhouse_core::ids::SessionId;
 use roundhouse_core::routing::TierRecipe;
 use roundhouse_core::validate::ValidationTerms;
-
-use crate::dialect::ClientDialect;
 
 pub use auth::AuthError;
 pub use budget::{AllocationConfig, BudgetConfig, OnExhaustionConfig};
@@ -203,14 +201,6 @@ pub const TURN_KEY_HEADER: &str = "x-roundhouse-key";
 /// [`has_valid_key_shape`] refuses it and it can never resolve to a membership
 /// however it is presented.
 pub const ROUNDHOUSE_API_KEY_SENTINEL: &str = "rh_sentinel_not_a_credential";
-
-/// The dialect [`ControlPlane::Open`] answers with.
-///
-/// A shared value rather than one built per call, because
-/// [`ControlPlane::client_dialect`] is asked once per request and a
-/// [`ClientDialect`] owns a `String`: an unconfigured deployment should not
-/// allocate a namespace to say it is using the default one.
-static OPEN_DIALECT: LazyLock<ClientDialect> = LazyLock::new(ClientDialect::default);
 
 /// The stem every minted secret's prefix shares: roundhouse's own key
 /// namespace.
@@ -578,16 +568,6 @@ pub enum ControlPlane {
         /// compiler refuses a duplicate hash across `keys` and `admin_keys`,
         /// and a tombstoned key is left out of the config it compiles from.
         refusals: HashMap<String, KeyRefusal>,
-        /// How this deployment's synthetic tool calls are spelled on the
-        /// wire, resolved once at load time from the file's optional
-        /// `"mcp_namespace"`.
-        ///
-        /// Beside the key tables rather than in an `EngineConfig` because it
-        /// is a *client-facing* name: the engine never renders a wire frame,
-        /// and this is the same question `qualify` answers for session ids —
-        /// what does this deployment call the things its clients say back to
-        /// it. See [`Self::client_dialect`].
-        dialect: ClientDialect,
         /// What this deployment hashes arm assignment against, resolved once
         /// at load time. Read by the composition root on its way into
         /// [`EngineConfig`](crate::EngineConfig) and by nothing else.
@@ -632,7 +612,11 @@ impl ControlPlane {
             users: _,
             keys: _,
             admin_keys,
-            mcp_namespace,
+            // Named and ignored because `validate` has already refused any
+            // deployment that set it (M12 review, F2): the namespace is
+            // `mcp__roundhouse` by construction, and this plane compiled no
+            // dialect from it because nothing downstream ever read one.
+            mcp_namespace: _,
             arm_salt,
             // Named and ignored: `validate` has already resolved these into
             // every `Admission` in `turn_keys`, secrets and all. Carrying the
@@ -652,14 +636,6 @@ impl ControlPlane {
             admin_keys: admin_keys.into_iter().collect(),
             refusals,
             arm_salt: arm_salt.unwrap_or_default(),
-            // An absent name is the default one rather than an absence
-            // carried forward: see [`ClientDialect::default`] on why there is
-            // no honest `None` for a surface every client of which is a
-            // Responses client.
-            dialect: match mcp_namespace {
-                Some(namespace) => ClientDialect::CodexResponses { namespace },
-                None => ClientDialect::default(),
-            },
         }
     }
 
@@ -828,18 +804,6 @@ impl ControlPlane {
         }
     }
 
-    /// How this deployment's synthetic tool calls are spelled on the wire.
-    ///
-    /// The one reader of the deployment's `"mcp_namespace"`, and the one place
-    /// [`ControlPlane::Open`]'s answer is decided — a default rather than an
-    /// absence, exactly as [`Admission::open`] is the *value* an unconfigured
-    /// deployment admits every request as rather than a flag meaning "no
-    /// admission". An open deployment still serves Codex clients, so it still
-    /// has to name the namespace they would resolve a call against.
-    ///
-    /// Deliberately not `Option`-returning: a `None` here would put a case on
-    /// the wire projection whose only possible behavior is to emit a call that
-    /// resolves against nothing.
     /// What arm assignment is hashed against.
     ///
     /// Empty in [`Self::Open`], which is the accurate answer rather than a
@@ -849,16 +813,6 @@ impl ControlPlane {
         match self {
             ControlPlane::Open => "",
             ControlPlane::Configured { arm_salt, .. } => arm_salt,
-        }
-    }
-
-    pub fn client_dialect(&self) -> &ClientDialect {
-        match self {
-            // Borrowed from a shared value rather than built per call: the
-            // projection asks once per request, and an unconfigured deployment
-            // should not allocate a namespace string to answer.
-            ControlPlane::Open => &OPEN_DIALECT,
-            ControlPlane::Configured { dialect, .. } => dialect,
         }
     }
 
@@ -1084,12 +1038,9 @@ impl ControlPlane {
                 // the comment this replaces was written to catch.
                 refusals,
                 // Named and ignored rather than swept under a `..`: this arm
-                // decides who a key is; the dialect decides how a call is
-                // spelled and the salt decides which arm a session lands in,
-                // and neither bears on identity. A field added here that
-                // authentication does have to read should make this line stop
-                // compiling.
-                dialect: _,
+                // decides who a key is, and which arm a session lands in does
+                // not bear on identity. A field added here that authentication
+                // does have to read should make this line stop compiling.
                 arm_salt: _,
             } => {
                 let secret = presented.ok_or(AuthError::MissingKey)?;
@@ -2025,51 +1976,43 @@ mod tests {
         );
     }
 
-    /// Every deployment answers the dialect question, and the two answers come
-    /// from one place.
+    /// M12 review F2: a deployment that asks for its own MCP namespace is
+    /// refused, and the refusal names the field.
     ///
-    /// The Open arm is the half worth a test. An unconfigured deployment still
-    /// serves Codex clients, so "no control plane" must not mean "no
-    /// namespace": a projection handed an empty one would emit calls that
-    /// resolve against nothing, and the turn would look perfectly healthy from
-    /// both ends while the steer did nothing.
+    /// The replacement for `every_deployment_names_a_namespace_and_a_configured_one_may_choose_it`,
+    /// which asserted that `client_dialect()` resolved the knob correctly — it
+    /// did, and nothing downstream ever asked it. Both launchers' registrations,
+    /// the Claude signage and the validate fold read the constant, so the only
+    /// honest thing a plane can do with a configured namespace is refuse to
+    /// compile one.
     #[test]
-    fn every_deployment_names_a_namespace_and_a_configured_one_may_choose_it() {
-        assert_eq!(
-            *ControlPlane::Open.client_dialect(),
-            ClientDialect::CodexResponses {
-                namespace: crate::dialect::DEFAULT_MCP_NAMESPACE.to_string(),
-            },
-            "an open deployment renders the default rather than nothing"
+    fn a_deployment_cannot_name_its_own_mcp_namespace() {
+        let error = ControlPlaneConfig::from_json(
+            r#"{
+              "projects": [{ "id": "acme" }],
+              "users": [{ "id": "ada" }],
+              "mcp_namespace": "mcp__acme"
+            }"#,
+            "test",
+        )
+        .expect_err("the retired knob is refused at load");
+        assert!(
+            error.to_string().contains("mcp_namespace"),
+            "the refusal has to name the field an operator would go looking \
+             for: {error}"
         );
 
-        let named = ControlPlane::configured(
+        // The control: the same file without the knob compiles, so the refusal
+        // is about that one field and not about the fixture.
+        ControlPlane::configured(
             ControlPlaneConfig::from_json(
                 r#"{
                   "projects": [{ "id": "acme" }],
-                  "users": [{ "id": "ada" }],
-                  "mcp_namespace": "mcp__acme"
+                  "users": [{ "id": "ada" }]
                 }"#,
                 "test",
             )
-            .expect("the fixture validates"),
-        );
-        assert_eq!(
-            *named.client_dialect(),
-            ClientDialect::CodexResponses {
-                namespace: "mcp__acme".to_string(),
-            },
-            "and a configured one renders the name its operator wrote"
-        );
-
-        // The control: a configured deployment that named none falls back to
-        // the same default the open one uses, rather than to an empty string.
-        let unnamed = ControlPlane::configured(
-            ControlPlaneConfig::from_json(sample_config(), "test").expect("the fixture validates"),
-        );
-        assert_eq!(
-            unnamed.client_dialect(),
-            ControlPlane::Open.client_dialect()
+            .expect("a deployment that names no namespace still loads"),
         );
     }
 }

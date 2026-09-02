@@ -1744,3 +1744,115 @@ async fn another_tenants_tool_use_id_is_worth_no_more_than_an_unknown_one() {
     );
     assert_ne!(with_stolen_id["conversation"], json!(adas.as_str()));
 }
+
+/// A [`ControlReads`] written the way a third one would be: its own lookups
+/// over its own tables, independent of [`FakeDeployment`] and of
+/// `roundhouse-server`'s `ControlPlaneReads`, with the R-M2 order taken from
+/// [`session_without_a_name`] rather than typed out again. Every other method
+/// forwards to `inner`.
+struct IndependentReads {
+    inner: FakeDeployment,
+}
+
+#[async_trait::async_trait]
+impl roundhouse_mcp::reads::ControlReads for IndependentReads {
+    /// The lookups are this implementor's; the order is not. Supplying them in
+    /// the other order is not a thing this arm can express — the two arguments
+    /// are a call-table read and a most-recent read, not a first choice and a
+    /// second — so the inversion F4 demonstrated has no spelling here.
+    async fn resolve_session(
+        &self,
+        principal: &Principal,
+        conversation: Option<&str>,
+        tool_use_id: Option<&str>,
+    ) -> Result<SessionId, roundhouse_mcp::SurfaceError> {
+        match conversation {
+            None => roundhouse_mcp::session_without_a_name(
+                tool_use_id,
+                |id| {
+                    self.inner
+                        .tool_use_ids
+                        .get(id)
+                        .filter(|(owner, _)| owner == principal)
+                        .map(|(_, session)| session.clone())
+                },
+                || self.inner.sessions.get(principal).cloned(),
+            ),
+            Some(named) => {
+                self.inner
+                    .resolve_session(principal, Some(named), None)
+                    .await
+            }
+        }
+    }
+
+    async fn ceiling_policy(
+        &self,
+        principal: &Principal,
+    ) -> Result<TurnPolicy, roundhouse_mcp::SurfaceError> {
+        self.inner.ceiling_policy(principal).await
+    }
+
+    async fn admissible_targets(
+        &self,
+        principal: &Principal,
+        policy: &TurnPolicy,
+    ) -> Result<Vec<roundhouse_core::routing::Target>, roundhouse_mcp::SurfaceError> {
+        self.inner.admissible_targets(principal, policy).await
+    }
+
+    async fn balance(
+        &self,
+        principal: &Principal,
+    ) -> Result<Option<roundhouse_core::control::Balance>, roundhouse_mcp::SurfaceError> {
+        self.inner.balance(principal).await
+    }
+
+    async fn session_facts(
+        &self,
+        session: &SessionId,
+    ) -> Result<SessionFacts, roundhouse_mcp::SurfaceError> {
+        self.inner.session_facts(session).await
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.inner.now_ms()
+    }
+}
+
+/// F4 (M12 review): the R-M2 order is a shared function every implementor
+/// calls, not a doc contract each one re-types.
+///
+/// This is the same assertion as
+/// `a_calls_tool_use_id_decides_which_conversation_the_answer_is_about`, run
+/// against [`IndependentReads`] instead of `FakeDeployment` — a *second*
+/// implementor, standing in for `roundhouse-server`'s `ControlPlaneReads`,
+/// which this crate's tests cannot reach. Before the fix its predecessor
+/// inverted the order by hand, type-checked, satisfied the trait, ran
+/// unmodified through `ControlPlaneSurface`, and failed this assertion; with
+/// the order behind [`session_without_a_name`] an implementor supplies only
+/// its own two lookups and the answer is R-M2's whichever way it was written.
+#[tokio::test]
+async fn an_independent_reads_impl_cannot_invert_the_shared_resolution_order() {
+    let subagent = SessionId::new("acme/ada/sess_subagent");
+    let mut deployment = FakeDeployment::default();
+    deployment
+        .tool_use_ids
+        .insert("toolu_sub".to_string(), (ada(), subagent.clone()));
+    let store = Arc::new(ControlStore::new());
+    let surface = ControlPlaneSurface::new(Arc::new(IndependentReads { inner: deployment }), store);
+
+    // R-M2: a call answering `toolu_sub` must resolve to the subagent's
+    // conversation, not to the principal's most recent one — from an
+    // implementor that shares no resolution code with `FakeDeployment` beyond
+    // the one function that holds the ruling.
+    let answered =
+        served(&call_answering(&surface, &ada(), "status", json!({}), Some("toolu_sub")).await);
+    assert_eq!(
+        answered["conversation"],
+        json!(subagent.as_str()),
+        "the tool-use id must decide the conversation even though a fallback \
+         'most recent session' exists — R-M2's ordering, enforced by the \
+         shared function rather than by this implementor's own care"
+    );
+}

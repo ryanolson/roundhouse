@@ -162,6 +162,28 @@ fn conversation_property() -> Value {
     })
 }
 
+/// The one descriptor named `tool`, or `None` for a name this deployment does
+/// not serve.
+///
+/// **Here rather than in each launcher** (M12 review, F12). `codex_launch`'s
+/// skill generator and `claude_launch`'s signage each carried their own scan of
+/// [`descriptors`] — one list, two private lookups, in a crate that neither
+/// owns. What each of them wants from the answer differs (a skill file quotes
+/// the description; the signage wants only the assurance that the name
+/// resolves), and that is the argument for one accessor and two call sites
+/// rather than one shared renderer: the lookup is the part that is the same.
+///
+/// An `Option`, so the caller decides what a missing tool costs. Both of
+/// today's callers panic, for a reason each states beside its own call — a
+/// generated file or an appended prompt that silently omits a tool is still a
+/// valid one, is still read on every turn, and costs the fleet context
+/// forever.
+pub fn descriptor(tool: &str) -> Option<ToolDescriptor> {
+    descriptors()
+        .into_iter()
+        .find(|candidate| candidate.name == tool)
+}
+
 /// The tool list, exactly as it goes on the wire.
 ///
 /// Stable across calls: this is a `const`-shaped function with no state, no

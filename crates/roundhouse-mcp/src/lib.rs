@@ -206,10 +206,10 @@ mod plane;
 
 pub use overlay::{ModeNarrowing, OverlayScope, PreferMode, SessionOverlay, TimedOverlay};
 pub use plane::ControlPlaneSurface;
-pub use reads::{ControlReads, SessionFacts};
+pub use reads::{ControlReads, SessionFacts, session_without_a_name};
 pub use store::{
     BindingId, ControlStore, IntentRecord, OutcomeRecord, SessionBinding, binding_ids_in_items,
     binding_in_items,
 };
 pub use surface::{Caller, ControlSurface, SurfaceError, ToolOutcome};
-pub use tools::{TOOL_NAMES, ToolCall, ToolDescriptor, descriptors, dispatch};
+pub use tools::{TOOL_NAMES, ToolCall, ToolDescriptor, descriptor, descriptors, dispatch};

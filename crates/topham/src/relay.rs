@@ -247,10 +247,10 @@ pub fn plan(
     // than absent because a chained launch that silently had no control surface
     // would be the same client as a direct one in every respect an operator can
     // see.
-    let agent_argv = crate::launch::generated_argv(resolution);
-    crate::launch::refuse_collisions(&agent_argv, &argv)?;
+    let agent_args = crate::launch::generated_args(resolution);
+    crate::launch::refuse_collisions(&agent_args, &argv)?;
     let mut generated_argv = handoff.run_argv(&config);
-    generated_argv.extend(agent_argv);
+    generated_argv.extend(crate::launch::flatten_argv(&agent_args));
 
     Ok(RelayLaunch {
         handoff,
