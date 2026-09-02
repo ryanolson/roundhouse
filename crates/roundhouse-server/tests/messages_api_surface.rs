@@ -2270,6 +2270,105 @@ async fn a_divergent_resend_forks_rather_than_merging() {
     );
 }
 
+/// **A restart's fork lands on the generation the store remembers, not one
+/// re-derived as empty (R13, M14.0), proved through this dialect's own
+/// surface and not only through `bind_prefix`'s unit tests.**
+///
+/// (M14.0 fix review, F2.) `bind_prefix` is shared with the Responses surface
+/// and its restart-then-fork property is pinned there directly
+/// (`responses_api::tests::restart_then_fork_lands_on_the_stores_existing_generation_with_only_the_delta`),
+/// but every `surface()`/`surface_over()` call in this file builds a fresh
+/// store and a fresh [`Conversations`] together -- so no test here can tell
+/// apart a process that never forked from a process that forked and then
+/// forgot. This one builds two routers over *one* store: the first plays the
+/// pre-restart process (opens the session, then a divergent resend forks it
+/// to `#g1`); the second, over the same store but a brand-new
+/// `Conversations`, plays the restart. Its own first check is against a
+/// re-derived generation zero, which still disagrees with the resend, so it
+/// forks back to `#g1` -- a name the store already holds a log under. That
+/// fork must be checked against the store, not assumed empty: an assumed-
+/// empty fork would append the resent `#g1` history a second time on top of
+/// itself.
+#[tokio::test]
+async fn a_restarted_process_s_fork_is_checked_against_the_store_not_assumed_empty() {
+    let store = Arc::new(MemoryStore::new());
+    let headers = [("x-claude-code-session-id", "sess-restart")];
+
+    // The pre-restart process: opens the session, then a divergent resend
+    // forks it to `#g1` and starts that generation's log -- the same shape
+    // `a_divergent_resend_forks_rather_than_merging` proves in isolation.
+    {
+        let app = messages_router(
+            ControlPlane::open(),
+            engine(Arc::clone(&store)),
+            Arc::clone(&store),
+            Arc::new(Conversations::new()),
+        );
+        stream(&app, &headers, &body("hello")).await;
+        let forked = stream(&app, &headers, &body("actually, goodbye")).await;
+        assert_eq!(forked.text, ANSWER);
+    }
+
+    let before = stored_items(&store, &named("sess-restart#g1")).await;
+    assert_eq!(
+        before.len(),
+        2,
+        "the pre-restart process's fork wrote exactly one turn: {before:#?}"
+    );
+
+    // The restart: same store, but a fresh `Conversations` -- its generation
+    // counter for this key re-derives at zero, exactly as a real process
+    // restart would leave it (see the `Conversations` module doc).
+    let app = messages_router(
+        ControlPlane::open(),
+        engine(Arc::clone(&store)),
+        Arc::clone(&store),
+        Arc::new(Conversations::new()),
+    );
+
+    // What the client actually holds: it never learned the process
+    // restarted, so it resends the `#g1` history it already has, plus one
+    // genuinely new turn.
+    let resend = json!({
+        "model": "claude-opus-5",
+        "max_tokens": 64000,
+        "stream": true,
+        "messages": [
+            { "role": "user", "content": "actually, goodbye" },
+            { "role": "assistant", "content": [{ "type": "text", "text": ANSWER }] },
+            { "role": "user", "content": "one more, after the restart" },
+        ],
+    });
+    let third = stream(&app, &headers, &resend).await;
+    assert_eq!(third.text, ANSWER);
+
+    assert!(
+        no_such_session(&store, &format!("{}#g2", named("sess-restart"))).await,
+        "the re-derived fork must land on the generation the store already \
+         holds, not fork past it hunting for one that reads empty"
+    );
+
+    let after = stored_items(&store, &named("sess-restart#g1")).await;
+    assert_eq!(
+        after
+            .iter()
+            .filter(|item| **item == Item::user_text("actually, goodbye"))
+            .count(),
+        1,
+        "the re-derived fork's resend must be admitted as a prefix against \
+         the log the pre-restart process already wrote, not appended whole \
+         on top of it a second time: {after:#?}"
+    );
+    assert_eq!(
+        after
+            .iter()
+            .filter(|item| **item == Item::user_text("one more, after the restart"))
+            .count(),
+        1,
+        "the one genuinely new turn is still appended: {after:#?}"
+    );
+}
+
 /// **A retried turn replays its answer instead of generating a second one.**
 ///
 /// The idempotency this dialect needs most. Claude Code re-POSTs after a 5xx and

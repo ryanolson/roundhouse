@@ -1347,3 +1347,27 @@ after M13.1:
 
 Not scheduled here: the durable admin directory (R15, M8-owned) and a
 cross-node aggregator for the metrics fold.
+
+### What the implementation settled beyond the rulings (2026-09-02, M14.0)
+
+- **The bound is eight, and the refusal is a 409.** `MAX_PREFIX_FORK_ATTEMPTS`
+  is the number of generations one request may disagree with before
+  `prefix_admission_exhausted` refuses it, naming the cache key and the
+  count; a client that has rewritten its history more times than that
+  inside one request is a loop, not a client. The refusal is a conflict,
+  not an internal error: nothing failed, the caller's claim and every log
+  this deployment holds disagree.
+- **The store's answer is read with its own polarity.** `create_session`
+  returns the store's "newly created" boolean rather than discarding it;
+  the first draft inverted it and the failing test caught it before any
+  fix landed — the reason the test comes first.
+- **Coverage the refute pass added.** The bound is pinned from the
+  admission side, not only from the refusal side (an off-by-one that tried
+  one generation too few passed every test that asserted the refusal); and
+  the Messages surface, which shares `bind_prefix`, has its own
+  restart-then-fork test over two routers on one store, so a regression in
+  the shared function is red on both surfaces.
+- **Not proven end to end on the Responses surface**: no Codex-dialect
+  integration suite exists in this tree, so the Responses-side proof is at
+  `bind_prefix`'s own level; the Messages suite carries the HTTP-level
+  proof.

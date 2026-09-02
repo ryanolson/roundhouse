@@ -50,6 +50,19 @@
 //! omitted both. Refusals and re-derivations, never a wrong session served
 //! quietly.
 //!
+//! **Re-deriving a generation is not minting one, and the difference is R13**
+//! (M14.0). A fresh process's counter starts at zero, so the first disagreeing
+//! claim after a restart forks straight back to `#g1` — a name the *shared
+//! store* may already hold a log under, from before the restart forgot it. The
+//! fork this node computes is checked against whatever that name already
+//! holds, exactly as [`bind_prefix`](crate::responses_api::bind_prefix) checks
+//! any other session: an agreeing log continues from the delta, a disagreeing
+//! one forks again. Only a generation the store has genuinely never seen takes
+//! the claim whole. So a restart costs the one avoidable fork's warm prefix —
+//! the same honest cost this table's fork always names — and never the
+//! duplicated log that treating a re-derived generation as empty would have
+//! produced.
+//!
 //! **That last clause used to be false for a name** (M12.1 review, F9).
 //! [`Conversations::resolve`] answered generation zero for a key this node had
 //! never bound, and a generation-zero id *exists in the shared store* whenever

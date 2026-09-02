@@ -301,6 +301,37 @@ impl ApiError {
         }
     }
 
+    /// A 409: the claimed history disagreed with `attempts` consecutive
+    /// generations of `key`, and [`bind_prefix`](crate::responses_api) gives
+    /// up rather than forking again.
+    ///
+    /// **The fork arm's own bound** (R13, M14.0). Each disagreement mints a
+    /// new generation and checks the claim against it in turn — an agreeing
+    /// generation continues, a disagreeing one forks again — and a caller
+    /// that disagrees with every generation this request tries is not
+    /// resending an edited history any more: it is a loop, or a probe for how
+    /// many generations one key holds. The alternative defaults are both
+    /// worse than a loud refusal: forking without limit turns one request
+    /// into unbounded store writes, and giving up silently by guessing a
+    /// generation is exactly the duplicated-prefix bug this bound exists to
+    /// close (see `Conversations`'s module doc and the D1 addendum, R13).
+    ///
+    /// The key and the count are on the wire (`detail`) and not just in the
+    /// message, for [`Self::detail`]'s reason: a client — or the operator
+    /// reading its logs — needs to know *which* cache key looped without
+    /// parsing English out of `message`.
+    pub(crate) fn prefix_admission_exhausted(key: &str, attempts: u32) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code: "prefix_admission_exhausted",
+            message: format!(
+                "the claimed history disagreed with {attempts} consecutive generation(s) of \
+                 `{key}`; refusing rather than forking further within one request"
+            ),
+            detail: Some(json!({ "cache_key": key, "attempts": attempts })),
+        }
+    }
+
     /// A 501: this build does not have the feature, and no request body would
     /// change that.
     pub(crate) fn not_implemented(code: &'static str, message: impl Into<String>) -> Self {

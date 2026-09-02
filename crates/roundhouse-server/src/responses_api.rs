@@ -566,6 +566,20 @@ fn codex_thread_id(headers: &HeaderMap) -> Option<String> {
 /// namespace stops being one. The plane is the handler's snapshot rather than a
 /// fresh read: a session id minted under one compiled plane and checked under
 /// another is a session created and immediately unreachable.
+/// A client that still disagrees after this many forks in one request is not
+/// resending an edited history any more.
+///
+/// Chosen small and deliberately not zero: the ordinary restart case this
+/// bound exists to admit (R13) needs exactly one extra generation checked —
+/// the one a prior process already forked to — so one is not enough to tell
+/// "the store remembers a fork this process forgot" from "a client that will
+/// never agree" apart. Eight is a client that rewrote its own history eight
+/// times over the course of resending *one* turn's claim; nothing sane does
+/// that, and a deployment whose clients legitimately fork this often within a
+/// single request has a different, larger problem this refusal is not trying
+/// to solve.
+const MAX_PREFIX_FORK_ATTEMPTS: u32 = 8;
+
 pub(crate) async fn bind_prefix<S, T>(
     engine: &Engine<S, T>,
     store: &S,
@@ -588,23 +602,71 @@ where
         return Ok((session_id, delta));
     }
 
-    // The client's history disagrees with what we stored — it edited or
-    // compacted the conversation, so what it is asking for is not a
-    // continuation of this session and appending the difference would produce a
-    // conversation neither side believes in. It gets a fresh internal session,
-    // which is empty and so agrees trivially; no second check is needed.
+    // The client's history disagrees with what we stored at this generation —
+    // it edited or compacted the conversation, so what it is asking for is not
+    // a continuation of the session `conversations.bind` handed back.
     //
-    // The honest cost: the new session starts with no history, so the routing
-    // ledger no longer knows any provider is warm for it and the next turn is
-    // priced cold. That is the conservative direction — a ledger that claimed a
-    // warm prefix for a conversation that just changed shape would be claiming a
-    // cache hit nobody can serve.
-    let session_id = conversations.fork(principal, &key);
-    create_session(engine, &session_id).await?;
-    Ok((session_id, claimed))
+    // **The forked-to session is admitted like any other, never assumed
+    // empty** (R13, M14.0). `Conversations` is node-local process state
+    // (see its module doc): a restart re-derives generation zero, and the
+    // very next disagreeing claim forks straight back to `#g1` — a name the
+    // *shared store* may already hold a log under, from before the restart.
+    // `create_session`'s own return says whether that happened, and the fix
+    // is to read it rather than discard it: an existing generation is
+    // compared with `admit` exactly as generation zero was above, so an
+    // agreeing one continues with the delta and a disagreeing one forks
+    // again. Only a generation the store says did *not* exist is the fresh
+    // case, and only then is `claimed` taken whole — that is the ordinary
+    // first fork, unchanged.
+    //
+    // Bounded, because a client that manages to disagree with every
+    // generation this loop tries is not a client compacting its own history —
+    // it is a loop, or a probe for how many generations one key holds. An
+    // unbounded version of this loop would answer both by growing the store
+    // once per attempt and never refusing; this one refuses loudly instead,
+    // naming the key and the count, once [`MAX_PREFIX_FORK_ATTEMPTS`] is
+    // spent.
+    for _ in 0..MAX_PREFIX_FORK_ATTEMPTS {
+        let session_id = conversations.fork(principal, &key);
+        // `create_session` answers `true` when this generation did not exist
+        // before this call — [`SessionStore::create_session`]'s own polarity,
+        // "returns `false` if it already existed" — so a fresh session is the
+        // `true` arm here, not the negation of it.
+        let created = create_session(engine, &session_id).await?;
+        if created {
+            // Fresh session: nothing recorded to disagree with, so the claim
+            // is admitted whole. The honest cost, paid once per genuine fork
+            // and not per restart: the new session starts with no history, so
+            // the routing ledger no longer knows any provider is warm for it
+            // and the next turn is priced cold. That is the conservative
+            // direction — a ledger that claimed a warm prefix for a
+            // conversation that just changed shape would be claiming a cache
+            // hit nobody can serve.
+            return Ok((session_id, claimed));
+        }
+        if let Some(delta) = admit(&stored_conversation(store, &session_id).await?, &claimed) {
+            return Ok((session_id, delta));
+        }
+    }
+
+    Err(ApiError::prefix_admission_exhausted(
+        &key,
+        MAX_PREFIX_FORK_ATTEMPTS,
+    ))
 }
 
-async fn create_session<S, T>(engine: &Engine<S, T>, session_id: &SessionId) -> Result<(), ApiError>
+/// Create `session_id` if it does not already exist, and say which happened.
+///
+/// The boolean is [`SessionStore::create_session`]'s own answer and not
+/// discarded, because [`bind_prefix`]'s fork arm depends on it: a forked-to
+/// generation the store already held is the restart case (R13) and must be
+/// checked against the claim, where one the store had never heard of is the
+/// ordinary first fork and takes the claim whole. A caller that mapped this
+/// to `()` would have to choose between the two blind.
+async fn create_session<S, T>(
+    engine: &Engine<S, T>,
+    session_id: &SessionId,
+) -> Result<bool, ApiError>
 where
     S: SessionStore,
     T: Tokenizer + Clone + Send + Sync + 'static,
@@ -612,7 +674,6 @@ where
     engine
         .create_session(session_id)
         .await
-        .map(|_| ())
         .map_err(|error| ApiError::internal("engine_error", error.to_string()))
 }
 
@@ -1675,6 +1736,386 @@ mod tests {
             ),
             Some(vec![user("again")]),
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // The fork arm admits (R13, M14.0)
+    // -----------------------------------------------------------------------
+
+    use axum::http::StatusCode;
+    use roundhouse_core::context::ByteTokenizer;
+    use roundhouse_core::routing::{AffinityPolicy, CacheModel, ProviderPricing};
+    use roundhouse_core::store::MemoryStore;
+    use roundhouse_fleet::{EchoFrontierClient, FrontierModelSpec, StaticFrontierCatalog};
+
+    use crate::engine::{EchoLocalExecutor, EngineConfig};
+
+    fn ada() -> Principal {
+        Principal::new("acme", "ada")
+    }
+
+    /// One priced frontier model, so `Engine::create_session`'s policy lookup
+    /// has somewhere to resolve. `bind_prefix` never dispatches a turn, so
+    /// nothing about routing or pricing is exercised below.
+    fn catalog() -> StaticFrontierCatalog {
+        StaticFrontierCatalog::new(vec![FrontierModelSpec {
+            provider: "anthropic".into(),
+            model: "claude".into(),
+            wire_protocol: WireProtocol::AnthropicMessages,
+            cache_model: CacheModel::Deterministic { ttl_ms: 300_000 },
+            pricing: ProviderPricing {
+                input_per_mtok_usd: 3.0,
+                cached_input_per_mtok_usd: 0.3,
+                cache_write_per_mtok_usd: 3.75,
+                output_per_mtok_usd: 15.0,
+            },
+            quality_prior: 0.95,
+            base_ttft_ms: 350.0,
+            ttft_ms_per_uncached_token: 0.002,
+        }])
+    }
+
+    fn engine_over(store: Arc<MemoryStore>) -> Engine<MemoryStore, ByteTokenizer> {
+        Engine::new(
+            store,
+            ByteTokenizer,
+            Arc::new(EchoLocalExecutor::new("local answer")),
+            catalog(),
+            Arc::new(EchoFrontierClient::new("answer")),
+            Arc::new(AffinityPolicy::new()),
+            EngineConfig::default(),
+        )
+    }
+
+    /// The session id `key` names at `generation`, spelled the same way
+    /// [`Conversations`]' own (private) `bound_session` spells it -- these
+    /// tests pre-seed the store directly, ahead of any `Conversations` call,
+    /// so they need the naming convention rather than a way to reach it.
+    fn gen_session(key: &str, generation: u32) -> SessionId {
+        match generation {
+            0 => SessionId::new(key),
+            n => SessionId::new(format!("{key}#g{n}")),
+        }
+    }
+
+    /// Writes `items` straight to `session_id`'s log, bypassing the engine.
+    ///
+    /// This is what "the store already holds a log under this generation"
+    /// means for the tests below: the log was written by an engine that, in
+    /// the restart scenario, belongs to a process that no longer exists. Going
+    /// through `Engine::create_session` and a real turn would only prove the
+    /// property for logs *this* process wrote, which is exactly the case R13
+    /// is not about.
+    async fn seed(store: &MemoryStore, session_id: &SessionId, items: Vec<Item>) {
+        store
+            .create_session(session_id, "test-policy")
+            .await
+            .expect("seed session creation");
+        let lease = store
+            .acquire_lease(session_id, "seed-node", 60_000)
+            .await
+            .expect("seed lease request")
+            .expect("seed lease granted");
+        let kinds = items
+            .into_iter()
+            .map(|item| SessionEventKind::ItemAppended { item })
+            .collect();
+        store
+            .append_events(&lease, kinds)
+            .await
+            .expect("seed append");
+    }
+
+    /// **(a) restart-then-fork.** A `MemoryStore` pre-seeded exactly as it
+    /// would be after a real restart -- generation zero holding the
+    /// pre-restart log, `#g1` holding what the pre-restart process had
+    /// already forked to -- and a *fresh* [`Conversations`], the post-restart
+    /// state that re-derives generation zero from nothing. A claim that
+    /// disagrees with generation zero and equals `#g1` (plus one genuinely new
+    /// turn) must land on `#g1` with only that turn appended: the D1
+    /// inventory's §6(a), verified.
+    #[tokio::test]
+    async fn restart_then_fork_lands_on_the_stores_existing_generation_with_only_the_delta() {
+        let store = Arc::new(MemoryStore::new());
+        let key = "acme/ada/restart";
+        let principal = ada();
+
+        seed(&store, &gen_session(key, 0), vec![user("hello")]).await;
+        let g1_history = vec![user("hello, redone"), assistant("hi again")];
+        seed(&store, &gen_session(key, 1), g1_history.clone()).await;
+
+        let engine = engine_over(Arc::clone(&store));
+        let conversations = Conversations::new();
+
+        let mut claimed = g1_history;
+        claimed.push(user("more"));
+
+        let (session_id, delta) = bind_prefix(
+            &engine,
+            store.as_ref(),
+            &conversations,
+            &ControlPlane::Open,
+            &principal,
+            key,
+            claimed,
+        )
+        .await
+        .expect("the claim agrees with #g1 once it is actually checked");
+
+        assert_eq!(
+            session_id,
+            gen_session(key, 1),
+            "the turn must land on the generation the store already holds, \
+             not re-fork past a log this process forgot"
+        );
+        assert_eq!(
+            delta,
+            vec![user("more")],
+            "and only the genuinely new turn may be appended -- appending \
+             the #g1 history a second time on top of itself is the \
+             duplicated prefix R13 exists to prevent"
+        );
+    }
+
+    /// **(b) the claim disagrees with every generation the store holds.** Two
+    /// generations are occupied and disagree; the turn must fork past both,
+    /// landing on the first generation the store has never heard of and
+    /// taking the claim whole there -- exactly as an ordinary first fork
+    /// does, just one generation further out.
+    #[tokio::test]
+    async fn a_claim_disagreeing_with_every_existing_generation_forks_to_a_fresh_one() {
+        let store = Arc::new(MemoryStore::new());
+        let key = "acme/ada/exhausted-generations";
+        let principal = ada();
+
+        seed(&store, &gen_session(key, 0), vec![user("hello")]).await;
+        seed(&store, &gen_session(key, 1), vec![user("hello, redone")]).await;
+
+        let engine = engine_over(Arc::clone(&store));
+        let conversations = Conversations::new();
+        let claimed = vec![user("a completely different opening")];
+
+        let (session_id, delta) = bind_prefix(
+            &engine,
+            store.as_ref(),
+            &conversations,
+            &ControlPlane::Open,
+            &principal,
+            key,
+            claimed.clone(),
+        )
+        .await
+        .expect("two disagreements is well inside the bound");
+
+        assert_eq!(
+            session_id,
+            gen_session(key, 2),
+            "generation one is occupied and disagrees too, so the turn must \
+             land on the first generation the store has never seen"
+        );
+        assert_eq!(
+            delta, claimed,
+            "a session the store never held takes the claim whole, exactly \
+             as an ordinary first fork does"
+        );
+    }
+
+    /// **(c) the bound.** Every generation up to and including the cap
+    /// disagrees, so the loop never finds one to land on and must refuse
+    /// loudly -- naming the cache key and the attempt count -- rather than
+    /// forking forever or guessing. Nothing is appended anywhere: every
+    /// generation's log is exactly the one item [`seed`] wrote it, untouched.
+    #[tokio::test]
+    async fn repeated_disagreement_within_one_request_is_refused_rather_than_forked_forever() {
+        let store = Arc::new(MemoryStore::new());
+        let key = "acme/ada/looping";
+        let principal = ada();
+
+        for generation in 0..=MAX_PREFIX_FORK_ATTEMPTS {
+            seed(
+                &store,
+                &gen_session(key, generation),
+                vec![user(&format!("generation {generation}"))],
+            )
+            .await;
+        }
+
+        let engine = engine_over(Arc::clone(&store));
+        let conversations = Conversations::new();
+        let claimed = vec![user("none of the above")];
+
+        let error = bind_prefix(
+            &engine,
+            store.as_ref(),
+            &conversations,
+            &ControlPlane::Open,
+            &principal,
+            key,
+            claimed,
+        )
+        .await
+        .expect_err("every generation this loop tries disagrees with the claim");
+
+        assert_eq!(error.status(), StatusCode::CONFLICT);
+        assert_eq!(error.code(), "prefix_admission_exhausted");
+        let detail = error
+            .detail()
+            .expect("a client acting on this refusal needs the key and the count, not English");
+        assert_eq!(detail.get("cache_key").and_then(Value::as_str), Some(key));
+        assert_eq!(
+            detail.get("attempts").and_then(Value::as_u64),
+            Some(u64::from(MAX_PREFIX_FORK_ATTEMPTS))
+        );
+
+        for generation in 0..=MAX_PREFIX_FORK_ATTEMPTS {
+            let stored = stored_conversation(store.as_ref(), &gen_session(key, generation))
+                .await
+                .expect("every pre-seeded generation must still read back");
+            assert_eq!(
+                stored.items.len(),
+                1,
+                "generation {generation} must be exactly what `seed` wrote -- \
+                 a refused request must append nothing anywhere"
+            );
+        }
+    }
+
+    /// **(d) control: agreement never forks.** The ordinary continuation case,
+    /// asserted once more at `bind_prefix`'s own level rather than only
+    /// through [`admit`] directly, so a change to the fork loop above cannot
+    /// silently start forking the common case it must leave alone.
+    #[tokio::test]
+    async fn an_agreeing_claim_continues_on_the_bound_session_without_forking() {
+        let store = Arc::new(MemoryStore::new());
+        let key = "acme/ada/agrees";
+        let principal = ada();
+        seed(&store, &gen_session(key, 0), vec![user("hello")]).await;
+
+        let engine = engine_over(Arc::clone(&store));
+        let conversations = Conversations::new();
+        let claimed = vec![user("hello"), user("again")];
+
+        let (session_id, delta) = bind_prefix(
+            &engine,
+            store.as_ref(),
+            &conversations,
+            &ControlPlane::Open,
+            &principal,
+            key,
+            claimed,
+        )
+        .await
+        .expect("a prefix match is not a disagreement");
+
+        assert_eq!(session_id, gen_session(key, 0));
+        assert_eq!(delta, vec![user("again")]);
+    }
+
+    /// **(d) control: the ordinary first fork is unchanged.** Only generation
+    /// zero exists and disagrees -- no restart, no generation the store
+    /// already forked to -- so the fork lands on a genuinely fresh session and
+    /// takes the claim whole, exactly as before R13.
+    #[tokio::test]
+    async fn the_ordinary_first_fork_still_takes_the_claim_whole() {
+        let store = Arc::new(MemoryStore::new());
+        let key = "acme/ada/first-fork";
+        let principal = ada();
+        seed(&store, &gen_session(key, 0), vec![user("hello")]).await;
+
+        let engine = engine_over(Arc::clone(&store));
+        let conversations = Conversations::new();
+        let claimed = vec![user("goodbye")];
+
+        let (session_id, delta) = bind_prefix(
+            &engine,
+            store.as_ref(),
+            &conversations,
+            &ControlPlane::Open,
+            &principal,
+            key,
+            claimed.clone(),
+        )
+        .await
+        .expect("one disagreement is well inside the bound");
+
+        assert_eq!(
+            session_id,
+            gen_session(key, 1),
+            "a generation the store has never seen is the fresh case"
+        );
+        assert_eq!(delta, claimed);
+    }
+
+    /// **(e) the bound generation is actually reached, not merely counted.**
+    ///
+    /// (M14.0 fix review, F1.) Test (c) above pins the *refusal* -- every
+    /// generation up to and including the cap disagrees -- but a fixture where
+    /// nothing agrees cannot tell "the loop tried every attempt and all of
+    /// them failed" from "the loop tried one fewer and would have failed
+    /// anyway": both mutations read `prefix_admission_exhausted` with the same
+    /// `attempts` value, because that value echoes the
+    /// [`MAX_PREFIX_FORK_ATTEMPTS`] constant rather than the number of
+    /// iterations the loop actually ran. This is the other direction: the
+    /// generation exactly at the bound *agrees*, so only a loop that actually
+    /// makes all [`MAX_PREFIX_FORK_ATTEMPTS`] attempts reaches it. An
+    /// off-by-one that runs one fewer iteration (`0..MAX_PREFIX_FORK_ATTEMPTS
+    /// - 1`) never reaches this generation and refuses instead of admitting.
+    #[tokio::test]
+    async fn the_bound_generation_is_actually_checked_not_merely_counted() {
+        let store = Arc::new(MemoryStore::new());
+        let key = "acme/ada/bound-generation";
+        let principal = ada();
+
+        // Every generation up to the bound disagrees, exactly as in (c) --
+        // the loop has to try all of them before it reaches the one that
+        // doesn't.
+        for generation in 0..MAX_PREFIX_FORK_ATTEMPTS {
+            seed(
+                &store,
+                &gen_session(key, generation),
+                vec![user(&format!("generation {generation}"))],
+            )
+            .await;
+        }
+        // The generation exactly at the bound is the one this loop must
+        // actually reach to succeed.
+        let agreeing_prefix = vec![user("the surviving generation")];
+        seed(
+            &store,
+            &gen_session(key, MAX_PREFIX_FORK_ATTEMPTS),
+            agreeing_prefix.clone(),
+        )
+        .await;
+
+        let engine = engine_over(Arc::clone(&store));
+        let conversations = Conversations::new();
+        let mut claimed = agreeing_prefix;
+        claimed.push(user("plus one more"));
+
+        let (session_id, delta) = bind_prefix(
+            &engine,
+            store.as_ref(),
+            &conversations,
+            &ControlPlane::Open,
+            &principal,
+            key,
+            claimed,
+        )
+        .await
+        .expect(
+            "MAX_PREFIX_FORK_ATTEMPTS disagreements are still inside the \
+             bound -- the loop must make every one of its attempts, not one \
+             fewer",
+        );
+
+        assert_eq!(
+            session_id,
+            gen_session(key, MAX_PREFIX_FORK_ATTEMPTS),
+            "the generation at the bound is the one attempt (c)'s fixture \
+             never forces the loop to actually make: an off-by-one that runs \
+             one fewer iteration refuses here instead of admitting"
+        );
+        assert_eq!(delta, vec![user("plus one more")]);
     }
 
     #[test]
