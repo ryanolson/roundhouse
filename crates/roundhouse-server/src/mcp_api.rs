@@ -48,8 +48,8 @@ use roundhouse_core::now_ms;
 use roundhouse_core::routing::{CacheLedger, Candidate, Target};
 use roundhouse_core::session::SessionState;
 use roundhouse_core::store::{SessionStore, StoreError};
-use roundhouse_mcp::reads::{ControlReads, SessionFacts};
-use roundhouse_mcp::surface::SurfaceError;
+use roundhouse_mcp::reads::{ControlReads, Correlated, SessionFacts};
+use roundhouse_mcp::surface::{Correlators, SurfaceError};
 use roundhouse_mcp::transport::HostGuard;
 use roundhouse_mcp::{ControlPlaneSurface, ControlStore};
 
@@ -129,50 +129,26 @@ impl<S: SessionStore> ControlPlaneReads<S> {
     fn plane(&self) -> Arc<ControlPlane> {
         self.planes.plane(self.now_ms())
     }
-}
 
-#[async_trait]
-impl<S: SessionStore> ControlReads for ControlPlaneReads<S> {
-    async fn resolve_session(
+    /// The conversation `named` denotes *for this caller*, or the refusal that
+    /// says it denotes none.
+    ///
+    /// **One function for both named inputs** (M12.1, R-M7). The model's
+    /// `conversation` argument and the client's `_meta.threadId` are the same
+    /// kind of thing — a `prompt_cache_key`-shaped name — and the only
+    /// difference between them is what a failure means, which is the caller's
+    /// business and not this lookup's. Two copies would be two chances for one
+    /// of them to skip the qualification, and a threadId resolved without it
+    /// would read a bare cache key straight out of another tenant's namespace.
+    ///
+    /// Through `qualify`, so the id a name resolves to is the id the Responses
+    /// surface minted for the same cache key. Two spellings of the namespace is
+    /// how a namespace stops being one.
+    async fn named_session(
         &self,
         principal: &Principal,
-        conversation: Option<&str>,
-        tool_use_id: Option<&str>,
+        named: &str,
     ) -> Result<SessionId, SurfaceError> {
-        let Some(named) = conversation else {
-            // **The tool-use id first, because it is the only exact answer**
-            // (M12, R-M2). It names a `tool_use` block this node emitted into
-            // one session, so a `status` call made from inside a subagent's
-            // tool loop resolves to the subagent's conversation rather than to
-            // whichever of the principal's turns opened most recently. Checked
-            // against the caller, and an id that is not this caller's is
-            // indistinguishable from one this node never emitted — see
-            // `Conversations::session_of_call`.
-            //
-            // No existence check on the way out, unlike the named path below.
-            // The binding is written at the moment the call was appended to
-            // that very log, so "the session exists" is not in question; a
-            // `last_seq` here would spend a store round trip to re-ask
-            // something this node observed itself.
-            //
-            // The *order* is not spelled here: `session_without_a_name` is
-            // where R-M2 lives, and this supplies the two lookups it weighs.
-            // The alternative — this arm encoding the order itself, as it did
-            // — put a second copy of the ruling beside the test double's, with
-            // nothing red when they disagreed (M12 review, F4). A principal
-            // this node has served no turn for gets the refusal rather than
-            // somebody else's session or an empty status.
-            return roundhouse_mcp::session_without_a_name(
-                tool_use_id,
-                |id| self.conversations.session_of_call(principal, id),
-                || self.conversations.latest(principal),
-            );
-        };
-
-        // Through `qualify`, so the id an agent's `conversation` argument
-        // resolves to is the id the Responses surface minted for the same cache
-        // key. Two spellings of the namespace is how a namespace stops being
-        // one.
         let session = self
             .conversations
             .resolve(&self.plane().qualify(principal, named));
@@ -180,7 +156,7 @@ impl<S: SessionStore> ControlReads for ControlPlaneReads<S> {
         // was qualified into *this* caller's namespace first: a conversation
         // that resolves to nothing either never existed or belongs to another
         // tenant, and those two are indistinguishable from here on purpose —
-        // telling them apart would make the argument an enumeration oracle, the
+        // telling them apart would make the name an enumeration oracle, the
         // same reasoning `fetch_steer` refuses an unknown steer under.
         //
         // **On the variant and not on `Err(_)`.** That oracle argument is about
@@ -203,6 +179,77 @@ impl<S: SessionStore> ControlReads for ControlPlaneReads<S> {
             }
             Err(error) => Err(SurfaceError::Internal(error.to_string())),
         }
+    }
+}
+
+#[async_trait]
+impl<S: SessionStore> ControlReads for ControlPlaneReads<S> {
+    async fn resolve_session(
+        &self,
+        principal: &Principal,
+        conversation: Option<&str>,
+        correlators: Correlators<'_>,
+    ) -> Result<SessionId, SurfaceError> {
+        // **The argument first, and it refuses where a correlator falls
+        // through** (M12, R-M2). A name the model wrote is a question about
+        // that conversation and nothing else, so a name outside this caller's
+        // namespace is `ForeignConversation` rather than a quiet fall-back —
+        // and it short-circuits, because there is no correlator worth
+        // resolving for a call that is already refused.
+        let named = match conversation {
+            Some(name) => Some(self.named_session(principal, name).await?),
+            None => None,
+        };
+
+        // **Both correlators, resolved even when the argument already decided**
+        // (M12.1, R-M7). That is the ruling's direct cost: a contradiction
+        // cannot be seen without asking both sides, so the store round trip the
+        // pre-R-M7 code skipped on a named call is now spent. It buys the one
+        // thing precedence could not — a caller whose two inputs disagree is
+        // told so, rather than served whichever one this file happened to
+        // prefer.
+        let correlated = Correlated {
+            // The thread id goes down the *named* path: it is the turn's
+            // `prompt_cache_key`, which is exactly what `qualify` turns into a
+            // session id, so reading it needs no second tenancy rule. What it
+            // does not inherit from that path is the refusal — a correlator is
+            // context the client volunteered and may simply be stale, so a
+            // thread id naming no conversation of this caller's falls through
+            // as an unknown tool-use id does. Only `ForeignConversation` is
+            // swallowed: a store outage is a fact about the deployment, and
+            // answering it as "unknown correlator" would quietly hand the
+            // caller its `latest` — a plausible answer about the wrong
+            // conversation, which is the failure this whole ruling removes.
+            thread: match correlators.thread_id {
+                Some(thread) => match self.named_session(principal, thread).await {
+                    Ok(session) => Some(session),
+                    Err(SurfaceError::ForeignConversation(_)) => None,
+                    Err(error) => return Err(error),
+                },
+                None => None,
+            },
+            // No existence check on this one, unlike the two above. The binding
+            // is written at the moment the call was appended to that very log,
+            // so "the session exists" is not in question; a `last_seq` here
+            // would spend a store round trip to re-ask something this node
+            // observed itself. An id that is not this caller's is
+            // indistinguishable from one this node never emitted — see
+            // `Conversations::session_of_call`.
+            call: correlators
+                .tool_use_id
+                .and_then(|id| self.conversations.session_of_call(principal, id)),
+        };
+
+        // The *order* is not spelled here: `session_this_call_is_about` is
+        // where R-M2 and R-M7 live, and this supplies the answers it weighs.
+        // The alternative — this function encoding the order itself, as it did
+        // — put a second copy of the ruling beside the test double's, with
+        // nothing red when they disagreed (M12 review, F4). A principal this
+        // node has served no turn for gets the refusal rather than somebody
+        // else's session or an empty status.
+        roundhouse_mcp::session_this_call_is_about(named, correlated, || {
+            self.conversations.latest(principal)
+        })
     }
 
     /// The log's end for `session`, which is what arms the surface's memo of
@@ -692,6 +739,27 @@ mod tests {
     /// one; a test asserting how a tool-use id resolves has to write the binding
     /// from the same side a turn would, or it is asserting against a table
     /// nothing populates.
+    /// No `_meta` at all — a client that attaches neither correlator.
+    fn uncorrelated() -> Correlators<'static> {
+        Correlators::default()
+    }
+
+    /// A Claude Code call: `_meta["claudecode/toolUseId"]` and nothing else.
+    fn answering(tool_use_id: &str) -> Correlators<'_> {
+        Correlators {
+            tool_use_id: Some(tool_use_id),
+            ..Correlators::default()
+        }
+    }
+
+    /// A Codex call: `_meta.threadId` and nothing else.
+    fn in_thread(thread_id: &str) -> Correlators<'_> {
+        Correlators {
+            thread_id: Some(thread_id),
+            ..Correlators::default()
+        }
+    }
+
     fn reads_sharing<S: SessionStore>(
         plane: ControlPlane,
         store: Arc<S>,
@@ -756,7 +824,7 @@ mod tests {
 
         assert_eq!(
             reads
-                .resolve_session(&ada, None, Some("toolu_sub"))
+                .resolve_session(&ada, None, answering("toolu_sub"))
                 .await
                 .expect("an id this node emitted for this caller resolves"),
             subagent,
@@ -767,28 +835,188 @@ mod tests {
         // about the ordering: with no id, the guess is what is left.
         assert_eq!(
             reads
-                .resolve_session(&ada, None, None)
+                .resolve_session(&ada, None, uncorrelated())
                 .await
                 .expect("a principal with a most recent conversation"),
             parent,
             "Codex sends no such key, and the surface must answer it exactly              as it did before R-M2"
         );
 
-        // And an argument the *model* wrote outranks the id the *client*
-        // attached, because only one of the two is something the agent chose.
+        // And an argument the *model* wrote is served when the id the *client*
+        // attached agrees with it.
+        //
+        // **This assertion used to read "the argument outranks the id"**, which
+        // is how R-M2 left it. R-M7 narrowed that: a disagreement is now a
+        // refusal rather than a precedence question — see
+        // `an_argument_and_a_correlator_naming_two_conversations_are_refused`
+        // below — so what survives here is the agreeing case.
         let store = Arc::new(MemoryStore::new());
         store
             .create_session(&parent, "gpt-4")
             .await
             .expect("a session for the named path to find");
+        conversations.bind_call(&ada, "toolu_parent", parent.clone());
         let named = reads_sharing(two_tenant_plane(), store, Arc::clone(&conversations));
         assert_eq!(
             named
-                .resolve_session(&ada, Some("main"), Some("toolu_sub"))
+                .resolve_session(&ada, Some("main"), answering("toolu_parent"))
                 .await
                 .expect("the named conversation exists"),
             parent,
         );
+    }
+
+    /// R-M7: `_meta.threadId` is the conversation the client names, resolved
+    /// through the same `qualify` the `conversation` argument goes through.
+    ///
+    /// **The race, made deterministic**, exactly as the tool-use id test above
+    /// makes it: the parent binds second, so `latest` is the parent's, and an
+    /// answer naming the subagent's log can only have come from the thread id.
+    /// A codex client stamps this on every `tools/call` and the value is that
+    /// turn's `prompt_cache_key` — which is what the fixture's `"sub"` stands
+    /// for here.
+    #[tokio::test]
+    async fn a_thread_id_resolves_the_conversation_the_client_names() {
+        let ada = Principal::new("acme", "ada");
+        let conversations = Arc::new(Conversations::new());
+        let subagent = conversations.bind(&ada, "acme/ada/sub");
+        let parent = conversations.bind(&ada, "acme/ada/main");
+
+        // Both conversations real in the store, because the thread id goes down
+        // the *named* path and that path checks existence. A rig whose rival
+        // existed only in the binding table would make the fall-through below
+        // fail loudly instead of quietly, which is the weaker claim.
+        let store = Arc::new(MemoryStore::new());
+        for session in [&subagent, &parent] {
+            store
+                .create_session(session, "gpt-4")
+                .await
+                .expect("a conversation the named path can find");
+        }
+        let reads = reads_sharing(two_tenant_plane(), store, Arc::clone(&conversations));
+
+        assert_eq!(
+            reads
+                .resolve_session(&ada, None, in_thread("sub"))
+                .await
+                .expect("the thread the client named is this caller's"),
+            subagent,
+            "the call came from the subagent's thread; `latest` would have \
+             answered with the parent's conversation"
+        );
+
+        // The control: with no correlator the guess stands, and it is the other
+        // conversation — which is what makes the assertion above about the
+        // thread id rather than about there being one answer available.
+        assert_eq!(
+            reads
+                .resolve_session(&ada, None, uncorrelated())
+                .await
+                .expect("a principal with a most recent conversation"),
+            parent,
+        );
+
+        // A thread id naming nothing of this caller's falls through to the
+        // guess rather than refusing — the same collapse an unknown tool-use id
+        // gets, and for the same enumeration-oracle reason. The *argument* with
+        // the same string refuses instead, which is the asymmetry R-M7 rules.
+        assert_eq!(
+            reads
+                .resolve_session(&ada, None, in_thread("no-such-thread"))
+                .await
+                .expect("an unknown correlator is not a refusal"),
+            parent,
+        );
+        assert!(
+            matches!(
+                reads
+                    .resolve_session(&ada, Some("no-such-thread"), uncorrelated())
+                    .await,
+                Err(SurfaceError::ForeignConversation(_))
+            ),
+            "a name the model wrote is a question about that name; a \
+             correlator is context the client volunteered"
+        );
+    }
+
+    /// R-M7's tenancy half for the thread id: another tenant's cache key names
+    /// nothing here, and it never reaches that tenant's session.
+    #[tokio::test]
+    async fn another_tenants_thread_id_never_resolves_to_that_tenants_session() {
+        let ada = Principal::new("acme", "ada");
+        let bob = Principal::new("globex", "bob");
+        let conversations = Arc::new(Conversations::new());
+        let adas = conversations.bind(&ada, "acme/ada/main");
+
+        let store = Arc::new(MemoryStore::new());
+        store
+            .create_session(&adas, "gpt-4")
+            .await
+            .expect("ada's conversation");
+        let reads = reads_sharing(two_tenant_plane(), store, Arc::clone(&conversations));
+
+        // `main` is ada's cache key. Qualified into bob's namespace it names
+        // nothing — which is the whole of the check, and why reading a
+        // client-supplied name needs no second tenancy rule.
+        let refused = reads
+            .resolve_session(&bob, None, in_thread("main"))
+            .await
+            .expect_err("bob has no conversation of his own to fall back to");
+        assert!(
+            matches!(refused, SurfaceError::NoSession),
+            "a thread id belonging to another tenant is a thread id this \
+             deployment has none of for *this* caller: {refused}"
+        );
+
+        let bobs = conversations.bind(&bob, "globex/bob/main");
+        assert_eq!(
+            reads
+                .resolve_session(&bob, None, in_thread("main"))
+                .await
+                .expect("bob's own most recent conversation"),
+            bobs,
+            "and once bob has one he gets his own, never ada's, with no hint \
+             that the name he presented meant anything to anybody"
+        );
+        assert_ne!(bobs, adas);
+    }
+
+    /// R-M7's refusal: the model's argument and the client's correlator naming
+    /// two different conversations is not a precedence question.
+    #[tokio::test]
+    async fn an_argument_and_a_correlator_naming_two_conversations_are_refused() {
+        let ada = Principal::new("acme", "ada");
+        let conversations = Arc::new(Conversations::new());
+        let subagent = conversations.bind(&ada, "acme/ada/sub");
+        let parent = conversations.bind(&ada, "acme/ada/main");
+        conversations.bind_call(&ada, "toolu_sub", subagent.clone());
+
+        let store = Arc::new(MemoryStore::new());
+        for session in [&subagent, &parent] {
+            store.create_session(session, "gpt-4").await.expect(
+                "both conversations exist, so neither half is refused \
+                         by the foreign-name door",
+            );
+        }
+        let reads = reads_sharing(two_tenant_plane(), store, Arc::clone(&conversations));
+
+        for correlators in [answering("toolu_sub"), in_thread("sub")] {
+            let refused = reads
+                .resolve_session(&ada, Some("main"), correlators)
+                .await
+                .expect_err("a caller contradicting itself is refused");
+            let message = refused.to_string();
+            assert!(
+                matches!(refused, SurfaceError::ContradictoryConversation { .. }),
+                "and refused as its own variant, not as a verdict about either \
+                 conversation's tenancy: {message}"
+            );
+            assert!(
+                message.contains(parent.as_str()) && message.contains(subagent.as_str()),
+                "the refusal must name both, or the agent cannot tell which of \
+                 its own two inputs to change: {message}"
+            );
+        }
     }
 
     /// R-M2's tenancy half: another principal's id names nothing here.
@@ -813,7 +1041,7 @@ mod tests {
         );
 
         let refused = reads
-            .resolve_session(&bob, None, Some("toolu_ada"))
+            .resolve_session(&bob, None, answering("toolu_ada"))
             .await
             .expect_err("bob has no conversation of his own to fall back to");
         assert!(
@@ -826,7 +1054,7 @@ mod tests {
         let bobs = conversations.bind(&bob, "globex/bob/main");
         assert_eq!(
             reads
-                .resolve_session(&bob, None, Some("toolu_ada"))
+                .resolve_session(&bob, None, answering("toolu_ada"))
                 .await
                 .expect("bob's own most recent conversation"),
             bobs,
@@ -849,7 +1077,7 @@ mod tests {
         let reads = reads_over(plane, Arc::new(OutageStore));
 
         let error = reads
-            .resolve_session(&Principal::new("acme", "ada"), Some("main"), None)
+            .resolve_session(&Principal::new("acme", "ada"), Some("main"), uncorrelated())
             .await
             .expect_err("a store that cannot answer has not answered");
         assert!(
@@ -874,7 +1102,7 @@ mod tests {
             Arc::new(MemoryStore::new()),
         );
         let refused = closed
-            .resolve_session(&Principal::new("acme", "ada"), Some("main"), None)
+            .resolve_session(&Principal::new("acme", "ada"), Some("main"), uncorrelated())
             .await
             .expect_err("a session nobody created is not this caller's");
         assert!(

@@ -30,8 +30,8 @@ use roundhouse_core::control::{
 };
 use roundhouse_core::ids::SessionId;
 use roundhouse_core::routing::{Candidate, DecisionRecord, Target};
-use roundhouse_mcp::reads::{ControlReads, SessionFacts};
-use roundhouse_mcp::surface::SurfaceError;
+use roundhouse_mcp::reads::{ControlReads, Correlated, SessionFacts};
+use roundhouse_mcp::surface::{Correlators, SurfaceError};
 use roundhouse_mcp::{ControlPlaneSurface, ControlStore};
 
 /// A distinctive per-model price, so a rendering that leaked one is visible as
@@ -148,6 +148,15 @@ pub struct FakeDeployment {
     /// The session each emitted tool-use id was emitted into, and for whom —
     /// the fake's stand-in for `Conversations`' call table (M12, R-M2).
     pub tool_use_ids: HashMap<String, (Principal, SessionId)>,
+    /// Every conversation this deployment holds *beyond* the per-principal
+    /// "most recent" above — a subagent's log, a parent's, a rival's.
+    ///
+    /// Needed since R-M7 made `_meta.threadId` resolve as a name: before it,
+    /// the only thing a name could denote was a principal's latest, so
+    /// [`Self::sessions`] was the whole namespace. A thread id names the
+    /// conversation the client is *in*, which on the race this suite exists to
+    /// test is precisely the one that does not hold the latest slot.
+    pub conversations: Vec<SessionId>,
     pub facts: HashMap<SessionId, SessionFacts>,
     pub now_ms: u64,
 }
@@ -169,6 +178,7 @@ impl Default for FakeDeployment {
             }),
             sessions,
             tool_use_ids: HashMap::new(),
+            conversations: Vec::new(),
             facts: HashMap::new(),
             now_ms: 1_700_000_000_000,
         }
@@ -194,6 +204,35 @@ impl FakeDeployment {
         self
     }
 
+    /// The conversation `named` denotes for this caller, or the refusal.
+    ///
+    /// The server resolves this through the same `bound_session` namespacing
+    /// the Responses surface uses; the fake reproduces the one property the
+    /// surface depends on, which is that a conversation outside the caller's
+    /// namespace is refused rather than silently replaced by the caller's own.
+    ///
+    /// One function for the `conversation` argument *and* for `_meta.threadId`,
+    /// exactly as `ControlPlaneReads::named_session` is: R-M7's claim is that
+    /// the two are one kind of name, and a fake that resolved them differently
+    /// would be testing a deployment nobody ships.
+    pub fn named_session(
+        &self,
+        principal: &Principal,
+        named: &str,
+    ) -> Result<SessionId, SurfaceError> {
+        let qualified = format!("{}{named}", principal.namespace_prefix());
+        if self
+            .sessions
+            .values()
+            .chain(self.conversations.iter())
+            .any(|id| id.as_str() == qualified)
+        {
+            Ok(SessionId::new(qualified))
+        } else {
+            Err(SurfaceError::ForeignConversation(named.to_string()))
+        }
+    }
+
     /// The surface under test, with a store the caller can also reach.
     pub fn surface(self) -> (ControlPlaneSurface<FakeDeployment>, Arc<ControlStore>) {
         let store = Arc::new(ControlStore::new());
@@ -210,41 +249,39 @@ impl ControlReads for FakeDeployment {
         &self,
         principal: &Principal,
         conversation: Option<&str>,
-        tool_use_id: Option<&str>,
+        correlators: Correlators<'_>,
     ) -> Result<SessionId, SurfaceError> {
-        match conversation {
-            // The fake's stand-in for the server's node-local call table: a
-            // tool-use id names the session it was emitted into, checked
-            // against the caller. Only the *lookups* are the fake's; the order
-            // they are weighed in comes from `session_without_a_name`, which
-            // is the same function the real `ControlPlaneReads` calls. Two
-            // hand-written orders is what F4 found — a fake free to disagree
-            // with the deployment turns the surface's tests into tests of the
-            // fake.
-            None => roundhouse_mcp::session_without_a_name(
-                tool_use_id,
-                |id| {
+        // Only the *lookups* are the fake's; the order they are weighed in
+        // comes from `session_this_call_is_about`, which is the same function
+        // the real `ControlPlaneReads` calls. Two hand-written orders is what
+        // F4 found — a fake free to disagree with the deployment turns the
+        // surface's tests into tests of the fake.
+        let named = match conversation {
+            Some(name) => Some(self.named_session(principal, name)?),
+            None => None,
+        };
+        Ok(roundhouse_mcp::session_this_call_is_about(
+            named,
+            Correlated {
+                // The thread id resolves down the named path and its refusal is
+                // swallowed, which is the fake reproducing R-M7's one asymmetry:
+                // a correlator that names nothing falls through, where the
+                // model's own argument refuses.
+                thread: correlators
+                    .thread_id
+                    .and_then(|thread| self.named_session(principal, thread).ok()),
+                // The fake's stand-in for the server's node-local call table: a
+                // tool-use id names the session it was emitted into, checked
+                // against the caller.
+                call: correlators.tool_use_id.and_then(|id| {
                     self.tool_use_ids
                         .get(id)
                         .filter(|(owner, _)| owner == principal)
                         .map(|(_, session)| session.clone())
-                },
-                || self.sessions.get(principal).cloned(),
-            ),
-            Some(named) => {
-                // The server resolves this through the same `bound_session`
-                // namespacing the Responses surface uses; the fake reproduces
-                // the one property the surface depends on, which is that a
-                // conversation outside the caller's namespace is refused rather
-                // than silently replaced by the caller's own.
-                let qualified = format!("{}{named}", principal.namespace_prefix());
-                if self.sessions.values().any(|id| id.as_str() == qualified) {
-                    Ok(SessionId::new(qualified))
-                } else {
-                    Err(SurfaceError::ForeignConversation(named.to_string()))
-                }
-            }
-        }
+                }),
+            },
+            || self.sessions.get(principal).cloned(),
+        )?)
     }
 
     async fn ceiling_policy(&self, _principal: &Principal) -> Result<TurnPolicy, SurfaceError> {
@@ -329,11 +366,11 @@ impl<R: ControlReads> ControlReads for CountingReads<R> {
         &self,
         principal: &Principal,
         conversation: Option<&str>,
-        tool_use_id: Option<&str>,
+        correlators: Correlators<'_>,
     ) -> Result<SessionId, SurfaceError> {
         self.resolve_session_calls.fetch_add(1, Ordering::SeqCst);
         self.inner
-            .resolve_session(principal, conversation, tool_use_id)
+            .resolve_session(principal, conversation, correlators)
             .await
     }
 

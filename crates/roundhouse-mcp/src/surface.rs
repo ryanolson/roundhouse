@@ -42,48 +42,67 @@ use crate::overlay::{OverlayScope, PreferMode};
 
 /// Who is calling, and from where in their own conversation.
 ///
-/// **Two facts that arrive together and are needed together.** The principal is
-/// resolved by the transport from the same `Authorization: Bearer rh_turn_…`
-/// header the turn surfaces use, so a tool can never be called without one and
-/// never has to ask whose deployment it is looking at. The tool-use id is the
-/// other half of the same question: *which* of that principal's conversations
-/// this call belongs to.
+/// **Two kinds of fact that arrive together and are needed together.** The
+/// principal is resolved by the transport from the same
+/// `Authorization: Bearer rh_turn_…` header the turn surfaces use, so a tool can
+/// never be called without one and never has to ask whose deployment it is
+/// looking at. The correlators are the other half of the same question: *which*
+/// of that principal's conversations this call belongs to.
 ///
-/// **Why the id is not a tool argument** (M12, R-M2). It is not something the
-/// model chose to say — it is protocol metadata the client attaches
-/// (`_meta["claudecode/toolUseId"]`), naming the `tool_use` block roundhouse
-/// itself emitted and is now being answered for. Putting it in the arguments
-/// schema would invite a model to invent one, and `deny_unknown_fields` would
-/// then refuse the call of a client that sent it honestly.
+/// **Why neither correlator is a tool argument** (M12, R-M2; M12.1, R-M7).
+/// Neither is something the model chose to say — both are protocol metadata the
+/// *client* attaches on `params._meta`, one naming the `tool_use` block
+/// roundhouse itself emitted (`claudecode/toolUseId`) and one naming the thread
+/// the client is running (`threadId`). Putting either in the arguments schema
+/// would invite a model to invent one, and `deny_unknown_fields` would then
+/// refuse the call of a client that sent it honestly.
 ///
-/// It is `Option` because it is a client's courtesy and not a protocol
-/// requirement: Codex sends no such key, and the surface must serve it exactly
-/// as it did before.
+/// Both are `Option` because each is one client's courtesy and not a protocol
+/// requirement: Codex sends `threadId` and no tool-use id, Claude Code sends the
+/// tool-use id and no `threadId`, and a client sending neither must be served
+/// exactly as it was before either existed.
 #[derive(Debug, Clone)]
 pub struct Caller {
     principal: Principal,
+    thread_id: Option<String>,
     tool_use_id: Option<String>,
 }
 
 impl Caller {
-    /// A caller who named no tool-use id — every client but Claude Code, and
-    /// Claude Code on a call it did not make from inside a `tool_use`.
+    /// A caller who attached no correlator at all — a client sending neither
+    /// `_meta` key, and either client on a call made from outside a turn.
     pub fn new(principal: Principal) -> Self {
         Self {
             principal,
+            thread_id: None,
             tool_use_id: None,
         }
     }
 
-    /// A caller answering a specific `tool_use` block.
-    pub fn answering(principal: Principal, tool_use_id: Option<String>) -> Self {
+    /// A caller naming the thread it is running in (`_meta.threadId`).
+    ///
+    /// A **builder taking one correlator at a time**, and the same below for
+    /// the tool-use id, rather than one constructor taking both. Two adjacent
+    /// `Option<String>` parameters are a swap nothing catches: the correlators
+    /// are weighed in a fixed order (R-M7), so transposing them at the door
+    /// would compile, would type-check, and would silently invert the ruling
+    /// for every client that sends both.
+    pub fn in_thread(self, thread_id: Option<String>) -> Self {
         Self {
             // An empty string is not an id, and it is what a client sending the
             // key with nothing in it would otherwise resolve *by*: an empty
             // lookup key can only miss, but it would have looked deliberate in
             // a trace. Normalised to absence at the one door it enters by.
+            thread_id: thread_id.filter(|id| !id.is_empty()),
+            ..self
+        }
+    }
+
+    /// A caller answering a specific `tool_use` block.
+    pub fn answering(self, tool_use_id: Option<String>) -> Self {
+        Self {
             tool_use_id: tool_use_id.filter(|id| !id.is_empty()),
-            ..Self::new(principal)
+            ..self
         }
     }
 
@@ -91,9 +110,45 @@ impl Caller {
         &self.principal
     }
 
+    pub fn thread_id(&self) -> Option<&str> {
+        self.thread_id.as_deref()
+    }
+
     pub fn tool_use_id(&self) -> Option<&str> {
         self.tool_use_id.as_deref()
     }
+
+    /// Both correlators, in the shape the resolution seam takes them.
+    pub fn correlators(&self) -> Correlators<'_> {
+        Correlators {
+            thread_id: self.thread_id(),
+            tool_use_id: self.tool_use_id(),
+        }
+    }
+}
+
+/// The correlators a client attached to a `tools/call`, before anything has
+/// been looked up.
+///
+/// **A struct and not two parameters** on
+/// [`resolve_session`](crate::reads::ControlReads::resolve_session). The seam
+/// would otherwise take three adjacent `Option<&str>` — a name, a thread and a
+/// call — which is three ways to transpose an argument into a different ruling
+/// with nothing red. Named fields make the transposition unspellable.
+///
+/// Borrowed rather than owned because every implementor only reads them, and a
+/// [`Caller`] outlives the call it is resolving.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Correlators<'a> {
+    /// `_meta.threadId` — the conversation the *client* says it is running
+    /// (M12.1, R-M7). Codex stamps it on every `tools/call` and it is the
+    /// turn's `prompt_cache_key`, so it resolves as a **name** through the
+    /// caller's own namespace.
+    pub thread_id: Option<&'a str>,
+    /// `_meta["claudecode/toolUseId"]` — the `tool_use` block this call is
+    /// answering (M12, R-M2). It resolves as a **call**, through the table of
+    /// ids this node emitted.
+    pub tool_use_id: Option<&'a str>,
 }
 
 /// Everything an MCP client can ask of a roundhouse deployment.
@@ -574,6 +629,28 @@ pub enum SurfaceError {
     NoSession,
     #[error("conversation `{0}` does not belong to this key")]
     ForeignConversation(String),
+    /// The caller's own two inputs name two different conversations.
+    ///
+    /// **A refusal and never a precedence rule** (M12.1, R-M7). The
+    /// `conversation` argument is what the *model* wrote; the correlator is what
+    /// the *client* attached on `_meta`. When they agree, either would do; when
+    /// they disagree, one of them is wrong and nothing here can say which — the
+    /// model may have carried a name over from an older turn, or the client may
+    /// be dispatching from a thread the model does not know it is in.
+    ///
+    /// Picking a winner is the tempting alternative and it is the dangerous
+    /// one: whichever side loses, the tool then answers about a conversation the
+    /// caller did not ask about, with a 200 on it. Worse, a rule that let the
+    /// argument win would make the argument a way to *steer past* the client's
+    /// own correlator, which is precisely the tenancy claim the correlator
+    /// exists to make. A caller contradicting itself is not a tenancy oracle, so
+    /// both conversations are named back and neither is served.
+    #[error(
+        "this call names conversation `{named}` but the client correlated it to `{correlated}`; \
+         roundhouse will not choose between a caller's own contradictory inputs -- send one or \
+         make them agree"
+    )]
+    ContradictoryConversation { named: String, correlated: String },
     #[error("conversation `{0}` has not been routed yet")]
     NotRoutedYet(String),
     #[error("the control plane could not answer: {0}")]

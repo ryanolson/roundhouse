@@ -533,28 +533,76 @@ fn completed_items(sse: &str) -> Vec<Value> {
 /// admin key, a 405 for a stream nobody offers — and a client library's job is
 /// to turn those into one uniform outcome.
 async fn tools_call(rig: &Rig, secret: Option<&str>, tool: &str, arguments: Value) -> Value {
-    tools_call_answering(rig, secret, tool, arguments, None).await
+    tools_call_with_meta(rig, secret, tool, arguments, None).await
 }
 
-/// The same, from inside a client's own tool loop.
+/// The same, from inside a Claude Code tool loop.
 ///
 /// `tool_use_id` goes on `params._meta` under the key Claude Code spells,
 /// exactly as the 2.1.257 capture shows it
-/// (`fixtures/claude-2.1.257-mcp-wire.json`, request 5). Sent as raw JSON-RPC
-/// so the assertion covers `rmcp`'s own `_meta` handling: the SDK strips
-/// `params._meta` into the message envelope on the way in and hands it to a
-/// tool through the request *context*, and a reader that took the typed
-/// params' `meta` field instead would compile and be empty forever.
+/// (`fixtures/claude-2.1.257-mcp-wire.json`, request 5).
 async fn tools_call_answering(
     rig: &Rig,
     secret: Option<&str>,
     tool: &str,
     arguments: Value,
-    tool_use_id: Option<&str>,
+    tool_use_id: &str,
+) -> Value {
+    tools_call_with_meta(
+        rig,
+        secret,
+        tool,
+        arguments,
+        Some(json!({ "claudecode/toolUseId": tool_use_id, "progressToken": 2 })),
+    )
+    .await
+}
+
+/// The same, from inside a Codex thread.
+///
+/// **The whole `_meta` object codex sends, and not just the key under test**
+/// (M12.1, R-M8). `with_mcp_tool_call_thread_id_meta` inserts `threadId`
+/// beside an `x-codex-turn-metadata` object carrying the client's own
+/// `session_id`, and a fixture that sent the one key alone would pass over a
+/// transport that read `_meta` as a string, that refused unknown siblings, or
+/// that mistook the *client's* session id for ours. The sibling is what makes
+/// the shape the client's rather than the test's.
+async fn tools_call_in_thread(
+    rig: &Rig,
+    secret: Option<&str>,
+    tool: &str,
+    arguments: Value,
+    thread_id: &str,
+) -> Value {
+    tools_call_with_meta(
+        rig,
+        secret,
+        tool,
+        arguments,
+        Some(json!({
+            "threadId": thread_id,
+            "x-codex-turn-metadata": { "session_id": "0199a0f0-0000-7000-8000-000000000000" },
+        })),
+    )
+    .await
+}
+
+/// One `tools/call` carrying whatever `_meta` the client would have sent.
+///
+/// Sent as raw JSON-RPC so the assertions cover `rmcp`'s own `_meta` handling:
+/// the SDK strips `params._meta` into the message envelope on the way in and
+/// hands it to a tool through the request *context*, and a reader that took the
+/// typed params' `meta` field instead would compile and be empty forever.
+async fn tools_call_with_meta(
+    rig: &Rig,
+    secret: Option<&str>,
+    tool: &str,
+    arguments: Value,
+    meta: Option<Value>,
 ) -> Value {
     let mut params = json!({ "name": tool, "arguments": arguments });
-    if let Some(id) = tool_use_id {
-        params["_meta"] = json!({ "claudecode/toolUseId": id, "progressToken": 2 });
+    if let Some(meta) = meta {
+        params["_meta"] = meta;
     }
     let (status, text) = post(
         &rig.app,
@@ -1893,7 +1941,7 @@ async fn a_tools_call_is_correlated_by_the_tool_use_id_the_client_quotes_back() 
             Some(&key("ada")),
             "status",
             json!({}),
-            Some("toolu_from_main"),
+            "toolu_from_main",
         )
         .await,
     );
@@ -1921,7 +1969,7 @@ async fn a_tools_call_is_correlated_by_the_tool_use_id_the_client_quotes_back() 
             Some(&key("bob")),
             "status",
             json!({}),
-            Some("toolu_from_main"),
+            "toolu_from_main",
         )
         .await,
     );
@@ -1935,4 +1983,150 @@ async fn a_tools_call_is_correlated_by_the_tool_use_id_the_client_quotes_back() 
         !refused.contains("acme"),
         "and it must not name the tenant that does own the id: {refused}"
     );
+}
+
+/// R-M7 (M12.1): a `tools/call` carrying a Codex-shaped `_meta.threadId` is
+/// answered about the conversation that thread id names.
+///
+/// **Through the real adapter, because the `_meta` half is `rmcp`'s and not
+/// ours** — the same reason the tool-use id test above is here. The SDK strips
+/// `params._meta` off the wire into the message envelope and hands it to a tool
+/// through the request *context*; a transport that read the obvious field would
+/// compile, find nothing on every real request, and leave every Codex call on
+/// the `latest` guess. Only a request that actually travelled the transport can
+/// tell those apart.
+///
+/// **The race, made deterministic.** One principal, two conversations — the
+/// shape a parent agent running subagents produces. `other` drives a turn last,
+/// so `latest` names it; the thread id names `main`. Without the correlation the
+/// answer is `other` and it is *plausible*, which is the failure worth a test.
+#[tokio::test]
+async fn a_tools_call_is_correlated_by_the_thread_id_a_codex_client_stamps() {
+    let rig = rig(control_plane()).await;
+
+    let mut main = Conversation::new(&key("ada"), "main");
+    main.say(&rig, "start the parser").await;
+    let mut other = Conversation::new(&key("ada"), "other");
+    other.say(&rig, "start the linter").await;
+
+    let main_session = rig.conversations.resolve("acme/ada/main");
+    // The thread id codex sends is the turn's own `prompt_cache_key`, which is
+    // the *unqualified* name — the qualification into `acme/ada/…` is
+    // roundhouse's, and doing it here would test the fixture rather than the
+    // resolver.
+    let answered =
+        served(&tools_call_in_thread(&rig, Some(&key("ada")), "status", json!({}), "main").await);
+    assert_eq!(
+        answered["conversation"],
+        json!(main_session.as_str()),
+        "the call answers the thread it was made from"
+    );
+
+    // The control: with no `_meta` the guess stands, and it is the other
+    // conversation — which is what makes the assertion above about the thread
+    // id rather than about there being only one answer available.
+    let guessed = served(&tools_call(&rig, Some(&key("ada")), "status", json!({})).await);
+    assert_eq!(
+        guessed["conversation"],
+        json!(rig.conversations.resolve("acme/ada/other").as_str()),
+    );
+
+    // An unknown thread id falls through to that same guess rather than
+    // refusing: a correlator is context the client volunteered, and telling
+    // "never existed" from "somebody else's" would make the key a probe.
+    let unknown = served(
+        &tools_call_in_thread(
+            &rig,
+            Some(&key("ada")),
+            "status",
+            json!({}),
+            "no-such-thread",
+        )
+        .await,
+    );
+    assert_eq!(unknown["conversation"], guessed["conversation"]);
+
+    // And another tenant quoting the same thread id learns nothing from it:
+    // bob has driven no turn on this node, so the answer is the refusal he
+    // would have got with no `_meta` at all.
+    let refused =
+        refused(&tools_call_in_thread(&rig, Some(&key("bob")), "status", json!({}), "main").await);
+    assert!(
+        refused.contains("this key has no conversation yet"),
+        "another tenant's thread id must answer exactly as a thread id nobody \
+         ran — the refusal a caller with no conversation of their own already \
+         gets: {refused}"
+    );
+    assert!(
+        !refused.contains("acme"),
+        "and it must not name the tenant that does own it: {refused}"
+    );
+}
+
+/// R-M7's refusal, over the real adapter: the model named one conversation and
+/// the client correlated the call to another.
+///
+/// Both correlators are exercised, because the ruling is about a caller
+/// contradicting itself and not about one `_meta` key. The two conversations
+/// both exist and both belong to this caller, so neither half is refused by the
+/// foreign-name door — the refusal can only be the contradiction.
+#[tokio::test]
+async fn a_tools_call_whose_argument_fights_its_own_meta_is_refused_naming_both() {
+    let rig = rig(control_plane()).await;
+    let ada = Principal::new("acme", "ada");
+
+    let mut main = Conversation::new(&key("ada"), "main");
+    main.say(&rig, "start the parser").await;
+    let mut other = Conversation::new(&key("ada"), "other");
+    other.say(&rig, "start the linter").await;
+
+    let main_session = rig.conversations.resolve("acme/ada/main");
+    let other_session = rig.conversations.resolve("acme/ada/other");
+    rig.conversations
+        .bind_call(&ada, "toolu_from_main", main_session.clone());
+
+    let by_thread = refused(
+        &tools_call_in_thread(
+            &rig,
+            Some(&key("ada")),
+            "status",
+            json!({ "conversation": "other" }),
+            "main",
+        )
+        .await,
+    );
+    let by_call = refused(
+        &tools_call_answering(
+            &rig,
+            Some(&key("ada")),
+            "status",
+            json!({ "conversation": "other" }),
+            "toolu_from_main",
+        )
+        .await,
+    );
+
+    for refusal in [&by_thread, &by_call] {
+        assert!(
+            refusal.contains(main_session.as_str()) && refusal.contains(other_session.as_str()),
+            "the refusal must name both conversations the caller pointed at, \
+             or the agent cannot tell which of its own two inputs to change: \
+             {refusal}"
+        );
+    }
+
+    // The control, and the ordinary case: an argument that *agrees* with the
+    // correlator is served, so the refusals above are about the disagreement
+    // and not about sending an argument and a `_meta` key at once.
+    let served = served(
+        &tools_call_in_thread(
+            &rig,
+            Some(&key("ada")),
+            "status",
+            json!({ "conversation": "main" }),
+            "main",
+        )
+        .await,
+    );
+    assert_eq!(served["conversation"], json!(main_session.as_str()));
 }

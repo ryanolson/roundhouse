@@ -238,9 +238,9 @@ impl<R: ControlReads> ControlPlaneSurface<R> {
 
     /// Resolve the conversation a session-scoped tool concerns.
     ///
-    /// One function for all eight tools, and the only place either half of the
+    /// One function for all eight tools, and the only place any part of the
     /// caller's identity is turned into a session: the argument the model wrote
-    /// and the tool-use id the client attached are weighed by
+    /// and both correlators the client attached are weighed by
     /// [`ControlReads::resolve_session`], which states the order. Eight copies
     /// of that decision is how two tools in one turn come to disagree about
     /// which conversation they are in.
@@ -253,7 +253,7 @@ impl<R: ControlReads> ControlPlaneSurface<R> {
             .resolve_session(
                 caller.principal(),
                 conversation.as_deref(),
-                caller.tool_use_id(),
+                caller.correlators(),
             )
             .await
     }

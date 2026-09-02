@@ -999,3 +999,67 @@ correctly for the current tree:
   generated flags are structured pairs rather than literals (F5), so the
   launcher's collision refusal no longer guesses which argv entries are
   flags.
+
+## Addendum (2026-09-02): M12.1 — Codex's `_meta.threadId` on the same seam
+
+M12 read a client-native correlator for Claude Code
+(`_meta["claudecode/toolUseId"]`) and made the principal's `latest` the
+fallback rather than the rule. The standing deferral of Codex's
+`_meta.threadId` (`roundhouse-mcp/src/lib.rs`, "deferred rather than
+pending") rested on a premise M12 changed: that reading a client-native
+shortcut would bind the surface to one client's conventions and that
+`init_session` was the client-agnostic path. The surface now reads one
+client's convention; refusing the other's leaves Codex's subagents in the
+`latest` race M12 closed for Claude. The rung is small and well-defined.
+
+**R-M7 — `_meta.threadId` is the conversation the client names.** Codex
+stamps it on every `tools/call` and it is byte-identical to the turn's
+`prompt_cache_key` (M9 capture), which is exactly what the tools'
+`conversation` argument already means on the Responses surface. So the
+transport reads it beside the tool-use id and hands it to the shared
+resolver as a *named* conversation, qualified into the caller's namespace
+and tenancy-checked by the existing path. Order in
+`session_without_a_name`'s caller: an explicit `conversation` argument, then
+the client's own correlators (threadId as a name; tool-use id as a call),
+then `latest`. **When a caller's own inputs disagree** — an explicit
+argument naming one conversation and a correlator resolving to another —
+the call is refused naming both: this is the caller contradicting itself,
+not a tenancy oracle, so loudness costs nothing and hides a client bug from
+nobody.
+
+**R-M8 — what proves it.** Hermetic: a Codex-shaped `tools/call` (`_meta`
+with `threadId` and the `x-codex-turn-metadata` sibling the capture shows)
+resolves to the named conversation with a rival `latest` in front of it;
+a foreign or unknown threadId falls through as an unknown correlator does;
+a threadId and an explicit `conversation` that disagree are refused with
+both named; a Claude-shaped `_meta` is unaffected. The gated codex suite
+gains the real-binary counterpart (ignored on this box — no codex binary —
+with its doc saying so). The deferral paragraph in `roundhouse-mcp/src/lib.rs`
+is replaced by the current contract; README's `_meta.threadId` sentences
+say what exists.
+
+### What the implementation settled beyond the rulings (2026-09-02, M12.1)
+
+- **Correlator-versus-correlator disagreement is ordered, not refused.** R-M7
+  named the refusal for an explicit argument against a correlator — the model
+  and the client answering separately. Two correlators (`threadId` and the
+  tool-use id) are one client naming one call in two vocabularies, so the
+  thread wins silently and the argument is compared against the effective
+  correlator; no shipped client sends both, and the behaviour is pinned by a
+  test rather than left implicit.
+- **Two assertions M12 shipped were R-M7's disagreement case.** They had
+  asserted that a `conversation` argument outranks a tool-use id resolving
+  elsewhere ("an argument the model wrote outranks metadata the client
+  attached"); both are rewritten to the agreeing case with the change
+  recorded beside them.
+- **The Codex real-binary counterpart is ignored for two reasons, and a
+  binary lifts only one.** This rig's upstream echoes and emits no tool call
+  (the M10.0 T7 ruling), so a runnable version needs a scripted upstream
+  emitting the namespaced `function_call` codex 0.146.0 routes to MCP — a
+  wire shape not established anywhere in this tree. The test states both
+  unlock conditions and fails loudly rather than passing vacuously.
+- **A named call costs one extra store round trip**: detecting a
+  contradiction means resolving the client's correlator even when the
+  argument would have decided. Recorded where the order lives; `latest` stays
+  lazy. `Caller` became a builder so two adjacent optional correlators cannot
+  be transposed, and one reader serves both `_meta` keys.

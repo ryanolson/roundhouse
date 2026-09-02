@@ -129,6 +129,27 @@ impl RoundhouseMcp {
     /// nothing here is reaching into a field that was not offered.
     const TOOL_USE_ID_META: &'static str = "claudecode/toolUseId";
 
+    /// The `_meta` key Codex puts the id of the thread it is running under.
+    ///
+    /// Spelled by the client, not by us, and unnamespaced because that is how
+    /// the client spells it: `with_mcp_tool_call_thread_id_meta`
+    /// (codex `core/src/mcp_tool_call.rs:1198-1220` @ `e363b08`, called at line
+    /// 442 with no conditional guard) inserts `sess.thread_id` under this exact
+    /// key on **every** `tools/call`, beside an `x-codex-turn-metadata` object
+    /// carrying the client's own `session_id`. The M9 capture shows the value
+    /// byte-identical to the `prompt_cache_key` on the same turn's
+    /// `/v1/responses` bodies, which is why the resolver treats it as a *name*
+    /// (M12.1, R-M7) and not as a second kind of opaque correlator.
+    ///
+    /// A bare key rather than a namespaced one is worth noting, not fixing:
+    /// MCP's `_meta` reserves namespaced keys for the sender's own use, and an
+    /// unnamespaced one is a name any client could collide with. Reading it is
+    /// safe regardless because what it resolves *through* is the caller's own
+    /// namespace — a client that meant something else by `threadId` names a
+    /// conversation this caller does not hold, and falls through as an unknown
+    /// correlator rather than reaching another tenant's session.
+    const THREAD_ID_META: &'static str = "threadId";
+
     /// The `tool_use` block this call is answering, if the client named one.
     ///
     /// **Read from the request *context* and not from `request.meta`.** `rmcp`
@@ -144,9 +165,31 @@ impl RoundhouseMcp {
     /// client that spells it oddly gets the fallback and its answer, not a
     /// protocol error mid-turn.
     fn tool_use_id(context: &RequestContext<RoleServer>) -> Option<String> {
+        Self::meta_string(context, Self::TOOL_USE_ID_META)
+    }
+
+    /// The thread the client says this call is in, if it named one.
+    ///
+    /// Read from the same place and on the same terms as [`Self::tool_use_id`]
+    /// — see that function for why the request *context* and not
+    /// `request.meta`, and why a non-string value is `None` rather than a
+    /// refusal.
+    fn thread_id(context: &RequestContext<RoleServer>) -> Option<String> {
+        Self::meta_string(context, Self::THREAD_ID_META)
+    }
+
+    /// One `_meta` string, or `None`.
+    ///
+    /// Both correlators read through one function rather than two copies of
+    /// four lines: the copies would be identical the day they were written and
+    /// the interesting way for them to diverge is silent — one reading
+    /// `context.meta` and the other `request.meta`, which is exactly the
+    /// mistake the doc above exists to warn about and which no test on either
+    /// key alone would catch.
+    fn meta_string(context: &RequestContext<RoleServer>, key: &str) -> Option<String> {
         context
             .meta
-            .get(Self::TOOL_USE_ID_META)
+            .get(key)
             .and_then(|value| value.as_str())
             .map(str::to_string)
     }
@@ -246,6 +289,7 @@ impl ServerHandler for RoundhouseMcp {
                 .arguments
                 .map(serde_json::Value::Object)
                 .unwrap_or(serde_json::Value::Null),
+            thread_id: Self::thread_id(&context),
             tool_use_id: Self::tool_use_id(&context),
         };
         let outcome = crate::tools::dispatch(self.surface.as_ref(), &principal, call).await;

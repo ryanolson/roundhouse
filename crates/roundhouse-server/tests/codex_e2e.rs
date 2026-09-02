@@ -1519,6 +1519,136 @@ async fn a_key_revoked_between_runs_fails_the_next_turn_and_leaves_no_half_writt
 // provider-emitted tool call is relayed through this wire is the day it becomes
 // testable again — which is worth noticing, because that day is also when the
 // MCP plugin surface becomes reachable from a roundhouse-served turn.
+//
+// **M12.1 addendum: the negative half of that ruling is gone.** R-M7 makes
+// `_meta.threadId` the conversation the client names, so "arrives on every call
+// and is discarded" is no longer true of this deployment and the retired test's
+// assertion would now be wrong rather than merely unobservable. Its positive
+// successor is
+// `a_real_codex_binary_is_correlated_by_the_thread_id_it_stamps` immediately
+// below. What has *not* changed is the observability argument: that successor
+// is ignored here for two independent reasons and either alone is enough, both
+// of which it states.
+
+/// **R-M7's real-binary counterpart: a real codex stamps `_meta.threadId`, and
+/// roundhouse answers the conversation it names.**
+///
+/// **Ignored, and for two reasons rather than one.** The first is this box:
+/// there is no codex binary on it, so every test in this suite is ignored by
+/// default. The second is the T7 ruling above and it does not lift with a
+/// binary — a run of this rig produces no `tools/call` at all, because the
+/// upstream double is [`EchoFrontierClient`] and this deployment's
+/// `/v1/responses` stream carries assistant text and nothing else, so no turn
+/// it serves can ask a model to call a tool. **Both** conditions have to
+/// change before this can go green:
+///
+/// 1. a real `codex` on `PATH` or `ROUNDHOUSE_TEST_CODEX_BIN`, and
+/// 2. an upstream that emits a tool call this client will dispatch — which for
+///    codex means a *namespaced* one, because `namespace_tools` defaults on and
+///    the tools reach the model under the `mcp{DELIMITER}roundhouse` namespace
+///    with bare names (see
+///    `the_delimiter_a_skill_spells_is_the_one_the_real_binary_namespaces_with`
+///    for the citations). `common::ScriptedTurns` is the double that would do
+///    it; what nothing in this tree has yet established is the exact wire shape
+///    of a namespaced `function_call` that codex 0.146.0 will route to MCP, and
+///    guessing it here would produce an ignored test that is confidently wrong.
+///
+/// Written now rather than when both land because the *assertions* are what the
+/// milestone owes: this is the one claim only a real binary can make — that the
+/// key R-M7 reads is a key the client actually sends, on the call it actually
+/// makes, with the value we believe it has. Until then the claim is pinned
+/// hermetically at three seams, none of which can see a real client:
+/// `roundhouse_mcp::reads`'s unit tests hold the order,
+/// `roundhouse-mcp/tests/tool_surface.rs` holds the dispatch chain, and
+/// `roundhouse-server/tests/mcp_surface.rs` holds `rmcp`'s `_meta` stripping
+/// against a Codex-shaped envelope this file's F09 capture supplied.
+///
+/// **It fails loudly rather than passing vacuously** if condition (2) is unmet:
+/// the first assertion is that exactly one `tools/call` reached the surface, so
+/// a run against the echo upstream reports "no tool call was dispatched" rather
+/// than finding nothing and agreeing with itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs the real codex binary AND an upstream that emits a namespaced tool call; \
+            see the doc comment -- neither exists on this box, so this cannot run here"]
+async fn a_real_codex_binary_is_correlated_by_the_thread_id_it_stamps() {
+    let rig = Rig::start("thread-id").await;
+    let run = rig
+        .exec("Ask roundhouse for its status, then tell me what it said.")
+        .await;
+    run.assert_completed("the control-tool run");
+
+    // ---- edge one: what the client sent -----------------------------------
+    let calls = rpc(&rig.recorder, "tools/call");
+    assert_eq!(
+        calls.len(),
+        1,
+        "exactly one `tools/call` must have reached the control surface; with \
+         an upstream that emits no tool call there is none, which is condition \
+         (2) in this test's doc rather than a defect in the surface. The \
+         deployment saw:\n{}",
+        rig.recorder.transcript()
+    );
+    let call = &calls[0];
+    assert_eq!(call.status, 200, "the control call was refused: {call:?}");
+    let body = call
+        .body
+        .as_ref()
+        .unwrap_or_else(|| panic!("a `tools/call` has a JSON body: {call:?}"));
+
+    let thread_id = body["params"]["_meta"]["threadId"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!(
+                "codex must stamp `_meta.threadId` on every `tools/call` \
+                 (`with_mcp_tool_call_thread_id_meta`, called with no \
+                 conditional guard) -- R-M7's whole correlation rides on this \
+                 one key: {body}"
+            )
+        });
+
+    // The value, not just its presence. F09's claim is that the thread id *is*
+    // the turn's `prompt_cache_key`, which is what makes reading it as a name
+    // sound rather than a coincidence this deployment relies on: a codex that
+    // started sending a thread id unrelated to the cache key would leave the
+    // key present, this assertion red, and R-M7 quietly resolving every call
+    // to `latest`.
+    let cache_keys: Vec<String> = rig
+        .recorder
+        .to("/v1/responses")
+        .iter()
+        .filter_map(|turn| {
+            turn.body.as_ref()?["prompt_cache_key"]
+                .as_str()
+                .map(str::to_string)
+        })
+        .collect();
+    assert!(
+        cache_keys.iter().any(|key| key == thread_id),
+        "the thread id must be the `prompt_cache_key` this client sent on its \
+         own turns -- the identity R-M7 resolves it as a name through. Sent: \
+         {cache_keys:?}, stamped: {thread_id}"
+    );
+
+    // ---- edge two: which conversation answered ----------------------------
+    //
+    // The thread id qualified into this caller's namespace is the session the
+    // client's own turns bound, which is what `Conversations::resolve` of the
+    // rig's discovered session says independently.
+    let answered: Value = call
+        .response
+        .as_ref()
+        .and_then(|reply| reply["result"]["content"][0]["text"].as_str())
+        .map(|text| serde_json::from_str(text).expect("a served tool answers with JSON"))
+        .unwrap_or_else(|| panic!("the control call answered nothing: {call:?}"));
+    assert_eq!(
+        answered["conversation"].as_str(),
+        Some(rig.session().as_str()),
+        "the answer must be about the conversation the thread id names, which \
+         is the one this client drove: {answered}"
+    );
+
+    rig.clean();
+}
 
 /// A real codex binary completes the MCP handshake against our own service.
 ///

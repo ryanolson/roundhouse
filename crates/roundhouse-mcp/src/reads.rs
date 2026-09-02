@@ -31,7 +31,7 @@ use roundhouse_core::control::{Balance, Principal, TurnPolicy};
 use roundhouse_core::ids::SessionId;
 use roundhouse_core::routing::{DecisionRecord, Target};
 
-use crate::surface::SurfaceError;
+use crate::surface::{Correlators, SurfaceError};
 
 /// What a session's log says, projected.
 ///
@@ -54,8 +54,31 @@ pub struct SessionFacts {
     pub last_decision: Option<DecisionRecord>,
 }
 
-/// Steps (2) and (3) of [`ControlReads::resolve_session`]'s order, in the one
-/// place that decides them.
+/// What each of the caller's correlators resolved to, in this implementor's
+/// own tables.
+///
+/// **Resolved, not raw** — the counterpart to [`Correlators`], which is what the
+/// client sent. The lookups are per deployment (one is a namespace
+/// qualification, the other a call table) and the *order they are weighed in* is
+/// not, so the two live on opposite sides of
+/// [`session_this_call_is_about`]: the implementor fills this in, the shared
+/// function rules on it.
+///
+/// Named fields rather than two positional `Option<SessionId>` arguments for
+/// the reason [`Correlators`] is a struct: transposing them would invert R-M7
+/// with nothing red.
+#[derive(Debug, Clone, Default)]
+pub struct Correlated {
+    /// What `_meta.threadId` named, or `None` when the client sent none **or
+    /// when what it sent named no conversation of this caller's**. Unknown and
+    /// foreign collapse here, exactly as they do for a tool-use id — see
+    /// [`ControlReads::resolve_session`].
+    pub thread: Option<SessionId>,
+    /// What `_meta["claudecode/toolUseId"]` named, on the same terms.
+    pub call: Option<SessionId>,
+}
+
+/// [`ControlReads::resolve_session`]'s order, in the one place that decides it.
 ///
 /// **A function taking lookups rather than a rule each implementor re-types**
 /// (M12 review, F4). The order used to live only in the doc comment above,
@@ -69,40 +92,69 @@ pub struct SessionFacts {
 /// Lookups differ per deployment; the order does not, so the order is what
 /// moves here.
 ///
-/// The caller supplies the two reads and this applies R-M2: the id the client
-/// attached is exact, so it decides; the principal's most recent conversation
-/// is a guess, so it is only ever the fallback; and neither is
-/// [`SurfaceError::NoSession`], which is a refusal rather than a default
-/// because a node that has served this principal no turn has nothing to
-/// answer about.
+/// The implementor supplies three already-resolved answers and this applies
+/// R-M2 as R-M7 extended it:
 ///
-/// Both lookups are `FnOnce` and lazy: `latest` is not consulted at all when
-/// the id resolves, which is what keeps a hot path from paying for the answer
-/// it did not use.
-pub fn session_without_a_name(
-    tool_use_id: Option<&str>,
-    session_of_call: impl FnOnce(&str) -> Option<SessionId>,
+/// 1. `named` — what the model's own `conversation` argument resolved to. It
+///    is `None` when the model wrote none; a name that resolved to *nothing*
+///    never reaches here, because that is [`SurfaceError::ForeignConversation`]
+///    and the implementor raises it before asking this.
+/// 2. `correlated.thread` then `correlated.call` — the client's own two
+///    correlators, threadId first (R-M7). Ordered rather than refused against
+///    each other because they come from one source: a client that spelled both
+///    is naming one call in two vocabularies, where an argument and a
+///    correlator are the *model* and the *client* answering separately.
+/// 3. `latest` — the principal's most recent conversation, a guess and never
+///    more.
+///
+/// **The disagreement arm is the one thing here that is not an order** (R-M7).
+/// When the model named a conversation and the client correlated the call to a
+/// different one, both are named back in
+/// [`SurfaceError::ContradictoryConversation`] and neither is served. Only the
+/// *effective* correlator is compared — the one the order above would have used
+/// — because that is the single answer the client gave.
+///
+/// `latest` stays `FnOnce` and lazy: it is not consulted at all when anything
+/// above it resolved, which is what keeps a hot path from paying for the answer
+/// it did not use. The correlators cannot be lazy any more, and that is R-M7's
+/// direct cost: detecting a contradiction means resolving the client's
+/// correlator even on a call whose argument would have decided it.
+pub fn session_this_call_is_about(
+    named: Option<SessionId>,
+    correlated: Correlated,
     latest: impl FnOnce() -> Option<SessionId>,
 ) -> Result<SessionId, SurfaceError> {
-    tool_use_id
-        .and_then(session_of_call)
-        .or_else(latest)
-        .ok_or(SurfaceError::NoSession)
+    let correlated = correlated.thread.or(correlated.call);
+    match (named, correlated) {
+        (Some(named), Some(correlated)) if named != correlated => {
+            Err(SurfaceError::ContradictoryConversation {
+                named: named.to_string(),
+                correlated: correlated.to_string(),
+            })
+        }
+        (Some(agreed), _) => Ok(agreed),
+        (None, Some(correlated)) => Ok(correlated),
+        (None, None) => latest().ok_or(SurfaceError::NoSession),
+    }
 }
 
 #[async_trait]
 pub trait ControlReads: Send + Sync + 'static {
     /// Which conversation this call concerns.
     ///
-    /// **Three answers in a fixed order, and the order is the ruling** (M12,
-    /// R-M2):
+    /// **Four answers in a fixed order, and the order is the ruling** (M12,
+    /// R-M2; M12.1, R-M7):
     ///
     /// 1. `conversation` — a name the model wrote, resolved through the same
     ///    namespacing the Responses surface qualifies a `prompt_cache_key`
     ///    with. First because it is the only one the *agent* chose: a tool call
-    ///    that names a conversation is asking about that conversation, and an
-    ///    id inferred from the transport must never overrule a name the model
-    ///    wrote.
+    ///    that names a conversation is asking about that conversation.
+    ///
+    ///    First, but no longer *overruling*: since R-M7 an argument that
+    ///    disagrees with the client's own correlator refuses instead of
+    ///    winning. The order below decides which conversation a call is about
+    ///    when the caller gave one answer in several places; it is not a
+    ///    licence to pick a side when the caller gave two.
     ///
     ///    **That namespacing is the Responses surface's, and a Messages client
     ///    has no name that lands in it** (M12). A Messages session is keyed
@@ -115,12 +167,20 @@ pub trait ControlReads: Send + Sync + 'static {
     ///    than made to try both spellings — one qualification per call is what
     ///    keeps a probe for another tenant's id indistinguishable from a
     ///    typo — and recorded here because the next reader will ask.
-    /// 2. `tool_use_id` — the id of the `tool_use` block this call is
-    ///    answering, which is an id roundhouse emitted into exactly one
+    /// 2. `correlators.thread_id` — `_meta.threadId`, **resolved as a name**
+    ///    through that same qualification (M12.1, R-M7). Codex stamps it on
+    ///    every `tools/call` and captured traffic shows it byte-identical to
+    ///    the turn's `prompt_cache_key`, which is exactly the string the
+    ///    Responses surface qualifies into a session id — so the client is
+    ///    naming a conversation, in the one vocabulary this deployment already
+    ///    understands, and it goes through the named path's tenancy check
+    ///    rather than beside it.
+    /// 3. `correlators.tool_use_id` — the id of the `tool_use` block this call
+    ///    is answering, which is an id roundhouse emitted into exactly one
     ///    session. Exact where the fallback below is a guess: a parent agent
     ///    and its subagents share a principal and race for the same "most
     ///    recent" slot, and the id is what tells them apart.
-    /// 3. Neither — the principal's most recent session.
+    /// 4. None of them — the principal's most recent session.
     ///
     /// Two failures are distinct and both are errors rather than defaults: a
     /// principal with no session at all is [`SurfaceError::NoSession`], and a
@@ -129,22 +189,31 @@ pub trait ControlReads: Send + Sync + 'static {
     /// caller's own most recent one, which would let a probe for someone else's
     /// key read as an ordinary answer.
     ///
-    /// A `tool_use_id` that names no conversation *of this caller's* — unknown,
-    /// evicted, or another tenant's — falls through to (3) rather than
-    /// refusing. Unknown and foreign answer alike on purpose: telling them
-    /// apart would make the id an enumeration oracle for ids the caller does
+    /// A **correlator** that names no conversation of this caller's — unknown,
+    /// evicted, or another tenant's — falls through to the next step rather
+    /// than refusing, and that holds for the thread id exactly as it does for
+    /// the tool-use id even though the thread id resolves down the named path.
+    /// Unknown and foreign answer alike on purpose: telling them apart would
+    /// make either key an enumeration oracle for conversations the caller does
     /// not hold, and the caller has no use for another tenant's session either
-    /// way.
+    /// way. The `conversation` *argument* is the one input that refuses instead,
+    /// because a model that wrote a name is asking about that name and nothing
+    /// else; a correlator is the client volunteering context it may simply be
+    /// wrong about.
     ///
-    /// The unnamed half of that order — steps (2) and (3), the two an
-    /// implementor answers from its own tables — is
-    /// [`session_without_a_name`], and an implementor is expected to call it
-    /// rather than re-encode it.
+    /// A third failure is R-M7's: when the argument and the effective
+    /// correlator resolve to two different conversations, neither is served and
+    /// [`SurfaceError::ContradictoryConversation`] names both.
+    ///
+    /// The order — every step of it, including that refusal — is
+    /// [`session_this_call_is_about`], and an implementor is expected to fill
+    /// in [`Correlated`] from its own tables and call it rather than re-encode
+    /// the ruling.
     async fn resolve_session(
         &self,
         principal: &Principal,
         conversation: Option<&str>,
-        tool_use_id: Option<&str>,
+        correlators: Correlators<'_>,
     ) -> Result<SessionId, SurfaceError>;
 
     /// The policy this principal's turns are admitted under, before any
@@ -244,15 +313,25 @@ mod tests {
         SessionId::new("acme/ada/main")
     }
 
-    /// R-M2's two unnamed steps, asserted where they are decided rather than
-    /// through a surface — this is the function F4 moved them into, and the
-    /// one an implementor is free to get wrong only by not calling it.
+    fn thread() -> SessionId {
+        SessionId::new("acme/ada/thread")
+    }
+
+    /// Just the call correlator, as R-M2 left it: exact where `latest` is a
+    /// guess, and both of them absent is a refusal rather than an invention.
+    ///
+    /// Asserted where it is decided rather than through a surface — this is the
+    /// function F4 moved the ruling into, and the one an implementor is free to
+    /// get wrong only by not calling it.
     #[test]
     fn the_tool_use_id_decides_and_the_most_recent_conversation_only_catches() {
         assert_eq!(
-            session_without_a_name(
-                Some("toolu_sub"),
-                |_| Some(subagent()),
+            session_this_call_is_about(
+                None,
+                Correlated {
+                    call: Some(subagent()),
+                    ..Correlated::default()
+                },
                 || Some(most_recent())
             )
             .ok(),
@@ -260,24 +339,135 @@ mod tests {
             "an id the node emitted is exact, so it outranks a guess"
         );
         assert_eq!(
-            session_without_a_name(Some("toolu_foreign"), |_| None, || Some(most_recent())).ok(),
+            session_this_call_is_about(None, Correlated::default(), || Some(most_recent())).ok(),
             Some(most_recent()),
-            "an id that names none of this caller's sessions falls through \
-             rather than refusing — unknown, evicted, ambiguous and foreign \
-             all answer alike"
-        );
-        assert_eq!(
-            session_without_a_name(None, |_| Some(subagent()), || Some(most_recent())).ok(),
-            Some(most_recent()),
-            "and with no id at all the fallback is the whole answer"
+            "an id that names none of this caller's sessions resolves to \
+             nothing and falls through rather than refusing — unknown, \
+             evicted, ambiguous and foreign all answer alike, and so does an \
+             absent id"
         );
         assert!(
             matches!(
-                session_without_a_name(None, |_| Some(subagent()), || None),
+                session_this_call_is_about(None, Correlated::default(), || None),
                 Err(SurfaceError::NoSession)
             ),
             "a node that has served this principal no turn refuses rather \
              than inventing a conversation"
+        );
+    }
+
+    /// R-M7: the thread id is a correlator too, and it is the first one.
+    #[test]
+    fn the_thread_id_is_weighed_ahead_of_the_tool_use_id_and_both_ahead_of_latest() {
+        assert_eq!(
+            session_this_call_is_about(
+                None,
+                Correlated {
+                    thread: Some(thread()),
+                    call: Some(subagent()),
+                },
+                || Some(most_recent())
+            )
+            .ok(),
+            Some(thread()),
+            "threadId first (R-M7): it is a *name* the client resolved through \
+             the caller's own namespace, where the tool-use id is a lookup in \
+             a node-local table"
+        );
+        assert_eq!(
+            session_this_call_is_about(
+                None,
+                Correlated {
+                    thread: Some(thread()),
+                    call: None,
+                },
+                || Some(most_recent())
+            )
+            .ok(),
+            Some(thread()),
+            "and on its own it still outranks the guess — the control that \
+             proves the assertion above is about the order and not about the \
+             tool-use id being present"
+        );
+        assert_eq!(
+            session_this_call_is_about(
+                None,
+                Correlated {
+                    thread: None,
+                    call: Some(subagent()),
+                },
+                || Some(most_recent())
+            )
+            .ok(),
+            Some(subagent()),
+            "a client sending only the other correlator is unaffected by R-M7"
+        );
+    }
+
+    /// R-M7's refusal: the model's argument and the client's correlator
+    /// disagreeing is not a precedence question.
+    #[test]
+    fn an_argument_that_contradicts_the_clients_correlator_is_refused_naming_both() {
+        let refused = session_this_call_is_about(
+            Some(most_recent()),
+            Correlated {
+                thread: Some(thread()),
+                call: None,
+            },
+            || panic!("`latest` must not be consulted once either input resolved"),
+        )
+        .expect_err("a caller contradicting itself is refused");
+        let message = refused.to_string();
+        assert!(
+            matches!(refused, SurfaceError::ContradictoryConversation { .. }),
+            "and refused as its own variant, not as a tenancy verdict about \
+             either conversation: {message}"
+        );
+        // **Both**, because either one alone leaves the agent guessing which of
+        // its own two inputs the deployment disliked — and the argument is the
+        // half a model can actually change.
+        assert!(
+            message.contains(most_recent().as_str()) && message.contains(thread().as_str()),
+            "the refusal must name both conversations: {message}"
+        );
+
+        // The control, and the ordinary case: an argument that *agrees* with
+        // the correlator is served, so the refusal above is about the
+        // disagreement and not about sending both at once.
+        assert_eq!(
+            session_this_call_is_about(
+                Some(most_recent()),
+                Correlated {
+                    thread: Some(most_recent()),
+                    call: Some(most_recent()),
+                },
+                || None
+            )
+            .ok(),
+            Some(most_recent()),
+        );
+
+        // And the correlator that is compared is the *effective* one — the one
+        // the order would have used — so a tool-use id behind an agreeing
+        // thread id does not manufacture a contradiction the client never had.
+        assert_eq!(
+            session_this_call_is_about(
+                Some(most_recent()),
+                Correlated {
+                    thread: Some(most_recent()),
+                    call: Some(subagent()),
+                },
+                || None
+            )
+            .ok(),
+            Some(most_recent()),
+        );
+
+        // A named argument with no correlator at all is the pre-R-M7 path and
+        // still answers: the refusal needs two answers to be a contradiction.
+        assert_eq!(
+            session_this_call_is_about(Some(most_recent()), Correlated::default(), || None).ok(),
+            Some(most_recent()),
         );
     }
 }

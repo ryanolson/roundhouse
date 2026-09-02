@@ -45,10 +45,11 @@ features — the first is what makes the second possible.
 >
 > Not built: the WebSocket and gRPC transports, and resuming an interrupted
 > generation from the partial output already durable in the log. Metrics are
-> per-process. The MCP surface still ignores the `_meta.threadId` a Codex
-> client sends on every `tools/call` — its Claude Code counterpart,
-> `_meta["claudecode/toolUseId"]`, *is* read — and a control call chained
-> through NeMo Relay is stated rather than tested.
+> per-process. The MCP surface reads both correlators its clients attach —
+> the `_meta.threadId` a Codex client stamps on every `tools/call` and the
+> `_meta["claudecode/toolUseId"]` Claude Code sends — but only the second
+> has been observed arriving from a real binary; a control call chained
+> through NeMo Relay is likewise stated rather than tested.
 
 Roundhouse depends on Dynamo but is not part of it. It pins two Dynamo crates
 (`dynamo-kv-router` with the `standalone-selection` feature, and `dynamo-tokens`)
@@ -1394,13 +1395,19 @@ same gate that makes an interactive run ask before it will call an
 `--allowedTools`. Both prompts are stated in `topham plan`'s output, not
 solved.
 
-The MCP surface still ignores the `_meta.threadId` a Codex client sends on every
-`tools/call`, because `init_session` is the client-agnostic path and reading
-`_meta` is a codex-native shortcut deferred to a plan of its own. The Claude
-Code counterpart, `_meta["claudecode/toolUseId"]`, *is* read, and it is not the
-same bargain: it carries an id *roundhouse emitted*, so it needs no cooperation
-from the model, and a caller presenting one that is not theirs learns nothing
-from it. The forwarded-ChatGPT-login stanza is exercised with a crafted
+The MCP surface reads the `_meta.threadId` a Codex client stamps on every
+`tools/call` — the value is that turn's `prompt_cache_key`, so it resolves as a
+*name* through the same namespace qualification the `conversation` argument goes
+through, and a thread id naming no conversation of the caller's falls through to
+the next correlator rather than reaching anyone else's session. Its Claude Code
+counterpart, `_meta["claudecode/toolUseId"]`, is read too and is a slightly
+different bargain: it carries an id *roundhouse emitted*, so it needs no
+cooperation from the model at all. What is unobserved is the Codex half's last
+mile: no run in this tree has yet seen a real `codex` dispatch a `tools/call`,
+because nothing here emits a tool call a codex client would route to MCP, so the
+threadId path is proved hermetically against a captured `_meta` shape rather
+than against the binary (`a_real_codex_binary_is_correlated_by_the_thread_id_it_stamps`
+is written and ignored, with both unlock conditions in its doc). The forwarded-ChatGPT-login stanza is exercised with a crafted
 `auth.json`; no real login has been forwarded through this code. The same is true of the Anthropic pass-through row that
 landed with the Messages client: the four headers it admits are asserted against
 a mock upstream on a real socket, and no real Claude subscription seat has been
