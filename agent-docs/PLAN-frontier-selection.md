@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Plan: frontier-only model selection, the text steer, and the Switchyard benchmark (M10)
 
-> **Status: proposed design.** Direction set by the product owner on
+> **Status: M10.0–M10.2 shipped; D1 ruled (2026-09-02).** Originally: proposed design. Direction set by the product owner on
 > 2026-08-22: intercept codex and model-select per Switchyard guidance,
 > frontier models only at first — mimic a user on a sol-only session with a
 > fraction of calls rerouted to terra/luna, then swap the source so sol maps
@@ -372,3 +372,128 @@ One build-order note recorded for honesty: PR #10 (the ToolSignals port)
 was merged into the M9 branch after #6 had already squash-merged, so its
 content never reached `main`; the M10 implementation branch re-lands the
 approved commit by cherry-pick and its PR says so.
+
+## Addendum (2026-09-02): D1 — the state-spectrum ruling
+
+R10 deferred the state question to a design round and named its shape: a
+declared mode spectrum — P0 proxy, P1 ephemeral, P2 durable — and a ruling
+on how much of Relay's proxy posture to adopt rather than rebuild, made
+against a working stateless-shaped path rather than a thought experiment.
+The round ran on the tree at `7c5369a`, after M10.0–M10.2, the Anthropic
+Messages surface (M11), the MCP control surface with its correlation tables
+(M12, M12.1) and the Redis fair-use ledger (M13). Three evidence documents
+carry it, every claim pinned and independently re-derived:
+
+- `research/roundhouse-state-inventory-7c5369a.md` — twenty pieces of state
+  in nine families, which promise each serves, what breaks on a restart and
+  on a second node, and the minimum durable set that closes the M12.1
+  handoffs.
+- `research/nemo-relay-0.8.2-proxy-posture.md` — what Relay keeps, where,
+  for which promise, and what it deliberately does not keep.
+- `research/client-carried-state-codex-6344a65-claude-2.1.257.md` — what a
+  node can know from one request alone, for both clients on both surfaces.
+
+**R11 — P0 is not a mode roundhouse ships.** Under a proxy that keeps no
+log, four promises are not degraded but deleted: replay and audit (the
+Relay-format exports are cold replays of a finished session), exact settle
+(the settle is re-driven by the replay a session performs when next opened;
+with no log, a process dying between dispatch and settle leaves spend never
+applied), drift reconciliation (definitionally the ledger's `committed_usd`
+against the log's `measured_usd`), and steering as it exists since M10.0
+(the correction is a conversation item; P0 would move it back out of the
+log). Three more degrade to a stated guess: prefix admission has nothing to
+compare a resent history against, so fork detection and the warm-prefix
+premise behind routing warmth lose their trigger, and idempotent retry
+across a reconnect becomes "run the turn again, bill twice". What survives
+intact — auth, tenancy, the routing decision, fair use, grants,
+pass-through credentials, the MCP tool shape — is Relay's product, which
+exists, and which roundhouse already hands off to under the S3 topology.
+The product sentence says roundhouse *owns the turn*; a mode that owns
+nothing between requests is a second Relay, not a roundhouse. So the
+spectrum collapses to two shipped modes: **P1 ephemeral**, today's
+no-Redis default — one node, process state, the memory store, a restart
+survived by refusal and re-derivation and never by a guess — and **P2
+durable**, Redis behind everything that has a durable implementation. P0's
+*disciplines* are adopted piecemeal under R14; P0 as a mode is closed.
+
+**R12 — one switch, and it widens to the three correlation maps.**
+`ROUNDHOUSE_REDIS_URL` set means every family with a durable implementation
+uses it — sessions, spend, fair use (R-F3′), and, once built, the three
+maps the inventory names as the minimum that closes the M12.1 handoffs:
+generations (`{project}/{user}/{key}` → generation), calls
+(`(principal, tool_use_id)` → session or ambiguous) and threads
+(`(principal, thread_id)` → session). Nothing is chosen by a second
+predicate; the M13 review showed what a second predicate costs. Two rows
+stay node-local by contract: `latest`, whose whole contract is "a guess,
+weighed as one", and which durability would make more confident without
+making more correct; and `ControlStore`'s four families, whose loss widens
+to the ceiling and never past it and whose durable shape is M8's ruling.
+The maps live in the store crate beside the spend and fair-use ledgers,
+with a shared contract the memory implementation passes first (the M13
+pattern), and the three properties already written as decisions in
+`conversations.rs` are the contract: partitioned by principal, an ambiguous
+call remembered rather than forgotten, a thread rebinding where a call
+collides. The hot-path cost is resolved rather than accepted: a generation
+is read through the store only on a node's first touch of a key and written
+through on a fork, so the common turn stays a local lookup and the round
+trip is spent exactly where a restart or a second node would otherwise
+guess. With a durable map, M12.1's "never bound on this node refuses" keeps
+its condition and widens its scope — never bound *anywhere* refuses — which
+is the answer to the inventory's last open question.
+
+**R13 — the fork arm admits, in every mode.** Handoff (a) has a cause and a
+symptom, at different prices. The cause is a re-derived generation; R12
+removes it. The symptom is independent of the mode and wrong on its own
+terms: the fork arm appends the claimed history whole on the premise that a
+forked-to session "is empty and so agrees trivially", and discards the
+store's already-existed answer that would have said otherwise. A forked-to
+session is admitted like any other — its log is compared with the claim,
+an agreeing log continues, a disagreeing one forks again, and a bounded
+number of disagreements refuses loudly rather than looping. This is
+well-defined, test-first, and ships alone before R12.
+
+**R14 — what to adopt from Relay's posture, and what not.** Adopted, each
+as a shipped decision rather than a re-litigation: a *staleness* bound on
+the call and thread tables beside the capacity bound they have (Relay bounds
+correlation state by TTL and turn boundary; a binding older than any
+plausible turn is a stale guess whatever the table's size); a declared
+tenancy namespace and a schema version folded into every shared-store key,
+rejected when empty; refuse-if-foreign process arbitration — file lock,
+owner record, ready file — for `topham` wherever it manages a local
+process; and the degradation of a shared-store outage *recorded as a typed
+reason*, never swallowed. Not adopted: correlation by hint scoring
+(roundhouse binds exact ids it emitted or the client stamped, and refuses
+on ambiguity rather than weighing it); a loopback-only single process as
+the deployment shape; and fail-open on a shared store as a blanket rule —
+right for Relay's response cache, wrong for a ledger. The ledger posture is
+split and stated: a check against a configured ceiling that cannot reach
+its store fails *closed*, refusing the turn with the retryable error an
+outage calls for, because a ceiling that cannot be checked cannot be
+honoured and the operator configured it on purpose; a draw already made
+that cannot be recorded fails *open* with the reason logged, because a
+bounded under-count is a fact about the outage and a wrong refusal is not.
+The engine's fair-use seam already has this shape; M13.1 pins it.
+
+**R15 — the admin directory is the next durability gap, and it is not
+D1's.** The inventory found one restart loss that corrupts a *surviving*
+store: losing an archived project's tombstone from the memory directory
+lets the id be recreated and silently joins the new tenant to the old one's
+spend in the Redis ledger that did survive — a hazard that appears exactly
+when a deployment upgrades from P1 to P2 partially. A durable
+`DirectoryStore` is M8-owned and carries its own placement question; D1
+records that it is the first gap after the three maps, and that until it
+closes, the Redis-arm boot warning is the honest statement of it.
+
+**What D1 leaves open, by name.** Whether `_meta["x-codex-turn-metadata"]
+.session_id` — the cache key, on every codex control call, unread today —
+should be read so a codex `status` needs no table at generation zero; it is
+cheap and exact, and it belongs with M14.1 where the generation map makes
+it whole. Whether the metrics fold gets an aggregator across nodes, which
+is the dashboard's P2 question and not a correlation one. And whether
+Relay's fail-open-with-deadline is the right posture for the *response
+cache* roundhouse does not have — moot until it does.
+
+The rungs this opens are recorded in `PLAN-anthropic-messages.md`, where
+the loop that drives this branch lives: M14.0 (R13), M14.1 (R12), M14.2
+(R14's bounds and key discipline), and the ledger posture folded into
+M13.1.

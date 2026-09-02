@@ -1240,3 +1240,35 @@ server. The `redis` crate is a watched dependency: no version moves here.
   caller's clock, two handles with different prefixes, floor instead of
   round at the edge, and the boot warning kept beside a wired Redis; eight
   went red under a named guard and the ninth became the predicate above.
+
+## Addendum (2026-09-02): D1 ruled — the rungs it opens
+
+The state-spectrum design round the frontier plan deferred (R10) has
+ruled; the ruling is `PLAN-frontier-selection.md`'s 2026-09-02 addendum
+(R11–R15) and its evidence is the three D1 documents under `research/`.
+For this branch it settles the M12.1 handoffs and the shape of what comes
+after M13.1:
+
+- **M14.0 — the fork arm admits** (R13). `bind_prefix`'s fork arm runs the
+  same admission against the forked-to session's log instead of assuming
+  it empty; an agreeing log continues, a disagreeing one forks again, and
+  a bounded number of disagreements refuses loudly. Test-first: a
+  restart-then-fork whose re-derived `#g1` already holds history no longer
+  duplicates the prefix. Well-defined; ships alone.
+- **M14.1 — durable generations, calls and threads** (R12). Three maps in
+  the store crate beside the spend and fair-use ledgers, one shared
+  contract the memory implementation passes first, `Conversations` reading
+  through on a node's first touch of a key and writing through on a fork
+  and a bind; the M12.1 "never bound" refusal widens from this node to
+  anywhere. With it, `_meta["x-codex-turn-metadata"].session_id` is read
+  so a codex control call at generation zero needs no table at all.
+- **M14.2 — staleness bounds and key discipline** (R14). A TTL beside the
+  capacity cap on the call and thread tables; a declared namespace and a
+  schema version in every shared-store key, rejected when empty.
+- **Folded into M13.1**: the ledger-outage posture — a ceiling check that
+  cannot reach its store fails closed with a retryable refusal, a draw that
+  cannot be recorded fails open with the reason logged — pinned by tests
+  beside the read-path redesign.
+
+Not scheduled here: the durable admin directory (R15, M8-owned) and a
+cross-node aggregator for the metrics fold.
