@@ -263,6 +263,15 @@ const CHILD_DEADLINE: Duration = Duration::from_secs(60);
 /// The environment variable that overrides which binary is driven.
 const CODEX_BIN_VAR: &str = "ROUNDHOUSE_TEST_CODEX_BIN";
 
+/// The environment variable naming the built `topham` the closure test drives.
+const TOPHAM_BIN_VAR: &str = "ROUNDHOUSE_TEST_TOPHAM_BIN";
+
+/// The profile name the closure test writes and resolves.
+///
+/// One name is enough because each test owns a rig, and therefore an isolated
+/// `XDG_CONFIG_HOME`: two tests holding this name mean two different files.
+const TOPHAM_PROFILE: &str = "e2e";
+
 /// The refusal a revoked turn key earns, in both of the shapes F15 asserts on.
 ///
 /// Spelled here rather than inline because the two assertions read the same
@@ -390,6 +399,9 @@ fn emitting_the_guidance(recorder: &Recorder) -> Option<Exchange> {
 struct Rig {
     /// Where this run's `CODEX_HOME`, work directory and generated files live.
     root: PathBuf,
+    /// This deployment's **root**, with no `/v1` — what a `topham` profile
+    /// names. See where it is built in [`Rig::start_as`].
+    deployment_root: String,
     /// The minted turn key, in plaintext — the value of the env var the client
     /// is launched with, and the only place it exists outside the directory's
     /// hash.
@@ -551,7 +563,14 @@ impl Rig {
             let _ = axum::serve(listener, app).await;
         });
 
-        let base_url = format!("http://{addr}/v1");
+        // The **deployment root** and the base URL derived from it, rather than
+        // one string with the prefix baked in. The root is what a `topham`
+        // profile names — the launcher derives each client's own shape from it,
+        // codex's with the prefix and Claude Code's without — so a rig that
+        // held only the prefixed form would have to strip it back off, which is
+        // the launcher's job being done twice.
+        let deployment_root = format!("http://{addr}");
+        let base_url = format!("{deployment_root}/v1");
         let catalog_path = root.join("home/models.json");
         // Fallible since F13; the rig's inputs are the documented-correct
         // shape, so a refusal here means the rig built them wrong.
@@ -599,6 +618,7 @@ impl Rig {
 
         Self {
             root,
+            deployment_root,
             key_sha256: minted.key_sha256.clone(),
             secret: minted.secret,
             directory,
@@ -798,7 +818,7 @@ impl Rig {
 
     async fn spawn(&self, subcommand: &[&str], prompt: &str) -> CodexRun {
         let last_message = self.root.join(format!("last-{}.txt", uuid::Uuid::new_v4()));
-        let mut command = build_child_command(
+        let command = build_child_command(
             &self.binary,
             subcommand,
             prompt,
@@ -806,39 +826,115 @@ impl Rig {
             &self.secret,
             &last_message,
         );
+        drive_child(
+            command,
+            &self.binary,
+            CODEX_BIN_VAR,
+            &format!("`{} {}`", self.binary, subcommand.join(" ")),
+            &self.root,
+            &last_message,
+        )
+        .await
+    }
 
-        let output = tokio::time::timeout(CHILD_DEADLINE, command.output())
-            .await
-            .unwrap_or_else(|_| {
-                panic!(
-                    "`{} {}` did not finish within {:?}. CODEX_HOME: {}",
-                    self.binary,
-                    subcommand.join(" "),
-                    CHILD_DEADLINE,
-                    self.root.join("home").display()
-                )
-            })
-            .unwrap_or_else(|error| {
-                panic!(
-                    "could not run `{}`: {error}. Set {CODEX_BIN_VAR} to a real codex binary, or \
-                     drop --include-ignored.",
-                    self.binary
-                )
-            });
+    /// One of this run's isolated XDG directories, created.
+    ///
+    /// `topham` resolves its profiles from `XDG_CONFIG_HOME` and its
+    /// per-profile `CODEX_HOME` from `XDG_DATA_HOME`, so a run that inherited
+    /// either would read a developer's profiles and write a generated
+    /// `config.toml` into their real data directory.
+    fn xdg(&self, what: &str) -> PathBuf {
+        let path = self.root.join("xdg").join(what);
+        std::fs::create_dir_all(&path).expect("the run's XDG directory");
+        path
+    }
 
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        let events = stdout
-            .lines()
-            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .collect::<Vec<_>>();
-        CodexRun {
-            events,
-            stdout,
-            stderr,
-            success: output.status.success(),
-            last_message: std::fs::read_to_string(&last_message).unwrap_or_default(),
-        }
+    /// Write the launch profile a `topham` child resolves, and answer with its
+    /// path.
+    ///
+    /// **Hand-written TOML rather than `Profile::to_toml`**: `topham`'s own
+    /// suite proves that what its `save` writes its `load` reads, which is two
+    /// functions agreeing. What only this file can claim is that the file *an
+    /// operator types*, from the vocabulary the README documents, resolves into
+    /// a launch a real client hooks up with — and a fixture built by the
+    /// serializer would agree with a renamed field on both sides and say
+    /// nothing.
+    ///
+    /// The `deployment-root` is the **root**, with no `/v1`: the launcher
+    /// derives codex's prefixed `base_url` from it, the same derivation
+    /// [`CodexLaunch::new`] refuses to have skipped. The absence of any key is
+    /// as load-bearing as anything present.
+    fn write_profile(&self) -> PathBuf {
+        let directory = self.xdg("config").join("topham").join("profiles");
+        std::fs::create_dir_all(&directory).expect("the run's profiles directory");
+        let path = directory.join(format!("{TOPHAM_PROFILE}.toml"));
+        std::fs::write(
+            &path,
+            format!(
+                "agent = \"codex\"\n\
+                 deployment-root = \"{}\"\n\
+                 auth = \"roundhouse-key\"\n\
+                 key-env = \"{DEFAULT_KEY_ENV}\"\n\
+                 topology = \"direct\"\n",
+                self.deployment_root
+            ),
+        )
+        .expect("the run's launch profile");
+        path
+    }
+
+    /// Drive the real client through a real `topham launch`, and answer with
+    /// what the client produced.
+    ///
+    /// The client's own argv after the `--` is [`codex_argv`], the same vector
+    /// [`build_child_command`] passes — so what the client is *asked* to do is
+    /// identical to every other test here and any difference in what arrives is
+    /// the launcher's doing.
+    ///
+    /// **The child's environment carries no `CODEX_HOME` and no config file**,
+    /// which is the difference between this and every other spawn in this file.
+    /// The others write the two generated files themselves and point the client
+    /// at them; here the child is handed a turn key, a home and a `PATH`, and
+    /// `topham` is what has to produce a `CODEX_HOME` with those two files in
+    /// it. A leaked `CODEX_HOME` would make a broken launcher look like a
+    /// working one.
+    async fn through_topham(&self, prompt: &str) -> CodexRun {
+        let topham = topham_binary();
+        println!("    topham binary: {topham}");
+        println!("    topham version: {}", topham_version(&topham));
+
+        let last_message = self.root.join(format!("last-{}.txt", uuid::Uuid::new_v4()));
+        let mut command = tokio::process::Command::new(&topham);
+        command.args(["launch", TOPHAM_PROFILE, "--"]);
+        command.args(codex_argv(&["exec"], prompt, &last_message));
+        command.current_dir(self.root.join("wd"));
+
+        command.env_clear();
+        // The client is resolved by `topham` through `PATH`, from the bare name
+        // its profile's agent implies — deliberately, since an operator with two
+        // `codex` binaries has already answered which one they mean. Putting
+        // this rig's answer first is the only way a launched client is the
+        // binary the version banner named.
+        command.env("PATH", path_with(&self.binary));
+        command.env("HOME", &self.root);
+        command.env("XDG_CONFIG_HOME", self.xdg("config"));
+        command.env("XDG_DATA_HOME", self.xdg("data"));
+        command.env(DEFAULT_KEY_ENV, &self.secret);
+        command.env("RUST_LOG", "info");
+
+        command.stdin(Stdio::null());
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
+
+        drive_child(
+            command,
+            &topham,
+            TOPHAM_BIN_VAR,
+            &format!("`topham launch {TOPHAM_PROFILE}`"),
+            &self.root,
+            &last_message,
+        )
+        .await
     }
 
     /// Remove this run's directory.
@@ -869,6 +965,155 @@ impl Rig {
 /// One function used by both the real harness and its own test, rather than a
 /// second copy that mirrors it: a copy is a fixture that can drift from what
 /// actually spawns, which is exactly the gap this function closes.
+/// The client's own argv, identical however it is started.
+///
+/// Split out of [`build_child_command`] so a `topham` child can pass the very
+/// same vector after its `--`: what the client is *asked* to do has to be the
+/// same on both paths, or the closure test would be comparing two different
+/// runs and attributing the difference to the launcher.
+fn codex_argv(subcommand: &[&str], prompt: &str, last_message: &std::path::Path) -> Vec<String> {
+    let mut argv: Vec<String> = subcommand.iter().copied().map(String::from).collect();
+    argv.extend(
+        [
+            "--json",
+            // Unknown config keys become hard errors rather than silent no-ops.
+            // Verified to pass against the generated config, and kept on
+            // purpose: this suite exists to notice client drift, and a knob
+            // that quietly stopped applying is exactly the drift it would
+            // otherwise miss.
+            "--strict-config",
+            "--skip-git-repo-check",
+            "-o",
+        ]
+        .map(String::from),
+    );
+    argv.push(last_message.to_string_lossy().into_owned());
+    argv.extend(
+        [
+            "-c",
+            "sandbox_mode=\"read-only\"",
+            // Provider-scoped, not top level: at 0.146.0 the bare
+            // `request_max_retries` is not a config field and `--strict-config`
+            // rejects it. Zero so a server bug fails once, loudly, instead of
+            // three times with the first failure scrolled away.
+            "-c",
+            "model_providers.roundhouse.request_max_retries=0",
+            "-c",
+            "model_providers.roundhouse.stream_max_retries=0",
+        ]
+        .map(String::from),
+    );
+    argv.push(prompt.to_string());
+    argv
+}
+
+/// Run one child to completion under [`CHILD_DEADLINE`], and read back what it
+/// produced.
+///
+/// A free function rather than a method on [`Rig`] because there are now two
+/// kinds of child a run of this suite starts: the client the rig builds itself,
+/// and a `topham` that resolves a profile and *becomes* one. Both are bounded
+/// the same way and both leave the same two artefacts — a JSONL stream and the
+/// `-o` file — so a second copy beside the second spawn is where the two would
+/// quietly stop agreeing about what a hung run does.
+async fn drive_child(
+    mut command: tokio::process::Command,
+    program: &str,
+    override_var: &str,
+    what: &str,
+    root: &std::path::Path,
+    last_message: &std::path::Path,
+) -> CodexRun {
+    let output = tokio::time::timeout(CHILD_DEADLINE, command.output())
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "{what} did not finish within {CHILD_DEADLINE:?}. CODEX_HOME: {}",
+                root.join("home").display()
+            )
+        })
+        .unwrap_or_else(|error| {
+            panic!(
+                "could not run `{program}`: {error}. Set {override_var} to a real binary, or drop \
+                 --include-ignored."
+            )
+        });
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let events = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect::<Vec<_>>();
+    CodexRun {
+        events,
+        stdout,
+        stderr,
+        success: output.status.success(),
+        last_message: std::fs::read_to_string(last_message).unwrap_or_default(),
+    }
+}
+
+/// The built `topham` the closure test drives, or a loud panic naming the
+/// variable that would have said where it is.
+///
+/// No `PATH` fallback, unlike [`CODEX_BIN_VAR`]: `topham` is this workspace's
+/// own binary and is installed nowhere, so a bare name would resolve to
+/// whatever a developer happened to have. The failure most likely to be caused
+/// here is forgetting to *rebuild* the launcher, and a test that silently ran a
+/// stale build would report green for code nobody compiled.
+fn topham_binary() -> String {
+    std::env::var(TOPHAM_BIN_VAR).unwrap_or_else(|_| {
+        panic!(
+            "the closure test drives this workspace's own launcher: set {TOPHAM_BIN_VAR} to a \
+             freshly built `target/debug/topham` (`cargo build -p topham`), or run without \
+             --include-ignored"
+        )
+    })
+}
+
+/// What `topham --version` prints, or a loud panic naming the override.
+///
+/// Isolated the way every other probe here is (M11.2b review F18), plus one
+/// reason of its own: `topham` reads profiles out of `XDG_CONFIG_HOME`, so a
+/// probe that inherited the developer's would resolve against configuration
+/// this suite never wrote.
+fn topham_version(binary: &str) -> String {
+    let home = std::env::temp_dir().join(format!(
+        "roundhouse-topham-version-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&home).expect("the probe's isolated home");
+    let version = version_probe(
+        binary,
+        &[
+            ("HOME", home.clone().into_os_string()),
+            ("XDG_CONFIG_HOME", home.join("config").into_os_string()),
+            ("XDG_DATA_HOME", home.join("data").into_os_string()),
+        ],
+        TOPHAM_BIN_VAR,
+    );
+    let _ = std::fs::remove_dir_all(&home);
+    version
+}
+
+/// The ambient `PATH` with `binary`'s own directory in front of it.
+///
+/// What a `topham` child needs and no other child here does: the launcher
+/// resolves the client from the **bare name** its profile's agent implies, so
+/// the only way to point a launched client at [`CODEX_BIN_VAR`]'s binary is to
+/// make the `PATH` answer be this rig's.
+fn path_with(binary: &str) -> String {
+    let ambient = std::env::var("PATH").unwrap_or_default();
+    match std::path::Path::new(binary)
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        Some(parent) => format!("{}:{ambient}", parent.display()),
+        None => ambient,
+    }
+}
+
 fn build_child_command(
     binary: &str,
     subcommand: &[&str],
@@ -878,31 +1123,7 @@ fn build_child_command(
     last_message: &std::path::Path,
 ) -> tokio::process::Command {
     let mut command = tokio::process::Command::new(binary);
-    command.args(subcommand);
-    command.args([
-        "--json",
-        // Unknown config keys become hard errors rather than silent no-ops.
-        // Verified to pass against the generated config, and kept on purpose:
-        // this suite exists to notice client drift, and a knob that quietly
-        // stopped applying is exactly the drift it would otherwise miss.
-        "--strict-config",
-        "--skip-git-repo-check",
-        "-o",
-    ]);
-    command.arg(last_message);
-    command.args([
-        "-c",
-        "sandbox_mode=\"read-only\"",
-        // Provider-scoped, not top level: at 0.146.0 the bare
-        // `request_max_retries` is not a config field and `--strict-config`
-        // rejects it. Zero so a server bug fails once, loudly, instead of
-        // three times with the first failure scrolled away.
-        "-c",
-        "model_providers.roundhouse.request_max_retries=0",
-        "-c",
-        "model_providers.roundhouse.stream_max_retries=0",
-    ]);
-    command.arg(prompt);
+    command.args(codex_argv(subcommand, prompt, last_message));
 
     // The working directory rather than `-C`: `exec resume` has no `--cd`
     // flag at all, and `--last` filters recorded sessions *by cwd*, so the
@@ -2362,6 +2583,111 @@ async fn the_next_turn_reflects_the_correction() {
         fourth.last_message
     );
     rig.assert_never_forked().await;
+
+    rig.clean();
+}
+
+/// **A real `codex`, launched by a real `topham`, from a profile a person
+/// wrote.**
+///
+/// Every other test here writes the client's `config.toml` and model catalog
+/// itself, points `CODEX_HOME` at them, and proves the *generated files* are
+/// ones a real client hooks up with. What none of them can prove is that
+/// anything an operator can run produces those files — until M11.3 nothing did,
+/// and this crate's README deferral said so in as many words: "no CLI
+/// subcommand or admin route produces these files".
+///
+/// This closes it, and the negative is the interesting half: the child is
+/// handed a turn key, a `HOME`, two XDG directories and a `PATH`, and **no
+/// `CODEX_HOME` and no config file at all**. If `topham launch` did not write
+/// them, the client resolves no roundhouse provider and the run cannot pass by
+/// inheriting anything, because there is nothing to inherit.
+/// [`CodexRun::assert_catalog_was_used`] is the second half: it goes red when
+/// the client fell back to invented model metadata, which is what a launcher
+/// that wrote a config but no catalog would produce.
+///
+/// **Ignored on this box for the ordinary reason and one more.** There is no
+/// `codex` binary here, so — unlike its `claude_e2e` siblings, which were run
+/// against real binaries when they were written — this test has never been
+/// executed. It is written to the same shape as those and reviewed against
+/// them; whoever first runs it with `ROUNDHOUSE_TEST_CODEX_BIN` set should
+/// treat a failure as evidence about the test as readily as about the launcher.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs the real codex and topham binaries: --features e2e-codex -- --include-ignored; ROUNDHOUSE_TEST_CODEX_BIN overrides PATH and ROUNDHOUSE_TEST_TOPHAM_BIN names a built topham"]
+async fn a_real_codex_launched_through_topham_hooks_up() {
+    let rig = Rig::start("topham-launch").await;
+    let profile = rig.write_profile();
+    println!("    profile      : {}", profile.display());
+
+    let run = rig.through_topham("Say the word alpha and stop.").await;
+    run.assert_completed("the turn launched through topham");
+    // The generated catalog loaded, which means `topham launch` wrote *both*
+    // files into the `CODEX_HOME` it created and pointed the client at.
+    run.assert_catalog_was_used();
+    assert!(
+        run.last_message.contains(ANSWER),
+        "a client launched through `topham launch` must end on the answer this deployment \
+         served: {:?}\n--- stderr\n{}",
+        run.last_message,
+        run.stderr
+    );
+
+    let turns = rig.recorder.to("/v1/responses");
+    assert_eq!(
+        turns.len(),
+        1,
+        "one launched turn is one request; recorder saw:\n{}",
+        rig.recorder.transcript()
+    );
+    let turn = &turns[0];
+    assert_eq!(turn.status, 200, "the launched turn was refused: {turn:?}");
+
+    println!("--- M11-SEAT-EVIDENCE (topham launch, codex)");
+    for (name, value) in turn.redacted_headers() {
+        println!("    {name}: {value}");
+    }
+
+    // The turn key arrived on the dedicated header, which is what the generated
+    // `env_http_headers` stanza asks the client to do — from a variable the
+    // *profile named* and that neither the launcher nor the generator ever
+    // wrote to a file.
+    assert_eq!(
+        turn.header(TURN_KEY_HEADER),
+        Some(rig.secret.as_str()),
+        "the launcher must carry the profile's `key-env` value onto `{TURN_KEY_HEADER}`: {:?}",
+        turn.redacted_headers()
+    );
+    // And no seat: a `RoundhouseKey` profile forwards no login, so an
+    // `Authorization` here would mean an ambient credential reached a
+    // deployment through a launcher that is supposed to have replaced it.
+    assert_eq!(
+        turn.header("authorization"),
+        None,
+        "a `RoundhouseKey` launch presents no bearer: {:?}",
+        turn.redacted_headers()
+    );
+
+    // The two files, where R-T2 says a launched codex profile's scratch goes:
+    // under `XDG_DATA_HOME`, per profile, and never in the operator's
+    // configuration directory beside the profile itself.
+    let codex_home = rig
+        .xdg("data")
+        .join("topham")
+        .join(TOPHAM_PROFILE)
+        .join("codex-home");
+    for file in ["config.toml", "model-catalog.json"] {
+        assert!(
+            codex_home.join(file).is_file(),
+            "`topham launch` must write {file} into the profile's own CODEX_HOME ({})",
+            codex_home.display()
+        );
+    }
+    let generated = std::fs::read_to_string(codex_home.join("config.toml"))
+        .expect("the generated config the client just read");
+    assert!(
+        !generated.contains(&rig.secret),
+        "the generated config names the key variable and never holds the key"
+    );
 
     rig.clean();
 }

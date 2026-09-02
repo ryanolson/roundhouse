@@ -1240,3 +1240,20 @@ resolves headers; nothing in the source comments says which. Either way the
 reference chained wiring in `crates/roundhouse-server/src/claude_launch.rs`
 relies on it only in the direction the code guarantees today (a
 credential-bearing client is left alone).
+
+### A.14 — Observed during M11.3: `--agent codex` splices a `--config model_provider=` override (2026-09-02)
+
+`nemo-relay run --agent codex --config <toml> --dry-run` at 0.8.2 reports an
+argv that appends `--config model_provider="nemo-relay-openai"` plus Relay's
+own `model_providers` table to the codex command line. Codex resolves a
+`--config` override above its `config.toml`, so a generated
+`config.toml` naming roundhouse's provider (the `codex_launch` output) is
+outranked for the provider selection, and the client presents whatever
+credential Relay's provider stanza implies — not the turn key the generated
+config placed on the dedicated header. Observed from the dry-run plan only;
+not traced to source lines here, and not exercised against a real codex
+binary (none on this box). Two readings, stated and stopped: this is the
+codex half of the "Relay owns the client's provider" design and an
+`[upstream] openai_auth_header` is the intended carrier for a downstream key,
+or it is an oversight that a generated config cannot be honoured. Either way
+`topham relay` for Codex is a documented limit in M11.3.

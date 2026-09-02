@@ -1,0 +1,69 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "topham"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The operator entry point: profiles, plan, launch and mint for the two clients roundhouse hooks up"
+
+# A library beside the binary, and it is where everything lives. A subcommand
+# that only exists inside `fn main` can be proven by spawning the binary and
+# reading its stdout, which is a test of a process rather than of a resolution;
+# with the library target, `plan`, `launch` and `mint` are functions a unit test
+# calls with an injected environment and no child at all.
+[lib]
+name = "topham"
+path = "src/lib.rs"
+
+[[bin]]
+name = "topham"
+path = "src/main.rs"
+
+[dependencies]
+# The two client-launch generators and the constants they need. The launcher
+# holds no copy of the environment map, the config template, the turn-key header
+# or the key shape: every one of those is read from the deployment that serves
+# them, so a launcher and the server it points a client at cannot disagree.
+roundhouse-server = { workspace = true }
+
+clap = { workspace = true }
+crossterm = { workspace = true }
+ratatui = { workspace = true }
+# `mint` posts one request to the admin API. Already in the tree with the same
+# rustls-only feature set as the server's own outbound client.
+reqwest = { workspace = true }
+serde = { workspace = true }
+# The minted-key response body, which is the one admin response carrying a
+# secret -- parsed into a struct that holds it just long enough to print the
+# export line.
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# `mint` is the only asynchronous thing this binary does, and it does it once.
+# A current-thread runtime built for that one request rather than a `#[tokio::main]`
+# on `fn main`: every other subcommand resolves a profile and `exec`s, and a
+# multi-threaded runtime spun up around an `exec` would be an executor whose
+# threads the replaced process never gets to unwind.
+tokio = { workspace = true }
+# Profiles are TOML for the reason the generated codex config is: an operator
+# edits them by hand, and a comment survives.
+toml = { workspace = true }
+
+[dev-dependencies]
+# `mint` is proven against the **real** admin router rather than a mock of it,
+# served over a real loopback socket by the same `axum::serve` a deployment
+# runs. What that buys over a hand-written double: the route path, the admin
+# key's header spelling, the 201 status and the response body's field names are
+# all read from the deployment instead of restated here, so a change to any of
+# them fails this crate's suite rather than an operator's first mint.
+axum = { workspace = true }
+roundhouse-core = { workspace = true }
+# The fixture control plane declares its admin key by hash, computed rather
+# than transcribed -- a fixture that declared a digest nothing hashes to parses
+# perfectly and authenticates nothing.
+hex = { workspace = true }
+sha2 = { workspace = true }
+# Scratch directories, per the house pattern: the temp dir plus a UUID, so two
+# tests in one run never collide.
+uuid = { workspace = true }

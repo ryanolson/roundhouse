@@ -10,6 +10,7 @@ members = [
     "crates/roundhouse-relay",
     "crates/roundhouse-store-redis",
     "crates/roundhouse-server",
+    "crates/topham",
 ]
 
 [workspace.package]
@@ -22,6 +23,12 @@ roundhouse-core = { path = "crates/roundhouse-core" }
 roundhouse-fleet = { path = "crates/roundhouse-fleet" }
 roundhouse-mcp = { path = "crates/roundhouse-mcp" }
 roundhouse-relay = { path = "crates/roundhouse-relay" }
+# The composition root, depended on *upwards* by `crates/topham`: the launcher
+# reads the two client-launch generators and the constants they need, and the
+# direction is the right one -- a launcher sits above the server it points a
+# client at, which is also what keeps `roundhouse-server/src/main.rs` free of a
+# flag parser.
+roundhouse-server = { path = "crates/roundhouse-server" }
 roundhouse-store-redis = { path = "crates/roundhouse-store-redis" }
 
 # Dynamo crates, pinned to an upstream commit of ai-dynamo/dynamo.
@@ -58,6 +65,20 @@ tokenizers = { version = "0.21.4", default-features = false, features = [
 anyhow = "1"
 async-trait = "0.1"
 axum = { version = "=0.8.4", features = ["macros", "ws"] }
+# The operator launcher's three, and all three are ordinary libraries rather
+# than synergy dependencies: none of them is the other half of the product, none
+# is read for wire conformance, and a bump is a bump. Exact-pinned anyway,
+# because `crates/topham` is the one binary an operator runs by hand and a
+# floating CLI parser changes what their muscle memory does.
+#
+# Scope check before they landed: none of the three constrains `tokio` or
+# `uuid`, which is what would have collided with the Dynamo pins, and toolchain
+# 1.96.1 clears ratatui's 1.88 rust-version floor. `crossterm` is ratatui's own
+# backend and is named here rather than left transitive because the TUI reads
+# key events from it directly.
+clap = { version = "=4.6.6", features = ["derive"] }
+crossterm = "=0.29.0"
+ratatui = "=0.30.2"
 futures = "0.3"
 # Minting a control-plane key (`roundhouse-server/src/control_config.rs`): 32
 # bytes straight from the system CSPRNG. `getrandom` rather than `rand`

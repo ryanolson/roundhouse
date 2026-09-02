@@ -5,7 +5,10 @@ SPDX-License-Identifier: Apache-2.0
 
 # Plan: the Anthropic Messages surface, the seat, and the launcher (M11)
 
-> **Status: proposed design.** Direction set by the product owner on
+> **Status: shipped through M11.3 (2026-09-02).** The rulings in §3 stand
+> as written; where an implementation round moved one, the dated addenda at
+> the end of this document record the move and its reason, and win over §3
+> for the current tree. Direction set by the product owner on
 > 2026-08-27: support Anthropic's Messages API the way roundhouse supports
 > OpenAI's Responses API; the test topology is a real Claude Code session on a
 > subscription login, intercepted by NeMo Relay and relayed to roundhouse; and
@@ -604,3 +607,138 @@ rulings are in the commit message.
 - Whether `N` in the budget notice ever tracks server-reported usage is
   under-determined (§5.7.1 varied only `output_tokens`); the drop rule is
   indifferent to it, which is why it was not chased.
+
+## Addendum (2026-09-02): M11.3 — `topham`, the rulings
+
+R8 named the crate and the split (Relay's CLI for instrumented chained runs;
+a roundhouse binary for profiles, Direct launches and the handoff). What the
+M11.2b round settled, and what it leaves for this rung to decide, is recorded
+here so the stage briefs carry it resolved.
+
+**R-T1 — one new workspace crate, above the server.** `crates/topham`
+(binary `topham`, with a library target so its subcommands are testable
+without spawning) depends on `roundhouse-server` for the two generators and
+the four constants; the dependency direction the seam map worried about is
+the right one — a launcher sits *above* the composition root, and `main.rs`
+keeps its no-flag-parser rule because the parser lives in `topham` alone.
+Three new dependencies, exact-pinned like the rest of the workspace and
+commented as ordinary libraries rather than synergy dependencies:
+`clap = "=4.6.6"`, `ratatui = "=0.30.2"`, `crossterm = "=0.29.0"` (toolchain
+1.96.1 clears ratatui's 1.88 floor; none of the three constrains `tokio` or
+`uuid`, which is what would have collided with the Dynamo pins). No
+config-directory crate: XDG resolution is `XDG_CONFIG_HOME` else
+`$HOME/.config`, two lines, the same rule Relay follows so an operator's two
+tools agree on where profiles live.
+
+**R-T2 — a profile names things; it never holds a secret.** A profile is a
+TOML file under `<config>/topham/profiles/<name>.toml` carrying: the agent
+(`claude` | `codex`), the deployment root, the auth kind
+(`RoundhouseKey` | `Forwarded…Login`), the **environment variable name** the
+turn key is read from (default `ROUNDHOUSE_API_KEY`, the codex generator's
+`DEFAULT_KEY_ENV`), optional model slug and catalog path for Codex, and the
+topology (`direct` | `chained`). The turn key itself rides the environment,
+exactly as both generators already require — `codex_launch`'s "secrets ride
+env only" rule and `ClaudeEnv`'s non-`Serialize` design are the constraint
+this rung inherits, not a choice it makes. A profile that tries to carry a
+key is refused on load, the way the generators refuse a config that sets an
+OAuth suppressor.
+
+**R-T3 — minting is a subcommand over the admin API, not a new route.**
+`topham mint --profile <p>` posts to `/v1/admin/projects/{p}/members/{u}/keys`
+with an admin key read from `ROUNDHOUSE_ADMIN_KEY` and prints the export
+line for the profile's key variable; it writes nothing to disk. The README
+deferral ("a subcommand or an admin read beside key minting") resolves to
+the subcommand, because the read already exists and the deferral was about
+who calls it.
+
+**R-T4 — launch is in-process and refuses before it spawns.**
+`topham launch <profile> [-- <agent argv>]` resolves the profile, builds the
+env through the generator, checks `must_be_unset()` against the *operator's*
+environment (the launcher inherits it — this is a real session, not a rig —
+so the refusal is what stands between an ambient login and a silent
+forwarding), writes the Codex files under a per-profile `CODEX_HOME` when the
+agent is Codex, and `exec`s the agent with the generated variables layered on
+top. `topham plan <profile>` prints the same resolution with every secret
+redacted through the generators' own `Debug` (which the review round made
+safe to print) and spawns nothing — it is the dry run Relay's `--dry-run`
+taught this design to have.
+
+**R-T5 — the chained handoff reuses the rig's template, moved to a library
+seam.** The `[upstream]`/`[agents.*]` config the e2e rig writes in
+`Rig::wire_relay` becomes a rendering in the server crate (beside the
+generators, one per agent), consumed by both the rig and
+`topham relay <profile>`, which writes it to the profile's scratch and execs
+`nemo-relay run --agent <agent> --config <toml> -- <argv>`. The reference
+chained wiring is R-D′'s: no upstream auth header, the turn key on the
+client's environment. `topham relay` runs the same isolated `--dry-run`
+preflight the rig runs (F8) and refuses when a system Relay layer re-aims
+the upstream.
+
+**R-T6 — the TUI is a front end over the subcommands, never a second
+implementation.** `topham` with no subcommand opens a ratatui screen: profile
+list, an editor for the fields R-T2 names, a plan pane rendered from the same
+redacted `Debug`, and launch/relay actions that call the same functions the
+subcommands do. Every action the TUI can take is a subcommand a script can
+run; the TUI owns no state the profile files do not.
+
+**R-T7 — what proves it.** Unit: profile round-trip and the secret refusal;
+`plan` output snapshots for both agents and both auth kinds with the key
+redacted; the `must_be_unset` refusal naming the variable. Integration: the
+gated real-binary suites each gain one test that launches the real client
+*through* `topham launch` on Direct (and, for Claude, `topham relay` on
+Chained) — the closure R8 asked for, "the environment fully configured
+in-process". The TUI is exercised by its model, not its terminal: the
+screen's state transitions are pure functions over key events, tested
+without a backend.
+
+**Left open, on purpose.** A `topham` home for MCP wiring waits on open
+question 3 (the flat-tool-name dialect arm); `/v1/models` stays unserved
+(open question 2); the interactive-approval limit on `RoundhouseKey` under
+a subscription login is documented in `topham plan`'s output, not solved.
+
+### What the implementation settled beyond the rulings (2026-09-02)
+
+Seven decisions the stage briefs did not make were flagged rather than made
+silently, and each is accepted here with its reason:
+
+- **`topham launch` sets `DISABLE_AUTOUPDATER=1` and
+  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` on a Claude child** (one
+  const, `CLAUDE_DEPLOYMENT_POLICY`, one test). Deployment policy on an
+  operator's own session, accepted because the client line moved twice in
+  five days under this phase's own captures (§5.6, §5.7) and a session
+  pointed at roundhouse has no business updating itself mid-turn or
+  reporting home; `claude_launch`'s doc already named the launcher as the
+  place these are set. Reversing it is the const and the test.
+- **`topham mint` takes `--project` and `--user`.** The mint route is under a
+  membership and a profile carries no tenancy; storing one there would be a
+  second copy of a tenancy edge.
+- **A wrong admin key is 401 for an unknown secret and 403 for a known one of
+  the wrong kind**; the mint suite pins both.
+- **Chained Codex is rendered but not credential-correct — a documented
+  limit, not a refusal.** A real 0.8.2 `--dry-run --agent codex` shows Relay
+  splicing `--config model_provider="nemo-relay-openai"` onto codex's argv,
+  and a codex `--config` override outranks the generated `config.toml`, so
+  the turn key the config puts on the dedicated header is not what the
+  client presents; roundhouse admits a credential-less turn and degrades to
+  local-only routing. Stated in `topham plan`'s notes and `relay.rs`'s doc
+  (evidence: `research/nemo-relay-0.8.0-published-read.md` §A.14). The
+  remedy is the upstream-layer carrier (key-authed only) or a Relay change
+  that lets a generated config win; neither is this rung's.
+- **`topham relay` does not isolate Relay's XDG state** (the rig does): an
+  operator's `plugins.toml` — exporters, pricing, PII — is the point of
+  chaining. The cost is that the isolated preflight and the inherited launch
+  resolve under different environments; the gap is exactly the
+  `NEMO_RELAY_*_BASE_URL` layer, which is why a second refusal
+  (`UpstreamOverriddenByEnv`) exists for it.
+- **`--relay <path>`** names this box's binary and is not a profile field;
+  a profile names things about a deployment.
+- **The TUI uses `try_init`/`restore`, not `ratatui::run`**, because `init`
+  panics without a tty; a piped `topham` now refuses naming the subcommands
+  and writes nothing to stdout. `topham relay`'s banner goes to stderr —
+  the chained closure test caught it corrupting `-p --output-format json`,
+  the first defect this rung found by a test rather than by reading.
+
+One observation for a later rung: `LaunchValue::Declared` is unreachable on
+a successful `topham` resolution (the generator refuses every declared
+suppressor), so its redaction is exercised only by `claude_launch`'s own
+tests; an operator-supplied pass-through variable would make it live.

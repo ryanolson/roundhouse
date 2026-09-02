@@ -68,6 +68,15 @@
 //! [`a_chained_continue_survives_relays_re_encode_without_forking`] (R7 hazard 1
 //! against the real re-encoder). See "The chained topology" below.
 //!
+//! …the **closure** ones drive both topologies through a real `topham`, the
+//! operator launcher, rather than through a launch this file constructed:
+//! [`a_real_client_launched_through_topham_hooks_up_on_direct`] and
+//! [`a_real_client_handed_to_relay_through_topham_hooks_up_chained`]. They are
+//! gated on `ROUNDHOUSE_TEST_TOPHAM_BIN` on top of everything else, and what
+//! they add over the tests above is the one link those cannot reach: that
+//! something a person can run produces the map the rest of this file hands the
+//! client directly. See "The closure" below.
+//!
 //! …and the Relay-only ones need no `claude` at all: they drive `nemo-relay run
 //! --dry-run` directly, which resolves configuration without spawning an agent.
 //! See "Hazard 4, made detectable" at the bottom of this file.
@@ -105,7 +114,10 @@
 //!
 //! `--features e2e-claude` compiles the file at all; `--include-ignored` opts
 //! into spawning processes. The chained tests additionally need
-//! `ROUNDHOUSE_TEST_RELAY_BIN`. `--test-threads=1` is not politeness: `claude
+//! `ROUNDHOUSE_TEST_RELAY_BIN`, and the two closure tests
+//! `ROUNDHOUSE_TEST_TOPHAM_BIN` naming a **freshly built** `target/debug/topham`
+//! (`cargo build -p topham`) — freshly, because a stale one reports green for
+//! code nobody compiled. `--test-threads=1` is not politeness: `claude
 //! --continue` resolves "the most recent conversation" from the session store in
 //! the run's isolated `HOME`, keyed by working directory, so two tests
 //! interleaving their spawns would be two clients racing for one rollout. Once
@@ -281,8 +293,18 @@ use roundhouse_server::claude_launch::{
     API_KEY_ENV, BASE_URL_ENV, CUSTOM_HEADERS_ENV, ClaudeEnv, ClaudeLaunch,
     ROUNDHOUSE_API_KEY_SENTINEL,
 };
+// The variable the launch profiles below name as where the turn key is read
+// from, read from the generator that defines it rather than spelled here: a
+// profile that named a variable nothing exports resolves to a launch with no
+// credential, which roundhouse admits and degrades to local-only.
+use roundhouse_server::codex_launch::DEFAULT_KEY_ENV;
 use roundhouse_server::control_config::TURN_KEY_HEADER;
 use roundhouse_server::messages_api::{MESSAGES_PATH, wire};
+// R-T5: the chained wiring this rig writes is a rendering in the library, not a
+// template spelled here. `topham relay` consumes the same one, so a rig that
+// went green against a config the launcher does not produce is not a state this
+// file can reach.
+use roundhouse_server::relay_handoff::{RELAY_STATE_VARS, RelayAgent, RelayHandoff};
 use roundhouse_server::{
     API_PREFIX, Conversations, EchoLocalExecutor, Engine, EngineConfig, messages_router,
 };
@@ -365,6 +387,24 @@ const RELAY_BIN_VAR: &str = "ROUNDHOUSE_TEST_RELAY_BIN";
 /// `agent-docs/research/nemo-relay-0.8.0-published-read.md`'s 2026-09-01
 /// addendum, which re-derived every hazard below against exactly this tarball.
 const VERIFIED_RELAY_VERSION: &str = "0.8.2";
+
+/// The environment variable naming the built `topham` the closure tests drive.
+///
+/// No `PATH` fallback, unlike [`CLAUDE_BIN_VAR`] and [`RELAY_BIN_VAR`]: `topham`
+/// is this workspace's own binary and is not installed anywhere, so a bare name
+/// would resolve to whatever a developer happened to have on their path — an
+/// older build, or something else entirely. The variable is the only honest way
+/// to say "this tree's `target/debug/topham`", and a missing one under
+/// `--include-ignored` is the same loud panic a missing client is.
+const TOPHAM_BIN_VAR: &str = "ROUNDHOUSE_TEST_TOPHAM_BIN";
+
+/// The profile name every `topham` closure test writes and resolves.
+///
+/// One name for both topologies because each test owns its own rig, and
+/// therefore its own isolated configuration directory: two tests can hold the
+/// same profile name and mean two different files, which is exactly what a
+/// per-rig `XDG_CONFIG_HOME` is for.
+const TOPHAM_PROFILE: &str = "e2e";
 
 /// The header Relay's transparent-run credential rides on
 /// (`provider_auth.rs`'s `TRANSPARENT_PROXY_CREDENTIAL_HEADER`).
@@ -492,6 +532,13 @@ enum Topology {
         relay: String,
         /// The `config.toml` aiming Relay's Anthropic upstream at roundhouse.
         config: PathBuf,
+        /// The rendering that wrote it, and the source of the argv below.
+        ///
+        /// Kept rather than discarded after the write so that this rig's
+        /// `--agent`, its `--config` placement and its trailing `--` come from
+        /// the same value `topham relay` execs with — the argv is as much part
+        /// of the shared seam as the four lines of TOML are.
+        handoff: RelayHandoff,
     },
 }
 
@@ -528,22 +575,18 @@ impl Topology {
                 deadline: CHILD_DEADLINE,
                 label: "Direct",
             },
-            // `run` rather than the bare `claude` shortcut: the shortcut runs an
-            // interactive setup wizard when no config layer exists
-            // (`commands/run.rs`'s `easy_path`, `needs_setup`), and a wizard in a
-            // test rig is a hang. `--` is not optional — `RunCommand::command` is
-            // `#[arg(last = true)]`, so without it the client's own flags are
-            // parsed as Relay's.
-            Self::Chained { relay, config } => Launch {
+            // The `run … --` argv comes from the handoff rather than being
+            // spelled here (R-T5): why it is `run` and not the bare `claude`
+            // shortcut, and why the trailing `--` is not optional, are facts
+            // about Relay that `topham relay` needs to be right about too, so
+            // they live with the rendering in `relay_handoff` and not in a test.
+            Self::Chained {
+                relay,
+                config,
+                handoff,
+            } => Launch {
                 program: relay.clone(),
-                leading: vec![
-                    "run".into(),
-                    "--agent".into(),
-                    "claude".into(),
-                    "--config".into(),
-                    config.to_string_lossy().into_owned(),
-                    "--".into(),
-                ],
+                leading: handoff.run_argv(config),
                 // Relay's own state, isolated the same way and for the same
                 // reason the client's is. `--config` replaces only the *user*
                 // config layer (`nemo-relay --help`: "system config still
@@ -580,6 +623,13 @@ struct Rig {
     /// carries into [`TURN_KEY_HEADER`], and the only place it exists outside
     /// the directory's hash.
     secret: String,
+    /// This deployment's **root**, with no [`API_PREFIX`].
+    ///
+    /// Kept rather than recovered from [`Self::env`] because the `topham` tests
+    /// need it as a *profile field*, which is a string an operator types — and
+    /// reading it back out of the generated map would make the profile a
+    /// restatement of the launch it is supposed to produce.
+    base_url: String,
     /// The environment a launched client is given, generated rather than
     /// re-spelled. Consuming [`ClaudeLaunch`]'s own output is what makes this
     /// suite evidence about the launcher and not only about the surface.
@@ -781,6 +831,7 @@ impl Rig {
         Self {
             root,
             secret: minted.secret,
+            base_url,
             env,
             store,
             conversations,
@@ -793,6 +844,12 @@ impl Rig {
 
     /// Write this run's Relay configuration, and refuse to spawn anything until
     /// Relay agrees it resolved to *this* deployment.
+    ///
+    /// **Neither the configuration nor the check is written here any more**
+    /// (R-T5). [`RelayHandoff`] renders the four lines and rules on the
+    /// `--dry-run` report; this function's job is the two things only a rig has
+    /// — a scratch root and a version banner — plus the panic that turns a
+    /// refusal into a test failure.
     ///
     /// **The preflight is M11.2b review F8, and it exists because the layering
     /// cannot be excluded.** `--config` replaces the *user* layer only; Relay
@@ -817,15 +874,10 @@ impl Rig {
             )
         });
         let version = relay_version(&relay);
+        let handoff = RelayHandoff::for_claude(base_url, binary)
+            .expect("the rig's own deployment root and binary are the correct shape");
         let config = root.join("relay-config.toml");
-        std::fs::write(
-            &config,
-            format!(
-                "[upstream]\nanthropic_base_url = \"{base_url}\"\n\n[agents.claude]\ncommand = \
-                 \"{binary}\"\n"
-            ),
-        )
-        .expect("the run's Relay configuration");
+        std::fs::write(&config, handoff.config_toml()).expect("the run's Relay configuration");
         std::fs::create_dir_all(root.join("relay")).expect("the run's Relay state directory");
 
         println!("    relay binary  : {relay}");
@@ -841,17 +893,15 @@ impl Rig {
         println!("    relay config  : {}", config.display());
 
         let resolved = relay_dry_run(&relay, root, &config, &[]);
-        let wanted = format!("anthropic_base_url = {base_url}");
-        assert!(
-            resolved.contains(&wanted),
-            "F8: this chained rig's explicit --config names `{wanted}`, but Relay resolved \
-             something else. `--config` replaces only the user layer, and \
-             /etc/nemo-relay/config.toml is folded in *after* it, so a system Relay install on \
-             this box is re-aiming the run — refusing to launch a real client with this rig's \
-             turn key at an upstream this test did not choose. Relay resolved:\n{resolved}"
-        );
+        if let Err(re_aimed) = handoff.verify_resolved(&resolved) {
+            panic!("F8: {re_aimed}");
+        }
 
-        Topology::Chained { relay, config }
+        Topology::Chained {
+            relay,
+            config,
+            handoff,
+        }
     }
 
     /// The principal every request below resolves to.
@@ -907,32 +957,125 @@ impl Rig {
         self.spawn(prompt, &[], true).await
     }
 
-    /// Run one child to completion, or kill its whole tree at the deadline.
+    /// Write the launch profile a `topham` child will resolve, into this run's
+    /// isolated configuration directory, and answer with its path.
     ///
-    /// **The deadline used to leak the very processes it exists to stop**
-    /// (M11.2b review F4). It wrapped `Command::output()` in
-    /// `tokio::time::timeout` and panicked on expiry, and tokio's `Child`
-    /// defaults to *not* killing on drop — so the one scenario the deadline
-    /// exists for, a hung client, was exactly the scenario that orphaned
-    /// `claude`, and under Chained also `nemo-relay` and the temporary plugin
-    /// directory it only removes on its way out.
+    /// **Hand-written TOML rather than `Profile::to_toml`**, and that is the
+    /// point of the closure tests. `topham`'s own suite proves the round trip —
+    /// that what `save` writes is what `load` reads — which is a claim about
+    /// two functions agreeing with each other. What no test in that crate can
+    /// make is the claim this file needs: that the file *an operator types*,
+    /// from the vocabulary the README documents, resolves into a launch a real
+    /// client hooks up with. A fixture built by the serializer would agree with
+    /// a renamed field on both sides and say nothing.
     ///
-    /// Three things close it, in the order they fire:
+    /// The absence here is as load-bearing as the presence: **no key**. The
+    /// turn key reaches the child on its environment, under the name this file
+    /// names, which is R-T2's whole rule.
+    fn write_profile(&self, topology: &str) -> PathBuf {
+        let directory = self.xdg("config").join("topham").join("profiles");
+        std::fs::create_dir_all(&directory).expect("the run's profiles directory");
+        let path = directory.join(format!("{TOPHAM_PROFILE}.toml"));
+        std::fs::write(
+            &path,
+            format!(
+                "agent = \"claude\"\n\
+                 deployment-root = \"{}\"\n\
+                 auth = \"roundhouse-key\"\n\
+                 key-env = \"{DEFAULT_KEY_ENV}\"\n\
+                 topology = \"{topology}\"\n",
+                self.base_url
+            ),
+        )
+        .expect("the run's launch profile");
+        path
+    }
+
+    /// One of this run's isolated XDG directories, created.
     ///
-    /// 1. `SIGINT` to the direct child. Under Chained that child is Relay, which
-    ///    puts the client in a process group of its own and tears it down — plus
-    ///    its plugin temp dir — on interrupt or normal exit. A `SIGKILL` first
-    ///    would skip both.
-    /// 2. A short grace period, then `SIGKILL` for whatever ignored the
-    ///    interrupt — pinned by
-    ///    [`an_expired_deadline_ends_a_child_that_ignores_the_interrupt`],
-    ///    which traps the interrupt on purpose so a harness that only
-    ///    interrupted would hang there rather than here.
-    /// 3. `kill_on_drop(true)` on the command itself, as the backstop for every
-    ///    path out of this function that is not this one — a panic between spawn
-    ///    and wait included.
+    /// Under the rig's own root like everything else it writes: `topham`
+    /// resolves its profiles from `XDG_CONFIG_HOME` and its per-profile scratch
+    /// from `XDG_DATA_HOME`, so a run that inherited either would read a
+    /// developer's profiles and write a chained config into their real data
+    /// directory.
+    fn xdg(&self, what: &str) -> PathBuf {
+        let path = self.root.join("xdg").join(what);
+        std::fs::create_dir_all(&path).expect("the run's XDG directory");
+        path
+    }
+
+    /// Drive the real client through a real `topham`, and answer with what the
+    /// client printed.
+    ///
+    /// `subcommand` is `topham`'s own argv up to the `--`; everything after it
+    /// is [`claude_argv`], the same vector the Direct and Chained tests hand the
+    /// client. That split is what makes these tests about the launcher: what
+    /// the client is *asked* to do is identical, so any difference in what
+    /// arrives at roundhouse's edge is `topham`'s doing.
+    ///
+    /// **The child's environment is cleared and rebuilt from a named set that
+    /// contains no `ANTHROPIC_*` variable at all** — which is the difference
+    /// between this and every other spawn in this file. The other tests hand
+    /// the client [`ClaudeEnv`] directly; here the child is handed a turn key,
+    /// two homes and a `PATH`, and `topham` is what has to produce the rest. A
+    /// leaked `ANTHROPIC_BASE_URL` would make a broken launcher look like a
+    /// working one.
+    async fn through_topham(
+        &self,
+        subcommand: &[&str],
+        prompt: &str,
+        deadline: Duration,
+    ) -> ClaudeRun {
+        let topham = topham_binary();
+        println!("    topham binary : {topham}");
+        println!("    topham version: {}", topham_version(&topham));
+
+        let mut command = tokio::process::Command::new(&topham);
+        command.args(subcommand);
+        command.arg("--");
+        command.args(claude_argv(prompt, &[], false));
+        command.current_dir(self.root.join("wd"));
+        command.kill_on_drop(true);
+
+        command.env_clear();
+        // The client's own binary is resolved by `topham` through `PATH`, from
+        // the bare name the profile's agent implies — so the directory holding
+        // the binary under test goes first. Without this the launcher would
+        // find whatever `claude` the box has, or none, and the test would be
+        // about a different binary than the one the version banner printed.
+        command.env("PATH", path_with(&self.binary));
+        command.env("HOME", self.root.join("home"));
+        command.env("CLAUDE_CONFIG_DIR", self.root.join("home/.claude"));
+        command.env("XDG_CONFIG_HOME", self.xdg("config"));
+        command.env("XDG_DATA_HOME", self.xdg("data"));
+        command.env("XDG_STATE_HOME", self.xdg("state"));
+        command.env("XDG_CACHE_HOME", self.xdg("cache"));
+        // The one credential, under the name the profile names — never as a
+        // generated `ANTHROPIC_*` variable, which is what `topham` is here to
+        // produce.
+        command.env(DEFAULT_KEY_ENV, &self.secret);
+
+        command.stdin(Stdio::null());
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
+
+        drive_child(
+            command,
+            deadline,
+            &topham,
+            TOPHAM_BIN_VAR,
+            &format!("a `topham {}`", subcommand.join(" ")),
+            &self.root,
+        )
+        .await
+    }
+
+    /// One `claude -p` on this rig's topology, bounded by [`drive_child`] —
+    /// which is where the deadline, the interrupt-then-kill and the reasoning
+    /// behind both now live, because a `topham` child needs exactly the same
+    /// treatment.
     async fn spawn(&self, prompt: &str, extra: &[&str], resume: bool) -> ClaudeRun {
-        let mut command = build_child_command(
+        let command = build_child_command(
             &self.binary,
             &self.topology,
             &self.env,
@@ -942,59 +1085,96 @@ impl Rig {
             resume,
         );
         let plan = self.topology.plan(&self.binary, &self.root);
-
-        let child = command.spawn().unwrap_or_else(|error| {
-            panic!(
-                "could not run `{}`: {error}. Set {CLAUDE_BIN_VAR} to a real claude binary, \
-                 or drop --include-ignored.",
-                plan.program
-            )
-        });
-        // A watchdog beside the child rather than a `timeout` around it: a
-        // `timeout` that expires drops the future holding the `Child`, and a
-        // dropped `Child` is killed outright by `kill_on_drop` — which is the
-        // backstop, not the shutdown. Signalling from beside it lets the
-        // interrupt land while the child is still ours to wait on, so Relay
-        // takes its own client and its plugin temp dir down with it.
-        let pid = child.id();
-        let deadline = plan.deadline;
-        let watchdog = tokio::spawn(async move {
-            tokio::time::sleep(deadline).await;
-            if let Some(pid) = pid {
-                interrupt_then_kill(pid).await;
-            }
-        });
-        let started = std::time::Instant::now();
-        let output = child
-            .wait_with_output()
-            .await
-            .expect("a spawned child's pipes are readable");
-        watchdog.abort();
-        assert!(
-            started.elapsed() < deadline,
-            "a {} `{} -p` did not finish within {deadline:?} and was interrupted, then killed. \
-             HOME: {}",
-            plan.label,
-            self.binary,
-            self.root.join("home").display()
-        );
-
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        ClaudeRun {
-            // `--output-format json` prints exactly one document. Parsed
-            // leniently so a client that printed something else fails on the
-            // assertion that names what was missing rather than on a panic here.
-            result: serde_json::from_str::<Value>(stdout.trim()).ok(),
-            stdout,
-            stderr,
-            success: output.status.success(),
-        }
+        drive_child(
+            command,
+            plan.deadline,
+            &plan.program,
+            CLAUDE_BIN_VAR,
+            &format!("a {} `{} -p`", plan.label, self.binary),
+            &self.root,
+        )
+        .await
     }
 
     /// Remove this run's directory.
     fn clean(&self) {
         clean(&self.root);
+    }
+}
+
+/// Run one child to completion, or kill its whole tree at `deadline`.
+///
+/// A free function rather than a method on [`Rig`] because there are now two
+/// kinds of child a run of this suite starts: the client (or Relay) the rig
+/// builds itself, and a `topham` that resolves a profile and *becomes* one of
+/// those. Both have to be bounded, both have to be killed the same way, and
+/// both produce the same one JSON document — so a second copy of the watchdog
+/// beside the second spawn would be the place the two quietly stopped agreeing
+/// about what a hung run does.
+///
+/// **The deadline used to leak the very processes it exists to stop** (M11.2b
+/// review F4). Three things close it, in the order they fire:
+///
+/// 1. `SIGINT` to the direct child. Under Chained that child is Relay, which
+///    puts the client in a process group of its own and tears it down — plus
+///    its plugin temp dir — on interrupt or normal exit. A `SIGKILL` first
+///    would skip both.
+/// 2. A short grace period, then `SIGKILL` for whatever ignored the interrupt —
+///    pinned by [`an_expired_deadline_ends_a_child_that_ignores_the_interrupt`],
+///    which traps the interrupt on purpose so a harness that only interrupted
+///    would hang there rather than here.
+/// 3. `kill_on_drop(true)` on the command itself, as the backstop for every
+///    path out of this function that is not this one — a panic between spawn
+///    and wait included.
+async fn drive_child(
+    mut command: tokio::process::Command,
+    deadline: Duration,
+    program: &str,
+    override_var: &str,
+    what: &str,
+    root: &Path,
+) -> ClaudeRun {
+    let child = command.spawn().unwrap_or_else(|error| {
+        panic!(
+            "could not run `{program}`: {error}. Set {override_var} to a real binary, or drop \
+             --include-ignored."
+        )
+    });
+    // A watchdog beside the child rather than a `timeout` around it: a
+    // `timeout` that expires drops the future holding the `Child`, and a
+    // dropped `Child` is killed outright by `kill_on_drop` — which is the
+    // backstop, not the shutdown. Signalling from beside it lets the interrupt
+    // land while the child is still ours to wait on, so Relay takes its own
+    // client and its plugin temp dir down with it.
+    let pid = child.id();
+    let watchdog = tokio::spawn(async move {
+        tokio::time::sleep(deadline).await;
+        if let Some(pid) = pid {
+            interrupt_then_kill(pid).await;
+        }
+    });
+    let started = std::time::Instant::now();
+    let output = child
+        .wait_with_output()
+        .await
+        .expect("a spawned child's pipes are readable");
+    watchdog.abort();
+    assert!(
+        started.elapsed() < deadline,
+        "{what} did not finish within {deadline:?} and was interrupted, then killed. HOME: {}",
+        root.join("home").display()
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    ClaudeRun {
+        // `--output-format json` prints exactly one document. Parsed leniently
+        // so a client that printed something else fails on the assertion that
+        // names what was missing rather than on a panic here.
+        result: serde_json::from_str::<Value>(stdout.trim()).ok(),
+        stdout,
+        stderr,
+        success: output.status.success(),
     }
 }
 
@@ -1140,19 +1320,6 @@ fn build_child_command(
     command
 }
 
-/// The XDG variables a chained run points at its own scratch.
-///
-/// Named as a constant rather than inlined because
-/// [`the_chained_child_is_relay_wrapping_the_very_same_launch`] asserts the
-/// child's key set with `==`, and a second copy of this list is exactly the
-/// drift that assertion exists to catch.
-const RELAY_STATE_VARS: [&str; 4] = [
-    "XDG_CONFIG_HOME",
-    "XDG_DATA_HOME",
-    "XDG_STATE_HOME",
-    "XDG_CACHE_HOME",
-];
-
 /// The client's own argv, identical on both topologies.
 ///
 /// The point of the split: under Chained this vector is handed to Relay after a
@@ -1241,6 +1408,66 @@ fn relay_version(binary: &str) -> String {
     version
 }
 
+/// The built `topham` the closure tests drive, or a loud panic naming the
+/// variable that would have said where it is.
+///
+/// A panic and never a fallback: see [`TOPHAM_BIN_VAR`]. The failure an operator
+/// of this suite is most likely to cause is forgetting to *rebuild* the
+/// launcher after changing it, and a test that silently ran the last build
+/// would report green for code nobody compiled.
+fn topham_binary() -> String {
+    std::env::var(TOPHAM_BIN_VAR).unwrap_or_else(|_| {
+        panic!(
+            "the closure tests drive this workspace's own launcher: set {TOPHAM_BIN_VAR} to a \
+             freshly built `target/debug/topham` (`cargo build -p topham`), or run without \
+             --include-ignored"
+        )
+    })
+}
+
+/// What `topham --version` prints, or a loud panic naming the override.
+///
+/// Isolated the way every other probe in this file is (M11.2b review F18), and
+/// with one extra reason of its own: `topham` reads profiles out of
+/// `XDG_CONFIG_HOME`, so a probe that inherited the developer's would list —
+/// and, if a future `--version` grew a diagnostic, print — profiles this suite
+/// never wrote.
+fn topham_version(binary: &str) -> String {
+    let home = probe_home();
+    std::fs::create_dir_all(&home).expect("the probe's isolated home");
+    let version = version_probe(
+        binary,
+        &[
+            ("HOME", home.clone().into_os_string()),
+            ("XDG_CONFIG_HOME", home.join("config").into_os_string()),
+            ("XDG_DATA_HOME", home.join("data").into_os_string()),
+        ],
+        TOPHAM_BIN_VAR,
+    );
+    let _ = std::fs::remove_dir_all(&home);
+    version
+}
+
+/// The ambient `PATH` with `binary`'s own directory in front of it.
+///
+/// What a `topham` child needs and what no other child in this file does: the
+/// launcher resolves the client from the **bare name** its profile's agent
+/// implies, deliberately — an operator with two `claude` binaries has already
+/// answered which one they mean, in their `PATH`. So the only way to point a
+/// launched client at [`CLAUDE_BIN_VAR`]'s binary is to make that answer be
+/// this rig's, which is what this does. A bare name that resolved to some other
+/// build would leave the version banner naming a binary the run never used.
+fn path_with(binary: &str) -> String {
+    let ambient = std::env::var("PATH").unwrap_or_default();
+    match Path::new(binary)
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        Some(parent) => format!("{}:{ambient}", parent.display()),
+        None => ambient,
+    }
+}
+
 /// `nemo-relay run --agent claude --config <toml> [extra] --dry-run`, and what
 /// it printed.
 ///
@@ -1253,17 +1480,23 @@ fn relay_version(binary: &str) -> String {
 ///
 /// `--dry-run` resolves configuration and exits without spawning the agent,
 /// which is what makes every caller here need Relay and nothing else.
+///
+/// Both the argv and the isolation come from
+/// [`relay_handoff`](roundhouse_server::relay_handoff) (R-T5), so this rig's
+/// preflight and `topham relay`'s are the same experiment rather than two that
+/// agree today. What stays here is the `extra` slot — the hazard-4 guards below
+/// need a *second* configuration layer, which is not a thing a launcher ever
+/// wants.
 fn relay_dry_run(relay: &str, home: &Path, config: &Path, extra: &[&str]) -> String {
     let mut command = std::process::Command::new(relay);
-    command.args(["run", "--agent", "claude", "--config"]);
-    command.arg(config);
+    command.args(RelayAgent::Claude.preflight_argv(config));
     command.args(extra);
-    command.args(["--dry-run", "--", "-p", "probe"]);
+    command.args(["--", "-p", "probe"]);
     command.env_clear();
-    command.env("PATH", std::env::var("PATH").unwrap_or_default());
-    command.env("HOME", home);
-    for name in RELAY_STATE_VARS {
-        command.env(name, home);
+    for (name, value) in
+        RelayHandoff::preflight_env(home, &std::env::var("PATH").unwrap_or_default())
+    {
+        command.env(name, value);
     }
     let output = command.output().unwrap_or_else(|error| {
         panic!(
@@ -1760,6 +1993,7 @@ fn the_chained_child_is_relay_wrapping_the_very_same_launch() {
     let chained = Topology::Chained {
         relay: "nemo-relay".into(),
         config: root.join("relay-config.toml"),
+        handoff: RelayHandoff::for_claude("http://127.0.0.1:9", "claude").expect("a handoff"),
     };
 
     let direct = build_child_command("claude", &Topology::Direct, &env, &root, "ask", &[], true);
@@ -1824,6 +2058,40 @@ fn the_chained_child_is_relay_wrapping_the_very_same_launch() {
          `{BASE_URL_ENV}` and merges into `{CUSTOM_HEADERS_ENV}` itself, so the launcher's map is \
          handed over whole and Relay decides what survives"
     );
+}
+
+/// **R-T5's guard: the configuration this rig writes is the one `topham relay`
+/// writes.**
+///
+/// The chained wiring used to be a `format!` inside [`Rig::wire_relay`], and the
+/// launcher was going to need the same four lines. Two copies of a template
+/// Relay parses with `deny_unknown_fields` is a drift whose failure lands on
+/// whichever of the two nobody ran this week — and the one nobody runs is
+/// exactly `topham relay`, which needs two binaries and a real deployment. So
+/// the template moved into
+/// [`relay_handoff`](roundhouse_server::relay_handoff) and both consume it.
+///
+/// What this test adds on top of that move is the thing the move alone cannot
+/// give: **the literal bytes the rig used to write, pinned here.** With the rig
+/// consuming the library, "the rig's config equals the library's rendering" is a
+/// tautology; what is not a tautology is that the library still renders what a
+/// real Relay 0.8.2 was observed accepting and echoing back. Change the
+/// rendering — reorder the tables, add a header comment, rename a key — and this
+/// goes red with the old bytes in the diff, which is the moment to re-run the
+/// chained suite rather than to update the constant.
+///
+/// The codex half is pinned in `relay_handoff`'s own tests, where the
+/// deployment-root-to-`openai_base_url` derivation lives; this file's business
+/// is the agent it can actually spawn.
+#[test]
+fn the_rigs_relay_config_is_byte_identical_to_the_shared_rendering() {
+    // Verbatim from `Rig::wire_relay`'s `format!` before R-T5 moved it, with
+    // the two holes filled in by hand.
+    let before_the_move = "[upstream]\nanthropic_base_url = \"http://127.0.0.1:4321\"\n\n\
+                           [agents.claude]\ncommand = \"/opt/bin/claude\"\n";
+    let handoff = RelayHandoff::for_claude("http://127.0.0.1:4321", "/opt/bin/claude")
+        .expect("the shape the rig itself passes");
+    assert_eq!(handoff.config_toml(), before_the_move);
 }
 
 /// The fork probe names a session a fork would actually create.
@@ -2644,6 +2912,262 @@ async fn a_chained_continue_survives_relays_re_encode_without_forking() {
 }
 
 // ---------------------------------------------------------------------------
+// The closure: an operator's launcher, driving the real client
+// ---------------------------------------------------------------------------
+
+/// **A real `claude`, launched by a real `topham`, from a profile a person
+/// wrote.**
+///
+/// Every other test in this file hands the client [`ClaudeEnv`] directly, which
+/// proves the generated map is one a client hooks up with and leaves one link
+/// unproven: that anything an operator can actually *run* produces that map.
+/// Until M11.3 nothing did — both README deferrals said so in the same words,
+/// "no CLI subcommand or admin route produces these files" — so the launcher's
+/// own suite could only prove `topham` builds the map the generator builds,
+/// which is a claim about two functions in one process.
+///
+/// This is the run that closes it. The child is `topham launch e2e`, handed a
+/// turn key, two homes and a `PATH` and **no `ANTHROPIC_*` variable at all**;
+/// what arrives at roundhouse's edge is asserted to be exactly what the Direct
+/// test asserts. A launcher that resolved the profile wrongly cannot pass this
+/// by inheriting anything, because there is nothing to inherit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs the real claude and topham binaries: --features e2e-claude -- --include-ignored; ROUNDHOUSE_TEST_CLAUDE_BIN overrides PATH and ROUNDHOUSE_TEST_TOPHAM_BIN names a built topham"]
+async fn a_real_client_launched_through_topham_hooks_up_on_direct() {
+    let rig = Rig::start("topham-direct", prose_upstream()).await;
+    let profile = rig.write_profile("direct");
+    println!("    profile       : {}", profile.display());
+
+    let run = rig
+        .through_topham(
+            &["launch", TOPHAM_PROFILE],
+            "Say the word alpha and stop.",
+            CHILD_DEADLINE,
+        )
+        .await;
+    run.assert_completed("the prose turn launched through topham");
+
+    // The client printed *our* answer, so the launcher resolved a base URL that
+    // reached this deployment and a credential this deployment admitted.
+    // Nothing in `claude` or in `topham` can produce this string.
+    assert_eq!(
+        run.text(),
+        ANSWER,
+        "a client launched through `topham launch` must have printed the answer this deployment \
+         served\n--- stdout\n{}\n--- stderr\n{}",
+        run.stdout,
+        run.stderr
+    );
+
+    let turns = rig.turns();
+    assert_eq!(
+        turns.len(),
+        1,
+        "one launched prose turn is one request; recorder saw:\n{}",
+        rig.recorder.transcript()
+    );
+    let turn = &turns[0];
+    assert_eq!(turn.status, 200, "the launched turn was refused: {turn:?}");
+
+    println!("--- M11-SEAT-EVIDENCE (topham launch, Direct)");
+    for (name, value) in turn.redacted_headers() {
+        println!("    {name}: {value}");
+    }
+
+    // 1. The turn key arrived on the dedicated header, which is the whole of
+    //    what a `RoundhouseKey` profile promises: `topham` read it from the
+    //    variable the *profile named* and the generator put it in the header
+    //    block, without either of them ever writing it to a file.
+    assert_eq!(
+        turn.header(TURN_KEY_HEADER),
+        Some(rig.secret.as_str()),
+        "the launcher must carry the profile's `key-env` value onto `{TURN_KEY_HEADER}`: {:?}",
+        turn.redacted_headers()
+    );
+
+    // 2. The sentinel is inert: it arrived where §1.3 puts a resolved API key,
+    //    suppressing any subscription login, and this deployment did not treat
+    //    it as a seat. A launcher that forwarded it as a tenant's own key would
+    //    be a 401 two processes from its cause.
+    assert_eq!(
+        turn.header("x-api-key"),
+        Some(ROUNDHOUSE_API_KEY_SENTINEL),
+        "the launch sentinel must arrive verbatim: {:?}",
+        turn.redacted_headers()
+    );
+    assert!(
+        !rig.upstream.any_credential_forwarded(),
+        "the sentinel must never be captured as a forwarded seat"
+    );
+
+    // 3. And no `Authorization` at all, which is the negative the whole
+    //    isolation story rests on: the child's environment was cleared, so a
+    //    bearer here would mean this box's ambient login had reached a
+    //    deployment through a launcher that is supposed to have replaced it.
+    assert_eq!(
+        turn.header("authorization"),
+        None,
+        "a `RoundhouseKey` launch presents no bearer: {:?}",
+        turn.redacted_headers()
+    );
+
+    // And roundhouse's own view, so the run is one accounted turn and not a
+    // client that answered from somewhere else.
+    assert_eq!(rig.upstream.dispatches(), 1, "one turn, one dispatch");
+    let items = rig.items().await;
+    assert!(
+        items.iter().any(|item| item.role == Role::Assistant
+            && item.content
+                == ItemContent::Text {
+                    text: ANSWER.into()
+                }),
+        "the answer must be committed as an assistant item, log holds:\n{}",
+        log_shape(&items)
+    );
+
+    rig.clean();
+}
+
+/// **The chained half: `topham relay` writes the wiring, runs the preflight,
+/// and hands the same launch to a real Relay.**
+///
+/// The rig's own chained tests write the Relay config themselves (through
+/// [`RelayHandoff`], the shared rendering) and spawn Relay directly. That proves
+/// the *rendering* is one Relay accepts; it does not prove an operator can
+/// produce it. Here the config is written by `topham relay` in the profile's
+/// own scratch, the F8 preflight is `topham`'s, and the exec is `topham`'s — and
+/// the assertions are the chained test's own, so what is being compared is two
+/// ways of reaching the identical wire.
+///
+/// The rig is deliberately built **Direct** ([`Rig::start`]) even though the
+/// profile is chained: [`Topology`] decides what *the rig* spawns, and the rig
+/// spawns nothing here. Constructing a chained rig would write a second Relay
+/// config that this run never uses, and would leave two answers in the tree to
+/// "who wired this chain".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs the real claude, nemo-relay and topham binaries: --features e2e-claude -- --include-ignored; ROUNDHOUSE_TEST_CLAUDE_BIN and ROUNDHOUSE_TEST_RELAY_BIN override PATH, ROUNDHOUSE_TEST_TOPHAM_BIN names a built topham"]
+async fn a_real_client_handed_to_relay_through_topham_hooks_up_chained() {
+    let rig = Rig::start("topham-chained", prose_upstream()).await;
+    let profile = rig.write_profile("chained");
+    println!("    profile       : {}", profile.display());
+
+    // The Relay binary is named here rather than resolved through `PATH` by the
+    // launcher, for the reason `Rig::wire_relay` names it: a chained test that
+    // ran whatever `nemo-relay` the box has is a test whose version banner is a
+    // guess. `--relay` is the flag `topham` offers for exactly this.
+    let relay = std::env::var(RELAY_BIN_VAR).unwrap_or_else(|_| {
+        panic!(
+            "the chained closure test needs a real Relay binary: set {RELAY_BIN_VAR}, or run \
+             without --include-ignored"
+        )
+    });
+    println!("    relay binary  : {relay}");
+    println!("    relay version : {}", relay_version(&relay));
+
+    let run = rig
+        .through_topham(
+            &["relay", TOPHAM_PROFILE, "--relay", &relay],
+            "Say the word alpha and stop.",
+            CHAINED_DEADLINE,
+        )
+        .await;
+    run.assert_completed("the chained prose turn handed over by topham");
+
+    assert_eq!(
+        run.text(),
+        ANSWER,
+        "the answer must reach the client through the Relay `topham` wired\n--- stdout\n{}\n\
+         --- stderr\n{}",
+        run.stdout,
+        run.stderr
+    );
+
+    let turns = rig.turns();
+    assert_eq!(
+        turns.len(),
+        1,
+        "one chained prose turn is one request at roundhouse's edge; recorder saw:\n{}",
+        rig.recorder.transcript()
+    );
+    let turn = &turns[0];
+    assert_eq!(turn.status, 200, "the chained turn was refused: {turn:?}");
+
+    println!("--- M11-SEAT-EVIDENCE (topham relay, Chained)");
+    for (name, value) in turn.redacted_headers() {
+        println!("    {name}: {value}");
+    }
+
+    // The proof of hop, first, because every negative below is vacuous without
+    // it: a run in which the client had somehow reached roundhouse directly
+    // would show no proxy token either, and would be green for the wrong
+    // reason. Relay stamps this on every request it dispatches, and it never
+    // appears on a Direct turn.
+    assert_eq!(
+        turn.header("x-nemo-relay-source"),
+        Some("gateway"),
+        "this request must have come through the Relay `topham relay` started: {:?}",
+        turn.redacted_headers()
+    );
+
+    // R-D′ through the launcher: one generated environment serves both
+    // topologies, so the turn key arrives on the dedicated header exactly as it
+    // does Direct.
+    assert_eq!(
+        turn.header(TURN_KEY_HEADER),
+        Some(rig.secret.as_str()),
+        "the launcher's map survives the hop: {:?}",
+        turn.redacted_headers()
+    );
+    assert_eq!(
+        turn.header(RELAY_PROXY_TOKEN_HEADER),
+        None,
+        "Relay's transparent-run credential must never leave its own gateway: {:?}",
+        turn.redacted_headers()
+    );
+    assert_eq!(
+        turn.header("x-api-key"),
+        Some(ROUNDHOUSE_API_KEY_SENTINEL),
+        "the launch sentinel rides through Relay untouched: {:?}",
+        turn.redacted_headers()
+    );
+    assert_eq!(
+        turn.query.as_deref(),
+        Some("beta=true"),
+        "the client's query string must survive Relay's base-URL concatenation; path was `{}`",
+        turn.path
+    );
+    assert!(
+        !rig.upstream.any_credential_forwarded(),
+        "the sentinel must never be captured as a forwarded seat"
+    );
+
+    // The config the launcher wrote, where R-T2 says it goes: under the
+    // profile's own scratch in `XDG_DATA_HOME`, not in the operator's
+    // configuration directory and not beside the rig's.
+    let scratch = rig
+        .xdg("data")
+        .join("topham")
+        .join(TOPHAM_PROFILE)
+        .join("relay");
+    let written = std::fs::read_to_string(scratch.join("relay-config.toml"))
+        .expect("`topham relay` writes its config into the profile's scratch");
+    assert_eq!(
+        written,
+        RelayHandoff::for_claude(&rig.base_url, "claude")
+            .expect("the rig's own root is the correct shape")
+            .config_toml(),
+        "the launcher must write the shared rendering and not a copy of it"
+    );
+
+    assert_eq!(
+        rig.upstream.dispatches(),
+        1,
+        "one chained turn, one dispatch"
+    );
+    rig.clean();
+}
+
+// ---------------------------------------------------------------------------
 // Hazard 4, made detectable
 // ---------------------------------------------------------------------------
 
@@ -3059,8 +3583,12 @@ fn topology_is_dispatched_on_at_one_site() {
             .expect("build_child_command exists");
         let after = &source[start..];
         let end = after
-            .find("\n/// The XDG variables")
-            .expect("the XDG-variables doc comment follows build_child_command");
+            // The anchor moved with R-T5: the `RELAY_STATE_VARS` const that
+            // used to follow this function is now in the library, so the next
+            // item is `claude_argv`. A structural test reads source, and source
+            // is what R-T5 rearranged.
+            .find("\n/// The client's own argv")
+            .expect("claude_argv's doc comment follows build_child_command");
         &after[..end]
     };
     let bcc_sites = build_child_command_body.matches("match topology").count()
@@ -3140,6 +3668,7 @@ fn build_child_command_kills_on_drop() {
         Topology::Chained {
             relay: "nemo-relay".into(),
             config: PathBuf::from("/does/not/need/to/exist/relay-config.toml"),
+            handoff: RelayHandoff::for_claude("http://127.0.0.1:9", "claude").expect("a handoff"),
         },
     ] {
         let command = build_child_command(

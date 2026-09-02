@@ -82,6 +82,7 @@ pub mod mcp_api;
 pub mod messages_api;
 pub mod metrics_api;
 pub mod relay_api;
+pub mod relay_handoff;
 pub mod responses_api;
 pub mod tokenizer;
 
@@ -106,5 +107,6 @@ pub use mcp_api::{ControlPlaneReads, describe_ambiguous_memberships, mcp_router}
 pub use messages_api::messages_router;
 pub use metrics_api::metrics_router;
 pub use relay_api::relay_router;
+pub use relay_handoff::{RelayAgent, RelayHandoff, RelayHandoffError, UpstreamReAimed};
 pub use responses_api::{API_PREFIX, responses_router};
 pub use tokenizer::HfTokenizer;

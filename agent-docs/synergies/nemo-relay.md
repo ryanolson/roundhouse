@@ -525,3 +525,15 @@ Relay's gateway stamps eight identity headers onto the dispatched request
 (`traceparent`, `x-nemo-relay-{agent-kind, identity-quality,
 parent-scope-id, request-id, root-scope-id, session-id, source, turn-id}`);
 roundhouse ignores them today, and a correlation ruling would start there.
+
+**Addendum (2026-09-02, M11.3):** the chained handoff for Claude Code is
+now a launcher subcommand (`topham relay`) over one rendering the e2e rig
+shares, verified against a real Relay 0.8.2 before the client is spawned
+(the published binary cannot exclude its system config layer, so the
+launcher verifies Relay's resolved upstream by dry-run and refuses when a
+system file or an ambient `NEMO_RELAY_*_BASE_URL` re-aims it). The Codex
+half is rendered but a documented limit: Relay splices a `--config
+model_provider=` override onto codex's argv that outranks the generated
+`config.toml` (`research/nemo-relay-0.8.0-published-read.md` §A.14), so a
+chained Codex turn arrives credential-less until Relay's upstream-layer
+carrier is used for it.
