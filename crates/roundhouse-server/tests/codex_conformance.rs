@@ -322,7 +322,7 @@ async fn a_codex_client_parses_a_tool_call_this_deployment_emitted() {
             name: "shell",
             // Unsorted keys and loose spacing, so the canonical form the log
             // stores is visibly not the model's own bytes.
-            arguments: r#"{"workdir": "/src", "command": ["ls"]}"#,
+            arguments: r#"{"workdir": "/src", "command": ["ls"]}"#.into(),
         },
     ]);
 
@@ -441,7 +441,7 @@ async fn a_codex_clients_tool_output_comes_back_onto_the_same_session() {
         Scripted::Call {
             id: "call_1",
             name: "shell",
-            arguments: r#"{"workdir": "/src", "command": ["ls"]}"#,
+            arguments: r#"{"workdir": "/src", "command": ["ls"]}"#.into(),
         },
     ]);
 

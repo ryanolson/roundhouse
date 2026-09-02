@@ -484,9 +484,15 @@ spawning processes; `--test-threads=1` is not politeness, because each test owns
 a `CODEX_HOME` and `codex exec resume --last` resolves "last" inside it. Once
 opted in, a missing binary is a loud panic naming `ROUNDHOUSE_TEST_CODEX_BIN`
 rather than a silent skip. No network is needed: loopback only, a pinned
-catalog, no login, and a cleared child environment — the last asserted on the
-constructed command rather than on the wire, because a credential that was
-available but never consulted leaves every wire assertion green.
+catalog, no login, and a cleared child environment. That last one is asserted
+on the constructed command's key set, and the M11.2b review pinned exactly how
+far that reaches: `Command::get_envs()` reports only the explicit additions, so
+the guard checks what the harness adds and cannot see a dropped `env_clear()`
+or an ambient variable riding through it. The shared harness in
+`tests/common/e2e.rs` carries that fact as a test; the Claude suite closes the
+gap on the wire (an ambient credential shows up as an `authorization` header
+the seat test refuses), while here no credential is ever consulted, so the
+wire has nothing to show — a documented gap, not a covered one.
 
 **Version vigilance.** The binary under test is `codex-cli 0.146.0` (tree
 `e363b08`, 2026-07-28); the Cargo pin for the conformance crates is `6344a65`
@@ -530,7 +536,12 @@ knowing any of it is happening.
 
 ## Hooking up Claude Code
 
-`POST /v1/messages` is the Anthropic Messages surface over the same log, and
+`POST /v1/messages` is the same idea in the other dialect: an Anthropic Messages
+surface over the same event log, same engine, same admission, same prefix check.
+`/v1/messages/count_tokens` is served from this deployment's own tokenizer,
+because the client's fallback when that route is missing is a real one-token
+create against the routed model.
+
 `roundhouse_server::claude_launch` is `codex_launch`'s sibling for the client
 that speaks it. Two things about it are different, and both are facts about the
 client rather than choices:
@@ -595,16 +606,8 @@ process.
 Like the codex generator, this is a library function with no operator entry
 point; the `topham` launcher that will call both is deferred by name.
 
-`POST /v1/messages` is the same idea in the other dialect: an Anthropic Messages
-surface over the same event log, same engine, same admission, same prefix
-check. There is no config file to generate — Claude Code takes
-`ANTHROPIC_BASE_URL` and `ANTHROPIC_CUSTOM_HEADERS`, so pointing it at a
-deployment is two environment variables — and `/v1/messages/count_tokens` is
-served from this deployment's own tokenizer, because the client's fallback when
-it is missing is a real one-token create against the routed model.
-
-Three things about this client shape the surface, and each is a cost rather than
-a preference:
+The surface the map points at is shaped by three further facts about the same
+client, and each is a cost rather than a preference:
 
 - **It has no field to name its session with.** There is no
   `prompt_cache_key` on this wire, so the session is resolved from
@@ -655,11 +658,15 @@ turn key, the log, the prefix check, and the tool the client chose to run.
 Scripted: only the frontier, so the suite decides when a `tool_use` block is
 emitted rather than asking a model to decide. The child's environment is
 *cleared* and rebuilt from the generated map plus five named isolation
-variables, asserted on the constructed command as well as on the wire — inside a
-Claude Code Remote container the ambient `CLAUDE_CODE_REMOTE=true` would make
-the client present that container's managed OAuth token to whatever base URL it
-was handed, and a wire assertion cannot see a credential that was merely
-available.
+variables, because inside a Claude Code Remote container the ambient
+`CLAUDE_CODE_REMOTE=true` would make the client present that container's managed
+OAuth token to whatever base URL it was handed. Two guards stand behind that,
+and they catch different things: a no-binary test asserts the key set of the
+*constructed command* with `==`, which checks the generated map and only that —
+`Command::get_envs()` reports the explicit `env()` diff and reports it
+identically whether or not the clear ran — so a dropped `env_clear()` or an
+ambient leak is caught by the wire test instead, as an `authorization` header on
+a request that reached this deployment.
 
 Two of its tests drive the **chained** topology through a real NeMo Relay
 (`ROUNDHOUSE_TEST_RELAY_BIN`, `nemo-relay run --agent claude`), and that is
@@ -1107,12 +1114,11 @@ chat-completions client is the one remaining `WireProtocol` arm with no
 transport; the composition root's dialect gate is an exhaustive `match`, so
 writing that client is a compile error there rather than a silent
 mis-dispatch. On the Anthropic wire roundhouse now serves as well as
-dispatches, but two things about that surface are worth stating plainly. It has
-not yet been driven by a real `claude` binary end to end — the gated suite that
-does for Codex what `codex_e2e` does has no counterpart here yet, so the
-evidence is a conformance oracle plus two request bodies captured from the
-shipping client, not a live session. And `/v1/models` is deliberately not
-served, so a client with gateway model discovery enabled sees no catalog:
+dispatches, and a real `claude` binary has driven it end to end on both
+topologies (the gated `claude_e2e` suite, the counterpart of `codex_e2e`) —
+what that surface still does not do is worth stating plainly. `/v1/models` is
+deliberately not served, so a client with gateway model discovery enabled sees
+no catalog:
 exposing roundhouse's routes in a user's `/model` picker is a product decision
 that has been deferred rather than made. Fair-use enforcement is
 single-node: the rolling window

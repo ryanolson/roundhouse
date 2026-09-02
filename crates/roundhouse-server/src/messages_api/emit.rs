@@ -1896,4 +1896,31 @@ mod tests {
             "the control must actually be a bare comment: {comment_only}"
         );
     }
+
+    /// F15: pins the plan's ruling that the Messages surface offers no SSE
+    /// `id:` line — [`Frame::into_sse`] never calls [`Event::id`] — because
+    /// that ruling justifies not relying on Relay's SSE decoder for anything
+    /// id-based, and today nothing in this module asserts the absence. A
+    /// future `.id(response_id)` addition to `into_sse` would land silently
+    /// (every other rendering test only checks for `event:`/`data:`) and
+    /// would then be dropped by Relay only on the chained topology
+    /// (`codec/streaming.rs:182-198`), diverging Direct and Chained behavior
+    /// with every Direct test still green.
+    #[test]
+    fn into_sse_carries_no_id_line() {
+        let keepalive_rendered = format!("{:?}", keepalive().into_sse());
+        assert!(
+            !keepalive_rendered.contains("id: "),
+            "the keepalive frame must not carry an id: line: {keepalive_rendered}"
+        );
+
+        let start_rendered = format!(
+            "{:?}",
+            message_start(&response(), "claude-sonnet-4-5", &Usage::default()).into_sse()
+        );
+        assert!(
+            !start_rendered.contains("id: "),
+            "the message_start frame must not carry an id: line: {start_rendered}"
+        );
+    }
 }

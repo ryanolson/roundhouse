@@ -26,13 +26,20 @@
 //! of the server like [`codex`] does, but it is a *judge* rather than a client,
 //! and the distinction is why it has its own file: nothing in it may be relaxed
 //! to make a test pass.
+//!
+//! [`e2e`] is the fifth, and it is neither a double nor a judge: it is the rig
+//! the two **real-binary** suites stand a real client inside — recorder,
+//! bootstrap, fork probe, version probe. It exists because the second such suite
+//! was written by copying the first, and the copies drifted inside one milestone
+//! (M11.2b review F1).
 #![allow(dead_code)]
 
 pub mod anthropic;
 pub mod codex;
+pub mod e2e;
 pub mod validate;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -266,7 +273,16 @@ pub enum Scripted {
     Call {
         id: &'static str,
         name: &'static str,
-        arguments: &'static str,
+        /// Owned, unlike the two beside it.
+        ///
+        /// M11.2b review F13: a real-client suite scripts a call against a path
+        /// its own rig only learns at run time, and a `&'static str` field made
+        /// that a `Box::leak` at every such call site — two of them in
+        /// `claude_e2e.rs`, each with a paragraph explaining why leaking was
+        /// acceptable. `id` and `name` stay borrowed because every caller writes
+        /// a literal for them; widening only the field that actually varies is
+        /// what keeps the common case free of `.to_string()` noise.
+        arguments: String,
     },
 }
 
@@ -329,7 +345,7 @@ impl FrontierClient for ToolCallingFrontierClient {
                     chunks.push(Ok(FrontierChunk::ToolCall {
                         id: (*id).to_string(),
                         name: (*name).to_string(),
-                        arguments: (*arguments).to_string(),
+                        arguments: arguments.clone(),
                     }));
                 }
             }
@@ -344,5 +360,88 @@ impl FrontierClient for ToolCallingFrontierClient {
             stop_reason: self.stop_reason.clone(),
         }));
         Ok(futures::stream::iter(chunks).boxed())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A frontier that answers a queue of turns and then terminates (M11.2b)
+// ---------------------------------------------------------------------------
+
+/// A [`FrontierClient`] that answers a queue of scripted turns and then answers
+/// one fixed turn forever.
+///
+/// **The tail is the whole reason this type exists** rather than
+/// [`ToolCallingFrontierClient`] being used directly by a real-client suite. A
+/// real agent answers a `tool_use` by running the tool and dispatching again, so
+/// an upstream whose fixed script *is* a call answers the resend with the same
+/// call and the loop never closes: the run ends at whatever deadline the harness
+/// set and reads as a hung client. Queue-then-tail makes termination a property
+/// of the double instead of a hope about the client.
+///
+/// Here rather than in one suite (M11.2b review F13): every real-client tool-loop
+/// suite needs exactly this double, and the one that had it kept it private, so
+/// the next one would have written it again — which is how the harness copy this
+/// module exists to undo started.
+pub struct ScriptedTurns {
+    queued: Mutex<VecDeque<ToolCallingFrontierClient>>,
+    then: ToolCallingFrontierClient,
+    /// Every quote this deployment dispatched, in call order — what roundhouse
+    /// actually sent upstream, as opposed to what the client sent us.
+    quotes: Mutex<Vec<FrontierQuote>>,
+}
+
+impl ScriptedTurns {
+    /// One prose turn, on every dispatch.
+    pub fn answering(text: &'static str) -> Self {
+        Self::then_answering(Vec::new(), text)
+    }
+
+    /// The queued turns in order, then prose forever.
+    pub fn then_answering(queued: Vec<ToolCallingFrontierClient>, text: &'static str) -> Self {
+        Self {
+            queued: Mutex::new(VecDeque::from(queued)),
+            then: prose_turn(text),
+            quotes: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn dispatches(&self) -> usize {
+        self.quotes.lock().expect("recording").len()
+    }
+
+    /// Whether any dispatch carried a *forwarded* caller credential upstream.
+    ///
+    /// Read from the quote rather than from the wire because that is where the
+    /// decision is made: `turn_admission` captures a presented credential into
+    /// `TurnCredential::Forwarded` and the dispatch client then puts it on the
+    /// upstream request. A launch sentinel that arrived on every turn and was
+    /// never captured as a seat is what stops a deployment forwarding a value
+    /// that authenticates nothing to a real frontier.
+    pub fn any_credential_forwarded(&self) -> bool {
+        self.quotes
+            .lock()
+            .expect("recording")
+            .iter()
+            .any(|quote| quote.credential.is_forwarded())
+    }
+}
+
+/// One turn that speaks `text` and stops.
+pub fn prose_turn(text: &'static str) -> ToolCallingFrontierClient {
+    ToolCallingFrontierClient::new(vec![Scripted::Text(text)], Some("end_turn"))
+}
+
+#[async_trait]
+impl FrontierClient for ScriptedTurns {
+    async fn execute(&self, quote: &FrontierQuote) -> Result<FrontierStream, FrontierError> {
+        self.quotes.lock().expect("recording").push(quote.clone());
+        // Popped and the guard dropped before the await: holding a `std::sync`
+        // lock across an await point in a multi-threaded runtime is how a rig
+        // deadlocks under `--test-threads=1` and gets diagnosed as a client hang.
+        let queued = self.queued.lock().expect("recording").pop_front();
+        match queued {
+            Some(turn) => turn.execute(quote).await,
+            None => self.then.execute(quote).await,
+        }
     }
 }

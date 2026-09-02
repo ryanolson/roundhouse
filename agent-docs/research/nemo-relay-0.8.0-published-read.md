@@ -1211,3 +1211,32 @@ emitter first. Two readings, stated and stopped: `session-id`/`turn-id` are
 a correlation key roundhouse could adopt for the chained topology, or they
 are observability metadata whose stability across Relay releases nobody has
 promised.
+
+### A.13 — Read during M11.2b's core stage: the gateway's inbound-credential rules (2026-09-01)
+
+Two 0.8.2 facts §A.5–A.7 did not ask about, read from the same tarballs
+while the chained carrier was being designed, and load-bearing for R-D′ in
+`../PLAN-anthropic-messages.md`:
+
+1. **A configured `[upstream] anthropic_auth_header` is injected only when
+   the inbound request carries no credential.** `gateway/mod.rs:1070-1078`
+   (the `already_authed` short-circuit) checks for any of `authorization`,
+   `x-api-key`, `api-key`, `anthropic-api-key` on the inbound request and
+   skips the upstream header when one is present. Consequence: a client that
+   presents any credential of its own — an API key, a sentinel, a
+   subscription bearer — never receives Relay's configured upstream
+   credential; the two carriers are mutually exclusive per request.
+2. **Inbound `x-api-key` is forwarded untouched** (`gateway/response.rs:59-72`,
+   `should_forward_request_header`), and unknown request headers are not
+   stripped — which is what lets a client-environment `x-roundhouse-key`
+   survive the hop. Relay's own `x-nemo-relay-proxy-token` is consumed at the
+   gateway (`provider_auth.rs`, `TRANSPARENT_PROXY_CREDENTIAL_HEADER`) and
+   does not reach the upstream; M11.2b's chained suite asserts that absence
+   at roundhouse's edge.
+
+Two readings, stated and stopped: (1) is a deliberate "bring your own
+credential wins" policy, or an accident of the order in which the gateway
+resolves headers; nothing in the source comments says which. Either way the
+reference chained wiring in `crates/roundhouse-server/src/claude_launch.rs`
+relies on it only in the direction the code guarantees today (a
+credential-bearing client is left alone).

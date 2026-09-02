@@ -28,6 +28,11 @@
 //! cleared environment, fake API key, `ANTHROPIC_BASE_URL` pointed at the mock).
 //! Only `metadata.user_id`'s `device_id` is edited, to a placeholder of the same
 //! shape; everything else is verbatim, tools and 9 KB system prompt included.
+//! That sentence is a claim about bytes and is checked as one, in
+//! `review_m11_2b_f12.rs` — the redaction that first stamped the placeholder in
+//! parsed and re-dumped the whole `user_id` string, silently rewriting the
+//! client's separators, and nothing here could see it because every reader of
+//! that field parses it too.
 //! Two of those bytes falsified a ruling made from reading alone — see
 //! `the_shipping_clients_two_turns_are_one_conversation_but_for_the_prompt_it_changed`.
 //!
@@ -63,7 +68,9 @@ use roundhouse_fleet::{
     FrontierQuote, FrontierStream, LocalFleet, StaticFrontierCatalog, WireProtocol,
 };
 use roundhouse_server::claude_launch::ROUNDHOUSE_API_KEY_SENTINEL;
-use roundhouse_server::messages_api::wire::{CreateMessageParams, canonicalize, session_key};
+use roundhouse_server::messages_api::wire::{
+    CreateMessageParams, canonicalize, is_budget_notice, session_key,
+};
 use roundhouse_server::{
     ControlPlane, ControlPlaneConfig, Conversations, EchoLocalExecutor, Engine, messages_router,
 };
@@ -142,8 +149,50 @@ static LINE_CURRENT: CapturedLine = CapturedLine {
     headers: include_str!("fixtures/claude-2.1.257-headers.json"),
 };
 
-/// Every pinned line, in the order they shipped.
-static LINES: [&CapturedLine; 2] = [&LINE_PRIOR, &LINE_CURRENT];
+/// Turn one `fn body(&CapturedLine)` into one `#[test]` per pinned line.
+///
+/// `per_line_tests!(fn foo)` emits `foo::line_2_1_251` and `foo::line_2_1_257`,
+/// each calling `foo` with its own line; `per_line_tests!(async foo)` does the
+/// same for a `#[tokio::test]`. (The module shares the body's name — modules
+/// and functions live in different namespaces — so the reported path reads as
+/// the test and the line it ran on, and no name is spelled twice.)
+///
+/// **Why generation and not a `for line in LINES` loop, which is what this
+/// replaced (M11.2b review, F6).** A loop makes the two lines one test, and
+/// that costs three things the fix buys back. A panic on the prior line unwinds
+/// the whole test, so the current line's own checks never run in the run that
+/// needed them — the shipping client's result is hidden behind the older one's
+/// failure, which is exactly backwards. No filter can select one line, so
+/// bisecting a client-drift failure means editing the suite. And because a
+/// failure message otherwise cannot say which line produced it, every assertion
+/// in the loop had to carry a hand-threaded `line.version` prefix — twenty-eight
+/// of them, each one a chance to forget. The test name carries it now.
+macro_rules! per_line_tests {
+    (async $body:ident) => {
+        mod $body {
+            #[tokio::test]
+            async fn line_2_1_251() {
+                super::$body(&super::LINE_PRIOR).await;
+            }
+            #[tokio::test]
+            async fn line_2_1_257() {
+                super::$body(&super::LINE_CURRENT).await;
+            }
+        }
+    };
+    (fn $body:ident) => {
+        mod $body {
+            #[test]
+            fn line_2_1_251() {
+                super::$body(&super::LINE_PRIOR);
+            }
+            #[test]
+            fn line_2_1_257() {
+                super::$body(&super::LINE_CURRENT);
+            }
+        }
+    };
+}
 
 /// The current line's *third* turn, captured by resuming the very session
 /// [`LINE_CURRENT`]'s two turns built (same isolated `HOME`, same
@@ -389,13 +438,13 @@ fn speaking_and_calling() -> Vec<Scripted> {
             // emits them: if anything on the path parsed and re-serialized this,
             // the bytes would change and the client's resend would stop matching
             // what the log holds.
-            arguments: r#"{"pattern": "fn main", "path": "/src"}"#,
+            arguments: r#"{"pattern": "fn main", "path": "/src"}"#.into(),
         },
         Scripted::Text(" And also:"),
         Scripted::Call {
             id: "toolu_02",
             name: "Read",
-            arguments: r#"{"path": "/src/main.rs"}"#,
+            arguments: r#"{"path": "/src/main.rs"}"#.into(),
         },
     ]
 }
@@ -805,7 +854,7 @@ fn fixture(text: &str) -> Value {
 /// line for a reason that has nothing to do with the surface. What is asserted
 /// instead is the property the tests below actually rest on: that this really is
 /// a live capture's toolbox and not a hand-written stub.
-fn declared_tools(captured: &Value, line: &CapturedLine) -> Value {
+fn declared_tools(captured: &Value) -> Value {
     let tools = captured["tools"].clone();
     let declared = tools
         .as_array()
@@ -813,9 +862,8 @@ fn declared_tools(captured: &Value, line: &CapturedLine) -> Value {
         .len();
     assert!(
         declared >= 20,
-        "{}: the fixture is the live capture; a toolbox of {declared} is \
-         describing a different request",
-        line.version
+        "the fixture is the live capture; a toolbox of {declared} is \
+         describing a different request"
     );
     tools
 }
@@ -1209,66 +1257,63 @@ async fn f1_the_clients_max_tokens_is_the_dispatch_ceiling_and_not_the_estimate(
 /// the *seam*: `AnthropicMessagesClient::body`'s unit tests already pin what a
 /// quote's tools become on the wire, and what nothing pinned was that a client's
 /// tools reach the quote.
-#[tokio::test]
-async fn the_clients_tool_definitions_reach_the_dispatch_verbatim() {
-    for line in LINES {
-        let (app, _store, client) = surface_scripted();
-        let captured = fixture(line.turn_one);
-        let tools = declared_tools(&captured, line);
+async fn the_clients_tool_definitions_reach_the_dispatch_verbatim(line: &CapturedLine) {
+    let (app, _store, client) = surface_scripted();
+    let captured = fixture(line.turn_one);
+    let tools = declared_tools(&captured);
 
-        let mut request = captured.clone();
-        // The capture streams; the scripted client answers either way, and a
-        // non-streaming turn keeps this test to one assertion about one thing.
-        request["stream"] = json!(false);
-        // The captured body carries no `tool_choice` (the client relies on the
-        // default), so one is added here: the field is independently optional
-        // and a surface that threaded only `tools` would pass every assertion
-        // above.
-        request["tool_choice"] = json!({ "type": "auto", "disable_parallel_tool_use": false });
+    let mut request = captured.clone();
+    // The capture streams; the scripted client answers either way, and a
+    // non-streaming turn keeps this test to one assertion about one thing.
+    request["stream"] = json!(false);
+    // The captured body carries no `tool_choice` (the client relies on the
+    // default), so one is added here: the field is independently optional
+    // and a surface that threaded only `tools` would pass every assertion
+    // above.
+    request["tool_choice"] = json!({ "type": "auto", "disable_parallel_tool_use": false });
 
-        let (status, _, text) = post(
-            &app,
-            "/v1/messages",
-            &[("x-claude-code-session-id", "sess-tools")],
-            &request,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{}: {text}", line.version);
+    let (status, _, text) = post(
+        &app,
+        "/v1/messages",
+        &[("x-claude-code-session-id", "sess-tools")],
+        &request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
 
-        let quotes = client.quotes_seen();
-        assert_eq!(quotes.len(), 1, "one frontier dispatch: {quotes:?}");
-        assert_eq!(
-            quotes[0].tools.as_ref(),
-            Some(&tools),
-            "{}: the dispatch must carry every one of the client's own \
-             definitions, unmodified — a model told about a smaller toolbox \
-             than the client has fails in the one way nobody debugs",
-            line.version
-        );
-        assert_eq!(
-            quotes[0].tool_choice,
-            Some(json!({ "type": "auto", "disable_parallel_tool_use": false }))
-        );
+    let quotes = client.quotes_seen();
+    assert_eq!(quotes.len(), 1, "one frontier dispatch: {quotes:?}");
+    assert_eq!(
+        quotes[0].tools.as_ref(),
+        Some(&tools),
+        "the dispatch must carry every one of the client's own \
+         definitions, unmodified — a model told about a smaller toolbox \
+         than the client has fails in the one way nobody debugs"
+    );
+    assert_eq!(
+        quotes[0].tool_choice,
+        Some(json!({ "type": "auto", "disable_parallel_tool_use": false }))
+    );
 
-        // CONTROL: a request that declares neither carries neither, so the
-        // assertions above are about threading rather than about a default that
-        // would have matched anything. `body()` is the minimal request this
-        // suite uses everywhere else, which is also what makes every other test
-        // here a control for the same thing.
-        let (status, _, text) = post(
-            &app,
-            "/v1/messages",
-            &[("x-claude-code-session-id", "sess-no-tools")],
-            &body("hello"),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{text}");
-        let quotes = client.quotes_seen();
-        assert_eq!(quotes.len(), 2, "{quotes:?}");
-        assert_eq!(quotes[1].tools, None);
-        assert_eq!(quotes[1].tool_choice, None);
-    }
+    // CONTROL: a request that declares neither carries neither, so the
+    // assertions above are about threading rather than about a default that
+    // would have matched anything. `body()` is the minimal request this
+    // suite uses everywhere else, which is also what makes every other test
+    // here a control for the same thing.
+    let (status, _, text) = post(
+        &app,
+        "/v1/messages",
+        &[("x-claude-code-session-id", "sess-no-tools")],
+        &body("hello"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let quotes = client.quotes_seen();
+    assert_eq!(quotes.len(), 2, "{quotes:?}");
+    assert_eq!(quotes[1].tools, None);
+    assert_eq!(quotes[1].tool_choice, None);
 }
+per_line_tests!(async the_clients_tool_definitions_reach_the_dispatch_verbatim);
 
 /// The control for the ignored F1 test below: [`surface_scripted_cross_dialect`]
 /// really does resolve an ordinary tool-declaring turn against a target that
@@ -1291,54 +1336,52 @@ async fn the_clients_tool_definitions_reach_the_dispatch_verbatim() {
 /// resolves there regardless of what the client declared -- there is no
 /// candidate-side dialect field for a policy to filter on either (`Candidate`
 /// carries only `target`, timing and price).
-#[tokio::test]
-async fn cross_dialect_routing_reaches_a_responses_target_with_anthropic_shaped_tools() {
-    for line in LINES {
-        let captured = fixture(line.turn_one);
-        let tools = declared_tools(&captured, line);
-        let first_tool = &tools[0];
-        assert!(
-            first_tool.get("type").is_none(),
-            "{}: the fixture must actually be Anthropic-shaped for the ignored \
-             test below to mean anything -- a `type` key on a tool here would \
-             make it already Responses-shaped, which is not the scenario",
-            line.version
-        );
-        assert!(
-            first_tool.get("input_schema").is_some() && first_tool.get("parameters").is_none(),
-            "{}: same as above, for the schema key the two dialects spell \
-             differently -- Anthropic's `input_schema` vs. the Responses \
-             upstream's required `parameters`",
-            line.version
-        );
+async fn cross_dialect_routing_reaches_a_responses_target_with_anthropic_shaped_tools(
+    line: &CapturedLine,
+) {
+    let captured = fixture(line.turn_one);
+    let tools = declared_tools(&captured);
+    let first_tool = &tools[0];
+    assert!(
+        first_tool.get("type").is_none(),
+        "the fixture must actually be Anthropic-shaped for the ignored \
+         test below to mean anything -- a `type` key on a tool here would \
+         make it already Responses-shaped, which is not the scenario"
+    );
+    assert!(
+        first_tool.get("input_schema").is_some() && first_tool.get("parameters").is_none(),
+        "same as above, for the schema key the two dialects spell \
+         differently -- Anthropic's `input_schema` vs. the Responses \
+         upstream's required `parameters`"
+    );
 
-        let (app, _store, client) = surface_scripted_cross_dialect();
-        let mut request = captured.clone();
-        request["stream"] = json!(false);
-        let (status, _, text) = post(
-            &app,
-            "/v1/messages",
-            &[("x-claude-code-session-id", "sess-cross-dialect-control")],
-            &request,
-        )
-        .await;
-        assert_eq!(
-            status,
-            StatusCode::OK,
-            "today (before F1 is fixed) this turn is accepted and dispatched \
-             rather than refused -- see the ignored test below: {text}"
-        );
-        let quotes = client.quotes_seen();
-        assert_eq!(quotes.len(), 1, "one frontier dispatch: {quotes:?}");
-        assert_eq!(
-            quotes[0].wire_protocol,
-            WireProtocol::OpenAiResponses,
-            "the only entry in this catalog speaks Responses -- if the quote \
-             says otherwise this harness is not exercising the cross-dialect \
-             path it claims to"
-        );
-    }
+    let (app, _store, client) = surface_scripted_cross_dialect();
+    let mut request = captured.clone();
+    request["stream"] = json!(false);
+    let (status, _, text) = post(
+        &app,
+        "/v1/messages",
+        &[("x-claude-code-session-id", "sess-cross-dialect-control")],
+        &request,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "today (before F1 is fixed) this turn is accepted and dispatched \
+         rather than refused -- see the ignored test below: {text}"
+    );
+    let quotes = client.quotes_seen();
+    assert_eq!(quotes.len(), 1, "one frontier dispatch: {quotes:?}");
+    assert_eq!(
+        quotes[0].wire_protocol,
+        WireProtocol::OpenAiResponses,
+        "the only entry in this catalog speaks Responses -- if the quote \
+         says otherwise this harness is not exercising the cross-dialect \
+         path it claims to"
+    );
 }
+per_line_tests!(async cross_dialect_routing_reaches_a_responses_target_with_anthropic_shaped_tools);
 
 /// **F1 (thermo-nuclear review of b8e8ddd), fixed: a toolbox and the target it
 /// is dispatched to may speak different dialects, and now something says so.**
@@ -1371,21 +1414,9 @@ async fn cross_dialect_routing_reaches_a_responses_target_with_anthropic_shaped_
 /// `an_anthropic_shaped_toolbox_is_restated_in_this_dialect_before_it_is_sent`
 /// and the Messages client's mirror of it), and `frontier.rs` pins the
 /// translation table and every refusal.
-#[tokio::test]
-async fn f1_cross_dialect_tools_must_not_reach_dispatch_unexamined() {
-    for line in LINES {
-        f1_one_line(line).await;
-    }
-}
-
-/// One captured line's worth of [`f1_cross_dialect_tools_must_not_reach_dispatch_unexamined`].
-///
-/// Split out rather than looped inline because the body is long and the failure
-/// messages have to name which line failed; an inner `async fn` keeps that name
-/// in one place instead of threading it through a dozen assertions.
-async fn f1_one_line(line: &CapturedLine) {
+async fn f1_cross_dialect_tools_must_not_reach_dispatch_unexamined(line: &CapturedLine) {
     let captured = fixture(line.turn_one);
-    let tools = declared_tools(&captured, line);
+    let tools = declared_tools(&captured);
     let declared = tools.as_array().map(Vec::len).unwrap_or(0);
 
     let (app, _store, client) = surface_scripted_cross_dialect();
@@ -1414,8 +1445,9 @@ async fn f1_one_line(line: &CapturedLine) {
     assert_eq!(
         quote.tools_dialect,
         Some(WireProtocol::AnthropicMessages),
-        "{}: and the surface that accepted these {declared} declarations speaks          Messages -- a quote that could not say so is a quote whose tools no          client can shape correctly",
-        line.version
+        "and the surface that accepted these {declared} declarations speaks \
+         Messages -- a quote that could not say so is a quote whose tools no \
+         client can shape correctly"
     );
 
     // The second half: the seam every dispatch client reads a toolbox through
@@ -1446,6 +1478,7 @@ async fn f1_one_line(line: &CapturedLine) {
         );
     }
 }
+per_line_tests!(async f1_cross_dialect_tools_must_not_reach_dispatch_unexamined);
 
 /// The control for the ignored F2 test below: [`surface_scripted_with_fleet`]
 /// really does route an ordinary, tool-free turn to the local worker by
@@ -1512,58 +1545,54 @@ async fn f2_control_the_rig_routes_local_by_default_without_tools() {
 ///   audit trail shows a frontier dispatch chosen over a cheaper local
 ///   candidate that is simply absent, and the counterfactual reads as a router
 ///   preference rather than a capability limit.
-#[tokio::test]
-async fn f2_a_tool_declaring_turn_routed_local_loses_its_toolbox_silently() {
-    for line in LINES {
-        let captured = fixture(line.turn_one);
-        let tools = declared_tools(&captured, line);
+async fn f2_a_tool_declaring_turn_routed_local_loses_its_toolbox_silently(line: &CapturedLine) {
+    let captured = fixture(line.turn_one);
+    let tools = declared_tools(&captured);
 
-        let (app, store, client) = surface_scripted_with_fleet().await;
-        let mut request = captured.clone();
-        request["stream"] = json!(false);
+    let (app, store, client) = surface_scripted_with_fleet().await;
+    let mut request = captured.clone();
+    request["stream"] = json!(false);
 
-        let (status, _, text) = post(
-            &app,
-            "/v1/messages",
-            &[("x-claude-code-session-id", "sess-tools-local")],
-            &request,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{}: {text}", line.version);
+    let (status, _, text) = post(
+        &app,
+        "/v1/messages",
+        &[("x-claude-code-session-id", "sess-tools-local")],
+        &request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
 
-        let quotes = client.quotes_seen();
-        assert_eq!(
-            quotes.len(),
-            1,
-            "{}: F2: a tool-declaring turn must reach the one candidate that \
-             can carry a toolbox, not the one structurally unable to carry any \
-             of them: {text}",
-            line.version
-        );
-        assert_eq!(
-            quotes[0].tools.as_ref(),
-            Some(&tools),
-            "{}: and it must arrive with the client's own declarations",
-            line.version
-        );
+    let quotes = client.quotes_seen();
+    assert_eq!(
+        quotes.len(),
+        1,
+        "F2: a tool-declaring turn must reach the one candidate that \
+         can carry a toolbox, not the one structurally unable to carry any \
+         of them: {text}"
+    );
+    assert_eq!(
+        quotes[0].tools.as_ref(),
+        Some(&tools),
+        "and it must arrive with the client's own declarations"
+    );
 
-        let message: Value = serde_json::from_str(&text).expect("a JSON message");
-        assert_eq!(
-            message["content"],
-            json!([{ "type": "text", "text": ANSWER }]),
-            "the frontier answered; `local answer` here would mean the turn was \
-             served by the worker after all: {text}"
-        );
+    let message: Value = serde_json::from_str(&text).expect("a JSON message");
+    assert_eq!(
+        message["content"],
+        json!([{ "type": "text", "text": ANSWER }]),
+        "the frontier answered; `local answer` here would mean the turn was \
+         served by the worker after all: {text}"
+    );
 
-        // And the audit trail says why the cheap candidate is missing.
-        let rationale = routing_rationale(&store, &named("sess-tools-local")).await;
-        assert!(
-            rationale.contains("the client declared tools, so local candidates were excluded"),
-            "F2: the decision record has to say why local was skipped, or the \
-             counterfactual reads as a router preference: {rationale}"
-        );
-    }
+    // And the audit trail says why the cheap candidate is missing.
+    let rationale = routing_rationale(&store, &named("sess-tools-local")).await;
+    assert!(
+        rationale.contains("the client declared tools, so local candidates were excluded"),
+        "F2: the decision record has to say why local was skipped, or the \
+         counterfactual reads as a router preference: {rationale}"
+    );
 }
+per_line_tests!(async f2_a_tool_declaring_turn_routed_local_loses_its_toolbox_silently);
 
 /// The rationale on this session's one routing decision.
 async fn routing_rationale(store: &MemoryStore, session_id: &str) -> String {
@@ -1730,7 +1759,7 @@ async fn the_clients_tool_results_come_back_onto_the_same_session() {
             Scripted::Call {
                 id: "toolu_01",
                 name: "Grep",
-                arguments: r#"{"pattern": "fn main", "path": "/src"}"#,
+                arguments: r#"{"pattern": "fn main", "path": "/src"}"#.into(),
             },
         ],
         Some("tool_use"),
@@ -1834,7 +1863,7 @@ async fn the_non_streaming_body_carries_the_tool_use_blocks() {
         vec![Scripted::Call {
             id: "toolu_01",
             name: "Bash",
-            arguments: r#"{"command": "ls -la"}"#,
+            arguments: r#"{"command": "ls -la"}"#.into(),
         }],
         Some("tool_use"),
     );
@@ -1883,7 +1912,7 @@ async fn a_call_from_a_wire_with_no_stop_reason_still_reports_tool_use() {
         vec![Scripted::Call {
             id: "call_1",
             name: "shell",
-            arguments: r#"{"command":["ls"]}"#,
+            arguments: r#"{"command":["ls"]}"#.into(),
         }],
         None,
     );
@@ -2073,45 +2102,42 @@ async fn count_tokens_answers_and_grows_with_the_conversation() {
 /// toolbox** rather than written out: the two rigs declared different toolboxes,
 /// and a literal here would fail the smaller one for a reason that is about the
 /// invocation and not about the count.
-#[tokio::test]
-async fn count_tokens_counts_the_declared_toolbox() {
-    for line in LINES {
-        let (app, _store) = surface();
-        let captured = fixture(line.turn_one);
-        declared_tools(&captured, line);
-        let tools_bytes = serde_json::to_string(&captured["tools"])
-            .expect("the fixture's tools serialize")
-            .len() as u64;
+async fn count_tokens_counts_the_declared_toolbox(line: &CapturedLine) {
+    let (app, _store) = surface();
+    let captured = fixture(line.turn_one);
+    declared_tools(&captured);
+    let tools_bytes = serde_json::to_string(&captured["tools"])
+        .expect("the fixture's tools serialize")
+        .len() as u64;
 
-        let mut untooled = captured.clone();
-        untooled
-            .as_object_mut()
-            .expect("a JSON object")
-            .remove("tools")
-            .expect("the capture declares tools");
+    let mut untooled = captured.clone();
+    untooled
+        .as_object_mut()
+        .expect("a JSON object")
+        .remove("tools")
+        .expect("the capture declares tools");
 
-        async fn count(app: &Router, request: &Value) -> u64 {
-            let (status, _, text) = post(app, "/v1/messages/count_tokens", &[], request).await;
-            assert_eq!(status, StatusCode::OK, "{text}");
-            serde_json::from_str::<Value>(&text).expect("JSON")["input_tokens"]
-                .as_u64()
-                .expect("a count")
-        }
-
-        let bare = count(&app, &untooled).await;
-        let tooled = count(&app, &captured).await;
-        // Nine tenths rather than all of it: the estimator is a tokenizer, not a
-        // byte counter, and pinning it to the exact serialization would make
-        // this test fail the day the tokenizer improves — which is not the
-        // finding it exists to hold.
-        assert!(
-            tooled >= bare + tools_bytes * 9 / 10,
-            "{}: F4: the estimate must include the {tools_bytes}-byte toolbox \
-             the same request is about to send — bare={bare}, tooled={tooled}",
-            line.version
-        );
+    async fn count(app: &Router, request: &Value) -> u64 {
+        let (status, _, text) = post(app, "/v1/messages/count_tokens", &[], request).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        serde_json::from_str::<Value>(&text).expect("JSON")["input_tokens"]
+            .as_u64()
+            .expect("a count")
     }
+
+    let bare = count(&app, &untooled).await;
+    let tooled = count(&app, &captured).await;
+    // Nine tenths rather than all of it: the estimator is a tokenizer, not a
+    // byte counter, and pinning it to the exact serialization would make
+    // this test fail the day the tokenizer improves — which is not the
+    // finding it exists to hold.
+    assert!(
+        tooled >= bare + tools_bytes * 9 / 10,
+        "F4: the estimate must include the {tools_bytes}-byte toolbox \
+         the same request is about to send — bare={bare}, tooled={tooled}"
+    );
 }
+per_line_tests!(async count_tokens_counts_the_declared_toolbox);
 
 // ---------------------------------------------------------------------------
 // The session across turns
@@ -3152,8 +3178,7 @@ async fn f3_an_oversized_body_is_refused_in_the_clients_envelope() {
 /// header map. The property is one-directional and both directions are asserted,
 /// because "no seat was captured" is trivially true of an implementation that
 /// captures nothing.
-#[test]
-fn a_seat_rides_only_beside_a_dedicated_turn_key() {
+fn a_seat_rides_only_beside_a_dedicated_turn_key(line: &CapturedLine) {
     let plane = ControlPlane::configured(
         ControlPlaneConfig::from_json(
             &json!({
@@ -3170,12 +3195,6 @@ fn a_seat_rides_only_beside_a_dedicated_turn_key() {
         .expect("the fixture config must validate"),
     );
 
-    for line in LINES {
-        a_seat_rides_only_beside_a_dedicated_turn_key_on(&plane, line);
-    }
-}
-
-fn a_seat_rides_only_beside_a_dedicated_turn_key_on(plane: &ControlPlane, line: &CapturedLine) {
     let mut with_seat = client_headers(line);
     with_seat.insert(
         HeaderName::from_static("x-roundhouse-key"),
@@ -3214,6 +3233,7 @@ fn a_seat_rides_only_beside_a_dedicated_turn_key_on(plane: &ControlPlane, line: 
         "roundhouse's own turn key must never be forwarded as a seat"
     );
 }
+per_line_tests!(fn a_seat_rides_only_beside_a_dedicated_turn_key);
 
 /// **The launcher's `ANTHROPIC_API_KEY` sentinel is served, and is inert.**
 ///
@@ -3229,8 +3249,7 @@ fn a_seat_rides_only_beside_a_dedicated_turn_key_on(plane: &ControlPlane, line: 
 /// the reason [`client_headers`] gives one test up: the sentinel arrives among
 /// twenty other headers no other surface sees, and the capture is the only
 /// statement of what those are that cannot drift from the client.
-#[tokio::test]
-async fn the_launchers_api_key_sentinel_is_served_and_never_becomes_a_seat() {
+async fn the_launchers_api_key_sentinel_is_served_and_never_becomes_a_seat(line: &CapturedLine) {
     let plane = Arc::new(ControlPlane::configured(
         ControlPlaneConfig::from_json(
             &json!({
@@ -3269,61 +3288,57 @@ async fn the_launchers_api_key_sentinel_is_served_and_never_becomes_a_seat() {
     );
     audit(&text).unwrap_or_else(|error| panic!("the stream is not conformant: {error}\n\n{text}"));
 
-    for line in LINES {
-        // Inert, in both directions, against the real header set.
-        let mut with_sentinel = client_headers(line);
-        with_sentinel.insert(
-            HeaderName::from_static("x-roundhouse-key"),
-            HeaderValue::from_str(&key("seat")).expect("a header value"),
-        );
-        with_sentinel.insert(
-            HeaderName::from_static("x-api-key"),
-            HeaderValue::from_static(ROUNDHOUSE_API_KEY_SENTINEL),
-        );
-        let admitted = plane
-            .turn_admission(&with_sentinel)
-            .expect("the dedicated header authenticates the turn key");
-        assert!(
-            !admitted.credentials.reaches("anthropic"),
-            "{}: the sentinel authenticates nothing and must make no provider reachable",
-            line.version
-        );
+    // Inert, in both directions, against the real header set.
+    let mut with_sentinel = client_headers(line);
+    with_sentinel.insert(
+        HeaderName::from_static("x-roundhouse-key"),
+        HeaderValue::from_str(&key("seat")).expect("a header value"),
+    );
+    with_sentinel.insert(
+        HeaderName::from_static("x-api-key"),
+        HeaderValue::from_static(ROUNDHOUSE_API_KEY_SENTINEL),
+    );
+    let admitted = plane
+        .turn_admission(&with_sentinel)
+        .expect("the dedicated header authenticates the turn key");
+    assert!(
+        !admitted.credentials.reaches("anthropic"),
+        "the sentinel authenticates nothing and must make no provider reachable"
+    );
 
-        // And the sharp case, which is what a chained Relay makes reachable
-        // without the client changing at all: Relay forwards an inbound
-        // `x-api-key` untouched while injecting its own `Authorization`, so the
-        // sentinel can arrive beside a real bearer. The bearer is the caller's
-        // credential and still forwards; the sentinel must not ride with it,
-        // because Anthropic answers a bad `x-api-key` next to a valid bearer
-        // with a `401` an operator reads as a revoked login.
-        let mut beside_a_seat = with_sentinel.clone();
-        beside_a_seat.insert(
-            AUTHORIZATION,
-            HeaderValue::from_static("Bearer sk-ant-oat01-not-a-real-seat"),
-        );
-        let admitted = plane
-            .turn_admission(&beside_a_seat)
-            .expect("the dedicated header authenticates the turn key");
-        let forwarded = admitted
-            .credentials
-            .access("anthropic")
-            .and_then(|access| access.credential.forwarded().cloned())
-            .expect("a real seat beside the sentinel is still a captured credential");
-        let names: Vec<&str> = forwarded.headers().map(|(name, _)| name).collect();
-        assert!(
-            names.contains(&"authorization"),
-            "{}: the caller's own bearer is still forwarded: {names:?}",
-            line.version
-        );
-        assert!(
-            !forwarded
-                .headers()
-                .any(|(_, value)| value == ROUNDHOUSE_API_KEY_SENTINEL),
-            "{}: a value roundhouse generated must never reach an upstream: {names:?}",
-            line.version
-        );
-    }
+    // And the sharp case, which is what a chained Relay makes reachable
+    // without the client changing at all: Relay forwards an inbound
+    // `x-api-key` untouched while injecting its own `Authorization`, so the
+    // sentinel can arrive beside a real bearer. The bearer is the caller's
+    // credential and still forwards; the sentinel must not ride with it,
+    // because Anthropic answers a bad `x-api-key` next to a valid bearer
+    // with a `401` an operator reads as a revoked login.
+    let mut beside_a_seat = with_sentinel.clone();
+    beside_a_seat.insert(
+        AUTHORIZATION,
+        HeaderValue::from_static("Bearer sk-ant-oat01-not-a-real-seat"),
+    );
+    let admitted = plane
+        .turn_admission(&beside_a_seat)
+        .expect("the dedicated header authenticates the turn key");
+    let forwarded = admitted
+        .credentials
+        .access("anthropic")
+        .and_then(|access| access.credential.forwarded().cloned())
+        .expect("a real seat beside the sentinel is still a captured credential");
+    let names: Vec<&str> = forwarded.headers().map(|(name, _)| name).collect();
+    assert!(
+        names.contains(&"authorization"),
+        "the caller's own bearer is still forwarded: {names:?}"
+    );
+    assert!(
+        !forwarded
+            .headers()
+            .any(|(_, value)| value == ROUNDHOUSE_API_KEY_SENTINEL),
+        "a value roundhouse generated must never reach an upstream: {names:?}"
+    );
 }
+per_line_tests!(async the_launchers_api_key_sentinel_is_served_and_never_becomes_a_seat);
 
 /// The header set an inference request of this line actually carries.
 ///
@@ -3362,8 +3377,7 @@ fn client_headers(line: &CapturedLine) -> HeaderMap {
     }
     assert!(
         headers.contains_key("anthropic-beta") && headers.contains_key("x-claude-code-session-id"),
-        "{}: the capture must actually carry this dialect's header set",
-        line.version
+        "the capture must actually carry this dialect's header set"
     );
     headers
 }
@@ -3385,23 +3399,15 @@ fn client_headers(line: &CapturedLine) -> HeaderMap {
 /// from the test: the attribution block's *shape* (block 0, uncached, first) is
 /// what this pins, and the only thing that moved between the two captures is the
 /// number inside it (§5.7).
-#[test]
-fn the_shipping_clients_body_becomes_the_prefix_it_will_be_checked_against() {
-    for line in LINES {
-        the_shipping_clients_body_is_a_prefix(line);
-    }
-}
-
-fn the_shipping_clients_body_is_a_prefix(line: &CapturedLine) {
+fn the_shipping_clients_body_becomes_the_prefix_it_will_be_checked_against(line: &CapturedLine) {
     let params = parse(line.turn_one);
     let items = canonicalize(&params).expect("the live client's body must be servable");
 
     assert_eq!(
         items.len(),
         6,
-        "{}: three system blocks, two user blocks and the mid-conversation \
+        "three system blocks, two user blocks and the mid-conversation \
          system message: {:#?}",
-        line.version,
         items.iter().map(|item| item.role).collect::<Vec<_>>()
     );
     // Block 0 of `system` is the attribution pseudo-header, stored as ordinary
@@ -3413,8 +3419,7 @@ fn the_shipping_clients_body_is_a_prefix(line: &CapturedLine) {
     assert!(
         matches!(&items[0].content, ItemContent::Text { text }
             if text.starts_with(&attribution)),
-        "{}: {:?}",
-        line.version,
+        "{:?}",
         items[0].content
     );
     // **The leading run of `system` blocks is turn configuration, and carries
@@ -3454,11 +3459,11 @@ fn the_shipping_clients_body_is_a_prefix(line: &CapturedLine) {
     assert_eq!(
         session_key(&HeaderMap::new(), &params),
         Some(line.named()),
-        "{}: the capture's `metadata.user_id` is a JSON object string, and the \
-         name it yields lives in this dialect's own namespace (F6)",
-        line.version
+        "the capture's `metadata.user_id` is a JSON object string, and the \
+         name it yields lives in this dialect's own namespace (F6)"
     );
 }
+per_line_tests!(fn the_shipping_clients_body_becomes_the_prefix_it_will_be_checked_against);
 
 /// **Two real turns of one conversation, and the one item that moved.**
 ///
@@ -3485,61 +3490,117 @@ fn the_shipping_clients_body_is_a_prefix(line: &CapturedLine) {
 /// the other, which is the shape §5.7 found and mistook for arithmetic. It is
 /// not arithmetic: an ephemeral notice is not a thing anyone said, so it never
 /// becomes an item, and the count is two on every line that ever ships.
-#[test]
-fn the_shipping_clients_two_turns_are_one_conversation_but_for_the_prompt_it_changed() {
-    for line in LINES {
-        let first = canonicalize(&parse(line.turn_one)).expect("turn one is servable");
-        let second = canonicalize(&parse(line.turn_two)).expect("turn two is servable");
+fn the_shipping_clients_two_turns_are_one_conversation_but_for_the_prompt_it_changed(
+    line: &CapturedLine,
+) {
+    let first = canonicalize(&parse(line.turn_one)).expect("turn one is servable");
+    let second = canonicalize(&parse(line.turn_two)).expect("turn two is servable");
 
-        assert_eq!(
-            second.len(),
-            first.len() + 2,
-            "{}: the answer and the new question, and nothing else a \
-             `--continue` happens to carry: {second:#?}",
-            line.version
-        );
-        let diverged: Vec<usize> = first
-            .iter()
-            .zip(&second)
-            .enumerate()
-            .filter(|(_, (a, b))| a != b)
-            .map(|(index, _)| index)
-            .collect();
-        assert_eq!(
-            diverged,
-            vec![2],
-            "{}: only the system prompt the client itself rewrote may differ: \
-             {diverged:?}",
-            line.version
-        );
-        assert_eq!(
-            first[5], second[5],
-            "{}: the mid-conversation system message is a block list on turn \
-             one and a string on the resend; if those canonicalize differently, \
-             every second turn of every session forks and every turn still \
-             answers",
-            line.version
-        );
-        assert_eq!(
-            second[6],
-            Item {
-                role: Role::Assistant,
-                content: ItemContent::Text {
-                    text: "MOCKED".to_string()
-                },
-                response_id: None,
+    assert_eq!(
+        second.len(),
+        first.len() + 2,
+        "the answer and the new question, and nothing else a \
+         `--continue` happens to carry: {second:#?}"
+    );
+    let diverged: Vec<usize> = first
+        .iter()
+        .zip(&second)
+        .enumerate()
+        .filter(|(_, (a, b))| a != b)
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(
+        diverged,
+        vec![2],
+        "only the system prompt the client itself rewrote may differ: \
+         {diverged:?}"
+    );
+    assert_eq!(
+        first[5], second[5],
+        "the mid-conversation system message is a block list on turn \
+         one and a string on the resend; if those canonicalize differently, \
+         every second turn of every session forks and every turn still \
+         answers"
+    );
+    assert_eq!(
+        second[6],
+        Item {
+            role: Role::Assistant,
+            content: ItemContent::Text {
+                text: "MOCKED".to_string()
             },
-            "{}: the client replays the assistant's reply verbatim, unstamped",
-            line.version
-        );
+            response_id: None,
+        },
+        "the client replays the assistant's reply verbatim, unstamped"
+    );
 
-        // And both turns name the same session, which is what makes the prefix
-        // check reach the same log at all.
-        assert_eq!(
-            session_key(&HeaderMap::new(), &parse(line.turn_one)),
-            session_key(&HeaderMap::new(), &parse(line.turn_two)),
-        );
-    }
+    // And both turns name the same session, which is what makes the prefix
+    // check reach the same log at all.
+    assert_eq!(
+        session_key(&HeaderMap::new(), &parse(line.turn_one)),
+        session_key(&HeaderMap::new(), &parse(line.turn_two)),
+    );
+}
+per_line_tests!(fn the_shipping_clients_two_turns_are_one_conversation_but_for_the_prompt_it_changed);
+
+/// **F6 (M11.2b review), closed: each pinned line is its own reported test.**
+///
+/// The finding was that `for line in LINES` made the two lines one test, and
+/// so a panic on 2.1.251 unwound before 2.1.257's own checks ever ran — the
+/// shipping client's result hidden behind the older line's failure — while no
+/// filter could select one line to look at. [`per_line_tests`] replaced the
+/// loop with generation.
+///
+/// What makes that a fix rather than a preference is that libtest now *has*
+/// two entries where it had one, so it schedules, runs and reports each
+/// independently. That is observed here rather than argued: the running test
+/// binary is asked for its own list (`--list` enumerates without running
+/// anything), and every parameterized body must appear once per line. A test
+/// that instead re-modelled independent execution in-process — two
+/// `catch_unwind`s in a row — would pass identically against the loop this
+/// replaced, and would be pinning the model rather than the suite.
+#[test]
+fn f6_every_pinned_line_is_its_own_reported_test() {
+    let listing = std::process::Command::new(
+        std::env::current_exe().expect("a running test knows its own binary"),
+    )
+    .args(["--list", "--format=terse"])
+    .output()
+    .expect("the test binary enumerates its own tests");
+    let listing = String::from_utf8(listing.stdout).expect("libtest's listing is UTF-8");
+
+    let named_for = |suffix: &str| -> Vec<String> {
+        let suffix = format!("::{suffix}: test");
+        let mut names: Vec<String> = listing
+            .lines()
+            .filter_map(|entry| entry.strip_suffix(&suffix))
+            .map(str::to_string)
+            .collect();
+        names.sort();
+        names
+    };
+    let prior = named_for("line_2_1_251");
+    let current = named_for("line_2_1_257");
+
+    assert!(
+        prior.len() >= 14,
+        "every fixture-driven test is parameterized over both lines, and there \
+         are at least fourteen of them; the listing found {}: {prior:#?}",
+        prior.len()
+    );
+    assert_eq!(
+        prior, current,
+        "a body reported for one line and not the other is a line that stopped \
+         being checked — the failure mode the loop had, arriving a different way"
+    );
+    assert!(
+        prior.contains(
+            &"f7_the_live_continue_pair_continues_across_ordinary_system_volatility".to_string()
+        ),
+        "and the names are the bodies' own, so `cargo test <body>` runs both \
+         lines and `cargo test line_2_1_257` runs the shipping client's: \
+         {prior:#?}"
+    );
 }
 
 /// **F7: replaying the two live turns through the running server continues one
@@ -3578,14 +3639,9 @@ fn the_shipping_clients_two_turns_are_one_conversation_but_for_the_prompt_it_cha
 /// *stable* projection rather than a one-off tolerance: turn three is checked
 /// against a session whose configuration run was rewritten in place, and it has
 /// to agree with it.
-#[tokio::test]
-async fn f7_the_live_continue_pair_continues_across_ordinary_system_volatility() {
-    for line in LINES {
-        f7_one_line(line).await;
-    }
-}
-
-async fn f7_one_line(line: &CapturedLine) {
+async fn f7_the_live_continue_pair_continues_across_ordinary_system_volatility(
+    line: &CapturedLine,
+) {
     let store = Arc::new(MemoryStore::new());
     let client = Arc::new(ScriptedFrontierClient::new("MOCKED"));
     let app = messages_router(
@@ -3605,9 +3661,8 @@ async fn f7_one_line(line: &CapturedLine) {
     assert_eq!(
         after_turn_one.len(),
         7,
-        "{}: turn one's own six canonicalized items plus its answer: \
-         {after_turn_one:#?}",
-        line.version
+        "turn one's own six canonicalized items plus its answer: \
+         {after_turn_one:#?}"
     );
 
     let mut turn_two = fixture(line.turn_two);
@@ -3627,9 +3682,8 @@ async fn f7_one_line(line: &CapturedLine) {
     assert_eq!(
         continued.len(),
         12,
-        "{}: turn two must extend the session it named, not silently orphan it: \
-         {continued:#?}",
-        line.version
+        "turn two must extend the session it named, not silently orphan it: \
+         {continued:#?}"
     );
     assert!(
         no_such_session(&store, &format!("{session}#g1")).await,
@@ -3653,9 +3707,8 @@ async fn f7_one_line(line: &CapturedLine) {
     assert_eq!(
         after_turn_three.len(),
         14,
-        "{}: the new question and its answer, and nothing re-recorded: turn \
-         three's configuration is the one already stored: {after_turn_three:#?}",
-        line.version
+        "the new question and its answer, and nothing re-recorded: turn \
+         three's configuration is the one already stored: {after_turn_three:#?}"
     );
     assert!(
         no_such_session(&store, &format!("{session}#g1")).await,
@@ -3673,6 +3726,7 @@ async fn f7_one_line(line: &CapturedLine) {
         .expect("the fixture's system block 2 is text");
     assert_ne!(rewritten, superseded, "control: the fixtures still differ");
 }
+per_line_tests!(async f7_the_live_continue_pair_continues_across_ordinary_system_volatility);
 
 /// CONTROL for the F7 probe above: neutralize the one line that differs
 /// between the two live captures (patch turn two's `system[2]` back to turn
@@ -3686,41 +3740,40 @@ async fn f7_one_line(line: &CapturedLine) {
 /// starts failing too, the probe's failure has stopped being about system-
 /// prompt volatility specifically and the F7 finding needs re-reading before
 /// anyone trusts it.
-#[tokio::test]
-async fn f7_control_the_same_pair_does_not_fork_once_the_one_line_is_neutralized() {
-    for line in LINES {
-        let store = Arc::new(MemoryStore::new());
-        let client = Arc::new(ScriptedFrontierClient::new("MOCKED"));
-        let app = messages_router(
-            ControlPlane::open(),
-            engine_scripted(Arc::clone(&store), Arc::clone(&client)),
-            Arc::clone(&store),
-            Arc::new(Conversations::new()),
-        );
+async fn f7_control_the_same_pair_does_not_fork_once_the_one_line_is_neutralized(
+    line: &CapturedLine,
+) {
+    let store = Arc::new(MemoryStore::new());
+    let client = Arc::new(ScriptedFrontierClient::new("MOCKED"));
+    let app = messages_router(
+        ControlPlane::open(),
+        engine_scripted(Arc::clone(&store), Arc::clone(&client)),
+        Arc::clone(&store),
+        Arc::new(Conversations::new()),
+    );
 
-        let mut turn_one = fixture(line.turn_one);
-        turn_one["stream"] = json!(true);
-        stream(&app, &[], &turn_one).await;
+    let mut turn_one = fixture(line.turn_one);
+    turn_one["stream"] = json!(true);
+    stream(&app, &[], &turn_one).await;
 
-        let mut turn_two = fixture(line.turn_two);
-        turn_two["stream"] = json!(true);
-        // The only edit: item 2 of `system` reset to turn one's own words, so
-        // every byte `suffix_after` compares now agrees.
-        turn_two["system"][2]["text"] = turn_one["system"][2]["text"].clone();
-        stream(&app, &[], &turn_two).await;
+    let mut turn_two = fixture(line.turn_two);
+    turn_two["stream"] = json!(true);
+    // The only edit: item 2 of `system` reset to turn one's own words, so
+    // every byte `suffix_after` compares now agrees.
+    turn_two["system"][2]["text"] = turn_one["system"][2]["text"].clone();
+    stream(&app, &[], &turn_two).await;
 
-        let continued = stored_items(&store, &line.named()).await;
-        assert_eq!(
-            continued.len(),
-            9,
-            "{}: with the one volatile line neutralized the configuration run \
-             is the one already stored, so nothing is re-recorded and the \
-             session grows by exactly the new question and its answer: \
-             {continued:#?}",
-            line.version
-        );
-    }
+    let continued = stored_items(&store, &line.named()).await;
+    assert_eq!(
+        continued.len(),
+        9,
+        "with the one volatile line neutralized the configuration run \
+         is the one already stored, so nothing is re-recorded and the \
+         session grows by exactly the new question and its answer: \
+         {continued:#?}"
+    );
 }
+per_line_tests!(async f7_control_the_same_pair_does_not_fork_once_the_one_line_is_neutralized);
 
 // ---------------------------------------------------------------------------
 // R-A: the current line's remaining-budget notice
@@ -3839,7 +3892,7 @@ async fn r_a_three_real_turns_are_one_conversation_and_the_notice_is_not_an_item
     assert!(
         !items.iter().any(|item| matches!(
             &item.content,
-            ItemContent::Text { text } if text.contains("<total_tokens>") && text.len() < 200
+            ItemContent::Text { text } if is_budget_notice(text)
         )),
         "no turn's budget notice may be in the log: {items:#?}"
     );
@@ -3857,6 +3910,35 @@ async fn r_a_three_real_turns_are_one_conversation_and_the_notice_is_not_an_item
         )),
         "the client's own environment block quotes the same tag and is real \
          configuration: {items:#?}"
+    );
+}
+
+/// F5 (M11.2b review), closed: the assertion above asks the *one* recognizer,
+/// [`is_budget_notice`], rather than re-spelling it as
+/// `text.contains("<total_tokens>") && text.len() < 200`. The length half was
+/// the drift: a real notice at or above 200 bytes — a plausible `N`, or a
+/// client that pads the wrapper — failed it, so the negative assertion would
+/// have gone on passing while no longer looking for anything.
+///
+/// Kept live as the pin on that: the recognizer must accept a notice the old
+/// heuristic rejected, and must still refuse the environment block that merely
+/// ends with the same tag (the reason the heuristic existed at all).
+#[test]
+fn the_one_recognizer_accepts_a_notice_the_length_heuristic_missed() {
+    let long_real_notice = format!("<total_tokens>{}</total_tokens>", "9".repeat(200));
+    assert!(
+        long_real_notice.len() >= 200,
+        "sanity: the fixture must actually exceed the old heuristic's threshold"
+    );
+    assert!(
+        is_budget_notice(&long_real_notice),
+        "F5: wire's tag-anchor rule does not care about length, and this is the          notice: {long_real_notice}"
+    );
+    assert!(
+        !is_budget_notice(&format!(
+            "<env>You are an interactive agent</env>\n<total_tokens>1 left</total_tokens>"
+        )),
+        "and it still refuses the environment block that merely ends with the tag"
     );
 }
 
@@ -3920,27 +4002,24 @@ async fn r_a_a_budget_that_counted_down_between_turns_does_not_fork_the_session(
 /// and a `thinking` object whose shape changed between 2.1.247 and 2.1.251
 /// (`budget_tokens` became `{"type":"adaptive"}`). An accepted-and-ignored
 /// field is only accepted if a request carrying it is answered.
-#[tokio::test]
-async fn the_captured_client_body_is_served_as_a_conformant_stream() {
-    for line in LINES {
-        let (app, store) = surface();
-        let mut body = fixture(line.turn_one);
-        body["stream"] = json!(true);
+async fn the_captured_client_body_is_served_as_a_conformant_stream(line: &CapturedLine) {
+    let (app, store) = surface();
+    let mut body = fixture(line.turn_one);
+    body["stream"] = json!(true);
 
-        let accumulated = stream(&app, &[], &body).await;
-        assert_eq!(accumulated.text, ANSWER);
-        assert_eq!(accumulated.model, "claude-opus-5");
+    let accumulated = stream(&app, &[], &body).await;
+    assert_eq!(accumulated.text, ANSWER);
+    assert_eq!(accumulated.model, "claude-opus-5");
 
-        let items = stored_items(&store, &line.named()).await;
-        assert_eq!(
-            items.len(),
-            7,
-            "{}: the six canonicalized items plus the answer: {:#?}",
-            line.version,
-            items.iter().map(|item| item.role).collect::<Vec<_>>()
-        );
-    }
+    let items = stored_items(&store, &line.named()).await;
+    assert_eq!(
+        items.len(),
+        7,
+        "the six canonicalized items plus the answer: {:#?}",
+        items.iter().map(|item| item.role).collect::<Vec<_>>()
+    );
 }
+per_line_tests!(async the_captured_client_body_is_served_as_a_conformant_stream);
 
 /// CONTROL for F4, live: the captured body really does carry a real system
 /// prompt past the attribution header, so the probe below is not vacuously
@@ -3951,30 +4030,26 @@ async fn the_captured_client_body_is_served_as_a_conformant_stream() {
 /// textually distinct from the attribution header at item 0. If this test ever
 /// fails, the fixture changed shape and F4's probe needs re-deriving, not just
 /// re-running.
-#[test]
-fn f4_control_the_captured_body_carries_a_real_system_prompt_past_the_header() {
-    for line in LINES {
-        let items =
-            canonicalize(&parse(line.turn_one)).expect("the live client's body must be servable");
+fn f4_control_the_captured_body_carries_a_real_system_prompt_past_the_header(line: &CapturedLine) {
+    let items =
+        canonicalize(&parse(line.turn_one)).expect("the live client's body must be servable");
 
-        assert_eq!(items[1].role, Role::Developer);
-        assert!(
-            matches!(&items[1].content, ItemContent::Text { text }
-                if text.contains("Claude Agent SDK")),
-            "{}: control: item 1 should be the agent-SDK identity line: {:?}",
-            line.version,
-            items[1].content
-        );
-        assert_eq!(items[2].role, Role::Developer);
-        assert!(
-            matches!(&items[2].content, ItemContent::Text { text }
-                if text.contains("interactive agent that helps users with software engineering")),
-            "{}: control: item 2 should be the real system prompt: {:?}",
-            line.version,
-            items[2].content
-        );
-    }
+    assert_eq!(items[1].role, Role::Developer);
+    assert!(
+        matches!(&items[1].content, ItemContent::Text { text }
+            if text.contains("Claude Agent SDK")),
+        "control: item 1 should be the agent-SDK identity line: {:?}",
+        items[1].content
+    );
+    assert_eq!(items[2].role, Role::Developer);
+    assert!(
+        matches!(&items[2].content, ItemContent::Text { text }
+            if text.contains("interactive agent that helps users with software engineering")),
+        "control: item 2 should be the real system prompt: {:?}",
+        items[2].content
+    );
 }
+per_line_tests!(fn f4_control_the_captured_body_carries_a_real_system_prompt_past_the_header);
 
 /// **F4: the judge is briefed on the whole instruction block, not on its first
 /// block.**
@@ -4000,14 +4075,7 @@ fn f4_control_the_captured_body_carries_a_real_system_prompt_past_the_header() {
 /// `validate::mod::consult`'s call shape exactly (same items, same
 /// `Objective::from_items`, same `BriefConfig::default()`), because the
 /// finding was about those two functions meeting.
-#[test]
-fn f4_the_judge_is_briefed_on_the_whole_leading_instruction_run() {
-    for line in LINES {
-        f4_one_line(line);
-    }
-}
-
-fn f4_one_line(line: &CapturedLine) {
+fn f4_the_judge_is_briefed_on_the_whole_leading_instruction_run(line: &CapturedLine) {
     let items =
         canonicalize(&parse(line.turn_one)).expect("the live client's body must be servable");
 
@@ -4061,6 +4129,7 @@ fn f4_one_line(line: &CapturedLine) {
         "an interior system message is history and must stay out of the instructions"
     );
 }
+per_line_tests!(fn f4_the_judge_is_briefed_on_the_whole_leading_instruction_run);
 
 // ---------------------------------------------------------------------------
 // The oracle's own proofs

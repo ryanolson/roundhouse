@@ -446,12 +446,33 @@ fn carries_a_roundhouse_secret(value: &str) -> bool {
 /// have no good answer; refusing the value here is what makes the sentinel free
 /// to set.
 ///
-/// Compared whole and trimmed rather than tokenized the way a secret is: the
-/// sentinel is a single fixed literal with no scheme prefix a client could vary,
-/// and a substring rule would refuse a third-party credential that happened to
-/// contain it.
+/// Compared whole rather than tokenized the way a secret is — a substring rule
+/// would refuse a third-party credential that happened to contain the literal —
+/// but whole *after* an optional `Bearer ` scheme is taken off, because the
+/// launcher's own environment offers two spellings of the same value and the
+/// gate must not care which one a client chose. `ANTHROPIC_API_KEY` puts the
+/// sentinel on `x-api-key` bare; `ANTHROPIC_AUTH_TOKEN` puts it in
+/// `Authorization` under the bearer scheme, where a whole-string compare against
+/// the bare literal never matches and the sentinel is captured and forwarded as
+/// if it were the caller's seat — the `401`-that-reads-as-a-revoked-login this
+/// function exists to prevent, arriving by the one route the pinned tests did
+/// not cover (F17).
 fn is_roundhouse_own_value(value: &str) -> bool {
-    carries_a_roundhouse_secret(value) || value.trim() == ROUNDHOUSE_API_KEY_SENTINEL
+    carries_a_roundhouse_secret(value) || is_the_api_key_sentinel(value)
+}
+
+/// The sentinel in any spelling a client can present it, and nothing else.
+///
+/// Scheme-insensitive by ASCII case because HTTP auth schemes are, and anchored
+/// at both ends of what remains so a value that merely *starts* with the
+/// sentinel is somebody else's credential rather than ours.
+fn is_the_api_key_sentinel(value: &str) -> bool {
+    let value = value.trim();
+    let bare = value
+        .split_once(char::is_whitespace)
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("Bearer"))
+        .map_or(value, |(_, rest)| rest.trim_start());
+    bare == ROUNDHOUSE_API_KEY_SENTINEL
 }
 
 /// A turn key as the request presented it.
@@ -1687,6 +1708,52 @@ mod tests {
         assert!(
             !admission.credentials.reaches("anthropic"),
             "the sentinel must not make a provider reachable: it authenticates nothing"
+        );
+    }
+
+    /// F17 (M11.2b thermo-nuclear review): the sentinel is inert in *every*
+    /// spelling a client can present it, not only the bare `x-api-key` one the
+    /// pinned test above covers.
+    ///
+    /// `ANTHROPIC_API_KEY` puts the sentinel on `x-api-key` bare;
+    /// `ANTHROPIC_AUTH_TOKEN` puts the same value in `Authorization` under the
+    /// bearer scheme. A whole-string compare against the bare literal misses
+    /// the second — and the tokenized secret check does not catch it either,
+    /// because the sentinel is deliberately not key-shaped
+    /// (`claude_launch`'s `the_api_key_sentinel_is_namespaced_and_is_not_key_shaped`).
+    /// So the value roundhouse itself generated was captured and forwarded to
+    /// Anthropic as the caller's seat.
+    #[test]
+    fn bearer_scheme_sentinel_is_never_forwarded_as_a_seat() {
+        let plane = pass_through_plane();
+
+        // PROBE: the turn key in its own header, the sentinel in
+        // `Authorization` — under the bearer scheme, in either case, and bare.
+        for spelling in [
+            format!("Bearer {ROUNDHOUSE_API_KEY_SENTINEL}"),
+            format!("bearer {ROUNDHOUSE_API_KEY_SENTINEL}"),
+            ROUNDHOUSE_API_KEY_SENTINEL.to_string(),
+        ] {
+            let launched = headers_with(TURN_SECRET, &[("authorization", &spelling)]);
+            assert_eq!(
+                forwarded_header(&plane, &launched, "anthropic", "authorization"),
+                None,
+                "the sentinel roundhouse generated must never leave this process, \
+                 regardless of which scheme carries it: {spelling:?}"
+            );
+        }
+
+        // CONTROL: a value that merely *starts* with the sentinel is somebody
+        // else's credential and is forwarded. Without this the rule above is
+        // indistinguishable from a prefix match, which would silently swallow a
+        // real seat whose token happened to begin with the published literal.
+        let near_miss = format!("Bearer {ROUNDHOUSE_API_KEY_SENTINEL}X");
+        let headers = headers_with(TURN_SECRET, &[("authorization", &near_miss)]);
+        assert_eq!(
+            forwarded_header(&plane, &headers, "anthropic", "authorization"),
+            Some(near_miss),
+            "only the sentinel itself is inert; a credential that contains it is the \
+             caller's own"
         );
     }
 

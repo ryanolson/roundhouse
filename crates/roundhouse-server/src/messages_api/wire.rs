@@ -421,7 +421,17 @@ fn is_ephemeral_client_notice(message: &InputMessage) -> bool {
 /// multi-KB environment block that *ends* with the same tag is not mistaken for
 /// it — deleting a client's system prompt would be a far worse bug than the one
 /// this avoids.
-fn is_budget_notice(text: &str) -> bool {
+///
+/// **Exported so the suites recognise the notice the way the drop rule does.**
+/// F5 (M11.2b review) found three spellings of "is this the notice" — this one,
+/// plus a `contains(..) && len < 200` heuristic in the surface suite and a
+/// close-anchor on the client's current wording in the e2e suite. Both copies
+/// were narrower than this rule in a way nothing would have reported: the
+/// length half stops recognising a notice once `N` grows past the threshold,
+/// and the wording half stops the day the client rephrases what sits between
+/// the tags. Each of those is a guard that goes green because it no longer
+/// looks for anything, which is the one failure mode a guard must not have.
+pub fn is_budget_notice(text: &str) -> bool {
     let trimmed = text.trim();
     trimmed
         .strip_prefix(BUDGET_NOTICE_OPEN)
@@ -1228,6 +1238,31 @@ mod tests {
         assert_eq!(
             kept,
             vec![Item::user_text("say hi"), Item::system_text(&environment)],
+        );
+    }
+
+    /// F5 (M11.2b review): `is_budget_notice` is anchored on tags alone
+    /// (`"<total_tokens>"` .. `"</total_tokens>"`, no inner `<`), not on the
+    /// current client's exact wording of what sits between them — so a client
+    /// that rewords the number, e.g. `"1 remaining"` instead of `"15000000
+    /// tokens left"`, must still be dropped. Pinned here as its own test,
+    /// against the public `canonicalize` and not a private-fn peek, so that
+    /// `claude_e2e.rs`'s `is_the_budget_notice` (which anchors its close on the
+    /// literal `"tokens left</total_tokens>"`) can be shown to disagree with
+    /// *this* module's actual behaviour rather than with a description of it.
+    #[test]
+    fn a_reworded_budget_notice_is_still_dropped() {
+        let reworded = canonicalize(&params(json!({
+            "messages": [
+                { "role": "user", "content": "say hi" },
+                { "role": "system", "content": "<total_tokens>1 remaining</total_tokens>" },
+            ],
+        })))
+        .expect("a reworded notice is still a servable turn");
+        assert_eq!(
+            reworded,
+            vec![Item::user_text("say hi")],
+            "the reworded notice must be dropped exactly like today's spelling"
         );
     }
 

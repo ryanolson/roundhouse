@@ -391,7 +391,7 @@ async fn streaming_and_non_streaming_agree_about_a_well_formed_tool_call() {
     let script = vec![Scripted::Call {
         id: "toolu_01",
         name: "Bash",
-        arguments: WELL_FORMED_ARGUMENTS,
+        arguments: WELL_FORMED_ARGUMENTS.into(),
     }];
 
     let (stream_app, _store, _client) = surface(script.clone(), Some("tool_use"));

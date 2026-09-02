@@ -162,14 +162,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Request, State};
-use axum::middleware::Next;
-use axum::response::Response;
+use axum::extract::Request;
 use serde_json::Value;
 
 use roundhouse_core::context::ByteTokenizer;
@@ -179,7 +177,7 @@ use roundhouse_core::ids::SessionId;
 use roundhouse_core::interject::Interjector;
 use roundhouse_core::item::{Item, ItemContent, Role};
 use roundhouse_core::now_ms;
-use roundhouse_core::routing::{AffinityPolicy, Candidate, Target};
+use roundhouse_core::routing::AffinityPolicy;
 use roundhouse_core::store::{MemoryStore, SessionStore};
 use roundhouse_core::validate::{Validator, ValidatorConfig};
 use roundhouse_fleet::EchoFrontierClient;
@@ -188,20 +186,27 @@ use roundhouse_server::codex_launch::{
     CONTEXT_WINDOW_TOKENS, CodexAuthKind, CodexLaunch, DEFAULT_KEY_ENV, namespaced_tool_name,
     skill_files,
 };
+use roundhouse_server::control_config::TURN_KEY_HEADER;
 use roundhouse_server::control_config::directory::key_id;
-use roundhouse_server::control_config::{MembershipRole, TURN_KEY_HEADER};
 use roundhouse_server::mcp_api::MCP_MOUNT_PATH;
 use roundhouse_server::{
-    ControlDirectory, ControlPlaneReads, Conversations, CrossChecks, DirectoryMutation,
-    EchoLocalExecutor, Engine, EngineConfig, MemoryDirectoryStore, mcp_api::mcp_router,
-    responses_api::responses_router,
+    ControlDirectory, ControlPlaneReads, Conversations, DirectoryMutation, EchoLocalExecutor,
+    Engine, EngineConfig, mcp_api::mcp_router, responses_api::responses_router,
 };
 
 use codex_utils_rustls_provider::ensure_rustls_crypto_provider;
 
 mod common;
+// The harness itself is `common::e2e` (M11.2b review F1): the recorder,
+// bootstrap, fork probe and version probe below were copied wholesale into
+// `claude_e2e.rs` when that suite was written, and the copies drifted inside one
+// milestone. One rig, two clients.
+use common::e2e::{
+    Exchange, PROJECT, Recorder, USER, bootstrap, clean, fork_probe, reachable, record,
+    version_probe,
+};
+use common::frontier_catalog;
 use common::validate::{AlwaysFires, OFF_TRACK, ScriptedJudge, judge_spec, open_trigger};
-use common::{frontier_catalog, sha256_hex};
 
 // ---------------------------------------------------------------------------
 // What this deployment is
@@ -213,10 +218,6 @@ use common::{frontier_catalog, sha256_hex};
 /// exec` is an assertion that the turn was served by roundhouse's frontier
 /// path and not by anything the client invented.
 const ANSWER: &str = "roundhouse answered this turn";
-
-/// The tenant every request below authenticates as.
-const PROJECT: &str = "acme";
-const USER: &str = "ada";
 
 /// A fragment of the correction `render_directive` builds.
 ///
@@ -323,260 +324,62 @@ fn forwarded_login_auth_json(access_token: &str, account_id: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// The recorder
+// Codex-side views over the shared recorder
 // ---------------------------------------------------------------------------
 
-/// One request the deployment served, as it arrived.
-#[derive(Clone, Debug)]
-struct Exchange {
-    method: String,
-    path: String,
-    headers: BTreeMap<String, String>,
-    /// The request body, parsed if it was JSON.
-    ///
-    /// Parsed rather than kept as bytes because every assertion downstream is
-    /// on a *value*: codex re-serializes items in its own struct order, so a
-    /// byte comparison of a resent item fails on field ordering even when
-    /// nothing changed. The one field that is byte-exact — `arguments` — is a
-    /// JSON string, and comparing two `String`s pulled out of two parsed
-    /// documents is still a byte comparison of that field.
-    body: Option<Value>,
-    status: u16,
-    /// The response body as bytes-turned-text, captured on **every** path.
-    ///
-    /// It used to be `/mcp` only, on the reasoning that buffering
-    /// `/v1/responses` would hold the whole SSE body until the turn ended —
-    /// "the one property that surface exists to not have". F11 showed what that
-    /// bought and what it cost. Two claims this suite makes live *only* in that
-    /// body and were therefore unobservable: a `SteerAction::Halt`'s reason is
-    /// committed as the assistant text of the very response that ends the run
-    /// (so the injection-boundary sweep in `the_next_turn_reflects_the_correction`
-    /// swept a document it could never see, and unlike a `Steer` there is no
-    /// next turn to resend it), and `response.completed.usage` — the number
-    /// codex folds into `last_token_usage` — is what F03's ruling is about.
-    ///
-    /// What buffering costs *here*, stated rather than assumed: the child sees
-    /// the frames of one turn arrive at once instead of as they are produced.
-    /// No assertion in this file is about frame arrival *timing*, every turn is
-    /// served by an in-process echo client and finishes in milliseconds, and
-    /// `codex exec` parses a complete SSE body identically to an incremental
-    /// one. The property genuinely traded away is the harness's fidelity to
-    /// backpressure, which nothing here measures; the property bought is two
-    /// findings' worth of evidence.
-    response_text: Option<String>,
-    /// The response body parsed as one JSON document, when it is one.
-    ///
-    /// `/mcp` answers exactly one document per POST, which is what makes the
-    /// handshake assertions readable. `/v1/responses` answers an SSE stream, so
-    /// this stays `None` there and [`Exchange::frames`] is the accessor.
-    response: Option<Value>,
-}
-
-impl Exchange {
-    fn header(&self, name: &str) -> Option<&str> {
-        self.headers.get(name).map(String::as_str)
-    }
-
-    /// The SSE `data:` payloads of this response, parsed, in arrival order.
-    ///
-    /// Parsed on demand rather than at capture time because the recorder is a
-    /// transport-level thing and SSE framing is a property of one route: a
-    /// recorder that pre-parsed frames would have to know which paths stream,
-    /// which is exactly the coupling F11's fix was supposed to remove.
-    fn frames(&self) -> Vec<Value> {
-        self.response_text
-            .as_deref()
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|line| line.strip_prefix("data: "))
-            .filter_map(|payload| serde_json::from_str::<Value>(payload).ok())
-            .collect()
-    }
-
-    /// The first SSE frame whose `type` is `kind`.
-    fn frame(&self, kind: &str) -> Option<Value> {
-        self.frames()
-            .into_iter()
-            .find(|frame| frame["type"].as_str() == Some(kind))
-    }
-
-    /// The `usage` object this response reported on the wire.
-    ///
-    /// The one the *client* reads: codex folds `response.completed.usage` into
-    /// `last_token_usage`, replacing it, and that is what drives its compaction
-    /// gate. Since F03 it is deliberately not the same number the log books for
-    /// the same turn, so a test asking "what did the client learn" has to read
-    /// the wire and a test asking "what did this cost" has to read the log.
-    fn wire_usage(&self) -> Option<Value> {
-        self.frame("response.completed")
-            .map(|frame| frame["response"]["usage"].clone())
-    }
-
-    /// The headers as a failure message should print them: credential-bearing
-    /// values replaced by their length.
-    ///
-    /// Under `RoundhouseKey` every captured bearer is a key this test minted
-    /// seconds earlier, so printing it whole cost nothing. `ForwardedOpenAiLogin`
-    /// (F12) is the first fixture where `Authorization` carries something that
-    /// is not ours, and although *this* seat is a hermetic constant compiled
-    /// into the file, the shape of the assertion is what a later fixture holding
-    /// a real one would copy. Redacting to a length keeps the diagnostic — "the
-    /// header arrived, and was this big" — which is the whole reason a failure
-    /// message prints headers at all.
-    fn redacted_headers(&self) -> BTreeMap<String, String> {
-        self.headers
-            .iter()
-            .map(|(name, value)| {
-                let value = match name.as_str() {
-                    "authorization" | TURN_KEY_HEADER | "chatgpt-account-id" => {
-                        format!("<{} bytes redacted>", value.len())
-                    }
-                    _ => value.clone(),
-                };
-                (name.clone(), value)
-            })
-            .collect()
-    }
-}
-
-/// Every request the deployment served, in arrival order.
-#[derive(Clone, Default)]
-struct Recorder {
-    exchanges: Arc<Mutex<Vec<Exchange>>>,
-}
-
-impl Recorder {
-    fn all(&self) -> Vec<Exchange> {
-        self.exchanges.lock().expect("recording").clone()
-    }
-
-    /// Every request to `path`, in arrival order.
-    fn to(&self, path: &str) -> Vec<Exchange> {
-        self.all()
-            .into_iter()
-            .filter(|exchange| exchange.path == path)
-            .collect()
-    }
-
-    /// Every `/mcp` request whose JSON-RPC method is `method`.
-    fn rpc(&self, method: &str) -> Vec<Exchange> {
-        self.to(MCP_MOUNT_PATH)
-            .into_iter()
-            .filter(|exchange| {
-                exchange
-                    .body
-                    .as_ref()
-                    .and_then(|body| body["method"].as_str())
-                    == Some(method)
-            })
-            .collect()
-    }
-
-    /// The `/v1/responses` exchange whose stream carried the correction.
-    ///
-    /// Found by frame content rather than by index into [`Self::to`]: "the
-    /// third request" is an assumption about how many requests the client chose
-    /// to make, and a client retry silently moves it. What makes a turn the
-    /// steered one is what it answered with, so that is what this looks for.
-    ///
-    /// **It used to look for an emitted `function_call` item by name**
-    /// (`emitting_a_call("fetch_steer")`), which is how a steer was
-    /// recognizable while outcome B was a synthetic tool call. Since M10.0 R1
-    /// the correction is the turn's assistant text, so the discriminator is the
-    /// text: [`GUIDANCE_FRAGMENT`] is roundhouse's own opening sentence and no
-    /// dispatched turn ever produces it — the echo provider answers [`ANSWER`].
-    fn emitting_the_guidance(&self) -> Option<Exchange> {
-        self.to("/v1/responses").into_iter().find(|exchange| {
-            exchange
-                .response_text
-                .as_deref()
-                .is_some_and(|body| body.contains(GUIDANCE_FRAGMENT))
-        })
-    }
-
-    /// A one-line rendering of every exchange, for a failure message.
-    fn transcript(&self) -> String {
-        self.all()
-            .iter()
-            .map(|exchange| {
-                let rpc = exchange
-                    .body
-                    .as_ref()
-                    .and_then(|body| body["method"].as_str())
-                    .unwrap_or("-");
-                format!(
-                    "{} {} -> {} (jsonrpc method: {rpc})",
-                    exchange.method, exchange.path, exchange.status
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-}
-
-/// Capture what arrived, without changing what is served.
+/// The `usage` object this response reported on the wire.
 ///
-/// A tower layer over the *merged* app rather than a wrapper per router,
-/// because the interleaving is the subject: a steer is a `/v1/responses`
-/// response followed by an `/mcp` dispatch followed by another
-/// `/v1/responses` request, and three separate recorders could not say that.
-async fn record(State(recorder): State<Recorder>, request: Request, next: Next) -> Response {
-    let method = request.method().to_string();
-    let path = request.uri().path().to_string();
-    let headers = request
-        .headers()
-        .iter()
-        .map(|(name, value)| {
-            (
-                name.as_str().to_string(),
-                value.to_str().unwrap_or("<non-utf8>").to_string(),
-            )
-        })
-        .collect();
+/// The one the *client* reads: codex folds `response.completed.usage` into
+/// `last_token_usage`, replacing it, and that is what drives its compaction
+/// gate. Since F03 it is deliberately not the same number the log books for the
+/// same turn, so a test asking "what did the client learn" has to read the wire
+/// and a test asking "what did this cost" has to read the log.
+///
+/// A free function beside this suite rather than a method on [`Exchange`]: the
+/// shared recorder holds what any real-binary suite needs from a request, and
+/// "which frame carries the number codex reads" is a fact about the Responses
+/// surface, not about recording.
+fn wire_usage(exchange: &Exchange) -> Option<Value> {
+    exchange
+        .frame("response.completed")
+        .map(|frame| frame["response"]["usage"].clone())
+}
 
-    let (parts, body) = request.into_parts();
-    // Generously bounded: turn 1 is already ~43 KB of instructions and the
-    // steered turn resends the whole history. A silent truncation here would
-    // surface as a 422 from our own canonicalizer, which reads exactly like a
-    // roundhouse bug and is not one.
-    let bytes = axum::body::to_bytes(body, 32 * 1024 * 1024)
-        .await
-        .expect("a loopback client's request body is readable");
-    let parsed = serde_json::from_slice::<Value>(&bytes).ok();
-    let response = next
-        .run(Request::from_parts(parts, Body::from(bytes)))
-        .await;
-
-    let status = response.status().as_u16();
-    let (mut response_parts, response_body) = response.into_parts();
-    // Every path, since F11: see `Exchange::response_text` for what buffering
-    // the streaming one costs and what it bought.
-    let bytes = axum::body::to_bytes(response_body, 32 * 1024 * 1024)
-        .await
-        .expect("a loopback response body is readable");
-    // The body just went from streamed to definite-length. Any framing header
-    // the streaming response carried would now describe a body that no longer
-    // exists, and hyper would serialize the mismatch rather than reconcile it —
-    // a corrupt response the child would report as a protocol error, which
-    // reads like a roundhouse bug and is not one.
-    response_parts.headers.remove("transfer-encoding");
-    response_parts.headers.remove("content-length");
-    let text = String::from_utf8(bytes.to_vec()).ok();
-
+/// Every `/mcp` request whose JSON-RPC method is `method`.
+fn rpc(recorder: &Recorder, method: &str) -> Vec<Exchange> {
     recorder
-        .exchanges
-        .lock()
-        .expect("recording")
-        .push(Exchange {
-            method,
-            path,
-            headers,
-            body: parsed,
-            status,
-            response: serde_json::from_slice::<Value>(&bytes).ok(),
-            response_text: text,
-        });
-    Response::from_parts(response_parts, Body::from(bytes))
+        .to(MCP_MOUNT_PATH)
+        .into_iter()
+        .filter(|exchange| {
+            exchange
+                .body
+                .as_ref()
+                .and_then(|body| body["method"].as_str())
+                == Some(method)
+        })
+        .collect()
+}
+
+/// The `/v1/responses` exchange whose stream carried the correction.
+///
+/// Found by frame content rather than by index into [`Recorder::to`]: "the third
+/// request" is an assumption about how many requests the client chose to make,
+/// and a client retry silently moves it. What makes a turn the steered one is
+/// what it answered with, so that is what this looks for.
+///
+/// **It used to look for an emitted `function_call` item by name**
+/// (`emitting_a_call("fetch_steer")`), which is how a steer was recognizable
+/// while outcome B was a synthetic tool call. Since M10.0 R1 the correction is
+/// the turn's assistant text, so the discriminator is the text:
+/// [`GUIDANCE_FRAGMENT`] is roundhouse's own opening sentence and no dispatched
+/// turn ever produces it — the echo provider answers [`ANSWER`].
+fn emitting_the_guidance(recorder: &Recorder) -> Option<Exchange> {
+    recorder.to("/v1/responses").into_iter().find(|exchange| {
+        exchange
+            .response_text
+            .as_deref()
+            .is_some_and(|body| body.contains(GUIDANCE_FRAGMENT))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -642,44 +445,19 @@ impl Rig {
         std::fs::create_dir_all(root.join("home")).expect("the run's CODEX_HOME");
         std::fs::create_dir_all(root.join("wd")).expect("the run's work directory");
 
-        // Bootstrap is file-only, by design: `admin_keys` in the file is the
-        // sole root of trust, and a directory with no admin plane refuses to
-        // mint. The arm salt is here for the same reason — it is deployment-wide
-        // file state no admin write can move.
-        let admin = common::admin_key("root");
-        let file = common::control_plane(
-            serde_json::json!({
-                "projects": [],
-                "users": [],
-                "admin_keys": [sha256_hex(&admin)],
-                "arm_salt": "m9-e2e",
-            }),
-            "codex-e2e bootstrap",
-        );
-        let directory = Arc::new(
-            ControlDirectory::new(
-                file,
-                "ROUNDHOUSE_CONTROL_PLANE",
-                Arc::new(MemoryDirectoryStore::new()),
-                // `Some(judge_spec())` and not `None`: a project whose
-                // `validate` block enrols its sessions promises a judge, and the
-                // startup cross-check refuses a plane that promises one with
-                // none reachable. The spec is the same one `ScriptedJudge`
-                // reports its side calls under, so the promise the directory
-                // checks and the target the fold books are one model.
-                CrossChecks::new(reachable(), Some(judge_spec())),
-                now_ms(),
-            )
-            .expect("the bootstrap file alone compiles"),
-        );
-
+        // `Some(judge_spec())` and not `None`: a project whose `validate` block
+        // enrols its sessions promises a judge, and the startup cross-check
+        // refuses a plane that promises one with none reachable. The spec is the
+        // same one `ScriptedJudge` reports its side calls under, so the promise
+        // the directory checks and the target the fold books are one model.
+        //
         // The project carries `validate` because that is the *file* vocabulary
         // for enrolment: `ValidationTerms` are per-project config state, and
         // there is no other way for a socket-driven turn to arrive enrolled.
-        directory
-            .apply(
-                DirectoryMutation::CreateProject {
-                    entry: serde_json::from_value(serde_json::json!({
+        let deployment = bootstrap(
+            "codex-e2e bootstrap",
+            "m9-e2e",
+            serde_json::json!({
                         "id": PROJECT,
                         "validate": {
                             "enabled": true,
@@ -700,36 +478,11 @@ impl Rig {
                             // nothing after it.
                             "steer_after_interventions": 1,
                         },
-                    }))
-                    .expect("the project entry is the file vocabulary"),
-                },
-                now_ms(),
-            )
-            .expect("creating a project");
-        directory
-            .apply(
-                DirectoryMutation::CreateUser {
-                    entry: serde_json::from_value(serde_json::json!({ "id": USER }))
-                        .expect("the user entry is the file vocabulary"),
-                },
-                now_ms(),
-            )
-            .expect("creating a user");
-        directory
-            .apply(
-                DirectoryMutation::UpsertMembership {
-                    project: PROJECT.to_string(),
-                    user: USER.to_string(),
-                    role: MembershipRole::Member,
-                    allocation: None,
-                    overrides: None,
-                },
-                now_ms(),
-            )
-            .expect("enrolling the member");
-        let minted = directory
-            .mint_turn_key(PROJECT, USER, now_ms())
-            .expect("the admin plane mints");
+            }),
+            Some(judge_spec()),
+        );
+        let directory = deployment.directory;
+        let minted = deployment.minted;
 
         let store = Arc::new(MemoryStore::new());
         let control = Arc::new(ControlStore::new());
@@ -893,11 +646,6 @@ impl Rig {
         files
     }
 
-    /// The principal every request below resolves to.
-    fn principal(&self) -> Principal {
-        Principal::new(PROJECT, USER)
-    }
-
     /// Revoke this run's turn key the way `DELETE /v1/admin/...` does: an
     /// `apply` on the live directory, not a fixture shortcut. The compiled
     /// plane swaps immediately (module doc, "Revocation, staleness, and the
@@ -922,23 +670,12 @@ impl Rig {
     /// on, on this node", reading the same `Arc<Conversations>` the router was
     /// handed.
     fn session(&self) -> SessionId {
-        self.conversations
-            .latest(&self.principal())
-            .expect("codex drove at least one turn")
+        common::e2e::session(&self.conversations)
     }
 
     /// The session's committed items, in log order.
     async fn items(&self) -> Vec<Item> {
-        self.store
-            .read_events(&self.session(), 0, 1024)
-            .await
-            .expect("the session exists")
-            .into_iter()
-            .filter_map(|event| match event.kind {
-                SessionEventKind::ItemAppended { item } => Some(item),
-                _ => None,
-            })
-            .collect()
+        common::e2e::items(&self.store, &self.session()).await
     }
 
     /// The turn index each validation was decided on, in log order.
@@ -1004,20 +741,7 @@ impl Rig {
     /// store, which does not depend on the binding table being right about
     /// itself.
     async fn assert_never_forked(&self) {
-        let session = self.session();
-        let probe = fork_probe(&session);
-        assert_eq!(
-            session,
-            base_session(&session),
-            "the client's resend must have matched its prefix: this principal's latest session \
-             is `{session}`, and a generation suffix means the prefix check refused the claim \
-             and rebound the conversation"
-        );
-        assert!(
-            self.store.last_seq(&probe).await.is_err(),
-            "the client's resend must have matched its prefix: `{probe}` exists, which means \
-             the prefix check refused the claim and rebound the conversation"
-        );
+        common::e2e::assert_never_forked(&self.store, &self.session()).await;
     }
 
     /// The three `codex exec` invocations one steer costs, driven in order.
@@ -1124,36 +848,8 @@ impl Rig {
     /// and the rollout of the run that just failed — the only two artefacts
     /// worth having at that moment.
     fn clean(&self) {
-        let _ = std::fs::remove_dir_all(&self.root);
+        clean(&self.root);
     }
-}
-
-/// The generation-zero id behind `session`, whatever generation it is at.
-///
-/// `conversations::bound_session` spells generation zero as the namespaced key
-/// verbatim and every later generation as `{key}#g{n}` — pinned by
-/// `conversations::tests::a_reader_and_a_turn_resolve_one_cache_key_to_one_session`
-/// — so the suffix *is* the fork, and stripping it recovers the stem. Sound
-/// here because the stem is `{project}/{user}/{uuid}` and a UUID carries no
-/// `#`: there is no key this can truncate by accident.
-fn base_session(session: &SessionId) -> SessionId {
-    match session.as_str().split_once("#g") {
-        Some((base, _)) => SessionId::new(base),
-        None => session.clone(),
-    }
-}
-
-/// The session id a first fork of `session`'s conversation would have created.
-///
-/// A free function rather than a method on [`Rig`] so the guard it powers can
-/// be tested without a rig, a binary, or a socket — F02 was that the guard's
-/// arithmetic was vacuous, and an arithmetic no test can evaluate is exactly
-/// how that survived. Derived from [`base_session`] and never from
-/// `Conversations::latest`: a fork moves `latest` to the forked id *before*
-/// any assertion runs, so appending `#g1` to it asks about `key#g1#g1`, which
-/// nothing ever creates and whose absence therefore says nothing.
-fn fork_probe(session: &SessionId) -> SessionId {
-    SessionId::new(format!("{}#g1", base_session(session)))
 }
 
 /// Build the exact `codex` child command `Rig::spawn` runs, without running it.
@@ -1241,37 +937,27 @@ fn build_child_command(
     command
 }
 
-/// Every target this deployment can route to, priced the way the router prices
-/// them.
+/// What `codex --version` prints, or a loud panic naming the override.
 ///
-/// The catalog's one model and nothing else: no fleet is attached, so a turn
-/// has exactly one place to go and "which target answered" is never a race.
-fn reachable() -> Vec<Candidate> {
-    vec![Candidate {
-        target: Target::Frontier {
-            provider: "anthropic".into(),
-            model: "claude".into(),
-        },
-        expected_prefill_tokens: 1_024.0,
-        matched_prefix_tokens: 0,
-        expected_ttft_ms: 1.0,
-        expected_cost_usd: 0.0,
-        quality_prior: 0.95,
-        load: None,
-    }]
-}
-
+/// Isolated exactly as [`build_child_command`] isolates a real run (M11.2b
+/// review F18, found against the claude sibling and fixed on both): cleared,
+/// then `PATH` and a scratch `CODEX_HOME` of the probe's own. A probe that read
+/// the developer's `CODEX_HOME` could print a version resolved under a login
+/// this suite is written never to touch.
 fn codex_version(binary: &str) -> String {
-    let output = std::process::Command::new(binary)
-        .arg("--version")
-        .output()
-        .unwrap_or_else(|error| {
-            panic!(
-                "--include-ignored asks for the real binary; `{binary} --version` failed: \
-                 {error}. Set {CODEX_BIN_VAR} to one, or run without --include-ignored."
-            )
-        });
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
+    let home =
+        std::env::temp_dir().join(format!("roundhouse-codex-version-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&home).expect("the probe's isolated CODEX_HOME");
+    let version = version_probe(
+        binary,
+        &[
+            ("HOME", home.clone().into_os_string()),
+            ("CODEX_HOME", home.clone().into_os_string()),
+        ],
+        CODEX_BIN_VAR,
+    );
+    let _ = std::fs::remove_dir_all(&home);
+    version
 }
 
 /// Finding B, stage 4's refute (mutation 14): nothing on the wire can prove
@@ -1638,7 +1324,7 @@ async fn a_key_revoked_between_runs_fails_the_next_turn_and_leaves_no_half_writt
     // doc comment on why a resumed run's MCP reconnect is not load-bearing for
     // the turn and a future client could omit it from this process lifetime
     // entirely.
-    if let Some(mcp_after) = rig.recorder.rpc("initialize").last() {
+    if let Some(mcp_after) = rpc(&rig.recorder, "initialize").last() {
         assert_eq!(
             mcp_after.status,
             401,
@@ -1719,7 +1405,7 @@ async fn a_real_codex_binary_completes_the_mcp_handshake_against_our_server() {
     let run = rig.exec("Say the word alpha and stop.").await;
     run.assert_completed("the handshake run");
 
-    let initialize = rig.recorder.rpc("initialize");
+    let initialize = rpc(&rig.recorder, "initialize");
     assert_eq!(
         initialize.len(),
         1,
@@ -1736,7 +1422,7 @@ async fn a_real_codex_binary_completes_the_mcp_handshake_against_our_server() {
         "the MCP surface must be reached with the same minted turn key"
     );
 
-    let listed = rig.recorder.rpc("tools/list");
+    let listed = rpc(&rig.recorder, "tools/list");
     assert!(
         !listed.is_empty(),
         "codex must have listed our tools:\n{}",
@@ -2263,7 +1949,7 @@ async fn a_real_codex_binary_receives_the_correction_as_the_turns_answer() {
          protocol items at all:\n{items:#?}"
     );
     assert!(
-        rig.recorder.rpc("tools/call").is_empty(),
+        rpc(&rig.recorder, "tools/call").is_empty(),
         "the correction must have cost no round trip. Dispatched:\n{}",
         rig.recorder.transcript()
     );
@@ -2381,13 +2067,13 @@ async fn a_steered_turns_reported_usage_is_the_context_it_admitted() {
     );
 
     // ---- the wire, which it did -------------------------------------------
-    let steered = rig.recorder.emitting_the_guidance().unwrap_or_else(|| {
+    let steered = emitting_the_guidance(&rig.recorder).unwrap_or_else(|| {
         panic!(
             "one /v1/responses stream must have carried the correction:\n{}",
             rig.recorder.transcript()
         )
     });
-    let wire = steered.wire_usage().unwrap_or_else(|| {
+    let wire = wire_usage(&steered).unwrap_or_else(|| {
         panic!(
             "the steered response must have completed: {:?}",
             steered.response_text

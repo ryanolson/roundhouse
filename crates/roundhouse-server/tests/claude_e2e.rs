@@ -17,8 +17,19 @@
 //!
 //! # What the suite is the closure of
 //!
-//! Seven real-binary tests, each closing one thing the milestones below it
-//! could only document. Four are the Direct topology:
+//! **Kinds of test, not a count of them.** An earlier draft of this doc opened
+//! with a number and then listed the tests by name, which is a second spelling
+//! of what `#[ignore]` already says — and it was wrong within one review round,
+//! because a later round added one more and nothing made the prose follow
+//! (M11.2b review F10). What is durable is the *taxonomy*: some
+//! tests need the real `claude` binary, some need the real `nemo-relay` binary
+//! as well, one needs Relay alone, and the rest need no binary at all because
+//! what they catch is this harness lying to itself. Each is gated by an
+//! `#[ignore]` reason that names which, and
+//! [`the_module_doc_does_not_enumerate_a_count_of_real_binary_tests`] keeps the
+//! prose from growing a number back.
+//!
+//! The real-binary tests that need `claude`, on the Direct topology:
 //!
 //! - `a_real_claude_binary_completes_a_prose_turn_through_roundhouse` — that
 //!   [`claude_launch`](roundhouse_server::claude_launch)'s environment map is
@@ -50,23 +61,21 @@
 //!   the chain cannot be observed here at all — see "The half this cannot
 //!   observe" below.
 //!
-//! …two more drive the Chained one, through a real `nemo-relay run --agent
-//! claude`: [`a_chained_turn_reaches_roundhouse_with_the_turn_key_and_not_relays_own`]
+//! …the Chained ones drive the other deployment shape, through a real
+//! `nemo-relay run --agent claude`:
+//! [`a_chained_turn_reaches_roundhouse_with_the_turn_key_and_not_relays_own`]
 //! (credential attribution and `?beta=true` survival across the hop) and
 //! [`a_chained_continue_survives_relays_re_encode_without_forking`] (R7 hazard 1
 //! against the real re-encoder). See "The chained topology" below.
 //!
-//! …and one more needs *only* Relay, not `claude` at all:
-//! [`hazard_4_a_different_base_url_layer_clears_the_configured_auth_header`]
-//! drives `nemo-relay run --dry-run` directly. See "Hazard 4, made detectable"
-//! at the bottom of this file.
+//! …and the Relay-only ones need no `claude` at all: they drive `nemo-relay run
+//! --dry-run` directly, which resolves configuration without spawning an agent.
+//! See "Hazard 4, made detectable" at the bottom of this file.
 //!
-//! Five more need no binary, because what they catch is this harness lying to
-//! itself: [`the_childs_environment_is_the_generated_map_plus_the_isolation_vars`],
-//! [`the_get_envs_diff_cannot_see_a_dropped_env_clear`],
-//! [`the_chained_child_is_relay_wrapping_the_very_same_launch`],
-//! [`the_fork_probe_names_a_session_a_fork_would_actually_create`] and
-//! [`a_rigs_root_cannot_be_claimed_twice`].
+//! The rest need no binary, because what they catch is this harness lying to
+//! itself: the constructed-command environment guard and its named limit, the
+//! two-topology launch comparison, the fork probe's arithmetic, the root claim,
+//! and the structural guards the M11.2b review left behind.
 //!
 //! # What is real here, and what is scripted
 //!
@@ -192,6 +201,16 @@
 //! under `--include-ignored` is the same loud panic naming the variable that a
 //! missing client is.
 //!
+//! **Where "Relay evidence §x" points.** Every claim below about what Relay
+//! does is read from one document —
+//! `agent-docs/research/nemo-relay-0.8.0-published-read.md`, whose 2026-09-01
+//! addendum re-derived each of them against the 0.8.2 tarball this suite drives
+//! — and is cited by section, never by file and line. M11.2b review F10: a
+//! citation by file and line, copied into Rust, is a claim about a pinned tree
+//! that nobody re-derives when the pin moves — and it had already been copied
+//! into two files. One pointer per claim leaves one place to re-read, which is
+//! what CLAUDE.md's synergy-vigilance rule asks for.
+//!
 //! **The chained launch is the Direct launch, wrapped** (R-D′). Relay overwrites
 //! `ANTHROPIC_BASE_URL` with its own gateway and *merges* its
 //! `x-nemo-relay-proxy-token` into `ANTHROPIC_CUSTOM_HEADERS` rather than
@@ -219,7 +238,7 @@
 //! - **Hazard 4: set the upstream base URL and auth header in one config layer.**
 //!   `replace_upstream_base_url` clears a configured `anthropic_auth_header`
 //!   whenever the base URL is changed by a *different* layer
-//!   (`configuration/mod.rs:1672-1681`), so a deployment that names the base URL
+//!   (Relay evidence §A.5), so a deployment that names the base URL
 //!   on the command line and the auth header in `config.toml` runs
 //!   unauthenticated and finds out at roundhouse's 401. The reference wiring
 //!   below sidesteps this by configuring no auth header at all — the turn key
@@ -230,52 +249,53 @@
 //!   drives `nemo-relay run --dry-run` directly, at the bottom of this file.
 //! - **Hazard 5: a plugin's dispatch-override turn is key-authed only.** Relay's
 //!   `effective_dispatch_request` strips provider credentials before redirecting
-//!   a turn to an explicit target (`gateway/mod.rs:874-908`), so a turn
+//!   a turn to an explicit target (Relay evidence §A.6), so a turn
 //!   redirected by a plugin arrives carrying no forwarded seat whatever the
 //!   client presented. No pass-through deployment may assume otherwise.
 //!
 //! **Resumption is not offered in band on this surface**, and R-D closes plan
 //! open question 4 that way for this rung: Relay's SSE decoder ignores `id:`
-//! lines outright (`codec/streaming.rs:182-198`), so a cursor carried as an SSE
+//! lines outright (Relay evidence §A.3), so a cursor carried as an SSE
 //! id does not survive the hop — and the Messages emitter carries none, so there
 //! is nothing to lose today and a documented reason not to add one tomorrow.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use axum::Router;
-use axum::body::Body;
-use axum::extract::{Request, State};
-use axum::middleware::Next;
-use axum::response::Response;
 use serde_json::Value;
 
 use roundhouse_core::context::ByteTokenizer;
 use roundhouse_core::control::Principal;
-use roundhouse_core::event::SessionEventKind;
 use roundhouse_core::ids::SessionId;
 use roundhouse_core::item::{Item, ItemContent, Role};
 use roundhouse_core::now_ms;
-use roundhouse_core::routing::{AffinityPolicy, Candidate, Target};
-use roundhouse_core::store::{MemoryStore, SessionStore};
-use roundhouse_fleet::{FrontierClient, FrontierError, FrontierQuote, FrontierStream};
+use roundhouse_core::routing::AffinityPolicy;
+use roundhouse_core::store::MemoryStore;
+use roundhouse_fleet::FrontierClient;
 use roundhouse_server::claude_launch::{
     API_KEY_ENV, BASE_URL_ENV, CUSTOM_HEADERS_ENV, ClaudeEnv, ClaudeLaunch,
     ROUNDHOUSE_API_KEY_SENTINEL,
 };
-use roundhouse_server::control_config::{MembershipRole, TURN_KEY_HEADER};
-use roundhouse_server::messages_api::MESSAGES_PATH;
+use roundhouse_server::control_config::TURN_KEY_HEADER;
+use roundhouse_server::messages_api::{MESSAGES_PATH, wire};
 use roundhouse_server::{
-    API_PREFIX, ControlDirectory, Conversations, CrossChecks, DirectoryMutation, EchoLocalExecutor,
-    Engine, EngineConfig, MemoryDirectoryStore, messages_router,
+    API_PREFIX, Conversations, EchoLocalExecutor, Engine, EngineConfig, messages_router,
 };
 
 mod common;
-use common::{Scripted, ToolCallingFrontierClient, frontier_catalog, sha256_hex};
+// The harness itself is `common::e2e` (M11.2b review F1): recorder, bootstrap,
+// fork probe and version probe are the same rig the codex sibling stands its
+// client inside, and were a line-for-line copy of it until the two drifted.
+use common::e2e::{
+    Exchange, PROJECT, Recorder, USER, base_session, bootstrap, clean, fork_probe, principal,
+    record, version_probe,
+};
+use common::{Scripted, ScriptedTurns, ToolCallingFrontierClient, frontier_catalog};
 
 // ---------------------------------------------------------------------------
 // What this deployment is
@@ -294,10 +314,6 @@ const ANSWER: &str = "roundhouse answered this turn";
 /// from the turn that closes the loop — two identical strings would make "the
 /// client came back" indistinguishable from "the client repeated itself".
 const BEFORE_THE_CALL: &str = "Let me look at that file.";
-
-/// The tenant every request below authenticates as.
-const PROJECT: &str = "acme";
-const USER: &str = "ada";
 
 /// What the file the client is asked to read contains.
 ///
@@ -333,7 +349,7 @@ const VERIFIED_VERSION: &str = "2.1.257";
 /// Longer than [`CHILD_DEADLINE`] because the chain is three processes rather
 /// than two: Relay resolves its configuration, binds an ephemeral loopback
 /// gateway, runs `claude --version` for its own minimum-version gate
-/// (`agents/claude/mod.rs:21`, `(2, 1, 121)`), writes a temporary plugin
+/// (Relay evidence §A.7), writes a temporary plugin
 /// directory and a synthesized `--settings` document, and only then spawns the
 /// client this suite is actually about.
 const CHAINED_DEADLINE: Duration = Duration::from_secs(180);
@@ -356,318 +372,86 @@ const VERIFIED_RELAY_VERSION: &str = "0.8.2";
 /// Named here so the chained tests can assert its **absence** at roundhouse's
 /// edge. Relay merges it into the client's `ANTHROPIC_CUSTOM_HEADERS` so the
 /// client presents it to the gateway, and strips it again before dispatch
-/// (`gateway/response.rs:59-72`) — so this is the one header whose arrival here
+/// (Relay evidence §2.3) — so this is the one header whose arrival here
 /// would mean Relay's own credential had been handed to an upstream that is not
 /// Relay.
 const RELAY_PROXY_TOKEN_HEADER: &str = "x-nemo-relay-proxy-token";
-
-/// The trailing per-request notice R-A rules is ephemeral (§5.7).
-///
-/// Spelled as its two anchors rather than as a whole string because the number
-/// between them is what makes the notice ephemeral: it is a client-side counter
-/// regenerated per request, so a test that matched the whole text would be
-/// asserting today's remaining budget.
-const NOTICE_OPEN: &str = "<total_tokens>";
-const NOTICE_CLOSE: &str = "tokens left</total_tokens>";
 
 // ---------------------------------------------------------------------------
 // The scripted upstream
 // ---------------------------------------------------------------------------
 
-/// One dispatch's worth of script.
-struct ScriptedTurn {
-    /// Reused rather than re-implemented: [`ToolCallingFrontierClient`] already
-    /// owns the chunk construction — interleaved text and calls, then a `Done`
-    /// carrying a caller-chosen `stop_reason` — and a second copy of it here
-    /// would be a double that drifts from the one every other Messages suite
-    /// asserts against.
-    client: ToolCallingFrontierClient,
+/// A frontier that answers prose on every dispatch.
+fn prose_upstream() -> Arc<ScriptedTurns> {
+    Arc::new(ScriptedTurns::answering(ANSWER))
 }
 
-impl ScriptedTurn {
-    fn new(script: Vec<Scripted>, stop_reason: Option<&str>) -> Self {
-        Self {
-            client: ToolCallingFrontierClient::new(script, stop_reason),
-        }
-    }
-
-    fn prose(text: &'static str) -> Self {
-        Self::new(vec![Scripted::Text(text)], Some("end_turn"))
-    }
-}
-
-/// A frontier that answers a queue of scripted turns and then prose forever.
+/// A frontier whose first turn speaks and then calls `Read` on `path`, then
+/// prose.
 ///
-/// **The tail is prose rather than a repeat of the last turn, and that is the
-/// whole reason this type exists** rather than [`ToolCallingFrontierClient`]
-/// being used directly. A real client answers a `tool_use` by running the tool
-/// and dispatching again, so an upstream whose fixed script is a call answers
-/// the resend with the same call and the loop never closes: the run ends at
-/// [`CHILD_DEADLINE`] and reads as a hung client. Queue-then-prose makes
-/// termination a property of the double instead of a hope about the client.
-struct ScriptedTurns {
-    queued: Mutex<VecDeque<ScriptedTurn>>,
-    then: ScriptedTurn,
-    /// Every quote this deployment dispatched, in call order — what roundhouse
-    /// actually sent upstream, as opposed to what the client sent us.
-    quotes: Mutex<Vec<FrontierQuote>>,
+/// `path` is owned, and that is the whole of M11.2b review F13's second half:
+/// the file this rig asks the client to read only has a path at run time, and
+/// while [`Scripted::Call`] held its arguments as `&'static str` the only way
+/// to script it was `Box::leak`, at two sites, each with a paragraph arguing
+/// that a bounded per-rig leak was acceptable. Widening the one field that
+/// actually varies deleted both the leaks and both the paragraphs.
+fn reading_upstream(path: &Path) -> Arc<ScriptedTurns> {
+    Arc::new(ScriptedTurns::then_answering(
+        vec![ToolCallingFrontierClient::new(
+            vec![
+                Scripted::Text(BEFORE_THE_CALL),
+                Scripted::Call {
+                    id: "toolu_e2e_01",
+                    name: "Read",
+                    arguments: serde_json::json!({ "file_path": path }).to_string(),
+                },
+            ],
+            Some("tool_use"),
+        )],
+        ANSWER,
+    ))
 }
 
-impl ScriptedTurns {
-    /// Prose on every dispatch: the shape three of the four tests want.
-    fn prose() -> Self {
-        Self {
-            queued: Mutex::new(VecDeque::new()),
-            then: ScriptedTurn::prose(ANSWER),
-            quotes: Mutex::new(Vec::new()),
-        }
-    }
+/// F13 (M11.2b review), now the guard on its own fix: the queue-then-prose
+/// double lives in `tests/common` where every real-client tool-loop suite can
+/// reach it, the identity wrapper that used to sit between it and
+/// [`ToolCallingFrontierClient`] is gone, and no call site in this file leaks a
+/// runtime-derived string to satisfy a `&'static str` field.
+///
+/// Structural, and read from this file's own source, because the defect was
+/// structural: nothing about the rig it produced behaved differently, which is
+/// exactly why it survived a milestone.
+#[test]
+fn the_tool_loop_double_is_shared_and_needs_no_leaks() {
+    let this_file = include_str!("claude_e2e.rs");
+    let common = include_str!("common/mod.rs");
 
-    /// One turn that speaks and then calls `Read` on `path`, then prose.
-    ///
-    /// `path` is `&'static str` because [`Scripted`] holds its arguments that
-    /// way — every other user of it writes a literal — and the file this rig
-    /// writes only has a path at run time. The leak is one boxed string per rig
-    /// in a test binary, which is bounded and deliberate; the alternative was to
-    /// widen a shared fixture type for one caller.
-    fn reading(path: &'static str) -> Self {
-        let arguments: &'static str = Box::leak(
-            serde_json::json!({ "file_path": path })
-                .to_string()
-                .into_boxed_str(),
-        );
-        Self {
-            queued: Mutex::new(VecDeque::from([ScriptedTurn::new(
-                vec![
-                    Scripted::Text(BEFORE_THE_CALL),
-                    Scripted::Call {
-                        id: "toolu_e2e_01",
-                        name: "Read",
-                        arguments,
-                    },
-                ],
-                Some("tool_use"),
-            )])),
-            then: ScriptedTurn::prose(ANSWER),
-            quotes: Mutex::new(Vec::new()),
-        }
-    }
+    assert!(
+        common.contains("pub struct ScriptedTurns"),
+        "F13: the queue-then-prose double belongs in tests/common, where the next real-client \
+         tool-loop suite can reach it rather than writing a second copy"
+    );
+    // Assembled at run time for the same reason the leak needle below is: a
+    // literal spelling of the type this file must not contain would be found
+    // in this assertion itself.
+    let wrapper = format!("struct {}{}", "ScriptedTurn", " {");
+    assert!(
+        !this_file.contains(wrapper.as_str()),
+        "F13: `ScriptedTurn` was an identity wrapper over ToolCallingFrontierClient — every use \
+         of it was an immediate `.client` field access — and reintroducing it puts a type with \
+         no behaviour of its own back between the suite and the double"
+    );
 
-    fn dispatches(&self) -> usize {
-        self.quotes.lock().expect("recording").len()
-    }
-
-    /// Whether any dispatch carried a *forwarded* caller credential upstream.
-    ///
-    /// Read from the quote rather than from the wire because that is where the
-    /// decision is made: `turn_admission` captures a presented credential into
-    /// `TurnCredential::Forwarded` and the dispatch client then puts it on the
-    /// upstream request. The chained tests assert this is `false` — the launch
-    /// sentinel arrives on `x-api-key` on every turn, and the serve side's rule
-    /// that it is never mistaken for a seat is what stops a chained deployment
-    /// forwarding `rh_sentinel_not_a_credential` to a frontier as if a tenant
-    /// had brought their own.
-    fn any_credential_forwarded(&self) -> bool {
-        self.quotes
-            .lock()
-            .expect("recording")
-            .iter()
-            .any(|quote| quote.credential.is_forwarded())
-    }
-}
-
-#[async_trait]
-impl FrontierClient for ScriptedTurns {
-    async fn execute(&self, quote: &FrontierQuote) -> Result<FrontierStream, FrontierError> {
-        self.quotes.lock().expect("recording").push(quote.clone());
-        // Popped and the guard dropped before the await: holding a `std::sync`
-        // lock across an await point in a multi-threaded runtime is how a rig
-        // deadlocks under `--test-threads=1` and gets diagnosed as a client hang.
-        let queued = self.queued.lock().expect("recording").pop_front();
-        match queued {
-            Some(turn) => turn.client.execute(quote).await,
-            None => self.then.client.execute(quote).await,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// The recorder
-// ---------------------------------------------------------------------------
-
-/// One request the deployment served, as it arrived.
-#[derive(Clone, Debug)]
-struct Exchange {
-    path: String,
-    /// The request's query string, if any.
-    ///
-    /// Kept apart from `path` rather than folded into it because the two are
-    /// asserted for opposite reasons: every filter below matches on the path
-    /// alone (axum routes past the query, and so must the filter), while the
-    /// chained tests assert on the query alone — `?beta=true` surviving Relay's
-    /// `format!("{base}{path_and_query}")` concatenation is R7 hazard 3, and a
-    /// combined string would make "the route matched" and "the query survived"
-    /// one assertion that cannot fail separately.
-    query: Option<String>,
-    headers: BTreeMap<String, String>,
-    /// The request body, parsed if it was JSON.
-    ///
-    /// Parsed rather than kept as bytes for the reason the codex sibling gives:
-    /// every assertion downstream is on a *value*, and a client re-serializes
-    /// what it resends in its own field order.
-    body: Option<Value>,
-    status: u16,
-    /// The response body as bytes-turned-text.
-    ///
-    /// Buffered on every path, which for `/v1/messages` means the child sees one
-    /// turn's frames arrive at once instead of as they are produced. Stated
-    /// rather than assumed: no assertion in this file is about frame *timing*,
-    /// every turn is served by an in-process frontier and finishes in
-    /// milliseconds, and the client parses a complete SSE body identically to an
-    /// incremental one. What is traded away is this harness's fidelity to
-    /// backpressure, which nothing here measures; what is bought is that the
-    /// stream the client actually read is inspectable at all.
-    response_text: Option<String>,
-}
-
-impl Exchange {
-    fn header(&self, name: &str) -> Option<&str> {
-        self.headers.get(name).map(String::as_str)
-    }
-
-    /// The `messages` array of this request's body, in arrival order.
-    fn messages(&self) -> Vec<Value> {
-        self.body
-            .as_ref()
-            .and_then(|body| body["messages"].as_array())
-            .cloned()
-            .unwrap_or_default()
-    }
-
-    /// The SSE `data:` payloads of this response, parsed, in arrival order.
-    fn frames(&self) -> Vec<Value> {
-        self.response_text
-            .as_deref()
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|line| line.strip_prefix("data: "))
-            .filter_map(|payload| serde_json::from_str::<Value>(payload).ok())
-            .collect()
-    }
-
-    /// The headers as an evidence block or a failure message should print them:
-    /// credential-bearing values replaced by their length.
-    ///
-    /// The turn key here is one this test minted seconds earlier, so printing it
-    /// whole would cost nothing *today*. Redacted anyway, because the shape of
-    /// this block is what a fixture holding something real would copy, and the
-    /// diagnostic — "the header arrived, and was this big" — is what a printed
-    /// header set is for.
-    fn redacted_headers(&self) -> BTreeMap<String, String> {
-        self.headers
-            .iter()
-            .map(|(name, value)| {
-                let value = match name.as_str() {
-                    "authorization" | TURN_KEY_HEADER => {
-                        format!("<{} bytes redacted>", value.len())
-                    }
-                    _ => value.clone(),
-                };
-                (name.clone(), value)
-            })
-            .collect()
-    }
-}
-
-/// Every request the deployment served, in arrival order.
-#[derive(Clone, Default)]
-struct Recorder {
-    exchanges: Arc<Mutex<Vec<Exchange>>>,
-}
-
-impl Recorder {
-    fn all(&self) -> Vec<Exchange> {
-        self.exchanges.lock().expect("recording").clone()
-    }
-
-    /// Every turn request, in arrival order.
-    ///
-    /// Matched on the path alone: the client appends `?beta=true`, which axum
-    /// routes past and this filter must too — a comparison against the whole URI
-    /// would find nothing and every assertion below would fail as "the client
-    /// never sent a turn".
-    fn turns(&self) -> Vec<Exchange> {
-        self.all()
-            .into_iter()
-            .filter(|exchange| exchange.path == format!("{API_PREFIX}/{MESSAGES_PATH}"))
-            .collect()
-    }
-
-    /// A one-line rendering of every exchange, for a failure message.
-    fn transcript(&self) -> String {
-        self.all()
-            .iter()
-            .map(|exchange| format!("POST {} -> {}", exchange.path, exchange.status))
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-}
-
-/// Capture what arrived, without changing what is served.
-async fn record(State(recorder): State<Recorder>, request: Request, next: Next) -> Response {
-    let path = request.uri().path().to_string();
-    let query = request.uri().query().map(str::to_string);
-    let headers = request
-        .headers()
-        .iter()
-        .map(|(name, value)| {
-            (
-                name.as_str().to_string(),
-                value.to_str().unwrap_or("<non-utf8>").to_string(),
-            )
-        })
-        .collect();
-
-    let (parts, body) = request.into_parts();
-    // Generously bounded: one turn of this client is already ~70 KB of system
-    // prompt and tool schemas, and a resend carries the whole history. A silent
-    // truncation here would surface as a 422 from our own canonicalizer, which
-    // reads exactly like a roundhouse bug and is not one.
-    let bytes = axum::body::to_bytes(body, 32 * 1024 * 1024)
-        .await
-        .expect("a loopback client's request body is readable");
-    let parsed = serde_json::from_slice::<Value>(&bytes).ok();
-    let response = next
-        .run(Request::from_parts(parts, Body::from(bytes)))
-        .await;
-
-    let status = response.status().as_u16();
-    let (mut response_parts, response_body) = response.into_parts();
-    let bytes = axum::body::to_bytes(response_body, 32 * 1024 * 1024)
-        .await
-        .expect("a loopback response body is readable");
-    // The body just went from streamed to definite-length. Any framing header
-    // the streaming response carried would now describe a body that no longer
-    // exists, and hyper would serialize the mismatch rather than reconcile it —
-    // a corrupt response the child reports as a protocol error, which reads like
-    // a roundhouse bug and is not one.
-    response_parts.headers.remove("transfer-encoding");
-    response_parts.headers.remove("content-length");
-    let text = String::from_utf8(bytes.to_vec()).ok();
-
-    recorder
-        .exchanges
-        .lock()
-        .expect("recording")
-        .push(Exchange {
-            path,
-            query,
-            headers,
-            body: parsed,
-            status,
-            response_text: text,
-        });
-    Response::from_parts(response_parts, Body::from(bytes))
+    // The needle is assembled at run time rather than spelled as one literal:
+    // `this_file` is this very file, so a literal here would match itself and
+    // report a leak site that is only this assertion.
+    let needle = format!("{}{}", "Box::leak", "(");
+    let leaks = this_file.matches(needle.as_str()).count();
+    assert_eq!(
+        leaks, 0,
+        "F13: {leaks} Box::leak site(s) remain in claude_e2e.rs; `Scripted::Call.arguments` is \
+         owned now, so a script naming a path this rig only learns at run time needs no leak"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -684,6 +468,20 @@ async fn record(State(recorder): State<Recorder>, request: Request, next: Next) 
 /// let the two drift, and the interesting failure ("Relay changed what the
 /// client presents") would be indistinguishable from "the chained harness spells
 /// the launch differently".
+/// Which topology a caller is *asking* for, before the deployment exists.
+///
+/// Distinct from [`Topology`] for one reason, and only for that reason: a
+/// chained rig's Relay configuration names this deployment's own base URL, which
+/// nobody knows until the listener is bound. The request can be stated before
+/// `start_at` runs; the resolved topology can only be built during it. Collapsing
+/// the two would put the config write back *after* construction, which is the
+/// post-construction mutation M11.2b review F2 ruled out.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Wiring {
+    Direct,
+    Chained,
+}
+
 enum Topology {
     /// The client is spawned directly, pointed at roundhouse.
     Direct,
@@ -697,19 +495,79 @@ enum Topology {
     },
 }
 
-impl Topology {
+/// Everything that differs between the two topologies, answered together.
+///
+/// **One dispatch site, and that is the point** (M11.2b review F2). The
+/// difference used to be branched at four places across two types — a `deadline`
+/// method, a `label` method, `build_child_command`'s `match` for program and
+/// argv, and a `matches!` twenty-four lines later for Relay's XDG state — so
+/// adding a third topology, or changing what a chained run needs, meant finding
+/// four sites that nothing held together. What it cost to leave that alone was
+/// not a wrong answer today; it was that any of the four could have been updated
+/// without the others and nothing would have said so.
+struct Launch {
+    /// The program actually spawned.
+    program: String,
+    /// Whatever must precede the client's own argv, `--` included.
+    leading: Vec<String>,
+    /// Environment this topology's own process needs, beyond the launch map and
+    /// the client's isolation set.
+    extra_env: Vec<(&'static str, PathBuf)>,
     /// How long one run of this topology may take.
-    fn deadline(&self) -> Duration {
-        match self {
-            Self::Direct => CHILD_DEADLINE,
-            Self::Chained { .. } => CHAINED_DEADLINE,
-        }
-    }
+    deadline: Duration,
+    label: &'static str,
+}
 
-    fn label(&self) -> &'static str {
+impl Topology {
+    fn plan(&self, binary: &str, root: &Path) -> Launch {
         match self {
-            Self::Direct => "Direct",
-            Self::Chained { .. } => "Chained",
+            Self::Direct => Launch {
+                program: binary.to_string(),
+                leading: Vec::new(),
+                extra_env: Vec::new(),
+                deadline: CHILD_DEADLINE,
+                label: "Direct",
+            },
+            // `run` rather than the bare `claude` shortcut: the shortcut runs an
+            // interactive setup wizard when no config layer exists
+            // (`commands/run.rs`'s `easy_path`, `needs_setup`), and a wizard in a
+            // test rig is a hang. `--` is not optional — `RunCommand::command` is
+            // `#[arg(last = true)]`, so without it the client's own flags are
+            // parsed as Relay's.
+            Self::Chained { relay, config } => Launch {
+                program: relay.clone(),
+                leading: vec![
+                    "run".into(),
+                    "--agent".into(),
+                    "claude".into(),
+                    "--config".into(),
+                    config.to_string_lossy().into_owned(),
+                    "--".into(),
+                ],
+                // Relay's own state, isolated the same way and for the same
+                // reason the client's is. `--config` replaces only the *user*
+                // config layer (`nemo-relay --help`: "system config still
+                // applies"), and Relay reads an XDG user config layer and writes
+                // its bootstrap/marketplace state under XDG data and state — all
+                // of which would otherwise land in whatever `HOME` this box's
+                // developer happens to have, and be read back by the next run as
+                // configuration this test never wrote.
+                //
+                // The earlier spelling of this comment justified the four
+                // variables with "Relay writes a session store and a
+                // resolved-config cache", which M11.2b review F14 found is not
+                // what 0.8.2's `run` mode persists: neither exists on that path,
+                // and what the isolation actually covers is the bootstrap state
+                // file and the marketplace state beside it. The variables stay —
+                // the isolation is right — but the reason had to stop naming
+                // artefacts nobody writes.
+                extra_env: RELAY_STATE_VARS
+                    .iter()
+                    .map(|name| (*name, root.join("relay")))
+                    .collect(),
+                deadline: CHAINED_DEADLINE,
+                label: "Chained",
+            },
         }
     }
 }
@@ -731,11 +589,6 @@ struct Rig {
     recorder: Recorder,
     upstream: Arc<ScriptedTurns>,
     binary: String,
-    /// This deployment's root, as an operator would hand it to a client or to
-    /// Relay's `[upstream] anthropic_base_url`. No `{API_PREFIX}`: both readers
-    /// append the version segment themselves, one by SDK default and one by
-    /// concatenating the inbound `path_and_query` whole.
-    base_url: String,
     topology: Topology,
 }
 
@@ -747,7 +600,7 @@ impl Rig {
     /// project `.claude/` and a git repository, so a run rooted in this checkout
     /// would launch carrying this repository as context.
     async fn start(label: &str, upstream: Arc<ScriptedTurns>) -> Self {
-        Self::start_at(Self::a_root_for(label), upstream).await
+        Self::start_at(Self::a_root_for(label), upstream, Wiring::Direct).await
     }
 
     /// The same deployment, driven through a real `nemo-relay run --agent
@@ -757,7 +610,7 @@ impl Rig {
     /// use, and that is the ruling this constructor exists to instantiate.**
     /// Relay overwrites `ANTHROPIC_BASE_URL` with its own gateway and *merges*
     /// its proxy token into `ANTHROPIC_CUSTOM_HEADERS` rather than replacing the
-    /// block (`agents/claude/launch.rs:19-31,113-127` — `replace_custom_header`
+    /// block (Relay evidence §A.7 — `replace_custom_header`
     /// drops only a line whose name matches), so the turn key survives the hop
     /// on [`TURN_KEY_HEADER`] and a chained turn keeps exactly Direct's
     /// semantics. One generator, two topologies.
@@ -767,11 +620,11 @@ impl Rig {
     ///
     /// - `[upstream] anthropic_base_url` is this deployment's **root**. Relay
     ///   concatenates the inbound `path_and_query` onto it whole
-    ///   (`gateway/routes.rs:141-151`), so a value carrying `/v1` would send
+    ///   (Relay evidence §A.4), so a value carrying `/v1` would send
     ///   `/v1/v1/messages`.
     /// - **No `anthropic_auth_header`.** Relay injects one only when the inbound
     ///   request carries none of `authorization` / `x-api-key` / `api-key` /
-    ///   `anthropic-api-key` (`gateway/mod.rs:1070-1078`, the `already_authed`
+    ///   `anthropic-api-key` (Relay evidence §2.3, the `already_authed`
     ///   short circuit), and a client launched with [`ClaudeAuthKind::RoundhouseKey`]
     ///   always carries the sentinel on `x-api-key`. Configuring one here would
     ///   therefore be dead configuration that silently becomes live the day the
@@ -783,54 +636,33 @@ impl Rig {
     ///
     /// The bind address is deliberately **not** configured: `run` picks an
     /// ephemeral loopback port, and 0.8.2 refuses a non-loopback bind outright
-    /// (`server/mod.rs:92-97`, new at this release), so naming one here could
+    /// (Relay evidence §A.10.1, new at this release), so naming one here could
     /// only make the run fail in a way the evidence already predicts.
+    ///
+    /// **Constructed chained, never mutated into it** (M11.2b review F2). This
+    /// used to build a Direct rig and overwrite `rig.topology` once `start_at`
+    /// had returned, which left a window — short, and never read from — in which
+    /// the value was a `Direct` rig wearing a chained label. Nothing behaved
+    /// wrongly because of it; what it cost is that "what topology is this rig"
+    /// had two answers depending on when you asked, and the second one was not
+    /// in the type.
+    ///
+    /// The reason it was written that way is real and is handled rather than
+    /// ignored: Relay's configuration names *this deployment's own base URL*,
+    /// which does not exist until the listener is bound inside `start_at`. So
+    /// the caller states a [`Wiring`] — a request, decidable before anything
+    /// binds — and `start_at` resolves it into a [`Topology`] at the one moment
+    /// both halves are known.
     async fn start_chained(label: &str, upstream: Arc<ScriptedTurns>) -> Self {
-        let mut rig = Self::start_at(Self::a_root_for(label), upstream).await;
-        let relay = std::env::var(RELAY_BIN_VAR).unwrap_or_else(|_| {
-            panic!(
-                "the chained topology needs a real Relay binary: set {RELAY_BIN_VAR}, or run \
-                 without --include-ignored"
-            )
-        });
-        let version = relay_version(&relay);
-        let config = rig.root.join("relay-config.toml");
-        std::fs::write(
-            &config,
-            format!(
-                "[upstream]\nanthropic_base_url = \"{}\"\n\n[agents.claude]\ncommand = \"{}\"\n",
-                rig.base_url, rig.binary
-            ),
-        )
-        .expect("the run's Relay configuration");
-        // Relay's own XDG state, beside the client's `HOME` rather than inside
-        // it: Relay writes a session store and a resolved-config cache, and a
-        // stray file under `CLAUDE_CONFIG_DIR` is exactly the kind of ambient
-        // input this suite's isolation exists to exclude.
-        std::fs::create_dir_all(rig.root.join("relay")).expect("the run's Relay state directory");
-
-        println!("    relay binary  : {relay}");
-        println!("    relay version : {version}");
-        if version.split_whitespace().last() != Some(VERIFIED_RELAY_VERSION) {
-            println!(
-                "    WARNING: the chained assertions were written against nemo-relay \
-                 {VERIFIED_RELAY_VERSION}. CLAUDE.md's synergy-vigilance rule applies: Relay is \
-                 the other half of this product, so re-read what changed upstream before trusting \
-                 a green run against a different build."
-            );
-        }
-        println!("    relay config  : {}", config.display());
-
-        rig.topology = Topology::Chained { relay, config };
-        rig
+        Self::start_at(Self::a_root_for(label), upstream, Wiring::Chained).await
     }
 
     /// Where a run of `label` puts its home and working directory.
     ///
     /// Public to the file rather than inlined into [`Self::start`] because one
     /// test needs the path *before* the rig exists: the scripted upstream names
-    /// the file the client will read, and [`Scripted`] holds that name as a
-    /// `&'static str` decided at script-construction time.
+    /// the file the client will read, and it has to be scripted before the rig
+    /// that writes it is built.
     fn a_root_for(label: &str) -> PathBuf {
         std::env::temp_dir()
             .join("roundhouse-claude-e2e")
@@ -843,7 +675,7 @@ impl Rig {
     /// `Arc<ControlDirectory>`, the one a shipped binary can name — rather than
     /// a file-declared one, for the reason the codex sibling gives: the point of
     /// the rung is that a real client authenticates the way a real tenant does.
-    async fn start_at(root: PathBuf, upstream: Arc<ScriptedTurns>) -> Self {
+    async fn start_at(root: PathBuf, upstream: Arc<ScriptedTurns>, wiring: Wiring) -> Self {
         assert!(
             claim_root(&root),
             "a Rig's root must be exclusive to it: {} already exists. Two rigs sharing one root \
@@ -860,64 +692,18 @@ impl Rig {
         std::fs::write(root.join("wd").join(CANARY_FILE), format!("{CANARY}\n"))
             .expect("the file the client is asked to read");
 
-        // Bootstrap is file-only: `admin_keys` in the file is the sole root of
-        // trust, and a directory with no admin plane refuses to mint.
-        let admin = common::admin_key("root");
-        let file = common::control_plane(
-            serde_json::json!({
-                "projects": [],
-                "users": [],
-                "admin_keys": [sha256_hex(&admin)],
-                "arm_salt": "m11-claude-e2e",
-            }),
+        // No judge in the cross-checks and no `validate` block on the project:
+        // nothing here enrols its sessions in validation, and promising a judge
+        // the cross-check would then have to find would be fixture state this
+        // suite makes no claim about.
+        let deployment = bootstrap(
             "claude-e2e bootstrap",
+            "m11-claude-e2e",
+            serde_json::json!({ "id": PROJECT }),
+            None,
         );
-        let directory = Arc::new(
-            ControlDirectory::new(
-                file,
-                "ROUNDHOUSE_CONTROL_PLANE",
-                Arc::new(MemoryDirectoryStore::new()),
-                // No judge: no project here enrols its sessions in validation,
-                // and promising one the cross-check would then have to find
-                // would be fixture state this suite makes no claim about.
-                CrossChecks::new(reachable(), None),
-                now_ms(),
-            )
-            .expect("the bootstrap file alone compiles"),
-        );
-        directory
-            .apply(
-                DirectoryMutation::CreateProject {
-                    entry: serde_json::from_value(serde_json::json!({ "id": PROJECT }))
-                        .expect("the project entry is the file vocabulary"),
-                },
-                now_ms(),
-            )
-            .expect("creating a project");
-        directory
-            .apply(
-                DirectoryMutation::CreateUser {
-                    entry: serde_json::from_value(serde_json::json!({ "id": USER }))
-                        .expect("the user entry is the file vocabulary"),
-                },
-                now_ms(),
-            )
-            .expect("creating a user");
-        directory
-            .apply(
-                DirectoryMutation::UpsertMembership {
-                    project: PROJECT.to_string(),
-                    user: USER.to_string(),
-                    role: MembershipRole::Member,
-                    allocation: None,
-                    overrides: None,
-                },
-                now_ms(),
-            )
-            .expect("enrolling the member");
-        let minted = directory
-            .mint_turn_key(PROJECT, USER, now_ms())
-            .expect("the admin plane mints");
+        let directory = deployment.directory;
+        let minted = deployment.minted;
 
         let store = Arc::new(MemoryStore::new());
         let conversations = Arc::new(Conversations::new());
@@ -985,6 +771,13 @@ impl Rig {
             env.names().collect::<Vec<_>>().join(", ")
         );
 
+        // The one place the requested wiring becomes a resolved topology, and
+        // the only place it is decided at all (M11.2b review F2).
+        let topology = match wiring {
+            Wiring::Direct => Topology::Direct,
+            Wiring::Chained => Self::wire_relay(&root, &base_url, &binary),
+        };
+
         Self {
             root,
             secret: minted.secret,
@@ -994,14 +787,86 @@ impl Rig {
             recorder,
             upstream,
             binary,
-            base_url,
-            topology: Topology::Direct,
+            topology,
         }
+    }
+
+    /// Write this run's Relay configuration, and refuse to spawn anything until
+    /// Relay agrees it resolved to *this* deployment.
+    ///
+    /// **The preflight is M11.2b review F8, and it exists because the layering
+    /// cannot be excluded.** `--config` replaces the *user* layer only; Relay
+    /// then folds `/etc/nemo-relay/config.toml` in after it, and a leaf that
+    /// appears in both wins from the system file (Relay evidence §2.4). The
+    /// switch that would turn that off, `skip_implicit_config`, is behind a
+    /// test-only cargo feature and is not in the published binary. So an
+    /// operator box with a system Relay install could re-aim a chained turn —
+    /// this rig's minted turn key and its launch sentinel — at whatever that
+    /// file names, and every assertion downstream would be about a foreign
+    /// upstream while reading perfectly green.
+    ///
+    /// Verifying instead of assuming costs one extra `--dry-run`, which resolves
+    /// configuration and exits without spawning the agent. What it buys is that
+    /// the failure names the file: a chained rig that silently pointed somewhere
+    /// else is exactly the kind of drift a green suite cannot report.
+    fn wire_relay(root: &Path, base_url: &str, binary: &str) -> Topology {
+        let relay = std::env::var(RELAY_BIN_VAR).unwrap_or_else(|_| {
+            panic!(
+                "the chained topology needs a real Relay binary: set {RELAY_BIN_VAR}, or run \
+                 without --include-ignored"
+            )
+        });
+        let version = relay_version(&relay);
+        let config = root.join("relay-config.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "[upstream]\nanthropic_base_url = \"{base_url}\"\n\n[agents.claude]\ncommand = \
+                 \"{binary}\"\n"
+            ),
+        )
+        .expect("the run's Relay configuration");
+        std::fs::create_dir_all(root.join("relay")).expect("the run's Relay state directory");
+
+        println!("    relay binary  : {relay}");
+        println!("    relay version : {version}");
+        if version.split_whitespace().last() != Some(VERIFIED_RELAY_VERSION) {
+            println!(
+                "    WARNING: the chained assertions were written against nemo-relay \
+                 {VERIFIED_RELAY_VERSION}. CLAUDE.md's synergy-vigilance rule applies: Relay is \
+                 the other half of this product, so re-read what changed upstream before trusting \
+                 a green run against a different build."
+            );
+        }
+        println!("    relay config  : {}", config.display());
+
+        let resolved = relay_dry_run(&relay, root, &config, &[]);
+        let wanted = format!("anthropic_base_url = {base_url}");
+        assert!(
+            resolved.contains(&wanted),
+            "F8: this chained rig's explicit --config names `{wanted}`, but Relay resolved \
+             something else. `--config` replaces only the user layer, and \
+             /etc/nemo-relay/config.toml is folded in *after* it, so a system Relay install on \
+             this box is re-aiming the run — refusing to launch a real client with this rig's \
+             turn key at an upstream this test did not choose. Relay resolved:\n{resolved}"
+        );
+
+        Topology::Chained { relay, config }
     }
 
     /// The principal every request below resolves to.
     fn principal(&self) -> Principal {
-        Principal::new(PROJECT, USER)
+        principal()
+    }
+
+    /// Every turn request, in arrival order.
+    ///
+    /// Matched on the path alone: the client appends `?beta=true`, which axum
+    /// routes past and this filter must too — a comparison against the whole URI
+    /// would find nothing and every assertion below would fail as "the client
+    /// never sent a turn".
+    fn turns(&self) -> Vec<Exchange> {
+        self.recorder.to(&format!("{API_PREFIX}/{MESSAGES_PATH}"))
     }
 
     /// The absolute path of the file the client is asked to read.
@@ -1017,48 +882,18 @@ impl Rig {
     /// session this principal drove a turn on, on this node", reading the same
     /// `Arc<Conversations>` the router was handed.
     fn session(&self) -> SessionId {
-        self.conversations
-            .latest(&self.principal())
-            .expect("the client drove at least one turn")
+        common::e2e::session(&self.conversations)
     }
 
     /// The session's committed items, in log order.
     async fn items(&self) -> Vec<Item> {
-        self.store
-            .read_events(&self.session(), 0, 4096)
-            .await
-            .expect("the session exists")
-            .into_iter()
-            .filter_map(|event| match event.kind {
-                SessionEventKind::ItemAppended { item } => Some(item),
-                _ => None,
-            })
-            .collect()
+        common::e2e::items(&self.store, &self.session()).await
     }
 
     /// A fork is silent from the client's side, so the only way to catch one is
     /// to ask the store whether generation one exists at all.
-    ///
-    /// Two assertions rather than one, because they fail on different evidence.
-    /// The first reads the binding: `Conversations::fork` moves `latest` to the
-    /// forked id, so a session id that still carries no generation suffix is this
-    /// node's own statement that nothing rebound. The second reads the store,
-    /// which does not depend on the binding table being right about itself.
     async fn assert_never_forked(&self) {
-        let session = self.session();
-        let probe = fork_probe(&session);
-        assert_eq!(
-            session,
-            base_session(&session),
-            "the client's resend must have matched its prefix: this principal's latest session \
-             is `{session}`, and a generation suffix means the prefix check refused the claim \
-             and rebound the conversation"
-        );
-        assert!(
-            self.store.last_seq(&probe).await.is_err(),
-            "the client's resend must have matched its prefix: `{probe}` exists, which means \
-             the prefix check refused the claim and rebound the conversation"
-        );
+        common::e2e::assert_never_forked(&self.store, &self.session()).await;
     }
 
     /// A first `claude -p` in this run's isolated home.
@@ -1072,6 +907,30 @@ impl Rig {
         self.spawn(prompt, &[], true).await
     }
 
+    /// Run one child to completion, or kill its whole tree at the deadline.
+    ///
+    /// **The deadline used to leak the very processes it exists to stop**
+    /// (M11.2b review F4). It wrapped `Command::output()` in
+    /// `tokio::time::timeout` and panicked on expiry, and tokio's `Child`
+    /// defaults to *not* killing on drop — so the one scenario the deadline
+    /// exists for, a hung client, was exactly the scenario that orphaned
+    /// `claude`, and under Chained also `nemo-relay` and the temporary plugin
+    /// directory it only removes on its way out.
+    ///
+    /// Three things close it, in the order they fire:
+    ///
+    /// 1. `SIGINT` to the direct child. Under Chained that child is Relay, which
+    ///    puts the client in a process group of its own and tears it down — plus
+    ///    its plugin temp dir — on interrupt or normal exit. A `SIGKILL` first
+    ///    would skip both.
+    /// 2. A short grace period, then `SIGKILL` for whatever ignored the
+    ///    interrupt — pinned by
+    ///    [`an_expired_deadline_ends_a_child_that_ignores_the_interrupt`],
+    ///    which traps the interrupt on purpose so a harness that only
+    ///    interrupted would hang there rather than here.
+    /// 3. `kill_on_drop(true)` on the command itself, as the backstop for every
+    ///    path out of this function that is not this one — a panic between spawn
+    ///    and wait included.
     async fn spawn(&self, prompt: &str, extra: &[&str], resume: bool) -> ClaudeRun {
         let mut command = build_child_command(
             &self.binary,
@@ -1082,25 +941,43 @@ impl Rig {
             extra,
             resume,
         );
-        let deadline = self.topology.deadline();
+        let plan = self.topology.plan(&self.binary, &self.root);
 
-        let output = tokio::time::timeout(deadline, command.output())
+        let child = command.spawn().unwrap_or_else(|error| {
+            panic!(
+                "could not run `{}`: {error}. Set {CLAUDE_BIN_VAR} to a real claude binary, \
+                 or drop --include-ignored.",
+                plan.program
+            )
+        });
+        // A watchdog beside the child rather than a `timeout` around it: a
+        // `timeout` that expires drops the future holding the `Child`, and a
+        // dropped `Child` is killed outright by `kill_on_drop` — which is the
+        // backstop, not the shutdown. Signalling from beside it lets the
+        // interrupt land while the child is still ours to wait on, so Relay
+        // takes its own client and its plugin temp dir down with it.
+        let pid = child.id();
+        let deadline = plan.deadline;
+        let watchdog = tokio::spawn(async move {
+            tokio::time::sleep(deadline).await;
+            if let Some(pid) = pid {
+                interrupt_then_kill(pid).await;
+            }
+        });
+        let started = std::time::Instant::now();
+        let output = child
+            .wait_with_output()
             .await
-            .unwrap_or_else(|_| {
-                panic!(
-                    "a {} `{} -p` did not finish within {deadline:?}. HOME: {}",
-                    self.topology.label(),
-                    self.binary,
-                    self.root.join("home").display()
-                )
-            })
-            .unwrap_or_else(|error| {
-                panic!(
-                    "could not run `{}`: {error}. Set {CLAUDE_BIN_VAR} to a real claude binary, \
-                     or drop --include-ignored.",
-                    self.binary
-                )
-            });
+            .expect("a spawned child's pipes are readable");
+        watchdog.abort();
+        assert!(
+            started.elapsed() < deadline,
+            "a {} `{} -p` did not finish within {deadline:?} and was interrupted, then killed. \
+             HOME: {}",
+            plan.label,
+            self.binary,
+            self.root.join("home").display()
+        );
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -1116,15 +993,38 @@ impl Rig {
     }
 
     /// Remove this run's directory.
-    ///
-    /// Called explicitly at the end of a passing test rather than from a `Drop`:
-    /// a guard fires on unwind too, which would delete the isolated home and the
-    /// session store of the run that just failed — the only two artefacts worth
-    /// having at that moment.
     fn clean(&self) {
-        let _ = std::fs::remove_dir_all(&self.root);
+        clean(&self.root);
     }
 }
+
+/// Take a hung child's tree down the way its own shutdown path expects, then
+/// make sure it is down.
+///
+/// `SIGINT` first because under Chained the child is Relay: it restores the
+/// temporary plugin directory it wrote and terminates the client it spawned into
+/// a separate process group only on a normal exit or an interrupt, so killing it
+/// outright leaves both behind. The grace period is short because nothing here
+/// is meant to survive it — this path runs only after a deadline has already
+/// expired, and the panic that follows is the diagnosis.
+///
+/// `kill(1)` rather than a signalling crate: sending a signal from Rust needs a
+/// libc binding this test tree does not otherwise carry, and adding a dependency
+/// to the workspace manifest to interrupt a test child is a larger change than
+/// the defect. A missing `kill` degrades to the `SIGKILL` below, which is what
+/// the previous behaviour would have been anyway.
+async fn interrupt_then_kill(pid: u32) {
+    let _ = std::process::Command::new("kill")
+        .args(["-INT", &pid.to_string()])
+        .status();
+    tokio::time::sleep(KILL_GRACE).await;
+    let _ = std::process::Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status();
+}
+
+/// How long an interrupted child gets to unwind before it is killed outright.
+const KILL_GRACE: Duration = Duration::from_secs(3);
 
 /// Claims `root` for exclusive use by one [`Rig`], or reports that something
 /// else already holds it.
@@ -1151,31 +1051,6 @@ fn claim_root(root: &Path) -> bool {
         std::fs::create_dir_all(parent).expect("the root's parent directory");
     }
     std::fs::create_dir(root).is_ok()
-}
-
-/// The generation-zero id behind `session`, whatever generation it is at.
-///
-/// `conversations::bound_session` spells generation zero as the namespaced key
-/// verbatim and every later generation as `{key}#g{n}`, so the suffix *is* the
-/// fork and stripping it recovers the stem. Sound here because the stem is
-/// `{project}/{user}/anthropic_messages/{uuid}` and a UUID carries no `#`.
-fn base_session(session: &SessionId) -> SessionId {
-    match session.as_str().split_once("#g") {
-        Some((base, _)) => SessionId::new(base),
-        None => session.clone(),
-    }
-}
-
-/// The session id a first fork of `session`'s conversation would have created.
-///
-/// A free function rather than a method on [`Rig`] so the guard it powers can be
-/// evaluated without a rig, a binary or a socket — an arithmetic no test can
-/// evaluate is how a vacuous fork probe survives. Derived from [`base_session`]
-/// and never from `Conversations::latest`: a fork moves `latest` to the forked id
-/// *before* any assertion runs, so appending `#g1` to it asks about `key#g1#g1`,
-/// which nothing ever creates and whose absence therefore says nothing.
-fn fork_probe(session: &SessionId) -> SessionId {
-    SessionId::new(format!("{}#g1", base_session(session)))
 }
 
 /// Build the exact `claude` child command [`Rig::spawn`] runs, without running
@@ -1213,29 +1088,19 @@ fn build_child_command(
     extra: &[&str],
     resume: bool,
 ) -> tokio::process::Command {
-    let client_argv = claude_argv(prompt, extra, resume);
-    let mut command = match topology {
-        Topology::Direct => {
-            let mut command = tokio::process::Command::new(binary);
-            command.args(&client_argv);
-            command
-        }
-        // `run` rather than the bare `claude` shortcut: the shortcut runs an
-        // interactive setup wizard when no config layer exists
-        // (`commands/run.rs`'s `easy_path`, `needs_setup`), and a wizard in a
-        // test rig is a hang. `--` is not optional — `RunCommand::command` is
-        // `#[arg(last = true)]`, so without it the client's own flags are parsed
-        // as Relay's.
-        Topology::Chained { relay, config } => {
-            let mut command = tokio::process::Command::new(relay);
-            command.args(["run", "--agent", "claude", "--config"]);
-            command.arg(config);
-            command.arg("--");
-            command.args(&client_argv);
-            command
-        }
-    };
+    let plan = topology.plan(binary, root);
+    let mut command = tokio::process::Command::new(&plan.program);
+    command.args(&plan.leading);
+    command.args(claude_argv(prompt, extra, resume));
     command.current_dir(root.join("wd"));
+
+    // The backstop under [`Rig::spawn`]'s watchdog, and the reason F4 was a
+    // defect rather than a style note: tokio's default is `false`, so before
+    // this line every path out of `spawn` that dropped the `Child` — the
+    // deadline above all — left the child running. Set here rather than in
+    // `spawn` so the guard that reads it needs no process
+    // ([`build_child_command_kills_on_drop`]).
+    command.kill_on_drop(true);
 
     // Cleared and rebuilt from the generated map plus a named isolation set, not
     // inherited. `CLAUDE_CODE_REMOTE=true` — the ambient value inside the
@@ -1258,17 +1123,11 @@ fn build_child_command(
     command.env("CLAUDE_CONFIG_DIR", root.join("home/.claude"));
     command.env("DISABLE_AUTOUPDATER", "1");
     command.env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
-    if matches!(topology, Topology::Chained { .. }) {
-        // Relay's own state, isolated the same way and for the same reason the
-        // client's is. `--config` replaces only the *user* config layer
-        // (`nemo-relay --help`: "system config still applies"), and Relay reads
-        // an XDG user layer, writes a session store, and caches resolved
-        // configuration — all of which would otherwise land in whatever `HOME`
-        // this box's developer happens to have, and be read back by the next
-        // run as configuration this test never wrote.
-        for name in RELAY_STATE_VARS {
-            command.env(name, root.join("relay"));
-        }
+    // Whatever else this topology's own process needs — for Chained, Relay's
+    // isolated XDG state. Decided in [`Topology::plan`] with the program and the
+    // argv, not branched on a second time here.
+    for (name, value) in &plan.extra_env {
+        command.env(name, value);
     }
 
     // Without this the child waits three seconds for piped input and says so on
@@ -1298,7 +1157,7 @@ const RELAY_STATE_VARS: [&str; 4] = [
 ///
 /// The point of the split: under Chained this vector is handed to Relay after a
 /// `--` and Relay splices its own `--plugin-dir` and `--settings` into it
-/// (`agents/claude/launch.rs:83-92,100-111`), so what the client is *asked* to
+/// (Relay evidence §A.7), so what the client is *asked* to
 /// do is by construction the same thing on both paths and any difference in
 /// outcome is Relay's doing rather than the harness's.
 fn claude_argv(prompt: &str, extra: &[&str], resume: bool) -> Vec<String> {
@@ -1323,39 +1182,40 @@ fn claude_argv(prompt: &str, extra: &[&str], resume: bool) -> Vec<String> {
     argv
 }
 
-/// Every target this deployment can route to, priced the way the router prices
-/// them.
+/// A scratch home for a version probe, thrown away as soon as it answers.
 ///
-/// The one model [`frontier_catalog`] declares and nothing else: no fleet is
-/// attached, so a turn has exactly one place to go and "which target answered"
-/// is never a race.
-fn reachable() -> Vec<Candidate> {
-    vec![Candidate {
-        target: Target::Frontier {
-            provider: "anthropic".into(),
-            model: "claude".into(),
-        },
-        expected_prefill_tokens: 1_024.0,
-        matched_prefix_tokens: 0,
-        expected_ttft_ms: 1.0,
-        expected_cost_usd: 0.0,
-        quality_prior: 0.95,
-        load: None,
-    }]
+/// A probe cannot borrow the rig's root: the Relay probes run from tests that
+/// have no rig at all, and the client probe runs inside `start_at` before the
+/// root is fully furnished. Its own directory per call is what lets one
+/// isolation rule cover every process this file spawns.
+fn probe_home() -> PathBuf {
+    std::env::temp_dir().join(format!("roundhouse-version-probe-{}", uuid::Uuid::new_v4()))
 }
 
 /// What `claude --version` prints, or a loud panic naming the override.
+///
+/// Isolated exactly as [`build_child_command`] isolates a real run (M11.2b
+/// review F18): cleared, then `PATH`, a scratch `HOME`, an isolated
+/// `CLAUDE_CONFIG_DIR`, and the two variables that stop a probe reaching the
+/// network on its way to printing a number.
 fn claude_version(binary: &str) -> String {
-    let output = std::process::Command::new(binary)
-        .arg("--version")
-        .output()
-        .unwrap_or_else(|error| {
-            panic!(
-                "--include-ignored asks for the real binary; `{binary} --version` failed: \
-                 {error}. Set {CLAUDE_BIN_VAR} to one, or run without --include-ignored."
-            )
-        });
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
+    let home = probe_home();
+    std::fs::create_dir_all(home.join(".claude")).expect("the probe's isolated config directory");
+    let version = version_probe(
+        binary,
+        &[
+            ("HOME", home.clone().into_os_string()),
+            ("CLAUDE_CONFIG_DIR", home.join(".claude").into_os_string()),
+            ("DISABLE_AUTOUPDATER", OsString::from("1")),
+            (
+                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+                OsString::from("1"),
+            ),
+        ],
+        CLAUDE_BIN_VAR,
+    );
+    let _ = std::fs::remove_dir_all(&home);
+    version
 }
 
 /// What `nemo-relay --version` prints, or a loud panic naming the override.
@@ -1363,17 +1223,55 @@ fn claude_version(binary: &str) -> String {
 /// A missing Relay under `--include-ignored` is a hard failure and never a
 /// silent skip, for the reason the whole suite is gated this way: a chained test
 /// that quietly does not run reports "green" for the topology nobody checked.
+///
+/// Isolated for F18's reason and for one of its own: a probe that read the
+/// developer's XDG configuration could print a version resolved under
+/// configuration this test never wrote.
 fn relay_version(binary: &str) -> String {
-    let output = std::process::Command::new(binary)
-        .arg("--version")
-        .output()
-        .unwrap_or_else(|error| {
-            panic!(
-                "--include-ignored asks for the real Relay; `{binary} --version` failed: \
-                 {error}. Set {RELAY_BIN_VAR} to one, or run without --include-ignored."
-            )
-        });
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
+    let home = probe_home();
+    std::fs::create_dir_all(&home).expect("the probe's isolated home");
+    let mut isolation = vec![("HOME", home.clone().into_os_string())];
+    isolation.extend(
+        RELAY_STATE_VARS
+            .iter()
+            .map(|name| (*name, home.clone().into_os_string())),
+    );
+    let version = version_probe(binary, &isolation, RELAY_BIN_VAR);
+    let _ = std::fs::remove_dir_all(&home);
+    version
+}
+
+/// `nemo-relay run --agent claude --config <toml> [extra] --dry-run`, and what
+/// it printed.
+///
+/// **Spawned with the ambient environment cleared** (M11.2b review F7). Relay
+/// applies its `NEMO_RELAY_*` environment layer *above* the explicit `--config`
+/// file, and a differing `NEMO_RELAY_ANTHROPIC_BASE_URL` also clears any
+/// configured auth header — so a probe that inherited the operator's environment
+/// could fail its own control assertion and read as Relay drift. The one thing
+/// preserved is `PATH`, because the binary has to be able to find its loader.
+///
+/// `--dry-run` resolves configuration and exits without spawning the agent,
+/// which is what makes every caller here need Relay and nothing else.
+fn relay_dry_run(relay: &str, home: &Path, config: &Path, extra: &[&str]) -> String {
+    let mut command = std::process::Command::new(relay);
+    command.args(["run", "--agent", "claude", "--config"]);
+    command.arg(config);
+    command.args(extra);
+    command.args(["--dry-run", "--", "-p", "probe"]);
+    command.env_clear();
+    command.env("PATH", std::env::var("PATH").unwrap_or_default());
+    command.env("HOME", home);
+    for name in RELAY_STATE_VARS {
+        command.env(name, home);
+    }
+    let output = command.output().unwrap_or_else(|error| {
+        panic!(
+            "could not run `{relay}`: {error}. Set {RELAY_BIN_VAR} to a real Relay binary, or \
+             drop --include-ignored."
+        )
+    });
+    String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
 // ---------------------------------------------------------------------------
@@ -1499,14 +1397,58 @@ fn log_shape(items: &[Item]) -> String {
 
 /// Whether this message is the trailing per-request budget notice (R-A).
 ///
-/// Matched by role and by the notice's two anchors rather than by position: the
-/// claim is about *which* message the client appends, and "the last one" would
-/// be satisfied by any trailing message at all.
+/// Matched by role and by [`wire::is_budget_notice`] rather than by position:
+/// the claim is about *which* message the client appends, and "the last one"
+/// would be satisfied by any trailing message at all.
+///
+/// **The anchors are the drop rule's, not this suite's** (M11.2b review F5).
+/// This function used to spell them itself, with a close anchor of `"tokens
+/// left</total_tokens>"` — today's client wording rather than the tag — while
+/// `wire::canonicalize` anchored on the tags alone. So a client that reworded
+/// the number's caption would still be correctly dropped by the surface and
+/// simultaneously reported here as "not the notice": a guard disagreeing with
+/// the rule it exists to guard, which is worse than no guard because it would
+/// have diagnosed a working drop as a failure to drop. Calling the exported
+/// predicate leaves one spelling in the tree.
 fn is_the_budget_notice(message: &Value) -> bool {
     message["role"] == "system"
         && text_blocks(message)
             .iter()
-            .any(|text| text.trim().starts_with(NOTICE_OPEN) && text.trim().ends_with(NOTICE_CLOSE))
+            .any(|text| wire::is_budget_notice(text))
+}
+
+/// F5 (M11.2b review), now the guard on its own fix: whatever
+/// `wire::is_budget_notice` drops, this suite recognises — including a wording
+/// this client does not use today.
+///
+/// The first assertion is the control: today's exact spelling must still be
+/// recognised, so the second is not passing because the predicate became
+/// vacuous. The second is the finding — a reworded notice, same tags, different
+/// caption for the number — which `wire::canonicalize` drops (pinned directly
+/// against the canonicaliser in `wire::tests::a_reworded_budget_notice_is_still_dropped`)
+/// and which this suite's own copy of the recogniser used to miss.
+#[test]
+fn is_the_budget_notice_recognizes_any_wire_dropped_reword() {
+    let today = serde_json::json!({
+        "role": "system",
+        "content": "<total_tokens>15000000 tokens left</total_tokens>",
+    });
+    assert!(
+        is_the_budget_notice(&today),
+        "control: today's exact client spelling must still be recognised"
+    );
+
+    let reworded = serde_json::json!({
+        "role": "system",
+        "content": "<total_tokens>1 remaining</total_tokens>",
+    });
+    assert!(
+        is_the_budget_notice(&reworded),
+        "F5: `wire::is_budget_notice` drops this text as the ephemeral notice (open \
+         '<total_tokens>', close '</total_tokens>', no inner '<'), so this suite must call it \
+         the notice too — a second, narrower spelling here is a guard that disagrees with the \
+         rule it guards"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1672,6 +1614,126 @@ fn the_get_envs_diff_cannot_see_a_dropped_env_clear() {
     );
 }
 
+/// F18 (M11.2b review), now the guard on its own fix: the version probes are
+/// isolated like every other process this file spawns.
+///
+/// They were not. `claude_version`/`relay_version` each built their command
+/// inline — `Command::new(binary).arg("--version")`, no `env_clear()` — so the
+/// child saw *this test process's own* `HOME`, no `CLAUDE_CONFIG_DIR`, and no
+/// `DISABLE_AUTOUPDATER=1`. Inside this repository's own container that means
+/// the probe ran `claude` against the real config directory with
+/// `CLAUDE_CODE_REMOTE=true` still set — the exact ambient state the module doc
+/// says every process here is cleared of. The cost of leaving it was not a wrong
+/// version string; it was that the rule had an exception nobody could see from
+/// the rule.
+///
+/// Proven against a stub "binary" — a shell script that ignores `--version` and
+/// reports the three variables back — so this needs no refactor of the probe's
+/// signature, no real binary and no `--include-ignored`.
+///
+/// **The three variables above do not, on their own, pin `env_clear()`** (its
+/// own mutation-verifier, on this guard): `version_probe` sets all three with
+/// an explicit `.env()` call regardless of whether `env_clear()` ran, so
+/// deleting only `env_clear()` — the `.env()` overrides left in place — kept
+/// this test green while leaving every *other* ambient variable free to reach
+/// the child. The fourth assertion below is what only `env_clear()` can
+/// satisfy: it plants a canary in this test process's own environment,
+/// something `version_probe` is never told to isolate, and requires the stub
+/// not see it. That costs one `std::env::set_var`, so this test now needs
+/// `--test-threads=1` — already this module's documented invocation — for the
+/// one line it writes to the ambient environment, restored immediately after
+/// the probe returns.
+#[test]
+fn the_version_probe_isolates_the_child_it_spawns() {
+    // A variable `version_probe` is never told to isolate. If `env_clear()` is
+    // ever dropped (keeping the three `.env()` overrides below, exactly the
+    // mutation the M11.2b mutation-verifier applied), `Command` inherits this
+    // process's ambient environment by default and the stub echoes this straight
+    // back; if `env_clear()` runs, the child never sees it at all.
+    const AMBIENT_CANARY_VAR: &str = "ROUNDHOUSE_E2E_AMBIENT_CANARY";
+    const AMBIENT_CANARY_VALUE: &str = "leaked";
+
+    let dir = std::env::temp_dir().join(format!(
+        "f18-version-probe-stub-{}-{}",
+        std::process::id(),
+        now_ms()
+    ));
+    std::fs::create_dir_all(&dir).expect("a scratch dir for the stub binary");
+    let stub = dir.join("stub-version-probe.sh");
+    std::fs::write(
+        &stub,
+        "#!/bin/sh\n\
+         echo \"HOME=$HOME\"\n\
+         echo \"CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR:-__unset__}\"\n\
+         echo \"DISABLE_AUTOUPDATER=${DISABLE_AUTOUPDATER:-__unset__}\"\n\
+         echo \"ROUNDHOUSE_E2E_AMBIENT_CANARY=${ROUNDHOUSE_E2E_AMBIENT_CANARY:-__unset__}\"\n",
+    )
+    .expect("the stub script writes");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .expect("the stub script is made executable");
+    }
+
+    let ambient_home = std::env::var("HOME").expect(
+        "this test needs an ambient HOME to prove the stub inherits it — every environment this \
+         suite runs in, including this container, sets one",
+    );
+
+    // SAFETY: this test runs alone under `--test-threads=1` (this module's
+    // documented invocation, "How to run it" above, and in practice the only
+    // test this file's `the_version_probe` name filter matches), so no other
+    // thread observes this process's environment while the canary is set.
+    // set_var/remove_var are the only way to plant an ambient variable a
+    // spawned child could inherit if version_probe's env_clear() were ever
+    // dropped — the exact mutation this assertion exists to catch.
+    unsafe {
+        std::env::set_var(AMBIENT_CANARY_VAR, AMBIENT_CANARY_VALUE);
+    }
+    let output = claude_version(stub.to_str().expect("a scratch path that is valid UTF-8"));
+    // SAFETY: see above.
+    unsafe {
+        std::env::remove_var(AMBIENT_CANARY_VAR);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // `build_child_command`'s own rule (claude_e2e.rs's module doc, "Cleared
+    // and rebuilt from the generated map plus a named isolation set, not
+    // inherited"): an isolated HOME under the rig's root, an isolated
+    // CLAUDE_CONFIG_DIR, and DISABLE_AUTOUPDATER=1. None of the three should
+    // survive unset or ambient if claude_version followed that rule.
+    assert!(
+        !output.contains(&format!("HOME={ambient_home}")),
+        "F18: claude_version spawned the stub with this test process's own ambient HOME \
+         ({ambient_home}) rather than an isolated one — got:\n{output}"
+    );
+    assert_ne!(
+        output
+            .lines()
+            .find(|line| line.starts_with("CLAUDE_CONFIG_DIR=")),
+        Some("CLAUDE_CONFIG_DIR=__unset__"),
+        "F18: claude_version left CLAUDE_CONFIG_DIR unset rather than isolating it — got:\n\
+         {output}"
+    );
+    assert!(
+        output.contains("DISABLE_AUTOUPDATER=1"),
+        "F18: claude_version did not set DISABLE_AUTOUPDATER=1 on the child — got:\n{output}"
+    );
+    // The mutation-verifier's finding, made detectable: the three assertions
+    // above pass whether or not `env_clear()` ran, because `version_probe`'s
+    // explicit `.env()` calls set HOME/CLAUDE_CONFIG_DIR/DISABLE_AUTOUPDATER
+    // either way. A variable neither `version_probe` nor its isolation set ever
+    // names is the one thing only `env_clear()` can keep from the child.
+    assert!(
+        !output.contains(&format!("{AMBIENT_CANARY_VAR}={AMBIENT_CANARY_VALUE}")),
+        "F18: claude_version's child echoed back {AMBIENT_CANARY_VAR}, a variable this test set \
+         only in its own process and never passed to version_probe as isolation — that is only \
+         possible if version_probe's env_clear() was dropped, since Command inherits the ambient \
+         environment by default when it is not cleared. Got:\n{output}"
+    );
+}
+
 /// **R-D′ made structural: the chained launch is the Direct launch, wrapped.**
 ///
 /// The ruling is that one generator serves both topologies — Relay overwrites
@@ -1833,7 +1895,7 @@ fn a_rigs_root_cannot_be_claimed_twice() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs the real claude binary: --features e2e-claude -- --include-ignored; ROUNDHOUSE_TEST_CLAUDE_BIN overrides PATH"]
 async fn a_real_claude_binary_completes_a_prose_turn_through_roundhouse() {
-    let rig = Rig::start("prose", Arc::new(ScriptedTurns::prose())).await;
+    let rig = Rig::start("prose", prose_upstream()).await;
 
     let run = rig.print("Say the word alpha and stop.", &[]).await;
     run.assert_completed("the prose turn");
@@ -1852,7 +1914,7 @@ async fn a_real_claude_binary_completes_a_prose_turn_through_roundhouse() {
     // One request, admitted. A second would mean the client retried, which under
     // a scripted upstream that never fails means it did not like the first
     // answer — worth failing on rather than averaging over.
-    let turns = rig.recorder.turns();
+    let turns = rig.turns();
     assert_eq!(
         turns.len(),
         1,
@@ -1927,21 +1989,14 @@ async fn a_real_claude_binary_completes_a_prose_turn_through_roundhouse() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs the real claude binary: --features e2e-claude -- --include-ignored; ROUNDHOUSE_TEST_CLAUDE_BIN overrides PATH"]
 async fn a_tool_using_turn_is_run_by_the_real_client_and_its_result_rejoins_the_session() {
-    // The script names the file before the rig exists, because `Scripted` holds
-    // its arguments as `&'static str`. The rig writes the file itself, and the
-    // assertion below is what keeps the two from drifting apart.
+    // The script names the file before the rig exists: the scripted upstream has
+    // to know what it will ask the client to read, and the rig writes that file
+    // itself. The assertion below is what keeps the two from drifting apart.
     let root = Rig::a_root_for("tools");
-    let canary: &'static str = Box::leak(
-        root.join("wd")
-            .join(CANARY_FILE)
-            .to_string_lossy()
-            .into_owned()
-            .into_boxed_str(),
-    );
-    let upstream = Arc::new(ScriptedTurns::reading(canary));
-    let rig = Rig::start_at(root, upstream).await;
+    let canary = root.join("wd").join(CANARY_FILE);
+    let rig = Rig::start_at(root, reading_upstream(&canary), Wiring::Direct).await;
     assert_eq!(
-        rig.canary_path().to_string_lossy(),
+        rig.canary_path(),
         canary,
         "the script must name the file the rig actually wrote"
     );
@@ -1973,7 +2028,7 @@ async fn a_tool_using_turn_is_run_by_the_real_client_and_its_result_rejoins_the_
     // tool result. The counts are asserted together because they fail
     // differently — two requests and one dispatch would mean roundhouse refused
     // or short-circuited the resend.
-    let turns = rig.recorder.turns();
+    let turns = rig.turns();
     assert_eq!(
         turns.len(),
         2,
@@ -2016,7 +2071,8 @@ async fn a_tool_using_turn_is_run_by_the_real_client_and_its_result_rejoins_the_
     assert_eq!(call["id"], "toolu_e2e_01");
     assert_eq!(call["name"], "Read");
     assert_eq!(
-        call["input"]["file_path"], canary,
+        call["input"]["file_path"],
+        Value::from(canary.to_string_lossy().as_ref()),
         "the client must have been asked to read the file this rig wrote"
     );
     let result = blocks
@@ -2118,7 +2174,7 @@ async fn a_tool_using_turn_is_run_by_the_real_client_and_its_result_rejoins_the_
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs the real claude binary: --features e2e-claude -- --include-ignored; ROUNDHOUSE_TEST_CLAUDE_BIN overrides PATH"]
 async fn a_continued_run_extends_the_session_rather_than_forking_it() {
-    let rig = Rig::start("continue", Arc::new(ScriptedTurns::prose())).await;
+    let rig = Rig::start("continue", prose_upstream()).await;
 
     let first = rig.print("Say the word alpha and stop.", &[]).await;
     first.assert_completed("the first run");
@@ -2137,7 +2193,7 @@ async fn a_continued_run_extends_the_session_rather_than_forking_it() {
         "`--continue` must continue the conversation the first run started"
     );
 
-    let turns = rig.recorder.turns();
+    let turns = rig.turns();
     assert_eq!(
         turns.len(),
         3,
@@ -2216,7 +2272,7 @@ async fn a_continued_run_extends_the_session_rather_than_forking_it() {
         .iter()
         .enumerate()
         .filter_map(|(at, item)| match &item.content {
-            ItemContent::Text { text } if text.trim().starts_with(NOTICE_OPEN) => {
+            ItemContent::Text { text } if wire::is_budget_notice(text) => {
                 Some(format!("#{at} {:?} {:?}", item.role, text.trim()))
             }
             _ => None,
@@ -2261,11 +2317,11 @@ async fn a_continued_run_extends_the_session_rather_than_forking_it() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs the real claude binary: --features e2e-claude -- --include-ignored; ROUNDHOUSE_TEST_CLAUDE_BIN overrides PATH"]
 async fn the_seat_chain_a_launched_client_presents() {
-    let rig = Rig::start("seat", Arc::new(ScriptedTurns::prose())).await;
+    let rig = Rig::start("seat", prose_upstream()).await;
     let run = rig.print("Say the word alpha and stop.", &[]).await;
     run.assert_completed("the seat-evidence turn");
 
-    let turns = rig.recorder.turns();
+    let turns = rig.turns();
     let turn = turns.first().expect("the client sent a turn");
 
     println!("--- M11-SEAT-EVIDENCE");
@@ -2340,8 +2396,8 @@ async fn the_seat_chain_a_launched_client_presents() {
 /// chained deployment has to answer is which of them went upstream. R-D′ rules
 /// that the carrier is the client's own environment: Relay overwrites
 /// `ANTHROPIC_BASE_URL` and *merges* into `ANTHROPIC_CUSTOM_HEADERS`
-/// (`agents/claude/launch.rs:19-31`), forwards unknown request headers
-/// untouched (`gateway/response.rs:59-72`), and strips only its own credential
+/// (Relay evidence §A.7), forwards unknown request headers
+/// untouched (Relay evidence §2.3), and strips only its own credential
 /// — so the turn key arrives on [`TURN_KEY_HEADER`] exactly as it does Direct,
 /// and a chained turn is dedicated-header authed with the same semantics.
 ///
@@ -2352,7 +2408,7 @@ async fn the_seat_chain_a_launched_client_presents() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs the real claude and nemo-relay binaries: --features e2e-claude -- --include-ignored; ROUNDHOUSE_TEST_CLAUDE_BIN and ROUNDHOUSE_TEST_RELAY_BIN override PATH"]
 async fn a_chained_turn_reaches_roundhouse_with_the_turn_key_and_not_relays_own() {
-    let rig = Rig::start_chained("chained", Arc::new(ScriptedTurns::prose())).await;
+    let rig = Rig::start_chained("chained", prose_upstream()).await;
 
     let run = rig.print("Say the word alpha and stop.", &[]).await;
     run.assert_completed("the chained prose turn");
@@ -2370,7 +2426,7 @@ async fn a_chained_turn_reaches_roundhouse_with_the_turn_key_and_not_relays_own(
         run.stderr
     );
 
-    let turns = rig.recorder.turns();
+    let turns = rig.turns();
     assert_eq!(
         turns.len(),
         1,
@@ -2441,7 +2497,7 @@ async fn a_chained_turn_reaches_roundhouse_with_the_turn_key_and_not_relays_own(
         turn.query.as_deref(),
         Some("beta=true"),
         "the client's query string must survive Relay's base-URL concatenation \
-         (gateway/routes.rs:141-151); path was `{}`",
+         (Relay evidence §A.4); path was `{}`",
         turn.path
     );
 
@@ -2521,7 +2577,7 @@ async fn a_chained_turn_reaches_roundhouse_with_the_turn_key_and_not_relays_own(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs the real claude and nemo-relay binaries: --features e2e-claude -- --include-ignored; ROUNDHOUSE_TEST_CLAUDE_BIN and ROUNDHOUSE_TEST_RELAY_BIN override PATH"]
 async fn a_chained_continue_survives_relays_re_encode_without_forking() {
-    let rig = Rig::start_chained("chained-continue", Arc::new(ScriptedTurns::prose())).await;
+    let rig = Rig::start_chained("chained-continue", prose_upstream()).await;
 
     let first = rig.print("Say the word alpha and stop.", &[]).await;
     first.assert_completed("the first chained run");
@@ -2538,7 +2594,7 @@ async fn a_chained_continue_survives_relays_re_encode_without_forking() {
         "`--continue` must continue the conversation the first chained run started"
     );
 
-    let turns = rig.recorder.turns();
+    let turns = rig.turns();
     assert_eq!(
         turns.len(),
         2,
@@ -2607,7 +2663,14 @@ async fn a_chained_continue_survives_relays_re_encode_without_forking() {
 /// configured, and a *second* layer supplying the *same* base URL must not
 /// clear it either — isolating that it is specifically a base URL arriving
 /// from a **different** layer that trips `replace_upstream_base_url`, exactly
-/// as the module doc's citation of `configuration/mod.rs:1672-1681` predicts.
+/// as the module doc's citation of the Relay evidence's §A.5 predicts.
+///
+/// The probe spawns Relay with the ambient environment **cleared** (M11.2b
+/// review F7): Relay applies its `NEMO_RELAY_*` layer above the explicit
+/// `--config`, so an operator with `NEMO_RELAY_ANTHROPIC_BASE_URL` set would
+/// have watched the first control assertion here fail and read it as Relay
+/// drift. [`f7_an_ambient_base_url_env_var_cannot_trip_the_hazard_4_control`]
+/// is the guard on that.
 #[test]
 #[ignore = "needs the real nemo-relay binary: --features e2e-claude -- --include-ignored; ROUNDHOUSE_TEST_RELAY_BIN overrides PATH"]
 fn hazard_4_a_different_base_url_layer_clears_the_configured_auth_header() {
@@ -2632,21 +2695,16 @@ fn hazard_4_a_different_base_url_layer_clears_the_configured_auth_header() {
 
     // `--dry-run` prints `anthropic_auth = configured|unset` and exits without
     // spawning the agent — the report [`ClaudeAuthKind`]'s own doc points at.
+    // Through [`relay_dry_run`], which clears the ambient environment: hazard 4
+    // *is* a layering claim, and a probe that let the operator's own
+    // `NEMO_RELAY_*` variables layer in would be one more layer than the
+    // experiment has (M11.2b review F7).
     let dry_run = |second_layer_base_url: Option<&str>| -> String {
-        let mut command = std::process::Command::new(&relay);
-        command.args(["run", "--agent", "claude", "--config"]);
-        command.arg(&config);
-        if let Some(url) = second_layer_base_url {
-            command.args(["--anthropic-base-url", url]);
-        }
-        command.args(["--dry-run", "--", "-p", "probe"]);
-        let output = command.output().unwrap_or_else(|error| {
-            panic!(
-                "could not run `{relay}`: {error}. Set {RELAY_BIN_VAR} to a real Relay binary, \
-                 or drop --include-ignored."
-            )
-        });
-        String::from_utf8_lossy(&output.stdout).into_owned()
+        let extra: Vec<&str> = match second_layer_base_url {
+            Some(url) => vec!["--anthropic-base-url", url],
+            None => Vec::new(),
+        };
+        relay_dry_run(&relay, &root, &config, &extra)
     };
 
     assert!(
@@ -2668,4 +2726,645 @@ fn hazard_4_a_different_base_url_layer_clears_the_configured_auth_header() {
     );
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// **F7 (M11.2b review), now the guard on its own fix: an ambient
+/// `NEMO_RELAY_ANTHROPIC_BASE_URL` cannot reach the hazard-4 probe.**
+///
+/// F7 was that
+/// [`hazard_4_a_different_base_url_layer_clears_the_configured_auth_header`]
+/// built its `--dry-run` child with `std::process::Command::new` and no
+/// `env_clear()`, so Relay's environment layer applied on top of the `--config`
+/// file even for the `dry_run(None)` *control* — and an operator with
+/// `NEMO_RELAY_ANTHROPIC_BASE_URL` set to anything other than the config's
+/// `127.0.0.1:9999` would watch that control fail and diagnose it as Relay
+/// drift rather than as the probe leaking its own environment. Reproduced
+/// exactly that way before the fix: the control panicked with "the header alone
+/// in config.toml must resolve as configured".
+///
+/// The guard is the same reproduction, read the other way round. Run the *real*
+/// hazard-4 function — a `#[test] fn` is still an ordinary callable fn — with
+/// the variable set in this process's environment, and require that it now
+/// completes. `relay_dry_run`'s `env_clear()` is what makes it complete, so
+/// removing that call turns this red on the same assertion the finding named.
+#[test]
+#[ignore = "needs the real nemo-relay binary: --features e2e-claude -- --include-ignored; ROUNDHOUSE_TEST_RELAY_BIN overrides PATH"]
+fn f7_an_ambient_base_url_env_var_cannot_trip_the_hazard_4_control() {
+    // Confirm the prerequisite up front so a missing binary fails with the
+    // same clear message hazard-4 itself would give, rather than surfacing
+    // only inside the caught panic below.
+    let relay = std::env::var(RELAY_BIN_VAR).unwrap_or_else(|_| {
+        panic!(
+            "this guard needs a real Relay binary: set {RELAY_BIN_VAR}, or run without \
+             --include-ignored"
+        )
+    });
+    println!("    relay version : {}", relay_version(&relay));
+
+    // Capture the panic message by formatted text, not by downcasting the
+    // payload: assert!'s panic payload type is a std internal that does not
+    // reliably downcast to `&str`/`String` across panic-machinery versions,
+    // but every panic hook is handed the fully formatted message regardless.
+    let captured: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let captured_in_hook = captured.clone();
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        *captured_in_hook.lock().unwrap() = Some(info.to_string());
+    }));
+
+    // SAFETY: this test runs with --test-threads=1 (required for the whole
+    // hazard-4/F7 pair, which share ambient process environment and, for
+    // this scope, the global panic hook), so no other thread observes
+    // either. set_var/remove_var are the only way to simulate an operator's
+    // ambient environment reaching a child spawned via `Command::new`.
+    unsafe {
+        std::env::set_var("NEMO_RELAY_ANTHROPIC_BASE_URL", "http://127.0.0.1:7777");
+    }
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        hazard_4_a_different_base_url_layer_clears_the_configured_auth_header()
+    }));
+    // SAFETY: see above.
+    unsafe {
+        std::env::remove_var("NEMO_RELAY_ANTHROPIC_BASE_URL");
+    }
+    std::panic::set_hook(previous_hook);
+
+    let message = captured.lock().unwrap().take().unwrap_or_default();
+    assert!(
+        outcome.is_ok(),
+        "F7: hazard-4 must be immune to an ambient NEMO_RELAY_ANTHROPIC_BASE_URL — its probe \
+         clears the environment before spawning Relay, so no operator variable can layer above \
+         the --config file it is experimenting on. It panicked instead:\n{message}"
+    );
+}
+
+/// **F8 (M11.2b review): Relay's system config layer at
+/// `/etc/nemo-relay/config.toml` outranks the rig's explicit `--config` and
+/// re-aims the resolved `anthropic_base_url` — pinned here, mitigated in
+/// [`Rig::wire_relay`].**
+///
+/// This is the one finding in the round with no in-tree fix. The switch that
+/// would exclude the system layer, `skip_implicit_config`, is behind a test-only
+/// cargo feature and is absent from the published binary, so a chained rig
+/// cannot make its explicit file authoritative — it can only *check* what Relay
+/// resolved before it hands a real client this deployment's turn key, which is
+/// what `Rig::wire_relay`'s preflight does. This test is the evidence that
+/// check is not paranoia, so it asserts the upstream behaviour as it is rather
+/// than the behaviour the rig wishes for: it goes red the day Relay changes its
+/// precedence, which is exactly when the preflight and the chained runbook want
+/// re-reading.
+///
+/// F8 claims the Relay evidence's §2.4 `config_paths` appends the
+/// system file *after* the explicit one and `merge_toml`'s later-wins
+/// semantics let a system file clobber an explicit config's leaf values, so
+/// an operator box with a system Relay install could re-aim a chained turn
+/// at a foreign upstream with nothing in the rig noticing. `--dry-run`
+/// prints the resolved config without spawning the agent (the same
+/// mechanism hazard-4 above already exploits), so this needs only Relay and
+/// root's ability to write the real system config path — no `claude`
+/// binary, no roundhouse process.
+///
+/// Two controls bracket the one case that matters: absent a system file, the
+/// explicit config's `anthropic_base_url` must resolve unmolested (control
+/// A); with a system file present but naming the *same* base URL, it must
+/// still resolve unmolested (control B, isolating that any failure below is
+/// about a *differing* system value winning, not an artifact of the system
+/// file's mere presence). Only then does the case assertion — a system file
+/// naming a *different* base URL wins over the explicit one — mean what it
+/// means. A `Drop` guard removes `/etc/nemo-relay` again regardless
+/// of outcome, and the test refuses to run at all if that path already holds
+/// a real operator config, so it can never clobber an actual system install.
+#[test]
+#[ignore = "F8: confirmed and unfixable in-tree — the system config layer wins over the rig's \
+            explicit --config, and the switch that would disable it is behind a test-only cargo \
+            feature absent from the published binary; the rig verifies instead (Rig::wire_relay's \
+            preflight). Kept as the evidence for that ruling; \
+            needs the real nemo-relay binary and root: --features e2e-claude -- --include-ignored; \
+            writes and then removes the real /etc/nemo-relay/config.toml — refuses to run if that \
+            path already exists"]
+fn f8_system_config_layer_outranks_the_chained_rigs_explicit_config() {
+    let relay = std::env::var(RELAY_BIN_VAR).unwrap_or_else(|_| {
+        panic!(
+            "this guard needs a real Relay binary: set {RELAY_BIN_VAR}, or run without \
+             --include-ignored"
+        )
+    });
+    println!("    relay version : {}", relay_version(&relay));
+
+    let root = std::env::temp_dir().join(format!("roundhouse-f8-{}", uuid::Uuid::new_v4()));
+    assert!(claim_root(&root), "the probe's scratch root must be fresh");
+    let config = root.join("config.toml");
+    std::fs::write(
+        &config,
+        "[upstream]\nanthropic_base_url = \"http://127.0.0.1:9999\"\n",
+    )
+    .expect("the probe's explicit config.toml");
+
+    let dry_run = || -> String { relay_dry_run(&relay, &root, &config, &[]) };
+
+    // `system_config_dir()` is hardcoded to `/etc/nemo-relay` on non-Windows
+    // (Relay evidence §2.4) — not overridable by any
+    // env var — so proving this claim means writing the real path. Guard it:
+    // refuse to touch a box that already has one, and remove it again on
+    // scope exit whether the test panics or not.
+    struct SystemConfigGuard {
+        dir: PathBuf,
+    }
+    impl Drop for SystemConfigGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+    let system_dir = PathBuf::from("/etc/nemo-relay");
+    assert!(
+        !system_dir.exists(),
+        "this box already has a real /etc/nemo-relay — refusing to overwrite an operator's \
+         actual system config; run this guard on a clean box only"
+    );
+    let _guard = SystemConfigGuard {
+        dir: system_dir.clone(),
+    };
+
+    assert!(
+        dry_run().contains("anthropic_base_url = http://127.0.0.1:9999"),
+        "control A: with no system file at all, the explicit config's base URL must resolve \
+         unmolested"
+    );
+
+    std::fs::create_dir_all(&system_dir).expect("the probe's system config directory");
+    std::fs::write(
+        system_dir.join("config.toml"),
+        "[upstream]\nanthropic_base_url = \"http://127.0.0.1:9999\"\n",
+    )
+    .expect("the probe's same-value system config.toml");
+    assert!(
+        dry_run().contains("anthropic_base_url = http://127.0.0.1:9999"),
+        "control B: a system file naming the *same* base URL must not read as a foreign \
+         upstream — otherwise this guard would prove nothing about which value won"
+    );
+
+    std::fs::write(
+        system_dir.join("config.toml"),
+        "[upstream]\nanthropic_base_url = \"http://127.0.0.1:8888\"\n",
+    )
+    .expect("the probe's differing-value system config.toml");
+    let resolved = dry_run();
+    assert!(
+        resolved.contains("anthropic_base_url = http://127.0.0.1:8888"),
+        "F8: a system config.toml naming a different anthropic_base_url is supposed to win over \
+         the rig's explicit --config — that is the upstream fact `Rig::wire_relay`'s preflight \
+         exists for, and if it has stopped being true, the preflight can be reconsidered and \
+         `claude_launch`'s chained runbook needs a matching addendum. Resolved:\n{resolved}"
+    );
+    assert!(
+        !resolved.contains(&format!("anthropic_base_url = {}", "http://127.0.0.1:9999")),
+        "F8: and the explicit value must be the one that lost — otherwise the two layers agree \
+         and this probe proves nothing about precedence. Resolved:\n{resolved}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// **F1 (M11.2b review), now the guard on its own fix: the shared redactor
+/// treats `x-api-key` as credential-bearing.**
+///
+/// The finding was structural and it was real: this suite's recorder was a
+/// line-for-line copy of the codex sibling's, and the copies had already
+/// diverged — codex's redactor had learned about `chatgpt-account-id`, this
+/// one's had never learned about `x-api-key`. One redactor in
+/// [`common::e2e`](../common/e2e.rs) is the fix; this asserts it from this side
+/// of the copy that used to exist.
+///
+/// **What the finding got wrong, kept here because the correction matters more
+/// than the fix.** It read the gap as a live credential leak — "under
+/// `ForwardedClaudeLogin` chained through Relay, a caller's real Anthropic key"
+/// — and no path in this file can produce that.
+/// [`forwarded_claude_login_never_writes_the_api_key_env`] below shows why: the
+/// only arm that writes `x-api-key` at all writes the public sentinel, and the
+/// arm that could carry a real credential writes no API key whatsoever and
+/// would present its bearer on `authorization`, which was redacted all along.
+/// So this arm is defence in depth for a future auth kind, not a leak that was
+/// open. Recording that distinction is what stops the next reader from
+/// concluding a key was exposed.
+#[test]
+fn redacted_headers_redacts_an_api_key() {
+    let real_looking_key = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let exchange = Exchange {
+        method: "POST".to_string(),
+        path: "/v1/messages".to_string(),
+        query: None,
+        headers: BTreeMap::from([("x-api-key".to_string(), real_looking_key.to_string())]),
+        body: None,
+        status: 200,
+        response: None,
+        response_text: None,
+    };
+
+    let redacted = exchange.redacted_headers();
+
+    assert_ne!(
+        redacted.get("x-api-key").map(String::as_str),
+        Some(real_looking_key),
+        "F1: `x-api-key` must be redacted the way `authorization` and the turn-key header are — \
+         a printed evidence block is the shape a fixture holding something real would copy"
+    );
+    assert_eq!(
+        redacted.get("x-api-key").map(String::as_str),
+        Some(format!("<{} bytes redacted>", real_looking_key.len()).as_str()),
+        "and redacted to its length, so the diagnostic a printed header set exists for — the \
+         header arrived, and was this big — survives"
+    );
+}
+
+/// **F1 refute, live control: `ForwardedClaudeLogin` never generates
+/// `API_KEY_ENV`, so it never puts anything on `x-api-key` in the first
+/// place.**
+///
+/// Where [`f1_citation_marker`] cites `claude_launch.rs`'s doc comment, this
+/// exercises the actual generator both ways with no binary and no socket —
+/// the same seam [`the_childs_environment_is_the_generated_map_plus_the_isolation_vars`]
+/// reads. `ClaudeAuthKind::RoundhouseKey` (the default, and the only arm this
+/// file's `Rig` drives) is the one that writes [`API_KEY_ENV`], and only ever
+/// with [`ROUNDHOUSE_API_KEY_SENTINEL`]; `.forwarding_claude_login()` omits
+/// the variable entirely. A client launched that way sends no `x-api-key` at
+/// all — whatever real credential it does present rides its OAuth login
+/// instead, straight to `authorization`, which `redacted_headers` already
+/// redacts. This is the fact that makes F1's "a caller's real Anthropic key"
+/// on `x-api-key`" reading of the mechanism unreachable, independent of the
+/// real structural gap above.
+#[test]
+fn forwarded_claude_login_never_writes_the_api_key_env() {
+    let turn_key = "rh_turn_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+    let roundhouse_key_env = ClaudeLaunch::new("http://127.0.0.1:9", turn_key)
+        .expect("the documented-correct shape constructs")
+        .env()
+        .expect("RoundhouseKey renders");
+    assert_eq!(
+        roundhouse_key_env.get(API_KEY_ENV).as_deref(),
+        Some(ROUNDHOUSE_API_KEY_SENTINEL),
+        "control: the default (RoundhouseKey) arm is the one this file's Rig actually drives, \
+         and it must write only the sentinel — never a real key — onto API_KEY_ENV"
+    );
+
+    let forwarded_login_env = ClaudeLaunch::new("http://127.0.0.1:9", turn_key)
+        .expect("the documented-correct shape constructs")
+        .forwarding_claude_login()
+        .env()
+        .expect("ForwardedClaudeLogin renders");
+    assert_eq!(
+        forwarded_login_env.get(API_KEY_ENV),
+        None,
+        "F1's mechanism claims a real Anthropic key reaches `x-api-key` under \
+         ForwardedClaudeLogin; it cannot, because that arm never writes API_KEY_ENV \
+         (claude_launch.rs's `if self.auth == ClaudeAuthKind::RoundhouseKey` gate) — a client \
+         launched this way sends no x-api-key at all, and its real credential (if any) rides \
+         `authorization` instead, which this file's redacted_headers already redacts"
+    );
+}
+
+/// **F2 (M11.2b review), now the guard on its own fix: the two topologies
+/// differ at one site.**
+///
+/// The finding counted four — a `deadline` method and a `label` method,
+/// each its own `match self`, plus `build_child_command`'s `match topology` for
+/// program and argv and a `matches!(topology, ..)` two dozen lines later for
+/// Relay's XDG state. Purely structural: nothing behaved wrongly, which is why
+/// it survived a milestone. What it cost is that a fifth site could be added, or
+/// one of four updated alone, and no assertion anywhere would notice.
+///
+/// A structural claim gets a structural test, read from this file's own source,
+/// counted the way the finding counted it. One site is [`Topology::plan`],
+/// which answers program, argv, environment, deadline and label together.
+#[test]
+fn topology_is_dispatched_on_at_one_site() {
+    let source = include_str!("claude_e2e.rs");
+
+    let impl_topology_body = {
+        let start = source
+            .find("impl Topology {")
+            .expect("impl Topology exists");
+        let after = &source[start..];
+        let end = after
+            .find("\n\n/// A live roundhouse")
+            .expect("Rig's doc comment follows impl Topology");
+        &after[..end]
+    };
+    let impl_sites = impl_topology_body.matches("match self").count();
+
+    let build_child_command_body = {
+        let start = source
+            .find("fn build_child_command(")
+            .expect("build_child_command exists");
+        let after = &source[start..];
+        let end = after
+            .find("\n/// The XDG variables")
+            .expect("the XDG-variables doc comment follows build_child_command");
+        &after[..end]
+    };
+    let bcc_sites = build_child_command_body.matches("match topology").count()
+        + build_child_command_body
+            .matches("matches!(topology")
+            .count();
+
+    let total_sites = impl_sites + bcc_sites;
+    assert_eq!(
+        total_sites, 1,
+        "F2: Topology must be branched at exactly one site — `Topology::plan`, which answers \
+         program, argv, environment, deadline and label together. Found {total_sites} \
+         (`impl Topology`: {impl_sites} `match self`; build_child_command: {bcc_sites})"
+    );
+}
+
+/// **F2, second half: a chained [`Rig`] is constructed chained.**
+///
+/// `start_chained` used to build a Direct rig via `start_at` — which stamped
+/// `topology: Topology::Direct` — and overwrite `rig.topology` afterwards.
+/// Nothing read the field in between, so there was no behavioural difference a
+/// black-box test could observe; the defect is that the type stopped being the
+/// answer to "what topology is this", which is the property the enum exists to
+/// carry. Read from source for that reason, rather than by standing up a rig to
+/// fail to observe it.
+///
+/// The construction-order problem that forced the mutation is real and is
+/// handled rather than removed: Relay's config names the deployment's own base
+/// URL, so the caller states a [`Wiring`] and `start_at` resolves it once both
+/// halves exist.
+#[test]
+fn a_chained_rigs_topology_is_not_a_post_construction_mutation() {
+    let source = include_str!("claude_e2e.rs");
+
+    let start_chained_body = {
+        let start = source
+            .find("async fn start_chained(")
+            .expect("start_chained exists");
+        let after = &source[start..];
+        let end = after
+            .find("\n    /// Where a run of `label` puts its home")
+            .expect("a_root_for's doc comment follows start_chained");
+        &after[..end]
+    };
+
+    assert!(
+        !start_chained_body.contains(".topology ="),
+        "F2: a chained rig must be constructed chained. Assigning `rig.topology` after \
+         `start_at` returns leaves a window in which the value is a Direct rig wearing a chained \
+         label, and puts the answer to \"what topology is this\" outside the type"
+    );
+}
+
+/// **F4 (M11.2b review), now the guard on its own fix: the command the harness
+/// spawns kills its child on drop.**
+///
+/// tokio's default is `false`, and nothing in `build_child_command` used to
+/// change it — so the one scenario `CHILD_DEADLINE`/`CHAINED_DEADLINE` exist
+/// for, a hung client, was exactly the one that leaked `claude`, and under
+/// Chained `nemo-relay` and the temporary plugin directory it removes only on
+/// its way out.
+///
+/// This is the no-binary half: construct the command the real harness spawns and
+/// read `get_kill_on_drop()` back off it. The graceful half — interrupt first so
+/// Relay tears down the client it owns, kill only what ignores that — is
+/// [`Rig::spawn`]'s watchdog, which needs two real binaries and a hung upstream
+/// to exercise and is documented there rather than sampled here.
+#[test]
+fn build_child_command_kills_on_drop() {
+    let turn_key = "rh_turn_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let env = ClaudeLaunch::new("http://127.0.0.1:9", turn_key)
+        .expect("the documented-correct shape constructs")
+        .env()
+        .expect("RoundhouseKey renders");
+    for topology in [
+        Topology::Direct,
+        Topology::Chained {
+            relay: "nemo-relay".into(),
+            config: PathBuf::from("/does/not/need/to/exist/relay-config.toml"),
+        },
+    ] {
+        let command = build_child_command(
+            "claude",
+            &topology,
+            &env,
+            Path::new("/tmp/f4-guard-root"),
+            "irrelevant prompt",
+            &[],
+            false,
+        );
+
+        assert!(
+            command.get_kill_on_drop(),
+            "F4: `{}` has kill_on_drop == false (tokio's default), so any path out of \
+             Rig::spawn that drops the Child — the deadline above all — leaves the child \
+             running: claude on Direct, and on Chained nemo-relay plus its temp plugin dir",
+            topology
+                .plan("claude", Path::new("/tmp/f4-guard-root"))
+                .label
+        );
+    }
+}
+
+/// **F4, second half: the deadline's shutdown really does end the child, even
+/// one that ignores the interrupt.**
+///
+/// [`build_child_command_kills_on_drop`] pins the backstop; this pins the path
+/// that runs first. It drives [`interrupt_then_kill`] — the function
+/// [`Rig::spawn`]'s watchdog calls — against a child that *traps* `SIGINT` and
+/// then sleeps, so a harness that only interrupted would hang here and one that
+/// only killed would never have given Relay the chance to remove its plugin
+/// directory. The child is a stub script rather than a real client for the same
+/// reason the version-probe guard uses one: what is under test is this file's
+/// shutdown, not either binary's response to a signal.
+///
+/// Reaped before the assertion, deliberately: an unreaped child is a zombie, and
+/// a zombie answers `kill -0` exactly as a live process does — so "is it gone"
+/// asked that way would pass whether or not anything worked. The exit status is
+/// the unambiguous form of the question.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_expired_deadline_ends_a_child_that_ignores_the_interrupt() {
+    let root = std::env::temp_dir().join(format!("f4-deadline-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(root.join("wd")).expect("the stub run's working directory");
+    let stub = root.join("ignores-sigint.sh");
+    std::fs::write(&stub, "#!/bin/sh\ntrap '' INT\nsleep 300\n").expect("the stub script writes");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .expect("the stub script is made executable");
+    }
+
+    let env = ClaudeLaunch::new(
+        "http://127.0.0.1:9",
+        "rh_turn_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    )
+    .expect("the documented-correct shape constructs")
+    .env()
+    .expect("RoundhouseKey renders");
+    let mut command = build_child_command(
+        stub.to_str().expect("a scratch path that is valid UTF-8"),
+        &Topology::Direct,
+        &env,
+        &root,
+        "irrelevant prompt",
+        &[],
+        false,
+    );
+    let mut child = command.spawn().expect("the stub script spawns");
+    let pid = child.id().expect("a freshly spawned child has a pid");
+
+    interrupt_then_kill(pid).await;
+    let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+        .await
+        .expect("the killed child must be reapable rather than still running")
+        .expect("waiting on a spawned child succeeds");
+
+    assert!(
+        !status.success(),
+        "F4: a child that ignores SIGINT must not be left to exit on its own terms; got {status}"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            status.signal(),
+            Some(9),
+            "F4: the grace period must end in SIGKILL for a child that ignored the interrupt — \
+             otherwise a hung client outlives the deadline that exists to stop it"
+        );
+    }
+
+    clean(&root);
+}
+
+/// **F10 (M11.2b review), now the guard on its own fix: the module doc names
+/// kinds of test, and cites Relay by section rather than by line.**
+///
+/// Two halves of one habit. The doc opened "Seven real-binary tests" and listed
+/// them — a count that was already eight by the time the finding was written,
+/// because a later review round added one and nothing made the prose follow.
+/// And Relay source citations were copied into this file by file and line, in
+/// two Rust files, where nobody re-derives them when the pin moves — which is
+/// precisely what CLAUDE.md's synergy-vigilance rule exists to stop.
+///
+/// Both are cheap to reintroduce and invisible when wrong, so both are guarded
+/// textually here rather than left to review.
+#[test]
+fn the_module_doc_does_not_enumerate_a_count_of_real_binary_tests() {
+    let source = include_str!("claude_e2e.rs");
+    let doc: Vec<&str> = source
+        .lines()
+        .filter(|line| line.starts_with("//!"))
+        .collect();
+
+    // Assembled at run time: a literal "N real-binary tests" spelled here would
+    // be found by the scan below in this very assertion.
+    let subject = format!("{}-binary tests", "real");
+    for count in [
+        "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten",
+    ] {
+        let claim = format!("{count} {subject}");
+        assert!(
+            !doc.iter().any(|line| line.contains(claim.as_str())),
+            "F10: the module doc counts the real-binary tests again (\"{claim}\"). \
+             `#[ignore]` already says which tests need a binary; a second spelling in prose is \
+             one that goes stale the next time a review round adds one — and did"
+        );
+    }
+
+    // Relay's source belongs in the evidence document, cited by section. A
+    // `file.rs:1070-1078` here is a claim about a pinned tree with no path back
+    // to the tree it was read from.
+    let relay_files = [
+        "gateway/mod.rs",
+        "gateway/routes.rs",
+        "gateway/response.rs",
+        "configuration/mod.rs",
+        "codec/streaming.rs",
+        "agents/claude/launch.rs",
+        "agents/claude/mod.rs",
+        "server/mod.rs",
+        "plugin.rs",
+    ];
+    let offenders: Vec<&str> = source
+        .lines()
+        .filter(|line| line.trim_start().starts_with("//"))
+        .filter(|line| {
+            relay_files
+                .iter()
+                .any(|file| line.contains(&format!("{file}:")))
+        })
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "F10: Relay source is cited by file and line in this file; cite the evidence document's \
+         section instead (see the module doc's \"Where Relay evidence §x points\"):\n{}",
+        offenders.join("\n")
+    );
+}
+
+/// **F14 (M11.2b review): the constructed-command guard cannot see a leaked
+/// `CLAUDE_CODE_REMOTE`, and this is where that limit is pinned against the real
+/// function.**
+///
+/// [`the_get_envs_diff_cannot_see_a_dropped_env_clear`] proves the same thing
+/// about `std::process::Command` in the abstract, with no dependency on this
+/// crate at all. This one re-derives it against
+/// [`build_child_command`]'s own construction steps, because that is the
+/// function two documents were describing when they credited the no-binary
+/// guard with going red on one leaked `CLAUDE_CODE_REMOTE`. It does not:
+/// `Command::get_envs()` reports only the explicit `env()`/`env_remove()` diff,
+/// and an ambient variable that was never named in an `env()` call is not in
+/// that diff whether or not `env_clear()` ran.
+///
+/// The one line deliberately absent below is `command.env_clear()` — the
+/// mutation the documents claimed their guard would catch. Its absence changes
+/// nothing about what `get_envs()` reports, which is the whole point: only
+/// [`the_seat_chain_a_launched_client_presents`], reading the real wire, can
+/// catch that mutation. Kept live so a future reader who reaches for the
+/// no-binary guard as the leak check finds this instead of rediscovering it.
+///
+/// The two documents' sentences are corrected in the docs half of this review
+/// round; what lives here is the fact they were wrong about.
+#[test]
+fn the_constructed_command_guard_cannot_see_a_leaked_claude_code_remote() {
+    let turn_key = "rh_turn_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let env = ClaudeLaunch::new("http://127.0.0.1:9", turn_key)
+        .expect("the documented-correct shape constructs")
+        .env()
+        .expect("the documented-correct shape renders");
+    let root = PathBuf::from("/does/not/need/to/exist");
+
+    // The exact steps build_child_command's Direct arm performs, minus
+    // `command.env_clear()` — the mutation both documents claim their guard
+    // would catch.
+    let mut command = std::process::Command::new("claude");
+    command.args(claude_argv("prompt", &[], false));
+    command.current_dir(root.join("wd"));
+    // No env_clear() here — the mutation this test exists to name.
+    for (name, value) in env.vars() {
+        command.env(name, value);
+    }
+    command.env("PATH", std::env::var("PATH").unwrap_or_default());
+    command.env("HOME", root.join("home"));
+    command.env("CLAUDE_CONFIG_DIR", root.join("home/.claude"));
+    command.env("DISABLE_AUTOUPDATER", "1");
+    command.env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
+
+    let envs: BTreeMap<String, Option<String>> = command
+        .get_envs()
+        .map(|(key, value)| {
+            (
+                key.to_string_lossy().into_owned(),
+                value.map(|value| value.to_string_lossy().into_owned()),
+            )
+        })
+        .collect();
+
+    assert!(
+        !envs.contains_key("CLAUDE_CODE_REMOTE"),
+        "F14: if this ever passes, `Command::get_envs()` has started reporting more than the \
+         explicit env()/env_remove() diff — at which point the no-binary guard really would \
+         catch a dropped env_clear(), and both this test and build_child_command's doc comment \
+         should be rewritten rather than deleted"
+    );
 }

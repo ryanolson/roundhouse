@@ -508,10 +508,14 @@ addition beyond the brief, accepted: the three cloud-provider selectors are
 refused under **both** kinds (`RedirectDefeated`), because `I7()` picks the
 provider before any credential resolves and a non-first-party provider never
 reads `ANTHROPIC_BASE_URL` — the sentinel would do its job and the client
-would still never arrive. Two documented, unreconciled limits: interactive
-mode prompts once before the key overrides a login; `CLAUDE_CODE_REMOTE=true`
-defeats the suppression outright (§5.7 — this box's own container presented
-its managed OAuth token until the environment was fully cleared). MCP wiring
+would still never arrive. `CLAUDE_CODE_REMOTE=true` is the one input that
+defeats the RoundhouseKey sentinel specifically (§5.7 — this box's own
+container presented its managed OAuth token until the environment was fully
+cleared); the review round (F3) made it a suppressor-table row that
+RoundhouseKey refuses and ForwardedClaudeLogin admits, so the table carries
+which kind each row defeats — eight rows, seven owed by the forwarded login
+and four by the roundhouse key. One documented, unreconciled limit remains:
+interactive mode prompts once before the key overrides a login. MCP wiring
 for Claude Code is deferred with open question 3.
 
 **R-C — the `e2e-claude` suite, the codex_e2e discipline verbatim.**
@@ -519,16 +523,17 @@ for Claude Code is deferred with open question 3.
 `ROUNDHOUSE_TEST_CLAUDE_BIN`, `--test-threads=1`, `VERIFIED_VERSION =
 "2.1.257"` printed with a mismatch warning, a missing binary a loud failure,
 `Command::env_clear()` then exactly the generated map plus the isolation set
-(a no-binary guard asserts key-set equality and goes red on one leaked
-`CLAUDE_CODE_REMOTE`). Real: the binary, the socket, the router over a
-production `ControlDirectory` with a minted key, the log, the prefix check,
-the tool the client chose to run. Scripted: the frontier. Against 2.1.257 it
-closes four claims only prose carried: a real client completes a prose turn
-through roundhouse; **a real agent executes a `tool_use` turn and its
-`tool_result` resend rejoins the same session** (M11.2a's loop, first
-real-binary evidence); three `-p`/`--continue` processes are one session
-with the notice never an item; and the seat-chain evidence block —
-`x-roundhouse-key` beside the inert sentinel on `x-api-key`, no
+(a no-binary guard asserts key-set equality on the constructed command —
+it cannot see an ambient leak or a dropped `env_clear()`, which only the
+real-wire seat test catches, as the refute round proved). Real: the binary,
+the socket, the router over a production `ControlDirectory` with a minted key,
+the log, the prefix check, the tool the client chose to run. Scripted: the
+frontier. Against 2.1.257 it closes four claims only prose carried: a real
+client completes a prose turn through roundhouse; **a real agent executes a
+`tool_use` turn and its `tool_result` resend rejoins the same session**
+(M11.2a's loop, first real-binary evidence); three `-p`/`--continue` processes
+are one session with the notice never an item; and the seat-chain evidence
+block — `x-roundhouse-key` beside the inert sentinel on `x-api-key`, no
 `authorization`. The forwarded-login half remains the one-capture §1.3
 predicts (a bearer beside the turn key); no login exists here and none may
 be created for a rig.
