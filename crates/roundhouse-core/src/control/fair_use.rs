@@ -37,12 +37,20 @@
 //! # Where the buckets live
 //!
 //! Two backing stores, and the composition root picks between them by exactly
-//! the rule it picks a session store and a spend ledger by: with
-//! `ROUNDHOUSE_REDIS_URL` set *and* some membership configuring a `fair_use`
-//! block, `RedisFairUseLedger` in `roundhouse-store-redis` counts into buckets
-//! every node of the deployment shares; with either absent,
-//! [`MemoryFairUseLedger`] counts into this process's own memory and the boot
-//! warning that says so stays.
+//! the rule it picks a session store and a spend ledger by, and by nothing
+//! else: with `ROUNDHOUSE_REDIS_URL` set, `RedisFairUseLedger` in
+//! `roundhouse-store-redis` counts into buckets every node of the deployment
+//! shares; without it, [`MemoryFairUseLedger`] counts into this process's own
+//! memory and warns the first time it enforces a ceiling.
+//!
+//! **Whether a ceiling is configured is deliberately not part of that
+//! choice.** It was, until M13's thermo-nuclear review: the boot site read it
+//! once from a plane the admin API `PATCH`es at runtime, so a deployment that
+//! started with a Redis and no `fair_use` block anywhere counted every
+//! later-added ceiling in one node's memory for the rest of the process's
+//! life, with nothing in Redis and no warning owed. The ledger follows the
+//! deployment's shape, which does not change; the caution follows the ceiling,
+//! which does.
 //!
 //! **The key layout was the one question the M10.1 deferral left open, and it
 //! is answered in that crate rather than here** (M13): one hash per (scope,
@@ -58,7 +66,17 @@
 //! narrowest-first check, the retry walk — is the specification, and a backend
 //! that cannot reproduce it is wrong rather than different.
 //!
-//! What is still true of the memory ledger, and is what the warning is about:
+//! **And the arithmetic is integer, in one bounded domain both backends
+//! share** — see [`MAX_COUNT`] and [`DrawCounts`]. Money was never defensibly
+//! an `f64` here: a ceiling accumulated by float addition disagrees with an
+//! exact one at ordinary decimal boundaries (`0.70 + 0.10 < 0.80`), so the two
+//! backends admitted and refused different turns at the same cap while both
+//! passed the contract. The `f64` the trait speaks is now converted to
+//! micro-dollars exactly once, by [`DrawCounts::of`], which both ledgers call;
+//! caps convert through [`cap_micros`] and [`cap_tokens`]; and every sum, cap
+//! comparison and retry walk on either side is done on those integers.
+//!
+//! What is still true of the memory ledger, and is what its warning is about:
 //! its counters live in one process, so two nodes enforce two independent
 //! ceilings and every counter resets on restart. That is honest for a
 //! single-node deployment and not for any other, which is why the deployment
@@ -69,6 +87,7 @@
 pub mod contract;
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -93,6 +112,121 @@ use crate::control::{Principal, ProjectId, UserId};
 /// to be approximately like a frontier lab's. Erring early rather than late is
 /// the deliberate half: a cap that leaks is a cap nobody trusts.
 pub const BUCKET_MS: u64 = 5 * 60_000;
+
+/// The ceiling both counters saturate at, and the whole of the shared integer
+/// domain: 2^53.
+///
+/// **The bound exists so two implementations in two languages agree
+/// bit-for-bit, not because anyone draws this much.** Money and tokens are
+/// counted as integers — micro-dollars and tokens — because a rolling ceiling
+/// accumulated through float addition drifts differently on every node, and
+/// `0.70 + 0.10` is not `0.80`. The *size* of the domain is then decided by
+/// the weaker of the two arithmetics: the Redis backend sums its buckets in
+/// Lua, whose only number is a double. Every integer through 2^53 is exact
+/// there; a sum that leaves the domain can only be rounded further out, never
+/// back under it, so a sum clamped at [`MAX_COUNT`] after *every* addition is
+/// the same number the `u64` arithmetic here produces — with no overflow error
+/// path on either side.
+///
+/// The alternative was `i64::MAX`, which is what `HINCRBY` holds: it would
+/// have bought nothing, because the read side goes through `tonumber` anyway,
+/// and it would have left the two backends disagreeing above 2^53 while both
+/// claimed to enforce one ceiling. Nine quadrillion micro-dollars is nine
+/// billion dollars and 2^53 tokens is more than any fleet serves; a draw past
+/// either is a number that arrived by accident, and it is refused at the edge
+/// by both ledgers rather than recorded differently by each.
+pub const MAX_COUNT: u64 = 1 << 53;
+
+/// Micro-dollars per dollar: the integer unit dollars are counted in.
+const MICROS_PER_USD: f64 = 1_000_000.0;
+
+/// Add inside the shared domain.
+///
+/// Clamped at [`MAX_COUNT`] after every addition rather than only on the
+/// total, because that is precisely what the Lua side must do to stay exact —
+/// and "the two ledgers do the same additions in the same order" is what makes
+/// them one ceiling rather than two that usually agree.
+fn add_count(sum: u64, add: u64) -> u64 {
+    sum.saturating_add(add).min(MAX_COUNT)
+}
+
+/// One draw's two counts, already in the domain both ledgers share.
+///
+/// **The one conversion of the `f64` the trait speaks**, and the one place a
+/// draw is refused for being outside the domain. It lives here rather than in
+/// a backend because a second spelling of the rounding is a second ceiling: a
+/// backend that rounded half-to-even where this rounds half away from zero
+/// would refuse a different set of turns while passing every test that does
+/// not sit on a boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrawCounts {
+    pub tokens: u64,
+    pub micros: u64,
+}
+
+impl DrawCounts {
+    /// Convert and bound one draw, or say why it cannot be recorded.
+    ///
+    /// Rounding is half away from zero, which for a non-negative draw is half
+    /// up, so a draw below half a micro-dollar records as zero. That is
+    /// 5 × 10⁻⁷ dollars, six orders of magnitude below the cheapest turn this
+    /// fleet can serve, and it is the only information the integer domain
+    /// loses.
+    ///
+    /// A `NaN` is refused rather than clamped for the reason
+    /// `SpendError::check_amount` gives: it would not blow up, it would make
+    /// every window sum `NaN` — never `>=` any cap — and the ceiling would
+    /// silently stop existing.
+    pub fn of(tokens: u64, usd: f64) -> Result<Self, FairUseError> {
+        if !usd.is_finite() || usd < 0.0 {
+            return Err(FairUseError::InvalidAmount {
+                field: "usd",
+                value: usd,
+            });
+        }
+        if tokens > MAX_COUNT {
+            return Err(FairUseError::OutOfDomain {
+                field: "tokens",
+                value: tokens,
+            });
+        }
+        let micros = (usd * MICROS_PER_USD).round();
+        if micros > MAX_COUNT as f64 {
+            return Err(FairUseError::OutOfDomain {
+                field: "micro-dollars",
+                // A float-to-integer `as` cast saturates in Rust rather than
+                // trapping, so an absurd draw is named as `u64::MAX` instead
+                // of as some wrapped nonsense the operator has to decode.
+                value: micros as u64,
+            });
+        }
+        Ok(Self {
+            tokens,
+            micros: micros as u64,
+        })
+    }
+}
+
+/// A token cap in the counters' domain.
+///
+/// Clamped rather than refused, unlike a *draw*: a cap past the domain is one
+/// no sum inside the domain can reach, and clamping it to the ceiling is that
+/// same answer said once here instead of on every comparison. Refusing it
+/// would turn a harmless configuration into a boot-time failure.
+pub fn cap_tokens(max_tokens: Option<u64>) -> Option<u64> {
+    max_tokens.map(|max| max.min(MAX_COUNT))
+}
+
+/// A dollar cap as micro-dollars, through the same rounding a draw takes.
+///
+/// A non-finite cap is *absent*, which is what it already meant when the
+/// comparison was in floats: every comparison against a `NaN` is false and no
+/// sum reaches an infinity. A negative cap clamps to zero, which is the same
+/// "refuses everything" a negative cap already was.
+pub fn cap_micros(max_usd: Option<f64>) -> Option<u64> {
+    let max = max_usd.filter(|max| max.is_finite())?;
+    Some((max * MICROS_PER_USD).round().clamp(0.0, MAX_COUNT as f64) as u64)
+}
 
 /// A rolling window an operator may cap.
 ///
@@ -253,10 +387,10 @@ impl FairUseTerms {
                 // Tokens before dollars where both are capped, because a
                 // token cap is the one an agent can reason about: it is the
                 // quantity in its own context window.
-                if limit.max_tokens.is_some_and(|max| drawn.tokens >= max) {
+                if cap_tokens(limit.max_tokens).is_some_and(|max| drawn.tokens >= max) {
                     return Some((scope, *limit, FairUseQuantity::Tokens, drawn));
                 }
-                if limit.max_usd.is_some_and(|max| drawn.usd >= max) {
+                if cap_micros(limit.max_usd).is_some_and(|max| drawn.micros >= max) {
                     return Some((scope, *limit, FairUseQuantity::Usd, drawn));
                 }
             }
@@ -269,7 +403,9 @@ impl FairUseTerms {
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Drawn {
     pub tokens: u64,
-    pub usd: f64,
+    /// Dollars as the integer micro-dollars every comparison is made in; see
+    /// [`MAX_COUNT`] for why money is not an `f64` past this edge.
+    pub micros: u64,
     /// The earliest time this window could have room again, or `None` where it
     /// is not over any cap.
     ///
@@ -299,6 +435,16 @@ pub struct FairUseRefusal {
 pub enum FairUseError {
     #[error("`{field}` must be a finite, non-negative number, got {value}")]
     InvalidAmount { field: &'static str, value: f64 },
+    /// A draw outside the counters' shared domain, refused before any ledger
+    /// writes anything — the same posture as a `NaN`, and for a related
+    /// reason: a count no backend can hold exactly is one the two backends
+    /// would hold *differently*. See [`MAX_COUNT`].
+    #[error(
+        "`{field}` of {value} is past the {} a fair-use counter holds; both ledgers \
+         count in integers so every node agrees exactly",
+        MAX_COUNT
+    )]
+    OutOfDomain { field: &'static str, value: u64 },
     #[error("fair-use ledger backend failure: {0}")]
     Backend(#[from] anyhow::Error),
 }
@@ -360,14 +506,14 @@ pub trait FairUseLedger: Send + Sync + 'static {
 /// draw — an idle principal costs one empty map rather than 2016 zeroes.
 #[derive(Debug, Default)]
 struct Buckets {
-    by_index: BTreeMap<u64, (u64, f64)>,
+    by_index: BTreeMap<u64, (u64, u64)>,
 }
 
 impl Buckets {
-    fn record(&mut self, at_ms: u64, tokens: u64, usd: f64) {
-        let entry = self.by_index.entry(at_ms / BUCKET_MS).or_insert((0, 0.0));
-        entry.0 = entry.0.saturating_add(tokens);
-        entry.1 += usd;
+    fn record(&mut self, at_ms: u64, counts: DrawCounts) {
+        let entry = self.by_index.entry(at_ms / BUCKET_MS).or_insert((0, 0));
+        entry.0 = add_count(entry.0, counts.tokens);
+        entry.1 = add_count(entry.1, counts.micros);
     }
 
     /// Drop everything older than the widest window, so an idle-then-busy
@@ -395,14 +541,16 @@ impl Buckets {
 
     fn drawn(&self, window: FairUseWindow, now_ms: u64, limit: &FairUseLimit) -> Drawn {
         let first = Self::first_index(window, now_ms);
-        let inside: Vec<(&u64, &(u64, f64))> = self.by_index.range(first..).collect();
+        let inside: Vec<(&u64, &(u64, u64))> = self.by_index.range(first..).collect();
         let tokens = inside
             .iter()
-            .fold(0u64, |sum, (_, (tokens, _))| sum.saturating_add(*tokens));
-        let usd = inside.iter().fold(0.0, |sum, (_, (_, usd))| sum + usd);
+            .fold(0u64, |sum, (_, (tokens, _))| add_count(sum, *tokens));
+        let micros = inside
+            .iter()
+            .fold(0u64, |sum, (_, (_, micros))| add_count(sum, *micros));
         Drawn {
             tokens,
-            usd,
+            micros,
             retry_at_ms: earliest_retry_ms(&inside, window, limit),
         }
     }
@@ -426,25 +574,28 @@ impl Buckets {
 /// the ordinary path one function rather than two that could disagree about
 /// which buckets are inside the window.
 fn earliest_retry_ms(
-    inside: &[(&u64, &(u64, f64))],
+    inside: &[(&u64, &(u64, u64))],
     window: FairUseWindow,
     limit: &FairUseLimit,
 ) -> Option<u64> {
-    let over = |tokens: u64, usd: f64| {
-        limit.max_tokens.is_some_and(|max| tokens >= max)
-            || limit.max_usd.is_some_and(|max| usd >= max)
+    let max_tokens = cap_tokens(limit.max_tokens);
+    let max_micros = cap_micros(limit.max_usd);
+    let over = |tokens: u64, micros: u64| {
+        max_tokens.is_some_and(|max| tokens >= max) || max_micros.is_some_and(|max| micros >= max)
     };
     let mut tokens = inside
         .iter()
-        .fold(0u64, |sum, (_, (tokens, _))| sum.saturating_add(*tokens));
-    let mut usd = inside.iter().fold(0.0, |sum, (_, (_, usd))| sum + usd);
-    if !over(tokens, usd) {
+        .fold(0u64, |sum, (_, (tokens, _))| add_count(sum, *tokens));
+    let mut micros = inside
+        .iter()
+        .fold(0u64, |sum, (_, (_, micros))| add_count(sum, *micros));
+    if !over(tokens, micros) {
         return None;
     }
-    for (index, (bucket_tokens, bucket_usd)) in inside {
+    for (index, (bucket_tokens, bucket_micros)) in inside {
         tokens = tokens.saturating_sub(*bucket_tokens);
-        usd -= bucket_usd;
-        if !over(tokens, usd) {
+        micros = micros.saturating_sub(*bucket_micros);
+        if !over(tokens, micros) {
             // This bucket's end, pushed out of the window by its full span.
             return Some((**index + 1) * BUCKET_MS + window.span_ms());
         }
@@ -460,11 +611,25 @@ fn earliest_retry_ms(
 /// Rolling draw counters in this process's memory.
 ///
 /// Enforces every ceiling correctly for the scope it covers — one node — and
-/// says so at boot. A deployment that wants one ceiling across nodes names a
-/// Redis; see the module doc for which store that selects and why.
+/// says so the first time it enforces one. A deployment that wants one ceiling
+/// across nodes names a Redis; see the module doc for which store that selects
+/// and why.
 #[derive(Debug, Default)]
 pub struct MemoryFairUseLedger {
     scopes: Mutex<HashMap<(ProjectId, Option<UserId>), Buckets>>,
+    /// Whether the single-node caution below has been said.
+    ///
+    /// **Here rather than at the composition root, because here is the only
+    /// place that knows both halves of what the caution is about.** The boot
+    /// site knows which ledger it wired but can only guess whether a ceiling
+    /// will ever exist — it reads a snapshot of a plane the admin API patches
+    /// at runtime, which is precisely how M13's review found a deployment
+    /// enforcing a PATCHed-in ceiling per node while owing no warning at all.
+    /// This type knows it is per-process by construction, and `would_exceed`
+    /// is handed the ceiling itself; the alternative — a `is_shared()` on the
+    /// trait, read by the engine, plus a flag on the engine — is three
+    /// spellings of one fact and a new obligation on every future backend.
+    warned_single_node: AtomicBool,
 }
 
 impl MemoryFairUseLedger {
@@ -482,24 +647,18 @@ impl FairUseLedger for MemoryFairUseLedger {
         tokens: u64,
         usd: f64,
     ) -> Result<(), FairUseError> {
-        // Refused rather than clamped, for the reason `SpendError::check_amount`
-        // gives: a `NaN` loses every comparison it is part of, so a `NaN` that
-        // reached these counters would not blow up — it would make the window
-        // sum `NaN`, which is never `>=` any cap, and the ceiling would
-        // silently stop existing.
-        if !usd.is_finite() || usd < 0.0 {
-            return Err(FairUseError::InvalidAmount {
-                field: "usd",
-                value: usd,
-            });
-        }
+        // The edge conversion, and it is the *same* function the Redis ledger
+        // calls: a `NaN` or a count outside the domain is refused here before
+        // any counter moves, and dollars become micro-dollars exactly once.
+        // Two spellings of this would be two ceilings.
+        let counts = DrawCounts::of(tokens, usd)?;
         let mut scopes = self.scopes.lock().await;
         // Both scopes from one call: the project's counters and this member's.
         // Two calls could record one and not the other, and a member ceiling
         // enforced against a project counter is not a member ceiling.
         for user in [None, Some(principal.user.clone())] {
             let buckets = scopes.entry((principal.project.clone(), user)).or_default();
-            buckets.record(at_ms, tokens, usd);
+            buckets.record(at_ms, counts);
             buckets.prune(at_ms);
         }
         Ok(())
@@ -513,6 +672,23 @@ impl FairUseLedger for MemoryFairUseLedger {
     ) -> Result<Option<FairUseRefusal>, FairUseError> {
         if terms.is_empty() {
             return Ok(None);
+        }
+        // **The honesty mechanism, at the moment it is owed rather than at
+        // boot.** A ceiling everyone believes in and nothing enforces across
+        // nodes is worse than no ceiling, and non-empty terms here mean this
+        // process is now the whole of that ceiling — however the terms got
+        // here, whether from the file this node booted from or from an admin
+        // `PATCH` an hour later. Once per ledger and not per turn: a caution
+        // repeated on every admitted request is one an operator filters out.
+        if !self.warned_single_node.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                "fair-use windows are being enforced against THIS PROCESS'S memory. Two \
+                 nodes serving one project therefore enforce two independent ceilings -- a \
+                 project capped at 2M tokens per 5 hours can draw 2M through each -- and \
+                 every counter resets on restart. Fair use across nodes is only true with \
+                 shared buckets, which is what naming a Redis selects; see \
+                 roundhouse_store_redis::fair_use for the key layout it lands on"
+            );
         }
         let scopes = self.scopes.lock().await;
         let empty = Buckets::default();
@@ -588,38 +764,67 @@ mod tests {
         assert!(spans.windows(2).all(|pair| pair[0] < pair[1]));
     }
 
-    /// A draw past `u64::MAX` saturates rather than wrapping.
+    /// The edge conversion: rounding, the sub-micro-dollar draw it loses, and
+    /// the domain it refuses outside of.
     ///
-    /// Memory-only, and deliberately not in the contract: a backend counting
-    /// in Redis integers cannot saturate at `u64::MAX` and must refuse instead,
-    /// so this is a statement about *this* representation's range and belongs
-    /// beside it. What the contract asserts is the shared part — that a draw of
-    /// any plausible size reaches the counters at all.
-    #[tokio::test]
-    async fn a_draw_that_would_overflow_the_counter_saturates() {
-        let ledger = MemoryFairUseLedger::new();
-        let ada = Principal::new("acme", "ada");
-        ledger.record_draw(&ada, 0, u64::MAX, 0.0).await.unwrap();
-        ledger.record_draw(&ada, 0, u64::MAX, 0.0).await.unwrap();
+    /// Here rather than in the contract because it is a property of the
+    /// *conversion function itself*, which both ledgers call — what each
+    /// ledger then does with a converted draw, and what it does with one that
+    /// does not convert, is asserted in the contract against both.
+    #[test]
+    fn dollars_convert_to_micro_dollars_once_at_the_edge() {
+        let micros = |usd| DrawCounts::of(0, usd).unwrap().micros;
+        assert_eq!(micros(0.0), 0);
+        assert_eq!(micros(5.0), 5_000_000);
+        assert_eq!(micros(0.35), 350_000);
+        // Half away from zero, and the sub-micro-dollar draw it loses.
+        assert_eq!(micros(0.0000005), 1);
+        assert_eq!(micros(0.0000004), 0);
+        // The boundary the whole domain exists for: exact integers, not the
+        // 0.7999999999999999 an `f64` sum of the same two draws produces.
+        assert_eq!(micros(0.70) + micros(0.10), micros(0.80));
 
-        let terms = FairUseTerms {
-            project: vec![FairUseLimit {
-                window: FairUseWindow::FiveHours,
-                max_tokens: Some(u64::MAX),
-                max_usd: None,
-            }],
-            member: Vec::new(),
-        };
-        // Wrapping would have put the sum at `u64::MAX - 1`, under the cap and
-        // therefore served: the assertion is that the second draw did not
-        // *empty* the counter the first one filled.
-        assert!(
-            ledger
-                .would_exceed(&ada, &terms, 60_000)
-                .await
-                .unwrap()
-                .is_some(),
-            "two saturating draws stay at the ceiling rather than wrapping past it"
-        );
+        // Outside the domain: refused, not clamped, and on either field.
+        assert!(matches!(
+            DrawCounts::of(MAX_COUNT + 1, 0.0),
+            Err(FairUseError::OutOfDomain {
+                field: "tokens",
+                ..
+            })
+        ));
+        assert!(matches!(
+            DrawCounts::of(0, 1e10),
+            Err(FairUseError::OutOfDomain { .. })
+        ));
+        assert!(matches!(
+            DrawCounts::of(0, f64::NAN),
+            Err(FairUseError::InvalidAmount { .. })
+        ));
+        // And the ceiling itself is inside the domain, or "saturates at
+        // MAX_COUNT" would be unreachable.
+        assert_eq!(DrawCounts::of(MAX_COUNT, 0.0).unwrap().tokens, MAX_COUNT);
+    }
+
+    /// A cap converts through the same rounding a draw does, and is *clamped*
+    /// into the domain where a draw is refused out of it.
+    #[test]
+    fn a_cap_converts_through_the_same_edge_and_clamps_rather_than_refusing() {
+        assert_eq!(cap_micros(Some(5.0)), Some(5_000_000));
+        assert_eq!(cap_micros(Some(0.80)), Some(800_000));
+        assert_eq!(cap_tokens(Some(1_000)), Some(1_000));
+        // A cap of zero is a cap, not an absence — confusing the two is the
+        // difference between a window that refuses everything and one that
+        // refuses nothing.
+        assert_eq!(cap_micros(Some(0.0)), Some(0));
+        assert_eq!(cap_tokens(Some(0)), Some(0));
+        assert_eq!(cap_micros(None), None);
+        assert_eq!(cap_tokens(None), None);
+        // Non-finite binds on nothing, exactly as it did when the comparison
+        // was in floats.
+        assert_eq!(cap_micros(Some(f64::NAN)), None);
+        assert_eq!(cap_micros(Some(f64::INFINITY)), None);
+        // Past the domain: clamped to the ceiling a saturated sum reaches.
+        assert_eq!(cap_tokens(Some(u64::MAX)), Some(MAX_COUNT));
+        assert_eq!(cap_micros(Some(1e300)), Some(MAX_COUNT));
     }
 }

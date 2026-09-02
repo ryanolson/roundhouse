@@ -40,37 +40,53 @@
 //! window plus one bucket is set on every write, so a bucket outside every
 //! window deletes itself and an idle scope costs nothing at all — not one key,
 //! not one field. What it costs instead is reads: a 7-day window is at most
-//! 2017 keys rather than one `HGETALL`. That is the trade, taken with two
-//! things making it cheap. The scan is *lazy and narrowest-first*, so the
-//! common case — the 5-hour window, which is the narrowest and therefore the
-//! first to bind — is 61 reads and the wider windows are paid for only when
-//! the narrower ones had room. And the reads are inside the script, so they
-//! are 2017 hash lookups in one round trip rather than 2017 round trips.
+//! 2017 keys rather than one `HGETALL`.
 //!
-//! One `HINCRBY` per field rather than one packed value: the two counters are
-//! summed independently and incremented independently, and `HINCRBY` is the
-//! operation that makes a concurrent draw from another node exact rather than
-//! last-write-wins.
+//! **That cost lands on the common case, not the rare one (M13 review,
+//! F4).** The scan is lazy and narrowest-first, which only makes the 5-hour
+//! window's 61 reads the whole story when a window *binds* — refuses — before
+//! a wider one is asked. But `would_exceed`'s admission path only stops early
+//! by finding a refusal, and an admitted turn is exactly the case where no
+//! window ever binds: it is the turn a fleet serves most of the time, and it
+//! widens through every configured window to the widest one. A membership
+//! capped on all three windows on both scopes therefore costs up to 2017
+//! reads per scope — 4034 total, measured at roughly 8ms of blocking Lua time
+//! per admission on a real Redis — on the ordinary, non-refusing path, not
+//! 61. What the lazy scan still buys is that those reads are inside one
+//! script rather than one round trip apiece, and that a *refusal* at the
+//! narrowest window really does cost only 61: the saving is real, it is just
+//! not the common case. Replacing the scan itself — running sums maintained
+//! on write, the bucket walk reserved for a refusal's retry time — is M13.1's
+//! rung, not this one's.
 //!
-//! # Micro-dollars, and what the rounding costs
+//! Two fields rather than one packed value: the two counters are summed
+//! independently and updated independently. They are read, added and written
+//! back *inside* the one script, which Redis runs indivisibly, so a concurrent
+//! draw from another node is exact rather than last-write-wins — and, unlike
+//! the `HINCRBY` pair this started as, there is no command that can fail
+//! part-way and leave one scope moved and the other not.
 //!
-//! `HINCRBY` is exact; `INCRBYFLOAT` is not, and a ceiling accumulated through
-//! float addition on the server would drift differently on every node. So the
-//! `f64` the trait speaks is converted **once, at this edge**, to
-//! micro-dollars — `(usd * 1_000_000).round()`, half away from zero, which for
-//! a non-negative draw is half up. A draw below half a micro-dollar therefore
-//! records as zero. That is 5 × 10⁻⁷ dollars, six orders of magnitude below
-//! the cheapest turn this fleet can serve, and it is the only information this
-//! ledger loses that the memory one keeps.
+//! # The integer domain, which is not this crate's to define
 //!
-//! The other end of the range is worth stating because it is where the two
-//! backends genuinely differ: these counters are Redis integers, so a draw
-//! past `i64::MAX` tokens or micro-dollars is **refused** here where
-//! [`MemoryFairUseLedger`](roundhouse_core::control::MemoryFairUseLedger)
-//! saturates. Nine quintillion tokens is not a turn anyone serves; a loud
-//! refusal is the right answer for a number that arrived by accident, and the
-//! contract suite deliberately asserts the shared middle of the range rather
-//! than either end.
+//! Both counters are integers — tokens, and dollars as micro-dollars —
+//! because a ceiling accumulated through float addition drifts differently on
+//! every node. The conversion, the rounding it uses and the bound it enforces
+//! all live in `roundhouse_core::control::fair_use`: [`DrawCounts::of`] is
+//! what turns the trait's `f64` into the two counts, [`cap_micros`] and
+//! [`cap_tokens`] convert a limit through the same rounding, and
+//! [`MAX_COUNT`] is the ceiling both fields saturate at. This crate calls
+//! them; it does not have opinions of its own about money.
+//!
+//! **The M13 addendum recorded a divergence here, and it is closed.** That
+//! text said these counters were `i64`, so a draw past `i64::MAX` was refused
+//! where the memory ledger saturated, and it asserted the contract covered
+//! only the shared middle of the range. Both halves are gone: the domain is
+//! `MAX_COUNT` on *both* sides, a draw past it is refused by both before
+//! anything is written, a sum at it saturates in both, and the contract suite
+//! asserts each of those against both backends. The bound is 2^53 rather than
+//! `i64::MAX` for the reason [`MAX_COUNT`] gives — the window sum is computed
+//! in Lua, whose only number is a double, so a wider write-side range would
+//! have been thrown away at the one comparison that decides a refusal.
 //!
 //! # What the clock is
 //!
@@ -95,23 +111,25 @@
 //! `tests/fair_use_contract.rs` exactly as `tests/spend_contract.rs` does for
 //! spend.
 
-mod scripts;
+// `pub(crate)` for one reason: `test_support` re-exports the `would_exceed`
+// script's text so the gated test that must hand it an argument list
+// `WouldExceedArgs` cannot express invokes the real script rather than a copy.
+pub(crate) mod scripts;
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use redis::aio::ConnectionManager;
 
-use roundhouse_core::control::fair_use::BUCKET_MS;
+use roundhouse_core::control::fair_use::{
+    BUCKET_MS, DrawCounts, MAX_COUNT, cap_micros, cap_tokens,
+};
 use roundhouse_core::control::{
     FairUseError, FairUseLedger, FairUseLimit, FairUseRefusal, FairUseTerms, FairUseWindow,
     Principal, ProjectId, UserId,
 };
 
 use crate::KEY_PREFIX;
-
-/// Micro-dollars per dollar: the integer unit the `u` field counts in.
-const MICROS_PER_USD: f64 = 1_000_000.0;
 
 /// The bucket-key prefix for a project's own counters.
 ///
@@ -167,65 +185,17 @@ pub(crate) fn bucket_ttl_ms() -> u64 {
         + BUCKET_MS
 }
 
-/// Dollars as an exact integer count of micro-dollars.
+/// A cap in the script's vocabulary: the decimal digits, or `''` for "not
+/// capped on this quantity".
 ///
-/// Refuses rather than saturating past the range a Redis integer holds; see
-/// the module doc for why that is the right end of the trade.
-fn micros_of(usd: f64) -> Result<i64, FairUseError> {
-    let micros = (usd * MICROS_PER_USD).round();
-    if micros > i64::MAX as f64 {
-        return Err(FairUseError::Backend(anyhow::anyhow!(
-            "a draw of ${usd} is past the {} micro-dollars a Redis counter holds; \
-             the fair-use buckets count in integers so two nodes agree exactly",
-            i64::MAX
-        )));
-    }
-    Ok(micros as i64)
-}
-
-/// Tokens as the decimal string `HINCRBY` will read.
-///
-/// A string rather than an integer argument because it reaches the script
-/// untouched by Lua's doubles — see [`scripts`].
-fn tokens_arg(tokens: u64) -> Result<String, FairUseError> {
-    if tokens > i64::MAX as u64 {
-        return Err(FairUseError::Backend(anyhow::anyhow!(
-            "a draw of {tokens} tokens is past the {} a Redis counter holds; \
-             the fair-use buckets count in integers so two nodes agree exactly",
-            i64::MAX
-        )));
-    }
-    Ok(tokens.to_string())
-}
-
-/// A token cap in the script's vocabulary: `''` for "not capped".
-///
-/// Clamped rather than refused, unlike a *draw*: a cap past the counter's range
-/// is one no sum inside that range can reach, which is what an unreachable cap
-/// means in the memory ledger too. Refusing it would turn a harmless
-/// configuration into a boot-time failure.
-fn cap_tokens(max_tokens: Option<u64>) -> String {
-    max_tokens.map_or_else(String::new, |max| max.min(i64::MAX as u64).to_string())
-}
-
-/// A dollar cap as micro-dollars, `''` for "not capped".
-///
-/// A non-finite cap encodes as *absent*, which is what it already means: the
-/// memory ledger compares `drawn.usd >= max`, and every comparison against a
-/// `NaN` is false while no finite sum reaches an infinity. Spelling it as the
-/// absent sentinel is that same answer arrived at once here instead of on
-/// every bucket.
-fn cap_micros(max_usd: Option<f64>) -> String {
-    match max_usd {
-        Some(max) if max.is_finite() => (max * MICROS_PER_USD)
-            .round()
-            .clamp(i64::MIN as f64, i64::MAX as f64)
-            .to_string(),
-        // `to_string` on the clamped f64 above would print `5000000` for 5.0
-        // — an integral f64 formats without a decimal point — which is what
-        // `tonumber` wants. Nothing here relies on more than that.
-        _ => String::new(),
-    }
+/// The only conversion left in this crate, and it is encoding rather than
+/// arithmetic: the cap itself was already put into the counters' domain by
+/// [`cap_tokens`]/[`cap_micros`] in core, which is what stops this backend
+/// clamping a cap somewhere the memory ledger does not. `''` is a sentinel the
+/// script tests by string equality, so it can never be confused with a cap of
+/// zero.
+fn cap_arg(cap: Option<u64>) -> String {
+    cap.map_or_else(String::new, |max| max.to_string())
 }
 
 fn scope_caps(limits: &[FairUseLimit], window: FairUseWindow) -> scripts::ScopeCaps {
@@ -233,8 +203,8 @@ fn scope_caps(limits: &[FairUseLimit], window: FairUseWindow) -> scripts::ScopeC
         None => scripts::ScopeCaps::absent(),
         Some(limit) => scripts::ScopeCaps {
             present: true,
-            max_tokens: cap_tokens(limit.max_tokens),
-            max_micros: cap_micros(limit.max_usd),
+            max_tokens: cap_arg(cap_tokens(limit.max_tokens)),
+            max_micros: cap_arg(cap_micros(limit.max_usd)),
         },
     }
 }
@@ -298,21 +268,12 @@ impl FairUseLedger for RedisFairUseLedger {
         tokens: u64,
         usd: f64,
     ) -> Result<(), FairUseError> {
-        // Refused before anything reaches Redis, and for the reason the memory
-        // ledger states: a `NaN` in the counters would not blow up, it would
-        // make every window sum `NaN` — never `>=` any cap — and the ceiling
-        // would silently stop existing. Here it would not even survive the
-        // conversion, but a `Backend` error naming a Lua failure is a worse
-        // answer than the trait's own `InvalidAmount`, and the contract suite
-        // asserts the counters are untouched afterwards.
-        if !usd.is_finite() || usd < 0.0 {
-            return Err(FairUseError::InvalidAmount {
-                field: "usd",
-                value: usd,
-            });
-        }
-        let tokens = tokens_arg(tokens)?;
-        let micros = micros_of(usd)?.to_string();
+        // The edge conversion, in core, shared with the memory ledger: a
+        // `NaN` or a count outside the domain is refused before anything
+        // reaches Redis, so a draw the two backends could not record
+        // identically is recorded by neither. A second copy of this rule here
+        // would be a second ceiling.
+        let counts = DrawCounts::of(tokens, usd)?;
 
         self.scripts
             .record_draw(
@@ -322,8 +283,8 @@ impl FairUseLedger for RedisFairUseLedger {
                     member_key: &member_bucket_prefix(&principal.project, &principal.user),
                     at_ms,
                     bucket_ms: BUCKET_MS,
-                    tokens,
-                    micros,
+                    counts,
+                    max_count: MAX_COUNT,
                     ttl_ms: self.bucket_ttl_ms,
                 },
             )
@@ -357,6 +318,7 @@ impl FairUseLedger for RedisFairUseLedger {
                     member_key: &member_bucket_prefix(&principal.project, &principal.user),
                     now_ms,
                     bucket_ms: BUCKET_MS,
+                    max_count: MAX_COUNT,
                     windows,
                 },
             )
@@ -459,40 +421,55 @@ mod tests {
         );
     }
 
-    /// Dollars round to the micro-dollar, half up, and the range is stated
-    /// rather than silently wrapped.
+    /// A count crosses as an integer `ARGV`, and that is byte-identical to the
+    /// decimal `String` this used to build.
+    ///
+    /// The live half of M13 review finding F7. `tokens_arg` existed because a
+    /// `String` was said to reach the script "untouched by Lua's doubles" —
+    /// true of *any* integer argument, and so not a reason to prefer a
+    /// `String`. The pinned `redis` crate formats an integer `ARGV` with
+    /// `itoa`, the same decimal ASCII bytes `to_string()` produces, so
+    /// removing the plumbing changed nothing on the wire. What actually keeps
+    /// Lua's doubles exact is the domain bound, which is asserted in core
+    /// beside `MAX_COUNT` and in the contract against both backends.
     #[test]
-    fn dollars_convert_to_micro_dollars_once_at_the_edge() {
-        assert_eq!(micros_of(0.0).unwrap(), 0);
-        assert_eq!(micros_of(5.0).unwrap(), 5_000_000);
-        assert_eq!(micros_of(0.35).unwrap(), 350_000);
-        // Half up, and the sub-micro-dollar draw the module doc admits is lost.
-        assert_eq!(micros_of(0.0000005).unwrap(), 1);
-        assert_eq!(micros_of(0.0000004).unwrap(), 0);
-        // Past the counter's range: refused, not wrapped into a negative.
-        assert!(micros_of(1e14).is_err());
-        assert!(tokens_arg(u64::MAX).is_err());
-        assert_eq!(tokens_arg(1_000_000_000_000).unwrap(), "1000000000000");
+    fn a_count_crosses_as_the_same_bytes_a_decimal_string_would_have() {
+        use redis::ToRedisArgs;
+        let value: u64 = 9_007_199_254_740_993; // past 2^53, the case that matters
+        assert_eq!(
+            value.to_redis_args(),
+            value.to_string().to_redis_args(),
+            "an integer ARGV and its decimal-string twin must serialize to \
+             the same RESP bytes, or dropping the String plumbing would have \
+             changed the wire rather than just the code"
+        );
     }
 
-    /// A cap crosses as micro-dollars too, and an absent one as the sentinel
-    /// the script tests by string equality.
+    /// A cap crosses as the digits core put it in the domain as, and an absent
+    /// one as the sentinel the script tests by string equality.
+    ///
+    /// The clamping and the rounding are core's and are asserted there; what
+    /// is asserted here is the *encoding*, which is this crate's half.
     #[test]
     fn a_cap_crosses_as_the_same_integers_a_draw_does() {
-        assert_eq!(cap_micros(Some(5.0)), "5000000");
-        assert_eq!(cap_micros(Some(0.01)), "10000");
-        assert_eq!(cap_tokens(Some(1_000)), "1000");
-        assert_eq!(cap_tokens(None), "");
-        assert_eq!(cap_micros(None), "");
+        let micros = |max| cap_arg(cap_micros(Some(max)));
+        assert_eq!(micros(5.0), "5000000");
+        assert_eq!(micros(0.01), "10000");
+        assert_eq!(cap_arg(cap_tokens(Some(1_000))), "1000");
+        assert_eq!(cap_arg(cap_tokens(None)), "");
+        assert_eq!(cap_arg(cap_micros(None)), "");
         // A cap of zero is a cap, not an absence — getting these two confused
         // is the difference between a window that refuses everything and one
         // that refuses nothing.
-        assert_eq!(cap_tokens(Some(0)), "0");
-        assert_eq!(cap_micros(Some(0.0)), "0");
+        assert_eq!(cap_arg(cap_tokens(Some(0))), "0");
+        assert_eq!(micros(0.0), "0");
         // A non-finite cap binds on nothing in the memory ledger, and encodes
         // as the absent sentinel here for exactly that reason.
-        assert_eq!(cap_micros(Some(f64::NAN)), "");
-        assert_eq!(cap_micros(Some(f64::INFINITY)), "");
+        assert_eq!(micros(f64::NAN), "");
+        assert_eq!(micros(f64::INFINITY), "");
+        // An unreachable cap arrives already clamped to the domain's ceiling,
+        // which is what a saturated sum reaches — so it stays reachable.
+        assert_eq!(cap_arg(cap_tokens(Some(u64::MAX))), MAX_COUNT.to_string());
     }
 
     /// The three windows are handed to the script narrowest-first, which is

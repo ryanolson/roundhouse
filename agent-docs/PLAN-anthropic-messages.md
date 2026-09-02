@@ -1241,6 +1241,81 @@ server. The `redis` crate is a watched dependency: no version moves here.
   round at the edge, and the boot warning kept beside a wired Redis; eight
   went red under a named guard and the ninth became the predicate above.
 
+### What the review round changed (2026-09-02, M13)
+
+Ten raw findings from two lenses, seven after triage, every one ruled valid
+test-first against a real Redis, every fix re-broken. Two moved a ruling and
+one opened a rung.
+
+**R-F5 — one integer domain, bounded, saturating, shared by both ledgers.**
+R-F1 named the memory ledger's arithmetic as the specification, and the
+memory ledger accumulated dollars in `f64`: seventy cents plus ten cents
+under an eighty-cent cap admitted in memory and refused in Redis, and a
+differential fuzz put the two backends' retry times up to thirty-two hours
+apart (F3). Money was never defensibly specified in floating point, so the
+specification is now the exact one and the memory ledger adopts it: tokens
+and micro-dollars are integers in both, the trait's `f64` is converted once
+at the edge by one function in core that both crates call (`DrawCounts::of`,
+half away from zero), and a window sum, a cap and a retry walk are computed
+in integers everywhere; a cap above the domain clamps into it rather than
+being refused, so a saturated window meets it. The domain
+is bounded at 2^53 for both fields — a single draw past it is refused at the
+edge before any write, and a window sum saturates there — because every
+integer up to 2^53 is exact in a Lua double and the sum of two such is exact
+below 2^54, so the record script reads, adds with a clamp and writes back
+in one script with no command left in it that can fail. That closes F5 (an overflow on the member's bucket had left the
+project's already moved — the script's "one indivisible step" was a claim,
+not a property) and F7 (amounts crossed the boundary as decimal strings for
+a reason that did not hold, and were summed as doubles anyway), and retires
+the M13 addendum's "divergence 2": neither ledger refuses at `i64::MAX` now;
+both saturate at the same bound.
+
+**R-F3′ — the fair-use ledger follows the Redis URL alone.** R-F3 had made
+the Redis ledger conditional on a `fair_use` block being configured *at
+boot*, and the admin plane accepts one after boot: a deployment booted with
+Redis and no ceiling enforced every later-patched ceiling per process, with
+nothing in Redis and no warning (F1). The predicate's stated justification
+— sparing a ceiling-less deployment a boot failure on an unreachable Redis
+— was false, since the session store fails boot on the same URL first. The
+ledger is now chosen by the same rule as sessions and spend, the URL and
+nothing else — `fair_use_backend` lives in the library so the gated boot
+test calls the predicate the boot site branches on rather than re-deriving
+it, which is the shape the M13 refute pass had caught catching nothing — and
+the single-node warning follows the ceiling rather than the boot snapshot:
+`MemoryFairUseLedger` warns once, the first time it is asked to enforce a
+non-empty ceiling, because it is the one thing that knows both halves
+(a ceiling is being enforced; these counters are per-process). The
+boot-time `fair_use_warning_owed` predicate the M13 addendum describes is
+gone. One ordering consequence, recorded at the call site: the fair-use
+ledger is resolved before the store match, so an unreachable Redis now fails
+boot naming the fair-use ledger rather than the session store — both name
+the variable the operator acts on.
+
+**M13.1 — the read path, opened rather than rushed** (F4). The module doc
+said an admitted turn costs sixty-one reads because the five-hour window
+binds first; an admitted turn is the common case and it is exactly the one
+where no window binds, so the scan widens to the widest configured window —
+2017 buckets per capped scope under a seven-day cap, measured at about
+eight milliseconds of blocking Redis time per admission. The claim is
+corrected in both docs and the true count is pinned inside the file's one
+`INFO commandstats` test as a derived expression, so the rung that lowers
+it turns that assertion red; the fix is a redesign of
+the read path — per-window running sums maintained on write, aged-out
+buckets subtracted on read from a decay pointer, the bucket scan reserved
+for computing a retry time on refusal, amortised O(1) per admitted turn —
+and it ships as its own rung with its own contract and review rather than
+inside a fix stage.
+
+The rest: the script learns its window count from its arguments and the
+Rust side passes `FairUseWindow::ALL.len()`, so a fourth window cannot
+compile without reaching the script (F6); three doc sites in `engine.rs` and
+`mutation.rs` that still called the Redis ledger deferred say what exists,
+and the PATCH-axis constraint records that the bucket-per-key layout is what
+satisfied it; those doc guards now read the working tree, since a pinned
+blob can never observe a fix (F2). The M13 addendum's 'divergence 2' and
+its `fair_use_warning_owed` sentence are superseded by R-F5 and R-F3′
+above.
+
 ## Addendum (2026-09-02): D1 ruled — the rungs it opens
 
 The state-spectrum design round the frontier plan deferred (R10) has

@@ -31,7 +31,7 @@
 
 use super::{
     BUCKET_MS, FairUseLedger, FairUseLimit, FairUseQuantity, FairUseRefusal, FairUseScope,
-    FairUseTerms, FairUseWindow,
+    FairUseTerms, FairUseWindow, MAX_COUNT,
 };
 use crate::control::Principal;
 
@@ -52,6 +52,14 @@ fn tokens(window: FairUseWindow, max: u64) -> FairUseLimit {
         window,
         max_tokens: Some(max),
         max_usd: None,
+    }
+}
+
+fn usd(window: FairUseWindow, max: f64) -> FairUseLimit {
+    FairUseLimit {
+        window,
+        max_tokens: None,
+        max_usd: Some(max),
     }
 }
 
@@ -349,6 +357,137 @@ pub async fn the_retry_time_names_the_oldest_bucket_that_has_to_age_out<L: FairU
     );
 }
 
+/// **A dollar cap is met by the exact micro-dollars drawn, not by an `f64`
+/// sum of them.**
+///
+/// $0.70 + $0.10 against a $0.80 cap is the sharpest ordinary case there is:
+/// `0.7_f64 + 0.1_f64` is `0.7999999999999999`, strictly under the cap, so a
+/// ledger that accumulated dollars in floats serves this turn while one
+/// counting exact micro-dollars refuses it. Two backends that disagree here
+/// are two ceilings, which is what the M13 review found; both now convert
+/// through `DrawCounts::of` and compare in integers.
+pub async fn a_dollar_cap_is_met_by_the_exact_micro_dollars_drawn<L: FairUseLedger>(ledger: &L) {
+    let ada = fresh_principal("ada");
+    let terms = project_only(vec![usd(FairUseWindow::FiveHours, 0.80)]);
+
+    ledger.record_draw(&ada, 0, 0, 0.70).await.unwrap();
+    ledger.record_draw(&ada, 0, 0, 0.10).await.unwrap();
+
+    assert_eq!(
+        refused(ledger, &ada, &terms, HOUR)
+            .await
+            .map(|refusal| refusal.quantity),
+        Some(FairUseQuantity::Usd),
+        "700000 + 100000 micro-dollars meets a cap of 800000 exactly -- the \
+         f64 sum of the same two draws does not"
+    );
+
+    // CONTROL: one micro-dollar of headroom, and the identical draws are
+    // served. Without it a ledger that refused every dollar cap would pass.
+    let generous = project_only(vec![usd(FairUseWindow::FiveHours, 0.800001)]);
+    assert_eq!(refused(ledger, &ada, &generous, HOUR).await, None);
+}
+
+/// The retry walk drops buckets in the same exact arithmetic the sum uses.
+///
+/// $0.10 in bucket 0 and $0.25 in bucket 1 against a $0.25 cap: dropping
+/// bucket 0 leaves exactly the cap, which is still over it, so the answer is
+/// when *bucket 1* leaves the window. In floats `0.35 - 0.10` is
+/// `0.24999999999999997` — under the cap — and the walk stops a bucket early,
+/// naming a retry time hours before the window can actually have room. The
+/// sum and the retry time have to be computed in one arithmetic or a client
+/// is sent back to a window that will refuse it again.
+pub async fn the_retry_walk_drops_buckets_in_exact_micro_dollars<L: FairUseLedger>(ledger: &L) {
+    let ada = fresh_principal("ada");
+    let terms = project_only(vec![usd(FairUseWindow::FiveHours, 0.25)]);
+
+    ledger.record_draw(&ada, 0, 0, 0.10).await.unwrap();
+    ledger.record_draw(&ada, BUCKET_MS, 0, 0.25).await.unwrap();
+
+    let hit = refused(ledger, &ada, &terms, HOUR)
+        .await
+        .expect("$0.35 is over a $0.25 cap");
+    assert_eq!(
+        hit.retry_at_ms,
+        2 * BUCKET_MS + 5 * HOUR,
+        "bucket 0 leaving still leaves exactly the cap drawn, so it is \
+         bucket 1's departure that gives the window room"
+    );
+
+    // CONTROL: the named instant really is the first with room, and one
+    // millisecond earlier there is none.
+    assert!(
+        refused(ledger, &ada, &terms, 2 * BUCKET_MS + 5 * HOUR - 1)
+            .await
+            .is_some()
+    );
+    assert_eq!(
+        refused(ledger, &ada, &terms, 2 * BUCKET_MS + 5 * HOUR).await,
+        None
+    );
+}
+
+/// A draw outside the shared domain is refused with nothing written.
+///
+/// `MAX_COUNT` is where two backends counting in two languages stop agreeing
+/// exactly, so a draw past it is refused at the edge by both — the same
+/// posture as a `NaN`, and with the same load-bearing half: the counters are
+/// untouched afterwards, so a refused draw is refused rather than
+/// half-applied.
+pub async fn a_draw_past_the_domain_is_refused_with_the_counters_untouched<L: FairUseLedger>(
+    ledger: &L,
+) {
+    let ada = fresh_principal("ada");
+    assert!(
+        ledger
+            .record_draw(&ada, 0, MAX_COUNT + 1, 0.0)
+            .await
+            .is_err(),
+        "one token past the domain is a count no ledger can hold exactly"
+    );
+    // Ten billion dollars is 10^16 micro-dollars, past the same ceiling.
+    assert!(ledger.record_draw(&ada, 0, 1, 1e10).await.is_err());
+
+    // CONTROL, and it is the whole point: neither refused draw moved either
+    // counter, on either scope. A cap of one is met by any draw at all.
+    let terms = FairUseTerms {
+        project: vec![tokens(FairUseWindow::FiveHours, 1)],
+        member: vec![tokens(FairUseWindow::FiveHours, 1)],
+    };
+    assert_eq!(refused(ledger, &ada, &terms, HOUR).await, None);
+
+    // And the draw one token *inside* the domain is recorded, so the refusal
+    // above is about the bound rather than about large numbers generally.
+    ledger.record_draw(&ada, 0, MAX_COUNT, 0.0).await.unwrap();
+    assert!(refused(ledger, &ada, &terms, HOUR).await.is_some());
+}
+
+/// A window sum saturates at the domain ceiling rather than wrapping or
+/// erroring.
+///
+/// Two draws of `MAX_COUNT` each: the counter holds `MAX_COUNT`, which is at
+/// the ceiling and therefore over any cap the domain can express. Wrapping
+/// would have put the second draw *under* the first, emptying a counter that
+/// was full — a ceiling that a big enough draw walks straight through.
+pub async fn a_window_sum_saturates_at_the_domain_ceiling<L: FairUseLedger>(ledger: &L) {
+    let ada = fresh_principal("ada");
+    ledger.record_draw(&ada, 0, MAX_COUNT, 0.0).await.unwrap();
+    ledger.record_draw(&ada, 0, MAX_COUNT, 0.0).await.unwrap();
+
+    let terms = project_only(vec![tokens(FairUseWindow::FiveHours, MAX_COUNT)]);
+    assert!(
+        refused(ledger, &ada, &terms, HOUR).await.is_some(),
+        "two saturating draws stay at the ceiling rather than wrapping past it"
+    );
+
+    // CONTROL: the same cap against a principal who has drawn nothing. Without
+    // it, a ledger that refused every cap of MAX_COUNT would pass above.
+    assert_eq!(
+        refused(ledger, &fresh_principal("bob"), &terms, HOUR).await,
+        None
+    );
+}
+
 /// Instantiate the whole conformance suite against one backend.
 ///
 /// The single list of contract tests, in the same idiom and for the same
@@ -396,6 +535,10 @@ macro_rules! fair_use_ledger_contract_suite {
             a_nonfinite_draw_is_refused_rather_than_silently_disabling_the_cap,
             a_window_refuses_early_rather_than_late,
             the_retry_time_names_the_oldest_bucket_that_has_to_age_out,
+            a_dollar_cap_is_met_by_the_exact_micro_dollars_drawn,
+            the_retry_walk_drops_buckets_in_exact_micro_dollars,
+            a_draw_past_the_domain_is_refused_with_the_counters_untouched,
+            a_window_sum_saturates_at_the_domain_ceiling,
         );
     };
     // One test per recursion step rather than one repetition over the names:

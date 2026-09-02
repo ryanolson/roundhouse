@@ -63,9 +63,9 @@ use roundhouse_server::catalog_config::{BUILT_IN_OPENAI, ProviderConfig};
 use roundhouse_server::control_config::crosscheck::CrossChecks;
 use roundhouse_server::{
     ControlDirectory, ControlPlane, ControlPlaneReads, Conversations, DirectoryError,
-    EchoLocalExecutor, Engine, EngineConfig, FleetJudge, JudgeConfig, MemoryDirectoryStore,
-    admin_api, catalog_config, control_config, http, mcp_api, messages_api, metrics_api, relay_api,
-    responses_api,
+    EchoLocalExecutor, Engine, EngineConfig, FairUseBackend, FleetJudge, JudgeConfig,
+    MemoryDirectoryStore, admin_api, catalog_config, control_config, fair_use_backend, http,
+    mcp_api, messages_api, metrics_api, relay_api, responses_api,
 };
 use roundhouse_store_redis::{RedisFairUseLedger, RedisSessionStore, RedisSpendLedger};
 use tracing_subscriber::EnvFilter;
@@ -742,11 +742,12 @@ async fn main() -> anyhow::Result<()> {
         ),
     }
 
-    // Whether anything in this deployment is standing in front of a fair-use
-    // ceiling. Read here, from the same compiled plane every surface resolves
-    // against, so the warning below fires for the deployments it is about and
-    // is silent for the ones it is not — a caution about a gap nobody is
-    // standing in is noise, and noise is how a real warning gets ignored.
+    // Whether anything in the plane this deployment *booted* with is standing
+    // in front of a fair-use ceiling. An operator-facing fact about the file,
+    // and nothing branches on it: a ceiling the admin plane adds an hour from
+    // now is equally real and equally enforced, and announces itself at the
+    // seam that enforces it rather than here, where this read has long since
+    // gone stale (M13 thermo-nuclear review, F1).
     let fair_use_configured = directory
         .plane(roundhouse_core::now_ms())
         .configured_admissions()
@@ -780,27 +781,50 @@ async fn main() -> anyhow::Result<()> {
     // restart while the log that proves it was already spent survives.
     let redis_url = std::env::var(REDIS_VAR).ok();
 
-    // Which fair-use ledger this deployment gets. Resolved once, before either
-    // arm, so the boot warning below and the ledger the engine is handed are
-    // one decision rather than two that could disagree about what is being
-    // enforced.
-    let fair_use_backend = fair_use_backend(redis_url.is_some(), fair_use_configured);
-    if fair_use_warning_owed(fair_use_backend, fair_use_configured) {
-        // The honesty mechanism the directory store uses, owed here for the
-        // same reason: a ceiling everyone believes in and nothing enforces is
-        // worse than no ceiling. It fires exactly when there IS a ceiling
-        // configured and it is NOT shared, which since M13 means one case --
-        // no Redis at all.
-        tracing::warn!(
-            var = REDIS_VAR,
-            "fair-use windows are configured but counted in THIS PROCESS'S memory. Two \
-             nodes serving one project therefore enforce two independent ceilings -- a \
-             project capped at 2M tokens per 5 hours can draw 2M through each -- and \
-             every counter resets on restart. Fair use across nodes is only true with \
-             shared buckets, which is what naming a Redis in this variable now selects; \
-             see roundhouse_store_redis::fair_use for the key layout it selects"
-        );
-    }
+    // Which fair-use ledger this deployment gets, resolved once and by the
+    // same variable as the two backends below.
+    //
+    // **It is deliberately not conditioned on whether a ceiling is configured
+    // right now.** That question has an answer only for this instant, and the
+    // admin plane changes it: `patch_project` writes a `fair_use` block onto a
+    // live project and the engine judges the very next turn against it. A boot
+    // snapshot of it therefore chose the ledger for the rest of the process's
+    // life from a fact that had already stopped being true -- M13's
+    // thermo-nuclear review, F1, where a deployment with a Redis and no
+    // ceiling at boot counted every later-added ceiling in one node's memory,
+    // silently. The single-node caution moved with it, to the enforcement
+    // seam: `MemoryFairUseLedger` warns the first time it is asked to enforce
+    // a real ceiling, whenever that turns out to be.
+    //
+    // This is now the first thing that touches the named Redis, so an
+    // unreachable one fails the boot here rather than four lines down at the
+    // session store. Both messages name `ROUNDHOUSE_REDIS_URL`, which is the
+    // part an operator acts on; ordering the connects to preserve which one
+    // arrives first would mean resolving this ledger inside both arms of the
+    // match below, and two sites choosing one ledger is the shape this rung
+    // removed.
+    let fair_use: Arc<dyn FairUseLedger> = match fair_use_backend(redis_url.as_deref()) {
+        FairUseBackend::Shared { url } => {
+            let ledger = RedisFairUseLedger::connect(url).await.with_context(|| {
+                format!("opening the fair-use ledger in the Redis named by {REDIS_VAR}")
+            })?;
+            tracing::info!(
+                var = REDIS_VAR,
+                "fair-use windows are counted in Redis; every node serving a project \
+                 shares one rolling ceiling"
+            );
+            Arc::new(ledger)
+        }
+        FairUseBackend::PerProcess => {
+            tracing::info!(
+                var = REDIS_VAR,
+                "fair-use windows are counted in this process's memory; a ceiling \
+                 configured here or added later through the admin plane is enforced per \
+                 node, and says so when it first enforces one"
+            );
+            Arc::new(MemoryFairUseLedger::new())
+        }
+    };
 
     match redis_url {
         Some(url) => {
@@ -814,24 +838,6 @@ async fn main() -> anyhow::Result<()> {
                 var = REDIS_VAR,
                 "sessions and committed spend are durable in Redis"
             );
-            let fair_use: Arc<dyn FairUseLedger> = match fair_use_backend {
-                FairUseBackend::Shared => {
-                    let ledger = RedisFairUseLedger::connect(&url).await.with_context(|| {
-                        format!("opening the fair-use ledger in the Redis named by {REDIS_VAR}")
-                    })?;
-                    tracing::info!(
-                        var = REDIS_VAR,
-                        "fair-use windows are counted in Redis; every node serving a \
-                         project shares one rolling ceiling"
-                    );
-                    Arc::new(ledger)
-                }
-                // Nothing configures a window, so there is no ceiling to share
-                // and nothing will ever read these counters. See
-                // `fair_use_backend` for why that is a second fact rather than
-                // the same one that chose the store above.
-                FairUseBackend::PerProcess => Arc::new(MemoryFairUseLedger::new()),
-            };
             if control_plane_file_configured {
                 tracing::warn!(
                     var = control_config::CONTROL_PLANE_VAR,
@@ -871,7 +877,7 @@ async fn main() -> anyhow::Result<()> {
             serve(
                 Arc::new(MemoryStore::new()),
                 Arc::new(MemorySpendLedger::new()),
-                Arc::new(MemoryFairUseLedger::new()),
+                fair_use,
                 Arc::clone(&directory),
                 catalog,
                 frontier,
@@ -883,61 +889,6 @@ async fn main() -> anyhow::Result<()> {
             .await
         }
     }
-}
-
-/// Where a deployment's rolling fair-use counters live.
-///
-/// Two variants rather than a `bool` because the *warning* is defined in terms
-/// of this and not in terms of the environment: it is owed exactly when a
-/// ceiling exists and is not shared, and spelling that as
-/// `redis_url.is_none() && fair_use_configured` at the log site is how the log
-/// and the ledger drift apart the day a third backend arrives.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FairUseBackend {
-    /// The buckets every node of the deployment shares.
-    Shared,
-    /// This process's own memory.
-    PerProcess,
-}
-
-/// The same rule that chooses a session store and a spend ledger, plus one
-/// more fact.
-///
-/// **The shared half is identical**: `ROUNDHOUSE_REDIS_URL` is the variable an
-/// operator sets when they mean "this is more than one process", and it is
-/// exactly then that a per-process rolling counter stops being the ceiling its
-/// configuration says it is. So Redis selects the shared buckets, the same way
-/// it selects the durable log and the durable ledger, and for the same reason.
-///
-/// **The extra fact is that fair use is absent by default.** A session store
-/// and a spend ledger are wanted unconditionally — every turn writes a log, and
-/// every project has a budget even if it is unlimited. A fair-use ceiling
-/// exists only where a membership writes a `fair_use` block, and most write
-/// none; connecting a third handle for a counter nothing will read would be a
-/// startup dependency bought for nothing, and — worse — it would make an
-/// unreachable-Redis boot failure possible in a deployment that has no
-/// fair-use ceiling to fail about.
-fn fair_use_backend(redis_configured: bool, fair_use_configured: bool) -> FairUseBackend {
-    match redis_configured && fair_use_configured {
-        true => FairUseBackend::Shared,
-        false => FairUseBackend::PerProcess,
-    }
-}
-
-/// Whether the single-node fair-use caution is owed: a ceiling is configured
-/// and this process is the only thing counting toward it.
-///
-/// Extracted so the boot site and its test call the *same* code rather than
-/// the boot site carrying the condition inline and a test re-deriving it in
-/// its own closure. The latter shape shipped once in M13's own thermo-nuclear
-/// review (F1): the test's hand-duplicated `owed` closure kept passing after
-/// the boot site's condition was mutated to drop the backend check entirely,
-/// because the test never called into the mutated code — it only re-evaluated
-/// its private copy of the same logic. A shared function closes that gap: any
-/// edit to the predicate, wherever it is called from, is exercised by the one
-/// test below.
-fn fair_use_warning_owed(backend: FairUseBackend, fair_use_configured: bool) -> bool {
-    backend == FairUseBackend::PerProcess && fair_use_configured
 }
 
 /// Compose the engine and the five surfaces over whichever backends were
@@ -1179,65 +1130,6 @@ mod tests {
 
     fn plane_with_policy(policy: serde_json::Value) -> ControlPlane {
         plane_with(policy, serde_json::Value::Null)
-    }
-
-    // -----------------------------------------------------------------------
-    // Which fair-use ledger a deployment gets (M13, R-F3)
-    // -----------------------------------------------------------------------
-
-    /// **The choice matches sessions and spend on the half they share, and
-    /// differs only where fair use is absent by default.**
-    ///
-    /// The whole table, because three of its four cells are the interesting
-    /// ones: naming a Redis is what selects shared buckets, exactly as it
-    /// selects the durable log and the durable ledger; and a deployment that
-    /// configures no window gets no third Redis handle, because there is no
-    /// ceiling for it to share.
-    #[test]
-    fn redis_and_a_configured_window_together_select_the_shared_buckets() {
-        use FairUseBackend::{PerProcess, Shared};
-        for (redis, configured, expected) in [
-            (true, true, Shared),
-            (true, false, PerProcess),
-            (false, true, PerProcess),
-            (false, false, PerProcess),
-        ] {
-            assert_eq!(
-                fair_use_backend(redis, configured),
-                expected,
-                "redis_configured={redis}, fair_use_configured={configured}"
-            );
-        }
-    }
-
-    /// **The boot warning is the exact complement of the shared arm.**
-    ///
-    /// The honesty mechanism only works if it fires whenever a ceiling is
-    /// believed in and not shared, and stays silent otherwise — a warning that
-    /// kept firing after M13 closed the gap it describes is how a real warning
-    /// gets ignored. This calls `fair_use_warning_owed`, the exact function
-    /// the composition root branches on at the boot call site — not a
-    /// hand-duplicated re-derivation of it — so a future edit to the
-    /// predicate is exercised here rather than silently diverging from what
-    /// this test asserts (M13 thermo-nuclear review, F1).
-    #[test]
-    fn the_single_node_warning_is_owed_exactly_when_a_ceiling_is_not_shared() {
-        let owed = |redis, configured| {
-            fair_use_warning_owed(fair_use_backend(redis, configured), configured)
-        };
-        assert!(
-            owed(false, true),
-            "a configured ceiling with no Redis is enforced per process, and must say so"
-        );
-        assert!(
-            !owed(true, true),
-            "and the warning goes the moment the buckets are shared -- the gap it \
-             describes is closed"
-        );
-        // Nothing configured: there is no ceiling to be wrong about, and a
-        // caution about a gap nobody is standing in is noise.
-        assert!(!owed(true, false));
-        assert!(!owed(false, false));
     }
 
     // -----------------------------------------------------------------------

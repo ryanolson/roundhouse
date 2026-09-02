@@ -68,24 +68,26 @@ pub struct ProjectPatch {
     /// **No window-mutation hazard here, which is why this axis is patchable at
     /// all while `budget.window` is refused.** A `BudgetWindow` change
     /// reinterprets committed spend — a total read as a month — so the admin
-    /// plane declines it. Fair use has nothing committed to reinterpret: the
-    /// shipped ledger — `MemoryFairUseLedger`, the only implementation in this
-    /// milestone — buckets draws by wall-clock index under `(project, member)`
-    /// and nothing else, and `would_exceed` reads the configured span at
-    /// admission time. Narrowing a window therefore sums fewer of the same
-    /// buckets and widening one sums more, both over draws that really
-    /// happened; the pruning horizon is the widest window the module offers, so
-    /// widening 5h to 7d finds its history intact rather than zeroed. A change
-    /// takes effect on the next admitted turn and no counter moves.
+    /// plane declines it. Fair use has nothing committed to reinterpret: both
+    /// backing ledgers — `MemoryFairUseLedger`'s `BTreeMap` and the Redis
+    /// ledger's bucket-per-key layout (M13) — bucket draws by wall-clock index
+    /// under `(project, member)` and nothing else, and `would_exceed` reads the
+    /// configured span at admission time. Narrowing a window therefore sums
+    /// fewer of the same buckets and widening one sums more, both over draws
+    /// that really happened; the pruning horizon is the widest window the
+    /// module offers, so widening 5h to 7d finds its history intact rather
+    /// than zeroed. A change takes effect on the next admitted turn and no
+    /// counter moves.
     ///
-    /// **That is a property of the ledger, not of the seam, and the Redis
-    /// implementation inherits it as a constraint.** `fair_use`'s module doc
-    /// leaves the Redis key layout explicitly undecided (bucket-per-key versus
-    /// hash-per-scope); a layout that keyed buckets *by window* would make a
-    /// window change reinterpret existing draws and would put this axis back
-    /// under the refusal `budget.window` is under. Whoever lands that store
-    /// keeps the keying independent of the configured window, or removes this
-    /// axis from the patch — not both quietly.
+    /// **That is a property of the key layout, and the Redis implementation was
+    /// built to keep it.** `fair_use`'s module doc named the layout question
+    /// this axis depends on — bucket-per-key versus hash-per-scope — and
+    /// settled it on bucket-per-key at `BUCKET_MS`: the bucket a draw lands in
+    /// is a function of `at_ms` alone, with no window anywhere in the key, so a
+    /// window change cannot reinterpret an existing bucket the way a layout
+    /// keyed *by window* would have. That was the constraint this comment used
+    /// to leave open; it is why bucket-per-key was chosen over hash-per-scope,
+    /// not a residual risk the chosen layout still carries.
     #[serde(default, deserialize_with = "keep_explicit_null")]
     pub fair_use: Option<Option<FairUseConfig>>,
     #[serde(default, deserialize_with = "keep_explicit_null")]

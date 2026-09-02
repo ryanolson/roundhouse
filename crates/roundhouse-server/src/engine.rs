@@ -790,12 +790,14 @@ pub struct Engine<S: SessionStore, T: Tokenizer + Clone> {
     spend: Arc<dyn SpendLedger>,
     /// This deployment's rolling fair-use counters.
     ///
-    /// Defaulted rather than required, and — unlike [`Self::spend`] — the
-    /// default is the *only* implementation this milestone has. See
-    /// [`fair_use`](roundhouse_core::control::fair_use) for what a memory
-    /// ledger does not survive and for the unlock condition on the Redis one;
-    /// the composition root warns when a deployment has made its sessions
-    /// durable while these counters have not.
+    /// Defaulted rather than required, and — like [`Self::spend`] — backed by
+    /// two implementations chosen the same way: the memory ledger here, or
+    /// the Redis one wired through [`Self::with_fair_use_ledger`] when the
+    /// composition root has a Redis and a `fair_use` block to serve (M13).
+    /// See [`fair_use`](roundhouse_core::control::fair_use) for what the
+    /// memory ledger does not survive and for the key layout the Redis one
+    /// ships; the composition root warns when a deployment has made its
+    /// sessions durable while these counters have not.
     ///
     /// A separate field from `spend` rather than a second method on it,
     /// because they are separate stores with separate arithmetic — the whole
@@ -969,13 +971,15 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
     /// Count rolling fair-use draws in `fair_use` instead of this process's own
     /// memory.
     ///
-    /// A builder for [`Self::with_spend_ledger`]'s reason, and unused by the
-    /// shipped binary today: the memory ledger is the only implementation, so
-    /// the seam exists for the tests that need a recording one and for the
-    /// Redis implementation whose unlock condition is written at
-    /// [`FairUseLedger`]. Present now rather than added later because a trait
-    /// with exactly one implementation and no way to substitute it is a trait
-    /// nobody can prove is a seam.
+    /// A builder for [`Self::with_spend_ledger`]'s reason, and wired by the
+    /// shipped binary today: `main` chooses between the memory ledger and the
+    /// Redis implementation by the rule [`fair_use`](roundhouse_core::control::fair_use)
+    /// states and installs the choice here, exactly as it does for
+    /// [`Self::with_spend_ledger`]. The seam predates that wiring and stays
+    /// for the tests that need a recording ledger. Present from the start
+    /// rather than added later because a trait with exactly one
+    /// implementation and no way to substitute it is a trait nobody can prove
+    /// is a seam.
     pub fn with_fair_use_ledger(mut self, fair_use: Arc<dyn FairUseLedger>) -> Self {
         self.fair_use = fair_use;
         self

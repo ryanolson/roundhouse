@@ -48,6 +48,19 @@
 //! settlement it found belongs to the response it was called for, and draws
 //! nothing when it does not.
 //!
+//! **Where the single-node caution is said, and why not here.** A deployment
+//! with no Redis counts its ceilings in one process, and an operator has to be
+//! told — but the fact has two halves, and this seam holds only one of them.
+//! It knows a ceiling is being enforced (`admission.fair_use` is non-empty);
+//! it does not know whether the ledger behind the trait object is shared.
+//! `MemoryFairUseLedger` knows both, so the warning lives there and fires the
+//! first time it is asked to enforce anything. It used to be a boot-time
+//! `if` in `main.rs` over a snapshot of the compiled plane, which is M13's
+//! thermo-nuclear review F1: the admin plane `PATCH`es a `fair_use` block onto
+//! a live project, so the snapshot was stale by exactly the deployments the
+//! caution was for. The test below is the seam's end of that — one warning,
+//! whatever route the ceiling arrived by.
+//!
 //! **A judge's side call is not a second draw.** Where the interjection seam
 //! answers a turn, the judge's tokens *are* the turn's booked usage and are
 //! counted once here; where the turn is dispatched, they are booked under the
@@ -362,6 +375,113 @@ mod tests {
             "the ghost turn must have drawn nothing; a second draw over the \
              same 100 tokens would put this 150-token window over and refuse a \
              turn that had room"
+        );
+    }
+
+    /// Everything `tracing::warn!` wrote during one closure, as text.
+    ///
+    /// The same capture point `main.rs`'s own suite keeps, and here for the
+    /// same reason: nothing else in this file reads what `tracing` emits, so
+    /// the single-node caution below could be deleted outright without a test
+    /// going red. The serialization and the interest-cache rebuild are not
+    /// tidiness — `with_default` installs a *thread-local* subscriber, and a
+    /// concurrent test evaluating this callsite under the no-op global
+    /// dispatcher caches "never interested" for it, which silently drops the
+    /// very line the assertion is about. See `main.rs`'s copy for the full
+    /// diagnosis.
+    fn captured_warnings(f: impl FnOnce()) -> String {
+        use std::io;
+        use std::sync::Mutex;
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl io::Write for Buf {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for Buf {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+        let _serialized = ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let buf = Buf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            f()
+        });
+        String::from_utf8(buf.0.lock().unwrap().clone()).expect("tracing output is UTF-8")
+    }
+
+    /// **A ceiling this node learned about after boot still says "one node",
+    /// exactly once.**
+    ///
+    /// M13's thermo-nuclear review, F1: the caution used to be a boot-time
+    /// `if` over a snapshot of the compiled plane, so a deployment whose
+    /// operator added a `fair_use` block through the admin plane an hour later
+    /// enforced it per node in silence — the snapshot the `if` read had been
+    /// taken before the ceiling existed. This fixture is that deployment: an
+    /// engine wired to a per-process ledger, and an admission carrying a
+    /// ceiling that no boot-time read could have seen.
+    ///
+    /// Three assertions, and the middle one is the load-bearing one:
+    ///
+    /// - a membership with **no** window enforces nothing and must therefore
+    ///   say nothing — a caution about a gap nobody is standing in is how a
+    ///   real warning gets ignored;
+    /// - the first turn judged against a real ceiling warns;
+    /// - and the second does not, because a line repeated on every admitted
+    ///   request is one an operator filters out and then never sees.
+    #[test]
+    fn a_ceiling_this_node_only_learns_of_at_enforcement_time_warns_once() {
+        let engine = engine(Arc::new(MemoryFairUseLedger::new()));
+        let uncapped = Admission {
+            fair_use: Arc::new(FairUseTerms::default()),
+            ..capped(100)
+        };
+        let capped = capped(100);
+
+        // CONTROL: nothing configured, nothing enforced, nothing said.
+        let quiet = captured_warnings(|| {
+            futures::executor::block_on(engine.fair_use_refusal(&uncapped)).unwrap();
+        });
+        assert!(
+            !quiet.contains("THIS PROCESS'S memory"),
+            "a membership with no window reaches no ledger and is not what the caution is \
+             about; said here it would be noise on every deployment that has none: {quiet}"
+        );
+
+        let first = captured_warnings(|| {
+            futures::executor::block_on(engine.fair_use_refusal(&capped)).unwrap();
+        });
+        assert!(
+            first.contains("THIS PROCESS'S memory"),
+            "the first turn judged against a real ceiling through a per-process ledger must \
+             say so, however late the ceiling arrived: {first}"
+        );
+
+        let second = captured_warnings(|| {
+            futures::executor::block_on(engine.fair_use_refusal(&capped)).unwrap();
+        });
+        assert!(
+            !second.contains("THIS PROCESS'S memory"),
+            "and only the first: {second}"
         );
     }
 

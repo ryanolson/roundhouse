@@ -76,6 +76,7 @@ pub mod control_config;
 pub mod conversations;
 pub mod dialect;
 pub mod engine;
+pub mod fair_use_backend;
 pub mod http;
 pub mod judge;
 pub mod mcp_api;
@@ -101,6 +102,7 @@ pub use engine::{
     EchoLocalExecutor, Engine, EngineConfig, EngineError, LocalExecution, LocalExecutor, TurnInput,
     TurnResult,
 };
+pub use fair_use_backend::{FairUseBackend, fair_use_backend};
 pub use http::router;
 pub use judge::{FleetJudge, JudgeConfig};
 pub use mcp_api::{ControlPlaneReads, describe_ambiguous_memberships, mcp_router};

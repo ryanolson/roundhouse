@@ -76,6 +76,17 @@ pub fn fair_use_bucket_keys(principal: &Principal, at_ms: u64) -> (String, Strin
     )
 }
 
+/// The `would_exceed` script's own text.
+///
+/// Exported for the one gated test that has to invoke it with a window group
+/// past the ones `FairUseWindow::ALL` names — an argument list the production
+/// `WouldExceedArgs` deliberately cannot build. Handing out the real script
+/// rather than letting the test carry a copy is the whole point: a copy drifts
+/// from what ships, and a test green against a stale copy proves nothing.
+pub fn fair_use_would_exceed_source() -> &'static str {
+    crate::fair_use::scripts::would_exceed_source()
+}
+
 /// The conformance suite's expiry lever. Deleting the key is exactly what
 /// Redis `PX` eventually does, so takeover behaves as if the TTL had elapsed.
 #[async_trait::async_trait]
