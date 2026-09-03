@@ -303,6 +303,100 @@ async fn an_evicted_key_costs_exactly_one_store_read_on_its_next_touch() {
     );
 }
 
+/// **M14.2 review, F9: the memo's cap may not evict a dirty entry.**
+///
+/// R-S2 rests on "an eviction costs one store read on the next touch and
+/// nothing else", which is true of every entry that is a *copy* of what the
+/// store holds and false of the one entry that is not. A commit the store
+/// refused is this node's only record of its own turn; once the cap takes it,
+/// [`Conversations::resolve`] falls through to `self.maps.generation(key)`
+/// and serves the generation that refused write was meant to supersede —
+/// M14.1's F7, re-opened one eviction later. So a dirty entry is pinned, and
+/// the cap steps over it to the oldest entry it may take.
+///
+/// This was F9's red test,
+/// `an_evicted_dirty_entry_stops_resolve_from_agreeing_with_itself`, over a
+/// live-Redis wrapper. It runs over [`HalfDownMaps`] now for the reason F7's
+/// own guard (`a_lost_write_is_served_from_the_memo_then_retried_and_cleared`)
+/// does: the mechanism is the memo's cap and `resolve`'s fallback, neither of
+/// which can tell one backend from another, and a guard that runs only where
+/// a Redis is named is a guard the next regression walks past.
+#[tokio::test]
+async fn a_dirty_entry_is_pinned_against_the_cap_so_resolve_agrees_with_itself() {
+    let maps = Arc::new(HalfDownMaps::new());
+    let node = Conversations::over(Arc::clone(&maps) as Arc<dyn CorrelationMaps>);
+    let key = "acme/ada/f9";
+
+    // g1 lands normally.
+    node.commit(&ada(), key, 1).await;
+    assert_eq!(
+        node.resolve(key).await.unwrap(),
+        Some(bound_session(key, 1)),
+        "sanity: the store really holds g1 before the dirty window opens"
+    );
+
+    // g2 is refused by the store — a dirty memo entry, F7's own fixture.
+    maps.refuse_writes(true);
+    node.commit(&ada(), key, 2).await;
+    maps.refuse_writes(false);
+
+    // BASELINE: F7 stays fixed while the dirty entry is in the memo — the
+    // node that committed g2 agrees with itself.
+    assert_eq!(
+        node.resolve(key).await.unwrap(),
+        Some(bound_session(key, 2)),
+        "F7 baseline: a dirty memo entry, still in the memo, is what \
+         resolve() must answer from"
+    );
+
+    // Touch GENERATION_MEMO_CAP other keys — enough to push the memo one past
+    // its cap with the dirty entry sitting at the very head of the queue,
+    // which is exactly where an oldest-first cap reaches first.
+    for n in 0..GENERATION_MEMO_CAP {
+        node.generation(&format!("acme/ada/f9-filler-{n}")).await;
+    }
+    assert_eq!(
+        node.lock_generations().len(),
+        GENERATION_MEMO_CAP,
+        "sanity: the memo is back at its cap, so the eviction really ran"
+    );
+    assert!(
+        node.lock_generations().get(key).is_some(),
+        "F9: the dirty entry is the oldest in the memo, so an oldest-first \
+         cap takes it first unless it steps over what is pinned"
+    );
+    assert!(
+        node.lock_generations()
+            .get("acme/ada/f9-filler-0")
+            .is_none(),
+        "control: what the cap took instead is the oldest entry it was \
+         allowed to take — without this the assertion above would also pass \
+         a memo that had quietly stopped evicting anything"
+    );
+
+    // THE CLAIM: resolve() still agrees with itself. That g2 is this node's
+    // own unretried commit did not change because the memo ran out of room
+    // to keep saying so.
+    assert_eq!(
+        node.resolve(key).await.unwrap(),
+        Some(bound_session(key, 2)),
+        "F9: resolve() must still serve the generation this node committed, \
+         not the one the store still holds because the write was refused"
+    );
+
+    // CONTROL: the store really does still hold the superseded g1, so the
+    // assertion above is about the pin and not about the write having landed
+    // some other way.
+    let elsewhere = Conversations::over(Arc::clone(&maps) as Arc<dyn CorrelationMaps>);
+    assert_eq!(
+        elsewhere.resolve(key).await.unwrap(),
+        Some(bound_session(key, 1)),
+        "sanity: another node — with no memo of its own — reads exactly what \
+         the store holds, which is the superseded g1 the refused write never \
+         overwrote"
+    );
+}
+
 /// **The line the memo may not cross.** A reader is answered from the
 /// store, whatever this node last committed.
 ///

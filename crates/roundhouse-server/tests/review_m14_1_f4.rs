@@ -66,6 +66,9 @@ fn repo_root() -> std::path::PathBuf {
 }
 
 const CORRELATION_RS: &str = "crates/roundhouse-core/src/control/correlation.rs";
+/// The memory implementation moved to a sibling file in M14.2's review round
+/// (R-S5); the working-tree assertions read both halves.
+const MEMORY_RS: &str = "crates/roundhouse-core/src/control/correlation/memory.rs";
 const CONVERSATIONS_RS: &str = "crates/roundhouse-server/src/conversations.rs";
 const PINNED_COMMIT_PEAK: &str = "b9d4d1244fd281a2314615dcfa5e2615bb812bbe"; // M14.1 rung itself, pre-fix
 
@@ -316,7 +319,7 @@ fn the_generations_field_doc_contradicted_the_trait_methods_doc() {
 /// doc already said, and neither describes a failure counter any more.
 #[test]
 fn the_generations_field_doc_now_agrees_with_the_trait_methods_doc() {
-    let src = read(CORRELATION_RS);
+    let src = read(CORRELATION_RS) + &read(MEMORY_RS);
     assert!(
         !src.contains("How many times each *namespaced* cache key's history has failed the"),
         "F4: the generations field doc should no longer describe a failure count"

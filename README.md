@@ -237,11 +237,20 @@ turn's ceiling.
 
 Configuration is environment variables and nothing else, because a flag parser
 in the composition root is the first place a deployment concern leaks in:
-`ROUNDHOUSE_ADDR`, `ROUNDHOUSE_REDIS_URL`, `ROUNDHOUSE_CATALOG`,
-`ROUNDHOUSE_CONTROL_PLANE`, `ROUNDHOUSE_JUDGE_MODEL`,
+`ROUNDHOUSE_ADDR`, `ROUNDHOUSE_REDIS_URL`, `ROUNDHOUSE_REDIS_NAMESPACE`,
+`ROUNDHOUSE_CATALOG`, `ROUNDHOUSE_CONTROL_PLANE`, `ROUNDHOUSE_JUDGE_MODEL`,
 `ROUNDHOUSE_FRONTIER_UPSTREAM`, and — for the two auth modes, which address
 genuinely different origins — `ROUNDHOUSE_OPENAI_API_BASE` and
 `ROUNDHOUSE_OPENAI_PASS_THROUGH_BASE`.
+
+`ROUNDHOUSE_REDIS_NAMESPACE` names the deployment boundary every shared key
+in `roundhouse-store-redis` is built under (M14.2, R-S3): absent defaults to
+`rh`, the namespace every deployment used before this variable existed;
+set-but-empty is a boot refusal rather than a silent read as absent, because
+an operator who typed the variable meant *something* by it, and a namespace
+that is itself blank would collide with the unnamespaced default. Read
+whether or not `ROUNDHOUSE_REDIS_URL` is set, so a typo is caught at the
+boot that introduced it rather than on the day a Redis is added.
 
 ## The MCP control surface
 

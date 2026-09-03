@@ -785,8 +785,14 @@ async fn main() -> anyhow::Result<()> {
     // Read and validated before anything connects: an empty
     // ROUNDHOUSE_REDIS_NAMESPACE is a boot error, not a per-process quirk
     // that surfaces as two deployments silently sharing a keyspace (R-S3).
+    // Names the variable, not the reason — `EmptyNamespace`'s own Display
+    // already says why (blank, or a character the key format itself
+    // reserves; M14.2 review, F5/F6), and repeating "must not be empty"
+    // here doubled a boot operator's one useful line into two identical
+    // ones instead of adding the one thing they don't already know: which
+    // variable to go fix.
     let namespace = resolve_namespace(std::env::var(REDIS_NAMESPACE_VAR).ok().as_deref())
-        .with_context(|| format!("{REDIS_NAMESPACE_VAR} must not be empty"))?;
+        .with_context(|| format!("reading {REDIS_NAMESPACE_VAR}"))?;
     let backends =
         shared_backend::open(std::env::var(REDIS_VAR).ok().as_deref(), &namespace).await?;
 

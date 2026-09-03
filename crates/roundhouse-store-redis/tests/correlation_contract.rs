@@ -35,7 +35,7 @@ mod common;
 
 use common::raw_from_env;
 use redis::AsyncCommands;
-use roundhouse_core::control::correlation::contract::fresh_key;
+use roundhouse_core::control::correlation::contract::{AdvancePastTheBound, fresh_key};
 use roundhouse_core::control::correlation::{
     CALL_BINDING_STALENESS_MS, THREAD_BINDING_STALENESS_MS,
 };
@@ -50,13 +50,37 @@ use roundhouse_store_redis::test_support::{
 
 roundhouse_core::correlation_maps_contract_suite!(
     ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored",
-    connect_maps_from_env().await
+    connect_maps_from_env().await,
+    aged = aged_maps_from_env().await,
 );
 
 async fn connect_maps_from_env() -> RedisCorrelationMaps {
     RedisCorrelationMaps::connect(url_from_env())
         .await
         .expect("Redis named by the env var must be reachable")
+}
+
+/// This backend's answer to the contract's "advance past the bound" hook
+/// (M14.2 review, F4): a handle whose bindings expire in a moment, and a real
+/// wait for that moment to pass.
+///
+/// Driven through the per-handle seam rather than by shortening
+/// `CALL_BINDING_TTL_MS`: the shipped bound is six hours, and a test that
+/// changed it would be asserting on a deployment nobody runs (R-C6). The wait
+/// is real because Redis expiry is wall-clock driven and forcing it would
+/// test the seam rather than the server — the one instantiation that waits,
+/// waiting out an expiry it owns, while the shared assertion the hook is
+/// handed to never sleeps. What the shipped bound actually is stays proven by
+/// [`the_default_call_and_thread_ttls_reach_redis_as_the_core_staleness_bounds`],
+/// which reads `PTTL` off a default handle rather than waiting for anything.
+async fn aged_maps_from_env() -> (RedisCorrelationMaps, AdvancePastTheBound) {
+    let maps = connect_maps_from_env().await.with_binding_ttls(80, 80);
+    let advance: AdvancePastTheBound = Box::new(|| {
+        Box::pin(async {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        })
+    });
+    (maps, advance)
 }
 
 fn session(name: &str) -> SessionId {
@@ -188,68 +212,15 @@ async fn a_collision_across_two_nodes_marks_the_id_ambiguous_in_the_store() {
     assert_eq!(stored.as_deref(), Some(AMBIGUOUS_MARKER));
 }
 
-/// A binding leaves at its staleness bound, and it leaves because Redis
-/// expired it.
-///
-/// Driven through the per-handle seam rather than by shortening
-/// `CALL_BINDING_TTL_MS`: the shipped bound is six hours, and a test that
-/// changed it would be asserting on a deployment nobody runs (R-C6).
-///
-/// The generation half is the control and is the point of the test as much as
-/// the expiry is: a generation that aged out would not be a lost guess but a
-/// reset fork counter, re-pointing a live conversation at a log it forked away
-/// from. So the same short-TTL handle is asked for a generation it wrote, and
-/// the generation is still there.
-#[tokio::test]
-#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
-async fn a_binding_expires_at_its_staleness_bound_and_a_generation_does_not() {
-    let maps = connect_maps_from_env().await.with_binding_ttls(80, 80);
-    let ada = fresh_principal("ada");
-    let key = fresh_key("main");
-
-    maps.bind_call(&ada, "toolu_brief", &session("acme/ada/main"))
-        .await
-        .unwrap();
-    maps.bind_thread(&ada, "thread-brief", &session("acme/ada/main"))
-        .await
-        .unwrap();
-    maps.set_generation(&key, 3).await.unwrap();
-
-    // The control: both bindings are live before the bound elapses. Without
-    // it, a `bind_call` that wrote nothing at all would pass the expiry
-    // assertions below.
-    assert!(
-        maps.session_of_call(&ada, "toolu_brief")
-            .await
-            .unwrap()
-            .is_some()
-    );
-    assert!(
-        maps.session_of_thread(&ada, "thread-brief")
-            .await
-            .unwrap()
-            .is_some()
-    );
-
-    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-
-    assert_eq!(
-        maps.session_of_call(&ada, "toolu_brief").await.unwrap(),
-        None,
-        "a binding older than any plausible turn is a stale guess, and it \
-         answers exactly as an id nothing ever emitted does"
-    );
-    assert_eq!(
-        maps.session_of_thread(&ada, "thread-brief").await.unwrap(),
-        None
-    );
-    assert_eq!(
-        maps.generation(&key).await.unwrap(),
-        Some(3),
-        "the generation map carries no expiry: an aged-out fork counter is not \
-         a lost guess but a live conversation re-pointed at a log it left"
-    );
-}
+// The per-backend expiry test that used to sit here is gone into the
+// contract (M14.2 review, F4): "a binding older than the bound is absent" is
+// a claim about both implementations, and one copy per backend is how the two
+// came to disagree at exactly the bound they were supposed to share. It runs
+// against this backend as
+// `a_binding_past_its_staleness_bound_is_absent_and_the_next_write_is_a_first_write`,
+// generated by the suite macro above from `aged_maps_from_env`, and it
+// asserts strictly more than the copy it replaces — the write path at the
+// bound as well as the read path, plus the same generation control.
 
 /// The bound every production handle actually ships — `BindingTtls::default()`,
 /// never `with_binding_ttls` — reaches Redis as `roundhouse-core`'s own

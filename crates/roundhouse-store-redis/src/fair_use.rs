@@ -159,7 +159,11 @@ use crate::keys::{self, KeyNamespace};
 /// third; and no spelling of a user id can make any of them collide, because
 /// the only thing after `m:` is the id.
 pub(crate) fn project_scope_key(namespace: &KeyNamespace, project: &ProjectId) -> String {
-    keys::build_key(namespace, "fairuse", &[&format!("{{{project}}}"), "p"])
+    keys::build_key(
+        namespace,
+        keys::KeyFamily::FairUse,
+        &[&format!("{{{project}}}"), "p"],
+    )
 }
 
 pub(crate) fn member_scope_key(
@@ -169,7 +173,7 @@ pub(crate) fn member_scope_key(
 ) -> String {
     keys::build_key(
         namespace,
-        "fairuse",
+        keys::KeyFamily::FairUse,
         &[&format!("{{{project}}}"), &format!("m:{user}")],
     )
 }

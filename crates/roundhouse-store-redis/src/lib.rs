@@ -13,10 +13,10 @@
 //! | `rh:v1:sess:{<session_id>}:lease` | hash | holder `node_id` + fencing token, expiry enforced by Redis `PEXPIRE` |
 //! | `rh:v1:sess:{<session_id>}:log` | stream | one entry per event, explicit id `<seq>-0` |
 //!
-//! `rh` is the default [`KeyNamespace`] (`keys`), `v1` is [`keys::SCHEMA_VERSION`]
-//! and `sess` is this family's name — see [`keys`] for the one function every
-//! family builds its keys from (R-S3), and the table below for the other
-//! three.
+//! `rh` is the default [`KeyNamespace`] (`keys`), `v1` is this family's own
+//! [`keys::KeyFamily::version`] and `sess` is its [`keys::KeyFamily::name`]
+//! — see [`keys`] for the one function every family builds its keys from
+//! (R-S3), and the table below for the other three.
 //!
 //! | Family | Version | Module |
 //! |---|---|---|
@@ -214,15 +214,27 @@ impl RedisSessionStore {
 // keys are an internal storage detail. Feature-gated test helpers expose them
 // only to the external wire-format tests that write raw Redis data.
 fn meta_key(namespace: &KeyNamespace, session_id: &SessionId) -> String {
-    keys::build_key(namespace, "sess", &[&format!("{{{session_id}}}"), "meta"])
+    keys::build_key(
+        namespace,
+        keys::KeyFamily::Session,
+        &[&format!("{{{session_id}}}"), "meta"],
+    )
 }
 
 fn lease_key(namespace: &KeyNamespace, session_id: &SessionId) -> String {
-    keys::build_key(namespace, "sess", &[&format!("{{{session_id}}}"), "lease"])
+    keys::build_key(
+        namespace,
+        keys::KeyFamily::Session,
+        &[&format!("{{{session_id}}}"), "lease"],
+    )
 }
 
 fn log_key(namespace: &KeyNamespace, session_id: &SessionId) -> String {
-    keys::build_key(namespace, "sess", &[&format!("{{{session_id}}}"), "log"])
+    keys::build_key(
+        namespace,
+        keys::KeyFamily::Session,
+        &[&format!("{{{session_id}}}"), "log"],
+    )
 }
 
 /// The value under `…:meta`.

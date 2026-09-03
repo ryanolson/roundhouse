@@ -149,7 +149,11 @@ pub const AMBIGUOUS_MARKER: &str = "!ambiguous";
 /// key)` triple, because that same string is the session id's stem: the
 /// counter and the id it names must not be able to key on different things.
 pub(crate) fn generation_key(namespace: &KeyNamespace, key: &str) -> String {
-    keys::build_key(namespace, "corr", &["gen", &format!("{{{key}}}")])
+    keys::build_key(
+        namespace,
+        keys::KeyFamily::Correlation,
+        &["gen", &format!("{{{key}}}")],
+    )
 }
 
 /// The key one principal's binding of one tool-use id occupies.
@@ -161,7 +165,7 @@ pub(crate) fn generation_key(namespace: &KeyNamespace, key: &str) -> String {
 pub(crate) fn call_key(namespace: &KeyNamespace, principal: &Principal, call_id: &str) -> String {
     keys::build_key(
         namespace,
-        "corr",
+        keys::KeyFamily::Correlation,
         &[
             "call",
             &format!("{{{}}}:{call_id}", principal_tag(principal)),
@@ -179,7 +183,7 @@ pub(crate) fn thread_key(
 ) -> String {
     keys::build_key(
         namespace,
-        "corr",
+        keys::KeyFamily::Correlation,
         &[
             "thread",
             &format!("{{{}}}:{thread_id}", principal_tag(principal)),

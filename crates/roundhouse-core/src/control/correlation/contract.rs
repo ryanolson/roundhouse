@@ -23,14 +23,28 @@
 //! assuming an empty store, so one shared backend instance — one real Redis —
 //! can host the whole suite with no cross-test interference.
 //!
-//! **What is deliberately not asserted here is each backend's *bound*.** The
-//! memory maps evict by capacity per principal and the Redis maps expire by
-//! TTL per key, and R-C3 makes that difference deliberate: a shared store has
-//! no natural place to keep an eviction queue. Asserting a cap would fail a
-//! backend that expires by time, and asserting an expiry would fail one that
-//! does not; each is pinned beside the implementation that owns it. What is
-//! shared — and is here — is what a *lost* binding costs, which is the same
-//! `None` an unknown id answers with.
+//! **The staleness bound is asserted here, and the *capacity* bound is
+//! not.** Until M14.2 neither was: the memory maps evicted by capacity per
+//! principal and the Redis maps expired by TTL per key, so — the earlier
+//! version of this paragraph reasoned — asserting a cap would fail a backend
+//! that expires by time and asserting an expiry would fail one that does not.
+//! R-S1 ended half of that: both implementations now age a binding out
+//! against the *same* constants, so "a binding older than the bound is
+//! absent" is a claim about both or it is not a claim at all, and a rung that
+//! left it as two unrelated unit tests let the two disagree at exactly the
+//! bound they were supposed to share (M14.2 review, F3, F4). What remains
+//! backend-private is the cap: a shared store has no natural place to keep an
+//! eviction queue, so a capacity assertion really would fail one of the two,
+//! and it stays beside the implementation that owns it. What a *lost* binding
+//! costs is the same `None` an unknown id answers with, whichever bound took
+//! it.
+//!
+//! **How the staleness assertion reaches the bound without sleeping.** Each
+//! instantiation hands the suite an [`AdvancePastTheBound`] hook alongside
+//! its backend: the memory maps move a scripted clock, the Redis maps shorten
+//! their per-handle TTL and wait it out. So the shared text never sleeps, an
+//! instantiation may wait out an expiry it owns, and neither has to change a
+//! shipped bound to be tested (R-C6).
 //!
 //! The [`correlation_maps_contract_suite!`](crate::correlation_maps_contract_suite)
 //! macro is the single list of these tests. A backend instantiates the whole
@@ -351,6 +365,111 @@ pub async fn a_call_a_thread_and_a_generation_do_not_share_a_name<M: Correlation
     assert_eq!(maps.generation(&key).await.unwrap(), Some(4));
 }
 
+/// How an instantiation moves a binding past its staleness bound.
+///
+/// A boxed factory of futures rather than a plain `async fn` argument,
+/// because the two backends reach the bound by different mechanisms and only
+/// one of them is asynchronous: the memory maps move a scripted clock (no
+/// wait at all), and the Redis maps shorten their per-handle TTL and await
+/// it. Boxing is what lets one shared assertion take either without the
+/// suite macro growing a generic parameter per backend.
+pub type AdvancePastTheBound =
+    Box<dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
+
+/// **The claim R-S1 makes and both implementations have to keep: a binding
+/// older than its bound is absent, and the next write is therefore a first
+/// write.**
+///
+/// The second half is the one that caught a real disagreement (M14.2 review,
+/// F3). Redis gets it by construction — the key it would have collided with
+/// has expired — while the memory maps had to be told, and until they were,
+/// one deployment answered a re-used tool-call id with the session that
+/// claimed it and the other answered `None` for a collision with a binding
+/// that no longer existed. That is exactly the kind of divergence a contract
+/// exists to make impossible, and exactly the kind a per-backend unit test
+/// cannot see.
+///
+/// The generation half is the control and is as much the point as the expiry
+/// is: a generation that aged out would not be a lost guess but a reset fork
+/// counter, re-pointing a live conversation at a log it forked away from. So
+/// the same handle is asked for a generation it wrote before the advance, and
+/// the generation is still there afterwards.
+pub async fn a_binding_past_its_staleness_bound_is_absent_and_the_next_write_is_a_first_write<
+    M: CorrelationMaps,
+>(
+    maps: &M,
+    advance_past_the_bound: AdvancePastTheBound,
+) {
+    let ada = fresh_principal("ada");
+    let key = fresh_key("main");
+    let first = session("acme/ada/first");
+    let second = session("acme/ada/second");
+
+    maps.bind_call(&ada, "toolu_ages_out", &first)
+        .await
+        .unwrap();
+    maps.bind_thread(&ada, "thread-ages-out", &first)
+        .await
+        .unwrap();
+    maps.set_generation(&key, 3).await.unwrap();
+
+    // CONTROL: both bindings answer before the bound elapses. Without it, a
+    // backend whose `bind_call` wrote nothing at all would pass everything
+    // below.
+    assert_eq!(
+        maps.session_of_call(&ada, "toolu_ages_out").await.unwrap(),
+        Some(first.clone()),
+        "control: the call binding has to be live before its bound elapses,          or what follows is asserting on a write that never happened"
+    );
+    assert_eq!(
+        maps.session_of_thread(&ada, "thread-ages-out")
+            .await
+            .unwrap(),
+        Some(first.clone()),
+        "control: same, for the thread binding"
+    );
+
+    advance_past_the_bound().await;
+
+    assert_eq!(
+        maps.session_of_call(&ada, "toolu_ages_out").await.unwrap(),
+        None,
+        "a binding older than any plausible turn is a stale guess, and it          answers exactly as an id nothing ever emitted does"
+    );
+    assert_eq!(
+        maps.session_of_thread(&ada, "thread-ages-out")
+            .await
+            .unwrap(),
+        None,
+        "same claim, for the thread binding — a wider bound, the same rule"
+    );
+    assert_eq!(
+        maps.generation(&key).await.unwrap(),
+        Some(3),
+        "the generation map carries no expiry: an aged-out fork counter is          not a lost guess but a live conversation re-pointed at a log it left"
+    );
+
+    // The write path, at the same bound the read path just used.
+    maps.bind_call(&ada, "toolu_ages_out", &second)
+        .await
+        .unwrap();
+    maps.bind_thread(&ada, "thread-ages-out", &second)
+        .await
+        .unwrap();
+    assert_eq!(
+        maps.session_of_call(&ada, "toolu_ages_out").await.unwrap(),
+        Some(second.clone()),
+        "the binding this id had was absent by the time the second session          claimed it, so this is a first bind and not a collision — an          implementation that matched the aged-out entry would answer None          here, for a conflict with a binding that no longer exists"
+    );
+    assert_eq!(
+        maps.session_of_thread(&ada, "thread-ages-out")
+            .await
+            .unwrap(),
+        Some(second),
+        "and a thread binding written past the bound is the thread's          binding, not a rebind of something that had already gone"
+    );
+}
+
 /// Instantiate the whole conformance suite against one backend.
 ///
 /// The single list of contract tests, in the same idiom and for the same
@@ -366,12 +485,23 @@ pub async fn a_call_a_thread_and_a_generation_do_not_share_a_name<M: Correlation
 /// `#[ignore]` on every generated test — how an infrastructure-gated backend
 /// applies its gate suite-wide.
 ///
+/// `aged` is the second half of every instantiation and is not optional: an
+/// expression yielding `(backend, `[`AdvancePastTheBound`]`)` for the one
+/// assertion that has to reach a bound. It is a *separate* handle from
+/// `$make` because a backend may only be able to reach its bound by being
+/// built differently — the Redis maps shorten their per-handle TTL, which the
+/// other nine tests must not run against.
+///
 /// ```ignore
-/// roundhouse_core::correlation_maps_contract_suite!(MemoryCorrelationMaps::new());
+/// roundhouse_core::correlation_maps_contract_suite!(
+///     MemoryCorrelationMaps::new(),
+///     aged = aged_memory_maps(),
+/// );
 ///
 /// roundhouse_core::correlation_maps_contract_suite!(
 ///     ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored",
-///     connect_from_env().await
+///     connect_from_env().await,
+///     aged = aged_maps_from_env().await,
 /// );
 /// ```
 ///
@@ -380,11 +510,31 @@ pub async fn a_call_a_thread_and_a_generation_do_not_share_a_name<M: Correlation
 /// dev-dependency.
 #[macro_export]
 macro_rules! correlation_maps_contract_suite {
-    (ignore = $reason:literal, $make:expr $(,)?) => {
+    (ignore = $reason:literal, $make:expr, aged = $aged:expr $(,)?) => {
         $crate::correlation_maps_contract_suite!(@list (#[ignore = $reason]) $make);
+        $crate::correlation_maps_contract_suite!(@staleness (#[ignore = $reason]) $aged);
     };
-    ($make:expr $(,)?) => {
+    ($make:expr, aged = $aged:expr $(,)?) => {
         $crate::correlation_maps_contract_suite!(@list () $make);
+        $crate::correlation_maps_contract_suite!(@staleness () $aged);
+    };
+    // The staleness assertion, written once here and taking each
+    // instantiation's own way of reaching the bound (M14.2 review, F4). It is
+    // outside the `@list` recursion below for one reason: it is the only
+    // assertion that takes a second argument, and the recursion's whole shape
+    // is one uniform `module::name(&binding).await` per name.
+    (@staleness ($(#[$attr:meta])*) $aged:expr) => {
+        #[tokio::test]
+        $(#[$attr])*
+        async fn a_binding_past_its_staleness_bound_is_absent_and_the_next_write_is_a_first_write() {
+            let (maps, advance_past_the_bound) = $aged;
+            $crate::control::correlation::contract::
+                a_binding_past_its_staleness_bound_is_absent_and_the_next_write_is_a_first_write(
+                    &maps,
+                    advance_past_the_bound,
+                )
+                .await;
+        }
     };
     // The single list. Both public arms land here, so gated and ungated
     // backends cannot drift apart in coverage. The recursion that turns this

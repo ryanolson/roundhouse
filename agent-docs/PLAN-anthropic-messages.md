@@ -1902,3 +1902,56 @@ families have. The `redis` crate does not move.
   the three that stayed green closed test-first: the Redis default
   compared with the core bound, the builder convention guard, and the
   no-sleep guard.
+
+### What the review round changed (2026-09-03, M14.2)
+
+Thirteen raw findings, eleven after triage, ten valid and one partially
+valid. Four of them were one design.
+
+**R-S5 — one bounded, aged table.** M14.2 gave two structurally identical
+tables the same age sweep by hand and left a third capped queue in the
+server crate (F2), and each copy carried the same three defects: a write
+past the bound matched the stale entry and marked it ambiguous where the
+Redis key had already expired, so the two implementations disagreed at
+exactly the bound the rung introduced (F3); a rebind kept its queue
+position with a fresh timestamp, so a live head shielded every stale
+entry behind it from the sweep and the count cap then evicted the fresh
+one (F8); and the generation memo's cap evicted dirty entries, the one
+state where the memo is the fresher fact, re-opening the M14.1 F7 answer
+(F9). One generic table in core now carries the rules once, each pinned
+on the type: a read past the bound is absent and drops the entry; a write
+past the bound is a first write; a rebind moves to the tail so the head is
+always the oldest; the cap evicts oldest-first among evictable entries
+and never a pinned one, and a dirty generation entry is pinned until its
+write lands. The call table, the thread table and the memo are three thin
+instantiations naming their bound and their cap. The contract gained the
+staleness assertion R-S4 promised and M14.2 did not deliver (F4), written
+once with an advance-past-the-bound hook each instantiation supplies —
+the memory one moves its scripted clock, the Redis one waits out a
+shortened expiry it does not own — which is what "never by sleeping"
+honestly means. `correlation.rs` took the house shape, the memory
+implementation and the tests in sibling files (F1).
+
+**Key discipline, closed rather than asserted** (F6, F7, F10). A
+namespace could contain a Redis Cluster hash tag and put every key of the
+deployment in one slot; braces, colons and whitespace are refused with
+the reason. The refuter's corroboration of the Cluster-slot collapse ran
+against a cluster-mode Redis it started itself; that test is not kept,
+because the crate's one infrastructure gate is a plain Redis and the gate
+run would fail it by design — the Redis fact it corroborated is stated in
+`keys.rs`'s doc and the roundhouse behaviour is pinned by the unit test
+that refuses the brace. The family is a closed enum with a name and, per family, a
+version, so a v2 of one family moves only its own key space rather than
+orphaning every session log; the convention guard scans for every key
+function rather than a hand list, and the module-doc table is pinned by
+the enum.
+
+Housekeeping: README names the namespace knob, the store crate's as-built
+key table shows the post-rule shapes, the empty-namespace error no longer
+says its message twice (F5 — whose guard the verifier found mirrors the
+message rather than exercising `main.rs`, the same limit every boot-site
+guard in this crate shares and the composition-root rung already named); the no-sleep guard says it is a spelling
+guard and scans for the spellings that matter (F11). The gate caught one
+thing the fix stages did not: the M14.1 round's doc guard read the field
+doc from the file the memory implementation had just been moved out of;
+it now reads both halves.

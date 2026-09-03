@@ -57,17 +57,25 @@ use crate::keys::{self, KeyNamespace};
 // `settle_grant` check-and-debit both the project and member ceilings in one
 // atomic script — see the module doc.
 pub(crate) fn account_key(namespace: &KeyNamespace, project: &ProjectId) -> String {
-    keys::build_key(namespace, "spend", &[&format!("{{{project}}}"), "account"])
+    keys::build_key(
+        namespace,
+        keys::KeyFamily::Spend,
+        &[&format!("{{{project}}}"), "account"],
+    )
 }
 
 pub(crate) fn holds_key(namespace: &KeyNamespace, project: &ProjectId) -> String {
-    keys::build_key(namespace, "spend", &[&format!("{{{project}}}"), "holds"])
+    keys::build_key(
+        namespace,
+        keys::KeyFamily::Spend,
+        &[&format!("{{{project}}}"), "holds"],
+    )
 }
 
 pub(crate) fn watermarks_key(namespace: &KeyNamespace, project: &ProjectId) -> String {
     keys::build_key(
         namespace,
-        "spend",
+        keys::KeyFamily::Spend,
         &[&format!("{{{project}}}"), "watermarks"],
     )
 }

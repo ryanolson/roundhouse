@@ -148,10 +148,11 @@
 //! return the error, and `mcp_api` renders it as an internal fault rather than
 //! as a tenancy answer.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use roundhouse_core::control::correlation::AgedTable;
 use roundhouse_core::control::{
     CorrelationError, CorrelationMaps, MemoryCorrelationMaps, Principal,
 };
@@ -168,9 +169,10 @@ use roundhouse_core::ids::SessionId;
 /// (see the module doc's "no reader is cached" section). So an entry going
 /// *stale* costs nothing this cap does not already cost by going *missing*:
 /// either way the next touch pays one store read. Capacity is therefore the
-/// only bound worth having, oldest-first, the same shape
-/// [`REMEMBERED_CALLS`](roundhouse_core::control::correlation::REMEMBERED_CALLS)
-/// already gives its own cache one seam over.
+/// only bound worth having, oldest-first — which is
+/// [`AgedTable`](roundhouse_core::control::correlation::AgedTable) with no
+/// staleness bound, the same type the two binding families one seam over are
+/// instantiations of (M14.2 review, F2).
 ///
 /// The M14.1 doc this replaces predicted the opposite — that this memo would
 /// gain the two binding families' staleness bound — and that prediction was
@@ -226,46 +228,58 @@ struct Memo {
     dirty: bool,
 }
 
-/// This node's whole memo of the generation map: the entries, and their
-/// write order for the cap to evict by.
+/// This node's whole memo of the generation map: one bounded table, holding
+/// entries the cap may not take while they are dirty.
 ///
-/// A separate type rather than a bare `HashMap` so the cap is enforced in one
-/// place — [`Self::set`] — instead of at every call site that touches the
-/// map, the same reason [`roundhouse_core::control::correlation`]'s own
-/// per-principal tables carry their insertion order beside their entries.
-#[derive(Debug, Default)]
+/// A named wrapper rather than the table bare, so the two things that are
+/// *this* memo's — its cap and which of its entries are pinned — are named
+/// once, here, and every call site below reads and writes without repeating
+/// either.
+#[derive(Debug)]
 struct GenerationMemo {
-    entries: HashMap<String, Memo>,
-    /// Write order of `entries`, so the cap evicts the oldest. A rebind of a
-    /// key already present does not push a second position — the same "does
-    /// not spend a queue slot" invariant `CorrelationMaps`' own tables keep.
-    order: VecDeque<String>,
+    /// Bounded by count alone: no staleness bound, for
+    /// [`GENERATION_MEMO_CAP`]'s reason.
+    ///
+    /// **Pinned while dirty** (M14.2 review, F9). A clean entry is a copy of
+    /// what the store holds, so evicting it costs the next touch one read and
+    /// nothing else — the whole of what R-S2 rests on. A *dirty* entry is not
+    /// a copy of anything: it is this node's only record of a commit the
+    /// store refused, and evicting it makes [`Conversations::resolve`] fall
+    /// back to the store's older generation and hand a client the session
+    /// this node moved it off — M14.1's F7, re-opened one eviction later. It
+    /// stops being pinned the moment a write lands, which
+    /// [`Conversations::write_generation`] retries on the next commit of the
+    /// same key; so the pinned population is bounded by the keys whose
+    /// commits one store outage refused, and it drains on that retry rather
+    /// than accumulating.
+    entries: AgedTable<Memo>,
+}
+
+impl Default for GenerationMemo {
+    fn default() -> Self {
+        Self {
+            entries: AgedTable::new(GENERATION_MEMO_CAP, None).with_pinned(|memo| memo.dirty),
+        }
+    }
 }
 
 impl GenerationMemo {
-    fn get(&self, key: &str) -> Option<Memo> {
+    /// `&mut self` because the table's read path is also where an aged-out
+    /// entry would be dropped — this table has no staleness bound, so nothing
+    /// is dropped here, but the seam belongs to the shared type rather than
+    /// to this wrapper.
+    fn get(&mut self, key: &str) -> Option<Memo> {
         self.entries.get(key).copied()
     }
 
-    /// Insert or overwrite `key`'s entry, evicting the oldest key once this
-    /// pushes the memo past [`GENERATION_MEMO_CAP`].
+    /// Insert or overwrite `key`'s entry, evicting the oldest *evictable* key
+    /// once this pushes the memo past [`GENERATION_MEMO_CAP`].
     ///
-    /// Only a genuinely new key spends a queue slot: overwriting an existing
-    /// entry — re-priming it from the store, or marking it dirty — must not
-    /// let repeated touches of one hot key crowd out everything else, which
-    /// is exactly the failure a queue that grew on every write would have.
+    /// Overwriting moves the entry to the queue's tail rather than leaving it
+    /// where it was, so repeated touches of one hot key keep it resident
+    /// without ever spending a second queue slot.
     fn set(&mut self, key: &str, memo: Memo) {
-        let is_new = !self.entries.contains_key(key);
-        self.entries.insert(key.to_string(), memo);
-        if is_new {
-            self.order.push_back(key.to_string());
-            while self.order.len() > GENERATION_MEMO_CAP {
-                let Some(oldest) = self.order.pop_front() else {
-                    break;
-                };
-                self.entries.remove(&oldest);
-            }
-        }
+        self.entries.write(key, |_| memo);
     }
 
     #[cfg(test)]
