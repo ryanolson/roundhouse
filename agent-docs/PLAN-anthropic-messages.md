@@ -1351,7 +1351,9 @@ cross-node aggregator for the metrics fold.
 ### What the implementation settled beyond the rulings (2026-09-02, M14.0)
 
 - **The bound is eight, and the refusal is a 409.** `MAX_PREFIX_FORK_ATTEMPTS`
-  is the number of generations one request may disagree with before
+  [renamed `MAX_PREFIX_PROBES` in the review round below — nothing forks
+  per attempt any more] is the number of generations one request may
+  disagree with before
   `prefix_admission_exhausted` refuses it, naming the cache key and the
   count; a client that has rewritten its history more times than that
   inside one request is a loop, not a client. The refusal is a conflict,
@@ -1371,3 +1373,65 @@ cross-node aggregator for the metrics fold.
   integration suite exists in this tree, so the Responses-side proof is at
   `bind_prefix`'s own level; the Messages suite carries the HTTP-level
   proof.
+
+### What the review round changed (2026-09-03, M14.0)
+
+Twelve findings from two lenses: eleven valid, one partially valid, one
+invalid — the store contract already catches the mutation F12 described,
+and the refuter's control stays as a pin. Six of the valid ones were one
+defect with six faces, and it moved the ruling.
+
+**R13′ — prefix admission probes, then commits, in its own module.** The
+M14.0 loop forked on every attempt: each `fork` advanced the key's counter
+and moved `latest` before anything was known. So a refusal left the counter
+and `latest` on a generation no turn ran on (F9), a verbatim retry resumed
+past the bound and was admitted whole a few forks later — and Claude Code
+retries a 409 unconditionally (F6); the reported count was the constant,
+not what was probed (F8); the search looked only upward from this node's
+counter, so a node that had served a divergent turn forked past an older
+generation that agreed and duplicated its prefix where a fresh node would
+have continued it (F11); and an empty generation another node was mid-turn
+on looked fresh and was taken whole, to die on the lease (F10). The
+admission step itself was spelled twice, once with the store's answer
+discarded (F2). The shape that removes all six: the *home* of a claim is
+the existing generation that agrees with it and holds the most of it; a
+fresh generation is created only when none agrees. The node's current
+generation is probed first and the common case still costs one read;
+otherwise the other existing generations are probed — upward to the first
+missing one, which is the fresh slot, and downward to zero — bounded in
+each direction. An empty existing generation is a home only if no other
+writer holds its lease: leased, it is another node's fresh slot; unleased,
+it is the shape a request leaves when it opened a generation and appended
+nothing — a client that hung up, or a turn refused downstream — and it is
+ours to use. (The ruling's brief had named `init_session` as the source of
+that shape; it is not — `init_session` mints a binding in the control
+store and never creates a session — and the fix pass said so rather than
+building on it.) Nothing is committed until the home is known — one
+`commit` on `Conversations` sets the counter and `latest`, and the session
+is created there and only for a fresh home — so a refusal mutates nothing
+in the table or the store, a retry is refused identically, and the refusal
+counts what it probed. The first fix pass had asked existence by creating,
+which minted the first free slot before the home was known whenever the
+home lay below the counter; the second pass asks existence through
+`last_seq`, so the probe writes nothing. The cluster the two dialects share — admission, the
+stored-conversation projection, the bound, the refusal, their tests —
+lives in `prefix_admission.rs` (F3), which is also the one home of this
+rationale (F4); `responses_api.rs` keeps only its dialect, and
+`conversations.rs`'s module doc has its F9 paragraph's referent back and
+says what a restart now costs: an agreeing restart forks nothing and loses
+no warm prefix, only one extra read of the prior generation (F7). The
+constant and the function each carry their own doc again (F1), the bound
+is named `MAX_PREFIX_PROBES` for what it now does, and the module's tests
+live in a sibling file as the crate's other large modules do.
+
+Also: the rung's tests run on one rig, and `Conversations` exposes its
+generation naming to the crate's tests so no test re-spells `#g{n}` (F5,
+partially valid — the crate's eleven echo-engine fixtures of one shape are
+a crate-wide hygiene item recorded here, not this rung's). With M14.1's
+durable generation map the probe is unchanged; only the counter's home
+moves. Left for a hygiene pass, by name: `Conversations::bind` and `fork`
+have no production caller now and survive as test fixtures; a refusal
+whose every probed generation was busy reports zero disagreements; the
+subagent fixture in the MCP surface suite changed its expected generation
+because the downward walk now puts the parent's third turn back on the
+generation it continues, which is the fix working, not a regression.

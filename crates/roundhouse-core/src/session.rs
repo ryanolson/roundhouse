@@ -242,7 +242,7 @@ pub fn turn_configuration_len(items: &[Item]) -> usize {
 /// **One rule, two readers**, which is the whole reason this is a type and not
 /// two loops: the session's own projection ([`SessionState::items`], what the
 /// prompt is rebuilt from) and the serve surfaces' prefix-admission projection
-/// (`responses_api::bind_prefix`) have to agree byte for byte about what the
+/// (`prefix_admission::bind_prefix`) have to agree byte for byte about what the
 /// session contains, or admission checks a conversation the model never sees.
 ///
 /// The rule: a turn's input may open with a run of configuration items, and

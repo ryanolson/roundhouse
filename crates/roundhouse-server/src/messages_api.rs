@@ -21,7 +21,7 @@
 //! namespace qualification, the `Conversations` binding, the fork on prefix
 //! disagreement — is what the Responses surface already does with the key a
 //! client hands it, through the one function both call
-//! ([`responses_api::bind_prefix`](crate::responses_api)).
+//! ([`prefix_admission::bind_prefix`](crate::prefix_admission)).
 //!
 //! **The client's parser is strict where the other one is forgiving.** Claude
 //! Code dispatches SSE frames on the `event:` name and *silently drops* a frame
@@ -86,7 +86,8 @@ use crate::control_config::{AuthError, PlaneSource};
 use crate::conversations::Conversations;
 use crate::engine::{Engine, TurnInput};
 use crate::http::{ApiError, POLL_INTERVAL, parse_body, refuse_over_fair_use, store_error};
-use crate::responses_api::{API_PREFIX, bind_prefix};
+use crate::prefix_admission::bind_prefix;
+use crate::responses_api::API_PREFIX;
 
 pub mod emit;
 // Private, unlike its two siblings: nothing outside this surface follows a

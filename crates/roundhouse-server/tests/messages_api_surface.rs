@@ -68,6 +68,7 @@ use roundhouse_fleet::{
     FrontierQuote, FrontierStream, LocalFleet, StaticFrontierCatalog, WireProtocol,
 };
 use roundhouse_server::claude_launch::ROUNDHOUSE_API_KEY_SENTINEL;
+use roundhouse_server::conversations::bound_session;
 use roundhouse_server::messages_api::wire::{
     CreateMessageParams, canonicalize, is_budget_notice, session_key,
 };
@@ -230,14 +231,24 @@ fn engine(store: Arc<MemoryStore>) -> Arc<Engine<MemoryStore, ByteTokenizer>> {
 /// property under test was gone.
 fn surface() -> (Router, Arc<MemoryStore>) {
     let store = Arc::new(MemoryStore::new());
-    (
-        messages_router(
-            ControlPlane::open(),
-            engine(Arc::clone(&store)),
-            Arc::clone(&store),
-            Arc::new(Conversations::new()),
-        ),
-        store,
+    let app = surface_on(&store);
+    (app, store)
+}
+
+/// A router over a store the caller already holds, with a generation counter
+/// of its own.
+///
+/// **One node, spelled once** (M14.0 review, F5). Two routers over one store,
+/// each with its own `Conversations`, is how this file plays a restart — the
+/// store survives, the node-local counter does not — and inlining that
+/// four-argument construction per router made the two halves of such a test
+/// look like two different fixtures rather than the same node twice.
+fn surface_on(store: &Arc<MemoryStore>) -> Router {
+    messages_router(
+        ControlPlane::open(),
+        engine(Arc::clone(store)),
+        Arc::clone(store),
+        Arc::new(Conversations::new()),
     )
 }
 
@@ -2298,18 +2309,14 @@ async fn a_restarted_process_s_fork_is_checked_against_the_store_not_assumed_emp
     // forks it to `#g1` and starts that generation's log -- the same shape
     // `a_divergent_resend_forks_rather_than_merging` proves in isolation.
     {
-        let app = messages_router(
-            ControlPlane::open(),
-            engine(Arc::clone(&store)),
-            Arc::clone(&store),
-            Arc::new(Conversations::new()),
-        );
+        let app = surface_on(&store);
         stream(&app, &headers, &body("hello")).await;
         let forked = stream(&app, &headers, &body("actually, goodbye")).await;
         assert_eq!(forked.text, ANSWER);
     }
 
-    let before = stored_items(&store, &named("sess-restart#g1")).await;
+    let generation = |n| bound_session(&named("sess-restart"), n).to_string();
+    let before = stored_items(&store, &generation(1)).await;
     assert_eq!(
         before.len(),
         2,
@@ -2319,12 +2326,7 @@ async fn a_restarted_process_s_fork_is_checked_against_the_store_not_assumed_emp
     // The restart: same store, but a fresh `Conversations` -- its generation
     // counter for this key re-derives at zero, exactly as a real process
     // restart would leave it (see the `Conversations` module doc).
-    let app = messages_router(
-        ControlPlane::open(),
-        engine(Arc::clone(&store)),
-        Arc::clone(&store),
-        Arc::new(Conversations::new()),
-    );
+    let app = surface_on(&store);
 
     // What the client actually holds: it never learned the process
     // restarted, so it resends the `#g1` history it already has, plus one
@@ -2343,12 +2345,12 @@ async fn a_restarted_process_s_fork_is_checked_against_the_store_not_assumed_emp
     assert_eq!(third.text, ANSWER);
 
     assert!(
-        no_such_session(&store, &format!("{}#g2", named("sess-restart"))).await,
+        no_such_session(&store, &generation(2)).await,
         "the re-derived fork must land on the generation the store already \
-         holds, not fork past it hunting for one that reads empty"
+         holds, not past it hunting for one that reads empty"
     );
 
-    let after = stored_items(&store, &named("sess-restart#g1")).await;
+    let after = stored_items(&store, &generation(1)).await;
     assert_eq!(
         after
             .iter()

@@ -105,7 +105,7 @@ pub trait SessionStore: Send + Sync + 'static {
     /// projection of the log cannot answer "is a turn writing this session
     /// right now" from the log alone: a turn mid-flight and a turn whose writer
     /// died leave byte-identical traces — items with no terminal event yet —
-    /// and only the lease distinguishes them. `responses_api`'s
+    /// and only the lease distinguishes them. `prefix_admission`'s
     /// `stored_conversation` reads it for exactly that (M11.2a's F3): items
     /// stamped by a response that never terminated may be superseded, but only
     /// once nobody is still producing them.

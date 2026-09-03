@@ -36,7 +36,8 @@
 //! - **Not at all.** The MCP surface's `conversation` argument is optional, and
 //!   omitted it means the principal's most recent conversation — which is only
 //!   knowable by having watched the turns go past, which is what
-//!   [`Conversations::bind`] does on every request the Responses surface serves.
+//!   [`Conversations::commit`] does on every request either wire surface
+//!   serves.
 //!
 //! # Node-local, deliberately, and on a stated precedent
 //!
@@ -50,19 +51,6 @@
 //! omitted both. Refusals and re-derivations, never a wrong session served
 //! quietly.
 //!
-//! **Re-deriving a generation is not minting one, and the difference is R13**
-//! (M14.0). A fresh process's counter starts at zero, so the first disagreeing
-//! claim after a restart forks straight back to `#g1` — a name the *shared
-//! store* may already hold a log under, from before the restart forgot it. The
-//! fork this node computes is checked against whatever that name already
-//! holds, exactly as [`bind_prefix`](crate::responses_api::bind_prefix) checks
-//! any other session: an agreeing log continues from the delta, a disagreeing
-//! one forks again. Only a generation the store has genuinely never seen takes
-//! the claim whole. So a restart costs the one avoidable fork's warm prefix —
-//! the same honest cost this table's fork always names — and never the
-//! duplicated log that treating a re-derived generation as empty would have
-//! produced.
-//!
 //! **That last clause used to be false for a name** (M12.1 review, F9).
 //! [`Conversations::resolve`] answered generation zero for a key this node had
 //! never bound, and a generation-zero id *exists in the shared store* whenever
@@ -71,9 +59,19 @@
 //! client was actually in. A key this node holds no binding for is `None` now,
 //! and the surface refuses it exactly as it refuses an unknown or a foreign
 //! name. What survives a restart is a *turn* re-binding its own cache key —
-//! [`Conversations::bind`] still defaults an unknown key to generation zero, so
-//! the common never-forked conversation re-binds to the same log — not a reader
-//! guessing at one on a node that has served it nothing.
+//! [`Conversations::generation`] still starts an unknown key's search at
+//! generation zero, so the common never-forked conversation re-binds to the
+//! same log — not a reader guessing at one on a node that has served it
+//! nothing.
+//!
+//! **What a re-derived generation costs is one read, not a fork.** A counter
+//! that starts at zero says nothing about which generations the shared store
+//! holds, so prefix admission searches the key's family for the one that
+//! agrees with the claim and lands the turn there — see
+//! [`prefix_admission`](crate::prefix_admission), which is the one home of
+//! that rule and of what the alternative cost. An agreeing restart therefore
+//! forks nothing and loses no warm prefix; it pays one extra read of the
+//! generation it walked past.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
@@ -370,10 +368,18 @@ impl Conversations {
 
     /// The session `key` names now, and a note that `principal` is using it.
     ///
-    /// Called by the surface that actually serves turns. The `latest` half is
-    /// recorded here rather than at the end of the turn because it answers
-    /// "which conversation is this agent working in", and an agent that opened a
-    /// turn is working in it whether or not the turn went on to succeed.
+    /// The `latest` half is recorded on the way in rather than at the end of
+    /// the turn because it answers "which conversation is this agent working
+    /// in", and an agent that opened a turn is working in it whether or not
+    /// the turn went on to succeed.
+    ///
+    /// **Not what a wire surface calls any more**, and the reason is M14.0's
+    /// review: a turn's generation is not known until prefix admission has
+    /// searched for it, so binding on the way in wrote a session the request
+    /// might never land on. [`Self::commit`] is the write that happens once
+    /// the answer is known, and this remains for the callers that genuinely do
+    /// mean "generation zero, now" — a fixture standing a conversation up
+    /// without driving a turn through it.
     pub fn bind(&self, principal: &Principal, key: &str) -> SessionId {
         let mut inner = self.lock();
         // Written rather than read-with-a-default, because the entry's
@@ -392,6 +398,12 @@ impl Conversations {
 
     /// Rebind `key` to a fresh session, because the client's history disagreed
     /// with the log.
+    ///
+    /// **Superseded on the serving path by [`Self::commit`]** (M14.0 review):
+    /// admission no longer advances a counter per attempt, so what used to be
+    /// a fork is now a commit to whichever generation the search settled on.
+    /// The paragraph below still describes what moving off a session costs,
+    /// whichever call does the moving.
     ///
     /// # What a fork costs the control plane, stated rather than hidden
     ///
@@ -419,6 +431,56 @@ impl Conversations {
         let generation = inner.generations.entry(key.to_string()).or_insert(0);
         *generation += 1;
         let session = bound_session(key, *generation);
+        inner.latest.insert(principal.clone(), session.clone());
+        session
+    }
+
+    /// Which generation of `key` this node last committed a turn to, or zero
+    /// for a key it has never bound.
+    ///
+    /// Where [`Self::resolve`] refuses an unbound key, this answers zero for
+    /// one, and the difference is who is asking. `resolve` answers a *reader* —
+    /// an MCP call naming a conversation — and a reader that guesses hands back
+    /// a log another node has already forked away from (M12.1 review, F9). This
+    /// answers prefix admission, which is not guessing but choosing where to
+    /// start a search it will check against the store anyway: zero is the
+    /// generation a never-bound key would be at if it exists, and a search that
+    /// begins there confirms or abandons it in one probe.
+    ///
+    /// Deliberately a read: it records nothing and moves nothing, so a request
+    /// that goes on to be refused leaves this table exactly as it found it. See
+    /// [`Self::commit`].
+    pub fn generation(&self, key: &str) -> u32 {
+        self.lock().generations.get(key).copied().unwrap_or(0)
+    }
+
+    /// Record that `principal`'s turn on `key` is landing on `generation`.
+    ///
+    /// **The one write prefix admission makes, and it happens after the answer
+    /// is known** (M14.0 review). Its predecessors — a `bind` on the way in and
+    /// a `fork` per attempt — wrote as they searched, so a request that ended
+    /// in a refusal still left the counter advanced and `latest` naming a
+    /// generation no turn had run on: the refusal stopped one request while the
+    /// retry behind it resumed past the bound, and an unnamed MCP call in
+    /// between was answered with a dead session. Committing once, at the end,
+    /// is what makes a refusal cost nothing.
+    ///
+    /// The counter is *set* rather than incremented, because the search that
+    /// chose `generation` may have walked backwards to an older generation the
+    /// claim still continues — see [`prefix_admission`](crate::prefix_admission).
+    ///
+    /// `latest` moves for [`Self::bind`]'s reason: it answers "which
+    /// conversation is this agent working in", and an agent whose turn is about
+    /// to open is working in it whether or not the turn goes on to succeed.
+    ///
+    /// What moving off a generation costs the control plane is
+    /// [`Self::fork`]'s paragraph, unchanged: `ControlStore`'s records are
+    /// keyed by the session id this commits *away from*, and nothing migrates
+    /// them.
+    pub fn commit(&self, principal: &Principal, key: &str, generation: u32) -> SessionId {
+        let mut inner = self.lock();
+        inner.generations.insert(key.to_string(), generation);
+        let session = bound_session(key, generation);
         inner.latest.insert(principal.clone(), session.clone());
         session
     }
@@ -543,7 +605,13 @@ impl Conversations {
 /// Generation zero is the key verbatim, so a session survives a process
 /// restart that loses the generation map: the common case is a conversation
 /// that never forked, and it re-binds to the same log.
-fn bound_session(key: &str, generation: u32) -> SessionId {
+///
+/// **Public because the convention has to have exactly one home.** Prefix
+/// admission searches a key's generations by name, and every test that seeds
+/// or asserts on one names it the same way — a second spelling of `#g{n}`
+/// anywhere is a second convention, and the two would agree only until one of
+/// them moved.
+pub fn bound_session(key: &str, generation: u32) -> SessionId {
     match generation {
         0 => SessionId::new(key),
         n => SessionId::new(format!("{key}#g{n}")),

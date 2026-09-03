@@ -2143,11 +2143,15 @@ async fn a_tools_call_is_correlated_by_the_thread_id_a_codex_client_stamps() {
 /// covers.
 ///
 /// **Made deterministic.** Two histories under one cache key is, to
-/// roundhouse, a client rewriting its own history, so each alternation forks:
-/// the parent's first turn takes generation 0, the subagent's forks to 1, and
-/// the parent's next forks to 2 — moving `latest` off the subagent while its
-/// tool loop is still in flight. Without the binding the subagent's call is
-/// answered about the parent's newest fork, plausibly and wrongly.
+/// roundhouse, a client rewriting its own history, so the subagent's first
+/// turn diverges from the parent's and opens generation 1. The parent's next
+/// turn resends the history it actually has, and prefix admission puts it back
+/// on generation 0 — a claim's home is the generation that agrees with it,
+/// whichever direction from this node's counter that lies in (M14.0 review,
+/// F11). Either way `latest` ends up off the subagent while its tool loop is
+/// still in flight, which is the condition this test needs: without the
+/// binding the subagent's call is answered about the parent's conversation,
+/// plausibly and wrongly.
 #[tokio::test]
 async fn a_codex_subagents_thread_id_resolves_its_own_fork() {
     let rig = rig(control_plane()).await;
@@ -2162,9 +2166,10 @@ async fn a_codex_subagents_thread_id_resolves_its_own_fork() {
     let latest = bound(&rig, "acme/ada/main");
     assert_eq!(
         latest.as_str(),
-        "acme/ada/main#g2",
-        "the fixture must really have alternated the shared key through three \
-         generations, or the assertions below are about one session"
+        "acme/ada/main",
+        "the fixture must really have split the shared key into two \
+         generations, with `latest` on the parent's rather than the \
+         subagent's, or the assertions below are about one session"
     );
 
     let subagents_call = served(

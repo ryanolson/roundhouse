@@ -82,6 +82,7 @@ pub mod judge;
 pub mod mcp_api;
 pub mod messages_api;
 pub mod metrics_api;
+pub mod prefix_admission;
 pub mod relay_api;
 pub mod relay_handoff;
 pub mod responses_api;
