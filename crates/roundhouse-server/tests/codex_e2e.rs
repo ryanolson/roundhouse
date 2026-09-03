@@ -189,6 +189,7 @@ use roundhouse_server::codex_launch::{
 use roundhouse_server::control_config::TURN_KEY_HEADER;
 use roundhouse_server::control_config::directory::key_id;
 use roundhouse_server::mcp_api::MCP_MOUNT_PATH;
+use roundhouse_server::test_support::{bind_conversation, fork_conversation};
 use roundhouse_server::{
     ControlDirectory, ControlPlaneReads, Conversations, DirectoryMutation, EchoLocalExecutor,
     Engine, EngineConfig, mcp_api::mcp_router, responses_api::responses_router,
@@ -2845,7 +2846,7 @@ async fn the_fork_probe_names_the_session_a_fork_would_have_created() {
     let conversations = Conversations::new();
     let store = MemoryStore::new();
 
-    let zero = conversations.bind(&principal, &key);
+    let zero = bind_conversation(&conversations, &principal, &key).await;
     store
         .create_session(&zero, "policy")
         .await
@@ -2859,7 +2860,7 @@ async fn the_fork_probe_names_the_session_a_fork_would_have_created() {
     // The fork `responses_api` performs when a client's resend disagrees with
     // the log. `latest` now answers `key#g1`, which is what made the old
     // arithmetic vacuous.
-    let forked = conversations.fork(&principal, &key);
+    let forked = fork_conversation(&conversations, &principal, &key).await;
     store
         .create_session(&forked, "policy")
         .await

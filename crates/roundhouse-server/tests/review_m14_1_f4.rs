@@ -182,12 +182,18 @@ fn conversations_holds_the_trait_object_not_the_concrete_type() {
 /// Half two of the contradiction: every one of `Conversations`'s public
 /// correlation-surface methods is `async`, so "whose surface is synchronous"
 /// does not describe it either.
+///
+/// `bind` and `fork` are not in this list any more (M15, H1): both were
+/// deleted once the migration to `commit` this file's own F4 finding is
+/// about (M14.0) left them with no serving-path caller — a fixture that
+/// still needs their exact shape now reads
+/// `roundhouse_server::test_support::{bind_conversation, fork_conversation}`,
+/// which are free functions and were never inherent methods this guard
+/// pinned.
 #[test]
 fn conversations_public_correlation_surface_is_entirely_async() {
     let src = read(CONVERSATIONS_RS);
     let methods = [
-        "bind",
-        "fork",
         "generation",
         "commit",
         "resolve",

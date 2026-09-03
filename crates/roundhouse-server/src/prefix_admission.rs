@@ -98,9 +98,12 @@
 //!    stopping at its first answer — this is where two agreeing generations
 //!    genuinely compete.
 //!
-//! Each walk is bounded ([`MAX_PREFIX_PROBES`]); a claim that disagrees
-//! with everything both of them reach is refused, with the number of
-//! generations actually read back and found disagreeing on the wire.
+//! Each walk is bounded ([`MAX_PREFIX_PROBES`]); a claim that finds no home
+//! anywhere both of them reach is refused, with the number of generations
+//! actually read back on the wire — split into how many disagreed and how
+//! many were another writer's (M15, H4), because folding the two into one
+//! tally is how a refusal that probed nine busy generations once reported
+//! zero of anything.
 //!
 //! Two consequences worth stating rather than discovering:
 //!
@@ -204,10 +207,10 @@ where
         // retry identically while a memo-less node served it at once. Asking
         // the store for a fresh hint and searching once more from it costs one
         // read on the refusal path alone; the ordinary turn is unchanged.
-        Search::Exhausted { disagreed } => {
+        Search::Exhausted { disagreed, busy } => {
             let refreshed = conversations.generation_refreshed(&key).await;
             if refreshed == hint {
-                Search::Exhausted { disagreed }
+                Search::Exhausted { disagreed, busy }
             } else {
                 search(store, &key, refreshed, &claimed).await?
             }
@@ -233,12 +236,12 @@ where
             Ok((session_id, claimed))
         }
         // Every generation a search from a fresh hint could reach disagreed
-        // and it never found a free slot. Refuse loudly, naming the key and
-        // the tally — and commit nothing, so a verbatim retry probes the same
-        // generations and is refused in exactly the same way rather than
-        // resuming past the bound.
-        Search::Exhausted { disagreed } => {
-            Err(ApiError::prefix_admission_exhausted(&key, disagreed))
+        // or was busy, and it never found a free slot. Refuse loudly, naming
+        // the key and both tallies — and commit nothing, so a verbatim retry
+        // probes the same generations and is refused in exactly the same way
+        // rather than resuming past the bound.
+        Search::Exhausted { disagreed, busy } => {
+            Err(ApiError::prefix_admission_exhausted(&key, disagreed, busy))
         }
     }
 }
@@ -257,10 +260,14 @@ enum Search {
     /// Nothing agreed, and `generation` is the key's first free slot — not yet
     /// created, since a probe that asked about it left it as it found it.
     Fresh { generation: u32 },
-    /// Every generation both walks reached disagreed, and neither reached a
-    /// free slot. `disagreed` is what the walks actually read rather than what
-    /// they were allowed to read.
-    Exhausted { disagreed: u32 },
+    /// Every generation both walks reached was either disagreeing or busy,
+    /// and neither walk reached a free slot. `disagreed` and `busy` are what
+    /// the walks actually read rather than what they were allowed to read —
+    /// kept apart (M15, H4) because a run of disagreements and a run of busy
+    /// slots are different facts about the deployment, and folding them into
+    /// one count is how a refusal that probed nine busy generations reported
+    /// zero of anything.
+    Exhausted { disagreed: u32, busy: u32 },
 }
 
 /// One pass of the search over `key`'s family, starting from `current`.
@@ -274,11 +281,15 @@ async fn search<S: SessionStore>(
     current: u32,
     claimed: &[Item],
 ) -> Result<Search, ApiError> {
-    // Generations found agreeing, and generations found disagreeing, kept
-    // rather than counted from the bound: the refusal above reports what the
-    // search actually read, not what it was allowed to read.
+    // Generations found agreeing, kept rather than counted from the bound:
+    // the refusal above reports what the search actually read, not what it
+    // was allowed to read. `disagreed` and `busy` are the same discipline for
+    // the two ways a generation can fail to be a home — kept apart (M15, H4)
+    // rather than folded into one tally, so a refusal reporting all-busy does
+    // not read as a refusal that probed nothing.
     let mut homes: Vec<Home> = Vec::new();
     let mut disagreed = 0u32;
+    let mut busy = 0u32;
 
     // The common case, and the reason it is asked first and alone: a
     // conversation nobody has edited is at the generation this node last
@@ -303,7 +314,7 @@ async fn search<S: SessionStore>(
             });
         }
         Probe::Disagrees => disagreed += 1,
-        Probe::Busy => {}
+        Probe::Busy => busy += 1,
     }
 
     // Upward, one generation at a time, until the claim finds a generation it
@@ -336,7 +347,7 @@ async fn search<S: SessionStore>(
                 break;
             }
             Probe::Disagrees => disagreed += 1,
-            Probe::Busy => {}
+            Probe::Busy => busy += 1,
         }
     }
 
@@ -363,7 +374,7 @@ async fn search<S: SessionStore>(
             // says the store cannot be in; the walk stops rather than
             // pretending the run of existing generations continues past it.
             Probe::Fresh => break,
-            Probe::Busy => {}
+            Probe::Busy => busy += 1,
         }
     }
 
@@ -385,7 +396,7 @@ async fn search<S: SessionStore>(
         return Ok(Search::Fresh { generation });
     }
 
-    Ok(Search::Exhausted { disagreed })
+    Ok(Search::Exhausted { disagreed, busy })
 }
 
 /// Create the generation the search decided is the claim's home, then commit

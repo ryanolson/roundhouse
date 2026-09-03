@@ -72,6 +72,7 @@ use roundhouse_server::conversations::bound_session;
 use roundhouse_server::messages_api::wire::{
     CreateMessageParams, canonicalize, is_budget_notice, session_key,
 };
+use roundhouse_server::test_support::engine_over_echo;
 use roundhouse_server::{
     ControlPlane, ControlPlaneConfig, Conversations, DEFAULT_MCP_NAMESPACE, EchoLocalExecutor,
     Engine, messages_router,
@@ -211,14 +212,13 @@ const TURN_THREE_CURRENT: &str = include_str!("fixtures/claude-2.1.257-turn-3-co
 // The service under test
 // ---------------------------------------------------------------------------
 
+/// [`engine_over_echo`] (M15, H2): one of the eleven fixtures of this exact
+/// shape the rung named.
 fn engine(store: Arc<MemoryStore>) -> Arc<Engine<MemoryStore, ByteTokenizer>> {
-    Arc::new(Engine::new(
+    Arc::new(engine_over_echo(
         Arc::clone(&store),
-        ByteTokenizer,
-        Arc::new(EchoLocalExecutor::new("local answer")),
         frontier_catalog(),
         Arc::new(EchoFrontierClient::new(ANSWER)),
-        Arc::new(AffinityPolicy::new()),
         config(),
     ))
 }

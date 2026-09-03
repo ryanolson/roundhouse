@@ -43,7 +43,7 @@ use roundhouse_core::control::{TargetFilter, TurnPolicy};
 use roundhouse_core::ids::{SessionId, TurnId};
 use roundhouse_core::item::{Item, ItemContent, Role};
 use roundhouse_core::routing::{
-    AffinityPolicy, CacheModel, DecisionSource, ProviderPricing, StagePolicy, Target, TierRecipe,
+    AffinityPolicy, DecisionSource, ProviderPricing, StagePolicy, Target, TierRecipe,
 };
 use roundhouse_core::routing::{PickerMode, stage::DEFAULT_CONFIDENCE_THRESHOLD};
 use roundhouse_core::store::{MemoryStore, SessionStore};
@@ -52,10 +52,10 @@ use roundhouse_fleet::{
     FrontierChunk, FrontierClient, FrontierClients, FrontierError, FrontierModelSpec,
     FrontierQuote, FrontierStream, StaticFrontierCatalog, WireProtocol,
 };
+use roundhouse_server::test_support::frontier_spec;
 use roundhouse_server::{Admission, EchoLocalExecutor, Engine, EngineConfig, LocalExecutor};
 
 mod common;
-use common::MINUTE;
 
 // ---------------------------------------------------------------------------
 // Three providers: two in the capable tier, one in the efficient tier
@@ -75,17 +75,19 @@ fn target(provider: &str) -> Target {
     }
 }
 
+/// [`frontier_spec`] (M15, H2): the same eight-field literal H2 named ten
+/// other copies of, with `provider` and `quality_prior` the two arguments
+/// this file's own escalation tests actually vary.
 fn spec(provider: &str, quality_prior: f64) -> FrontierModelSpec {
-    FrontierModelSpec {
-        provider: provider.into(),
-        model: "m".into(),
-        wire_protocol: WireProtocol::OpenAiResponses,
-        cache_model: CacheModel::Deterministic { ttl_ms: 5 * MINUTE },
-        pricing: ProviderPricing::free(),
+    frontier_spec(
+        provider,
+        "m",
+        WireProtocol::OpenAiResponses,
         quality_prior,
-        base_ttft_ms: 1.0,
-        ttft_ms_per_uncached_token: 0.0,
-    }
+        ProviderPricing::free(),
+        1.0,
+        0.0,
+    )
 }
 
 fn catalog() -> StaticFrontierCatalog {

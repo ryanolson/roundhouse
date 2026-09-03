@@ -13,7 +13,7 @@
 //! feature, so an HTTP client has nowhere to keep a cursor — and it names the
 //! conversation with `prompt_cache_key`, which is its own session id. (A
 //! configured deployment resolves that name inside the caller's namespace
-//! rather than taking it verbatim — see [`Compat::namespaced_key`] — because a
+//! rather than taking it verbatim — see [`ControlPlane::qualify`] — because a
 //! name the client chooses is a name two clients can choose.) Against an
 //! append-only log the resent history is not input: it is a claim about what the
 //! session already contains. The handler checks that claim as a prefix and
@@ -80,7 +80,7 @@ use wire::{
 /// Two shapes and not an `Option<&str>`, because the second one is not text: a
 /// tool call is three fields, three frames, and — unlike a seam answer — the
 /// product of a turn that really did dispatch. Making them one type is what
-/// keeps [`Follower::emitted`] the single narrowing that both `concerns` and
+/// keeps [`ResponsesFollower::emitted`] the single narrowing that both `concerns` and
 /// `project` read, which is the property that doc insists on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Emitted<'a> {

@@ -77,6 +77,7 @@ use roundhouse_core::control::{CorrelationMaps, MemorySpendLedger, Principal, Sp
 use roundhouse_core::ids::SessionId;
 use roundhouse_core::store::{MemoryStore, SessionStore};
 use roundhouse_mcp::ControlStore;
+use roundhouse_server::test_support::bind_conversation;
 use roundhouse_server::{ControlPlane, ControlPlaneReads, Conversations, mcp_router};
 use roundhouse_store_redis::RedisCorrelationMaps;
 use roundhouse_store_redis::test_support::url_from_env;
@@ -128,19 +129,20 @@ fn app_for(
     mcp_router(Arc::clone(plane), reads, Arc::new(ControlStore::new()))
 }
 
-/// Opens a conversation `bind` alone (M14.0's "fixture standing a
-/// conversation up without driving a turn through it") plus what
-/// `named_session`'s existence check separately requires: a session record in
-/// the store, since the read path checks `last_seq` and not only the
-/// correlation maps' generation entry. `create_session` is enough — an empty
-/// log still answers `last_seq` `Ok(0)`.
+/// Opens a conversation with [`bind_conversation`] alone (M14.0's "fixture
+/// standing a conversation up without driving a turn through it", the shape
+/// `Conversations::bind` used to spell before M15's H1 moved it here) plus
+/// what `named_session`'s existence check separately requires: a session
+/// record in the store, since the read path checks `last_seq` and not only
+/// the correlation maps' generation entry. `create_session` is enough — an
+/// empty log still answers `last_seq` `Ok(0)`.
 async fn open_conversation(
     conversations: &Conversations,
     store: &MemoryStore,
     principal: &Principal,
     qualified_key: &str,
 ) -> SessionId {
-    let session = conversations.bind(principal, qualified_key).await;
+    let session = bind_conversation(conversations, principal, qualified_key).await;
     store
         .create_session(&session, "policy")
         .await

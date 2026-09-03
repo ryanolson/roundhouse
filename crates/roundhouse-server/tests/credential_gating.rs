@@ -42,19 +42,18 @@ use roundhouse_core::event::{SessionEvent, SessionEventKind};
 use roundhouse_core::ids::SessionId;
 use roundhouse_core::metrics::MetricsConfig;
 use roundhouse_core::routing::policy::Weights;
-use roundhouse_core::routing::{AffinityPolicy, CacheModel, DecisionRecord, ProviderPricing};
+use roundhouse_core::routing::{AffinityPolicy, DecisionRecord, ProviderPricing};
 use roundhouse_core::store::{MemoryStore, SessionStore};
-use roundhouse_fleet::{
-    EchoFrontierClient, FrontierModelSpec, StaticFrontierCatalog, WireProtocol,
-};
+use roundhouse_fleet::{EchoFrontierClient, StaticFrontierCatalog, WireProtocol};
 use roundhouse_mcp::{ControlStore, ModeNarrowing, PreferMode, TimedOverlay};
+use roundhouse_server::test_support::frontier_spec;
 use roundhouse_server::{
     ControlPlane, ControlPlaneConfig, Conversations, EchoLocalExecutor, Engine, EngineConfig, http,
     metrics_api, responses_api,
 };
 
 mod common;
-use common::{BLOCK_SIZE, LOCAL_MODEL, MINUTE, embedded_fleet, path_segment};
+use common::{BLOCK_SIZE, LOCAL_MODEL, embedded_fleet, path_segment};
 
 // ---------------------------------------------------------------------------
 // The secrets, and the variables that hold them
@@ -115,21 +114,26 @@ const LIMIT_USD: f64 = 1_000.0;
 
 /// Two hosted providers, so "this one is withheld and that one is not" is a
 /// claim a single catalog can make.
+///
+/// [`frontier_spec`] (M15, H2): the per-provider closure this used to
+/// hand-roll was the same eight-field literal H2 named ten other copies of;
+/// only `provider` ever varied here, so it is the one argument left open.
 fn catalog() -> StaticFrontierCatalog {
-    let spec = |provider: &str| FrontierModelSpec {
-        provider: provider.into(),
-        model: "flagship".into(),
-        wire_protocol: WireProtocol::OpenAiResponses,
-        cache_model: CacheModel::Deterministic { ttl_ms: 5 * MINUTE },
-        pricing: ProviderPricing {
-            input_per_mtok_usd: 0.0,
-            cached_input_per_mtok_usd: 0.0,
-            cache_write_per_mtok_usd: 0.0,
-            output_per_mtok_usd: OUTPUT_PER_MTOK_USD,
-        },
-        quality_prior: 0.95,
-        base_ttft_ms: 10.0,
-        ttft_ms_per_uncached_token: 0.0,
+    let spec = |provider: &str| {
+        frontier_spec(
+            provider,
+            "flagship",
+            WireProtocol::OpenAiResponses,
+            0.95,
+            ProviderPricing {
+                input_per_mtok_usd: 0.0,
+                cached_input_per_mtok_usd: 0.0,
+                cache_write_per_mtok_usd: 0.0,
+                output_per_mtok_usd: OUTPUT_PER_MTOK_USD,
+            },
+            10.0,
+            0.0,
+        )
     };
     StaticFrontierCatalog::new(vec![spec("openai"), spec("anthropic")])
 }

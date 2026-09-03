@@ -96,6 +96,37 @@ async fn call_correlated(
     .await
 }
 
+/// One dispatched call carrying all three correlators at once — the shape
+/// none of the three callers above can produce, and the one an ordering
+/// claim needs: `resolve_session`'s thread arm, cache-key arm and
+/// tool-use-id arm are each consulted only when every one before it
+/// answered nothing, so proving the thread arm wins requires the other two
+/// to be *answerable*, not merely absent.
+async fn call_with_every_correlator(
+    surface: &dyn ControlSurface,
+    principal: &Principal,
+    name: &str,
+    arguments: Value,
+    thread_id: &str,
+    cache_key: &str,
+    tool_use_id: &str,
+) -> ToolOutcome {
+    dispatch(
+        surface,
+        principal,
+        ToolCall {
+            name: name.to_string(),
+            arguments,
+            correlators: roundhouse_mcp::Correlators {
+                thread_id: Some(thread_id.to_string()),
+                cache_key: Some(cache_key.to_string()),
+                tool_use_id: Some(tool_use_id.to_string()),
+            },
+        },
+    )
+    .await
+}
+
 /// The JSON a served tool answered with.
 fn served(outcome: &ToolOutcome) -> Value {
     assert!(
@@ -1807,6 +1838,64 @@ async fn a_codex_thread_id_names_the_conversation_and_outranks_the_latest_guess(
     // is a different conversation.
     let guessed = served(&call(&surface, &ada(), "status", json!({})).await);
     assert_eq!(guessed["conversation"], json!(adas_session().as_str()));
+}
+
+/// H5 (M15 hygiene rung): [`FakeDeployment::thread_ids`] is wired into
+/// [`ControlReads::session_of_thread`](roundhouse_mcp::reads::ControlReads::session_of_thread)
+/// but nothing in this file had ever populated it.
+///
+/// Every thread-shaped case above resolves through the *name* fallback —
+/// `deployment.conversations` holds a session whose id is the qualified
+/// thread id string, which is R-M9's second arm and the only one a codex
+/// *root* thread ever needs, since its thread id and its cache key are one
+/// string. This is the case that fell through the cracks: an ingest's own
+/// binding — the table a *subagent's* thread resolves through, since a
+/// subagent's thread id is nobody's cache key (R-M9) — with a cache-key
+/// name and a tool-use id both bound to *different* conversations besides,
+/// so an answer naming the thread table's session is proof the table was
+/// actually consulted and not merely the only thing that could have
+/// answered.
+#[tokio::test]
+async fn a_threads_own_binding_resolves_ahead_of_the_cache_key_and_the_tool_use_id() {
+    let bound_by_thread = SessionId::new("acme/ada/sess_thread_table");
+    let bound_by_cache_key = SessionId::new("acme/ada/sess_cache_key");
+    let bound_by_tool_use = SessionId::new("acme/ada/sess_tool_use");
+
+    let mut deployment = FakeDeployment::default();
+    deployment.thread_ids.insert(
+        "subagent-thread".to_string(),
+        (ada(), bound_by_thread.clone()),
+    );
+    // Reachable only through the name fallback (R-M9's second arm) — present
+    // so that arm has something to answer with, proving the table above it
+    // is what actually decided this call rather than the fallback losing by
+    // default.
+    deployment.conversations.insert(bound_by_cache_key.clone());
+    deployment
+        .tool_use_ids
+        .insert("toolu_1".to_string(), (ada(), bound_by_tool_use));
+    let (surface, _store) = deployment.surface();
+
+    let answered = served(
+        &call_with_every_correlator(
+            &surface,
+            &ada(),
+            "status",
+            json!({}),
+            "subagent-thread",
+            "sess_cache_key",
+            "toolu_1",
+        )
+        .await,
+    );
+    assert_eq!(
+        answered["conversation"],
+        json!(bound_by_thread.as_str()),
+        "H5: the thread table's own binding must decide this call ahead of \
+         both the cache-key name lookup and the tool-use id, which the \
+         deployment could also have answered from -- resolve_session's own \
+         doc orders the three this way and nothing here had proved it"
+    );
 }
 
 /// R-M7's tenancy half: a thread id naming nothing of this caller's is worth

@@ -19,11 +19,9 @@ use roundhouse_core::context::ByteTokenizer;
 use roundhouse_core::event::SessionEvent;
 use roundhouse_core::ids::TurnId;
 use roundhouse_core::item::{ItemContent, Role};
-use roundhouse_core::routing::{AffinityPolicy, CacheModel, ProviderPricing};
+use roundhouse_core::routing::{AffinityPolicy, ProviderPricing};
 use roundhouse_core::store::{Lease, MemoryStore, StoreError};
-use roundhouse_fleet::{
-    EchoFrontierClient, FrontierModelSpec, StaticFrontierCatalog, WireProtocol,
-};
+use roundhouse_fleet::{EchoFrontierClient, StaticFrontierCatalog, WireProtocol};
 
 use crate::engine::{EchoLocalExecutor, EngineConfig};
 
@@ -180,22 +178,26 @@ fn ada() -> Principal {
 /// One priced frontier model, so `Engine::create_session`'s policy lookup
 /// has somewhere to resolve. `bind_prefix` never dispatches a turn, so
 /// nothing about routing or pricing is exercised below.
+///
+/// [`single_model_catalog`](crate::test_support::single_model_catalog) (M15,
+/// H2): this crate's own unit tests are the one audience
+/// `tests/common/mod.rs::frontier_catalog` cannot reach, so this is that
+/// shared fixture rather than a second hand-rolled copy of it.
 fn catalog() -> StaticFrontierCatalog {
-    StaticFrontierCatalog::new(vec![FrontierModelSpec {
-        provider: "anthropic".into(),
-        model: "claude".into(),
-        wire_protocol: WireProtocol::AnthropicMessages,
-        cache_model: CacheModel::Deterministic { ttl_ms: 300_000 },
-        pricing: ProviderPricing {
+    crate::test_support::single_model_catalog(
+        "anthropic",
+        "claude",
+        WireProtocol::AnthropicMessages,
+        0.95,
+        ProviderPricing {
             input_per_mtok_usd: 3.0,
             cached_input_per_mtok_usd: 0.3,
             cache_write_per_mtok_usd: 3.75,
             output_per_mtok_usd: 15.0,
         },
-        quality_prior: 0.95,
-        base_ttft_ms: 350.0,
-        ttft_ms_per_uncached_token: 0.002,
-    }])
+        350.0,
+        0.002,
+    )
 }
 
 /// One node: a store, an engine over it, this node's generation counter,
@@ -287,6 +289,27 @@ impl<S: SessionStore> Rig<S> {
             .append_events(&lease, kinds)
             .await
             .expect("seed append");
+    }
+
+    /// Creates a generation's session and leaves it leased, with nothing
+    /// appended — the shape [`probe`] reads back as [`Probe::Busy`]: another
+    /// writer's fresh slot, one instruction into its first turn.
+    ///
+    /// The F10 pair above builds this by hand for one generation; H4's
+    /// all-busy topology needs it for every generation a search can reach,
+    /// so it is named once here rather than repeated at each of nine call
+    /// sites.
+    async fn hold_busy(&self, generation: u32, node_id: &str) {
+        let session_id = self.generation(generation);
+        self.store
+            .create_session(&session_id, "test-policy")
+            .await
+            .expect("busy session creation");
+        self.store
+            .acquire_lease(&session_id, node_id, 60_000)
+            .await
+            .expect("busy lease request")
+            .expect("busy lease granted -- the slot must still be free to hold");
     }
 
     async fn bind(&self, claimed: Vec<Item>) -> Result<(SessionId, Vec<Item>), ApiError> {
@@ -800,6 +823,70 @@ async fn an_empty_generation_nobody_is_writing_is_a_home() {
     assert!(
         no_such_generation(rig.store.as_ref(), &rig.generation(2)).await,
         "and no second slot may be minted beside it"
+    );
+}
+
+/// **H4 (M15 hygiene rung): a refusal whose every probed generation was
+/// busy must not report zero disagreements.**
+///
+/// `search` kept one tally, `disagreed`, and [`Probe::Busy`] never
+/// incremented it — so a topology where every probe in range answers
+/// `Busy` (another writer's slot, F10's shape, at *every* generation
+/// rather than one) exhausted with `disagreed: 0` and the refusal read as
+/// "the claimed history disagreed with all 0 probed generation(s)", which
+/// is not what happened: nine generations were read and every one of them
+/// was leased and empty, not disagreeing. The fix counts what the search
+/// actually did — probed and found busy — separately from what it probed
+/// and found disagreeing, so an operator reading the refusal can tell a
+/// client stuck disagreeing with real history from a client colliding with
+/// live concurrent writers.
+///
+/// The topology is F10's, widened from one busy generation to the whole
+/// range a search from a fresh hint can reach: generation zero through
+/// [`MAX_PREFIX_PROBES`], each created and leased by another node with
+/// nothing appended. None of them is `Fresh` (all nine exist), none is
+/// `Home` or `Disagrees` (all nine are empty and leased), so the search
+/// exhausts having read every one of them and landed on none.
+#[tokio::test]
+async fn a_refusal_where_every_probe_was_busy_reports_what_it_probed() {
+    let rig = Rig::new("acme/ada/all-busy");
+    for generation in 0..=MAX_PREFIX_PROBES {
+        rig.hold_busy(generation, "other-node").await;
+    }
+
+    let error = rig
+        .bind(vec![user("anything")])
+        .await
+        .expect_err("every reachable generation is another writer's, never a home");
+
+    assert_eq!(error.status(), StatusCode::CONFLICT);
+    assert_eq!(error.code(), "prefix_admission_exhausted");
+    let detail = error
+        .detail()
+        .expect("a client acting on this refusal needs the tally, not English");
+    assert_eq!(
+        detail.get("cache_key").and_then(Value::as_str),
+        Some(rig.key.as_str())
+    );
+    assert_eq!(
+        detail.get("attempts").and_then(Value::as_u64),
+        Some(u64::from(MAX_PREFIX_PROBES) + 1),
+        "H4: every generation from the hint through the bound was probed, \
+         whether or not any of them disagreed -- the total must not \
+         collapse to the disagreement count alone"
+    );
+    assert_eq!(
+        detail.get("disagreed").and_then(Value::as_u64),
+        Some(0),
+        "H4: nothing here disagreed -- every probe found the slot busy, \
+         and the defect this guards is exactly that a reader could not \
+         tell that apart from 'nothing was probed at all'"
+    );
+    assert_eq!(
+        detail.get("busy").and_then(Value::as_u64),
+        Some(u64::from(MAX_PREFIX_PROBES) + 1),
+        "H4: the refusal must say what it actually found busy rather than \
+         folding it into a silent zero"
     );
 }
 

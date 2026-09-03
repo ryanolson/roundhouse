@@ -20,10 +20,11 @@ use std::sync::Arc;
 use roundhouse_core::context::ByteTokenizer;
 use roundhouse_core::ids::{SessionId, TurnId};
 use roundhouse_core::item::{Item, Role};
-use roundhouse_core::routing::{AffinityPolicy, CacheLedger};
+use roundhouse_core::routing::CacheLedger;
 use roundhouse_core::session::Session;
 use roundhouse_fleet::EchoFrontierClient;
-use roundhouse_server::{Admission, EchoLocalExecutor, Engine, EngineConfig};
+use roundhouse_server::test_support::engine_over_echo;
+use roundhouse_server::{Admission, Engine, EngineConfig};
 use roundhouse_store_redis::RedisSessionStore;
 use roundhouse_store_redis::test_support::connect_from_env;
 
@@ -35,17 +36,17 @@ async fn store_from_env() -> Arc<RedisSessionStore> {
 }
 
 /// The offline-demo engine shape from `main.rs`, over Redis instead.
+///
+/// [`engine_over_echo`] (M15, H2): one of the eleven fixtures of this exact
+/// shape the rung named.
 fn engine_over(
     store: Arc<RedisSessionStore>,
     node_id: &str,
 ) -> Engine<RedisSessionStore, ByteTokenizer> {
-    Engine::new(
+    engine_over_echo(
         store,
-        ByteTokenizer,
-        Arc::new(EchoLocalExecutor::new("local answer")),
         frontier_catalog(),
         Arc::new(EchoFrontierClient::new("frontier answer")),
-        Arc::new(AffinityPolicy::new()),
         EngineConfig {
             node_id: node_id.to_string(),
             ..config()

@@ -43,16 +43,15 @@ use roundhouse_core::control::{
 use roundhouse_core::metrics::{MetricsConfig, MetricsRecorder, ReferenceModel, ShadowPricing};
 use roundhouse_core::now_ms;
 use roundhouse_core::routing::{
-    AffinityPolicy, CacheModel, Candidate, ProviderPricing, Target, policy::Weights,
+    AffinityPolicy, Candidate, ProviderPricing, Target, policy::Weights,
 };
 use roundhouse_core::store::MemoryStore;
-use roundhouse_fleet::{
-    EchoFrontierClient, FrontierModelSpec, StaticFrontierCatalog, WireProtocol,
-};
+use roundhouse_fleet::{EchoFrontierClient, StaticFrontierCatalog, WireProtocol};
 use roundhouse_server::control_config::crosscheck::CrossChecks;
 use roundhouse_server::control_config::directory::{
     DirectoryRecords, StoreFailure, VersionedRecords,
 };
+use roundhouse_server::test_support::single_model_catalog;
 use roundhouse_server::{
     ControlDirectory, Conversations, DirectoryStore, EchoLocalExecutor, Engine, EngineConfig,
     MemoryDirectoryStore, admin_api, has_valid_key_shape, http, metrics_api, responses_api,
@@ -90,22 +89,24 @@ fn assert_usd(actual: f64, expected: f64, what: &str) {
 
 /// One hosted model, priced on output alone so a turn's cost does not drift with
 /// the length of the conversation.
+///
+/// [`single_model_catalog`] (M15, H2): one of the eleven fixtures of this
+/// exact shape the rung named.
 fn catalog() -> StaticFrontierCatalog {
-    StaticFrontierCatalog::new(vec![FrontierModelSpec {
-        provider: "anthropic".into(),
-        model: "claude".into(),
-        wire_protocol: WireProtocol::AnthropicMessages,
-        cache_model: CacheModel::Deterministic { ttl_ms: 5 * 60_000 },
-        pricing: ProviderPricing {
+    single_model_catalog(
+        "anthropic",
+        "claude",
+        WireProtocol::AnthropicMessages,
+        0.95,
+        ProviderPricing {
             input_per_mtok_usd: 0.0,
             cached_input_per_mtok_usd: 0.0,
             cache_write_per_mtok_usd: 0.0,
             output_per_mtok_usd: OUTPUT_PER_MTOK_USD,
         },
-        quality_prior: 0.95,
-        base_ttft_ms: 1.0,
-        ttft_ms_per_uncached_token: 0.0,
-    }])
+        1.0,
+        0.0,
+    )
 }
 
 /// The same rate card, declared to the metrics fold.

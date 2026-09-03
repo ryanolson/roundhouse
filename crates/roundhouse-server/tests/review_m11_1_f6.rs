@@ -332,9 +332,10 @@ async fn f6_control_two_messages_turns_under_one_key_do_not_fork() {
 /// `acme/ada/shared-key#g1`; turn three then read *that* generation's content
 /// as its own prefix, disagreed with it too, and forked again to `#g2`. Three
 /// turns, three sessions, one nominal conversation -- and per
-/// `Conversations::fork`'s own doc each fork drops `ControlStore`'s overlay,
-/// intent, steer-payload and session-binding records for the generation it
-/// left, so an agent that narrowed a session's routing over MCP silently
+/// `Conversations::commit`'s own doc each such move drops `ControlStore`'s
+/// overlay, intent, steer-payload and session-binding records for the
+/// generation it left, so an agent that narrowed a session's routing over MCP
+/// silently
 /// stopped being narrowed the moment the *other* dialect took a turn.
 ///
 /// What is asserted now: the two dialects' names never meet, so each

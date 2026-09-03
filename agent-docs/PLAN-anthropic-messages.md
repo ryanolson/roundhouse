@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Plan: the Anthropic Messages surface, the seat, and the launcher (M11)
 
-> **Status: shipped through M14.1; M14.2 in flight (2026-09-03).** The rulings in §3 stand
+> **Status: shipped through M14.2; M15 in flight (2026-09-03).** The rulings in §3 stand
 > as written; where an implementation round moved one, the dated addenda at
 > the end of this document record the move and its reason, and win over §3
 > for the current tree. Direction set by the product owner on
@@ -1955,3 +1955,49 @@ guard and scans for the spellings that matter (F11). The gate caught one
 thing the fix stages did not: the M14.1 round's doc guard read the field
 doc from the file the memory implementation had just been moved out of;
 it now reads both halves.
+
+## Addendum (2026-09-03): M15 — the hygiene rung the reviews opened by name
+
+Every review round since M12.1 recorded one or two items it found real
+but out of its rung's scope, each with the file and the reason. This rung
+closes them together, and its one rule is the one a hygiene rung has to
+keep: **a move keeps behaviour** — every migrated fixture asserts what it
+asserted before, every folded fixture keeps the variation each copy
+carried, and the two items that are behaviours (the all-busy refusal
+count; the thread-table case on the control surface's fake) land
+test-first like any other. The seven, by name: `Conversations::bind` and
+`fork`, which lost their serving-path caller to M14.0's probe-then-commit
+and survived as fixtures; the eleven echo-engine test fixtures of one
+shape; the pointers the M14 moves left stale; the prefix-admission
+refusal that counted only disagreements and so reported none when every
+probed generation was busy; the thread-table case the control surface's
+fake could model but no test did; the read-then-write on the maps; and
+roundhouse-mcp's largest module taking the sibling-test convention the
+server crate already keeps.
+
+### What the implementation settled beyond the rulings (2026-09-03, M15)
+
+- **The dead entry points went with their fixtures migrated**: `bind` and
+  `fork` left `Conversations`; the fixtures that used them call the two
+  test-support helpers or `commit` directly, and migrating the codex e2e
+  rig fixed a missing await that no stage had compiled.
+- **Eleven fixtures became three parameterised helpers** (a frontier spec,
+  a single-model catalog, an engine over echo doubles); one fixture with
+  a genuinely different constructor stays and says why. Every migrated
+  suite's count is unchanged.
+- **The refusal counts busy separately from disagreed**, so an all-busy
+  search reports nine probed rather than none, and `attempts` stays their
+  sum for the message.
+- **The thread arm is exercised on the control surface's fake** at last,
+  ahead of the cache-key name and the tool-use id.
+- **The audit found no other read-then-write on the maps**: the
+  hint-then-commit in prefix admission is the probe-then-commit design,
+  not the defect shape.
+- **roundhouse-mcp took the sibling-test convention** for its largest
+  module; no other module there is past the line.
+- **One incident, recorded.** The refute stage undid a mutation with a
+  checkout that discarded the rung's own uncommitted change to the same
+  file, and reconstructed it from a capture it had taken; the orchestrator
+  re-ran the affected suite before the gate and the chain's own gate ran
+  it again. Future refute briefs say: restore from your byte backup, never
+  from HEAD.

@@ -26,6 +26,7 @@ use roundhouse_core::store::{MemoryStore, SessionStore};
 use roundhouse_fleet::{
     EchoFrontierClient, FrontierChunk, FrontierClient, FrontierError, FrontierQuote, FrontierStream,
 };
+use roundhouse_server::test_support::engine_over_echo;
 use roundhouse_server::{Admission, EchoLocalExecutor, Engine, EngineConfig};
 
 mod common;
@@ -37,19 +38,13 @@ fn metrics_config() -> MetricsConfig {
     MetricsConfig::new(frontier_catalog().shadow_pricing())
 }
 
+/// [`engine_over_echo`] (M15, H2): one of the eleven fixtures of this exact
+/// shape the rung named.
 fn engine(
     store: Arc<MemoryStore>,
     frontier: Arc<dyn FrontierClient>,
 ) -> Engine<MemoryStore, ByteTokenizer> {
-    Engine::new(
-        store,
-        ByteTokenizer,
-        Arc::new(EchoLocalExecutor::new("local answer")),
-        frontier_catalog(),
-        frontier,
-        Arc::new(AffinityPolicy::new()) as Arc<dyn RoutingPolicy>,
-        config(),
-    )
+    engine_over_echo(store, frontier_catalog(), frontier, config())
 }
 
 async fn run_turns(engine: &Engine<MemoryStore, ByteTokenizer>, session: &SessionId, turns: usize) {

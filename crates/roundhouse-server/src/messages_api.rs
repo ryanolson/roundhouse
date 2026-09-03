@@ -559,7 +559,8 @@ fn anonymous_key() -> String {
 /// `POST /v1/messages/count_tokens`
 ///
 /// **An estimate, and it says so.** The number is this deployment's own
-/// tokenizer counting [`Item::render`]ed items — the same function
+/// tokenizer counting [`Item::render`](roundhouse_core::item::Item::render)ed
+/// items — the same function
 /// [`Engine::admitted_input_tokens`] prices a turn with, so it is exactly what
 /// roundhouse will bill and admit — and it is *not* what the model this turn
 /// gets routed to would count. Two vocabularies are in play at once: the

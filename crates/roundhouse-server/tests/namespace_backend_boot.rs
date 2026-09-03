@@ -55,7 +55,7 @@ async fn the_composition_roots_namespace_read_reaches_the_wired_keys() {
     let conversations = backends.conversations();
 
     let ada = Principal::new("acme".to_string(), "ada".to_string());
-    conversations.bind(&ada, &key).await;
+    conversations.commit(&ada, &key, 0).await;
 
     let under_custom = RedisCorrelationMaps::connect_namespaced(&url, namespace)
         .await

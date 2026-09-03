@@ -326,65 +326,6 @@ impl Conversations {
         }
     }
 
-    /// The session `key` names now, and a note that `principal` is using it.
-    ///
-    /// The `latest` half is recorded on the way in rather than at the end of
-    /// the turn because it answers "which conversation is this agent working
-    /// in", and an agent that opened a turn is working in it whether or not
-    /// the turn went on to succeed.
-    ///
-    /// **Not what a wire surface calls any more**, and the reason is M14.0's
-    /// review: a turn's generation is not known until prefix admission has
-    /// searched for it, so binding on the way in wrote a session the request
-    /// might never land on. [`Self::commit`] is the write that happens once
-    /// the answer is known, and this remains for the callers that genuinely do
-    /// mean "generation zero, now" — a fixture standing a conversation up
-    /// without driving a turn through it.
-    pub async fn bind(&self, principal: &Principal, key: &str) -> SessionId {
-        // Written rather than read-with-a-default, because the entry's
-        // *presence* is what tells a reader this key was bound at all (M12.1
-        // review, F9). A read that defaulted to zero here would leave every
-        // never-forked conversation indistinguishable — to `resolve` — from a
-        // key nothing has ever heard of.
-        let generation = self.generation(key).await;
-        self.commit(principal, key, generation).await
-    }
-
-    /// Rebind `key` to a fresh session, because the client's history disagreed
-    /// with the log.
-    ///
-    /// **Superseded on the serving path by [`Self::commit`]** (M14.0 review):
-    /// admission no longer advances a counter per attempt, so what used to be
-    /// a fork is now a commit to whichever generation the search settled on.
-    /// The paragraph below still describes what moving off a session costs,
-    /// whichever call does the moving.
-    ///
-    /// # What a fork costs the control plane, stated rather than hidden
-    ///
-    /// `ControlStore`'s four families — overlay, intent, steer payload, session
-    /// binding — are keyed by the `SessionId` this rebinds *away from*, and
-    /// nothing migrates them. The visible consequence is one: an agent that
-    /// asked for `scope=session` narrowing, on a client that then edited its own
-    /// history mid-session, silently stops being narrowed — the engine asks the
-    /// post-fork id for an overlay and finds none. The trigger is specific and
-    /// worth naming, because it is not "a fork happens": a fork happens when a
-    /// *client rewrites history it already sent*, which is a compaction or a
-    /// user editing a message, not an ordinary turn.
-    ///
-    /// Not migrated on purpose. Carrying an overlay across a fork means a
-    /// narrowing surviving a history rewrite that the agent which asked for it
-    /// may no longer be running, and deciding that is a decision about what an
-    /// overlay's identity *is* — which belongs to the milestone that gives it a
-    /// durable one (M8), not to a rebind hook reaching across two crates. What
-    /// holds in the meantime is a bound rather than a fix: the orphaned records
-    /// are collected by `ControlStore`'s retention sweep like any other aged
-    /// state, so a forking client leaks for a day and not for the process's
-    /// life.
-    pub async fn fork(&self, principal: &Principal, key: &str) -> SessionId {
-        let generation = self.generation(key).await.saturating_add(1);
-        self.commit(principal, key, generation).await
-    }
-
     /// Which generation of `key` a turn was last committed to, or zero for a
     /// key no node has ever committed.
     ///
@@ -491,12 +432,13 @@ impl Conversations {
     ///
     /// **The one write prefix admission makes, and it happens after the answer
     /// is known** (M14.0 review). Its predecessors — a `bind` on the way in and
-    /// a `fork` per attempt — wrote as they searched, so a request that ended
-    /// in a refusal still left the counter advanced and `latest` naming a
-    /// generation no turn had run on: the refusal stopped one request while the
-    /// retry behind it resumed past the bound, and an unnamed MCP call in
-    /// between was answered with a dead session. Committing once, at the end,
-    /// is what makes a refusal cost nothing.
+    /// a `fork` per attempt, both since removed (M15, H1: neither has had a
+    /// serving-path caller since M14.0) — wrote as they searched, so a request
+    /// that ended in a refusal still left the counter advanced and `latest`
+    /// naming a generation no turn had run on: the refusal stopped one request
+    /// while the retry behind it resumed past the bound, and an unnamed MCP
+    /// call in between was answered with a dead session. Committing once, at
+    /// the end, is what makes a refusal cost nothing.
     ///
     /// The counter is *set* rather than incremented, because the search that
     /// chose `generation` may have walked backwards to an older generation the
@@ -516,14 +458,32 @@ impl Conversations {
     /// client off. The next commit is the retry — a turn on this key writes
     /// the key again anyway — and the warn is once per outage, not per turn.
     ///
-    /// `latest` moves for [`Self::bind`]'s reason: it answers "which
-    /// conversation is this agent working in", and an agent whose turn is about
-    /// to open is working in it whether or not the turn goes on to succeed.
+    /// `latest` moves on every call, whatever generation it lands on: it
+    /// answers "which conversation is this agent working in", and an agent
+    /// whose turn is about to open is working in it whether or not the turn
+    /// goes on to succeed.
     ///
-    /// What moving off a generation costs the control plane is
-    /// [`Self::fork`]'s paragraph, unchanged: `ControlStore`'s records are
-    /// keyed by the session id this commits *away from*, and nothing migrates
-    /// them.
+    /// # What moving off a generation costs the control plane, stated rather than hidden
+    ///
+    /// `ControlStore`'s four families — overlay, intent, steer payload, session
+    /// binding — are keyed by the `SessionId` this commits *away from*, and
+    /// nothing migrates them. The visible consequence is one: an agent that
+    /// asked for `scope=session` narrowing, on a client that then edited its own
+    /// history mid-session, silently stops being narrowed — the engine asks the
+    /// post-fork id for an overlay and finds none. The trigger is specific and
+    /// worth naming, because it is not "a fork happens": a fork happens when a
+    /// *client rewrites history it already sent*, which is a compaction or a
+    /// user editing a message, not an ordinary turn.
+    ///
+    /// Not migrated on purpose. Carrying an overlay across a fork means a
+    /// narrowing surviving a history rewrite that the agent which asked for it
+    /// may no longer be running, and deciding that is a decision about what an
+    /// overlay's identity *is* — which belongs to the milestone that gives it a
+    /// durable one (M8), not to a rebind hook reaching across two crates. What
+    /// holds in the meantime is a bound rather than a fix: the orphaned records
+    /// are collected by `ControlStore`'s retention sweep like any other aged
+    /// state, so a forking client leaks for a day and not for the process's
+    /// life.
     pub async fn commit(&self, principal: &Principal, key: &str, generation: u32) -> SessionId {
         self.write_generation(key, generation).await;
         self.mark_latest(principal, bound_session(key, generation))
@@ -565,15 +525,16 @@ impl Conversations {
     /// for a key no node holds a binding for.
     ///
     /// What a *reader* asks — the MCP surface resolving an explicit
-    /// `conversation` argument. Distinct from [`Self::bind`] because an agent
+    /// `conversation` argument. Distinct from [`Self::commit`] because an agent
     /// asking `status` about a conversation must not thereby make that
     /// conversation its most recent one: the two tools that take the argument
     /// and the tool that omits it would then disagree about what "most recent"
     /// means, in an order the agent chose.
     ///
     /// **`None` and not generation zero for an unbound key** (M12.1 review,
-    /// F9). Zero is what [`Self::bind`] would mint, but a reader minting it is
-    /// not the same act as a turn minting it: the store is shared across
+    /// F9). Zero is what a turn's [`Self::commit`] would mint, but a reader
+    /// minting it is not the same act as a turn minting it: the store is
+    /// shared across
     /// nodes, so a generation-zero id exists there whenever *any* node ever
     /// created it, and answering with one hands the caller a superseded log
     /// that another node has already forked away from — quietly, with a 200 on
@@ -736,11 +697,12 @@ impl Conversations {
 
     /// Record that `principal` is working in `session`, and hand it back.
     ///
-    /// One helper rather than the same two lines in `bind`, `fork` and
-    /// `commit`: the three differ in which generation they arrived at and in
-    /// nothing else, and a fourth caller that forgot the `latest` half would
-    /// leave an agent's next unnamed MCP call answered from a conversation it
-    /// has moved on from.
+    /// [`Self::commit`]'s own helper, named separately so the two things one
+    /// commit does — write the generation, then move `latest` — read as two
+    /// steps rather than one write with a side effect buried inside it. `bind`
+    /// and `fork` were the other two callers this once served; both were
+    /// removed in M15 (H1) once M14.0 moved every serving-path write onto
+    /// `commit` alone.
     fn mark_latest(&self, principal: &Principal, session: SessionId) -> SessionId {
         self.lock_latest()
             .insert(principal.clone(), session.clone());

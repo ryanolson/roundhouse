@@ -17,11 +17,176 @@
 //! turns `test-support` on for, and every downstream integration-test binary
 //! already depends on this crate with the same feature to reach
 //! `roundhouse_store_redis::test_support` for its own Redis fixtures.
+//!
+//! [`bind_conversation`] and [`fork_conversation`] are the same story told
+//! about [`crate::conversations::Conversations`] rather than a store (M15,
+//! H1): `Conversations::bind` and `::fork` had no caller left on the serving
+//! path once M14.0 moved every real turn's write onto `Conversations::commit`,
+//! but the fixtures that stand a conversation up without driving a turn
+//! through admission still need the shape those two spelled — so it is named
+//! once, here, rather than reappearing as `conversations.generation(key).await`
+//! followed by a hand-rolled `commit` at each of the call sites that used to
+//! read `conversations.bind(...)`.
+//!
+//! [`frontier_spec`], [`single_model_catalog`] and [`engine_over_echo`] are
+//! the same discipline applied to a shape M15's H2 named eleven copies of:
+//! `fn catalog() -> StaticFrontierCatalog` and `fn engine(...)` /
+//! `fn engine_over(...)` under `tests/` and (once, for the unit suite that
+//! cannot reach `tests/common`) `src/prefix_admission/tests.rs`. Each copy
+//! hand-rolled the same [`FrontierModelSpec`] literal — provider, model and
+//! quality genuinely varying; `wire_protocol`, `cache_model` and
+//! `ttft_ms_per_uncached_token` never doing anything but repeating — and the
+//! same seven-argument `Engine::new`, varying only in the store, the catalog,
+//! the frontier client and the config. `tests/common/mod.rs::frontier_catalog`
+//! already named the single-entry, zero-variation case for the binaries that
+//! could reach it (M14.0 review, F5's shared-fixture lesson applied to a
+//! different pair of duplicates); these three go one level down, to the
+//! *pieces* a catalog and an engine are built from, so a fixture that needs
+//! two or three priced models, or a store `tests/common` cannot name, still
+//! shares the boilerplate rather than retyping it.
 
 use std::sync::{Arc, Mutex};
 
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
+
+use roundhouse_core::context::ByteTokenizer;
+use roundhouse_core::control::Principal;
+use roundhouse_core::routing::{AffinityPolicy, CacheModel, ProviderPricing};
+use roundhouse_core::store::SessionStore;
+use roundhouse_fleet::{FrontierClient, FrontierModelSpec, StaticFrontierCatalog, WireProtocol};
+
+use crate::engine::{EchoLocalExecutor, Engine, EngineConfig};
+use roundhouse_core::ids::SessionId;
+
+use crate::conversations::Conversations;
+
+/// Bind `key` to the generation [`Conversations::commit`] would land a fresh,
+/// never-forked turn on — the shape `Conversations::bind` used to spell before
+/// M14.0 moved every serving-path write onto `commit` once prefix admission's
+/// search had an answer (M15, H1). A fixture that stands a conversation up
+/// without driving a real turn through admission still needs exactly this:
+/// "generation zero (or whatever this key is already at), now" — and one
+/// helper here, rather than `self.generation(key).await` repeated at each of
+/// the dozens of call sites `bind` used to serve, is what stops the shape from
+/// silently drifting the day `commit`'s signature next changes.
+pub async fn bind_conversation(
+    conversations: &Conversations,
+    principal: &Principal,
+    key: &str,
+) -> SessionId {
+    let generation = conversations.generation(key).await;
+    conversations.commit(principal, key, generation).await
+}
+
+/// Rebind `key` to a fresh session one generation past whatever it is at now
+/// — the shape `Conversations::fork` used to spell, for the fixtures that
+/// need to play a client whose resent history disagreed with the log without
+/// running prefix admission's search to get there. See
+/// [`bind_conversation`] for why this lives here rather than at each call
+/// site.
+pub async fn fork_conversation(
+    conversations: &Conversations,
+    principal: &Principal,
+    key: &str,
+) -> SessionId {
+    let generation = conversations.generation(key).await.saturating_add(1);
+    conversations.commit(principal, key, generation).await
+}
+
+/// One [`FrontierModelSpec`], priced and named the way a caller asks and
+/// unremarkable everywhere else.
+///
+/// `cache_model` is fixed to a five-minute deterministic cache — the one
+/// field every one of H2's eleven fixtures actually agreed on, whatever
+/// else they varied (`wire_protocol` split `AnthropicMessages` against
+/// `OpenAiResponses`, and one fixture priced a non-zero
+/// `ttft_ms_per_uncached_token` where the rest left it at zero, so both stay
+/// arguments rather than joining `cache_model` as a constant). A fixture
+/// that genuinely needs a different cache posture still writes the literal
+/// by hand; this is the shape that recurred, not a claim that no other
+/// shape exists.
+pub fn frontier_spec(
+    provider: &str,
+    model: &str,
+    wire_protocol: WireProtocol,
+    quality_prior: f64,
+    pricing: ProviderPricing,
+    base_ttft_ms: f64,
+    ttft_ms_per_uncached_token: f64,
+) -> FrontierModelSpec {
+    FrontierModelSpec {
+        provider: provider.to_string(),
+        model: model.to_string(),
+        wire_protocol,
+        cache_model: CacheModel::Deterministic { ttl_ms: 5 * 60_000 },
+        pricing,
+        quality_prior,
+        base_ttft_ms,
+        ttft_ms_per_uncached_token,
+    }
+}
+
+/// A catalog of one priced frontier model, so a turn always has somewhere to
+/// go — [`frontier_spec`] wrapped in the one-entry
+/// [`StaticFrontierCatalog`] every single-model fixture built by hand.
+///
+/// `tests/common/mod.rs::frontier_catalog` already names this exact shape
+/// for the integration binaries that can reach it; this is the same
+/// function for the two audiences that cannot — this crate's own unit
+/// tests (`src/prefix_admission/tests.rs`), and a fixture whose price,
+/// wire protocol, quality or TTFT genuinely needs to differ from
+/// `frontier_catalog`'s own.
+pub fn single_model_catalog(
+    provider: &str,
+    model: &str,
+    wire_protocol: WireProtocol,
+    quality_prior: f64,
+    pricing: ProviderPricing,
+    base_ttft_ms: f64,
+    ttft_ms_per_uncached_token: f64,
+) -> StaticFrontierCatalog {
+    StaticFrontierCatalog::new(vec![frontier_spec(
+        provider,
+        model,
+        wire_protocol,
+        quality_prior,
+        pricing,
+        base_ttft_ms,
+        ttft_ms_per_uncached_token,
+    )])
+}
+
+/// `Engine::new` over this crate's local double, [`EchoLocalExecutor`]
+/// answering `"local answer"`, and a plain [`AffinityPolicy`] — the two
+/// things every `fn engine(...)` / `fn engine_over(...)` fixture H2
+/// replaces built identically, whatever else it varied.
+///
+/// The frontier client stays a parameter rather than fixed to
+/// [`roundhouse_fleet::EchoFrontierClient`], because one of the five
+/// fixtures this replaces (`metrics_end_to_end.rs`) is parameterized over it
+/// for exactly the reason a caller would still want to be: the same engine
+/// shape driven by a client that answers differently per test. A fixture
+/// that dispatches through more than one provider's own client
+/// (`tests/provider_registry.rs`) needs `Engine::with_provider_clients`
+/// instead and is not this function's shape at all — a different
+/// constructor is a real variation, not boilerplate this could absorb.
+pub fn engine_over_echo<S: SessionStore>(
+    store: Arc<S>,
+    catalog: StaticFrontierCatalog,
+    frontier: Arc<dyn FrontierClient>,
+    config: EngineConfig,
+) -> Engine<S, ByteTokenizer> {
+    Engine::new(
+        store,
+        ByteTokenizer,
+        Arc::new(EchoLocalExecutor::new("local answer")),
+        catalog,
+        frontier,
+        Arc::new(AffinityPolicy::new()),
+        config,
+    )
+}
 
 /// A TCP relay in front of a real Redis, so a store can be taken away
 /// mid-test without touching a Redis the test does not own.

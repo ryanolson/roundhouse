@@ -65,18 +65,18 @@ use roundhouse_core::event::SessionEventKind;
 use roundhouse_core::ids::{SessionId, TurnId};
 use roundhouse_core::item::Item;
 use roundhouse_core::now_ms;
-use roundhouse_core::routing::{AffinityPolicy, CacheModel, DecisionRecord, ProviderPricing};
+use roundhouse_core::routing::{AffinityPolicy, DecisionRecord, ProviderPricing};
 use roundhouse_core::store::{MemoryStore, SessionStore};
 use roundhouse_fleet::{
-    FrontierChunk, FrontierClient, FrontierClients, FrontierError, FrontierModelSpec,
-    FrontierQuote, FrontierStream, StaticFrontierCatalog, WireProtocol,
+    FrontierChunk, FrontierClient, FrontierClients, FrontierError, FrontierQuote, FrontierStream,
+    StaticFrontierCatalog, WireProtocol,
 };
+use roundhouse_server::test_support::single_model_catalog;
 use roundhouse_server::{
     Admission, EchoLocalExecutor, Engine, EngineConfig, LocalExecutor, TurnInput,
 };
 
 mod common;
-use common::MINUTE;
 
 // ---------------------------------------------------------------------------
 // The fixture
@@ -120,22 +120,24 @@ fn big_tools() -> serde_json::Value {
 }
 
 /// One frontier candidate, input-priced, on a provider named `acme`.
+///
+/// [`single_model_catalog`] (M15, H2): one of the eleven fixtures of this
+/// exact shape the rung named.
 fn catalog() -> StaticFrontierCatalog {
-    StaticFrontierCatalog::new(vec![FrontierModelSpec {
-        provider: "acme".into(),
-        model: "flagship".into(),
-        wire_protocol: WireProtocol::AnthropicMessages,
-        cache_model: CacheModel::Deterministic { ttl_ms: 5 * MINUTE },
-        pricing: ProviderPricing {
+    single_model_catalog(
+        "acme",
+        "flagship",
+        WireProtocol::AnthropicMessages,
+        0.9,
+        ProviderPricing {
             input_per_mtok_usd: INPUT_PER_MTOK_USD,
             cached_input_per_mtok_usd: 0.0,
             cache_write_per_mtok_usd: 0.0,
             output_per_mtok_usd: 0.0,
         },
-        quality_prior: 0.9,
-        base_ttft_ms: 1.0,
-        ttft_ms_per_uncached_token: 0.0,
-    }])
+        1.0,
+        0.0,
+    )
 }
 
 /// A provider stand-in that bills the way a real upstream does.

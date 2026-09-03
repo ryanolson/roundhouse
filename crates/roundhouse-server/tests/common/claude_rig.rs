@@ -57,6 +57,7 @@ use roundhouse_server::messages_api::MESSAGES_PATH;
 // went green against a config the launcher does not produce is not a state this
 // file can reach.
 use roundhouse_server::relay_handoff::{RELAY_STATE_VARS, RelayAgent, RelayHandoff};
+use roundhouse_server::test_support::bind_conversation;
 use roundhouse_server::{
     API_PREFIX, ControlPlaneReads, Conversations, EchoLocalExecutor, Engine, EngineConfig,
     mcp_router, messages_router,
@@ -316,7 +317,7 @@ async fn take_the_latest_slot(
         .lock()
         .expect("recording")
         .push((method, rival.conversations.latest(&rival.principal)));
-    rival.conversations.bind(&rival.principal, &rival.key).await;
+    bind_conversation(&rival.conversations, &rival.principal, &rival.key).await;
     next.run(Request::from_parts(parts, Body::from(bytes)))
         .await
 }
@@ -549,7 +550,7 @@ impl Rig {
             ControlRace::None => None,
             ControlRace::RivalIsLatest => {
                 let key = format!("{PROJECT}/{USER}/a-rival-conversation");
-                let session = conversations.bind(&principal(), &key).await;
+                let session = bind_conversation(&conversations, &principal(), &key).await;
                 store
                     .create_session(&session, "rival")
                     .await

@@ -296,7 +296,8 @@ impl<S: SessionStore, T: Tokenizer + Clone + Send + Sync + 'static> MessagesFoll
     ///
     /// Counted in polls rather than timed off a clock so the keepalive is a
     /// function of the same loop everything else here is, and so a test can
-    /// reach it without waiting. See [`KEEPALIVE_INTERVAL`] for the cadence and
+    /// reach it without waiting. See
+    /// [`KEEPALIVE_INTERVAL`](super::KEEPALIVE_INTERVAL) for the cadence and
     /// [`emit::keepalive`] for why it is an event rather than an SSE comment.
     async fn idle(&mut self) {
         self.idle_polls += 1;

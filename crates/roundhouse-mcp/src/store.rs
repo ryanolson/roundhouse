@@ -5,13 +5,19 @@
 //!
 //! # In-process, deliberately, and on a stated precedent
 //!
-//! Every family here is a `HashMap` behind a `Mutex` in one process. That is
-//! the same posture `responses_api.rs` takes for its generations map, which
-//! documents itself as "process state standing in for a durable mapping the
-//! Redis store will own", and it is taken here for the same reason: the durable
-//! shape belongs to the admin plane (M8), which is where a key's records get a
-//! lifecycle, a reconciliation view and a migration. Building the durable store
-//! now would fix that shape before the plane that owns it exists.
+//! Every family here is a `HashMap` behind a `Mutex` in one process. That was
+//! the posture `responses_api.rs`'s own generations map once took, before
+//! M14.1 gave that map — and the two binding families beside it — a durable
+//! home behind [`CorrelationMaps`](roundhouse_core::control::CorrelationMaps),
+//! reached now through `roundhouse_server::conversations::Conversations`
+//! rather than a `Mutex<HashMap<…>>` a process restart could lose. What this
+//! store's four families still stand on is the reason that migration gave for
+//! itself before it happened: "process state standing in for a durable mapping
+//! the Redis store will own", and it is taken here for the same reason —
+//! the durable shape belongs to the admin plane (M8), which is where a key's
+//! records get a lifecycle, a reconciliation view and a migration. Building
+//! the durable store now would fix that shape before the plane that owns it
+//! exists.
 //!
 //! What the choice costs, said plainly rather than left for a reader to
 //! discover: an overlay does not survive a process restart, and in a multi-node

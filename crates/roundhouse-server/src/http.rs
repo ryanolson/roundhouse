@@ -316,24 +316,35 @@ impl ApiError {
     /// exists to close (see the D1 addendum, R13).
     ///
     /// **`attempts` is a tally, not the bound.** It is the number of
-    /// generations this request actually read back and found disagreeing —
-    /// which is what an operator reading the log needs, and which the constant
-    /// cannot say, since the search stops early on the first free slot and
-    /// walks in two directions.
+    /// generations this request actually read back — split into how many
+    /// disagreed and how many were busy (another writer's, M15 H4), rather
+    /// than folded into one count, because that fold is how a refusal that
+    /// probed nine busy generations once reported zero of anything. Which is
+    /// what an operator reading the log needs, and which the constant cannot
+    /// say, since the search stops early on the first free slot and walks in
+    /// two directions.
     ///
-    /// The key and the count are on the wire (`detail`) and not just in the
+    /// The key and the counts are on the wire (`detail`) and not just in the
     /// message, for [`Self::detail`]'s reason: a client — or the operator
-    /// reading its logs — needs to know *which* cache key looped without
-    /// parsing English out of `message`.
-    pub(crate) fn prefix_admission_exhausted(key: &str, attempts: u32) -> Self {
+    /// reading its logs — needs to know *which* cache key looped, and whether
+    /// it looped disagreeing or looped busy, without parsing English out of
+    /// `message`.
+    pub(crate) fn prefix_admission_exhausted(key: &str, disagreed: u32, busy: u32) -> Self {
+        let attempts = disagreed + busy;
         Self {
             status: StatusCode::CONFLICT,
             code: "prefix_admission_exhausted",
             message: format!(
-                "the claimed history disagreed with all {attempts} probed generation(s) of \
-                 `{key}`; refusing rather than searching further within one request"
+                "the claimed history could not be admitted after probing {attempts} \
+                 generation(s) of `{key}` ({disagreed} disagreed, {busy} busy); refusing \
+                 rather than searching further within one request"
             ),
-            detail: Some(json!({ "cache_key": key, "attempts": attempts })),
+            detail: Some(json!({
+                "cache_key": key,
+                "attempts": attempts,
+                "disagreed": disagreed,
+                "busy": busy,
+            })),
         }
     }
 

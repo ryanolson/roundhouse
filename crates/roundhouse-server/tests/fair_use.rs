@@ -35,12 +35,11 @@ use roundhouse_core::control::{
 };
 use roundhouse_core::ids::{SessionId, TurnId};
 use roundhouse_core::item::Item;
-use roundhouse_core::routing::AffinityPolicy;
 use roundhouse_core::store::MemoryStore;
 use roundhouse_fleet::EchoFrontierClient;
+use roundhouse_server::test_support::engine_over_echo;
 use roundhouse_server::{
-    ControlPlane, ControlPlaneConfig, Conversations, EchoLocalExecutor, Engine, messages_router,
-    responses_api,
+    ControlPlane, ControlPlaneConfig, Conversations, Engine, messages_router, responses_api,
 };
 use roundhouse_store_redis::RedisFairUseLedger;
 use roundhouse_store_redis::test_support::url_from_env;
@@ -107,19 +106,19 @@ fn plane(max_tokens: u64) -> Arc<ControlPlane> {
     ))
 }
 
+/// [`engine_over_echo`] (M15, H2): one of the eleven fixtures of this exact
+/// shape the rung named, chained with the two ledgers this file's own turns
+/// need recorded.
 fn engine(
     store: Arc<MemoryStore>,
     spend: Arc<CountingLedger>,
     fair_use: Arc<dyn FairUseLedger>,
 ) -> Arc<Engine<MemoryStore, ByteTokenizer>> {
     Arc::new(
-        Engine::new(
+        engine_over_echo(
             store,
-            ByteTokenizer,
-            Arc::new(EchoLocalExecutor::new("local answer")),
             frontier_catalog(),
             Arc::new(EchoFrontierClient::new("frontier answer")),
-            Arc::new(AffinityPolicy::new()),
             config(),
         )
         .with_spend_ledger(spend)

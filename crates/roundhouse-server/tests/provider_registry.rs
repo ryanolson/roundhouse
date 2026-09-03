@@ -38,6 +38,7 @@ use roundhouse_fleet::{
     EchoFrontierClient, FrontierChunk, FrontierClient, FrontierClients, FrontierError,
     FrontierModelSpec, FrontierQuote, FrontierStream, StaticFrontierCatalog, WireProtocol,
 };
+use roundhouse_server::test_support::single_model_catalog;
 use roundhouse_server::{Admission, EchoLocalExecutor, Engine, LocalExecutor, TurnResult};
 
 mod common;
@@ -84,19 +85,30 @@ impl FrontierClient for Recorder {
 
 /// One hosted entry, free and instant, so the router has exactly one thing it
 /// could pick and the assertion is never about scoring.
+///
+/// [`single_model_catalog`] (M15, H2): counted among the rung's eleven
+/// fixtures by its neighbour below, `fn engine_over`, even though this
+/// helper's own name (`catalog_for`, not `catalog`) did not match the
+/// literal grep.
 fn catalog_for(provider: &str) -> StaticFrontierCatalog {
-    StaticFrontierCatalog::new(vec![FrontierModelSpec {
-        provider: provider.into(),
-        model: "flagship".into(),
-        wire_protocol: WireProtocol::OpenAiResponses,
-        cache_model: CacheModel::Deterministic { ttl_ms: 5 * MINUTE },
-        pricing: ProviderPricing::free(),
-        quality_prior: 0.9,
-        base_ttft_ms: 1.0,
-        ttft_ms_per_uncached_token: 0.0,
-    }])
+    single_model_catalog(
+        provider,
+        "flagship",
+        WireProtocol::OpenAiResponses,
+        0.9,
+        ProviderPricing::free(),
+        1.0,
+        0.0,
+    )
 }
 
+/// **Not [`engine_over_echo`]'s shape, and deliberately so** (M15, H2): this
+/// file's whole claim is that a catalog entry dispatches through *its own
+/// provider's* client, which needs `Engine::with_provider_clients` and a
+/// registry of them — not the one shared [`roundhouse_fleet::EchoFrontierClient`]
+/// every other `fn engine_over`/`fn engine` this rung unified answers with.
+/// A different constructor is a real variation this crate's shared fixture
+/// could not absorb without hiding the thing the file exists to prove.
 fn engine_over(
     catalog: StaticFrontierCatalog,
     clients: FrontierClients,

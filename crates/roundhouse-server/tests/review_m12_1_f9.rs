@@ -56,6 +56,7 @@ use roundhouse_core::control::{
 use roundhouse_core::store::{MemoryStore, SessionStore};
 use roundhouse_mcp::reads::ControlReads;
 use roundhouse_mcp::surface::{Correlators, SurfaceError};
+use roundhouse_server::test_support::{bind_conversation, fork_conversation};
 use roundhouse_server::{ControlPlane, ControlPlaneConfig, ControlPlaneReads, Conversations};
 
 /// The one-tenant plane the finding's topology needs: `named_session` must
@@ -131,12 +132,12 @@ async fn two_node_topology() -> (
     let conversations_a = Arc::new(Conversations::over(
         Arc::clone(&maps) as Arc<dyn CorrelationMaps>
     ));
-    let g0 = conversations_a.bind(&ada, &key).await;
+    let g0 = bind_conversation(&conversations_a, &ada, &key).await;
     store
         .create_session(&g0, "claude")
         .await
         .expect("node_a creates ada's generation-0 session");
-    let g1 = conversations_a.fork(&ada, &key).await;
+    let g1 = fork_conversation(&conversations_a, &ada, &key).await;
     store
         .create_session(&g1, "claude")
         .await

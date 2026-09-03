@@ -15,6 +15,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 
+use crate::test_support::{bind_conversation, fork_conversation};
+
 fn ada() -> Principal {
     Principal::new("acme", "ada")
 }
@@ -57,11 +59,11 @@ async fn a_reader_and_a_turn_resolve_one_cache_key_to_one_session() {
     );
 
     assert_eq!(
-        Some(conversations.bind(&ada(), key).await),
+        Some(bind_conversation(&conversations, &ada(), key).await),
         conversations.resolve(key).await.unwrap()
     );
 
-    let forked = conversations.fork(&ada(), key).await;
+    let forked = fork_conversation(&conversations, &ada(), key).await;
     assert_eq!(forked.as_str(), "acme/ada/main#g1");
     assert_eq!(
         conversations.resolve(key).await.unwrap(),
@@ -69,7 +71,7 @@ async fn a_reader_and_a_turn_resolve_one_cache_key_to_one_session() {
         "a rebound key stays rebound: a reader that kept answering \
          generation zero would narrow a session no turn will run in"
     );
-    assert_eq!(conversations.bind(&ada(), key).await, forked);
+    assert_eq!(bind_conversation(&conversations, &ada(), key).await, forked);
 }
 
 /// R-M2 (M12): a tool-use id names one session exactly, and binding one is
@@ -83,8 +85,8 @@ async fn a_reader_and_a_turn_resolve_one_cache_key_to_one_session() {
 #[tokio::test]
 async fn binding_a_tool_call_names_its_session_without_moving_latest() {
     let conversations = Conversations::new();
-    let subagent = conversations.bind(&ada(), "acme/ada/sub").await;
-    let parent = conversations.bind(&ada(), "acme/ada/main").await;
+    let subagent = bind_conversation(&conversations, &ada(), "acme/ada/sub").await;
+    let parent = bind_conversation(&conversations, &ada(), "acme/ada/main").await;
     conversations
         .bind_call(&ada(), "toolu_sub", subagent.clone())
         .await;
@@ -115,7 +117,7 @@ async fn reading_a_conversation_does_not_make_it_the_principals_most_recent_one(
          conversation, which is an answer rather than a default"
     );
 
-    conversations.bind(&ada(), "acme/ada/main").await;
+    bind_conversation(&conversations, &ada(), "acme/ada/main").await;
     assert_eq!(
         conversations.resolve("acme/ada/other").await.unwrap(),
         None,
@@ -129,7 +131,7 @@ async fn reading_a_conversation_does_not_make_it_the_principals_most_recent_one(
     );
 
     // The control: a turn on the other conversation does move it.
-    conversations.bind(&ada(), "acme/ada/other").await;
+    bind_conversation(&conversations, &ada(), "acme/ada/other").await;
     assert_eq!(
         conversations.latest(&ada()).unwrap().as_str(),
         "acme/ada/other"
@@ -153,15 +155,15 @@ async fn a_thread_is_in_the_session_its_own_latest_turn_decided() {
     let conversations = Conversations::new();
     let key = "acme/ada/main";
 
-    let parent_g0 = conversations.bind(&ada(), key).await;
+    let parent_g0 = bind_conversation(&conversations, &ada(), key).await;
     conversations
         .bind_thread(&ada(), "thread-parent", parent_g0.clone())
         .await;
-    let child_g1 = conversations.fork(&ada(), key).await;
+    let child_g1 = fork_conversation(&conversations, &ada(), key).await;
     conversations
         .bind_thread(&ada(), "thread-child", child_g1.clone())
         .await;
-    let parent_g2 = conversations.fork(&ada(), key).await;
+    let parent_g2 = fork_conversation(&conversations, &ada(), key).await;
     conversations
         .bind_thread(&ada(), "thread-parent", parent_g2.clone())
         .await;
@@ -409,8 +411,8 @@ async fn the_node_memo_does_not_answer_a_reader() {
     let (node_a, node_b) = two_nodes();
     let key = "acme/ada/main";
 
-    let served_here = node_a.bind(&ada(), key).await;
-    let forked_elsewhere = node_b.fork(&ada(), key).await;
+    let served_here = bind_conversation(&node_a, &ada(), key).await;
+    let forked_elsewhere = fork_conversation(&node_b, &ada(), key).await;
     assert_ne!(served_here, forked_elsewhere, "sanity: the fork moved");
 
     assert_eq!(
