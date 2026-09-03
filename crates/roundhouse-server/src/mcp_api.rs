@@ -150,11 +150,11 @@ impl<S: SessionStore> ControlReads for ControlPlaneReads<S> {
         principal: &Principal,
         named: &str,
     ) -> Result<SessionId, SurfaceError> {
-        // A key this node holds no binding for refuses with the *same* variant
-        // an unknown or another tenant's name does (M12.1 review, F9). Three
+        // A key nothing has bound anywhere refuses with the *same* variant an
+        // unknown or another tenant's name does (M12.1 review, F9). Three
         // distinguishable answers would make the argument an enumeration
         // oracle, which the trait's own doc refuses; and the third state is
-        // not "somebody else's" anyway but "not served here", which the caller
+        // not "somebody else's" anyway but "never bound", which the caller
         // can do nothing with either. What it must not do is fall through to
         // generation zero: the store is shared between nodes, so that id
         // exists whenever any node minted it, and answering with it hands back

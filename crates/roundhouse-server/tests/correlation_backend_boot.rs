@@ -4,8 +4,8 @@
 //! M14.1 thermo-nuclear review, F1: the composition root's own choice of
 //! correlation maps, unexercised.
 //!
-//! `main.rs` picks `Conversations::over(RedisCorrelationMaps)` or
-//! `Conversations::new()` by matching on [`shared_backend`], the same match
+//! `shared_backend::open` picks `Conversations::over(RedisCorrelationMaps)` or
+//! `Conversations::new()`, the same call
 //! [`fair_use_backend_boot.rs`](../tests/fair_use_backend_boot.rs) proves for
 //! the fair-use ledger. That file exists because the M13 review's F1 found
 //! the fair-use half of this exact wiring silently detached from the rule its
@@ -16,19 +16,17 @@
 //! fair-use buckets" — three of which had, or already had, an end-to-end boot
 //! assertion. This file is the fourth.
 //!
-//! # Why re-deriving the match is still the right shape
+//! # Why this calls the wiring rather than re-typing it
 //!
-//! `main.rs` is a `[[bin]]` source with no `[lib]` counterpart, so nothing
-//! outside it can call its composition root directly — the same limitation
-//! `fair_use_backend_boot.rs` names in its own doc. What is testable, and
-//! what actually carries the risk, is whether the *pattern* main.rs follows
-//! — [`shared_backend`]'s `Shared` arm wired to `RedisCorrelationMaps`, its
-//! `PerProcess` arm to the in-process table — reaches a real, independent
-//! Redis handle end-to-end. This mirrors that match verbatim rather than
-//! reimplementing its own idea of what main.rs should do, so a diff that
-//! changes main.rs's wiring without changing this one is visible on review as
-//! the two drifting apart, the same discipline the fair-use file already
-//! established.
+//! It used to re-type it. Until M14.1's review (F1) the four families were
+//! wired inside `main.rs`, a `[[bin]]` source with no `[lib]` counterpart, so
+//! nothing outside it could call the composition root and this file could only
+//! mirror the match and rely on a reviewer noticing when the copies drifted.
+//! They drifted on demand: mutating main.rs's `Shared` arm to
+//! `Conversations::new()` — the composition root dropping the Redis handle it
+//! had just connected — left this suite green, because the arm it ran was its
+//! own copy. [`open`] is that wiring now, and this file calls it, so the
+//! mutation has nowhere left to hide.
 //!
 //! Gated like every Redis-touching suite in this tree: `#[ignore]`, opted
 //! into with `--include-ignored`, and a missing `ROUNDHOUSE_TEST_REDIS_URL`
@@ -41,23 +39,16 @@ use roundhouse_core::control::{CorrelationMaps, Principal};
 use roundhouse_core::routing::AffinityPolicy;
 use roundhouse_core::store::MemoryStore;
 use roundhouse_fleet::EchoFrontierClient;
-use roundhouse_server::{
-    ControlPlane, Conversations, EchoLocalExecutor, Engine, SharedBackend, responses_api,
-    shared_backend,
-};
+use roundhouse_server::shared_backend::open;
+use roundhouse_server::{ControlPlane, EchoLocalExecutor, Engine, responses_api};
 use roundhouse_store_redis::RedisCorrelationMaps;
 use roundhouse_store_redis::test_support::url_from_env;
 
 mod common;
-use common::codex::{request, user_message};
+use common::codex::post_responses_turn;
 use common::{config, control_plane, frontier_catalog, key, sha256_hex};
 
-use axum::Router;
-use axum::body::Body;
-use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
-use axum::http::{Request, StatusCode};
-use http_body_util::BodyExt;
-use tower::ServiceExt;
+use axum::http::StatusCode;
 
 /// One project, one user, one key — enough to authenticate a turn and
 /// nothing the finding needs the admin plane's own mutation path for. The
@@ -78,36 +69,13 @@ fn plane(secret: &str) -> ControlPlane {
     ))
 }
 
-/// One `POST /v1/responses`, draining the SSE body so the turn's tail —
-/// including the `Conversations::commit` inside `prefix_admission::bind_prefix`
-/// — actually runs before this function returns.
-async fn post(app: &Router, secret: &str, cache_key: &str) -> StatusCode {
-    let body = request(cache_key, vec![user_message("count some tokens")]);
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/responses")
-                .header(CONTENT_TYPE, "application/json")
-                .header(AUTHORIZATION, format!("Bearer {secret}"))
-                .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = response.status();
-    let _ = response.into_body().collect().await.unwrap().to_bytes();
-    status
-}
-
 /// **The defect cell, proved rather than asserted.**
 ///
-/// 1. Resolve `Conversations` by calling [`shared_backend`] and matching on
-///    it exactly as `main.rs` does — the `Shared` arm connects
-///    `RedisCorrelationMaps` and wraps it with `Conversations::over`, the
-///    `PerProcess` arm builds `Conversations::new()`. Nothing here re-derives
-///    the rule; it re-derives only the wiring the rule already chose.
+/// 1. Take the `Conversations` the composition root itself builds, by calling
+///    [`open`] — the same call `main.rs` makes and the only place the
+///    `Shared` arm's `RedisCorrelationMaps` is wrapped in
+///    `Conversations::over`. Nothing here re-derives the rule or the wiring;
+///    it runs both.
 /// 2. Drive one real turn against a fresh cache key through the live
 ///    `/v1/responses` surface, so the commit happens on the real turn path
 ///    (`prefix_admission::bind_prefix`) and not a fixture's shortcut.
@@ -128,18 +96,13 @@ async fn the_wired_conversations_reach_the_named_redis_not_this_processs_memory(
     let secret = key("corrboot");
     let cache_key = format!("cache-{run}");
 
-    // The composition root's own choice, re-derived by matching on the same
-    // function main.rs calls -- not by asserting "it must be Redis" as a
-    // fixture's premise.
-    let conversations = Arc::new(match shared_backend(Some(&url)) {
-        SharedBackend::Shared { url } => {
-            let maps = RedisCorrelationMaps::connect(url)
-                .await
-                .expect("the test Redis named by ROUNDHOUSE_TEST_REDIS_URL must be reachable");
-            Conversations::over(Arc::new(maps) as Arc<dyn CorrelationMaps>)
-        }
-        SharedBackend::PerProcess => Conversations::new(),
-    });
+    // The composition root's own choice, *run* rather than re-typed -- and not
+    // asserted as a fixture's premise either: `open` is handed this
+    // deployment's URL and answers with whatever it answers.
+    let backends = open(Some(&url))
+        .await
+        .expect("the test Redis named by ROUNDHOUSE_TEST_REDIS_URL must be reachable");
+    let conversations = Arc::clone(backends.conversations());
 
     let store = Arc::new(MemoryStore::new());
     let engine = Arc::new(Engine::new(
@@ -159,7 +122,7 @@ async fn the_wired_conversations_reach_the_named_redis_not_this_processs_memory(
         Arc::clone(&conversations),
     );
 
-    let status = post(&app, &secret, &cache_key).await;
+    let status = post_responses_turn(&app, &secret, &cache_key).await;
     assert_eq!(
         status,
         StatusCode::OK,
@@ -171,11 +134,10 @@ async fn the_wired_conversations_reach_the_named_redis_not_this_processs_memory(
 
     // **The assertion the finding turns on.** A *fresh* handle on the real
     // Redis -- a second node, in every way that matters -- must already see
-    // the generation this turn committed. Before this file existed, nothing
-    // in the workspace would have gone red had `main.rs`'s own match wired
-    // `Conversations::new()` unconditionally: every other suite touching
-    // `Conversations` builds it directly, bypassing the composition root's
-    // choice entirely.
+    // the generation this turn committed. Had `open`'s `Shared` arm wired
+    // `Conversations::new()` instead, nothing else in the workspace would go
+    // red: every other suite touching `Conversations` builds it directly,
+    // bypassing the composition root's choice entirely.
     let second_node = RedisCorrelationMaps::connect(&url)
         .await
         .expect("the test Redis named by ROUNDHOUSE_TEST_REDIS_URL must be reachable");

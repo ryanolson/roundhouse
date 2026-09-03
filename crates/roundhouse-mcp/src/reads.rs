@@ -282,7 +282,13 @@ pub trait ControlReads: Send + Sync + 'static {
     /// # What it costs
     ///
     /// `latest` stays lazy: it is not consulted at all when anything above it
-    /// resolved. The correlators cannot be, and that is R-M7's direct cost:
+    /// resolved. So are the correlators *against each other* — one chain, each
+    /// arm resolved only where the one above it answered nothing, which is
+    /// what keeps a table that cannot be reached from refusing a call no arm
+    /// of it was going to decide (review M14.1, F11).
+    ///
+    /// What is not lazy is the correlators against the *argument*, and that
+    /// asymmetry is R-M7's direct cost:
     /// detecting a contradiction means resolving the client's correlator even
     /// on a call whose argument would have decided it.
     ///
@@ -305,7 +311,15 @@ pub trait ControlReads: Send + Sync + 'static {
             None => None,
         };
 
-        let thread = match correlators.thread_id.as_deref() {
+        // (2), (3) and (4) as one lazy chain, each arm consulted only where
+        // every arm above it answered nothing. Stated once rather than per arm
+        // because two shapes drifted apart (review M14.1, F11): the cache-key
+        // arm short-circuited on the thread arm's answer and the tool-use-id
+        // arm did not, and since this rung the table lookups return a `Result`
+        // — so the eagerness that was free while they returned `Option` became
+        // a call-table outage refusing a call the thread arm had already
+        // served. An arm the order would have discarded cannot refuse.
+        let mut correlated = match correlators.thread_id.as_deref() {
             None => None,
             // One string, one answer (F8). The argument and the correlator
             // agreeing is the ordinary Codex case, and re-deriving that one
@@ -320,25 +334,33 @@ pub trait ControlReads: Send + Sync + 'static {
                 None => named_correlator(self, principal, thread).await?,
             },
         };
-        // (3) R-C5. Resolved only where the thread arm answered nothing: the
-        // arms are ordered, so a name the order would discard is a store round
-        // trip spent for no reader — and for a codex root thread, where
-        // `threadId` and this string are the same value, it is the identical
-        // lookup a second time.
-        let cache_key = match (&thread, correlators.cache_key.as_deref()) {
-            (Some(_), _) | (None, None) => None,
-            // One string, one answer (F8), as on the thread arm: an argument
-            // and a correlator spelling one name must not manufacture a
-            // disagreement between two of this deployment's own reads.
-            (None, Some(key)) if Some(key) == conversation => named.clone(),
-            (None, Some(key)) => named_correlator(self, principal, key).await?,
-        };
-        let call = match correlators.tool_use_id.as_deref() {
-            Some(id) => self.session_of_call(principal, id).await?,
-            None => None,
-        };
+        // (3) R-C5. A name the order would discard is a store round trip spent
+        // for no reader — and for a codex root thread, where `threadId` and
+        // this string are the same value, it is the identical lookup a second
+        // time.
+        if correlated.is_none()
+            && let Some(key) = correlators.cache_key.as_deref()
+        {
+            correlated = if Some(key) == conversation {
+                // One string, one answer (F8), as on the thread arm: an
+                // argument and a correlator spelling one name must not
+                // manufacture a disagreement between two of this deployment's
+                // own reads.
+                named.clone()
+            } else {
+                named_correlator(self, principal, key).await?
+            };
+        }
+        // (4) The id roundhouse itself emitted — exact, and last because a
+        // client that stamped a thread or a cache key on the call has already
+        // said which conversation it is in.
+        if correlated.is_none()
+            && let Some(id) = correlators.tool_use_id.as_deref()
+        {
+            correlated = self.session_of_call(principal, id).await?;
+        }
 
-        match (named, thread.or(cache_key).or(call)) {
+        match (named, correlated) {
             (Some(named), Some(correlated)) if named != correlated => {
                 Err(SurfaceError::ContradictoryConversation {
                     named: named.to_string(),
@@ -506,6 +528,11 @@ mod tests {
         /// A store that cannot answer, so a test can drive the one error the
         /// thread arm must *not* swallow.
         outage: bool,
+        /// A per-table outage for the call table alone (review F11), so a
+        /// test can drive an outage on the *last* arm while an earlier arm
+        /// still answers — `outage` above fails every table together and
+        /// cannot spell that case.
+        calls_outage: bool,
     }
 
     #[async_trait]
@@ -529,7 +556,7 @@ mod tests {
             _principal: &Principal,
             tool_use_id: &str,
         ) -> Result<Option<SessionId>, SurfaceError> {
-            if self.outage {
+            if self.outage || self.calls_outage {
                 return Err(SurfaceError::Internal("redis connection reset".into()));
             }
             Ok(self.calls.get(tool_use_id).cloned())
@@ -994,6 +1021,52 @@ mod tests {
                 .await
                 .ok(),
             Some(most_recent()),
+        );
+    }
+
+    /// Review M14.1 F11, closed: the tool-use-id arm (4) used to run
+    /// unconditionally while the cache-key arm (3) short-circuited on the
+    /// thread arm's answer, and since M14.1 the call-table lookup propagates
+    /// its error with `?` — so a call-table outage refused a call arm (2) had
+    /// already answered. Under one lazy chain arm (4) is never consulted here,
+    /// and an arm that is not consulted cannot refuse.
+    #[tokio::test]
+    async fn f11_lazy_chain_skips_tool_use_id_arm_once_thread_arm_answers() {
+        let tables = Tables {
+            threads: HashMap::from([("thread", subagent())]),
+            calls_outage: true,
+            ..Tables::default()
+        };
+        assert_eq!(
+            tables
+                .resolve_session(&ada(), None, &correlators(Some("thread"), Some("toolu")))
+                .await
+                .ok(),
+            Some(subagent()),
+            "the thread arm already answered; a later arm's outage must not \
+             refuse a call the resolver could already serve",
+        );
+    }
+
+    /// CONTROL for the test above: the same outage, but with no earlier arm
+    /// to answer first. Here arm (4) *must* be consulted — the whole
+    /// resolution rests on it — so its outage refusing is correct, and stays
+    /// correct under the lazy chain. This is what proves the test above is
+    /// about ordering, not about whether a call-table outage should ever
+    /// refuse.
+    #[tokio::test]
+    async fn f11_control_tool_use_id_arm_outage_refuses_when_nothing_earlier_answered() {
+        let tables = Tables {
+            calls_outage: true,
+            ..Tables::default()
+        };
+        let error = tables
+            .resolve_session(&ada(), None, &correlators(None, Some("toolu")))
+            .await
+            .expect_err("no earlier arm answered, so the call table's outage must surface");
+        assert!(
+            matches!(error, SurfaceError::Internal(_)),
+            "must refuse as an outage, not read as an unknown id: {error}"
         );
     }
 }

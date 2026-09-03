@@ -192,10 +192,90 @@ where
     // Computed once and used for both the generation counter and the session
     // id, so the two cannot key on different strings. See [`Conversations`].
     let key = plane.qualify(principal, cache_key);
-    let current = conversations.generation(&key).await;
+    let hint = conversations.generation(&key).await;
 
+    let outcome = match search(store, &key, hint, &claimed).await? {
+        // **A hint that ran the search off its bound is stale, and is
+        // refreshed before anything is refused** (review M14.1, F2; R-C2″).
+        // The memo is where a probe starts and never what it concludes, so a
+        // node whose memo sat at generation zero while another node forked the
+        // key nine times walked 1..=8 and refused a claim the store placed one
+        // read away — and, since a refusal commits nothing, refused every
+        // retry identically while a memo-less node served it at once. Asking
+        // the store for a fresh hint and searching once more from it costs one
+        // read on the refusal path alone; the ordinary turn is unchanged.
+        Search::Exhausted { disagreed } => {
+            let refreshed = conversations.generation_refreshed(&key).await;
+            if refreshed == hint {
+                Search::Exhausted { disagreed }
+            } else {
+                search(store, &key, refreshed, &claimed).await?
+            }
+        }
+        decided => decided,
+    };
+
+    match outcome {
+        Search::Lands { generation, delta } => Ok((
+            conversations.commit(principal, &key, generation).await,
+            delta,
+        )),
+        // The claim opens a generation of its own and is taken whole: there is
+        // nothing recorded there to disagree with. The honest cost, paid once
+        // per genuine divergence and not per restart, is that the new session
+        // starts with no history — the routing ledger no longer knows any
+        // provider is warm for it and the next turn is priced cold. That is
+        // the conservative direction: a ledger claiming a warm prefix for a
+        // conversation that just changed shape would be claiming a cache hit
+        // nobody can serve.
+        Search::Fresh { generation } => {
+            let session_id = open_fresh(engine, conversations, principal, &key, generation).await?;
+            Ok((session_id, claimed))
+        }
+        // Every generation a search from a fresh hint could reach disagreed
+        // and it never found a free slot. Refuse loudly, naming the key and
+        // the tally — and commit nothing, so a verbatim retry probes the same
+        // generations and is refused in exactly the same way rather than
+        // resuming past the bound.
+        Search::Exhausted { disagreed } => {
+            Err(ApiError::prefix_admission_exhausted(&key, disagreed))
+        }
+    }
+}
+
+/// What one pass over a key's family concluded, having written nothing down.
+///
+/// A value rather than three exits taken inside the walk itself, because a
+/// pass is no longer necessarily the last word: one that ran off its bound
+/// from a stale hint is run again from a fresh one (F2 above), and a walk that
+/// committed or minted as it went could not be re-run at all — which is the
+/// same reason [`probe`] writes nothing.
+enum Search {
+    /// `generation` agrees with the claim, and `delta` is the part of the
+    /// claim it does not already hold.
+    Lands { generation: u32, delta: Vec<Item> },
+    /// Nothing agreed, and `generation` is the key's first free slot — not yet
+    /// created, since a probe that asked about it left it as it found it.
+    Fresh { generation: u32 },
+    /// Every generation both walks reached disagreed, and neither reached a
+    /// free slot. `disagreed` is what the walks actually read rather than what
+    /// they were allowed to read.
+    Exhausted { disagreed: u32 },
+}
+
+/// One pass of the search over `key`'s family, starting from `current`.
+///
+/// `current` is a *hint* and not a fact — this node's memo, or the store's own
+/// answer when the memo ran the first pass off its bound — which is what makes
+/// running this twice on one request meaningful rather than wasteful.
+async fn search<S: SessionStore>(
+    store: &S,
+    key: &str,
+    current: u32,
+    claimed: &[Item],
+) -> Result<Search, ApiError> {
     // Generations found agreeing, and generations found disagreeing, kept
-    // rather than counted from the bound: the refusal below reports what the
+    // rather than counted from the bound: the refusal above reports what the
     // search actually read, not what it was allowed to read.
     let mut homes: Vec<Home> = Vec::new();
     let mut disagreed = 0u32;
@@ -203,9 +283,12 @@ where
     // The common case, and the reason it is asked first and alone: a
     // conversation nobody has edited is at the generation this node last
     // committed, and finding it there costs exactly one read.
-    match probe(store, &bound_session(&key, current), &claimed).await? {
+    match probe(store, &bound_session(key, current), claimed).await? {
         Probe::Home { delta, .. } => {
-            return Ok((conversations.commit(principal, &key, current).await, delta));
+            return Ok(Search::Lands {
+                generation: current,
+                delta,
+            });
         }
         // A generation the store has never held has nothing above it either:
         // this node's counter only ever names a generation this node actually
@@ -215,8 +298,9 @@ where
         // the existence check: the claim has nothing anywhere to disagree
         // with, so [`open_fresh`] creates the generation and takes it whole.
         Probe::Fresh => {
-            let session_id = open_fresh(engine, conversations, principal, &key, current).await?;
-            return Ok((session_id, claimed));
+            return Ok(Search::Fresh {
+                generation: current,
+            });
         }
         Probe::Disagrees => disagreed += 1,
         Probe::Busy => {}
@@ -238,7 +322,7 @@ where
     let mut fresh = None;
     for step in 1..=MAX_PREFIX_PROBES {
         let generation = current.saturating_add(step);
-        match probe(store, &bound_session(&key, generation), &claimed).await? {
+        match probe(store, &bound_session(key, generation), claimed).await? {
             Probe::Fresh => {
                 fresh = Some(generation);
                 break;
@@ -268,7 +352,7 @@ where
         let Some(generation) = current.checked_sub(step) else {
             break;
         };
-        match probe(store, &bound_session(&key, generation), &claimed).await? {
+        match probe(store, &bound_session(key, generation), claimed).await? {
             Probe::Home { held, delta } => homes.push(Home {
                 generation,
                 held,
@@ -291,33 +375,17 @@ where
         .into_iter()
         .max_by_key(|home| (home.held, Reverse(home.generation)))
     {
-        return Ok((
-            conversations.commit(principal, &key, home.generation).await,
-            home.delta,
-        ));
+        return Ok(Search::Lands {
+            generation: home.generation,
+            delta: home.delta,
+        });
     }
 
-    // Nothing agrees, so the claim opens a generation of its own and is taken
-    // whole: there is nothing recorded there to disagree with. This is the one
-    // place [`open_fresh`] actually creates the free slot the upward walk
-    // found — every generation between here and there having agreed with
-    // nothing is what makes it the home rather than a slot merely passed on
-    // the way to one further out. The honest cost, paid once per genuine
-    // divergence and not per restart, is that the new session starts with no
-    // history — the routing ledger no longer knows any provider is warm for
-    // it and the next turn is priced cold. That is the conservative
-    // direction: a ledger claiming a warm prefix for a conversation that just
-    // changed shape would be claiming a cache hit nobody can serve.
     if let Some(generation) = fresh {
-        let session_id = open_fresh(engine, conversations, principal, &key, generation).await?;
-        return Ok((session_id, claimed));
+        return Ok(Search::Fresh { generation });
     }
 
-    // Every generation the search could reach disagreed and it never found a
-    // free slot. Refuse loudly, naming the key and the tally — and commit
-    // nothing, so a verbatim retry probes the same generations and is refused
-    // in exactly the same way rather than resuming past the bound.
-    Err(ApiError::prefix_admission_exhausted(&key, disagreed))
+    Ok(Search::Exhausted { disagreed })
 }
 
 /// Create the generation the search decided is the claim's home, then commit

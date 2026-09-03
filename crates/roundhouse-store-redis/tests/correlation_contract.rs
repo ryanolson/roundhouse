@@ -40,9 +40,8 @@ use roundhouse_core::control::spend::contract::fresh_principal;
 use roundhouse_core::control::{CorrelationMaps, MemoryCorrelationMaps};
 use roundhouse_core::ids::SessionId;
 use roundhouse_store_redis::RedisCorrelationMaps;
-use roundhouse_store_redis::test_support::{
-    correlation_ambiguous_marker, correlation_call_key, correlation_with_binding_ttls, url_from_env,
-};
+use roundhouse_store_redis::correlation::AMBIGUOUS_MARKER;
+use roundhouse_store_redis::test_support::{correlation_call_key, url_from_env};
 
 roundhouse_core::correlation_maps_contract_suite!(
     ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored",
@@ -166,7 +165,7 @@ async fn a_collision_across_two_nodes_marks_the_id_ambiguous_in_the_store() {
     let stored: Option<String> = raw.get(correlation_call_key(&ada, "call_0")).await.unwrap();
     assert_eq!(
         stored.as_deref(),
-        Some(correlation_ambiguous_marker()),
+        Some(AMBIGUOUS_MARKER),
         "the second node's claim must leave the id marked, not replace the \
          first node's binding — a replaced binding answers the first \
          conversation's still-open tools/call with the second's session"
@@ -181,7 +180,7 @@ async fn a_collision_across_two_nodes_marks_the_id_ambiguous_in_the_store() {
         .await
         .unwrap();
     let stored: Option<String> = raw.get(correlation_call_key(&ada, "call_0")).await.unwrap();
-    assert_eq!(stored.as_deref(), Some(correlation_ambiguous_marker()));
+    assert_eq!(stored.as_deref(), Some(AMBIGUOUS_MARKER));
 }
 
 /// A binding leaves at its staleness bound, and it leaves because Redis
@@ -199,7 +198,7 @@ async fn a_collision_across_two_nodes_marks_the_id_ambiguous_in_the_store() {
 #[tokio::test]
 #[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
 async fn a_binding_expires_at_its_staleness_bound_and_a_generation_does_not() {
-    let maps = correlation_with_binding_ttls(connect_maps_from_env().await, 80, 80);
+    let maps = connect_maps_from_env().await.with_binding_ttls(80, 80);
     let ada = fresh_principal("ada");
     let key = fresh_key("main");
 
@@ -324,7 +323,7 @@ async fn a_conversation_named_like_the_ambiguous_marker_resolves_on_both_backend
     let redis = connect_maps_from_env().await;
     let memory = MemoryCorrelationMaps::new();
     let ada = fresh_principal("ada");
-    let impostor = session(correlation_ambiguous_marker());
+    let impostor = session(AMBIGUOUS_MARKER);
 
     for maps in [
         &redis as &dyn CorrelationMaps,

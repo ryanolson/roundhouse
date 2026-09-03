@@ -148,7 +148,16 @@ const BOUND_TAG: &str = "s:";
 /// never-seen, so the next binding of the same colliding id would look like a
 /// first one and start answering confidently again — the defect, one turn
 /// later.
-pub(crate) const AMBIGUOUS_MARKER: &str = "!ambiguous";
+///
+/// `pub` rather than `pub(crate)`: the gated integration test that reads the
+/// raw stored value (`correlation_contract.rs`) needs the real constant, not
+/// a copy that can drift from what ships — the same reasoning
+/// [`test_support::fair_use_would_exceed_source`](crate::test_support::fair_use_would_exceed_source)
+/// gives for handing out the real script rather than letting a test carry its
+/// own copy. Reading it as `roundhouse_store_redis::correlation::AMBIGUOUS_MARKER`
+/// needs no `test_support` wrapper the way `scripts.rs` needs none either
+/// (M14.1 review, F9).
+pub const AMBIGUOUS_MARKER: &str = "!ambiguous";
 
 /// The generation key for one namespaced cache key.
 ///
@@ -294,22 +303,38 @@ impl RedisCorrelationMaps {
 
     /// Shorten this handle's staleness bounds. See [`BindingTtls`].
     ///
-    /// `pub(crate)` and surfaced through `test_support`, which is where this
-    /// crate keeps the levers that exist only for the gated suites.
-    pub(crate) fn with_binding_ttls(mut self, call_ms: u64, thread_ms: u64) -> Self {
+    /// A direct `pub fn` behind the `test-support` feature, the same shape
+    /// [`RedisFairUseLedger::with_bucket_ttl_ms`](crate::fair_use::RedisFairUseLedger::with_bucket_ttl_ms)
+    /// already has: the gated integration test calls this lever itself rather
+    /// than through a `test_support.rs` pass-through that existed only to
+    /// re-export a `pub(crate)` fn an outside crate could not otherwise reach
+    /// (M14.1 review, F9).
+    #[cfg(feature = "test-support")]
+    pub fn with_binding_ttls(mut self, call_ms: u64, thread_ms: u64) -> Self {
         self.ttls = BindingTtls { call_ms, thread_ms };
         self
+    }
+
+    /// The one GET round trip every read path here needs.
+    ///
+    /// `generation`, `session_of_call` and `session_of_thread` each built this
+    /// same five-line block themselves before this rung, issuing the `GET`
+    /// command directly — three spellings of one round trip (M14.1 review,
+    /// F8), where `decode_binding` already collapsed the two binding reads'
+    /// *parsing* into one function without touching the fetch above it.
+    async fn get(&self, key: &str) -> Result<Option<String>, CorrelationError> {
+        redis::cmd("GET")
+            .arg(key)
+            .query_async(&mut self.conn.clone())
+            .await
+            .map_err(backend)
     }
 }
 
 #[async_trait]
 impl CorrelationMaps for RedisCorrelationMaps {
     async fn generation(&self, key: &str) -> Result<Option<u32>, CorrelationError> {
-        let raw: Option<String> = redis::cmd("GET")
-            .arg(generation_key(key))
-            .query_async(&mut self.conn.clone())
-            .await
-            .map_err(backend)?;
+        let raw = self.get(&generation_key(key)).await?;
         raw.map(|value| {
             value.parse::<u32>().map_err(|error| {
                 CorrelationError::Backend(anyhow::anyhow!(
@@ -346,7 +371,6 @@ impl CorrelationMaps for RedisCorrelationMaps {
                 &mut self.conn.clone(),
                 &call_key(principal, call_id),
                 &bound_value(session),
-                AMBIGUOUS_MARKER,
                 self.ttls.call_ms,
             )
             .await
@@ -358,11 +382,7 @@ impl CorrelationMaps for RedisCorrelationMaps {
         call_id: &str,
     ) -> Result<Option<SessionId>, CorrelationError> {
         let key = call_key(principal, call_id);
-        let raw: Option<String> = redis::cmd("GET")
-            .arg(&key)
-            .query_async(&mut self.conn.clone())
-            .await
-            .map_err(backend)?;
+        let raw = self.get(&key).await?;
         decode_binding(raw, &key)
     }
 
@@ -391,11 +411,7 @@ impl CorrelationMaps for RedisCorrelationMaps {
         thread_id: &str,
     ) -> Result<Option<SessionId>, CorrelationError> {
         let key = thread_key(principal, thread_id);
-        let raw: Option<String> = redis::cmd("GET")
-            .arg(&key)
-            .query_async(&mut self.conn.clone())
-            .await
-            .map_err(backend)?;
+        let raw = self.get(&key).await?;
         decode_binding(raw, &key)
     }
 }

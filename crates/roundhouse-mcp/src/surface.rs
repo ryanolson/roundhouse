@@ -122,7 +122,8 @@ pub struct Correlators {
     pub thread_id: Option<String>,
     /// `_meta["claudecode/toolUseId"]` — the `tool_use` block this call is
     /// answering (M12, R-M2). It resolves as a **call**, through the table of
-    /// ids this node emitted.
+    /// ids this deployment emitted — durable and shared since M14.1
+    /// (R-C4), rather than kept by whichever node happened to stream it.
     pub tool_use_id: Option<String>,
     /// `_meta["x-codex-turn-metadata"].session_id` — the client's own session
     /// id, which is the `prompt_cache_key` its turns carry (M14.1, R-C5). It

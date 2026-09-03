@@ -387,9 +387,12 @@ macro_rules! correlation_maps_contract_suite {
         $crate::correlation_maps_contract_suite!(@list () $make);
     };
     // The single list. Both public arms land here, so gated and ungated
-    // backends cannot drift apart in coverage.
+    // backends cannot drift apart in coverage. The recursion that turns this
+    // list into one `#[tokio::test]` per name is
+    // [`__contract_suite!`](crate::__contract_suite), shared with the other
+    // three families (M14.1 review, F6).
     (@list $attrs:tt $make:expr) => {
-        $crate::correlation_maps_contract_suite!(@tests $attrs $make;
+        $crate::__contract_suite!(maps, $crate::control::correlation::contract, $attrs, $make;
             a_committed_generation_is_read_back_and_an_uncommitted_key_is_absent,
             a_generation_is_set_rather_than_advanced_so_a_backward_search_can_commit,
             an_emitted_call_names_its_session_and_only_for_its_own_principal,
@@ -401,17 +404,4 @@ macro_rules! correlation_maps_contract_suite {
             a_call_a_thread_and_a_generation_do_not_share_a_name,
         );
     };
-    // One test per recursion step rather than one repetition over the names:
-    // the attribute group is captured at depth one, and macro_rules cannot
-    // re-expand it inside a second repetition.
-    (@tests ($(#[$attr:meta])*) $make:expr; $name:ident $(, $rest:ident)* $(,)?) => {
-        #[tokio::test]
-        $(#[$attr])*
-        async fn $name() {
-            let maps = $make;
-            $crate::control::correlation::contract::$name(&maps).await;
-        }
-        $crate::correlation_maps_contract_suite!(@tests ($(#[$attr])*) $make; $($rest),*);
-    };
-    (@tests ($(#[$attr:meta])*) $make:expr; ) => {};
 }

@@ -500,9 +500,12 @@ macro_rules! store_contract_suite {
         $crate::store_contract_suite!(@list () $make);
     };
     // The single list. Both public arms land here, so gated and ungated
-    // backends cannot drift apart in coverage.
+    // backends cannot drift apart in coverage. The recursion that turns this
+    // list into one `#[tokio::test]` per name is
+    // [`__contract_suite!`](crate::__contract_suite), shared with the other
+    // three families (M14.1 review, F6).
     (@list $attrs:tt $make:expr) => {
-        $crate::store_contract_suite!(@tests $attrs $make;
+        $crate::__contract_suite!(store, $crate::store::contract, $attrs, $make;
             create_is_idempotent_and_reports_existing,
             unknown_sessions_are_not_found,
             a_live_lease_blocks_others_and_retakes_with_a_fresh_fence,
@@ -517,17 +520,4 @@ macro_rules! store_contract_suite {
             renew_fails_once_the_lease_was_taken_over,
         );
     };
-    // One test per recursion step rather than one repetition over the names:
-    // the attribute group is captured at depth one, and macro_rules cannot
-    // re-expand it inside a second repetition.
-    (@tests ($(#[$attr:meta])*) $make:expr; $name:ident $(, $rest:ident)* $(,)?) => {
-        #[tokio::test]
-        $(#[$attr])*
-        async fn $name() {
-            let store = $make;
-            $crate::store::contract::$name(&store).await;
-        }
-        $crate::store_contract_suite!(@tests ($(#[$attr])*) $make; $($rest),*);
-    };
-    (@tests ($(#[$attr:meta])*) $make:expr; ) => {};
 }

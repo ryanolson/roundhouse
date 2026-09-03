@@ -613,9 +613,12 @@ macro_rules! fair_use_ledger_contract_suite {
         $crate::fair_use_ledger_contract_suite!(@list () $make);
     };
     // The single list. Both public arms land here, so gated and ungated
-    // backends cannot drift apart in coverage.
+    // backends cannot drift apart in coverage. The recursion that turns this
+    // list into one `#[tokio::test]` per name is
+    // [`__contract_suite!`](crate::__contract_suite), shared with the other
+    // three families (M14.1 review, F6).
     (@list $attrs:tt $make:expr) => {
-        $crate::fair_use_ledger_contract_suite!(@tests $attrs $make;
+        $crate::__contract_suite!(ledger, $crate::control::fair_use::contract, $attrs, $make;
             a_turn_over_the_5h_window_is_refused_with_the_earliest_retry_time,
             windows_roll_rather_than_reset,
             the_member_window_binds_even_when_the_projects_has_room,
@@ -633,17 +636,4 @@ macro_rules! fair_use_ledger_contract_suite {
             a_draw_ahead_of_the_check_clock_is_reached_by_the_retry_walk,
         );
     };
-    // One test per recursion step rather than one repetition over the names:
-    // the attribute group is captured at depth one, and macro_rules cannot
-    // re-expand it inside a second repetition.
-    (@tests ($(#[$attr:meta])*) $make:expr; $name:ident $(, $rest:ident)* $(,)?) => {
-        #[tokio::test]
-        $(#[$attr])*
-        async fn $name() {
-            let ledger = $make;
-            $crate::control::fair_use::contract::$name(&ledger).await;
-        }
-        $crate::fair_use_ledger_contract_suite!(@tests ($(#[$attr])*) $make; $($rest),*);
-    };
-    (@tests ($(#[$attr:meta])*) $make:expr; ) => {};
 }

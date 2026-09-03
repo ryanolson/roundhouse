@@ -14,6 +14,7 @@
 //! account.
 
 pub mod context;
+pub mod contract_macro;
 pub mod control;
 pub mod event;
 pub mod ids;

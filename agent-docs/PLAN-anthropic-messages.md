@@ -1734,6 +1734,10 @@ deployment holds these maps. The `redis` crate does not move.
   generation memo is uncapped (bounded by the conversations a node has
   served) and has no staleness bound; `Conversations::bind` is now
   read-then-write and has no serving-path caller.
+- **The gate caught what the stages could not compile.** The async
+  surface broke two calls in the real-binary suite's rig, which no stage
+  compiles (it is feature-gated); the gate refused to commit, the two
+  awaits were added, and the churn brief now compiles that suite too.
 - **Refute by mutation against the real server**: ten mutations — the
   ambiguous marker overwritten, the call expiry dropped, the write-through
   removed, the memo never primed, generation zero minted for an unknown
@@ -1741,3 +1745,66 @@ deployment holds these maps. The `redis` crate does not move.
   arm, the schema version dropped from a key, the composition root
   unconditional, call bindings unpartitioned — nine red under named
   guards and the tenth closed test-first.
+
+### What the review round changed (2026-09-03, M14.1)
+
+Eleven findings from two lenses, ten valid and one partially valid. Two
+were coherence defects in the cache the rung introduced, one was the
+resolver's shape, and one was the composition root; the rest were the
+strict lens doing its job.
+
+**R-C2″ — a hint that runs the search off its bound is stale, and is
+refreshed before anything is refused** (F2). The generation memo is where
+the probe starts, never what it concludes; but nothing refreshed it, and
+a node whose memo lagged the store by more than the probe bound walked
+its eight generations, never reached the store's, and refused — and
+because a refusal commits nothing, refused every retry, while a fresh
+node served the same claim at once. Now a walk that reaches the bound
+without a free slot or an agreeing generation asks for a fresh hint (one
+store read that re-primes the memo), restarts once from it if it
+differs, and only a search that ran off the bound from a fresh hint
+refuses. One extra read on the refusal path; the common turn unchanged.
+
+**The node that committed must agree with itself** (F7). A commit whose
+store write was lost primed the memo and moved `latest`, but the same
+node's named reads went to the store and served the generation the
+client had just left, with `Ok`. A memo entry now records whether its
+last write reached the store; a named read answers from a dirty entry
+ahead of the store, the next commit or read-through retries the write
+and clears the flag, and the failure is logged once per outage. The turn
+is not refused: it ran correctly here, and what the lost write costs
+another node is still one walk. One consequence, stated: under a total
+correlation-store outage a node answers a named read for a key it
+committed during the outage from its own memo rather than refusing,
+while every key it did not commit still refuses — the exception is the
+staleness rule applied to the one node that knows, not a hole in it.
+
+**One lazy chain** (F11). The cache-key arm M14.1 added was lazy and the
+tool-use-id arm was not, and it carried a `?` — so an outage on the call
+table refused a call the thread arm had already answered. Each arm is
+consulted only when the previous answered nothing, and an arm not
+consulted cannot refuse; the explicit argument is still compared against
+the effective correlator, and correlator-versus-correlator stays ordered,
+not refused.
+
+**The lib builds the four families in one match** (F1). R-C4 promised one
+predicate and `main.rs` evaluated it three times, with the wiring in a
+binary no test can reach, so both boot tests mirrored the match by hand
+and a mutation of the real wiring stayed green. `shared_backend::open`
+builds the store, the spend ledger, the fair-use ledger and the
+correlation maps in one match in the library, with one boot line per
+arm; `main.rs` matches once on the result, and the boot tests call
+`open`. The three per-family boot lines became two per-arm lines, which
+is a visible log change; nothing in the tree asserted on the old
+strings.
+
+The rest: the memory maps lost a sync surface justified by a claim the
+same rung had falsified (F4); the four contract macros share one helper
+for their recursion plumbing (F6); `conversations.rs`'s tests are a
+sibling file with one double instead of two (F3); README's ordering
+sentence and two scope sentences say what the resolver does (F5, partial);
+one `get` in the Redis maps (F8); the TTL lever takes its sibling's
+shape (F9); the new suites use core's fixtures (F10). Left for M15 by name:
+roundhouse-mcp has no sibling-test-file convention and `reads.rs` now
+stands at 1072 lines with its tests inline; and the refreshed hint has
+the memo's staleness question, which M14.2 owns.

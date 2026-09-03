@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::body::{Body, Bytes};
-use axum::http::header::AUTHORIZATION;
+use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use futures::StreamExt;
 use http_body_util::BodyExt;
@@ -255,6 +255,37 @@ pub fn request(cache_key: &str, input: Vec<ResponseItem>) -> ResponsesApiRequest
         text: None,
         client_metadata: None,
     }
+}
+
+/// One `POST /v1/responses` with a codex-shaped body naming `cache_key`,
+/// draining the SSE response so the turn's tail — including whatever the
+/// caller is testing runs on completion (`Conversations::commit` inside
+/// `prefix_admission::bind_prefix`, a fair-use draw, …) — actually runs
+/// before this function returns.
+///
+/// Shared by `correlation_backend_boot.rs` and `fair_use_backend_boot.rs`,
+/// which spelled this five-line request/drain themselves before this rung —
+/// `correlation_backend_boot.rs`'s copy differed only in taking `cache_key`
+/// as a parameter where `fair_use_backend_boot.rs`'s hard-coded the literal
+/// `"cache-key"` (M14.1 review, F10).
+pub async fn post_responses_turn(app: &Router, secret: &str, cache_key: &str) -> StatusCode {
+    let body = request(cache_key, vec![user_message("count some tokens")]);
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header(CONTENT_TYPE, "application/json")
+                .header(AUTHORIZATION, format!("Bearer {secret}"))
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let _ = response.into_body().collect().await.unwrap().to_bytes();
+    status
 }
 
 pub fn user_message(text: &str) -> ResponseItem {

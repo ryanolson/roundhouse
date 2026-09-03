@@ -200,12 +200,12 @@
 //! exactly — through every fork of the cache key underneath it, and from any
 //! node where `ROUNDHOUSE_REDIS_URL` puts the bindings in one shared store
 //! (M14.1, R-C4). A thread whose binding has aged out of that store, or whose
-//! turns a different node served on a deployment that shares nothing,
-//! resolves as any unknown correlator does: down the cache-key path (which
-//! answers a root thread and nothing else) and then to `latest`, which is a
-//! guess and stays node-local on purpose. A client that sends no
-//! `x-codex-turn-metadata` header is in that second case on every call, and
-//! sends neither of the two correlators this section is about.
+//! turns a different node served on a deployment that shares nothing, falls to
+//! the cache-key arm, which answers the whole agent family exactly — root
+//! thread and subagent alike, per R-C5 above — for as long as the client
+//! sends `x-codex-turn-metadata` at all. `latest` is reached only once that
+//! header is itself absent, which is a guess and stays node-local on purpose.
+//! A client that sends neither correlator is in that last case on every call.
 //!
 //! `init_session` remains the client-agnostic path and this does not replace
 //! it; see the section below for what is still write-only about it. What

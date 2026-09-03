@@ -54,7 +54,7 @@
 //! *this node*" becomes "never bound *anywhere*" — the same refusal with the
 //! scope it always should have had (R12, R-C2).
 //!
-//! # The memo is the turn path's, and every reader goes to the store
+//! # The memo is the turn path's, and what a reader may take from it
 //!
 //! R-C2 asks for a write-through cache so the common turn stays a local
 //! lookup, and [`Conversations::generation`] is where that cache lives: a
@@ -90,6 +90,17 @@
 //! `a_binding_another_node_moved_is_read_from_the_store` below are what hold
 //! that line.
 //!
+//! **The one exception is a memo entry whose write the store refused**, and it
+//! is the rule rather than a hole in it (M14.1 review, F7). Every case above is
+//! the memo being *behind* the store; a refused write is the store being behind
+//! the memo, because the generation this node committed exists nowhere else.
+//! Reading over it hands a control call the session the client was just moved
+//! off — with a 200 on it, from the very node that moved them, while an
+//! unnamed call on the same node answers the new one from `latest`. So
+//! [`Conversations::resolve`] answers such an entry from the memo, the next
+//! write on the key retries it, and the entry stops being the answer the
+//! moment one lands.
+//!
 //! **`latest` stays node-local and stays a guess**, and that is a decision
 //! rather than an omission (R12). It answers "which conversation is this agent
 //! working in", which is knowable only by having watched turns arrive; two
@@ -120,7 +131,9 @@
 //!
 //! A turn asks for a hint and records where it landed. A hint that could not be
 //! loaded is still a hint — the probe checks it — and a commit that could not
-//! be written costs another node's next probe a walk of the same bounded size.
+//! be written costs *another* node's next probe a walk of the same bounded
+//! size, this node's own readers nothing (F7, above), and the write itself
+//! only until the next commit on that key.
 //! Failing the turn instead would make the serving path depend on the
 //! correlation store for something nothing trusts unchecked, and on a
 //! deployment where both live in one Redis the *session log* fails loudly on
@@ -136,6 +149,7 @@
 //! as a tenancy answer.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use roundhouse_core::control::{
@@ -152,22 +166,43 @@ pub struct Conversations {
     /// (R-C4) and every method below reads identically either way.
     maps: Arc<dyn CorrelationMaps>,
     /// This node's memo of the generation map. See the module doc for why the
-    /// turn path may hold one and no reader may.
-    ///
-    /// `Option<u32>` rather than `u32`, so the memo distinguishes three states
-    /// where the map itself has two: not read through yet, read and absent,
-    /// read and committed at *n*. Collapsing the middle one into zero would be
-    /// F9's defect stored locally — the node would stop asking the store about
-    /// a key it had only ever heard silence about.
+    /// turn path may hold one, and which one entry a reader must.
     ///
     /// Uncapped, like the generation map it memoises and for its reason: this
     /// is bounded by the number of distinct conversations a node has served
     /// rather than by their tool traffic. M14.2 gives it the staleness bound
     /// the two binding families already have.
-    generations: Mutex<HashMap<String, Option<u32>>>,
+    generations: Mutex<HashMap<String, Memo>>,
+    /// Whether this node is currently carrying a commit the store refused —
+    /// so [`Self::commit`] warns once per outage rather than once per turn,
+    /// the shape the engine's fair-use seam already uses (M13.1 review, F4).
+    /// A per-turn line about a condition that lasts as long as the outage
+    /// trains an operator to filter exactly the line they need.
+    generation_write_failing: AtomicBool,
     /// The session each principal most recently drove a turn on. Node-local by
     /// contract — see the module doc.
     latest: Mutex<HashMap<Principal, SessionId>>,
+}
+
+/// One key's entry in this node's memo of the generation map.
+///
+/// `Option<u32>` rather than `u32`, so the memo distinguishes three states
+/// where the map itself has two: not read through yet (no entry at all), read
+/// and absent, read and committed at *n*. Collapsing the middle one into zero
+/// would be F9's defect stored locally — the node would stop asking the store
+/// about a key it had only ever heard silence about.
+#[derive(Clone, Copy, Debug)]
+struct Memo {
+    generation: Option<u32>,
+    /// **This node committed this generation and the store did not take the
+    /// write** (review M14.1, F7). A dirty entry is the one thing a store read
+    /// cannot know: the value here is newer than anything the maps can answer,
+    /// so [`Conversations::resolve`] serves it and
+    /// [`Conversations::generation_refreshed`] retries the write rather than
+    /// reading over it. Cleared by the first write that lands — every
+    /// [`Conversations::commit`] is that retry, since a turn on this key
+    /// writes the key again anyway.
+    dirty: bool,
 }
 
 impl std::fmt::Debug for Conversations {
@@ -203,6 +238,7 @@ impl Conversations {
         Self {
             maps,
             generations: Mutex::new(HashMap::new()),
+            generation_write_failing: AtomicBool::new(false),
             latest: Mutex::new(HashMap::new()),
         }
     }
@@ -289,12 +325,12 @@ impl Conversations {
     /// nothing, so a request that goes on to be refused leaves the maps exactly
     /// as it found them. See [`Self::commit`].
     pub async fn generation(&self, key: &str) -> u32 {
-        if let Some(memoised) = self.memoised(key) {
-            return memoised.unwrap_or(0);
+        if let Some(memo) = self.memoised(key) {
+            return memo.generation.unwrap_or(0);
         }
         match self.maps.generation(key).await {
             Ok(found) => {
-                self.memoise(key, found);
+                self.memoise(key, found, false);
                 found.unwrap_or(0)
             }
             // Degraded, not refused — see the module doc. Deliberately *not*
@@ -310,6 +346,60 @@ impl Conversations {
                      reads rather than correctness"
                 );
                 0
+            }
+        }
+    }
+
+    /// What the *store* holds for `key` now, re-priming the memo with it.
+    ///
+    /// **The refusal path's question, and only its** (review M14.1, F2;
+    /// R-C2″). [`Self::generation`] hands out a hint and a hint is where a
+    /// probe starts, so being wrong about it normally costs a walk of one or
+    /// two extra reads. Past [`prefix_admission`](crate::prefix_admission)'s
+    /// probe bound it stops costing reads and starts costing correctness: a
+    /// memo at generation zero while another node forked the key nine times
+    /// runs the walk off its bound, and a refusal commits nothing, so the memo
+    /// stays where it was and every retry on this node is refused identically
+    /// — while a node holding no memo at all serves the same claim in one
+    /// read. So a search that ran off its bound asks this before refusing, and
+    /// only a search that ran off its bound *from a fresh hint* refuses.
+    ///
+    /// Not the turn path's question: the common turn's whole benefit is that
+    /// it costs no store read, and this read is paid where a request was about
+    /// to be refused outright.
+    ///
+    /// **A dirty entry is retried rather than read over** (F7). Its value is
+    /// this node's own commit that the store never took, which is newer than
+    /// anything a read can return; reading over it would replace a known
+    /// generation with the superseded one and hand the next probe a hint that
+    /// walks backwards.
+    pub async fn generation_refreshed(&self, key: &str) -> u32 {
+        if let Some(Memo {
+            generation: Some(generation),
+            dirty: true,
+        }) = self.memoised(key)
+        {
+            self.write_generation(key, generation).await;
+            return generation;
+        }
+        match self.maps.generation(key).await {
+            Ok(found) => {
+                self.memoise(key, found, false);
+                found.unwrap_or(0)
+            }
+            // Degraded for [`Self::generation`]'s reason and with its answer:
+            // an unreachable store leaves the hint this node already had,
+            // which is what the caller was going to use anyway.
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    key,
+                    "the correlation maps could not be re-read for this cache key; the \
+                     prefix search is refused from the hint this node already held"
+                );
+                self.memoised(key)
+                    .and_then(|memo| memo.generation)
+                    .unwrap_or(0)
             }
         }
     }
@@ -332,9 +422,16 @@ impl Conversations {
     /// Written through to the store and to this node's memo, in that order.
     /// **The memo is written even when the store write failed**, and that is
     /// deliberate: this node's turn did land on `generation`, so this node's
-    /// next probe should start there. What the lost write costs is another
-    /// node's next probe walking to find it, which is the bounded cost R-C2
+    /// next probe should start there. What the lost write costs another node
+    /// is its next probe walking to find it, which is the bounded cost R-C2
     /// already accepts for two nodes committing different generations.
+    ///
+    /// What it must not cost is *this* node disagreeing with itself (review
+    /// M14.1, F7): the entry is marked dirty, and a dirty entry is what
+    /// [`Self::resolve`] answers a named conversation from, so the control
+    /// surface cannot hand back the generation this very node just moved the
+    /// client off. The next commit is the retry — a turn on this key writes
+    /// the key again anyway — and the warn is once per outage, not per turn.
     ///
     /// `latest` moves for [`Self::bind`]'s reason: it answers "which
     /// conversation is this agent working in", and an agent whose turn is about
@@ -345,17 +442,40 @@ impl Conversations {
     /// keyed by the session id this commits *away from*, and nothing migrates
     /// them.
     pub async fn commit(&self, principal: &Principal, key: &str, generation: u32) -> SessionId {
-        if let Err(error) = self.maps.set_generation(key, generation).await {
-            tracing::warn!(
-                %error,
-                key,
-                generation,
-                "this turn's generation could not be recorded in the correlation maps; \
-                 another node's next probe of this key walks to find it"
-            );
-        }
-        self.memoise(key, Some(generation));
+        self.write_generation(key, generation).await;
         self.mark_latest(principal, bound_session(key, generation))
+    }
+
+    /// Write `generation` through to the store, and memoise it either way —
+    /// dirty when the store refused.
+    ///
+    /// One helper because [`Self::commit`] and
+    /// [`Self::generation_refreshed`]'s retry are the same write with the same
+    /// bookkeeping, and a second copy is how one of them would forget to clear
+    /// the flag and leave this node answering from a memo the store had long
+    /// since caught up with.
+    async fn write_generation(&self, key: &str, generation: u32) {
+        let lost = self.maps.set_generation(key, generation).await;
+        if let Err(error) = &lost {
+            // Once per outage rather than once per turn, the shape the engine's
+            // fair-use seam already uses: the condition lasts as long as the
+            // store is unreachable, and a line per request is a line an
+            // operator learns to filter.
+            if !self.generation_write_failing.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    %error,
+                    key,
+                    generation,
+                    "this turn's generation could not be recorded in the correlation maps; \
+                     this node serves it from its own memo and retries the write on this \
+                     key's next commit, and another node's next probe walks to find it"
+                );
+            }
+        } else {
+            self.generation_write_failing
+                .store(false, Ordering::Relaxed);
+        }
+        self.memoise(key, Some(generation), lost.is_err());
     }
 
     /// The session `key` names now, without claiming to be using it, or `None`
@@ -382,7 +502,24 @@ impl Conversations {
     /// unchecked. A node that had committed generation 2 and then watched
     /// another node fork to 3 would otherwise narrow the routing of a session
     /// its client has left.
+    ///
+    /// **With one exception, and it is the same rule and not a hole in it**
+    /// (review M14.1, F7): a memo entry this node could not write through. The
+    /// store cannot be more current than that entry — it is a commit the store
+    /// refused — so reading it there hands back the generation this very node
+    /// moved the client *off*, with a 200 on it, while an unnamed call on the
+    /// same node answers the new session from `latest`. Staleness is what the
+    /// rule above is about, and a dirty entry is the one state where the memo
+    /// is the fresher of the two. It stops being the answer the moment a write
+    /// lands; see [`Self::write_generation`].
     pub async fn resolve(&self, key: &str) -> Result<Option<SessionId>, CorrelationError> {
+        if let Some(Memo {
+            generation: Some(generation),
+            dirty: true,
+        }) = self.memoised(key)
+        {
+            return Ok(Some(bound_session(key, generation)));
+        }
         Ok(self
             .maps
             .generation(key)
@@ -498,13 +635,15 @@ impl Conversations {
     }
 
     /// What this node last read or wrote for `key`, if it has touched it.
-    fn memoised(&self, key: &str) -> Option<Option<u32>> {
+    fn memoised(&self, key: &str) -> Option<Memo> {
         self.lock_generations().get(key).copied()
     }
 
-    /// Remember what the store said, or what this node just committed.
-    fn memoise(&self, key: &str, generation: Option<u32>) {
-        self.lock_generations().insert(key.to_string(), generation);
+    /// Remember what the store said, or what this node just committed —
+    /// `dirty` when the store refused that commit.
+    fn memoise(&self, key: &str, generation: Option<u32>, dirty: bool) {
+        self.lock_generations()
+            .insert(key.to_string(), Memo { generation, dirty });
     }
 
     /// Record that `principal` is working in `session`, and hand it back.
@@ -533,7 +672,7 @@ impl Conversations {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn lock_generations(&self) -> std::sync::MutexGuard<'_, HashMap<String, Option<u32>>> {
+    fn lock_generations(&self) -> std::sync::MutexGuard<'_, HashMap<String, Memo>> {
         self.generations
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -559,473 +698,4 @@ pub fn bound_session(key: &str, generation: u32) -> SessionId {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use async_trait::async_trait;
-
-    fn ada() -> Principal {
-        Principal::new("acme", "ada")
-    }
-
-    fn bob() -> Principal {
-        Principal::new("globex", "bob")
-    }
-
-    /// Two `Conversations` over one set of maps: the deployment this rung
-    /// exists for, expressed without a Redis.
-    ///
-    /// A shared [`MemoryCorrelationMaps`] is the same seam a shared Redis is —
-    /// one store, two nodes' vocabularies over it — and it isolates what this
-    /// file is responsible for from what the backend is. The Redis half of the
-    /// same claim is `tests/correlation_any_node.rs`, gated on a real server.
-    fn two_nodes() -> (Conversations, Conversations) {
-        let maps = Arc::new(MemoryCorrelationMaps::new());
-        (
-            Conversations::over(Arc::clone(&maps) as Arc<dyn CorrelationMaps>),
-            Conversations::over(maps),
-        )
-    }
-
-    #[tokio::test]
-    async fn a_reader_and_a_turn_resolve_one_cache_key_to_one_session() {
-        // The whole reason these maps are shared rather than owned by the
-        // Responses surface: an overlay installed against `resolve`'s answer
-        // has to reach the session `bind` hands the engine, generation and all.
-        let conversations = Conversations::new();
-        let key = "acme/ada/main";
-
-        // F9 (M12.1 review): before a turn has bound it, the key names nothing
-        // — not generation zero, which is a real session id in the shared
-        // store the moment any node mints it.
-        assert_eq!(
-            conversations.resolve(key).await.unwrap(),
-            None,
-            "a reader with no binding must say so rather than mint the id a \
-             first turn would have minted"
-        );
-
-        assert_eq!(
-            Some(conversations.bind(&ada(), key).await),
-            conversations.resolve(key).await.unwrap()
-        );
-
-        let forked = conversations.fork(&ada(), key).await;
-        assert_eq!(forked.as_str(), "acme/ada/main#g1");
-        assert_eq!(
-            conversations.resolve(key).await.unwrap(),
-            Some(forked.clone()),
-            "a rebound key stays rebound: a reader that kept answering \
-             generation zero would narrow a session no turn will run in"
-        );
-        assert_eq!(conversations.bind(&ada(), key).await, forked);
-    }
-
-    /// R-M2 (M12): a tool-use id names one session exactly, and binding one is
-    /// not a claim about who is working where.
-    ///
-    /// The correlation semantics themselves — the partition by principal, the
-    /// unknown and foreign ids — are the shared contract's now and are
-    /// asserted against both backends in
-    /// `roundhouse_core::control::correlation::contract`. What is *this*
-    /// type's is the second assertion: `latest` does not move.
-    #[tokio::test]
-    async fn binding_a_tool_call_names_its_session_without_moving_latest() {
-        let conversations = Conversations::new();
-        let subagent = conversations.bind(&ada(), "acme/ada/sub").await;
-        let parent = conversations.bind(&ada(), "acme/ada/main").await;
-        conversations
-            .bind_call(&ada(), "toolu_sub", subagent.clone())
-            .await;
-
-        assert_eq!(
-            conversations
-                .session_of_call(&ada(), "toolu_sub")
-                .await
-                .unwrap(),
-            Some(subagent),
-            "the session that emitted the call is the session the answer to it \
-             concerns, whatever else the principal has been doing since"
-        );
-
-        // Binding a call is not a claim that the principal is now working in
-        // that conversation — the very race this exists to remove would come
-        // straight back if a subagent's tool call moved its parent's `latest`.
-        assert_eq!(conversations.latest(&ada()), Some(parent));
-    }
-
-    #[tokio::test]
-    async fn reading_a_conversation_does_not_make_it_the_principals_most_recent_one() {
-        let conversations = Conversations::new();
-        assert_eq!(
-            conversations.latest(&ada()),
-            None,
-            "a principal no turn has been served for has no most-recent \
-             conversation, which is an answer rather than a default"
-        );
-
-        conversations.bind(&ada(), "acme/ada/main").await;
-        assert_eq!(
-            conversations.resolve("acme/ada/other").await.unwrap(),
-            None,
-            "and a read of a key nothing has bound is a read all the same"
-        );
-        assert_eq!(
-            conversations.latest(&ada()).unwrap().as_str(),
-            "acme/ada/main",
-            "a `status` call naming a conversation must not become the answer \
-             the next `status` call gets for omitting one"
-        );
-
-        // The control: a turn on the other conversation does move it.
-        conversations.bind(&ada(), "acme/ada/other").await;
-        assert_eq!(
-            conversations.latest(&ada()).unwrap().as_str(),
-            "acme/ada/other"
-        );
-        // And one principal's turns are not another's.
-        assert_eq!(conversations.latest(&bob()), None);
-    }
-
-    /// R-M9 (M12.1 review, F2): a thread is in the session its own latest turn
-    /// decided, and the thread's family sharing one cache key does not change
-    /// that.
-    ///
-    /// The topology is the oracle's: parent and subagent send one
-    /// `prompt_cache_key` and two `thread_id`s, so the cache key forks under
-    /// them while each thread stays pinned to the fork its own turn produced.
-    /// Here rather than in the shared contract because what it exercises is the
-    /// *`#g{n}` naming* interacting with the thread map — a fact about this
-    /// type, not about a correlation backend.
-    #[tokio::test]
-    async fn a_thread_is_in_the_session_its_own_latest_turn_decided() {
-        let conversations = Conversations::new();
-        let key = "acme/ada/main";
-
-        let parent_g0 = conversations.bind(&ada(), key).await;
-        conversations
-            .bind_thread(&ada(), "thread-parent", parent_g0.clone())
-            .await;
-        let child_g1 = conversations.fork(&ada(), key).await;
-        conversations
-            .bind_thread(&ada(), "thread-child", child_g1.clone())
-            .await;
-        let parent_g2 = conversations.fork(&ada(), key).await;
-        conversations
-            .bind_thread(&ada(), "thread-parent", parent_g2.clone())
-            .await;
-
-        assert_eq!(
-            conversations
-                .session_of_thread(&ada(), "thread-child")
-                .await
-                .unwrap(),
-            Some(child_g1),
-            "the subagent's thread stays in the fork its own turn produced, \
-             however far the shared cache key has moved since — this is the \
-             whole of F2"
-        );
-        assert_eq!(
-            conversations
-                .session_of_thread(&ada(), "thread-parent")
-                .await
-                .unwrap(),
-            Some(parent_g2.clone()),
-            "and a thread that forked is in the session it forked *to*: the \
-             latest binding wins, where a colliding call id is refused"
-        );
-
-        // Binding a thread is not a claim about who is working where: the
-        // ingest has already moved `latest` for the turn it is serving.
-        assert_eq!(conversations.latest(&ada()), Some(parent_g2));
-    }
-
-    // -----------------------------------------------------------------------
-    // M14.1: the memo, and the line it is not allowed to cross
-    // -----------------------------------------------------------------------
-
-    /// **The read-through cost R-C2 budgets, counted.** One store read per key
-    /// per node, and then none.
-    ///
-    /// Counted at the seam rather than at Redis, because what this file
-    /// decides is how many times it *asks*: the round trip one ask costs is
-    /// pinned against a real server by `one_generation_read_is_one_round_trip`
-    /// in `roundhouse-store-redis`, and the two together are the whole claim.
-    ///
-    /// The second half — that a commit primes the memo rather than merely
-    /// invalidating it — is what keeps the *first* turn of a conversation to
-    /// one read as well: probe, commit, and every later turn is local.
-    #[tokio::test]
-    async fn a_key_is_read_through_once_per_node_and_then_memoised() {
-        let maps = Arc::new(CountingMaps::new());
-        let conversations = Conversations::over(Arc::clone(&maps) as Arc<dyn CorrelationMaps>);
-        let key = "acme/ada/main";
-
-        assert_eq!(conversations.generation(key).await, 0);
-        assert_eq!(
-            maps.reads(),
-            1,
-            "the node's first touch of a key must go to the store, or a client \
-             that reconnected elsewhere silently loses its generation"
-        );
-
-        for _ in 0..5 {
-            assert_eq!(conversations.generation(key).await, 0);
-        }
-        assert_eq!(
-            maps.reads(),
-            1,
-            "an absent generation is an answer and must be memoised as one; \
-             re-asking the store on every turn is the round trip the \
-             write-through cache exists to remove"
-        );
-
-        conversations.commit(&ada(), key, 3).await;
-        assert_eq!(conversations.generation(key).await, 3);
-        assert_eq!(
-            maps.reads(),
-            1,
-            "a commit primes the memo with what this node just wrote, so the \
-             next turn of the same conversation reads nothing"
-        );
-
-        // CONTROL: the memo is per key, not one slot. A second conversation on
-        // the same node still pays its own first read.
-        assert_eq!(conversations.generation("acme/ada/other").await, 0);
-        assert_eq!(maps.reads(), 2);
-    }
-
-    /// **The line the memo may not cross.** A reader is answered from the
-    /// store, whatever this node last committed.
-    ///
-    /// The topology is the one the durable maps exist for: this node committed
-    /// generation 0 and another node then forked the same key to 1. A `resolve`
-    /// answered from the memo would narrow the routing of the session the
-    /// client has just left — F9's defect one fork later, and with a 200 on it.
-    #[tokio::test]
-    async fn the_node_memo_does_not_answer_a_reader() {
-        let (node_a, node_b) = two_nodes();
-        let key = "acme/ada/main";
-
-        let served_here = node_a.bind(&ada(), key).await;
-        let forked_elsewhere = node_b.fork(&ada(), key).await;
-        assert_ne!(served_here, forked_elsewhere, "sanity: the fork moved");
-
-        assert_eq!(
-            node_a.resolve(key).await.unwrap(),
-            Some(forked_elsewhere),
-            "a reader must answer from the store: this node's memo says \
-             generation 0, and the conversation is at 1"
-        );
-
-        // CONTROL: the turn path *is* allowed to start from the stale memo,
-        // because prefix admission checks whatever it starts from against the
-        // log before committing to it. If this ever changes, the read-through
-        // cost test above is measuring something else.
-        assert_eq!(node_a.generation(key).await, 0);
-    }
-
-    /// The same line for the two binding families: a call another node made
-    /// ambiguous, and a thread another node moved.
-    ///
-    /// Both are read from the store on every ask for the same reason `resolve`
-    /// is — nothing downstream re-checks them — and both would be wrong under
-    /// a node-local table read first. The call half is M12's F14 with a
-    /// network in the middle; the thread half is F2's "the session its own
-    /// latest turn decided", where the latest turn was served elsewhere.
-    #[tokio::test]
-    async fn a_binding_another_node_moved_is_read_from_the_store() {
-        let (node_a, node_b) = two_nodes();
-        let first = SessionId::new("acme/ada/first");
-        let second = SessionId::new("acme/ada/second");
-
-        node_a.bind_call(&ada(), "call_0", first.clone()).await;
-        node_b.bind_call(&ada(), "call_0", second.clone()).await;
-        assert_eq!(
-            node_a.session_of_call(&ada(), "call_0").await.unwrap(),
-            None,
-            "the node that bound the id first must see the collision the \
-             second node's claim made, or it answers its own still-open \
-             tools/call confidently about the wrong session"
-        );
-
-        node_a.bind_thread(&ada(), "thread-1", first).await;
-        node_b.bind_thread(&ada(), "thread-1", second.clone()).await;
-        assert_eq!(
-            node_a.session_of_thread(&ada(), "thread-1").await.unwrap(),
-            Some(second),
-            "a thread is in the session its own latest turn decided, and that \
-             turn was served on the other node"
-        );
-    }
-
-    /// A store that cannot be reached is a fact about the deployment, and the
-    /// two halves of this type treat it differently on purpose.
-    ///
-    /// The turn path degrades — a generation is a hint, and a hint nobody can
-    /// load still leaves the probe a starting point — while every reader
-    /// returns the error, because a reader's `None` reads as "no conversation
-    /// of yours" and sends the caller to `latest`: a plausible answer about
-    /// the wrong conversation.
-    #[tokio::test]
-    async fn an_unreachable_store_degrades_the_turn_path_and_refuses_the_readers() {
-        let conversations = Conversations::over(Arc::new(OutageMaps));
-        let key = "acme/ada/main";
-
-        assert_eq!(
-            conversations.generation(key).await,
-            0,
-            "the search still has a place to start"
-        );
-        // And the failure is not memoised: the next turn asks again rather
-        // than serving one outage for the life of the process.
-        assert_eq!(conversations.memoised(key), None);
-        // A commit still moves `latest` and still names the session, so the
-        // turn it belongs to is served.
-        assert_eq!(
-            conversations.commit(&ada(), key, 2).await.as_str(),
-            "acme/ada/main#g2"
-        );
-
-        assert!(conversations.resolve(key).await.is_err());
-        assert!(
-            conversations
-                .session_of_call(&ada(), "toolu_1")
-                .await
-                .is_err()
-        );
-        assert!(
-            conversations
-                .session_of_thread(&ada(), "thread-1")
-                .await
-                .is_err()
-        );
-    }
-
-    /// Maps that count what the node asks of them.
-    ///
-    /// Wrapping the memory maps rather than reimplementing them: what is under
-    /// test is how often `Conversations` reaches for the store, and a double
-    /// with its own semantics would let the count be right while the answers
-    /// were not.
-    struct CountingMaps {
-        inner: MemoryCorrelationMaps,
-        reads: AtomicUsize,
-    }
-
-    impl CountingMaps {
-        fn new() -> Self {
-            Self {
-                inner: MemoryCorrelationMaps::new(),
-                reads: AtomicUsize::new(0),
-            }
-        }
-
-        fn reads(&self) -> usize {
-            self.reads.load(Ordering::Relaxed)
-        }
-    }
-
-    #[async_trait]
-    impl CorrelationMaps for CountingMaps {
-        async fn generation(&self, key: &str) -> Result<Option<u32>, CorrelationError> {
-            self.reads.fetch_add(1, Ordering::Relaxed);
-            CorrelationMaps::generation(&self.inner, key).await
-        }
-
-        async fn set_generation(&self, key: &str, generation: u32) -> Result<(), CorrelationError> {
-            CorrelationMaps::set_generation(&self.inner, key, generation).await
-        }
-
-        async fn bind_call(
-            &self,
-            principal: &Principal,
-            call_id: &str,
-            session: &SessionId,
-        ) -> Result<(), CorrelationError> {
-            CorrelationMaps::bind_call(&self.inner, principal, call_id, session).await
-        }
-
-        async fn session_of_call(
-            &self,
-            principal: &Principal,
-            call_id: &str,
-        ) -> Result<Option<SessionId>, CorrelationError> {
-            CorrelationMaps::session_of_call(&self.inner, principal, call_id).await
-        }
-
-        async fn bind_thread(
-            &self,
-            principal: &Principal,
-            thread_id: &str,
-            session: &SessionId,
-        ) -> Result<(), CorrelationError> {
-            CorrelationMaps::bind_thread(&self.inner, principal, thread_id, session).await
-        }
-
-        async fn session_of_thread(
-            &self,
-            principal: &Principal,
-            thread_id: &str,
-        ) -> Result<Option<SessionId>, CorrelationError> {
-            CorrelationMaps::session_of_thread(&self.inner, principal, thread_id).await
-        }
-    }
-
-    /// Maps that are never reachable, which is the one failure the trait has.
-    struct OutageMaps;
-
-    fn outage() -> CorrelationError {
-        CorrelationError::Backend(anyhow::anyhow!("the correlation store is unreachable"))
-    }
-
-    #[async_trait]
-    impl CorrelationMaps for OutageMaps {
-        async fn generation(&self, _key: &str) -> Result<Option<u32>, CorrelationError> {
-            Err(outage())
-        }
-
-        async fn set_generation(
-            &self,
-            _key: &str,
-            _generation: u32,
-        ) -> Result<(), CorrelationError> {
-            Err(outage())
-        }
-
-        async fn bind_call(
-            &self,
-            _principal: &Principal,
-            _call_id: &str,
-            _session: &SessionId,
-        ) -> Result<(), CorrelationError> {
-            Err(outage())
-        }
-
-        async fn session_of_call(
-            &self,
-            _principal: &Principal,
-            _call_id: &str,
-        ) -> Result<Option<SessionId>, CorrelationError> {
-            Err(outage())
-        }
-
-        async fn bind_thread(
-            &self,
-            _principal: &Principal,
-            _thread_id: &str,
-            _session: &SessionId,
-        ) -> Result<(), CorrelationError> {
-            Err(outage())
-        }
-
-        async fn session_of_thread(
-            &self,
-            _principal: &Principal,
-            _thread_id: &str,
-        ) -> Result<Option<SessionId>, CorrelationError> {
-            Err(outage())
-        }
-    }
-}
+mod tests;

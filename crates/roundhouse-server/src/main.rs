@@ -8,12 +8,15 @@
 //! environment variable, because a flag parser here would be the first place a
 //! deployment concern leaked into the composition root.
 //!
-//! Durability is the one seam a deployment selects here, and it selects every
-//! half of it at once: `ROUNDHOUSE_REDIS_URL` set means sessions, committed
-//! spend *and* — where any membership configures one — the rolling fair-use
-//! windows live in that Redis; absent means [`MemoryStore`],
-//! [`MemorySpendLedger`] and [`MemoryFairUseLedger`], all of which die with
-//! this process. A URL
+//! Durability is the one seam a deployment selects, and it selects every family
+//! of it at once — but the selecting does not happen here. `shared_backend::open`
+//! makes it, in the library, and this file wires whichever four backends it
+//! hands back. That split is M14.1's review, F1: the choice used to be spelled
+//! out three times in this function, inside a `[[bin]]` nothing else can call,
+//! so the boot suites could only re-type it by hand and a mutation of the real
+//! wiring went unnoticed.
+//!
+//! A URL
 //! that is set but unreachable stops the process at startup — falling back to
 //! memory would silently demote "durable" to "until the next restart", which
 //! is the one property the variable exists to promise, and it would demote it
@@ -43,15 +46,13 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use roundhouse_core::context::ByteTokenizer;
-use roundhouse_core::control::{
-    FairUseLedger, MemoryFairUseLedger, MemorySpendLedger, SpendLedger,
-};
+use roundhouse_core::control::{FairUseLedger, SpendLedger};
 use roundhouse_core::metrics::MetricsConfig;
 use roundhouse_core::routing::{
     AffinityPolicy, CacheLedger, CacheModel, Candidate, ProviderPricing, RoutingPolicy,
     StagePolicy, Target,
 };
-use roundhouse_core::store::{MemoryStore, SessionStore};
+use roundhouse_core::store::SessionStore;
 use roundhouse_core::validate::{Validator, ValidatorConfig};
 use roundhouse_fleet::{
     AnthropicMessagesClient, DEFAULT_API_BASE, DEFAULT_PASS_THROUGH_BASE, EchoFrontierClient,
@@ -62,13 +63,10 @@ use roundhouse_mcp::ControlStore;
 use roundhouse_server::catalog_config::{BUILT_IN_OPENAI, ProviderConfig};
 use roundhouse_server::control_config::crosscheck::CrossChecks;
 use roundhouse_server::{
-    ControlDirectory, ControlPlane, ControlPlaneReads, Conversations, DirectoryError,
+    Backends, ControlDirectory, ControlPlane, ControlPlaneReads, Conversations, DirectoryError,
     EchoLocalExecutor, Engine, EngineConfig, FleetJudge, JudgeConfig, MemoryDirectoryStore,
-    SharedBackend, admin_api, catalog_config, control_config, http, mcp_api, messages_api,
-    metrics_api, relay_api, responses_api, shared_backend,
-};
-use roundhouse_store_redis::{
-    RedisCorrelationMaps, RedisFairUseLedger, RedisSessionStore, RedisSpendLedger,
+    REDIS_VAR, admin_api, catalog_config, control_config, http, mcp_api, messages_api, metrics_api,
+    relay_api, responses_api, shared_backend,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -92,9 +90,6 @@ fn echo_catalog() -> StaticFrontierCatalog {
 /// Where to bind, as `host:port`.
 const ADDR_VAR: &str = "ROUNDHOUSE_ADDR";
 const DEFAULT_ADDR: &str = "127.0.0.1:8080";
-
-/// Where sessions live, as a `redis://` URL. Absent means in-memory.
-const REDIS_VAR: &str = "ROUNDHOUSE_REDIS_URL";
 
 /// Which catalog model the validate loop's judge runs on, as `provider/model`.
 ///
@@ -772,115 +767,31 @@ async fn main() -> anyhow::Result<()> {
         listener.local_addr()?
     );
 
+    // **One call, one match** (M14.1 review, F1). Which four backends this
+    // deployment gets is `shared_backend::open`'s answer, taken in the library
+    // where the boot suites can call it and where a mutation of the wiring is
+    // therefore a mutation of something a test runs. This site does nothing
+    // but wire what it hands back: re-deriving any part of the choice here is
+    // exactly what put it beyond every test's reach, three spellings deep.
+    //
+    // One variable selects every family, and they are chosen together on
+    // purpose. The session log and the spend ledger answer two questions about
+    // the same turns, and a deployment that made one durable and left the other
+    // in memory would re-grant its whole budget on every restart while the log
+    // that proves it was already spent survives.
+    //
     // The two arms monomorphize `serve` twice; that is the entire cost of
-    // keeping the engine generic over its store. The URL itself is never
-    // logged — a `redis://` URL may carry credentials.
-    //
-    // One variable selects *both* durable backends, and they are chosen
-    // together on purpose. The session log and the spend ledger answer two
-    // questions about the same turns, and a deployment that made one durable
-    // and left the other in memory would re-grant its whole budget on every
-    // restart while the log that proves it was already spent survives.
-    let redis_url = std::env::var(REDIS_VAR).ok();
+    // keeping the engine generic over its store.
+    let backends = shared_backend::open(std::env::var(REDIS_VAR).ok().as_deref()).await?;
 
-    // Which fair-use ledger this deployment gets, resolved once and by the
-    // same variable as the two backends below.
-    //
-    // **It is deliberately not conditioned on whether a ceiling is configured
-    // right now.** That question has an answer only for this instant, and the
-    // admin plane changes it: `patch_project` writes a `fair_use` block onto a
-    // live project and the engine judges the very next turn against it. A boot
-    // snapshot of it therefore chose the ledger for the rest of the process's
-    // life from a fact that had already stopped being true -- M13's
-    // thermo-nuclear review, F1, where a deployment with a Redis and no
-    // ceiling at boot counted every later-added ceiling in one node's memory,
-    // silently. The single-node caution moved with it, to the enforcement
-    // seam: `MemoryFairUseLedger` warns the first time it is asked to enforce
-    // a real ceiling, whenever that turns out to be.
-    //
-    // This is now the first thing that touches the named Redis, so an
-    // unreachable one fails the boot here rather than four lines down at the
-    // session store. Both messages name `ROUNDHOUSE_REDIS_URL`, which is the
-    // part an operator acts on; ordering the connects to preserve which one
-    // arrives first would mean resolving this ledger inside both arms of the
-    // match below, and two sites choosing one ledger is the shape this rung
-    // removed.
-    let fair_use: Arc<dyn FairUseLedger> = match shared_backend(redis_url.as_deref()) {
-        SharedBackend::Shared { url } => {
-            let ledger = RedisFairUseLedger::connect(url).await.with_context(|| {
-                format!("opening the fair-use ledger in the Redis named by {REDIS_VAR}")
-            })?;
-            tracing::info!(
-                var = REDIS_VAR,
-                "fair-use windows are counted in Redis; every node serving a project \
-                 shares one rolling ceiling"
-            );
-            Arc::new(ledger)
-        }
-        SharedBackend::PerProcess => {
-            tracing::info!(
-                var = REDIS_VAR,
-                "fair-use windows are counted in this process's memory; a ceiling \
-                 configured here or added later through the admin plane is enforced per \
-                 node, and says so when it first enforces one"
-            );
-            Arc::new(MemoryFairUseLedger::new())
-        }
-    };
-
-    // Which correlation maps this deployment gets — the generation of each
-    // cache key, the session each emitted tool call belongs to, and the
-    // session each client thread is in — resolved by the *same* predicate as
-    // the three families above and by no second one (M14.1, R-C4).
-    //
-    // The reason it is the same rule is the reason it is the same rule for
-    // fair use: naming a Redis is how an operator says "this is more than one
-    // process", and it is exactly then that a per-process correlation table
-    // stops being able to answer the question it exists for. A control call
-    // landing on a node that served none of the conversation's turns is
-    // refused or guessed at, however exactly the client named itself — the
-    // M12.1 F9 handoff, which this closes only for a deployment that shares
-    // the maps.
-    //
-    // `Conversations` is built here rather than inside `serve` because *which
-    // maps* is this site's decision and nothing else's; the node-local halves
-    // it keeps beside them — `latest`, and the generation memo — are the same
-    // either way.
-    let conversations = Arc::new(match shared_backend(redis_url.as_deref()) {
-        SharedBackend::Shared { url } => {
-            let maps = RedisCorrelationMaps::connect(url).await.with_context(|| {
-                format!("opening the correlation maps in the Redis named by {REDIS_VAR}")
-            })?;
-            tracing::info!(
-                var = REDIS_VAR,
-                "conversation correlation is shared in Redis; a cache key, a tool call \
-                 or a client thread bound by one node resolves on every node"
-            );
-            Conversations::over(Arc::new(maps))
-        }
-        SharedBackend::PerProcess => {
-            tracing::info!(
-                var = REDIS_VAR,
-                "conversation correlation is held in this process's memory; a control \
-                 call landing on a node that served none of its conversation's turns \
-                 falls back to a guess or refuses"
-            );
-            Conversations::new()
-        }
-    });
-
-    match redis_url {
-        Some(url) => {
-            let store = RedisSessionStore::connect(&url)
-                .await
-                .with_context(|| format!("connecting to the Redis named by {REDIS_VAR}"))?;
-            let spend = RedisSpendLedger::connect(&url).await.with_context(|| {
-                format!("opening the spend ledger in the Redis named by {REDIS_VAR}")
-            })?;
-            tracing::info!(
-                var = REDIS_VAR,
-                "sessions and committed spend are durable in Redis"
-            );
+    match backends {
+        Backends::Shared {
+            store,
+            spend,
+            fair_use,
+            conversations,
+            ..
+        } => {
             if control_plane_file_configured {
                 tracing::warn!(
                     var = control_config::CONTROL_PLANE_VAR,
@@ -898,8 +809,8 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
             serve(
-                Arc::new(store),
-                Arc::new(spend),
+                store,
+                spend,
                 fair_use,
                 conversations,
                 Arc::clone(&directory),
@@ -912,15 +823,15 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
         }
-        None => {
-            tracing::warn!(
-                var = REDIS_VAR,
-                "no Redis configured; sessions and committed spend are in-memory and die \
-                 with this process"
-            );
+        Backends::PerProcess {
+            store,
+            spend,
+            fair_use,
+            conversations,
+        } => {
             serve(
-                Arc::new(MemoryStore::new()),
-                Arc::new(MemorySpendLedger::new()),
+                store,
+                spend,
                 fair_use,
                 conversations,
                 Arc::clone(&directory),
@@ -944,9 +855,10 @@ async fn main() -> anyhow::Result<()> {
 /// to "which session is the conversation the client calls `main`?", and the
 /// Responses surface and the control surface both ask it — two of them would
 /// agree only until a client edited its own history. It arrives as an argument
-/// rather than being built here because *which maps are behind it* is the
-/// caller's one decision (M14.1, R-C4), taken by the same predicate that chose
-/// the store, the spend ledger and the fair-use buckets. [`ControlStore`] is
+/// rather than being built here because *which maps are behind it* is
+/// `shared_backend::open`'s one decision (M14.1, R-C4), taken by the same
+/// predicate — in the same match — that chose the store, the spend ledger and
+/// the fair-use buckets. [`ControlStore`] is
 /// the node's control-plane state, and the engine and the control surface hold
 /// opposite ends of it: the surface writes an agent's overlay and the engine
 /// spends it at the start of the next turn.

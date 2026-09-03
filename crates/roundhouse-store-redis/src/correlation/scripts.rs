@@ -81,13 +81,12 @@ impl Scripts {
         conn: &mut ConnectionManager,
         key: &str,
         bound_value: &str,
-        ambiguous_marker: &str,
         ttl_ms: u64,
     ) -> Result<(), CorrelationError> {
         self.bind_call
             .key(key)
             .arg(bound_value)
-            .arg(ambiguous_marker)
+            .arg(super::AMBIGUOUS_MARKER)
             .arg(ttl_ms)
             .invoke_async::<()>(conn)
             .await

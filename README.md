@@ -57,8 +57,11 @@ features — the first is what makes the second possible.
 > that served none of the conversation's turns falls back to a guess. Two of
 > the three are exact — a tool-use id and a thread id each name one
 > conversation — where the third, codex's own session id, names the whole
-> agent family's, which is why it is weighed last of the three. What stays a guess either
-> way is "this agent's most recent conversation", which is answerable only by
+> agent family's, which is why it is weighed after the thread arm and before
+> the tool-use id: an id this deployment itself emitted is exact enough to be
+> trusted last, once a client's own more specific claims have already come up
+> empty. What stays a guess either way is "this agent's most recent
+> conversation", which is answerable only by
 > having watched the turns arrive.
 
 Roundhouse depends on Dynamo but is not part of it. It pins two Dynamo crates

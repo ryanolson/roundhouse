@@ -25,7 +25,9 @@
 
 use std::sync::Arc;
 
-use roundhouse_core::control::{CorrelationMaps, Principal};
+use roundhouse_core::control::CorrelationMaps;
+use roundhouse_core::control::correlation::contract::fresh_key;
+use roundhouse_core::control::spend::contract::fresh_principal;
 use roundhouse_core::ids::SessionId;
 use roundhouse_server::Conversations;
 use roundhouse_store_redis::RedisCorrelationMaps;
@@ -43,19 +45,15 @@ async fn node() -> Conversations {
     Conversations::over(Arc::new(maps) as Arc<dyn CorrelationMaps>)
 }
 
-/// A principal no other run shares, so the suite needs no flush and can run
-/// against a Redis with anything else in it.
-fn fresh_principal() -> Principal {
-    Principal::new(
-        format!("acme-{}", uuid::Uuid::new_v4()),
-        format!("ada-{}", uuid::Uuid::new_v4()),
-    )
-}
-
-/// A namespaced cache key nothing else shares, shaped like the real thing.
-fn fresh_key(principal: &Principal, name: &str) -> String {
-    format!("{}/{}/{name}", principal.project, principal.user)
-}
+// `fresh_principal` and `fresh_key` used to be re-spelled here -- the
+// dev-dependency graph already provides both
+// (`roundhouse_core::control::spend::contract::fresh_principal`,
+// `roundhouse_core::control::correlation::contract::fresh_key`), and
+// `Conversations::commit`/`bind_call`/`bind_thread` take `principal` and
+// `key` as independent parameters, so the mismatch between `fresh_key`'s own
+// internally-minted principal and the `ada` held throughout a test below
+// costs nothing (M14.1 review, F10; confirmed live over a real Redis before
+// this fix, not merely reasoned about).
 
 /// **The unlock condition, at the layer the deployment calls.**
 ///
@@ -71,8 +69,8 @@ fn fresh_key(principal: &Principal, name: &str) -> String {
 async fn what_one_node_bound_is_what_the_other_node_answers() {
     let first = node().await;
     let second = node().await;
-    let ada = fresh_principal();
-    let key = fresh_key(&ada, "main");
+    let ada = fresh_principal("ada");
+    let key = fresh_key("main");
 
     // (a) Never bound anywhere: both nodes refuse, and neither mints the
     // generation-zero id a first turn would have minted (M12.1 F9, widened).
@@ -142,10 +140,7 @@ async fn what_one_node_bound_is_what_the_other_node_answers() {
             .unwrap(),
         None
     );
-    assert_eq!(
-        second.resolve(&fresh_key(&ada, "other")).await.unwrap(),
-        None
-    );
+    assert_eq!(second.resolve(&fresh_key("other")).await.unwrap(), None);
 
     // CONTROL: `latest` is deliberately *not* shared (R12). The first node
     // committed a turn and the second still has no guess to offer, which is
@@ -169,8 +164,8 @@ async fn what_one_node_bound_is_what_the_other_node_answers() {
 async fn the_node_that_committed_a_key_still_reads_what_another_node_did_next() {
     let first = node().await;
     let second = node().await;
-    let ada = fresh_principal();
-    let key = fresh_key(&ada, "main");
+    let ada = fresh_principal("ada");
+    let key = fresh_key("main");
 
     let here = first.commit(&ada, &key, 0).await;
     assert_eq!(
@@ -209,8 +204,8 @@ async fn the_node_that_committed_a_key_still_reads_what_another_node_did_next() 
 async fn a_call_id_two_nodes_claimed_is_unanswerable_on_both() {
     let first = node().await;
     let second = node().await;
-    let ada = fresh_principal();
-    let key = fresh_key(&ada, "main");
+    let ada = fresh_principal("ada");
+    let key = fresh_key("main");
 
     first.bind_call(&ada, "call_0", SessionId::new(&key)).await;
     second
@@ -243,8 +238,8 @@ async fn a_call_id_two_nodes_claimed_is_unanswerable_on_both() {
 async fn a_thread_follows_the_node_that_served_its_latest_turn() {
     let first = node().await;
     let second = node().await;
-    let ada = fresh_principal();
-    let key = fresh_key(&ada, "main");
+    let ada = fresh_principal("ada");
+    let key = fresh_key("main");
 
     let before = first.commit(&ada, &key, 0).await;
     first.bind_thread(&ada, "thread-parent", before).await;

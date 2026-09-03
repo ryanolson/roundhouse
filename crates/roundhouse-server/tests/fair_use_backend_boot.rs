@@ -18,10 +18,13 @@
 //!
 //! [`shared_backend`] now follows `ROUNDHOUSE_REDIS_URL` alone, exactly as
 //! the session store and the spend ledger do, and this is the end-to-end proof
-//! of it: the ledger under the engine is resolved by calling that function —
-//! not by re-deriving its rule here, which is the shape M13's own refute pass
-//! caught catching nothing — and the assertion is against a *separate* handle
-//! on the real Redis.
+//! of it: the ledger under the engine is the one
+//! [`open`](roundhouse_server::shared_backend::open) built — not one re-derived
+//! here, which is the shape M13's own refute pass caught catching nothing — and
+//! the assertion is against a *separate* handle on the real Redis. Until
+//! M14.1's review (F1) this file could only call the *rule* and re-type the
+//! wiring the rule chose, because that wiring lived in a `[[bin]]`; it calls
+//! both now.
 //!
 //! Gated like the store's own integration tests: `#[ignore]`, opted into with
 //! `--include-ignored`, and a missing `ROUNDHOUSE_TEST_REDIS_URL` fails loudly.
@@ -30,32 +33,26 @@ use std::sync::Arc;
 
 use roundhouse_core::context::ByteTokenizer;
 use roundhouse_core::control::spend::contract::fresh_principal;
-use roundhouse_core::control::{
-    FairUseLedger, FairUseWindow, MemoryFairUseLedger, MemorySpendLedger, Principal,
-};
+use roundhouse_core::control::{FairUseLedger, FairUseWindow, MemorySpendLedger, Principal};
 use roundhouse_core::now_ms;
 use roundhouse_core::routing::AffinityPolicy;
 use roundhouse_core::store::MemoryStore;
 use roundhouse_fleet::EchoFrontierClient;
 use roundhouse_server::control_config::crosscheck::CrossChecks;
 use roundhouse_server::control_config::{FairUseConfig, FairUseWindowConfig, ProjectPatch};
+use roundhouse_server::shared_backend::open;
 use roundhouse_server::{
     Conversations, DirectoryMutation, EchoLocalExecutor, Engine, MemoryDirectoryStore,
-    SharedBackend, responses_api, shared_backend,
+    responses_api,
 };
 use roundhouse_store_redis::RedisFairUseLedger;
 use roundhouse_store_redis::test_support::url_from_env;
 
 mod common;
-use common::codex::{request, user_message};
+use common::codex::post_responses_turn;
 use common::{admin_key, config, control_plane, frontier_catalog, sha256_hex};
 
-use axum::Router;
-use axum::body::Body;
-use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
-use axum::http::{Request, StatusCode};
-use http_body_util::BodyExt;
-use tower::ServiceExt;
+use axum::http::StatusCode;
 
 /// The file half of the fixture: an admin plane and nothing else. The
 /// project, its member and the turn key are all minted through the API
@@ -92,39 +89,16 @@ fn reachable() -> Vec<roundhouse_core::routing::Candidate> {
     }]
 }
 
-/// One `POST /v1/responses` as the fixture's membership, authenticating with
-/// the secret `mint_turn_key` minted for it.
-async fn post(app: &Router, secret: &str) -> StatusCode {
-    let body = request("cache-key", vec![user_message("count some tokens")]);
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/responses")
-                .header(CONTENT_TYPE, "application/json")
-                .header(AUTHORIZATION, format!("Bearer {secret}"))
-                .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = response.status();
-    // Drain the SSE body so the turn's tail — including
-    // `record_fair_use_draw` — actually runs before this function returns.
-    let _ = response.into_body().collect().await.unwrap().to_bytes();
-    status
-}
-
 /// **The defect cell, proved rather than asserted.**
 ///
 /// 1. Boot a directory from a file with no `fair_use` block — the boot-time
 ///    snapshot is empty, exactly as the finding's premise requires.
-/// 2. Resolve the engine's fair-use ledger by *calling* [`shared_backend`]
-///    with what the composition root knows at that point — this deployment
-///    names a Redis — and wiring whichever backend it answers, the way
-///    `main.rs` does. Re-deriving the rule here instead is the shape M13's
-///    own refute pass found catching nothing.
+/// 2. Take the engine's fair-use ledger from
+///    [`open`](roundhouse_server::shared_backend::open), handed what the
+///    composition root knows at that point — this deployment names a Redis —
+///    exactly as `main.rs` does. Re-deriving either the rule or the wiring
+///    here instead is the shape M13's own refute pass, and M14.1's, found
+///    catching nothing.
 /// 3. PATCH the project through the same `DirectoryMutation::PatchProject`
 ///    the admin plane's `patch_project` route applies, adding a fair-use
 ///    window.
@@ -215,18 +189,14 @@ async fn a_ceiling_patched_in_after_boot_is_counted_in_the_shared_buckets() {
         "fixture premise: the file this deployment boots from must declare no fair-use window"
     );
 
-    // The composition root's own choice, called rather than re-derived. This
+    // The composition root's own choice, run rather than re-derived. This
     // deployment names a Redis; whether the boot snapshot happened to carry a
     // ceiling is not this function's business any more.
     let url = url_from_env();
-    let fair_use_ledger: Arc<dyn FairUseLedger> = match shared_backend(Some(&url)) {
-        SharedBackend::Shared { url } => Arc::new(
-            RedisFairUseLedger::connect(url)
-                .await
-                .expect("the test Redis named by ROUNDHOUSE_TEST_REDIS_URL must be reachable"),
-        ),
-        SharedBackend::PerProcess => Arc::new(MemoryFairUseLedger::new()),
-    };
+    let backends = open(Some(&url))
+        .await
+        .expect("the test Redis named by ROUNDHOUSE_TEST_REDIS_URL must be reachable");
+    let fair_use_ledger: Arc<dyn FairUseLedger> = Arc::clone(backends.fair_use());
 
     let store = Arc::new(MemoryStore::new());
     let engine = Arc::new(
@@ -285,7 +255,7 @@ async fn a_ceiling_patched_in_after_boot_is_counted_in_the_shared_buckets() {
     );
 
     // Drive one real turn large enough to cross a 1-token cap.
-    let status = post(&app, &turn_key.secret).await;
+    let status = post_responses_turn(&app, &turn_key.secret, "cache-key").await;
     assert_eq!(
         status,
         StatusCode::OK,

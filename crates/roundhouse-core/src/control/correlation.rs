@@ -222,14 +222,12 @@ pub trait CorrelationMaps: Send + Sync + 'static {
 /// The three maps in this process's memory: the specification, and the whole
 /// of a deployment that has not named a Redis.
 ///
-/// **Its methods are inherent as well as trait methods, and the inherent ones
-/// are not `async`.** A `HashMap` behind a `Mutex` has nothing to await; the
-/// trait is `async` because the *other* implementation is. A caller holding
-/// the concrete type — `Conversations`, whose surface is synchronous and whose
-/// callers this rung deliberately does not touch — therefore pays no runtime
-/// for a seam it is not crossing, and the [`CorrelationMaps`] impl below is
-/// one delegating line per method, which is too thin to drift from what the
-/// contract judges.
+/// Its own methods are `async` like the trait's, with nothing to await
+/// underneath — a `HashMap` behind a `Mutex` never yields — because every
+/// caller now holds it behind `Arc<dyn CorrelationMaps>` (`Conversations`
+/// included, since R-C4 lets the composition root swap in the Redis backend)
+/// and a second, synchronous surface here would have no caller to be thin
+/// for.
 #[derive(Debug, Default)]
 pub struct MemoryCorrelationMaps {
     inner: Mutex<Tables>,
@@ -237,8 +235,8 @@ pub struct MemoryCorrelationMaps {
 
 #[derive(Debug, Default)]
 struct Tables {
-    /// How many times each *namespaced* cache key's history has failed the
-    /// prefix check, for every key this node has committed.
+    /// The generation each *namespaced* cache key was last committed at, for
+    /// every key this node has committed.
     ///
     /// **Presence is load-bearing and not merely a counter's storage** (M12.1
     /// review, F9): an entry means "this key has been committed", which is the
@@ -438,36 +436,6 @@ impl MemoryCorrelationMaps {
         Self::default()
     }
 
-    /// See [`CorrelationMaps::generation`].
-    pub fn generation(&self, key: &str) -> Option<u32> {
-        self.lock().generations.get(key).copied()
-    }
-
-    /// See [`CorrelationMaps::set_generation`].
-    pub fn set_generation(&self, key: &str, generation: u32) {
-        self.lock().generations.insert(key.to_string(), generation);
-    }
-
-    /// See [`CorrelationMaps::bind_call`].
-    pub fn bind_call(&self, principal: &Principal, call_id: &str, session: &SessionId) {
-        self.lock().calls.bind(principal, call_id, session);
-    }
-
-    /// See [`CorrelationMaps::session_of_call`].
-    pub fn session_of_call(&self, principal: &Principal, call_id: &str) -> Option<SessionId> {
-        self.lock().calls.session_of(principal, call_id)
-    }
-
-    /// See [`CorrelationMaps::bind_thread`].
-    pub fn bind_thread(&self, principal: &Principal, thread_id: &str, session: &SessionId) {
-        self.lock().threads.bind(principal, thread_id, session);
-    }
-
-    /// See [`CorrelationMaps::session_of_thread`].
-    pub fn session_of_thread(&self, principal: &Principal, thread_id: &str) -> Option<SessionId> {
-        self.lock().threads.session_of(principal, thread_id)
-    }
-
     /// The lock, in one place.
     ///
     /// Recovering a poisoned guard rather than propagating the panic: every
@@ -485,11 +453,11 @@ impl MemoryCorrelationMaps {
 #[async_trait]
 impl CorrelationMaps for MemoryCorrelationMaps {
     async fn generation(&self, key: &str) -> Result<Option<u32>, CorrelationError> {
-        Ok(MemoryCorrelationMaps::generation(self, key))
+        Ok(self.lock().generations.get(key).copied())
     }
 
     async fn set_generation(&self, key: &str, generation: u32) -> Result<(), CorrelationError> {
-        MemoryCorrelationMaps::set_generation(self, key, generation);
+        self.lock().generations.insert(key.to_string(), generation);
         Ok(())
     }
 
@@ -499,7 +467,7 @@ impl CorrelationMaps for MemoryCorrelationMaps {
         call_id: &str,
         session: &SessionId,
     ) -> Result<(), CorrelationError> {
-        MemoryCorrelationMaps::bind_call(self, principal, call_id, session);
+        self.lock().calls.bind(principal, call_id, session);
         Ok(())
     }
 
@@ -508,9 +476,7 @@ impl CorrelationMaps for MemoryCorrelationMaps {
         principal: &Principal,
         call_id: &str,
     ) -> Result<Option<SessionId>, CorrelationError> {
-        Ok(MemoryCorrelationMaps::session_of_call(
-            self, principal, call_id,
-        ))
+        Ok(self.lock().calls.session_of(principal, call_id))
     }
 
     async fn bind_thread(
@@ -519,7 +485,7 @@ impl CorrelationMaps for MemoryCorrelationMaps {
         thread_id: &str,
         session: &SessionId,
     ) -> Result<(), CorrelationError> {
-        MemoryCorrelationMaps::bind_thread(self, principal, thread_id, session);
+        self.lock().threads.bind(principal, thread_id, session);
         Ok(())
     }
 
@@ -528,9 +494,7 @@ impl CorrelationMaps for MemoryCorrelationMaps {
         principal: &Principal,
         thread_id: &str,
     ) -> Result<Option<SessionId>, CorrelationError> {
-        Ok(MemoryCorrelationMaps::session_of_thread(
-            self, principal, thread_id,
-        ))
+        Ok(self.lock().threads.session_of(principal, thread_id))
     }
 }
 
@@ -552,22 +516,26 @@ mod tests {
     /// backend that expires by time instead — as the Redis one does — has no
     /// queue to assert on. What losing an entry costs is the fallback the
     /// contract's own "an unknown id answers `None`" already pins.
-    #[test]
-    fn the_call_table_is_capped_and_forgets_its_oldest_bindings_first() {
+    #[tokio::test]
+    async fn the_call_table_is_capped_and_forgets_its_oldest_bindings_first() {
         let maps = MemoryCorrelationMaps::new();
         let ada = fresh_principal("ada");
         let session = SessionId::new("acme/ada/main");
         for n in 0..=REMEMBERED_CALLS {
-            maps.bind_call(&ada, &format!("toolu_{n}"), &session);
+            maps.bind_call(&ada, &format!("toolu_{n}"), &session)
+                .await
+                .unwrap();
         }
 
         assert_eq!(
-            maps.session_of_call(&ada, "toolu_0"),
+            maps.session_of_call(&ada, "toolu_0").await.unwrap(),
             None,
             "the oldest binding is the one the cap gives up"
         );
         assert_eq!(
-            maps.session_of_call(&ada, &format!("toolu_{REMEMBERED_CALLS}")),
+            maps.session_of_call(&ada, &format!("toolu_{REMEMBERED_CALLS}"))
+                .await
+                .unwrap(),
             Some(session),
             "and the newest is kept, which is the one a live tool loop is \
              about to answer"
@@ -580,7 +548,9 @@ mod tests {
         // Re-binding an id already held must not grow the order queue past the
         // map, or the cap evicts a key that is still live and the two halves
         // drift apart.
-        maps.bind_call(&ada, "toolu_1", &SessionId::new("acme/ada/other"));
+        maps.bind_call(&ada, "toolu_1", &SessionId::new("acme/ada/other"))
+            .await
+            .unwrap();
         let (held, ordered) = maps.lock().calls.sizes(&ada);
         assert_eq!(ordered, held);
     }
@@ -589,21 +559,25 @@ mod tests {
     /// traffic cannot evict a *different* principal's binding (M12 review,
     /// F15) — the half the oldest-first test above does not cover, that one
     /// being the control that a tenant still ages out its own oldest entry.
-    #[test]
-    fn a_co_tenants_call_traffic_does_not_evict_another_principals_call_binding() {
+    #[tokio::test]
+    async fn a_co_tenants_call_traffic_does_not_evict_another_principals_call_binding() {
         let maps = MemoryCorrelationMaps::new();
         let ada = fresh_principal("ada");
         let bob = fresh_principal("bob");
         let subagent = SessionId::new("acme/ada/sub");
-        maps.bind_call(&ada, "toolu_ada_sub", &subagent);
+        maps.bind_call(&ada, "toolu_ada_sub", &subagent)
+            .await
+            .unwrap();
 
         let bobs = SessionId::new("globex/bob/main");
         for n in 0..REMEMBERED_CALLS {
-            maps.bind_call(&bob, &format!("toolu_bob_{n}"), &bobs);
+            maps.bind_call(&bob, &format!("toolu_bob_{n}"), &bobs)
+                .await
+                .unwrap();
         }
 
         assert_eq!(
-            maps.session_of_call(&ada, "toolu_ada_sub"),
+            maps.session_of_call(&ada, "toolu_ada_sub").await.unwrap(),
             Some(subagent),
             "a principal's own call binding must survive another tenant's \
              tool traffic; a node-wide cap makes it fall through to the same \
@@ -617,22 +591,26 @@ mod tests {
     /// The second half is the one with teeth: rebinding is the *ordinary* case
     /// here (every fork rebinds), so a `bind` that pushed a second order entry
     /// would evict live threads at a rate set by how often clients compact.
-    #[test]
-    fn the_thread_table_is_capped_and_a_rebinding_does_not_grow_its_queue() {
+    #[tokio::test]
+    async fn the_thread_table_is_capped_and_a_rebinding_does_not_grow_its_queue() {
         let maps = MemoryCorrelationMaps::new();
         let ada = fresh_principal("ada");
         let session = SessionId::new("acme/ada/main");
         for n in 0..=REMEMBERED_THREADS {
-            maps.bind_thread(&ada, &format!("thread-{n}"), &session);
+            maps.bind_thread(&ada, &format!("thread-{n}"), &session)
+                .await
+                .unwrap();
         }
 
         assert_eq!(
-            maps.session_of_thread(&ada, "thread-0"),
+            maps.session_of_thread(&ada, "thread-0").await.unwrap(),
             None,
             "the oldest binding is the one the cap gives up"
         );
         assert_eq!(
-            maps.session_of_thread(&ada, &format!("thread-{REMEMBERED_THREADS}")),
+            maps.session_of_thread(&ada, &format!("thread-{REMEMBERED_THREADS}"))
+                .await
+                .unwrap(),
             Some(session),
             "and the newest is kept, which is the thread a live tool loop is \
              about to answer"
@@ -643,9 +621,12 @@ mod tests {
         );
 
         let forked = SessionId::new("acme/ada/main#g1");
-        maps.bind_thread(&ada, "thread-1", &forked);
+        maps.bind_thread(&ada, "thread-1", &forked).await.unwrap();
         let (held, ordered) = maps.lock().threads.sizes(&ada);
         assert_eq!(ordered, held);
-        assert_eq!(maps.session_of_thread(&ada, "thread-1"), Some(forked));
+        assert_eq!(
+            maps.session_of_thread(&ada, "thread-1").await.unwrap(),
+            Some(forked)
+        );
     }
 }
