@@ -16,7 +16,7 @@
 //! reaching the Redis it names for everything else — and no warning, because
 //! the warning was computed from the same dead snapshot.
 //!
-//! [`fair_use_backend`] now follows `ROUNDHOUSE_REDIS_URL` alone, exactly as
+//! [`shared_backend`] now follows `ROUNDHOUSE_REDIS_URL` alone, exactly as
 //! the session store and the spend ledger do, and this is the end-to-end proof
 //! of it: the ledger under the engine is resolved by calling that function —
 //! not by re-deriving its rule here, which is the shape M13's own refute pass
@@ -40,8 +40,8 @@ use roundhouse_fleet::EchoFrontierClient;
 use roundhouse_server::control_config::crosscheck::CrossChecks;
 use roundhouse_server::control_config::{FairUseConfig, FairUseWindowConfig, ProjectPatch};
 use roundhouse_server::{
-    Conversations, DirectoryMutation, EchoLocalExecutor, Engine, FairUseBackend,
-    MemoryDirectoryStore, fair_use_backend, responses_api,
+    Conversations, DirectoryMutation, EchoLocalExecutor, Engine, MemoryDirectoryStore,
+    SharedBackend, responses_api, shared_backend,
 };
 use roundhouse_store_redis::RedisFairUseLedger;
 use roundhouse_store_redis::test_support::url_from_env;
@@ -120,7 +120,7 @@ async fn post(app: &Router, secret: &str) -> StatusCode {
 ///
 /// 1. Boot a directory from a file with no `fair_use` block — the boot-time
 ///    snapshot is empty, exactly as the finding's premise requires.
-/// 2. Resolve the engine's fair-use ledger by *calling* [`fair_use_backend`]
+/// 2. Resolve the engine's fair-use ledger by *calling* [`shared_backend`]
 ///    with what the composition root knows at that point — this deployment
 ///    names a Redis — and wiring whichever backend it answers, the way
 ///    `main.rs` does. Re-deriving the rule here instead is the shape M13's
@@ -219,13 +219,13 @@ async fn a_ceiling_patched_in_after_boot_is_counted_in_the_shared_buckets() {
     // deployment names a Redis; whether the boot snapshot happened to carry a
     // ceiling is not this function's business any more.
     let url = url_from_env();
-    let fair_use_ledger: Arc<dyn FairUseLedger> = match fair_use_backend(Some(&url)) {
-        FairUseBackend::Shared { url } => Arc::new(
+    let fair_use_ledger: Arc<dyn FairUseLedger> = match shared_backend(Some(&url)) {
+        SharedBackend::Shared { url } => Arc::new(
             RedisFairUseLedger::connect(url)
                 .await
                 .expect("the test Redis named by ROUNDHOUSE_TEST_REDIS_URL must be reachable"),
         ),
-        FairUseBackend::PerProcess => Arc::new(MemoryFairUseLedger::new()),
+        SharedBackend::PerProcess => Arc::new(MemoryFairUseLedger::new()),
     };
 
     let store = Arc::new(MemoryStore::new());

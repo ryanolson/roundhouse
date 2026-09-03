@@ -45,14 +45,21 @@ features — the first is what makes the second possible.
 >
 > Not built: the WebSocket and gRPC transports, and resuming an interrupted
 > generation from the partial output already durable in the log. Metrics are
-> per-process. The MCP surface reads both correlators its clients attach —
-> the `_meta.threadId` a Codex client stamps on every `tools/call` and the
-> `_meta["claudecode/toolUseId"]` Claude Code sends — but only the second
+> per-process. The MCP surface reads all three correlators its clients attach —
+> the `_meta.threadId` a Codex client stamps on every `tools/call`, the
+> client's own session id beside it in `_meta["x-codex-turn-metadata"]`, and
+> the `_meta["claudecode/toolUseId"]` Claude Code sends — but only the last
 > has been observed arriving from a real binary; a control call chained
-> through NeMo Relay is likewise stated rather than tested. Both correlators
-> are exact only on the node that served the turn they name: the tables
-> behind them are per-process, so a call landing elsewhere falls back to a
-> guess.
+> through NeMo Relay is likewise stated rather than tested. What each resolves
+> to is now the same on every node of a deployment that names a
+> `ROUNDHOUSE_REDIS_URL`, which is what puts the three correlation maps in one
+> shared store; without one they are per-process, and a call landing on a node
+> that served none of the conversation's turns falls back to a guess. Two of
+> the three are exact — a tool-use id and a thread id each name one
+> conversation — where the third, codex's own session id, names the whole
+> agent family's, which is why it is weighed last of the three. What stays a guess either
+> way is "this agent's most recent conversation", which is answerable only by
+> having watched the turns arrive.
 
 Roundhouse depends on Dynamo but is not part of it. It pins two Dynamo crates
 (`dynamo-kv-router` with the `standalone-selection` feature, and `dynamo-tokens`)
@@ -696,9 +703,12 @@ inside a subagent's tool loop resolves to the subagent's log rather than to
 whichever of the principal's turns opened most recently. The binding is written
 as the call is streamed to the client, which is the one moment both halves are
 in one place; the id is checked against the caller, and one that is not the
-caller's is indistinguishable from one this node never emitted. A call carrying
-no such key — every Codex call — falls back to the principal's most recent
-conversation exactly as before.
+caller's is indistinguishable from one nothing ever emitted. An id two of one
+principal's sessions claimed is remembered as ambiguous and answers as an
+unknown one does, rather than resolving to whichever session bound it last. A
+call carrying no such key falls back to the principal's most recent
+conversation exactly as before — for a Codex call, only after its own two
+correlators have both missed.
 
 **The registration is inline argv, and the key rides `${VAR}`.** Of the config
 forms this client honours, `--mcp-config` is the only one that writes nothing:
@@ -1410,10 +1420,24 @@ as a name missed exactly the subagents the feature exists for and answered them
 about their parent. The named path is still there behind the binding, as the
 route a root thread takes on a node that recorded none, and a thread id naming
 no conversation of the caller's falls through to the next correlator rather than
-reaching anyone else's session. What is *not* exact: a thread whose turns
-another node served, one whose binding this node's bounded table has evicted, or
-a client that sends no such header — each of those lands on the `latest` guess,
-as it did before. Its Claude Code counterpart,
+reaching anyone else's session. Behind both sits a third correlator the same
+codex `_meta` was already carrying and nothing read until M14.1: the client's
+own session id in `x-codex-turn-metadata.session_id`, which *is* that turn's
+`prompt_cache_key`, resolved as a name. For a never-forked conversation the
+roundhouse session id is a pure function of the caller and that string, so a
+codex root thread resolves with no table consulted at all — and it is read
+after the thread binding precisely because a whole agent family shares the one
+value while each member stamps its own thread id.
+
+What is *not* exact: a thread whose binding has aged past its staleness bound,
+and a client that sends no such header — each of those lands on the `latest`
+guess, as it did before. A thread whose turns another *node* served is no
+longer on that list where a `ROUNDHOUSE_REDIS_URL` is configured: the
+generation, call and thread maps live in that Redis, so what one node bound is
+what every node reads, and a name no node has ever bound refuses rather than
+resolving to a superseded log. `latest` is deliberately not shared — two nodes
+serving one agent would each write their own answer to it and whichever wrote
+last would speak for both. Its Claude Code counterpart,
 `_meta["claudecode/toolUseId"]`, is read too and is a slightly different
 bargain: it carries an id *roundhouse emitted*, so it needs no cooperation from
 the model at all. What is unobserved is the Codex half's last

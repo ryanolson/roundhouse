@@ -176,14 +176,36 @@
 //! Responses ingest binds it to the session it decided, per principal, and
 //! `resolve_session` reads that binding before falling back to the name.
 //!
+//! **A third correlator, which the same `_meta` was already carrying**
+//! (M14.1, R-C5). Beside `threadId`, codex's `tools/call` carries its whole
+//! turn-metadata object under `x-codex-turn-metadata`
+//! (`build_mcp_tool_call_request_meta`, `core/src/mcp_tool_call.rs:1175-1221`,
+//! built by `current_meta_value_for_mcp_request`,
+//! `core/src/turn_metadata.rs:183-222`), and that object keeps `session_id` —
+//! the id an agent family shares, and therefore that family's
+//! `prompt_cache_key`. Until M14.1 nothing read it. The transport reads it now
+//! and hands it to [`ControlReads::resolve_session`] as a **name**, weighed
+//! *after* the thread arm and before the tool-use id. A never-forked
+//! conversation's session id is a pure function of the caller and that string,
+//! so this arm consults no table at all — but for a **root** thread it is the
+//! same string `threadId` already carried, so what it actually rescues is the
+//! member whose thread id is nobody's cache key and whose binding this
+//! deployment does not hold: that call reached `latest` before and reaches its
+//! own family's conversation now. It is ordered behind the thread binding for
+//! F2's reason: reading the family's shared cache key first would answer every
+//! subagent about its parent.
+//!
 //! **What is exact and what still falls through**, since an agent reading this
-//! should know which: a thread this deployment served a turn of, on this node,
-//! resolves exactly — through every fork of the cache key underneath it. A
-//! thread whose turns a *different* node served, or whose binding this node's
-//! bounded table has since evicted, resolves as any unknown correlator does:
-//! down the R-M7 named path (which answers a root thread and nothing else) and
-//! then to `latest`, which is a guess. A client that sends no
-//! `x-codex-turn-metadata` header is in that second case on every call.
+//! should know which: a thread this deployment served a turn of resolves
+//! exactly — through every fork of the cache key underneath it, and from any
+//! node where `ROUNDHOUSE_REDIS_URL` puts the bindings in one shared store
+//! (M14.1, R-C4). A thread whose binding has aged out of that store, or whose
+//! turns a different node served on a deployment that shares nothing,
+//! resolves as any unknown correlator does: down the cache-key path (which
+//! answers a root thread and nothing else) and then to `latest`, which is a
+//! guess and stays node-local on purpose. A client that sends no
+//! `x-codex-turn-metadata` header is in that second case on every call, and
+//! sends neither of the two correlators this section is about.
 //!
 //! `init_session` remains the client-agnostic path and this does not replace
 //! it; see the section below for what is still write-only about it. What
@@ -298,6 +320,13 @@ mod tests {
             "core/src/agent/control.rs:104-110",
             "core/src/responses_metadata.rs:281",
             "x-codex-turn-metadata",
+            // The third correlator the same `_meta` was already carrying, and
+            // the upstream fact that it is the family's cache key (M14.1,
+            // R-C5). Without these the section can lose the arm while still
+            // reading as a complete account of what codex sends.
+            "core/src/mcp_tool_call.rs:1175-1221",
+            "core/src/turn_metadata.rs:183-222",
+            "session_id",
             // The ruling itself, R-M7.
             "ControlReads::resolve_session",
             "ContradictoryConversation",
@@ -324,6 +353,10 @@ mod tests {
             "*same string*",
             // R-M9's order within the thread step (F2).
             "session_of_thread",
+            // R-C5's arm and its position: behind the thread binding, ahead of
+            // the tool-use id, and swallowing the same one error.
+            "correlators.cache_key",
+            "Behind (2) rather than in front of it",
         ] {
             assert!(
                 before_tests(DECISION_SITE).contains(marker),

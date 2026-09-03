@@ -149,6 +149,32 @@ impl RoundhouseMcp {
     /// states about a correlator that names nothing of this caller's.
     const THREAD_ID_META: &'static str = "threadId";
 
+    /// The `_meta` key Codex puts its whole turn-metadata object under, and the
+    /// one field of it this deployment reads.
+    ///
+    /// Spelled by the client: `build_mcp_tool_call_request_meta`
+    /// (codex `core/src/mcp_tool_call.rs:1175-1221` @ `6344a65`) inserts the
+    /// turn metadata under this exact key on every `tools/call`, built by
+    /// `current_meta_value_for_mcp_request` (`core/src/turn_metadata.rs:183-222`),
+    /// which keeps `session_id` — the id shared by a whole agent family and
+    /// therefore that family's `prompt_cache_key` (`core/src/client.rs`, from
+    /// `core/src/agent/control.rs:104-110`).
+    ///
+    /// **Read as a name and not as an id** (M14.1, R-C5). It is the client's
+    /// own session id, and this deployment's session id for a never-forked
+    /// conversation is a pure function of the caller and that string — which
+    /// is what makes a codex root thread answerable on a node that recorded
+    /// nothing. The sibling field `thread_id` is deliberately *not* read here:
+    /// the per-thread correlator arrives as the top-level `threadId` above,
+    /// and taking it from two places would be two spellings of one
+    /// correlator.
+    const TURN_METADATA_META: &'static str = "x-codex-turn-metadata";
+
+    /// The one field of that object this deployment reads. See
+    /// [`Self::TURN_METADATA_META`] for why it is this field and not
+    /// `thread_id` beside it.
+    const TURN_METADATA_SESSION_ID: &'static str = "session_id";
+
     /// The `tool_use` block this call is answering, if the client named one.
     ///
     /// **Read from the request *context* and not from `request.meta`.** `rmcp`
@@ -177,25 +203,49 @@ impl RoundhouseMcp {
         Self::meta_string(context, Self::THREAD_ID_META)
     }
 
-    /// One `_meta` string, or `None`.
+    /// The cache key the client's turns carry, if it sent its turn metadata.
     ///
-    /// Both correlators read through one function rather than two copies of
-    /// four lines: the copies would be identical the day they were written and
-    /// the interesting way for them to diverge is silent — one reading
-    /// `context.meta` and the other `request.meta`, which is exactly the
-    /// mistake the doc above exists to warn about and which no test on either
-    /// key alone would catch.
+    /// One level deeper than the other two — the value under
+    /// [`Self::TURN_METADATA_META`] is an object, not a string — and read on
+    /// exactly the same terms otherwise: a value of the wrong shape at either
+    /// level is `None` rather than a refusal, because this is a correlation
+    /// hint on a call the deployment can serve without it.
+    fn cache_key(context: &RequestContext<RoleServer>) -> Option<String> {
+        Self::as_id(
+            context
+                .meta
+                .get(Self::TURN_METADATA_META)
+                .and_then(|metadata| metadata.get(Self::TURN_METADATA_SESSION_ID)),
+        )
+    }
+
+    /// One top-level `_meta` string, or `None`.
+    ///
+    /// The two top-level correlators read through one function rather than two
+    /// copies of four lines: the copies would be identical the day they were
+    /// written and the interesting way for them to diverge is silent — one
+    /// reading `context.meta` and the other `request.meta`, which is exactly
+    /// the mistake the doc above exists to warn about and which no test on
+    /// either key alone would catch.
+    ///
+    /// The *shape* is here; what makes a value an id is [`Self::as_id`], which
+    /// the nested reader shares — see F5 below.
+    fn meta_string(context: &RequestContext<RoleServer>, key: &str) -> Option<String> {
+        Self::as_id(context.meta.get(key))
+    }
+
+    /// One `_meta` value as a correlator id, or `None`.
     ///
     /// **The empty-string normalisation is here and nowhere else** (M12.1
     /// review, F5). An empty value is not an id, and it is what a client
     /// sending the key with nothing in it would otherwise resolve *by*: an
     /// empty lookup key can only miss, but it would have looked deliberate in
     /// a trace. Normalised to absence at the one door these ids enter by,
-    /// rather than once per correlator further in.
-    fn meta_string(context: &RequestContext<RoleServer>, key: &str) -> Option<String> {
-        context
-            .meta
-            .get(key)
+    /// rather than once per correlator further in — which is why the third
+    /// correlator, which lives one level deeper in the same object, comes
+    /// through this function rather than repeating its tail (M14.1, R-C5).
+    fn as_id(value: Option<&serde_json::Value>) -> Option<String> {
+        value
             .and_then(|value| value.as_str())
             .map(str::to_string)
             .filter(|id| !id.is_empty())
@@ -299,6 +349,7 @@ impl ServerHandler for RoundhouseMcp {
             correlators: Correlators {
                 thread_id: Self::thread_id(&context),
                 tool_use_id: Self::tool_use_id(&context),
+                cache_key: Self::cache_key(&context),
             },
         };
         let outcome = crate::tools::dispatch(self.surface.as_ref(), &principal, call).await;

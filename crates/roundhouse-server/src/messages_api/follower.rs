@@ -167,7 +167,7 @@ impl<S: SessionStore, T: Tokenizer + Clone + Send + Sync + 'static> MessagesFoll
             }
             Ok(events) => {
                 self.idle_polls = 0;
-                self.consume(&events, None);
+                self.consume(&events, None).await;
             }
             Err(error) => self.fail(&error.to_string()),
         }
@@ -187,7 +187,7 @@ impl<S: SessionStore, T: Tokenizer + Clone + Send + Sync + 'static> MessagesFoll
             Ok(events) if events.is_empty() => self.phase = Phase::Done,
             Ok(events) => {
                 let last_seq = events.last().map_or(cursor, |event| event.seq);
-                self.consume(&events, Some(bound));
+                self.consume(&events, Some(bound)).await;
                 // `consume` sets `Done` on a terminal frame and `Replaying` on a
                 // nested dedup; neither should be overwritten here.
                 if matches!(self.phase, Phase::Replaying { .. }) {
@@ -211,7 +211,7 @@ impl<S: SessionStore, T: Tokenizer + Clone + Send + Sync + 'static> MessagesFoll
     /// not the phase's: what differs between tailing and replaying is only the
     /// `bound` and the marker exclusion, which are two lines rather than a
     /// second copy of the loop.
-    fn consume(&mut self, events: &[SessionEvent], bound: Option<u64>) {
+    async fn consume(&mut self, events: &[SessionEvent], bound: Option<u64>) {
         for event in events {
             if let Some(bound) = bound
                 && (event.seq >= bound
@@ -253,13 +253,22 @@ impl<S: SessionStore, T: Tokenizer + Clone + Send + Sync + 'static> MessagesFoll
                     // every `ToolCall` item in the window, so the binding is
                     // for a call this response actually announced to this
                     // client and not for one a concurrent replay walked past.
+                    //
+                    // **Awaited inline, and on a durable deployment that is a
+                    // round trip in the projection loop** (M14.1). Not spawned
+                    // off, because the ordering is load-bearing: the client
+                    // cannot call the tool until it has been handed this
+                    // block, so the binding must be in the store *before* the
+                    // frame carrying the id leaves — a write racing the answer
+                    // to it is the pre-R-M2 guess with a stopwatch on it. One
+                    // `SET`-shaped write per tool call the deployment emits is
+                    // the price, and it is paid on the leg that then waits for
+                    // a model.
                     Some(Emitted::ToolCall { call_id, .. }) => {
                         let call_id = call_id.to_string();
-                        self.conversations.bind_call(
-                            &self.principal,
-                            &call_id,
-                            self.tail.session_id().clone(),
-                        );
+                        self.conversations
+                            .bind_call(&self.principal, &call_id, self.tail.session_id().clone())
+                            .await;
                     }
                     None => {}
                 }
@@ -696,31 +705,35 @@ mod tests {
         let mut call = Item::tool_call("call_f11", "mcp__roundhouse__status", "{}");
         call.response_id = Some(response.clone());
 
-        follower.consume(
-            &[
-                SessionEvent {
-                    seq: 1,
-                    session_id: followed.clone(),
-                    at_ms: 0,
-                    kind: SessionEventKind::TurnStarted {
-                        turn_id: TurnId::new("turn_f9"),
-                        response_id: response.clone(),
+        follower
+            .consume(
+                &[
+                    SessionEvent {
+                        seq: 1,
+                        session_id: followed.clone(),
+                        at_ms: 0,
+                        kind: SessionEventKind::TurnStarted {
+                            turn_id: TurnId::new("turn_f9"),
+                            response_id: response.clone(),
+                        },
                     },
-                },
-                SessionEvent {
-                    seq: 2,
-                    session_id: followed.clone(),
-                    at_ms: 0,
-                    kind: SessionEventKind::ItemAppended { item: call },
-                },
-            ],
-            None,
-        );
+                    SessionEvent {
+                        seq: 2,
+                        session_id: followed.clone(),
+                        at_ms: 0,
+                        kind: SessionEventKind::ItemAppended { item: call },
+                    },
+                ],
+                None,
+            )
+            .await;
 
         assert_eq!(
             follower
                 .conversations
-                .session_of_call(&follower.principal, "call_f11"),
+                .session_of_call(&follower.principal, "call_f11")
+                .await
+                .unwrap(),
             Some(followed),
             "the call this response announced must resolve to the log it was \
              emitted into"

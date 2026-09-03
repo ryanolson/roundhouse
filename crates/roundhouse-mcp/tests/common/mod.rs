@@ -268,18 +268,38 @@ impl ControlReads for FakeDeployment {
         }
     }
 
-    async fn session_of_call(&self, principal: &Principal, tool_use_id: &str) -> Option<SessionId> {
-        self.tool_use_ids
+    async fn session_of_call(
+        &self,
+        principal: &Principal,
+        tool_use_id: &str,
+    ) -> Result<Option<SessionId>, SurfaceError> {
+        // The outage this double models is the *store's*, and since M14.1 the
+        // correlation tables are in it too: a double whose `named_session`
+        // could fail while its two lookups could not would let the resolver's
+        // one swallow go untested on the arms that matter (M12.1 review, F1).
+        if let Some(backend) = &self.store_outage {
+            return Err(SurfaceError::Internal(backend.clone()));
+        }
+        Ok(self
+            .tool_use_ids
             .get(tool_use_id)
             .filter(|(owner, _)| owner == principal)
-            .map(|(_, session)| session.clone())
+            .map(|(_, session)| session.clone()))
     }
 
-    async fn session_of_thread(&self, principal: &Principal, thread_id: &str) -> Option<SessionId> {
-        self.thread_ids
+    async fn session_of_thread(
+        &self,
+        principal: &Principal,
+        thread_id: &str,
+    ) -> Result<Option<SessionId>, SurfaceError> {
+        if let Some(backend) = &self.store_outage {
+            return Err(SurfaceError::Internal(backend.clone()));
+        }
+        Ok(self
+            .thread_ids
             .get(thread_id)
             .filter(|(owner, _)| owner == principal)
-            .map(|(_, session)| session.clone())
+            .map(|(_, session)| session.clone()))
     }
 
     async fn latest_session(&self, principal: &Principal) -> Option<SessionId> {
@@ -372,11 +392,19 @@ impl<R: ControlReads> ControlReads for CountingReads<R> {
         self.inner.named_session(principal, named).await
     }
 
-    async fn session_of_call(&self, principal: &Principal, tool_use_id: &str) -> Option<SessionId> {
+    async fn session_of_call(
+        &self,
+        principal: &Principal,
+        tool_use_id: &str,
+    ) -> Result<Option<SessionId>, SurfaceError> {
         self.inner.session_of_call(principal, tool_use_id).await
     }
 
-    async fn session_of_thread(&self, principal: &Principal, thread_id: &str) -> Option<SessionId> {
+    async fn session_of_thread(
+        &self,
+        principal: &Principal,
+        thread_id: &str,
+    ) -> Result<Option<SessionId>, SurfaceError> {
         self.inner.session_of_thread(principal, thread_id).await
     }
 

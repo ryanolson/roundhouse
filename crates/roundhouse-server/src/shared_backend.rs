@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Which fair-use ledger a deployment gets.
+//! Which state a deployment shares between its nodes, and the one rule that
+//! decides.
 //!
 //! **In the library rather than in `main.rs`, and that placement is the
 //! finding.** M13 shipped this rule as a private function of the binary, so
@@ -13,16 +14,23 @@
 //! now, against a real Redis, by calling *this* function rather than
 //! re-deriving its rule — which is the same lesson M13's own refute pass
 //! learned about the boot warning one layer down.
+//!
+//! **It was `fair_use_backend` until M14.1, and the rename is the point**
+//! (R-C4). The correlation maps became the fourth family chosen by
+//! `ROUNDHOUSE_REDIS_URL`, beside the session log, the spend ledger and the
+//! fair-use buckets, and a second function spelling the same predicate is how
+//! a deployment ends up with three of the four shared. One name, one rule, and
+//! every caller reads it.
 
-/// Where a deployment's rolling fair-use counters live.
+/// Where a deployment's shared state lives.
 ///
 /// Two variants rather than a `bool` because the shared arm carries the URL it
 /// was chosen by: a bare `bool` would leave the composition root holding
-/// "shared buckets" and an `Option<String>` it had to unwrap again, and the
-/// two disagreeing is exactly the boot-time state this rung exists to remove.
+/// "shared" and an `Option<String>` it had to unwrap again, and the two
+/// disagreeing is exactly the boot-time state this rung exists to remove.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FairUseBackend<'a> {
-    /// The buckets every node of the deployment shares, in the Redis named by
+pub enum SharedBackend<'a> {
+    /// The state every node of the deployment shares, in the Redis named by
     /// this URL.
     Shared { url: &'a str },
     /// This process's own memory.
@@ -34,9 +42,11 @@ pub enum FairUseBackend<'a> {
 ///
 /// `ROUNDHOUSE_REDIS_URL` is the variable an operator sets when they mean
 /// "this is more than one process", and it is exactly then that a per-process
-/// rolling counter stops being the ceiling its configuration says it is. So
-/// Redis selects the shared buckets, the same way it selects the durable log
-/// and the durable ledger, and for the same reason.
+/// rolling counter stops being the ceiling its configuration says it is, and
+/// that a per-process correlation table stops being able to say which
+/// conversation a control call is about. So Redis selects the shared buckets
+/// and the shared maps, the same way it selects the durable log and the
+/// durable ledger, and for the same reason.
 ///
 /// **It used to take a second argument — whether any membership had a
 /// `fair_use` block — and that was the M13 thermo-nuclear review's F1.** The
@@ -51,12 +61,12 @@ pub enum FairUseBackend<'a> {
 /// about — was false besides: `RedisSessionStore::connect` on the same URL
 /// already fails that boot, several lines earlier.
 ///
-/// What is left is one connection per deployment that named a Redis, which is
-/// what naming one already means for the two backends beside this.
-pub fn fair_use_backend(redis_url: Option<&str>) -> FairUseBackend<'_> {
+/// What is left is one connection per family per deployment that named a
+/// Redis, which is what naming one already means for the backends beside them.
+pub fn shared_backend(redis_url: Option<&str>) -> SharedBackend<'_> {
     match redis_url {
-        Some(url) => FairUseBackend::Shared { url },
-        None => FairUseBackend::PerProcess,
+        Some(url) => SharedBackend::Shared { url },
+        None => SharedBackend::PerProcess,
     }
 }
 
@@ -74,13 +84,13 @@ mod tests {
     /// choice, since a `Shared` that had to be paired with the URL again at
     /// the call site is the two-facts-that-can-disagree shape over again.
     #[test]
-    fn naming_a_redis_selects_the_shared_buckets_and_carries_its_url() {
+    fn naming_a_redis_selects_the_shared_state_and_carries_its_url() {
         assert_eq!(
-            fair_use_backend(Some("redis://127.0.0.1:6379/")),
-            FairUseBackend::Shared {
+            shared_backend(Some("redis://127.0.0.1:6379/")),
+            SharedBackend::Shared {
                 url: "redis://127.0.0.1:6379/"
             }
         );
-        assert_eq!(fair_use_backend(None), FairUseBackend::PerProcess);
+        assert_eq!(shared_backend(None), SharedBackend::PerProcess);
     }
 }

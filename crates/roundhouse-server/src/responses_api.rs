@@ -481,7 +481,8 @@ impl<S: SessionStore, T: Tokenizer + Clone + Send + Sync + 'static> Compat<S, T>
         // vocabulary in the one place both dialects have to agree.
         if let Some(thread_id) = thread_id {
             self.conversations
-                .bind_thread(principal, thread_id, session_id.clone());
+                .bind_thread(principal, thread_id, session_id.clone())
+                .await;
         }
         Ok((session_id, delta))
     }

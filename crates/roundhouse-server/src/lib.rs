@@ -76,7 +76,6 @@ pub mod control_config;
 pub mod conversations;
 pub mod dialect;
 pub mod engine;
-pub mod fair_use_backend;
 pub mod http;
 pub mod judge;
 pub mod mcp_api;
@@ -86,6 +85,7 @@ pub mod prefix_admission;
 pub mod relay_api;
 pub mod relay_handoff;
 pub mod responses_api;
+pub mod shared_backend;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 pub mod tokenizer;
@@ -105,7 +105,6 @@ pub use engine::{
     EchoLocalExecutor, Engine, EngineConfig, EngineError, LocalExecution, LocalExecutor, TurnInput,
     TurnResult,
 };
-pub use fair_use_backend::{FairUseBackend, fair_use_backend};
 pub use http::router;
 pub use judge::{FleetJudge, JudgeConfig};
 pub use mcp_api::{ControlPlaneReads, describe_ambiguous_memberships, mcp_router};
@@ -114,4 +113,5 @@ pub use metrics_api::metrics_router;
 pub use relay_api::relay_router;
 pub use relay_handoff::{RelayAgent, RelayHandoff, RelayHandoffError, UpstreamReAimed};
 pub use responses_api::{API_PREFIX, responses_router};
+pub use shared_backend::{SharedBackend, shared_backend};
 pub use tokenizer::HfTokenizer;

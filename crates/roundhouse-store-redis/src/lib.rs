@@ -42,13 +42,21 @@
 //! The store passes the same contract suite as `MemoryStore` — instantiated
 //! by the same `store_contract_suite!` macro — and the binary selects it when
 //! `ROUNDHOUSE_REDIS_URL` is set (see `roundhouse-server`'s `main.rs`).
+//!
+//! That one variable selects every family this crate serves and nothing else
+//! selects any of them (R12, R-C4): the session log here, the spend ledger in
+//! `spend`, the fair-use buckets in `fair_use`, and — since M14.1 — the three
+//! correlation maps in `correlation`, which are what let a client's own name
+//! for a conversation reach the same session from any node.
 
+pub mod correlation;
 pub mod fair_use;
 mod scripts;
 pub mod spend;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 
+pub use correlation::RedisCorrelationMaps;
 pub use fair_use::RedisFairUseLedger;
 pub use spend::RedisSpendLedger;
 
@@ -63,7 +71,7 @@ use roundhouse_core::now_ms;
 use roundhouse_core::store::{Lease, SessionStore, StoreError};
 
 // ---------------------------------------------------------------------------
-// One `connect`, for all three Redis families this crate serves
+// One `connect`, for every Redis family this crate serves
 // ---------------------------------------------------------------------------
 
 /// How long a fresh connection attempt may take before this manager gives up
@@ -117,8 +125,8 @@ const RECONNECT_BACKOFF_FACTOR: f32 = 2.0;
 /// without every command in that window failing.
 const RECONNECT_RETRIES: usize = 3;
 
-/// Build the `ConnectionManager` every Redis-backed store, ledger and
-/// fair-use tracker in this crate connects through.
+/// Build the `ConnectionManager` every Redis-backed store, ledger, fair-use
+/// tracker and correlation map in this crate connects through.
 ///
 /// One function rather than the three copies of `ConnectionManagerConfig::default()`
 /// this replaces (session store, spend ledger, fair-use ledger, each

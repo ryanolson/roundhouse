@@ -316,7 +316,7 @@ async fn take_the_latest_slot(
         .lock()
         .expect("recording")
         .push((method, rival.conversations.latest(&rival.principal)));
-    rival.conversations.bind(&rival.principal, &rival.key);
+    rival.conversations.bind(&rival.principal, &rival.key).await;
     next.run(Request::from_parts(parts, Body::from(bytes)))
         .await
 }
@@ -549,7 +549,7 @@ impl Rig {
             ControlRace::None => None,
             ControlRace::RivalIsLatest => {
                 let key = format!("{PROJECT}/{USER}/a-rival-conversation");
-                let session = conversations.bind(&principal(), &key);
+                let session = conversations.bind(&principal(), &key).await;
                 store
                     .create_session(&session, "rival")
                     .await

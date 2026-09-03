@@ -10,6 +10,7 @@
 use roundhouse_core::control::{Principal, ProjectId};
 use roundhouse_core::ids::SessionId;
 
+use crate::correlation::{RedisCorrelationMaps, call_key as correlation_call_key_impl};
 use crate::fair_use::{
     bucket_fields, bucket_index, member_scope_key, project_scope_key, window_sum_fields,
 };
@@ -103,6 +104,43 @@ pub fn fair_use_window_sum_fields(
 /// from what ships, and a test green against a stale copy proves nothing.
 pub fn fair_use_would_exceed_source() -> &'static str {
     crate::fair_use::scripts::would_exceed_source()
+}
+
+/// One correlation handle whose staleness bounds are milliseconds rather than
+/// hours.
+///
+/// **The seam R-C6 names, and the alternative it beat is the one that looks
+/// cheaper**: shortening the shipped `CALL_BINDING_TTL_MS` under `cfg(test)`
+/// would make the expiry test green against a deployment nobody runs, which is
+/// worse than not testing expiry at all. A per-handle bound leaves the shipped
+/// numbers shipped and still lets one test watch a binding actually leave.
+pub fn correlation_with_binding_ttls(
+    maps: RedisCorrelationMaps,
+    call_ms: u64,
+    thread_ms: u64,
+) -> RedisCorrelationMaps {
+    maps.with_binding_ttls(call_ms, thread_ms)
+}
+
+/// The raw key one call binding occupies, for the test that reads the
+/// ambiguous marker itself rather than only the `None` it decodes to.
+///
+/// Its two siblings — the generation and thread keys — are pinned by
+/// `every_key_carries_the_namespace_the_version_and_its_family` beside the
+/// functions that build them, and exporting them here with no caller would be
+/// an untested surface reading as a supported one.
+pub fn correlation_call_key(principal: &Principal, call_id: &str) -> String {
+    correlation_call_key_impl(principal, call_id)
+}
+
+/// What a call id two sessions of one principal have claimed holds instead of
+/// a session.
+///
+/// Handed out rather than restated in the test, for the reason
+/// `fair_use_would_exceed_source` is: a copy of a wire constant drifts from
+/// what ships, and a test green against a stale copy proves nothing.
+pub fn correlation_ambiguous_marker() -> &'static str {
+    crate::correlation::AMBIGUOUS_MARKER
 }
 
 /// The conformance suite's expiry lever. Deleting the key is exactly what

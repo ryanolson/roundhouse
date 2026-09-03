@@ -337,9 +337,11 @@ fn two_tenant_plane() -> ControlPlane {
 async fn a_tool_use_id_resolves_the_conversation_that_emitted_it() {
     let ada = Principal::new("acme", "ada");
     let conversations = Arc::new(Conversations::new());
-    let subagent = conversations.bind(&ada, "acme/ada/sub");
-    let parent = conversations.bind(&ada, "acme/ada/main");
-    conversations.bind_call(&ada, "toolu_sub", subagent.clone());
+    let subagent = conversations.bind(&ada, "acme/ada/sub").await;
+    let parent = conversations.bind(&ada, "acme/ada/main").await;
+    conversations
+        .bind_call(&ada, "toolu_sub", subagent.clone())
+        .await;
 
     let reads = reads_sharing(
         two_tenant_plane(),
@@ -380,7 +382,9 @@ async fn a_tool_use_id_resolves_the_conversation_that_emitted_it() {
         .create_session(&parent, "gpt-4")
         .await
         .expect("a session for the named path to find");
-    conversations.bind_call(&ada, "toolu_parent", parent.clone());
+    conversations
+        .bind_call(&ada, "toolu_parent", parent.clone())
+        .await;
     let named = reads_sharing(two_tenant_plane(), store, Arc::clone(&conversations));
     assert_eq!(
         named
@@ -404,8 +408,8 @@ async fn a_tool_use_id_resolves_the_conversation_that_emitted_it() {
 async fn a_thread_id_resolves_the_conversation_the_client_names() {
     let ada = Principal::new("acme", "ada");
     let conversations = Arc::new(Conversations::new());
-    let subagent = conversations.bind(&ada, "acme/ada/sub");
-    let parent = conversations.bind(&ada, "acme/ada/main");
+    let subagent = conversations.bind(&ada, "acme/ada/sub").await;
+    let parent = conversations.bind(&ada, "acme/ada/main").await;
 
     // Both conversations real in the store, because the thread id goes down
     // the *named* path and that path checks existence. A rig whose rival
@@ -471,7 +475,7 @@ async fn another_tenants_thread_id_never_resolves_to_that_tenants_session() {
     let ada = Principal::new("acme", "ada");
     let bob = Principal::new("globex", "bob");
     let conversations = Arc::new(Conversations::new());
-    let adas = conversations.bind(&ada, "acme/ada/main");
+    let adas = conversations.bind(&ada, "acme/ada/main").await;
 
     let store = Arc::new(MemoryStore::new());
     store
@@ -493,7 +497,7 @@ async fn another_tenants_thread_id_never_resolves_to_that_tenants_session() {
          deployment has none of for *this* caller: {refused}"
     );
 
-    let bobs = conversations.bind(&bob, "globex/bob/main");
+    let bobs = conversations.bind(&bob, "globex/bob/main").await;
     assert_eq!(
         reads
             .resolve_session(&bob, None, &in_thread("main"))
@@ -541,7 +545,7 @@ async fn f2_control_a_subagents_own_thread_id_was_never_bound_as_a_cache_key() {
     // The shared key every member of the family actually sends as
     // `prompt_cache_key` -- nothing in this test ever binds the
     // subagent's own thread id under any key.
-    let _parent = conversations.bind(&ada, "acme/ada/main");
+    let _parent = conversations.bind(&ada, "acme/ada/main").await;
 
     let reads = reads_over(two_tenant_plane(), Arc::new(MemoryStore::new()));
     let refused = reads
@@ -607,14 +611,18 @@ async fn f2_a_subagents_thread_id_resolves_its_own_fork_and_not_the_parents() {
     // The one shared cache key the whole family sends as
     // `prompt_cache_key`, per `agent/control.rs:104-110`.
     let key = "acme/ada/main";
-    let parent_g0 = conversations.bind(&ada, key);
-    conversations.bind_thread(&ada, "parent-own-thread-id", parent_g0.clone());
+    let parent_g0 = conversations.bind(&ada, key).await;
+    conversations
+        .bind_thread(&ada, "parent-own-thread-id", parent_g0.clone())
+        .await;
 
     // The subagent's turn: a different conversation under the same key
     // reads, to roundhouse, as a client that rewrote its own history.
-    let subagent_fork = conversations.fork(&ada, key);
+    let subagent_fork = conversations.fork(&ada, key).await;
     assert_eq!(subagent_fork.as_str(), "acme/ada/main#g1");
-    conversations.bind_thread(&ada, "subagent-own-thread-id", subagent_fork.clone());
+    conversations
+        .bind_thread(&ada, "subagent-own-thread-id", subagent_fork.clone())
+        .await;
 
     let store = Arc::new(MemoryStore::new());
     for session in [&parent_g0, &subagent_fork] {
@@ -631,9 +639,11 @@ async fn f2_a_subagents_thread_id_resolves_its_own_fork_and_not_the_parents() {
 
     // Mid-subagent-turn, the parent drives another turn on the same
     // shared key, forking again and moving `latest` to the parent.
-    let parent_fork2 = conversations.fork(&ada, key);
+    let parent_fork2 = conversations.fork(&ada, key).await;
     assert_eq!(parent_fork2.as_str(), "acme/ada/main#g2");
-    conversations.bind_thread(&ada, "parent-own-thread-id", parent_fork2.clone());
+    conversations
+        .bind_thread(&ada, "parent-own-thread-id", parent_fork2.clone())
+        .await;
     store
         .create_session(&parent_fork2, "gpt-4")
         .await
@@ -684,9 +694,11 @@ async fn f2_a_subagents_thread_id_resolves_its_own_fork_and_not_the_parents() {
 async fn an_argument_and_a_correlator_naming_two_conversations_are_refused() {
     let ada = Principal::new("acme", "ada");
     let conversations = Arc::new(Conversations::new());
-    let subagent = conversations.bind(&ada, "acme/ada/sub");
-    let parent = conversations.bind(&ada, "acme/ada/main");
-    conversations.bind_call(&ada, "toolu_sub", subagent.clone());
+    let subagent = conversations.bind(&ada, "acme/ada/sub").await;
+    let parent = conversations.bind(&ada, "acme/ada/main").await;
+    conversations
+        .bind_call(&ada, "toolu_sub", subagent.clone())
+        .await;
 
     let store = Arc::new(MemoryStore::new());
     for session in [&subagent, &parent] {
@@ -728,8 +740,10 @@ async fn another_principals_tool_use_id_never_resolves_to_that_principals_sessio
     let ada = Principal::new("acme", "ada");
     let bob = Principal::new("globex", "bob");
     let conversations = Arc::new(Conversations::new());
-    let adas = conversations.bind(&ada, "acme/ada/main");
-    conversations.bind_call(&ada, "toolu_ada", adas.clone());
+    let adas = conversations.bind(&ada, "acme/ada/main").await;
+    conversations
+        .bind_call(&ada, "toolu_ada", adas.clone())
+        .await;
 
     let reads = reads_sharing(
         two_tenant_plane(),
@@ -748,7 +762,7 @@ async fn another_principals_tool_use_id_never_resolves_to_that_principals_sessio
 
     // Once bob has one, he gets his own — never ada's, and with no hint
     // that the id he presented meant anything to anybody.
-    let bobs = conversations.bind(&bob, "globex/bob/main");
+    let bobs = conversations.bind(&bob, "globex/bob/main").await;
     assert_eq!(
         reads
             .resolve_session(&bob, None, &answering("toolu_ada"))
@@ -775,7 +789,9 @@ async fn a_store_outage_is_reported_as_infrastructure_rather_than_as_tenancy() {
     // node has bound -- an unbound one is refused before any store is
     // asked, which would make this fixture pass for the wrong reason.
     let conversations = Arc::new(Conversations::new());
-    conversations.bind(&Principal::new("acme", "ada"), "acme/ada/main");
+    conversations
+        .bind(&Principal::new("acme", "ada"), "acme/ada/main")
+        .await;
     let reads = reads_sharing(plane, Arc::new(OutageStore), Arc::clone(&conversations));
 
     let error = reads
@@ -843,7 +859,9 @@ async fn a_store_outage_on_the_thread_correlator_is_also_infrastructure_not_tena
     // the name path this test is about: a thread binding would answer from
     // the node's own table and never reach the store at all.
     let conversations = Arc::new(Conversations::new());
-    conversations.bind(&Principal::new("acme", "ada"), "acme/ada/main");
+    conversations
+        .bind(&Principal::new("acme", "ada"), "acme/ada/main")
+        .await;
     let reads = reads_sharing(plane, Arc::new(OutageStore), conversations);
 
     let error = reads
@@ -958,7 +976,7 @@ async fn f8_an_agreeing_argument_and_correlator_resolve_the_same_string_once() {
     // for keys this node has bound, so a fixture that computed the id
     // without binding it would be asking about a conversation this node
     // has never served.
-    let session = conversations.bind(&ada, &plane.qualify(&ada, "main"));
+    let session = conversations.bind(&ada, &plane.qualify(&ada, "main")).await;
 
     let last_seq_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let store = Arc::new(CountingStore {

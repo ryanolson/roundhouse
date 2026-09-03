@@ -1,50 +1,58 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! M12.1 review, finding F9 — refuted (valid).
+//! M12.1 review, finding F9 — refuted (valid); re-aimed at M14.1's wider
+//! promise.
 //!
 //! **The claim.** `Conversations` is node-local but the `SessionStore` behind
 //! it is shared. On a node that has never bound a client's cache key (a fresh
 //! node, or one that simply never served this principal's turns),
-//! `Conversations::resolve` defaults the key's generation to zero
-//! (`conversations.rs:280`, `generations.get(key).unwrap_or(0)`), and if that
-//! generation-zero session happens to exist in the *shared* store — because
-//! some other node created and later forked it — `mcp_api.rs`'s
-//! `named_session` sees `store.last_seq` succeed and returns it as though it
-//! were the client's real conversation. Pre-M12.1, the same unnamed-thread
-//! path went through `Conversations::latest`, which is empty on a node that
-//! served none of this principal's turns, and refused `NoSession` instead.
+//! `Conversations::resolve` defaulted the key's generation to zero, and if
+//! that generation-zero session happened to exist in the *shared* store —
+//! because some other node created and later forked it — `mcp_api.rs`'s
+//! `named_session` saw `store.last_seq` succeed and returned it as though it
+//! were the client's real conversation.
 //!
-//! **The test below** builds the exact two-node topology `how_to_prove`
-//! describes: `node_a`'s `Conversations` binds `ada`'s cache key at
-//! generation 0, then forks it to generation 1 (both sessions created in one
-//! shared `MemoryStore`); `node_b` shares the same store but holds a
-//! *fresh, empty* `Conversations` — never having bound or forked
-//! anything for `ada`. It then drives the identical call `how_to_prove`
-//! names — `resolve_session(&ada, None, in_thread("main"))` — through
-//! `node_b`'s reads.
+//! **Ruling: valid, and fixed.** The assertion failed for exactly the stated
+//! mechanism: `node_b` returned `Ok(g0)`, the stale, superseded session,
+//! instead of either acceptable contract (refuse `NoSession`, or resolve to
+//! `g1`, the client's actual current conversation). The fix, in
+//! `Conversations::resolve`: a key no binding exists for answers `None` rather
+//! than generation zero, and `named_session` refuses it with the same
+//! `ForeignConversation` an unknown or another tenant's name gets.
 //!
-//! **Ruling: valid, and fixed.** The assertion below failed for exactly the
-//! stated mechanism: `node_b` returned `Ok(g0)`, the stale, superseded
-//! session, instead of either acceptable contract (refuse `NoSession`, or
-//! resolve to `g1`, the client's actual current conversation). The control —
-//! `resolve_session(&ada, None, uncorrelated())` on `node_b` — passed
-//! throughout and still refuses `NoSession`, which isolated the regression to
-//! the threadId path exactly as the finding says, and ruled out "the whole
-//! function is broken" as an alternative, weaker explanation.
+//! # What M14.1 changed here, and why the file stayed
 //!
-//! **The fix**, in `Conversations::resolve`: a key this node holds no binding
-//! for answers `None` rather than generation zero, and `named_session` refuses
-//! it with the same `ForeignConversation` an unknown or another tenant's name
-//! gets — the three stay indistinguishable to the caller on purpose. The
-//! `latest` fall-through then refuses `NoSession`, which is the loud answer the
-//! `conversations` module doc promises. The third test below is the twin on the
-//! *argument* arm: the same defect was reachable through a model-written
-//! `conversation` too, and both arms now refuse.
+//! F9 offered two acceptable contracts and the fix took the *weaker* one,
+//! because it was the only one a per-process table could reach: refuse. With
+//! the three correlation maps in a store the nodes share (R12, R-C2), the
+//! stronger one is available, and these tests now hold it — the topology below
+//! is two `Conversations` over one set of maps, which is what a deployment
+//! that names a `ROUNDHOUSE_REDIS_URL` is:
+//!
+//! - **bound elsewhere resolves.** `node_b` served none of this
+//!   conversation's turns and still answers `g1`, the fork `node_a` made. It
+//!   is no longer allowed to refuse, and it is still not allowed to answer
+//!   `g0`;
+//! - **never bound anywhere refuses.** The refusal did not go away; its scope
+//!   widened from "this node has not seen it" to "nothing has", which is the
+//!   promise it always should have made. That is the second topology below,
+//!   over maps nothing has written;
+//! - **`latest` stayed node-local and stayed a guess** (R12), so the control
+//!   below — no correlator at all on a node that served no turn — still
+//!   refuses `NoSession` exactly as it did.
+//!
+//! The Redis half of the same claim, over two real connections, is
+//! `tests/correlation_any_node.rs`. This file stays on in-process maps
+//! deliberately: what it exercises is the *resolver's* behaviour on a node
+//! with no local history, and running that over a socket would make an
+//! infrastructure outage look like a correlation regression.
 
 use std::sync::Arc;
 
-use roundhouse_core::control::{MemorySpendLedger, Principal};
+use roundhouse_core::control::{
+    CorrelationMaps, MemoryCorrelationMaps, MemorySpendLedger, Principal,
+};
 use roundhouse_core::store::{MemoryStore, SessionStore};
 use roundhouse_mcp::reads::ControlReads;
 use roundhouse_mcp::surface::{Correlators, SurfaceError};
@@ -94,12 +102,16 @@ fn in_thread(thread_id: &str) -> Correlators {
     }
 }
 
-/// Shared setup for both tests below: `node_a` binds `ada`'s cache key at
-/// generation 0, then forks it to generation 1, creating both sessions in
-/// one shared [`MemoryStore`]. Returns the store, the fork ids, and reads
-/// bound to a *fresh, empty* `node_b` `Conversations` over that same store —
-/// the node the finding says a Codex call can land on after another node
-/// forked the thread.
+/// Shared setup: `node_a` binds `ada`'s cache key at generation 0, then forks
+/// it to generation 1, creating both sessions in one shared [`MemoryStore`].
+/// Returns the fork ids and reads bound to a *second* `Conversations` over
+/// that same store **and the same correlation maps** — the node the finding
+/// says a Codex call can land on after another node forked the thread, on a
+/// deployment that shares its maps (M14.1, R-C2).
+///
+/// The second node has its own `latest` and its own generation memo, which is
+/// the whole of what stays node-local: everything it answers below it answers
+/// from state another process wrote.
 async fn two_node_topology() -> (
     Principal,
     roundhouse_core::ids::SessionId,
@@ -114,70 +126,110 @@ async fn two_node_topology() -> (
     );
 
     let store = Arc::new(MemoryStore::new());
+    let maps = Arc::new(MemoryCorrelationMaps::new());
 
-    let conversations_a = Arc::new(Conversations::new());
-    let g0 = conversations_a.bind(&ada, &key);
+    let conversations_a = Arc::new(Conversations::over(
+        Arc::clone(&maps) as Arc<dyn CorrelationMaps>
+    ));
+    let g0 = conversations_a.bind(&ada, &key).await;
     store
         .create_session(&g0, "claude")
         .await
         .expect("node_a creates ada's generation-0 session");
-    let g1 = conversations_a.fork(&ada, &key);
+    let g1 = conversations_a.fork(&ada, &key).await;
     store
         .create_session(&g1, "claude")
         .await
         .expect("node_a creates ada's generation-1 session (the fork)");
     assert_ne!(g0, g1, "sanity: the fork really is a different session");
 
-    let conversations_b = Arc::new(Conversations::new());
+    let conversations_b = Arc::new(Conversations::over(maps));
     let reads_b = reads_over(conversations_b, Arc::clone(&store));
 
     (ada, g0, g1, reads_b)
 }
 
-/// F9 (M12.1 review, correlation-boundary): a node with no local generation
-/// entry for a principal's cache key must not quietly resolve an unnamed
-/// `threadId` to a stale generation-0 session just because that session
-/// happens to exist in the shared store.
-///
-/// `node_b` used to resolve the call to `g0` — the stale, superseded session
-/// — where the module doc's stated design ("never a wrong session served
-/// quietly") requires either a loud `NoSession` refusal or resolution to
-/// `g1`, the client's real current conversation. It now takes the first of
-/// those: `node_b` bound nothing, so it says so.
-#[tokio::test]
-async fn a_fresh_node_does_not_serve_another_nodes_stale_generation_zero_session() {
-    let (ada, g0, g1, reads_b) = two_node_topology().await;
-
-    // The call under test: an unnamed thread id naming `ada`'s cache key,
-    // served by the fresh node.
-    let result = reads_b
-        .resolve_session(&ada, None, &in_thread("main"))
-        .await;
-    match result {
-        // Correct per the module doc's stated design ("never a wrong session
-        // served quietly"): either refuse loudly...
-        Err(SurfaceError::NoSession) => {}
-        // ...or resolve to the client's *actual* current conversation.
-        Ok(session) if session == g1 => {}
-        // What F9 says happens today: the stale, superseded generation-0
-        // session, served with no hint it is stale.
-        Ok(session) if session == g0 => panic!(
-            "F9: node_b resolved ada's unnamed thread id to the stale \
-             generation-0 session {g0:?} even though node_a had already \
-             forked it to {g1:?} in the store they share — the exact \
-             loud-refusal-to-quiet-wrong-answer regression the \
-             conversations.rs module doc says the design avoids"
-        ),
-        other => panic!("unexpected resolution: {other:?}"),
-    }
+/// The same store, and maps nothing has ever written: a deployment where this
+/// key was never bound *anywhere*.
+fn never_bound_anywhere() -> (Principal, ControlPlaneReads<MemoryStore>) {
+    let reads = reads_over(Arc::new(Conversations::new()), Arc::new(MemoryStore::new()));
+    (Principal::new("acme", "ada"), reads)
 }
 
-/// F9 control, kept live: the same fresh node, the same principal, but no
-/// correlator at all. `latest` is empty on `node_b` for `ada`, so this must
-/// still refuse `NoSession` -- isolating the regression to the threadId path
-/// (the ignored test above) rather than to `resolve_session` wholesale. If
-/// this control ever goes red too, the ignored test above is no longer
-/// isolating anything and needs re-diagnosis.
+/// F9, re-aimed (M14.1, R-C2): a node with no local history must not serve
+/// another node's stale generation-zero session — and, where the maps are
+/// shared, must serve the fork instead of refusing.
+///
+/// `node_b` used to resolve this call to `g0`, the stale superseded session.
+/// The M12.1 fix made it refuse, which was the strongest answer a per-process
+/// table could give. It resolves to `g1` now: the client's real current
+/// conversation, decided by a turn this node never served.
+#[tokio::test]
+async fn a_node_that_served_no_turn_resolves_the_fork_another_node_made() {
+    let (ada, g0, g1, reads_b) = two_node_topology().await;
+
+    let resolved = reads_b
+        .resolve_session(&ada, None, &in_thread("main"))
+        .await
+        .expect("the maps are shared, so this node knows the conversation");
+    assert_eq!(
+        resolved, g1,
+        "the fork another node committed is what this key names now; \
+         answering {g0:?} is F9 exactly, and refusing is the narrower promise \
+         M12.1 could only half-make"
+    );
+
+    // The same, through the model-written argument rather than the correlator:
+    // both arms reach one `Conversations::resolve`, and F9 was never only
+    // about correlators.
+    assert_eq!(
+        reads_b
+            .resolve_session(&ada, Some("main"), &uncorrelated())
+            .await
+            .expect("the named arm reaches the same shared map"),
+        g1
+    );
+}
+
+/// The refusal that stayed, with the scope it always should have had: a name
+/// **no node** has ever bound.
+///
+/// This is what stops the assertion above from being "resolve anything that
+/// exists in the store". The store here holds no such session and the maps
+/// hold no such binding, and both arms refuse — the correlator by falling
+/// through to a `latest` that is empty, the argument by
+/// `ForeignConversation`, which is also what an unknown name and another
+/// tenant's get.
+#[tokio::test]
+async fn a_name_no_node_ever_bound_still_refuses() {
+    let (ada, reads) = never_bound_anywhere();
+
+    assert!(
+        matches!(
+            reads.resolve_session(&ada, None, &in_thread("main")).await,
+            Err(SurfaceError::NoSession)
+        ),
+        "a thread id naming a conversation nothing has bound falls through to \
+         a `latest` that is empty"
+    );
+
+    let refused = reads
+        .resolve_session(&ada, Some("main"), &uncorrelated())
+        .await
+        .expect_err("nothing has bound `main`, so nothing holds it");
+    assert!(
+        matches!(refused, SurfaceError::ForeignConversation(ref named) if named == "main"),
+        "a name nothing has bound must refuse exactly as an unknown or a \
+         foreign one does, never resolve to the generation-zero session a \
+         first turn would have minted: {refused:?}"
+    );
+}
+
+/// F9 control, kept live: the same second node, the same principal, but no
+/// correlator at all. `latest` is node-local by contract (R12), so this must
+/// still refuse `NoSession` — isolating every assertion above to the maps
+/// rather than to `resolve_session` wholesale, and pinning the one piece of
+/// state M14.1 deliberately did not share.
 #[tokio::test]
 async fn control_a_fresh_node_with_no_correlator_still_refuses_no_session() {
     let (ada, _g0, _g1, reads_b) = two_node_topology().await;
@@ -185,35 +237,8 @@ async fn control_a_fresh_node_with_no_correlator_still_refuses_no_session() {
     let control = reads_b.resolve_session(&ada, None, &uncorrelated()).await;
     assert!(
         matches!(control, Err(SurfaceError::NoSession)),
-        "control: a fresh node with no correlator at all must still refuse \
-         NoSession rather than guess -- got {control:?}"
-    );
-}
-
-/// The twin on the *argument* arm, and the reason F9 was never only about
-/// correlators.
-///
-/// A model-written `conversation` reaches the same `Conversations::resolve`
-/// the threadId correlator does, so on a node that bound nothing it was served
-/// the same stale generation-0 session — and with a 200 on it rather than a
-/// refusal, because the argument arm does not fall through. It refuses now,
-/// and it refuses with `ForeignConversation`: "this node never served it",
-/// "no such conversation" and "somebody else's" are one answer here on
-/// purpose, since three distinguishable answers would make the argument an
-/// enumeration oracle and none of them is anything the caller can act on
-/// differently.
-#[tokio::test]
-async fn a_fresh_node_refuses_a_named_conversation_it_has_bound_nothing_for() {
-    let (ada, _g0, _g1, reads_b) = two_node_topology().await;
-
-    let refused = reads_b
-        .resolve_session(&ada, Some("main"), &uncorrelated())
-        .await
-        .expect_err("node_b has bound nothing, so it holds no `main`");
-    assert!(
-        matches!(refused, SurfaceError::ForeignConversation(ref named) if named == "main"),
-        "a name this node has bound nothing for must refuse exactly as an \
-         unknown or a foreign one does, never resolve to the generation-zero \
-         session another node has already forked away from: {refused:?}"
+        "a node that served this principal no turn has no most-recent \
+         conversation to guess with, whatever the shared maps hold -- got \
+         {control:?}"
     );
 }

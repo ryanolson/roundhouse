@@ -159,9 +159,18 @@ impl<S: SessionStore> ControlReads for ControlPlaneReads<S> {
         // generation zero: the store is shared between nodes, so that id
         // exists whenever any node minted it, and answering with it hands back
         // a log another node has already forked away from.
+        //
+        // A store that could not be *reached* is none of those three and is
+        // rendered as an internal fault, for the reason the trait's own doc
+        // gives: "not yours" about a conversation that is the caller's own is
+        // both wrong and the least actionable answer available. Since M14.1
+        // this is a real arm rather than a theoretical one — the generation
+        // map is in the deployment's Redis.
         let Some(session) = self
             .conversations
             .resolve(&self.plane().qualify(principal, named))
+            .await
+            .map_err(|error| SurfaceError::Internal(error.to_string()))?
         else {
             return Err(SurfaceError::ForeignConversation(named.to_string()));
         };
@@ -185,17 +194,36 @@ impl<S: SessionStore> ControlReads for ControlPlaneReads<S> {
     /// No existence check on this one, unlike [`Self::named_session`]. The
     /// binding is written at the moment the call was appended to that very log,
     /// so "the session exists" is not in question; a `last_seq` here would
-    /// spend a store round trip to re-ask something this node observed itself.
-    async fn session_of_call(&self, principal: &Principal, tool_use_id: &str) -> Option<SessionId> {
-        self.conversations.session_of_call(principal, tool_use_id)
+    /// spend a store round trip to re-ask something *some* node observed
+    /// itself.
+    ///
+    /// The `Result` carries only the one thing a shared table can fail with,
+    /// and it is deliberately not collapsed into the `None` that means
+    /// "nothing of yours" — see the trait's doc.
+    async fn session_of_call(
+        &self,
+        principal: &Principal,
+        tool_use_id: &str,
+    ) -> Result<Option<SessionId>, SurfaceError> {
+        self.conversations
+            .session_of_call(principal, tool_use_id)
+            .await
+            .map_err(|error| SurfaceError::Internal(error.to_string()))
     }
 
     /// No existence check here either, and for [`Self::session_of_call`]'s
     /// reason: the binding is written by the ingest at the moment it decided
     /// which session that turn's history belongs to, so the session exists
-    /// because this node created it.
-    async fn session_of_thread(&self, principal: &Principal, thread_id: &str) -> Option<SessionId> {
-        self.conversations.session_of_thread(principal, thread_id)
+    /// because the node that served that turn created it.
+    async fn session_of_thread(
+        &self,
+        principal: &Principal,
+        thread_id: &str,
+    ) -> Result<Option<SessionId>, SurfaceError> {
+        self.conversations
+            .session_of_thread(principal, thread_id)
+            .await
+            .map_err(|error| SurfaceError::Internal(error.to_string()))
     }
 
     async fn latest_session(&self, principal: &Principal) -> Option<SessionId> {

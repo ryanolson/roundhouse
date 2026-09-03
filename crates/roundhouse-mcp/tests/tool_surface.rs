@@ -89,6 +89,7 @@ async fn call_correlated(
             correlators: roundhouse_mcp::Correlators {
                 thread_id: thread_id.map(str::to_string),
                 tool_use_id: tool_use_id.map(str::to_string),
+                cache_key: None,
             },
         },
     )
@@ -633,7 +634,11 @@ impl roundhouse_mcp::reads::ControlReads for RacingReads {
         self.inner.named_session(principal, named).await
     }
 
-    async fn session_of_call(&self, principal: &Principal, tool_use_id: &str) -> Option<SessionId> {
+    async fn session_of_call(
+        &self,
+        principal: &Principal,
+        tool_use_id: &str,
+    ) -> Result<Option<SessionId>, roundhouse_mcp::SurfaceError> {
         self.inner.session_of_call(principal, tool_use_id).await
     }
 
@@ -814,7 +819,11 @@ impl roundhouse_mcp::reads::ControlReads for MemoProbeReads {
         self.inner.named_session(principal, named).await
     }
 
-    async fn session_of_call(&self, principal: &Principal, tool_use_id: &str) -> Option<SessionId> {
+    async fn session_of_call(
+        &self,
+        principal: &Principal,
+        tool_use_id: &str,
+    ) -> Result<Option<SessionId>, roundhouse_mcp::SurfaceError> {
         self.inner.session_of_call(principal, tool_use_id).await
     }
 
@@ -2185,12 +2194,17 @@ impl roundhouse_mcp::reads::ControlReads for IndependentReads {
         }
     }
 
-    async fn session_of_call(&self, principal: &Principal, tool_use_id: &str) -> Option<SessionId> {
-        self.inner
+    async fn session_of_call(
+        &self,
+        principal: &Principal,
+        tool_use_id: &str,
+    ) -> Result<Option<SessionId>, roundhouse_mcp::SurfaceError> {
+        Ok(self
+            .inner
             .tool_use_ids
             .get(tool_use_id)
             .filter(|(owner, _)| owner == principal)
-            .map(|(_, session)| session.clone())
+            .map(|(_, session)| session.clone()))
     }
 
     async fn latest_session(&self, principal: &Principal) -> Option<SessionId> {

@@ -192,7 +192,7 @@ where
     // Computed once and used for both the generation counter and the session
     // id, so the two cannot key on different strings. See [`Conversations`].
     let key = plane.qualify(principal, cache_key);
-    let current = conversations.generation(&key);
+    let current = conversations.generation(&key).await;
 
     // Generations found agreeing, and generations found disagreeing, kept
     // rather than counted from the bound: the refusal below reports what the
@@ -205,7 +205,7 @@ where
     // committed, and finding it there costs exactly one read.
     match probe(store, &bound_session(&key, current), &claimed).await? {
         Probe::Home { delta, .. } => {
-            return Ok((conversations.commit(principal, &key, current), delta));
+            return Ok((conversations.commit(principal, &key, current).await, delta));
         }
         // A generation the store has never held has nothing above it either:
         // this node's counter only ever names a generation this node actually
@@ -292,7 +292,7 @@ where
         .max_by_key(|home| (home.held, Reverse(home.generation)))
     {
         return Ok((
-            conversations.commit(principal, &key, home.generation),
+            conversations.commit(principal, &key, home.generation).await,
             home.delta,
         ));
     }
@@ -346,7 +346,7 @@ where
         .create_session(&bound_session(key, generation))
         .await
         .map_err(|error| ApiError::internal("engine_error", error.to_string()))?;
-    Ok(conversations.commit(principal, key, generation))
+    Ok(conversations.commit(principal, key, generation).await)
 }
 
 /// One generation that agrees with the claim, and how much of the claim it

@@ -615,6 +615,35 @@ async fn tools_call_in_thread(
     arguments: Value,
     thread_id: &str,
 ) -> Value {
+    tools_call_in_codex_turn(
+        rig,
+        secret,
+        tool,
+        arguments,
+        thread_id,
+        // A client session id that is nobody's cache key here, so this helper
+        // keeps exercising the *thread* arm alone. R-C5 made the sibling a
+        // correlator in its own right, and a helper that sent the cache key
+        // under test would let every assertion above pass through the wrong
+        // arm.
+        "0199a0f0-0000-7000-8000-000000000000",
+    )
+    .await
+}
+
+/// The same, with both halves of the codex `_meta` chosen by the caller.
+///
+/// One helper behind [`tools_call_in_thread`] rather than a second copy of the
+/// JSON: the two ids travel together on every real call, and a fixture that
+/// could send them in two shapes is a fixture that can drift from the client.
+async fn tools_call_in_codex_turn(
+    rig: &Rig,
+    secret: Option<&str>,
+    tool: &str,
+    arguments: Value,
+    thread_id: &str,
+    session_id: &str,
+) -> Value {
     tools_call_with_meta(
         rig,
         secret,
@@ -622,7 +651,7 @@ async fn tools_call_in_thread(
         arguments,
         Some(json!({
             "threadId": thread_id,
-            "x-codex-turn-metadata": { "session_id": "0199a0f0-0000-7000-8000-000000000000" },
+            "x-codex-turn-metadata": { "session_id": session_id },
         })),
     )
     .await
@@ -782,17 +811,20 @@ async fn post_with_extra_headers(
 // Reading the log
 // ---------------------------------------------------------------------------
 
-/// The session this node has bound `key` to, which a turn must already have
-/// established.
+/// The session this deployment has bound `key` to, which a turn must already
+/// have established.
 ///
-/// `Conversations::resolve` answers `Option` since M12.1 review F9 — a node
-/// that bound nothing says so rather than minting the generation-zero id
-/// another node's first turn would have minted. Every call site here follows a
-/// turn on that key, so the `None` is a fixture mistake and worth naming as
-/// one.
-fn bound(rig: &Rig, key: &str) -> SessionId {
+/// `Conversations::resolve` answers `Option` since M12.1 review F9 — a
+/// deployment that bound nothing says so rather than minting the
+/// generation-zero id another node's first turn would have minted. Every call
+/// site here follows a turn on that key, so the `None` is a fixture mistake and
+/// worth naming as one. The `Err` arm is the store being unreachable, which
+/// these maps (in this process) cannot be.
+async fn bound(rig: &Rig, key: &str) -> SessionId {
     rig.conversations
         .resolve(key)
+        .await
+        .expect("in-process correlation maps cannot fail to answer")
         .unwrap_or_else(|| panic!("a turn on `{key}` must have bound it before this read"))
 }
 
@@ -1986,9 +2018,10 @@ async fn a_tools_call_is_correlated_by_the_tool_use_id_the_client_quotes_back() 
     // follower. Written here rather than driven through a second surface
     // because the claim under test is the *resolution*, and mounting a third
     // router would make the failure ambiguous between the two halves.
-    let main_session = bound(&rig, "acme/ada/main");
+    let main_session = bound(&rig, "acme/ada/main").await;
     rig.conversations
-        .bind_call(&ada, "toolu_from_main", main_session.clone());
+        .bind_call(&ada, "toolu_from_main", main_session.clone())
+        .await;
 
     let answered = served(
         &tools_call_answering(
@@ -2012,7 +2045,7 @@ async fn a_tools_call_is_correlated_by_the_tool_use_id_the_client_quotes_back() 
     let guessed = served(&tools_call(&rig, Some(&key("ada")), "status", json!({})).await);
     assert_eq!(
         guessed["conversation"],
-        json!(bound(&rig, "acme/ada/other").as_str()),
+        json!(bound(&rig, "acme/ada/other").await.as_str()),
     );
 
     // And another tenant quoting the same id learns nothing from it: bob has
@@ -2064,7 +2097,7 @@ async fn a_tools_call_is_correlated_by_the_thread_id_a_codex_client_stamps() {
     let mut other = Conversation::new(&key("ada"), "other");
     other.say(&rig, "start the linter").await;
 
-    let main_session = bound(&rig, "acme/ada/main");
+    let main_session = bound(&rig, "acme/ada/main").await;
     // The thread id codex sends is the turn's own `prompt_cache_key`, which is
     // the *unqualified* name — the qualification into `acme/ada/…` is
     // roundhouse's, and doing it here would test the fixture rather than the
@@ -2083,7 +2116,7 @@ async fn a_tools_call_is_correlated_by_the_thread_id_a_codex_client_stamps() {
     let guessed = served(&tools_call(&rig, Some(&key("ada")), "status", json!({})).await);
     assert_eq!(
         guessed["conversation"],
-        json!(bound(&rig, "acme/ada/other").as_str()),
+        json!(bound(&rig, "acme/ada/other").await.as_str()),
     );
 
     // An unknown thread id falls through to that same guess rather than
@@ -2163,7 +2196,7 @@ async fn a_codex_subagents_thread_id_resolves_its_own_fork() {
     subagent.say(&rig, "grep for the callers").await;
     parent.say(&rig, "and now write it up").await;
 
-    let latest = bound(&rig, "acme/ada/main");
+    let latest = bound(&rig, "acme/ada/main").await;
     assert_eq!(
         latest.as_str(),
         "acme/ada/main",
@@ -2222,6 +2255,114 @@ async fn a_codex_subagents_thread_id_resolves_its_own_fork() {
     );
 }
 
+/// R-C5 (M14.1): the third correlator the codex `_meta` was already carrying —
+/// `x-codex-turn-metadata.session_id`, which is the turn's `prompt_cache_key`.
+///
+/// **Through the real adapter, and one level deeper than the other two.** The
+/// value is a *field of an object* on `params._meta` rather than a top-level
+/// string, so a reader that took the whole object, or that reached for
+/// `thread_id` beside it, would compile and be wrong on every real request.
+/// Only a request that actually travelled `rmcp`'s `_meta` handling can tell
+/// those apart.
+///
+/// **What it is for, and the fixture says so.** The thread id here is a
+/// subagent's own — nobody's cache key, and with no binding recorded, which is
+/// what a node sees when the binding has aged past its staleness bound or was
+/// never written. Both halves of the thread arm therefore miss, and before
+/// this arm the call fell to `latest`: a conversation of the same principal's
+/// that has nothing to do with the caller. The family's cache key is on the
+/// call already.
+#[tokio::test]
+async fn a_codex_call_falls_back_to_the_cache_key_its_turn_metadata_carries() {
+    let rig = rig(control_plane()).await;
+
+    let mut parent = Conversation::from_thread(&key("ada"), "main", "thread-parent");
+    parent.say(&rig, "plan the refactor").await;
+    // Driven last, so `latest` names it: without the new arm this is the
+    // answer, and it is *plausible*, which is the failure worth a test.
+    let mut other = Conversation::new(&key("ada"), "other");
+    other.say(&rig, "start the linter").await;
+
+    let main_session = bound(&rig, "acme/ada/main").await;
+    let other_session = bound(&rig, "acme/ada/other").await;
+    assert_ne!(main_session, other_session, "sanity: two conversations");
+
+    let answered = served(
+        &tools_call_in_codex_turn(
+            &rig,
+            Some(&key("ada")),
+            "status",
+            json!({}),
+            "thread-nothing-bound",
+            "main",
+        )
+        .await,
+    );
+    assert_eq!(
+        answered["conversation"],
+        json!(main_session.as_str()),
+        "a thread id nothing bound must fall through to the cache key the same          `_meta` carries, not to whatever this principal did most recently"
+    );
+
+    // CONTROL: the same unbound thread id with *no* turn metadata beside it is
+    // the guess, so the assertion above is about the sibling being read rather
+    // than about there being one answer available.
+    let guessed = served(
+        &tools_call_with_meta(
+            &rig,
+            Some(&key("ada")),
+            "status",
+            json!({}),
+            Some(json!({ "threadId": "thread-nothing-bound" })),
+        )
+        .await,
+    );
+    assert_eq!(guessed["conversation"], json!(other_session.as_str()));
+
+    // CONTROL: the ordering, which is F2 restated. A thread the deployment
+    // *did* bind outranks the cache key its whole family shares — reading the
+    // cache key first would answer every subagent about its parent.
+    let bound_thread = served(
+        &tools_call_in_codex_turn(
+            &rig,
+            Some(&key("ada")),
+            "status",
+            json!({}),
+            "thread-parent",
+            "other",
+        )
+        .await,
+    );
+    assert_eq!(
+        bound_thread["conversation"],
+        json!(main_session.as_str()),
+        "the thread binding is exact and the cache key is the family's, so the          binding decides"
+    );
+
+    // CONTROL: another tenant sending the same cache key learns nothing. It is
+    // qualified into *their* namespace before it is looked up, so it names
+    // nothing and the call is refused exactly as one with no `_meta` is.
+    let refused = refused(
+        &tools_call_in_codex_turn(
+            &rig,
+            Some(&key("bob")),
+            "status",
+            json!({}),
+            "thread-nothing-bound",
+            "main",
+        )
+        .await,
+    );
+    assert!(
+        refused.contains("this key has no conversation yet"),
+        "another tenant's cache key must answer as a name nobody holds: {refused}"
+    );
+    assert!(
+        !refused.contains("acme"),
+        "and it must not name the tenant that does own it: {refused}"
+    );
+}
+
 /// R-M7's refusal, over the real adapter: the model named one conversation and
 /// the client correlated the call to another.
 ///
@@ -2239,10 +2380,11 @@ async fn a_tools_call_whose_argument_fights_its_own_meta_is_refused_naming_both(
     let mut other = Conversation::new(&key("ada"), "other");
     other.say(&rig, "start the linter").await;
 
-    let main_session = bound(&rig, "acme/ada/main");
-    let other_session = bound(&rig, "acme/ada/other");
+    let main_session = bound(&rig, "acme/ada/main").await;
+    let other_session = bound(&rig, "acme/ada/other").await;
     rig.conversations
-        .bind_call(&ada, "toolu_from_main", main_session.clone());
+        .bind_call(&ada, "toolu_from_main", main_session.clone())
+        .await;
 
     let by_thread = refused(
         &tools_call_in_thread(

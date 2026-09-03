@@ -49,8 +49,17 @@
 //! renders as a fingerprint everywhere but the one seam that reveals it.
 //! [`payer`] holds whose money that was — and the rule that stops roundhouse
 //! naming a price it did not pay.
+//!
+//! Which *conversation* a turn or a control call belongs to is a fifth answer,
+//! and [`correlation`] holds the three maps that give it: the generation a
+//! cache key was last committed at, the session a tool-use id was emitted by,
+//! and the session a client-declared thread is in. It sits here rather than in
+//! the server crate because a deployment of more than one node needs those
+//! three shared, and "shared" means a trait with a Redis implementation beside
+//! the spend and fair-use ledgers.
 
 pub mod budget;
+pub mod correlation;
 pub mod credential;
 pub mod fair_use;
 pub mod payer;
@@ -64,6 +73,7 @@ use serde::{Deserialize, Serialize};
 pub use budget::{
     Allocation, Budget, BudgetState, BudgetWindow, DEFAULT_WARN_AT, Exhaustion, TurnBudget,
 };
+pub use correlation::{CorrelationError, CorrelationMaps, MemoryCorrelationMaps};
 pub use credential::{
     CredentialError, CredentialKind, CredentialMode, CredentialRef, ForwardedCredential,
     OauthEvidence, PresentedCredential, ProviderAccess, Reachable, Secret, TurnCredential,

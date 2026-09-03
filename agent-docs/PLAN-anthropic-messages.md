@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Plan: the Anthropic Messages surface, the seat, and the launcher (M11)
 
-> **Status: shipped through M14.0; M13.1 in flight (2026-09-03).** The rulings in §3 stand
+> **Status: shipped through M14.0 and M13.1; M14.1 in flight (2026-09-03).** The rulings in §3 stand
 > as written; where an implementation round moved one, the dated addenda at
 > the end of this document record the move and its reason, and win over §3
 > for the current tree. Direction set by the product owner on
@@ -1614,3 +1614,130 @@ test in the same binary are serialised by a lock, because `INFO
 commandstats` is a server-wide counter and a neighbour's own reads landed
 inside the measurement — nine and eleven where the script issues seven —
 which the "one measuring loop per binary" rule had not covered.
+
+## Addendum (2026-09-03): M14.1 — durable generations, calls and threads, the rulings
+
+D1's R12 named the minimum durable set that closes the M12.1 handoffs:
+the generation of each cache key, the session each emitted tool call
+belongs to, and the session each codex thread is in. This rung lands it,
+after M14.0's probe-then-commit made the generation counter a *hint* —
+the place a search starts — rather than the answer, which is what makes
+a durable copy of it cheap to be right about.
+
+**R-C1 — one trait, two implementations, one contract.** A
+`CorrelationMaps` trait in roundhouse-core beside the spend and fair-use
+ledgers: the generation a key was last committed at; the binding of a
+`(principal, tool_use_id)` to a session, which a second binding to a
+different session turns *ambiguous* and never silently overwrites; the
+binding of a `(principal, thread_id)` to a session, where rebinding is
+the normal case because a thread legitimately moves on every fork. The
+memory implementation is the existing tables, moved behind the trait
+with their three written properties intact (partitioned by principal;
+ambiguous remembered rather than forgotten; threads rebind where calls
+collide). The Redis implementation lives in roundhouse-store-redis, and a
+shared contract macro the memory implementation passes first is what the
+Redis one is proven against, gated as every store suite is.
+
+**R-C2 — the counter is a hint; the store is the truth; the node caches.**
+A durable generation map needs no atomicity: two nodes committing
+different generations for one key both leave a value the other's next
+search merely starts from, and the probe reaches the right home either
+way. So `Conversations` keeps its in-process table as a write-through
+cache — read through the store on a node's first touch of a key, written
+through on every commit — and the per-turn cost in the common case stays
+a local lookup. `resolve` for a named conversation answers from the
+store when the node has no entry, so M12.1's "never bound on this node
+refuses" becomes "never bound anywhere refuses", which is the same
+promise with a wider scope. `latest` stays node-local and a guess by
+contract, as R12 ruled.
+
+**R-C3 — call and thread bindings are keys with a lifetime, not a table
+with a cap.** In Redis each binding is one key with a `PEXPIRE` at the
+staleness bound (a binding older than any plausible turn is a stale guess
+whatever a table's size — D1 R14, brought forward here because the
+durable shape needs a bound and a TTL is the one Redis owns), written at
+the moment the call is streamed or the thread's turn is bound, exactly
+where the memory tables are written today; a second write of a call id to
+a different session marks it ambiguous in one script. The memory tables
+keep their capacity cap and gain the same TTL under M14.2; the contract
+asserts the semantics both share, not the bound each uses.
+
+**R-C4 — the composition root chooses by the one rule.** `ROUNDHOUSE_REDIS_URL`
+set means the Redis maps, wired beside sessions, spend and fair use; no
+second predicate, and the boot line says which maps were wired. Every
+shared key carries the declared namespace and a schema version, the
+discipline M14.2 audits across the older families.
+
+**R-C5 — codex's cache key on the control surface.** A codex
+`tools/call` carries `_meta["x-codex-turn-metadata"].session_id`, which
+is the turn's `prompt_cache_key`; the transport reads it beside
+`threadId` and hands it to the resolver as a *named* conversation after
+the thread arm, so a codex root thread's `status` at generation zero
+resolves with no table at all and a subagent's resolves through the
+thread binding first. A Claude-shaped call is unaffected.
+
+**R-C6 — what proves it.** The contract over both implementations; the
+M12.1 handoff tests re-aimed from "this node" to "any node" — two
+`Conversations` over one Redis where a fork on one is the other's
+starting point, a call bound on one resolved on the other, a thread bound
+on one resolved on the other, and a refusal for a key never bound
+anywhere; the ambiguous-call collision through the script; the staleness
+expiry through a test seam, never a production TTL change; the read-through
+cost pinned (one store read per key per node, then none). No migration: no
+deployment holds these maps. The `redis` crate does not move.
+
+### What the implementation settled beyond the rulings (2026-09-03, M14.1)
+
+- **The node cache serves the turn path only** (R-C2, refined by the
+  wiring stage test-first and accepted). R-C2 asked for a write-through
+  cache read local-first on every family. The generation memo is exactly
+  that for the turn path — three-state, unread / absent / at-n, read on a
+  node's first touch of a key and primed by `commit`, so the common turn
+  costs no store read — but the control surface's reads (`resolve` for a
+  named conversation, `session_of_call`, `session_of_thread`) go to the
+  store on every ask: a cached generation goes stale when another node
+  forks and would narrow a session the client left; a cached call binding
+  cannot see the ambiguous marker another node's colliding claim wrote;
+  a cached thread binding goes stale on any fork served elsewhere. Each
+  of those is a wrong-conversation answer with a network in the middle,
+  and a control call is rare beside a turn. `latest` stays node-local.
+- **A store outage on a correlator read is an outage, not "unknown".**
+  `session_of_call` and `session_of_thread` on the reads seam return a
+  `Result`; the justification for `Option` — the deployment wrote this
+  table itself, so nothing can fail — died with the durable maps, and
+  answering an outage as an unknown correlator would quietly hand the
+  caller its `latest`, which the M12.1 thread arm already refused to do.
+- **R-C5's gain, stated exactly** (partially valid as ruled): a codex root
+  thread's `status` at generation zero already resolved through R-M7's
+  named path, because a root thread's id is its cache key. The cache-key
+  arm's real gain is the member whose thread id is nobody's cache key and
+  whose thread binding the deployment does not hold — never recorded, or
+  aged past its staleness bound — which reached `latest` before and
+  reaches its own family's conversation now. The arm sits after the
+  thread arm and before the tool-use id.
+- **One predicate for four families.** `fair_use_backend` became
+  `shared_backend`, the fourth caller being the correlation maps; the
+  boot line names them. The composition-root wiring had no test — the
+  refute pass's one green mutation — and gained the same real-Redis boot
+  test the fair-use family has.
+- **A write on the streaming path, deliberately.** In a durable
+  deployment `bind_call` is awaited inline in the Messages follower's
+  projection loop: one SET-shaped round trip per emitted tool call before
+  the frame carrying the id leaves, because spawning it would race the
+  client's answer to that very id.
+- **Keys and values.** `rh:v1:corr:...`, namespaced and schema-versioned,
+  values tagged so no client-spellable session id can impersonate the
+  ambiguous marker, a delimiter in an id unable to make two members share
+  a key, a foreign value refused rather than read as never bound; two
+  named staleness bounds with a per-handle test seam.
+- **Left for M14.2, by name:** the memory tables' staleness bound; the
+  generation memo is uncapped (bounded by the conversations a node has
+  served) and has no staleness bound; `Conversations::bind` is now
+  read-then-write and has no serving-path caller.
+- **Refute by mutation against the real server**: ten mutations — the
+  ambiguous marker overwritten, the call expiry dropped, the write-through
+  removed, the memo never primed, generation zero minted for an unknown
+  key, the two `_meta` keys swapped, the cache-key arm before the thread
+  arm, the schema version dropped from a key, the composition root
+  unconditional, call bindings unpartitioned — nine red under named
+  guards and the tenth closed test-first.

@@ -63,11 +63,13 @@ use roundhouse_server::catalog_config::{BUILT_IN_OPENAI, ProviderConfig};
 use roundhouse_server::control_config::crosscheck::CrossChecks;
 use roundhouse_server::{
     ControlDirectory, ControlPlane, ControlPlaneReads, Conversations, DirectoryError,
-    EchoLocalExecutor, Engine, EngineConfig, FairUseBackend, FleetJudge, JudgeConfig,
-    MemoryDirectoryStore, admin_api, catalog_config, control_config, fair_use_backend, http,
-    mcp_api, messages_api, metrics_api, relay_api, responses_api,
+    EchoLocalExecutor, Engine, EngineConfig, FleetJudge, JudgeConfig, MemoryDirectoryStore,
+    SharedBackend, admin_api, catalog_config, control_config, http, mcp_api, messages_api,
+    metrics_api, relay_api, responses_api, shared_backend,
 };
-use roundhouse_store_redis::{RedisFairUseLedger, RedisSessionStore, RedisSpendLedger};
+use roundhouse_store_redis::{
+    RedisCorrelationMaps, RedisFairUseLedger, RedisSessionStore, RedisSpendLedger,
+};
 use tracing_subscriber::EnvFilter;
 
 /// The echo provider's catalog entry.
@@ -803,8 +805,8 @@ async fn main() -> anyhow::Result<()> {
     // arrives first would mean resolving this ledger inside both arms of the
     // match below, and two sites choosing one ledger is the shape this rung
     // removed.
-    let fair_use: Arc<dyn FairUseLedger> = match fair_use_backend(redis_url.as_deref()) {
-        FairUseBackend::Shared { url } => {
+    let fair_use: Arc<dyn FairUseLedger> = match shared_backend(redis_url.as_deref()) {
+        SharedBackend::Shared { url } => {
             let ledger = RedisFairUseLedger::connect(url).await.with_context(|| {
                 format!("opening the fair-use ledger in the Redis named by {REDIS_VAR}")
             })?;
@@ -815,7 +817,7 @@ async fn main() -> anyhow::Result<()> {
             );
             Arc::new(ledger)
         }
-        FairUseBackend::PerProcess => {
+        SharedBackend::PerProcess => {
             tracing::info!(
                 var = REDIS_VAR,
                 "fair-use windows are counted in this process's memory; a ceiling \
@@ -825,6 +827,47 @@ async fn main() -> anyhow::Result<()> {
             Arc::new(MemoryFairUseLedger::new())
         }
     };
+
+    // Which correlation maps this deployment gets — the generation of each
+    // cache key, the session each emitted tool call belongs to, and the
+    // session each client thread is in — resolved by the *same* predicate as
+    // the three families above and by no second one (M14.1, R-C4).
+    //
+    // The reason it is the same rule is the reason it is the same rule for
+    // fair use: naming a Redis is how an operator says "this is more than one
+    // process", and it is exactly then that a per-process correlation table
+    // stops being able to answer the question it exists for. A control call
+    // landing on a node that served none of the conversation's turns is
+    // refused or guessed at, however exactly the client named itself — the
+    // M12.1 F9 handoff, which this closes only for a deployment that shares
+    // the maps.
+    //
+    // `Conversations` is built here rather than inside `serve` because *which
+    // maps* is this site's decision and nothing else's; the node-local halves
+    // it keeps beside them — `latest`, and the generation memo — are the same
+    // either way.
+    let conversations = Arc::new(match shared_backend(redis_url.as_deref()) {
+        SharedBackend::Shared { url } => {
+            let maps = RedisCorrelationMaps::connect(url).await.with_context(|| {
+                format!("opening the correlation maps in the Redis named by {REDIS_VAR}")
+            })?;
+            tracing::info!(
+                var = REDIS_VAR,
+                "conversation correlation is shared in Redis; a cache key, a tool call \
+                 or a client thread bound by one node resolves on every node"
+            );
+            Conversations::over(Arc::new(maps))
+        }
+        SharedBackend::PerProcess => {
+            tracing::info!(
+                var = REDIS_VAR,
+                "conversation correlation is held in this process's memory; a control \
+                 call landing on a node that served none of its conversation's turns \
+                 falls back to a guess or refuses"
+            );
+            Conversations::new()
+        }
+    });
 
     match redis_url {
         Some(url) => {
@@ -858,6 +901,7 @@ async fn main() -> anyhow::Result<()> {
                 Arc::new(store),
                 Arc::new(spend),
                 fair_use,
+                conversations,
                 Arc::clone(&directory),
                 catalog,
                 frontier,
@@ -878,6 +922,7 @@ async fn main() -> anyhow::Result<()> {
                 Arc::new(MemoryStore::new()),
                 Arc::new(MemorySpendLedger::new()),
                 fair_use,
+                conversations,
                 Arc::clone(&directory),
                 catalog,
                 frontier,
@@ -895,11 +940,14 @@ async fn main() -> anyhow::Result<()> {
 /// chosen.
 ///
 /// **The one composition site**, and two of its values are shared rather than
-/// minted per router on purpose. [`Conversations`] is the node's answer to
-/// "which session is the conversation the client calls `main`?", and the
-/// Responses surface and the control surface both ask it — two tables would
-/// agree only until a client edited its own history. [`ControlStore`] is the
-/// node's control-plane state, and the engine and the control surface hold
+/// minted per router on purpose. [`Conversations`] is the deployment's answer
+/// to "which session is the conversation the client calls `main`?", and the
+/// Responses surface and the control surface both ask it — two of them would
+/// agree only until a client edited its own history. It arrives as an argument
+/// rather than being built here because *which maps are behind it* is the
+/// caller's one decision (M14.1, R-C4), taken by the same predicate that chose
+/// the store, the spend ledger and the fair-use buckets. [`ControlStore`] is
+/// the node's control-plane state, and the engine and the control surface hold
 /// opposite ends of it: the surface writes an agent's overlay and the engine
 /// spends it at the start of the next turn.
 ///
@@ -914,6 +962,7 @@ async fn serve<S: SessionStore>(
     store: Arc<S>,
     spend: Arc<dyn SpendLedger>,
     fair_use: Arc<dyn FairUseLedger>,
+    conversations: Arc<Conversations>,
     directory: Arc<ControlDirectory>,
     catalog: StaticFrontierCatalog,
     frontier: Arc<FrontierClients>,
@@ -922,7 +971,6 @@ async fn serve<S: SessionStore>(
     metrics_config: Arc<MetricsConfig>,
     listener: tokio::net::TcpListener,
 ) -> anyhow::Result<()> {
-    let conversations = Arc::new(Conversations::new());
     let control = Arc::new(ControlStore::new());
     // The judge's own transport, resolved from its own catalog entry's
     // provider rather than from whatever client the engine happens to hold.

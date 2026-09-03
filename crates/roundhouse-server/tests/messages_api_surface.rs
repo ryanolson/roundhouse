@@ -4722,7 +4722,10 @@ async fn the_captured_mcp_tool_loop_stores_one_flat_call_and_rejoins_its_session
     // this principal, and it was recorded without moving `latest` off anything.
     let principal = roundhouse_core::control::Principal::default_open();
     assert_eq!(
-        conversations.session_of_call(&principal, MCP_CALL_ID),
+        conversations
+            .session_of_call(&principal, MCP_CALL_ID)
+            .await
+            .expect("in-process correlation maps cannot fail to answer"),
         Some(SessionId::new(&session)),
         "the MCP call answering this block must resolve to the conversation \
          that emitted it, not to whichever conversation opened a turn last"

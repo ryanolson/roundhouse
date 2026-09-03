@@ -51,13 +51,15 @@ use crate::overlay::{OverlayScope, PreferMode};
 /// [`ControlReads::resolve_session`](crate::reads::ControlReads::resolve_session),
 /// which is where that ruling lives and the only place it is stated.
 ///
-/// **Why neither correlator is a tool argument** (M12, R-M2; M12.1, R-M7).
-/// Neither is something the model chose to say — both are protocol metadata the
-/// *client* attaches on `params._meta`, one naming the `tool_use` block
-/// roundhouse itself emitted (`claudecode/toolUseId`) and one naming the thread
-/// the client is running (`threadId`). Putting either in the arguments schema
-/// would invite a model to invent one, and `deny_unknown_fields` would then
-/// refuse the call of a client that sent it honestly.
+/// **Why no correlator is a tool argument** (M12, R-M2; M12.1, R-M7; M14.1,
+/// R-C5). None of them is something the model chose to say — all three are
+/// protocol metadata the *client* attaches on `params._meta`: one naming the
+/// `tool_use` block roundhouse itself emitted (`claudecode/toolUseId`), one
+/// naming the thread the client is running (`threadId`), and one carrying the
+/// client's own session id, which is the turn's `prompt_cache_key`
+/// (`x-codex-turn-metadata.session_id`). Putting any of them in the arguments
+/// schema would invite a model to invent one, and `deny_unknown_fields` would
+/// then refuse the call of a client that sent it honestly.
 #[derive(Debug, Clone)]
 pub struct Caller {
     principal: Principal,
@@ -122,6 +124,28 @@ pub struct Correlators {
     /// answering (M12, R-M2). It resolves as a **call**, through the table of
     /// ids this node emitted.
     pub tool_use_id: Option<String>,
+    /// `_meta["x-codex-turn-metadata"].session_id` — the client's own session
+    /// id, which is the `prompt_cache_key` its turns carry (M14.1, R-C5). It
+    /// resolves as a **name**, through the caller's own namespace, exactly as
+    /// [`Self::thread_id`] does on the arm behind the thread binding.
+    ///
+    /// **Named `cache_key` rather than `session_id`, deliberately.** In this
+    /// deployment a `SessionId` is roundhouse's own id for a log, and this is
+    /// the *client's* id for its conversation; a field that borrowed the name
+    /// would read, at every hop, as though it already were the answer. What it
+    /// actually is is the string `ControlPlane::qualify` turns into that
+    /// answer, which is what "cache key" means everywhere else here.
+    ///
+    /// What it buys is narrow and worth stating narrowly: for a codex *root*
+    /// thread this is the same string as [`Self::thread_id`], which the thread
+    /// arm's own name lookup already resolved, so nothing changes there. It is
+    /// the member whose thread id is nobody's cache key and whose binding the
+    /// deployment does not hold — never recorded, or aged out — that this
+    /// catches, and it catches it as the *family's* conversation rather than
+    /// as `latest`, which for an agent family is a coin toss between its
+    /// members. The ordering behind the thread binding is what keeps a
+    /// subagent whose binding *is* held from being answered about its parent.
+    pub cache_key: Option<String>,
 }
 
 /// Everything an MCP client can ask of a roundhouse deployment.

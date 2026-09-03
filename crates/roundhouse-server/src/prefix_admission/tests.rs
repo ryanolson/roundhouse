@@ -447,9 +447,11 @@ async fn a_refused_request_leaves_latest_and_the_binding_where_the_last_turn_lef
     }
 
     let qualified_key = ControlPlane::Open.qualify(&rig.principal, &rig.key);
-    rig.conversations.commit(&rig.principal, &qualified_key, 0);
+    rig.conversations
+        .commit(&rig.principal, &qualified_key, 0)
+        .await;
     let latest_before = rig.conversations.latest(&rig.principal);
-    let resolved_before = rig.conversations.resolve(&qualified_key);
+    let resolved_before = rig.conversations.resolve(&qualified_key).await.unwrap();
 
     let error = rig
         .bind(vec![user("none of the above")])
@@ -465,7 +467,7 @@ async fn a_refused_request_leaves_latest_and_the_binding_where_the_last_turn_lef
          generation the search merely looked at"
     );
     assert_eq!(
-        rig.conversations.resolve(&qualified_key),
+        rig.conversations.resolve(&qualified_key).await.unwrap(),
         resolved_before,
         "F9: `resolve` reads the same counter, so it must not be left \
          naming a generation this node never served either"
@@ -677,11 +679,13 @@ async fn two_agreeing_generations_resolve_to_the_one_holding_more() {
     rig.seed(1, vec![user("hello"), assistant("hi"), user("again")])
         .await;
     rig.seed(2, vec![user("a different opening")]).await;
-    rig.conversations.commit(
-        &rig.principal,
-        &ControlPlane::Open.qualify(&rig.principal, &rig.key),
-        2,
-    );
+    rig.conversations
+        .commit(
+            &rig.principal,
+            &ControlPlane::Open.qualify(&rig.principal, &rig.key),
+            2,
+        )
+        .await;
 
     let (session_id, delta) = rig
         .bind(vec![
@@ -819,11 +823,13 @@ async fn the_upward_walks_free_slot_is_not_created_when_the_home_is_elsewhere() 
     let rig = Rig::new("acme/ada/no-residual-fork");
     rig.seed(0, vec![user("hello")]).await;
     rig.seed(1, vec![user("goodbye")]).await;
-    rig.conversations.commit(
-        &rig.principal,
-        &ControlPlane::Open.qualify(&rig.principal, &rig.key),
-        1,
-    );
+    rig.conversations
+        .commit(
+            &rig.principal,
+            &ControlPlane::Open.qualify(&rig.principal, &rig.key),
+            1,
+        )
+        .await;
 
     let resume = vec![user("hello"), user("more")];
     let (session_id, delta) = rig

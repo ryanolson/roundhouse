@@ -81,11 +81,26 @@ pub trait ControlReads: Send + Sync + 'static {
     /// The conversation `tool_use_id` was emitted into, if this caller holds
     /// it.
     ///
-    /// `Option` and not `Result`: this is a lookup in a table the deployment
-    /// wrote itself at the moment it streamed the call, so there is no
-    /// existence question to fail on and an id that is not this caller's is
-    /// indistinguishable from one the deployment never emitted.
-    async fn session_of_call(&self, principal: &Principal, tool_use_id: &str) -> Option<SessionId>;
+    /// `Ok(None)` covers unknown, evicted, ambiguous and another tenant's
+    /// alike: the deployment wrote this binding itself at the moment it
+    /// streamed the call, so there is no existence question to fail on, and an
+    /// id that is not this caller's is indistinguishable from one nothing ever
+    /// emitted.
+    ///
+    /// **The `Result` is M14.1's, and it is the same asymmetry
+    /// [`Self::named_session`] carries** (R-C1). This was an `Option` while the
+    /// table was a `HashMap` in the answering process: there was nothing to
+    /// fail. The bindings are in a store shared across nodes now, and a store
+    /// that cannot be *reached* is not one of the four answers above — it is a
+    /// fact about the deployment. Left as an `Option` it would spell "no
+    /// conversation of yours", and [`Self::resolve_session`] would hand the
+    /// caller its `latest`: a plausible answer about the wrong conversation,
+    /// which is the failure this whole ruling removes.
+    async fn session_of_call(
+        &self,
+        principal: &Principal,
+        tool_use_id: &str,
+    ) -> Result<Option<SessionId>, SurfaceError>;
 
     /// The principal's most recent conversation, or `None` for a principal
     /// this deployment has served no turn for.
@@ -107,20 +122,24 @@ pub trait ControlReads: Send + Sync + 'static {
     /// record which session each thread's latest turn went to and answer this
     /// with no guess.
     ///
-    /// `Option` and not `Result`, exactly as [`Self::session_of_call`] is: a
-    /// lookup in a table the deployment wrote itself, where an id that is not
-    /// this caller's is indistinguishable from one never seen.
+    /// `Ok(None)` for an unknown, evicted or foreign thread, and the `Result`
+    /// for an unreachable store, exactly as [`Self::session_of_call`] carries
+    /// both and for the reason spelled out there.
     ///
-    /// The default answers `None`, meaning "this deployment records no such
+    /// The default answers `Ok(None)`, meaning "this deployment records no such
     /// thing" — and a `None` costs only a fall through to the R-M7 named path,
     /// which is where every implementation was before this method existed. It
     /// is a default rather than a required method for [`Self::session_cursor`]'s
     /// reason: the table is a property of an implementation that *ingests the
     /// turns*, and a double that only answers questions about sessions has no
     /// ingest to have watched.
-    async fn session_of_thread(&self, principal: &Principal, thread_id: &str) -> Option<SessionId> {
+    async fn session_of_thread(
+        &self,
+        principal: &Principal,
+        thread_id: &str,
+    ) -> Result<Option<SessionId>, SurfaceError> {
         let _ = (principal, thread_id);
-        None
+        Ok(None)
     }
 
     /// Which conversation this call concerns.
@@ -137,7 +156,7 @@ pub trait ControlReads: Send + Sync + 'static {
     /// a store outage — while the server spelled it correctly. Nothing was red,
     /// because neither double had a store that could fail.
     ///
-    /// Four answers in a fixed order:
+    /// Five answers in a fixed order:
     ///
     /// 1. `conversation` — a name the model wrote, resolved through
     ///    [`Self::named_session`]. First because it is the only one the *agent*
@@ -175,17 +194,51 @@ pub trait ControlReads: Send + Sync + 'static {
     ///    Both spellings resolve *in this caller's namespace*: the table is
     ///    partitioned by principal and the name is qualified, so neither can
     ///    reach another tenant's session.
-    /// 3. `correlators.tool_use_id` — the id of the `tool_use` block this call
+    /// 3. `correlators.cache_key` — codex's
+    ///    `_meta["x-codex-turn-metadata"].session_id`, resolved as a **name**
+    ///    through [`Self::named_session`] (M14.1, R-C5). It is the client's own
+    ///    session id, byte-identical to the `prompt_cache_key` its turns carry,
+    ///    and it needs no table at all: a never-forked conversation's session id
+    ///    is a pure function of the caller and that string, and the generation
+    ///    map answers the forked case from a store every node shares.
+    ///
+    ///    **What it adds, stated narrowly, because a root thread was already
+    ///    served.** For a codex *root* thread this string and `threadId` are
+    ///    one value, so (2)'s own name lookup answers it and this arm is the
+    ///    same answer by a second route — which is why (3) does not run at all
+    ///    when (2) answered. Where it earns its place is the member whose
+    ///    thread id is *nobody's* cache key and whose thread binding this
+    ///    deployment does not hold: never recorded, or aged past its staleness
+    ///    bound. Both halves of (2) then miss, and before this arm the call
+    ///    fell straight to `latest` — "whatever this principal did most
+    ///    recently", which for an agent family is a coin toss between its
+    ///    members. The family's own cache key names the family's conversation,
+    ///    which is not the subagent's exactly but is not somebody else's
+    ///    either.
+    ///
+    ///    Behind (2) rather than in front of it, and that ordering is the same
+    ///    F2 correction: a whole codex agent family shares this one string
+    ///    while each member stamps its own thread id, so reading it first would
+    ///    answer *every* subagent about its parent even where the exact
+    ///    binding was available. Resolved only when (2) answered nothing — the
+    ///    arms are ordered, so resolving a name the order will discard would
+    ///    spend a store round trip for nothing, and for a root thread it is the
+    ///    *same* lookup twice.
+    ///
+    ///    `ForeignConversation` is swallowed here exactly as on the thread
+    ///    arm's name lookup, and every other error is returned, for the reason
+    ///    below.
+    /// 4. `correlators.tool_use_id` — the id of the `tool_use` block this call
     ///    is answering, which is an id roundhouse emitted into exactly one
     ///    session. Exact where the fallback below is a guess: a parent agent
     ///    and its subagents share a principal and race for the same "most
     ///    recent" slot, and the id is what tells them apart.
     ///
-    ///    Ordered against (2) rather than refused against it, unlike (1)
-    ///    against either: two correlators are one *client* naming one call in
-    ///    two vocabularies, where an argument and a correlator are the *model*
-    ///    and the *client* answering separately.
-    /// 4. None of them — [`Self::latest_session`], a guess and never more.
+    ///    Ordered against (2) and (3) rather than refused against them, unlike
+    ///    (1) against any of them: three correlators are one *client* naming
+    ///    one call in three vocabularies, where an argument and a correlator
+    ///    are the *model* and the *client* answering separately.
+    /// 5. None of them — [`Self::latest_session`], a guess and never more.
     ///
     /// # The two refusals, and the one swallow between them
     ///
@@ -200,13 +253,15 @@ pub trait ControlReads: Send + Sync + 'static {
     /// wrote a name is asking about that name and nothing else; a correlator is
     /// the client volunteering context it may simply be wrong about.
     ///
-    /// **Only `ForeignConversation` is swallowed on the thread arm.** That
+    /// **Only `ForeignConversation` is swallowed on the two named arms.** That
     /// oracle argument is about one question — does this conversation exist for
     /// this caller — and it justifies collapsing only the answers to *it*.
     /// Every other error is a fact about the deployment, and answering a store
     /// outage as "unknown correlator" would quietly hand the caller its
     /// `latest`: a plausible answer about the wrong conversation, which is the
-    /// failure this whole ruling removes.
+    /// failure this whole ruling removes. The same asymmetry is why the two
+    /// table lookups return a `Result` since M14.1: the tables are in a store
+    /// shared across nodes now, and an unreachable one is not an unknown id.
     ///
     /// A principal with no session at all is [`SurfaceError::NoSession`] —
     /// never a silent empty answer.
@@ -260,21 +315,30 @@ pub trait ControlReads: Send + Sync + 'static {
             Some(thread) if Some(thread) == conversation => named.clone(),
             // Exact first, then the name (R-M9). See rule (2) above for why a
             // thread id is not reliably a cache key.
-            Some(thread) => match self.session_of_thread(principal, thread).await {
+            Some(thread) => match self.session_of_thread(principal, thread).await? {
                 Some(session) => Some(session),
-                None => match self.named_session(principal, thread).await {
-                    Ok(session) => Some(session),
-                    Err(SurfaceError::ForeignConversation(_)) => None,
-                    Err(error) => return Err(error),
-                },
+                None => named_correlator(self, principal, thread).await?,
             },
         };
+        // (3) R-C5. Resolved only where the thread arm answered nothing: the
+        // arms are ordered, so a name the order would discard is a store round
+        // trip spent for no reader — and for a codex root thread, where
+        // `threadId` and this string are the same value, it is the identical
+        // lookup a second time.
+        let cache_key = match (&thread, correlators.cache_key.as_deref()) {
+            (Some(_), _) | (None, None) => None,
+            // One string, one answer (F8), as on the thread arm: an argument
+            // and a correlator spelling one name must not manufacture a
+            // disagreement between two of this deployment's own reads.
+            (None, Some(key)) if Some(key) == conversation => named.clone(),
+            (None, Some(key)) => named_correlator(self, principal, key).await?,
+        };
         let call = match correlators.tool_use_id.as_deref() {
-            Some(id) => self.session_of_call(principal, id).await,
+            Some(id) => self.session_of_call(principal, id).await?,
             None => None,
         };
 
-        match (named, thread.or(call)) {
+        match (named, thread.or(cache_key).or(call)) {
             (Some(named), Some(correlated)) if named != correlated => {
                 Err(SurfaceError::ContradictoryConversation {
                     named: named.to_string(),
@@ -375,6 +439,33 @@ pub trait ControlReads: Send + Sync + 'static {
     fn now_ms(&self) -> u64;
 }
 
+/// `named`, resolved as a conversation of `principal`'s, with the one swallow a
+/// *correlator* is allowed and no other.
+///
+/// **One function because the asymmetry has to have one home** (M12.1 review,
+/// F1). Two arms of [`ControlReads::resolve_session`] resolve a client-supplied
+/// string as a name — the thread id behind its binding, and codex's cache key —
+/// and each must fall through for "no conversation of yours" while returning
+/// everything else. F1 is what happened the last time that rule was written
+/// twice: two doubles spelled it `.ok()`, which eats a store outage as well,
+/// and nothing was red because neither double had a store that could fail.
+///
+/// A free function rather than a trait method: it is a rule about how the
+/// provided resolver reads an implementor's [`ControlReads::named_session`],
+/// not a question an implementor answers, and a method would be one more thing
+/// a double could override into disagreement.
+async fn named_correlator<R: ControlReads + ?Sized>(
+    reads: &R,
+    principal: &Principal,
+    named: &str,
+) -> Result<Option<SessionId>, SurfaceError> {
+    match reads.named_session(principal, named).await {
+        Ok(session) => Ok(Some(session)),
+        Err(SurfaceError::ForeignConversation(_)) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -437,16 +528,22 @@ mod tests {
             &self,
             _principal: &Principal,
             tool_use_id: &str,
-        ) -> Option<SessionId> {
-            self.calls.get(tool_use_id).cloned()
+        ) -> Result<Option<SessionId>, SurfaceError> {
+            if self.outage {
+                return Err(SurfaceError::Internal("redis connection reset".into()));
+            }
+            Ok(self.calls.get(tool_use_id).cloned())
         }
 
         async fn session_of_thread(
             &self,
             _principal: &Principal,
             thread_id: &str,
-        ) -> Option<SessionId> {
-            self.threads.get(thread_id).cloned()
+        ) -> Result<Option<SessionId>, SurfaceError> {
+            if self.outage {
+                return Err(SurfaceError::Internal("redis connection reset".into()));
+            }
+            Ok(self.threads.get(thread_id).cloned())
         }
 
         async fn latest_session(&self, _principal: &Principal) -> Option<SessionId> {
@@ -482,6 +579,22 @@ mod tests {
         Correlators {
             thread_id: thread_id.map(str::to_string),
             tool_use_id: tool_use_id.map(str::to_string),
+            cache_key: None,
+        }
+    }
+
+    /// The `_meta` a codex client actually sends: its thread id and, beside it,
+    /// the turn metadata's `session_id` — which is that turn's
+    /// `prompt_cache_key` (R-C5).
+    ///
+    /// Both together rather than one helper each, because the ordering between
+    /// them is the thing under test and a fixture that could send only one of
+    /// them would make the interesting case unspellable.
+    fn codex_meta(thread_id: Option<&str>, cache_key: Option<&str>) -> Correlators {
+        Correlators {
+            thread_id: thread_id.map(str::to_string),
+            tool_use_id: None,
+            cache_key: cache_key.map(str::to_string),
         }
     }
 
@@ -726,6 +839,158 @@ mod tests {
         assert_eq!(
             tables
                 .resolve_session(&ada(), Some("main"), &Correlators::default())
+                .await
+                .ok(),
+            Some(most_recent()),
+        );
+    }
+
+    /// M14.1, R-C5: a codex root thread resolves from the cache key it was
+    /// already sending, on a deployment holding no thread binding at all.
+    ///
+    /// This is the whole of what the third correlator buys. The thread table is
+    /// *empty* here — the state of any node that served none of this
+    /// conversation's turns — and before this arm the call fell through to
+    /// `latest`, which for a principal running several agents is a coin toss
+    /// and for a fresh node is `NoSession`. The name is in `names` because
+    /// that is what a durable generation map makes true: at generation zero the
+    /// session id is a pure function of the caller and this string.
+    #[tokio::test]
+    async fn a_codex_root_thread_resolves_from_its_cache_key_with_no_thread_binding() {
+        let tables = Tables {
+            names: HashMap::from([("cache-key", thread())]),
+            latest: Some(most_recent()),
+            ..Tables::default()
+        };
+
+        assert_eq!(
+            tables
+                .resolve_session(
+                    &ada(),
+                    None,
+                    &codex_meta(Some("cache-key"), Some("cache-key"))
+                )
+                .await
+                .ok(),
+            Some(thread()),
+            "a root thread stamps one string as both its thread id and its              session id, and either route reaches the same conversation"
+        );
+
+        // The case the arm exists for: a thread id that is *not* the cache key
+        // and that nothing has bound. The thread arm misses both ways — no
+        // binding, and no conversation under that name — and the cache key is
+        // what is left before the guess.
+        assert_eq!(
+            tables
+                .resolve_session(
+                    &ada(),
+                    None,
+                    &codex_meta(Some("unbound-thread"), Some("cache-key"))
+                )
+                .await
+                .ok(),
+            Some(thread()),
+            "the cache key answers where the thread arm found nothing, rather              than the call falling to `latest`"
+        );
+
+        // CONTROL: the arm is a *fallback* and not a promotion. A subagent
+        // whose own thread is bound stays in its own conversation, where its
+        // family's shared cache key would have answered about the parent —
+        // which is F2 exactly.
+        let with_binding = Tables {
+            names: HashMap::from([("cache-key", most_recent())]),
+            threads: HashMap::from([("subagent-thread", subagent())]),
+            latest: None,
+            ..Tables::default()
+        };
+        assert_eq!(
+            with_binding
+                .resolve_session(
+                    &ada(),
+                    None,
+                    &codex_meta(Some("subagent-thread"), Some("cache-key"))
+                )
+                .await
+                .ok(),
+            Some(subagent()),
+            "the thread binding is exact and the family's cache key is not, so              reading the cache key first would answer every subagent about its              parent"
+        );
+
+        // CONTROL: a cache key naming no conversation of this caller's falls
+        // through like any other correlator, rather than refusing.
+        assert_eq!(
+            tables
+                .resolve_session(&ada(), None, &codex_meta(None, Some("nobodys")))
+                .await
+                .ok(),
+            Some(most_recent()),
+        );
+
+        // CONTROL: a Claude-shaped call carries none of this and is unaffected.
+        let claude = Tables {
+            calls: HashMap::from([("toolu_sub", subagent())]),
+            latest: Some(most_recent()),
+            ..Tables::default()
+        };
+        assert_eq!(
+            claude
+                .resolve_session(&ada(), None, &correlators(None, Some("toolu_sub")))
+                .await
+                .ok(),
+            Some(subagent()),
+        );
+    }
+
+    /// M14.1: a table lookup that could not reach its store refuses, where an
+    /// id the store answered "no" about falls through.
+    ///
+    /// The two are one line apart in the resolver and were one answer before
+    /// the tables became shared: `Option` could only say "nothing of yours",
+    /// so an unreachable store handed the caller `latest` — a plausible answer
+    /// about the wrong conversation. The control below is what proves this
+    /// test is about the outage and not about the correlator being unknown.
+    #[tokio::test]
+    async fn a_correlator_whose_store_is_unreachable_refuses_rather_than_guessing() {
+        let outage = Tables {
+            calls: HashMap::from([("toolu_sub", subagent())]),
+            latest: Some(most_recent()),
+            outage: true,
+            ..Tables::default()
+        };
+        let error = outage
+            .resolve_session(&ada(), None, &correlators(None, Some("toolu_sub")))
+            .await
+            .expect_err("a store that cannot answer has not answered");
+        assert!(
+            matches!(error, SurfaceError::Internal(_)),
+            "an unreachable call table must not read as an unknown id: {error}"
+        );
+
+        let thread_outage = Tables {
+            latest: Some(most_recent()),
+            outage: true,
+            ..Tables::default()
+        };
+        assert!(
+            matches!(
+                thread_outage
+                    .resolve_session(&ada(), None, &correlators(Some("thread"), None))
+                    .await,
+                Err(SurfaceError::Internal(_))
+            ),
+            "and neither must an unreachable thread table"
+        );
+
+        // CONTROL: the same tables, reachable. An id nothing bound falls
+        // through to the guess, which is the answer the outage must not be
+        // confused with.
+        let reachable = Tables {
+            latest: Some(most_recent()),
+            ..Tables::default()
+        };
+        assert_eq!(
+            reachable
+                .resolve_session(&ada(), None, &correlators(None, Some("toolu_nobody")))
                 .await
                 .ok(),
             Some(most_recent()),
