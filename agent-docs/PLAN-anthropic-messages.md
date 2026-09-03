@@ -1518,7 +1518,9 @@ for data that does not exist. The `redis` crate does not move.
   client retries; it is now `ApiError::unavailable`, and the Messages
   surface already spells 503, and only 503, as `overloaded_error` — the
   one string Claude Code retries on (R-F7).
-- **Divergences, stated.** After a rebuild, a draw stamped later than the
+- **Divergences, stated.** [Superseded 2026-09-03 by R-F9 in the review
+  section below: under the high-water-mark clock neither divergence
+  exists.] After a rebuild, a draw stamped later than the
   `now_ms` a check supplies is excluded — fields cannot be enumerated
   forward without bound — extending the backwards-clock divergence M13
   recorded and reachable only with a clock that steps backwards between a
@@ -1545,3 +1547,70 @@ for data that does not exist. The `redis` crate does not move.
   reproduce it in 135 bounded runs, and the capture is a thread-local
   subscriber serialized by one mutex, so the claim is recorded as not
   reproducible rather than papered over with a retry.
+
+### What the review round changed (2026-09-03, M13.1)
+
+Nine findings from two lenses, eight ruled valid by their refuters and one
+whose refuter exhausted its output budget and was ruled test-first by the
+fix stage. Three of them were one defect, and it moved a ruling.
+
+**R-F9 — the ledger's clock is the high-water mark of every time it has
+seen, in both implementations.** Decay owned by the read made the Redis
+ledger's answer a function of the largest `now_ms` ever supplied for a
+scope rather than of the `now_ms` handed to a call, and three faces
+followed: a draw stamped below a decayed `from` lowered `from` and was
+subtracted twice on the next decay, under-counting in the permissive
+direction (F6); a check clock one millisecond behind an earlier check
+admitted where the memory ledger refused (F9); and a draw stamped a few
+milliseconds past the check's clock across a bucket boundary sat beyond
+the retry walk's reach, so the refusal said "retry now" instead of the
+real departure time (F8). The honest rule is the one the store had
+already half-adopted: the clock is monotone. A check earlier than the mark
+is evaluated at the mark; a draw earlier than the mark lands in its own
+bucket and never widens a window backwards; a draw later than the mark
+advances it, so the next check's window and walk cover every bucket the
+sum does. No admission can be made more permissive by a clock stepping
+back. The memory ledger — the specification of outputs — adopts the same
+rule, so the contract now asserts agreement under a backwards check clock
+and under an out-of-order draw, and the "divergences" the M13 and M13.1
+addenda recorded are gone: under the mark there are none. Two things the
+implementation settled: the per-window `to` field stays beside the mark,
+because the read-free reset needs to know whether *this window's* newest
+bucket has aged out, which a per-scope mark cannot say; and a check whose
+clock is ahead of the mark pays one `HSET` per capped scope, once per
+run, with the pinned counts otherwise unchanged. One storage-only
+asymmetry is documented rather than fixed: a draw stamped more than the
+widest window behind the mark still writes its bucket field, below every
+`from` the pruning walk starts at, and is reaped by the hash's own
+expiry; no window on either side counts it.
+
+**The outage posture has a time bound and a redacted body** (F2, F4, F5).
+R-F7 said a check that cannot reach its store fails closed with a
+retryable refusal and named no time; the redis crate's default reconnect
+backoff made every admission after the first wait about nine and a half
+seconds for its 503 while the shared reconnect future ran. One `connect`
+now serves the session store, the spend ledger and the fair-use ledger
+with named bounds — 300 ms connection and response timeouts, three
+retries, a 50 to 300 ms backoff at factor two — chosen so a check against
+a severed store refuses within two seconds, measured, and the doc beside the constants says this
+is the latency failing closed accepts. The fail-closed branch warns
+server-side once per outage — with the store's error text in the log and
+an info line on recovery — and the client body carries a fixed message
+and the roundhouse code, never the operator's store error. Both dialects'
+wire envelopes are pinned by a fair-use test, so the 503 that the
+Messages surface spells `overloaded_error` cannot drift out from under
+the retryability claim; the severed-store fixture moved out of the
+production module into test support.
+
+Housekeeping: `decay` is two functions, one that computes and one that
+persists, and its doc states the true bound — one `HMGET` per chunk of
+four hundred fields, six for the seven-day worst case — beside the steady
+state (F7); the window type is split so the draw script builds no dummy
+caps, and the refuter's test for it is a compile error now rather than a
+runtime check (F3); the contract suite is three sibling files with one shared
+raw-connection helper, and a guard pins the crate's convention (F1). One more thing the round
+settled after its fixes: a read-count measurement and any other real-Redis
+test in the same binary are serialised by a lock, because `INFO
+commandstats` is a server-wide counter and a neighbour's own reads landed
+inside the measurement — nine and eleven where the script issues seven —
+which the "one measuring loop per binary" rule had not covered.

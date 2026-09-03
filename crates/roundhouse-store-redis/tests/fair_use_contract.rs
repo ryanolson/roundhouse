@@ -13,28 +13,29 @@
 //! rather than as ignore-gated duplicates that would depend on infrastructure
 //! they do not use.
 //!
-//! Below the suite are the claims a shared contract cannot make, because each
-//! is about *sharing*, about *Redis*, or about the two backends *side by
-//! side*:
+//! **This file holds the unlock condition and the differentials** — the
+//! claims that are about *sharing*, or about the two backends compared *side
+//! by side*, rather than about decay, pruning, expiry, or raw storage. Those
+//! themed slices live in this crate's own sibling-file convention (see
+//! `recovery.rs`'s doc comment) instead of growing this file past it (M13.1
+//! review F1): the decay/prune/expiry tests are in `fair_use_decay.rs`, and
+//! the raw-storage and commandstats-loop tests are in `fair_use_storage.rs`,
+//! with the fixtures both share (and this file needs too) in
+//! `tests/common/fair_use.rs`.
+//!
+//! Below the suite is what stays here:
 //!
 //! - **the unlock condition itself** — two handles over one Redis, a draw
 //!   through one refused by the other, which is the whole reason this ledger
 //!   exists;
-//! - **the two-scope update as storage**, read out of the raw hashes rather
-//!   than inferred from a refusal — and, since the M13 review, the two ways
-//!   that update can end: refused with neither scope moved, or saturated with
-//!   both;
-//! - **the expiry**, in two halves: the TTL a production draw actually arms,
-//!   and — through a `test-support` seam that shortens only the wait, never the
-//!   policy — a stale bucket really disappearing and dropping out of the sum;
-//! - **one round trip per operation**, the claim the whole key layout was
-//!   chosen for;
 //! - **the differentials**: the same draws through both ledgers at the
 //!   boundaries where two arithmetics used to part company — a dollar cap met
 //!   exactly, and the ceiling of the shared integer domain. The contract
 //!   asserts each backend against the specification; these assert the two
 //!   against *each other*, which is what a list of expected values cannot do
-//!   once both lists can be edited;
+//!   once both lists can be edited. Since M13.1's review that includes the
+//!   three places a clock that does not run forwards used to part them (F6,
+//!   F8, F9), all three now closed by the mark;
 //! - **a window group past the ones `FairUseWindow::ALL` names**, invoked
 //!   against the real script text through a `test-support` seam, because
 //!   `WouldExceedArgs` deliberately cannot express one.
@@ -43,108 +44,24 @@
 //! `#[ignore]`, opted into with `--include-ignored`, and a missing
 //! `ROUNDHOUSE_TEST_REDIS_URL` fails loudly rather than skipping quietly.
 
+mod common;
+
 use roundhouse_core::control::fair_use::{BUCKET_MS, MAX_COUNT};
 use roundhouse_core::control::spend::contract::fresh_principal;
 use roundhouse_core::control::{
-    FairUseLedger, FairUseLimit, FairUseQuantity, FairUseScope, FairUseTerms, FairUseWindow,
-    MemoryFairUseLedger,
+    FairUseLedger, FairUseQuantity, FairUseScope, FairUseWindow, MemoryFairUseLedger,
 };
-use roundhouse_store_redis::RedisFairUseLedger;
-use roundhouse_store_redis::test_support::{
-    fair_use_bucket_fields, fair_use_scope_keys, fair_use_window_sum_fields,
-    fair_use_would_exceed_source, url_from_env,
+use roundhouse_store_redis::test_support::{fair_use_scope_keys, fair_use_would_exceed_source};
+
+use common::fair_use::{
+    bucket_exists, connect_fair_use_from_env, project_only, tokens_cap, usd_cap, window_sum,
 };
+use common::raw_from_env;
 
 roundhouse_core::fair_use_ledger_contract_suite!(
     ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored",
     connect_fair_use_from_env().await
 );
-
-async fn connect_fair_use_from_env() -> RedisFairUseLedger {
-    RedisFairUseLedger::connect(url_from_env())
-        .await
-        .expect("Redis named by the env var must be reachable")
-}
-
-async fn raw_from_env() -> redis::aio::MultiplexedConnection {
-    redis::Client::open(url_from_env().as_str())
-        .unwrap()
-        .get_multiplexed_async_connection()
-        .await
-        .unwrap()
-}
-
-fn tokens_cap(window: FairUseWindow, max: u64) -> FairUseLimit {
-    FairUseLimit {
-        window,
-        max_tokens: Some(max),
-        max_usd: None,
-    }
-}
-
-fn usd_cap(window: FairUseWindow, max: f64) -> FairUseLimit {
-    FairUseLimit {
-        window,
-        max_tokens: None,
-        max_usd: Some(max),
-    }
-}
-
-fn project_only(limits: Vec<FairUseLimit>) -> FairUseTerms {
-    FairUseTerms {
-        project: limits,
-        member: Vec::new(),
-    }
-}
-
-/// Script invocations the *server* has seen since the last reset.
-///
-/// The `redis` crate's `ConnectionManager` exposes no per-call counter, so the
-/// count comes from `INFO commandstats` — which is server-wide, and therefore
-/// only ever usable as a lower bound taken across attempts. See
-/// [`record_draw_and_would_exceed_are_single_round_trips`] for why that is
-/// still the right answer.
-async fn eval_calls_since_reset(raw: &mut redis::aio::MultiplexedConnection) -> u64 {
-    let info: String = redis::cmd("INFO")
-        .arg("commandstats")
-        .query_async(raw)
-        .await
-        .unwrap();
-    info.lines()
-        .filter_map(|line| {
-            line.strip_prefix("cmdstat_eval:calls=")
-                .or_else(|| line.strip_prefix("cmdstat_evalsha:calls="))
-        })
-        .filter_map(|rest| rest.split(',').next())
-        .filter_map(|n| n.parse::<u64>().ok())
-        .sum()
-}
-
-async fn reset_stats(raw: &mut redis::aio::MultiplexedConnection) {
-    let _: () = redis::cmd("CONFIG")
-        .arg("RESETSTAT")
-        .query_async(raw)
-        .await
-        .unwrap();
-}
-
-/// `HMGET` calls the *server* has seen since the last reset -- the primitive
-/// `would_exceed` issues once per (scope, window) it checks, plus once per
-/// bucket range it has to walk. Same server-wide-counter caveat as
-/// [`eval_calls_since_reset`]: a lower bound, read after a single attempt
-/// with nothing else talking to this private Redis.
-async fn hmget_calls_since_reset(raw: &mut redis::aio::MultiplexedConnection) -> u64 {
-    let info: String = redis::cmd("INFO")
-        .arg("commandstats")
-        .query_async(raw)
-        .await
-        .unwrap();
-    info.lines()
-        .filter_map(|line| line.strip_prefix("cmdstat_hmget:calls="))
-        .filter_map(|rest| rest.split(',').next())
-        .filter_map(|n| n.parse::<u64>().ok())
-        .sum()
-}
 
 /// **The unlock condition, as a test.**
 ///
@@ -186,737 +103,6 @@ async fn a_draw_through_one_node_is_refused_by_another() {
         BUCKET_MS + 5 * 60 * 60_000,
         "and the second node computes the same retry time from the same \
          buckets, rather than one of its own"
-    );
-}
-
-/// One call moves both scopes' counters *in both shapes*, read out of the
-/// storage itself.
-///
-/// The contract suite already asserts the *consequence* — a second member of
-/// the project is refused by the project's window that the first filled. This
-/// asserts the mechanism, because on this backend "both scopes" is two Redis
-/// hashes written by one script, and a script that wrote one and not the other
-/// would leave a member enforced against a project's counter. Reading the raw
-/// fields is what tells those two apart.
-///
-/// **And it is the storage assertion M13.1 is actually about.** A draw writes
-/// the bucket amount *and* every window's running sum, because the sum is what
-/// a later admission compares against a cap without reading a bucket at all.
-/// A ledger that wrote only the bucket fields would pass every behavioural
-/// test in the contract — by re-scanning buckets on the read, which is the
-/// path this rung replaced — and fail here.
-#[tokio::test]
-#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
-async fn one_call_writes_both_scopes_buckets_and_every_windows_running_sum() {
-    let ledger = connect_fair_use_from_env().await;
-    let mut raw = raw_from_env().await;
-    let ada = fresh_principal("ada");
-
-    // A draw landing squarely inside bucket 3, at a millisecond that is not
-    // the bucket's own boundary: the index has to come from the floor
-    // division rather than from the timestamp.
-    let at_ms = 3 * BUCKET_MS + 17;
-    ledger.record_draw(&ada, at_ms, 250, 1.5).await.unwrap();
-
-    let (project_key, member_key) = fair_use_scope_keys(&ada);
-    let (bucket_t, bucket_u) = fair_use_bucket_fields(at_ms);
-    for (key, whose) in [(&project_key, "the project's"), (&member_key, "ada's own")] {
-        let fields: Vec<Option<String>> = redis::cmd("HMGET")
-            .arg(key)
-            .arg(&bucket_t)
-            .arg(&bucket_u)
-            .query_async(&mut raw)
-            .await
-            .unwrap();
-        assert_eq!(
-            fields,
-            vec![Some("250".to_string()), Some("1500000".to_string())],
-            "{whose} bucket holds the tokens and the dollars as micro-dollars"
-        );
-
-        // Every window's running sum, including the two nobody has configured
-        // — a draw has no terms, and an admin PATCH can start enforcing any of
-        // them a minute later.
-        for window in FairUseWindow::ALL {
-            let (sum_t, sum_u, from, to) = fair_use_window_sum_fields(window);
-            let fields: Vec<Option<String>> = redis::cmd("HMGET")
-                .arg(key)
-                .arg(&sum_t)
-                .arg(&sum_u)
-                .arg(&from)
-                .arg(&to)
-                .query_async(&mut raw)
-                .await
-                .unwrap();
-            assert_eq!(
-                fields,
-                vec![
-                    Some("250".to_string()),
-                    Some("1500000".to_string()),
-                    Some("3".to_string()),
-                    Some("3".to_string()),
-                ],
-                "{whose} {} window carries the same draw as a running sum, \
-                 covering exactly bucket 3",
-                window.wire_name()
-            );
-        }
-    }
-
-    // CONTROL: the neighbouring bucket was not touched. Without it, a script
-    // that wrote every bucket in sight would pass the assertions above.
-    let (neighbour_t, _) = fair_use_bucket_fields(at_ms + BUCKET_MS);
-    let exists: bool = redis::cmd("HEXISTS")
-        .arg(&project_key)
-        .arg(&neighbour_t)
-        .query_async(&mut raw)
-        .await
-        .unwrap();
-    assert!(!exists, "only the bucket the draw landed in exists");
-}
-
-/// One window's persisted running sum, as `(tokens, micros, from, to)`.
-///
-/// `None` where the window carries no sum at all, which is a state the decay
-/// really does write: a window every draw it covered has aged out of is
-/// *deleted* rather than zeroed, so an untouched window and a fully-decayed
-/// one are one state rather than two spellings a later read has to tell
-/// apart.
-async fn window_sum(
-    raw: &mut redis::aio::MultiplexedConnection,
-    key: &str,
-    window: FairUseWindow,
-) -> Option<(u64, u64, u64, u64)> {
-    let (t, u, from, to) = fair_use_window_sum_fields(window);
-    let fields: Vec<Option<String>> = redis::cmd("HMGET")
-        .arg(key)
-        .arg(&t)
-        .arg(&u)
-        .arg(&from)
-        .arg(&to)
-        .query_async(raw)
-        .await
-        .unwrap();
-    let read = |at: usize| fields[at].as_ref().map(|text| text.parse::<u64>().unwrap());
-    Some((read(0)?, read(1)?, read(2)?, read(3)?))
-}
-
-async fn bucket_exists(raw: &mut redis::aio::MultiplexedConnection, key: &str, at_ms: u64) -> bool {
-    let (t, _) = fair_use_bucket_fields(at_ms);
-    redis::cmd("HEXISTS")
-        .arg(key)
-        .arg(&t)
-        .query_async(raw)
-        .await
-        .unwrap()
-}
-
-/// **The decay, at the boundary where exactly one bucket leaves.**
-///
-/// The running sum is only as good as what ages back out of it, and this is
-/// the smallest step of that: two draws a bucket apart, a `now_ms` one
-/// millisecond either side of the older one's departure. The sum, `from` and
-/// the answer all have to move together — a ledger that decayed the answer
-/// but not the stored sum would serve this turn and refuse the next one.
-///
-/// The memory ledger is the control on every assertion here, because it
-/// re-sums its buckets from scratch and therefore cannot be wrong about which
-/// ones are inside the window.
-#[tokio::test]
-#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
-async fn a_bucket_leaving_a_window_is_subtracted_from_its_running_sum() {
-    let memory = MemoryFairUseLedger::new();
-    let redis = connect_fair_use_from_env().await;
-    let mut raw = raw_from_env().await;
-    let ada = fresh_principal("ada");
-    let terms = project_only(vec![tokens_cap(FairUseWindow::FiveHours, 100)]);
-    let five_hours = FairUseWindow::FiveHours.span_ms();
-
-    for ledger in [&memory as &dyn FairUseLedger, &redis] {
-        ledger.record_draw(&ada, 0, 60, 0.0).await.unwrap();
-        ledger.record_draw(&ada, BUCKET_MS, 60, 0.0).await.unwrap();
-    }
-    let (project_key, _) = fair_use_scope_keys(&ada);
-
-    // A whisker before bucket 0 leaves the five-hour window: 120 tokens are
-    // inside it and the turn is refused.
-    let before = five_hours + BUCKET_MS - 1;
-    assert_eq!(
-        redis.would_exceed(&ada, &terms, before).await.unwrap(),
-        memory.would_exceed(&ada, &terms, before).await.unwrap(),
-    );
-    assert!(
-        redis
-            .would_exceed(&ada, &terms, before)
-            .await
-            .unwrap()
-            .is_some(),
-        "and it is a refusal they agree on, not two Nones"
-    );
-    assert_eq!(
-        window_sum(&mut raw, &project_key, FairUseWindow::FiveHours).await,
-        Some((120, 0, 0, 1)),
-        "nothing has left the window yet, so the sum still covers both buckets"
-    );
-
-    // One millisecond later bucket 0 is out, and 60 tokens is under the cap.
-    let after = five_hours + BUCKET_MS;
-    assert_eq!(
-        redis.would_exceed(&ada, &terms, after).await.unwrap(),
-        memory.would_exceed(&ada, &terms, after).await.unwrap(),
-    );
-    assert_eq!(redis.would_exceed(&ada, &terms, after).await.unwrap(), None);
-    assert_eq!(
-        window_sum(&mut raw, &project_key, FairUseWindow::FiveHours).await,
-        Some((60, 0, 1, 1)),
-        "the read subtracted exactly the bucket that left and moved `from` \
-         past it -- the decay is persisted, not recomputed per call"
-    );
-
-    // CONTROL, and the reason the decay is per window rather than per scope:
-    // the same draws are still whole inside the seven-day window, whose sum
-    // this read must not have touched.
-    assert_eq!(
-        window_sum(&mut raw, &project_key, FairUseWindow::SevenDays).await,
-        Some((120, 0, 0, 1)),
-        "a five-hour read must not age the seven-day window's sum"
-    );
-    // And the bucket fields are still there: only the *widest* window's decay
-    // deletes, because only it knows a bucket is outside every window.
-    assert!(bucket_exists(&mut raw, &project_key, 0).await);
-}
-
-/// An idle shorter than the window leaves the sum exactly where it was.
-///
-/// The control on every decay assertion in this file: a read that aged
-/// something out when nothing had left the window would pass most of them —
-/// sums only ever move down — and fail this one.
-#[tokio::test]
-#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
-async fn an_idle_shorter_than_the_window_leaves_the_running_sum_untouched() {
-    let memory = MemoryFairUseLedger::new();
-    let redis = connect_fair_use_from_env().await;
-    let mut raw = raw_from_env().await;
-    let ada = fresh_principal("ada");
-    let terms = project_only(vec![tokens_cap(FairUseWindow::FiveHours, 100)]);
-
-    for ledger in [&memory as &dyn FairUseLedger, &redis] {
-        ledger.record_draw(&ada, 0, 100, 0.0).await.unwrap();
-    }
-    let (project_key, _) = fair_use_scope_keys(&ada);
-
-    // Four hours and twenty-five minutes later: inside the five-hour window
-    // by a comfortable margin, however many buckets have gone by.
-    let idle = 3 * 60 * 60_000 + 17 * BUCKET_MS;
-    assert_eq!(
-        redis.would_exceed(&ada, &terms, idle).await.unwrap(),
-        memory.would_exceed(&ada, &terms, idle).await.unwrap(),
-    );
-    assert!(
-        redis
-            .would_exceed(&ada, &terms, idle)
-            .await
-            .unwrap()
-            .is_some()
-    );
-    assert_eq!(
-        window_sum(&mut raw, &project_key, FairUseWindow::FiveHours).await,
-        Some((100, 0, 0, 0)),
-        "no bucket has left the window, so the read has nothing to age and \
-         `from` stays where the draw put it"
-    );
-}
-
-/// An idle past the narrowest window drops that window's sum and keeps the
-/// wider ones', which is the branch that costs no reads at all.
-///
-/// The sum is *deleted* rather than zeroed: `to` — the newest bucket the sum
-/// covers — is older than the window, so nothing it covers can still be
-/// inside, and the whole of the answer is "start again". Keeping `to` in the
-/// hash is what makes that exact rather than a bet on the caller's clock
-/// never stepping backwards.
-#[tokio::test]
-#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
-async fn an_idle_past_the_narrowest_window_drops_its_sum_and_keeps_the_widest() {
-    let memory = MemoryFairUseLedger::new();
-    let redis = connect_fair_use_from_env().await;
-    let mut raw = raw_from_env().await;
-    let ada = fresh_principal("ada");
-    let five_hours = project_only(vec![tokens_cap(FairUseWindow::FiveHours, 100)]);
-    let a_day = project_only(vec![tokens_cap(FairUseWindow::TwentyFourHours, 100)]);
-
-    for ledger in [&memory as &dyn FairUseLedger, &redis] {
-        ledger.record_draw(&ada, 0, 100, 0.0).await.unwrap();
-    }
-    let (project_key, _) = fair_use_scope_keys(&ada);
-
-    // Six hours later: past the five-hour window, nowhere near the 24-hour
-    // one.
-    let now_ms = 6 * 60 * 60_000;
-    assert_eq!(
-        redis.would_exceed(&ada, &five_hours, now_ms).await.unwrap(),
-        memory
-            .would_exceed(&ada, &five_hours, now_ms)
-            .await
-            .unwrap(),
-    );
-    assert_eq!(
-        redis.would_exceed(&ada, &five_hours, now_ms).await.unwrap(),
-        None,
-        "the draw has aged out of the five-hour window"
-    );
-    assert_eq!(
-        window_sum(&mut raw, &project_key, FairUseWindow::FiveHours).await,
-        None,
-        "a window whose every bucket has aged out carries no sum at all, \
-         which is the same state it had before the first draw"
-    );
-
-    // CONTROL: the 24-hour window still holds the identical draw, and both
-    // ledgers still refuse on it. Without this, a decay that simply deleted
-    // every window's sum would pass the assertions above.
-    assert_eq!(
-        redis.would_exceed(&ada, &a_day, now_ms).await.unwrap(),
-        memory.would_exceed(&ada, &a_day, now_ms).await.unwrap(),
-    );
-    assert!(
-        redis
-            .would_exceed(&ada, &a_day, now_ms)
-            .await
-            .unwrap()
-            .is_some()
-    );
-    assert_eq!(
-        window_sum(&mut raw, &project_key, FairUseWindow::TwentyFourHours).await,
-        Some((100, 0, 0, 0)),
-    );
-    // And the bucket the draw landed in is still there: it is outside the
-    // five-hour window and inside the widest one, and only the widest one's
-    // decay deletes.
-    assert!(bucket_exists(&mut raw, &project_key, 0).await);
-}
-
-/// **The pruning pass, owned.** A draw that lands past the widest window
-/// deletes the bucket fields that window just aged out.
-///
-/// This is the objection M13 raised against a hash per scope — "it needs a
-/// pruning pass nothing currently owns" — answered rather than inherited. The
-/// owner is `record_draw`, and it has to be: a membership capped only on the
-/// five-hour window would never ask the seven-day window anything, so a
-/// pruning pass that ran only on the read would never run at all for it. An
-/// idle scope is still Redis's to delete, by the `PEXPIRE` asserted below;
-/// this is the *busy* scope, whose hash never expires.
-#[tokio::test]
-#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
-async fn a_draw_past_the_widest_window_prunes_the_bucket_fields_it_ages_out() {
-    let memory = MemoryFairUseLedger::new();
-    let redis = connect_fair_use_from_env().await;
-    let mut raw = raw_from_env().await;
-    let ada = fresh_principal("ada");
-    let terms = project_only(vec![tokens_cap(FairUseWindow::FiveHours, 100)]);
-
-    for ledger in [&memory as &dyn FairUseLedger, &redis] {
-        ledger.record_draw(&ada, 0, 100, 0.0).await.unwrap();
-    }
-    let (project_key, _) = fair_use_scope_keys(&ada);
-    // CONTROL: before the second draw the old bucket is still stored.
-    assert!(bucket_exists(&mut raw, &project_key, 0).await);
-
-    // Eight days later — one day past the widest window.
-    let later = 8 * 24 * 60 * 60_000;
-    for ledger in [&memory as &dyn FairUseLedger, &redis] {
-        ledger.record_draw(&ada, later, 100, 0.0).await.unwrap();
-    }
-    assert!(
-        !bucket_exists(&mut raw, &project_key, 0).await,
-        "the widest window's decay deletes the bucket fields it ages out, so \
-         a scope drawn against for years holds at most one widest window of \
-         them"
-    );
-    assert!(
-        bucket_exists(&mut raw, &project_key, later).await,
-        "and it deletes only what left: the draw that did the pruning is \
-         still counted"
-    );
-    assert_eq!(
-        window_sum(&mut raw, &project_key, FairUseWindow::SevenDays).await,
-        Some((100, 0, later / BUCKET_MS, later / BUCKET_MS)),
-        "the widest window's sum was restarted from the draw that outlived \
-         everything before it"
-    );
-
-    // And the read agrees with the memory ledger on both instants either side
-    // of the second draw's own five-hour window.
-    for now_ms in [later, later + 5 * 60 * 60_000 + BUCKET_MS] {
-        assert_eq!(
-            redis.would_exceed(&ada, &terms, now_ms).await.unwrap(),
-            memory.would_exceed(&ada, &terms, now_ms).await.unwrap(),
-            "the two ledgers must agree at {now_ms} after a prune"
-        );
-    }
-}
-
-/// **The retry walk agrees with the memory ledger after a decay**, compared
-/// as whole refusals rather than as two lists of expected values.
-///
-/// The walk is the one place M13.1 left reading buckets, and it now starts
-/// from a *decayed* running sum rather than from a sum recomputed out of the
-/// same buckets it is about to drop. Those two are only equal if the decay
-/// subtracted exactly what left; a walk that started one bucket out of step
-/// would name a retry time a window-width wrong while still refusing the
-/// turn, which no assertion about `is_some()` can see.
-///
-/// **Four draws, not three, and the cap sits where two must leave before the
-/// window clears** (M13.1 refute F2). A fixture where dropping the single
-/// oldest bucket is always enough to clear the cap cannot tell the real walk
-/// — subtract each aged-in bucket in turn, checking after every one — from a
-/// formula that assumes exactly one bucket ever has to leave and stops there;
-/// both land on the same answer by coincidence. Bucket 2 staying in the sum
-/// after bucket 1's departure is what forces a second iteration, and the
-/// literal retry time asserted below is only reachable by actually walking
-/// it.
-#[tokio::test]
-#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
-async fn the_retry_walk_agrees_with_the_memory_ledger_after_a_decay() {
-    let memory = MemoryFairUseLedger::new();
-    let redis = connect_fair_use_from_env().await;
-    let ada = fresh_principal("ada");
-    let terms = project_only(vec![tokens_cap(FairUseWindow::FiveHours, 110)]);
-    let five_hours = FairUseWindow::FiveHours.span_ms();
-
-    // Four draws spread across the window, each under the cap on its own.
-    for ledger in [&memory as &dyn FairUseLedger, &redis] {
-        ledger.record_draw(&ada, 0, 60, 0.0).await.unwrap();
-        ledger.record_draw(&ada, BUCKET_MS, 60, 0.0).await.unwrap();
-        ledger
-            .record_draw(&ada, 2 * BUCKET_MS, 60, 0.0)
-            .await
-            .unwrap();
-        ledger
-            .record_draw(&ada, 30 * BUCKET_MS, 60, 0.0)
-            .await
-            .unwrap();
-    }
-
-    // Past bucket 0's departure: the decay has already dropped 60 tokens, and
-    // the 180 that remain are still over the 110 cap. Which bucket has to
-    // leave next is the whole content of the answer — and here it takes two:
-    // dropping bucket 1 alone still leaves 120, over the cap; only after
-    // bucket 2 leaves too does the sum clear it.
-    let now_ms = five_hours + BUCKET_MS;
-    let memory_hit = memory.would_exceed(&ada, &terms, now_ms).await.unwrap();
-    let redis_hit = redis.would_exceed(&ada, &terms, now_ms).await.unwrap();
-    assert_eq!(memory_hit, redis_hit);
-    assert_eq!(
-        memory_hit.map(|hit| hit.retry_at_ms),
-        Some(3 * BUCKET_MS + five_hours),
-        "bucket 2 is what has to leave next, not bucket 1: dropping bucket 1 \
-         alone (120 tokens) is still over the 110 cap, so a walk that stopped \
-         after the first departing bucket -- or one that never read a bucket \
-         at all and assumed exactly one always suffices -- would have named \
-         bucket 1's departure a window-width early"
-    );
-
-    // And once it has: both ledgers serve the turn, at the instant the
-    // refusal named.
-    let cleared = 3 * BUCKET_MS + five_hours;
-    assert_eq!(
-        redis.would_exceed(&ada, &terms, cleared).await.unwrap(),
-        memory.would_exceed(&ada, &terms, cleared).await.unwrap(),
-    );
-    assert_eq!(
-        redis.would_exceed(&ada, &terms, cleared).await.unwrap(),
-        None
-    );
-}
-
-/// **A saturated sum is rebuilt rather than subtracted from**, which is the
-/// one hazard a running sum has that a re-summing scan did not.
-///
-/// A sum sitting at `MAX_COUNT` has forgotten how far past it the true total
-/// went. Subtracting an aged-out bucket from it would take a window that is
-/// still completely full to nearly empty — the memory ledger re-sums its
-/// buckets and stays at the ceiling, so the two would disagree by the whole
-/// domain, and a big enough draw would walk straight through a cap by
-/// *waiting* for its own oldest bucket to age out. The decay detects
-/// saturation and rebuilds the sum from the window's own buckets instead.
-///
-/// Reachable only above 2^53, which is why it is a differential against the
-/// specification rather than an assertion about a number: the two ledgers are
-/// compared, so neither list of expectations can be edited to match a
-/// drifting backend.
-#[tokio::test]
-#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
-async fn memory_and_redis_ledgers_agree_when_a_saturated_sum_decays() {
-    let memory = MemoryFairUseLedger::new();
-    let redis = connect_fair_use_from_env().await;
-    let ada = fresh_principal("ada");
-    let terms = project_only(vec![tokens_cap(FairUseWindow::FiveHours, MAX_COUNT)]);
-
-    // Two draws at the ceiling, a bucket apart: the sum saturates, and the
-    // draw still inside the window after the first ages out is *itself* at
-    // the ceiling.
-    for ledger in [&memory as &dyn FairUseLedger, &redis] {
-        ledger.record_draw(&ada, 0, MAX_COUNT, 0.0).await.unwrap();
-        ledger
-            .record_draw(&ada, BUCKET_MS, MAX_COUNT, 0.0)
-            .await
-            .unwrap();
-    }
-
-    let now_ms = FairUseWindow::FiveHours.span_ms() + BUCKET_MS;
-    let memory_hit = memory.would_exceed(&ada, &terms, now_ms).await.unwrap();
-    let redis_hit = redis.would_exceed(&ada, &terms, now_ms).await.unwrap();
-    assert_eq!(
-        memory_hit, redis_hit,
-        "bucket 0 has aged out and bucket 1 alone is at the ceiling, so both \
-         ledgers must still refuse -- a sum that had been decremented by a \
-         saturated bucket's worth would be at zero and serve the turn"
-    );
-    assert!(
-        memory_hit.is_some(),
-        "and it is a refusal they agree on, not two Nones"
-    );
-}
-
-/// The expiry a real draw arms is the derived one: the widest window plus one
-/// bucket.
-///
-/// No sleeping and no seam — `PTTL` answers directly. This is the half of the
-/// expiry story that is about *policy*, and it is the half a shortened TTL
-/// could not check. It is armed on the scope's whole hash (M13.1), which is
-/// what makes an *idle* scope cost nothing; a busy scope never expires and is
-/// kept trimmed by the widest window's decay instead.
-#[tokio::test]
-#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
-async fn a_scope_is_armed_to_expire_one_bucket_past_the_widest_window() {
-    let ledger = connect_fair_use_from_env().await;
-    let mut raw = raw_from_env().await;
-    let ada = fresh_principal("ada");
-    ledger.record_draw(&ada, 0, 1, 0.0).await.unwrap();
-
-    let expected = FairUseWindow::SevenDays.span_ms() + BUCKET_MS;
-    let (project_key, member_key) = fair_use_scope_keys(&ada);
-    for key in [&project_key, &member_key] {
-        let pttl: i64 = redis::cmd("PTTL")
-            .arg(key)
-            .query_async(&mut raw)
-            .await
-            .unwrap();
-        // A window either side of the round trip's own cost, rather than
-        // equality: the TTL starts ticking on the server the moment the script
-        // runs. What is being pinned is the *policy* — one bucket past seven
-        // days — not the millisecond.
-        assert!(
-            pttl > expected as i64 - 5_000 && pttl <= expected as i64,
-            "a scope's counters must outlive the widest window by one bucket \
-             width; PTTL was {pttl}, expected about {expected}"
-        );
-    }
-}
-
-/// A scope that has expired stops counting, watched happening.
-///
-/// **Why this sleeps when nothing else in the suite does.** Every other
-/// time-dependent assertion is reached by supplying a later `now_ms`, which is
-/// exactly what the caller-supplied clock is for. Redis key expiry is the one
-/// clock this ledger does *not* own: it is the server's, and it is what makes
-/// an idle scope cost nothing rather than one hash that lives forever. The
-/// only way to watch a key actually leave is to wait for it — so the
-/// `test-support` seam shortens the wait to a fraction of a second while the
-/// production policy, asserted directly above, stays derived from the window
-/// widths.
-#[tokio::test]
-#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
-async fn an_expired_scope_leaves_the_sum_as_well_as_the_keyspace() {
-    let ledger = connect_fair_use_from_env().await.with_bucket_ttl_ms(120);
-    let mut raw = raw_from_env().await;
-    let ada = fresh_principal("ada");
-    let terms = project_only(vec![tokens_cap(FairUseWindow::FiveHours, 100)]);
-
-    ledger.record_draw(&ada, 0, 100, 0.0).await.unwrap();
-    // CONTROL: while the bucket is alive the window is spent, at a `now_ms`
-    // well inside the five hours. This is the assertion that makes the one
-    // below about *expiry* rather than about the window rolling.
-    assert!(
-        ledger
-            .would_exceed(&ada, &terms, 60_000)
-            .await
-            .unwrap()
-            .is_some(),
-        "the draw counts while its bucket exists"
-    );
-
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-
-    let (project_key, _) = fair_use_scope_keys(&ada);
-    let exists: bool = redis::cmd("EXISTS")
-        .arg(&project_key)
-        .query_async(&mut raw)
-        .await
-        .unwrap();
-    assert!(
-        !exists,
-        "an idle scope is Redis's to delete; nothing in this crate sweeps one"
-    );
-
-    assert_eq!(
-        ledger.would_exceed(&ada, &terms, 60_000).await.unwrap(),
-        None,
-        "and an expired bucket is gone from the window sum too -- the same \
-         instant that was refused a moment ago is now served"
-    );
-}
-
-/// Each trait method is one script and therefore one round trip — and a
-/// membership with no windows is no round trip at all.
-///
-/// Counts `EVAL`/`EVALSHA` calls between `CONFIG RESETSTAT`-bounded points on
-/// the *server*, taking the minimum over many attempts: the same technique,
-/// and the same reasoning, as
-/// `open_grant_and_settle_grant_are_single_round_trips` in `spend_contract.rs`.
-/// The counter is server-wide, so a test running concurrently can only *add*
-/// calls this one did not make, never hide one it did, and the minimum across
-/// attempts is the attempt that raced nobody.
-///
-/// **All four measurements live in one test on purpose.** That argument holds
-/// only while the competing traffic is sparse relative to the measurement
-/// window; two such counting loops running concurrently are each other's dense
-/// competitor, and a first draft that split this in two failed for exactly
-/// that reason — reliably, not occasionally. One measuring loop per test
-/// binary is the invariant, and this comment is where it is written down.
-///
-/// **The fourth measurement is what M13.1 is for.** M13's review (F4) pinned
-/// what the bucket-per-key scan cost an *admitted* turn — the common case,
-/// and the one where no window binds, so the scan widened through every
-/// configured window to the widest: 2017 `HMGET`s per capped scope, 4034 for
-/// a membership capped on both. The running sums replace that scan, and this
-/// assertion is where the drop is proved rather than claimed: an admitted
-/// turn now costs **one `HMGET` per (scope, window) checked** and nothing per
-/// bucket, because the sum it compares against the cap was maintained on
-/// write. Derived from `FairUseWindow::ALL`, not pasted, so a fourth window
-/// moves it by construction.
-///
-/// **This measurement is the decay-free steady state on purpose, and does not
-/// itself guard `decay`'s zero-read reset branch** (M13.1 refute F1): the
-/// `steady` fixture below lands its draw in the bucket right before the
-/// check so nothing has aged out, because that no-decay case is what an
-/// admitted turn actually costs in production. A `to < first` reset costs the
-/// same one `HMGET` this measurement already pins — the branch it disables
-/// only shows up as *extra* reads on a scope with something to age out, which
-/// this fixture deliberately has none of. That branch's removal is caught
-/// instead by `an_idle_past_the_narrowest_window_drops_its_sum_and_keeps_the_widest`
-/// and `a_draw_past_the_widest_window_prunes_the_bucket_fields_it_ages_out`,
-/// which assert on the sum and bucket fields a disabled reset would leave
-/// behind rather than on a read count.
-#[tokio::test]
-#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
-async fn every_operation_is_one_round_trip_and_an_unconfigured_one_is_none() {
-    let ledger = connect_fair_use_from_env().await;
-    let mut raw = raw_from_env().await;
-    let ada = fresh_principal("ada");
-    // All three windows capped on both scopes: the widest, most-scanning shape
-    // this ledger can be asked for, and still one round trip.
-    let terms = FairUseTerms {
-        project: FairUseWindow::ALL
-            .iter()
-            .map(|window| tokens_cap(*window, 1_000_000))
-            .collect(),
-        member: FairUseWindow::ALL
-            .iter()
-            .map(|window| tokens_cap(*window, 1_000_000))
-            .collect(),
-    };
-    // The admitted turn the read-count pin is about, given its own principal
-    // and its own instant so the measurement is the steady state rather than
-    // whatever the loop above happened to leave behind. `now_ms` is past the
-    // widest window's span, so no window's scan clamps at the epoch and every
-    // one of them is a full-width window; the draw lands in the bucket before
-    // it, so nothing has aged out and the read is exactly the decay-free path
-    // an admitted turn takes.
-    let steady = fresh_principal("steady");
-    let steady_now_ms = FairUseWindow::SevenDays.span_ms() + BUCKET_MS;
-
-    const ATTEMPTS: u64 = 25;
-    let (mut draw, mut check, mut unconfigured, mut admitted_hmgets) =
-        (u64::MAX, u64::MAX, u64::MAX, u64::MAX);
-    for attempt in 0..ATTEMPTS {
-        reset_stats(&mut raw).await;
-        ledger
-            .record_draw(&ada, attempt * BUCKET_MS, 1, 0.001)
-            .await
-            .unwrap();
-        draw = draw.min(eval_calls_since_reset(&mut raw).await);
-
-        reset_stats(&mut raw).await;
-        ledger
-            .would_exceed(&ada, &terms, ATTEMPTS * BUCKET_MS)
-            .await
-            .unwrap();
-        check = check.min(eval_calls_since_reset(&mut raw).await);
-
-        reset_stats(&mut raw).await;
-        assert_eq!(
-            ledger
-                .would_exceed(&ada, &FairUseTerms::default(), ATTEMPTS * BUCKET_MS)
-                .await
-                .unwrap(),
-            None
-        );
-        unconfigured = unconfigured.min(eval_calls_since_reset(&mut raw).await);
-
-        ledger
-            .record_draw(&steady, steady_now_ms - BUCKET_MS, 1, 0.001)
-            .await
-            .unwrap();
-        reset_stats(&mut raw).await;
-        assert_eq!(
-            ledger
-                .would_exceed(&steady, &terms, steady_now_ms)
-                .await
-                .unwrap(),
-            None,
-            "the handful of tokens drawn above are nowhere near the 1,000,000 \
-             cap, so every window has room -- this is the admitted turn whose \
-             read cost the whole rung is about"
-        );
-        admitted_hmgets = admitted_hmgets.min(hmget_calls_since_reset(&mut raw).await);
-    }
-
-    assert_eq!(
-        draw, 1,
-        "record_draw updates both scopes and arms both expiries in one script"
-    );
-    assert_eq!(
-        check, 1,
-        "would_exceed sums every window over both scopes in one script, however \
-         many buckets that is"
-    );
-    // The shipped posture: every project has no fair-use block until an
-    // operator writes one down, so the admission path of every turn in such a
-    // deployment must cost nothing at all rather than a round trip that comes
-    // back saying "nothing configured". The `check` measurement above is this
-    // one's control — the identical call under configured terms does reach the
-    // script, so a ledger that had simply stopped talking to Redis would fail
-    // there rather than pass here.
-    assert_eq!(
-        unconfigured, 0,
-        "a membership with no windows is answered without asking Redis anything"
-    );
-    // M13.1's pin, derived rather than pasted: one read of one window's
-    // running sum per capped scope, and no read per bucket at all. Under the
-    // layout this rung replaced the same call cost `2 * 2017` — the widest
-    // window's own width, twice — which is what made this assertion the red
-    // test the redesign had to turn green.
-    let expected_hmgets = 2 * FairUseWindow::ALL.len() as u64; // project scope + member scope
-    assert_eq!(
-        admitted_hmgets,
-        expected_hmgets,
-        "an admitted turn reads one running sum per (scope, window) and walks \
-         no buckets: expected {expected_hmgets} HMGETs (2 scopes x \
-         {} windows), not the 2017-per-scope bucket scan the bucket-per-key \
-         layout paid on every admission (M13 review, F4)",
-        FairUseWindow::ALL.len()
     );
 }
 
@@ -982,84 +168,6 @@ async fn memory_and_redis_ledgers_agree_at_a_dollar_cap_boundary() {
         memory_hit.map(|hit| hit.retry_at_ms),
         Some(2 * BUCKET_MS + 5 * 60 * 60_000),
     );
-}
-
-/// M13 thermo-nuclear review finding F5, closed: a draw either moves both
-/// scopes or moves neither, with no third outcome left.
-///
-/// The finding was that `RECORD_DRAW` claimed its writes were "one indivisible
-/// step" while Redis Lua does not roll back writes made before a command
-/// error: an `HINCRBY` overflowing on the *member*'s bucket aborted the script
-/// with the *project*'s bucket already incremented and its TTL re-armed. What
-/// closed it is that there is no failing command any more — the script reads,
-/// adds with a clamp at `MAX_COUNT` and writes back, and the only draw that
-/// can be refused is refused in Rust before the script runs at all.
-///
-/// Both halves are asserted through the raw hashes rather than through a
-/// refusal, because storage is what the finding was about: a refused draw
-/// leaves both buckets unset, and a draw that carries a counter past the
-/// domain leaves *both* scopes at the ceiling rather than one moved and one
-/// not.
-#[tokio::test]
-#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
-async fn a_refused_draw_moves_neither_scope_and_a_saturating_one_moves_both() {
-    let ledger = connect_fair_use_from_env().await;
-    let mut raw = raw_from_env().await;
-    let ada = fresh_principal("ada");
-
-    // Bucket 0: at_ms = 0 lands squarely in it, no boundary ambiguity.
-    let at_ms = 0;
-    let (project_key, member_key) = fair_use_scope_keys(&ada);
-    let (bucket_t, bucket_u) = fair_use_bucket_fields(at_ms);
-
-    // A draw one token outside the domain: refused at the edge, in Rust.
-    assert!(
-        ledger
-            .record_draw(&ada, at_ms, MAX_COUNT + 1, 0.0)
-            .await
-            .is_err(),
-        "a count no ledger can hold exactly is refused rather than recorded"
-    );
-    for key in [&project_key, &member_key] {
-        let exists: bool = redis::cmd("EXISTS")
-            .arg(key)
-            .query_async(&mut raw)
-            .await
-            .unwrap();
-        assert!(
-            !exists,
-            "a refused draw leaves {key} exactly as it was -- absent -- and \
-             in particular does not leave the project's hash carrying a \
-             draw the member's never got"
-        );
-    }
-
-    // Two draws that together leave the domain. Neither is refused; both
-    // scopes saturate, together.
-    ledger
-        .record_draw(&ada, at_ms, MAX_COUNT, 0.0)
-        .await
-        .unwrap();
-    ledger
-        .record_draw(&ada, at_ms, MAX_COUNT, 0.0)
-        .await
-        .unwrap();
-    for key in [&project_key, &member_key] {
-        let fields: Vec<Option<String>> = redis::cmd("HMGET")
-            .arg(key)
-            .arg(&bucket_t)
-            .arg(&bucket_u)
-            .query_async(&mut raw)
-            .await
-            .unwrap();
-        assert_eq!(
-            fields,
-            vec![Some(MAX_COUNT.to_string()), Some("0".to_string())],
-            "{key} saturates at the domain ceiling rather than wrapping, \
-             erroring, or being written in scientific notation by Lua's own \
-             number-to-string conversion"
-        );
-    }
 }
 
 /// M13 thermo-nuclear review finding F7, closed: the two ledgers agree across
@@ -1167,7 +275,7 @@ fn push_absent_window(invocation: &mut redis::ScriptInvocation<'_>) {
 /// The reply tag (`"REFUSED"`/`"NONE"`), read the same way
 /// `fair_use/scripts.rs`'s own `tag_of`/`str_at` do, duplicated here because
 /// those are `pub(crate)` and this test invokes the script directly rather
-/// than through [`RedisFairUseLedger`].
+/// than through [`roundhouse_store_redis::RedisFairUseLedger`].
 fn reply_tag(reply: &[redis::Value]) -> Option<&str> {
     match reply.first()? {
         redis::Value::BulkString(bytes) => std::str::from_utf8(bytes).ok(),
@@ -1297,5 +405,324 @@ async fn a_window_group_past_the_ones_the_enum_names_is_still_read() {
          script's loop bound is the argument list's length, so a window added \
          to FairUseWindow::ALL is checked rather than silently ignored -- \
          reply was {claim_reply:?}"
+    );
+}
+
+/// **M13.1 review F6, closed: a draw whose bucket is below a window's
+/// already-decayed `from` is not subtracted from that window's sum twice.**
+///
+/// `record_draw` used to lower `from` to a draw's bucket index whenever that
+/// index was lower, with no decay on the write. If the window's decay had
+/// already advanced `from` past that index once -- subtracting the bucket's
+/// then-current value out of the running sum -- and the bucket's physical
+/// fields were never pruned (only the widest window's decay deletes), an
+/// out-of-order draw at that same low index dragged `from` back over ground
+/// the sum no longer covered, and the next decay re-read the bucket's *total*
+/// and subtracted all of it. The sum came out under-counted, in the
+/// permissive direction, floored at zero so nothing complained.
+///
+/// The fix is the mark (R-F9): a draw older than a window's first bucket *at
+/// the ledger's clock* is outside that window, so it neither joins the sum
+/// nor moves `from` back -- which is exactly what the memory ledger does from
+/// the other side, since its window is a range starting at that same first
+/// bucket. The two are compared here as whole answers, and the stored sum is
+/// read out of the raw hash as well, because an under-count of the running
+/// sum is invisible in an admitted turn until the cap it clears is one it
+/// should not have.
+///
+/// The fixture builds exactly the state that used to break: a first decay at
+/// `first_decay_now` advances `from` past bucket 5 (subtracting its 10
+/// tokens, leaving `from` at 6, the bucket itself unpruned since the
+/// five-hour window is never the widest of the three `record_draw` tracks).
+/// A second draw then lands back in bucket 5 -- below both that `from` and
+/// the window's first bucket at the ledger's clock -- adding 90 more tokens
+/// to the physical bucket. A second decay at `second_decay_now` then walks
+/// `from` forward again over that bucket. Before the fix the sum was
+/// credited with only the 90 and debited the whole 100, and the window came
+/// out empty; now the 90 never joined the sum, `from` never went back, and
+/// the walk finds the bucket already spent for. The memory ledger re-sums its
+/// buckets from scratch and cannot make either mistake, so it is the control
+/// the redis ledger is judged against.
+#[tokio::test]
+#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
+async fn f6_a_draw_below_an_already_decayed_from_is_not_double_subtracted() {
+    let memory = MemoryFairUseLedger::new();
+    let redis = connect_fair_use_from_env().await;
+    let mut raw = raw_from_env().await;
+    let ada = fresh_principal("ada");
+    // Five hours only: the narrower of the two windows `record_draw` always
+    // maintains alongside the (never checked here) seven-day one, so its
+    // decay in `would_exceed` never prunes. The cap sits strictly between the
+    // correct final sum (60, bucket 40 alone) and the double-subtracted one
+    // the finding described (60 - 100, floored at 0) -- so the two ledgers
+    // agreeing on a refusal at the end is a direct sign the sum survived
+    // rather than an incidental side effect of some other cap value.
+    let terms = project_only(vec![tokens_cap(FairUseWindow::FiveHours, 55)]);
+    let five_hours = FairUseWindow::FiveHours.span_ms();
+
+    for ledger in [&memory as &dyn FairUseLedger, &redis] {
+        // Bucket 5: ten tokens, the value the first decay will subtract.
+        ledger
+            .record_draw(&ada, 5 * BUCKET_MS, 10, 0.0)
+            .await
+            .unwrap();
+        // Bucket 40: sixty tokens, comfortably inside the window the whole
+        // way through -- what should still be counted at the end.
+        ledger
+            .record_draw(&ada, 40 * BUCKET_MS, 60, 0.0)
+            .await
+            .unwrap();
+    }
+    let (project_key, _) = fair_use_scope_keys(&ada);
+
+    // First decay: `now_ms` one bucket past bucket 5's departure from the
+    // five-hour window, so `from` advances from 5 to 6 and the running sum
+    // drops bucket 5's ten tokens -- 60 remain, all bucket 40's.
+    let first_decay_now = five_hours + 5 * BUCKET_MS + BUCKET_MS;
+    assert_eq!(
+        redis
+            .would_exceed(&ada, &terms, first_decay_now)
+            .await
+            .unwrap(),
+        memory
+            .would_exceed(&ada, &terms, first_decay_now)
+            .await
+            .unwrap(),
+        "before the out-of-order draw the two ledgers must still agree"
+    );
+    assert_eq!(
+        window_sum(&mut raw, &project_key, FairUseWindow::FiveHours).await,
+        Some((60, 0, 6, 40)),
+        "the first decay subtracted exactly bucket 5's ten tokens and moved \
+         `from` past it, leaving only bucket 40's sixty"
+    );
+    assert!(
+        bucket_exists(&mut raw, &project_key, 5 * BUCKET_MS).await,
+        "bucket 5's fields are not pruned: only the widest (seven-day) \
+         window's decay deletes, and it was never asked anything here"
+    );
+
+    // The out-of-order draw: ninety more tokens land back in bucket 5, below
+    // the `from` the first decay just advanced past it.
+    for ledger in [&memory as &dyn FairUseLedger, &redis] {
+        ledger
+            .record_draw(&ada, 5 * BUCKET_MS, 90, 0.0)
+            .await
+            .unwrap();
+    }
+
+    // Second decay: `first` must land strictly between bucket 5 (so the
+    // subtract branch runs, not the read-free `to < first` reset -- `to` is
+    // still 40, comfortably ahead) and bucket 40 (so bucket 40 is untouched).
+    // `from` advances from 6 to 7 over an empty bucket, and bucket 5 -- which
+    // now physically holds 10 + 90 tokens -- is below it and stays there.
+    // This is the step that used to re-read that bucket and subtract all 100
+    // of it out of a sum that had only ever been credited with 90.
+    let second_decay_now = five_hours + 7 * BUCKET_MS;
+    let memory_hit = memory
+        .would_exceed(&ada, &terms, second_decay_now)
+        .await
+        .unwrap();
+    let redis_hit = redis
+        .would_exceed(&ada, &terms, second_decay_now)
+        .await
+        .unwrap();
+    assert_eq!(
+        memory_hit, redis_hit,
+        "F6: a draw below an already-decayed `from` must not make the next \
+         decay subtract bucket 5's now-100-token total out of a sum that was \
+         never credited with it -- the two ledgers must agree at \
+         {second_decay_now}, memory={memory_hit:?} redis={redis_hit:?}"
+    );
+    assert!(
+        memory_hit.is_some(),
+        "the true sum is bucket 40's 60 tokens against a cap of 55, so the \
+         memory ledger -- which re-sums its buckets and cannot make this \
+         mistake -- must refuse"
+    );
+    assert_eq!(
+        window_sum(&mut raw, &project_key, FairUseWindow::FiveHours).await,
+        Some((60, 0, 7, 40)),
+        "F6: the five-hour window's running sum after the second decay must \
+         still be bucket 40's sixty tokens -- 60 - 100 floored at zero would \
+         show the double subtraction directly, and read back as 0 rather \
+         than 60"
+    );
+}
+
+/// **M13.1 review F8, closed: a draw stamped in a bucket newer than the
+/// check's own clock is reached by the retry walk.**
+///
+/// The walk ran from the sum's oldest surviving bucket up to `now_index` --
+/// the check's own clock, floored to a bucket -- dropping each in turn until
+/// the remainder cleared every cap. A draw recorded at a timestamp a few
+/// milliseconds past the checking node's clock (ordinary skew, straddling a
+/// bucket boundary) still landed in the running sum, but the walk never
+/// reached it: when that bucket was the only thing in the sum the loop's
+/// range was empty and the answer fell through to `retry = now_ms`, an
+/// immediate-retry 429 indistinguishable on the wire from "this window can
+/// never have room". The memory ledger's walk is open-ended, reaches the
+/// bucket, and returns its real departure time.
+///
+/// Under the mark (R-F9) the check is evaluated at the newest time the scope
+/// has seen -- which the draw itself advanced -- so the walk's bound is past
+/// the draw's bucket by construction rather than by a special case, and the
+/// two ledgers name the same instant. The shared contract asserts the retry
+/// time against each ledger on its own
+/// (`a_draw_ahead_of_the_check_clock_is_reached_by_the_retry_walk`); this is
+/// the differential.
+///
+/// A single draw five milliseconds into bucket 100, checked one millisecond
+/// before bucket 100 begins: the draw is the only thing in the sum and is
+/// unambiguously "the future" relative to the check's clock, so the retry
+/// this produces has nothing else it could be answering.
+#[tokio::test]
+#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
+async fn f8_a_draw_a_bucket_ahead_of_the_check_clock_is_reached_by_the_retry_walk() {
+    let memory = MemoryFairUseLedger::new();
+    let redis = connect_fair_use_from_env().await;
+    let ada = fresh_principal("ada");
+    let terms = project_only(vec![tokens_cap(FairUseWindow::FiveHours, 100)]);
+
+    // Bucket 100, five milliseconds in -- the only draw in the sum.
+    let draw_at = 100 * BUCKET_MS + 5;
+    for ledger in [&memory as &dyn FairUseLedger, &redis] {
+        ledger.record_draw(&ada, draw_at, 100, 0.0).await.unwrap();
+    }
+
+    // One millisecond before bucket 100 begins: the draw above is stamped
+    // inside bucket 100, which is therefore ahead of this check's own clock.
+    let now_ms = 100 * BUCKET_MS - 1;
+    let memory_hit = memory.would_exceed(&ada, &terms, now_ms).await.unwrap();
+    let redis_hit = redis.would_exceed(&ada, &terms, now_ms).await.unwrap();
+
+    assert!(
+        memory_hit.is_some() && redis_hit.is_some(),
+        "the single 100-token draw meets the 100-token cap on both ledgers, \
+         so both must refuse -- memory={memory_hit:?} redis={redis_hit:?}"
+    );
+    assert_eq!(
+        memory_hit, redis_hit,
+        "F8: the retry walk must reach a bucket stamped newer than the \
+         check's own clock rather than falling through to `retry = now_ms`, \
+         which is the answer reserved for a window that can never have room; \
+         memory={memory_hit:?} redis={redis_hit:?}"
+    );
+    assert_eq!(
+        memory_hit.map(|hit| hit.retry_at_ms),
+        Some(101 * BUCKET_MS + FairUseWindow::FiveHours.span_ms()),
+        "and the instant they agree on is when the draw's own bucket leaves \
+         the window -- not `now_ms`, which is what a walk bounded by the \
+         checking clock returns while still looking like a refusal"
+    );
+}
+
+/// **M13.1 review F9, closed: a check clock one millisecond behind an earlier
+/// check agrees with the memory ledger, because both are evaluated at the
+/// mark.**
+///
+/// `would_exceed` persists the decay it performs -- a window every bucket of
+/// which has aged out has its sum `HDEL`ed -- so the Redis ledger cannot
+/// answer a *later* call from an *earlier* clock by recomputing: the state
+/// that answer would need is gone. The finding was that the memory ledger
+/// (which re-sums what it holds) therefore refused where Redis admitted, in
+/// the permissive direction, with a one-millisecond backwards step across a
+/// boundary enough to reach it.
+///
+/// The ruling (R-F9) put the clock in the specification rather than making
+/// the decay reversible: each scope's clock is the high-water mark of every
+/// time handed to it, in *both* ledgers, so the second check below is
+/// evaluated at the first check's `now_ms` and the two agree on `None`. The
+/// shared contract asserts the rule against each ledger on its own
+/// (`a_check_behind_an_earlier_one_is_evaluated_at_the_mark`); this is the
+/// differential the contract cannot be, the same draws through both.
+///
+/// **Two controls, and neither is decoration.** The forward check at the
+/// boundary is `scripts.rs`'s own worked example, and without it a ledger
+/// that answered `None` to everything would pass. The second principal --
+/// identical draw, identical instant, no clock history in front of it -- is
+/// what proves the agreed `None` is the mark rather than a window that had
+/// genuinely cleared for everybody.
+#[tokio::test]
+#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
+async fn f9_a_check_clock_one_ms_behind_an_earlier_check_agrees_with_memory() {
+    let memory = MemoryFairUseLedger::new();
+    let redis = connect_fair_use_from_env().await;
+    let ada = fresh_principal("ada");
+    let terms = project_only(vec![tokens_cap(FairUseWindow::FiveHours, 100)]);
+
+    // A single 100-token draw at the epoch -- meets the 100-token cap on the
+    // five-hour window on both ledgers.
+    for ledger in [&memory as &dyn FairUseLedger, &redis] {
+        ledger.record_draw(&ada, 0, 100, 0.0).await.unwrap();
+    }
+
+    let span_ms = FairUseWindow::FiveHours.span_ms();
+    let boundary = span_ms + BUCKET_MS;
+
+    // CONTROL: a forward check landing on the boundary where the draw's
+    // bucket has just aged out of the window. Both ledgers agree, and both
+    // say the window is clear -- this is `scripts.rs`'s own worked example
+    // and passes today. Without this control, a decay that always answered
+    // `None` (rather than one that specifically forgets on a later, earlier
+    // `now_ms`) would also pass the divergence assertion below for the wrong
+    // reason.
+    let memory_at_boundary = memory.would_exceed(&ada, &terms, boundary).await.unwrap();
+    let redis_at_boundary = redis.would_exceed(&ada, &terms, boundary).await.unwrap();
+    assert_eq!(
+        redis_at_boundary, memory_at_boundary,
+        "both ledgers must agree at the boundary itself"
+    );
+    assert_eq!(
+        redis_at_boundary, None,
+        "the draw has aged out of the five-hour window exactly at the \
+         boundary, on both ledgers"
+    );
+
+    // The check clock now steps one millisecond BACKWARD across that same
+    // boundary. Both ledgers answer at the mark the boundary check set, so
+    // both answer exactly what it answered.
+    let one_ms_earlier = boundary - 1;
+    let memory_hit = memory
+        .would_exceed(&ada, &terms, one_ms_earlier)
+        .await
+        .unwrap();
+    let redis_hit = redis
+        .would_exceed(&ada, &terms, one_ms_earlier)
+        .await
+        .unwrap();
+    assert_eq!(
+        redis_hit, memory_hit,
+        "F9: a check clock that steps back across a boundary must not part \
+         the two ledgers -- the Redis one persisted the boundary check's \
+         decay and cannot recompute what it deleted, so both are defined to \
+         answer at the mark; memory={memory_hit:?} redis={redis_hit:?}"
+    );
+    assert_eq!(
+        redis_hit, None,
+        "and the answer is the one the mark's instant gives, not the one \
+         this call's own now_ms would have"
+    );
+
+    // CONTROL: the identical draw and the identical instant, on a principal
+    // no check has ever taken past the boundary. Without it, a ledger that
+    // had simply forgotten the draw would pass every assertion above.
+    let bob = fresh_principal("bob");
+    for ledger in [&memory as &dyn FairUseLedger, &redis] {
+        ledger.record_draw(&bob, 0, 100, 0.0).await.unwrap();
+    }
+    let memory_bob = memory
+        .would_exceed(&bob, &terms, one_ms_earlier)
+        .await
+        .unwrap();
+    let redis_bob = redis
+        .would_exceed(&bob, &terms, one_ms_earlier)
+        .await
+        .unwrap();
+    assert_eq!(memory_bob, redis_bob, "the control must agree too");
+    assert!(
+        memory_bob.is_some(),
+        "one millisecond before the boundary the draw is still inside the \
+         five-hour window: the agreed None above is the mark at work"
     );
 }

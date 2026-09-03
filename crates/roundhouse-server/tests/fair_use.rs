@@ -39,8 +39,11 @@ use roundhouse_core::routing::AffinityPolicy;
 use roundhouse_core::store::MemoryStore;
 use roundhouse_fleet::EchoFrontierClient;
 use roundhouse_server::{
-    ControlPlane, ControlPlaneConfig, Conversations, EchoLocalExecutor, Engine, responses_api,
+    ControlPlane, ControlPlaneConfig, Conversations, EchoLocalExecutor, Engine, messages_router,
+    responses_api,
 };
+use roundhouse_store_redis::RedisFairUseLedger;
+use roundhouse_store_redis::test_support::url_from_env;
 
 mod common;
 use common::codex::{request, user_message};
@@ -649,5 +652,186 @@ async fn the_fair_use_429_body_decodes_as_the_shape_codex_treats_specially() {
     assert!(
         retry_at_ms > 0,
         "a refusal with no retry time would make the assertion above vacuous: {text}"
+    );
+}
+
+// -----------------------------------------------------------------------
+// M13.1 thermo-nuclear review, F5: the outage composition, at the wire
+// -----------------------------------------------------------------------
+
+// `SeveredStore` used to be duplicated here from `engine/fair_use.rs`'s own
+// test module, because that module's copy was private to the crate's
+// `#[cfg(test)]` build and unreachable from an integration-test binary. It
+// now lives once, in `roundhouse_server::test_support` (M13.1 review F5),
+// gated behind the same `test-support` feature this suite already turns on
+// for `roundhouse_store_redis::test_support::url_from_env` below. See that
+// module's own doc for why a relay stands in for a real outage: a connection
+// that stops answering and a reconnect that is refused, with the store
+// itself untouched.
+use roundhouse_server::test_support::SeveredStore;
+
+/// A control plane with a fair-use window, for the Messages surface.
+fn messages_plane(max_tokens: u64) -> Arc<ControlPlane> {
+    let json = serde_json::json!({
+        "projects": [{
+            "id": "bench",
+            "fair_use": { "windows": [{ "window": "5h", "max_tokens": max_tokens }] },
+        }],
+        "users": [{ "id": "ada" }],
+        "keys": [{
+            "project": "bench", "user": "ada", "key_sha256": sha256_hex(&key("ada")),
+        }],
+    })
+    .to_string();
+    Arc::new(ControlPlane::configured(
+        ControlPlaneConfig::from_json(&json, "messages fair-use fixture")
+            .expect("the fixture config must validate"),
+    ))
+}
+
+/// `POST /v1/messages` as `bench/ada`, non-streaming — a fair-use refusal
+/// happens before the stream would begin either way, so this keeps the
+/// fixture simple without changing which envelope answers it.
+async fn post_messages(app: &Router, text: &str) -> (StatusCode, serde_json::Value) {
+    let body = serde_json::json!({
+        "model": "claude-opus-5",
+        "max_tokens": 64,
+        "messages": [{ "role": "user", "content": text }],
+    });
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header(CONTENT_TYPE, "application/json")
+                .header(AUTHORIZATION, format!("Bearer {}", key("ada")))
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+    (status, parsed)
+}
+
+/// **F5 (M13.1 thermo-nuclear review): the outage refusal, through
+/// `MessagesError::into_response` rather than the raw `ApiError`.**
+///
+/// R-F7's retryability claim is that a fair-use ledger nobody can reach fails
+/// closed with a `503` that the Messages dialect spells `overloaded_error` —
+/// the one string Claude Code retries on regardless of status. Every
+/// existing outage test (`engine/fair_use.rs`'s
+/// `a_ceiling_that_cannot_be_checked_refuses_the_turn_retryably` and its F2
+/// sibling) asserts on the raw `ApiError` returned by
+/// `refuse_over_fair_use` directly — never through `messages_router` and
+/// never through `MessagesError::into_response`, so a change to
+/// `error_kind`'s `SERVICE_UNAVAILABLE` arm cannot turn any of them red. This
+/// is the composition none of them drive: a real `POST /v1/messages` against
+/// an `Engine` backed by a `RedisFairUseLedger` whose store is cut mid-test,
+/// asserting on the wire body's `error.type` — the field the finding says is
+/// untested.
+#[tokio::test]
+#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
+async fn f5_the_outage_refusal_is_spelled_overloaded_error_at_the_messages_wire() {
+    let relay = SeveredStore::in_front_of(&url_from_env()).await;
+    let fair_use = Arc::new(
+        RedisFairUseLedger::connect(&relay.url)
+            .await
+            .expect("the relay in front of the test Redis must be reachable"),
+    );
+    let plane = messages_plane(1_000_000);
+    let store = Arc::new(MemoryStore::new());
+    let engine = engine(
+        Arc::clone(&store),
+        Arc::new(CountingLedger::default()),
+        Arc::clone(&fair_use) as Arc<dyn FairUseLedger>,
+    );
+    let app = messages_router(plane, engine, store, Arc::new(Conversations::new()));
+
+    // CONTROL: reachable, so the assertion below is about the outage and not
+    // about a route that always answers 503.
+    let (status, _) = post_messages(&app, "count some tokens").await;
+    assert_eq!(status, StatusCode::OK, "a reachable ledger must admit");
+
+    relay.cut();
+
+    // THE CLAIM: the ledger cannot answer, and the *wire* — not the raw
+    // `ApiError` — must spell this as the one string Claude Code retries on
+    // regardless of status.
+    let (status, body) = post_messages(&app, "count more tokens").await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "an unreachable ledger is a retryable outage at the wire too: {body}"
+    );
+    assert_eq!(
+        body["error"]["type"], "overloaded_error",
+        "the Messages dialect's client retries on this string regardless of \
+         status (§3.2) -- a mapping regression here is invisible to every \
+         existing fair-use test, which asserts the raw `ApiError` and never \
+         routes through `MessagesError::into_response`: {body}"
+    );
+    assert_eq!(
+        body["error"]["roundhouse_code"], "fair_use_unavailable",
+        "and it must still name the store that is down, unmodified by the \
+         envelope translation: {body}"
+    );
+}
+
+/// **F5's twin: the same outage, at the Responses wire.**
+///
+/// The Responses surface has no dialect envelope of its own — `ApiError`'s
+/// `IntoResponse` impl is the whole answer — but before this test nothing
+/// drove *that* composition against a real outage either: every prior
+/// assertion on `refuse_over_fair_use`'s 503 called it directly, in-process,
+/// never through `responses_router`. This is what F5's ruling calls its
+/// twin: `POST /v1/responses` against an `Engine` backed by a
+/// `RedisFairUseLedger` whose store is cut mid-test, asserting on the wire
+/// body — the fixed message (M13.1 review F4: no more raw store error text
+/// on the wire) and the `fair_use_unavailable` code — exactly as F5 pins the
+/// Messages envelope above it.
+#[tokio::test]
+#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
+async fn f5_twin_the_outage_refusal_reaches_the_responses_wire_too() {
+    let relay = SeveredStore::in_front_of(&url_from_env()).await;
+    let fair_use = Arc::new(
+        RedisFairUseLedger::connect(&relay.url)
+            .await
+            .expect("the relay in front of the test Redis must be reachable"),
+    );
+    let plane = plane(1_000_000);
+    let store = Arc::new(MemoryStore::new());
+    let engine = engine(
+        Arc::clone(&store),
+        Arc::new(CountingLedger::default()),
+        Arc::clone(&fair_use) as Arc<dyn FairUseLedger>,
+    );
+    let app = app(plane, engine, store);
+
+    // CONTROL: reachable, so the assertion below is about the outage and not
+    // about a route that always answers 503.
+    let (status, _) = post(&app, "sess-one").await;
+    assert_eq!(status, StatusCode::OK, "a reachable ledger must admit");
+
+    relay.cut();
+
+    // THE CLAIM: the same outage, driven through the real Responses router
+    // rather than by calling `refuse_over_fair_use` in-process.
+    let (status, error) = post(&app, "sess-two").await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "an unreachable ledger is a retryable outage at the Responses wire \
+         too: {error}"
+    );
+    assert_eq!(error["code"], "fair_use_unavailable");
+    assert_eq!(
+        error["message"], "the fair-use ledger is unavailable; retry",
+        "the wire message is fixed, not the store's own error text -- a \
+         tenant does not get the operator's Redis error string (M13.1 \
+         review F4): {error}"
     );
 }

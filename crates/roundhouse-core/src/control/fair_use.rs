@@ -474,6 +474,19 @@ pub enum FairUseError {
 /// would need a hold, a TTL and a release — the whole budget machinery this
 /// seam exists to stay out of — to bound an overshoot of one turn.
 ///
+/// **A ledger's clock is the high-water mark of every time it has been
+/// handed, per scope** (M13.1 review, R-F9), and that is part of the contract
+/// rather than of either implementation: a call whose time is behind the mark
+/// is evaluated *at* the mark, a call ahead of it advances the mark, and a
+/// draw stamped behind it is recorded in its own bucket but widens no window
+/// backwards. The rule exists because a backend may — and the Redis one does
+/// — age draws out of a window destructively as it reads, which no later
+/// call can undo; defining both ledgers on the mark makes each a
+/// deterministic function of (the draws, the mark) rather than leaving them
+/// to disagree whenever a node's clock steps backwards. It fixes the
+/// direction of the error too: a clock that goes backwards can never make an
+/// admission *more* permissive.
+///
 /// [`SpendLedger`]: super::spend::SpendLedger
 #[async_trait]
 pub trait FairUseLedger: Send + Sync + 'static {
@@ -518,9 +531,33 @@ pub trait FairUseLedger: Send + Sync + 'static {
 #[derive(Debug, Default)]
 struct Buckets {
     by_index: BTreeMap<u64, (u64, u64)>,
+    /// This scope's clock: the newest `at_ms` or `now_ms` any call has handed
+    /// it. See [`Buckets::tick`].
+    mark_ms: u64,
 }
 
 impl Buckets {
+    /// Take the caller's time into the scope's clock and hand back the time
+    /// this call is therefore evaluated at.
+    ///
+    /// **The ledger's clock is a high-water mark, and that is the
+    /// specification rather than an implementation detail of one backend**
+    /// (M13.1 review, R-F9). It is here because the Redis ledger's decay is
+    /// owned by the read and so is irreversible — a check that ages a bucket
+    /// out deletes it — and a ledger that answered a *later* call from an
+    /// *earlier* clock would have to un-delete it. Rather than let the two
+    /// backends disagree whenever a clock steps backwards, both are defined
+    /// on the mark: a call whose time is behind it is evaluated at the mark, a
+    /// call ahead of it advances it, and a draw stamped behind it is still
+    /// recorded in its own bucket but cannot widen a window backwards, because
+    /// the window's range is measured from the mark. The consequence worth
+    /// stating: no admission is ever made *more permissive* by a clock going
+    /// backwards, which is the direction that matters for a ceiling.
+    fn tick(&mut self, at_ms: u64) -> u64 {
+        self.mark_ms = self.mark_ms.max(at_ms);
+        self.mark_ms
+    }
+
     fn record(&mut self, at_ms: u64, counts: DrawCounts) {
         let entry = self.by_index.entry(at_ms / BUCKET_MS).or_insert((0, 0));
         entry.0 = add_count(entry.0, counts.tokens);
@@ -669,8 +706,14 @@ impl FairUseLedger for MemoryFairUseLedger {
         // enforced against a project counter is not a member ceiling.
         for user in [None, Some(principal.user.clone())] {
             let buckets = scopes.entry((principal.project.clone(), user)).or_default();
+            // The draw lands in its own bucket whatever the clock has already
+            // seen — it happened — but the prune, like every window, is
+            // measured from the mark, so a draw stamped a week behind it is
+            // dropped again immediately rather than counted by nothing and
+            // kept forever.
+            let mark = buckets.tick(at_ms);
             buckets.record(at_ms, counts);
-            buckets.prune(at_ms);
+            buckets.prune(mark);
         }
         Ok(())
     }
@@ -701,8 +744,11 @@ impl FairUseLedger for MemoryFairUseLedger {
                  roundhouse_store_redis::fair_use for the key layout it lands on"
             );
         }
-        let scopes = self.scopes.lock().await;
-        let empty = Buckets::default();
+        let mut scopes = self.scopes.lock().await;
+        // The clock the *refusing* scope was evaluated at, which is the one a
+        // retry time falls back to. `exceeded_by` returns at the first
+        // refusal, so the last scope this closure touched is that scope.
+        let mut evaluated_at = now_ms;
         let refused = terms.exceeded_by(|scope, window| {
             let key = (
                 principal.project.clone(),
@@ -711,7 +757,6 @@ impl FairUseLedger for MemoryFairUseLedger {
                     FairUseScope::Member => Some(principal.user.clone()),
                 },
             );
-            let buckets = scopes.get(&key).unwrap_or(&empty);
             let limit = match scope {
                 FairUseScope::Project => &terms.project,
                 FairUseScope::Member => &terms.member,
@@ -720,7 +765,17 @@ impl FairUseLedger for MemoryFairUseLedger {
             .find(|limit| limit.window == window)
             .copied()
             .expect("exceeded_by only asks about a window it found a limit for");
-            buckets.drawn(window, now_ms, &limit)
+            // A scope nothing has ever drawn against has no clock to keep:
+            // every window over it is empty at any time, and minting an entry
+            // to hold a mark would be state a check created. The Redis ledger
+            // makes the same call on the same condition — no `mark` field, no
+            // write — which is what keeps the two marks in step.
+            let Some(buckets) = scopes.get_mut(&key) else {
+                evaluated_at = now_ms;
+                return Drawn::default();
+            };
+            evaluated_at = buckets.tick(now_ms);
+            buckets.drawn(window, evaluated_at, &limit)
         });
         Ok(
             refused.map(|(scope, limit, quantity, drawn)| FairUseRefusal {
@@ -730,8 +785,10 @@ impl FairUseLedger for MemoryFairUseLedger {
                 // Present whenever the limit was exceeded, which is the only way
                 // this arm is reached — `drawn` computes both from one walk of the
                 // same buckets, so the sum that refused and the retry time that
-                // explains it cannot disagree about which draws are inside.
-                retry_at_ms: drawn.retry_at_ms.unwrap_or(now_ms),
+                // explains it cannot disagree about which draws are inside. The
+                // fallback is the clock that scope was judged at rather than the
+                // `now_ms` this call supplied, for the same reason the window was.
+                retry_at_ms: drawn.retry_at_ms.unwrap_or(evaluated_at),
             }),
         )
     }

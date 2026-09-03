@@ -52,7 +52,7 @@ pub mod test_support;
 pub use fair_use::RedisFairUseLedger;
 pub use spend::RedisSpendLedger;
 
-use redis::aio::ConnectionManager;
+use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use redis::streams::StreamRangeReply;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -61,6 +61,82 @@ use roundhouse_core::event::{SessionEvent, SessionEventKind};
 use roundhouse_core::ids::SessionId;
 use roundhouse_core::now_ms;
 use roundhouse_core::store::{Lease, SessionStore, StoreError};
+
+// ---------------------------------------------------------------------------
+// One `connect`, for all three Redis families this crate serves
+// ---------------------------------------------------------------------------
+
+/// How long a fresh connection attempt may take before this manager gives up
+/// on it and moves to the next retry.
+///
+/// **Named because R-F7's fail-closed half accepts a latency, and a latency
+/// nobody wrote down is one nobody can hold to.** Redis-1.2.4's own default
+/// (`DEFAULT_CONNECTION_TIMEOUT`, one second) is sized for a manager that only
+/// ever reconnects in the background; ours is on the critical path of a
+/// ceiling check the M13.1 addendum promises refuses "within a couple of
+/// seconds" of an outage, so it has to be tight enough that the retry budget
+/// below still fits inside that promise even in the worst case this bounds —
+/// a peer that accepts the TCP handshake and then never answers, rather than
+/// the refused connection a closed port returns instantly.
+const CONNECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// How long a command may wait for a reply once a connection is up.
+///
+/// Reduced from the crate default's 500ms for the same reason as
+/// [`CONNECTION_TIMEOUT`]: this manager sits under a ceiling check with its
+/// own two-second budget, not under a background job that can afford to be
+/// generous.
+const RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// The smallest delay between reconnect attempts, and the base the backoff
+/// grows from.
+const RECONNECT_MIN_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The delay between reconnect attempts never grows past this, so a run of
+/// retries cannot itself blow the two-second budget even before
+/// [`RECONNECT_RETRIES`] is reached.
+const RECONNECT_MAX_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Each retry's delay is `RECONNECT_MIN_DELAY * RECONNECT_BACKOFF_FACTOR^n`,
+/// clamped at [`RECONNECT_MAX_DELAY`], before jitter.
+const RECONNECT_BACKOFF_FACTOR: f32 = 2.0;
+
+/// How many times a severed connection is retried before `send_packed_command`
+/// gives up and returns the error to the caller.
+///
+/// **The number R-F7's cost is paid in.** The crate default is six, and
+/// six retries at the crate's own defaults is where the ~9.45s this bound
+/// replaces came from (M13.1 review F2) — every admission after the first
+/// during an outage waiting on the shared reconnect future those six retries
+/// walk. Three, at the tighter delays above, keeps the worst-case sum
+/// (backoff sleeps plus, if the peer black-holes rather than refuses, three
+/// connection-timeout waits) comfortably under two seconds, measured against
+/// a real severed connection by
+/// `a_ceiling_that_cannot_be_checked_refuses_within_a_bounded_time` — while
+/// still giving a connection that drops for one round trip a chance to heal
+/// without every command in that window failing.
+const RECONNECT_RETRIES: usize = 3;
+
+/// Build the `ConnectionManager` every Redis-backed store, ledger and
+/// fair-use tracker in this crate connects through.
+///
+/// One function rather than the three copies of `ConnectionManagerConfig::default()`
+/// this replaces (session store, spend ledger, fair-use ledger, each
+/// hand-rolled and each silently accepting the crate's six-retry default) —
+/// so the outage-latency bound above is a fact about the crate, verified
+/// once, rather than three unlabelled call sites that happened to agree by
+/// copy-paste and could just as easily drift apart.
+async fn connect_manager(url: &str) -> Result<ConnectionManager, redis::RedisError> {
+    let client = redis::Client::open(url)?;
+    let config = ConnectionManagerConfig::new()
+        .set_connection_timeout(Some(CONNECTION_TIMEOUT))
+        .set_response_timeout(Some(RESPONSE_TIMEOUT))
+        .set_min_delay(RECONNECT_MIN_DELAY)
+        .set_max_delay(RECONNECT_MAX_DELAY)
+        .set_exponent_base(RECONNECT_BACKOFF_FACTOR)
+        .set_number_of_retries(RECONNECT_RETRIES);
+    ConnectionManager::new_with_config(client, config).await
+}
 
 /// Redis implementation of [`SessionStore`].
 ///
@@ -75,8 +151,7 @@ impl RedisSessionStore {
     /// Connect and fail fast: a store that cannot reach its Redis at startup
     /// should stop the process there, not on the first session.
     pub async fn connect(url: impl AsRef<str>) -> Result<Self, StoreError> {
-        let client = redis::Client::open(url.as_ref()).map_err(backend)?;
-        let conn = ConnectionManager::new(client).await.map_err(backend)?;
+        let conn = connect_manager(url.as_ref()).await.map_err(backend)?;
         Ok(Self {
             conn,
             scripts: std::sync::Arc::new(scripts::Scripts::new()),

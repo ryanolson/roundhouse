@@ -611,10 +611,17 @@ where
     S: SessionStore,
     T: Tokenizer + Clone + Send + Sync + 'static,
 {
-    let refusal = engine
-        .fair_use_refusal(admission)
-        .await
-        .map_err(|error| ApiError::unavailable("fair_use_unavailable", error.to_string()))?;
+    // The message is fixed, not `error.to_string()` (M13.1 review F4): the
+    // store's own error text can be an OS error string off a Redis client --
+    // an operator's connection detail, not this tenant's business. It is not
+    // thrown away, only kept off the wire: `Engine::fair_use_refusal` already
+    // logs it server-side, once per outage, before this mapping ever sees it.
+    let refusal = engine.fair_use_refusal(admission).await.map_err(|_error| {
+        ApiError::unavailable(
+            "fair_use_unavailable",
+            "the fair-use ledger is unavailable; retry",
+        )
+    })?;
     let Some(refusal) = refusal else {
         return Ok(());
     };

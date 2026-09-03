@@ -488,6 +488,96 @@ pub async fn a_window_sum_saturates_at_the_domain_ceiling<L: FairUseLedger>(ledg
     );
 }
 
+/// **A check whose clock is behind an earlier call's is evaluated at the
+/// mark**, so a backwards step of one millisecond cannot admit a turn the
+/// same instant would have been refused before (M13.1 review, R-F9 / F9).
+///
+/// The ledger's clock is the high-water mark of every time it has been handed
+/// for a scope. This is that rule where it bites: a check that lands exactly
+/// on the boundary where a window empties is answered `None`, and a *later*
+/// check one millisecond *earlier* — the clock stepping back across the same
+/// boundary — is answered from the mark rather than from its own `now_ms`,
+/// which is `None` too. A ledger whose read destroys what it ages out (the
+/// Redis one does) could not answer otherwise without un-deleting it, and a
+/// ledger that recomputed from `now_ms` would be *more permissive* than the
+/// mark's answer only by luck; making both evaluate at the mark is what turns
+/// each into a deterministic function of the draws and that clock.
+///
+/// **The control is the whole test**: a second principal, drawn identically
+/// and asked at the same earlier instant with no history in front of it, is
+/// refused. Without it a ledger that had simply forgotten the draw — or one
+/// whose window had genuinely cleared for everybody — would pass.
+pub async fn a_check_behind_an_earlier_one_is_evaluated_at_the_mark<L: FairUseLedger>(ledger: &L) {
+    let terms = project_only(vec![tokens(FairUseWindow::FiveHours, 100)]);
+    let span_ms = FairUseWindow::FiveHours.span_ms();
+    // The instant bucket 0 leaves the five-hour window: its own end, pushed
+    // out by the window's span.
+    let boundary = span_ms + BUCKET_MS;
+
+    let ada = fresh_principal("ada");
+    ledger.record_draw(&ada, 0, 100, 0.0).await.unwrap();
+    assert_eq!(
+        refused(ledger, &ada, &terms, boundary).await,
+        None,
+        "at the boundary the draw has aged out and the window is clear"
+    );
+    assert_eq!(
+        refused(ledger, &ada, &terms, boundary - 1).await,
+        None,
+        "and a clock that steps one millisecond back over that same boundary \
+         is answered at the mark the check above set, not at its own now_ms"
+    );
+
+    // CONTROL: the identical draw and the identical instant, on a principal
+    // whose clock has never been past it.
+    let bob = fresh_principal("bob");
+    ledger.record_draw(&bob, 0, 100, 0.0).await.unwrap();
+    assert!(
+        refused(ledger, &bob, &terms, boundary - 1).await.is_some(),
+        "one millisecond before the boundary the draw is still inside the \
+         window: the None above is the mark, not a window that had cleared"
+    );
+}
+
+/// **A draw stamped ahead of the checking clock is inside the window the mark
+/// defines, and the retry walk reaches it** (M13.1 review, R-F9 / F8).
+///
+/// Nodes' clocks differ by milliseconds, so a draw settled on one node can
+/// carry an `at_ms` a few milliseconds past the `now_ms` the next admission
+/// checks with on another — and across a bucket boundary that puts the draw
+/// in a bucket *newer* than the check's own. The mark is what makes that a
+/// non-event: the draw advanced it, so the check is evaluated there, the
+/// bucket is inside the window, and the refusal names the moment that bucket
+/// leaves rather than "retry now".
+///
+/// The retry time is asserted exactly, because an immediate-retry answer —
+/// `now_ms`, which is what a walk that stopped at the checking clock falls
+/// through to — is still a refusal and no `is_some()` can tell the two apart.
+pub async fn a_draw_ahead_of_the_check_clock_is_reached_by_the_retry_walk<L: FairUseLedger>(
+    ledger: &L,
+) {
+    let ada = fresh_principal("ada");
+    let terms = project_only(vec![tokens(FairUseWindow::FiveHours, 100)]);
+    let span_ms = FairUseWindow::FiveHours.span_ms();
+
+    // Five milliseconds into bucket 100, checked one millisecond before that
+    // bucket begins.
+    let draw_at = 100 * BUCKET_MS + 5;
+    let now_ms = 100 * BUCKET_MS - 1;
+    ledger.record_draw(&ada, draw_at, 100, 0.0).await.unwrap();
+
+    let hit = refused(ledger, &ada, &terms, now_ms)
+        .await
+        .expect("the draw meets the cap, whichever side of the bucket boundary the check is on");
+    assert_eq!(
+        hit.retry_at_ms,
+        101 * BUCKET_MS + span_ms,
+        "the refusal names the moment the draw's own bucket leaves the \
+         window, not the check's own now_ms -- a walk bounded by the \
+         checking clock never reaches a bucket stamped past it"
+    );
+}
+
 /// Instantiate the whole conformance suite against one backend.
 ///
 /// The single list of contract tests, in the same idiom and for the same
@@ -539,6 +629,8 @@ macro_rules! fair_use_ledger_contract_suite {
             the_retry_walk_drops_buckets_in_exact_micro_dollars,
             a_draw_past_the_domain_is_refused_with_the_counters_untouched,
             a_window_sum_saturates_at_the_domain_ceiling,
+            a_check_behind_an_earlier_one_is_evaluated_at_the_mark,
+            a_draw_ahead_of_the_check_clock_is_reached_by_the_retry_walk,
         );
     };
     // One test per recursion step rather than one repetition over the names:

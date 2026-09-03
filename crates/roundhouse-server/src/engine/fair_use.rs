@@ -129,10 +129,61 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         if admission.fair_use.is_empty() {
             return Ok(None);
         }
-        let refusal = self
+        let refusal = match self
             .fair_use
             .would_exceed(&admission.principal, &admission.fair_use, now_ms())
-            .await?;
+            .await
+        {
+            Ok(refusal) => {
+                // The outage, if there was one, is over: the next one gets its
+                // own warning rather than inheriting this success's silence.
+                // `swap` rather than a bare `store` so the recovery line below
+                // fires exactly once too, on the transition rather than on
+                // every reachable check for the rest of the process's life.
+                if self
+                    .fair_use_unreachable_warned
+                    .swap(false, std::sync::atomic::Ordering::Relaxed)
+                {
+                    tracing::info!(
+                        project = %admission.principal.project,
+                        user = %admission.principal.user,
+                        "fair use: the ledger is reachable again; the outage above has cleared"
+                    );
+                }
+                refusal
+            }
+            Err(error) => {
+                // **The other half of R-F7's asymmetry, closed.** A refused
+                // *draw* warns per failure (`record_fair_use_draw`, below) --
+                // this is the *check* that fails closed, and until this fix it
+                // said nothing server-side while it silently 503'd every
+                // admission for the length of an outage. An operator watching
+                // logs saw the fail-open draws complaining and heard nothing
+                // at all from the fail-closed checks failing the same outage's
+                // turns (M13.1 review F4).
+                //
+                // Once per outage, not once per refused turn: a `503` a
+                // second into an outage and a `503` an hour into the same one
+                // are the same fact, and a line repeated on every admission is
+                // the line an operator learns to filter -- the same reasoning
+                // `unread_recipe`'s doc gives, applied to a condition that
+                // clears rather than one that never does.
+                if !self
+                    .fair_use_unreachable_warned
+                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
+                    tracing::warn!(
+                        project = %admission.principal.project,
+                        user = %admission.principal.user,
+                        %error,
+                        "fair use: a ceiling could not be checked because its ledger is \
+                         unreachable; refusing this turn and every one after it, retryably, \
+                         until the ledger answers again"
+                    );
+                }
+                return Err(EngineError::from(error));
+            }
+        };
         if let Some(refusal) = &refusal {
             // A log fact, deliberately structured rather than prose: an
             // operator watching a benchmark run needs to be able to count these
@@ -521,75 +572,12 @@ mod tests {
     // R-F7: the outage posture, pinned against a store taken away mid-test
     // -----------------------------------------------------------------------
 
-    /// A TCP relay in front of the real Redis, so a store can be taken away
-    /// mid-test without touching a Redis this suite does not own.
-    ///
-    /// **Why a relay rather than a `SHUTDOWN`.** The Redis the environment
-    /// names is shared with every other gated suite in this workspace, and
-    /// stopping it would fail them rather than this one; starting a second
-    /// server would put a binary on the test's requirements. What an outage
-    /// *is*, from this process's side, is a connection that stops answering
-    /// and a reconnect that is refused — which is exactly what dropping the
-    /// relay produces, with the store itself untouched.
-    struct SeveredStore {
-        url: String,
-        accept: tokio::task::JoinHandle<()>,
-        pipes: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
-    }
-
-    impl SeveredStore {
-        async fn in_front_of(upstream: &str) -> Self {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let port = listener.local_addr().unwrap().port();
-            // `redis://host:port/db`, which is the only shape
-            // `ROUNDHOUSE_TEST_REDIS_URL` takes in this workspace. Parsed by
-            // hand because the `redis` crate is not a dependency of this
-            // crate — only of the store's — and a URL parser is not what this
-            // test is about.
-            let target = upstream
-                .trim_start_matches("redis://")
-                .split('/')
-                .next()
-                .expect("a redis URL names a host and a port")
-                .to_string();
-            let pipes: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
-                Arc::new(std::sync::Mutex::new(Vec::new()));
-            let accept = tokio::spawn({
-                let pipes = Arc::clone(&pipes);
-                async move {
-                    loop {
-                        let Ok((mut inbound, _)) = listener.accept().await else {
-                            return;
-                        };
-                        let target = target.clone();
-                        let pipe = tokio::spawn(async move {
-                            let Ok(mut outbound) = tokio::net::TcpStream::connect(target).await
-                            else {
-                                return;
-                            };
-                            let _ =
-                                tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
-                        });
-                        pipes.lock().unwrap().push(pipe);
-                    }
-                }
-            });
-            Self {
-                url: format!("redis://127.0.0.1:{port}/"),
-                accept,
-                pipes,
-            }
-        }
-
-        /// The outage: stop listening — so a reconnect is refused — and drop
-        /// every connection already open.
-        fn cut(&self) {
-            self.accept.abort();
-            for pipe in self.pipes.lock().unwrap().drain(..) {
-                pipe.abort();
-            }
-        }
-    }
+    // `SeveredStore` moved to `crate::test_support` (M13.1 review F5): this
+    // module and `tests/fair_use.rs` each carried their own 270-line copy,
+    // and a fixture two files disagree about by construction is one an edit
+    // to either can silently stop matching the other's outage. See that
+    // module's own doc for why a relay stands in for a real outage.
+    use crate::test_support::SeveredStore;
 
     async fn severed_ledger() -> (SeveredStore, Arc<RedisFairUseLedger>) {
         let store = SeveredStore::in_front_of(&url_from_env()).await;
@@ -677,6 +665,131 @@ mod tests {
         assert_eq!(
             json["error"]["code"], "fair_use_unavailable",
             "and it names the store that is down rather than the tenant"
+        );
+    }
+
+    /// **F2 (M13.1 thermo-nuclear review): the fail-closed refusal above must
+    /// not spend the whole outage getting there.**
+    ///
+    /// R-F7 said an unreachable ceiling "fails closed with a retryable
+    /// refusal" and named no time bound. Before this fix,
+    /// `RedisFairUseLedger::connect` built its `ConnectionManager` with
+    /// `ConnectionManagerConfig::default()`, and `send_packed_command`
+    /// against a severed connection awaited that manager's own
+    /// reconnect-with-backoff future — six retries, unbounded by anything
+    /// this crate named — before the command itself ever timed out.
+    /// `RedisFairUseLedger::connect` (and every other `connect` in
+    /// `roundhouse-store-redis`) now goes through that crate's one shared
+    /// `connect_manager`, whose named, tightened bounds replace the crate
+    /// default; this test bounds the same post-cut call the control test
+    /// above makes and asserts it returns inside two seconds — a bound
+    /// generous enough for any admission path an agent's stack would still
+    /// call "retryable" rather than "hung".
+    #[tokio::test]
+    #[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
+    async fn a_ceiling_that_cannot_be_checked_refuses_within_a_bounded_time() {
+        let (store, ledger) = severed_ledger().await;
+        let engine = engine(Arc::clone(&ledger) as Arc<dyn FairUseLedger>);
+        let admission = capped_for(fresh_principal("ada-f2"), 100);
+
+        // CONTROL: reachable, so the bound below is not passing merely
+        // because the whole call is a no-op against a store that answers
+        // instantly regardless of backoff.
+        assert!(
+            crate::http::refuse_over_fair_use(&engine, &admission)
+                .await
+                .is_ok()
+        );
+
+        store.cut();
+
+        // The *first* call after the cut fails fast: `send_packed_command`
+        // finds the already-established connection's IO error, returns it
+        // immediately, and only spawns the reconnect future in the
+        // background without awaiting it. That is not the call R-F7's cost
+        // lands on — it is every admission *after* the first, which is what
+        // the second, timed call below stands in for.
+        let _ = crate::http::refuse_over_fair_use(&engine, &admission).await;
+
+        // The claim: a *second* admission during the same outage — the
+        // ordinary case for an outage that outlives one request — is bounded
+        // well under the ~9.45s a default `ConnectionManagerConfig` backoff
+        // spends awaiting the reconnect future this second call now finds
+        // already in flight.
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            crate::http::refuse_over_fair_use(&engine, &admission),
+        )
+        .await;
+        assert!(
+            outcome.is_ok(),
+            "a ceiling check that cannot reach its store must refuse inside a \
+             couple of seconds, not spend the redis-crate's default \
+             reconnect backoff on every admission for the length of the \
+             outage"
+        );
+    }
+
+    /// **F4 (M13.1 thermo-nuclear review): the fail-closed half must warn
+    /// server-side too, the way the fail-open half already does.**
+    ///
+    /// R-F7 pins "record fails open with the reason logged" for
+    /// `record_fair_use_draw`, proven by the guard right below. `fair_use_refusal`
+    /// is the other half of the same seam, and when its ledger is unreachable
+    /// it propagates the store's error straight out through a bare `?` —
+    /// nothing is logged on this path at all; only a *found* refusal
+    /// (`Some(refusal)`) gets a `tracing::info!`. An operator watching logs
+    /// during an outage of the fair-use store sees the fail-open draws warn
+    /// per failure and sees nothing at all from the fail-closed checks that
+    /// are failing the same outage's turns, every one of them, for as long as
+    /// it lasts.
+    ///
+    /// Same rig as the retryability test above: a real Redis fronted by a
+    /// relay this test can sever without touching the shared server. A plain
+    /// `#[test]` driving its own runtime, for the reason given on the sibling
+    /// draw-side test below — `captured_warnings` installs a thread-local
+    /// subscriber around a synchronous closure, and `block_on` inside it is
+    /// what puts the ledger's I/O on the thread the subscriber is installed
+    /// on.
+    #[test]
+    #[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
+    fn a_ceiling_that_cannot_be_checked_warns_server_side_too() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (store, engine, admission) = runtime.block_on(async {
+            let (store, ledger) = severed_ledger().await;
+            let engine = engine(ledger as Arc<dyn FairUseLedger>);
+            let admission = capped_for(fresh_principal("ada-f4"), 100);
+            (store, engine, admission)
+        });
+
+        // CONTROL: while the store is reachable, nothing is drawn and nothing
+        // is said — a `fair_use_refusal` that warned unconditionally would
+        // satisfy the claim below for the wrong reason.
+        let quiet = captured_warnings(|| {
+            let _ = runtime.block_on(engine.fair_use_refusal(&admission));
+        });
+        assert!(
+            !quiet.contains("could not be checked"),
+            "a reachable ledger must not itself claim it could not be checked: {quiet}"
+        );
+
+        store.cut();
+
+        // The claim: the same call against a store that is gone still
+        // returns an error (proven already, above) but — today — says
+        // nothing about it server-side.
+        let warnings = captured_warnings(|| {
+            let _ = runtime.block_on(engine.fair_use_refusal(&admission));
+        });
+        assert!(
+            warnings.contains("could not be checked"),
+            "a fail-closed refusal that cannot reach its store must warn \
+             server-side the same way record_fair_use_draw's fail-open half \
+             does, so an outage of the ledger is visible in the logs and not \
+             only in client-facing 503s: got {warnings:?}"
         );
     }
 

@@ -98,9 +98,14 @@ pub struct RedisSpendLedger {
 impl RedisSpendLedger {
     /// Connect and fail fast: a ledger that cannot reach its Redis at
     /// startup should stop the process there, not on the first grant.
+    ///
+    /// Through [`crate::connect_manager`] rather than
+    /// `ConnectionManagerConfig::default()` — see its doc for the outage
+    /// latency this crate's one `connect` bounds (M13.1 review F2).
     pub async fn connect(url: impl AsRef<str>) -> Result<Self, SpendError> {
-        let client = redis::Client::open(url.as_ref()).map_err(backend)?;
-        let conn = ConnectionManager::new(client).await.map_err(backend)?;
+        let conn = crate::connect_manager(url.as_ref())
+            .await
+            .map_err(backend)?;
         Ok(Self {
             conn,
             scripts: Arc::new(scripts::Scripts::new()),

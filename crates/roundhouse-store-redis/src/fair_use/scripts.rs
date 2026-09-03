@@ -85,12 +85,44 @@ pub(crate) fn would_exceed_source() -> &'static str {
 /// | `b:<index>:t`, `b:<index>:u` | one bucket's tokens and micro-dollars |
 /// | `s:<window>:t`, `s:<window>:u` | that window's running sum |
 /// | `s:<window>:from`, `s:<window>:to` | the oldest and newest bucket index the sum includes |
+/// | `mark` | the scope's clock: the newest time any caller has handed it |
+///
+/// # The mark, which is what "now" means here (M13.1 review, R-F9)
+///
+/// A scope's clock is the high-water mark of every `at_ms` and `now_ms` it has
+/// been handed, and every window is aged and compared at *that* time rather
+/// than at whatever the current call supplied. It has to be, because the decay
+/// is owned by the read and is therefore irreversible: a check that ages a
+/// bucket out deletes it, and a later check whose clock stepped back one
+/// millisecond would read the hole and admit a turn the memory ledger — which
+/// re-sums what it still holds — refuses (F9). Evaluating at the mark makes
+/// both ledgers deterministic functions of (the draws, the mark), so no
+/// admission can be made more permissive by a clock going backwards, and it is
+/// what lets the retry walk reach a bucket stamped ahead of the checking
+/// node's own clock (F8) — under the mark, `to` can never exceed `now_index`,
+/// because the draw that set `to` advanced the mark past it in the same write.
+///
+/// One field per scope, read in the same `HMGET` that reads a window's sum and
+/// written at most once per script run, so the mark costs no round trip and
+/// no extra read; a check whose clock advances the mark pays one `HSET` for it.
+/// A scope that has never been drawn against has no mark and nothing to
+/// forget, so nothing is written for it — which is also what keeps a check
+/// from creating a hash that no `PEXPIRE` has ever been armed on.
 ///
 /// # `decay`, and why `to` is stored rather than inferred
 ///
 /// A running sum is only usable if something ages the draws that have left
 /// the window back out of it. `decay` is that something, and it is written
 /// once here because both scripts need it to age a sum *the same way*.
+///
+/// **It computes and never writes.** The two writes a decay can imply are its
+/// callers' to compose: `prune_decayed` deletes the bucket fields it aged out,
+/// and `persist_sum` writes the moved sum back. That is a split rather than
+/// the two boolean modes this started with (M13.1 review, F7) — the draw
+/// prunes without persisting, because its own `HSET` already carries these
+/// fields, and the check persists and prunes only at the widest window; a
+/// `persist` flag and a `name` that only one of the two callers ever used made
+/// the signature ten parameters wide and hid which caller reached which arm.
 ///
 /// It has three branches, and which one runs is decided by `to` — the newest
 /// bucket the sum includes:
@@ -102,7 +134,12 @@ pub(crate) fn would_exceed_source() -> &'static str {
 ///   non-decreasing time order — a caller whose clock stepped backwards by
 ///   more than a window between two draws would have had a full window's
 ///   draws deleted by that rule. One extra field per window buys the branch
-///   its precondition instead of assuming it.
+///   its precondition instead of assuming it. `to` is never `nil` here: both
+///   scripts write the four fields of a window's sum as a set and delete them
+///   as a set, so a `from` that survived the early return above has a `to`
+///   beside it — the arm that guarded the other case was unreachable and is
+///   gone (M13.1 review, F7), with
+///   `a_windows_four_sum_fields_move_as_a_set` holding the premise.
 /// - **the gap is no wider than the window, and the sum is inside the
 ///   domain**: read the fields that aged out, subtract them, floored at zero
 ///   exactly as the memory ledger's walk floors. This is the steady state,
@@ -116,17 +153,21 @@ pub(crate) fn would_exceed_source() -> &'static str {
 ///   walks straight through, and a disagreement with the memory ledger, which
 ///   re-sums its buckets every time and therefore stays at the ceiling.
 ///
-/// Every read is one `HMGET` over a bucket range, and every range is bounded
-/// by one window's width by construction. `read_buckets`/`drop_buckets` still
-/// chunk: `unpack` is limited by Lua's C stack (`LUAI_MAXCSTACK`, 8000 in
-/// Redis), and a range assembled into one call would sit within a factor of
-/// two of that at today's widest window and past it the moment a wider one is
-/// added.
+/// Every bucket range a decay reads is bounded by one window's width by
+/// construction, but it is *not* one `HMGET`: `read_buckets`/`drop_buckets`
+/// chunk at `CHUNK` fields per command, because `unpack` is limited by Lua's C
+/// stack (`LUAI_MAXCSTACK`, 8000 in Redis) and a range assembled into one call
+/// would sit within a factor of two of that at today's widest window and past
+/// it the moment a wider one is added. So the worst case is one command per
+/// chunk — six for the seven-day window's 2016 buckets — and the steady state
+/// is the handful of buckets that elapsed since the last touch, in one. The
+/// module doc states the same bound; it said "one `HMGET`" until M13.1's
+/// review measured seven (F7).
 ///
 /// # The pruning pass, owned
 ///
-/// `prune` deletes the bucket fields the decay just aged out, and it is
-/// passed for the *widest* window only — those fields are outside every
+/// `prune_decayed` deletes the bucket fields the decay just aged out, and it
+/// is called for the *widest* window only — those fields are outside every
 /// window, so nothing can still need them. Which is why `record_draw` decays
 /// the widest window on every draw even though it compares nothing: that is
 /// the one pass guaranteed to run, and without it a membership capped only on
@@ -157,6 +198,19 @@ end
 local function sum_fields(name)
   return 's:' .. name .. ':t', 's:' .. name .. ':u',
          's:' .. name .. ':from', 's:' .. name .. ':to'
+end
+
+-- The scope's clock. One field, one spelling, both scripts.
+local MARK = 'mark'
+
+-- The oldest bucket index a window covers at `now_ms`. Floor division from a
+-- start clamped at the epoch, which is what the memory ledger's saturating
+-- subtraction does -- and the flooring is what includes the partially
+-- overlapping trailing bucket whole.
+local function window_first(now_ms, span_ms, bucket_ms)
+  local start = now_ms - span_ms
+  if start < 0 then start = 0 end
+  return math.floor(start / bucket_ms)
 end
 
 -- At most this many buckets -- twice as many field names -- per command. See
@@ -201,19 +255,22 @@ end
 -- Age one window's running sum forward so that it covers exactly the buckets
 -- from `first`. `state` is {t, u, from, to} as read out of the hash; the four
 -- are returned moved, and `from`/`to` come back nil when nothing is left.
-local function decay(key, name, state, span_ms, bucket_ms, first, now_index,
-                     max_count, prune, persist)
+--
+-- Nothing is written here. The fifth return is the newest bucket index that
+-- aged out, or nil when nothing did -- which is both what `prune_decayed`
+-- deletes and the caller's signal that there is nothing to persist either.
+local function decay(key, state, span_ms, bucket_ms, first, max_count)
   -- A window nothing has ever drawn against reads back as four nils. It
   -- returns as a sum of zero rather than as nils, because the caller compares
   -- it against a cap -- and a cap of zero refuses an empty window, which is
   -- the one configuration where an untouched sum still has to be a number.
   local t, u, from, to = state[1] or 0, state[2] or 0, state[3], state[4]
-  if from == nil or from >= first then return t, u, from, to end
+  if from == nil or from >= first then return t, u, from, to, nil end
   local last = first - 1
-  local prune_last = last
-  if to == nil or to < first then
+  local aged = last
+  if to < first then
     -- Nothing the sum covers is inside the window any more.
-    if to ~= nil and to < prune_last then prune_last = to end
+    if to < aged then aged = to end
     t, u, from, to = 0, 0, nil, nil
   elseif (first - from) <= math.floor(span_ms / bucket_ms) + 1
      and t < max_count and u < max_count then
@@ -228,28 +285,37 @@ local function decay(key, name, state, span_ms, bucket_ms, first, now_index,
     end
     from = first
   else
-    local hi = to
-    if hi > now_index then hi = now_index end
-    local got = read_buckets(key, first, hi)
+    -- `to` needs no clamp to the caller's clock: every draw advanced the mark
+    -- past its own bucket, and every caller evaluates at the mark, so the
+    -- newest bucket the sum covers is never in the future of `first`'s clock.
+    local got = read_buckets(key, first, to)
     t, u = 0, 0
     local i = 1
-    for _ = first, hi do
+    for _ = first, to do
       t = add(t, tonumber(got[i]) or 0, max_count)
       u = add(u, tonumber(got[i + 1]) or 0, max_count)
       i = i + 2
     end
-    from, to = first, hi
+    from = first
   end
-  if prune then drop_buckets(key, state[3], prune_last) end
-  if persist then
-    local ft, fu, ff, fto = sum_fields(name)
-    if from == nil then
-      redis.call('HDEL', key, ft, fu, ff, fto)
-    else
-      redis.call('HSET', key, ft, fmt(t), fu, fmt(u), ff, fmt(from), fto, fmt(to))
-    end
+  return t, u, from, to, aged
+end
+
+-- The pruning pass: delete the bucket fields a decay just aged out. Only the
+-- widest window's caller does this, and only it may.
+local function prune_decayed(key, state, aged)
+  if aged ~= nil then drop_buckets(key, state[3], aged) end
+end
+
+-- Write a decayed sum back, or delete it when nothing is left. The check's
+-- half of the split: a draw's own HSET already carries these fields.
+local function persist_sum(key, name, t, u, from, to)
+  local ft, fu, ff, fto = sum_fields(name)
+  if from == nil then
+    redis.call('HDEL', key, ft, fu, ff, fto)
+  else
+    redis.call('HSET', key, ft, fmt(t), fu, fmt(u), ff, fmt(from), fto, fmt(to))
   end
-  return t, u, from, to
 end
 ";
 
@@ -285,7 +351,9 @@ end
 /// remaining outcomes are "both scopes moved" and "the script never ran".
 ///
 /// `from` is lowered and `to` raised to admit this draw's bucket, so the sum
-/// always names the exact stretch of buckets it covers. The field names are
+/// always names the exact stretch of buckets it covers — except where the
+/// draw's bucket is older than the window's own first bucket *at the mark*,
+/// which is outside the window and so joins no sum at all. The field names are
 /// built here rather than passed in, so the caller cannot send `at_ms` and a
 /// bucket index that disagree; both keys carry the project's Redis Cluster
 /// hash tag, so every key this touches is in one slot.
@@ -311,7 +379,7 @@ local bt, bu = 'b:' .. fmt(index) .. ':t', 'b:' .. fmt(index) .. ':u'
 
 for s = 1, 2 do
   local key = KEYS[s]
-  local names = {key, bt, bu}
+  local names = {key, bt, bu, MARK}
   for w = 1, windows do
     local ft, fu, ff, fto = sum_fields(ARGV[header + (w - 1) * group + 2])
     names[#names + 1] = ft
@@ -321,49 +389,81 @@ for s = 1, 2 do
   end
   local got = redis.call('HMGET', unpack(names))
 
+  -- The scope's clock, advanced by this draw if it is the newest time this
+  -- scope has seen. A draw stamped *behind* the mark is still recorded in its
+  -- own bucket -- it happened -- but the windows are judged at the mark, so
+  -- such a draw cannot widen one backwards. A draw behind it by more than the
+  -- widest window is therefore counted by nothing, and its bucket field sits
+  -- below every `from` the pruning walk starts at: the memory ledger's prune
+  -- drops the same bucket outright, and here it is left to the hash's own
+  -- expiry rather than paid for with an unbounded delete range.
+  local mark = tonumber(got[3]) or 0
+  if at_ms > mark then mark = at_ms end
+
   local writes = {key}
   writes[#writes + 1] = bt
   writes[#writes + 1] = fmt(add(tonumber(got[1]) or 0, tokens, max_count))
   writes[#writes + 1] = bu
   writes[#writes + 1] = fmt(add(tonumber(got[2]) or 0, micros, max_count))
+  writes[#writes + 1] = MARK
+  writes[#writes + 1] = fmt(mark)
+  local deletes = {key}
 
   for w = 1, windows do
     local base = header + (w - 1) * group
     local span_ms = tonumber(ARGV[base + 1])
     local name = ARGV[base + 2]
-    local at = 2 + (w - 1) * 4
-    local t = tonumber(got[at + 1])
-    local u = tonumber(got[at + 2])
-    local from = tonumber(got[at + 3])
-    local to = tonumber(got[at + 4])
+    local at = 3 + (w - 1) * 4
+    local state = {tonumber(got[at + 1]), tonumber(got[at + 2]),
+                   tonumber(got[at + 3]), tonumber(got[at + 4])}
+    local t, u, from, to = state[1] or 0, state[2] or 0, state[3], state[4]
+    local first = window_first(mark, span_ms, bucket_ms)
     if w == windows then
       -- The pruning pass, owned. The widest window is the one whose aged-out
       -- buckets are outside every window, and this is the call that is
       -- guaranteed to run: a membership capped only on the 5-hour window
       -- would otherwise never ask the 7-day window anything and would keep
-      -- every bucket field it ever wrote. `persist` is false because the
-      -- write below carries these same fields.
-      local start = at_ms - span_ms
-      if start < 0 then start = 0 end
-      t, u, from, to = decay(key, name, {t, u, from, to}, span_ms, bucket_ms,
-                             math.floor(start / bucket_ms), index, max_count, true, false)
+      -- every bucket field it ever wrote. Nothing is persisted here because
+      -- the write below carries these same fields.
+      local aged
+      t, u, from, to, aged = decay(key, state, span_ms, bucket_ms, first, max_count)
+      prune_decayed(key, state, aged)
     end
-    t = add(t or 0, tokens, max_count)
-    u = add(u or 0, micros, max_count)
-    if from == nil or index < from then from = index end
-    if to == nil or index > to then to = index end
+    -- A draw older than this window's first bucket *at the mark* is outside
+    -- it, so it neither adds to the sum nor drags `from` back over ground a
+    -- decay already subtracted -- which is what made a later decay subtract
+    -- an aged-out bucket twice (M13.1 review, F6). The memory ledger reaches
+    -- the same answer from the other side: its window is a range from that
+    -- same first bucket, so a draw below it is simply not in the range.
+    if index >= first then
+      t = add(t, tokens, max_count)
+      u = add(u, micros, max_count)
+      if from == nil or index < from then from = index end
+      if to == nil or index > to then to = index end
+    end
     local ft, fu, ff, fto = sum_fields(name)
-    writes[#writes + 1] = ft
-    writes[#writes + 1] = fmt(t)
-    writes[#writes + 1] = fu
-    writes[#writes + 1] = fmt(u)
-    writes[#writes + 1] = ff
-    writes[#writes + 1] = fmt(from)
-    writes[#writes + 1] = fto
-    writes[#writes + 1] = fmt(to)
+    if from ~= nil then
+      writes[#writes + 1] = ft
+      writes[#writes + 1] = fmt(t)
+      writes[#writes + 1] = fu
+      writes[#writes + 1] = fmt(u)
+      writes[#writes + 1] = ff
+      writes[#writes + 1] = fmt(from)
+      writes[#writes + 1] = fto
+      writes[#writes + 1] = fmt(to)
+    elseif state[3] ~= nil then
+      -- The sum this draw found had aged out entirely and the draw itself is
+      -- older than the window: the four fields go together or not at all, so
+      -- the window is left with no sum rather than a stale one.
+      deletes[#deletes + 1] = ft
+      deletes[#deletes + 1] = fu
+      deletes[#deletes + 1] = ff
+      deletes[#deletes + 1] = fto
+    end
   end
 
   redis.call('HSET', unpack(writes))
+  if #deletes > 1 then redis.call('HDEL', unpack(deletes)) end
   redis.call('PEXPIRE', key, ARGV[6])
 end
 return {'OK'}
@@ -394,8 +494,9 @@ return {'OK'}
 ///
 /// **What it does *not* do any more is scan buckets to answer the question**
 /// (M13.1). The sum a cap is compared against was maintained by
-/// `record_draw`; all this has to do is age it forward — one `HMGET` of four
-/// fields, plus, in the steady state, nothing at all — which is what turns an
+/// `record_draw`; all this has to do is age it forward — one `HMGET` of the
+/// window's four sum fields and the scope's mark, plus, in the steady state,
+/// nothing at all — which is what turns an
 /// admitted turn from 2017 reads per capped scope into one. The bucket walk
 /// survives in exactly one place: computing the earliest retry time on a
 /// *refusal*, where the answer is which bucket has to leave and no running sum
@@ -410,7 +511,11 @@ return {'OK'}
 /// that a ceiling check is not a read-only command: it cannot be served by a
 /// replica, and it is one more reason the two operations are scripts rather
 /// than pipelines, since a decay interleaved with a concurrent draw would
-/// otherwise subtract from a sum the draw had already moved.
+/// otherwise subtract from a sum the draw had already moved. It also advances
+/// the scope's mark, once per run and only when the caller's clock is ahead of
+/// it — which is what makes the persisted decay safe rather than a hazard: the
+/// state a check destroys can never be asked for again by a clock that steps
+/// back, because the mark is what the next check is evaluated at (R-F9).
 ///
 /// Empty buckets in that walk are dropped on the way through. That is not a
 /// filter on the arithmetic: a bucket of zeroes changes no sum and can never
@@ -426,27 +531,46 @@ local max_count = tonumber(ARGV[7])
 -- is whatever the caller sent, not a number written down here.
 local header, group = 7, 8
 local count = (#ARGV - header) / group
-local now_index = math.floor(now_ms / bucket_ms)
+-- Each scope's clock, resolved the first time a window asks that scope
+-- anything and reused by every window after it, so one check is one instant
+-- however many windows it walks.
+local clocks = {}
 
 for w = 1, count do
   local base = header + (w - 1) * group
   local span_ms = tonumber(ARGV[base + 1])
   local name = ARGV[base + 2]
-  -- Floor division from a start clamped at the epoch, which is what the
-  -- memory ledger's saturating subtraction does -- and the flooring is what
-  -- includes the partially-overlapping trailing bucket whole.
-  local start = now_ms - span_ms
-  if start < 0 then start = 0 end
-  local first = math.floor(start / bucket_ms)
   for s = 1, 2 do
     local sbase = base + 2 + (s - 1) * 3
     if ARGV[sbase + 1] == '1' then
       local key = KEYS[s]
       local ft, fu, ff, fto = sum_fields(name)
-      local got = redis.call('HMGET', key, ft, fu, ff, fto)
-      local t, u, from = decay(key, name,
-        {tonumber(got[1]), tonumber(got[2]), tonumber(got[3]), tonumber(got[4])},
-        span_ms, bucket_ms, first, now_index, max_count, w == count, true)
+      local got = redis.call('HMGET', key, ft, fu, ff, fto, MARK)
+      local clock = clocks[s]
+      if clock == nil then
+        -- A scope never drawn against has no mark: every sum is empty, so
+        -- there is no state a later call could disagree about and nothing
+        -- worth writing -- and a mark written here would leave a hash no
+        -- PEXPIRE had ever been armed on.
+        local mark = tonumber(got[5])
+        clock = now_ms
+        if mark ~= nil then
+          if mark > now_ms then
+            clock = mark
+          elseif mark < now_ms then
+            redis.call('HSET', key, MARK, fmt(now_ms))
+          end
+        end
+        clocks[s] = clock
+      end
+      local first = window_first(clock, span_ms, bucket_ms)
+      local now_index = math.floor(clock / bucket_ms)
+      local state = {tonumber(got[1]), tonumber(got[2]), tonumber(got[3]), tonumber(got[4])}
+      local t, u, from, to, aged = decay(key, state, span_ms, bucket_ms, first, max_count)
+      if aged ~= nil then
+        if w == count then prune_decayed(key, state, aged) end
+        persist_sum(key, name, t, u, from, to)
+      end
       local max_tokens = tonumber(ARGV[sbase + 2])
       local max_micros = tonumber(ARGV[sbase + 3])
       local function over(tt, uu)
@@ -463,9 +587,9 @@ for w = 1, count do
         -- turn until what remains is under every cap; the answer is when that
         -- bucket's end leaves the window. Every bucket dropped and still over
         -- is only reachable with a cap of zero or below -- a window that can
-        -- never have room -- and is answered with now_ms rather than a lie
+        -- never have room -- and is answered with the clock rather than a lie
         -- about the future, exactly as the memory ledger's `None` is.
-        local retry = now_ms
+        local retry = clock
         local walk = from
         if walk == nil then walk = now_index + 1 end
         local buckets = read_buckets(key, walk, now_index)
@@ -528,12 +652,25 @@ impl ScopeCaps {
     }
 }
 
-/// One window's group of arguments.
-pub(crate) struct WindowArgs {
+/// One window, as both scripts need it: how wide it is and what its running
+/// sum is filed under.
+pub(crate) struct WindowSpan {
     pub(crate) span_ms: u64,
     /// The window's wire name, which is also the field name its running sum
     /// lives under. One fact used twice rather than two that could disagree.
     pub(crate) name: &'static str,
+}
+
+/// One window *and the caps to judge it against*, which only the check has.
+///
+/// Two types rather than one with cap fields a draw fills with dummies
+/// (M13.1 review, F3): `record_draw` reads neither cap, so every draw was
+/// building two `ScopeCaps::absent()` per window for a script that ignores
+/// them, and a unit test existed to assert the dummies were dummies. What
+/// stops a caps field reaching the draw path now is that there is none to
+/// send.
+pub(crate) struct WindowCaps {
+    pub(crate) span: WindowSpan,
     pub(crate) project: ScopeCaps,
     pub(crate) member: ScopeCaps,
 }
@@ -559,7 +696,7 @@ pub(crate) struct RecordDrawArgs<'a> {
     /// off a live control plane and may name a window nobody had configured
     /// when this draw landed. Narrowest-first matters here too — the last
     /// group is the widest, and the widest is the one whose decay prunes.
-    pub(crate) windows: [WindowArgs; FairUseWindow::ALL.len()],
+    pub(crate) windows: [WindowSpan; FairUseWindow::ALL.len()],
 }
 
 pub(crate) struct WouldExceedArgs<'a> {
@@ -574,7 +711,7 @@ pub(crate) struct WouldExceedArgs<'a> {
     /// window added to the enum cannot reach the script as a group the caller
     /// forgot to build — and the script's own loop is bounded by what arrives,
     /// so it cannot reach the script as a group nothing reads either.
-    pub(crate) windows: [WindowArgs; FairUseWindow::ALL.len()],
+    pub(crate) windows: [WindowCaps; FairUseWindow::ALL.len()],
 }
 
 /// The two scripts, compiled once per ledger.
@@ -633,7 +770,7 @@ impl Scripts {
             .arg(FairUseQuantity::Usd.wire_name())
             .arg(args.max_count);
         for window in &args.windows {
-            invocation.arg(window.span_ms).arg(window.name);
+            invocation.arg(window.span.span_ms).arg(window.span.name);
             for scope in [&window.project, &window.member] {
                 invocation
                     .arg(scope.flag())

@@ -865,6 +865,10 @@ pub struct Engine<S: SessionStore, T: Tokenizer + Clone> {
     /// to filter exactly the line they need. The remedy is a restart, and one
     /// line survives to the next one.
     unread_recipe: std::sync::Once,
+    /// Whether the last fair-use ceiling check found its ledger unreachable —
+    /// so `fair_use_refusal` warns once per outage rather than once per
+    /// refused turn. See its own doc for why (M13.1 review F4).
+    fair_use_unreachable_warned: std::sync::atomic::AtomicBool,
 }
 
 impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
@@ -933,6 +937,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             control: None,
             turn_gates: Mutex::new(HashMap::new()),
             unread_recipe: std::sync::Once::new(),
+            fair_use_unreachable_warned: std::sync::atomic::AtomicBool::new(false),
         }
     }
 

@@ -86,6 +86,8 @@ pub mod prefix_admission;
 pub mod relay_api;
 pub mod relay_handoff;
 pub mod responses_api;
+#[cfg(feature = "test-support")]
+pub mod test_support;
 pub mod tokenizer;
 
 pub use admin_api::admin_router;
