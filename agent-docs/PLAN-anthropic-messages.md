@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Plan: the Anthropic Messages surface, the seat, and the launcher (M11)
 
-> **Status: shipped through M14.2; M15 in flight (2026-09-03).** The rulings in §3 stand
+> **Status: shipped through M14.2; M15 review in flight; D2 ruled (2026-09-03).** The rulings in §3 stand
 > as written; where an implementation round moved one, the dated addenda at
 > the end of this document record the move and its reason, and win over §3
 > for the current tree. Direction set by the product owner on
@@ -2001,3 +2001,124 @@ server crate already keeps.
   re-ran the affected suite before the gate and the chain's own gate ran
   it again. Future refute briefs say: restore from your byte backup, never
   from HEAD.
+
+## Addendum (2026-09-03): D2 ruled — the stored namespace, and the rungs it opens
+
+R-M1 pinned a cost on the Responses surface and named the day it would be
+re-examined: the log keeps the bare name codex sends, so a third party's
+tool literally named `status` is folded out of the task view with ours,
+and the day the log keeps a namespace, that exemption's test is the one to
+delete. D2 is the re-examination, run on the tree at `1b85d64` alongside
+the durable-directory question (ruled R16–R19 in
+`PLAN-frontier-selection.md`). Its evidence is
+`research/stored-control-call-namespace-1b85d64.md` — what each surface
+stores, the sixteen consumers of the stored name, what moves a turn id and
+what does not, why a Redis stream entry cannot be rewritten in place, and
+the two gaps the read surfaced on the way.
+
+**R-N1 — nothing stored is rewritten, renamed or re-read differently.**
+R-M1 stands for both surfaces: the log keeps the name each client sent,
+verbatim. The three migration shapes are closed by evidence, not
+preference. A one-shot rewrite cannot recover a namespace that was never
+written, so it could only guess which bare `status` was ours — the
+ambiguity the change exists to remove — and it would move the turn id of
+every conversation holding a control call, because the name is inside
+`Item::render` and the dedup key *is* the turn id: an in-flight retry
+misses its own completed response and buys a second billed answer. A
+read-time canonicalisation is today's `CONTROL_TOOL_NAMES.contains`
+recogniser under another name and resolves none of the collision shapes.
+A versioned record tag is a new variant on an internally tagged enum, which
+an older build cannot read — the failure the log's additive discipline
+exists to prevent. Nothing has shipped that holds a pre-rule key, and that
+is the state to preserve, not to spend.
+
+**R-N2 — the namespace is carried beside the name, forward-only, and the
+render leaves it out.** `ItemContent::ToolCall` gains `namespace:
+Option<String>`, `#[serde(default, skip_serializing_if =
+"Option::is_none")]`. The Responses canonicalisation reads codex's own
+`namespace` field into it; the Messages surface stores `None`, because
+Claude Code folds the registration into the name it declares, calls and
+permits, and the flat spelling *is* the namespace there. `Item::render`
+omits the field, so no turn id moves and no pre-change record changes a
+byte; `call_id` already separates any two calls in one conversation, which
+is why this is the opposite of the `Thinking::signature` call and is stated
+as such in a comment beside it. Because the existing pinned turn-id
+literal's fixture tool is `search` and cannot see this edit, the rung adds
+two pinned literals over control-call conversations, one bare and one
+namespaced, so the render decision has a guard that goes red. Every
+construction site names the field — struct literals, no default —
+`Item::tool_call` keeps meaning `None`, and the Responses wire gets the one
+constructor that takes a namespace. An older build reads a namespaced
+record as a bare one: the one-way door `SessionCreated::principal` and
+`::arm` already walked through.
+
+**R-N3 — prefix admission treats a stored `None` as agreeing with any
+claimed namespace, and a stored `Some` as requiring equality.** Not blind:
+a comparison blind to the field never notices a client changing which
+server a name came from, which is a genuinely different call and should
+fork like a different name does. Not symmetric: a stored `None` is a
+record written before the field existed, or by the Messages surface, and
+it agrees with any claim, so a conversation that straddles the change
+continues rather than forking on its next request. `same_item` is already
+blind to `response_id` for a stated reason; this is the second stated
+exception, and it is the single load-bearing edit of the rung.
+
+**R-N4 — the Responses recogniser matches on the field when present and
+falls back to the bare arm when absent; the exemption narrows and does
+not disappear; the outbound projection emits what it stored.**
+`ControlCallDialect::CodexResponses` recognises a control call by
+`namespace == Some("mcp__roundhouse")` and a name in the eight; with
+`namespace == None` it falls back to the bare-name arm, because records
+written before the change stay ambiguous forever and the fold has to read
+them. So `a_third_partys_bare_status_tool_is_exempted_with_ours_on_the_
+responses_wire_only` narrows to the `None` arm rather than being deleted,
+and a new test proves that a third party's `status` under another
+namespace is *not* ours — the realistic exposure was one name of eight,
+and it is now zero for every record written after the change.
+`function_call_item` emits the carried `namespace` when present:
+re-emitting what codex sent is not the guess `codex_e2e.rs:1552` declined
+to make, and the shape is pinned in `codex_wire_shapes.rs` against the
+encoder in the pinned codex crates, which is the oracle that test file
+exists for. A real-binary round trip stays with the blocked codex
+counterpart of R-M8.
+
+**R-N5 — the hygiene that ships with it, and the gap that does not.**
+`Item::tool_call`'s doc still carries the claim the M12 review's F10
+falsified ("a namespaced resend and a flat one arrive as this same item"),
+and `dialect.rs` still says nothing renders a tool call outbound, which is
+true of the `ClientDialect` type and false of the stored name on both
+surfaces. Both are corrected in the same rung: the doc on the constructor
+is the one a migration author reads first, and a reason that does not hold
+is what gets a future change waved through. `TurnSignals::turn_depth`
+counting control calls before they are dropped is real, pinned, and not
+this ruling's — no spelling of the stored name changes it — so it stays
+open by name for a validate rung with its own failing test.
+
+### The rungs D2 opens
+
+- **M16.0 — the directory seam** (R17): `DirectoryStore` becomes async
+  and `Managed::compiled` compiles outside the write guard, judged under
+  the memory store by the directory's existing tests plus the one guard
+  R17 names. The lock span is the load-bearing reasoning; the rest is
+  churn and refute.
+- **M16.1 — the durable directory** (R16, R18, R19): the versioned
+  opaque-document contract in core with its memory implementation and
+  contract suite; `KeyFamily::Directory` in the store crate under one key
+  with a Lua compare-and-set; the typed adapter at the directory's
+  boundary; `Serialize` on the wrapped config entries with a pinned
+  byte-for-byte round trip; the boot re-order and the fail-closed
+  directory read; the flag and the warning deleted; the ignored
+  `recreating_an_archived_project_after_a_restart_inherits_its_spend` live
+  with its line numbers corrected; the input fingerprint and the typed
+  divergence reason. The contract and the boot order carry the reasoning;
+  the adapter and the serde are churn.
+- **M17 — the carried namespace** (R-N2..R-N5): the field, the render
+  decision with its two pinned literals, the prefix-admission rule, the
+  recogniser and the narrowed exemption, the outbound projection pinned
+  against the oracle, and the two doc corrections. The recogniser and the
+  admission rule carry the reasoning; the rest is churn.
+
+M16.0 goes first: it is small, behaviour-preserving, and the prerequisite
+of the rung that closes the one restart loss that corrupts a surviving
+ledger. M17 is independent of both and can be taken whenever the cadence
+has room.

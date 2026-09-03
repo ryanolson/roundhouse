@@ -1617,3 +1617,26 @@ not asserted: a suite that silently passes against 0.146.0 and silently
 changes meaning against the next release is the failure CLAUDE.md's
 vigilance rule exists to prevent, and the Cargo pin stays at `6344a65`
 until its own diff-and-map pass.
+
+## Addendum (2026-09-03): the deferred Redis `DirectoryStore`, decided
+
+M8 deferred the Redis `DirectoryStore` with its placement "decided then"
+— either the records move to core with a dated amendment of
+`control/mod.rs`'s placement note, or the implementation lands in this
+crate over its own Redis handle. D2 (`PLAN-frontier-selection.md`, R16–R19,
+evidence in `research/roundhouse-admin-directory-1b85d64.md`) took
+neither: the *contract* moves to core as a versioned opaque document
+(`load` / `commit(expected_version, bytes)` / `version`, the shape this
+module's trait already has over whole records), `roundhouse-store-redis`
+implements it as a fifth key family under one key with a compare-and-set,
+and `ControlDirectory`, its records, `KeyScope` and the compiler stay here
+beside the resolver — the placement note stays true of the record and
+gains a dated line saying its bytes did not need to stay. The seam lands
+first (M16.0: async trait, compile outside the write guard), the store
+second (M16.1), and with it the boot warning and the flag that gates it
+are deleted rather than moved, because no memory-backed Redis branch
+remains. The "still deferred" list above is unchanged by this: audit
+trail, key rotation, per-key rate limiting, pagination, rate-card editing
+and un-archive stay deferred by name; MCP-overlay durability and the
+sealed credential store gain a contract they can ride on and keep their
+own questions.

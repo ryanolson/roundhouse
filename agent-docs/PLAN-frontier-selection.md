@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Plan: frontier-only model selection, the text steer, and the Switchyard benchmark (M10)
 
-> **Status: M10.0–M10.2 shipped; D1 ruled (2026-09-02).** Originally: proposed design. Direction set by the product owner on
+> **Status: M10.0–M10.2 shipped; D1 ruled (2026-09-02); D2 ruled (2026-09-03).** Originally: proposed design. Direction set by the product owner on
 > 2026-08-22: intercept codex and model-select per Switchyard guidance,
 > frontier models only at first — mimic a user on a sol-only session with a
 > fraction of calls rerouted to terra/luna, then swap the source so sol maps
@@ -497,3 +497,105 @@ The rungs this opens are recorded in `PLAN-anthropic-messages.md`, where
 the loop that drives this branch lives: M14.0 (R13), M14.1 (R12), M14.2
 (R14's bounds and key discipline), and the ledger posture folded into
 M13.1.
+
+## Addendum (2026-09-03): D2 — the durable admin directory, ruled
+
+R15 named the admin directory as the first durability gap after the three
+correlation maps and left its placement question to M8. D2 is that round,
+run on the tree at `1b85d64` after M14.2 and M15, with two evidence
+documents, every claim pinned and independently re-derived:
+
+- `research/roundhouse-admin-directory-1b85d64.md` — what the directory
+  stores, how it changes, what a restart breaks and what a second node
+  would, the two placements and their unwritten costs, and what a durable
+  store must guarantee that no other family does.
+- `research/stored-control-call-namespace-1b85d64.md` — the second D2
+  question; ruled in `PLAN-anthropic-messages.md`, where R-M1 lives.
+
+**R16 — the contract moves to core as a versioned document; the records
+stay beside the resolver.** The two placements the deferral note wrote
+down both cost something the evidence makes exact: moving the records to
+`roundhouse-core` drags the file's whole config vocabulary with them (every
+record *wraps* a `ProjectEntry`, `UserEntry`, `KeyEntry`, and those wrap
+budgets, policies and windows), and landing the implementation in the
+server crate either re-spells a key format R-S3 just made singular or
+widens the store crate's private machinery to one outside caller. Neither
+is what the trait actually needs. `DirectoryStore`'s shape is already
+`load` / `commit(expected_version, records)` / `version` over the *whole*
+`DirectoryRecords`, which is what makes `DeleteMembership`'s cascade one
+commit by construction — so what the store persists is one document, and
+a document needs no vocabulary. The contract lands in core as a versioned
+*opaque document* store — `load() -> Versioned<bytes>`,
+`commit(expected_version, bytes) -> version`, `version()` — with the
+memory implementation and a contract suite beside the other three families,
+and `roundhouse-store-redis` implements it as a fifth `KeyFamily::Directory`
+under one key with a Lua compare-and-set, the key machinery staying
+`pub(crate)`. `ControlDirectory`, its records, `KeyScope`, the compiler and
+the cross-checks stay in the server crate exactly where `control/mod.rs`'s
+note says a key record belongs; the typed `DirectoryStore` the directory
+calls becomes an adapter that serializes at the boundary, and the note gains
+a dated amendment saying so — the record stayed next to the resolver, its
+*bytes* did not need to. The records take `Serialize` (the "first mechanical
+step" the deferral named), and the document is JSON under the log's own
+discipline: additive fields with defaults, one top-level document version
+for the day that is not enough, and a pinned byte-for-byte round-trip test
+the way `a_pre_m11_log_record_still_deserializes` pins an item.
+
+**R17 — the seam lands first, alone, and is judged under the memory
+store.** `DirectoryStore` becomes async and `Managed::compiled` stops
+compiling under the write guard — compile into a fresh value, then swap it
+in under a lock held only long enough to publish — as one rung with no
+Redis in it, because it is a behaviour-preserving change to a path the
+existing directory tests already exercise, and because landing the trait
+change with the Redis implementation would put the one round trip every
+TTL-driven refresh costs on every concurrent admission. The rung's own
+guard is the one the deferral note implies: a refresh whose `load` stalls
+must not hold an admission that only needs the current plane.
+
+**R18 — one switch, and it now widens to the directory; a directory the
+store cannot read refuses the boot.** `ROUNDHOUSE_REDIS_URL` set means the
+directory is durable too (R12's rule, unchanged). The boot re-orders so the
+backends open before the directory compiles when the variable is set, and
+the directory's first `load` from Redis *is* the boot check, as constructing
+it is today: a Redis that serves sessions but refuses the directory read
+refuses the boot with the reason named, on the ledger posture R14 stated —
+a check that cannot reach its store fails closed, because the operator
+configured tenancy on purpose. With that, the memory-backed `Shared` branch
+no longer exists, so `control_plane_file_configured` and the boot warning it
+gates are deleted rather than moved (the note at `main.rs:703-710` said
+"move"; there is nowhere left to move it to), the ignored
+`recreating_an_archived_project_after_a_restart_inherits_its_spend` goes
+live with its stale line numbers corrected, and the `ControlDirectory`
+deferral note becomes a dated record of what landed.
+
+**R19 — node divergence is recorded, never refused, and reported once.**
+A durable store makes two states reachable for the first time: two nodes
+compiling different planes from identical records because the file, the
+cross-checks and the TTL are per-process, and a mutation validated on node
+A that node B cannot compile. The writer stamps the document with a
+fingerprint of its own inputs — the control-plane file's hash, and the
+catalog and fleet identities the cross-checks were built from — and a
+reader whose own fingerprint differs *warns with a typed reason naming what
+differs, once per stored version rather than once per TTL, and keeps
+serving the plane it can compile*. Refusing would make a rolling file
+change impossible (node A has the new file, node B not yet), and refusing
+silently is the failure R14 forbade. A compile failure on B keeps the last
+good plane, as today, but records the version it could not take beside the
+version it serves; that pair is the first row of a per-node status surface
+roundhouse does not yet have, deferred by name with the audit trail rather
+than invented here.
+
+**What D2 leaves open, by name.** Un-archive: durable tombstones are its
+precondition, not its answer, and the keys-refused-while-closed question is
+as open as M8 left it. The audit trail and key rotation, which need an
+identity `KeyScope::Admin` deliberately lacks. MCP-overlay durability
+(`roundhouse_mcp::ControlStore`'s four maps) and the sealed credential
+store, which R16's document contract can carry as sibling documents but
+which are separate rungs with separate questions — the overlay maps are
+per-session and swept, and a credential document needs the key it is sealed
+under. And whether a per-node status surface exists at all, which R19 needs
+and nothing else yet does.
+
+The rungs this opens are recorded in `PLAN-anthropic-messages.md`, where
+the loop that drives this branch lives: M16.0 (R17), M16.1 (R16, R18,
+R19), and M17 (the stored namespace, R-N1..R-N5).
