@@ -113,5 +113,7 @@ pub use metrics_api::metrics_router;
 pub use relay_api::relay_router;
 pub use relay_handoff::{RelayAgent, RelayHandoff, RelayHandoffError, UpstreamReAimed};
 pub use responses_api::{API_PREFIX, responses_router};
-pub use shared_backend::{Backends, REDIS_VAR, SharedBackend, shared_backend};
+pub use shared_backend::{
+    Backends, REDIS_NAMESPACE_VAR, REDIS_VAR, SharedBackend, resolve_namespace, shared_backend,
+};
 pub use tokenizer::HfTokenizer;

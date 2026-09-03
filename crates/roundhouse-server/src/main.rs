@@ -65,8 +65,8 @@ use roundhouse_server::control_config::crosscheck::CrossChecks;
 use roundhouse_server::{
     Backends, ControlDirectory, ControlPlane, ControlPlaneReads, Conversations, DirectoryError,
     EchoLocalExecutor, Engine, EngineConfig, FleetJudge, JudgeConfig, MemoryDirectoryStore,
-    REDIS_VAR, admin_api, catalog_config, control_config, http, mcp_api, messages_api, metrics_api,
-    relay_api, responses_api, shared_backend,
+    REDIS_NAMESPACE_VAR, REDIS_VAR, admin_api, catalog_config, control_config, http, mcp_api,
+    messages_api, metrics_api, relay_api, resolve_namespace, responses_api, shared_backend,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -782,7 +782,13 @@ async fn main() -> anyhow::Result<()> {
     //
     // The two arms monomorphize `serve` twice; that is the entire cost of
     // keeping the engine generic over its store.
-    let backends = shared_backend::open(std::env::var(REDIS_VAR).ok().as_deref()).await?;
+    // Read and validated before anything connects: an empty
+    // ROUNDHOUSE_REDIS_NAMESPACE is a boot error, not a per-process quirk
+    // that surfaces as two deployments silently sharing a keyspace (R-S3).
+    let namespace = resolve_namespace(std::env::var(REDIS_NAMESPACE_VAR).ok().as_deref())
+        .with_context(|| format!("{REDIS_NAMESPACE_VAR} must not be empty"))?;
+    let backends =
+        shared_backend::open(std::env::var(REDIS_VAR).ok().as_deref(), &namespace).await?;
 
     match backends {
         Backends::Shared {

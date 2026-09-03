@@ -193,7 +193,7 @@ async fn a_ceiling_patched_in_after_boot_is_counted_in_the_shared_buckets() {
     // deployment names a Redis; whether the boot snapshot happened to carry a
     // ceiling is not this function's business any more.
     let url = url_from_env();
-    let backends = open(Some(&url))
+    let backends = open(Some(&url), &roundhouse_store_redis::KeyNamespace::default())
         .await
         .expect("the test Redis named by ROUNDHOUSE_TEST_REDIS_URL must be reachable");
     let fair_use_ledger: Arc<dyn FairUseLedger> = Arc::clone(backends.fair_use());

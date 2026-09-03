@@ -42,7 +42,8 @@ use roundhouse_core::control::{
 };
 use roundhouse_core::store::MemoryStore;
 use roundhouse_store_redis::{
-    RedisCorrelationMaps, RedisFairUseLedger, RedisSessionStore, RedisSpendLedger,
+    EmptyNamespace, KeyNamespace, RedisCorrelationMaps, RedisFairUseLedger, RedisSessionStore,
+    RedisSpendLedger,
 };
 
 use crate::Conversations;
@@ -56,6 +57,34 @@ use crate::Conversations;
 /// somewhere else is a message pointing at a variable the process never
 /// consulted.
 pub const REDIS_VAR: &str = "ROUNDHOUSE_REDIS_URL";
+
+/// The deployment namespace every shared key is built under (M14.2, R-S3).
+/// Absent means the default `KeyNamespace` (`rh`); set-but-empty is refused
+/// at boot rather than silently read as absent — an operator who typed the
+/// variable meant *something* by it, and treating a blank value as "no
+/// namespace" would answer both cases with the same key an unnamespaced
+/// deployment already uses, silently reuniting two deployments an operator
+/// meant to keep apart.
+///
+/// Read here whether or not [`REDIS_VAR`] is set: a deployment with no Redis
+/// has no keys for a namespace to separate, but a typo an operator will not
+/// discover until the day they add a Redis is worth refusing at the boot
+/// that introduced it.
+pub const REDIS_NAMESPACE_VAR: &str = "ROUNDHOUSE_REDIS_NAMESPACE";
+
+/// Resolve [`REDIS_NAMESPACE_VAR`]'s value into a [`KeyNamespace`].
+///
+/// A pure function of the one string the environment might hold, for
+/// [`shared_backend`]'s own testability reason: a boot-time refusal is the
+/// load-bearing half of "an empty namespace stops the process", and a test
+/// that had to set process-wide environment to reach it would race every
+/// other test in the binary.
+pub fn resolve_namespace(raw: Option<&str>) -> Result<KeyNamespace, EmptyNamespace> {
+    match raw {
+        Some(raw) => KeyNamespace::new(raw),
+        None => Ok(KeyNamespace::default()),
+    }
+}
 
 /// Where a deployment's shared state lives.
 ///
@@ -192,21 +221,32 @@ impl Backends {
 /// family: a deployment reading three separate "shared in Redis" lines cannot
 /// tell whether the fourth is missing because it is per-process or because it
 /// was never logged.
-pub async fn open(redis_url: Option<&str>) -> anyhow::Result<Backends> {
+///
+/// `namespace` is taken already resolved rather than as a raw `Option<&str>`
+/// this function validates itself: [`resolve_namespace`]'s refusal is a boot
+/// error the caller reports before ever reaching here, the same shape
+/// [`REDIS_VAR`] already has by being read once, in `main.rs`, and handed in.
+pub async fn open(redis_url: Option<&str>, namespace: &KeyNamespace) -> anyhow::Result<Backends> {
     match shared_backend(redis_url) {
         SharedBackend::Shared { url } => {
-            let fair_use = RedisFairUseLedger::connect(url).await.with_context(|| {
-                format!("opening the fair-use ledger in the Redis named by {REDIS_VAR}")
-            })?;
-            let maps = RedisCorrelationMaps::connect(url).await.with_context(|| {
-                format!("opening the correlation maps in the Redis named by {REDIS_VAR}")
-            })?;
-            let store = RedisSessionStore::connect(url)
+            let fair_use = RedisFairUseLedger::connect_namespaced(url, namespace.clone())
+                .await
+                .with_context(|| {
+                    format!("opening the fair-use ledger in the Redis named by {REDIS_VAR}")
+                })?;
+            let maps = RedisCorrelationMaps::connect_namespaced(url, namespace.clone())
+                .await
+                .with_context(|| {
+                    format!("opening the correlation maps in the Redis named by {REDIS_VAR}")
+                })?;
+            let store = RedisSessionStore::connect_namespaced(url, namespace.clone())
                 .await
                 .with_context(|| format!("connecting to the Redis named by {REDIS_VAR}"))?;
-            let spend = RedisSpendLedger::connect(url).await.with_context(|| {
-                format!("opening the spend ledger in the Redis named by {REDIS_VAR}")
-            })?;
+            let spend = RedisSpendLedger::connect_namespaced(url, namespace.clone())
+                .await
+                .with_context(|| {
+                    format!("opening the spend ledger in the Redis named by {REDIS_VAR}")
+                })?;
             // The URL itself is never logged -- a `redis://` URL may carry
             // credentials.
             tracing::info!(
@@ -265,5 +305,23 @@ mod tests {
             }
         );
         assert_eq!(shared_backend(None), SharedBackend::PerProcess);
+    }
+
+    /// **M14.2, R-S3: absent means the default, set-but-empty is refused.**
+    ///
+    /// Not "absent or blank both mean default": an operator who set the
+    /// variable to an empty or whitespace-only string meant *something* by
+    /// it, and reading that as "no namespace" would silently reunite two
+    /// deployments an empty-string typo was never supposed to be able to
+    /// join — see [`resolve_namespace`]'s own doc.
+    #[test]
+    fn an_unset_namespace_is_the_default_and_an_empty_one_is_refused() {
+        assert_eq!(resolve_namespace(None).unwrap(), KeyNamespace::default());
+        assert_eq!(
+            resolve_namespace(Some("acme-prod")).unwrap(),
+            KeyNamespace::new("acme-prod").unwrap()
+        );
+        assert!(resolve_namespace(Some("")).is_err());
+        assert!(resolve_namespace(Some("   ")).is_err());
     }
 }

@@ -9,9 +9,21 @@
 //!
 //! | Key | Type | Holds |
 //! |---|---|---|
-//! | `rh:{<session_id>}:meta` | string | JSON `{model_policy, created_at_ms}`, written `SET NX` |
-//! | `rh:{<session_id>}:lease` | hash | holder `node_id` + fencing token, expiry enforced by Redis `PEXPIRE` |
-//! | `rh:{<session_id>}:log` | stream | one entry per event, explicit id `<seq>-0` |
+//! | `rh:v1:sess:{<session_id>}:meta` | string | JSON `{model_policy, created_at_ms}`, written `SET NX` |
+//! | `rh:v1:sess:{<session_id>}:lease` | hash | holder `node_id` + fencing token, expiry enforced by Redis `PEXPIRE` |
+//! | `rh:v1:sess:{<session_id>}:log` | stream | one entry per event, explicit id `<seq>-0` |
+//!
+//! `rh` is the default [`KeyNamespace`] (`keys`), `v1` is [`keys::SCHEMA_VERSION`]
+//! and `sess` is this family's name — see [`keys`] for the one function every
+//! family builds its keys from (R-S3), and the table below for the other
+//! three.
+//!
+//! | Family | Version | Module |
+//! |---|---|---|
+//! | `sess` — sessions and their leases | v1 | [`crate`] (this module) |
+//! | `spend` — the committed-spend ledger | v1 | [`spend`] |
+//! | `fairuse` — the rolling fair-use windows | v1 | [`fair_use`] |
+//! | `corr` — the generation/call/thread correlation maps | v1 | [`correlation`] |
 //!
 //! The log's wire format is the load-bearing decision. Entries are added with
 //! *explicit* stream ids `<seq>-0`, so the entry id and the event's `seq` are
@@ -51,6 +63,7 @@
 
 pub mod correlation;
 pub mod fair_use;
+pub mod keys;
 mod scripts;
 pub mod spend;
 #[cfg(feature = "test-support")]
@@ -58,6 +71,7 @@ pub mod test_support;
 
 pub use correlation::RedisCorrelationMaps;
 pub use fair_use::RedisFairUseLedger;
+pub use keys::{EmptyNamespace, KeyNamespace};
 pub use spend::RedisSpendLedger;
 
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
@@ -153,16 +167,32 @@ async fn connect_manager(url: &str) -> Result<ConnectionManager, redis::RedisErr
 pub struct RedisSessionStore {
     conn: ConnectionManager,
     scripts: std::sync::Arc<scripts::Scripts>,
+    namespace: KeyNamespace,
 }
 
 impl RedisSessionStore {
-    /// Connect and fail fast: a store that cannot reach its Redis at startup
-    /// should stop the process there, not on the first session.
+    /// Connect under the default namespace (`rh`) and fail fast: a store
+    /// that cannot reach its Redis at startup should stop the process there,
+    /// not on the first session.
+    ///
+    /// What every caller in this workspace used before R-S3 named a
+    /// namespace, and what stays true for all of them except the composition
+    /// root: see [`Self::connect_namespaced`].
     pub async fn connect(url: impl AsRef<str>) -> Result<Self, StoreError> {
+        Self::connect_namespaced(url, KeyNamespace::default()).await
+    }
+
+    /// Connect under an explicit [`KeyNamespace`] — what the composition root
+    /// calls once it has read `ROUNDHOUSE_REDIS_NAMESPACE` (R-S3).
+    pub async fn connect_namespaced(
+        url: impl AsRef<str>,
+        namespace: KeyNamespace,
+    ) -> Result<Self, StoreError> {
         let conn = connect_manager(url.as_ref()).await.map_err(backend)?;
         Ok(Self {
             conn,
             scripts: std::sync::Arc::new(scripts::Scripts::new()),
+            namespace,
         })
     }
 
@@ -179,26 +209,20 @@ impl RedisSessionStore {
     }
 }
 
-/// Every key this store writes starts here. A constant, not configuration:
-/// nothing selects a different prefix today, and an untested knob would be a
-/// promise nobody checked. A future prefix parameter requires an isolation
-/// test.
-const KEY_PREFIX: &str = "rh";
-
 // The braces are a Redis Cluster hash tag. Every key for one session hashes to
 // one slot, which keeps the lease-fenced append single-slot scriptable. The
 // keys are an internal storage detail. Feature-gated test helpers expose them
 // only to the external wire-format tests that write raw Redis data.
-fn meta_key(session_id: &SessionId) -> String {
-    format!("{KEY_PREFIX}:{{{session_id}}}:meta")
+fn meta_key(namespace: &KeyNamespace, session_id: &SessionId) -> String {
+    keys::build_key(namespace, "sess", &[&format!("{{{session_id}}}"), "meta"])
 }
 
-fn lease_key(session_id: &SessionId) -> String {
-    format!("{KEY_PREFIX}:{{{session_id}}}:lease")
+fn lease_key(namespace: &KeyNamespace, session_id: &SessionId) -> String {
+    keys::build_key(namespace, "sess", &[&format!("{{{session_id}}}"), "lease"])
 }
 
-fn log_key(session_id: &SessionId) -> String {
-    format!("{KEY_PREFIX}:{{{session_id}}}:log")
+fn log_key(namespace: &KeyNamespace, session_id: &SessionId) -> String {
+    keys::build_key(namespace, "sess", &[&format!("{{{session_id}}}"), "log"])
 }
 
 /// The value under `…:meta`.
@@ -308,7 +332,7 @@ impl SessionStore for RedisSessionStore {
         // NX both answers "did it exist" and refuses to overwrite the policy
         // an earlier creation recorded.
         let created: Option<String> = redis::cmd("SET")
-            .arg(meta_key(session_id))
+            .arg(meta_key(&self.namespace, session_id))
             .arg(meta)
             .arg("NX")
             .query_async(&mut self.conn.clone())
@@ -330,8 +354,8 @@ impl SessionStore for RedisSessionStore {
             .scripts
             .acquire(
                 &mut self.conn.clone(),
-                &meta_key(session_id),
-                &lease_key(session_id),
+                &meta_key(&self.namespace, session_id),
+                &lease_key(&self.namespace, session_id),
                 identity,
                 ttl_ms,
             )
@@ -346,8 +370,8 @@ impl SessionStore for RedisSessionStore {
             .scripts
             .renew(
                 &mut self.conn.clone(),
-                &meta_key(&lease.session_id),
-                &lease_key(&lease.session_id),
+                &meta_key(&self.namespace, &lease.session_id),
+                &lease_key(&self.namespace, &lease.session_id),
                 identity,
                 ttl_ms,
             )
@@ -367,7 +391,7 @@ impl SessionStore for RedisSessionStore {
         self.scripts
             .release(
                 &mut self.conn.clone(),
-                &lease_key(&lease.session_id),
+                &lease_key(&self.namespace, &lease.session_id),
                 identity,
             )
             .await
@@ -384,8 +408,8 @@ impl SessionStore for RedisSessionStore {
     /// it read as an ordinary idle session.
     async fn is_leased(&self, session_id: &SessionId) -> Result<bool, StoreError> {
         let (exists, leased): (bool, bool) = redis::pipe()
-            .exists(meta_key(session_id))
-            .exists(lease_key(session_id))
+            .exists(meta_key(&self.namespace, session_id))
+            .exists(lease_key(&self.namespace, session_id))
             .query_async(&mut self.conn.clone())
             .await
             .map_err(backend)?;
@@ -411,9 +435,9 @@ impl SessionStore for RedisSessionStore {
             .scripts
             .append(
                 &mut self.conn.clone(),
-                &meta_key(&lease.session_id),
-                &lease_key(&lease.session_id),
-                &log_key(&lease.session_id),
+                &meta_key(&self.namespace, &lease.session_id),
+                &lease_key(&self.namespace, &lease.session_id),
+                &log_key(&self.namespace, &lease.session_id),
                 identity,
                 &payloads,
             )
@@ -451,7 +475,7 @@ impl SessionStore for RedisSessionStore {
         after_seq: u64,
         limit: usize,
     ) -> Result<Vec<SessionEvent>, StoreError> {
-        let log_key = log_key(session_id);
+        let log_key = log_key(&self.namespace, session_id);
         // XRANGE treats COUNT 0 as unlimited. Fetch at most one entry for a
         // zero-limit request, then discard it below. The pipelined EXISTS still
         // enforces SessionNotFound without a second round trip or branch.
@@ -461,7 +485,7 @@ impl SessionStore for RedisSessionStore {
         // exactly `after_seq-0` is precisely "seq > after_seq" — with no
         // arithmetic on `after_seq` that could overflow at u64::MAX.
         let (exists, range): (bool, StreamRangeReply) = redis::pipe()
-            .exists(meta_key(session_id))
+            .exists(meta_key(&self.namespace, session_id))
             .xrange_count(&log_key, format!("({after_seq}-0"), "+", redis_limit)
             .query_async(&mut self.conn.clone())
             .await
@@ -493,9 +517,9 @@ impl SessionStore for RedisSessionStore {
     }
 
     async fn last_seq(&self, session_id: &SessionId) -> Result<u64, StoreError> {
-        let log_key = log_key(session_id);
+        let log_key = log_key(&self.namespace, session_id);
         let (exists, len, newest): (bool, u64, StreamRangeReply) = redis::pipe()
-            .exists(meta_key(session_id))
+            .exists(meta_key(&self.namespace, session_id))
             .xlen(&log_key)
             .xrevrange_count(&log_key, "+", "-", 1)
             .query_async(&mut self.conn.clone())
@@ -519,5 +543,38 @@ impl SessionStore for RedisSessionStore {
             )));
         }
         Ok(last)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every key this family builds carries the namespace, the schema
+    /// version and the family name (M14.2, R-S3) — the shape the other three
+    /// families each pin beside their own key functions.
+    #[test]
+    fn every_key_carries_the_namespace_the_version_and_the_family() {
+        let namespace = KeyNamespace::default();
+        let session = SessionId::new("acme/ada/main");
+        assert_eq!(
+            meta_key(&namespace, &session),
+            "rh:v1:sess:{acme/ada/main}:meta"
+        );
+        assert_eq!(
+            lease_key(&namespace, &session),
+            "rh:v1:sess:{acme/ada/main}:lease"
+        );
+        assert_eq!(
+            log_key(&namespace, &session),
+            "rh:v1:sess:{acme/ada/main}:log"
+        );
+
+        let other = KeyNamespace::new("acme-prod").unwrap();
+        assert_ne!(
+            meta_key(&namespace, &session),
+            meta_key(&other, &session),
+            "two namespaces must never build the same key"
+        );
     }
 }

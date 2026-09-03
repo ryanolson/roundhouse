@@ -73,7 +73,10 @@ use serde::{Deserialize, Serialize};
 pub use budget::{
     Allocation, Budget, BudgetState, BudgetWindow, DEFAULT_WARN_AT, Exhaustion, TurnBudget,
 };
-pub use correlation::{CorrelationError, CorrelationMaps, MemoryCorrelationMaps};
+pub use correlation::{
+    CALL_BINDING_STALENESS_MS, CorrelationError, CorrelationMaps, MemoryCorrelationMaps,
+    THREAD_BINDING_STALENESS_MS,
+};
 pub use credential::{
     CredentialError, CredentialKind, CredentialMode, CredentialRef, ForwardedCredential,
     OauthEvidence, PresentedCredential, ProviderAccess, Reachable, Secret, TurnCredential,

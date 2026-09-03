@@ -10,12 +10,24 @@
 use roundhouse_core::control::{Principal, ProjectId};
 use roundhouse_core::ids::SessionId;
 
+use crate::KeyNamespace;
 use crate::correlation::call_key as correlation_call_key_impl;
+use crate::correlation::thread_key as correlation_thread_key_impl;
 use crate::fair_use::{
     bucket_fields, bucket_index, member_scope_key, project_scope_key, window_sum_fields,
 };
 use crate::spend::holds_key as spend_holds_key_impl;
 use crate::{RedisSessionStore, lease_key as store_lease_key, log_key as store_log_key};
+
+/// The namespace every helper in this module builds a key under.
+///
+/// Every gated test in this crate connects through [`connect_from_env`] or
+/// the family-specific analogues, none of which have opted into a namespace
+/// of their own — so the raw key a test computes to inspect a handle's state
+/// must agree with the default the handle itself connected under.
+fn default_namespace() -> KeyNamespace {
+    KeyNamespace::default()
+}
 
 /// The one variable every Redis-gated integration test reads.
 pub const URL_VAR: &str = "ROUNDHOUSE_TEST_REDIS_URL";
@@ -39,12 +51,12 @@ pub async fn connect_from_env() -> RedisSessionStore {
 
 /// The raw lease key used by adversarial tests.
 pub fn lease_key(session_id: &SessionId) -> String {
-    store_lease_key(session_id)
+    store_lease_key(&default_namespace(), session_id)
 }
 
 /// The raw log key used by wire-format tests.
 pub fn log_key(session_id: &SessionId) -> String {
-    store_log_key(session_id)
+    store_log_key(&default_namespace(), session_id)
 }
 
 /// The raw holds key, for the one test that inspects the hash field a hold
@@ -56,7 +68,7 @@ pub fn log_key(session_id: &SessionId) -> String {
 /// the key format it pins is already pinned by
 /// `the_project_and_member_keys_share_one_hash_tag` beside the real functions.
 pub fn spend_holds_key(project: &ProjectId) -> String {
-    spend_holds_key_impl(project)
+    spend_holds_key_impl(&default_namespace(), project)
 }
 
 /// The two raw hashes one draw touches, for the tests that assert on the
@@ -67,9 +79,10 @@ pub fn spend_holds_key(project: &ProjectId) -> String {
 /// handed back one key at a time would let a test assert half of it and look
 /// green.
 pub fn fair_use_scope_keys(principal: &Principal) -> (String, String) {
+    let namespace = default_namespace();
     (
-        project_scope_key(&principal.project),
-        member_scope_key(&principal.project, &principal.user),
+        project_scope_key(&namespace, &principal.project),
+        member_scope_key(&namespace, &principal.project, &principal.user),
     )
 }
 
@@ -109,12 +122,21 @@ pub fn fair_use_would_exceed_source() -> &'static str {
 /// The raw key one call binding occupies, for the test that reads the
 /// ambiguous marker itself rather than only the `None` it decodes to.
 ///
-/// Its two siblings — the generation and thread keys — are pinned by
+/// Its generation sibling is pinned by
 /// `every_key_carries_the_namespace_the_version_and_its_family` beside the
-/// functions that build them, and exporting them here with no caller would be
-/// an untested surface reading as a supported one.
+/// functions that build them, and exporting it here with no caller would be
+/// an untested surface reading as a supported one. The thread key gained a
+/// caller of its own (M14.2 review, F1) — see [`correlation_thread_key`].
 pub fn correlation_call_key(principal: &Principal, call_id: &str) -> String {
-    correlation_call_key_impl(principal, call_id)
+    correlation_call_key_impl(&default_namespace(), principal, call_id)
+}
+
+/// The raw key one thread binding occupies, for the gated test that reads
+/// the shipped `PTTL` a production handle's default arms — the half of R-S1
+/// no unit test can reach, since a unit test never touches a real Redis
+/// clock (M14.2 review, F1).
+pub fn correlation_thread_key(principal: &Principal, thread_id: &str) -> String {
+    correlation_thread_key_impl(&default_namespace(), principal, thread_id)
 }
 
 /// The conformance suite's expiry lever. Deleting the key is exactly what
@@ -123,7 +145,7 @@ pub fn correlation_call_key(principal: &Principal, call_id: &str) -> String {
 impl roundhouse_core::store::contract::LeaseControl for RedisSessionStore {
     async fn force_expire_lease(&self, session_id: &SessionId) {
         let _: i64 = redis::cmd("DEL")
-            .arg(store_lease_key(session_id))
+            .arg(store_lease_key(&self.namespace, session_id))
             .query_async(&mut self.conn.clone())
             .await
             .expect("the test Redis must accept a DEL");

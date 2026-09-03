@@ -36,12 +36,17 @@ mod common;
 use common::raw_from_env;
 use redis::AsyncCommands;
 use roundhouse_core::control::correlation::contract::fresh_key;
+use roundhouse_core::control::correlation::{
+    CALL_BINDING_STALENESS_MS, THREAD_BINDING_STALENESS_MS,
+};
 use roundhouse_core::control::spend::contract::fresh_principal;
 use roundhouse_core::control::{CorrelationMaps, MemoryCorrelationMaps};
 use roundhouse_core::ids::SessionId;
 use roundhouse_store_redis::RedisCorrelationMaps;
 use roundhouse_store_redis::correlation::AMBIGUOUS_MARKER;
-use roundhouse_store_redis::test_support::{correlation_call_key, url_from_env};
+use roundhouse_store_redis::test_support::{
+    correlation_call_key, correlation_thread_key, url_from_env,
+};
 
 roundhouse_core::correlation_maps_contract_suite!(
     ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored",
@@ -243,6 +248,62 @@ async fn a_binding_expires_at_its_staleness_bound_and_a_generation_does_not() {
         Some(3),
         "the generation map carries no expiry: an aged-out fork counter is not \
          a lost guess but a live conversation re-pointed at a log it left"
+    );
+}
+
+/// The bound every production handle actually ships — `BindingTtls::default()`,
+/// never `with_binding_ttls` — reaches Redis as `roundhouse-core`'s own
+/// staleness constants.
+///
+/// Every other expiry test in this file (above) shortens the bound first, so
+/// it proves the *mechanism* (a binding leaves when its `PEXPIRE` fires) but
+/// never once exercises the number a real deployment runs (M14.2 review, F1)
+/// — the unit test beside `BindingTtls::default()` in `correlation.rs`
+/// pins that number in Rust; this is its live-Redis half, reading `PTTL`
+/// straight off the key the default handle just wrote, the same proof
+/// `fair_use_decay.rs`'s
+/// `a_scope_is_armed_to_expire_one_bucket_past_the_widest_window` uses for
+/// the same reason: waiting out six hours (or seven days) is not a test.
+#[tokio::test]
+#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
+async fn the_default_call_and_thread_ttls_reach_redis_as_the_core_staleness_bounds() {
+    let maps = connect_maps_from_env().await; // the shipped default, no with_binding_ttls
+    let mut raw = raw_from_env().await;
+    let ada = fresh_principal("ada");
+
+    maps.bind_call(&ada, "toolu_default_ttl", &session("acme/ada/main"))
+        .await
+        .unwrap();
+    maps.bind_thread(&ada, "thread-default-ttl", &session("acme/ada/main"))
+        .await
+        .unwrap();
+
+    let call_pttl: i64 = redis::cmd("PTTL")
+        .arg(correlation_call_key(&ada, "toolu_default_ttl"))
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    let thread_pttl: i64 = redis::cmd("PTTL")
+        .arg(correlation_thread_key(&ada, "thread-default-ttl"))
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+
+    // A window either side of the round trip's own cost, the same tolerance
+    // and reasoning fair_use_decay.rs's PTTL check uses: PTTL starts ticking
+    // on the server the instant the write lands, so what is pinned is the
+    // policy, not the millisecond.
+    assert!(
+        call_pttl > CALL_BINDING_STALENESS_MS as i64 - 5_000
+            && call_pttl <= CALL_BINDING_STALENESS_MS as i64,
+        "F1: the shipped call binding TTL must be roundhouse-core's staleness \
+         bound; PTTL was {call_pttl}, expected about {CALL_BINDING_STALENESS_MS}"
+    );
+    assert!(
+        thread_pttl > THREAD_BINDING_STALENESS_MS as i64 - 5_000
+            && thread_pttl <= THREAD_BINDING_STALENESS_MS as i64,
+        "F1: the shipped thread binding TTL must be roundhouse-core's staleness \
+         bound; PTTL was {thread_pttl}, expected about {THREAD_BINDING_STALENESS_MS}"
     );
 }
 

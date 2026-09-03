@@ -246,6 +246,63 @@ async fn a_key_is_read_through_once_per_node_and_then_memoised() {
     assert_eq!(maps.reads(), 2);
 }
 
+/// **M14.2, R-S2: the memo is a cache and is bounded like one.** An eviction
+/// costs the next touch of the evicted key exactly one store read, and
+/// nothing else — no wrong answer, because the memo was never trusted
+/// unchecked in the first place (see [`GENERATION_MEMO_CAP`]'s own doc).
+///
+/// [`GENERATION_MEMO_CAP`] keys other than `"first"` fill the memo past its
+/// cap, evicting `"first"` (the oldest) before it is touched again. The
+/// assertion is the read count at `"first"`'s *second* touch: one, not zero
+/// (it would be zero if the entry had survived) and not two (which would
+/// mean the eviction cost more than the one read the cap's doc promises).
+#[tokio::test]
+async fn an_evicted_key_costs_exactly_one_store_read_on_its_next_touch() {
+    let maps = Arc::new(Double::counting());
+    let conversations = Conversations::over(Arc::clone(&maps) as Arc<dyn CorrelationMaps>);
+
+    assert_eq!(conversations.generation("first").await, 0);
+    assert_eq!(maps.reads(), 1);
+
+    for n in 0..GENERATION_MEMO_CAP {
+        conversations.generation(&format!("filler-{n}")).await;
+    }
+    assert_eq!(
+        conversations.lock_generations().len(),
+        GENERATION_MEMO_CAP,
+        "the memo must have evicted exactly one entry to stay at the cap, \
+         which is only true if \"first\" — the oldest — was the one it gave up"
+    );
+
+    let reads_before = maps.reads();
+    assert_eq!(
+        conversations.generation("first").await,
+        0,
+        "an evicted key still answers correctly — it just costs a read"
+    );
+    assert_eq!(
+        maps.reads(),
+        reads_before + 1,
+        "the eviction must cost exactly the one store read a never-touched \
+         key would cost, and not two — the memo silently re-priming itself \
+         from a stale local guess, or asking the store twice, are both \
+         wrong here"
+    );
+
+    // CONTROL: a key touched more recently than the fill is not evicted, so
+    // its next touch costs no read at all — the cap is evicting the oldest
+    // key, not merely making room by some other rule.
+    let recent = "filler-0-touched-again";
+    conversations.generation(recent).await;
+    let reads_before = maps.reads();
+    assert_eq!(conversations.generation(recent).await, 0);
+    assert_eq!(
+        maps.reads(),
+        reads_before,
+        "a live entry costs no read at all"
+    );
+}
+
 /// **The line the memo may not cross.** A reader is answered from the
 /// store, whatever this node last committed.
 ///

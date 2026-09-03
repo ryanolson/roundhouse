@@ -34,15 +34,18 @@
 //! — and nothing reads them that way, because every question here is about
 //! exactly one id.
 //!
-//! # The namespace and the schema version are in every key (R-C4)
+//! # The namespace and the schema version are in every key (R-C4, R-S3)
 //!
-//! `rh` is the declared namespace this crate's other families already carry;
-//! `v1` is this family's schema version, and it is here from the first
-//! deployment rather than retrofitted. The version is what makes the *value*
-//! encodings below changeable: a v2 that stored a call binding as a hash would
-//! be a different key space rather than a value some v1 node misreads as a
-//! session id. M14.2 audits the same discipline across the older families,
-//! which predate the rule.
+//! `rh` is the default [`KeyNamespace`](crate::KeyNamespace) — a deployment
+//! that names its own with `ROUNDHOUSE_REDIS_NAMESPACE` gets that one
+//! instead, on every key any family in this crate writes; `v1` is this
+//! family's schema version, and it is here from the first deployment rather
+//! than retrofitted. The version is what makes the *value* encodings below
+//! changeable: a v2 that stored a call binding as a hash would be a different
+//! key space rather than a value some v1 node misreads as a session id. Every
+//! key is built through [`crate::keys::build_key`] (M14.2, R-S3), which is
+//! what makes "every key carries the namespace and the version" a property of
+//! one function rather than a convention four families each had to remember.
 //!
 //! # Values are tagged, because a session id is an arbitrary string
 //!
@@ -85,51 +88,26 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use redis::aio::ConnectionManager;
 
+use roundhouse_core::control::correlation::{
+    CALL_BINDING_STALENESS_MS, THREAD_BINDING_STALENESS_MS,
+};
 use roundhouse_core::control::{CorrelationError, CorrelationMaps, Principal};
 use roundhouse_core::ids::SessionId;
 
-use crate::KEY_PREFIX;
+use crate::keys::{self, KeyNamespace};
 
-/// This family's schema version, in every key it writes.
+/// How long a tool-call binding lives here.
 ///
-/// Separate from [`KEY_PREFIX`], which says *whose* keys these are, because
-/// the two answer different questions: the namespace keeps two deployments
-/// sharing one Redis apart, and the version keeps two roundhouse builds apart.
-/// A value encoding that changes — a call binding that becomes a hash, a
-/// generation that gains a stamp — moves this and leaves the old key space
-/// inert rather than misread (R-C4).
-const SCHEMA_VERSION: &str = "v1";
+/// Re-exported from `roundhouse-core` (M14.2, R-S1) rather than defined here:
+/// the memory tables now enforce the same bound themselves, so the number and
+/// its reasoning have exactly one home, beside the trait both implementations
+/// answer to. What stays local to this backend is the *mechanism* — `PEXPIRE`
+/// — not the bound.
+pub const CALL_BINDING_TTL_MS: u64 = CALL_BINDING_STALENESS_MS;
 
-/// How long a tool-call binding lives.
-///
-/// **A staleness bound, not a capacity one** (R14, R-C3). The question it
-/// answers is "could a `tools/call` quoting this id still be in flight?", and
-/// the answer is bounded by how long a turn can run: a tool-use id is minted
-/// as roundhouse streams the call and consumed by the client's answer to it,
-/// which is one leg of one tool loop. Six hours is orders of magnitude beyond
-/// any such leg while keeping a node's call keys bounded by six hours of
-/// traffic rather than by the process's lifetime.
-///
-/// Erring long is deliberate and the two errors are not symmetric. Expiring
-/// early costs one MCP call falling back to the principal's most recent
-/// conversation — the answer it got before R-M2 existed. Expiring late costs
-/// memory in Redis and nothing else: a binding cannot become *wrong* with age,
-/// because the id it names was emitted once and never re-minted.
-pub const CALL_BINDING_TTL_MS: u64 = 6 * 60 * 60 * 1_000;
-
-/// How long a thread binding lives.
-///
-/// Longer than [`CALL_BINDING_TTL_MS`] by two orders of magnitude, because the
-/// thing bounded is different: a call id is live for one leg of one tool loop,
-/// where a thread id names a conversation a client may resume tomorrow. Seven
-/// days is the point past which a resumed thread has almost certainly compacted
-/// — which forks, which rebinds this key anyway — so an expiry beyond it would
-/// be keeping an answer no client is going to ask for.
-///
-/// What expiry costs here is one control call falling back to the named path
-/// (the cache key) and then to `latest`, which is the answer it got before the
-/// thread map existed.
-pub const THREAD_BINDING_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+/// How long a thread binding lives here. See [`CALL_BINDING_TTL_MS`] for why
+/// this moved.
+pub const THREAD_BINDING_TTL_MS: u64 = THREAD_BINDING_STALENESS_MS;
 
 /// The tag a bound value carries.
 ///
@@ -170,8 +148,8 @@ pub const AMBIGUOUS_MARKER: &str = "!ambiguous";
 /// Keyed by the whole namespaced string rather than by a `(project, user,
 /// key)` triple, because that same string is the session id's stem: the
 /// counter and the id it names must not be able to key on different things.
-pub(crate) fn generation_key(key: &str) -> String {
-    format!("{KEY_PREFIX}:{SCHEMA_VERSION}:corr:gen:{{{key}}}")
+pub(crate) fn generation_key(namespace: &KeyNamespace, key: &str) -> String {
+    keys::build_key(namespace, "corr", &["gen", &format!("{{{key}}}")])
 }
 
 /// The key one principal's binding of one tool-use id occupies.
@@ -180,20 +158,32 @@ pub(crate) fn generation_key(key: &str) -> String {
 /// bindings share a slot: the same reason the spend ledger tags on the project.
 /// Nothing needs that today — every operation here is single-key — and it
 /// costs nothing to leave the door open.
-pub(crate) fn call_key(principal: &Principal, call_id: &str) -> String {
-    format!(
-        "{KEY_PREFIX}:{SCHEMA_VERSION}:corr:call:{{{}}}:{call_id}",
-        principal_tag(principal)
+pub(crate) fn call_key(namespace: &KeyNamespace, principal: &Principal, call_id: &str) -> String {
+    keys::build_key(
+        namespace,
+        "corr",
+        &[
+            "call",
+            &format!("{{{}}}:{call_id}", principal_tag(principal)),
+        ],
     )
 }
 
 /// The key one principal's binding of one client-declared thread occupies.
 /// Tagged like [`call_key`], and a separate family from it — see
 /// `a_call_a_thread_and_a_generation_do_not_share_a_name` in the contract.
-pub(crate) fn thread_key(principal: &Principal, thread_id: &str) -> String {
-    format!(
-        "{KEY_PREFIX}:{SCHEMA_VERSION}:corr:thread:{{{}}}:{thread_id}",
-        principal_tag(principal)
+pub(crate) fn thread_key(
+    namespace: &KeyNamespace,
+    principal: &Principal,
+    thread_id: &str,
+) -> String {
+    keys::build_key(
+        namespace,
+        "corr",
+        &[
+            "thread",
+            &format!("{{{}}}:{thread_id}", principal_tag(principal)),
+        ],
     )
 }
 
@@ -281,16 +271,27 @@ pub struct RedisCorrelationMaps {
     conn: ConnectionManager,
     scripts: Arc<scripts::Scripts>,
     ttls: BindingTtls,
+    namespace: KeyNamespace,
 }
 
 impl RedisCorrelationMaps {
-    /// Connect and fail fast: maps that cannot reach their Redis at startup
-    /// should stop the process there, not on the first turn.
+    /// Connect under the default namespace (`rh`) and fail fast: maps that
+    /// cannot reach their Redis at startup should stop the process there,
+    /// not on the first turn.
     ///
     /// Through `crate::connect_manager` (private, so not a doc-link) for the
     /// reason every other family in this crate goes through it — the outage
     /// latency this crate bounds once rather than per call site.
     pub async fn connect(url: impl AsRef<str>) -> Result<Self, CorrelationError> {
+        Self::connect_namespaced(url, KeyNamespace::default()).await
+    }
+
+    /// Connect under an explicit [`KeyNamespace`] — what the composition
+    /// root calls once it has read `ROUNDHOUSE_REDIS_NAMESPACE` (R-S3).
+    pub async fn connect_namespaced(
+        url: impl AsRef<str>,
+        namespace: KeyNamespace,
+    ) -> Result<Self, CorrelationError> {
         let conn = crate::connect_manager(url.as_ref())
             .await
             .map_err(backend)?;
@@ -298,6 +299,7 @@ impl RedisCorrelationMaps {
             conn,
             scripts: Arc::new(scripts::Scripts::new()),
             ttls: BindingTtls::default(),
+            namespace,
         })
     }
 
@@ -334,7 +336,7 @@ impl RedisCorrelationMaps {
 #[async_trait]
 impl CorrelationMaps for RedisCorrelationMaps {
     async fn generation(&self, key: &str) -> Result<Option<u32>, CorrelationError> {
-        let raw = self.get(&generation_key(key)).await?;
+        let raw = self.get(&generation_key(&self.namespace, key)).await?;
         raw.map(|value| {
             value.parse::<u32>().map_err(|error| {
                 CorrelationError::Backend(anyhow::anyhow!(
@@ -352,7 +354,7 @@ impl CorrelationMaps for RedisCorrelationMaps {
         // not be a lost guess but a reset fork counter, which re-points a live
         // conversation at a log it forked away from.
         let _: () = redis::cmd("SET")
-            .arg(generation_key(key))
+            .arg(generation_key(&self.namespace, key))
             .arg(generation)
             .query_async(&mut self.conn.clone())
             .await
@@ -369,7 +371,7 @@ impl CorrelationMaps for RedisCorrelationMaps {
         self.scripts
             .bind_call(
                 &mut self.conn.clone(),
-                &call_key(principal, call_id),
+                &call_key(&self.namespace, principal, call_id),
                 &bound_value(session),
                 self.ttls.call_ms,
             )
@@ -381,7 +383,7 @@ impl CorrelationMaps for RedisCorrelationMaps {
         principal: &Principal,
         call_id: &str,
     ) -> Result<Option<SessionId>, CorrelationError> {
-        let key = call_key(principal, call_id);
+        let key = call_key(&self.namespace, principal, call_id);
         let raw = self.get(&key).await?;
         decode_binding(raw, &key)
     }
@@ -395,7 +397,7 @@ impl CorrelationMaps for RedisCorrelationMaps {
         // No script: the latest write is the answer by contract, so there is
         // no condition to evaluate atomically against it.
         let _: () = redis::cmd("SET")
-            .arg(thread_key(principal, thread_id))
+            .arg(thread_key(&self.namespace, principal, thread_id))
             .arg(bound_value(session))
             .arg("PX")
             .arg(self.ttls.thread_ms)
@@ -410,7 +412,7 @@ impl CorrelationMaps for RedisCorrelationMaps {
         principal: &Principal,
         thread_id: &str,
     ) -> Result<Option<SessionId>, CorrelationError> {
-        let key = thread_key(principal, thread_id);
+        let key = thread_key(&self.namespace, principal, thread_id);
         let raw = self.get(&key).await?;
         decode_binding(raw, &key)
     }
@@ -424,6 +426,36 @@ mod tests {
         Principal::new("acme", "ada")
     }
 
+    /// **R-S1's claim ("the memory tables and the Redis keys expire by the
+    /// same constant") checked, not only true by construction.**
+    /// `CALL_BINDING_TTL_MS`/`THREAD_BINDING_TTL_MS` are aliases of the core
+    /// crate's staleness bounds today, but an alias is not a check: nothing
+    /// failed before this test if a future edit replaced either alias with a
+    /// hand-typed literal that happened to look right (M14.2 review, F1).
+    /// `BindingTtls::default()` — what every production handle actually
+    /// carries — is what is compared here, because every gated test in
+    /// `correlation_contract.rs` shortens it with `with_binding_ttls` before
+    /// touching Redis, so this unit test is the only place the shipped
+    /// default is checked against anything at all. The live-Redis half of
+    /// this proof — that the default handle's write really arms this many
+    /// milliseconds on the server — is
+    /// `the_default_call_and_thread_ttls_reach_redis_as_the_core_staleness_bounds`
+    /// in `correlation_contract.rs`.
+    #[test]
+    fn the_default_ttls_equal_the_core_staleness_bounds() {
+        let ttls = BindingTtls::default();
+        assert_eq!(
+            ttls.call_ms, CALL_BINDING_STALENESS_MS,
+            "a Redis call binding must expire on exactly the bound \
+             roundhouse-core enforces in memory, or the two implementations \
+             disagree about what \"stale\" means"
+        );
+        assert_eq!(
+            ttls.thread_ms, THREAD_BINDING_STALENESS_MS,
+            "same for the thread binding"
+        );
+    }
+
     /// The three families are three key spaces, and every key carries the
     /// namespace and the schema version (R-C4).
     ///
@@ -433,9 +465,10 @@ mod tests {
     /// beside its key functions.
     #[test]
     fn every_key_carries_the_namespace_the_version_and_its_family() {
-        let generation = generation_key("acme/ada/main");
-        let call = call_key(&ada(), "toolu_1");
-        let thread = thread_key(&ada(), "thread-1");
+        let namespace = KeyNamespace::default();
+        let generation = generation_key(&namespace, "acme/ada/main");
+        let call = call_key(&namespace, &ada(), "toolu_1");
+        let thread = thread_key(&namespace, &ada(), "thread-1");
 
         for key in [&generation, &call, &thread] {
             assert!(key.starts_with("rh:v1:corr:"), "{key}");
@@ -443,6 +476,10 @@ mod tests {
         assert_eq!(generation, "rh:v1:corr:gen:{acme/ada/main}");
         assert_eq!(call, "rh:v1:corr:call:{4:acme:3:ada}:toolu_1");
         assert_eq!(thread, "rh:v1:corr:thread:{4:acme:3:ada}:thread-1");
+
+        // A different namespace must never build the same key.
+        let other = KeyNamespace::new("acme-prod").unwrap();
+        assert_ne!(generation_key(&other, "acme/ada/main"), generation);
     }
 
     /// No pair of ids can spell one principal's key segment two ways.
@@ -454,15 +491,16 @@ mod tests {
     /// it, which is exactly why the encoding is pinned here.
     #[test]
     fn a_delimiter_in_an_id_cannot_make_two_members_share_a_key() {
+        let namespace = KeyNamespace::default();
         let straddling = Principal::new("acme", "x");
         let shifted = Principal::new("acme", "x:y");
         assert_ne!(
-            call_key(&straddling, "y:call_0"),
-            call_key(&shifted, "call_0")
+            call_key(&namespace, &straddling, "y:call_0"),
+            call_key(&namespace, &shifted, "call_0")
         );
         assert_ne!(
-            thread_key(&straddling, "y:thread"),
-            thread_key(&shifted, "thread")
+            thread_key(&namespace, &straddling, "y:thread"),
+            thread_key(&namespace, &shifted, "thread")
         );
     }
 

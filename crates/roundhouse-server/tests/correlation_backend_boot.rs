@@ -99,7 +99,7 @@ async fn the_wired_conversations_reach_the_named_redis_not_this_processs_memory(
     // The composition root's own choice, *run* rather than re-typed -- and not
     // asserted as a fixture's premise either: `open` is handed this
     // deployment's URL and answers with whatever it answers.
-    let backends = open(Some(&url))
+    let backends = open(Some(&url), &roundhouse_store_redis::KeyNamespace::default())
         .await
         .expect("the test Redis named by ROUNDHOUSE_TEST_REDIS_URL must be reachable");
     let conversations = Arc::clone(backends.conversations());

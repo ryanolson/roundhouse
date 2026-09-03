@@ -148,7 +148,7 @@
 //! return the error, and `mcp_api` renders it as an internal fault rather than
 //! as a tenancy answer.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -156,6 +156,28 @@ use roundhouse_core::control::{
     CorrelationError, CorrelationMaps, MemoryCorrelationMaps, Principal,
 };
 use roundhouse_core::ids::SessionId;
+
+/// How many keys this node's generation memo holds at once.
+///
+/// **A cache's cap, not the correlation store's staleness bound** (M14.2,
+/// R-S2), and the distinction is the whole of the ruling: [`CorrelationMaps`]'
+/// call and thread bindings age out because a *wrong* answer there is served
+/// to an agent with a 200 on it, where a wrong entry here is never served —
+/// [`Conversations::generation`] hands the memo out only as a hint a probe
+/// starts from and corrects, never as an answer a caller trusts unchecked
+/// (see the module doc's "no reader is cached" section). So an entry going
+/// *stale* costs nothing this cap does not already cost by going *missing*:
+/// either way the next touch pays one store read. Capacity is therefore the
+/// only bound worth having, oldest-first, the same shape
+/// [`REMEMBERED_CALLS`](roundhouse_core::control::correlation::REMEMBERED_CALLS)
+/// already gives its own cache one seam over.
+///
+/// The M14.1 doc this replaces predicted the opposite — that this memo would
+/// gain the two binding families' staleness bound — and that prediction was
+/// wrong, not merely stale: aging out a *correct* hint early would trade a
+/// free local lookup for a needless store read, which is a cost with nothing
+/// bought for it.
+const GENERATION_MEMO_CAP: usize = 4096;
 
 /// The binding from a client's names to the sessions holding them.
 pub struct Conversations {
@@ -168,11 +190,10 @@ pub struct Conversations {
     /// This node's memo of the generation map. See the module doc for why the
     /// turn path may hold one, and which one entry a reader must.
     ///
-    /// Uncapped, like the generation map it memoises and for its reason: this
-    /// is bounded by the number of distinct conversations a node has served
-    /// rather than by their tool traffic. M14.2 gives it the staleness bound
-    /// the two binding families already have.
-    generations: Mutex<HashMap<String, Memo>>,
+    /// Bounded by [`GENERATION_MEMO_CAP`], oldest-first — a capacity cap and
+    /// not a staleness bound; see the constant's own doc for why those are
+    /// different questions here.
+    generations: Mutex<GenerationMemo>,
     /// Whether this node is currently carrying a commit the store refused —
     /// so [`Self::commit`] warns once per outage rather than once per turn,
     /// the shape the engine's fair-use seam already uses (M13.1 review, F4).
@@ -203,6 +224,54 @@ struct Memo {
     /// [`Conversations::commit`] is that retry, since a turn on this key
     /// writes the key again anyway.
     dirty: bool,
+}
+
+/// This node's whole memo of the generation map: the entries, and their
+/// write order for the cap to evict by.
+///
+/// A separate type rather than a bare `HashMap` so the cap is enforced in one
+/// place — [`Self::set`] — instead of at every call site that touches the
+/// map, the same reason [`roundhouse_core::control::correlation`]'s own
+/// per-principal tables carry their insertion order beside their entries.
+#[derive(Debug, Default)]
+struct GenerationMemo {
+    entries: HashMap<String, Memo>,
+    /// Write order of `entries`, so the cap evicts the oldest. A rebind of a
+    /// key already present does not push a second position — the same "does
+    /// not spend a queue slot" invariant `CorrelationMaps`' own tables keep.
+    order: VecDeque<String>,
+}
+
+impl GenerationMemo {
+    fn get(&self, key: &str) -> Option<Memo> {
+        self.entries.get(key).copied()
+    }
+
+    /// Insert or overwrite `key`'s entry, evicting the oldest key once this
+    /// pushes the memo past [`GENERATION_MEMO_CAP`].
+    ///
+    /// Only a genuinely new key spends a queue slot: overwriting an existing
+    /// entry — re-priming it from the store, or marking it dirty — must not
+    /// let repeated touches of one hot key crowd out everything else, which
+    /// is exactly the failure a queue that grew on every write would have.
+    fn set(&mut self, key: &str, memo: Memo) {
+        let is_new = !self.entries.contains_key(key);
+        self.entries.insert(key.to_string(), memo);
+        if is_new {
+            self.order.push_back(key.to_string());
+            while self.order.len() > GENERATION_MEMO_CAP {
+                let Some(oldest) = self.order.pop_front() else {
+                    break;
+                };
+                self.entries.remove(&oldest);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 impl std::fmt::Debug for Conversations {
@@ -237,7 +306,7 @@ impl Conversations {
     pub fn over(maps: Arc<dyn CorrelationMaps>) -> Self {
         Self {
             maps,
-            generations: Mutex::new(HashMap::new()),
+            generations: Mutex::new(GenerationMemo::default()),
             generation_write_failing: AtomicBool::new(false),
             latest: Mutex::new(HashMap::new()),
         }
@@ -634,16 +703,21 @@ impl Conversations {
         self.maps.session_of_thread(principal, thread_id).await
     }
 
-    /// What this node last read or wrote for `key`, if it has touched it.
+    /// What this node last read or wrote for `key`, if it has touched it *and*
+    /// the cap has not since evicted it.
+    ///
+    /// An eviction is silent here on purpose: the caller's next touch of
+    /// `key` reads through the store exactly as a never-touched key would,
+    /// which is the whole of what [`GENERATION_MEMO_CAP`]'s doc promises —
+    /// one extra store read, and nothing else.
     fn memoised(&self, key: &str) -> Option<Memo> {
-        self.lock_generations().get(key).copied()
+        self.lock_generations().get(key)
     }
 
     /// Remember what the store said, or what this node just committed —
     /// `dirty` when the store refused that commit.
     fn memoise(&self, key: &str, generation: Option<u32>, dirty: bool) {
-        self.lock_generations()
-            .insert(key.to_string(), Memo { generation, dirty });
+        self.lock_generations().set(key, Memo { generation, dirty });
     }
 
     /// Record that `principal` is working in `session`, and hand it back.
@@ -672,7 +746,7 @@ impl Conversations {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn lock_generations(&self) -> std::sync::MutexGuard<'_, HashMap<String, Memo>> {
+    fn lock_generations(&self) -> std::sync::MutexGuard<'_, GenerationMemo> {
         self.generations
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())

@@ -10,8 +10,12 @@
 //!
 //! | Key | Type | Holds |
 //! |---|---|---|
-//! | `rh:{<project_id>}:fairuse:p` | hash | everything drawn by anyone in the project |
-//! | `rh:{<project_id>}:fairuse:m:<user_id>` | hash | the same, for one member |
+//! | `rh:v1:fairuse:{<project_id>}:p` | hash | everything drawn by anyone in the project |
+//! | `rh:v1:fairuse:{<project_id>}:m:<user_id>` | hash | the same, for one member |
+//!
+//! `rh:v1:fairuse` is this family's [`crate::keys::build_key`] prefix under
+//! the default namespace — see [`crate`]'s module doc for the table of every
+//! family and [`crate::keys`] for the builder (R-S3).
 //!
 //! One hash per *scope*, and two families of fields inside it:
 //!
@@ -144,7 +148,7 @@ use roundhouse_core::control::{
     Principal, ProjectId, UserId,
 };
 
-use crate::KEY_PREFIX;
+use crate::keys::{self, KeyNamespace};
 
 /// The hash holding a project's own counters.
 ///
@@ -154,12 +158,20 @@ use crate::KEY_PREFIX;
 /// from it. Two members of one project are two keys; the project itself is a
 /// third; and no spelling of a user id can make any of them collide, because
 /// the only thing after `m:` is the id.
-pub(crate) fn project_scope_key(project: &ProjectId) -> String {
-    format!("{KEY_PREFIX}:{{{project}}}:fairuse:p")
+pub(crate) fn project_scope_key(namespace: &KeyNamespace, project: &ProjectId) -> String {
+    keys::build_key(namespace, "fairuse", &[&format!("{{{project}}}"), "p"])
 }
 
-pub(crate) fn member_scope_key(project: &ProjectId, user: &UserId) -> String {
-    format!("{KEY_PREFIX}:{{{project}}}:fairuse:m:{user}")
+pub(crate) fn member_scope_key(
+    namespace: &KeyNamespace,
+    project: &ProjectId,
+    user: &UserId,
+) -> String {
+    keys::build_key(
+        namespace,
+        "fairuse",
+        &[&format!("{{{project}}}"), &format!("m:{user}")],
+    )
 }
 
 /// One bucket's two field names, and the bucket a timestamp lands in.
@@ -289,11 +301,13 @@ pub struct RedisFairUseLedger {
     /// test-support seam below can shorten it without the production path
     /// having a knob. See [`Self::with_bucket_ttl_ms`].
     bucket_ttl_ms: u64,
+    namespace: KeyNamespace,
 }
 
 impl RedisFairUseLedger {
-    /// Connect and fail fast: a ledger that cannot reach its Redis at startup
-    /// should stop the process there, not on the first refused turn.
+    /// Connect under the default namespace (`rh`) and fail fast: a ledger
+    /// that cannot reach its Redis at startup should stop the process
+    /// there, not on the first refused turn.
     ///
     /// Through [`crate::connect_manager`] rather than
     /// `ConnectionManagerConfig::default()` — see its doc for the outage
@@ -301,6 +315,15 @@ impl RedisFairUseLedger {
     /// against a severed store must fail closed within a couple of seconds,
     /// not the crate default's ~9.45s.
     pub async fn connect(url: impl AsRef<str>) -> Result<Self, FairUseError> {
+        Self::connect_namespaced(url, KeyNamespace::default()).await
+    }
+
+    /// Connect under an explicit [`KeyNamespace`] — what the composition
+    /// root calls once it has read `ROUNDHOUSE_REDIS_NAMESPACE` (R-S3).
+    pub async fn connect_namespaced(
+        url: impl AsRef<str>,
+        namespace: KeyNamespace,
+    ) -> Result<Self, FairUseError> {
         let conn = crate::connect_manager(url.as_ref())
             .await
             .map_err(|error| FairUseError::Backend(anyhow::Error::new(error)))?;
@@ -308,6 +331,7 @@ impl RedisFairUseLedger {
             conn,
             scripts: Arc::new(scripts::Scripts::new()),
             bucket_ttl_ms: bucket_ttl_ms(),
+            namespace,
         })
     }
 
@@ -356,8 +380,12 @@ impl FairUseLedger for RedisFairUseLedger {
             .record_draw(
                 &mut self.conn.clone(),
                 scripts::RecordDrawArgs {
-                    project_key: &project_scope_key(&principal.project),
-                    member_key: &member_scope_key(&principal.project, &principal.user),
+                    project_key: &project_scope_key(&self.namespace, &principal.project),
+                    member_key: &member_scope_key(
+                        &self.namespace,
+                        &principal.project,
+                        &principal.user,
+                    ),
                     at_ms,
                     bucket_ms: BUCKET_MS,
                     counts,
@@ -386,8 +414,12 @@ impl FairUseLedger for RedisFairUseLedger {
             .would_exceed(
                 &mut self.conn.clone(),
                 scripts::WouldExceedArgs {
-                    project_key: &project_scope_key(&principal.project),
-                    member_key: &member_scope_key(&principal.project, &principal.user),
+                    project_key: &project_scope_key(&self.namespace, &principal.project),
+                    member_key: &member_scope_key(
+                        &self.namespace,
+                        &principal.project,
+                        &principal.user,
+                    ),
                     now_ms,
                     bucket_ms: BUCKET_MS,
                     max_count: MAX_COUNT,
@@ -431,18 +463,43 @@ mod tests {
             &key[start + 1..end]
         }
 
+        let namespace = KeyNamespace::default();
         let project = ProjectId::new("acme");
         let ada = UserId::new("ada");
-        let project_key = project_scope_key(&project);
-        let member_key = member_scope_key(&project, &ada);
+        let project_key = project_scope_key(&namespace, &project);
+        let member_key = member_scope_key(&namespace, &project, &ada);
         let tag = hash_tag(&project_key);
         assert_eq!(tag, "acme", "the tag is the project id, unadorned");
         assert_eq!(hash_tag(&member_key), tag);
 
         // The control: two projects must land on two tags, or every project
         // would collide onto one slot.
-        let other = project_scope_key(&ProjectId::new("other"));
+        let other = project_scope_key(&namespace, &ProjectId::new("other"));
         assert_ne!(hash_tag(&other), tag);
+    }
+
+    /// Every family's keys carry the namespace, the schema version and the
+    /// family name (M14.2, R-S3).
+    #[test]
+    fn every_key_carries_the_namespace_the_version_and_the_family() {
+        let namespace = KeyNamespace::default();
+        let project = ProjectId::new("acme");
+        let ada = UserId::new("ada");
+        assert_eq!(
+            project_scope_key(&namespace, &project),
+            "rh:v1:fairuse:{acme}:p"
+        );
+        assert_eq!(
+            member_scope_key(&namespace, &project, &ada),
+            "rh:v1:fairuse:{acme}:m:ada"
+        );
+
+        let other = KeyNamespace::new("acme-prod").unwrap();
+        assert_ne!(
+            project_scope_key(&namespace, &project),
+            project_scope_key(&other, &project),
+            "two namespaces must never build the same key"
+        );
     }
 
     /// Two members of one project, and the project itself, are three key
@@ -456,12 +513,13 @@ mod tests {
     /// is the property that keeps it true.
     #[test]
     fn no_two_scopes_can_name_one_key() {
+        let namespace = KeyNamespace::default();
         let project = ProjectId::new("acme");
         let mut keys = vec![
-            project_scope_key(&project),
-            member_scope_key(&project, &UserId::new("ada")),
-            member_scope_key(&project, &UserId::new("bob")),
-            member_scope_key(&project, &UserId::new("ada:1")),
+            project_scope_key(&namespace, &project),
+            member_scope_key(&namespace, &project, &UserId::new("ada")),
+            member_scope_key(&namespace, &project, &UserId::new("bob")),
+            member_scope_key(&namespace, &project, &UserId::new("ada:1")),
         ];
         let before = keys.len();
         keys.sort();
@@ -709,8 +767,9 @@ mod tests {
             ProjectId::new("f7-sum-fields-move-as-a-set"),
             UserId::new("ada"),
         );
-        let project_key = project_scope_key(&ada.project);
-        let member_key = member_scope_key(&ada.project, &ada.user);
+        let namespace = KeyNamespace::default();
+        let project_key = project_scope_key(&namespace, &ada.project);
+        let member_key = member_scope_key(&namespace, &ada.project, &ada.user);
         let _: () = redis::cmd("DEL")
             .arg(&project_key)
             .arg(&member_key)
@@ -821,10 +880,11 @@ mod tests {
             .expect("the test Redis must be reachable");
         let scripts = scripts::Scripts::new();
 
+        let namespace = KeyNamespace::default();
         let project = ProjectId::new("f7-decay-chunk-worst-case");
         let user = UserId::new("ada");
-        let project_key = project_scope_key(&project);
-        let member_key = member_scope_key(&project, &user);
+        let project_key = project_scope_key(&namespace, &project);
+        let member_key = member_scope_key(&namespace, &project, &user);
 
         // A clean slate: a re-run of this test must not inherit a previous
         // run's sums or bucket fields.

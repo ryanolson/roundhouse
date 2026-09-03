@@ -14,9 +14,13 @@
 //!
 //! | Key | Type | Holds |
 //! |---|---|---|
-//! | `rh:{<project_id>}:budget:account` | hash | `committed` (project, current window), `member:<user_id>` per member, `window_start_ms` |
-//! | `rh:{<project_id>}:budget:holds` | hash | `response_id` → packed `user`/`amount`/`expires_at_ms`, one field per live grant |
-//! | `rh:{<project_id>}:budget:watermarks` | hash | `session_id` → highest settled `seq` |
+//! | `rh:v1:spend:{<project_id>}:account` | hash | `committed` (project, current window), `member:<user_id>` per member, `window_start_ms` |
+//! | `rh:v1:spend:{<project_id>}:holds` | hash | `response_id` → packed `user`/`amount`/`expires_at_ms`, one field per live grant |
+//! | `rh:v1:spend:{<project_id>}:watermarks` | hash | `session_id` → highest settled `seq` |
+//!
+//! `rh:v1:spend` is this family's [`crate::keys::build_key`] prefix under the
+//! default namespace — see [`crate`]'s module doc for the table of every
+//! family and [`crate::keys`] for the builder (R-S3).
 //!
 //! The write and read paths both live in `spend::scripts`: every
 //! trait method is exactly one Lua script, so a grant, a settle, and a
@@ -46,22 +50,26 @@ use roundhouse_core::control::{
     Settlement, SpendError, SpendLedger,
 };
 
-use crate::KEY_PREFIX;
+use crate::keys::{self, KeyNamespace};
 
 // The braces are a Redis Cluster hash tag, on the *project* id. All three
 // keys for one project hash to one slot, which is what lets `open_grant` and
 // `settle_grant` check-and-debit both the project and member ceilings in one
 // atomic script — see the module doc.
-pub(crate) fn account_key(project: &ProjectId) -> String {
-    format!("{KEY_PREFIX}:{{{project}}}:budget:account")
+pub(crate) fn account_key(namespace: &KeyNamespace, project: &ProjectId) -> String {
+    keys::build_key(namespace, "spend", &[&format!("{{{project}}}"), "account"])
 }
 
-pub(crate) fn holds_key(project: &ProjectId) -> String {
-    format!("{KEY_PREFIX}:{{{project}}}:budget:holds")
+pub(crate) fn holds_key(namespace: &KeyNamespace, project: &ProjectId) -> String {
+    keys::build_key(namespace, "spend", &[&format!("{{{project}}}"), "holds"])
 }
 
-pub(crate) fn watermarks_key(project: &ProjectId) -> String {
-    format!("{KEY_PREFIX}:{{{project}}}:budget:watermarks")
+pub(crate) fn watermarks_key(namespace: &KeyNamespace, project: &ProjectId) -> String {
+    keys::build_key(
+        namespace,
+        "spend",
+        &[&format!("{{{project}}}"), "watermarks"],
+    )
 }
 
 fn window_mode(window: BudgetWindow) -> &'static str {
@@ -93,22 +101,34 @@ fn backend(error: redis::RedisError) -> SpendError {
 pub struct RedisSpendLedger {
     conn: ConnectionManager,
     scripts: Arc<scripts::Scripts>,
+    namespace: KeyNamespace,
 }
 
 impl RedisSpendLedger {
-    /// Connect and fail fast: a ledger that cannot reach its Redis at
-    /// startup should stop the process there, not on the first grant.
+    /// Connect under the default namespace (`rh`) and fail fast: a ledger
+    /// that cannot reach its Redis at startup should stop the process
+    /// there, not on the first grant.
     ///
     /// Through [`crate::connect_manager`] rather than
     /// `ConnectionManagerConfig::default()` — see its doc for the outage
     /// latency this crate's one `connect` bounds (M13.1 review F2).
     pub async fn connect(url: impl AsRef<str>) -> Result<Self, SpendError> {
+        Self::connect_namespaced(url, KeyNamespace::default()).await
+    }
+
+    /// Connect under an explicit [`KeyNamespace`] — what the composition
+    /// root calls once it has read `ROUNDHOUSE_REDIS_NAMESPACE` (R-S3).
+    pub async fn connect_namespaced(
+        url: impl AsRef<str>,
+        namespace: KeyNamespace,
+    ) -> Result<Self, SpendError> {
         let conn = crate::connect_manager(url.as_ref())
             .await
             .map_err(backend)?;
         Ok(Self {
             conn,
             scripts: Arc::new(scripts::Scripts::new()),
+            namespace,
         })
     }
 }
@@ -120,8 +140,8 @@ impl SpendLedger for RedisSpendLedger {
         SpendError::check_amount("limit_usd", request.terms.budget.limit_usd)?;
 
         let member_ceiling = member_ceiling_arg(&request.terms);
-        let account = account_key(&request.principal.project);
-        let holds = holds_key(&request.principal.project);
+        let account = account_key(&self.namespace, &request.principal.project);
+        let holds = holds_key(&self.namespace, &request.principal.project);
         let outcome = self
             .scripts
             .open_grant(
@@ -150,9 +170,9 @@ impl SpendLedger for RedisSpendLedger {
     async fn settle_grant(&self, settlement: Settlement) -> Result<Settled, SpendError> {
         SpendError::check_amount("actual_usd", settlement.actual_usd)?;
 
-        let account = account_key(&settlement.principal.project);
-        let holds = holds_key(&settlement.principal.project);
-        let watermarks = watermarks_key(&settlement.principal.project);
+        let account = account_key(&self.namespace, &settlement.principal.project);
+        let holds = holds_key(&self.namespace, &settlement.principal.project);
+        let watermarks = watermarks_key(&self.namespace, &settlement.principal.project);
         let outcome = self
             .scripts
             .settle_grant(
@@ -192,8 +212,8 @@ impl SpendLedger for RedisSpendLedger {
         SpendError::check_amount("limit_usd", query.terms.budget.limit_usd)?;
 
         let member_ceiling = member_ceiling_arg(&query.terms);
-        let account = account_key(&query.principal.project);
-        let holds = holds_key(&query.principal.project);
+        let account = account_key(&self.namespace, &query.principal.project);
+        let holds = holds_key(&self.namespace, &query.principal.project);
         let outcome = self
             .scripts
             .balance(
@@ -241,10 +261,11 @@ mod tests {
             &key[start + 1..end]
         }
 
+        let namespace = KeyNamespace::default();
         let project = ProjectId::new("acme");
-        let account = account_key(&project);
-        let holds = holds_key(&project);
-        let watermarks = watermarks_key(&project);
+        let account = account_key(&namespace, &project);
+        let holds = holds_key(&namespace, &project);
+        let watermarks = watermarks_key(&namespace, &project);
 
         let tag = hash_tag(&account);
         assert_eq!(tag, "acme", "the tag is the project id, unadorned");
@@ -254,7 +275,32 @@ mod tests {
         // The control: two different projects must land on two different
         // tags, or every project would collide onto one Redis Cluster slot.
         let other = ProjectId::new("other-project");
-        assert_ne!(hash_tag(&account_key(&other)), tag);
+        assert_ne!(hash_tag(&account_key(&namespace, &other)), tag);
+    }
+
+    /// Every family's keys carry the namespace, the schema version and the
+    /// family name (M14.2, R-S3) — the shape [`correlation`](crate::correlation)'s
+    /// own key test already pins, asserted here for this family too.
+    #[test]
+    fn every_key_carries_the_namespace_the_version_and_the_family() {
+        let namespace = KeyNamespace::default();
+        let project = ProjectId::new("acme");
+        assert_eq!(
+            account_key(&namespace, &project),
+            "rh:v1:spend:{acme}:account"
+        );
+        assert_eq!(holds_key(&namespace, &project), "rh:v1:spend:{acme}:holds");
+        assert_eq!(
+            watermarks_key(&namespace, &project),
+            "rh:v1:spend:{acme}:watermarks"
+        );
+
+        let other = KeyNamespace::new("acme-prod").unwrap();
+        assert_ne!(
+            account_key(&namespace, &project),
+            account_key(&other, &project),
+            "two namespaces must never build the same key"
+        );
     }
 
     #[test]

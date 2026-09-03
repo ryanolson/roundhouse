@@ -63,17 +63,32 @@
 //! moment the turn ingest decides which session the thread's history belongs
 //! to. Nothing later can reconstruct either pairing.
 //!
-//! What bounds them differs by backend *by design*, and the contract asserts
-//! the semantics both share rather than the bound each uses. In memory the
-//! bound is a capacity cap per principal ([`REMEMBERED_CALLS`],
-//! [`REMEMBERED_THREADS`]); in Redis it is a TTL per key, because a shared
-//! store has no natural place to keep an eviction queue and because a binding
-//! older than any plausible turn is a stale guess whatever a table's size —
-//! D1's R14, brought forward here because the durable shape needs a bound and
-//! a TTL is the one Redis already owns. The memory tables gain the same
-//! staleness bound under M14.2; asserting a *cap* in the contract would have
-//! made a backend that expires by time fail a test about a table it does not
-//! have.
+//! Both bindings are bounded by *age* now (M14.2, R-S1) as well as by count —
+//! [`CALL_BINDING_STALENESS_MS`] and [`THREAD_BINDING_STALENESS_MS`], named
+//! here rather than in `roundhouse-store-redis` so the memory tables and the
+//! Redis keys expire against the same constant. A binding older than any
+//! plausible turn is a stale guess whatever a table's size — D1's R14 — and
+//! that reasoning does not care which backend is holding the guess. What
+//! still differs by backend is the *mechanism*: Redis has no natural place to
+//! keep an eviction queue, so it hands the bound straight to `PEXPIRE`
+//! (`roundhouse-store-redis::correlation`); the memory tables have no
+//! background sweeper, so [`MemoryCorrelationMaps`] records the instant of
+//! every write and enforces the bound itself — a read past it answers absent
+//! and drops the entry, and a write sweeps the queue's head for anything else
+//! that has aged out, independently of the capacity sweep
+//! ([`REMEMBERED_CALLS`], [`REMEMBERED_THREADS`]) that already runs there.
+//! Neither bound waits on the other: a table under its cap still ages out an
+//! idle entry, and a table with everything fresh still evicts at the cap.
+//!
+//! **What one rung's doc got wrong about the next one, left here rather than
+//! quietly fixed.** M14.1's version of this section predicted that
+//! `roundhouse-server`'s `Conversations` would give its own generation memo
+//! "the staleness bound the two binding families already have" — but R-S2
+//! gives that memo a *capacity* cap with no staleness bound at all, for the
+//! opposite reason: a wrong generation hint costs a probe, not a wrong
+//! answer, so aging it out would only trade a cheap correction for a
+//! needless one. The binding families here are not that memo, and this doc
+//! no longer conflates them.
 //!
 //! # What is deliberately not here
 //!
@@ -87,12 +102,52 @@
 pub mod contract;
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
 use crate::control::Principal;
 use crate::ids::SessionId;
+
+/// How long a tool-call binding is a plausible answer for, in either
+/// implementation (M14.2, R-S1).
+///
+/// Moved here from `roundhouse-store-redis` so the memory tables and the
+/// Redis keys age out against the *same* constant rather than two numbers
+/// that happen to agree today and are free to drift tomorrow. The value and
+/// its reasoning are unchanged from M14.1: a tool-use id is minted as
+/// roundhouse streams the call and consumed by the client's answer to it,
+/// one leg of one tool loop, and six hours is orders of magnitude beyond any
+/// such leg. Expiring early costs one MCP call falling back to the
+/// principal's most recent conversation — the answer it got before R-M2
+/// existed; expiring late costs memory and nothing else, because the id it
+/// names was emitted once and never re-minted.
+pub const CALL_BINDING_STALENESS_MS: u64 = 6 * 60 * 60 * 1_000;
+
+/// How long a thread binding is a plausible answer for, in either
+/// implementation. See [`CALL_BINDING_STALENESS_MS`] for why this moved.
+///
+/// Longer by two orders of magnitude because the thing bounded is different:
+/// a call id is live for one leg of one tool loop, where a thread id names a
+/// conversation a client may resume tomorrow. Seven days is the point past
+/// which a resumed thread has almost certainly compacted — which forks,
+/// which rebinds this key anyway — so an expiry beyond it would be keeping an
+/// answer no client is going to ask for.
+pub const THREAD_BINDING_STALENESS_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+
+/// What time [`MemoryCorrelationMaps`] thinks it is.
+///
+/// A function pointer rather than a parameter on every trait method: the
+/// trait's methods are shared with [`RedisCorrelationMaps`](https://docs.rs/roundhouse-store-redis)
+/// wire-compatible signatures, and threading a clock through all of them
+/// for the sake of one backend's test seam would be the tail wagging the
+/// dog. The production default is [`crate::now_ms`]; a test that wants to
+/// watch a binding age out without sleeping replaces it with
+/// [`MemoryCorrelationMaps::with_clock`] — the same shape
+/// `RedisFairUseLedger::with_bucket_ttl_ms` and
+/// `RedisCorrelationMaps::with_binding_ttls` already give their own
+/// backends, a lever on the handle rather than a knob on the constant.
+type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
 
 /// How many emitted tool calls one principal's in-memory table remembers.
 ///
@@ -228,9 +283,27 @@ pub trait CorrelationMaps: Send + Sync + 'static {
 /// included, since R-C4 lets the composition root swap in the Redis backend)
 /// and a second, synchronous surface here would have no caller to be thin
 /// for.
-#[derive(Debug, Default)]
 pub struct MemoryCorrelationMaps {
     inner: Mutex<Tables>,
+    /// See [`Clock`]. Not `Debug`, so [`MemoryCorrelationMaps`] implements it
+    /// by hand rather than deriving — the same shape `Conversations`'
+    /// hand-written `Debug` already has for its own trait object field.
+    clock: Clock,
+}
+
+impl std::fmt::Debug for MemoryCorrelationMaps {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MemoryCorrelationMaps")
+            .field("inner", &self.inner)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for MemoryCorrelationMaps {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -270,16 +343,32 @@ struct CallTable {
     per_principal: HashMap<Principal, PrincipalCalls>,
 }
 
-/// One principal's remembered calls, oldest-first.
+/// One principal's remembered calls, oldest-written-first.
 #[derive(Debug, Default)]
 struct PrincipalCalls {
-    sites: HashMap<String, CallSite>,
-    /// Insertion order of [`PrincipalCalls::sites`], so the cap evicts the
-    /// oldest. Exactly one entry per site, which is this type's invariant —
-    /// kept here rather than inline in one method's body because an invariant
-    /// like that is one the next edit breaks with nothing red (M12 review,
-    /// F13).
+    sites: HashMap<String, CallEntry>,
+    /// Write order of [`PrincipalCalls::sites`], so a sweep sees the oldest
+    /// first — both the capacity sweep, which evicts from here regardless of
+    /// age, and the staleness sweep, which stops at the first entry whose own
+    /// timestamp says it is still live (M14.2, R-S1). A rebind refreshes the
+    /// entry in place rather than pushing a second position, exactly as
+    /// before: the invariant is still exactly one entry per site, kept here
+    /// rather than inline in one method's body because an invariant like that
+    /// is one the next edit breaks with nothing red (M12 review, F13).
     order: VecDeque<String>,
+}
+
+/// What one remembered call id names, if anything, and when this table last
+/// heard it asserted.
+#[derive(Debug, Clone)]
+struct CallEntry {
+    site: CallSite,
+    /// When this entry was last written — bound, refreshed, or turned
+    /// ambiguous by a collision. A collision refreshes it for the same reason
+    /// the Redis script's `PEXPIRE` fires on every branch: a binding's
+    /// staleness is measured from the last time anything asserted it, not
+    /// from the first.
+    written_at_ms: u64,
 }
 
 /// What one remembered call id names, if anything.
@@ -292,15 +381,20 @@ enum CallSite {
 }
 
 impl CallTable {
-    fn bind(&mut self, principal: &Principal, call_id: &str, session: &SessionId) {
+    fn bind(&mut self, principal: &Principal, call_id: &str, session: &SessionId, now: u64) {
         self.per_principal
             .entry(principal.clone())
             .or_default()
-            .bind(call_id, session);
+            .bind(call_id, session, now);
     }
 
-    fn session_of(&self, principal: &Principal, call_id: &str) -> Option<SessionId> {
-        self.per_principal.get(principal)?.session_of(call_id)
+    /// `&mut self`, not `&self`: a read past the staleness bound drops the
+    /// entry it answers absent for (M14.2, R-S1) — the same rule Redis
+    /// enforces by simply no longer having the key.
+    fn session_of(&mut self, principal: &Principal, call_id: &str, now: u64) -> Option<SessionId> {
+        self.per_principal
+            .get_mut(principal)?
+            .session_of(call_id, now)
     }
 
     /// How many bindings this table holds for `principal`, and how long its
@@ -319,19 +413,72 @@ impl CallTable {
 }
 
 impl PrincipalCalls {
-    fn bind(&mut self, call_id: &str, session: &SessionId) {
+    fn bind(&mut self, call_id: &str, session: &SessionId, now: u64) {
         match self.sites.get_mut(call_id) {
             // A resend or a dedup replay re-binds an id this node already
             // holds to the session that already holds it. That is one call
             // seen twice, not two calls, and treating it as a collision would
-            // throw away a binding that is still exactly right.
-            Some(CallSite::Bound(held)) if held == session => {}
-            Some(site) => *site = CallSite::Ambiguous,
+            // throw away a binding that is still exactly right — only its
+            // lifetime is refreshed, the same shape the Redis script's
+            // `PEXPIRE`-on-every-branch has.
+            Some(entry) if matches!(&entry.site, CallSite::Bound(held) if held == session) => {
+                entry.written_at_ms = now;
+            }
+            Some(entry) => {
+                entry.site = CallSite::Ambiguous;
+                entry.written_at_ms = now;
+            }
             None => {
-                self.sites
-                    .insert(call_id.to_string(), CallSite::Bound(session.clone()));
+                self.sites.insert(
+                    call_id.to_string(),
+                    CallEntry {
+                        site: CallSite::Bound(session.clone()),
+                        written_at_ms: now,
+                    },
+                );
                 self.order.push_back(call_id.to_string());
             }
+        }
+        self.sweep(now);
+    }
+
+    fn session_of(&mut self, call_id: &str, now: u64) -> Option<SessionId> {
+        let entry = self.sites.get(call_id)?;
+        if is_stale(entry.written_at_ms, now, CALL_BINDING_STALENESS_MS) {
+            self.drop_entry(call_id);
+            return None;
+        }
+        match &self.sites.get(call_id)?.site {
+            CallSite::Bound(session) => Some(session.clone()),
+            CallSite::Ambiguous => None,
+        }
+    }
+
+    /// Age out whatever has aged out at the queue's head, then cap by count —
+    /// two independent walks, so a table under its cap still ages out an idle
+    /// entry and a table with nothing stale still evicts at the cap.
+    ///
+    /// Stops at the first entry whose *own* timestamp is not stale: a
+    /// rebound entry keeps its original queue position (a rebind spends no
+    /// slot) but its timestamp is current, so the age sweep correctly leaves
+    /// it — and anything behind it — for a later write or for the read-side
+    /// drop to catch. That is a bound on how much one write's sweep does, not
+    /// a bound on correctness: nothing is ever answered past its staleness
+    /// bound, because [`Self::session_of`] checks the entry it is about to
+    /// answer regardless of what any sweep has gotten to.
+    fn sweep(&mut self, now: u64) {
+        while let Some(front) = self.order.front() {
+            let stale = self
+                .sites
+                .get(front)
+                .is_none_or(|entry| is_stale(entry.written_at_ms, now, CALL_BINDING_STALENESS_MS));
+            if !stale {
+                break;
+            }
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.sites.remove(&oldest);
         }
         while self.order.len() > REMEMBERED_CALLS {
             let Some(oldest) = self.order.pop_front() else {
@@ -341,12 +488,20 @@ impl PrincipalCalls {
         }
     }
 
-    fn session_of(&self, call_id: &str) -> Option<SessionId> {
-        match self.sites.get(call_id)? {
-            CallSite::Bound(session) => Some(session.clone()),
-            CallSite::Ambiguous => None,
-        }
+    fn drop_entry(&mut self, call_id: &str) {
+        self.sites.remove(call_id);
+        self.order.retain(|id| id != call_id);
     }
+}
+
+/// Whether an entry written at `written_at_ms` is stale as of `now`, against
+/// `bound_ms`.
+///
+/// `saturating_sub` rather than plain subtraction: a clock seam a test moves
+/// backwards, or a node whose wall clock jumps, must read as "not yet stale"
+/// rather than panic or wrap into a number bigger than any bound.
+fn is_stale(written_at_ms: u64, now: u64, bound_ms: u64) -> bool {
+    now.saturating_sub(written_at_ms) > bound_ms
 }
 
 /// Which session each client-declared thread is in, remembered per principal
@@ -374,31 +529,43 @@ struct ThreadTable {
     per_principal: HashMap<Principal, PrincipalThreads>,
 }
 
-/// One principal's remembered threads, oldest-first.
+/// One principal's remembered threads, oldest-written-first.
 #[derive(Debug, Default)]
 struct PrincipalThreads {
-    sessions: HashMap<String, SessionId>,
-    /// Insertion order of [`PrincipalThreads::sessions`], so the cap evicts
-    /// the oldest. Exactly one entry per thread, which is this type's
-    /// invariant — a rebinding must not push a second one, or the cap drops a
-    /// key that is still live.
+    sessions: HashMap<String, ThreadEntry>,
+    /// Write order of [`PrincipalThreads::sessions`], for
+    /// [`PrincipalCalls::order`]'s reason. Exactly one entry per thread — a
+    /// rebinding must not push a second one, or the cap drops a key that is
+    /// still live.
     order: VecDeque<String>,
 }
 
+/// Which session a thread is in, and when this table last heard it asserted.
+#[derive(Debug, Clone)]
+struct ThreadEntry {
+    session: SessionId,
+    written_at_ms: u64,
+}
+
 impl ThreadTable {
-    fn bind(&mut self, principal: &Principal, thread_id: &str, session: &SessionId) {
+    fn bind(&mut self, principal: &Principal, thread_id: &str, session: &SessionId, now: u64) {
         self.per_principal
             .entry(principal.clone())
             .or_default()
-            .bind(thread_id, session);
+            .bind(thread_id, session, now);
     }
 
-    fn session_of(&self, principal: &Principal, thread_id: &str) -> Option<SessionId> {
+    /// `&mut self` for [`CallTable::session_of`]'s reason: a read past the
+    /// staleness bound drops the entry it answers absent for.
+    fn session_of(
+        &mut self,
+        principal: &Principal,
+        thread_id: &str,
+        now: u64,
+    ) -> Option<SessionId> {
         self.per_principal
-            .get(principal)?
-            .sessions
-            .get(thread_id)
-            .cloned()
+            .get_mut(principal)?
+            .session_of(thread_id, now)
     }
 
     /// How many bindings this table holds for `principal`, and how long its
@@ -413,15 +580,53 @@ impl ThreadTable {
 }
 
 impl PrincipalThreads {
-    fn bind(&mut self, thread_id: &str, session: &SessionId) {
+    fn bind(&mut self, thread_id: &str, session: &SessionId, now: u64) {
         if let Some(held) = self.sessions.get_mut(thread_id) {
             // The fork case, and the resend case, and they are the same
-            // write: this thread's newest turn decided this session.
-            *held = session.clone();
+            // write: this thread's newest turn decided this session, and
+            // either way the binding's lifetime is measured from now.
+            held.session = session.clone();
+            held.written_at_ms = now;
+            self.sweep(now);
             return;
         }
-        self.sessions.insert(thread_id.to_string(), session.clone());
+        self.sessions.insert(
+            thread_id.to_string(),
+            ThreadEntry {
+                session: session.clone(),
+                written_at_ms: now,
+            },
+        );
         self.order.push_back(thread_id.to_string());
+        self.sweep(now);
+    }
+
+    fn session_of(&mut self, thread_id: &str, now: u64) -> Option<SessionId> {
+        let entry = self.sessions.get(thread_id)?;
+        if is_stale(entry.written_at_ms, now, THREAD_BINDING_STALENESS_MS) {
+            self.drop_entry(thread_id);
+            return None;
+        }
+        self.sessions
+            .get(thread_id)
+            .map(|entry| entry.session.clone())
+    }
+
+    /// See [`PrincipalCalls::sweep`]: age first, from the head, then cap by
+    /// count — two independent bounds.
+    fn sweep(&mut self, now: u64) {
+        while let Some(front) = self.order.front() {
+            let stale = self.sessions.get(front).is_none_or(|entry| {
+                is_stale(entry.written_at_ms, now, THREAD_BINDING_STALENESS_MS)
+            });
+            if !stale {
+                break;
+            }
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.sessions.remove(&oldest);
+        }
         while self.order.len() > REMEMBERED_THREADS {
             let Some(oldest) = self.order.pop_front() else {
                 break;
@@ -429,11 +634,32 @@ impl PrincipalThreads {
             self.sessions.remove(&oldest);
         }
     }
+
+    fn drop_entry(&mut self, thread_id: &str) {
+        self.sessions.remove(thread_id);
+        self.order.retain(|id| id != thread_id);
+    }
 }
 
 impl MemoryCorrelationMaps {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            inner: Mutex::new(Tables::default()),
+            clock: Arc::new(crate::now_ms),
+        }
+    }
+
+    /// Replace this handle's notion of "now", so a test can watch a binding
+    /// age out without sleeping and without touching the production bound.
+    ///
+    /// The same lever `RedisFairUseLedger::with_bucket_ttl_ms` and
+    /// `RedisCorrelationMaps::with_binding_ttls` already give their own
+    /// backends — one seam per implementation, not one signature change on
+    /// the trait every caller would have to carry.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_clock(mut self, clock: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
+        self.clock = Arc::new(clock);
+        self
     }
 
     /// The lock, in one place.
@@ -447,6 +673,10 @@ impl MemoryCorrelationMaps {
         self.inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn now(&self) -> u64 {
+        (self.clock)()
     }
 }
 
@@ -467,7 +697,8 @@ impl CorrelationMaps for MemoryCorrelationMaps {
         call_id: &str,
         session: &SessionId,
     ) -> Result<(), CorrelationError> {
-        self.lock().calls.bind(principal, call_id, session);
+        let now = self.now();
+        self.lock().calls.bind(principal, call_id, session, now);
         Ok(())
     }
 
@@ -476,7 +707,8 @@ impl CorrelationMaps for MemoryCorrelationMaps {
         principal: &Principal,
         call_id: &str,
     ) -> Result<Option<SessionId>, CorrelationError> {
-        Ok(self.lock().calls.session_of(principal, call_id))
+        let now = self.now();
+        Ok(self.lock().calls.session_of(principal, call_id, now))
     }
 
     async fn bind_thread(
@@ -485,7 +717,8 @@ impl CorrelationMaps for MemoryCorrelationMaps {
         thread_id: &str,
         session: &SessionId,
     ) -> Result<(), CorrelationError> {
-        self.lock().threads.bind(principal, thread_id, session);
+        let now = self.now();
+        self.lock().threads.bind(principal, thread_id, session, now);
         Ok(())
     }
 
@@ -494,7 +727,8 @@ impl CorrelationMaps for MemoryCorrelationMaps {
         principal: &Principal,
         thread_id: &str,
     ) -> Result<Option<SessionId>, CorrelationError> {
-        Ok(self.lock().threads.session_of(principal, thread_id))
+        let now = self.now();
+        Ok(self.lock().threads.session_of(principal, thread_id, now))
     }
 }
 
@@ -627,6 +861,169 @@ mod tests {
         assert_eq!(
             maps.session_of_thread(&ada, "thread-1").await.unwrap(),
             Some(forked)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // M14.2, R-S1: age, under a scripted clock rather than a sleep
+    // -----------------------------------------------------------------------
+
+    /// A shared, settable clock a test can move without sleeping — the memory
+    /// side's half of R-S4's "clock seam each implementation already has for
+    /// tests", the Redis side's being its per-handle TTL lever.
+    fn scripted_clock() -> (
+        impl Fn() -> u64 + Send + Sync + 'static,
+        Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        let now = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let read = Arc::clone(&now);
+        (move || read.load(std::sync::atomic::Ordering::Relaxed), now)
+    }
+
+    /// **The claim R-S1 states in the module doc, proved rather than only
+    /// documented:** a binding older than its family's staleness bound
+    /// answers exactly as one nothing ever wrote does, on both families, and
+    /// a binding well inside the bound is untouched by the same clock advance.
+    #[tokio::test]
+    async fn a_binding_older_than_the_bound_is_absent_under_a_scripted_clock() {
+        let (clock, now) = scripted_clock();
+        let maps = MemoryCorrelationMaps::new().with_clock(clock);
+        let ada = fresh_principal("ada");
+        let session = SessionId::new("acme/ada/main");
+
+        maps.bind_call(&ada, "toolu_ages_out", &session)
+            .await
+            .unwrap();
+        maps.bind_thread(&ada, "thread-ages-out", &session)
+            .await
+            .unwrap();
+
+        // CONTROL: well inside both bounds, both bindings still answer.
+        now.store(60_000, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            maps.session_of_call(&ada, "toolu_ages_out").await.unwrap(),
+            Some(session.clone())
+        );
+        assert_eq!(
+            maps.session_of_thread(&ada, "thread-ages-out")
+                .await
+                .unwrap(),
+            Some(session.clone())
+        );
+
+        // Past the call bound, short of the (much wider) thread bound: the
+        // call binding is gone and the thread binding is not, which is the
+        // proof the two ages are independent rather than one clock tripping
+        // both at once.
+        now.store(
+            CALL_BINDING_STALENESS_MS + 1,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        assert_eq!(
+            maps.session_of_call(&ada, "toolu_ages_out").await.unwrap(),
+            None,
+            "a binding older than the bound answers exactly as an id nothing \
+             ever emitted does"
+        );
+        assert_eq!(
+            maps.session_of_thread(&ada, "thread-ages-out")
+                .await
+                .unwrap(),
+            Some(session.clone()),
+            "the thread bound is wider, and this clock has not reached it yet"
+        );
+
+        // Past both bounds: the thread binding is gone too.
+        now.store(
+            THREAD_BINDING_STALENESS_MS + 1,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        assert_eq!(
+            maps.session_of_thread(&ada, "thread-ages-out")
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    /// **Age and count are independent bounds, neither waiting on the
+    /// other.** A table well under its capacity cap still ages out an idle
+    /// entry on the next write to a *different* key, and a table with
+    /// nothing stale still evicts at the cap.
+    #[tokio::test]
+    async fn a_write_sweeps_aged_out_entries_from_the_head_independently_of_the_cap() {
+        let (clock, now) = scripted_clock();
+        let maps = MemoryCorrelationMaps::new().with_clock(clock);
+        let ada = fresh_principal("ada");
+        let first = SessionId::new("acme/ada/first");
+        let second = SessionId::new("acme/ada/second");
+
+        maps.bind_call(&ada, "toolu_stale", &first).await.unwrap();
+
+        // Advance well past the call bound, then bind a second, unrelated
+        // call. The table holds two entries, nowhere near REMEMBERED_CALLS —
+        // the sweep that drops the first one is the age sweep, not the cap.
+        now.store(
+            CALL_BINDING_STALENESS_MS + 1,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        maps.bind_call(&ada, "toolu_fresh", &second).await.unwrap();
+
+        let (held, ordered) = maps.lock().calls.sizes(&ada);
+        assert_eq!(
+            (held, ordered),
+            (1, 1),
+            "the write that bound the fresh id must have swept the aged-out \
+             one from the queue's head, or the table only shrinks when a \
+             reader happens to ask about the stale key"
+        );
+        assert_eq!(
+            maps.session_of_call(&ada, "toolu_fresh").await.unwrap(),
+            Some(second)
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // M14.2 thermo-nuclear review, F3: the clock seam is a convention
+    // above; this pins it as a checked one.
+    // -------------------------------------------------------------------
+
+    /// **R-S4's methodology — through the clock seam, never by waiting out
+    /// a real timer — checked, not merely written down.** A test author who
+    /// drops `with_clock`/`scripted_clock` for a real, awaited timer does
+    /// not fail an assertion here: the test just gets slow, and the only
+    /// thing that notices today is the workspace's bounded-timeout house
+    /// rule, which reports an opaque `exit 124` that names neither the
+    /// timer nor the test. Scanning this file's own source for the banned
+    /// call is what `fair_use_contract_convention.rs` does for its
+    /// sibling-file convention, aimed here instead at the seam-vs-timer one.
+    ///
+    /// **The banned spelling is assembled at runtime, deliberately**, so
+    /// this doc comment can describe it in prose without the scan tripping
+    /// over its own description the way `fair_use_contract_convention.rs`'s
+    /// scan has to special-case its one unavoidable self-match. There is no
+    /// legitimate reason for `crate::time::sleep` (Tokio's async wait) to
+    /// appear anywhere in this file, this doc comment included.
+    ///
+    /// Scoped to this file rather than the whole crate: `session.rs` waits
+    /// on a real timer on purpose (a background poll loop and its test), and
+    /// a crate-wide ban would be a false positive on a use this file's own
+    /// staleness tests have nothing to do with.
+    #[test]
+    fn this_files_staleness_tests_move_time_through_the_seam_not_a_real_wait() {
+        let banned = ["tokio", "time", "sleep"].join("::");
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let path = std::path::Path::new(manifest_dir).join("src/control/correlation.rs");
+        let src = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("reading {path:?}: {error}"));
+        assert!(
+            !src.contains(&banned),
+            "F3: this module ages a binding out by moving `with_clock`'s \
+             scripted clock forward, never by waiting out a real one — a \
+             test that waited instead would still pass every assertion, \
+             only slower, and nothing but the workspace's bounded-timeout \
+             habit would notice, as a bare exit 124 that points at no timer \
+             and no test"
         );
     }
 }

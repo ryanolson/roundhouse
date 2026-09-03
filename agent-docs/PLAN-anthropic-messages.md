@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Plan: the Anthropic Messages surface, the seat, and the launcher (M11)
 
-> **Status: shipped through M14.0 and M13.1; M14.1 in flight (2026-09-03).** The rulings in §3 stand
+> **Status: shipped through M14.1; M14.2 in flight (2026-09-03).** The rulings in §3 stand
 > as written; where an implementation round moved one, the dated addenda at
 > the end of this document record the move and its reason, and win over §3
 > for the current tree. Direction set by the product owner on
@@ -1808,3 +1808,97 @@ shape (F9); the new suites use core's fixtures (F10). Left for M15 by name:
 roundhouse-mcp has no sibling-test-file convention and `reads.rs` now
 stands at 1072 lines with its tests inline; and the refreshed hint has
 the memo's staleness question, which M14.2 owns.
+
+## Addendum (2026-09-03): M14.2 — staleness bounds and shared-key discipline, the rulings
+
+D1's R14 adopted two of Relay's disciplines by name: a staleness bound on
+correlation state beside the capacity bound it has, and a declared
+namespace and schema version on every shared-store key, rejected when
+empty. M14.1 gave the Redis maps both; this rung gives the memory tables
+the first and every older key family the second.
+
+**R-S1 — one staleness bound per family, shared by both implementations.**
+The call and thread binding lifetimes M14.1 named in the store crate move
+to roundhouse-core beside the trait, so the memory tables and the Redis
+keys expire by the same constant. A memory binding records the instant it
+was written; a read past the bound answers absent and drops it, and a
+write sweeps the queue's head, so the tables are bounded by age and by
+count and neither bound waits on the other. The contract asserts the
+semantics both share — a binding older than the bound is absent — through
+the clock seam each implementation already has for tests, never by
+sleeping and never by changing a production bound.
+
+**R-S2 — the generation memo is a cache and is bounded like one.** It
+holds one entry per key this node has touched, evicted oldest-first at a
+named cap; an eviction costs one store read on the next touch and nothing
+else, because the probe tolerates a stale or absent hint. It carries no
+staleness bound: a generation hint that is wrong costs a probe, not a
+wrong answer.
+
+**R-S3 — one deployment namespace, one builder per crate, every family
+audited.** Every key any roundhouse family writes to a shared Redis is
+built by one function in the store crate from a deployment namespace
+(default `rh`, set from the composition root, rejected when empty), the
+schema version, the family and the family's own parts — sessions and
+their leases, the spend ledger, the fair-use hashes, the correlation
+bindings. The families that predate the rule are converted to the
+builder; a unit test per family pins its shape, and one table in the
+store crate's module doc lists every family with its version. Two
+deployments sharing one Redis under different namespaces cannot see each
+other's keys, which a gated test proves. No migration: the version is
+already in the correlation keys, the older families gain it with this
+rung, and the module doc says no deployment holds pre-rule keys.
+
+**R-S4 — what proves it.** The contract's staleness assertions over both
+implementations; the memory tables' age-and-count eviction under a
+scripted clock; the memo's cap; the per-family key-shape tests and the
+two-namespace isolation test against a real Redis; the composition
+root's namespace read pinned by the same boot-test shape the other
+families have. The `redis` crate does not move.
+
+### What the implementation settled beyond the rulings (2026-09-03, M14.2)
+
+- **The bounds live in core and the store re-exports them.**
+  `CALL_BINDING_STALENESS_MS` and `THREAD_BINDING_STALENESS_MS` sit beside
+  the trait; the memory tables take an injectable clock behind the
+  test-support feature and stamp each write, a read past the bound
+  answers absent and drops the entry, a write sweeps the queue head, and
+  age and count bound the tables independently — both proven under a
+  scripted clock. The Redis maps' defaults are the same constants, and a
+  test reads the live `PTTL` back to prove the shipped default reaches
+  Redis at the core bound, because a re-exported alias is only a promise
+  until something compares it.
+- **The memo's cap is 4096, oldest-first**, with an eviction costing
+  exactly one store read on the key's next touch; the M14.1 prediction
+  that the memo would gain a staleness bound was wrong and its doc says
+  so — a wrong hint costs a probe, never a wrong answer.
+- **One `keys` module builds every key.** `KeyNamespace` refuses empty
+  and blank, defaults to `rh`, and `build_key(namespace, family, parts)`
+  joins the namespace, the schema version, the family and the parts;
+  sessions and leases, spend, fair use and correlation all go through it,
+  a shape test per family pins the result, a gated test proves two
+  namespaces on one Redis are invisible to each other for all four
+  families, and a convention test brace-extracts every key function's
+  body to assert it calls the builder and never spells the version
+  itself — the refute pass showed a byte-identical hand-formatted bypass
+  was otherwise invisible. Each family keeps its old `connect` and gains
+  `connect_namespaced`; `shared_backend::open` takes the namespace and
+  `resolve_namespace` reads `ROUNDHOUSE_REDIS_NAMESPACE` at the
+  composition root, pinned by a boot test in the shape the other families
+  have.
+- **One stated deviation.** R-S4 said the staleness assertions never
+  sleep; the memory side never does, but the Redis side's expiry test
+  still waits a quarter second over a shortened per-handle TTL, because
+  Redis expiry is wall-clock driven and forcing it would test the seam
+  rather than the server. Recorded rather than papered over; a
+  convention guard now pins the core side, where the seam is the whole
+  point.
+- **Refute by mutation against the real server**: ten mutations — the
+  read no longer drops an aged binding, the write no longer sweeps, the
+  two constants diverge, the memo uncapped, an evicted key served stale,
+  one family ignoring its namespace, the builder ignoring its namespace,
+  an empty namespace accepted, one family hand-formatting its key, the
+  scripted clock replaced by a sleep — seven red under named guards and
+  the three that stayed green closed test-first: the Redis default
+  compared with the core bound, the builder convention guard, and the
+  no-sleep guard.
