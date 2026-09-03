@@ -46,12 +46,14 @@ use roundhouse_core::routing::{
     AffinityPolicy, Candidate, ProviderPricing, Target, policy::Weights,
 };
 use roundhouse_core::store::MemoryStore;
-use roundhouse_fleet::{EchoFrontierClient, StaticFrontierCatalog, WireProtocol};
+use roundhouse_fleet::{
+    EchoFrontierClient, FrontierModelSpec, StaticFrontierCatalog, WireProtocol,
+};
 use roundhouse_server::control_config::crosscheck::CrossChecks;
 use roundhouse_server::control_config::directory::{
     DirectoryRecords, StoreFailure, VersionedRecords,
 };
-use roundhouse_server::test_support::single_model_catalog;
+use roundhouse_server::test_support::{frontier_spec, single_model_catalog};
 use roundhouse_server::{
     ControlDirectory, Conversations, DirectoryStore, EchoLocalExecutor, Engine, EngineConfig,
     MemoryDirectoryStore, admin_api, has_valid_key_shape, http, metrics_api, responses_api,
@@ -93,20 +95,17 @@ fn assert_usd(actual: f64, expected: f64, what: &str) {
 /// [`single_model_catalog`] (M15, H2): one of the eleven fixtures of this
 /// exact shape the rung named.
 fn catalog() -> StaticFrontierCatalog {
-    single_model_catalog(
-        "anthropic",
-        "claude",
-        WireProtocol::AnthropicMessages,
-        0.95,
-        ProviderPricing {
+    single_model_catalog(FrontierModelSpec {
+        pricing: ProviderPricing {
             input_per_mtok_usd: 0.0,
             cached_input_per_mtok_usd: 0.0,
             cache_write_per_mtok_usd: 0.0,
             output_per_mtok_usd: OUTPUT_PER_MTOK_USD,
         },
-        1.0,
-        0.0,
-    )
+        base_ttft_ms: 1.0,
+        ttft_ms_per_uncached_token: 0.0,
+        ..frontier_spec("anthropic", "claude", WireProtocol::AnthropicMessages)
+    })
 }
 
 /// The same rate card, declared to the metrics fold.

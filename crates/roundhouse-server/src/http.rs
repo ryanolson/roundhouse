@@ -301,9 +301,10 @@ impl ApiError {
         }
     }
 
-    /// A 409: the claimed history disagreed with all `attempts` generations of
-    /// `key` that [`bind_prefix`](crate::prefix_admission) probed, and it
-    /// refuses rather than searching further.
+    /// A 409: the claimed history disagreed with, or found busy, every one of
+    /// the `attempts` generations of `key` that
+    /// [`bind_prefix`](crate::prefix_admission) probed, and it refuses rather
+    /// than searching further.
     ///
     /// **Prefix admission's own bound** (R13, M14.0). Admission searches a
     /// key's generations for the one the claim continues; a caller that

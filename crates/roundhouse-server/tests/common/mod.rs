@@ -58,12 +58,12 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use futures::StreamExt;
 
-use roundhouse_core::routing::{CacheModel, ProviderPricing};
 use roundhouse_fleet::{
-    EmbeddedFleet, FrontierChunk, FrontierClient, FrontierError, FrontierModelSpec, FrontierQuote,
-    FrontierStream, KvRouterConfig, SelectionServiceBuilder, StaticFrontierCatalog, WireProtocol,
+    EmbeddedFleet, FrontierChunk, FrontierClient, FrontierError, FrontierQuote, FrontierStream,
+    KvRouterConfig, SelectionServiceBuilder, StaticFrontierCatalog, WireProtocol,
     WorkerRegistration,
 };
+use roundhouse_server::test_support::{frontier_spec, single_model_catalog};
 use roundhouse_server::{ControlPlaneConfig, EngineConfig};
 use sha2::{Digest, Sha256};
 
@@ -130,22 +130,17 @@ pub fn path_segment(session_id: &str) -> String {
 }
 
 /// One priced frontier model, so a turn always has somewhere to go.
+///
+/// M15 review, F3: this used to hand-roll the same `FrontierModelSpec`
+/// literal `single_model_catalog`/`frontier_spec` already build for the same
+/// values — the values below are exactly `frontier_spec`'s own defaults, so
+/// this is that pairing rather than a second copy of it.
 pub fn frontier_catalog() -> StaticFrontierCatalog {
-    StaticFrontierCatalog::new(vec![FrontierModelSpec {
-        provider: "anthropic".into(),
-        model: "claude".into(),
-        wire_protocol: WireProtocol::AnthropicMessages,
-        cache_model: CacheModel::Deterministic { ttl_ms: 5 * MINUTE },
-        pricing: ProviderPricing {
-            input_per_mtok_usd: 3.0,
-            cached_input_per_mtok_usd: 0.3,
-            cache_write_per_mtok_usd: 3.75,
-            output_per_mtok_usd: 15.0,
-        },
-        quality_prior: 0.95,
-        base_ttft_ms: 350.0,
-        ttft_ms_per_uncached_token: 0.002,
-    }])
+    single_model_catalog(frontier_spec(
+        "anthropic",
+        "claude",
+        WireProtocol::AnthropicMessages,
+    ))
 }
 
 pub fn config() -> EngineConfig {

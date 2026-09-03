@@ -72,15 +72,13 @@ fn target(provider: &str) -> Target {
 /// other copies of, with `provider` and `quality_prior` the two arguments
 /// this file's own tier-selection tests actually vary.
 fn spec(provider: &str, quality_prior: f64) -> FrontierModelSpec {
-    frontier_spec(
-        provider,
-        "m",
-        WireProtocol::OpenAiResponses,
+    FrontierModelSpec {
         quality_prior,
-        ProviderPricing::free(),
-        1.0,
-        0.0,
-    )
+        pricing: ProviderPricing::free(),
+        base_ttft_ms: 1.0,
+        ttft_ms_per_uncached_token: 0.0,
+        ..frontier_spec(provider, "m", WireProtocol::OpenAiResponses)
+    }
 }
 
 /// The whole hosted catalog these tests route over.

@@ -21,13 +21,12 @@ use roundhouse_core::item::Item;
 use roundhouse_core::metrics::{
     MetricsConfig, MetricsFold, MetricsSnapshot, Scope, ServingMode, ShadowPricing,
 };
-use roundhouse_core::routing::{AffinityPolicy, RoutingPolicy};
 use roundhouse_core::store::{MemoryStore, SessionStore};
 use roundhouse_fleet::{
     EchoFrontierClient, FrontierChunk, FrontierClient, FrontierError, FrontierQuote, FrontierStream,
 };
 use roundhouse_server::test_support::engine_over_echo;
-use roundhouse_server::{Admission, EchoLocalExecutor, Engine, EngineConfig};
+use roundhouse_server::{Admission, Engine, EngineConfig};
 
 mod common;
 use common::{config, frontier_catalog};
@@ -283,13 +282,10 @@ async fn the_live_numbers_match_a_cold_rebuild_from_the_log() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_traffic_with_no_correlary_is_reported_unpriced() {
     let store = Arc::new(MemoryStore::new());
-    let engine = Engine::new(
+    let engine = engine_over_echo(
         Arc::clone(&store),
-        ByteTokenizer,
-        Arc::new(EchoLocalExecutor::new("local answer")),
         frontier_catalog(),
         Arc::new(EchoFrontierClient::new("frontier answer")),
-        Arc::new(AffinityPolicy::new()) as Arc<dyn RoutingPolicy>,
         EngineConfig {
             local_model: "tiny-7b".to_string(),
             ..config()

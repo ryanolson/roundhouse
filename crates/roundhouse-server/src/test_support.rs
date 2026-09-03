@@ -94,67 +94,63 @@ pub async fn fork_conversation(
     conversations.commit(principal, key, generation).await
 }
 
-/// One [`FrontierModelSpec`], priced and named the way a caller asks and
-/// unremarkable everywhere else.
+/// One [`FrontierModelSpec`], named and dialected the way a caller asks and
+/// priced the way every one of H2's eleven fixtures that never varied price
+/// agreed on: `$3`/`$0.3`/`$3.75`/`$15` per Mtok, `quality_prior` 0.95,
+/// `base_ttft_ms` 350.0, `ttft_ms_per_uncached_token` 0.002, and a
+/// five-minute deterministic cache. A call site whose price, quality or TTFT
+/// genuinely differs from that names the field it overrides with struct-update
+/// syntax over this — `FrontierModelSpec { quality_prior: 0.6, ..frontier_spec(p,
+/// m, w) }` — rather than a positional argument.
 ///
-/// `cache_model` is fixed to a five-minute deterministic cache — the one
-/// field every one of H2's eleven fixtures actually agreed on, whatever
-/// else they varied (`wire_protocol` split `AnthropicMessages` against
-/// `OpenAiResponses`, and one fixture priced a non-zero
-/// `ttft_ms_per_uncached_token` where the rest left it at zero, so both stay
-/// arguments rather than joining `cache_model` as a constant). A fixture
-/// that genuinely needs a different cache posture still writes the literal
-/// by hand; this is the shape that recurred, not a claim that no other
-/// shape exists.
+/// **Why not parameters, after M15's F1.** The four values that varied were
+/// three bare `f64`s in a row (`quality_prior`, `base_ttft_ms`,
+/// `ttft_ms_per_uncached_token`) with a `ProviderPricing` between the first
+/// two — nothing in that signature stopped a call site from transposing
+/// `quality_prior` and `base_ttft_ms`; the swap still type-checked and
+/// silently moved both the capability gate (`quality_prior`) and the
+/// router's TTFT term (`base_ttft_ms`) at once, with no diagnostic between
+/// the call site and whatever assertion later noticed. A named
+/// struct-update field is a compile error to misspell and a diff to
+/// transpose — it cannot silently swap with its neighbor the way a bare
+/// positional `f64` can.
 pub fn frontier_spec(
     provider: &str,
     model: &str,
     wire_protocol: WireProtocol,
-    quality_prior: f64,
-    pricing: ProviderPricing,
-    base_ttft_ms: f64,
-    ttft_ms_per_uncached_token: f64,
 ) -> FrontierModelSpec {
     FrontierModelSpec {
         provider: provider.to_string(),
         model: model.to_string(),
         wire_protocol,
         cache_model: CacheModel::Deterministic { ttl_ms: 5 * 60_000 },
-        pricing,
-        quality_prior,
-        base_ttft_ms,
-        ttft_ms_per_uncached_token,
+        pricing: ProviderPricing {
+            input_per_mtok_usd: 3.0,
+            cached_input_per_mtok_usd: 0.3,
+            cache_write_per_mtok_usd: 3.75,
+            output_per_mtok_usd: 15.0,
+        },
+        quality_prior: 0.95,
+        base_ttft_ms: 350.0,
+        ttft_ms_per_uncached_token: 0.002,
     }
 }
 
 /// A catalog of one priced frontier model, so a turn always has somewhere to
-/// go — [`frontier_spec`] wrapped in the one-entry
-/// [`StaticFrontierCatalog`] every single-model fixture built by hand.
+/// go — `spec` wrapped in the one-entry [`StaticFrontierCatalog`] every
+/// single-model fixture built by hand.
 ///
 /// `tests/common/mod.rs::frontier_catalog` already names this exact shape
 /// for the integration binaries that can reach it; this is the same
 /// function for the two audiences that cannot — this crate's own unit
 /// tests (`src/prefix_admission/tests.rs`), and a fixture whose price,
 /// wire protocol, quality or TTFT genuinely needs to differ from
-/// `frontier_catalog`'s own.
-pub fn single_model_catalog(
-    provider: &str,
-    model: &str,
-    wire_protocol: WireProtocol,
-    quality_prior: f64,
-    pricing: ProviderPricing,
-    base_ttft_ms: f64,
-    ttft_ms_per_uncached_token: f64,
-) -> StaticFrontierCatalog {
-    StaticFrontierCatalog::new(vec![frontier_spec(
-        provider,
-        model,
-        wire_protocol,
-        quality_prior,
-        pricing,
-        base_ttft_ms,
-        ttft_ms_per_uncached_token,
-    )])
+/// `frontier_catalog`'s own. Takes the built [`FrontierModelSpec`] rather
+/// than [`frontier_spec`]'s own parameters, so a caller who needs to
+/// override a field does it once, by name, at the call site — see
+/// [`frontier_spec`]'s doc for why that replaced a positional tail.
+pub fn single_model_catalog(spec: FrontierModelSpec) -> StaticFrontierCatalog {
+    StaticFrontierCatalog::new(vec![spec])
 }
 
 /// `Engine::new` over this crate's local double, [`EchoLocalExecutor`]
@@ -264,6 +260,75 @@ impl SeveredStore {
         self.accept.abort();
         for pipe in self.pipes.lock().unwrap().drain(..) {
             pipe.abort();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Control for the F1 guard below: a named struct-update override round
+    /// trips into the built spec exactly, and the fields that were not
+    /// named keep `frontier_spec`'s defaults. Keeping this live is what
+    /// proves the guard is checking a real shape property, not failing for
+    /// an unrelated reason.
+    #[test]
+    fn correctly_ordered_quality_prior_and_base_ttft_ms_round_trip() {
+        let correct = single_model_catalog(FrontierModelSpec {
+            quality_prior: 0.6,
+            base_ttft_ms: 900.0,
+            ..frontier_spec("anthropic", "claude", WireProtocol::AnthropicMessages)
+        });
+        let spec = &correct.models()[0];
+        assert_eq!(spec.quality_prior, 0.6);
+        assert_eq!(spec.base_ttft_ms, 900.0);
+        // Untouched fields keep frontier_spec's own defaults — the whole
+        // point of struct-update over a positional tail: naming the two
+        // fields that vary does not require restating the rest.
+        assert_eq!(spec.ttft_ms_per_uncached_token, 0.002);
+    }
+
+    /// M15 review, F1: `frontier_spec`/`single_model_catalog` used to take
+    /// `quality_prior`, `base_ttft_ms` and `ttft_ms_per_uncached_token` as
+    /// three positional, unlabeled `f64` parameters, so a call site that
+    /// transposed `quality_prior` and `base_ttft_ms` type-checked and
+    /// silently moved both the capability gate and the router's TTFT term.
+    ///
+    /// The fix removed the positional tail rather than validating it: a
+    /// transposed *value* can still be wrong (0.6 really was meant for one
+    /// field or the other), but it can no longer be wrong from the shape of
+    /// the call alone. That is a static property of the signature, not a
+    /// runtime one — the old ignored test's demonstration (an out-of-range
+    /// `quality_prior` slipping through unvalidated) has no equivalent to
+    /// swap in any more, because there is no longer a positional pair to
+    /// transpose. What replaces it is this: read the source and assert
+    /// neither helper declares an `f64` parameter, so a positional tail
+    /// cannot come back unnoticed in a later edit.
+    #[test]
+    fn frontier_spec_and_single_model_catalog_take_no_positional_f64_parameters() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let source =
+            std::fs::read_to_string(std::path::Path::new(manifest_dir).join("src/test_support.rs"))
+                .expect("this crate's own test_support.rs must be readable from its own test");
+
+        for signature in ["fn frontier_spec(", "fn single_model_catalog("] {
+            let start = source
+                .find(signature)
+                .unwrap_or_else(|| panic!("test_support.rs should declare {signature}"));
+            let params_end = source[start..]
+                .find(") ->")
+                .unwrap_or_else(|| panic!("{signature} should have a return type"));
+            let params = &source[start..start + params_end];
+            assert!(
+                !params.contains("f64"),
+                "{signature} declares a bare f64 parameter again: {params:?} — \
+                 F1 replaced the positional quality_prior/base_ttft_ms/\
+                 ttft_ms_per_uncached_token tail with named struct-update \
+                 overrides on FrontierModelSpec precisely because a \
+                 positional f64 pair type-checks when transposed and moves \
+                 the capability gate and the router's TTFT term silently"
+            );
         }
     }
 }

@@ -58,7 +58,7 @@
 //!
 //! # A leak the sweep bounds rather than closes
 //!
-//! `Conversations::fork` rebinds a client's cache key to a fresh `SessionId`
+//! `Conversations::commit` rebinds a client's cache key to a fresh `SessionId`
 //! when the client's resent history disagrees with the log — a client editing
 //! its own history mid-session. Every family here is keyed by the *pre-fork*
 //! id, so the agent's standing narrowing silently stops applying (the engine

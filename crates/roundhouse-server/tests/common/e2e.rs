@@ -471,7 +471,7 @@ pub fn fork_probe(session: &SessionId) -> SessionId {
 /// ask the store whether generation one exists at all.
 ///
 /// Two assertions rather than one, because they fail on different evidence. The
-/// first reads the binding: `Conversations::fork` moves `latest` to the forked
+/// first reads the binding: `Conversations::commit` moves `latest` to the forked
 /// id, so a session id that still carries no generation suffix is this node's own
 /// statement that nothing rebound. The second reads the store, which does not
 /// depend on the binding table being right about itself.

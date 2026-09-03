@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Plan: the Anthropic Messages surface, the seat, and the launcher (M11)
 
-> **Status: shipped through M14.2; M15 review in flight; D2 ruled (2026-09-03).** The rulings in §3 stand
+> **Status: shipped through M15; D2 ruled (2026-09-03).** The rulings in §3 stand
 > as written; where an implementation round moved one, the dated addenda at
 > the end of this document record the move and its reason, and win over §3
 > for the current tree. Direction set by the product owner on
@@ -2001,6 +2001,58 @@ server crate already keeps.
   re-ran the affected suite before the gate and the chain's own gate ran
   it again. Future refute briefs say: restore from your byte backup, never
   from HEAD.
+
+### What the review round changed (2026-09-03, M15)
+
+The M15 thermo-nuclear review (six findings, six valid; rulings in the
+commit message) ran one reviewer on the strict maintainability lens a
+hygiene rung deserves — did any move change a behaviour, and does the
+crate read better after — and moved four things:
+
+- **The fixture helpers name their fields.** `frontier_spec` took seven
+  positional arguments, three of them bare `f64`s; transposing
+  `quality_prior` and `base_ttft_ms` type-checked and moved the capability
+  gate and the router's TTFT term together, silently (F1).
+  `frontier_spec(provider, model, wire_protocol)` now returns the shape
+  the fixtures agreed on, every departure is a named field in
+  struct-update syntax, `single_model_catalog` wraps one spec, and a live
+  shape guard reads the source and refuses an `f64` parameter on either.
+- **The fold is by shape, not by name.** H2 retired the fixtures literally
+  named `engine` and `catalog` and left ten hand-rolled copies of the same
+  constructor in the very files that took the helpers, with
+  `frontier_catalog` still spelling the literal `single_model_catalog`
+  produces (F3). Folded; the review's two guards are live.
+- **Two orders no test pinned are pinned.** The cache-key arm ahead of the
+  tool-use id when the thread arm answers nothing (F2), and H4's split
+  seen from the disagreed side plus the downward walk's busy tally from a
+  non-zero hint (F4): each was reachable by no test, each has one now,
+  landed by the refuter and left live with nothing to fix.
+- **Prose the doc-warning check cannot see.** Five backtick mentions of the
+  removed `Conversations::fork` and `bind`, and the 409 doc that still said
+  "disagreed with all `attempts` generations" after H4 split the count
+  (F6): corrected, with a word-boundary shape guard that does not flag the
+  live `bind_call` and `bind_thread`. And `hold_busy` is used where its own
+  doc said a hand-rolled copy stood (F5).
+- **One more incident, recorded.** A refuter's mutation of the downward
+  walk's busy arm was still in the tree after the review round returned;
+  the orchestrator found it by diff before the fix round, restored the
+  line and re-ran the suite. The rule from M15's own incident stands and is
+  in every refuter and verifier brief: back up bytes, restore from the
+  backup, and leave `git status` as you found it.
+- **What the gate found on the way.** The full-workspace run turned one
+  end-to-end test red once, with a worker the reservation path said did
+  not exist. `EmbeddedFleet::register_worker` returned when Dynamo's
+  `upsert_worker` did, which marks the worker schedulable and publishes
+  the topology synchronously — but the table a *reservation* books against
+  is kept current by a separate task that consumes that publication on the
+  executor's own schedule, so under a saturated box a select followed at
+  once by a reserve could name a worker the booking table had not yet
+  seen. `register_worker` now waits, bounded, until the worker is routable
+  on the same table `loads` reads, with a typed error if it never is; a
+  flood test in the fleet crate reproduces the window deterministically
+  (between one and eighteen of three hundred before, none after). Every
+  caller is a fixture today, and the wait lives in the one place they all
+  register rather than as a sleep copied into each.
 
 ## Addendum (2026-09-03): D2 ruled — the stored namespace, and the rungs it opens
 

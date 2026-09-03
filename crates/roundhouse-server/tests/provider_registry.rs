@@ -38,7 +38,7 @@ use roundhouse_fleet::{
     EchoFrontierClient, FrontierChunk, FrontierClient, FrontierClients, FrontierError,
     FrontierModelSpec, FrontierQuote, FrontierStream, StaticFrontierCatalog, WireProtocol,
 };
-use roundhouse_server::test_support::single_model_catalog;
+use roundhouse_server::test_support::{frontier_spec, single_model_catalog};
 use roundhouse_server::{Admission, EchoLocalExecutor, Engine, LocalExecutor, TurnResult};
 
 mod common;
@@ -91,15 +91,12 @@ impl FrontierClient for Recorder {
 /// helper's own name (`catalog_for`, not `catalog`) did not match the
 /// literal grep.
 fn catalog_for(provider: &str) -> StaticFrontierCatalog {
-    single_model_catalog(
-        provider,
-        "flagship",
-        WireProtocol::OpenAiResponses,
-        0.9,
-        ProviderPricing::free(),
-        1.0,
-        0.0,
-    )
+    single_model_catalog(FrontierModelSpec {
+        quality_prior: 0.9,
+        pricing: ProviderPricing::free(),
+        base_ttft_ms: 1.0,
+        ..frontier_spec(provider, "flagship", WireProtocol::OpenAiResponses)
+    })
 }
 
 /// **Not [`engine_over_echo`]'s shape, and deliberately so** (M15, H2): this

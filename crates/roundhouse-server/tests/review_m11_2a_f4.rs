@@ -68,10 +68,10 @@ use roundhouse_core::now_ms;
 use roundhouse_core::routing::{AffinityPolicy, DecisionRecord, ProviderPricing};
 use roundhouse_core::store::{MemoryStore, SessionStore};
 use roundhouse_fleet::{
-    FrontierChunk, FrontierClient, FrontierClients, FrontierError, FrontierQuote, FrontierStream,
-    StaticFrontierCatalog, WireProtocol,
+    FrontierChunk, FrontierClient, FrontierClients, FrontierError, FrontierModelSpec,
+    FrontierQuote, FrontierStream, StaticFrontierCatalog, WireProtocol,
 };
-use roundhouse_server::test_support::single_model_catalog;
+use roundhouse_server::test_support::{frontier_spec, single_model_catalog};
 use roundhouse_server::{
     Admission, EchoLocalExecutor, Engine, EngineConfig, LocalExecutor, TurnInput,
 };
@@ -124,20 +124,18 @@ fn big_tools() -> serde_json::Value {
 /// [`single_model_catalog`] (M15, H2): one of the eleven fixtures of this
 /// exact shape the rung named.
 fn catalog() -> StaticFrontierCatalog {
-    single_model_catalog(
-        "acme",
-        "flagship",
-        WireProtocol::AnthropicMessages,
-        0.9,
-        ProviderPricing {
+    single_model_catalog(FrontierModelSpec {
+        quality_prior: 0.9,
+        pricing: ProviderPricing {
             input_per_mtok_usd: INPUT_PER_MTOK_USD,
             cached_input_per_mtok_usd: 0.0,
             cache_write_per_mtok_usd: 0.0,
             output_per_mtok_usd: 0.0,
         },
-        1.0,
-        0.0,
-    )
+        base_ttft_ms: 1.0,
+        ttft_ms_per_uncached_token: 0.0,
+        ..frontier_spec("acme", "flagship", WireProtocol::AnthropicMessages)
+    })
 }
 
 /// A provider stand-in that bills the way a real upstream does.

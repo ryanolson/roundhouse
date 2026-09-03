@@ -44,7 +44,9 @@ use roundhouse_core::metrics::MetricsConfig;
 use roundhouse_core::routing::policy::Weights;
 use roundhouse_core::routing::{AffinityPolicy, DecisionRecord, ProviderPricing};
 use roundhouse_core::store::{MemoryStore, SessionStore};
-use roundhouse_fleet::{EchoFrontierClient, StaticFrontierCatalog, WireProtocol};
+use roundhouse_fleet::{
+    EchoFrontierClient, FrontierModelSpec, StaticFrontierCatalog, WireProtocol,
+};
 use roundhouse_mcp::{ControlStore, ModeNarrowing, PreferMode, TimedOverlay};
 use roundhouse_server::test_support::frontier_spec;
 use roundhouse_server::{
@@ -119,21 +121,16 @@ const LIMIT_USD: f64 = 1_000.0;
 /// hand-roll was the same eight-field literal H2 named ten other copies of;
 /// only `provider` ever varied here, so it is the one argument left open.
 fn catalog() -> StaticFrontierCatalog {
-    let spec = |provider: &str| {
-        frontier_spec(
-            provider,
-            "flagship",
-            WireProtocol::OpenAiResponses,
-            0.95,
-            ProviderPricing {
-                input_per_mtok_usd: 0.0,
-                cached_input_per_mtok_usd: 0.0,
-                cache_write_per_mtok_usd: 0.0,
-                output_per_mtok_usd: OUTPUT_PER_MTOK_USD,
-            },
-            10.0,
-            0.0,
-        )
+    let spec = |provider: &str| FrontierModelSpec {
+        pricing: ProviderPricing {
+            input_per_mtok_usd: 0.0,
+            cached_input_per_mtok_usd: 0.0,
+            cache_write_per_mtok_usd: 0.0,
+            output_per_mtok_usd: OUTPUT_PER_MTOK_USD,
+        },
+        base_ttft_ms: 10.0,
+        ttft_ms_per_uncached_token: 0.0,
+        ..frontier_spec(provider, "flagship", WireProtocol::OpenAiResponses)
     };
     StaticFrontierCatalog::new(vec![spec("openai"), spec("anthropic")])
 }

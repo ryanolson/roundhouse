@@ -1898,6 +1898,51 @@ async fn a_threads_own_binding_resolves_ahead_of_the_cache_key_and_the_tool_use_
     );
 }
 
+/// M15 review F2: [`a_threads_own_binding_resolves_ahead_of_the_cache_key_and_the_tool_use_id`]
+/// pins the thread arm ahead of *both* rivals, but says nothing about the
+/// order of the two arms behind it. Arm (3) (the cache-key name) and arm (4)
+/// (the tool-use id) were each independently `is_none()`-guarded, so
+/// reordering them only changes an answer when both are answerable and the
+/// thread arm answered nothing — a topology no other test in this file or in
+/// `reads/tests.rs` builds: the thread id here is deliberately unbound, so
+/// the thread arm falls through and leaves the two rivals to settle it.
+#[tokio::test]
+async fn a_cache_key_binding_resolves_ahead_of_the_tool_use_id_when_the_thread_arm_answers_nothing()
+{
+    let bound_by_cache_key = SessionId::new("acme/ada/sess_cache_key");
+    let bound_by_tool_use = SessionId::new("acme/ada/sess_tool_use");
+
+    let mut deployment = FakeDeployment::default();
+    // Deliberately absent from `thread_ids`: the thread arm must answer
+    // nothing so the call reaches the two arms this test is about.
+    deployment.conversations.insert(bound_by_cache_key.clone());
+    deployment
+        .tool_use_ids
+        .insert("toolu_1".to_string(), (ada(), bound_by_tool_use));
+    let (surface, _store) = deployment.surface();
+
+    let answered = served(
+        &call_with_every_correlator(
+            &surface,
+            &ada(),
+            "status",
+            json!({}),
+            "unbound-thread",
+            "sess_cache_key",
+            "toolu_1",
+        )
+        .await,
+    );
+    assert_eq!(
+        answered["conversation"],
+        json!(bound_by_cache_key.as_str()),
+        "F2: with the thread arm answering nothing, the cache-key arm must \
+         decide this call ahead of the tool-use id, which the deployment \
+         could also have answered from -- resolve_session orders arm (3) \
+         ahead of arm (4) and nothing here had proved it"
+    );
+}
+
 /// R-M7's tenancy half: a thread id naming nothing of this caller's is worth
 /// exactly what an unknown tool-use id is worth — the caller's own `latest`,
 /// or the refusal, and never the conversation the id actually belongs to.

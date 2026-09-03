@@ -19,11 +19,10 @@ use roundhouse_core::context::ByteTokenizer;
 use roundhouse_core::event::SessionEvent;
 use roundhouse_core::ids::TurnId;
 use roundhouse_core::item::{ItemContent, Role};
-use roundhouse_core::routing::{AffinityPolicy, ProviderPricing};
 use roundhouse_core::store::{Lease, MemoryStore, StoreError};
 use roundhouse_fleet::{EchoFrontierClient, StaticFrontierCatalog, WireProtocol};
 
-use crate::engine::{EchoLocalExecutor, EngineConfig};
+use crate::engine::EngineConfig;
 
 use super::*;
 
@@ -184,20 +183,11 @@ fn ada() -> Principal {
 /// `tests/common/mod.rs::frontier_catalog` cannot reach, so this is that
 /// shared fixture rather than a second hand-rolled copy of it.
 fn catalog() -> StaticFrontierCatalog {
-    crate::test_support::single_model_catalog(
+    crate::test_support::single_model_catalog(crate::test_support::frontier_spec(
         "anthropic",
         "claude",
         WireProtocol::AnthropicMessages,
-        0.95,
-        ProviderPricing {
-            input_per_mtok_usd: 3.0,
-            cached_input_per_mtok_usd: 0.3,
-            cache_write_per_mtok_usd: 3.75,
-            output_per_mtok_usd: 15.0,
-        },
-        350.0,
-        0.002,
-    )
+    ))
 }
 
 /// One node: a store, an engine over it, this node's generation counter,
@@ -230,13 +220,10 @@ impl Rig<MemoryStore> {
 
 impl<S: SessionStore> Rig<S> {
     fn over(store: Arc<S>, key: &str) -> Self {
-        let engine = Engine::new(
+        let engine = crate::test_support::engine_over_echo(
             Arc::clone(&store),
-            ByteTokenizer,
-            Arc::new(EchoLocalExecutor::new("local answer")),
             catalog(),
             Arc::new(EchoFrontierClient::new("answer")),
-            Arc::new(AffinityPolicy::new()),
             EngineConfig::default(),
         );
         Self {
@@ -295,10 +282,9 @@ impl<S: SessionStore> Rig<S> {
     /// appended — the shape [`probe`] reads back as [`Probe::Busy`]: another
     /// writer's fresh slot, one instruction into its first turn.
     ///
-    /// The F10 pair above builds this by hand for one generation; H4's
-    /// all-busy topology needs it for every generation a search can reach,
-    /// so it is named once here rather than repeated at each of nine call
-    /// sites.
+    /// H4's all-busy topology needs this for every generation a search can
+    /// reach, so it is named once here rather than repeated at each of nine
+    /// call sites.
     async fn hold_busy(&self, generation: u32, node_id: &str) {
         let session_id = self.generation(generation);
         self.store
@@ -750,17 +736,7 @@ async fn an_empty_generation_another_writer_holds_is_not_a_home() {
     let rig = Rig::new("acme/ada/lease-race");
     rig.seed(0, vec![user("hello")]).await;
 
-    let g1 = rig.generation(1);
-    rig.store
-        .create_session(&g1, "test-policy")
-        .await
-        .expect("the other node creates #g1");
-    let _node_b = rig
-        .store
-        .acquire_lease(&g1, "node-b", 60_000)
-        .await
-        .expect("the other node's lease request")
-        .expect("#g1 is fresh and unleased until now");
+    rig.hold_busy(1, "node-b").await;
 
     let claimed = vec![user("goodbye")];
     let (session_id, delta) = rig
@@ -887,6 +863,105 @@ async fn a_refusal_where_every_probe_was_busy_reports_what_it_probed() {
         Some(u64::from(MAX_PREFIX_PROBES) + 1),
         "H4: the refusal must say what it actually found busy rather than \
          folding it into a silent zero"
+    );
+}
+
+/// F4 (M15 review) refutation, part (a): the F8 topology (nine generations
+/// disagreeing, none busy) checked against the `disagreed`/`busy` split
+/// H4 added, not just `attempts`.
+///
+/// F8's own test only reads `attempts`, so a mutant that folds
+/// [`Probe::Disagrees`] into the `busy` counter (or that builds the
+/// refusal as `disagreed: 0, busy: attempts`) still satisfies it: nine
+/// disagreements report `attempts == 9` either way. This test is the same
+/// topology with the two tallies read individually, which the fold cannot
+/// satisfy — under the real code both are visible here; under either
+/// described mutant this would read `disagreed == 0, busy == 9` instead.
+#[tokio::test]
+async fn f4_a_refusal_where_every_probe_disagreed_reports_disagreed_not_busy() {
+    let rig = Rig::new("acme/ada/f4-all-disagree");
+    for generation in 0..=MAX_PREFIX_PROBES {
+        rig.seed(generation, vec![user(&format!("generation {generation}"))])
+            .await;
+    }
+
+    let error = rig
+        .bind(vec![user("none of the above")])
+        .await
+        .expect_err("every generation the search can reach disagrees");
+
+    let detail = error
+        .detail()
+        .expect("a client acting on this refusal needs the tally, not English");
+    assert_eq!(
+        detail.get("attempts").and_then(Value::as_u64),
+        Some(u64::from(MAX_PREFIX_PROBES) + 1),
+    );
+    assert_eq!(
+        detail.get("disagreed").and_then(Value::as_u64),
+        Some(u64::from(MAX_PREFIX_PROBES) + 1),
+        "F4: every probe here disagreed and none was busy -- a mutant \
+         folding Probe::Disagrees into the busy counter would report 0 \
+         here, and F8's own test (which never reads this field) would not \
+         catch it"
+    );
+    assert_eq!(
+        detail.get("busy").and_then(Value::as_u64),
+        Some(0),
+        "F4: nothing here was busy -- see disagreed's assertion above"
+    );
+}
+
+/// F4 (M15 review) refutation, part (b): the downward walk's own
+/// `Probe::Busy => busy += 1` arm (`prefix_admission.rs:377`), reached only
+/// when the search's hint is already above zero.
+///
+/// Every other busy-topology test in this suite binds from a fresh `Rig`,
+/// whose hint is 0 — so the downward walk's `current.checked_sub(step)`
+/// fails on step 1 and the loop body never runs at all, regardless of what
+/// its `Probe::Busy` arm does. Here the hint is walked to generation 4
+/// first (via `Conversations::commit`, the same seam the P1 test above
+/// uses to move a node's counter without a real turn), and generations
+/// 0..=12 are all held busy by another node: 4 downward
+/// (3, 2, 1, 0), the current generation itself, and 8 upward (5..=12) is
+/// every reachable generation, all of them busy. If the arm at :377 were
+/// removed (or its `Probe::Busy` case were a no-op), the four generations
+/// this walk reaches downward would silently drop out of both tallies and
+/// `busy` would read 9, not 13.
+#[tokio::test]
+async fn f4_the_downward_walks_busy_arm_is_reached_from_a_nonzero_hint() {
+    let rig = Rig::new("acme/ada/f4-downward-busy");
+    let key = ControlPlane::Open.qualify(&rig.principal, &rig.key);
+    rig.conversations.commit(&rig.principal, &key, 4).await;
+
+    for generation in 0..=(4 + MAX_PREFIX_PROBES) {
+        rig.hold_busy(generation, "other-node").await;
+    }
+
+    let error = rig
+        .bind(vec![user("anything")])
+        .await
+        .expect_err("every generation this walk can reach, in both directions, is busy");
+
+    let detail = error
+        .detail()
+        .expect("a client acting on this refusal needs the tally, not English");
+    assert_eq!(
+        detail.get("attempts").and_then(Value::as_u64),
+        Some(u64::from(4 + MAX_PREFIX_PROBES) + 1),
+        "F4: 4 downward (3,2,1,0) + 1 current (4) + 8 upward (5..=12) = 13 \
+         generations probed, every one of them busy"
+    );
+    assert_eq!(
+        detail.get("disagreed").and_then(Value::as_u64),
+        Some(0),
+        "F4: nothing here disagreed -- every probe found the slot busy"
+    );
+    assert_eq!(
+        detail.get("busy").and_then(Value::as_u64),
+        Some(u64::from(4 + MAX_PREFIX_PROBES) + 1),
+        "F4: including the 4 the downward walk itself reached below the \
+         hint -- the arm this test exists to reach"
     );
 }
 

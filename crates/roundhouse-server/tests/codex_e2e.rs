@@ -748,7 +748,7 @@ impl Rig {
     /// to ask the store whether generation one exists at all.
     ///
     /// Two assertions rather than one, because they fail on different evidence.
-    /// The first reads the binding: `Conversations::fork` moves `latest` to the
+    /// The first reads the binding: `Conversations::commit` moves `latest` to the
     /// forked id, so a session id that still carries no generation suffix is
     /// this node's own statement that nothing rebound. The second reads the
     /// store, which does not depend on the binding table being right about
@@ -2835,7 +2835,7 @@ async fn the_injection_sweep_can_see_a_halts_reason_in_the_v1_responses_body() {
 ///
 /// The original guard read `SessionId::new(format!("{}#g1", self.session()))`.
 /// `Rig::session()` is `Conversations::latest(principal)`, and
-/// `Conversations::fork` writes the *new* id into `latest` before returning it,
+/// `Conversations::commit` writes the *new* id into `latest` before returning it,
 /// so after a real fork the guard probed `key#g1#g1` — an id nothing in the
 /// system ever constructs — found it absent, and called that clean. It could
 /// not fail for the reason it named.

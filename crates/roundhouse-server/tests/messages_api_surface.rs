@@ -60,7 +60,7 @@ use roundhouse_core::context::ByteTokenizer;
 use roundhouse_core::event::{SessionEvent, SessionEventKind};
 use roundhouse_core::ids::SessionId;
 use roundhouse_core::item::{Item, ItemContent, Role};
-use roundhouse_core::routing::{AffinityPolicy, CacheModel, ProviderPricing};
+use roundhouse_core::routing::{CacheModel, ProviderPricing};
 use roundhouse_core::store::{Lease, MemoryStore, SessionStore, StoreError};
 use roundhouse_core::validate::{BriefConfig, Objective, ValidationBrief};
 use roundhouse_fleet::{
@@ -74,8 +74,7 @@ use roundhouse_server::messages_api::wire::{
 };
 use roundhouse_server::test_support::engine_over_echo;
 use roundhouse_server::{
-    ControlPlane, ControlPlaneConfig, Conversations, DEFAULT_MCP_NAMESPACE, EchoLocalExecutor,
-    Engine, messages_router,
+    ControlPlane, ControlPlaneConfig, Conversations, DEFAULT_MCP_NAMESPACE, Engine, messages_router,
 };
 
 mod common;
@@ -261,13 +260,10 @@ fn engine_scripted(
     store: Arc<MemoryStore>,
     client: Arc<ScriptedFrontierClient>,
 ) -> Arc<Engine<MemoryStore, ByteTokenizer>> {
-    Arc::new(Engine::new(
+    Arc::new(engine_over_echo(
         Arc::clone(&store),
-        ByteTokenizer,
-        Arc::new(EchoLocalExecutor::new("local answer")),
         frontier_catalog(),
         client,
-        Arc::new(AffinityPolicy::new()),
         config(),
     ))
 }
@@ -325,13 +321,10 @@ fn engine_scripted_cross_dialect(
     store: Arc<MemoryStore>,
     client: Arc<ScriptedFrontierClient>,
 ) -> Arc<Engine<MemoryStore, ByteTokenizer>> {
-    Arc::new(Engine::new(
+    Arc::new(engine_over_echo(
         Arc::clone(&store),
-        ByteTokenizer,
-        Arc::new(EchoLocalExecutor::new("local answer")),
         cross_dialect_catalog(),
         client,
-        Arc::new(AffinityPolicy::new()),
         config(),
     ))
 }
@@ -371,16 +364,8 @@ async fn engine_scripted_with_fleet(
     client: Arc<ScriptedFrontierClient>,
 ) -> Arc<Engine<MemoryStore, ByteTokenizer>> {
     Arc::new(
-        Engine::new(
-            Arc::clone(&store),
-            ByteTokenizer,
-            Arc::new(EchoLocalExecutor::new("local answer")),
-            frontier_catalog(),
-            client,
-            Arc::new(AffinityPolicy::new()),
-            config(),
-        )
-        .with_fleet(embedded_fleet().await as Arc<dyn LocalFleet>),
+        engine_over_echo(Arc::clone(&store), frontier_catalog(), client, config())
+            .with_fleet(embedded_fleet().await as Arc<dyn LocalFleet>),
     )
 }
 
@@ -449,13 +434,10 @@ fn surface_over(
 ) -> (Router, Arc<MemoryStore>, Arc<Conversations>) {
     let store = Arc::new(MemoryStore::new());
     let conversations = Arc::new(Conversations::new());
-    let engine = Arc::new(Engine::new(
+    let engine = Arc::new(engine_over_echo(
         Arc::clone(&store),
-        ByteTokenizer,
-        Arc::new(EchoLocalExecutor::new("local answer")),
         frontier_catalog(),
         frontier,
-        Arc::new(AffinityPolicy::new()),
         config(),
     ));
     (
@@ -570,13 +552,10 @@ impl FrontierClient for PartialThenFailClient {
 fn surface_partial_then_fail() -> (Router, Arc<MemoryStore>, Arc<PartialThenFailClient>) {
     let store = Arc::new(MemoryStore::new());
     let client = Arc::new(PartialThenFailClient::new());
-    let engine = Arc::new(Engine::new(
+    let engine = Arc::new(engine_over_echo(
         Arc::clone(&store),
-        ByteTokenizer,
-        Arc::new(EchoLocalExecutor::new("local answer")),
         frontier_catalog(),
         Arc::clone(&client) as Arc<dyn FrontierClient>,
-        Arc::new(AffinityPolicy::new()),
         config(),
     ));
     (
@@ -763,13 +742,10 @@ fn surface_orphaned_tool_call() -> (
 ) {
     let store = Arc::new(DropsFirstTerminalWrite::new());
     let client = Arc::new(ToolCallThenTextClient::new());
-    let engine = Arc::new(Engine::new(
+    let engine = Arc::new(engine_over_echo(
         Arc::clone(&store),
-        ByteTokenizer,
-        Arc::new(EchoLocalExecutor::new("local answer")),
         frontier_catalog(),
         Arc::clone(&client) as Arc<dyn FrontierClient>,
-        Arc::new(AffinityPolicy::new()),
         config(),
     ));
     (
@@ -1123,13 +1099,10 @@ impl FrontierClient for CacheReportingFrontierClient {
 #[tokio::test]
 async fn the_non_streaming_bodys_usage_is_the_same_object_the_streaming_terminal_reported() {
     let store = Arc::new(MemoryStore::new());
-    let engine = Arc::new(Engine::new(
+    let engine = Arc::new(engine_over_echo(
         Arc::clone(&store),
-        ByteTokenizer,
-        Arc::new(EchoLocalExecutor::new("local answer")),
         frontier_catalog(),
         Arc::new(CacheReportingFrontierClient) as Arc<dyn FrontierClient>,
-        Arc::new(AffinityPolicy::new()),
         config(),
     ));
     let app = messages_router(
@@ -1836,8 +1809,9 @@ async fn the_clients_tool_results_come_back_onto_the_same_session() {
     let second = stream(&app, &headers, &second_request).await;
     assert_eq!(second.stop_reason, Some(StrictStopReason::ToolUse));
 
-    // One session, and it is the one the first turn used. `Conversations::fork`
-    // names the second session `…#g1`, so its absence is the honest spelling of
+    // One session, and it is the one the first turn used. `Conversations::commit`
+    // names the second session `…#g1` when it lands one generation past this
+    // key's current one, so its absence is the honest spelling of
     // "did not fork" — an assertion on item counts alone would pass while a
     // fork quietly served the second turn from an empty history.
     assert!(
@@ -3083,13 +3057,10 @@ async fn an_unauthenticated_request_is_refused_before_its_body_is_parsed() {
 /// A router with nowhere to route, so a turn is admitted and then fails.
 fn nowhere() -> Router {
     let store = Arc::new(MemoryStore::new());
-    let engine = Arc::new(Engine::new(
+    let engine = Arc::new(engine_over_echo(
         Arc::clone(&store),
-        ByteTokenizer,
-        Arc::new(EchoLocalExecutor::new("local answer")),
         roundhouse_fleet::StaticFrontierCatalog::new(vec![]),
         Arc::new(EchoFrontierClient::new(ANSWER)),
-        Arc::new(AffinityPolicy::new()),
         config(),
     ));
     messages_router(
