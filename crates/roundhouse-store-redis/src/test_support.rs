@@ -10,7 +10,9 @@
 use roundhouse_core::control::{Principal, ProjectId};
 use roundhouse_core::ids::SessionId;
 
-use crate::fair_use::{bucket_index, bucket_key, member_bucket_prefix, project_bucket_prefix};
+use crate::fair_use::{
+    bucket_fields, bucket_index, member_scope_key, project_scope_key, window_sum_fields,
+};
 use crate::spend::holds_key as spend_holds_key_impl;
 use crate::{RedisSessionStore, lease_key as store_lease_key, log_key as store_log_key};
 
@@ -56,24 +58,40 @@ pub fn spend_holds_key(project: &ProjectId) -> String {
     spend_holds_key_impl(project)
 }
 
-/// The two raw bucket keys one draw touches, for the tests that assert on the
+/// The two raw hashes one draw touches, for the tests that assert on the
 /// storage mechanism rather than only on the refusal derived from it.
 ///
 /// Returned as a pair because that is the fact under test: `record_draw` takes
 /// one [`Principal`] and moves *both* scopes' counters, so a helper that
 /// handed back one key at a time would let a test assert half of it and look
-/// green. The bucket is derived from `at_ms` here exactly as the script
-/// derives it server-side; a test that computed the index itself would be
-/// pinning its own arithmetic rather than the ledger's.
-pub fn fair_use_bucket_keys(principal: &Principal, at_ms: u64) -> (String, String) {
-    let index = bucket_index(at_ms);
+/// green.
+pub fn fair_use_scope_keys(principal: &Principal) -> (String, String) {
     (
-        bucket_key(&project_bucket_prefix(&principal.project), index),
-        bucket_key(
-            &member_bucket_prefix(&principal.project, &principal.user),
-            index,
-        ),
+        project_scope_key(&principal.project),
+        member_scope_key(&principal.project, &principal.user),
     )
+}
+
+/// The two field names a draw at `at_ms` lands in.
+///
+/// The bucket index is derived from `at_ms` here exactly as the script derives
+/// it server-side; a test that computed the index itself would be pinning its
+/// own arithmetic rather than the ledger's.
+pub fn fair_use_bucket_fields(at_ms: u64) -> (String, String) {
+    bucket_fields(bucket_index(at_ms))
+}
+
+/// One window's four running-sum field names: tokens, micro-dollars, and the
+/// oldest and newest bucket index the sum covers.
+///
+/// Exported because the running sums are the whole of M13.1: a test that only
+/// read the per-bucket fields would pass against a ledger that maintained no
+/// sum at all and re-scanned every bucket, which is exactly the read path this
+/// rung replaced.
+pub fn fair_use_window_sum_fields(
+    window: roundhouse_core::control::FairUseWindow,
+) -> (String, String, String, String) {
+    window_sum_fields(window)
 }
 
 /// The `would_exceed` script's own text.

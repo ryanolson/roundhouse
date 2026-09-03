@@ -48,6 +48,23 @@
 //! settlement it found belongs to the response it was called for, and draws
 //! nothing when it does not.
 //!
+//! **The outage posture, and why its two halves point opposite ways** (D1
+//! R14, pinned here by M13.1's R-F7). A ceiling *check* that cannot reach its
+//! store fails **closed**: [`Engine::fair_use_refusal`] returns the error, the
+//! transport turns it into a `503` — retryable, because nothing about the
+//! request was wrong and the outage clears on its own — and the turn is
+//! refused. An operator configured that ceiling on purpose, and a ceiling
+//! nobody can read cannot be honoured; waving the turn through would make an
+//! outage of our own store the one condition under which a tenant's limit
+//! quietly stops existing. A *draw* that cannot be recorded fails **open**:
+//! [`Engine::record_fair_use_draw`] logs the reason and returns, because it
+//! runs after the answer has been streamed and the project charged, so the
+//! only thing left to lose is a counter's update — a bounded under-count for
+//! the length of the outage, which is a fact about the outage, where a refused
+//! turn would be a fact about nothing. Both halves are pinned by tests against
+//! a store taken away mid-test; see `SeveredStore` below for why that is a
+//! relay rather than a `SHUTDOWN`.
+//!
 //! **Where the single-node caution is said, and why not here.** A deployment
 //! with no Redis counts its ceilings in one process, and an operator has to be
 //! told — but the fact has two halves, and this seam holds only one of them.
@@ -237,6 +254,7 @@ mod tests {
     use std::sync::Arc;
 
     use roundhouse_core::context::ByteTokenizer;
+    use roundhouse_core::control::spend::contract::fresh_principal;
     use roundhouse_core::control::{
         FairUseLedger, FairUseLimit, FairUseTerms, FairUseWindow, MemoryFairUseLedger, Principal,
         TurnCredentials, TurnPolicy,
@@ -248,6 +266,10 @@ mod tests {
     use roundhouse_core::session::Session;
     use roundhouse_core::store::{MemoryStore, SessionStore};
     use roundhouse_fleet::{EchoFrontierClient, StaticFrontierCatalog};
+    use roundhouse_store_redis::RedisFairUseLedger;
+    use roundhouse_store_redis::test_support::url_from_env;
+
+    use axum::response::IntoResponse;
 
     use crate::engine::{EchoLocalExecutor, EngineConfig};
 
@@ -256,8 +278,18 @@ mod tests {
     /// A membership whose 5-hour window admits exactly one turn of the size the
     /// fixture below books.
     fn capped(max_tokens: u64) -> Admission {
+        capped_for(Principal::new("acme", "ada"), max_tokens)
+    }
+
+    /// The same, for a membership named by the caller.
+    ///
+    /// The gated tests below need a principal nothing else has drawn against,
+    /// because their ledger is a *real, shared* Redis whose counters outlive
+    /// the process: a fixed project id would let one green run's draws decide
+    /// the next run's answer.
+    fn capped_for(principal: Principal, max_tokens: u64) -> Admission {
         Admission {
-            principal: Principal::new("acme", "ada"),
+            principal,
             policy: Arc::new(TurnPolicy::unrestricted()),
             budget: None,
             fair_use: Arc::new(FairUseTerms {
@@ -482,6 +514,243 @@ mod tests {
         assert!(
             !second.contains("THIS PROCESS'S memory"),
             "and only the first: {second}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // R-F7: the outage posture, pinned against a store taken away mid-test
+    // -----------------------------------------------------------------------
+
+    /// A TCP relay in front of the real Redis, so a store can be taken away
+    /// mid-test without touching a Redis this suite does not own.
+    ///
+    /// **Why a relay rather than a `SHUTDOWN`.** The Redis the environment
+    /// names is shared with every other gated suite in this workspace, and
+    /// stopping it would fail them rather than this one; starting a second
+    /// server would put a binary on the test's requirements. What an outage
+    /// *is*, from this process's side, is a connection that stops answering
+    /// and a reconnect that is refused — which is exactly what dropping the
+    /// relay produces, with the store itself untouched.
+    struct SeveredStore {
+        url: String,
+        accept: tokio::task::JoinHandle<()>,
+        pipes: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    }
+
+    impl SeveredStore {
+        async fn in_front_of(upstream: &str) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            // `redis://host:port/db`, which is the only shape
+            // `ROUNDHOUSE_TEST_REDIS_URL` takes in this workspace. Parsed by
+            // hand because the `redis` crate is not a dependency of this
+            // crate — only of the store's — and a URL parser is not what this
+            // test is about.
+            let target = upstream
+                .trim_start_matches("redis://")
+                .split('/')
+                .next()
+                .expect("a redis URL names a host and a port")
+                .to_string();
+            let pipes: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
+                Arc::new(std::sync::Mutex::new(Vec::new()));
+            let accept = tokio::spawn({
+                let pipes = Arc::clone(&pipes);
+                async move {
+                    loop {
+                        let Ok((mut inbound, _)) = listener.accept().await else {
+                            return;
+                        };
+                        let target = target.clone();
+                        let pipe = tokio::spawn(async move {
+                            let Ok(mut outbound) = tokio::net::TcpStream::connect(target).await
+                            else {
+                                return;
+                            };
+                            let _ =
+                                tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                        });
+                        pipes.lock().unwrap().push(pipe);
+                    }
+                }
+            });
+            Self {
+                url: format!("redis://127.0.0.1:{port}/"),
+                accept,
+                pipes,
+            }
+        }
+
+        /// The outage: stop listening — so a reconnect is refused — and drop
+        /// every connection already open.
+        fn cut(&self) {
+            self.accept.abort();
+            for pipe in self.pipes.lock().unwrap().drain(..) {
+                pipe.abort();
+            }
+        }
+    }
+
+    async fn severed_ledger() -> (SeveredStore, Arc<RedisFairUseLedger>) {
+        let store = SeveredStore::in_front_of(&url_from_env()).await;
+        let ledger = RedisFairUseLedger::connect(&store.url)
+            .await
+            .expect("the relay in front of the test Redis must be reachable");
+        (store, Arc::new(ledger))
+    }
+
+    /// **A ceiling that cannot be checked refuses the turn, retryably** (D1
+    /// R14, folded into M13.1 as R-F7).
+    ///
+    /// The half of the outage posture that fails *closed*, and the reasoning
+    /// is short: an operator configured this ceiling on purpose, and a
+    /// ceiling nobody can read cannot be honoured. Waving the turn through
+    /// would make an outage of our own store the one condition under which a
+    /// tenant's rolling limit does not exist — silently, and for as long as
+    /// the outage lasts.
+    ///
+    /// What it must *not* be is a permanent-looking failure. Nothing about
+    /// the request was wrong, and the condition clears on its own, so the
+    /// status is the one an agent's stack already treats as "come back":
+    /// `503`, distinct from the `429` a spent window answers with, which is
+    /// the control asserted alongside it. A `500` would tell a client its
+    /// request was the problem.
+    #[tokio::test]
+    #[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
+    async fn a_ceiling_that_cannot_be_checked_refuses_the_turn_retryably() {
+        let (store, ledger) = severed_ledger().await;
+        let engine = engine(Arc::clone(&ledger) as Arc<dyn FairUseLedger>);
+        let admission = capped_for(fresh_principal("ada"), 100);
+
+        // CONTROL: reachable and nothing drawn, so the turn is admitted and
+        // the transport says nothing at all.
+        assert_eq!(engine.fair_use_refusal(&admission).await.unwrap(), None);
+        assert!(
+            crate::http::refuse_over_fair_use(&engine, &admission)
+                .await
+                .is_ok()
+        );
+
+        // CONTROL: reachable and spent, which is the *other* refusal — a 429
+        // naming the window. Without this the assertion below would pass for
+        // a transport that answered 503 to every fair-use refusal.
+        ledger
+            .record_draw(&admission.principal, now_ms(), 100, 0.0)
+            .await
+            .unwrap();
+        let spent = crate::http::refuse_over_fair_use(&engine, &admission)
+            .await
+            .expect_err("a spent window refuses");
+        assert_eq!(
+            spent.into_response().status(),
+            axum::http::StatusCode::TOO_MANY_REQUESTS
+        );
+
+        store.cut();
+
+        // The claim: the ledger cannot answer, and the turn is refused rather
+        // than served.
+        let error = engine
+            .fair_use_refusal(&admission)
+            .await
+            .expect_err("a ceiling check that cannot reach its store must fail");
+        assert!(
+            matches!(error, EngineError::FairUse(_)),
+            "and it must fail as the fair-use ledger being unreachable, which \
+             is what tells an operator which store is down: {error}"
+        );
+
+        let outage = crate::http::refuse_over_fair_use(&engine, &admission)
+            .await
+            .expect_err("and the transport must refuse the request")
+            .into_response();
+        assert_eq!(
+            outage.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "an unreachable ledger is a retryable outage, not a bad request \
+             and not a permanent failure"
+        );
+        let body = axum::body::to_bytes(outage.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["error"]["code"], "fair_use_unavailable",
+            "and it names the store that is down rather than the tenant"
+        );
+    }
+
+    /// **A draw that cannot be recorded is logged, and the turn stands** (D1
+    /// R14, R-F7).
+    ///
+    /// The half that fails *open*, and the asymmetry with the check above is
+    /// the whole ruling. This runs after the turn's terminal event is
+    /// committed and after the settle: the answer has been streamed and the
+    /// project has been charged. Failing here can only lose a rolling
+    /// counter's update, which under-counts by one turn for the length of the
+    /// outage — a bounded, honest consequence *of* the outage. Failing the
+    /// turn instead would throw away work already done and already paid for
+    /// in order to report that a counter did not move.
+    ///
+    /// What must not happen is silence: an operator reading a window that is
+    /// low has to be able to find out that draws were dropped, which is why
+    /// the assertion is on the warning rather than only on the call returning.
+    ///
+    /// A plain `#[test]` driving its own runtime rather than `#[tokio::test]`,
+    /// because `captured_warnings` installs a *thread-local* subscriber around
+    /// a synchronous closure — see its own doc for why that serialization is
+    /// not tidiness — and `block_on` inside the closure is what puts the
+    /// ledger's I/O on the thread the subscriber is installed on.
+    #[test]
+    #[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
+    fn a_draw_that_cannot_be_recorded_is_logged_and_the_turn_still_stands() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (store, engine, session, response_id, admission) = runtime.block_on(async {
+            let (store, ledger) = severed_ledger().await;
+            let engine = engine(ledger as Arc<dyn FairUseLedger>);
+            let admission = capped_for(fresh_principal("ada"), 100);
+            let (session, response_id) = session_with_one_completed_turn(100).await;
+            (store, engine, session, response_id, admission)
+        });
+
+        // CONTROL: while the store is reachable the draw lands, and the
+        // window it filled refuses the next turn. Without it, a
+        // `record_fair_use_draw` that had been gutted would satisfy the claim
+        // below by warning about nothing.
+        let quiet = captured_warnings(|| {
+            runtime.block_on(engine.record_fair_use_draw(&session, &response_id, &admission));
+        });
+        assert!(
+            !quiet.contains("could not be recorded"),
+            "a draw against a reachable ledger warns about nothing: {quiet}"
+        );
+        assert!(
+            runtime
+                .block_on(engine.fair_use_refusal(&admission))
+                .unwrap()
+                .is_some(),
+            "the control draw must actually have reached the ledger"
+        );
+
+        store.cut();
+
+        // The claim: the same call against a store that is gone returns, and
+        // says so.
+        let warnings = captured_warnings(|| {
+            runtime.block_on(engine.record_fair_use_draw(&session, &response_id, &admission));
+        });
+        assert!(
+            warnings.contains("could not be recorded"),
+            "a draw that cannot reach its store must leave a warning naming \
+             the project, not vanish: {warnings}"
+        );
+        assert!(
+            warnings.contains("errs permissive"),
+            "and the warning must say which way it erred, because that is the \
+             half an operator reading a low window needs: {warnings}"
         );
     }
 

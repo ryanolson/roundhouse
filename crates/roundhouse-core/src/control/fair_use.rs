@@ -53,13 +53,24 @@
 //! which does.
 //!
 //! **The key layout was the one question the M10.1 deferral left open, and it
-//! is answered in that crate rather than here** (M13): one hash per (scope,
-//! bucket) at [`BUCKET_MS`], two integer fields, expired by Redis at the widest
-//! window plus one bucket — which is what buys the pruning pass a
-//! hash-per-scope layout would have needed and nothing owns. The shape of the
-//! two operations was already decided by this trait, and it held:
-//! `record_draw` is one script and `would_exceed` is one script, the same way
-//! [`RedisSpendLedger`](super::spend::SpendLedger) expresses a grant.
+//! is answered in that crate rather than here** (M13, redecided by M13.1):
+//! one hash per *scope*, holding a field per bucket at [`BUCKET_MS`] and, per
+//! window, a running sum with the oldest and newest bucket index it covers.
+//! M13 shipped a hash per (scope, bucket) instead, so that Redis's own expiry
+//! could be the pruning pass a hash-per-scope layout needs and nothing owned;
+//! what the review then measured is that the read paid for it, because an
+//! *admitted* turn — the common case, and the one where no window binds — had
+//! to scan every bucket in the widest configured window. Running sums move
+//! that cost to the write and give the pruning an owner: the sum is
+//! maintained on every draw, the read ages it forward, and the widest
+//! window's ageing deletes the bucket fields it drops. The shape of the two
+//! operations was already decided by this trait, and it held through both
+//! layouts: `record_draw` is one script and `would_exceed` is one script, the
+//! same way [`RedisSpendLedger`](super::spend::SpendLedger) expresses a
+//! grant.
+//!
+//! Nothing about the *arithmetic* moved with either layout, which is what
+//! made the swap a rung rather than a rewrite.
 //!
 //! **What keeps the two honest is [`contract`]**: one list of behavioural
 //! assertions, run against both. The arithmetic below — the window sum, the

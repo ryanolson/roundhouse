@@ -10,61 +10,72 @@
 //!
 //! | Key | Type | Holds |
 //! |---|---|---|
-//! | `rh:{<project_id>}:fairuse:p:<bucket>` | hash | `t` tokens, `u` micro-dollars, drawn by anyone in the project inside that bucket |
-//! | `rh:{<project_id>}:fairuse:m:<user_id>:<bucket>` | hash | the same two counters for one member |
+//! | `rh:{<project_id>}:fairuse:p` | hash | everything drawn by anyone in the project |
+//! | `rh:{<project_id>}:fairuse:m:<user_id>` | hash | the same, for one member |
 //!
-//! `<bucket>` is `at_ms / BUCKET_MS`, the same floor division the memory
-//! ledger's `BTreeMap` is keyed by. The braces are a Redis Cluster hash tag on
-//! the *project* id, exactly as the spend ledger's three keys are: both scopes
-//! and every one of their buckets land in one slot, which is what lets one
-//! script read a project's and a member's counters together. A member ceiling
-//! checked in a different round trip from the project's is two answers about
-//! one turn.
+//! One hash per *scope*, and two families of fields inside it:
 //!
-//! # The layout, and the one it beat
+//! | Field | Holds |
+//! |---|---|
+//! | `b:<index>:t`, `b:<index>:u` | one bucket's tokens and micro-dollars |
+//! | `s:<window>:t`, `s:<window>:u` | that window's running sum |
+//! | `s:<window>:from`, `s:<window>:to` | the oldest and newest bucket index that sum includes |
 //!
-//! The deferral named two candidates. **Hash-per-scope** — one hash per
-//! (project; member) with a field per bucket — is one `HINCRBY` and one
-//! `HGETALL`, which is the cheaper pair of round trips, and it was rejected on
-//! the sentence the deferral itself wrote: it *needs a pruning pass nothing
-//! currently owns*. A hash grows a field per five minutes forever, so a
-//! project that ran a benchmark in March and nothing since keeps its March
-//! fields until somebody sweeps them, and the somebody does not exist: this
-//! repo has no background task, deliberately — the spend ledger's whole crash
-//! story is that a leaked hold self-heals lazily on the next call rather than
-//! by a sweeper. Pruning inside `record_draw` would make every draw walk the
-//! whole hash to find what to delete, which is the cost the layout was chosen
-//! to avoid.
+//! `<index>` is `at_ms / BUCKET_MS`, the same floor division the memory
+//! ledger's `BTreeMap` is keyed by; `<window>` is the window's own
+//! `wire_name`, which is the same string a refusal names and a config file
+//! writes. The braces are a Redis Cluster hash tag on the *project* id,
+//! exactly as the spend ledger's three keys are: both scopes land in one slot,
+//! which is what lets one script read a project's counters and a member's
+//! together. A member ceiling checked in a different round trip from the
+//! project's is two answers about one turn.
 //!
-//! **Bucket-per-key makes Redis the sweeper.** A `PEXPIRE` at the widest
-//! window plus one bucket is set on every write, so a bucket outside every
-//! window deletes itself and an idle scope costs nothing at all — not one key,
-//! not one field. What it costs instead is reads: a 7-day window is at most
-//! 2017 keys rather than one `HGETALL`.
+//! # The layout, and the one it replaced (M13.1, R-F6)
 //!
-//! **That cost lands on the common case, not the rare one (M13 review,
-//! F4).** The scan is lazy and narrowest-first, which only makes the 5-hour
-//! window's 61 reads the whole story when a window *binds* — refuses — before
-//! a wider one is asked. But `would_exceed`'s admission path only stops early
-//! by finding a refusal, and an admitted turn is exactly the case where no
-//! window ever binds: it is the turn a fleet serves most of the time, and it
-//! widens through every configured window to the widest one. A membership
-//! capped on all three windows on both scopes therefore costs up to 2017
-//! reads per scope — 4034 total, measured at roughly 8ms of blocking Lua time
-//! per admission on a real Redis — on the ordinary, non-refusing path, not
-//! 61. What the lazy scan still buys is that those reads are inside one
-//! script rather than one round trip apiece, and that a *refusal* at the
-//! narrowest window really does cost only 61: the saving is real, it is just
-//! not the common case. Replacing the scan itself — running sums maintained
-//! on write, the bucket walk reserved for a refusal's retry time — is M13.1's
-//! rung, not this one's.
+//! M13 shipped **bucket-per-key**: one hash per (scope, bucket), expired by
+//! Redis at the widest window plus one bucket. It was chosen over a
+//! hash-per-scope because that layout "needs a pruning pass nothing currently
+//! owns", and letting Redis be the sweeper was worth paying for on the read.
 //!
-//! Two fields rather than one packed value: the two counters are summed
-//! independently and updated independently. They are read, added and written
-//! back *inside* the one script, which Redis runs indivisibly, so a concurrent
-//! draw from another node is exact rather than last-write-wins — and, unlike
-//! the `HINCRBY` pair this started as, there is no command that can fail
-//! part-way and leave one scope moved and the other not.
+//! **The read is where it was measured, and the measurement is what moved
+//! this rung** (M13 review, F4). A `would_exceed` that binds — refuses at the
+//! narrowest window — really did cost only the 61 buckets of a five-hour
+//! window. But the check only stops early by *finding* a refusal, and an
+//! admitted turn is precisely the case where no window binds: the scan then
+//! widens through every configured window to the widest, 2017 `HMGET`s per
+//! capped scope, 4034 for a membership capped on both, about eight
+//! milliseconds of blocking Lua time on the admission path of every ordinary
+//! turn — ahead of every queued session-log append on the same Redis. The
+//! cost was per command, not per byte, and it landed on the common case
+//! rather than the rare one.
+//!
+//! **Running sums give the pruning an owner, which is what the M13 objection
+//! was really about.** Each window's sum is maintained on write, so a ceiling
+//! check compares a cap against four fields instead of a window's worth of
+//! keys; the read then *decays* that sum — subtracting the buckets that have
+//! aged out since `from` and advancing it — and the widest window's decay
+//! deletes the bucket fields it ages out. That deletion is the pruning pass,
+//! and `record_draw` performs it on every draw, so it runs whether or not any
+//! membership has ever configured the widest window. What Redis's own expiry
+//! still does is the other half: one `PEXPIRE` on the scope hash, re-armed on
+//! every draw, so an idle scope costs nothing at all rather than one field per
+//! five minutes forever.
+//!
+//! An admitted turn now costs one `HMGET` of four fields per (scope, window)
+//! checked, amortised O(1); the bounded worst case — a scope idle for almost
+//! a window and then resumed — is one `HMGET` of at most that window's fields,
+//! once, after which the sum is current again. A *refusal* still walks
+//! buckets, because "which bucket has to leave" is a question no running sum
+//! answers, and a refusal is both rare and the case where the client is
+//! waiting on that number rather than on a turn.
+//!
+//! **No migration, and that is a fact about this branch rather than a
+//! policy.** M13's bucket-per-key layout has never been deployed — it landed
+//! here days before this rung replaced it — so no live Redis holds a key of
+//! that shape, and a converter would be code with no data to convert and no
+//! test that could prove it right. The two layouts do not even collide: the
+//! old keys were `…:fairuse:p:<index>`, this one's are `…:fairuse:p`, so a
+//! stray old key from a development box is inert rather than misread.
 //!
 //! # The integer domain, which is not this crate's to define
 //!
@@ -77,16 +88,12 @@
 //! [`MAX_COUNT`] is the ceiling both fields saturate at. This crate calls
 //! them; it does not have opinions of its own about money.
 //!
-//! **The M13 addendum recorded a divergence here, and it is closed.** That
-//! text said these counters were `i64`, so a draw past `i64::MAX` was refused
-//! where the memory ledger saturated, and it asserted the contract covered
-//! only the shared middle of the range. Both halves are gone: the domain is
-//! `MAX_COUNT` on *both* sides, a draw past it is refused by both before
-//! anything is written, a sum at it saturates in both, and the contract suite
-//! asserts each of those against both backends. The bound is 2^53 rather than
-//! `i64::MAX` for the reason [`MAX_COUNT`] gives — the window sum is computed
-//! in Lua, whose only number is a double, so a wider write-side range would
-//! have been thrown away at the one comparison that decides a refusal.
+//! A running sum has one hazard the old re-summing scan did not, and it is
+//! closed rather than tolerated: a sum sitting *at* `MAX_COUNT` has forgotten
+//! how far past it the true total went, so subtracting an aged-out bucket
+//! from it would empty a window the memory ledger still holds full. The decay
+//! therefore rebuilds a saturated window's sum from its own buckets instead
+//! of subtracting from it — see `scripts`, where the branch and its cost live.
 //!
 //! # What the clock is
 //!
@@ -98,12 +105,12 @@
 //! A window's sum runs over the buckets from `first_index(window, now_ms)`
 //! through `now_ms / BUCKET_MS`; keys cannot be enumerated forward without
 //! bound, so a draw stamped *after* the `now_ms` a later check supplies is
-//! summed by the memory ledger's open-ended range and not by this one. Reaching
-//! it takes a clock that went backwards between a settle and the next
-//! admission by more than the remainder of a bucket, and the divergence it
-//! causes is bounded by that skew. It is stated rather than papered over: the
-//! alternative — bounding the memory ledger's range to match — would change the
-//! specification to fit an implementation, which is the wrong direction.
+//! summed by the memory ledger's open-ended range and not, once a decay has
+//! rebuilt the sum, by this one. Reaching it takes a clock that went backwards
+//! between a settle and the next admission, and the divergence it causes is
+//! bounded by that skew. It is stated rather than papered over: the
+//! alternative — bounding the memory ledger's range to match — would change
+//! the specification to fit an implementation, which is the wrong direction.
 //!
 //! Passes the same
 //! `fair_use_ledger_contract_suite!`
@@ -131,25 +138,26 @@ use roundhouse_core::control::{
 
 use crate::KEY_PREFIX;
 
-/// The bucket-key prefix for a project's own counters.
+/// The hash holding a project's own counters.
 ///
-/// The bucket index is appended as the final `:`-separated segment and is
-/// always decimal digits, which is what keeps
-/// [`member_bucket_prefix`]'s embedded user id unambiguous: splitting a key at
-/// its last colon recovers exactly (prefix, index), so no two (scope, bucket)
-/// pairs can name one key however a user id is spelled.
-pub(crate) fn project_bucket_prefix(project: &ProjectId) -> String {
+/// A key per scope and nothing appended: what used to be a key suffix — the
+/// bucket index — is a field name now, which is why
+/// [`member_scope_key`]'s embedded user id no longer needs to be disambiguated
+/// from it. Two members of one project are two keys; the project itself is a
+/// third; and no spelling of a user id can make any of them collide, because
+/// the only thing after `m:` is the id.
+pub(crate) fn project_scope_key(project: &ProjectId) -> String {
     format!("{KEY_PREFIX}:{{{project}}}:fairuse:p")
 }
 
-pub(crate) fn member_bucket_prefix(project: &ProjectId, user: &UserId) -> String {
+pub(crate) fn member_scope_key(project: &ProjectId, user: &UserId) -> String {
     format!("{KEY_PREFIX}:{{{project}}}:fairuse:m:{user}")
 }
 
-/// One bucket's key, and the bucket a timestamp lands in.
+/// One bucket's two field names, and the bucket a timestamp lands in.
 ///
 /// **Compiled only for tests**, and that is the honest shape rather than an
-/// oversight: the production path never builds a bucket key in Rust, because
+/// oversight: the production path never builds a field name in Rust, because
 /// the script builds it server-side from `at_ms` so a caller cannot send a
 /// timestamp and an index that disagree. What these exist for is the gated
 /// assertions that read the raw hashes — and they are load-bearing there
@@ -158,24 +166,45 @@ pub(crate) fn member_bucket_prefix(project: &ProjectId, user: &UserId) -> String
 /// accident to pass. Left ungated they would be dead code in every shipped
 /// build, which is a surface that reads as supported and is not.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn bucket_key(prefix: &str, index: u64) -> String {
-    format!("{prefix}:{index}")
+pub(crate) fn bucket_fields(index: u64) -> (String, String) {
+    (format!("b:{index}:t"), format!("b:{index}:u"))
+}
+
+/// One window's running-sum field names: tokens, micro-dollars, and the
+/// oldest and newest bucket index the sum covers. Test-only for
+/// [`bucket_fields`]'s reason.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn window_sum_fields(window: FairUseWindow) -> (String, String, String, String) {
+    let name = window.wire_name();
+    (
+        format!("s:{name}:t"),
+        format!("s:{name}:u"),
+        format!("s:{name}:from"),
+        format!("s:{name}:to"),
+    )
 }
 
 /// Floor division, the same key the memory ledger's `BTreeMap` is keyed by.
-/// Test-only for [`bucket_key`]'s reason.
+/// Test-only for [`bucket_fields`]'s reason.
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) fn bucket_index(at_ms: u64) -> u64 {
     at_ms / BUCKET_MS
 }
 
-/// How long a bucket lives: the widest window plus one bucket.
+/// How long an idle scope's hash lives: the widest window plus one bucket.
 ///
 /// Derived from [`FairUseWindow::ALL`] rather than naming the 7-day window, so
 /// a wider window added to that enum lengthens this by construction. Plus one
 /// bucket because a bucket is included in a window until its *end* has passed
 /// out of it — the staircase rule `BUCKET_MS` documents — so a TTL of exactly
-/// the span would delete a bucket that is still being summed.
+/// the span would delete a hash whose newest bucket is still being summed.
+///
+/// This is the expiry of the whole scope, re-armed on every draw, and it is
+/// what makes an idle principal cost nothing. It is *not* what prunes a busy
+/// one: a scope drawn against every day never expires, and its aged-out
+/// bucket fields are deleted by the widest window's decay instead. Two
+/// mechanisms because there are two states — idle and busy — and only one of
+/// them is something Redis can see.
 pub(crate) fn bucket_ttl_ms() -> u64 {
     FairUseWindow::ALL
         .iter()
@@ -209,6 +238,27 @@ fn scope_caps(limits: &[FairUseLimit], window: FairUseWindow) -> scripts::ScopeC
     }
 }
 
+/// Every window, narrowest first, with the caps `terms` puts on each scope.
+///
+/// `caps` decides what a group carries: the check hands it the membership's
+/// own limits, and a draw hands it nothing at all — a draw moves every
+/// window's sum whether or not anyone has configured that window, because the
+/// ceiling a later admission is judged against is read off a live control
+/// plane that an admin `PATCH` can widen between the two.
+fn window_args(
+    caps: impl Fn(FairUseWindow) -> (scripts::ScopeCaps, scripts::ScopeCaps),
+) -> [scripts::WindowArgs; FairUseWindow::ALL.len()] {
+    FairUseWindow::ALL.map(|window| {
+        let (project, member) = caps(window);
+        scripts::WindowArgs {
+            span_ms: window.span_ms(),
+            name: window.wire_name(),
+            project,
+            member,
+        }
+    })
+}
+
 /// Redis implementation of [`FairUseLedger`].
 ///
 /// Cheap to clone: clones share one auto-reconnecting multiplexed connection,
@@ -240,18 +290,24 @@ impl RedisFairUseLedger {
         })
     }
 
-    /// Shorten the bucket TTL, for the one test that has to watch a bucket
-    /// actually disappear.
+    /// Shorten the scope hash's TTL, for the one test that has to watch a
+    /// counter actually disappear.
     ///
     /// **Gated behind `test-support` and not a configuration knob.** The
     /// production expiry is derived from the window widths and must stay
-    /// derived — an operator who could shorten it would be deleting buckets a
+    /// derived — an operator who could shorten it would be deleting counters a
     /// window is still summing, which is a ceiling that silently leaks. What
     /// the test needs is not a different policy but a shorter wait, and this
     /// is the smallest seam that gives it one: the ordinary
-    /// `bucket_ttl_ms()` still decides what
-    /// [`connect`](Self::connect) builds, and a separate gated test asserts
-    /// the `PTTL` a real draw arms is the derived one.
+    /// [`bucket_ttl_ms`] still decides what [`connect`](Self::connect) builds,
+    /// and a separate gated test asserts the `PTTL` a real draw arms is the
+    /// derived one.
+    ///
+    /// Named for the bucket lifetime it bounds rather than for the key it is
+    /// armed on, which is the name it has had since M13 and the one the gated
+    /// suite calls: what the TTL *means* — a counter outlives the widest
+    /// window by one bucket and no longer — is unchanged by the layout that
+    /// now keeps every one of a scope's counters in one hash.
     #[cfg(feature = "test-support")]
     pub fn with_bucket_ttl_ms(mut self, bucket_ttl_ms: u64) -> Self {
         self.bucket_ttl_ms = bucket_ttl_ms;
@@ -279,13 +335,16 @@ impl FairUseLedger for RedisFairUseLedger {
             .record_draw(
                 &mut self.conn.clone(),
                 scripts::RecordDrawArgs {
-                    project_key: &project_bucket_prefix(&principal.project),
-                    member_key: &member_bucket_prefix(&principal.project, &principal.user),
+                    project_key: &project_scope_key(&principal.project),
+                    member_key: &member_scope_key(&principal.project, &principal.user),
                     at_ms,
                     bucket_ms: BUCKET_MS,
                     counts,
                     max_count: MAX_COUNT,
                     ttl_ms: self.bucket_ttl_ms,
+                    windows: window_args(|_| {
+                        (scripts::ScopeCaps::absent(), scripts::ScopeCaps::absent())
+                    }),
                 },
             )
             .await
@@ -304,22 +363,21 @@ impl FairUseLedger for RedisFairUseLedger {
         if terms.is_empty() {
             return Ok(None);
         }
-        let windows = FairUseWindow::ALL.map(|window| scripts::WindowArgs {
-            span_ms: window.span_ms(),
-            name: window.wire_name(),
-            project: scope_caps(&terms.project, window),
-            member: scope_caps(&terms.member, window),
-        });
         self.scripts
             .would_exceed(
                 &mut self.conn.clone(),
                 scripts::WouldExceedArgs {
-                    project_key: &project_bucket_prefix(&principal.project),
-                    member_key: &member_bucket_prefix(&principal.project, &principal.user),
+                    project_key: &project_scope_key(&principal.project),
+                    member_key: &member_scope_key(&principal.project, &principal.user),
                     now_ms,
                     bucket_ms: BUCKET_MS,
                     max_count: MAX_COUNT,
-                    windows,
+                    windows: window_args(|window| {
+                        (
+                            scope_caps(&terms.project, window),
+                            scope_caps(&terms.member, window),
+                        )
+                    }),
                 },
             )
             .await
@@ -335,9 +393,9 @@ mod tests {
     ///
     /// The same assertion `the_project_and_member_keys_share_one_hash_tag`
     /// makes for the spend ledger, and it earns its place for the same reason:
-    /// if the two prefixes ever drifted to different tags, `WOULD_EXCEED`
-    /// would refuse to run at all on a clustered deployment, and this catches
-    /// it at build time rather than at first boot against a cluster.
+    /// if the two keys ever drifted to different tags, `WOULD_EXCEED` would
+    /// refuse to run at all on a clustered deployment, and this catches it at
+    /// build time rather than at first boot against a cluster.
     #[test]
     fn both_scopes_hash_to_one_slot_and_two_projects_do_not() {
         fn hash_tag(key: &str) -> &str {
@@ -350,64 +408,87 @@ mod tests {
 
         let project = ProjectId::new("acme");
         let ada = UserId::new("ada");
-        let project_prefix = project_bucket_prefix(&project);
-        let member_prefix = member_bucket_prefix(&project, &ada);
-        let tag = hash_tag(&project_prefix);
+        let project_key = project_scope_key(&project);
+        let member_key = member_scope_key(&project, &ada);
+        let tag = hash_tag(&project_key);
         assert_eq!(tag, "acme", "the tag is the project id, unadorned");
-        assert_eq!(hash_tag(&member_prefix), tag);
-        // And the bucket key is the prefix plus a segment, so it inherits the
-        // tag rather than having one of its own to get wrong.
-        let one_bucket = bucket_key(&project_prefix, 12);
-        assert_eq!(hash_tag(&one_bucket), tag);
+        assert_eq!(hash_tag(&member_key), tag);
 
         // The control: two projects must land on two tags, or every project
         // would collide onto one slot.
-        let other = project_bucket_prefix(&ProjectId::new("other"));
+        let other = project_scope_key(&ProjectId::new("other"));
         assert_ne!(hash_tag(&other), tag);
     }
 
     /// Two members of one project, and the project itself, are three key
     /// spaces — including when a user id contains the separator.
+    ///
+    /// The hazard this guards shrank when the bucket index moved out of the
+    /// key and into a field (M13.1): a member key's last segment is now the
+    /// whole of the user id, so there is no longer a trailing numeric segment
+    /// a cleverly-spelled id could impersonate. The adversarial id stays in
+    /// the list because "the key is the prefix plus the id, and nothing else"
+    /// is the property that keeps it true.
     #[test]
-    fn no_two_scopes_or_buckets_can_name_one_key() {
+    fn no_two_scopes_can_name_one_key() {
         let project = ProjectId::new("acme");
         let mut keys = vec![
-            bucket_key(&project_bucket_prefix(&project), 1),
-            bucket_key(&member_bucket_prefix(&project, &UserId::new("ada")), 1),
-            bucket_key(&member_bucket_prefix(&project, &UserId::new("bob")), 1),
-            bucket_key(&member_bucket_prefix(&project, &UserId::new("ada")), 2),
-            // The adversarial pair: a user id that itself ends in what looks
-            // like a bucket segment. The index is always the final segment and
-            // always digits, so splitting at the last colon still recovers the
-            // right (scope, bucket) — which is why these two are different
-            // keys rather than one.
-            bucket_key(&member_bucket_prefix(&project, &UserId::new("ada:1")), 2),
-            bucket_key(&member_bucket_prefix(&project, &UserId::new("ada")), 12),
+            project_scope_key(&project),
+            member_scope_key(&project, &UserId::new("ada")),
+            member_scope_key(&project, &UserId::new("bob")),
+            member_scope_key(&project, &UserId::new("ada:1")),
         ];
         let before = keys.len();
         keys.sort();
         keys.dedup();
-        assert_eq!(
-            keys.len(),
-            before,
-            "every scope-and-bucket pair is its own key"
-        );
+        assert_eq!(keys.len(), before, "every scope is its own key");
     }
 
-    /// The bucket index is the memory ledger's floor division, and the
-    /// boundary belongs to the bucket it opens.
+    /// A bucket's field names and a window's are two families that cannot
+    /// collide, and the index is the memory ledger's floor division.
     #[test]
-    fn a_bucket_index_is_the_same_floor_division_the_memory_ledger_uses() {
+    fn a_field_name_says_which_family_it_belongs_to() {
         assert_eq!(bucket_index(0), 0);
         assert_eq!(bucket_index(BUCKET_MS - 1), 0);
         assert_eq!(bucket_index(BUCKET_MS), 1);
         assert_eq!(bucket_index(2 * BUCKET_MS + 17), 2);
+
+        assert_eq!(bucket_fields(12), ("b:12:t".into(), "b:12:u".into()));
+        assert_eq!(
+            window_sum_fields(FairUseWindow::FiveHours),
+            (
+                "s:5h:t".into(),
+                "s:5h:u".into(),
+                "s:5h:from".into(),
+                "s:5h:to".into()
+            ),
+            "a window's sum is filed under the same string a refusal names and \
+             a config file writes, so there is no second spelling to drift"
+        );
+
+        // The families are disjoint, and every window's four are distinct:
+        // one hash holds all of them, so a collision would be one counter
+        // wearing another's name.
+        let mut names: Vec<String> = (0..4)
+            .flat_map(|i| {
+                let (t, u) = bucket_fields(i);
+                [t, u]
+            })
+            .collect();
+        for window in FairUseWindow::ALL {
+            let (t, u, from, to) = window_sum_fields(window);
+            names.extend([t, u, from, to]);
+        }
+        let before = names.len();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), before, "no two counters share a field name");
     }
 
     /// The expiry is the widest window plus one bucket, derived rather than
     /// written down.
     #[test]
-    fn a_bucket_outlives_the_widest_window_by_exactly_one_bucket() {
+    fn a_scope_outlives_the_widest_window_by_exactly_one_bucket() {
         assert_eq!(
             bucket_ttl_ms(),
             FairUseWindow::SevenDays.span_ms() + BUCKET_MS
@@ -472,8 +553,9 @@ mod tests {
         assert_eq!(cap_arg(cap_tokens(Some(u64::MAX))), MAX_COUNT.to_string());
     }
 
-    /// The three windows are handed to the script narrowest-first, which is
-    /// the order the whole refusal rule depends on.
+    /// The three windows are handed to both scripts narrowest-first, which is
+    /// the order the refusal rule *and* the pruning pass depend on: the last
+    /// group is the widest, and the widest is the one whose decay deletes.
     #[test]
     fn the_windows_reach_the_script_narrowest_first() {
         let terms = FairUseTerms {
@@ -484,22 +566,51 @@ mod tests {
             }],
             member: Vec::new(),
         };
-        let windows: Vec<(&str, bool, String)> = FairUseWindow::ALL
+        let windows = window_args(|window| {
+            (
+                scope_caps(&terms.project, window),
+                scope_caps(&terms.member, window),
+            )
+        });
+        let described: Vec<(&str, u64, bool, &str)> = windows
             .iter()
             .map(|window| {
-                let caps = scope_caps(&terms.project, *window);
-                (window.wire_name(), caps.present, caps.max_tokens)
+                (
+                    window.name,
+                    window.span_ms,
+                    window.project.present,
+                    window.project.max_tokens.as_str(),
+                )
             })
             .collect();
         assert_eq!(
-            windows,
+            described,
             vec![
-                ("5h", false, String::new()),
-                ("24h", true, "7".to_string()),
-                ("7d", false, String::new()),
+                ("5h", 5 * 60 * 60_000, false, ""),
+                ("24h", 24 * 60 * 60_000, true, "7"),
+                ("7d", 7 * 24 * 60 * 60_000, false, ""),
             ],
-            "the one configured window lands in its own slot, and the two \
-             unconfigured ones are marked absent rather than capped at zero"
+            "the one configured window lands in its own slot, the two \
+             unconfigured ones are marked absent rather than capped at zero, \
+             and the spans ascend so the last group is the widest"
+        );
+    }
+
+    /// A *draw* carries every window and caps none of them.
+    ///
+    /// The control on the shape above, and the reason `record_draw` takes a
+    /// window list at all: a draw made while a project had no fair-use block
+    /// must still move the sums an admin `PATCH` can start enforcing a minute
+    /// later, or the first turn after the patch would be judged against a
+    /// window that had counted nothing.
+    #[test]
+    fn a_draw_carries_every_window_and_no_caps() {
+        let windows = window_args(|_| (scripts::ScopeCaps::absent(), scripts::ScopeCaps::absent()));
+        assert_eq!(windows.len(), FairUseWindow::ALL.len());
+        assert!(
+            windows
+                .iter()
+                .all(|window| !window.project.present && !window.member.present)
         );
     }
 }

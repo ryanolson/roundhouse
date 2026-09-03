@@ -357,6 +357,32 @@ impl ApiError {
         }
     }
 
+    /// A 503: a store this deployment depends on could not answer, and the
+    /// condition clears on its own.
+    ///
+    /// Named rather than folded into [`Self::internal`] because the two say
+    /// opposite things to a client. A `500` is "this request produced a
+    /// failure", which an agent's stack reasonably treats as a reason to stop
+    /// or to change what it sent; a `503` is "come back", which is the truth
+    /// when nothing about the request was wrong and our own dependency is
+    /// down. It is what the fair-use ledger's outage posture (D1 R14, R-F7)
+    /// needs to be expressible: a ceiling that cannot be read fails *closed*,
+    /// and a refusal a client will never retry is a fail-closed that never
+    /// reopens.
+    ///
+    /// The one client this product exists to serve reads it that way already:
+    /// [`messages_api`](crate::messages_api)'s `error_kind` spells a 503 —
+    /// and only a 503 — `overloaded_error`, the single string Claude Code
+    /// retries on regardless of status.
+    pub(crate) fn unavailable(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code,
+            message: message.into(),
+            detail: None,
+        }
+    }
+
     /// A refusal at a status the named constructors above do not cover.
     ///
     /// Deliberately last and deliberately awkward to reach: the constructors
@@ -568,10 +594,15 @@ impl IntoResponse for ApiError {
 /// second copy is the one somebody forgets to add: a ceiling enforced on the
 /// Responses surface and not on the native one is not a ceiling.
 ///
-/// A ledger that cannot answer fails the request rather than waving it through.
-/// The alternative is a fail-open on a limit, and this is the one place in the
-/// request path where refusing costs a client a retryable error rather than a
-/// turn's work.
+/// A ledger that cannot answer fails the request rather than waving it through,
+/// and it does so *retryably* — a `503`, not a `500` (D1 R14, pinned by M13.1
+/// as R-F7). The alternative is a fail-open on a limit, and this is the one
+/// place in the request path where refusing costs a client a retryable error
+/// rather than a turn's work: nothing about the request was wrong and the
+/// outage clears on its own, so the status has to be the one that says come
+/// back rather than the one that says stop. Its opposite number is the *draw*
+/// after the turn, which fails open and logs — see `Engine::record_fair_use_draw`
+/// for why the two halves of one seam point in opposite directions.
 pub(crate) async fn refuse_over_fair_use<S, T>(
     engine: &Engine<S, T>,
     admission: &Admission,
@@ -583,7 +614,7 @@ where
     let refusal = engine
         .fair_use_refusal(admission)
         .await
-        .map_err(|error| ApiError::internal("fair_use_unavailable", error.to_string()))?;
+        .map_err(|error| ApiError::unavailable("fair_use_unavailable", error.to_string()))?;
     let Some(refusal) = refusal else {
         return Ok(());
     };

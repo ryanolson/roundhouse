@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Plan: the Anthropic Messages surface, the seat, and the launcher (M11)
 
-> **Status: shipped through M14.0 (2026-09-02).** The rulings in §3 stand
+> **Status: shipped through M14.0; M13.1 in flight (2026-09-03).** The rulings in §3 stand
 > as written; where an implementation round moved one, the dated addenda at
 > the end of this document record the move and its reason, and win over §3
 > for the current tree. Direction set by the product owner on
@@ -1488,3 +1488,60 @@ ledger after decay; a two-node test through one Redis as before. No
 migration: no deployment holds M13-layout keys — M13 landed on this branch
 the same day — and the module doc says so rather than shipping a converter
 for data that does not exist. The `redis` crate does not move.
+
+### What the implementation settled beyond the rulings (2026-09-03, M13.1)
+
+- **A window's sum carries the newest bucket it covers, not only the
+  oldest.** R-F6 said a `from` older than the whole window resets the sum
+  with no reads; that is sound only while draws arrive in non-decreasing
+  time order, and with decay owned by the read a scope drawn at bucket
+  zero and again long after, with no check between, has an ancient `from`
+  and recent content. A fourth field per window, `to`, makes the read-free
+  reset exact: reset only when `to` is older than the window's first
+  bucket. One field per window on the write.
+- **A saturated sum rebuilds rather than subtracts.** A sum clamped at the
+  domain ceiling has forgotten how far past it the true total went, so
+  subtracting an aged-out bucket would take a still-full window to nearly
+  empty while the memory ledger, which re-sums, stays at the ceiling; the
+  decay rebuilds from the bucket fields when the sum sits at the ceiling,
+  and the same branch absorbs a gap wider than the window, which keeps
+  every read bounded by one window's width. A test goes red without it.
+- **The pruning pass runs in `record_draw`, not only in the check.** A
+  membership capped only on the five-hour window never asks the widest
+  window anything, so a read-only pruner would never run for it and the
+  hash would gain a field every five minutes forever. And `would_exceed`
+  now writes: the decay is persisted and the widest window's decay
+  deletes, so a ceiling check cannot be served by a read-only replica —
+  said at the script; nothing routes it to one today.
+- **The fail-closed half is a 503.** The seam already failed closed and
+  open in the right directions, but the closed half was a 500, which no
+  client retries; it is now `ApiError::unavailable`, and the Messages
+  surface already spells 503, and only 503, as `overloaded_error` — the
+  one string Claude Code retries on (R-F7).
+- **Divergences, stated.** After a rebuild, a draw stamped later than the
+  `now_ms` a check supplies is excluded — fields cannot be enumerated
+  forward without bound — extending the backwards-clock divergence M13
+  recorded and reachable only with a clock that steps backwards between a
+  settle and the next admission. Bucket ranges are chunked at four hundred
+  fields per command because Lua's `unpack` is bounded; only refusal walks
+  and the rare rebuild reach a second chunk, and the admitted path reads no
+  buckets at all.
+- **The read count.** Six commands per admitted turn on a three-window
+  membership, derived as twice the window count and red first at the old
+  4034; the pin is deliberately the decay-free steady state, and two
+  sibling tests guard the reset branch — the refute pass showed the pin
+  alone did not, and a second counting loop in that binary is the dense
+  competitor the M13 implementation warned about. The retry-walk
+  agreement test's fixture now forces two buckets to depart, since with
+  one the naive formula agreed by coincidence.
+- **Refute by mutation against the real server**: ten mutations — no
+  decay, the oldest bucket off by one each way, the reset disabled, the
+  pruning suppressed, one window's sum only, the retry from the sum, the
+  expiry dropped, a store error swallowed into admitted, a record error
+  turned into a refusal, `TIME` instead of the caller's clock — all red
+  under named guards; two coverage findings closed test-first with no
+  production change. The fix stage also reported the warn-once test as
+  order-dependent in one full library run; an independent pass could not
+  reproduce it in 135 bounded runs, and the capture is a thread-local
+  subscriber serialized by one mutex, so the claim is recorded as not
+  reproducible rather than papered over with a retry.
