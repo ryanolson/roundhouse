@@ -1435,3 +1435,56 @@ whose every probed generation was busy reports zero disagreements; the
 subagent fixture in the MCP surface suite changed its expected generation
 because the downward walk now puts the parent's third turn back on the
 generation it continues, which is the fix working, not a regression.
+
+## Addendum (2026-09-02): M13.1 — the fair-use read path, the rulings
+
+The M13 review measured what R-F1's layout costs where it matters: an
+admitted turn — the common case — lets no window bind, so `would_exceed`
+widens to the widest configured window and reads every bucket in it, 2017
+`HMGET`s per capped scope under a seven-day cap, about eight milliseconds
+of blocking Redis time per admission ahead of every queued session-log
+append (F4). The cost was per command, not per byte. This rung replaces
+the read path; the contract of M13 and R-F5's integer domain are
+unchanged, and the shared contract suite is what proves it.
+
+**R-F6 — one hash per scope, running sums per window, decay owned by the
+read.** R-F1 rejected a hash per scope because it would have needed a
+pruning pass nothing owned; running sums give the pruning an owner. Each
+scope is one hash holding two field families: per-bucket amounts
+(`b:<index>:t`, `b:<index>:u`) and, per window, a running sum with the
+oldest bucket index it includes (`s:<window>:t`, `s:<window>:u`,
+`s:<window>:from`). `record_draw` is one script that read-add-clamp-writes
+the bucket fields and every window's sum for both scopes (R-F5's domain,
+no command that can fail). `would_exceed` is one script that, per scope
+and window narrowest first, *decays* the sum — one `HMGET` of the fields
+that aged out since `from`, subtracted with a floor at zero, `from`
+advanced; a `from` older than the whole window resets the sum to zero
+without reading anything — compares the sum with the cap, and only on a
+refusal walks the window's fields from `from` forward to compute the
+earliest retry exactly as the memory ledger does. The widest window's
+decay deletes the bucket fields it ages out, which is the pruning pass,
+owned. The hash carries one `PEXPIRE` at the widest window plus one bucket,
+re-armed on every draw, so an idle scope still costs nothing. Per admitted
+turn the cost is a handful of field reads in one round trip, amortised
+O(1); the bounded worst case — a scope idle for almost the widest window
+and then resumed — is one `HMGET` of at most a window's fields, once.
+
+**R-F7 — the outage posture, pinned** (D1 R14). A ceiling check that
+cannot reach its store fails closed: the turn is refused with the
+retryable error an outage calls for, because a ceiling that cannot be
+checked cannot be honoured and the operator configured it on purpose. A
+draw already made that cannot be recorded fails open with the reason
+logged, because a bounded under-count is a fact about the outage and a
+wrong refusal is not. The engine's seam already has this shape; this rung
+pins both halves with tests against a Redis that is stopped mid-test.
+
+**R-F8 — what proves it, and what moves.** The shared contract suite,
+unchanged in its assertions, over both ledgers; the read-count pin the
+M13 review folded into the single `INFO commandstats` test goes red and is
+re-pinned to the new cost, derived not pasted; decay tests at bucket
+boundaries, after an idle period shorter and longer than each window, and
+across the widest window's expiry; the retry walk agreeing with the memory
+ledger after decay; a two-node test through one Redis as before. No
+migration: no deployment holds M13-layout keys — M13 landed on this branch
+the same day — and the module doc says so rather than shipping a converter
+for data that does not exist. The `redis` crate does not move.
