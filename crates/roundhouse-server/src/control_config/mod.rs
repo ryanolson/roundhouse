@@ -230,6 +230,8 @@ pub async fn boot_directory(
                         .admission_cache_ttl_ms
                         .unwrap_or(DEFAULT_ADMISSION_CACHE_TTL_MS),
                 ),
+                // M18, H3: the judge's own axis, beside the fleet's.
+                judge: checks.judge_identity(),
             };
             ControlDirectory::new(
                 file.config,

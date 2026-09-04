@@ -538,7 +538,8 @@ impl CrossChecks {
     /// `ROUNDHOUSE_JUDGE_MODEL` resolved against the catalog — and R-D9's four
     /// axes name the file, the catalog, the fleet and the TTL; folding a fifth
     /// input into the fleet's list would report `Fleet` for a divergence that
-    /// is not about the fleet at all.
+    /// is not about the fleet at all. See [`Self::judge_identity`] for its own
+    /// axis (M18, H3).
     pub fn fingerprint(&self) -> Vec<String> {
         let mut identities: Vec<String> = self
             .reachable
@@ -548,6 +549,24 @@ impl CrossChecks {
         identities.sort();
         identities.dedup();
         identities
+    }
+
+    /// The judge half of a stored document's fingerprint (M18, H3): the
+    /// judge's own identity, as [`fingerprint`](Self::fingerprint) reports one
+    /// for a routing candidate, or `None` for a deployment with no judge.
+    ///
+    /// **Its own axis, not folded into [`Self::fingerprint`]'s list** — see
+    /// that method's doc for why. Before this, `refuse_promises_of_a_local_fallback`
+    /// read the judge (`unkeepable_promises`'s `VALIDATION_PROMISE` arm) while
+    /// nothing in a stored document's fingerprint carried it, so two nodes
+    /// differing only in `ROUNDHOUSE_JUDGE_MODEL` compiled two different
+    /// planes — one enrols a project in the validate/steer loop, the other
+    /// refuses to boot under the same file — and reported no divergence at
+    /// all.
+    pub fn judge_identity(&self) -> Option<String> {
+        self.judge
+            .as_ref()
+            .map(|spec| spec.target().policy_identity())
     }
 
     /// Refuse a plane no boot of this deployment would have started under.

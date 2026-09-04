@@ -160,7 +160,7 @@ fn every_field_populated() -> DirectoryRecords {
 /// or adds `skip_serializing_if` to a field an older build reads as required —
 /// and this document is durable, so the first symptom of getting it wrong is a
 /// deployment whose entire tenancy no longer loads.
-const PINNED: &str = r#"{"schema":1,"records":{"projects":[{"entry":{"id":"acme","name":"Acme Corp","policy":{"min_quality":0.5,"allow":["local/*"],"frontier_cadence":{"max_frontier":1,"per_turns":4}},"budget":{"limit_usd":25.0,"window":"monthly","on_exhaustion":"degrade_to_local","overflow_when_local_saturated":false,"warn_at":0.75},"fair_use":{"windows":[{"window":"5h","max_tokens":1000,"max_usd":2.5}]},"validate":{"enabled":true,"channel":"text","arms":{"live":1,"shadow":2,"placebo":3},"placebo_rate":0.1,"escalation_floor":0.8,"escalation_turns":3,"steer_after_interventions":1,"handoff_note":"say why"},"credentials":{"mode":"project_only","budget_counts":"all_frontier_spend","providers":{"anthropic":{"env_var":"ACME_ANTHROPIC_KEY","kind":"api_key"}}},"tiers":{"capable":["anthropic/big"],"efficient":["local/small"],"picker":"efficient_first","confidence_threshold":0.65}},"provenance":"admin","created_at_ms":1700000000000,"archived_at_ms":1700000001000}],"users":[{"entry":{"id":"ada"},"provenance":"admin","created_at_ms":1700000002000}],"memberships":[{"project":"acme","user":"ada","role":"owner","allocation":{"capped":{"limit_usd":5.0}},"overrides":{"min_quality":0.9,"allow":["anthropic/*"],"frontier_cadence":null},"provenance":"admin","created_at_ms":1700000003000}],"keys":[{"id":"key_0123456789abcdef","key_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","display_tail":"wxyz","scope":{"turn":{"project":"acme","user":"ada"}},"provenance":"admin","created_at_ms":1700000004000,"revoked_at_ms":1700000005000,"fair_use":{"windows":[{"window":"7d","max_usd":9.0}]}}]},"compiled_under":{"file_sha256":null,"catalog":[],"fleet":[],"admission_cache_ttl_ms":null}}"#;
+const PINNED: &str = r#"{"schema":1,"records":{"projects":[{"entry":{"id":"acme","name":"Acme Corp","policy":{"min_quality":0.5,"allow":["local/*"],"frontier_cadence":{"max_frontier":1,"per_turns":4}},"budget":{"limit_usd":25.0,"window":"monthly","on_exhaustion":"degrade_to_local","overflow_when_local_saturated":false,"warn_at":0.75},"fair_use":{"windows":[{"window":"5h","max_tokens":1000,"max_usd":2.5}]},"validate":{"enabled":true,"channel":"text","arms":{"live":1,"shadow":2,"placebo":3},"placebo_rate":0.1,"escalation_floor":0.8,"escalation_turns":3,"steer_after_interventions":1,"handoff_note":"say why"},"credentials":{"mode":"project_only","budget_counts":"all_frontier_spend","providers":{"anthropic":{"env_var":"ACME_ANTHROPIC_KEY","kind":"api_key"}}},"tiers":{"capable":["anthropic/big"],"efficient":["local/small"],"picker":"efficient_first","confidence_threshold":0.65}},"provenance":"admin","created_at_ms":1700000000000,"archived_at_ms":1700000001000}],"users":[{"entry":{"id":"ada"},"provenance":"admin","created_at_ms":1700000002000}],"memberships":[{"project":"acme","user":"ada","role":"owner","allocation":{"capped":{"limit_usd":5.0}},"overrides":{"min_quality":0.9,"allow":["anthropic/*"],"frontier_cadence":null},"provenance":"admin","created_at_ms":1700000003000}],"keys":[{"id":"key_0123456789abcdef","key_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","display_tail":"wxyz","scope":{"turn":{"project":"acme","user":"ada"}},"provenance":"admin","created_at_ms":1700000004000,"revoked_at_ms":1700000005000,"fair_use":{"windows":[{"window":"7d","max_usd":9.0}]}}]},"compiled_under":{"file_sha256":null,"catalog":[],"fleet":[],"admission_cache_ttl_ms":null,"judge":null}}"#;
 
 /// **A fully populated directory is written exactly this way, and reads back
 /// exactly this way.**
@@ -524,6 +524,7 @@ async fn the_writers_fingerprint_is_what_a_reader_loads_back() {
         catalog: vec!["anthropic/big".into(), "local/small".into()],
         fleet: vec!["local/small".into()],
         admission_cache_ttl_ms: Some(30_000),
+        judge: Some("anthropic/judge".into()),
     };
     let backing = Arc::new(MemoryDocumentStore::new());
     let writer = DocumentDirectoryStore::stamped(
@@ -638,10 +639,19 @@ async fn a_document_at_the_ceiling_commits_and_one_byte_over_is_refused_before_a
         .await
         .expect_err("one byte over the ceiling must be refused");
     let reason = error.to_string();
+    // M18, H2: a named variant rather than `Unavailable`, so an operator (and
+    // `http.rs`'s mapping) can tell a size breach -- caused by this write --
+    // from a store that is genuinely down without parsing the message.
     assert!(
-        matches!(error, StoreFailure::Unavailable(_)),
-        "the refusal must be typed as a store failure rather than a bad change, since nothing \
-         about a caller's request produced it beyond size: {reason}"
+        matches!(
+            error,
+            StoreFailure::DocumentTooLarge {
+                size,
+                ceiling: DIRECTORY_DOCUMENT_CEILING_BYTES,
+            } if size == DIRECTORY_DOCUMENT_CEILING_BYTES + 1
+        ),
+        "the refusal must be typed as a size breach naming the exact size and ceiling on the \
+         type, not folded into the store's generic unavailable variant: {error:?}"
     );
     assert!(
         reason.contains(&(DIRECTORY_DOCUMENT_CEILING_BYTES + 1).to_string())

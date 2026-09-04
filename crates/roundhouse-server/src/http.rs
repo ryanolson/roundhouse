@@ -369,6 +369,25 @@ impl ApiError {
         }
     }
 
+    /// A 413: the request body — a document this write would have produced —
+    /// is over a size this deployment enforces.
+    ///
+    /// Named rather than folded into [`Self::internal`] (M18, H2), for the
+    /// same reason [`StoreFailure::DocumentTooLarge`] exists rather than
+    /// reusing `Unavailable`: the request caused this, not a dependency
+    /// outage, and a client's retry logic should treat the two oppositely —
+    /// retrying a `413` unchanged only ever produces the same `413`.
+    ///
+    /// [`StoreFailure::DocumentTooLarge`]: crate::control_config::StoreFailure::DocumentTooLarge
+    pub(crate) fn payload_too_large(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            code,
+            message: message.into(),
+            detail: None,
+        }
+    }
+
     /// A 503: a store this deployment depends on could not answer, and the
     /// condition clears on its own.
     ///
@@ -520,6 +539,14 @@ impl From<DirectoryError> for ApiError {
             }
             DirectoryError::Store(StoreFailure::Unavailable(_)) => {
                 ApiError::internal("directory_unavailable", message)
+            }
+            // 413 and its own code (M18, H2): before this the ceiling
+            // refusal rode `Unavailable` and answered `directory_unavailable`
+            // — the same 500 a dead store answers — so a document too large
+            // to write read as an outage rather than as the client-caused
+            // refusal it is.
+            DirectoryError::Store(StoreFailure::DocumentTooLarge { .. }) => {
+                ApiError::payload_too_large("directory_document_too_large", message)
             }
             DirectoryError::Mint(_) => ApiError::internal("key_mint_failed", message),
             DirectoryError::Inconsistent { .. } => {
@@ -1262,4 +1289,54 @@ fn error_frame(message: &str) -> Event {
 
 fn error_payload(message: &str) -> String {
     json!({ "type": "error", "message": message }).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **M18, H2: a size-ceiling refusal maps to its own wire refusal, not to
+    /// the same `500` a dead store answers.**
+    ///
+    /// Before `StoreFailure::DocumentTooLarge` existed, `From<DirectoryError>
+    /// for ApiError` had no arm to give it — the ceiling refusal rode
+    /// `StoreFailure::Unavailable` and answered `directory_unavailable` at
+    /// `500`, indistinguishable on the wire from a Redis that is simply down.
+    /// A unit test over the mapping (rather than a request through the admin
+    /// rig) because driving this cheaply over HTTP would mean posting a
+    /// multi-megabyte body through the whole admin stack for a fact this
+    /// `From` impl decides in one match arm; the adapter's own refusal at the
+    /// ceiling is already pinned directly against `commit`
+    /// (`control_config::directory::document::tests::
+    /// a_document_at_the_ceiling_commits_and_one_byte_over_is_refused_before_any_wire`).
+    #[test]
+    fn a_document_too_large_answers_413_with_its_own_code_not_the_generic_outage_one() {
+        let error = DirectoryError::Store(StoreFailure::DocumentTooLarge {
+            size: 9_000_000,
+            ceiling: 8 * 1024 * 1024,
+        });
+        let api_error: ApiError = error.into();
+
+        assert_eq!(api_error.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(api_error.code(), "directory_document_too_large");
+        assert_ne!(
+            api_error.code(),
+            "directory_unavailable",
+            "a size breach must not answer the same code an outage does, or a client cannot \
+             tell a refusal it caused from a dependency that is down"
+        );
+        assert!(
+            api_error.message().contains("9000000") && api_error.message().contains("8388608"),
+            "the message must still name both the size and the ceiling: {}",
+            api_error.message()
+        );
+
+        // The control: `StoreFailure::Unavailable` -- a real outage -- must
+        // still answer the generic code and a 500, or this test would only
+        // be proving that the two variants exist.
+        let outage: ApiError =
+            DirectoryError::Store(StoreFailure::Unavailable("connection refused".into())).into();
+        assert_eq!(outage.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(outage.code(), "directory_unavailable");
+    }
 }

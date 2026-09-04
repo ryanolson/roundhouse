@@ -145,6 +145,23 @@ pub struct CompiledUnder {
     /// The admission-cache TTL in force when this document was written.
     #[serde(default)]
     pub admission_cache_ttl_ms: Option<u64>,
+    /// The judge's identity — `ROUNDHOUSE_JUDGE_MODEL` resolved against the
+    /// catalog, as [`Target::policy_identity`](roundhouse_core::routing::Target::policy_identity)
+    /// spells it — or `None` for a deployment with no judge (M18, H3).
+    ///
+    /// **Its own axis, not folded into [`Self::fleet`].** `fleet` is the
+    /// fingerprint of the *routing candidates* — see
+    /// `CrossChecks::fingerprint`'s own doc for why the judge is deliberately
+    /// excluded from that one — and `refuse_promises_of_a_local_fallback`
+    /// reads the judge on a question `fingerprint()` never asks: whether a
+    /// project's `validate` block has anything to check against. Before this,
+    /// two nodes differing only in `ROUNDHOUSE_JUDGE_MODEL` compiled two
+    /// different planes — one enrols sessions in the validate/steer loop, the
+    /// other refuses to boot under the same file — and reported no divergence
+    /// at all, because nothing in `CompiledUnder` read the variable the
+    /// difference actually came from.
+    #[serde(default)]
+    pub judge: Option<String>,
 }
 
 impl CompiledUnder {
@@ -177,6 +194,9 @@ impl CompiledUnder {
         if self.admission_cache_ttl_ms != other.admission_cache_ttl_ms {
             differs.push(DivergentInput::Ttl);
         }
+        if self.judge != other.judge {
+            differs.push(DivergentInput::Judge);
+        }
         differs
     }
 }
@@ -198,6 +218,8 @@ pub enum DivergentInput {
     Fleet,
     /// `admission_cache_ttl_ms`.
     Ttl,
+    /// `ROUNDHOUSE_JUDGE_MODEL`'s resolved identity (M18, H3).
+    Judge,
 }
 
 impl DivergentInput {
@@ -208,6 +230,7 @@ impl DivergentInput {
             DivergentInput::Catalog => "catalog",
             DivergentInput::Fleet => "fleet",
             DivergentInput::Ttl => "admission_cache_ttl_ms",
+            DivergentInput::Judge => "judge",
         }
     }
 }
@@ -382,15 +405,15 @@ impl DirectoryStore for DocumentDirectoryStore {
         })?;
         // Refused here rather than handed to the store, so growing past the
         // ceiling is a named refusal and not a timeout the caller has to
-        // guess the cause of (M16.1 review, F6).
+        // guess the cause of (M16.1 review, F6). Typed as its own variant
+        // rather than `Unavailable` (M18, H2): a size breach is caused by
+        // this write, not by the store, and the two need different remedies
+        // on the wire -- see `StoreFailure::DocumentTooLarge`.
         if bytes.len() > DIRECTORY_DOCUMENT_CEILING_BYTES {
-            return Err(StoreFailure::Unavailable(format!(
-                "the directory document is {} bytes, over this family's \
-                 {DIRECTORY_DOCUMENT_CEILING_BYTES}-byte ceiling; refusing to write it rather \
-                 than risk a store's response budget sized for a document at or under that \
-                 ceiling",
-                bytes.len()
-            )));
+            return Err(StoreFailure::DocumentTooLarge {
+                size: bytes.len(),
+                ceiling: DIRECTORY_DOCUMENT_CEILING_BYTES,
+            });
         }
         self.store
             .commit(expected_version, bytes)

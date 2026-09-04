@@ -208,11 +208,24 @@ impl DecisionSource {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TurnSignals {
     pub tools: ToolSignals,
-    /// How many tool exchanges this session holds.
+    /// How many *task* exchanges this session holds — roundhouse's own
+    /// control calls dropped, exactly as [`task_exchanges_on`] drops them from
+    /// every other window this file reads.
     ///
-    /// Upstream's `turn_depth` is `messages.len()`; this is the exchange count.
-    /// See the module attribution for why the substitution is the honest one
-    /// and not merely the convenient one.
+    /// Upstream's `turn_depth` is `messages.len()`; this is the task-exchange
+    /// count. See the module attribution for why the substitution is the
+    /// honest one and not merely the convenient one.
+    ///
+    /// **Counted after the control-call drop, not before (M18, H5).** Before
+    /// this, `exchanges.len()` counted every exchange including our own —
+    /// three reads of roundhouse's own `status` tool (the generated
+    /// `rh-status` skill's own advice to an agent) opened the stall gate on a
+    /// session with as few as five lines of real task work, exactly the depth
+    /// [`STALL_MIN_TURN_DEPTH`] the tool-signal window itself already treats
+    /// those three calls as absent from. A depth counted one way and a window
+    /// counted another is how a shallow session reads as a stall.
+    ///
+    /// [`task_exchanges_on`]: crate::validate::task_exchanges_on
     pub turn_depth: u32,
 }
 
@@ -222,9 +235,10 @@ impl TurnSignals {
         exchanges: &[crate::validate::Exchange],
         dialect: crate::validate::ControlCallDialect,
     ) -> Self {
+        let task_exchanges = crate::validate::task_exchanges_on(exchanges, dialect);
         Self {
             tools: ToolSignals::from_exchanges(exchanges, dialect),
-            turn_depth: exchanges.len() as u32,
+            turn_depth: task_exchanges.len() as u32,
         }
     }
 }
@@ -861,11 +875,14 @@ mod tests {
     ///
     /// **The depth is load-bearing and a four-exchange fixture would make this
     /// vacuous**: at `turn_depth < STALL_MIN_TURN_DEPTH` nothing fires anyway
-    /// and the assertion would have passed before the fix. Ten exchanges is
-    /// what makes `spinning == 1.0` the old answer. The production assertion
-    /// is the other half: without it, "spinning is zero" would also be
-    /// satisfied by a fix that zeroed every count instead of dropping our own
-    /// calls from the walk.
+    /// and the assertion would have passed before the fix. Since M18 (H5)
+    /// `turn_depth` itself drops the trailing control calls, so it takes eight
+    /// real exchanges — not six — to clear `STALL_MIN_TURN_DEPTH` on their own
+    /// and keep this fixture exercising the gate rather than falling short of
+    /// it before the identity question is even asked. The production
+    /// assertion is the other half: without it, "spinning is zero" would also
+    /// be satisfied by a fix that zeroed every count instead of dropping our
+    /// own calls from the walk.
     #[test]
     fn our_own_control_calls_do_not_synthesize_a_stall() {
         use crate::validate::Exchange;
@@ -883,11 +900,13 @@ mod tests {
             }
         }
 
-        // Six exchanges of real production work, then the four trailing
-        // control calls the generated `rh-status` skill tells an agent to
-        // make. Ten exchanges total clears `STALL_MIN_TURN_DEPTH` (8).
+        // Eight exchanges of real production work -- enough on their own to
+        // clear `STALL_MIN_TURN_DEPTH` (8) once `turn_depth` counts only task
+        // exchanges (M18, H5) -- then the four trailing control calls the
+        // generated `rh-status` skill tells an agent to make. Twelve
+        // exchanges total; `turn_depth` must stay at eight.
         let mut exchanges = Vec::new();
-        for n in 0..6 {
+        for n in 0..8 {
             exchanges.push(control_call(&format!("p{n}"), "edit", "{}"));
         }
         exchanges.push(control_call("c0", "mcp__roundhouse__status", "{}"));
@@ -906,10 +925,14 @@ mod tests {
             "mcp__roundhouse__set_quality_floor",
             r#"{"floor":0.5}"#,
         ));
-        assert_eq!(exchanges.len(), 10);
+        assert_eq!(exchanges.len(), 12);
 
         let signals = TurnSignals::from_exchanges(&exchanges, ControlCallDialect::ClaudeMessages);
-        assert_eq!(signals.turn_depth, 10);
+        assert_eq!(
+            signals.turn_depth, 8,
+            "H5: the four trailing control calls must not inflate `turn_depth` past the real \
+             task-exchange count"
+        );
         let dims = dimensions_from_signal(&signals);
         assert_eq!(
             dims.spinning, 0.0,
@@ -921,21 +944,15 @@ mod tests {
             "and they must not zero the production the agent actually did: {dims:?}"
         );
 
-        // The half of limb C this fix does NOT close, pinned at its real value
-        // rather than left for somebody to rediscover. `turn_depth` is
-        // `exchanges.len()` (above), counted *before* the control calls are
-        // dropped, so our own surface still supplies the depth that opens the
-        // stall gate — Lens A's words, and the half of the limb the three
-        // shipped tests do not reach. Five uncategorised `cargo` calls are a
-        // build loop too shallow to be a stall; three reads of our own status
-        // tool make the same session deep enough, and the window behind the
-        // gate is unchanged because those three are dropped from it.
-        //
-        // Closing it is one line here — `task_exchanges_on(exchanges,
-        // dialect).len()` —
-        // and it is a non-test `routing/stage.rs` change, which M10's fix
-        // clusters assign elsewhere; see reports/m10-fix-D.md for the ruling
-        // asked for and the default taken.
+        // The half of limb C this fix used to leave open, now closed (M18,
+        // H5): `turn_depth` is `task_exchanges_on(exchanges, dialect).len()`
+        // (below), counted *after* the control calls are dropped, so our own
+        // surface no longer supplies the depth that opens the stall gate.
+        // Five uncategorised `cargo` calls are a build loop too shallow to be
+        // a stall; three reads of our own status tool must not make the same
+        // session read as deep enough, because those three are dropped from
+        // the window behind the gate already and the depth that gates it has
+        // to agree.
         let shallow_pit: Vec<Exchange> = (0..5)
             .map(|n| control_call(&format!("b{n}"), "cargo", "{}"))
             .collect();
@@ -955,9 +972,57 @@ mod tests {
         let dims = dimensions_from_signal(&inflated);
         assert_eq!(
             (inflated.turn_depth, dims.spinning),
-            (8, 1.0),
-            "three reads of our own control surface still supply the depth that calls the \
-             same session a stall: {dims:?}"
+            (5, 0.0),
+            "H5: three reads of our own control surface must not supply the depth that calls \
+             the same session a stall -- they are dropped from `turn_depth` exactly as they \
+             are already dropped from the tool-signal window behind the gate: {dims:?}"
+        );
+    }
+
+    /// H5, second dialect: the same fix over `CodexResponses`, whose
+    /// recogniser reads `namespace` rather than the flat name (M17, R-N9) --
+    /// the two dialects tell a control call apart differently, and a fix
+    /// pinned on one alone would leave the other supplying the old, inflated
+    /// depth.
+    #[test]
+    fn our_own_control_calls_do_not_synthesize_a_stall_on_codex_responses() {
+        use crate::validate::Exchange;
+
+        fn task_call(id: &str) -> Exchange {
+            Exchange {
+                call_id: id.into(),
+                name: "edit".into(),
+                namespace: None,
+                arguments: "{}".into(),
+                output: Some("ok".into()),
+                failed: false,
+            }
+        }
+
+        fn control_call(id: &str, name: &str) -> Exchange {
+            Exchange {
+                call_id: id.into(),
+                name: name.into(),
+                // CodexResponses recognises a control call by the namespace
+                // field, not the flat name (M17, R-N9).
+                namespace: Some("mcp__roundhouse".into()),
+                arguments: "{}".into(),
+                output: Some("ok".into()),
+                failed: false,
+            }
+        }
+
+        let shallow_pit: Vec<Exchange> = (0..5).map(|n| task_call(&format!("b{n}"))).collect();
+        let mut with_control = shallow_pit;
+        with_control.extend((0..3).map(|n| control_call(&format!("c{n}"), "status")));
+        let inflated =
+            TurnSignals::from_exchanges(&with_control, ControlCallDialect::CodexResponses);
+        let dims = dimensions_from_signal(&inflated);
+        assert_eq!(
+            (inflated.turn_depth, dims.spinning),
+            (5, 0.0),
+            "the namespaced dialect must drop its own three control calls from `turn_depth` \
+             the same way the flat dialect does: {dims:?}"
         );
     }
 

@@ -109,6 +109,25 @@ pub enum StoreFailure {
     Concurrent { expected: u64, found: u64 },
     #[error("the directory store is unavailable: {0}")]
     Unavailable(String),
+    /// The encoded document is over
+    /// [`DIRECTORY_DOCUMENT_CEILING_BYTES`](super::document::DIRECTORY_DOCUMENT_CEILING_BYTES).
+    ///
+    /// **Named rather than folded into [`Self::Unavailable`] (M18, H2).**
+    /// `DocumentDirectoryStore::commit` used to answer a ceiling breach with
+    /// `Unavailable`, which is the same variant a dead Redis answers -- so
+    /// over HTTP a client-caused refusal and a dependency outage rendered as
+    /// the identical `directory_unavailable` `500`, and an operator watching
+    /// error rates could not tell "our own tenancy grew past a size this
+    /// deployment ships with" from "the store is down" without reading the
+    /// message. `size` and `ceiling` travel on the type, not only in the
+    /// message, so `http.rs`'s mapping can answer a `413` naming both without
+    /// re-parsing English out of a string.
+    #[error(
+        "the directory document is {size} bytes, over this family's {ceiling}-byte ceiling; \
+         refusing to write it rather than risk a store's response budget sized for a document \
+         at or under that ceiling"
+    )]
+    DocumentTooLarge { size: usize, ceiling: usize },
 }
 
 /// Where admin-created tenancy lives.

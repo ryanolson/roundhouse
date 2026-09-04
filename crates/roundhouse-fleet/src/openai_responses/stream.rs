@@ -418,6 +418,19 @@ mod tests {
     /// `include_str!` (rustdoc text is not otherwise inspectable at
     /// runtime); this test fails while both readings are asserted at once,
     /// which is the on-its-face contradiction the finding names.
+    ///
+    /// **M18, H6: the conjunction alone is not a guard once one side of it
+    /// is fixed for good.** The M17 review's fix reworded this file's
+    /// `function_call` doc to stop asserting "no server" (it now points at
+    /// item.rs's reading instead — see the doc above `function_call`), which
+    /// makes `fleet_reads_absence_as_a_fact` `false` forever: the `&&` below
+    /// can never be true again, so `!(false && anything)` holds whatever
+    /// item.rs's doc says from here on. A reword of item.rs's namespace-field
+    /// doc away from "this client does not spell one" would pass this test
+    /// in perfect silence. The control assertion after it is the fix: it
+    /// pins the item.rs literal on its own, unconditionally, so a reword
+    /// fails a named assertion instead of emptying a conjunction nobody is
+    /// watching.
     #[test]
     fn fleet_and_core_namespace_docs_do_not_read_absence_oppositely() {
         let fleet_doc = include_str!("stream.rs");
@@ -436,6 +449,25 @@ mod tests {
              doc reads it as the unknown \"this client does not spell one\" -- R-N8's \
              stored-None-agrees-with-any-claim admission rule (prefix_admission.rs) only \
              holds under the core reading"
+        );
+
+        // The control (M18, H6). Sliced up to (not including) `mod tests`,
+        // the same pattern `item.rs`'s own
+        // `canonical_arguments_doc_names_current_join_call_shape` uses and
+        // for the identical reason: the whole-file version is a tautology,
+        // since this very assertion's message quotes the phrase it searches
+        // for, and `include_str!` reading the whole file would find that
+        // quotation however the doc comment above `namespace` was mutated.
+        let core_src_before_tests = core_doc.split("\n#[cfg(test)]").next().unwrap();
+        assert!(
+            core_src_before_tests
+                .contains("is not \"no namespace\"; it is \"this client does not spell"),
+            "item.rs's ItemContent::ToolCall::namespace doc no longer reads a stored `None` as \
+             \"this client does not spell one\" -- R-N8's stored-None-agrees-with-any-claim \
+             admission rule (prefix_admission.rs) is sound only under that reading, and the \
+             assertion above this one cannot catch a reword here on its own: the fleet doc's \
+             half of the contradiction it checks was fixed for good in the M17 review, so the \
+             `&&` above never fires again regardless of what this file says"
         );
     }
 

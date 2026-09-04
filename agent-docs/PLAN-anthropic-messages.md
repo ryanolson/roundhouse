@@ -2745,6 +2745,35 @@ anything that is a behaviour lands test-first. The six, by name:
   searches for — so a reword would disarm it silently. A control pins the
   literal, so a reword fails rather than empties the guard.
 
+### What the implementation settled beyond the rulings (2026-09-04, M18)
+
+- **Two of the six items needed no production change**: the empty-Redis
+  lineage exemption and the cancelled apply's pick-up were already right,
+  and what landed is the proof — a gated boot test over a real Redis, and a
+  test over the scripted double's commit gate that aborts an apply while
+  its commit is in flight and watches the next refresh adopt it. The
+  write-path ruling (no give-back, because the client that cancelled saw
+  no success) sits in the directory's module doc beside the claim guard's.
+- **The size ceiling has its own variant and its own status**: a document
+  over the ceiling answers 413 with its own code, and only a store that
+  cannot be reached answers the outage code.
+- **The judge is a fifth fingerprint axis**, sourced beside the fleet's
+  identity and stamped by the boot composition; the byte-for-byte document
+  fixture moved for that reason and no other.
+- **`turn_depth` counts task exchanges**, so the two assertions that had
+  pinned the cost — three reads of our own status tool reading as a stall
+  — are the guard for the fix, on both dialects.
+- **The namespace doc guard's conjunction was already vacuous**: its
+  fleet-side half had been false since the M17 review's own fix, so the
+  guard passed whatever the item doc said. The control that pins the item
+  doc's literal on its own was proved by mutation before and after.
+- **The rung's refute stage found one gap in its own proof.** The boot
+  test's doc claimed the refresh-path exemption was proven too; no
+  assertion ever evaluated it, because the first node always adopted its
+  own write through apply. A second scenario closes it: the first node
+  boots on the empty Redis, the second node writes first, and the first
+  node's refresh adopts without naming a regression.
+
 ## Addendum (2026-09-04): D3 ruled — the rungs it opens
 
 D3 ruled the questions the durable directory unlocked — R20–R23 in

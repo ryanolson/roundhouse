@@ -49,6 +49,7 @@ use std::sync::Arc;
 
 use roundhouse_core::now_ms;
 use roundhouse_fleet::{StaticFrontierCatalog, WireProtocol};
+use roundhouse_server::control_config::DEFAULT_ADMISSION_CACHE_TTL_MS;
 use roundhouse_server::control_config::boot_directory;
 use roundhouse_server::control_config::crosscheck::CrossChecks;
 use roundhouse_server::shared_backend::open;
@@ -432,5 +433,314 @@ async fn directory_boot_fingerprint_catalog_half_never_reflects_the_real_catalog
          catalog identities -- boot_directory is fed the real StaticFrontierCatalog here, so a \
          mutation to StaticFrontierCatalog::identities's sort/dedup/format is visible to this \
          suite."
+    );
+}
+
+/// **M18, H1: the empty-Redis lineage exemption, under a real boot.**
+///
+/// `StoredVersion::supersedes` skips the lineage comparison at
+/// `served.version == 0` — a node that has never seen a document has no
+/// lineage to disagree about, so the deployment's first write is adopted
+/// whichever lineage minted it, or a node booted against an empty store
+/// would refuse that very first write for the life of the process. Until
+/// this rung the exemption was pinned only by
+/// `control_config::directory::store::tests::
+/// later_means_later_in_the_same_lineage_and_anything_beats_version_zero`
+/// — a unit test over the type alone, driving no real store's answer at
+/// version zero. This is that exemption through a real boot: the Redis
+/// store's own version-zero answer (`lineage: String::new()`, from
+/// `decode_identity` in the store crate's `directory.rs`) is what a node
+/// actually reads at an empty key, not a fixture's stand-in for it.
+///
+/// Three claims, in one deployment's lifetime:
+///
+/// 1. **The first write is accepted.** A node that read its own empty-store
+///    boot as having claimed a lineage would refuse this `apply` as a
+///    regression against a lineage nothing minted yet.
+/// 2. **The next refresh past the TTL reports no regression and serves the
+///    written version.** An ordinary refresh, not a proof of the
+///    refresh-path exemption: node one's own `apply` in claim 1 already
+///    adopted the lineage the store minted, so by the time this refresh
+///    runs, `claimed.lineage` at `Managed::compiled`'s
+///    `claimed.version != 0 && stored.lineage != claimed.lineage` site
+///    (directory.rs, near line 1080) already equals the store's lineage —
+///    the guard is never exercised at `claimed.version == 0` here, because
+///    this node's own `claimed.version` is already `1`. That branch is what
+///    `a_node_that_never_wrote_adopts_a_strangers_first_write_on_its_own_
+///    refresh` below proves: a node that boots over an empty store and never
+///    writes to it itself, refreshing past a first write another node made
+///    while this one's `claimed.version` was still `0`.
+/// 3. **A second node booted afterward over the same Redis agrees** — same
+///    version, no divergence, and, driven by a further write from the
+///    second node, no regression when the first node refreshes past it.
+///    Agreement on today's version alone would also be produced by two
+///    nodes that each minted their own lineage at an empty-store boot and
+///    happened to be looking at the same document; only a *second* round
+///    trip, refreshed without a regression, proves the two are on one
+///    lineage rather than two that coincide once.
+#[tokio::test]
+#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
+async fn a_node_booted_against_an_empty_redis_accepts_and_agrees_on_the_deployments_first_write() {
+    let namespace = fresh_namespace();
+    let t0 = now_ms();
+
+    // Node 1 boots over a Redis with no `dir` key at all: the empty
+    // directory, version zero, no lineage minted yet.
+    let first = boot(&namespace)
+        .await
+        .expect("the file alone compiles, since it is what a boot would have loaded");
+    assert_eq!(
+        first.status().served_version,
+        0,
+        "a fresh namespace's directory starts at version zero"
+    );
+
+    // Claim 1: the deployment's first admin write, against that empty store.
+    first
+        .apply(
+            DirectoryMutation::CreateProject {
+                entry: roundhouse_server::control_config::ProjectEntry {
+                    id: format!("h1-{}", uuid::Uuid::new_v4()),
+                    name: None,
+                    policy: None,
+                    budget: None,
+                    fair_use: None,
+                    validate: None,
+                    credentials: None,
+                    tiers: None,
+                },
+            },
+            t0,
+        )
+        .await
+        .expect(
+            "H1: the deployment's first write, against an empty store, must be accepted -- a \
+             refusal here means the empty-Redis lineage exemption did not hold on the write path",
+        );
+    assert_eq!(
+        first.last_regression(),
+        None,
+        "the node's own first write must never be recorded as a regression against itself"
+    );
+
+    // Claim 2: force a refresh well past the TTL. This is the write's own
+    // node re-reading the very lineage it just minted through the store,
+    // which is the shape the refresh path's version of the exemption has to
+    // survive.
+    let past_first_ttl = t0 + DEFAULT_ADMISSION_CACHE_TTL_MS + 5_000;
+    first.plane(past_first_ttl).await;
+    assert_eq!(
+        first.status().served_version,
+        1,
+        "the refresh past the TTL must still serve the version this node itself just wrote"
+    );
+    assert_eq!(
+        first.last_regression(),
+        None,
+        "H1: re-reading the store's very first lineage on a refresh must never be reported as \
+         this node going backwards"
+    );
+    assert_eq!(
+        first.status().divergence,
+        None,
+        "one node compiling its own write under its own inputs never diverges from itself"
+    );
+
+    // Claim 3: a second node boots afterward over the same Redis and agrees.
+    let second = boot(&namespace)
+        .await
+        .expect("the file plus what the store now holds");
+    assert_eq!(
+        second.status().served_version,
+        1,
+        "H1: a second node booted after the first write must see the same version, or the \
+         empty-Redis exemption let the two nodes diverge on the deployment's very first commit"
+    );
+    assert_eq!(second.last_regression(), None);
+    assert_eq!(second.status().divergence, None);
+
+    // A further write from the second node, picked up by the first node on
+    // a later refresh, must not read as a regression either -- the proof
+    // that the two nodes share one lineage rather than each having minted
+    // its own at an empty-store boot and merely agreeing on today's version
+    // by coincidence.
+    second
+        .apply(
+            DirectoryMutation::CreateProject {
+                entry: roundhouse_server::control_config::ProjectEntry {
+                    id: format!("h1-second-{}", uuid::Uuid::new_v4()),
+                    name: None,
+                    policy: None,
+                    budget: None,
+                    fair_use: None,
+                    validate: None,
+                    credentials: None,
+                    tiers: None,
+                },
+            },
+            past_first_ttl,
+        )
+        .await
+        .expect("a fresh project id from the second node");
+
+    let past_second_ttl = past_first_ttl + DEFAULT_ADMISSION_CACHE_TTL_MS + 5_000;
+    first.plane(past_second_ttl).await;
+    assert_eq!(
+        first.status().served_version,
+        2,
+        "the first node's refresh must pick up the second node's write"
+    );
+    assert_eq!(
+        first.last_regression(),
+        None,
+        "H1: the first node refreshing past the second node's write must not read it as a \
+         lineage regression -- which is what proves the two nodes agree on one lineage rather \
+         than each minting its own at an empty-store boot"
+    );
+}
+
+/// **M18, H1 correction: the empty-Redis lineage exemption, on the refresh
+/// path itself.**
+///
+/// The sibling above, `a_node_booted_against_an_empty_redis_accepts_and_
+/// agrees_on_the_deployments_first_write`, never drives `Managed::compiled`'s
+/// own exemption (`claimed.version != 0 && stored.lineage != claimed.lineage`
+/// at directory.rs, near line 1080, with the version guard skipping the
+/// lineage comparison at `claimed.version == 0`): node one there always
+/// mints the deployment's first lineage through its own `apply`, whose
+/// separate exemption (`published.version != 0` at directory.rs ~1360) is
+/// what actually fires, and by the time that test's node one ever calls
+/// `plane`, its `claimed.version` is already `1`. The refresh-path guard is
+/// left standing over an assertion that would pass exactly the same with it
+/// deleted.
+///
+/// This test drives it directly: node one boots over an empty Redis and
+/// then never writes to it at all, so its `claimed` state -- what a refresh
+/// compares the store against -- stays at version `0`, lineage `""`, from
+/// the moment it boots until the moment it refreshes. A *different* node
+/// mints the deployment's first lineage in the meantime. Node one's first
+/// refresh is therefore the only place in this file `claimed.version == 0`
+/// reaches the refresh-path check with a `stored.lineage` that is not the
+/// empty string it started with -- exactly the shape the version guard
+/// exists to wave through rather than name a regression.
+///
+/// Two claims:
+///
+/// 1. **Node one's first refresh adopts the stranger's first write.** Serves
+///    version 1, names no regression and no divergence. Without the
+///    `claimed.version != 0 &&` guard, `"" != <the store's real lineage>`
+///    would be true and this refresh would record its own adoption as a
+///    lineage regression against a lineage it never claimed in the first
+///    place.
+/// 2. **The two nodes are now on one shared lineage, not two that merely
+///    coincide.** A further write from node one, refreshed by node two,
+///    still names no regression.
+#[tokio::test]
+#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
+async fn a_node_that_never_wrote_adopts_a_strangers_first_write_on_its_own_refresh() {
+    let namespace = fresh_namespace();
+    let t0 = now_ms();
+
+    // Node 1 boots over a Redis with no `dir` key: version zero, no lineage
+    // minted. Unlike the sibling test, this node never calls `apply` before
+    // its first refresh -- its `claimed` state stays exactly what boot left
+    // it at.
+    let first = boot(&namespace)
+        .await
+        .expect("the file alone compiles, since it is what a boot would have loaded");
+    assert_eq!(
+        first.status().served_version,
+        0,
+        "a fresh namespace's directory starts at version zero"
+    );
+
+    // Node 2 boots over the very same empty Redis and performs the
+    // deployment's first admin write, through `apply`. That call exercises
+    // apply's own exemption, not the one this test is about -- it is only
+    // how the store comes to hold a first lineage at all, minted by a node
+    // that is not the one about to refresh.
+    let second = boot(&namespace)
+        .await
+        .expect("the file plus whatever node one has -- nothing -- written");
+    second
+        .apply(
+            DirectoryMutation::CreateProject {
+                entry: roundhouse_server::control_config::ProjectEntry {
+                    id: format!("h1-refresh-{}", uuid::Uuid::new_v4()),
+                    name: None,
+                    policy: None,
+                    budget: None,
+                    fair_use: None,
+                    validate: None,
+                    credentials: None,
+                    tiers: None,
+                },
+            },
+            t0,
+        )
+        .await
+        .expect("the deployment's first write, minted by node two");
+
+    // Claim 1: node one's own first refresh, past the TTL, with
+    // `claimed.version` still `0` -- the branch the sibling test never
+    // reaches.
+    let past_ttl = t0 + DEFAULT_ADMISSION_CACHE_TTL_MS + 5_000;
+    first.plane(past_ttl).await;
+    assert_eq!(
+        first.status().served_version,
+        1,
+        "H1: a node's own first refresh must adopt what the store holds, even though a \
+         different node minted the lineage it is adopting"
+    );
+    assert_eq!(
+        first.last_regression(),
+        None,
+        "H1: a node's very first refresh, reading a lineage it never claimed because it has \
+         never written or refreshed before, must not report that lineage as a regression -- \
+         this is the refresh-path half of the empty-Redis exemption, and the guard this \
+         asserts against is `claimed.version != 0 &&` at directory.rs's Managed::compiled"
+    );
+    assert_eq!(
+        first.status().divergence,
+        None,
+        "both nodes compiled the same file under the same catalog and checks, so adopting the \
+         other one's write is not a divergence"
+    );
+
+    // Claim 2: a later write from node one, refreshed by node two, still
+    // names no regression -- the two nodes share one lineage, the one node
+    // one just adopted, rather than each having minted its own and merely
+    // agreeing on today's version.
+    first
+        .apply(
+            DirectoryMutation::CreateProject {
+                entry: roundhouse_server::control_config::ProjectEntry {
+                    id: format!("h1-refresh-second-{}", uuid::Uuid::new_v4()),
+                    name: None,
+                    policy: None,
+                    budget: None,
+                    fair_use: None,
+                    validate: None,
+                    credentials: None,
+                    tiers: None,
+                },
+            },
+            past_ttl,
+        )
+        .await
+        .expect("a fresh project id from node one, now on the lineage it just adopted");
+
+    let past_second_ttl = past_ttl + DEFAULT_ADMISSION_CACHE_TTL_MS + 5_000;
+    second.plane(past_second_ttl).await;
+    assert_eq!(
+        second.status().served_version,
+        2,
+        "node two's refresh must pick up node one's write"
+    );
+    assert_eq!(
+        second.last_regression(),
+        None,
+        "H1: node two refreshing past node one's write must not read it as a lineage \
+         regression -- the two nodes agree on one lineage rather than each minting its own"
     );
 }

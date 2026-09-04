@@ -147,7 +147,36 @@
 //!   being newer, and one uniform TTL of backoff behind every kind of refresh
 //!   failure.
 //!
+//! # A cancelled write gets no give-back — the next refresh picks it up (2026-09-04, M18, H4)
+//!
+//! [`ClaimGuard`] gives the *refresh* path's single-flight token back when a
+//! claimant is dropped mid-await, because nothing there has committed
+//! anything: a claim is a promise to go and look, and a broken promise is
+//! simply undone. [`Managed::apply`] is not that shape. By the time its own
+//! `commit` call returns — the only await between it and `apply`'s publish —
+//! the store's compare-and-set has already accepted the write; a caller
+//! dropped after that point (a client disconnecting between the commit
+//! returning and the handler future finishing) leaves the store one version
+//! ahead of this node, with nobody left to run the publish that would have
+//! installed it into `current`.
+//!
+//! **The ruling is no give-back, and it could not be otherwise.** Rolling the
+//! commit back would mean lying to the store about what it just durably
+//! accepted — and by the time a caller could react to its own cancellation
+//! there is no caller left to run any compensating action at all. So the
+//! record a cancelled `apply` leaves is exactly the record any other node's
+//! write leaves: a version in the store this node has not yet loaded. The
+//! next refresh — on this node past its own TTL, or on any other node in the
+//! fleet — reads it the ordinary way, `stored.version > current.version`,
+//! same lineage, no regression, and serves it like any other write nobody
+//! local remembers making. The client that cancelled saw no success, which is
+//! correct: it does not know its write landed, only that the deployment
+//! itself has been changed. See
+//! `a_cancelled_apply_s_write_is_picked_up_by_the_next_refresh` for the
+//! property pinned against [`ScriptedDirectoryStore`]'s commit gate.
+//!
 //! [`AuthError::RevokedKey`]: super::AuthError::RevokedKey
+//! [`ScriptedDirectoryStore`]: crate::test_support::ScriptedDirectoryStore
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};

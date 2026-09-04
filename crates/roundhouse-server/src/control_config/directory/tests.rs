@@ -2395,6 +2395,108 @@ async fn apply_s_publish_does_not_clobber_a_newer_version_a_concurrent_refresh_a
     );
 }
 
+/// **M18, H4: a cancelled `apply`'s write is picked up by the next refresh.**
+///
+/// `apply` has no give-back on the write path, unlike [`ClaimGuard`] on the
+/// refresh path — see the module doc it is recorded beside. Its own `write`
+/// mutex is held across `load` and `commit`, and dropping the caller mid-await
+/// (a client disconnecting, the handler future cancelled) drops that guard
+/// too, which is fine: nothing else was waiting on it. What matters is *what
+/// the store is left holding*. `commit` mutates the store's own state before
+/// this double's gate ever blocks — see [`ScriptedDirectoryStore::commit`]'s
+/// own doc — so a caller cancelled at the gate has already landed its write;
+/// only `apply`'s own publish, the part that installs the result into
+/// `current` and clears `refused_version`, never runs. The client that
+/// cancelled saw no success, which is the point: the ruling is no give-back,
+/// because giving one back would mean the store's own compare-and-set lied
+/// about what it just accepted. What is pinned here is the other half —
+/// nothing is lost. The write sits in the store exactly as any other node's
+/// write would, and the next refresh, on this node or any other, picks it up
+/// the ordinary way: `stored.version > current.version`, same lineage, no
+/// regression.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_apply_s_write_is_picked_up_by_the_next_refresh() {
+    let store = Arc::new(ScriptedDirectoryStore::new(DirectoryRecords::default(), 1).await);
+    let directory = scripted(Arc::clone(&store)).await;
+
+    let release_commit = store.block_next_commit();
+    let applier = tokio::spawn({
+        let directory = Arc::clone(&directory);
+        async move {
+            directory
+                .apply(
+                    DirectoryMutation::CreateProject {
+                        entry: project("widgets"),
+                    },
+                    // Well inside the TTL: the point of this test is what a
+                    // *refresh* does with the orphaned write, and an `apply`
+                    // that itself crossed the TTL would let an incidental
+                    // refresh inside `apply` blur the two.
+                    GUARD_TTL_MS / 2,
+                )
+                .await
+        }
+    });
+    // `apply`'s commit has already mutated the store -- the wrapped store's
+    // own compare-and-set ran to completion before this double's gate blocks
+    // -- and is now parked before returning to `apply`, which has therefore
+    // not reached its own publish.
+    store.commit_in_flight().await;
+
+    // The disconnect: the caller is gone before `apply` ever installs its
+    // result into `current`.
+    applier.abort();
+    let outcome = applier.await;
+    assert!(
+        outcome.as_ref().is_err_and(|error| error.is_cancelled()),
+        "this test proves nothing about a cancelled apply unless the applying task was truly \
+         cancelled while suspended past its own commit, not merely finished or panicked: \
+         {outcome:?}"
+    );
+
+    // Nothing left to release into -- the task that was waiting on this gate
+    // is gone -- but doing it anyway is what a real cancellation leaves
+    // behind, and proves the store side is not left stuck waiting on a
+    // caller that no longer exists.
+    release_commit.add_permits(1);
+
+    // Still inside the TTL: nobody told this node its own write landed, so
+    // the plane it serves is still the one it booted with. This is the
+    // "client saw no success" half of the ruling -- the write is real, but
+    // this node does not yet know it.
+    assert_eq!(
+        directory.version(GUARD_TTL_MS / 2).await,
+        1,
+        "inside the TTL, with no refresh yet due, this node must not have adopted a write its \
+         own cancelled caller never published"
+    );
+
+    // Past the TTL, an ordinary refresh -- on this node, standing in for any
+    // node in the fleet -- reads the store the same way it would read a
+    // neighbour's write, and picks it up.
+    directory.plane(2 * GUARD_TTL_MS).await;
+    assert_eq!(
+        directory.version(2 * GUARD_TTL_MS).await,
+        2,
+        "H4: the next refresh past the TTL must serve the version the cancelled apply's own \
+         commit landed in the store"
+    );
+    assert_eq!(
+        directory.last_regression(),
+        None,
+        "H4: picking up this node's own orphaned write is an ordinary newer-version refresh, \
+         never a regression -- the write really did move the store forward"
+    );
+    let served = directory.view(2 * GUARD_TTL_MS).await;
+    assert!(
+        served
+            .projects
+            .iter()
+            .any(|project| project.id() == "widgets"),
+        "the refreshed plane must actually admit the project the cancelled apply committed"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // F3 (M16.0 thermo-nuclear review), R-D2′: publish-by-version reads the store's
 // version as monotone — which `DirectoryStore` now *requires* of every
@@ -3098,6 +3200,115 @@ async fn two_nodes_compiled_from_the_same_inputs_never_diverge() {
     assert_eq!(reader.status().divergence, None);
     assert_eq!(reader.status().divergences_named, 0);
     assert_eq!(reader.status().refused_version, None);
+}
+
+/// A fingerprint that declares one judge and nothing else.
+fn stamped_judge(identity: &str) -> CompiledUnder {
+    CompiledUnder {
+        judge: Some(identity.to_string()),
+        ..CompiledUnder::default()
+    }
+}
+
+/// **M18, H3: the judge is its own divergence axis.**
+///
+/// Two nodes mid-rollout on `ROUNDHOUSE_JUDGE_MODEL` alone — everything else
+/// about their fingerprint agrees. Before this, `CompiledUnder` carried no
+/// judge at all, so two nodes in exactly this shape — the one
+/// `refuse_promises_of_a_local_fallback`'s `VALIDATION_PROMISE` arm actually
+/// reads, and `CrossChecks::fingerprint`'s routing-candidate list does not —
+/// compiled two different planes (one enrols a project in the validate/steer
+/// loop, the other refuses to boot under the same file) and reported no
+/// divergence at all.
+#[tokio::test]
+async fn a_document_written_under_another_judge_is_named_once_per_version() {
+    let documents: Arc<dyn DocumentStore> = Arc::new(MemoryDocumentStore::new());
+    let writer = node(
+        Arc::clone(&documents),
+        stamped_judge("anthropic/big"),
+        checks(),
+        0,
+    )
+    .await;
+    let reader = node(
+        Arc::clone(&documents),
+        stamped_judge("anthropic/small"),
+        checks(),
+        0,
+    )
+    .await;
+
+    assert_eq!(reader.status().divergences_named, 0);
+
+    writer
+        .apply(
+            DirectoryMutation::CreateProject {
+                entry: project("one"),
+            },
+            1,
+        )
+        .await
+        .expect("a fresh project id");
+
+    reader.plane(2).await;
+    assert_eq!(
+        reader.status().divergence,
+        Some(DirectoryDivergence {
+            version: 1,
+            differs: vec![DivergentInput::Judge],
+        }),
+        "the one input these two nodes disagree about is the judge, and the check must name \
+         that axis rather than folding it silently into `fleet` or missing it altogether"
+    );
+    assert_eq!(reader.status().divergences_named, 1);
+    assert_eq!(
+        reader.status().served_version,
+        1,
+        "divergence is a fact, never a refusal, on this axis exactly as on the other three"
+    );
+
+    // The control: the writer's own documents carry the writer's own
+    // fingerprint, so the node that wrote them has nothing to report.
+    assert_eq!(writer.status().divergences_named, 0);
+    assert_eq!(writer.status().divergence, None);
+}
+
+/// CONTROL for the guard above: identical judges never diverge on this axis
+/// — the other control, and the one that would catch a comparison written
+/// the wrong way round, or a `judge` field that fingerprinted every read as
+/// different from itself.
+#[tokio::test]
+async fn two_nodes_with_the_same_judge_never_diverge_on_it() {
+    let documents: Arc<dyn DocumentStore> = Arc::new(MemoryDocumentStore::new());
+    let writer = node(
+        Arc::clone(&documents),
+        stamped_judge("anthropic/big"),
+        checks(),
+        0,
+    )
+    .await;
+    let reader = node(
+        Arc::clone(&documents),
+        stamped_judge("anthropic/big"),
+        checks(),
+        0,
+    )
+    .await;
+
+    writer
+        .apply(
+            DirectoryMutation::CreateProject {
+                entry: project("one"),
+            },
+            1,
+        )
+        .await
+        .expect("a fresh project id");
+    reader.plane(2).await;
+
+    assert_eq!(reader.status().served_version, 1);
+    assert_eq!(reader.status().divergence, None);
+    assert_eq!(reader.status().divergences_named, 0);
 }
 
 /// **A version this node cannot compile is recorded beside the one it serves,
