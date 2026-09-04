@@ -73,13 +73,43 @@ pub enum StoreFailure {
 /// `async fn` is not dyn compatible at this toolchain, and this trait exists to
 /// be held as `Arc<dyn DirectoryStore>` — one directory, whichever backing
 /// store the boot chose.
+///
+/// # The version is monotone, by contract (R-D2′)
+///
+/// **An implementation's version only ever goes up.** Every [`commit`] returns
+/// a version strictly greater than any version this store has previously
+/// returned from [`commit`] or answered from [`version`], and [`version`] never
+/// answers something lower than it answered before. A store that breaks that
+/// has *regressed* — restored from a backup, flushed, or failed over to a
+/// replica that had not caught up — and a regression is not something the
+/// callers above can prevent; it is something they have to be able to name.
+///
+/// This is stated here rather than discovered per backend because the whole
+/// refresh rung turns on it: [`ControlDirectory::plane`] publishes by comparing
+/// versions, so under a store whose numbers can go down, "newer wins" silently
+/// means "the store's current truth loses, forever". The in-memory
+/// implementation below satisfies the requirement structurally — one counter,
+/// only ever incremented — and a durable one must arrange it deliberately.
+///
+/// What the directory does when it happens anyway is not this trait's business
+/// and is described where it is decided ([`ControlDirectory::plane`]'s refresh
+/// doc): the store is the shared truth, so a regression is adopted and named,
+/// never silently discarded. The alternative was tried and is worse — a node
+/// that quietly kept its own higher version would drop its *own* admin writes
+/// while answering them `2xx`.
+///
+/// [`commit`]: DirectoryStore::commit
+/// [`version`]: DirectoryStore::version
+/// [`ControlDirectory::plane`]: super::ControlDirectory::plane
 #[async_trait]
 pub trait DirectoryStore: Send + Sync + 'static {
     /// Every admin-created record, and the version they were read at.
     async fn load(&self) -> Result<VersionedRecords, StoreFailure>;
 
     /// Replace the records, if and only if the store is still at
-    /// `expected_version`. Returns the new version.
+    /// `expected_version`. Returns the new version, which is strictly greater
+    /// than every version this store has handed out before — see the trait
+    /// doc's monotone requirement.
     async fn commit(
         &self,
         expected_version: u64,
@@ -91,6 +121,10 @@ pub trait DirectoryStore: Send + Sync + 'static {
     /// The cheap half of [`ControlDirectory::plane`]'s refresh: a node past its
     /// TTL asks this first and recompiles only if the answer moved, so a quiet
     /// deployment costs one version read per TTL rather than a compile.
+    ///
+    /// Never lower than an answer this store has already given — the trait
+    /// doc's monotone requirement, which is what lets a caller read "lower than
+    /// last time" as a regression rather than as an ordinary write.
     async fn version(&self) -> Result<u64, StoreFailure>;
 }
 

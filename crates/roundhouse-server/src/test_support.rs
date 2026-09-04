@@ -44,10 +44,24 @@
 //! *pieces* a catalog and an engine are built from, so a fixture that needs
 //! two or three priced models, or a store `tests/common` cannot name, still
 //! shares the boilerplate rather than retyping it.
+//!
+//! [`ScriptedDirectoryStore`] is the same discipline applied to a
+//! [`DirectoryStore`] double (M16.0 review, F1): before this, the directory
+//! suite (`control_config/directory/tests.rs`) and the admin HTTP suite
+//! (`tests/admin_api.rs`) each hand-rolled their own `(records, version)`
+//! store with its own copy of the compare-and-set `commit` performs — three
+//! copies, two of which never had their `commit` driven by a test at all,
+//! because every fixture that needed a store double reached for `load` and
+//! `version` alone. This wraps the real [`MemoryDirectoryStore`] instead of
+//! re-implementing it, so a fixture that scripts a stall, a count, a failure
+//! or a scripted write is still exercising the one compare-and-set this
+//! deployment actually ships.
 
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{RwLock, Semaphore};
 use tokio::task::JoinHandle;
 
 use roundhouse_core::context::ByteTokenizer;
@@ -56,6 +70,9 @@ use roundhouse_core::routing::{AffinityPolicy, CacheModel, ProviderPricing};
 use roundhouse_core::store::SessionStore;
 use roundhouse_fleet::{FrontierClient, FrontierModelSpec, StaticFrontierCatalog, WireProtocol};
 
+use crate::control_config::directory::{
+    DirectoryRecords, DirectoryStore, MemoryDirectoryStore, StoreFailure, VersionedRecords,
+};
 use crate::engine::{EchoLocalExecutor, Engine, EngineConfig};
 use roundhouse_core::ids::SessionId;
 
@@ -261,6 +278,365 @@ impl SeveredStore {
         for pipe in self.pipes.lock().unwrap().drain(..) {
             pipe.abort();
         }
+    }
+}
+
+/// A [`DirectoryStore`] double that stalls, counts, fails and scripts writes
+/// -- over a real [`MemoryDirectoryStore`], never a copy of its own.
+///
+/// # Why this wraps rather than re-implements (M16.0 review, F1)
+///
+/// `WriteBetweenReads`, `ScriptedStore` and `ArmedStore` -- one in the
+/// directory suite, two of them in the same file, one in the admin HTTP
+/// suite -- each hand-rolled the same `(records, version)` state and the
+/// same `if state.1 != expected_version { Concurrent }` guard `commit`
+/// performs. Three independent copies is already the duplication the
+/// module doc these crates share warns against; the sharper defect was
+/// that two of the three never had that guard driven by a test at all --
+/// every fixture that reached for a double wanted `load` or `version`
+/// scripted, never `commit`, so the copies existed only to be `load`ed
+/// from. A commit guard nothing calls is a guard nothing protects.
+///
+/// So this delegates `load`, `commit` and `version` to a real
+/// [`MemoryDirectoryStore`] it owns, behind a [`RwLock`] only so
+/// [`Self::set`] can swap in a fresh one -- the one operation a real store's
+/// own compare-and-set cannot express, because [`MemoryDirectoryStore`]'s
+/// version is monotone by contract and a scripted regression or an
+/// arbitrary starting version is neither. Everything else -- a stalled
+/// `load`, a stalled `commit`, a failed `version`, a write that lands on a
+/// scripted later read -- is scripted *around* that real store, so the
+/// compare-and-set every one of them eventually reaches is the one
+/// deployment ships, not a copy of it.
+pub struct ScriptedDirectoryStore {
+    inner: RwLock<MemoryDirectoryStore>,
+    /// Every [`DirectoryStore::version`] and [`DirectoryStore::load`] call.
+    /// Counted separately because the two answer different questions: one is
+    /// the cheap half of a refresh and the other is the expensive half, and
+    /// "how many callers paid anything at all" is the single-flight
+    /// property M16.0's guards pin.
+    versions: AtomicUsize,
+    loads: AtomicUsize,
+    /// When set, every [`DirectoryStore::version`] read moves the store on
+    /// one -- a stand-in for a neighbour node committing continuously, which
+    /// is what makes "did this caller refresh" observable without any
+    /// blocking at all.
+    moving: AtomicBool,
+    /// When set, `version` answers [`StoreFailure::Unavailable`].
+    version_fails: AtomicBool,
+    /// When set, `load` answers [`StoreFailure::Unavailable`].
+    load_fails: AtomicBool,
+    /// What the next scripted write installs, and how many
+    /// [`DirectoryStore::version`] calls since [`Self::arm`] it lands on --
+    /// generalises `WriteBetweenReads` (which always landed on the second
+    /// call ever) and `ArmedStore` (which landed on a call counted from
+    /// whenever the test armed it) into the one primitive: a write that
+    /// lands on the Nth `version` read since arming, however many reads that
+    /// takes.
+    pending: Mutex<Option<DirectoryRecords>>,
+    countdown: Mutex<Option<(u64, u64)>>,
+    /// Taken by the *next* `load` to arrive, which then waits on it. One
+    /// load at a time, so a test can hold one refresh open and let a later
+    /// one run to completion past it.
+    gate: Mutex<Option<Arc<Semaphore>>>,
+    /// A permit per `load` that has begun, so a test can wait for one to be
+    /// in flight instead of guessing.
+    entered: Semaphore,
+    /// Taken by the *next* `commit` to arrive, held **after** the store's
+    /// state has already been mutated and **before** the call returns to its
+    /// caller -- the only place a commit-to-publish race in the directory's
+    /// own `apply` can be driven under test control, since nothing else in
+    /// `apply` awaits between `commit` returning and its own publish.
+    commit_gate: Mutex<Option<Arc<Semaphore>>>,
+    /// A permit per `commit` that has already mutated the store and is
+    /// waiting on `commit_gate`.
+    commit_entered: Semaphore,
+}
+
+impl ScriptedDirectoryStore {
+    /// A store at `version`, holding `records` -- reached the same way a real
+    /// deployment would reach it, one real [`MemoryDirectoryStore::commit`]
+    /// at a time, so `records` is what the *last* of those commits carried
+    /// rather than a value this double invented some other way.
+    pub async fn new(records: DirectoryRecords, version: u64) -> Self {
+        Self {
+            inner: RwLock::new(Self::store_at(records, version).await),
+            versions: AtomicUsize::new(0),
+            loads: AtomicUsize::new(0),
+            moving: AtomicBool::new(false),
+            version_fails: AtomicBool::new(false),
+            load_fails: AtomicBool::new(false),
+            pending: Mutex::new(None),
+            countdown: Mutex::new(None),
+            gate: Mutex::new(None),
+            entered: Semaphore::new(0),
+            commit_gate: Mutex::new(None),
+            commit_entered: Semaphore::new(0),
+        }
+    }
+
+    /// A fresh [`MemoryDirectoryStore`], committed up to `version` -- through
+    /// its own real compare-and-set, `version` times -- with `records` landing
+    /// on the last of those commits. What a store `set`/`new` scripts to a
+    /// version below zero commits (an empty, version-0 store) or above it
+    /// looks like from a store that has genuinely been written to that many
+    /// times, including a "version" lower than whatever this double answered
+    /// before -- the regression topology M16.0's F3 guards need, and something
+    /// no sequence of calls against a real store's own monotone `commit` could
+    /// produce, which is exactly why this reaches for a fresh one rather than
+    /// asking the current one to go backwards.
+    async fn store_at(records: DirectoryRecords, version: u64) -> MemoryDirectoryStore {
+        let store = MemoryDirectoryStore::new();
+        for at in 0..version {
+            let payload = if at + 1 == version {
+                records.clone()
+            } else {
+                DirectoryRecords::default()
+            };
+            store
+                .commit(at, payload)
+                .await
+                .expect("a fresh store's own commits against its own versions never conflict");
+        }
+        store
+    }
+
+    /// Replace the records and version outright -- what a neighbour node's
+    /// write, or a restored backup, looks like from this store's side. See
+    /// [`Self::store_at`] for why this is a fresh store rather than a further
+    /// commit against the one already there.
+    pub async fn set(&self, records: DirectoryRecords, version: u64) {
+        *self.inner.write().await = Self::store_at(records, version).await;
+    }
+
+    /// Bump the wrapped store by exactly one real commit, landing `records` --
+    /// the mechanics `keep_moving` and a scripted [`Self::arm`] landing both
+    /// reduce to: a write that advances the version this store already has by
+    /// one, through its own compare-and-set, never around it.
+    async fn bump_with(&self, records: DirectoryRecords) {
+        let inner = self.inner.read().await;
+        if let Ok(current) = inner.load().await {
+            let _ = inner.commit(current.version, records).await;
+        }
+    }
+
+    /// Forget the store traffic the boot itself made.
+    ///
+    /// [`crate::control_config::ControlDirectory::new`] loads once to compile
+    /// what it starts serving, and every count a guard asserts on is about
+    /// what a *refresh* costs -- so the boot's read is subtracted here rather
+    /// than added to each guard's expected number, where it would read as an
+    /// unexplained off-by-one.
+    pub fn forget_boot(&self) {
+        self.versions.store(0, Ordering::SeqCst);
+        self.loads.store(0, Ordering::SeqCst);
+        while let Ok(stale) = self.entered.try_acquire() {
+            stale.forget();
+        }
+    }
+
+    pub fn versions(&self) -> usize {
+        self.versions.load(Ordering::SeqCst)
+    }
+
+    pub fn loads(&self) -> usize {
+        self.loads.load(Ordering::SeqCst)
+    }
+
+    /// A neighbour that never stops writing.
+    pub fn keep_moving(&self) {
+        self.moving.store(true, Ordering::SeqCst);
+    }
+
+    pub fn fail_versions(&self) {
+        self.version_fails.store(true, Ordering::SeqCst);
+    }
+
+    pub fn fail_loads(&self) {
+        self.load_fails.store(true, Ordering::SeqCst);
+    }
+
+    /// Stage `records` to land on the `land_at`-th [`DirectoryStore::version`]
+    /// call from this point on, replacing whatever this store already holds
+    /// the moment it lands. `WriteBetweenReads`'s shape is `arm` called once,
+    /// immediately after construction, with `land_at` fixed at `2`; `ArmedStore`'s
+    /// is `arm` called whenever a test is ready, with `land_at` chosen against
+    /// [`Self::reads_since_armed`] rather than a count from construction.
+    pub fn arm(&self, records: DirectoryRecords, land_at: u64) {
+        *self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(records);
+        *self
+            .countdown
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some((0, land_at));
+    }
+
+    /// How many [`DirectoryStore::version`] calls have landed since the last
+    /// [`Self::arm`], `0` if never armed.
+    pub fn reads_since_armed(&self) -> u64 {
+        self.countdown
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .map(|(count, _)| count)
+            .unwrap_or(0)
+    }
+
+    /// Hold the next `load` open. The returned handle releases it.
+    ///
+    /// Drains the in-flight signal first, because construction already read
+    /// the store once: a test that waited on a permit left over from
+    /// construction would be told a refresh was in flight before one had
+    /// started, and would then race the very caller it means to observe.
+    pub fn block_next_load(&self) -> Arc<Semaphore> {
+        while let Ok(stale) = self.entered.try_acquire() {
+            stale.forget();
+        }
+        let gate = Arc::new(Semaphore::new(0));
+        *self.gate.lock().unwrap_or_else(|error| error.into_inner()) = Some(Arc::clone(&gate));
+        gate
+    }
+
+    /// Returns once a `load` has begun. The signal, never a sleep.
+    pub async fn load_in_flight(&self) {
+        self.entered
+            .acquire()
+            .await
+            .expect("the store outlives the loads it counts")
+            .forget();
+    }
+
+    /// Hold the next `commit` open, *after* it has mutated the store's
+    /// state. The returned handle releases it.
+    pub fn block_next_commit(&self) -> Arc<Semaphore> {
+        while let Ok(stale) = self.commit_entered.try_acquire() {
+            stale.forget();
+        }
+        let gate = Arc::new(Semaphore::new(0));
+        *self
+            .commit_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(Arc::clone(&gate));
+        gate
+    }
+
+    /// Returns once a `commit` has already mutated the store and is waiting
+    /// on the gate [`Self::block_next_commit`] armed. The signal, never a
+    /// sleep.
+    pub async fn commit_in_flight(&self) {
+        self.commit_entered
+            .acquire()
+            .await
+            .expect("the store outlives the commits it gates")
+            .forget();
+    }
+}
+
+#[async_trait::async_trait]
+impl DirectoryStore for ScriptedDirectoryStore {
+    async fn load(&self) -> Result<VersionedRecords, StoreFailure> {
+        self.loads.fetch_add(1, Ordering::SeqCst);
+        if self.load_fails.load(Ordering::SeqCst) {
+            return Err(StoreFailure::Unavailable(
+                "the scripted store is refusing load reads".into(),
+            ));
+        }
+        let gate = self
+            .gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        // Read before the gate, never after. A load held open is a request
+        // already in flight, and what comes back is what the wrapped store
+        // held when it was made -- not what a commit that landed while it was
+        // open changed it to. Reading after the gate would make every blocked
+        // load answer with the newest records, which is the one thing the
+        // out-of-order publish guard needs it not to do.
+        let answer = {
+            let inner = self.inner.read().await;
+            inner.load().await?
+        };
+        self.entered.add_permits(1);
+        if let Some(gate) = gate {
+            gate.acquire()
+                .await
+                .expect("the gate outlives the load waiting on it")
+                .forget();
+        }
+        Ok(answer)
+    }
+
+    async fn commit(
+        &self,
+        expected_version: u64,
+        records: DirectoryRecords,
+    ) -> Result<u64, StoreFailure> {
+        // The wrapped store's own compare-and-set decides Concurrent-or-not
+        // and, on success, is already mutated by the time this returns -- so
+        // a caller that reads the store from here on (a concurrent refresh's
+        // `version`/`load`) sees this commit's own result, not a stale one.
+        // That is what makes the gate below able to hold a *successful*
+        // commit open long enough for another writer to publish past it
+        // first, the seam the directory's own commit-to-publish race needs.
+        let new_version = {
+            let inner = self.inner.read().await;
+            inner.commit(expected_version, records).await?
+        };
+        let gate = self
+            .commit_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        self.commit_entered.add_permits(1);
+        if let Some(gate) = gate {
+            gate.acquire()
+                .await
+                .expect("the gate outlives the commit waiting on it")
+                .forget();
+        }
+        Ok(new_version)
+    }
+
+    async fn version(&self) -> Result<u64, StoreFailure> {
+        self.versions.fetch_add(1, Ordering::SeqCst);
+        if self.version_fails.load(Ordering::SeqCst) {
+            return Err(StoreFailure::Unavailable(
+                "the scripted store is refusing version reads".into(),
+            ));
+        }
+        let landing = {
+            let mut countdown = self
+                .countdown
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            match countdown.as_mut() {
+                Some((count, land_at)) => {
+                    *count += 1;
+                    if *count == *land_at {
+                        self.pending
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .take()
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            }
+        };
+        match landing {
+            Some(records) => self.bump_with(records).await,
+            None if self.moving.load(Ordering::SeqCst) => {
+                let current = {
+                    let inner = self.inner.read().await;
+                    inner.load().await?
+                };
+                self.bump_with(current.records).await;
+            }
+            None => {}
+        }
+        let inner = self.inner.read().await;
+        inner.version().await
     }
 }
 

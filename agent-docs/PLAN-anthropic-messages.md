@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Plan: the Anthropic Messages surface, the seat, and the launcher (M11)
 
-> **Status: shipped through M15; D2 ruled; M16.0 in flight (2026-09-03).** The rulings in §3 stand
+> **Status: shipped through M16.0; D2 ruled (2026-09-04).** The rulings in §3 stand
 > as written; where an implementation round moved one, the dated addenda at
 > the end of this document record the move and its reason, and win over §3
 > for the current tree. Direction set by the product owner on
@@ -2273,3 +2273,75 @@ still true; no Redis, no serde, no boot re-order — those are M16.1's.
   the feature-gated real-binary suites compile; the doc-warning count did
   not move. Nothing in this rung touches Redis, serde or the boot order:
   those are M16.1's.
+
+### What the review round changed (2026-09-04, M16.0)
+
+The M16.0 thermo-nuclear review (five findings after triage from eight,
+four valid and one partially valid; rulings in the commit message) ran two
+reviewers — one on lock spans and races, one on the async port as a
+change to the crate's surface — primed with the rung's own eight
+mutations, and moved three things the rulings above state differently:
+
+- **R-D2′ — the store's version is monotone by contract, and a regression
+  is adopted and named, never silently discarded.** Publish-by-version
+  assumed a version that only rises, which the trait never said (F3).
+  Under the memory store that holds within a process; under M16.1's Redis
+  store a restore from backup, a flush or a lagging failover makes it
+  false — and then every refresh loaded, compiled and discarded the
+  store's state forever with no line in the log, while a node's own
+  `apply` returned success and dropped its own write, so a key an
+  operator revoked stayed live until restart. `DirectoryStore::commit`
+  and `version` now state the monotone requirement, so M16.1's store
+  inherits it. In the refresh, a `version()` below the claimed version is
+  a regression: recorded as a typed reason naming both versions, warned
+  once inside the single-flight claim, and the store's state adopted if
+  nobody published meanwhile — the store is the shared truth, and a node
+  that diverges from it silently is the worse failure — while a late
+  older refresh is discarded exactly as R-D2 said. In `apply` the
+  orchestrator's ruling was unsound as written: "a load below the
+  published version" also describes a write overtaken by a concurrent
+  refresh of another node's newer commit, the very case guard 5 pins, and
+  the committed version alone cannot tell the two apart because what
+  separates them is whether the version this node serves is one the store
+  still holds. So on the rare branch where its commit is not newer than
+  what it publishes, `apply` asks the store once: a store at or beyond
+  the served version means the write was overtaken and the newer plane
+  stays; a store below it means the served version is a phantom, so the
+  commit is published and the regression recorded. A failed probe there
+  is warned and left to the next refresh.
+- **Cancellation gives the single-flight token back** (F4). The claim
+  stamp was written before two awaits with nothing to undo it if the
+  claiming future was dropped — a client disconnecting mid-load left a
+  claim no task held, nothing refreshing until the next TTL, and no
+  warning. Unreachable under the memory store, whose futures resolve on
+  first poll; reachable under any store whose load genuinely awaits,
+  which is the store the next rung lands. A guard armed at the stamp
+  restores the previous value if the future is dropped before publish,
+  and only if the stamp is still the one it wrote; every failure return
+  disarms it first, so R-D3's backoff stands: cancellation is not a
+  failure and does not spend the slot. The compile is CPU, so the live
+  drop points are exactly the two store awaits.
+- **One scripted store double wraps the production store** (F1,
+  partially valid: three of three test-double commits were dead, not two
+  of three). Four hand-rolled copies of the memory store's records-and-
+  version core existed and no test drove a stale version through any of
+  them, so the production compare-and-set was pinned by one test and
+  copied by three that pinned nothing. The one double in test support
+  delegates to the production store and carries every knob the three had
+  between them — gated loads and commits, counted reads, failures on
+  demand, a write landed between two reads, a version set for the
+  regression topologies — so every fixture exercises the real
+  compare-and-set, and a stale commit through the double is refused by
+  production code. It is the double that wraps the document-backed
+  adapter next rung.
+- **Two guards the refuters landed live**: a confirmed-unchanged version
+  still stamps the TTL (F2 — the quiet-node path, one cheap version read
+  per TTL, was pinned by no test), and the field doc of the stamp now
+  says what it is since M16.0 (F5): the claim, kept on failure, given
+  back on cancellation.
+
+Left open by name, for M16.1: an `apply` dropped between its commit and
+its publish loses the publish (the commit is in the store, and the next
+refresh picks it up); the claim guard covers the refresh only, and a
+give-back on the write path needs the tokio mutex's span reasoned about
+beside the durable store.

@@ -275,16 +275,45 @@ impl ConfigIdentities {
 // The directory
 // ---------------------------------------------------------------------------
 
+/// A store that answered a version below one this node had already seen.
+///
+/// Typed rather than a log line alone because it is a *fact about the
+/// deployment* — the store was restored from a backup, flushed, or failed over
+/// to a lagging replica — and the operator asking "why did my node go
+/// backwards" needs to be able to read the answer off the node rather than
+/// find it in a log that has rotated. See [`DirectoryStore`]'s monotone
+/// requirement for what makes this an anomaly rather than an ordinary write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirectoryRegression {
+    /// The version this node had already compiled.
+    pub from: u64,
+    /// The lower version the store answered.
+    pub to: u64,
+}
+
 /// One node's compiled answer, and what it was compiled from.
 struct Compiled {
     version: u64,
     records: Arc<DirectoryRecords>,
     plane: Arc<ControlPlane>,
-    /// When this node last confirmed its snapshot against the store — not when
-    /// it last recompiled. A confirmed-unchanged snapshot is as fresh as a
-    /// rebuilt one, and treating it otherwise would recompile a quiet
-    /// deployment once per TTL forever.
+    /// **The single-flight claim stamp**, and not a confirmation receipt: it is
+    /// written when a refresh is *claimed* — in [`Managed::compiled`]'s second
+    /// window, before the store has been asked anything — and by
+    /// [`Managed::apply`] when it publishes its own write.
+    ///
+    /// So it moves on all four endings of a refresh, deliberately: a load and
+    /// publish, a confirmed-unchanged version (a snapshot confirmed unchanged
+    /// is as fresh as a rebuilt one, and treating it otherwise would recompile
+    /// a quiet deployment once per TTL forever), *and* a failure — which is
+    /// R-D3's uniform one-TTL backoff, not an oversight. The one ending that
+    /// gives it back is cancellation: a claimant dropped mid-await restores
+    /// what it overwrote, because nothing refreshed and nothing failed. See
+    /// [`Managed::compiled`] for the three windows and [`ClaimGuard`] for the
+    /// give-back.
     refreshed_at_ms: u64,
+    /// The last time this node saw the store's version go *down*, if it ever
+    /// has. Observability only — the regression is adopted either way.
+    last_regression: Option<DirectoryRegression>,
 }
 
 /// The file, the API's records, and the compiled plane the two produce.
@@ -526,6 +555,24 @@ impl ControlDirectory {
         }
     }
 
+    /// The last time this node saw its store answer a version lower than one it
+    /// had already compiled, if it ever has.
+    ///
+    /// Observability, and the seam the regression guards read — the same reason
+    /// [`Self::version`] is public. A store is required never to do this (see
+    /// [`DirectoryStore`]), the directory adopts what the store holds when it
+    /// happens anyway, and this is where an operator can see that it did rather
+    /// than having to still have the log line. Never refreshes: it reports what
+    /// this node has already observed, and a call that went to the store to
+    /// answer it could itself observe one, which is a surprising thing for a
+    /// read of a past event to do.
+    pub fn last_regression(&self) -> Option<DirectoryRegression> {
+        match &self.backing {
+            Backing::Fixed(_) => None,
+            Backing::Managed(managed) => managed.last_regression(),
+        }
+    }
+
     /// The writable half, or the refusal that says there is none.
     ///
     /// **Defence in depth rather than a path.** The admin router refuses
@@ -568,6 +615,7 @@ impl Managed {
                 records: Arc::new(loaded.records),
                 plane,
                 refreshed_at_ms: now_ms,
+                last_regression: None,
             }),
             write: tokio::sync::Mutex::new(()),
         })
@@ -630,6 +678,38 @@ impl Managed {
     /// than one that arrives a TTL late. Newer wins, whoever got back first.
     /// [`Self::apply`] publishes under the same rule.
     ///
+    /// **Unless the store itself went backwards** (R-D2′). "Newer wins" reads
+    /// the version as monotone, which is what [`DirectoryStore`] now requires
+    /// of every implementation — and a store that breaks it has regressed
+    /// (restored from a backup, flushed, failed over to a replica that had not
+    /// caught up), which is a different event from a late refresh and is told
+    /// apart from one here: a late refresh finds the store *ahead* of the
+    /// version it claimed, a regression finds it *behind*. A regression is
+    /// adopted and named — a [`DirectoryRegression`] on the published
+    /// [`Compiled`] and one warning — rather than discarded, because the store
+    /// is the shared truth and a node that quietly kept its own higher version
+    /// would reload and throw away that same state every TTL forever, and would
+    /// drop its own admin writes through [`Self::apply`] while answering them
+    /// `2xx`. The adoption is still guarded, just on a different question: only
+    /// if nobody published while this refresh was out (`current.version` is
+    /// still the version this claim read), so two refreshes that both saw the
+    /// regression do not fight. [`Self::apply`] adopts a regression too, and
+    /// has to *recognise* one differently — it has just written to the store,
+    /// so its own commit is not evidence about where the store stands; see
+    /// there.
+    ///
+    /// **A claim given up mid-flight is not a claim.** The stamp is written
+    /// before the two awaits, so a caller dropped at either — a client
+    /// disconnecting takes the handler future, and the future carrying this
+    /// call with it — would otherwise leave a token no task holds, and every
+    /// caller for the rest of the TTL would be served the stale plane by a
+    /// refresh that is not happening. [`ClaimGuard`] restores the stamp on
+    /// drop, so the next caller past the TTL claims again. Cancellation is not
+    /// a failure and does not spend the backoff: every *failure* return below
+    /// disarms the guard first, and so does every success. The compile between
+    /// the awaits is CPU and cannot be cancelled, so the guard's live drop
+    /// points are exactly the two store calls.
+    ///
     /// **A refresh that fails keeps serving the last good plane**, and says so
     /// in the log. The alternative is a node that stops authenticating anything
     /// because the store blinked or because a variable moved out of the
@@ -663,14 +743,19 @@ impl Managed {
         // The re-ask guards a scheduling gap no scripted clock can reach (two
         // callers both past window one before either stamps), so no test
         // drives it: deleting it leaves the suite green and the race open.
-        let claimed_version = {
+        let (previous_ms, claimed_version) = {
             let mut current = self.write_current();
             if now_ms.saturating_sub(current.refreshed_at_ms) < self.ttl_ms {
                 return taken(&current);
             }
+            let previous_ms = current.refreshed_at_ms;
             current.refreshed_at_ms = now_ms;
-            current.version
+            (previous_ms, current.version)
         };
+        // Armed here rather than inside the block above only because there is
+        // no await between the two: the stamp and the guard over it are one
+        // step as far as any cancellation is concerned.
+        let claim = ClaimGuard::new(self, previous_ms, now_ms);
         // From here to window three no guard is held, which is the whole point:
         // both of the calls below may be round trips, and the compile between
         // them is the CPU cost this used to make every concurrent admission
@@ -678,6 +763,7 @@ impl Managed {
         let version = match self.store.version().await {
             Ok(version) => version,
             Err(error) => {
+                claim.disarm();
                 tracing::warn!(
                     %error,
                     "the control directory could not be re-read; serving the last compiled \
@@ -687,11 +773,32 @@ impl Managed {
             }
         };
         if version == claimed_version {
+            claim.disarm();
             return taken(&self.read_current());
+        }
+        // Below the version this claim read is a store that has gone backwards,
+        // not a neighbour that has written: see the doc above, and
+        // `DirectoryStore`'s monotone requirement. Named once here — inside the
+        // single-flight claim, so once per TTL — rather than at the publish, so
+        // that a regression is still reported if the load or the compile that
+        // follows it fails.
+        let regression = (version < claimed_version).then_some(DirectoryRegression {
+            from: claimed_version,
+            to: version,
+        });
+        if let Some(regression) = regression {
+            tracing::warn!(
+                from = regression.from,
+                to = regression.to,
+                "the control directory's store answered a lower version than this node had \
+                 already compiled, which a store is required never to do; adopting what the \
+                 store holds, because it is what every other node will resolve against"
+            );
         }
         let loaded = match self.store.load().await {
             Ok(loaded) => loaded,
             Err(error) => {
+                claim.disarm();
                 tracing::warn!(
                     %error,
                     "the control directory's version moved but its records could not be read; \
@@ -703,6 +810,7 @@ impl Managed {
         let plane = match self.compile(&loaded.records) {
             Ok(plane) => plane,
             Err(error) => {
+                claim.disarm();
                 tracing::warn!(
                     %error,
                     "the control directory changed but the new state does not compile on this \
@@ -711,16 +819,35 @@ impl Managed {
                 return taken(&self.read_current());
             }
         };
-        // Window three. `>` and not `!=`: a refresh that finished late with
-        // older records must leave the newer plane where it is, and hand its
-        // own caller the newer one too.
+        // Window three. Nothing below awaits, so the claim is honoured however
+        // the publish goes.
+        claim.disarm();
         let mut current = self.write_current();
-        if loaded.version > current.version {
+        // Two different questions, because the two events are different. With
+        // no regression: `>` and not `!=`, so a refresh that finished late with
+        // older records leaves the newer plane where it is, and hands its own
+        // caller the newer one too. With one: the store is behind this node by
+        // definition, so version order cannot decide — what decides is whether
+        // anybody published while this refresh was out.
+        let adopt = match regression {
+            Some(_) => current.version == claimed_version,
+            None => loaded.version > current.version,
+        };
+        if adopt {
             current.version = loaded.version;
             current.records = Arc::new(loaded.records);
             current.plane = plane;
+            if regression.is_some() {
+                current.last_regression = regression;
+            }
         }
         taken(&current)
+    }
+
+    /// The last store regression this node saw, if any. See
+    /// [`ControlDirectory::last_regression`].
+    fn last_regression(&self) -> Option<DirectoryRegression> {
+        self.read_current().last_regression
     }
 
     /// The plane alone, for the surfaces that only authenticate. See
@@ -869,16 +996,74 @@ impl Managed {
         // must not be the one that decides. The commit above is what makes
         // this write the newer of the pair — a store that had moved under it
         // would have answered `Concurrent` rather than a version.
+        //
+        // Unless the store went backwards under this node (R-D2′), where that
+        // rule would drop this node's *own* successful commit and answer the
+        // operator `2xx` for a revocation that keeps authenticating until the
+        // process restarts. That case has to be told apart from the ordinary
+        // race above, and it cannot be told apart locally: both look like "the
+        // version I am about to publish is not newer than the one I serve".
+        // What distinguishes them is whether the version this node serves is
+        // one the *store* still has, and the store is the only thing that
+        // knows — so on that branch alone, and never on the common one, it is
+        // asked. `version()` is the cheap half of a refresh and this is
+        // precisely the question it exists to answer.
+        let published = self.read_current().version;
+        let regression = if version > published {
+            None
+        } else {
+            match self.store.version().await {
+                // The store is at or beyond what this node serves, so this
+                // write was simply overtaken — another node committed on top of
+                // it while this call was still in `commit`. Leave the newer one.
+                Ok(store_version) if store_version >= published => None,
+                Ok(_) => Some(DirectoryRegression {
+                    from: published,
+                    // What the store answered *this* write, which is the moment
+                    // it went backwards; the probe above only confirms that the
+                    // version this node serves is gone for good.
+                    to: loaded.version,
+                }),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "a change was committed to the control directory but this node could \
+                         not tell whether the version it serves is still the store's, so it \
+                         kept serving it; the change is in the store and the next refresh that \
+                         succeeds will publish it"
+                    );
+                    None
+                }
+            }
+        };
         {
             let mut current = self.write_current();
-            if version > current.version {
+            // Re-read rather than trust `published`: the probe above awaits, and
+            // a refresh may have published across it — in which case its answer
+            // was about a version this node no longer serves.
+            let adopt = match regression {
+                Some(_) => current.version == published,
+                None => version > current.version,
+            };
+            if adopt {
+                let last_regression = regression.or(current.last_regression);
                 *current = Compiled {
                     version,
                     records: Arc::clone(&records),
                     plane,
                     refreshed_at_ms: now_ms,
+                    last_regression,
                 };
             }
+        }
+        if let Some(regression) = regression {
+            tracing::warn!(
+                from = regression.from,
+                to = regression.to,
+                "the control directory's store answered a lower version than this node had \
+                 already compiled, which a store is required never to do; this node's own \
+                 change was committed against the store's version and is published from it"
+            );
         }
         Ok(records)
     }
@@ -1338,6 +1523,68 @@ impl Managed {
         self.current
             .write()
             .unwrap_or_else(|error| error.into_inner())
+    }
+}
+
+/// The single-flight claim, held for exactly as long as somebody is refreshing.
+///
+/// [`Managed::compiled`] stamps `refreshed_at_ms` before it talks to the store,
+/// and that stamp is what tells every other caller "a refresh is happening,
+/// serve what we have". The stamp is therefore a promise that something is
+/// still running — and a future dropped at one of the two awaits between the
+/// stamp and the publish breaks it silently: no failure, so no warning, and
+/// every caller for the rest of the TTL is served a stale plane by a refresh
+/// that no longer exists. Under a durable store the requests most likely to be
+/// dropped are the slow ones, which are precisely the ones parked in the store,
+/// so the loss compounds exactly when it hurts.
+///
+/// So the claim is given back when it is not being honoured. Every ending that
+/// *is* an answer — a publish, a confirmed-unchanged version, or any of the
+/// three failures, whose one-TTL backoff is R-D3 and is deliberate — disarms
+/// this guard first; what is left for `Drop` is cancellation alone.
+///
+/// **The restore is conditional on the stamp still being this claim's.** A
+/// newer claim, or [`Managed::apply`]'s own publish, may have stamped in the
+/// meantime, and handing back a stamp somebody else is standing behind would
+/// cost them their single flight. The one case the comparison cannot tell apart
+/// is a later stamp of the *same* millisecond, which costs an extra refresh and
+/// never a missed one — the direction this whole guard exists to fail in.
+struct ClaimGuard<'a> {
+    managed: &'a Managed,
+    /// What `refreshed_at_ms` held before this claim overwrote it, so a
+    /// give-back leaves the previous claimant's backoff exactly where it was.
+    previous_ms: u64,
+    /// What this claim wrote, so the give-back can tell "still mine" from
+    /// "somebody else's now".
+    claimed_ms: u64,
+    armed: bool,
+}
+
+impl<'a> ClaimGuard<'a> {
+    fn new(managed: &'a Managed, previous_ms: u64, claimed_ms: u64) -> Self {
+        Self {
+            managed,
+            previous_ms,
+            claimed_ms,
+            armed: true,
+        }
+    }
+
+    /// This claim was honoured — kept whatever the answer was.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ClaimGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut current = self.managed.write_current();
+        if current.refreshed_at_ms == self.claimed_ms {
+            current.refreshed_at_ms = self.previous_ms;
+        }
     }
 }
 

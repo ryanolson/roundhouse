@@ -10,7 +10,7 @@
 //! busy machine and passes on a quiet one.
 
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use roundhouse_core::control::{Allocation, BudgetWindow, Principal};
 use roundhouse_core::routing::{Candidate, Target};
@@ -20,6 +20,7 @@ use super::super::config::{ControlPlaneConfig, PolicyConfig, ProjectEntry, UserE
 use super::super::fixtures::{ADMIN_HASH, TURN_HASH, TURN_SECRET, bearer_headers, sample_config};
 use super::super::{AuthError, KeyScope, has_valid_key_shape};
 use super::*;
+use crate::test_support::ScriptedDirectoryStore;
 
 /// The one thing this deployment can route to.
 ///
@@ -1631,88 +1632,16 @@ async fn the_view_lists_both_halves_and_marks_which_is_which() {
 // One snapshot, or two versions (R2)
 // ---------------------------------------------------------------------------
 
-/// A store that lets another node's write land *between* two reads.
+/// The store double this section scripts a write between two reads with is
+/// [`ScriptedDirectoryStore`] (M16.0 review, F1): `arm(after, 2)` right after
+/// construction lands `after` on the second [`DirectoryStore::version`] call
+/// ever, which is what a directory past its TTL asks first on every refresh,
+/// whether or not it goes on to load -- the injection point that makes "how
+/// many times did this call refresh" observable and the other node's write
+/// timeable exactly. A caller that refreshes once per snapshot therefore never
+/// sees the second answer at all; one that refreshes twice sees both, and that
+/// is exactly the pair-from-two-versions R2 names.
 ///
-/// The defect R2 names needs a write to arrive after a directory has read its
-/// plane and before it reads its records. Arranging that with a second thread
-/// would be a test that passes on a busy machine and fails on a quiet one, so it
-/// is arranged here instead: a directory past its TTL reaches for its store once
-/// per refresh, which makes "how many times did this call refresh" observable,
-/// and makes the store the one place the other node's write can be timed
-/// exactly. The first read answers the version this was built with; the second
-/// hands over the records the other node wrote, one version on.
-///
-/// [`DirectoryStore::version`] is the injection point because every refresh asks
-/// it first, whether or not it goes on to load. A caller that refreshes once per
-/// snapshot therefore never sees the second answer at all; one that refreshes
-/// twice sees both, and that is exactly the pair-from-two-versions this is here
-/// to catch.
-struct WriteBetweenReads {
-    state: Mutex<(DirectoryRecords, u64)>,
-    /// What the other node wrote, handed over on the second read.
-    pending: Mutex<Option<DirectoryRecords>>,
-    reads: Mutex<u64>,
-}
-
-impl WriteBetweenReads {
-    fn new(before: DirectoryRecords, after: DirectoryRecords) -> Self {
-        Self {
-            state: Mutex::new((before, 1)),
-            pending: Mutex::new(Some(after)),
-            reads: Mutex::new(0),
-        }
-    }
-
-    fn locked(&self) -> std::sync::MutexGuard<'_, (DirectoryRecords, u64)> {
-        self.state.lock().unwrap_or_else(|error| error.into_inner())
-    }
-}
-
-#[async_trait::async_trait]
-impl DirectoryStore for WriteBetweenReads {
-    async fn load(&self) -> Result<VersionedRecords, StoreFailure> {
-        let state = self.locked();
-        Ok(VersionedRecords {
-            records: state.0.clone(),
-            version: state.1,
-        })
-    }
-
-    async fn commit(
-        &self,
-        expected_version: u64,
-        records: DirectoryRecords,
-    ) -> Result<u64, StoreFailure> {
-        let mut state = self.locked();
-        if state.1 != expected_version {
-            return Err(StoreFailure::Concurrent {
-                expected: expected_version,
-                found: state.1,
-            });
-        }
-        state.0 = records;
-        state.1 += 1;
-        Ok(state.1)
-    }
-
-    async fn version(&self) -> Result<u64, StoreFailure> {
-        let mut reads = self.reads.lock().unwrap_or_else(|error| error.into_inner());
-        *reads += 1;
-        if *reads == 2
-            && let Some(after) = self
-                .pending
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .take()
-        {
-            let mut state = self.locked();
-            state.0 = after;
-            state.1 += 1;
-        }
-        Ok(self.locked().1)
-    }
-}
-
 /// The records `widgets`/`bo` stand at before and after their turn key is
 /// minted.
 ///
@@ -1802,18 +1731,25 @@ fn assert_coherent(plane: &ControlPlane, view: &DirectoryView, when: &str) {
 /// than a comment saying to be careful.
 ///
 /// Reproduced at the seam the two reads share rather than over HTTP, and with
-/// the other node's write timed by the store — see [`WriteBetweenReads`] — so
-/// that the failure is deterministic instead of a race the test hopes to lose.
+/// the other node's write timed by the store — see the doc above — so that
+/// the failure is deterministic instead of a race the test hopes to lose.
 #[tokio::test]
 async fn budget_view_s_plane_and_view_must_describe_the_same_version() {
     let (before, after) = staged_mint().await;
-    let store = Arc::new(WriteBetweenReads::new(before, after));
+    let store = Arc::new(ScriptedDirectoryStore::new(before, 1).await);
+    store.arm(after, 2);
     // TTL zero, because a directory inside its TTL never reaches for the store
     // at all: with a live cache both reads answer from the same `Compiled` by
     // luck rather than by design, and this test would pass on the defect.
-    let directory = ControlDirectory::new(file_with_ttl(0), PATH, store, checks(), 0)
-        .await
-        .expect("the file alone compiles, since it is what a boot would have loaded");
+    let directory = ControlDirectory::new(
+        file_with_ttl(0),
+        PATH,
+        store as Arc<dyn DirectoryStore>,
+        checks(),
+        0,
+    )
+    .await
+    .expect("the file alone compiles, since it is what a boot would have loaded");
 
     // The other node's write lands during this call if — and only if — it
     // refreshes twice. One refresh, and this snapshot is coherently the older
@@ -1965,16 +1901,15 @@ async fn a_membership_naming_nothing_is_refused_before_anything_compiles() {
 // M16.0 — the refresh runs outside every lock (R-D2, R-D3)
 // ---------------------------------------------------------------------------
 
-/// A store a test can stall, count, move and break.
-///
-/// One double for all four guards below rather than four, extending
-/// [`WriteBetweenReads`]'s pattern rather than inventing a second: what changed
-/// with M16.0 is that a refresh is now a pair of *awaits*, so the question a
-/// double has to be able to answer moved from "how many reads did this call
-/// make" to "what was another caller allowed to do while one read was in
-/// flight". [`WriteBetweenReads`] scripts a write between two reads and is
-/// exactly right for the coherence property it was written for; it has no way
-/// to hold a read open, which is the whole subject here.
+/// The store double every guard below stalls, counts, moves and breaks is
+/// [`ScriptedDirectoryStore`] (M16.0 review, F1) -- one wrapper over a real
+/// `MemoryDirectoryStore` shared with the coherence guard above, rather than
+/// a second hand-rolled copy of the same `(records, version)` state and its
+/// compare-and-set: what changed with M16.0 is that a refresh is now a pair
+/// of *awaits*, so the question a double has to be able to answer moved from
+/// "how many reads did this call make" to "what was another caller allowed to
+/// do while one read was in flight" -- [`ScriptedDirectoryStore::block_next_load`]
+/// and [`ScriptedDirectoryStore::block_next_commit`] are what answer it.
 ///
 /// Nothing sleeps to order anything: a blocked `load` announces itself on a
 /// semaphore and is released on another, so the interleavings below are decided
@@ -1982,232 +1917,61 @@ async fn a_membership_naming_nothing_is_refused_before_anything_compiles() {
 /// [`tokio::time::timeout`], and it is a *bound* on a stall rather than an
 /// ordering device — a test that stalls fails in a second instead of hanging
 /// the suite, which is what this repo's bounded-run rule wants of a lock test.
-struct ScriptedStore {
-    state: Mutex<(DirectoryRecords, u64)>,
-    /// Every [`DirectoryStore::version`] and [`DirectoryStore::load`] call.
-    /// Counted separately because the two answer different questions: one is
-    /// the cheap half of a refresh and the other is the expensive half, and
-    /// "how many callers paid anything at all" is the single-flight property.
-    versions: std::sync::atomic::AtomicUsize,
-    loads: std::sync::atomic::AtomicUsize,
-    /// When set, every `version` read moves the store on one — a stand-in for
-    /// a neighbour node committing continuously, which is what makes "did this
-    /// caller refresh" observable without any blocking at all.
-    moving: std::sync::atomic::AtomicBool,
-    /// When set, `version` answers [`StoreFailure::Unavailable`].
-    version_fails: std::sync::atomic::AtomicBool,
-    /// Taken by the *next* `load` to arrive, which then waits on it. One load
-    /// at a time, so a test can hold one refresh open and let a later one run
-    /// to completion past it.
-    gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
-    /// A permit per `load` that has begun, so a test can wait for one to be in
-    /// flight instead of guessing.
-    entered: tokio::sync::Semaphore,
-    /// Taken by the *next* `commit` to arrive, held **after** the store's
-    /// state has already been mutated and **before** the call returns to its
-    /// caller. Where `gate` opens a window before a read, this one opens a
-    /// window after a write has already landed -- the only place `apply`'s
-    /// own commit-to-publish race (guard 5, below) can be driven under test
-    /// control, since nothing else in `apply` awaits between `commit`
-    /// returning and its own publish.
-    commit_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
-    /// A permit per `commit` that has already mutated the store and is
-    /// waiting on `commit_gate`.
-    commit_entered: tokio::sync::Semaphore,
-}
 
-impl ScriptedStore {
-    fn new(records: DirectoryRecords, version: u64) -> Self {
-        Self {
-            state: Mutex::new((records, version)),
-            versions: std::sync::atomic::AtomicUsize::new(0),
-            loads: std::sync::atomic::AtomicUsize::new(0),
-            moving: std::sync::atomic::AtomicBool::new(false),
-            version_fails: std::sync::atomic::AtomicBool::new(false),
-            gate: Mutex::new(None),
-            entered: tokio::sync::Semaphore::new(0),
-            commit_gate: Mutex::new(None),
-            commit_entered: tokio::sync::Semaphore::new(0),
-        }
-    }
+/// M16.0 review, F1: a stale `expected_version` reaches
+/// [`MemoryDirectoryStore`]'s own compare-and-set through the double, not a
+/// hand-rolled copy of it.
+///
+/// Before this rung, three of this crate's `DirectoryStore` doubles each
+/// re-implemented the same `if state.1 != expected_version { Concurrent }`
+/// guard [`MemoryDirectoryStore::commit`] performs, and two of the three --
+/// `WriteBetweenReads`, formerly here, and `ArmedStore`, formerly in
+/// `tests/admin_api.rs` -- never had that guard driven by any test at all:
+/// every fixture that reached for a double wanted `load` or `version`
+/// scripted, never `commit`. [`ScriptedDirectoryStore`] delegates `commit` to
+/// a real `MemoryDirectoryStore` instead of re-implementing it (see its own
+/// doc), so this is what that delegation buys: a stale write against the
+/// double is refused by the same compare-and-set
+/// [`super::store::tests::commit_refuses_a_stale_expected_version`] pins
+/// directly against `MemoryDirectoryStore`, not by a second copy of it that
+/// could silently drop the guard while every other test here stayed green.
+#[tokio::test]
+async fn a_stale_commit_against_the_scripted_store_is_refused_by_the_real_compare_and_set() {
+    let store = ScriptedDirectoryStore::new(DirectoryRecords::default(), 1).await;
 
-    fn locked(&self) -> std::sync::MutexGuard<'_, (DirectoryRecords, u64)> {
-        self.state.lock().unwrap_or_else(|error| error.into_inner())
-    }
+    let first = store
+        .commit(1, DirectoryRecords::default())
+        .await
+        .expect("the double is still at the version this write read");
+    assert_eq!(
+        first, 2,
+        "the first successful commit through the double is version 2"
+    );
 
-    /// What another node just committed.
-    fn set(&self, records: DirectoryRecords, version: u64) {
-        let mut state = self.locked();
-        state.0 = records;
-        state.1 = version;
-    }
-
-    /// Forget the store traffic the boot itself made.
-    ///
-    /// `ControlDirectory::new` loads once to compile what it starts serving, and
-    /// every count below is about what a *refresh* costs — so the boot's read is
-    /// subtracted here rather than added to each guard's expected number, where
-    /// it would read as an unexplained off-by-one.
-    fn forget_boot(&self) {
-        self.versions.store(0, std::sync::atomic::Ordering::SeqCst);
-        self.loads.store(0, std::sync::atomic::Ordering::SeqCst);
-        while let Ok(stale) = self.entered.try_acquire() {
-            stale.forget();
-        }
-    }
-
-    fn versions(&self) -> usize {
-        self.versions.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    fn loads(&self) -> usize {
-        self.loads.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    /// A neighbour that never stops writing.
-    fn keep_moving(&self) {
-        self.moving.store(true, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    fn fail_versions(&self) {
-        self.version_fails
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    /// Hold the next `load` open. The returned handle releases it.
-    ///
-    /// Drains the in-flight signal first, because construction already read
-    /// the store once: a test that waited on a permit left over from
-    /// `ControlDirectory::new` would be told a refresh was in flight before one
-    /// had started, and would then race the very caller it means to observe.
-    fn block_next_load(&self) -> Arc<tokio::sync::Semaphore> {
-        while let Ok(stale) = self.entered.try_acquire() {
-            stale.forget();
-        }
-        let gate = Arc::new(tokio::sync::Semaphore::new(0));
-        *self.gate.lock().unwrap_or_else(|error| error.into_inner()) = Some(Arc::clone(&gate));
-        gate
-    }
-
-    /// Returns once a `load` has begun. The signal, never a sleep.
-    async fn load_in_flight(&self) {
-        self.entered
-            .acquire()
-            .await
-            .expect("the store outlives the loads it counts")
-            .forget();
-    }
-
-    /// Hold the next `commit` open, *after* it has mutated the store's
-    /// state. The returned handle releases it.
-    fn block_next_commit(&self) -> Arc<tokio::sync::Semaphore> {
-        while let Ok(stale) = self.commit_entered.try_acquire() {
-            stale.forget();
-        }
-        let gate = Arc::new(tokio::sync::Semaphore::new(0));
-        *self
-            .commit_gate
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(Arc::clone(&gate));
-        gate
-    }
-
-    /// Returns once a `commit` has already mutated the store and is waiting
-    /// on the gate `block_next_commit` armed. The signal, never a sleep.
-    async fn commit_in_flight(&self) {
-        self.commit_entered
-            .acquire()
-            .await
-            .expect("the store outlives the commits it gates")
-            .forget();
-    }
-}
-
-#[async_trait::async_trait]
-impl DirectoryStore for ScriptedStore {
-    async fn load(&self) -> Result<VersionedRecords, StoreFailure> {
-        self.loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let gate = self
-            .gate
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take();
-        // Read before the gate, never after. A load held open is a request
-        // already in flight, and what comes back is what the store held when it
-        // was made — not what a commit that landed while it was open changed it
-        // to. Reading after the gate would make every blocked load answer with
-        // the newest records, which is the one thing the out-of-order publish
-        // guard needs it not to do.
-        let answer = {
-            let state = self.locked();
-            VersionedRecords {
-                records: state.0.clone(),
-                version: state.1,
-            }
-        };
-        self.entered.add_permits(1);
-        if let Some(gate) = gate {
-            gate.acquire()
-                .await
-                .expect("the gate outlives the load waiting on it")
-                .forget();
-        }
-        Ok(answer)
-    }
-
-    async fn commit(
-        &self,
-        expected_version: u64,
-        records: DirectoryRecords,
-    ) -> Result<u64, StoreFailure> {
-        let new_version = {
-            let mut state = self.locked();
-            if state.1 != expected_version {
-                return Err(StoreFailure::Concurrent {
-                    expected: expected_version,
-                    found: state.1,
-                });
-            }
-            state.0 = records;
-            state.1 += 1;
-            state.1
-        };
-        // The store's state is already advanced by the time this gate is
-        // taken -- a caller that reads the store from here on (a concurrent
-        // refresh's `version`/`load`) sees this commit's own result, not a
-        // stale one. That is what makes this the seam guard 5 needs: `apply`
-        // has no await between `commit` returning and its own publish, so
-        // this is the only place a test can hold a *successful* commit open
-        // long enough for another writer to publish past it first.
-        let gate = self
-            .commit_gate
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take();
-        self.commit_entered.add_permits(1);
-        if let Some(gate) = gate {
-            gate.acquire()
-                .await
-                .expect("the gate outlives the commit waiting on it")
-                .forget();
-        }
-        Ok(new_version)
-    }
-
-    async fn version(&self) -> Result<u64, StoreFailure> {
-        self.versions
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if self.version_fails.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(StoreFailure::Unavailable(
-                "the scripted store is refusing version reads".into(),
-            ));
-        }
-        let mut state = self.locked();
-        if self.moving.load(std::sync::atomic::Ordering::SeqCst) {
-            state.1 += 1;
-        }
-        Ok(state.1)
-    }
+    // The version the double is actually at has moved to 2. A second write
+    // that still thinks it is 1 -- the shape of a second node that read
+    // before the first node's commit landed -- must be refused, and refused
+    // by the wrapped store's own guard rather than one this double forgot to
+    // carry over.
+    let stale = store.commit(1, DirectoryRecords::default()).await;
+    assert!(
+        matches!(
+            stale,
+            Err(StoreFailure::Concurrent {
+                expected: 1,
+                found: 2,
+            })
+        ),
+        "a commit against a version the scripted double has moved past must answer \
+         `Concurrent`, naming both the version it expected and the one actually found -- \
+         the same refusal `commit_refuses_a_stale_expected_version` pins directly against \
+         `MemoryDirectoryStore`: {stale:?}"
+    );
+    assert_eq!(
+        store.version().await.unwrap(),
+        2,
+        "a refused commit must not have advanced the double"
+    );
 }
 
 /// The TTL every guard below runs at.
@@ -2221,7 +1985,7 @@ impl DirectoryStore for ScriptedStore {
 const GUARD_TTL_MS: u64 = 1_000;
 
 /// A managed directory over a scripted store, booted at instant zero.
-async fn scripted(store: Arc<ScriptedStore>) -> Arc<ControlDirectory> {
+async fn scripted(store: Arc<ScriptedDirectoryStore>) -> Arc<ControlDirectory> {
     let directory = Arc::new(
         ControlDirectory::new(
             file_with_ttl(GUARD_TTL_MS),
@@ -2252,12 +2016,12 @@ fn admits_bo(plane: &ControlPlane) -> bool {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refresh_in_flight_does_not_stall_a_concurrent_admission() {
     let (_before, after) = staged_mint().await;
-    let store = Arc::new(ScriptedStore::new(DirectoryRecords::default(), 1));
+    let store = Arc::new(ScriptedDirectoryStore::new(DirectoryRecords::default(), 1).await);
     let directory = scripted(Arc::clone(&store)).await;
 
     // Another node's write, and a load that will not come back until this test
     // says so.
-    store.set(after, 2);
+    store.set(after, 2).await;
     let release = store.block_next_load();
 
     let refresher = tokio::spawn({
@@ -2308,7 +2072,7 @@ async fn a_refresh_in_flight_does_not_stall_a_concurrent_admission() {
 /// caller that *did* go to the store would find a reason to load.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_callers_past_the_ttl_cost_exactly_one_refresh() {
-    let store = Arc::new(ScriptedStore::new(DirectoryRecords::default(), 1));
+    let store = Arc::new(ScriptedDirectoryStore::new(DirectoryRecords::default(), 1).await);
     let directory = scripted(Arc::clone(&store)).await;
     store.keep_moving();
 
@@ -2348,6 +2112,62 @@ async fn concurrent_callers_past_the_ttl_cost_exactly_one_refresh() {
     refresher.await.expect("the refreshing task does not panic");
 }
 
+/// R-D2, guard 2's quiet-path sibling: **a confirmed-unchanged version still
+/// stamps `refreshed_at_ms`.**
+///
+/// [`ControlDirectory::compiled`]'s doc promises "one cheap version read per
+/// TTL when nothing is happening", and [`Compiled::refreshed_at_ms`]'s doc
+/// says a confirmed-unchanged snapshot is as fresh as a rebuilt one. Nothing
+/// above reaches that: guard 2 runs with [`ScriptedDirectoryStore::keep_moving`] set,
+/// so the version is never unchanged, and guard 4 only exercises the
+/// version-fails arm. A refactor that stamps `refreshed_at_ms` on load-or-fail
+/// but not on confirmed-unchanged would leave the "quiet node" case paying a
+/// version read on every admission past the TTL instead of one per TTL — and
+/// every guard above stays green, because none of them holds the store still.
+///
+/// No blocking or spawning: single flight is not what this guard is about,
+/// only whether the stamp lands on the path that finds nothing to do. The
+/// clock is scripted throughout, never a sleep — each call is timed by the
+/// `now_ms` passed to it, not by wall time.
+#[tokio::test]
+async fn a_confirmed_unchanged_version_still_stamps_the_ttl() {
+    let store = Arc::new(ScriptedDirectoryStore::new(DirectoryRecords::default(), 1).await);
+    let directory = scripted(Arc::clone(&store)).await;
+
+    // First call past the TTL: the store is still at version 1, so this is
+    // the confirmed-unchanged path. If the stamp lands here, the next call —
+    // just past this instant but still inside the TTL window it opens — must
+    // not touch the store at all.
+    let _ = directory.plane(GUARD_TTL_MS).await;
+    assert_eq!(
+        store.versions(),
+        1,
+        "one caller past an expired TTL costs exactly one version read, confirmed-unchanged \
+         or not"
+    );
+
+    for _ in 0..5 {
+        let _ = directory.plane(GUARD_TTL_MS + 1).await;
+    }
+    assert_eq!(
+        store.versions(),
+        1,
+        "five more callers inside the TTL the confirmed-unchanged refresh just opened must \
+         find the stamp fresh and never reach the store — if the stamp only lands on \
+         load-or-fail, each of these re-asks a version that never changed"
+    );
+
+    // A second TTL has now elapsed since the stamp: due again, and again
+    // confirmed-unchanged.
+    let _ = directory.plane(2 * GUARD_TTL_MS).await;
+    assert_eq!(
+        store.versions(),
+        2,
+        "a second expired TTL costs exactly one more version read — two full TTLs, two reads, \
+         however many callers landed inside them"
+    );
+}
+
 /// R-D2, guard 3: **a refresh publishes only if it loaded something newer.**
 ///
 /// With the load outside the lock, two refreshes can be in flight at once and
@@ -2368,12 +2188,12 @@ async fn concurrent_callers_past_the_ttl_cost_exactly_one_refresh() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refresh_that_loaded_an_older_version_does_not_replace_a_newer_one() {
     let (before, after) = staged_mint().await;
-    let store = Arc::new(ScriptedStore::new(DirectoryRecords::default(), 1));
+    let store = Arc::new(ScriptedDirectoryStore::new(DirectoryRecords::default(), 1).await);
     let directory = scripted(Arc::clone(&store)).await;
 
     // The first refresh reads version 2 — bo has a membership and no key — and
     // is held open there.
-    store.set(before, 2);
+    store.set(before, 2).await;
     let release = store.block_next_load();
     let slow = tokio::spawn({
         let directory = Arc::clone(&directory);
@@ -2383,7 +2203,7 @@ async fn a_refresh_that_loaded_an_older_version_does_not_replace_a_newer_one() {
 
     // A second node commits bo's key while that read is open, and a later
     // caller — one TTL on — refreshes past it and finishes first.
-    store.set(after, 3);
+    store.set(after, 3).await;
     let fast = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         directory.plane(2 * GUARD_TTL_MS),
@@ -2429,7 +2249,7 @@ async fn a_refresh_that_loaded_an_older_version_does_not_replace_a_newer_one() {
 /// rather than once per TTL.
 #[tokio::test]
 async fn a_failed_version_read_backs_off_one_ttl_like_every_other_failure() {
-    let store = Arc::new(ScriptedStore::new(DirectoryRecords::default(), 1));
+    let store = Arc::new(ScriptedDirectoryStore::new(DirectoryRecords::default(), 1).await);
     let directory = scripted(Arc::clone(&store)).await;
     store.fail_versions();
 
@@ -2480,13 +2300,13 @@ async fn a_failed_version_read_backs_off_one_ttl_like_every_other_failure() {
 /// current.version` guard would let it clobber that newer state with its own,
 /// now-stale one.
 ///
-/// [`ScriptedStore::block_next_commit`] is what makes this constructible:
+/// [`ScriptedDirectoryStore::block_next_commit`] is what makes this constructible:
 /// `apply`'s `commit` succeeds and mutates the store, then blocks *before
 /// returning*, which is the only window in the source with no await to hook —
 /// so the test opens one inside the double instead of inside `apply`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_s_publish_does_not_clobber_a_newer_version_a_concurrent_refresh_already_installed() {
-    let store = Arc::new(ScriptedStore::new(DirectoryRecords::default(), 1));
+    let store = Arc::new(ScriptedDirectoryStore::new(DirectoryRecords::default(), 1).await);
     let directory = scripted(Arc::clone(&store)).await;
 
     let release_commit = store.block_next_commit();
@@ -2524,7 +2344,7 @@ async fn apply_s_publish_does_not_clobber_a_newer_version_a_concurrent_refresh_a
         created_at_ms: Some(0),
         archived_at_ms: None,
     });
-    store.set(newer, applys_version + 1);
+    store.set(newer, applys_version + 1).await;
     directory.plane(2 * GUARD_TTL_MS).await;
     let advanced_version = directory.version(2 * GUARD_TTL_MS).await;
     assert_eq!(
@@ -2561,4 +2381,419 @@ async fn apply_s_publish_does_not_clobber_a_newer_version_a_concurrent_refresh_a
         "the newer state must still be what this node serves, not the older \
          one apply's own write would have installed"
     );
+}
+
+// ---------------------------------------------------------------------------
+// F3 (M16.0 thermo-nuclear review), R-D2′: publish-by-version reads the store's
+// version as monotone — which `DirectoryStore` now *requires* of every
+// implementation — so a store that answers a lower version than this node has
+// already compiled has regressed (a Redis `FLUSHALL`, an eviction, a restore
+// from backup, a lagging failover), and `>` alone would discard it forever:
+// every refresh would reload and throw away the same state each TTL, and a
+// node's own successful commit would be dropped while its caller was told
+// `2xx`. The rule is now: a regression is adopted and named. Both guards below
+// are timed entirely by the scripted `now_ms` clock the rest of this file uses
+// — this is not a concurrency race, so nothing needs a signal to order it: the
+// behaviour is a single node taking one refresh, or one apply, after its store
+// has moved backward. `ScriptedDirectoryStore::set` is what moves it backward, which is
+// the whole of what a store-side regression looks like from this node.
+// ---------------------------------------------------------------------------
+
+/// F3, refresh path: **a version regression is adopted once, named, and then
+/// converged on — not reloaded and discarded every TTL forever.**
+///
+/// The store boots at version 5 (a stand-in for "this node already saw a
+/// newer state"), then regresses to version 2 the way a restored backup or a
+/// flushed cache would. Under `>` alone the node stayed at version 5 for good,
+/// re-reading and re-compiling the store's actual state once per TTL and
+/// throwing it away each time with no warning — a success that changed
+/// nothing, so none of the three `warn!` arms in `compiled()` fired. Under
+/// R-D2′ the first refresh past the TTL adopts what the store holds and
+/// records why, and the two after it find the store unchanged and cost one
+/// version read each: convergence, and a bounded one.
+#[tokio::test]
+async fn a_version_regression_is_adopted_once_and_then_converged_on() {
+    let store = Arc::new(ScriptedDirectoryStore::new(DirectoryRecords::default(), 5).await);
+    let directory = scripted(Arc::clone(&store)).await;
+
+    // What a restore from an earlier backup, or a flushed cache resurrected
+    // by a lagging replica, looks like from this node's side: the store's
+    // whole state stepped backward to a version this node had already moved
+    // past.
+    let (_before, after) = staged_mint().await;
+    store.set(after, 2).await;
+
+    let _ = directory.plane(GUARD_TTL_MS).await;
+    let _ = directory.plane(2 * GUARD_TTL_MS).await;
+    let _ = directory.plane(3 * GUARD_TTL_MS).await;
+
+    assert_eq!(
+        store.versions(),
+        3,
+        "each of the three refreshes is due and the store really did move \
+         (2 != 5), so each pays for a version read"
+    );
+    assert_eq!(
+        store.loads(),
+        1,
+        "F3: only the first of the three sees a version it does not already \
+         hold, so only the first pays for a load -- a node that refused to \
+         adopt the regression would still be at version 5, would still find \
+         2 != 5 on every later refresh, and would fetch and compile the same \
+         regressed state once per TTL forever"
+    );
+
+    assert_eq!(
+        directory.version(3 * GUARD_TTL_MS).await,
+        2,
+        "F3: the store is the shared truth, so a version that goes down is \
+         adopted rather than discarded -- this node converges on what the \
+         store actually holds"
+    );
+    assert_eq!(
+        directory.last_regression(),
+        Some(DirectoryRegression { from: 5, to: 2 }),
+        "F3: and says why it went backwards, naming both versions -- adopting \
+         a regression silently would leave an operator with a node that lost \
+         state and no record of when or from where"
+    );
+}
+
+/// F3, apply path: **a node's own successful write is published even after the
+/// store it wrote to has regressed under it.**
+///
+/// The node boots caught up to the store at version 3. The store then
+/// regresses to version 0 with empty records -- again, a restored backup --
+/// and a fresh `apply` reads that regressed state, validates and compiles a
+/// new project against it, and commits at version `0 -> 1`. `apply` returns
+/// `Ok`, and as far as its caller (an admin `POST`) is concerned the write
+/// happened. Under `>` alone it had not: `1 > 3` is false, the publish
+/// discarded the result, and the node went on serving the state it had before
+/// -- a revocation answered `2xx` and still authenticating until a restart,
+/// which is the worse half of F3. The commit landed in the shared store, so it
+/// is what this node serves.
+#[tokio::test]
+async fn apply_publishes_its_own_commit_after_a_store_regression() {
+    let store = Arc::new(ScriptedDirectoryStore::new(DirectoryRecords::default(), 3).await);
+    let directory = scripted(Arc::clone(&store)).await;
+    assert_eq!(
+        directory.version(0).await,
+        3,
+        "sanity: the node booted caught up to the store's version 3, inside \
+         its TTL, so this reads the boot-time compile with no extra refresh"
+    );
+
+    // The store regresses to version 0 with nothing in it -- the same
+    // restored-backup shape as the refresh-path guard above, this time
+    // arriving between a boot and the first write this node makes.
+    store.set(DirectoryRecords::default(), 0).await;
+
+    directory
+        .apply(
+            DirectoryMutation::CreateProject {
+                entry: project("widgets"),
+            },
+            2 * GUARD_TTL_MS,
+        )
+        .await
+        .expect(
+            "apply validates and commits fine against the store's own \
+             (regressed) version -- the store has no way to know 0 -> 1 is a \
+             regression rather than an ordinary first write",
+        );
+
+    let served = directory.view(2 * GUARD_TTL_MS).await;
+    assert!(
+        served
+            .projects
+            .iter()
+            .any(|project| project.id() == "widgets"),
+        "F3: apply returned Ok, so this node's own write must be what it \
+         serves -- not silently discarded, forever, because the store's \
+         version regressed below what this node had already seen"
+    );
+    assert_eq!(
+        directory.last_regression(),
+        Some(DirectoryRegression { from: 3, to: 0 }),
+        "F3: and the regression that made this publish unconditional is \
+         recorded, naming the version this node held and the one the store \
+         answered"
+    );
+}
+
+/// Control for the apply-path guard above: the same write, with the store
+/// never regressed, does publish and is immediately visible. This is what
+/// proves the assertion above is checking the right thing and is not simply
+/// broken in a way that would fail regardless of F3 -- if this one failed
+/// too, the fixture would be the story, not the defect.
+#[tokio::test]
+async fn apply_publishes_its_own_commit_when_the_store_has_not_regressed() {
+    let store = Arc::new(ScriptedDirectoryStore::new(DirectoryRecords::default(), 3).await);
+    let directory = scripted(Arc::clone(&store)).await;
+
+    directory
+        .apply(
+            DirectoryMutation::CreateProject {
+                entry: project("widgets"),
+            },
+            2 * GUARD_TTL_MS,
+        )
+        .await
+        .expect("apply validates and commits fine against the store's current version");
+
+    let served = directory.view(2 * GUARD_TTL_MS).await;
+    assert!(
+        served
+            .projects
+            .iter()
+            .any(|project| project.id() == "widgets"),
+        "control: with no regression, apply's own write is what this node \
+         serves"
+    );
+    assert_eq!(
+        directory.last_regression(),
+        None,
+        "control: and nothing is recorded as a regression -- the guards above \
+         would pass just as well against an `apply` that called every publish \
+         a regression, so this is what makes them about the store going \
+         backwards"
+    );
+}
+
+/// F4 (M16.0 review): **a claim dropped mid-load gives up the single-flight
+/// token, rather than keeping it for the rest of the TTL.**
+///
+/// `compiled`'s window two stamps `refreshed_at_ms` *before* the two awaits
+/// that follow — `store.version()` and `store.load()` — so if the claiming
+/// future is dropped at either (exactly what happens when a client
+/// disconnects and the handler future carrying this call is dropped
+/// mid-poll), nothing is left to publish a plane. Without a give-back every
+/// caller inside the same TTL found the stamp fresh in window one and was
+/// served the stale plane the dead claim never refreshed — a revocation
+/// landing and not taking effect for up to one whole TTL, silently: no
+/// warning fires, because nothing ever reaches the `Err` arms that log one.
+/// `ClaimGuard` restores the stamp on drop, which is what this pins.
+///
+/// `abort()` — not a drop of an unpolled future — is what proves the claim,
+/// because it cancels a task that is genuinely suspended inside
+/// [`ScriptedDirectoryStore::load`]'s gate, i.e. inside the `store.load().await` this
+/// finding names, rather than one that never started. No sleep orders
+/// anything: [`ScriptedDirectoryStore::load_in_flight`] is a semaphore signal, and the
+/// bound on the second caller is a timeout, not a race against wall time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_claim_dropped_mid_load_gives_up_the_single_flight_token() {
+    let (before, after) = staged_mint().await;
+    let store = Arc::new(ScriptedDirectoryStore::new(DirectoryRecords::default(), 1).await);
+    let directory = scripted(Arc::clone(&store)).await;
+
+    // The store has already moved by the time the claim reads `version()`, so
+    // the claim proceeds past the version check and into `load()` — where the
+    // gate below blocks it, and where a dropped handler future's cancellation
+    // would land in production. `before` is bo's membership without a key, so
+    // this state admits nobody: what the dead claim had in hand is not what the
+    // final assertion is looking for.
+    store.set(before.clone(), 2).await;
+    let release = store.block_next_load();
+
+    let claimer = tokio::spawn({
+        let directory = Arc::clone(&directory);
+        async move { directory.plane(GUARD_TTL_MS).await }
+    });
+    // Waits for `load` to have entered and be blocked on the gate -- the
+    // claim has stamped `refreshed_at_ms` (a synchronous write, before either
+    // await) and is now genuinely suspended inside `store.load().await`.
+    store.load_in_flight().await;
+
+    // The disconnect: hyper/axum dropping the handler future mid-load, stood
+    // in for by aborting the task actually parked in that await.
+    claimer.abort();
+    let outcome = claimer.await;
+    assert!(
+        outcome.as_ref().is_err_and(|error| error.is_cancelled()),
+        "this test proves nothing about a cancelled claim unless the claiming task was truly \
+         cancelled while suspended inside `load()`, not merely finished or panicked: {outcome:?}"
+    );
+
+    // The dead claim's own blocked load is released (it has no task left to
+    // wake, so this is inert) and the store moves on again -- to the one state
+    // that admits bo, which neither the boot nor the version the dead claim was
+    // carrying could produce. That is what makes the last assertion say "this
+    // caller reached the store and got the newest version" rather than just
+    // "this caller returned something".
+    release.add_permits(1);
+    store.set(after, 3).await;
+
+    // A second caller, inside the very same TTL the dead claim stamped.
+    let served = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        directory.plane(GUARD_TTL_MS),
+    )
+    .await
+    .expect("a caller inside the same TTL must not hang behind a claim nothing is refreshing");
+
+    assert_eq!(
+        store.loads(),
+        2,
+        "F4: the aborted claim's own load counts as one; the guard that restores the stamp on \
+         drop is what lets this second caller inside the same TTL reclaim and refresh, costing \
+         a second load -- with nothing giving the stamp back this caller finds it fresh in \
+         window one and never reaches the store at all"
+    );
+    assert!(
+        admits_bo(&served),
+        "F4: the plane served to the second caller should be the one compiled from the store's \
+         current state, not the one this node had before the dead claim ever started"
+    );
+}
+
+/// A store whose `version()` can be held open indefinitely and counted, to
+/// observe `refreshed_at_ms` while the store has not yet answered anything at
+/// all — not even a failure. [`ScriptedDirectoryStore`] cannot do this: its `version`
+/// never awaits a gate, only its `load` does.
+struct GatedVersionStore {
+    records: DirectoryRecords,
+    version: u64,
+    versions: std::sync::atomic::AtomicUsize,
+    /// Signalled once a `version()` call has begun. The signal, never a sleep.
+    entered: tokio::sync::Semaphore,
+    /// Held by `version()` until the test releases it.
+    gate: tokio::sync::Semaphore,
+}
+
+impl GatedVersionStore {
+    fn new(records: DirectoryRecords, version: u64) -> Self {
+        Self {
+            records,
+            version,
+            versions: std::sync::atomic::AtomicUsize::new(0),
+            entered: tokio::sync::Semaphore::new(0),
+            gate: tokio::sync::Semaphore::new(0),
+        }
+    }
+
+    fn versions(&self) -> usize {
+        self.versions.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Returns once a `version()` call has begun and is parked on the gate.
+    async fn version_in_flight(&self) {
+        self.entered
+            .acquire()
+            .await
+            .expect("the store outlives the version call it gates")
+            .forget();
+    }
+
+    fn release(&self) {
+        self.gate.add_permits(1);
+    }
+}
+
+#[async_trait::async_trait]
+impl DirectoryStore for GatedVersionStore {
+    async fn load(&self) -> Result<VersionedRecords, StoreFailure> {
+        // Only ever called at boot in this guard.
+        Ok(VersionedRecords {
+            records: self.records.clone(),
+            version: self.version,
+        })
+    }
+
+    async fn commit(
+        &self,
+        _expected_version: u64,
+        _records: DirectoryRecords,
+    ) -> Result<u64, StoreFailure> {
+        unimplemented!("this guard never mutates the directory")
+    }
+
+    async fn version(&self) -> Result<u64, StoreFailure> {
+        self.versions
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.entered.add_permits(1);
+        self.gate
+            .acquire()
+            .await
+            .expect("the gate outlives the version call waiting on it")
+            .forget();
+        Ok(self.version)
+    }
+}
+
+/// F5 (M16.0 thermo-nuclear review): **the field doc on
+/// `Compiled::refreshed_at_ms` (directory.rs:283-287) reads "When this node
+/// last confirmed its snapshot against the store" — but the stamp is written
+/// at claim time, before the store is asked anything at all, and a
+/// concurrent caller is served as "fresh" off that stamp while the first
+/// caller's own `version()` call to the store is still open and has not
+/// confirmed (or denied) anything.**
+///
+/// This is not a behavioral defect — R-D3 (see `compiled()`'s own doc, and
+/// guard 4 above) means this ordering is exactly intended: the stamp is the
+/// single-flight token, not a confirmation receipt, and it must land before
+/// the first fallible call so a failed `version()` backs off like every
+/// other failure. But that is a distinct meaning from the field doc's own
+/// words, which is the finding: a reader who took the field doc literally
+/// would conclude a caller is only ever told "fresh" once the store has
+/// actually confirmed the snapshot, which this guard shows is false.
+///
+/// The bound on the second caller is a `tokio::time::timeout`, not a sleep
+/// used for ordering: if `refreshed_at_ms` really were only advanced on
+/// confirmation (the field doc's wording taken at face value), the second
+/// caller below would find the *old* stamp, fail its own window-one check,
+/// go on to contend for window two, and block on this store's still-open
+/// `version()` call right alongside the first — which would hang rather than
+/// return, so the timeout is what turns that into a clean assertion failure
+/// instead of a stalled test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f5_refreshed_at_ms_is_stamped_at_claim_not_at_confirmation() {
+    let store = Arc::new(GatedVersionStore::new(DirectoryRecords::default(), 1));
+    let directory = Arc::new(
+        ControlDirectory::new(
+            file_with_ttl(GUARD_TTL_MS),
+            PATH,
+            Arc::clone(&store) as Arc<dyn DirectoryStore>,
+            checks(),
+            0,
+        )
+        .await
+        .expect("the file alone compiles, since it is what a boot would have loaded"),
+    );
+
+    // Past the TTL: this caller claims the refresh (window two stamps
+    // refreshed_at_ms) and then calls into the store's version(), which this
+    // store holds open until told otherwise -- the store has confirmed
+    // nothing yet.
+    let claimant = {
+        let directory = Arc::clone(&directory);
+        tokio::spawn(async move { directory.plane(GUARD_TTL_MS).await })
+    };
+    store.version_in_flight().await;
+
+    let second = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        directory.plane(GUARD_TTL_MS),
+    )
+    .await;
+    assert!(
+        second.is_ok(),
+        "a second caller at the same instant did not return promptly -- which is what the \
+         field doc's 'last confirmed' wording predicts: refreshed_at_ms not yet advanced, so \
+         this caller would itself contend for window two and block on the store's still-open \
+         version() call"
+    );
+
+    // Only the first caller ever reached the store: the second was served
+    // off the stamp compiled() wrote before asking the store anything, not
+    // off anything the store confirmed.
+    assert_eq!(
+        store.versions(),
+        1,
+        "F5: the second caller must not have touched the store at all -- if it had, the stamp \
+         was not yet 'fresh' when it looked, meaning it was written only on confirmation, which \
+         would make the field doc accurate instead of stale"
+    );
+
+    store.release();
+    let _ = claimant.await.expect("the claimant's task does not panic");
 }

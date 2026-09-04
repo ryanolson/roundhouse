@@ -21,8 +21,8 @@
 //! is also the only way to get a key that may be minted at all (a membership the
 //! file declares is owned by the file, and minting under it is refused 409).
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use axum::Router;
@@ -50,10 +50,9 @@ use roundhouse_fleet::{
     EchoFrontierClient, FrontierModelSpec, StaticFrontierCatalog, WireProtocol,
 };
 use roundhouse_server::control_config::crosscheck::CrossChecks;
-use roundhouse_server::control_config::directory::{
-    DirectoryRecords, StoreFailure, VersionedRecords,
+use roundhouse_server::test_support::{
+    ScriptedDirectoryStore, frontier_spec, single_model_catalog,
 };
-use roundhouse_server::test_support::{frontier_spec, single_model_catalog};
 use roundhouse_server::{
     ControlDirectory, Conversations, DirectoryStore, EchoLocalExecutor, Engine, EngineConfig,
     MemoryDirectoryStore, admin_api, has_valid_key_shape, http, metrics_api, responses_api,
@@ -736,135 +735,34 @@ async fn revoking_a_key_stops_it_within_one_cache_ttl() {
 // R2, over the wire: budget_view's plane and view must be one call
 // ---------------------------------------------------------------------------
 
-/// A directory store whose `version()` answers land a staged write at an
-/// exact call count from an armed instant, rather than at whichever call
-/// happens to be second ever.
+/// The double this section arms is [`ScriptedDirectoryStore`]
+/// (`roundhouse_server::test_support`, M16.0 review, F1) -- the same wrapper
+/// over a real `MemoryDirectoryStore` the directory suite's own coherence and
+/// M16.0 guards use, rather than a second hand-rolled `(records, version)`
+/// double with its own copy of `commit`'s compare-and-set.
 ///
-/// `WriteBetweenReads` in the directory suite
-/// (`control_config/directory/tests.rs`) proves `ControlDirectory::snapshot`
-/// itself is atomic against this failure mode, by timing a write on the
-/// store's second `version()` call, ever. That pins the *primitive* -- it
-/// never reaches `budget_view`, because that guard drives `snapshot`
-/// directly and has no seam at which to watch what happens if a caller
-/// stopped using it. Nothing in this suite routes through the handler with a
-/// write timed to land between two independent reads either, which is why a
-/// regression from its one `state.directory.snapshot(at_ms)` back to two
-/// separate `state.directory.plane(at_ms)` / `.view(at_ms)` calls would
-/// compile and pass every test here today.
+/// `ScriptedDirectoryStore::arm` lands a staged write at an exact
+/// `version()` call count from an armed instant, rather than at whichever
+/// call happens to be second ever -- which is what lets this survive contact
+/// with the HTTP boundary: `admin_auth_layer` reads the plane once, ahead of
+/// every handler on this router (see its own doc comment), so a fixed call
+/// count burns unpredictably on setup traffic before the request under test
+/// ever fires. `arm` resets the count the instant the test is ready, so the
+/// write lands `land_at` reads later regardless of how many earlier requests
+/// this store has already answered.
 ///
-/// Timing the write on "the Nth `version()` call ever" does not survive
-/// contact with the HTTP boundary: `admin_auth_layer` reads the plane once,
-/// ahead of every handler on this router (see its own doc comment), so a
-/// fixed call count burns unpredictably on setup traffic before the request
-/// under test ever fires. `arm` resets the count the instant the test is
-/// ready, so the write lands `land_at` reads later regardless of how many
-/// earlier requests this store has already answered.
-struct ArmedStore {
-    state: Mutex<(DirectoryRecords, u64)>,
-    /// What the write installs, taken once the countdown reaches zero.
-    pending: Mutex<Option<DirectoryRecords>>,
-    /// `(reads since armed, the read count the write lands on)` -- `None`
-    /// while unarmed, so the setup calls that build `before`/`after` on a
-    /// throwaway router never touch this store at all, and this store's own
-    /// setup can never trip it early either.
-    countdown: Mutex<Option<(u64, u64)>>,
-}
-
-impl ArmedStore {
-    fn new(before: DirectoryRecords) -> Self {
-        Self {
-            state: Mutex::new((before, 1)),
-            pending: Mutex::new(None),
-            countdown: Mutex::new(None),
-        }
-    }
-
-    fn locked(&self) -> std::sync::MutexGuard<'_, (DirectoryRecords, u64)> {
-        self.state.lock().unwrap_or_else(|error| error.into_inner())
-    }
-
-    /// Stage `after` to land on the `land_at`-th `version()` call from this
-    /// point on.
-    fn arm(&self, after: DirectoryRecords, land_at: u64) {
-        *self
-            .pending
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(after);
-        *self
-            .countdown
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some((0, land_at));
-    }
-
-    /// How many `version()` calls have landed since the last `arm`, `0` if
-    /// never armed.
-    ///
-    /// What pins the read-count arithmetic in the test below to reality
-    /// rather than to a guess: without this, a request that produced *no*
-    /// `version()` calls at all -- because `arm` was never reached, or
-    /// `admin_auth_layer` stopped reading the plane, or the router changed
-    /// shape -- would satisfy "bob's row is absent" exactly as well as the
-    /// request this test means to exercise, and the guard would enforce
-    /// nothing while still going green.
-    fn reads_since_armed(&self) -> u64 {
-        self.countdown
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .map(|(count, _)| count)
-            .unwrap_or(0)
-    }
-}
-
-#[async_trait::async_trait]
-impl DirectoryStore for ArmedStore {
-    async fn load(&self) -> Result<VersionedRecords, StoreFailure> {
-        let state = self.locked();
-        Ok(VersionedRecords {
-            records: state.0.clone(),
-            version: state.1,
-        })
-    }
-
-    async fn commit(
-        &self,
-        expected_version: u64,
-        records: DirectoryRecords,
-    ) -> Result<u64, StoreFailure> {
-        let mut state = self.locked();
-        if state.1 != expected_version {
-            return Err(StoreFailure::Concurrent {
-                expected: expected_version,
-                found: state.1,
-            });
-        }
-        state.0 = records;
-        state.1 += 1;
-        Ok(state.1)
-    }
-
-    async fn version(&self) -> Result<u64, StoreFailure> {
-        let mut countdown = self
-            .countdown
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if let Some((count, land_at)) = countdown.as_mut() {
-            *count += 1;
-            if *count == *land_at {
-                let taken = self
-                    .pending
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .take();
-                if let Some(after) = taken {
-                    let mut state = self.locked();
-                    state.0 = after;
-                    state.1 += 1;
-                }
-            }
-        }
-        Ok(self.locked().1)
-    }
-}
+/// The directory suite's own coherence guard
+/// (`control_config::directory::tests::budget_view_s_plane_and_view_must_describe_the_same_version`)
+/// proves `ControlDirectory::snapshot` itself is atomic against this failure
+/// mode, by timing a write on the store's second `version()` call, ever --
+/// that pins the *primitive*, and never reaches `budget_view`, because that
+/// guard drives `snapshot` directly and has no seam at which to watch what
+/// happens if a caller stopped using it. Nothing else in this suite routes
+/// through the handler with a write timed to land between two independent
+/// reads either, which is why a regression from its one
+/// `state.directory.snapshot(at_ms)` back to two separate
+/// `state.directory.plane(at_ms)` / `.view(at_ms)` calls would compile and
+/// pass every other test here.
 
 /// R2 (thermo-nuclear review, M8), reproduced at the HTTP boundary: nothing
 /// else in this suite drives the real router with a write timed to land
@@ -885,7 +783,7 @@ impl DirectoryStore for ArmedStore {
 /// which this module reserves for a membership with no *live* admission. The
 /// only way to see bob's row **and** `no_keys` together is a plane that has
 /// not heard about him yet paired with a listing that has -- exactly the
-/// split [`ArmedStore`] is armed to produce.
+/// split [`ScriptedDirectoryStore::arm`] is armed to produce.
 ///
 /// **Reach:** this pins the call order the R2 regression actually had --
 /// `plane(at_ms)` before `view(at_ms)`. A handler regressed to the opposite
@@ -962,7 +860,7 @@ async fn budget_view_over_http_reads_plane_and_view_from_one_version() {
     // The router under test, over the armed double. `admission_cache_ttl_ms:
     // 0` so every `plane`/`view` call re-asks the store instead of answering
     // from a cache that would hide the whole race.
-    let armed = Arc::new(ArmedStore::new(before));
+    let armed = Arc::new(ScriptedDirectoryStore::new(before, 1).await);
     let directory = Arc::new(
         ControlDirectory::new(
             control_plane(
