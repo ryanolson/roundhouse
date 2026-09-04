@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Plan: the Anthropic Messages surface, the seat, and the launcher (M11)
 
-> **Status: shipped through M17; D2 ruled (2026-09-04).** The rulings in §3 stand
+> **Status: shipped through M17; D2 and D3 ruled; M18 in flight (2026-09-04).** The rulings in §3 stand
 > as written; where an implementation round moved one, the dated addenda at
 > the end of this document record the move and its reason, and win over §3
 > for the current tree. Direction set by the product owner on
@@ -2706,3 +2706,89 @@ verifier's snapshot, so nothing was lost this time, and the fix briefs now
 say byte backups only, on the write path as on the refute path. And the
 F5 guard is conjunctive: a reword of the item doc would disarm it rather
 than fail it, which M18 pins with a control.
+
+## Addendum (2026-09-04): M18 — the items M16 and M17 opened by name
+
+The M16.0, M16.1 and M17 rounds each left one or two things real but out
+of their rung's scope, with the file and the reason; this rung closes them
+together under the hygiene rule M15 set — a move keeps behaviour, and
+anything that is a behaviour lands test-first. The six, by name:
+
+- **The empty-Redis lineage exemption, under a real boot.** A node booted
+  against an empty Redis claims no lineage, so version zero supersedes
+  and regresses nothing; the M16.1 review pinned that only by a unit
+  test. A gated boot test proves the deployment's first admin write is
+  accepted, refreshed without a regression, and agreed with by a second
+  node booted afterwards.
+- **A typed refusal for the size ceiling.** The adapter's ceiling refusal
+  rode the store's unavailable variant, so over HTTP a document too large
+  read as an outage. A variant of its own names the size and the ceiling
+  and maps to a client error with its own code.
+- **The judge in the fingerprint.** The cross-checks read the judge and
+  the fingerprint did not carry it, so two nodes differing only in their
+  judge compiled different planes and reported no divergence. The judge
+  is an axis of its own.
+- **A cancelled apply's write is picked up by the next refresh.** An
+  apply whose caller is dropped after the store applied the commit and
+  before the publish leaves the store one version ahead of the node until
+  the next refresh; the client that cancelled saw no success, so the
+  write path gets no give-back — but the property is pinned, over the
+  scripted double's commit gate.
+- **`turn_depth` counts task exchanges only.** Three reads of
+  roundhouse's own status tool made a shallow session read as a stall
+  because the depth was counted before control calls were dropped; the
+  one-line remedy the code's own comment named lands, and the test that
+  pinned the cost becomes the guard for the fix, on both dialects.
+- **The namespace doc guard gets a control.** The M17 review's guard on
+  the fleet decoder's reading of an absent namespace is conjunctive — it
+  fires only while the item's field doc still holds the literal it
+  searches for — so a reword would disarm it silently. A control pins the
+  literal, so a reword fails rather than empties the guard.
+
+## Addendum (2026-09-04): D3 ruled — the rungs it opens
+
+D3 ruled the questions the durable directory unlocked — R20–R23 in
+`PLAN-frontier-selection.md` (the dashboard across nodes, the time leg,
+the deployment aggregate, the node status surface) and R-O1..R-O3 and
+R-U1..R-U2 in `PLAN-agentic-control-plane.md` (the overlay, the intent
+and outcome, the sealed credential, un-archive, admin identity and the
+audit stream). The rungs, in the order the cadence takes them, each a
+failing test first:
+
+- **M19.0 — the dashboard says what it is** (R20): a configured node name
+  beside the per-tenure id, the window qualified as this process's, the
+  shared-backend arm shown, and the page readable under a configured
+  plane. Mechanical; churn-sized.
+- **M20 — the overlay family** (R-O1, R-O2): the per-session overlay as a
+  key family with its staleness bound and the memory table it has,
+  patterns stored as strings and re-parsed, routability re-derived at the
+  engine's admission with a typed reason, the engine's read async; the
+  intent and the outcome as control items in the log; the binding family
+  ruled process-local. The re-derivation and the store are one rung, not
+  two. The reasoning is in the admission re-derivation.
+- **M19.1 — the time leg** (R21): TTFT folded from the log's own
+  timestamps into a per-target latency column with its basis, under the
+  fold-equivalence test. The fold's vocabulary carries the reasoning.
+- **M21 — un-archive and the audit stream** (R-U1, R-U2): the un-archive
+  arm revoking the keys live at archive time and recording the closed
+  interval; the admin scope's identity; the append-shaped audit family
+  with the lineage and version each commit produced. The reasoning is in
+  what resumes.
+- **M22 — the node status surface** (R23): the unauthenticated identity
+  probe and the authenticated detail read, with the lineage added to the
+  status type; the launcher gating readiness on the probe. Churn-sized
+  once M21's identity exists.
+- **M19.2 — the deployment aggregate** (R22): the per-session fold row
+  written set-if-newer, scope totals by atomic delta, the snapshot built
+  from summed counters, published beside the fold under its own stamp; the
+  one script write per turn the product owner is told about. The reasoning
+  is in the idempotency argument.
+- **M23 — the sealed credential document** (R-O3): the sibling document
+  family, the authenticated cipher under `ROUNDHOUSE_CONTROL_KEY`, the key
+  id as a fingerprint axis, the fail-closed boot; the first cryptographic
+  dependency, pinned and watched. Product-shaped; last.
+
+Two of these are put to the product owner as options with their costs
+rather than taken silently: the deployment aggregate's per-turn write
+(M19.2), and the status detail read's exact shape (M22). Both rungs are
+authored with the ruling's default and can be reshaped before they launch.

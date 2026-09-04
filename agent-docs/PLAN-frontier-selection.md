@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Plan: frontier-only model selection, the text steer, and the Switchyard benchmark (M10)
 
-> **Status: M10.0–M10.2 shipped; D1 ruled (2026-09-02); D2 ruled (2026-09-03).** Originally: proposed design. Direction set by the product owner on
+> **Status: M10.0–M10.2 shipped; D1 ruled (2026-09-02); D2 ruled (2026-09-03); D3 ruled (2026-09-04).** Originally: proposed design. Direction set by the product owner on
 > 2026-08-22: intercept codex and model-select per Switchyard guidance,
 > frontier models only at first — mimic a user on a sol-only session with a
 > fraction of calls rerouted to terra/luna, then swap the source so sol maps
@@ -599,3 +599,99 @@ and nothing else yet does.
 The rungs this opens are recorded in `PLAN-anthropic-messages.md`, where
 the loop that drives this branch lives: M16.0 (R17), M16.1 (R16, R18,
 R19), and M17 (the stored namespace, R-N1..R-N5).
+
+## Addendum (2026-09-04): D3 — the dashboard across nodes, and the node that can say what it is
+
+D1 left one question open by name — "whether the metrics fold gets an
+aggregator across nodes, which is the dashboard's P2 question" — and D2's
+R19 recorded a served-and-refused version pair "for the node-status surface
+roundhouse does not yet have". With the directory durable (M16) and the
+namespace carried (M17), D3 rules on both, on the tree at `1d016f2`. Two
+evidence documents carry the dashboard half and the status half, every
+claim pinned and independently re-derived:
+
+- `research/roundhouse-dashboard-across-nodes-1d016f2.md` — what the fold
+  holds and how it is fed, which dashboard numbers are node-local, what the
+  shared ledger already answers, what the session store cannot enumerate,
+  the time leg nothing measures, and the three shapes a cross-node
+  aggregate could take with what each costs.
+- `research/unarchive-admin-identity-and-node-status-1d016f2.md` — its
+  §6–§9: what a node can say about itself today, that no route reports any
+  of it, and Relay 0.8.2's health probe as the precedent.
+
+**R20 — the dashboard says what it is before it says more.** Every number
+on the dashboard is one process's fold, and the page renders "since the
+first event this process folded" as if it were the deployment's window,
+with no node identity anywhere on it; in Configured mode no browser can
+read it at all, because the page's own fetch sends no key. The honest
+number ships first and is cheap: the page names the node, the tenure and
+the shared-backend arm it runs under, qualifies its window as this
+process's, and can be read under a configured plane. A node gains a
+configured, restart-stable name (`ROUNDHOUSE_NODE_NAME`, defaulting to the
+per-tenure id) beside the per-tenure id the lease keeps — two identities
+with two jobs: the lease's must be unique per live engine, the report's
+must survive a restart so two tenures of one machine do not read as two
+nodes.
+
+**R21 — the time leg is measured before the deployment is.** The product
+sentence claims function, cost and time co-optimised, and the dashboard
+measures two of the three: no observed TTFT is folded or published on any
+node, though the engine states it is derivable from the log's own
+timestamps. A deployment-wide number for a leg nobody measures on one node
+is the claim unmeasured twice. TTFT joins the fold's vocabulary from the
+events already in the log — the fold's first read of a text delta against
+the turn's start — as a per-target latency column carrying its basis, under
+the same fold-equivalence test the other columns answer to.
+
+**R22 — the deployment aggregate keeps identity until the sum.** Of the
+three shapes the evidence priced, one is forbidden by the surface's own
+contract (a poll must not cost the store a replay, and no session census
+exists to replay from) and one is unsound as stated: a durable fold state
+per node, merged at read, double-counts by construction, because a failover
+replays a session's whole log into the second node's fold and the
+identity that would let a merge deduplicate was discarded when events
+became sums. The shape that is sound keeps the fold's own unit of
+idempotency, the session: a shared row per session holding that session's
+fold-to-date at its sequence number, written set-if-newer and never added
+to, so a replay writes what is already there; scope totals maintained by
+atomic delta against that row, so the running sum is exact by the same
+argument the fair-use ledger's running sums are; and the snapshot built
+from summed counters below the pricing walk, never from merged snapshots —
+the reference model a local model is priced against is inferred from the
+scope's own traffic, so two nodes' finished snapshots are not commensurable
+and the deployment's must be chosen from the deployment's traffic. The
+non-sums merge as what they are: the declared baseline as its three-state
+lattice, the window as min and max, the session count as the rows. It is
+published beside the node's fold under its own stamp — the reconciliation
+view's precedent for a second accumulator — and the fold stays the node's
+own truth. The cost is one script write per turn at the turn's terminal
+event, and the product owner is told so; it is not free, and it is the
+only shape that is right.
+
+**R23 — a node reports itself on two routes, the way Relay does.** No
+route on any of the six routers reports directory status, divergence,
+regression or node identity, and `status()` has no caller outside its own
+tests. Relay 0.8.2's health probe is the precedent worth taking whole: an
+unauthenticated identity probe answering what the process is — service,
+version, node name, tenure — that a launcher can gate readiness on and a
+foreign process is refused by, and an authenticated detail read carrying
+what R19 recorded and what this round adds: the served lineage and version
+(the status type omits the lineage today, so two nodes' served versions are
+not comparable — that is fixed here), the refused version, the divergence,
+the last regression, the shared-backend arm, and the fold's window. The
+detail read is a product surface and its exact shape is the product
+owner's; the split is the ruling, because a probe that discloses version
+state to an unauthenticated caller and a probe a launcher cannot reach are
+the two failures the split avoids.
+
+**What D3 leaves open, by name.** Whether the aggregate's per-session row
+lives as long as the session's log or is pruned with the fold's own
+retention, which is the one number the R22 rung has to choose. Whether the
+dashboard's deployment view is the default view or a second one beside the
+node's — a product call once both exist. And the session census the store
+lacks: R22's rows imply a per-project index of sessions, which is also what
+a replay or an operator listing would need, and which nothing else in the
+tree has asked for yet.
+
+The rungs this opens are recorded in `PLAN-anthropic-messages.md`, where
+the loop that drives this branch lives.

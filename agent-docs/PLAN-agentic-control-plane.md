@@ -1644,3 +1644,105 @@ trail, key rotation, per-key rate limiting, pagination, rate-card editing
 and un-archive stay deferred by name; MCP-overlay durability and the
 sealed credential store gain a contract they can ride on and keep their
 own questions.
+
+## Addendum (2026-09-04): D3 — what the durable directory unlocked
+
+M8 deferred three things "to the same unlock" as a durable directory —
+the MCP overlay maps' durability, the sealed credential store, and, with
+the audit trail, un-archive — and M16 landed the unlock. D3 rules on them,
+on the tree at `1d016f2`, from two evidence documents, every claim pinned
+and independently re-derived:
+
+- `research/mcp-overlay-and-sealed-credentials-1d016f2.md` — what the
+  control store holds and what the engine spends, what a restart and a
+  second node lose, which durable shape each map is, what sealing needs and
+  where a sealed blob could ride, and what Relay does with credentials.
+- `research/unarchive-admin-identity-and-node-status-1d016f2.md` — what
+  archiving does, why un-archive was deferred, what its keys and windows
+  would resume as, what an attributed admin write needs, and what audit
+  material exists.
+
+**R-O1 — the overlay is durable, correlation-shaped, and re-derived where
+it is spent.** The engine spends exactly one thing from the control store
+per turn: the overlay, whose loss on a restart or a node hop widens the
+turn back to the key's ceiling — never past it, and visibly in the digest —
+but silently, and against a promise the surface makes out loud: `prefer`
+and `status` answer with the digest the next decision will carry, and
+M14.1 made session identity deployment-wide while the state keyed by it
+stayed node-local, so a node hop now falsifies that promise where before
+it would more often have refused. The overlay becomes a key family of its
+own in the store crate, keyed per session with the one-day staleness bound
+the control store already chose from consequence, and the memory table it
+already has. It is not a straight port, and the evidence names both
+halves: the narrowing's patterns are stored as the strings the agent sent
+and re-parsed, never re-resolved against the reader's catalog (a narrowing
+that grew to cover a model added later is a widening with an agent-authored
+trigger); and the write-time guarantee that a narrowing leaves something
+routable held only because the catalog outlived every overlay, so the
+engine's admission re-derives it — a stored narrowing that admits nothing
+under this node's catalog is set aside with a typed reason, never
+silently, never widened. The engine's read goes async as the directory's
+did.
+
+**R-O2 — the intent and the outcome move into the session log.** The
+intent is read on the turn it was declared and never spent; the outcome is
+written and read by nothing in production. Both are agent-authored text
+with the shape M10.0 gave the steer when it moved the steer into the log to
+kill a node-local second source of truth. They become control items in the
+log — additive variants, the M11.1 discipline — durable and replayable for
+free, visible to the validator from the log it already folds, and gone from
+the control store. The binding family, which nothing in production resolves
+from, stays process-local by ruling and says so; whether a duplicate
+binding id is a defect is undecided because nothing reads one.
+
+**R-O3 — a sealed credential is its own document, and a node that cannot
+open it does not serve.** The credential *reference* already rides the
+directory document; the *material* is what an environment variable per
+node cannot distribute. It rides a sibling document family under the
+document contract — its own key, its own lineage, its own ceiling — sealed
+with an authenticated cipher under `ROUNDHOUSE_CONTROL_KEY`, with the
+sealing key's id as a fifth, defaulted axis of the fingerprint so a reader
+can name which key a document was sealed under. The first cryptographic
+dependency in the tree is a watched addition: pinned, its unlock condition
+written beside the pin. A node that cannot open the document refuses the
+boot naming the key id, and on refresh keeps the last good plane and
+records it, because a plane compiled without a credential admits keys whose
+every dispatch will fail — the failure furthest from its cause. What
+sealing does not buy is stated plainly: the sealing key has exactly the
+distribution problem the provider key had, one secret per node out of
+band, and that is the residue this design accepts rather than hides.
+
+**R-U1 — un-archive resumes the identity and not the keys.** Archiving
+sets one field and cascades nothing: every key of an archived project keeps
+its own row unrevoked and is refused only by a derivation at compile time,
+so an un-archive that cleared the field would silently re-admit every key
+that was live when the project closed — the question the deferral could
+not answer. It is answered conservatively: an un-archive revokes, as part
+of the same commit, every turn key that was live at archive time, so
+resumption is empty by construction and the operator re-mints; archive
+itself stays non-destructive. The record keeps the closed intervals, so a
+Monthly budget window that zeroed across the gap is visible rather than
+inferred, and the reconciliation view carries the gap; a Total budget
+resumes with its lifetime figure, said so. The mechanism is one more
+mutation arm and one compare-and-set, now that tombstones survive and a
+document has a lineage.
+
+**R-U2 — the admin scope carries an identity, and the audit trail is a
+stream.** `KeyScope::Admin` carries no principal because M8 had no key
+record to name; the record exists, its id is derived from the hash and
+minted for file-declared keys too, and open mode never produces the admin
+scope at all, so a required identity on that arm costs the open-mode
+default nothing. An actor field on the records would attribute creation
+only and leave every patch, archive and revocation unattributed, so the
+attribution is a log: an append-shaped family in the store crate, the
+session log's shape, one entry per admin mutation carrying the actor's key
+id, the mutation, its targets, and the lineage and version the commit
+produced — the one field that orders admin writes across nodes. The file
+still names an admin key by its hash alone; a label is a file-format
+question left where it is.
+
+**Still deferred, by name.** Key rotation, per-key rate limiting,
+pagination and rate-card editing are unchanged. Per-key credentials stay a
+thing only the file can say until the sealed store lands.
+
+The rungs this opens are recorded in `PLAN-anthropic-messages.md`.
