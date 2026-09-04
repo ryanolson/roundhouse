@@ -177,7 +177,7 @@ pub use records::{
     ApiKeyRecord, DirectoryRecords, DirectoryView, EntityKind, KeyRecordScope, MembershipRecord,
     MembershipRole, ProjectRecord, Provenance, UserRecord, key_id,
 };
-pub use store::{DirectoryStore, StoreFailure, VersionedRecords};
+pub use store::{DirectoryStore, StoreFailure, StoredVersion, VersionedRecords};
 
 // ---------------------------------------------------------------------------
 // Where a surface gets its plane
@@ -298,20 +298,44 @@ impl ConfigIdentities {
 // The directory
 // ---------------------------------------------------------------------------
 
-/// A store that answered a version below one this node had already seen.
+/// A store that answered something it had promised never to answer: a version
+/// below one this node had already seen, or a different run of the counter.
 ///
 /// Typed rather than a log line alone because it is a *fact about the
 /// deployment* — the store was restored from a backup, flushed, or failed over
 /// to a lagging replica — and the operator asking "why did my node go
 /// backwards" needs to be able to read the answer off the node rather than
-/// find it in a log that has rotated. See [`DirectoryStore`]'s monotone
-/// requirement for what makes this an anomaly rather than an ordinary write.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// find it in a log that has rotated. See [`DirectoryStore`]'s identity rule
+/// for what makes this an anomaly rather than an ordinary write.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectoryRegression {
     /// The version this node had already compiled.
     pub from: u64,
-    /// The lower version the store answered.
+    /// The version the store answered instead.
     pub to: u64,
+    /// Which of the two ways the store broke its promise this was.
+    pub cause: RegressionCause,
+}
+
+/// Why a [`DirectoryRegression`] is one (R-D2″, M16.1 review's F1).
+///
+/// Two arms because an operator's next move differs. A lower version in the
+/// same lineage is a replica behind its primary, or a restore from a snapshot
+/// of *this* key: the numbers say how far back it went. A different lineage is
+/// the key itself gone and re-created — a `DEL`, a `FLUSHDB`, a restore that
+/// did not include this family — and the numbers say nothing at all, because
+/// the new counter's `1` is not comparable with the old counter's `1`. Folding
+/// the second into the first would report "the store went from 5 to 1" for an
+/// event where 5 and 1 are measurements of different things.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegressionCause {
+    /// The store answered a lower version within the lineage this node had
+    /// been serving.
+    Version,
+    /// The store is on a different run of its counter than the version this
+    /// node had compiled — so whatever it now answers, the document this node
+    /// serves is gone.
+    Lineage { from: String, to: String },
 }
 
 /// What this node is serving, what it has refused, and what it has named as
@@ -362,6 +386,11 @@ struct DivergenceState {
 /// One node's compiled answer, and what it was compiled from.
 struct Compiled {
     version: u64,
+    /// The store lineage the served version belongs to (R-D2″). Beside the
+    /// number rather than folded into it, because the pair is the identity a
+    /// refresh compares: a store that lost its key answers a version this node
+    /// may well have claimed before, and only the lineage tells the two apart.
+    lineage: String,
     records: Arc<DirectoryRecords>,
     plane: Arc<ControlPlane>,
     /// **The single-flight claim stamp**, and not a confirmation receipt: it is
@@ -739,6 +768,7 @@ impl Managed {
             divergence: RwLock::new(DivergenceState::default()),
             current: RwLock::new(Compiled {
                 version: loaded.version,
+                lineage: loaded.lineage,
                 records: Arc::new(loaded.records),
                 plane,
                 refreshed_at_ms: now_ms,
@@ -776,6 +806,23 @@ impl Managed {
         }
         let differs = self.compiled_under.differs_from(stored);
         if differs.is_empty() {
+            // An agreeing load: `DirectoryStatus::divergence` answers "is this
+            // node out of step *now*", the same question `refused_version`
+            // answers, and that sibling field is explicitly cleared the
+            // moment a later version compiles rather than left standing —
+            // leaving it would report a node as stuck long after it caught
+            // up. `last` is the same fact for divergence and gets the same
+            // treatment (M16.1 review, F5). `warned_version` is untouched: it
+            // is not "the last version this node was out of step at", it is
+            // "the last version this node has already told the operator
+            // about", and clearing it here would let a later refresh that
+            // reloads the very version already warned about warn a second
+            // time.
+            let mut state = self
+                .divergence
+                .write()
+                .unwrap_or_else(|error| error.into_inner());
+            state.last = None;
             return;
         }
         let divergence = DirectoryDivergence { version, differs };
@@ -877,13 +924,19 @@ impl Managed {
     /// than one that arrives a TTL late. Newer wins, whoever got back first.
     /// [`Self::apply`] publishes under the same rule.
     ///
-    /// **Unless the store itself went backwards** (R-D2′). "Newer wins" reads
-    /// the version as monotone, which is what [`DirectoryStore`] now requires
-    /// of every implementation — and a store that breaks it has regressed
-    /// (restored from a backup, flushed, failed over to a replica that had not
-    /// caught up), which is a different event from a late refresh and is told
-    /// apart from one here: a late refresh finds the store *ahead* of the
-    /// version it claimed, a regression finds it *behind*. A regression is
+    /// **Unless the store itself went backwards** (R-D2′, completed by
+    /// R-D2″). "Newer wins" reads the version as monotone, which is what
+    /// [`DirectoryStore`] now requires of every implementation — and a store
+    /// that breaks it has regressed (restored from a backup, flushed, failed
+    /// over to a replica that had not caught up), which is a different event
+    /// from a late refresh and is told apart from one here: a late refresh
+    /// finds the store *ahead* of the version it claimed, a regression finds it
+    /// *behind* — or on a different lineage, where "ahead" and "behind" have no
+    /// meaning at all, because the store's counter has been restarted and its
+    /// `1` is not this node's `1` (M16.1 review, F1). The lineage case is the
+    /// one a version comparison could never have caught: a deleted key whose
+    /// replacement climbs back to the number this node claimed reads exactly
+    /// like a deployment where nothing happened. A regression is
     /// adopted and named — a [`DirectoryRegression`] on the published
     /// [`Compiled`] and one warning — rather than discarded, because the store
     /// is the shared truth and a node that quietly kept its own higher version
@@ -942,14 +995,20 @@ impl Managed {
         // The re-ask guards a scheduling gap no scripted clock can reach (two
         // callers both past window one before either stamps), so no test
         // drives it: deleting it leaves the suite green and the race open.
-        let (previous_ms, claimed_version) = {
+        let (previous_ms, claimed) = {
             let mut current = self.write_current();
             if now_ms.saturating_sub(current.refreshed_at_ms) < self.ttl_ms {
                 return taken(&current);
             }
             let previous_ms = current.refreshed_at_ms;
             current.refreshed_at_ms = now_ms;
-            (previous_ms, current.version)
+            (
+                previous_ms,
+                StoredVersion {
+                    lineage: current.lineage.clone(),
+                    version: current.version,
+                },
+            )
         };
         // Armed here rather than inside the block above only because there is
         // no await between the two: the stamp and the guard over it are one
@@ -959,8 +1018,8 @@ impl Managed {
         // both of the calls below may be round trips, and the compile between
         // them is the CPU cost this used to make every concurrent admission
         // wait behind.
-        let version = match self.store.version().await {
-            Ok(version) => version,
+        let stored = match self.store.version().await {
+            Ok(stored) => stored,
             Err(error) => {
                 claim.disarm();
                 tracing::warn!(
@@ -971,27 +1030,47 @@ impl Managed {
                 return taken(&self.read_current());
             }
         };
-        if version == claimed_version {
+        // The *pair* and not the number: the version alone cannot tell a quiet
+        // deployment from a store whose key was deleted and whose new counter
+        // has climbed back to the number this node claimed (R-D2″).
+        if stored == claimed {
             claim.disarm();
             return taken(&self.read_current());
         }
-        // Below the version this claim read is a store that has gone backwards,
-        // not a neighbour that has written: see the doc above, and
-        // `DirectoryStore`'s monotone requirement. Named once here — inside the
-        // single-flight claim, so once per TTL — rather than at the publish, so
-        // that a regression is still reported if the load or the compile that
-        // follows it fails.
-        let regression = (version < claimed_version).then_some(DirectoryRegression {
-            from: claimed_version,
-            to: version,
-        });
-        if let Some(regression) = regression {
-            tracing::warn!(
-                from = regression.from,
-                to = regression.to,
-                "the control directory's store answered a lower version than this node had \
-                 already compiled, which a store is required never to do; adopting what the \
-                 store holds, because it is what every other node will resolve against"
+        // Below the version this claim read, or on another lineage entirely,
+        // is a store that has gone backwards rather than a neighbour that has
+        // written: see the doc above, and `DirectoryStore`'s identity rule.
+        // Named once here — inside the single-flight claim, so once per TTL —
+        // rather than at the publish, so that a regression is still reported if
+        // the load or the compile that follows it fails.
+        //
+        // Version zero claims nothing: a node that has never seen a document
+        // has no lineage to have been moved off, so the first write of a
+        // deployment's life is an ordinary write and not a regression. Same
+        // reasoning as `note_divergence`'s version-zero skip.
+        let regression = if claimed.version != 0 && stored.lineage != claimed.lineage {
+            Some(DirectoryRegression {
+                from: claimed.version,
+                to: stored.version,
+                cause: RegressionCause::Lineage {
+                    from: claimed.lineage.clone(),
+                    to: stored.lineage.clone(),
+                },
+            })
+        } else if stored.version < claimed.version {
+            Some(DirectoryRegression {
+                from: claimed.version,
+                to: stored.version,
+                cause: RegressionCause::Version,
+            })
+        } else {
+            None
+        };
+        if let Some(regression) = &regression {
+            warn_regression(
+                regression,
+                "adopting what the store holds, because it is what every other node will \
+                 resolve against",
             );
         }
         let loaded = match self.store.load().await {
@@ -1029,7 +1108,7 @@ impl Managed {
                 // published past this claim -- so two refreshes that both
                 // refused do not overwrite each other with the same number.
                 let mut current = self.write_current();
-                if current.version == claimed_version {
+                if current.version == claimed.version && current.lineage == claimed.lineage {
                     current.refused_version = Some(loaded.version);
                 }
                 return taken(&current);
@@ -1045,12 +1124,20 @@ impl Managed {
         // caller the newer one too. With one: the store is behind this node by
         // definition, so version order cannot decide — what decides is whether
         // anybody published while this refresh was out.
-        let adopt = match regression {
-            Some(_) => current.version == claimed_version,
-            None => loaded.version > current.version,
+        let adopt = match &regression {
+            Some(_) => current.version == claimed.version && current.lineage == claimed.lineage,
+            None => StoredVersion {
+                lineage: loaded.lineage.clone(),
+                version: loaded.version,
+            }
+            .supersedes(&StoredVersion {
+                lineage: current.lineage.clone(),
+                version: current.version,
+            }),
         };
         if adopt {
             current.version = loaded.version;
+            current.lineage = loaded.lineage;
             current.records = Arc::new(loaded.records);
             current.plane = plane;
             // A refusal that has been overtaken by a version that compiles is
@@ -1069,7 +1156,7 @@ impl Managed {
     /// The last store regression this node saw, if any. See
     /// [`ControlDirectory::last_regression`].
     fn last_regression(&self) -> Option<DirectoryRegression> {
-        self.read_current().last_regression
+        self.read_current().last_regression.clone()
     }
 
     /// The plane alone, for the surfaces that only authenticate. See
@@ -1210,7 +1297,11 @@ impl Managed {
         let mut next = loaded.records.clone();
         self.mutate(&mut next, mutation, now_ms)?;
         let plane = self.compile(&next)?;
-        let version = self.store.commit(loaded.version, next.clone()).await?;
+        // The identity and not just the number, because a commit that *started*
+        // a lineage -- the first write of a deployment's life, or the first
+        // after the key was lost -- is the only place this node can learn which
+        // lineage it has just published into (R-D2″).
+        let committed = self.store.commit(loaded.version, next.clone()).await?;
         let records = Arc::new(next);
         // Published under the same version rule a refresh uses, and for the
         // same reason: a refresh started before this write may still be in
@@ -1230,21 +1321,48 @@ impl Managed {
         // knows — so on that branch alone, and never on the common one, it is
         // asked. `version()` is the cheap half of a refresh and this is
         // precisely the question it exists to answer.
-        let published = self.read_current().version;
-        let regression = if version > published {
+        let published = {
+            let current = self.read_current();
+            StoredVersion {
+                lineage: current.lineage.clone(),
+                version: current.version,
+            }
+        };
+        let regression = if committed.lineage != published.lineage && published.version != 0 {
+            // The store this write landed in is not the one this node's served
+            // version came from: the key was deleted, flushed or restored
+            // between the two, and no comparison of the two numbers means
+            // anything (R-D2″). No probe, because there is nothing left to
+            // ask -- the version this node serves belongs to a counter that no
+            // longer exists.
+            Some(DirectoryRegression {
+                from: published.version,
+                to: committed.version,
+                cause: RegressionCause::Lineage {
+                    from: published.lineage.clone(),
+                    to: committed.lineage.clone(),
+                },
+            })
+        } else if committed.version > published.version {
             None
         } else {
             match self.store.version().await {
                 // The store is at or beyond what this node serves, so this
                 // write was simply overtaken — another node committed on top of
                 // it while this call was still in `commit`. Leave the newer one.
-                Ok(store_version) if store_version >= published => None,
+                Ok(stored)
+                    if stored.lineage == published.lineage
+                        && stored.version >= published.version =>
+                {
+                    None
+                }
                 Ok(_) => Some(DirectoryRegression {
-                    from: published,
+                    from: published.version,
                     // What the store answered *this* write, which is the moment
                     // it went backwards; the probe above only confirms that the
                     // version this node serves is gone for good.
                     to: loaded.version,
+                    cause: RegressionCause::Version,
                 }),
                 Err(error) => {
                     tracing::warn!(
@@ -1258,19 +1376,25 @@ impl Managed {
                 }
             }
         };
-        {
+        let adopt = {
             let mut current = self.write_current();
             // Re-read rather than trust `published`: the probe above awaits, and
             // a refresh may have published across it — in which case its answer
             // was about a version this node no longer serves.
-            let adopt = match regression {
-                Some(_) => current.version == published,
-                None => version > current.version,
+            let adopt = match &regression {
+                Some(_) => {
+                    current.version == published.version && current.lineage == published.lineage
+                }
+                None => committed.supersedes(&StoredVersion {
+                    lineage: current.lineage.clone(),
+                    version: current.version,
+                }),
             };
             if adopt {
-                let last_regression = regression.or(current.last_regression);
+                let last_regression = regression.clone().or(current.last_regression.clone());
                 *current = Compiled {
-                    version,
+                    version: committed.version,
+                    lineage: committed.lineage.clone(),
                     records: Arc::clone(&records),
                     plane,
                     refreshed_at_ms: now_ms,
@@ -1280,14 +1404,27 @@ impl Managed {
                     refused_version: None,
                 };
             }
+            adopt
+        };
+        // A write this node just published is stamped with this node's own
+        // fingerprint (`DocumentDirectoryStore::commit`), so it trivially
+        // agrees with `self.compiled_under` -- and unlike a refresh, `apply`
+        // never routes through the "loaded != claimed" branch that would
+        // otherwise reach `note_divergence` on this path (M16.1 review, F5):
+        // a quiet refresh immediately after this commit sees its own version
+        // already served and returns before ever loading again, so a stale
+        // divergence named before this write would survive this node's own
+        // agreeing commit forever. Only on `adopt`, and only what this node
+        // just published -- an overtaken write leaves whatever divergence the
+        // version actually being served already carries alone.
+        if adopt {
+            self.note_divergence(committed.version, &self.compiled_under);
         }
-        if let Some(regression) = regression {
-            tracing::warn!(
-                from = regression.from,
-                to = regression.to,
-                "the control directory's store answered a lower version than this node had \
-                 already compiled, which a store is required never to do; this node's own \
-                 change was committed against the store's version and is published from it"
+        if let Some(regression) = &regression {
+            warn_regression(
+                regression,
+                "this node's own change was committed against the store's version and is \
+                 published from it",
             );
         }
         Ok(records)
@@ -1821,6 +1958,28 @@ impl Drop for ClaimGuard<'_> {
 /// the whole property that function exists to have.
 fn taken(current: &Compiled) -> (Arc<ControlPlane>, Arc<DirectoryRecords>) {
     (Arc::clone(&current.plane), Arc::clone(&current.records))
+}
+
+/// One warning, whichever of the two paths saw the regression and whichever
+/// promise the store broke.
+///
+/// Both call sites end the same sentence differently — a refresh adopts what
+/// the store holds, a write publishes what it just committed — so the tail is a
+/// parameter and the head is not: an operator grepping for a store that went
+/// backwards should find both events under one phrase, and a second copy of
+/// that phrase is how the two drift apart.
+fn warn_regression(regression: &DirectoryRegression, resolution: &str) {
+    let (cause, detail) = match &regression.cause {
+        RegressionCause::Version => ("version", String::new()),
+        RegressionCause::Lineage { from, to } => ("lineage", format!(" (`{from}` -> `{to}`)")),
+    };
+    tracing::warn!(
+        from = regression.from,
+        to = regression.to,
+        cause,
+        "the control directory's store answered a version this node had already moved past, \
+         by {cause}{detail}, which a store is required never to do; {resolution}"
+    );
 }
 
 /// See [`ControlDirectory::compile`].

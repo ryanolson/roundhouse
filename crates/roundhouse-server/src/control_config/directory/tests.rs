@@ -1956,7 +1956,7 @@ async fn a_stale_commit_against_the_scripted_store_is_refused_by_the_real_compar
         .await
         .expect("the double is still at the version this write read");
     assert_eq!(
-        first, 2,
+        first.version, 2,
         "the first successful commit through the double is version 2"
     );
 
@@ -1980,7 +1980,7 @@ async fn a_stale_commit_against_the_scripted_store_is_refused_by_the_real_compar
          the production store: {stale:?}"
     );
     assert_eq!(
-        store.version().await.unwrap(),
+        store.version().await.unwrap().version,
         2,
         "a refused commit must not have advanced the double"
     );
@@ -2464,11 +2464,120 @@ async fn a_version_regression_is_adopted_once_and_then_converged_on() {
     );
     assert_eq!(
         directory.last_regression(),
-        Some(DirectoryRegression { from: 5, to: 2 }),
+        Some(DirectoryRegression {
+            from: 5,
+            to: 2,
+            cause: RegressionCause::Version
+        }),
         "F3: and says why it went backwards, naming both versions -- adopting \
          a regression silently would leave an operator with a node that lost \
          state and no record of when or from where"
     );
+}
+
+/// M16.1 review, F1 (R-D2″): **a counter that restarted at the very version
+/// this node serves is not read as a quiet deployment.**
+///
+/// The ABA the version comparison above cannot see. `a_version_regression_is_
+/// adopted_once_and_then_converged_on` covers a store that answers a *lower*
+/// number; this covers the one that answers the *same* number for a different
+/// document — an operator `DEL`, a `FLUSHDB`, a restore that did not include
+/// this key, after which the next write starts the counter again at 1. The
+/// refresh's first question is `version()`, and before the lineage existed the
+/// answer `1` was indistinguishable from "nothing has changed": the node
+/// short-circuited on `version == claimed_version` and went on serving a plane
+/// the deployment had replaced — including keys it had revoked — with no line
+/// in any log. What makes it reachable rather than theoretical is the TTL: a
+/// young deployment flushed and re-populated inside one TTL never observes a
+/// version below the one it claimed, so nothing else in this file would fire.
+///
+/// The control below is half of this test's evidence: the *same* two records
+/// at the *same* two versions, with the lineage carried forward, must still
+/// cost nothing and change nothing — otherwise the pair comparison would have
+/// bought the ABA at the price of a reload per TTL on every quiet deployment.
+#[tokio::test]
+async fn a_counter_that_restarted_at_the_served_version_is_not_read_as_unchanged() {
+    let (before, after) = staged_mint().await;
+    let store = Arc::new(ScriptedDirectoryStore::new(before, 1).await);
+    let directory = scripted(Arc::clone(&store)).await;
+    let booted = directory.plane(0).await;
+    assert!(
+        !admits_bo(&booted),
+        "fixture premise: this node boots serving version 1, which has no key for bo"
+    );
+
+    // The key is gone and written again from nothing, and the new counter's
+    // first write lands at version 1 -- the number this node is already
+    // serving -- carrying a document that revoked nothing and granted bo a
+    // key. Only the lineage separates this from a deployment where nobody has
+    // written anything since boot.
+    store.set_in_a_new_lineage(after, 1).await;
+
+    let plane = directory.plane(GUARD_TTL_MS).await;
+    assert!(
+        admits_bo(&plane),
+        "F1: the store's key was replaced under this node and its counter \
+         restarted at the version this node had claimed; a refresh that \
+         compared numbers alone saw `1 == 1`, skipped the load outright, and \
+         served the replaced plane until the process restarted"
+    );
+    assert_eq!(
+        store.loads(),
+        1,
+        "and it noticed by loading once -- the short circuit is what the \
+         defect was"
+    );
+    match directory.last_regression() {
+        Some(DirectoryRegression {
+            from,
+            to,
+            cause: RegressionCause::Lineage { .. },
+        }) => {
+            assert_eq!(
+                (from, to),
+                (1, 1),
+                "the two numbers are equal, which is the whole point: this is a \
+                 regression the version fields cannot show on their own"
+            );
+        }
+        other => panic!(
+            "a store whose counter restarted has regressed however the numbers compare, and \
+             the cause has to say `lineage` rather than report a fall from 1 to 1: {other:?}"
+        ),
+    }
+}
+
+/// The control for the guard above: the same document arriving at the same
+/// version *in the same lineage* is what a store is required never to do, and
+/// this node still treats an unmoved identity as unmoved.
+///
+/// This is what proves the pair comparison did not simply turn every refresh
+/// into a reload: a quiet deployment must still cost one `version()` read per
+/// TTL and no load at all, which is the property `version()` exists for.
+#[tokio::test]
+async fn an_unmoved_identity_still_costs_one_version_read_and_no_load() {
+    let (before, after) = staged_mint().await;
+    let store = Arc::new(ScriptedDirectoryStore::new(before, 1).await);
+    let directory = scripted(Arc::clone(&store)).await;
+
+    // Same version, same lineage, different records -- a store violating its
+    // own contract rather than a real event, and the only way to hold every
+    // other variable of the guard above fixed while changing the lineage.
+    store.set(after, 1).await;
+
+    let refreshed = directory.plane(GUARD_TTL_MS).await;
+    assert!(
+        !admits_bo(&refreshed),
+        "an identity that has not moved is not a reason to reload"
+    );
+    assert_eq!(store.versions(), 1, "the cheap read, once");
+    assert_eq!(
+        store.loads(),
+        0,
+        "and no load: a node that reloaded on every refresh would pay for the \
+         deployment's whole tenancy once per TTL, whether or not it changed"
+    );
+    assert_eq!(directory.last_regression(), None);
 }
 
 /// F3, apply path: **a node's own successful write is published even after the
@@ -2526,7 +2635,11 @@ async fn apply_publishes_its_own_commit_after_a_store_regression() {
     );
     assert_eq!(
         directory.last_regression(),
-        Some(DirectoryRegression { from: 3, to: 0 }),
+        Some(DirectoryRegression {
+            from: 3,
+            to: 0,
+            cause: RegressionCause::Version
+        }),
         "F3: and the regression that made this publish unconditional is \
          recorded, naming the version this node held and the one the store \
          answered"
@@ -2662,6 +2775,11 @@ async fn a_claim_dropped_mid_load_gives_up_the_single_flight_token() {
 /// observe `refreshed_at_ms` while the store has not yet answered anything at
 /// all — not even a failure. [`ScriptedDirectoryStore`] cannot do this: its `version`
 /// never awaits a gate, only its `load` does.
+/// One lineage for every answer this double gives: it scripts *when* the store
+/// answers, never *what* it holds, so a lineage that moved would be scripting a
+/// second thing by accident.
+const GATED_LINEAGE: &str = "gated-version-store";
+
 struct GatedVersionStore {
     records: DirectoryRecords,
     version: u64,
@@ -2708,6 +2826,7 @@ impl DirectoryStore for GatedVersionStore {
         Ok(VersionedRecords {
             records: self.records.clone(),
             version: self.version,
+            lineage: GATED_LINEAGE.to_string(),
             compiled_under: CompiledUnder::default(),
         })
     }
@@ -2716,11 +2835,11 @@ impl DirectoryStore for GatedVersionStore {
         &self,
         _expected_version: u64,
         _records: DirectoryRecords,
-    ) -> Result<u64, StoreFailure> {
+    ) -> Result<StoredVersion, StoreFailure> {
         unimplemented!("this guard never mutates the directory")
     }
 
-    async fn version(&self) -> Result<u64, StoreFailure> {
+    async fn version(&self) -> Result<StoredVersion, StoreFailure> {
         self.versions
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.entered.add_permits(1);
@@ -2729,7 +2848,10 @@ impl DirectoryStore for GatedVersionStore {
             .await
             .expect("the gate outlives the version call waiting on it")
             .forget();
-        Ok(self.version)
+        Ok(StoredVersion {
+            lineage: GATED_LINEAGE.to_string(),
+            version: self.version,
+        })
     }
 }
 
@@ -3084,4 +3206,84 @@ async fn a_version_this_node_refuses_is_recorded_beside_the_one_it_serves() {
         "a version loaded again is not a version seen again"
     );
     assert_eq!(reader.status().refused_version, Some(refused_at));
+}
+
+/// **F5: `divergence` reads like `refused_version` -- a fact about *now*,
+/// not a scar from the last time the two disagreed.**
+///
+/// `refused_version` is explicitly cleared the moment a later version
+/// compiles (see the publish arm of [`Managed::compiled`]), on the stated
+/// reasoning that leaving it standing "would report a node as stuck long
+/// after it caught up". `DivergenceState.last` is the sibling field
+/// answering the same conceptual question -- is this node currently out of
+/// step -- and [`Managed::note_divergence`] now clears it the same way, on
+/// an agreeing load.
+///
+/// The reader here diverges once against the writer's foreign file, then
+/// itself writes a document under its *own* fingerprint -- the case where
+/// every node agrees again after a rollout completes. `warned_version` is
+/// left alone by the same fix (it answers a different question -- which
+/// version this node has already told the operator about, not which version
+/// it currently disagrees with), so a later divergence at a *new* version
+/// still warns; nothing here exercises that half, since D2's own
+/// `divergences_named` coverage above already pins it.
+#[tokio::test]
+async fn divergence_clears_once_a_later_version_agrees() {
+    let documents: Arc<dyn DocumentStore> = Arc::new(MemoryDocumentStore::new());
+    let writer = node(Arc::clone(&documents), stamped_file("aaaa"), checks(), 0).await;
+    let reader = node(Arc::clone(&documents), stamped_file("bbbb"), checks(), 0).await;
+
+    writer
+        .apply(
+            DirectoryMutation::CreateProject {
+                entry: project("one"),
+            },
+            1,
+        )
+        .await
+        .expect("a fresh project id");
+
+    // The reader sees the writer's foreign-file version and names it.
+    reader.plane(2).await;
+    assert_eq!(
+        reader.status().divergence,
+        Some(DirectoryDivergence {
+            version: 1,
+            differs: vec![DivergentInput::File],
+        }),
+        "fixture premise: the reader has named the writer's version divergent"
+    );
+
+    // The reader now writes its own document, under its own fingerprint --
+    // the moment every node agrees again. `apply` also runs
+    // `note_divergence` (M16.1, R-D9), and this load agrees with the
+    // reader's own inputs, so `differs` is empty.
+    reader
+        .apply(
+            DirectoryMutation::CreateProject {
+                entry: project("two"),
+            },
+            3,
+        )
+        .await
+        .expect("the reader's own fingerprint compiles its own write");
+    assert_eq!(
+        reader.status().served_version,
+        2,
+        "fixture premise: the reader's write published a newer version"
+    );
+
+    // A further refresh past that version, for the same reason: the fix is
+    // in `note_divergence` on *any* agreeing load, not only the one made by
+    // `apply` -- so a plain refresh must clear it too.
+    reader.plane(4).await;
+
+    assert_eq!(
+        reader.status().divergence,
+        None,
+        "F5: the reader now serves a version written under its own fingerprint, agreeing with \
+         every node in the fleet, so it must not go on reporting a divergence named against a \
+         version it has long since moved past -- the same staleness `refused_version` is \
+         explicitly cleared to avoid"
+    );
 }

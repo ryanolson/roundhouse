@@ -48,9 +48,11 @@
 use std::sync::Arc;
 
 use roundhouse_core::now_ms;
+use roundhouse_fleet::{StaticFrontierCatalog, WireProtocol};
 use roundhouse_server::control_config::boot_directory;
 use roundhouse_server::control_config::crosscheck::CrossChecks;
 use roundhouse_server::shared_backend::open;
+use roundhouse_server::test_support::frontier_spec;
 use roundhouse_server::{ControlDirectory, DirectoryError, DirectoryMutation};
 use roundhouse_store_redis::KeyNamespace;
 use roundhouse_store_redis::test_support::{directory_records_key, url_from_env};
@@ -126,7 +128,12 @@ async fn boot(namespace: &KeyNamespace) -> Result<Arc<ControlDirectory>, Directo
     boot_directory(
         Some(boot_file()),
         Arc::clone(backends.directory()),
-        Vec::new(),
+        // Empty: neither test that calls this helper reads the fingerprint's
+        // catalog axis, only whether the boot succeeds or is refused --
+        // `directory_boot_fingerprint_catalog_half_never_reflects_the_real_catalog`
+        // below builds its own catalog and calls `boot_directory` directly for
+        // that reason.
+        &StaticFrontierCatalog::default(),
         CrossChecks::new(reachable(), None),
         now_ms(),
     )
@@ -319,4 +326,111 @@ async fn a_directory_key_this_deployment_cannot_read_refuses_the_boot() {
     boot(&namespace)
         .await
         .expect("with nothing foreign at the key, the same boot is the empty directory");
+}
+
+/// **M16.1 review, F2: the boot composition threads the real catalog into
+/// the stored fingerprint.**
+///
+/// `StaticFrontierCatalog::identities` (`roundhouse-fleet/src/frontier.rs`)
+/// is the real computation -- sort, dedup, `"{provider}/{model}"` -- and it
+/// used to be a private `fn` inside the `[[bin]] roundhouse` target that only
+/// a unit test living beside it could reach; this file's own `boot()` helper,
+/// like every boot in this suite, handed `boot_directory` a hand-written
+/// `Vec::new()` for the catalog axis because there was no way to thread a
+/// different value through it. Moving the computation into the library (this
+/// finding's fix) is what lets this suite build a real
+/// `StaticFrontierCatalog`, hand it to `boot_directory` -- the very function
+/// `main.rs::serve` calls -- and check that what lands in Redis is what that
+/// catalog actually identifies, rather than asserting the absence of a
+/// function.
+#[tokio::test]
+#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
+async fn directory_boot_fingerprint_catalog_half_never_reflects_the_real_catalog() {
+    let namespace = fresh_namespace();
+
+    // A catalog that names the same target `reachable()` (above) already
+    // uses, plus a duplicate and a second provider, so dedup and sort both
+    // have something to do -- not a strawman invented for the test.
+    let catalog = StaticFrontierCatalog::new(vec![
+        frontier_spec("anthropic", "claude", WireProtocol::AnthropicMessages),
+        frontier_spec("anthropic", "claude", WireProtocol::AnthropicMessages),
+        frontier_spec(
+            "openrouter",
+            "capable-m",
+            WireProtocol::OpenAiChatCompletions,
+        ),
+    ]);
+    let real_catalog_identities = catalog.identities();
+
+    // Exactly the boot this file performs everywhere else: `open` chooses the
+    // backend, `boot_directory` is the same function `main.rs::serve` calls,
+    // and the catalog is the real one built above rather than `boot()`'s own
+    // `StaticFrontierCatalog::default()`.
+    let backends = open(Some(&url_from_env()), &namespace)
+        .await
+        .expect("the test Redis named by ROUNDHOUSE_TEST_REDIS_URL must be reachable");
+    let directory = boot_directory(
+        Some(boot_file()),
+        Arc::clone(backends.directory()),
+        &catalog,
+        CrossChecks::new(reachable(), None),
+        now_ms(),
+    )
+    .await
+    .expect("the file alone compiles, since it is what a boot would have loaded");
+
+    // `Managed::new` only loads and compiles on boot -- it commits nothing
+    // (see `directory.rs`, `note_divergence`'s version-zero skip, which is
+    // exactly for a store nothing has written to yet). A mutation is the
+    // first thing that stamps `compiled_under` into Redis, so one is applied
+    // here purely to produce the document this test reads back.
+    directory
+        .apply(
+            DirectoryMutation::CreateProject {
+                entry: roundhouse_server::control_config::ProjectEntry {
+                    id: format!("f2-fingerprint-probe-{}", uuid::Uuid::new_v4()),
+                    name: None,
+                    policy: None,
+                    budget: None,
+                    fair_use: None,
+                    validate: None,
+                    credentials: None,
+                    tiers: None,
+                },
+            },
+            now_ms(),
+        )
+        .await
+        .expect("a fresh project id in a fresh namespace commits and stamps the fingerprint");
+
+    // Read the envelope this commit just wrote back out of Redis, raw --
+    // bypassing the typed directory entirely, so this checks what actually
+    // landed rather than an in-process copy.
+    let stored = backends
+        .directory()
+        .load()
+        .await
+        .expect("the document boot_directory just committed")
+        .document
+        .expect("a document exists once boot_directory has written one");
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&stored).expect("boot_directory writes valid JSON (R-D7)");
+    let stored_catalog: Vec<String> = envelope["compiled_under"]["catalog"]
+        .as_array()
+        .expect("CompiledUnder::catalog is #[serde(default)] and always written")
+        .iter()
+        .map(|v| {
+            v.as_str()
+                .expect("catalog identities are strings")
+                .to_string()
+        })
+        .collect();
+
+    assert_eq!(
+        stored_catalog, real_catalog_identities,
+        "F2: the directory-boot integration suite's stored fingerprint must carry the real \
+         catalog identities -- boot_directory is fed the real StaticFrontierCatalog here, so a \
+         mutation to StaticFrontierCatalog::identities's sort/dedup/format is visible to this \
+         suite."
+    );
 }

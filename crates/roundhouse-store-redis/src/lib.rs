@@ -113,6 +113,13 @@ const CONNECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_millis
 /// [`CONNECTION_TIMEOUT`]: this manager sits under a ceiling check with its
 /// own two-second budget, not under a background job that can afford to be
 /// generous.
+///
+/// **What this buys the other four families and only the other four**
+/// (M16.1 review, F6). `sess`, `spend`, `fairuse` and `corr` all move small,
+/// fixed-shape payloads — a lease hash, a counter, a stream entry — so 300ms
+/// is generous for any of them and the ceiling-check budget above is what
+/// actually constrains it. The `dir` family does not fit that shape: see
+/// [`directory::DIRECTORY_RESPONSE_TIMEOUT`], which carries it instead.
 const RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(300);
 
 /// The smallest delay between reconnect attempts, and the base the backoff
@@ -145,7 +152,8 @@ const RECONNECT_BACKOFF_FACTOR: f32 = 2.0;
 const RECONNECT_RETRIES: usize = 3;
 
 /// Build the `ConnectionManager` every Redis-backed store, ledger, fair-use
-/// tracker and correlation map in this crate connects through.
+/// tracker and correlation map in this crate connects through, at
+/// [`RESPONSE_TIMEOUT`].
 ///
 /// One function rather than the three copies of `ConnectionManagerConfig::default()`
 /// this replaces (session store, spend ledger, fair-use ledger, each
@@ -153,11 +161,34 @@ const RECONNECT_RETRIES: usize = 3;
 /// so the outage-latency bound above is a fact about the crate, verified
 /// once, rather than three unlabelled call sites that happened to agree by
 /// copy-paste and could just as easily drift apart.
+///
+/// A thin wrapper over [`connect_manager_at`] at this crate's shared timeout
+/// (M16.1 review, F6) — every family but `dir` wants exactly this, and this
+/// name is what four call sites already spell.
 async fn connect_manager(url: &str) -> Result<ConnectionManager, redis::RedisError> {
+    connect_manager_at(url, RESPONSE_TIMEOUT).await
+}
+
+/// [`connect_manager`], with the response timeout as a parameter rather than
+/// the shared constant.
+///
+/// **The sibling F6 asks for, not a widened `connect_manager` signature.**
+/// Four call sites already spell `connect_manager(url)` for a timeout sized
+/// for a small, fixed-shape payload; only [`directory::RedisDocumentStore`]
+/// needs a different number, so it is the one caller that names this function
+/// and the one that carries [`directory::DIRECTORY_RESPONSE_TIMEOUT`] in.
+/// Every other tuning knob — the connection timeout, the reconnect backoff,
+/// the retry count — stays shared, because F6 is about the one budget that
+/// scales with document size, not about this family needing a different
+/// reconnect posture too.
+async fn connect_manager_at(
+    url: &str,
+    response_timeout: std::time::Duration,
+) -> Result<ConnectionManager, redis::RedisError> {
     let client = redis::Client::open(url)?;
     let config = ConnectionManagerConfig::new()
         .set_connection_timeout(Some(CONNECTION_TIMEOUT))
-        .set_response_timeout(Some(RESPONSE_TIMEOUT))
+        .set_response_timeout(Some(response_timeout))
         .set_min_delay(RECONNECT_MIN_DELAY)
         .set_max_delay(RECONNECT_MAX_DELAY)
         .set_exponent_base(RECONNECT_BACKOFF_FACTOR)

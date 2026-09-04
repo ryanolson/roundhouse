@@ -11,7 +11,9 @@
 
 use std::sync::Arc;
 
-use roundhouse_core::control::directory::{DocumentStore, MemoryDocumentStore, VersionedDocument};
+use roundhouse_core::control::directory::{
+    DocumentStore, DocumentVersion, MemoryDocumentStore, VersionedDocument,
+};
 
 use super::*;
 use crate::control_config::budget::{AllocationConfig, BudgetConfig, OnExhaustionConfig};
@@ -350,13 +352,17 @@ async fn an_empty_store_is_the_empty_directory_and_a_lost_document_is_not() {
             Ok(VersionedDocument {
                 document: None,
                 version: 7,
+                lineage: "lost-document".into(),
             })
         }
-        async fn commit(&self, _: u64, _: Vec<u8>) -> Result<u64, DocumentStoreError> {
+        async fn commit(&self, _: u64, _: Vec<u8>) -> Result<DocumentVersion, DocumentStoreError> {
             unreachable!("this double is only ever loaded from")
         }
-        async fn version(&self) -> Result<u64, DocumentStoreError> {
-            Ok(7)
+        async fn version(&self) -> Result<DocumentVersion, DocumentStoreError> {
+            Ok(DocumentVersion {
+                lineage: "lost-document".into(),
+                version: 7,
+            })
         }
     }
 
@@ -369,6 +375,72 @@ async fn an_empty_store_is_the_empty_directory_and_a_lost_document_is_not() {
             "a store at a nonzero version holding no document has lost it, and \
              reading that as an empty directory would commit the emptiness on \
              the next write: {other:?}"
+        ),
+    }
+}
+
+/// The mirror of the case above, and refused for the mirror reason (M16.1
+/// review, F4): a document at version 0.
+///
+/// Version 0 *is* "no document" — the contract says so, and this adapter's own
+/// empty-store arm is the reading of it — so a store answering `Some(bytes)`
+/// at version 0 is answering two things that cannot both be true. Only a
+/// durable backend can produce the shape (a hash whose `version` field was
+/// deleted, a foreign writer, a restore that landed half a key);
+/// `MemoryDocumentStore` moves its document and its counter together from
+/// `(None, 0)` and cannot reach it at all, which is exactly why the refusal
+/// has to be here rather than in one backend — and why this test needs a
+/// double to reach it.
+///
+/// What it costs to get this wrong is the whole of F4: the plane would be
+/// compiled from tenancy whose version this node never observed, and the very
+/// next admin write would `commit(0, ..)` straight over the key it came from.
+#[tokio::test]
+async fn a_document_at_version_zero_is_refused_rather_than_compiled() {
+    struct DocumentWithoutAVersion;
+    #[async_trait]
+    impl DocumentStore for DocumentWithoutAVersion {
+        async fn load(&self) -> Result<VersionedDocument, DocumentStoreError> {
+            Ok(VersionedDocument {
+                // Valid bytes, deliberately: the refusal must be about the
+                // version being zero beside a document, not about a document
+                // this build cannot read -- which would pass this test for the
+                // wrong reason.
+                document: Some(
+                    serde_json::to_vec(&serde_json::json!({
+                        "schema": DIRECTORY_DOCUMENT_SCHEMA,
+                        "records": DirectoryRecords::default(),
+                        "compiled_under": CompiledUnder::default(),
+                    }))
+                    .unwrap(),
+                ),
+                version: 0,
+                lineage: String::new(),
+            })
+        }
+        async fn commit(&self, _: u64, _: Vec<u8>) -> Result<DocumentVersion, DocumentStoreError> {
+            unreachable!("this double is only ever loaded from")
+        }
+        async fn version(&self) -> Result<DocumentVersion, DocumentStoreError> {
+            Ok(DocumentVersion {
+                lineage: String::new(),
+                version: 0,
+            })
+        }
+    }
+
+    let store = DocumentDirectoryStore::over(Arc::new(DocumentWithoutAVersion));
+    match store.load().await {
+        Err(StoreFailure::Unavailable(reason)) => {
+            assert!(
+                reason.contains("version 0"),
+                "the reason has to say which impossible pair it saw: {reason}"
+            );
+        }
+        other => panic!(
+            "version zero is the empty directory, so a store holding a document at version \
+             zero has a key whose version this node never read -- compiling it would serve \
+             tenancy the next write clobbers: {other:?}"
         ),
     }
 }
@@ -388,7 +460,7 @@ async fn an_empty_store_is_the_empty_directory_and_a_lost_document_is_not() {
 async fn a_stale_commit_arrives_as_concurrent_and_an_outage_as_unavailable() {
     let store = memory();
     let version = store.commit(0, DirectoryRecords::default()).await.unwrap();
-    assert_eq!(version, 1);
+    assert_eq!(version.version, 1);
 
     let stale = store.commit(0, every_field_populated()).await;
     assert!(
@@ -413,10 +485,10 @@ async fn a_stale_commit_arrives_as_concurrent_and_an_outage_as_unavailable() {
         async fn load(&self) -> Result<VersionedDocument, DocumentStoreError> {
             Err(DocumentStoreError::Unavailable("connection refused".into()))
         }
-        async fn commit(&self, _: u64, _: Vec<u8>) -> Result<u64, DocumentStoreError> {
+        async fn commit(&self, _: u64, _: Vec<u8>) -> Result<DocumentVersion, DocumentStoreError> {
             Err(DocumentStoreError::Unavailable("connection refused".into()))
         }
-        async fn version(&self) -> Result<u64, DocumentStoreError> {
+        async fn version(&self) -> Result<DocumentVersion, DocumentStoreError> {
             Err(DocumentStoreError::Unavailable("connection refused".into()))
         }
     }
@@ -482,4 +554,108 @@ async fn the_writers_fingerprint_is_what_a_reader_loads_back() {
         older.load().await.unwrap().compiled_under,
         CompiledUnder::default()
     );
+}
+
+/// One project record whose `name` is `pad_bytes` copies of `'a'` and nothing
+/// else populated — a single ASCII field long enough to dial the envelope's
+/// encoded length to an exact byte count, since a plain ASCII letter costs
+/// exactly one byte in the JSON output with no escaping to throw the count off.
+fn records_padded_to(pad_bytes: usize) -> DirectoryRecords {
+    DirectoryRecords {
+        projects: vec![ProjectRecord {
+            entry: ProjectEntry {
+                id: "pad".into(),
+                name: Some("a".repeat(pad_bytes)),
+                policy: None,
+                budget: None,
+                fair_use: None,
+                validate: None,
+                credentials: None,
+                tiers: None,
+            },
+            provenance: Provenance::Admin,
+            created_at_ms: None,
+            archived_at_ms: None,
+        }],
+        ..DirectoryRecords::default()
+    }
+}
+
+/// The exact byte length [`DocumentDirectoryStore::commit`] would encode
+/// `records` to, computed the same way `commit` does (same envelope, same
+/// default fingerprint a bare [`DocumentDirectoryStore::over`] stamps) but
+/// without writing anywhere — what lets the two tests below dial a document to
+/// precisely the ceiling rather than merely somewhere near it.
+fn encoded_len(records: &DirectoryRecords) -> usize {
+    serde_json::to_vec(&DirectoryDocument {
+        schema: DIRECTORY_DOCUMENT_SCHEMA,
+        records: records.clone(),
+        compiled_under: CompiledUnder::default(),
+    })
+    .expect("a directory document of plain ASCII strings always encodes")
+    .len()
+}
+
+/// **M16.1 review, F6: the ceiling is enforced by the adapter, before any
+/// store call, and the boundary is exact.**
+///
+/// `connect_manager`'s shared `RESPONSE_TIMEOUT` (`roundhouse-store-redis`,
+/// `lib.rs`) is 300ms, sized for a fair-use ceiling check with its own
+/// two-second budget — not for this family, whose `commit` wraps the entire
+/// document in one Lua argument. A document large enough to blow that budget
+/// used to surface as a bare timeout, indistinguishable from Redis being
+/// down. [`DIRECTORY_DOCUMENT_CEILING_BYTES`] is the fix's other half: a
+/// document at the ceiling still commits, and one byte over is refused here,
+/// by this adapter, before `self.store.commit` is ever called — which this
+/// test proves by checking the underlying store never saw a write for the
+/// refused document, not only that the call returned an error.
+#[tokio::test]
+async fn a_document_at_the_ceiling_commits_and_one_byte_over_is_refused_before_any_wire() {
+    let base_len = encoded_len(&records_padded_to(0));
+    let pad_to_ceiling = DIRECTORY_DOCUMENT_CEILING_BYTES - base_len;
+
+    let at_ceiling = records_padded_to(pad_to_ceiling);
+    assert_eq!(
+        encoded_len(&at_ceiling),
+        DIRECTORY_DOCUMENT_CEILING_BYTES,
+        "fixture premise: the padding must land the encoded document on the exact ceiling"
+    );
+    let store = memory();
+    store
+        .commit(0, at_ceiling)
+        .await
+        .expect("a document at the ceiling, not over it, must still commit");
+
+    let backing = Arc::new(MemoryDocumentStore::new());
+    let over_ceiling = DocumentDirectoryStore::over(Arc::clone(&backing) as Arc<dyn DocumentStore>);
+    let one_byte_over = records_padded_to(pad_to_ceiling + 1);
+    assert_eq!(
+        encoded_len(&one_byte_over),
+        DIRECTORY_DOCUMENT_CEILING_BYTES + 1
+    );
+    let error = over_ceiling
+        .commit(0, one_byte_over)
+        .await
+        .expect_err("one byte over the ceiling must be refused");
+    let reason = error.to_string();
+    assert!(
+        matches!(error, StoreFailure::Unavailable(_)),
+        "the refusal must be typed as a store failure rather than a bad change, since nothing \
+         about a caller's request produced it beyond size: {reason}"
+    );
+    assert!(
+        reason.contains(&(DIRECTORY_DOCUMENT_CEILING_BYTES + 1).to_string())
+            && reason.contains(&DIRECTORY_DOCUMENT_CEILING_BYTES.to_string()),
+        "the reason must name both the document's actual size and the ceiling it exceeded: \
+         {reason}"
+    );
+
+    // Before any wire: the underlying store this adapter wraps never saw a
+    // commit for the refused document. Version 0 with no document is exactly
+    // what a store nothing has ever written to answers -- proof this refusal
+    // happened in the adapter's own encode-then-check step, never reaching
+    // `self.store.commit`.
+    let never_written = backing.load().await.unwrap();
+    assert_eq!(never_written.version, 0);
+    assert_eq!(never_written.document, None);
 }

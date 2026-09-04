@@ -46,10 +46,52 @@ use super::records::DirectoryRecords;
 pub struct VersionedRecords {
     pub records: DirectoryRecords,
     pub version: u64,
+    /// Which run of the store's counter this version belongs to (R-D2″).
+    /// Opaque: compared for equality against the lineage this node claimed,
+    /// and never anything else. See [`DirectoryStore`]'s identity rule.
+    pub lineage: String,
     /// What the writer of *this version* said it compiled against. Compared
     /// against [`DirectoryStore::compiled_under`] by the reader; see
     /// [`ControlDirectory::divergence`](super::ControlDirectory::divergence).
     pub compiled_under: CompiledUnder,
+}
+
+/// What version a store stands at, and which run of its counter that version
+/// belongs to (R-D2″).
+///
+/// The pair rather than a number, because a number alone cannot answer the
+/// question the reader is actually asking — *has the document I compiled been
+/// replaced* — for a store that can lose its key and start counting again. See
+/// [`DirectoryStore`]'s identity rule for why that is a real deployment event
+/// rather than a hypothetical, and
+/// [`ControlDirectory::plane`](super::ControlDirectory::plane) for what a
+/// reader does about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredVersion {
+    pub lineage: String,
+    pub version: u64,
+}
+
+impl StoredVersion {
+    /// Whether this identity is a **later state of the same document** than
+    /// the one a node is serving — the publish rule, in one place.
+    ///
+    /// Both the refresh and the write path decide whether to install what they
+    /// are holding, and they have to decide it the same way: a second copy of
+    /// this comparison that drifted would let one of the two install a plane
+    /// the other had already moved past. Two halves, and the second is the
+    /// M16.1 review's F1: a higher number only means "later" *within* a
+    /// lineage, so a document from a run of the counter this node has already
+    /// moved off is not newer however it is numbered.
+    ///
+    /// Version zero is the exception, and not a special case bolted on: a node
+    /// that has never seen a document has no lineage to be the same as, so the
+    /// first document a deployment ever writes is adopted whichever lineage
+    /// minted it. Without that, a node booted against an empty store would
+    /// refuse the very first write for the life of the process.
+    pub fn supersedes(&self, served: &StoredVersion) -> bool {
+        self.version > served.version && (served.version == 0 || self.lineage == served.lineage)
+    }
 }
 
 /// Why a store could not answer.
@@ -107,25 +149,39 @@ pub enum StoreFailure {
 /// be held as `Arc<dyn DirectoryStore>` — one directory, whichever backing
 /// store the boot chose.
 ///
-/// # The version is monotone, by contract (R-D2′)
+/// # A document's identity is (lineage, version) (R-D2′, completed as R-D2″)
 ///
-/// **An implementation's version only ever goes up.** Every [`commit`] returns
-/// a version strictly greater than any version this store has previously
-/// returned from [`commit`] or answered from [`version`], and [`version`] never
-/// answers something lower than it answered before. A store that breaks that
-/// has *regressed* — restored from a backup, flushed, or failed over to a
-/// replica that had not caught up — and a regression is not something the
-/// callers above can prevent; it is something they have to be able to name.
+/// **Within one lineage, an implementation's version only ever goes up.** Every
+/// [`commit`] returns a version strictly greater than any version this store
+/// has previously returned from [`commit`] or answered from [`version`] in that
+/// lineage, and [`version`] never answers something lower than it answered
+/// before. A store that breaks that has *regressed* — restored from a backup,
+/// flushed, or failed over to a replica that had not caught up — and a
+/// regression is not something the callers above can prevent; it is something
+/// they have to be able to name.
+///
+/// **The lineage is the half that makes the promise keepable**, and it was
+/// added because the number alone was not (M16.1 review, F1). A durable
+/// store's counter lives in the store: delete the key, flush it, restore an
+/// older snapshot, and the next commit hands out version 1 again — a version a
+/// node is *already serving*. Nothing about that number is lower than what
+/// that node claimed, so a check that compared numbers would see a quiet
+/// deployment and go on serving a plane the deployment has replaced,
+/// revocations included. So the store answers which run of the counter it is
+/// on, and a reader compares the pair: same lineage and same version is
+/// genuinely unchanged, a different lineage is a regression however the
+/// numbers compare.
 ///
 /// This is stated here rather than discovered per backend because the whole
 /// refresh rung turns on it: [`ControlDirectory::plane`] publishes by comparing
-/// versions, so under a store whose numbers can go down, "newer wins" silently
-/// means "the store's current truth loses, forever". The requirement is
-/// inherited by [`DocumentStore`](roundhouse_core::control::DocumentStore),
+/// identities, so under a store whose numbers can repeat, "newer wins"
+/// silently means "the store's current truth loses, forever". The requirement
+/// is inherited by [`DocumentStore`](roundhouse_core::control::DocumentStore),
 /// which is where both backends satisfy it: `MemoryDocumentStore`
-/// structurally, with one counter only ever incremented, and the Redis store
-/// deliberately, with a script that writes the version and the document it
-/// describes together.
+/// structurally, with one counter only ever incremented under one lineage
+/// minted at construction, and the Redis store deliberately, with a script
+/// that writes the version, the lineage and the document they describe
+/// together and mints a new lineage exactly when it finds a key holding none.
 ///
 /// What the directory does when it happens anyway is not this trait's business
 /// and is described where it is decided ([`ControlDirectory::plane`]'s refresh
@@ -143,25 +199,31 @@ pub trait DirectoryStore: Send + Sync + 'static {
     async fn load(&self) -> Result<VersionedRecords, StoreFailure>;
 
     /// Replace the records, if and only if the store is still at
-    /// `expected_version`. Returns the new version, which is strictly greater
-    /// than every version this store has handed out before — see the trait
-    /// doc's monotone requirement.
+    /// `expected_version`. Returns the identity the store now stands at, whose
+    /// version is strictly greater than every version this store has handed
+    /// out in that lineage — see the trait doc's identity rule.
+    ///
+    /// The identity rather than the number, because a writer whose commit
+    /// *started* a lineage — the first write of a deployment's life, or the
+    /// first after the key was lost — has no other way to learn which lineage
+    /// it just published into, and would have to guess or re-read.
     async fn commit(
         &self,
         expected_version: u64,
         records: DirectoryRecords,
-    ) -> Result<u64, StoreFailure>;
+    ) -> Result<StoredVersion, StoreFailure>;
 
-    /// The current version, without paying to read the records.
+    /// The current identity, without paying to read the records.
     ///
     /// The cheap half of [`ControlDirectory::plane`]'s refresh: a node past its
     /// TTL asks this first and recompiles only if the answer moved, so a quiet
-    /// deployment costs one version read per TTL rather than a compile.
+    /// deployment costs one small read per TTL rather than a compile.
     ///
-    /// Never lower than an answer this store has already given — the trait
-    /// doc's monotone requirement, which is what lets a caller read "lower than
-    /// last time" as a regression rather than as an ordinary write.
-    async fn version(&self) -> Result<u64, StoreFailure>;
+    /// Within a lineage, never lower than an answer this store has already
+    /// given — the trait doc's identity rule, which is what lets a caller read
+    /// "lower than last time" as a regression rather than as an ordinary
+    /// write, and "a different lineage" as one however the numbers compare.
+    async fn version(&self) -> Result<StoredVersion, StoreFailure>;
 
     /// What *this node* compiles against, to be compared with what a loaded
     /// version was written against (M16.1, R-D9).
@@ -177,5 +239,54 @@ pub trait DirectoryStore: Send + Sync + 'static {
     /// adding the method a change to every test file.
     fn compiled_under(&self) -> CompiledUnder {
         CompiledUnder::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(lineage: &str, version: u64) -> StoredVersion {
+        StoredVersion {
+            lineage: lineage.to_string(),
+            version,
+        }
+    }
+
+    /// The publish rule, including the case no fixture in this workspace can
+    /// reach through a store (M16.1 review, F1).
+    ///
+    /// The first three lines are what "newer wins" always meant. The last two
+    /// are the ones a test has to hold, because nothing else does: only a
+    /// durable backend can answer *no lineage at all* — its key does not exist
+    /// yet, so there is nothing to mint one from — and `MemoryDocumentStore`
+    /// mints one at construction and answers it from version zero on. So a
+    /// node booted against an empty Redis serves `("", 0)`, and a rule that
+    /// asked for a matching lineage would refuse the deployment's very first
+    /// write, for the life of the process, with every in-memory fixture in the
+    /// suite still green.
+    #[test]
+    fn later_means_later_in_the_same_lineage_and_anything_beats_version_zero() {
+        assert!(at("one", 2).supersedes(&at("one", 1)));
+        assert!(!at("one", 1).supersedes(&at("one", 2)));
+        assert!(!at("one", 1).supersedes(&at("one", 1)));
+
+        assert!(
+            !at("two", 9).supersedes(&at("one", 1)),
+            "a document from a run of the counter this node has moved off is \
+             not newer however it is numbered -- the whole of the identity rule"
+        );
+
+        assert!(
+            at("one", 1).supersedes(&at("", 0)),
+            "a node that has never seen a document has no lineage to match, so \
+             the first write of a deployment's life is adopted -- a durable \
+             store's empty key is exactly this shape"
+        );
+        assert!(
+            at("one", 1).supersedes(&at("two", 0)),
+            "and the same holds whatever a backend chooses to answer at \
+             version zero, since version zero means no document"
+        );
     }
 }

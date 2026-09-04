@@ -84,6 +84,39 @@ impl StaticFrontierCatalog {
         &self.models
     }
 
+    /// The catalog half of a stored directory document's fingerprint (M16.1,
+    /// R-D9): every `(provider, model)` this deployment prices, sorted.
+    ///
+    /// The identities and not the prices, for the reason
+    /// `CrossChecks::fingerprint` gives about candidates: a fingerprint that
+    /// moved with a rate card would report a node as divergent from a
+    /// neighbour that had merely re-read the same file. What a divergence
+    /// check is for is *which models exist here*, which is what the
+    /// capability gate and every cross-check read.
+    ///
+    /// Sorted so the fingerprint is a property of the set rather than of the
+    /// order the catalog file happened to list it in; two nodes on one
+    /// catalog must produce identical vectors or the check fires on every
+    /// document.
+    ///
+    /// Lives here rather than beside its one caller (M16.1 review, F2) so a
+    /// `tests/` integration suite that builds a `StaticFrontierCatalog` can
+    /// reach the real computation: the boot composition used to compute this
+    /// with a private free function inside the `[[bin]]`, which only a unit
+    /// test living beside it could ever call, and a regression to the
+    /// sort/dedup/format was invisible to every suite that boots a directory
+    /// end to end.
+    pub fn identities(&self) -> Vec<String> {
+        let mut identities: Vec<String> = self
+            .models
+            .iter()
+            .map(|spec| format!("{}/{}", spec.provider, spec.model))
+            .collect();
+        identities.sort();
+        identities.dedup();
+        identities
+    }
+
     /// Seed a ledger with this catalog's cache models and pricing.
     ///
     /// Must run before the session replays its log, so replayed dispatches are
@@ -1211,6 +1244,18 @@ mod tests {
         }])
     }
 
+    /// One catalog entry, parameterized on the two fields
+    /// [`the_catalog_fingerprint_is_the_sorted_provider_model_set`] varies;
+    /// every other field is [`catalog`]'s own fixed value, since a fingerprint
+    /// test cares about identity, not price.
+    fn entry(provider: &str, model: &str) -> FrontierModelSpec {
+        FrontierModelSpec {
+            provider: provider.into(),
+            model: model.into(),
+            ..catalog().models()[0].clone()
+        }
+    }
+
     #[test]
     fn a_cold_frontier_prices_the_whole_prompt_as_prefill() {
         let catalog = catalog();
@@ -1253,6 +1298,60 @@ mod tests {
 
         assert_eq!(inside.expected_prefill_tokens, 0.0);
         assert_eq!(outside.expected_prefill_tokens, 50_000.0);
+    }
+
+    /// **The catalog fingerprint is the sorted identity set** (M16.1, R-D9).
+    ///
+    /// The companion to `CrossChecks::fingerprint`'s own test, and it exists
+    /// for the same reason: two nodes whose catalog files list the same models
+    /// in a different order must fingerprint identically, or the divergence
+    /// warning fires on every document of every healthy deployment and gets
+    /// switched off. The identity is `provider/model` and carries no price,
+    /// because a rate card that moved would otherwise read as a config
+    /// divergence.
+    #[test]
+    fn the_catalog_fingerprint_is_the_sorted_provider_model_set() {
+        let catalog = StaticFrontierCatalog::new(vec![
+            FrontierModelSpec {
+                wire_protocol: WireProtocol::OpenAiChatCompletions,
+                ..entry("openrouter", "capable-m")
+            },
+            FrontierModelSpec {
+                wire_protocol: WireProtocol::AnthropicMessages,
+                ..entry("anthropic", "big")
+            },
+        ]);
+        assert_eq!(
+            catalog.identities(),
+            vec![
+                "anthropic/big".to_string(),
+                "openrouter/capable-m".to_string()
+            ]
+        );
+
+        // The same two models, listed the other way round and priced
+        // differently: one fingerprint.
+        let reordered = StaticFrontierCatalog::new(vec![
+            FrontierModelSpec {
+                quality_prior: 0.99,
+                base_ttft_ms: 500.0,
+                wire_protocol: WireProtocol::AnthropicMessages,
+                ..entry("anthropic", "big")
+            },
+            FrontierModelSpec {
+                wire_protocol: WireProtocol::OpenAiChatCompletions,
+                ..entry("openrouter", "capable-m")
+            },
+        ]);
+        assert_eq!(catalog.identities(), reordered.identities());
+
+        // A catalog that genuinely differs fingerprints differently, or none
+        // of the above is worth asserting.
+        let smaller = StaticFrontierCatalog::new(vec![FrontierModelSpec {
+            wire_protocol: WireProtocol::AnthropicMessages,
+            ..entry("anthropic", "big")
+        }]);
+        assert_ne!(catalog.identities(), smaller.identities());
     }
 
     /// A plaintext with no substring in common with any fingerprint, marker or

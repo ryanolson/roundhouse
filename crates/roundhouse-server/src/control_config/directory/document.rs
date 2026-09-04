@@ -74,7 +74,7 @@ use serde::{Deserialize, Serialize};
 use roundhouse_core::control::directory::{DocumentStore, DocumentStoreError};
 
 use super::records::DirectoryRecords;
-use super::store::{DirectoryStore, StoreFailure, VersionedRecords};
+use super::store::{DirectoryStore, StoreFailure, StoredVersion, VersionedRecords};
 
 /// The schema this build writes, and the highest it will read.
 ///
@@ -84,6 +84,32 @@ use super::store::{DirectoryStore, StoreFailure, VersionedRecords};
 /// wraps. It is *not* bumped for an added optional field on a record type
 /// itself: those are `#[serde(default)]`, so both directions still read.
 pub const DIRECTORY_DOCUMENT_SCHEMA: u32 = 1;
+
+/// The largest encoded document this adapter will hand to a store (M16.1
+/// review, F6).
+///
+/// **8 MiB, because the contract this family actually promises is small.**
+/// The directory's own module doc puts the whole deployment's tenancy at "a
+/// few thousand keys", and the fully populated fixture this module's tests
+/// pin (`every_field_populated`) encodes at roughly 330 bytes per key record
+/// — so even a generous multiple of "a few thousand" (ten thousand keys, a
+/// deployment two orders of magnitude past anything this crate has been
+/// asked to hold) lands in the *tens* of megabytes at the very most, and a
+/// real deployment's document is hundreds of kilobytes. 8 MiB leaves that
+/// room without leaving so much that a document large enough to hurt the
+/// shared Redis connection ever reaches the wire in the first place.
+///
+/// **Enforced here, before any store call, rather than left to whatever the
+/// backend's own timeout does with an oversized write.** A store's response
+/// budget is sized to carry a document up to some size with margin — see
+/// `DIRECTORY_RESPONSE_TIMEOUT` in `roundhouse-store-redis` — but a budget is
+/// a number chosen for *today's* ceiling, and a document that grew past it
+/// used to fail as a bare timeout indistinguishable from Redis being down,
+/// with no line anywhere naming the actual problem. A refusal here names both
+/// numbers and happens before the write is ever attempted, so growing past
+/// the ceiling is a refusal an operator can read rather than an outage they
+/// have to diagnose.
+pub const DIRECTORY_DOCUMENT_CEILING_BYTES: usize = 8 * 1024 * 1024;
 
 /// What the writer compiled its plane from, as a fingerprint (R-D9).
 ///
@@ -289,8 +315,26 @@ impl DirectoryStore for DocumentDirectoryStore {
             None if loaded.version == 0 => Ok(VersionedRecords {
                 records: DirectoryRecords::default(),
                 version: 0,
+                lineage: loaded.lineage,
                 compiled_under: CompiledUnder::default(),
             }),
+            // The mirror of the arm below, and refused for the mirror reason
+            // (M16.1 review, F4). Version zero *is* "no document" by contract,
+            // so a store answering a document at version zero is answering two
+            // things that cannot both be true -- and the one it can only be is
+            // a durable key whose version field is gone: a foreign writer, an
+            // `HDEL`, a partial restore. Compiling that document would be
+            // compiling tenancy whose version this deployment never observed,
+            // and the very next admin write would `commit(0, ..)` straight
+            // over it. `MemoryDocumentStore` cannot produce the shape at all,
+            // which is exactly why the refusal belongs here rather than in one
+            // backend.
+            Some(_) if loaded.version == 0 => Err(StoreFailure::Unavailable(
+                "the directory store is at version 0 -- the empty directory -- and holds a \
+                 document; refusing to compile a plane from a document whose version this \
+                 node never read"
+                    .to_string(),
+            )),
             // A store that says it has been written and holds nothing has lost
             // the document -- a hand-edited key, a partial restore. Reading it
             // as the empty directory would silently un-configure every project
@@ -307,6 +351,7 @@ impl DirectoryStore for DocumentDirectoryStore {
                 Ok(VersionedRecords {
                     records: document.records,
                     version: loaded.version,
+                    lineage: loaded.lineage,
                     compiled_under: document.compiled_under,
                 })
             }
@@ -317,7 +362,7 @@ impl DirectoryStore for DocumentDirectoryStore {
         &self,
         expected_version: u64,
         records: DirectoryRecords,
-    ) -> Result<u64, StoreFailure> {
+    ) -> Result<StoredVersion, StoreFailure> {
         let document = DirectoryDocument {
             schema: DIRECTORY_DOCUMENT_SCHEMA,
             records,
@@ -335,14 +380,27 @@ impl DirectoryStore for DocumentDirectoryStore {
                 "the directory records could not be encoded as a document: {error}"
             ))
         })?;
+        // Refused here rather than handed to the store, so growing past the
+        // ceiling is a named refusal and not a timeout the caller has to
+        // guess the cause of (M16.1 review, F6).
+        if bytes.len() > DIRECTORY_DOCUMENT_CEILING_BYTES {
+            return Err(StoreFailure::Unavailable(format!(
+                "the directory document is {} bytes, over this family's \
+                 {DIRECTORY_DOCUMENT_CEILING_BYTES}-byte ceiling; refusing to write it rather \
+                 than risk a store's response budget sized for a document at or under that \
+                 ceiling",
+                bytes.len()
+            )));
+        }
         self.store
             .commit(expected_version, bytes)
             .await
+            .map(identity)
             .map_err(failure)
     }
 
-    async fn version(&self) -> Result<u64, StoreFailure> {
-        self.store.version().await.map_err(failure)
+    async fn version(&self) -> Result<StoredVersion, StoreFailure> {
+        self.store.version().await.map(identity).map_err(failure)
     }
 
     /// What this node compiles against — the stamp [`Self::stamped`] was
@@ -365,6 +423,15 @@ fn failure(error: DocumentStoreError) -> StoreFailure {
             StoreFailure::Concurrent { expected, found }
         }
         DocumentStoreError::Unavailable(reason) => StoreFailure::Unavailable(reason),
+    }
+}
+
+/// The document store's identity, in this seam's vocabulary — one field for
+/// one field, the way [`failure`] maps the errors.
+fn identity(version: roundhouse_core::control::DocumentVersion) -> StoredVersion {
+    StoredVersion {
+        lineage: version.lineage,
+        version: version.version,
     }
 }
 

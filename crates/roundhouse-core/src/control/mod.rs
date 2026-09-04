@@ -94,7 +94,9 @@ pub use credential::{
     OauthEvidence, PresentedCredential, ProviderAccess, Reachable, Secret, TurnCredential,
     TurnCredentials,
 };
-pub use directory::{DocumentStore, DocumentStoreError, MemoryDocumentStore, VersionedDocument};
+pub use directory::{
+    DocumentStore, DocumentStoreError, DocumentVersion, MemoryDocumentStore, VersionedDocument,
+};
 pub use fair_use::{
     FairUseError, FairUseLedger, FairUseLimit, FairUseQuantity, FairUseRefusal, FairUseScope,
     FairUseTerms, FairUseWindow, MemoryFairUseLedger,

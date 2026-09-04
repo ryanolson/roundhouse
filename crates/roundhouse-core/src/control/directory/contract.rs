@@ -69,7 +69,7 @@ pub async fn an_untouched_store_is_version_zero_and_holds_no_document<S: Documen
          nothing`, which is a different deployment"
     );
     assert_eq!(
-        store.version().await.unwrap(),
+        store.version().await.unwrap().version,
         0,
         "and the cheap read agrees with the expensive one"
     );
@@ -88,19 +88,25 @@ pub async fn a_commit_against_the_read_version_advances_it_and_the_bytes_come_ba
 ) {
     let read = store.load().await.unwrap();
     let written = document("first");
-    let version = store
+    let committed = store
         .commit(read.version, written.clone())
         .await
         .expect("a commit against the version just read is admitted");
     assert_eq!(
-        version,
+        committed.version,
         read.version + 1,
         "a commit advances by exactly one, which is what makes `has anything \
          changed` an integer comparison rather than a document read"
     );
 
     let loaded = store.load().await.unwrap();
-    assert_eq!(loaded.version, version);
+    assert_eq!(loaded.version, committed.version);
+    assert_eq!(
+        loaded.lineage, committed.lineage,
+        "the identity a commit hands back is the identity the next reader \
+         loads: a writer that was told one lineage and a reader that is told \
+         another would each be right about a different store"
+    );
     assert_eq!(
         loaded.document.as_deref(),
         Some(written.as_slice()),
@@ -127,7 +133,7 @@ pub async fn a_stale_commit_is_refused_naming_both_versions_and_changes_nothing<
     store: &S,
 ) {
     let kept = document("kept");
-    let version = store.commit(0, kept.clone()).await.unwrap();
+    let version = store.commit(0, kept.clone()).await.unwrap().version;
 
     let stale = store.commit(0, document("clobbering")).await;
     match stale {
@@ -170,16 +176,17 @@ pub async fn a_stale_commit_is_refused_naming_both_versions_and_changes_nothing<
 pub async fn version_tracks_commits_without_reading_the_document<S: DocumentStore + ?Sized>(
     store: &S,
 ) {
-    assert_eq!(store.version().await.unwrap(), 0);
+    assert_eq!(store.version().await.unwrap().version, 0);
 
     let mut expected = 0;
     for round in 0..3 {
         expected = store
             .commit(expected, document(&format!("round-{round}")))
             .await
-            .unwrap();
+            .unwrap()
+            .version;
         assert_eq!(
-            store.version().await.unwrap(),
+            store.version().await.unwrap().version,
             expected,
             "the cheap read must answer what the commit returned, or a node \
              that refreshes on `version` alone serves a plane the store has \
@@ -203,8 +210,8 @@ pub async fn identical_bytes_committed_again_still_advance_the_version<
     store: &S,
 ) {
     let same = document("unchanged");
-    let first = store.commit(0, same.clone()).await.unwrap();
-    let second = store.commit(first, same.clone()).await.unwrap();
+    let first = store.commit(0, same.clone()).await.unwrap().version;
+    let second = store.commit(first, same.clone()).await.unwrap().version;
     assert!(
         second > first,
         "an identical document committed again is still a write, and a store \
@@ -298,7 +305,9 @@ pub async fn two_commits_racing_against_one_version_admit_exactly_one<S: Documen
 }
 
 /// **The claim.** Versions strictly increase across every commit, whoever
-/// commits and whatever they write.
+/// commits and whatever they write — within one lineage, which is the whole
+/// of the promise a durable backend can actually keep (see
+/// [`one_lineage_spans_every_commit_and_every_read`]).
 ///
 /// R-D2′ inherited (M16.0 review, F3). The directory above publishes by
 /// comparing versions, so under a store whose numbers can repeat or fall,
@@ -311,7 +320,7 @@ pub async fn two_commits_racing_against_one_version_admit_exactly_one<S: Documen
 /// returned the *found* version as if it were the new one would look monotone
 /// under a suite that only ever committed successfully.
 pub async fn versions_strictly_increase_across_commits<S: DocumentStore + ?Sized>(store: &S) {
-    let mut seen = store.version().await.unwrap();
+    let mut seen = store.version().await.unwrap().version;
     for round in 0..4 {
         // A refused commit in between every admitted one. Its version must
         // not be handed back as a new version, and must not move the store.
@@ -320,12 +329,13 @@ pub async fn versions_strictly_increase_across_commits<S: DocumentStore + ?Sized
             refused,
             Err(DocumentStoreError::Concurrent { .. })
         ));
-        assert_eq!(store.version().await.unwrap(), seen);
+        assert_eq!(store.version().await.unwrap().version, seen);
 
         let next = store
             .commit(seen, document(&format!("advance-{round}")))
             .await
-            .unwrap();
+            .unwrap()
+            .version;
         assert!(
             next > seen,
             "every commit returns a version strictly greater than any this \
@@ -333,6 +343,59 @@ pub async fn versions_strictly_increase_across_commits<S: DocumentStore + ?Sized
         );
         seen = next;
     }
+}
+
+/// **The claim.** One lineage spans every commit and every read, and all three
+/// methods agree about it.
+///
+/// R-D2″ (M16.1 review, F1). The lineage is what a reader compares to catch a
+/// counter that restarted, so it is worth exactly nothing if it moves on its
+/// own: a backend that minted a fresh one per commit, or per handle, or per
+/// read, would make every ordinary write look like a store that had lost its
+/// key, and the reader above would reload and warn once per admin call
+/// forever. The lost-key case itself is not assertable from here — no backend
+/// can lose its key on request through this trait, which is why the delete
+/// case lives beside the Redis instantiation, where a raw `DEL` is available.
+///
+/// The empty store is deliberately not part of the claim. Version zero means
+/// nothing has been written, so there is no document for a lineage to be
+/// about, and a durable backend whose key does not exist yet has nothing to
+/// answer with; the lineage becomes meaningful with the first commit, which is
+/// where this starts looking.
+pub async fn one_lineage_spans_every_commit_and_every_read<S: DocumentStore + ?Sized>(store: &S) {
+    let first = store.commit(0, document("first")).await.unwrap();
+    assert!(
+        !first.lineage.is_empty(),
+        "a store holding a document has a lineage to name it by; an empty one \
+         cannot be compared against anything and would make every reader's \
+         check vacuous"
+    );
+
+    assert_eq!(
+        store.load().await.unwrap().lineage,
+        first.lineage,
+        "the expensive read agrees with the commit that produced it"
+    );
+    assert_eq!(
+        store.version().await.unwrap().lineage,
+        first.lineage,
+        "and so does the cheap one -- the reader's refresh asks `version` \
+         first, so a lineage that only appeared on the load path would be a \
+         lineage the refresh never checks"
+    );
+
+    let second = store
+        .commit(first.version, document("second"))
+        .await
+        .unwrap();
+    assert_eq!(
+        second.lineage, first.lineage,
+        "an ordinary write is the same deployment's key, still there: a \
+         backend that minted a new lineage per commit would make every admin \
+         call indistinguishable from a flushed store"
+    );
+    assert!(second.version > first.version);
+    assert_eq!(store.load().await.unwrap().lineage, first.lineage);
 }
 
 /// **The claim.** A document of a few megabytes survives the round trip whole.
@@ -350,10 +413,14 @@ pub async fn a_multi_megabyte_document_round_trips<S: DocumentStore + ?Sized>(st
     const SIZE: usize = 3 * 1024 * 1024;
     let big: Vec<u8> = (0..SIZE).map(|index| (index % 251) as u8).collect();
 
-    let version = store.commit(0, big.clone()).await.expect(
-        "a store that cannot take a few megabytes cannot hold a real \
-         deployment's tenancy",
-    );
+    let version = store
+        .commit(0, big.clone())
+        .await
+        .expect(
+            "a store that cannot take a few megabytes cannot hold a real \
+             deployment's tenancy",
+        )
+        .version;
     let loaded = store.load().await.unwrap();
     assert_eq!(loaded.version, version);
     let stored = loaded.document.expect("the big document is stored");
@@ -420,6 +487,7 @@ macro_rules! document_store_contract_suite {
             identical_bytes_committed_again_still_advance_the_version,
             two_commits_racing_against_one_version_admit_exactly_one,
             versions_strictly_increase_across_commits,
+            one_lineage_spans_every_commit_and_every_read,
             a_multi_megabyte_document_round_trips,
         );
     };

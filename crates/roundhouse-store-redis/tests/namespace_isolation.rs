@@ -269,11 +269,16 @@ async fn a_directory_committed_under_one_namespace_is_absent_under_another() {
         "and b is still the empty directory, so its own first write is a \
          first write rather than a stale one"
     );
-    assert_eq!(b.version().await.unwrap(), 0);
+    assert_eq!(b.version().await.unwrap().version, 0);
 
     // CONTROL: the same document, read back through the namespace that wrote
     // it, is there in full.
     let seen_from_a = a.load().await.unwrap();
     assert_eq!(seen_from_a.document.as_deref(), Some(document.as_slice()));
-    assert_eq!(seen_from_a.version, version);
+    assert_eq!(seen_from_a.version, version.version);
+    assert_eq!(
+        seen_from_a.lineage, version.lineage,
+        "and the lineage the commit minted is the one that namespace's key \
+         still carries"
+    );
 }

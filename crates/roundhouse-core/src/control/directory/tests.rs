@@ -41,6 +41,40 @@ async fn a_document_of_zero_bytes_is_not_the_absence_of_a_document() {
     assert_eq!(loaded.version, 1);
 }
 
+/// A fresh store is a new lineage; one that continues a lineage says so.
+///
+/// The memory half of R-D2″ (M16.1 review, F1). This store cannot lose a key
+/// and keep answering, so "the counter restarted" has exactly one shape here:
+/// a *different store*. Pinning it is what makes the fixture above it able to
+/// tell a neighbour node's ordinary write ([`MemoryDocumentStore::continuing`],
+/// same lineage, higher version) from a restored backup (a fresh store, a new
+/// lineage, whatever version) — the two cases the durable backend has to be
+/// able to distinguish and could not, before the lineage existed.
+#[tokio::test]
+async fn a_fresh_store_is_a_new_lineage_and_continuing_one_is_not() {
+    let first = MemoryDocumentStore::new();
+    let second = MemoryDocumentStore::new();
+    assert_ne!(
+        first.commit(0, b"one".to_vec()).await.unwrap().lineage,
+        second.commit(0, b"two".to_vec()).await.unwrap().lineage,
+        "two stores that each answered version 1 for different documents must \
+         not claim to be the same run of one counter"
+    );
+
+    let continuing = MemoryDocumentStore::continuing(first.lineage());
+    assert_eq!(
+        continuing
+            .commit(0, b"three".to_vec())
+            .await
+            .unwrap()
+            .lineage,
+        first.lineage(),
+        "a store told which lineage it continues answers that one -- what a \
+         fixture rebuilding a store at some version means by `the same \
+         deployment's key, still there`"
+    );
+}
+
 /// A poisoned lock does not take the store down with it.
 ///
 /// The recovery the implementation's comment argues for, exercised: a panic
@@ -65,6 +99,6 @@ async fn a_poisoned_lock_still_answers() {
 
     let loaded = store.load().await.unwrap();
     assert_eq!(loaded.document.as_deref(), Some(b"before".as_slice()));
-    assert_eq!(store.version().await.unwrap(), 1);
-    assert_eq!(store.commit(1, b"after".to_vec()).await.unwrap(), 2);
+    assert_eq!(store.version().await.unwrap().version, 1);
+    assert_eq!(store.commit(1, b"after".to_vec()).await.unwrap().version, 2);
 }

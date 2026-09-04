@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Plan: the Anthropic Messages surface, the seat, and the launcher (M11)
 
-> **Status: shipped through M16.0; D2 ruled; M16.1 in flight (2026-09-04).** The rulings in §3 stand
+> **Status: shipped through M16.1; D2 ruled (2026-09-04).** The rulings in §3 stand
 > as written; where an implementation round moved one, the dated addenda at
 > the end of this document record the move and its reason, and win over §3
 > for the current tree. Direction set by the product owner on
@@ -2488,3 +2488,71 @@ node-status surface D2 deferred by name. Nothing here refuses, and M8's
 - **The stage's disk kept running out**; the whole-crate integration run
   was completed by the churn stage (fifty-nine server suites, the Redis
   suites against a real server), and the gate below is the record.
+
+### What the review round changed (2026-09-04, M16.1)
+
+The M16.1 thermo-nuclear review (six findings after triage from
+fourteen, all valid; rulings in the commit message) ran two reviewers —
+one on the document contract and the Redis compare-and-set, one on the
+boot, the adapter and the divergence machinery — primed with the rung's
+own fourteen mutations, and moved four things the rulings above state
+differently:
+
+- **R-D2″ — a document's identity is a lineage and a version, not a
+  version alone.** R-D2′ made the version monotone by contract and the
+  reader adopt a regression it could see; the Redis store could still
+  break the contract invisibly (F1). Deleting the key — an operator's
+  `DEL`, a flush, a restore — made the script's first-write branch
+  restart the counter at one, a number already handed out, and a
+  deployment young enough to be flushed and re-populated inside one TTL
+  saw its claimed version come back equal, took the cheap "unchanged"
+  exit, and served a revoked key from a plane the store no longer held,
+  with no line in the log. The memory store cannot regress, so the
+  contract suite could not express it. Now a store mints an opaque
+  lineage the first time it writes a key and a key that was lost starts a
+  new one; `commit` and `version` answer the pair, because only the
+  commit can tell a writer which lineage it just started; within a
+  lineage versions strictly increase and a version is never handed out
+  twice; and a reader whose claimed lineage differs names a regression
+  with a typed cause and adopts, exactly as it does for a lower version.
+  One exemption is load-bearing and pinned only by a unit test: a node
+  booted against an empty Redis claims no lineage, so version zero
+  supersedes and regresses nothing, or that node would refuse the
+  deployment's first write for the life of the process — a Redis-backed
+  boot test for that shape is owed.
+- **The write path refuses what the read path refuses.** The commit
+  script's number grammar was looser than the decoder's — hex,
+  whitespace and exponent forms read as numbers in Lua and as corruption
+  in Rust — so a foreign key the read path called unreadable could be
+  clobbered by a first commit (F3); and a hash holding a document with no
+  version field read as version zero with a document, a shape the
+  contract defines away and the memory store cannot produce, which the
+  adapter then compiled and the script overwrote (F4). Both paths now
+  accept only the shapes this store writes — plain decimal digits under a
+  written ceiling, a lineage of this store's shape, both fields or
+  neither — refuse the rest naming the key and the field, and the adapter
+  refuses a document at version zero the way it refuses a lost one above
+  it. The two ceilings are literals on both sides, each side's doc naming
+  the other, because a Lua script cannot share a Rust constant without an
+  argument.
+- **The directory family has a size ceiling and a timeout that carries
+  it** (F6). The store crate's 300 ms response timeout is sized for a
+  ceiling check; a document of tens of megabytes timed out through it as
+  an outage nobody could tell from a Redis being down. The adapter refuses
+  a document over a written ceiling with an error naming both numbers,
+  before any wire, and the directory family connects with its own timeout
+  sized to carry that ceiling with margin, leaving the other four
+  families' bound as it was. The margin is margin, not a guard: at the
+  ceiling the old bound also passed on this box, so the ceiling is what a
+  mutation trips and the timeout is what the measured crossover justifies.
+  The refusal rides the existing unavailable variant, so over HTTP it
+  reads as an outage; a variant of its own is owed with the next change
+  to that error surface.
+- **Two smaller moves.** The catalog half of the fingerprint was computed
+  inside the binary where no boot test could reach it, and its doc block
+  had swallowed a neighbour's (F2): the catalog computes its own
+  identities in the fleet crate, the boot composition takes the catalog,
+  and the boot suite asserts the real identities. And `status().divergence`
+  never cleared once a node agreed again, unlike its sibling (F5): an
+  agreeing load — a node's own commit included — clears it, and the
+  once-per-version warning memory stays.

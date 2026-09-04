@@ -516,30 +516,6 @@ const PROBE_OSL_TOKENS: u64 = 256;
 /// serve.
 ///
 /// [`LocalFleet`]: roundhouse_fleet::LocalFleet
-/// The catalog half of a stored directory document's fingerprint (M16.1,
-/// R-D9): every `(provider, model)` this deployment prices, sorted.
-///
-/// The identities and not the prices, for the reason
-/// [`CrossChecks::fingerprint`] gives about candidates: a fingerprint that
-/// moved with a rate card would report a node as divergent from a neighbour
-/// that had merely re-read the same file. What a divergence check is for is
-/// *which models exist here*, which is what the capability gate and every
-/// cross-check read.
-///
-/// Sorted so the fingerprint is a property of the set rather than of the order
-/// the catalog file happened to list it in; two nodes on one catalog must
-/// produce identical vectors or the check fires on every document.
-fn catalog_identities(catalog: &StaticFrontierCatalog) -> Vec<String> {
-    let mut identities: Vec<String> = catalog
-        .models()
-        .iter()
-        .map(|spec| format!("{}/{}", spec.provider, spec.model))
-        .collect();
-    identities.sort();
-    identities.dedup();
-    identities
-}
-
 fn reachable_candidates(catalog: &StaticFrontierCatalog) -> Vec<Candidate> {
     let mut ledger = CacheLedger::new();
     catalog.apply_to_ledger(&mut ledger);
@@ -795,7 +771,7 @@ async fn main() -> anyhow::Result<()> {
     let directory = control_config::boot_directory(
         file,
         Arc::clone(backends.directory()),
-        catalog_identities(&catalog),
+        &catalog,
         checks,
         roundhouse_core::now_ms(),
     )
@@ -1164,58 +1140,11 @@ mod tests {
         }
     }
 
-    /// **The catalog fingerprint is the sorted identity set** (M16.1, R-D9).
-    ///
-    /// The companion to `CrossChecks::fingerprint`'s own test, and it exists
-    /// for the same reason: two nodes whose catalog files list the same models
-    /// in a different order must fingerprint identically, or the divergence
-    /// warning fires on every document of every healthy deployment and gets
-    /// switched off. The identity is `provider/model` and carries no price,
-    /// because a rate card that moved would otherwise read as a config
-    /// divergence.
-    #[test]
-    fn the_catalog_fingerprint_is_the_sorted_provider_model_set() {
-        let catalog = StaticFrontierCatalog::new(vec![
-            entry(
-                "openrouter",
-                "capable-m",
-                WireProtocol::OpenAiChatCompletions,
-            ),
-            entry("anthropic", "big", WireProtocol::AnthropicMessages),
-        ]);
-        assert_eq!(
-            catalog_identities(&catalog),
-            vec![
-                "anthropic/big".to_string(),
-                "openrouter/capable-m".to_string()
-            ]
-        );
-
-        // The same two models, listed the other way round and priced
-        // differently: one fingerprint.
-        let reordered = StaticFrontierCatalog::new(vec![
-            FrontierModelSpec {
-                quality_prior: 0.99,
-                base_ttft_ms: 500.0,
-                ..entry("anthropic", "big", WireProtocol::AnthropicMessages)
-            },
-            entry(
-                "openrouter",
-                "capable-m",
-                WireProtocol::OpenAiChatCompletions,
-            ),
-        ]);
-        assert_eq!(catalog_identities(&catalog), catalog_identities(&reordered));
-
-        // A catalog that genuinely differs fingerprints differently, or none
-        // of the above is worth asserting.
-        let smaller = StaticFrontierCatalog::new(vec![entry(
-            "anthropic",
-            "big",
-            WireProtocol::AnthropicMessages,
-        )]);
-        assert_ne!(catalog_identities(&catalog), catalog_identities(&smaller));
-    }
+    // The catalog fingerprint itself (`StaticFrontierCatalog::identities`) is
+    // pinned in `roundhouse-fleet/src/frontier.rs`'s own tests now (M16.1
+    // review, F2): moving the computation into the library is what let
+    // `tests/directory_backend_boot.rs` reach it, and a test that stayed here
+    // would pin a function this crate no longer defines.
 
     fn responses_provider(base_url: &str) -> ProviderConfig {
         serde_json::from_value(serde_json::json!({

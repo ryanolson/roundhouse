@@ -108,6 +108,7 @@ use roundhouse_core::control::{
 use roundhouse_core::ids::SessionId;
 use roundhouse_core::routing::TierRecipe;
 use roundhouse_core::validate::ValidationTerms;
+use roundhouse_fleet::StaticFrontierCatalog;
 
 pub use auth::AuthError;
 pub use budget::{AllocationConfig, BudgetConfig, OnExhaustionConfig};
@@ -197,15 +198,21 @@ pub struct ControlPlaneFile {
 /// either the `Some` or the `None` arm is a mutation of code a test actually
 /// runs, not a second copy of it.
 ///
-/// `catalog_identities` and `now_ms` are taken as plain values rather than a
-/// `&StaticFrontierCatalog` and a clock read internally, so this module —
-/// which otherwise knows nothing about the fleet crate or wall-clock time —
-/// stays a pure function of its arguments and every test drives it with
-/// fixed ones.
+/// `now_ms` is taken as a plain value rather than a clock read internally, so
+/// every test drives it with a fixed one. `catalog` is taken as a
+/// `&StaticFrontierCatalog` rather than the caller's own precomputed
+/// identities (M16.1 review, F2): this module already knows the fleet crate
+/// through [`CrossChecks`] (`crosscheck.rs` reads `FrontierModelSpec`
+/// directly), so nothing is bought by asking `main.rs` to fingerprint the
+/// catalog by hand before calling in — and a `[[bin]]`-private helper doing
+/// that fingerprinting was exactly the code no `tests/` integration suite
+/// could ever call, so a regression to it was invisible to every suite that
+/// boots a directory end to end. `StaticFrontierCatalog::identities` is the
+/// one computation now, reachable from any crate that can build a catalog.
 pub async fn boot_directory(
     file: Option<ControlPlaneFile>,
     directory_store: Arc<dyn roundhouse_core::control::DocumentStore>,
-    catalog_identities: Vec<String>,
+    catalog: &StaticFrontierCatalog,
     checks: CrossChecks,
     now_ms: u64,
 ) -> Result<Arc<ControlDirectory>, DirectoryError> {
@@ -216,7 +223,7 @@ pub async fn boot_directory(
             // this file itself sets.
             let compiled_under = CompiledUnder {
                 file_sha256: Some(file.sha256),
-                catalog: catalog_identities,
+                catalog: catalog.identities(),
                 fleet: checks.fingerprint(),
                 admission_cache_ttl_ms: Some(
                     file.config

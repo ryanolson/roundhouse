@@ -77,7 +77,8 @@ use roundhouse_fleet::{FrontierClient, FrontierModelSpec, StaticFrontierCatalog,
 use roundhouse_core::control::MemoryDocumentStore;
 
 use crate::control_config::directory::{
-    DirectoryRecords, DirectoryStore, DocumentDirectoryStore, StoreFailure, VersionedRecords,
+    DirectoryRecords, DirectoryStore, DocumentDirectoryStore, StoreFailure, StoredVersion,
+    VersionedRecords,
 };
 use crate::engine::{EchoLocalExecutor, Engine, EngineConfig};
 use roundhouse_core::ids::SessionId;
@@ -365,7 +366,7 @@ impl ScriptedDirectoryStore {
     /// rather than a value this double invented some other way.
     pub async fn new(records: DirectoryRecords, version: u64) -> Self {
         Self {
-            inner: RwLock::new(Self::store_at(records, version).await),
+            inner: RwLock::new(Self::store_at(records, version, None).await),
             versions: AtomicUsize::new(0),
             loads: AtomicUsize::new(0),
             moving: AtomicBool::new(false),
@@ -391,8 +392,24 @@ impl ScriptedDirectoryStore {
     /// no sequence of calls against a real store's own monotone `commit` could
     /// produce, which is exactly why this reaches for a fresh one rather than
     /// asking the current one to go backwards.
-    async fn store_at(records: DirectoryRecords, version: u64) -> DocumentDirectoryStore {
-        let store = DocumentDirectoryStore::over(Arc::new(MemoryDocumentStore::new()));
+    ///
+    /// `lineage` is what makes the rebuild mean something: carried forward, the
+    /// new store is *the same deployment's key, still there* -- a neighbour
+    /// node's write, or a lagging replica -- and `None` mints a new one, which
+    /// is a key that was deleted, flushed or restored from a snapshot that did
+    /// not have it (R-D2″). Both are real events, they are told apart by
+    /// nothing but the lineage, and a double that could only produce one of
+    /// them would leave the other untestable.
+    async fn store_at(
+        records: DirectoryRecords,
+        version: u64,
+        lineage: Option<String>,
+    ) -> DocumentDirectoryStore {
+        let documents = match lineage {
+            Some(lineage) => MemoryDocumentStore::continuing(lineage),
+            None => MemoryDocumentStore::new(),
+        };
+        let store = DocumentDirectoryStore::over(Arc::new(documents));
         for at in 0..version {
             let payload = if at + 1 == version {
                 records.clone()
@@ -408,11 +425,37 @@ impl ScriptedDirectoryStore {
     }
 
     /// Replace the records and version outright -- what a neighbour node's
-    /// write, or a restored backup, looks like from this store's side. See
-    /// [`Self::store_at`] for why this is a fresh store rather than a further
-    /// commit against the one already there.
+    /// write, or a replica that had not caught up, looks like from this
+    /// store's side. See [`Self::store_at`] for why this is a fresh store
+    /// rather than a further commit against the one already there, and why it
+    /// carries the current lineage forward: whatever version this scripts, it
+    /// is still *this deployment's* key.
     pub async fn set(&self, records: DirectoryRecords, version: u64) {
-        *self.inner.write().await = Self::store_at(records, version).await;
+        let lineage = self.lineage().await;
+        *self.inner.write().await = Self::store_at(records, version, lineage).await;
+    }
+
+    /// Replace the records and version *in a new lineage* -- what a `DEL`, a
+    /// `FLUSHDB`, or a restore that did not include this family looks like
+    /// from this store's side (R-D2″).
+    ///
+    /// The knob [`Self::set`] deliberately does not have. A counter that
+    /// restarts is indistinguishable from a quiet deployment by version alone
+    /// -- that is the whole of the M16.1 review's F1 -- so the only way to
+    /// script it is to script the thing that actually differs.
+    pub async fn set_in_a_new_lineage(&self, records: DirectoryRecords, version: u64) {
+        *self.inner.write().await = Self::store_at(records, version, None).await;
+    }
+
+    /// The lineage the wrapped store is currently on, if it has one.
+    async fn lineage(&self) -> Option<String> {
+        let inner = self.inner.read().await;
+        inner
+            .version()
+            .await
+            .ok()
+            .map(|stored| stored.lineage)
+            .filter(|lineage| !lineage.is_empty())
     }
 
     /// Bump the wrapped store by exactly one real commit, landing `records` --
@@ -584,7 +627,7 @@ impl DirectoryStore for ScriptedDirectoryStore {
         &self,
         expected_version: u64,
         records: DirectoryRecords,
-    ) -> Result<u64, StoreFailure> {
+    ) -> Result<StoredVersion, StoreFailure> {
         // The wrapped store's own compare-and-set decides Concurrent-or-not
         // and, on success, is already mutated by the time this returns -- so
         // a caller that reads the store from here on (a concurrent refresh's
@@ -611,7 +654,7 @@ impl DirectoryStore for ScriptedDirectoryStore {
         Ok(new_version)
     }
 
-    async fn version(&self) -> Result<u64, StoreFailure> {
+    async fn version(&self) -> Result<StoredVersion, StoreFailure> {
         self.versions.fetch_add(1, Ordering::SeqCst);
         if self.version_fails.load(Ordering::SeqCst) {
             return Err(StoreFailure::Unavailable(

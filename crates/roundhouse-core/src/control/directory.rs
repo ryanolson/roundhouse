@@ -25,23 +25,43 @@
 //! the only question it is qualified to answer: did this write race another
 //! one.
 //!
-//! # The version is monotone, and every commit advances it
+//! # A document's identity is (lineage, version), not version alone (R-D2″)
 //!
-//! Inherited word for word from the seam above (`DirectoryStore`'s R-D2′ in
-//! `roundhouse-server`): [`DocumentStore::commit`] returns a version strictly
-//! greater than any this store has previously returned from `commit` or
-//! answered from [`DocumentStore::version`], and `version` never answers lower
-//! than it answered before. **Including a commit of bytes identical to the
-//! ones already stored** — the version is a *write* counter and not a content
-//! hash, because the caller above compares versions to decide whether to
-//! recompile, and a store that declined to advance on an identical write would
-//! silently make an idempotent-looking admin call unobservable to every other
-//! node.
+//! Inherited from the seam above (`DirectoryStore` in `roundhouse-server`) and
+//! completed here by the M16.1 review's F1. **Within one lineage**
+//! [`DocumentStore::commit`] returns a version strictly greater than any this
+//! store has previously returned from `commit` or answered from
+//! [`DocumentStore::version`], `version` never answers lower than it answered
+//! before, and a version is never handed out twice. **Including a commit of
+//! bytes identical to the ones already stored** — the version is a *write*
+//! counter and not a content hash, because the caller above compares versions
+//! to decide whether to recompile, and a store that declined to advance on an
+//! identical write would silently make an idempotent-looking admin call
+//! unobservable to every other node.
 //!
-//! A store that regresses has been restored from a backup, flushed, or failed
-//! over to a replica that had not caught up. That is not something a caller
-//! can prevent, only name — and what the directory does when it happens is
-//! decided one crate up, where the plane being served is.
+//! The lineage is what makes that promise keepable by a durable backend, and
+//! it exists because the counter alone could not keep it. A store whose key is
+//! deleted, flushed or restored from an older backup has no memory of the
+//! versions it handed out, so its next commit starts at 1 again — a version
+//! some node is *already serving*, which a reader comparing numbers cannot
+//! tell from a deployment where nothing has changed. That is the ABA the
+//! regression check one crate up would otherwise miss entirely: not a version
+//! that went down, but one that came back around. So a store that loses its
+//! key **changes lineage** rather than restarting the counter silently, and
+//! the reader compares the pair.
+//!
+//! The lineage is opaque — a reader may compare two for equality and may do
+//! nothing else with one. A store that has never been written carries no
+//! lineage claim at all (version zero is the empty store, and there is no
+//! document for a lineage to be about); a backend may answer whatever it likes
+//! for that case, and the contract only pins the lineage from the first commit
+//! on.
+//!
+//! A store that regresses — a lower version, or a new lineage — has been
+//! restored from a backup, flushed, or failed over to a replica that had not
+//! caught up. That is not something a caller can prevent, only name — and what
+//! the directory does when it happens is decided one crate up, where the plane
+//! being served is.
 //!
 //! # [`MemoryDocumentStore`] is the specification
 //!
@@ -80,6 +100,28 @@ use async_trait::async_trait;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VersionedDocument {
     pub document: Option<Vec<u8>>,
+    pub version: u64,
+    /// Which run of the counter this version belongs to — see the module
+    /// doc's identity rule. Meaningless at version zero, where nothing has
+    /// been written for a lineage to be about.
+    pub lineage: String,
+}
+
+/// A document's identity: which run of the counter, and how far along it
+/// (R-D2″).
+///
+/// What [`DocumentStore::version`] and [`DocumentStore::commit`] both answer,
+/// as one value rather than two calls, for the reason [`VersionedDocument`]
+/// keeps its two fields together: a reader that took the lineage and the
+/// version from two round trips could take them from two different states of
+/// the store, and the pair is only meaningful read at one instant. It is also
+/// why `commit` answers it rather than a bare number — a writer whose commit
+/// *started* the lineage (the first write of a deployment's life, or the first
+/// after the key was lost) has no other way to learn which lineage it is now
+/// in, and would otherwise have to guess or re-read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentVersion {
+    pub lineage: String,
     pub version: u64,
 }
 
@@ -123,39 +165,82 @@ pub trait DocumentStore: Send + Sync + 'static {
     async fn load(&self) -> Result<VersionedDocument, DocumentStoreError>;
 
     /// Replace the document, if and only if the store is still at
-    /// `expected_version`. Returns the new version, strictly greater than
-    /// every version this store has handed out before — see the module doc.
+    /// `expected_version`. Returns the identity it now stands at: a version
+    /// strictly greater than every version this store has handed out in that
+    /// lineage — see the module doc.
     async fn commit(
         &self,
         expected_version: u64,
         document: Vec<u8>,
-    ) -> Result<u64, DocumentStoreError>;
+    ) -> Result<DocumentVersion, DocumentStoreError>;
 
-    /// The current version, without paying to read the document.
+    /// The current identity, without paying to read the document.
     ///
     /// The cheap half of the caller's refresh: a node past its TTL asks this
     /// first and reads the document only if the answer moved, so a quiet
-    /// deployment costs one integer read per TTL rather than a whole document.
+    /// deployment costs one small read per TTL rather than a whole document.
     /// That is worth a method of its own here in a way it is not for a
     /// `HashMap`-shaped store, because the document is the deployment's entire
     /// tenancy and can be megabytes.
-    async fn version(&self) -> Result<u64, DocumentStoreError>;
+    ///
+    /// The lineage rides along rather than being asked for separately: it is
+    /// the half of the answer that catches a counter which restarted, and a
+    /// reader that had to make a second call for it would be comparing two
+    /// halves read at two instants.
+    async fn version(&self) -> Result<DocumentVersion, DocumentStoreError>;
 }
 
-/// The single-node store: a `Mutex` over the document and a counter.
+/// The single-node store: a `Mutex` over the document and a counter, under one
+/// lineage.
 ///
 /// Version 0 with no document is the empty store, and every successful commit
 /// increments — so the monotone requirement holds structurally here (one
 /// counter, only ever incremented) and a durable backend has to arrange it
 /// deliberately.
-#[derive(Debug, Default)]
+///
+/// **The lineage is minted at construction and never changes**, which is the
+/// honest answer for a store that lives and dies with its process: this store
+/// cannot lose a key and keep answering, so every version it ever hands out
+/// belongs to one run of one counter. A *fresh* store is a new lineage, and
+/// that is not incidental — it is what lets a fixture express the durable
+/// backend's lost-key case (see [`Self::continuing`] for the other half).
+#[derive(Debug)]
 pub struct MemoryDocumentStore {
     state: Mutex<(Option<Vec<u8>>, u64)>,
+    lineage: String,
+}
+
+impl Default for MemoryDocumentStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MemoryDocumentStore {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            state: Mutex::new((None, 0)),
+            lineage: uuid::Uuid::new_v4().to_string(),
+        }
+    }
+
+    /// A store carrying on a lineage some earlier store started.
+    ///
+    /// For a fixture that rebuilds a store at some version and means *the same
+    /// deployment's key, still there* rather than *the key was replaced*. The
+    /// two are exactly what the identity rule exists to tell apart, so a
+    /// double that could only ever do the second could not script a neighbour
+    /// node's ordinary write at all.
+    pub fn continuing(lineage: impl Into<String>) -> Self {
+        Self {
+            state: Mutex::new((None, 0)),
+            lineage: lineage.into(),
+        }
+    }
+
+    /// The lineage every version from this store belongs to.
+    pub fn lineage(&self) -> &str {
+        &self.lineage
     }
 }
 
@@ -171,6 +256,7 @@ impl DocumentStore for MemoryDocumentStore {
         Ok(VersionedDocument {
             document: state.0.clone(),
             version: state.1,
+            lineage: self.lineage.clone(),
         })
     }
 
@@ -178,7 +264,7 @@ impl DocumentStore for MemoryDocumentStore {
         &self,
         expected_version: u64,
         document: Vec<u8>,
-    ) -> Result<u64, DocumentStoreError> {
+    ) -> Result<DocumentVersion, DocumentStoreError> {
         // The compare and the write MUST stay under this one lock
         // acquisition. Splitting them -- reading `state.1` under one
         // `lock()`, dropping the guard, then reacquiring a second `lock()`
@@ -211,11 +297,17 @@ impl DocumentStore for MemoryDocumentStore {
         }
         state.0 = Some(document);
         state.1 += 1;
-        Ok(state.1)
+        Ok(DocumentVersion {
+            lineage: self.lineage.clone(),
+            version: state.1,
+        })
     }
 
-    async fn version(&self) -> Result<u64, DocumentStoreError> {
+    async fn version(&self) -> Result<DocumentVersion, DocumentStoreError> {
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        Ok(state.1)
+        Ok(DocumentVersion {
+            lineage: self.lineage.clone(),
+            version: state.1,
+        })
     }
 }
