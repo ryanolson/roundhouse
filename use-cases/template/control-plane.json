@@ -1,0 +1,49 @@
+{
+  "$comment": [
+    "TODO: Replace every TODO_ placeholder before running the demo.",
+    "projects[].id: short slug used in (project, user) membership tuples.",
+    "projects[].policy.allow: glob list of admitted model targets; '*' admits all.",
+    "projects[].policy.min_quality: minimum quality_prior a model must have to be routed to.",
+    "credentials.mode: 'project_only' means the project supplies the frontier key, not the user.",
+    "credentials.providers: map of provider name -> {env_var, kind}.",
+    "  env_var: the shell variable the server reads at startup for the API key.",
+    "  kind: always 'api_key' for token-based frontier credentials.",
+    "users[].id: short slug; paired with a project in keys[].",
+    "keys[]: one entry per (project, user) membership.",
+    "  key_sha256: run mint_keys.py to fill this in — never put the secret here.",
+    "admin_keys: filled in by mint_keys.py; empty by default.",
+    "NOTE: frontier_cadence and degrade_to_local should only be set if a local fleet is wired.",
+    "  With no local fleet, these settings cause the server to refuse to start."
+  ],
+
+  "projects": [
+    {
+      "id": "TODO_PROJECT",
+      "name": "TODO Project Name",
+      "policy": {
+        "min_quality": 0.0,
+        "allow": ["*"]
+      },
+      "credentials": {
+        "mode": "project_only",
+        "providers": {
+          "TODO_PROVIDER": { "env_var": "INFERENCE_API_KEY", "kind": "api_key" }
+        }
+      }
+    }
+  ],
+
+  "users": [
+    { "id": "TODO_USER_1" }
+  ],
+
+  "keys": [
+    {
+      "project": "TODO_PROJECT",
+      "user": "TODO_USER_1",
+      "key_sha256": "run_mint_keys_to_fill_this_in"
+    }
+  ],
+
+  "admin_keys": []
+}

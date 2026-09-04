@@ -1,0 +1,1 @@
+{"q": "TODO: Replace each line with a question answerable only from corpus.md. Use JSON lines format: one object per line with a single 'q' key. Questions should be closed-world (answerable from the document) with a clear 'not specified' contract for anything outside it."}
