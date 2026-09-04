@@ -636,6 +636,19 @@ fn block_item(role: Role, block: &Value) -> Result<Item, ApiError> {
             ItemContent::ToolCall {
                 call_id: id,
                 name,
+                // **`None`, and that is the ruling rather than a gap** (M17,
+                // R-N6). This wire has no `namespace` key to read: Claude Code
+                // folds the MCP registration into every tool name it declares,
+                // calls and permits, so what arrives is `mcp__roundhouse__status`
+                // as one flat string — the flat spelling *is* the namespace
+                // here. Splitting it on `__` to manufacture a `Some` would put
+                // this module's guess where the client's word belongs, would
+                // make a second server called `roundhouse_extra` read as ours,
+                // and would change the canonical form of every already-stored
+                // Messages session. `validate::is_control_call_on`'s Messages
+                // arm reads the flat name and never this field, for the same
+                // reason.
+                namespace: None,
                 // The canonical item carries arguments as a string because the
                 // Responses wire does; `Value::to_string` over a `BTreeMap`
                 // gives one key order for any given object, so a body a chained
@@ -910,6 +923,7 @@ mod tests {
                     content: ItemContent::ToolCall {
                         call_id: "toolu_1".into(),
                         name: "Grep".into(),
+                        namespace: None,
                         // Key-sorted by `serde_json`'s `BTreeMap`, which is what
                         // makes a Relay-alphabetized resend canonicalize alike.
                         arguments: r#"{"path":"src","pattern":"fn main"}"#.into(),
@@ -963,9 +977,20 @@ mod tests {
         })))
         .unwrap();
 
-        let ItemContent::ToolCall { name, call_id, .. } = &items[0].content else {
+        let ItemContent::ToolCall {
+            name,
+            call_id,
+            namespace,
+            ..
+        } = &items[0].content
+        else {
             panic!("the client's `tool_use` is a tool call: {items:#?}");
         };
+        assert_eq!(
+            namespace, &None,
+            "this wire has no `namespace` key and this module must not \
+             manufacture one by splitting the flat name (M17, R-N6)"
+        );
         assert_eq!(
             name.as_str(),
             crate::dialect::ClientDialect::claude_messages().stored_call_name("status"),
@@ -978,7 +1003,11 @@ mod tests {
         // module produced, rather than on a name a test typed: it is the join
         // between the two crates that R-M0 found broken on the other surface.
         assert!(
-            roundhouse_core::validate::is_control_call_on(name, MESSAGES_DIALECT),
+            roundhouse_core::validate::is_control_call_on(
+                name,
+                namespace.as_deref(),
+                MESSAGES_DIALECT
+            ),
             "the agent asked roundhouse for its own status"
         );
         let exchanges = roundhouse_core::validate::exchanges(&items);
@@ -1789,6 +1818,7 @@ mod tests {
                 content: ItemContent::ToolCall {
                     call_id: "toolu_1".into(),
                     name: "Grep".into(),
+                    namespace: None,
                     arguments: stored.clone(),
                 },
                 response_id: None,

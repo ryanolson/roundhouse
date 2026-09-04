@@ -605,6 +605,7 @@ impl FrontierClient for ToolCallThenTextClient {
                 Ok(FrontierChunk::ToolCall {
                     id: "toolu_01".to_string(),
                     name: "read_file".to_string(),
+                    namespace: None,
                     arguments: r#"{"path":"/tmp/x"}"#.to_string(),
                 }),
                 Ok(FrontierChunk::Done {
@@ -1738,6 +1739,7 @@ async fn a_tool_using_turn_streams_interleaved_blocks_the_client_can_run() {
             ItemContent::ToolCall {
                 call_id: "toolu_01".into(),
                 name: "Grep".into(),
+                namespace: None,
                 arguments: r#"{"path":"/src","pattern":"fn main"}"#.into(),
             },
             ItemContent::Text {
@@ -1746,6 +1748,7 @@ async fn a_tool_using_turn_streams_interleaved_blocks_the_client_can_run() {
             ItemContent::ToolCall {
                 call_id: "toolu_02".into(),
                 name: "Read".into(),
+                namespace: None,
                 arguments: r#"{"path":"/src/main.rs"}"#.into(),
             },
         ],
@@ -1845,6 +1848,7 @@ async fn the_clients_tool_results_come_back_onto_the_same_session() {
             ItemContent::ToolCall {
                 call_id: "toolu_01".into(),
                 name: "Grep".into(),
+                namespace: None,
                 arguments: r#"{"path":"/src","pattern":"fn main"}"#.into(),
             },
         ],

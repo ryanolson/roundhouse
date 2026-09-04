@@ -14,11 +14,19 @@
 //! its design** (M12 review, F8). Two clients spell one call two ways: Claude
 //! Code folds the MCP registration's server name into every tool name it
 //! declares and emits (`mcp__roundhouse__status`), while codex sends the
-//! namespace in its own wire field and canonicalization drops it, leaving
-//! `status` alone in the log. Asking one dialect-blind function to accept both
-//! is what F8 found: a Messages client's own tool literally named `status` was
-//! swallowed by an exemption written for the *other* wire, and dropped from the
-//! task view along with roundhouse's own chatter.
+//! namespace in its own wire field and the log keeps it there, beside a bare
+//! `status`. Asking one dialect-blind function to accept both is what F8
+//! found: a Messages client's own tool literally named `status` was swallowed
+//! by an exemption written for the *other* wire, and dropped from the task view
+//! along with roundhouse's own chatter.
+//!
+//! **Since M17 (R-N9) the Responses arm reads the stored namespace first and
+//! the bare name only as a fallback.** The log carries the field now, so a call
+//! that names `mcp__roundhouse` is exactly ours and one that names another
+//! server is exactly not. The bare arm stays for records written before the
+//! field existed, which can never gain one — recovering it means guessing which
+//! bare `status` was ours, and rewriting the log would move the turn id of
+//! every conversation holding a control call.
 
 use super::exchange::Exchange;
 
@@ -65,11 +73,13 @@ pub const CONTROL_TOOL_DELIMITER: &str = "__";
 /// **Why a list of names is needed at all, and it is not a convenience.** A
 /// client that folds the namespace into the tool's own name leaves the whole
 /// `mcp__roundhouse__status` in the log, and the prefix alone identifies it. A
-/// client that sends the namespace in its own wire field leaves only `status`
-/// — the namespace is dropped at canonicalization on purpose (see
-/// `responses_api::wire::canonical_item`) — and there is then *nothing* in the
-/// stored record but the name. See [`ControlCallDialect::CodexResponses`] for
-/// what that costs.
+/// client that sends the namespace in its own wire field leaves a bare
+/// `status` in `name`, with the server it went to in the record's own
+/// `namespace` field since M17 — so the name alone still identifies nothing,
+/// and the list is what the field is checked *against* once it says the call is
+/// ours. For a record written before M17 the field is absent and the list is
+/// all there is; see [`ControlCallDialect::CodexResponses`] for what that
+/// costs and why the arm cannot be removed.
 pub const CONTROL_TOOL_NAMES: [&str; 8] = [
     "status",
     "init_session",
@@ -105,7 +115,10 @@ pub fn flat_control_call_name(tool: &str) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlCallDialect {
     /// Codex over the OpenAI Responses API: the namespace rides its own wire
-    /// field and canonicalization drops it, so the log holds `status`.
+    /// field, and since M17 the log keeps it there — a bare `status` in `name`
+    /// with `mcp__roundhouse` beside it. A record written before M17 has the
+    /// bare name and nothing else, which is the case the recogniser's fallback
+    /// arm exists for and the one the remaining exemption pays for.
     CodexResponses,
     /// Claude Code over the Anthropic Messages API: the namespace is folded
     /// into the tool's own name, so the log holds `mcp__roundhouse__status`.
@@ -131,21 +144,42 @@ impl ControlCallDialect {
         }
     }
 
-    /// Whether `name`, as this dialect's client spells it, is one of ours.
-    fn recognises(self, name: &str) -> bool {
+    /// Whether the call `name`, under `namespace`, as this dialect's client
+    /// spells it, is one of ours.
+    fn recognises(self, name: &str, namespace: Option<&str>) -> bool {
         match self {
-            // The flat spelling carries whose server it is, so it is exact.
+            // The flat spelling carries whose server it is, so it is exact —
+            // and the namespace argument is ignored here rather than consulted,
+            // because on this surface it is `None` by construction. Claude Code
+            // folds the registration into every tool name it declares, so the
+            // wire has no separate field for canonicalization to read; a `Some`
+            // arriving here would be a record no Messages client can write.
             Self::ClaudeMessages => is_flat_control_call(name),
-            // The bare spelling does not, so recognition is by name alone and a
-            // third party's MCP tool called `status` is exempted with ours.
-            // That under-counts an agent's work by a call or two; the failure
-            // it replaces over-counted roundhouse's own chatter as the agent's
-            // work and fired steers at an agent that had done nothing wrong,
-            // which is the louder error and the one G04 names. Closing it
-            // properly means keeping the namespace in the stored record, which
-            // moves the canonical form of every already-stored tool-using
-            // session — a decision above this function.
-            Self::CodexResponses => CONTROL_TOOL_NAMES.contains(&name),
+            // **The field first, the bare name second** (M17, R-N9).
+            //
+            // Codex sends the namespace beside the name, and since M17 the log
+            // keeps it, so a call that says `mcp__roundhouse` is exactly ours
+            // and a call that names any *other* server is exactly not — which
+            // closes the collision this arm used to pay for, where a third
+            // party's MCP tool called `status` was exempted from the task view
+            // along with roundhouse's own chatter.
+            //
+            // `None` is the arm that cannot be removed. Records written before
+            // M17 carry no namespace and never will: the field could only be
+            // recovered by guessing which bare `status` was ours, which is the
+            // ambiguity the change exists to remove, and a rewrite would move
+            // the turn id of every conversation holding a control call. So a
+            // `None` falls back to name-alone recognition and keeps the old
+            // trade — an under-count of a call or two, against G04's
+            // over-count of roundhouse's own chatter, which fired steers at an
+            // agent that had done nothing wrong and is the louder error. The
+            // exposure was one name of eight and is now zero for every record
+            // written after the change.
+            Self::CodexResponses => match namespace {
+                Some(CONTROL_TOOL_NAMESPACE) => CONTROL_TOOL_NAMES.contains(&name),
+                Some(_) => false,
+                None => CONTROL_TOOL_NAMES.contains(&name),
+            },
         }
     }
 }
@@ -158,8 +192,21 @@ const MESSAGES_SESSION_SEGMENT: &str = "anthropic_messages";
 
 /// Whether this call is the agent talking to *us* rather than working on its
 /// task, as `dialect`'s client spells it.
-pub fn is_control_call_on(name: &str, dialect: ControlCallDialect) -> bool {
-    dialect.recognises(name)
+///
+/// Takes the stored `namespace` as well as the stored name since M17 (R-N9),
+/// because on the Responses surface the name alone can no longer answer the
+/// question for a record that has one: `status` under `mcp__other` is the
+/// client's own tool and `status` under `mcp__roundhouse` is ours, and the
+/// caller holding the record is the only one that can tell this function
+/// which. `None` means the record does not say — a pre-M17 log, or a plain
+/// function tool that sends no namespace at all — and is what the bare-name
+/// fallback exists for.
+pub fn is_control_call_on(
+    name: &str,
+    namespace: Option<&str>,
+    dialect: ControlCallDialect,
+) -> bool {
+    dialect.recognises(name, namespace)
 }
 
 /// The flat spelling alone: `mcp__roundhouse__<tool>`, any tool.
@@ -200,7 +247,9 @@ pub fn is_flat_control_call(name: &str) -> bool {
 pub fn task_exchanges_on(exchanges: &[Exchange], dialect: ControlCallDialect) -> Vec<&Exchange> {
     exchanges
         .iter()
-        .filter(|exchange| !is_control_call_on(&exchange.name, dialect))
+        .filter(|exchange| {
+            !is_control_call_on(&exchange.name, exchange.namespace.as_deref(), dialect)
+        })
         .collect()
 }
 
@@ -213,6 +262,12 @@ mod tests {
 
     fn call(call_id: &str, name: &str) -> Item {
         Item::tool_call(call_id, name, "{}")
+    }
+
+    /// A call a *post-M17* Responses log holds: the name and the namespace its
+    /// client sent beside it.
+    fn namespaced_call(call_id: &str, name: &str, namespace: &str) -> Item {
+        Item::namespaced_tool_call(call_id, name, Some(namespace.to_string()), "{}")
     }
 
     fn task_names(items: &[Item], dialect: ControlCallDialect) -> Vec<String> {
@@ -236,6 +291,7 @@ mod tests {
         let name = flat_control_call_name("status");
         assert!(is_control_call_on(
             &name,
+            None,
             ControlCallDialect::ClaudeMessages
         ));
 
@@ -254,9 +310,11 @@ mod tests {
     /// MCP server to the model as a `namespace` object and lists each tool
     /// under its **bare** name, so the model's call comes back as
     /// `{"name":"status","namespace":"mcp__roundhouse"}` — two wire fields, not
-    /// one flat string. `responses_api::wire::canonical_item` deliberately
-    /// drops the namespace (keeping it would fork every already-stored
-    /// tool-using session), so the log stores `status`. That is pinned a crate
+    /// one flat string. `responses_api::wire::canonical_item` used to drop the
+    /// namespace, so the log stored `status` alone; M17 carries it beside the
+    /// name instead, without moving any turn id (the render leaves it out), and
+    /// this test still exercises the arm that reads such a record — because
+    /// every record written before M17 is one. That is pinned a crate
     /// above by `r_m0_a_codex_mcp_call_arrives_bare_with_a_separate_namespace`,
     /// built from codex's own `ResponseItem`, and the namespace half was read
     /// off a real binary by `codex_e2e.rs`'s
@@ -272,7 +330,7 @@ mod tests {
         // What `canonicalize` writes to the log for a codex `status` call.
         let stored = "status";
         assert!(
-            is_control_call_on(stored, ControlCallDialect::CodexResponses),
+            is_control_call_on(stored, None, ControlCallDialect::CodexResponses),
             "the agent asked roundhouse for its own status; the fold counted it \
              as work on the task"
         );
@@ -296,12 +354,13 @@ mod tests {
     fn both_spellings_of_every_control_tool_are_ours_and_the_near_misses_are_not() {
         for tool in CONTROL_TOOL_NAMES {
             assert!(
-                is_control_call_on(tool, ControlCallDialect::CodexResponses),
-                "the bare spelling of `{tool}`"
+                is_control_call_on(tool, None, ControlCallDialect::CodexResponses),
+                "the bare spelling of `{tool}` in a record written before M17"
             );
             assert!(
                 is_control_call_on(
                     &flat_control_call_name(tool),
+                    None,
                     ControlCallDialect::ClaudeMessages
                 ),
                 "the flat spelling of `{tool}`"
@@ -328,7 +387,7 @@ mod tests {
                 ControlCallDialect::CodexResponses,
             ] {
                 assert!(
-                    !is_control_call_on(theirs, dialect),
+                    !is_control_call_on(theirs, None, dialect),
                     "`{theirs}` is not ours on {dialect:?}"
                 );
             }
@@ -350,19 +409,23 @@ mod tests {
 
         assert!(!is_control_call_on(
             "status",
+            None,
             ControlCallDialect::ClaudeMessages
         ));
         assert!(is_control_call_on(
             &flat,
+            None,
             ControlCallDialect::ClaudeMessages
         ));
 
         assert!(is_control_call_on(
             "status",
+            None,
             ControlCallDialect::CodexResponses
         ));
         assert!(!is_control_call_on(
             &flat,
+            None,
             ControlCallDialect::CodexResponses
         ));
     }
@@ -402,21 +465,29 @@ mod tests {
         }
     }
 
-    /// The bare arm's price, pinned rather than left to be discovered.
+    /// The bare arm's price, pinned rather than left to be discovered — and
+    /// **narrowed by M17 to the records that still pay it**.
     ///
     /// Somebody else's MCP server offering a tool named `status` arrives over
-    /// the Responses wire as the bare string `status`, exactly as ours does,
-    /// and is exempted from the task view with it. Nothing in the stored record
-    /// can tell the two apart — the namespace that could have is the field
-    /// canonicalization drops.
+    /// the Responses wire as the bare string `status`, exactly as ours did
+    /// before M17, and is exempted from the task view with it. Nothing in such
+    /// a record can tell the two apart — the namespace that could have was the
+    /// field canonicalization dropped.
     ///
-    /// Asserted as a *fact about the trade*, not as a behaviour anyone wants:
-    /// the day the log keeps a namespace, this test is the one that should go
-    /// red and be deleted. It is now scoped to the one surface that pays it —
-    /// F8's correction — and the Messages half below is what proves the scoping
-    /// is real.
+    /// **The day the log kept a namespace, this was to be the test to delete,
+    /// and deleting it would have been wrong** (R-N9). A record written before
+    /// M17 carries no namespace and never will: recovering one means guessing
+    /// which bare `status` was ours, which is the ambiguity the change exists
+    /// to remove, and rewriting the log would move the turn id of every
+    /// conversation holding a control call. So the bare arm stays as the
+    /// fallback for a `None`, this test narrows to that arm, and
+    /// `a_third_partys_status_under_another_namespace_is_the_agents_work` is
+    /// the half that proves the price is no longer paid by anything written
+    /// after the change. Still scoped to the one surface that pays it — F8's
+    /// correction — with the Messages half below proving the scoping is real.
     #[test]
     fn a_third_partys_bare_status_tool_is_exempted_with_ours_on_the_responses_wire_only() {
+        // Both calls stored with no namespace: a log written before M17.
         let items = vec![call("c1", "status"), call("c2", "grep")];
         assert_eq!(
             task_names(&items, ControlCallDialect::CodexResponses),
@@ -439,5 +510,81 @@ mod tests {
             task_names(&flat_items, ControlCallDialect::ClaudeMessages),
             vec!["mcp__other__status", "grep"]
         );
+    }
+
+    /// **R-N9: a third party's `status`, under a third party's namespace, is
+    /// the agent's own work — and ours, under ours, is still not.**
+    ///
+    /// The half the test above could not assert and the reason the exemption
+    /// narrowed rather than stayed. The realistic collision was one name of
+    /// eight (`status` is a common MCP tool name; the other seven are
+    /// distinctive enough that a clash would be a coincidence), and for every
+    /// record written after M17 it is now zero: the stored record itself says
+    /// which server the call went to.
+    ///
+    /// The three shapes are asserted together on purpose. `Some("mcp__other")`
+    /// is a *different* answer from `None`, not a stricter one — a fold that
+    /// simply ignored the field would put the first call back in the exemption
+    /// and this would go red, while a fold that required a namespace outright
+    /// would drop the pre-M17 record on the floor and the test above would.
+    #[test]
+    fn a_third_partys_status_under_another_namespace_is_the_agents_work() {
+        let items = vec![
+            namespaced_call("c1", "status", "mcp__other"),
+            namespaced_call("c2", "status", CONTROL_TOOL_NAMESPACE),
+            call("c3", "grep"),
+        ];
+        assert_eq!(
+            task_names(&items, ControlCallDialect::CodexResponses),
+            vec!["status", "grep"],
+            "the `status` that survives is the one under somebody else's \
+             server: it is the agent working on its task, and folding it out \
+             with ours is the under-count the carried namespace closes"
+        );
+
+        // And the same call under our own namespace is ours whichever tool it
+        // names, walked over the whole list so a name added to
+        // `CONTROL_TOOL_NAMES` and not to the surface goes red here.
+        for tool in CONTROL_TOOL_NAMES {
+            assert!(
+                is_control_call_on(
+                    tool,
+                    Some(CONTROL_TOOL_NAMESPACE),
+                    ControlCallDialect::CodexResponses
+                ),
+                "`{tool}` under `{CONTROL_TOOL_NAMESPACE}` is ours"
+            );
+            assert!(
+                !is_control_call_on(tool, Some("mcp__other"), ControlCallDialect::CodexResponses),
+                "`{tool}` under somebody else's server is theirs"
+            );
+        }
+    }
+
+    /// The Messages arm did not move, and a `Some` cannot reach it.
+    ///
+    /// R-N9 left that surface alone because there is nothing there to read:
+    /// Claude Code folds the registration into every tool name it declares, so
+    /// canonicalization has no separate field to store and the record's
+    /// namespace is `None` by construction. Pinned anyway, because "the
+    /// recogniser now takes a namespace" is exactly the change that invites a
+    /// later reader to start consulting it on both arms — and doing so on this
+    /// one would make a flat `mcp__roundhouse__status` stop being ours the day
+    /// something upstream started filling the field in.
+    #[test]
+    fn the_messages_arm_reads_the_flat_name_and_not_the_field() {
+        let flat = flat_control_call_name("status");
+        for namespace in [None, Some(CONTROL_TOOL_NAMESPACE), Some("mcp__other")] {
+            assert!(
+                is_control_call_on(&flat, namespace, ControlCallDialect::ClaudeMessages),
+                "`{flat}` is ours on the Messages surface whatever a namespace \
+                 field says ({namespace:?})"
+            );
+            assert!(
+                !is_control_call_on("status", namespace, ControlCallDialect::ClaudeMessages),
+                "a bare `status` is the client's own tool on the Messages \
+                 surface, and no namespace field changes that ({namespace:?})"
+            );
+        }
     }
 }

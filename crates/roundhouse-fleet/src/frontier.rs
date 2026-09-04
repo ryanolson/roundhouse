@@ -246,6 +246,24 @@ pub enum FrontierChunk {
         /// result with the call, and rewriting it breaks the pairing.
         id: String,
         name: String,
+        /// The MCP server the upstream named this tool under, when it named
+        /// one.
+        ///
+        /// **Read since M17 (R-N6), and the gap it closes is a round trip that
+        /// never worked.** The Responses wire carries an MCP call as two fields
+        /// — a bare `name` and a separate `namespace` — and codex dispatches on
+        /// an exact `ToolName { name, namespace }` registry lookup, so a call
+        /// re-emitted with the namespace missing resolves against nothing at
+        /// the client. This decoder used to drop the field on the way in; a
+        /// model asking for one of roundhouse's *own* MCP tools was therefore
+        /// stored bare and re-emitted unresolvable. Carrying it here, into
+        /// [`ItemContent::ToolCall::namespace`](roundhouse_core::item::ItemContent),
+        /// is what lets the outbound projection put it back.
+        ///
+        /// `None` is the honest reading of an absent field, not a default: a
+        /// plain (non-MCP) function tool sends no `namespace` at all, and the
+        /// Anthropic wire has no such field for its decoder to read.
+        namespace: Option<String>,
         /// The accumulated argument JSON, as a *string*.
         ///
         /// Field-shaped to match
@@ -1572,8 +1590,12 @@ mod tests {
     ///
     /// The variant exists so a decoder can hand a completed tool call to the
     /// engine, and the engine's only durable home for one is
-    /// [`ItemContent::ToolCall`]: same three fields, same types, so the join is
-    /// a field-for-field mapping with nothing to invent.
+    /// [`ItemContent::ToolCall`]: same four fields, same types, so the join is
+    /// a field-for-field mapping with nothing to invent. (Four since M17 —
+    /// [`Self::ToolCall::namespace`](Self::ToolCall) meets
+    /// `ItemContent::ToolCall::namespace`, and the join stayed field-for-field
+    /// rather than gaining a rule, which is the point of adding the field on
+    /// both sides at once.)
     ///
     /// What the first reading of this test asserted — that the arguments cross
     /// that join *byte-exactly* — was wrong, and wrong in the expensive
@@ -1598,24 +1620,27 @@ mod tests {
         let chunk = FrontierChunk::ToolCall {
             id: "toolu_01A".into(),
             name: "Grep".into(),
+            namespace: None,
             arguments: ARGUMENTS.to_string(),
         };
 
         let FrontierChunk::ToolCall {
             id,
             name,
+            namespace,
             arguments,
         } = chunk
         else {
             unreachable!("constructed as a tool call")
         };
-        let item = Item::tool_call(id, name, canonical_arguments(&arguments));
+        let item = Item::namespaced_tool_call(id, name, namespace, canonical_arguments(&arguments));
 
         assert_eq!(
             item.content,
             ItemContent::ToolCall {
                 call_id: "toolu_01A".into(),
                 name: "Grep".into(),
+                namespace: None,
                 arguments: r#"{"path":"/a","pattern":"fn main"}"#.to_string(),
             }
         );

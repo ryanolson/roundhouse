@@ -91,15 +91,23 @@ fn canonical_item(value: &Value) -> Result<Option<Item>, ApiError> {
                 response_id: None,
             }))
         }
-        "function_call" => Ok(Some(Item {
-            role: Role::Assistant,
-            content: ItemContent::ToolCall {
-                call_id: required_str(value, "call_id")?,
-                name: required_str(value, "name")?,
-                arguments: required_str(value, "arguments")?,
-            },
-            response_id: None,
-        })),
+        // **The `namespace` is carried into the item since M17 (R-N6), and the
+        // item `id` is still dropped.** The two look alike on the wire and are
+        // not alike at all: `id` names the *item* within one response and means
+        // nothing on a resend, while `namespace` names the MCP server the call
+        // was dispatched to and is half of what codex resolves a call against
+        // (`ToolName { name, namespace }`). Dropping it made a third party's
+        // tool named `status` indistinguishable from ours in the log, and made
+        // the outbound projection re-emit a call the client could not route.
+        //
+        // Carrying it does not move any turn id: `Item::render` leaves the
+        // field out, deliberately and with the reasoning stated there.
+        "function_call" => Ok(Some(Item::namespaced_tool_call(
+            required_str(value, "call_id")?,
+            required_str(value, "name")?,
+            optional_str(value, "namespace"),
+            required_str(value, "arguments")?,
+        ))),
         "function_call_output" => Ok(Some(Item {
             role: Role::Tool,
             content: ItemContent::ToolResult {
@@ -182,6 +190,20 @@ fn required_str(value: &Value, field: &str) -> Result<String, ApiError> {
         .ok_or_else(|| {
             ApiError::unprocessable(format!("`{field}` is required and must be a string"))
         })
+}
+
+/// A string field that may be absent, as `None` when it is.
+///
+/// Separate from [`required_str`] rather than folded into it with a flag,
+/// because the two answer different questions about a malformed request: a
+/// missing `call_id` is a client bug worth a 422, while a missing `namespace`
+/// is the ordinary shape of a plain (non-MCP) function tool. A non-string value
+/// under the key reads as absent rather than as a refusal for the same reason
+/// the item `id` is ignored — this field is decoration to everything below the
+/// wire except the projection that puts it back, and refusing a turn over it
+/// would fail a conversation that is otherwise entirely well formed.
+fn optional_str(value: &Value, field: &str) -> Option<String> {
+    value.get(field).and_then(Value::as_str).map(str::to_string)
 }
 
 // ---------------------------------------------------------------------------
@@ -304,14 +326,39 @@ fn message_item(id: &str, text: &str) -> Value {
 /// `id` is set to the call id rather than omitted, because a streaming consumer
 /// pairs `output_item.added` with its `done` on the item id, and two calls in
 /// one turn that shared one id would be indistinguishable.
-fn function_call_item(call_id: &str, name: &str, arguments: &str) -> Value {
-    json!({
+///
+/// **`namespace` is emitted when the stored call carries one and omitted
+/// otherwise** (M17, R-N10), which is not a guess about what the client wants
+/// but the field it sent coming back. Codex dispatches a call by an exact
+/// `ToolName { name, namespace }` registry lookup, so a namespaced call
+/// re-emitted flat — or bare — resolves against nothing there and the tool
+/// simply never runs. Omitted rather than sent as `null` because that is what
+/// the oracle's own encoder does (`skip_serializing_if = "Option::is_none"` on
+/// `ResponseItem::FunctionCall::namespace` @ the pin), and
+/// `codex_wire_shapes.rs` asserts this object against that encoder field for
+/// field rather than against a shape this module typed.
+///
+/// Public, and that is what makes the pin possible: the oracle suite is an
+/// integration test and cannot see a private helper, so the alternative was to
+/// assert the *frames* — and an axum [`Event`] is write-only, which is how this
+/// projection went unpinned through the whole of its life.
+pub fn function_call_item(
+    call_id: &str,
+    name: &str,
+    namespace: Option<&str>,
+    arguments: &str,
+) -> Value {
+    let mut item = json!({
         "type": "function_call",
         "id": call_id,
         "call_id": call_id,
         "name": name,
         "arguments": arguments,
-    })
+    });
+    if let Some(namespace) = namespace {
+        item["namespace"] = json!(namespace);
+    }
+    item
 }
 
 /// The call announced, with its arguments still empty.
@@ -320,12 +367,12 @@ fn function_call_item(call_id: &str, name: &str, arguments: &str) -> Value {
 /// afterwards, and a consumer that acted on this frame's `arguments` would act
 /// on an empty object. The pinned parser turns this into `OutputItemAdded` and
 /// waits for the `done`.
-pub(super) fn call_added_frame(call_id: &str, name: &str) -> Event {
+pub(super) fn call_added_frame(call_id: &str, name: &str, namespace: Option<&str>) -> Event {
     frame(
         "response.output_item.added",
         json!({
             "type": "response.output_item.added",
-            "item": function_call_item(call_id, name, ""),
+            "item": function_call_item(call_id, name, namespace, ""),
         }),
     )
 }
@@ -356,12 +403,17 @@ pub(super) fn call_arguments_delta_frame(call_id: &str, arguments: &str) -> Even
 /// The pinned parser reads `ResponseItem` off `output_item.done` and only there;
 /// an item it cannot parse is dropped with a `debug!` and no error, so a turn
 /// whose call was malformed arrives looking like a turn that called nothing.
-pub(super) fn call_done_frame(call_id: &str, name: &str, arguments: &str) -> Event {
+pub(super) fn call_done_frame(
+    call_id: &str,
+    name: &str,
+    namespace: Option<&str>,
+    arguments: &str,
+) -> Event {
     frame(
         "response.output_item.done",
         json!({
             "type": "response.output_item.done",
-            "item": function_call_item(call_id, name, arguments),
+            "item": function_call_item(call_id, name, namespace, arguments),
         }),
     )
 }
@@ -554,27 +606,33 @@ mod tests {
         assert!(canonicalize("", &[json!({ "type": "web_search_call" })]).is_err());
     }
 
-    /// A client's MCP tool call and the item the log keeps are the same call.
+    /// A client's MCP tool call and the item the log keeps are the same call —
+    /// **name and namespace both, since M17 (R-N6), and still never the item
+    /// `id`**.
     ///
-    /// **Inbound machinery, and M10.0 left it exactly where it was (T4).** The
-    /// outbound half is gone — no response projects a `function_call` frame any
-    /// more, so `EmittedCall` and its two builders were deleted with the steer
-    /// they existed for — but the *input* path still meets namespaced calls on
-    /// every turn, because a codex agent runs its own MCP tools between ours and
-    /// re-sends them in the history. Canonicalization must read neither the
-    /// `namespace` nor the item `id`, or the claimed prefix disagrees with the
-    /// stored one on the very next turn and the session rebinds to a cold
-    /// generation — silently, since every turn would still answer.
+    /// The two wire fields look alike and are not. `id` names the item within
+    /// one response and means nothing on a resend, so reading it would make the
+    /// claimed prefix disagree with the stored one on the very next turn and
+    /// rebind the session to a cold generation — silently, since every turn
+    /// would still answer. `namespace` names the MCP server the call was
+    /// dispatched to: it is stable across resends by construction (the client
+    /// sends the same one every time it re-sends the call), it is half of what
+    /// codex resolves a call against, and dropping it was what made a third
+    /// party's tool named `status` indistinguishable from ours in the log.
+    ///
+    /// Carrying it moves no turn id — `Item::render` leaves the field out, and
+    /// `the_turn_id_of_a_control_call_conversation_is_pinned_bare_and_namespaced`
+    /// is the literal that says so.
     ///
     /// The wire item is written out here rather than built by a projection,
-    /// which is what the deleted version did. That is a real loss and it is
+    /// which is what the pre-M10.0 version did. That is a real loss and it is
     /// named: the old test could not drift from what we emitted, because it
     /// asked the emitter. This one is a fixture of what *codex* emits, so it is
     /// pinned against a client instead — `codex_wire_shapes.rs` builds the same
     /// shape from codex's own types, and that is where the fixture is kept
     /// honest.
     #[test]
-    fn a_clients_namespaced_call_canonicalizes_to_the_bare_stored_item() {
+    fn a_clients_namespaced_call_canonicalizes_with_its_namespace_and_without_its_item_id() {
         let wire = json!({
             "type": "function_call",
             "id": "fc_resp_03L",
@@ -587,14 +645,30 @@ mod tests {
         let stored = canonicalize("", &[wire]).expect("a client's own call is resendable");
         assert_eq!(
             stored,
-            vec![Item::tool_call(
+            vec![Item::namespaced_tool_call(
                 "call_03L",
                 "status",
+                Some("mcp__roundhouse".into()),
                 r#"{"conversation":"main"}"#,
             )],
-            "the wire's namespace and item id must leave no trace in the \
-             canonical item: {stored:#?}"
+            "the wire's namespace is kept beside the bare name and its item id \
+             leaves no trace: {stored:#?}"
         );
+
+        // A plain function tool sends no `namespace` at all, and that absence
+        // is stored as an absence rather than refused — the shape every
+        // non-MCP tool call on this wire has.
+        let plain = canonicalize(
+            "",
+            &[json!({
+                "type": "function_call",
+                "name": "search",
+                "call_id": "call_04",
+                "arguments": "{}",
+            })],
+        )
+        .expect("a plain function tool is resendable");
+        assert_eq!(plain, vec![Item::tool_call("call_04", "search", "{}")]);
     }
 
     /// A namespace folded into `name` is part of the name, and canonicalization
@@ -624,6 +698,14 @@ mod tests {
     /// buy nothing and would move the `turn_id` of every already-stored
     /// tool-using session. So the divergence below is the
     /// shipped behaviour, not a debt.
+    ///
+    /// **M17 widened the gap rather than closing it, and deliberately.** The
+    /// namespaced form now canonicalizes with a `namespace` field the flat form
+    /// cannot have, so the two items differ in two places instead of one. That
+    /// is the same ruling read forward: each spelling stays the word of the
+    /// client that sent it. It is also why `Item::tool_call`'s doc had to be
+    /// corrected in the same rung (R-N10) — it still claimed the two arrive as
+    /// one item, which the `assert_ne!` below has pinned as false since M12.
     #[test]
     fn a_flat_spelling_is_a_different_canonical_call_until_the_wire_learns_to_split_it() {
         let namespaced = json!({
@@ -645,9 +727,14 @@ mod tests {
 
         assert_eq!(
             namespaced_item,
-            vec![Item::tool_call("call_1", "fetch_steer", "{}")],
-            "a separate `namespace` field leaves no trace: this is the property \
-             the steering round trip rests on"
+            vec![Item::namespaced_tool_call(
+                "call_1",
+                "fetch_steer",
+                Some("mcp__roundhouse".into()),
+                "{}"
+            )],
+            "a separate `namespace` field is carried beside the bare name \
+             (M17, R-N6) and is never folded into it"
         );
         assert_eq!(
             flat_item,
@@ -741,8 +828,14 @@ mod tests {
         let stored = canonicalize("", &[wire]).expect("a client's own call is resendable");
         assert_eq!(
             stored,
-            vec![Item::tool_call("call_r_m0", "status", "{}")],
-            "the log keeps the bare name, so nothing downstream may match on a \
+            vec![Item::namespaced_tool_call(
+                "call_r_m0",
+                "status",
+                Some(crate::dialect::DEFAULT_MCP_NAMESPACE.to_string()),
+                "{}"
+            )],
+            "the log keeps codex's two fields as two fields — the bare name and \
+             the namespace beside it — so nothing downstream may match on a \
              flat `mcp__roundhouse__` prefix without splitting it first"
         );
 
@@ -753,19 +846,22 @@ mod tests {
         // item rather than against a literal, so a change to canonicalization
         // that reintroduced the namespace would be caught here rather than
         // agreeing with a string this test typed.
-        let Some(roundhouse_core::item::ItemContent::ToolCall { name, .. }) =
-            stored.first().map(|item| &item.content)
+        let Some(roundhouse_core::item::ItemContent::ToolCall {
+            name, namespace, ..
+        }) = stored.first().map(|item| &item.content)
         else {
             panic!("the canonical item is a tool call: {stored:#?}");
         };
         assert!(
             roundhouse_core::validate::is_control_call_on(
                 name,
+                namespace.as_deref(),
                 roundhouse_core::validate::ControlCallDialect::CodexResponses
             ),
             "an MCP control call made over the Responses wire has to be \
-             recognisable from what the log actually holds (`{name}`), or the \
-             fold counts roundhouse's own chatter as the agent's work"
+             recognisable from what the log actually holds (`{name}` under \
+             `{namespace:?}`), or the fold counts roundhouse's own chatter as \
+             the agent's work"
         );
     }
 
@@ -801,6 +897,7 @@ mod tests {
         assert!(
             roundhouse_core::validate::is_control_call_on(
                 &flat,
+                None,
                 ControlCallDialect::ClaudeMessages
             ),
             "the flat spelling `{flat}` is what the Messages surface stores"
@@ -808,6 +905,7 @@ mod tests {
         assert!(
             !roundhouse_core::validate::is_control_call_on(
                 &flat,
+                None,
                 ControlCallDialect::CodexResponses
             ),
             "this wire cannot produce `{flat}` — codex dispatches on an exact \
@@ -840,6 +938,63 @@ mod tests {
         )
         .expect("a fixed, well-formed conversation canonicalizes");
         assert_eq!(turn_id_for(&claimed).to_string(), "turn_6a7aaa94e5b59fd2");
+    }
+
+    /// **R-N7: the turn id of a conversation that *contains a control call*,
+    /// bare and namespaced, pinned as one literal.**
+    ///
+    /// The existing pin above cannot see this rung's edit: its fixture tool is
+    /// `search`, an ordinary client tool with no `namespace` on the wire, so a
+    /// change confined to how a namespaced call canonicalizes leaves it green.
+    /// That is the hazard §3.5 of the stored-namespace evidence names — the
+    /// guard the tree wrote to catch "an edit that moves historical hashes" is
+    /// blind to exactly the edit that carries a namespace into the log.
+    ///
+    /// So these two fixtures differ in **one wire field and nothing else**, and
+    /// they pin the *same* literal. An implementation that folded the carried
+    /// namespace into [`Item::render`] would move both away from the literal at
+    /// once, and a client's in-flight retry of a control-call turn would miss
+    /// its own completed response and buy a second billed answer. Pinned as a
+    /// literal rather than as `assert_eq!(bare, namespaced)` alone, because the
+    /// equality on its own would stay true if the render started hashing the
+    /// namespace *and* canonicalization stopped reading it.
+    #[test]
+    fn the_turn_id_of_a_control_call_conversation_is_pinned_bare_and_namespaced() {
+        let conversation = |call: Value| {
+            canonicalize(
+                "be brief",
+                &[
+                    json!({"type": "message", "role": "user", "content": "how am I doing?"}),
+                    call,
+                    json!({"type": "function_call_output", "call_id": "call_1",
+                            "output": "on budget"}),
+                ],
+            )
+            .expect("a fixed, well-formed control-call conversation canonicalizes")
+        };
+
+        let bare = conversation(json!({
+            "type": "function_call", "call_id": "call_1",
+            "name": "status", "arguments": "{}",
+        }));
+        let namespaced = conversation(json!({
+            "type": "function_call", "call_id": "call_1",
+            "name": "status", "namespace": "mcp__roundhouse", "arguments": "{}",
+        }));
+
+        assert_eq!(
+            turn_id_for(&bare).to_string(),
+            "turn_a579e6c0755cc987",
+            "a control-call conversation stored before this rung must keep the \
+             turn id it already has"
+        );
+        assert_eq!(
+            turn_id_for(&namespaced).to_string(),
+            "turn_a579e6c0755cc987",
+            "the namespace is carried beside the name and left out of the \
+             render, so the same conversation hashes the same way whether the \
+             client sent the field or not"
+        );
     }
 
     /// F18 (review): codex's `ResponseItem` enum has resendable variants far
@@ -901,6 +1056,7 @@ mod tests {
                     content: ItemContent::ToolCall {
                         call_id: "call_1".into(),
                         name: "grep".into(),
+                        namespace: None,
                         arguments: "{\"q\":\"x\"}".into(),
                     },
                     response_id: None,

@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Plan: the Anthropic Messages surface, the seat, and the launcher (M11)
 
-> **Status: shipped through M16.1; D2 ruled (2026-09-04).** The rulings in §3 stand
+> **Status: shipped through M16.1; D2 ruled; M17 in flight (2026-09-04).** The rulings in §3 stand
 > as written; where an implementation round moved one, the dated addenda at
 > the end of this document record the move and its reason, and win over §3
 > for the current tree. Direction set by the product owner on
@@ -2556,3 +2556,103 @@ differently:
   never cleared once a node agreed again, unlike its sibling (F5): an
   agreeing load — a node's own commit included — clears it, and the
   once-per-version warning memory stays.
+
+## Addendum (2026-09-04): M17 — the carried namespace, the rulings
+
+D2 ruled the stored namespace in R-N1..R-N5; the five refinements below
+say precisely what lands, resolved in advance so the stage does not
+re-derive them.
+
+**R-N6 — one field, three producers, one reader that does not care.**
+`ItemContent::ToolCall` gains `namespace: Option<String>` with
+`#[serde(default, skip_serializing_if = "Option::is_none")]`. It is set by
+the Responses canonicalisation from codex's own `namespace` wire field, by
+the fleet's Responses decoder from an upstream model's `namespace` (the
+gap the D2 read surfaced: a model calling one of roundhouse's own tools
+had its namespace dropped on the way in and could not be dispatched on
+the way out), and by nothing on the Messages surface, where the flat
+spelling is the namespace and the field stays `None`. `Item::render`
+leaves it out, so no turn id moves; the comment beside the render says
+why this is the opposite of the `Thinking::signature` call. Every
+construction names the field: `Item::tool_call` keeps meaning `None`, and
+one new constructor takes a namespace for the two inbound paths that have
+one; struct literals gain the field explicitly, nowhere a default.
+
+**R-N7 — the render decision has guards that go red.** Two pinned turn-id
+literals over control-call conversations join the existing one over
+`search`: a bare `status` and a namespaced `status`, whose fixtures differ
+only in the field, pin the same turn id — the existing literal cannot see
+the edit, and an implementation that folded the namespace into the render
+would move both. A pre-change record deserialises byte for byte and
+re-serialises without the field; a namespaced record round-trips with it.
+
+**R-N8 — prefix admission: a stored `None` agrees, a stored `Some` must
+match.** `same_item` compares role and content as before except for the
+namespace, where a stored `None` agrees with any claim and a stored
+`Some` requires equality — so a conversation whose early turns were
+stored before the field existed continues, and a client that changes
+which server a name came from forks as a changed name would. Three tests:
+the straddling conversation continues; a stored namespace against a
+different claimed one forks; a stored namespace against an absent claimed
+one forks.
+
+**R-N9 — the recogniser reads the field first and the bare arm second;
+the exemption narrows.** `ControlCallDialect::CodexResponses` recognises
+a control call by `namespace == Some("mcp__roundhouse")` with a name in
+the eight; a `None` namespace falls back to the bare-name arm for records
+written before the change; any other `Some` is not ours. The existing
+exemption test narrows to the `None` arm rather than being deleted, and a
+new test proves a third party's `status` under another namespace is
+folded as the client's own tool. The Messages arm is unchanged.
+
+**R-N10 — the outbound projection emits what it stored, pinned against
+the oracle.** `function_call_item` emits `namespace` when the stored call
+carries one and omits it otherwise; the shape is pinned in the codex wire
+suite against the encoder in the pinned codex crates — the emitted object
+for a namespaced call equals what codex's own `FunctionCall` with the same
+namespace serialises to — which is the oracle that suite exists for, and
+not the real-binary round trip R-M8's counterpart still owes. The two
+stale docs (the constructor's, and the dialect module's "nothing renders
+a tool call outbound") are corrected in the same rung; `turn_depth`
+counting control calls stays open by name.
+
+### What the implementation settled beyond the rulings (2026-09-04, M17)
+
+- **Every construction site landed in the core stage**, not the churn
+  stage: the fleet's chunk type gained the field because its decoder is
+  a producer, and the Relay exporters destructure the call, so the server
+  crate could not compile without them. The exporters drop the namespace
+  on purpose, with a comment at each site: neither the Relay trace format
+  nor the chat-completions tool-call shape has a field for an MCP server,
+  and adding one is a schema decision in a format another project owns.
+  Open by name for a Relay rung.
+- **Two shipped tests were the pre-M17 statements of the old ruling and
+  were rewritten rather than deleted**: the one asserting that a client's
+  namespace and item id do not perturb the turn hash (its dedup half
+  depended on prefix admission, and a bare resend of a namespaced call
+  now forks by R-N8; the hash half is pinned as a literal at the unit
+  level), and the one asserting the log stores no namespace, inverted.
+  The item-id half of the old test was already vacuous — no fixture in
+  that file ever sent one — and is now asserted directly on a
+  hand-written wire object.
+- **The oracle pin reads one function.** The Responses wire module is
+  public for exactly `function_call_item`, so the codex wire suite can
+  compare what roundhouse emits with what codex's own encoder produces
+  for the same value; everything else in the module stays crate-private,
+  and the module declaration says so.
+- **The render blindness D2 named was reproduced before it was
+  guarded.** Folding the namespace into the render only when present
+  leaves the pre-existing pinned literal green — its fixture tool is
+  `search` — and reddens only the new control-call pin; that is the exact
+  edit the old guard could not see, and the reason R-N7 asked for two
+  literals over one value.
+- **More stale docs than the two R-N10 named made the same false
+  claim** — the recogniser's module header and its constant's doc, the
+  dialect module's Responses bullet, the fleet's join doc and its
+  decoder's "deliberately not read" note — and were corrected in the same
+  pass, because a reason that does not hold is what waves the next change
+  through.
+- **The refute stage found nothing to fix**: ten mutations went red
+  under the guards the rulings named and the two inspections confirmed
+  the constant is reused and the oracle is codex's encoder, not a
+  literal. `turn_depth` counting control calls stays open by name.

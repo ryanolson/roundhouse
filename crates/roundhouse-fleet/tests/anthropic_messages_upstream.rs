@@ -465,6 +465,7 @@ async fn a_tool_using_turn_sends_the_clients_tools_and_yields_one_completed_call
             FrontierChunk::ToolCall {
                 id: "toolu_01ZZZ".into(),
                 name: "Grep".into(),
+                namespace: None,
                 arguments: r#"{"pattern":"fn main"}"#.into(),
             },
             FrontierChunk::Done {

@@ -156,6 +156,7 @@ async fn a_tool_only_turn_with_unreported_usage_settles_at_zero_output_tokens() 
         .send(Ok(FrontierChunk::ToolCall {
             id: "toolu_01".into(),
             name: "Grep".into(),
+            namespace: None,
             arguments: r#"{"pattern": "fn main", "path": "/src", "output_mode": "content"}"#.into(),
         }))
         .await
@@ -164,6 +165,7 @@ async fn a_tool_only_turn_with_unreported_usage_settles_at_zero_output_tokens() 
         .send(Ok(FrontierChunk::ToolCall {
             id: "toolu_02".into(),
             name: "Read".into(),
+            namespace: None,
             arguments: r#"{"path": "/src/main.rs", "limit": 200}"#.into(),
         }))
         .await

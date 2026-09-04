@@ -13,7 +13,9 @@
 //!   is the *statement* of what each one stores, and a test per surface asserts
 //!   the canonical form equals it.
 //! - **[`ClientDialect::CodexResponses`]** — the namespace travels in its own
-//!   wire field, canonicalization drops it, and the log holds `status`.
+//!   wire field, and the log holds it there: a bare `status` in the name, with
+//!   the server beside it in the record's own `namespace` (M17, R-N6). This
+//!   type answers what the *name* is, which is why its arm did not move.
 //!   **[`ClientDialect::ClaudeMessages`]** — Claude Code flattens the
 //!   registration into every tool name it declares, calls and permits, so the
 //!   log holds `mcp__roundhouse__status`.
@@ -22,9 +24,19 @@
 //!   stored tool name, and it takes the surface as a parameter for the reason
 //!   the two bullets above give: a bare name is ours on one wire and the
 //!   client's own on the other.
-//! - **Nothing renders a tool call outbound.** The steer is assistant text, so
-//!   there is no projection this type feeds and no replay hazard from a name
-//!   applied on the way out.
+//! - **This type is never rendered outbound; the stored *name* is** — on both
+//!   surfaces. The sentence this replaces said "nothing renders a tool call
+//!   outbound", which was true of [`ClientDialect`] (no projection reads it,
+//!   and the steer is assistant text rather than a synthetic call) and false of
+//!   the log: `responses_api::wire::function_call_item` and
+//!   `messages_api::emit` both put a stored call back on the wire for the
+//!   client to run. The distinction matters because it is what makes the
+//!   carried namespace reachable at all — the projection re-emits the field the
+//!   client sent, so an MCP call resolves against codex's exact
+//!   `ToolName { name, namespace }` lookup instead of arriving bare (M17,
+//!   R-N10). What still holds is the half the sentence was written for: no
+//!   *name* is composed on the way out, so there is no replay hazard from a
+//!   spelling applied at projection time.
 //! - **The namespace is `mcp__roundhouse` by construction**, shared by both
 //!   launchers' registrations, the signage and the fold. There is no
 //!   per-deployment rename; the control plane refuses a config that asks for
@@ -135,8 +147,12 @@ impl ClientDialect {
     /// agreeing by hand.
     pub fn stored_call_name(&self, tool: &str) -> String {
         match self {
-            // The namespace rides its own wire field and canonicalization drops
-            // it, so what reaches the log is the bare name and nothing else.
+            // The namespace rides its own wire field, so the *name* that
+            // reaches the log is the bare one. Since M17 the record also
+            // carries the namespace beside it — which is a fact about the
+            // record, not about the name, and is why this arm is unchanged: a
+            // caller asking "what is this tool called in that log" still gets
+            // `status`.
             Self::CodexResponses => tool.to_string(),
             // The one renderer, shared with `codex_launch::skills` and the
             // Claude signage (M12 review, F7): three `format!` calls composing
@@ -193,7 +209,7 @@ mod tests {
             for tool in CONTROL_TOOL_NAMES {
                 let stored = dialect.stored_call_name(tool);
                 assert!(
-                    is_control_call_on(&stored, recognizer(&dialect)),
+                    is_control_call_on(&stored, None, recognizer(&dialect)),
                     "`{stored}` is what {dialect:?} leaves in the log for `{tool}`"
                 );
             }
@@ -218,10 +234,12 @@ mod tests {
 
         assert!(!is_control_call_on(
             &bare,
+            None,
             ControlCallDialect::ClaudeMessages
         ));
         assert!(!is_control_call_on(
             &flat,
+            None,
             ControlCallDialect::CodexResponses
         ));
     }

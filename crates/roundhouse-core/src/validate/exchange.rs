@@ -56,6 +56,18 @@ use crate::item::{Item, ItemContent};
 pub struct Exchange {
     pub call_id: String,
     pub name: String,
+    /// The MCP namespace the call carried, when its client spelled one.
+    ///
+    /// Carried through from
+    /// [`ItemContent::ToolCall::namespace`](crate::item::ItemContent) so the
+    /// one consumer that has to tell roundhouse's own control traffic from a
+    /// third party's identically-named tool —
+    /// [`is_control_call_on`](super::is_control_call_on) — can read it. It is
+    /// on the projection rather than looked up again at the fold because this
+    /// projection *is* the fold's view of the log: a second walk over the items
+    /// to recover one field would be the second answer to "what did this agent
+    /// just do" that this module's own header exists to prevent.
+    pub namespace: Option<String>,
     pub arguments: String,
     /// `None` for a call nothing has answered yet — the last call of a turn
     /// that is still running, or a steer the client has not fetched.
@@ -97,9 +109,11 @@ pub fn exchanges(items: &[Item]) -> Vec<Exchange> {
                 call_id,
                 name,
                 arguments,
+                namespace,
             } => exchanges.push(Exchange {
                 call_id: call_id.clone(),
                 name: name.clone(),
+                namespace: namespace.clone(),
                 arguments: arguments.clone(),
                 output: None,
                 failed: false,

@@ -293,12 +293,15 @@ fn lines(event: &str) -> impl Iterator<Item = &str> {
 /// either would fail at a place that says nothing about where the value went
 /// missing.
 ///
-/// `namespace` — the oracle's optional MCP qualifier — is deliberately not read.
-/// [`ItemContent::ToolCall`](roundhouse_core::item::ItemContent) stores the bare
-/// name by its own ruling, because a namespace belongs to a client dialect and
-/// lives in the wire projection; folding one into `name` here would put a
-/// dialect's spelling into the log and make a namespaced call and a flat call to
-/// one tool two different tools.
+/// `namespace` — the oracle's optional MCP qualifier — is read **beside** the
+/// name and never folded into it (M17, R-N6). Folding would put a dialect's
+/// spelling into the log and make a namespaced call and a flat call to one tool
+/// two different tools; dropping it, which is what this decoder did until M17,
+/// left a model that asked for one of roundhouse's own MCP tools stored bare
+/// and re-emitted with no `namespace` for codex's exact
+/// `ToolName { name, namespace }` lookup to resolve. Optional here because it
+/// is optional on the wire: a plain function tool sends no such field, and an
+/// absent one means "this tool has no server", not "nobody said".
 fn function_call(item: Option<&Value>) -> Option<FrontierChunk> {
     let item = item?;
     if item.get("type").and_then(Value::as_str) != Some("function_call") {
@@ -307,6 +310,13 @@ fn function_call(item: Option<&Value>) -> Option<FrontierChunk> {
     Some(FrontierChunk::ToolCall {
         id: item.get("call_id").and_then(Value::as_str)?.to_string(),
         name: item.get("name").and_then(Value::as_str)?.to_string(),
+        // Absent reads as `None` rather than dropping the item, unlike the
+        // three required fields above: a call with no server is a call, while a
+        // call with no id cannot be paired and one with no name names nothing.
+        namespace: item
+            .get("namespace")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         // `as_str` and not `to_string` on the value: this field is a JSON
         // *string* on the wire, so a `Value::String` renders with its quotes and
         // escapes if stringified whole, and the client would receive
@@ -705,6 +715,7 @@ mod tests {
                     // `function_call_output` is paired on.
                     id: "call_1".into(),
                     name: "shell".into(),
+                    namespace: None,
                     // The wire's own string, with its spacing, moved rather than
                     // parsed — see `function_call`.
                     arguments: r#"{"command": ["ls", "-l"]}"#.into(),
@@ -725,6 +736,58 @@ mod tests {
             "exactly one call: the `added` placeholder and the argument delta \
              must not each produce one"
         );
+    }
+
+    /// **R-N6: an upstream's `namespace` reaches the chunk, and its absence
+    /// reaches it as `None` rather than as a dropped call.**
+    ///
+    /// The gap this closes had no test because it had no field: a model asking
+    /// for one of roundhouse's own MCP tools had its namespace dropped here,
+    /// was stored bare, and was re-emitted to a codex client with no
+    /// `namespace` for that client's exact `ToolName { name, namespace }`
+    /// lookup to resolve — a round trip that never worked and that nothing went
+    /// red about.
+    ///
+    /// The negative half is the one that would go wrong quietly. `namespace` is
+    /// optional on this wire (a plain function tool sends none), so reading it
+    /// with the same `?` the three required fields use would turn every
+    /// non-MCP tool call into a silently dropped item — a turn that called a
+    /// tool arriving as a turn that called nothing.
+    #[test]
+    fn a_namespaced_function_call_carries_its_namespace_and_a_bare_one_carries_none() {
+        for (item, name, expected, why) in [
+            (
+                concat!(
+                    r#"{"type":"function_call","call_id":"call_1","name":"status","#,
+                    r#""namespace":"mcp__roundhouse","arguments":"{}"}"#,
+                ),
+                "status",
+                Some("mcp__roundhouse"),
+                "the model asked for an MCP tool and named the server it is on",
+            ),
+            (
+                r#"{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{}"}"#,
+                "shell",
+                None,
+                "a plain function tool has no server and sends no field",
+            ),
+        ] {
+            let done =
+                format!("data: {{\"type\":\"response.output_item.done\",\"item\":{item}}}\n\n");
+            let chunks =
+                decode(&[&done, COMPLETED]).unwrap_or_else(|error| panic!("{why}: {error:?}"));
+
+            assert_eq!(
+                chunks.first(),
+                Some(&FrontierChunk::ToolCall {
+                    id: "call_1".into(),
+                    name: name.into(),
+                    namespace: expected.map(str::to_string),
+                    arguments: "{}".into(),
+                }),
+                "{why}"
+            );
+        }
     }
 
     /// Output items that are not function calls, and function calls missing a

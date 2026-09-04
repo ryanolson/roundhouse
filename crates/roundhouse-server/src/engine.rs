@@ -1578,6 +1578,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                 FrontierChunk::ToolCall {
                     id,
                     name,
+                    namespace,
                     arguments,
                 } => {
                     if !pending.is_empty() {
@@ -1609,7 +1610,20 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                     // `{"path":…,"pattern":…}` it comes back as. The serve
                     // projections emit this same stored string, so the round
                     // trip closes. See `canonical_arguments`.
-                    let call = Item::tool_call(id, name, canonical_arguments(&arguments));
+                    //
+                    // The namespace crosses this join untouched (M17, R-N6):
+                    // it is the upstream's own word for which MCP server the
+                    // call goes to, the log is the only place it can be kept,
+                    // and the Responses projection reads it straight back out
+                    // — which is what makes a model's call to one of
+                    // roundhouse's own MCP tools resolvable at the client
+                    // instead of arriving bare.
+                    let call = Item::namespaced_tool_call(
+                        id,
+                        name,
+                        namespace,
+                        canonical_arguments(&arguments),
+                    );
                     // F5: measured before the move below, on the same rendering
                     // `context_contribution` uses for this item once it is a
                     // resend rather than a fresh commit — so an unreported-usage

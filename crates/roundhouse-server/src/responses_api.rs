@@ -68,7 +68,18 @@ use crate::http::{
 use crate::messages_api::MAX_REQUEST_BYTES;
 use crate::prefix_admission::bind_prefix;
 
-mod wire;
+/// **Public for one function and one reason** (M17, R-N10):
+/// [`wire::function_call_item`] is the outbound projection of a stored tool
+/// call, and the suite that pins it against codex's own encoder —
+/// `tests/codex_wire_shapes.rs`, this repo's wire oracle — is an integration
+/// test and cannot see a private helper. Every other item here stays
+/// `pub(super)` or `pub(crate)`, so the surface this exposes is exactly the one
+/// value the oracle has to compare.
+///
+/// The alternative was to assert the *frames* instead, which is how this
+/// projection went unpinned for its whole life: an axum `Event` is write-only,
+/// so nothing outside this module could ever read back what it emitted.
+pub mod wire;
 use wire::{
     call_added_frame, call_arguments_delta_frame, call_done_frame, canonicalize, completed_frame,
     created_frame, delta_frame, failed_frame, incomplete_frame, item_added_frame, item_done_frame,
@@ -90,6 +101,12 @@ enum Emitted<'a> {
     ToolCall {
         call_id: &'a str,
         name: &'a str,
+        /// The MCP server the stored call named, when its client named one.
+        ///
+        /// Carried through the projection since M17 (R-N10) so the frames
+        /// re-emit what the log holds rather than a bare name codex's exact
+        /// `ToolName { name, namespace }` lookup cannot resolve.
+        namespace: Option<&'a str>,
         arguments: &'a str,
     },
 }
@@ -802,9 +819,11 @@ impl<S: SessionStore, T: Tokenizer + Clone + Send + Sync + 'static> ResponsesFol
                 call_id,
                 name,
                 arguments,
+                namespace,
             } => Some(Emitted::ToolCall {
                 call_id,
                 name,
+                namespace: namespace.as_deref(),
                 arguments,
             }),
             // The three M11.1 variants join `ToolResult` here rather than
@@ -998,12 +1017,13 @@ impl<S: SessionStore, T: Tokenizer + Clone + Send + Sync + 'static> ResponsesFol
                     Some(Emitted::ToolCall {
                         call_id,
                         name,
+                        namespace,
                         arguments,
                     }) => {
                         let call = [
-                            call_added_frame(call_id, name),
+                            call_added_frame(call_id, name, namespace),
                             call_arguments_delta_frame(call_id, arguments),
-                            call_done_frame(call_id, name, arguments),
+                            call_done_frame(call_id, name, namespace, arguments),
                         ];
                         self.close_message_item();
                         self.queued.extend(call);

@@ -1277,6 +1277,7 @@ mod tests {
         working.push(Exchange {
             call_id: "c9".into(),
             name: "edit".into(),
+            namespace: None,
             arguments: "{}".into(),
             output: Some("ok".into()),
             failed: false,
@@ -1535,6 +1536,7 @@ mod tests {
         recovered.push(Exchange {
             call_id: "c9".into(),
             name: "edit".into(),
+            namespace: None,
             arguments: "{}".into(),
             output: Some("ok".into()),
             failed: false,
@@ -1547,6 +1549,7 @@ mod tests {
         reading.push(Exchange {
             call_id: "c9".into(),
             name: "bash".into(),
+            namespace: None,
             arguments: shell("grep needle src/lib.rs"),
             output: Some("ok".into()),
             failed: false,

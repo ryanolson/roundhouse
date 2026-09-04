@@ -308,10 +308,14 @@ fn response_payload(turn: &TurnRecord) -> Option<Value> {
         .output
         .iter()
         .filter_map(|item| match &item.content {
+            // Not published, for the reason `atif::tool_calls` states: this is
+            // the OpenAI chat-completions tool-call shape, which spells a
+            // function name flat and has no namespace field at all (M17).
             ItemContent::ToolCall {
                 call_id,
                 name,
                 arguments,
+                namespace: _,
             } => Some(json!({
                 "id": call_id,
                 "type": "function",

@@ -874,6 +874,9 @@ mod tests {
             Exchange {
                 call_id: id.into(),
                 name: name.into(),
+                // The flat spelling this fixture uses *is* the Messages
+                // surface's namespace, so there is no field to fill (M17).
+                namespace: None,
                 arguments: arguments.into(),
                 output: Some("ok".into()),
                 failed: false,

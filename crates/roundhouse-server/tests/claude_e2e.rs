@@ -599,10 +599,15 @@ fn log_shape(items: &[Item]) -> String {
         .map(|(at, item)| {
             let (kind, sample) = match &item.content {
                 ItemContent::Text { text } => ("text", text.clone()),
+                // The namespace is not in this transcript line: the Messages
+                // surface stores `None` by construction (M17, R-N6), and a
+                // rendering that printed `None` on every call would be noise in
+                // the one place a human reads the log.
                 ItemContent::ToolCall {
                     call_id,
                     name,
                     arguments,
+                    namespace: _,
                 } => ("tool_call", format!("{name} {call_id} {arguments}")),
                 ItemContent::ToolResult { call_id, output } => {
                     ("tool_result", format!("{call_id} {output}"))
@@ -2273,7 +2278,11 @@ async fn a_real_client_reaches_the_control_surface_through_the_turn() {
         "one call, one result, one exchange: {folded:?}"
     );
     assert!(
-        is_control_call_on(&folded[0].name, ControlCallDialect::ClaudeMessages),
+        is_control_call_on(
+            &folded[0].name,
+            folded[0].namespace.as_deref(),
+            ControlCallDialect::ClaudeMessages
+        ),
         "the fold must recognise `{}` as roundhouse's own control traffic",
         folded[0].name
     );
@@ -2290,6 +2299,14 @@ async fn a_real_client_reaches_the_control_surface_through_the_turn() {
         task_exchanges_on(&folded, ControlCallDialect::CodexResponses).len(),
         1,
         "the flat spelling is the Messages surface's; the Responses recogniser          must not claim it"
+    );
+    // And the namespace field is empty on this surface, which is what makes the
+    // assertion above about the *spelling* rather than about a field the real
+    // client never sends (M17, R-N6).
+    assert_eq!(
+        folded[0].namespace, None,
+        "a real Claude Code turn stores no namespace field: the registration is \
+         folded into the name it declares, calls and permits"
     );
 
     rig.clean();

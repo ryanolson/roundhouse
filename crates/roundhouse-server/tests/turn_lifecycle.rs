@@ -706,6 +706,7 @@ async fn a_tool_calling_turn_commits_its_items_in_the_order_it_produced_them() {
         FrontierChunk::ToolCall {
             id: "toolu_01".into(),
             name: "Grep".into(),
+            namespace: None,
             // Not in canonical spelling: the engine stores the form the client's
             // resend will canonicalize to, not the model's own bytes.
             arguments: r#"{"pattern": "fn main", "path": "/src"}"#.into(),
@@ -714,6 +715,7 @@ async fn a_tool_calling_turn_commits_its_items_in_the_order_it_produced_them() {
         FrontierChunk::ToolCall {
             id: "toolu_02".into(),
             name: "Read".into(),
+            namespace: None,
             arguments: r#"{"path": "/src/main.rs"}"#.into(),
         },
         FrontierChunk::Done {
@@ -759,6 +761,7 @@ async fn a_tool_calling_turn_commits_its_items_in_the_order_it_produced_them() {
             ItemContent::ToolCall {
                 call_id: "toolu_01".into(),
                 name: "Grep".into(),
+                namespace: None,
                 arguments: r#"{"path":"/src","pattern":"fn main"}"#.into(),
             },
             ItemContent::Text {
@@ -767,6 +770,7 @@ async fn a_tool_calling_turn_commits_its_items_in_the_order_it_produced_them() {
             ItemContent::ToolCall {
                 call_id: "toolu_02".into(),
                 name: "Read".into(),
+                namespace: None,
                 arguments: r#"{"path":"/src/main.rs"}"#.into(),
             },
         ],
@@ -881,6 +885,7 @@ async fn a_call_only_turn_commits_no_empty_trailing_item() {
         Ok(FrontierChunk::ToolCall {
             id: "toolu_01".into(),
             name: "Bash".into(),
+            namespace: None,
             arguments: r#"{"command":"ls"}"#.into(),
         }),
         done(),
@@ -959,6 +964,7 @@ async fn a_failure_after_a_committed_call_still_reads_as_a_warm_provider() {
         .send(Ok(FrontierChunk::ToolCall {
             id: "toolu_01".into(),
             name: "Bash".into(),
+            namespace: None,
             arguments: r#"{"command":"ls"}"#.into(),
         }))
         .await

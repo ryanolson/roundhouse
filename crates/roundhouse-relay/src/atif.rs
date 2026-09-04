@@ -507,10 +507,17 @@ fn tool_calls(turn: &TurnRecord) -> Vec<AtifToolCall> {
     turn.output
         .iter()
         .filter_map(|item| match &item.content {
+            // `namespace` is not published, and that is a schema question
+            // rather than an oversight: ATIF's `AtifToolCall` is Relay's
+            // vocabulary, it has no field for an MCP server, and inventing one
+            // — or folding it into `function_name` — would put a roundhouse
+            // spelling into a format another project owns. Named here so the
+            // loss is visible if Relay ever grows the field (M17).
             roundhouse_core::item::ItemContent::ToolCall {
                 call_id,
                 name,
                 arguments,
+                namespace: _,
             } => Some(AtifToolCall {
                 tool_call_id: call_id.clone(),
                 function_name: name.clone(),

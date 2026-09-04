@@ -1182,78 +1182,112 @@ async fn a_steered_turn_opens_no_grant_and_books_no_model_row() {
     );
 }
 
-/// A namespace and an item id are wire decoration, and the turn id is a hash of
-/// the conversation — so neither may move it.
+/// A client's verbatim retry of a namespaced conversation replays, and the
+/// same conversation with the namespace dropped does not.
 ///
-/// **Re-aimed at the client's own MCP calls (T4).** This used to send back the
-/// call *we* emitted, spelled two ways; there is no such call now, so it sends
-/// back a call the agent ran of its own accord, which is the only kind of tool
-/// call this wire still carries — and the property being pinned is unchanged,
-/// because it was never about whose call it was.
+/// **Rewritten by M17, and the rewrite is the ruling.** Until M17 this asserted
+/// that a namespaced spelling and a bare one were *one* turn, on the reasoning
+/// that a namespace is wire decoration the hash must not read. Half of that
+/// survives and half of it was overturned:
 ///
-/// Observable only through deduplication, which is the honest place for it: a
-/// client that re-sends the same conversation spelled *flat* — no namespace, no
-/// item id, the shape a future Messages surface would send — must land on the
-/// same turn id and be answered with the response the namespaced spelling
-/// already produced. If canonicalization read either field, this would be a new
-/// turn, generated and billed a second time.
+/// - **The hash still does not read it.** `Item::render` leaves the field out
+///   deliberately, so no already-stored conversation moved when the field
+///   landed, and `responses_api::wire`'s
+///   `the_turn_id_of_a_control_call_conversation_is_pinned_bare_and_namespaced`
+///   pins that as one literal over two fixtures. That property is asserted at
+///   the unit level now, where it can be pinned as a *value*, rather than
+///   inferred here from a deduplication that also depends on prefix admission.
+/// - **The two spellings are no longer one conversation.** The log keeps the
+///   namespace beside the name (R-N6), and prefix admission requires a stored
+///   `Some` to match (R-N8) — because a client that changes which MCP server a
+///   tool name came from is describing a different call, and appending it onto
+///   the first client's conversation would be the silent error. So the bare
+///   resend forks, deliberately, and this is the end-to-end guard for that.
+///
+/// The retry half is what the deduplication claim was really protecting and it
+/// is asserted first: an identical resend must still land on the response it
+/// already paid for, or a client's ordinary retry buys a second billed answer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_clients_namespace_and_item_id_do_not_perturb_the_turn_hash() {
-    let rig = rig([Plan::Proceed]);
+async fn a_verbatim_namespaced_retry_replays_and_a_bare_resend_is_a_different_conversation() {
+    let rig = rig([Plan::Proceed, Plan::Proceed]);
     let session = "sess-hash";
 
-    let namespaced = vec![
-        user_message("hello"),
-        function_call_item("grep", Some(NAMESPACE), "call_theirs", r#"{"q":"x"}"#),
-        function_call_output_item("call_theirs", "3 hits"),
-    ];
-    let first = drive(&rig, request(session, namespaced))
+    let namespaced = || {
+        vec![
+            user_message("hello"),
+            function_call_item("grep", Some(NAMESPACE), "call_theirs", r#"{"q":"x"}"#),
+            function_call_output_item("call_theirs", "3 hits"),
+        ]
+    };
+    let first = drive(&rig, request(session, namespaced()))
         .await
         .expect("the namespaced turn completes");
 
-    // The same conversation, spelled without a namespace and without an item
-    // id. Everything a dialect adds is gone; everything the hash reads is the
-    // same.
-    let flat = vec![
+    let retry = drive(&rig, request(session, namespaced()))
+        .await
+        .expect("the verbatim retry completes");
+    assert_eq!(
+        response_id(&retry),
+        response_id(&first),
+        "a client's retry of the conversation it already sent must replay the \
+         answer it already paid for"
+    );
+    assert_never_forked(&rig.store, session).await;
+    assert_eq!(
+        stored_items(&rig.store, session).await.len(),
+        5,
+        "instructions, question, call, output, answer — and nothing appended a \
+         second time"
+    );
+
+    // The same call with the namespace dropped. The turn id is unmoved — the
+    // render never saw the field — so this is not a hash change; it is prefix
+    // admission refusing to continue somebody else's conversation, which is
+    // R-N8's stated asymmetry running in the direction it does not forgive.
+    let bare = vec![
         user_message("hello"),
         function_call_item("grep", None, "call_theirs", r#"{"q":"x"}"#),
         function_call_output_item("call_theirs", "3 hits"),
     ];
-    let second = drive(&rig, request(session, flat))
+    let forked = drive(&rig, request(session, bare))
         .await
-        .expect("the flat resend completes");
-
-    assert_eq!(
-        response_id(&second),
+        .expect("the bare resend completes");
+    assert_ne!(
+        response_id(&forked),
         response_id(&first),
-        "two spellings of one conversation are one turn: a namespace or an \
-         item id reaching the hash would bill this twice"
+        "a claim that dropped the namespace is not the stored conversation, \
+         and answering it out of the stored one would attribute a call to a \
+         server it never went to"
     );
-    assert_never_forked(&rig.store, session).await;
-    let items = stored_items(&rig.store, session).await;
-    assert_eq!(
-        items.len(),
-        5,
-        "instructions, question, call, output, answer — and nothing appended a \
-         second time: {items:#?}"
+    assert!(
+        rig.store
+            .last_seq(&SessionId::new(format!("{session}#g1")))
+            .await
+            .is_ok(),
+        "the disagreeing claim must open its own generation rather than \
+         appending onto the first client's"
     );
 }
 
-/// A namespace is a wire fact and never a stored one.
+/// The log stores the bare tool name **and the namespace beside it** — two
+/// fields, exactly as the client sent two fields.
 ///
-/// A negative assertion over the log's own bytes, because the cost of getting
-/// this wrong is invisible until a second dialect appears: a namespace stored in
-/// the item would make Codex's resend and a flat resend canonicalize to two
-/// different items, and every session carrying an agent's own MCP calls would
-/// fork on the turn that agent changed dialect.
+/// **Inverted by M17 (R-N6), and the inversion is the point.** This used to
+/// assert the namespace appeared nowhere in the stored bytes, on the reasoning
+/// that keeping it would make a namespaced resend and a flat resend two
+/// different items. They *are* two different items, that is now the ruling
+/// rather than the hazard, and what the old assertion cost was named in the
+/// evidence: a third party's tool called `status` was indistinguishable from
+/// ours in the log, and a call re-emitted without its namespace resolved
+/// against nothing in codex's exact `ToolName { name, namespace }` lookup.
 ///
-/// **Asked of an inbound call now (T4)**, because outbound calls no longer
-/// exist. That makes the claim narrower and more honest than it was: the
-/// namespace is stripped by `canonical_item`, and this is the assertion that
-/// says so against a real client's bytes rather than against our own projection
-/// of them.
+/// Asserted over the log's own bytes rather than over the typed item, because
+/// what a future migration reads is the stored JSON: the key is `namespace`,
+/// it sits beside `name` rather than folded into it, and a build that started
+/// writing `mcp__roundhouse__grep` into `name` would pass a typed check and
+/// fail here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_log_stores_the_bare_tool_name_and_no_namespace() {
+async fn the_log_stores_the_bare_tool_name_with_the_namespace_beside_it() {
     let rig = rig([Plan::Proceed]);
 
     drive(
@@ -1271,14 +1305,30 @@ async fn the_log_stores_the_bare_tool_name_and_no_namespace() {
     .expect("the turn completes");
 
     let items = stored_items(&rig.store, "sess-bare").await;
-    let ItemContent::ToolCall { name, .. } = &items[2].content else {
+    let ItemContent::ToolCall {
+        name, namespace, ..
+    } = &items[2].content
+    else {
         panic!("the third item is the client's own call: {items:#?}");
     };
     assert_eq!(name, "grep", "the log keeps the bare tool name");
+    assert_eq!(
+        namespace.as_deref(),
+        Some(NAMESPACE),
+        "and the server it went to, beside the name rather than folded into it"
+    );
+
     let encoded: Value = serde_json::to_value(&items[2]).expect("an item serializes");
-    assert!(
-        !encoded.to_string().contains(NAMESPACE),
-        "the stored item must carry no namespace anywhere: {encoded}"
+    assert_eq!(
+        encoded["content"]["namespace"],
+        Value::String(NAMESPACE.to_string()),
+        "the stored record's own key: {encoded}"
+    );
+    assert_eq!(
+        encoded["content"]["name"],
+        Value::String("grep".to_string()),
+        "and the name is still the bare one — a build that folded the \
+         namespace in would pass a typed check and fail here: {encoded}"
     );
 }
 

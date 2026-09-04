@@ -62,6 +62,33 @@ pub enum ItemContent {
         call_id: String,
         name: String,
         arguments: String,
+        /// The MCP server this tool was registered under, when the client that
+        /// sent the call spelled it as a field of its own.
+        ///
+        /// **Forward-only, and last on purpose** (M17, R-N6). A record written
+        /// before this field existed carries no `namespace` key, `default`
+        /// reads it back as `None`, and `skip_serializing_if` writes it back
+        /// out with the key still absent — so every stored byte of every
+        /// pre-M17 tool call is unchanged, which is the property
+        /// `a_pre_m11_log_record_still_deserializes` pins. An older build
+        /// reading a newer record sees an unknown key and ignores it, which is
+        /// the same one-way door `SessionCreated::principal` and `::arm`
+        /// already walked through.
+        ///
+        /// **`None` is not "no namespace"; it is "this client does not spell
+        /// one".** Codex sends `{"name":"status","namespace":"mcp__roundhouse"}`
+        /// — two wire fields — so its calls arrive with `Some`. Claude Code
+        /// folds the registration into every tool name it declares, calls and
+        /// permits, so `mcp__roundhouse__status` arrives as one flat `name` and
+        /// the field stays `None`: on that surface the flat spelling *is* the
+        /// namespace, and inventing a `Some` here by splitting the name would
+        /// move the canonical form of every already-stored Messages session.
+        /// The two consumers that care read the asymmetry directly —
+        /// `validate::is_control_call_on` falls back to the bare-name arm on
+        /// `None`, and prefix admission treats a stored `None` as agreeing with
+        /// any claim.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
     },
     ToolResult {
         call_id: String,
@@ -183,10 +210,27 @@ impl ItemContent {
     pub fn render(&self) -> String {
         match self {
             ItemContent::Text { text } => text.clone(),
+            // **The namespace is left out, and that is the opposite of the
+            // `Thinking::signature` call below — deliberately, and for the same
+            // reasoning read the other way.** The signature is included because
+            // excluding it would let two genuinely different conversations hash
+            // to one turn id, and a turn id collision is a *second billed
+            // answer* attributed to the first. Here there is no such collision
+            // to buy: `call_id` already separates any two calls in one
+            // conversation, so a namespace in the render would distinguish
+            // nothing the id does not. What including it *would* buy is the
+            // failure in the other direction — every conversation already
+            // holding a control call would hash differently the day the field
+            // landed, and a client's in-flight retry would miss its own
+            // completed response and pay for the answer twice (M17, R-N6/R-N7).
+            // `the_turn_id_of_a_control_call_conversation_is_pinned_bare_and_namespaced`
+            // in `responses_api::wire` is the guard: one literal, two fixtures
+            // differing only in this field.
             ItemContent::ToolCall {
                 call_id,
                 name,
                 arguments,
+                namespace: _,
             } => format!("<tool_call id=\"{call_id}\" name=\"{name}\">{arguments}</tool_call>"),
             ItemContent::ToolResult { call_id, output } => {
                 format!("<tool_result id=\"{call_id}\">{output}</tool_result>")
@@ -317,13 +361,46 @@ impl Item {
     /// everything a client sends — so the provenance marker is not something a
     /// client can forge.
     ///
-    /// The name is the bare one. A namespace belongs to a client dialect and
-    /// lives in the wire projection: canonicalization ignores it on the way
-    /// in, so a namespaced resend and a flat one arrive as this same item, and
-    /// the log keeps one spelling per tool.
+    /// **The name is the one its own client sent, and this constructor means
+    /// "no namespace field"** — see [`Item::namespaced_tool_call`] for the two
+    /// inbound paths that have one.
+    ///
+    /// The doc this replaces claimed the name was always the bare one and that
+    /// "a namespaced resend and a flat one arrive as this same item". Both
+    /// halves were false, and M12's review found the second one (F10):
+    /// `responses_api::wire`'s
+    /// `a_flat_spelling_is_a_different_canonical_call_until_the_wire_learns_to_split_it`
+    /// pins the divergence with an `assert_ne!`, and the Messages surface
+    /// stores `mcp__roundhouse__status` rather than a bare name at all. The
+    /// sentence was left standing on the one doc a migration author reads
+    /// first, which is exactly the reasoning-by-stale-doc that gets a future
+    /// change waved through — so M17 (R-N10) corrects it here rather than only
+    /// in the two modules that already knew.
     pub fn tool_call(
         call_id: impl Into<String>,
         name: impl Into<String>,
+        arguments: impl Into<String>,
+    ) -> Self {
+        Self::namespaced_tool_call(call_id, name, None, arguments)
+    }
+
+    /// A tool call whose client spelled the MCP namespace as its own field.
+    ///
+    /// Two inbound paths reach this and no third exists: the Responses
+    /// canonicalization, reading the `namespace` a codex client sends beside
+    /// the name, and the fleet's Responses decoder, reading the one an upstream
+    /// model sends back. Everything else keeps meaning [`Self::tool_call`] —
+    /// the Messages surface most of all, where the flat spelling *is* the
+    /// namespace (see [`ItemContent::ToolCall::namespace`](ItemContent)).
+    ///
+    /// `Option<String>` rather than two constructors because the field is
+    /// optional *on the wire*: a plain (non-MCP) function tool sends no
+    /// `namespace` at all, and a caller that had to choose a constructor per
+    /// call would be deciding at the call site what the client already said.
+    pub fn namespaced_tool_call(
+        call_id: impl Into<String>,
+        name: impl Into<String>,
+        namespace: Option<String>,
         arguments: impl Into<String>,
     ) -> Self {
         Self {
@@ -332,6 +409,7 @@ impl Item {
                 call_id: call_id.into(),
                 name: name.into(),
                 arguments: arguments.into(),
+                namespace,
             },
             response_id: None,
         }
@@ -398,6 +476,7 @@ mod tests {
                 call_id: "c1".into(),
                 name: "grep".into(),
                 arguments: "{\"q\":\"x\"}".into(),
+                namespace: None,
             },
             response_id: None,
         };
@@ -441,6 +520,91 @@ mod tests {
                 "a new build must write the old shape byte for byte"
             );
         }
+    }
+
+    /// **M17: a tool call written before the namespace field existed still
+    /// reads and still writes back without it, and one written with it round
+    /// trips.**
+    ///
+    /// The pair is the guard on `skip_serializing_if`, and each half fails a
+    /// different way. Drop the attribute and the first literal starts writing
+    /// back `"namespace":null` — a byte-for-byte change to a shape every stored
+    /// record is in, and the failure
+    /// `a_pre_m11_log_record_still_deserializes` exists to catch. Drop
+    /// `default` and the same literal stops *reading* at all, which is a log
+    /// that can no longer be replayed. Write the field under any other key, or
+    /// anywhere but last, and the second literal moves — and a record a running
+    /// node already wrote is a record its successor cannot round trip.
+    ///
+    /// Pinned against literals rather than round-tripped through this build's
+    /// own encoder for the reason the two neighbours are: an encode-then-decode
+    /// with the same code is self-consistent by construction and would stay
+    /// green through a rename of the key it is meant to pin.
+    #[test]
+    fn a_tool_call_reads_and_writes_the_same_way_with_and_without_a_namespace() {
+        for stored in [
+            r#"{"role":"assistant","content":{"type":"tool_call","call_id":"c1","name":"status","arguments":"{}"}}"#,
+            r#"{"role":"assistant","content":{"type":"tool_call","call_id":"c1","name":"status","arguments":"{}","namespace":"mcp__roundhouse"}}"#,
+        ] {
+            let item: Item = serde_json::from_str(stored)
+                .unwrap_or_else(|error| panic!("a stored tool call must read: {stored} ({error})"));
+            assert_eq!(
+                serde_json::to_string(&item).expect("an item serializes"),
+                stored,
+                "a tool call must write back the shape it was read from, byte \
+                 for byte"
+            );
+        }
+
+        // What each literal became, so a failure above says *which* half of the
+        // asymmetry moved rather than only that the bytes did.
+        let bare: Item = serde_json::from_str(
+            r#"{"role":"assistant","content":{"type":"tool_call","call_id":"c1","name":"status","arguments":"{}"}}"#,
+        )
+        .expect("the pre-M17 record reads");
+        assert_eq!(bare, Item::tool_call("c1", "status", "{}"));
+
+        let namespaced: Item = serde_json::from_str(
+            r#"{"role":"assistant","content":{"type":"tool_call","call_id":"c1","name":"status","arguments":"{}","namespace":"mcp__roundhouse"}}"#,
+        )
+        .expect("the namespaced record reads");
+        assert_eq!(
+            namespaced,
+            Item::namespaced_tool_call("c1", "status", Some("mcp__roundhouse".into()), "{}")
+        );
+        assert_ne!(
+            bare, namespaced,
+            "a stored `None` and a stored `Some` are different records, which \
+             is what prefix admission's asymmetric rule is about: they compare \
+             unequal here and the admission check is the one place that \
+             deliberately does not"
+        );
+    }
+
+    /// **The render is blind to the namespace, and the two halves above are
+    /// not.**
+    ///
+    /// `responses_api::wire` pins the resulting turn id; this pins the input to
+    /// it, one crate down and against the shape a caller can see, so an edit
+    /// that folded the field into the render says *which* rendering moved
+    /// rather than only that a hash did.
+    #[test]
+    fn the_namespace_is_not_in_the_render() {
+        let bare = Item::tool_call("c1", "status", "{}");
+        let namespaced =
+            Item::namespaced_tool_call("c1", "status", Some("mcp__roundhouse".into()), "{}");
+
+        assert_eq!(
+            bare.render(),
+            "<|assistant|><tool_call id=\"c1\" name=\"status\">{}</tool_call>"
+        );
+        assert_eq!(
+            namespaced.render(),
+            bare.render(),
+            "carrying the namespace must not move the turn id of any \
+             conversation holding a control call — an in-flight retry that \
+             missed its own completed response would buy a second billed answer"
+        );
     }
 
     /// **The three M11.1 variants' own shipped tags, pinned against literal
@@ -491,6 +655,7 @@ mod tests {
                 call_id: "c1".into(),
                 name: "grep".into(),
                 arguments: "{\"q\":\"x\"}".into(),
+                namespace: None,
             })
             .render(),
             "<|assistant|><tool_call id=\"c1\" name=\"grep\">{\"q\":\"x\"}</tool_call>"

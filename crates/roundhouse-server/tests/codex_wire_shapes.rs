@@ -213,6 +213,86 @@ fn a_namespaced_function_call_round_trips_through_codex_protocol() {
     }
 }
 
+/// **R-N10: what roundhouse *emits* for a namespaced call equals what codex's
+/// own encoder produces for the same call, field for field.**
+///
+/// The half of the round trip that had never been asserted. The test above
+/// pins what a codex client *sends*; this pins what this deployment sends back,
+/// which is the direction the M17 evidence found broken: `function_call_item`
+/// emitted `{type, id, call_id, name, arguments}` and no `namespace`, so a
+/// call re-emitted from the log resolved against nothing in codex's exact
+/// `ToolName { name, namespace }` registry lookup and the tool simply never
+/// ran. Nothing went red, because nothing could see the value — an axum
+/// `Event` is write-only, so the frames could only ever be asserted through a
+/// socket.
+///
+/// **Compared against the oracle rather than against a literal**, which is the
+/// whole reason this file exists: a hand-written expectation only ever agrees
+/// with whoever typed it, and `codex_e2e.rs:1552` declined to guess this exact
+/// shape for that reason. So the expectation is built by serializing codex's
+/// own `ResponseItem::FunctionCall` with codex's own `Serialize` at the pin,
+/// and our object is compared to it after removing the one key that is ours to
+/// choose — `id`, which names the *item* so a streaming consumer can pair
+/// `output_item.added` with its `done`, and which the oracle's encoder skips
+/// because it is `None` on a call a client is sending rather than receiving.
+/// Every other key, `namespace` included, must match exactly.
+///
+/// The bare half is asserted with it: a call the log holds without a namespace
+/// must emit *no* `namespace` key at all, not `null`. `null` is what a
+/// `json!` that always wrote the field would produce, it is not what the
+/// oracle's `skip_serializing_if = "Option::is_none"` produces, and a whole-
+/// `Value` comparison is what makes the difference visible.
+#[test]
+fn what_we_emit_for_a_namespaced_call_is_what_codex_encodes_for_one() {
+    for (namespace, why) in [
+        (
+            Some("mcp__roundhouse"),
+            "an MCP call re-emitted from the log has to carry the server it              goes to, or codex's exact ToolName{name, namespace} lookup              resolves it against nothing",
+        ),
+        (
+            None,
+            "a plain function tool has no server, and the key must be absent              rather than null — which is what the oracle's own encoder does",
+        ),
+    ] {
+        let arguments = r#"{"conversation":"main"}"#;
+
+        let ours = roundhouse_server::responses_api::wire::function_call_item(
+            "call_theirs",
+            "status",
+            namespace,
+            arguments,
+        );
+
+        let oracle = serde_json::to_value(function_call_item(
+            "status",
+            namespace,
+            "call_theirs",
+            arguments,
+        ))
+        .expect("a FunctionCall item always serializes");
+
+        // `id` is ours and only ours: it names the item within one response so
+        // a streaming consumer can pair `added` with `done`, and the oracle's
+        // encoder skips its own `id` because a client sending a call has none.
+        // Removed rather than expected on both sides, so a *missing* namespace
+        // cannot hide behind a key this comparison was going to ignore anyway.
+        let mut emitted = ours.clone();
+        assert_eq!(
+            emitted
+                .as_object_mut()
+                .expect("the item is an object")
+                .remove("id"),
+            Some(json!("call_theirs")),
+            "the item id is the one key this projection adds, and it is the              call id: {ours}"
+        );
+
+        assert_eq!(
+            emitted, oracle,
+            "{why}: we emit {ours}, codex encodes {oracle}"
+        );
+    }
+}
+
 /// Pinned fact 2: dispatch is keyed off `response.output_item.done` alone.
 ///
 /// `handle_output_item_done` (the private `core/src/stream_events_utils.rs:288`

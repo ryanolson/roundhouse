@@ -842,10 +842,17 @@ impl MessageEmission {
             ItemContent::Text { text } if !self.streamed && !text.is_empty() => {
                 Some(Emitted::SeamText(text))
             }
+            // The namespace is not projected, and on this surface there is
+            // nothing to project: Claude Code folds the registration into every
+            // tool name it declares, calls and permits, so the flat `name`
+            // already carries it and a Messages record's field is `None` by
+            // construction (M17, R-N6). A `tool_use` block has no namespace key
+            // for one to go in either.
             ItemContent::ToolCall {
                 call_id,
                 name,
                 arguments,
+                namespace: _,
             } => Some(Emitted::ToolCall {
                 call_id,
                 name,
@@ -1289,6 +1296,7 @@ mod tests {
                 content: ItemContent::ToolCall {
                     call_id: "toolu_01".into(),
                     name: "Grep".into(),
+                    namespace: None,
                     arguments: r#"{"pattern":"fn main"}"#.into(),
                 },
                 response_id: Some(response()),

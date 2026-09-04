@@ -418,6 +418,7 @@ async fn a_codex_client_parses_a_tool_call_this_deployment_emitted() {
         ItemContent::ToolCall {
             call_id: "call_1".into(),
             name: "shell".into(),
+            namespace: None,
             arguments: r#"{"command":["ls"],"workdir":"/src"}"#.into(),
         }
     );

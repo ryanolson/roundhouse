@@ -353,6 +353,12 @@ impl FrontierClient for ToolCallingFrontierClient {
                     chunks.push(Ok(FrontierChunk::ToolCall {
                         id: (*id).to_string(),
                         name: (*name).to_string(),
+                        // `Scripted::Call` names a tool, not a server: the
+                        // suites built on it are about the turn loop, and a
+                        // namespace here would be a fixture detail none of them
+                        // asserts. The namespaced path has its own coverage in
+                        // the fleet decoder and the Responses projection (M17).
+                        namespace: None,
                         arguments: arguments.clone(),
                     }));
                 }

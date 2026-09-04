@@ -67,6 +67,95 @@ fn an_edited_history_is_refused_rather_than_appended() {
     assert_eq!(suffix_after(&stored, &[user("goodbye")]), None);
 }
 
+/// A tool call as a pre-M17 log holds it, or as the Messages surface still
+/// does: name only, no namespace field.
+fn bare_call() -> Item {
+    Item::tool_call("call_1", "status", "{}")
+}
+
+/// The same call as a post-M17 Responses log holds it.
+fn namespaced_call(namespace: &str) -> Item {
+    Item::namespaced_tool_call("call_1", "status", Some(namespace.to_string()), "{}")
+}
+
+/// **R-N8, half one: a conversation that straddles the change continues.**
+///
+/// The failure this exists to prevent is the one that would have shipped
+/// silently. Every turn of a tool-using session stored before M17 holds
+/// `namespace: None`; the client's very next request canonicalizes the same
+/// resent call with `Some("mcp__roundhouse")`, because the wire always carried
+/// the field and only the log has changed. A `same_item` comparing content
+/// structurally would disagree at that item, `suffix_after` would return
+/// `None`, and the conversation would fork into a fresh generation — while
+/// every turn still answered, which is why nothing would go red anywhere else.
+///
+/// So a stored `None` agrees with any claim, and the suffix is what the client
+/// genuinely added.
+#[test]
+fn a_conversation_stored_before_the_namespace_existed_still_admits_a_namespaced_claim() {
+    let stored = vec![user("hello"), bare_call()];
+    let claimed = vec![
+        user("hello"),
+        namespaced_call("mcp__roundhouse"),
+        user("and now?"),
+    ];
+    assert_eq!(
+        suffix_after(&stored, &claimed),
+        Some(vec![user("and now?")]),
+        "a record written before the field existed must not fork the \
+         conversation the day the field lands"
+    );
+}
+
+/// **R-N8, half two: a stored namespace requires equality.**
+///
+/// Not blind, and this is what blindness would have cost. A client that
+/// re-sends the same tool name under a *different* MCP server is describing a
+/// different call — dispatched to a different server, answered by different
+/// code — and the log it claims to be continuing does not contain it. That is
+/// a changed history, exactly as a changed name is, and the surface's answer to
+/// a changed history is to fork rather than to append onto somebody else's
+/// conversation.
+#[test]
+fn a_stored_namespace_disagrees_with_a_different_claimed_one() {
+    let stored = vec![user("hello"), namespaced_call("mcp__roundhouse")];
+    let claimed = vec![user("hello"), namespaced_call("mcp__other")];
+    assert_eq!(
+        suffix_after(&stored, &claimed),
+        None,
+        "`status` on our server and `status` on somebody else's are two calls"
+    );
+}
+
+/// **R-N8, half three: and it disagrees with an absent one.**
+///
+/// The direction the asymmetry does *not* run, pinned because it is the one a
+/// reader would expect to be symmetric. A stored `None` agreeing with any claim
+/// is a statement about records written before the field existed; it says
+/// nothing about a client that stored a namespace and then stopped sending one.
+/// Treating that as agreement would make the rule blind in both directions for
+/// any conversation whose first turn happened to carry the field, which is the
+/// whole of what "not blind" was for.
+#[test]
+fn a_stored_namespace_disagrees_with_an_absent_claimed_one() {
+    let stored = vec![user("hello"), namespaced_call("mcp__roundhouse")];
+    let claimed = vec![user("hello"), bare_call()];
+    assert_eq!(
+        suffix_after(&stored, &claimed),
+        None,
+        "a claim that dropped the field is not evidence it means the same call"
+    );
+
+    // The control, and it is what proves the two assertions above are about the
+    // namespace rather than about tool calls being compared strictly at all:
+    // identical records on both sides still admit.
+    assert_eq!(
+        suffix_after(&stored, &stored),
+        Some(Vec::new()),
+        "a verbatim resend of a namespaced call is the ordinary retry"
+    );
+}
+
 fn configuration(text: &str) -> Item {
     Item {
         role: Role::Developer,

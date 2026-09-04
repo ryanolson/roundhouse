@@ -225,6 +225,13 @@ impl ToolBlock {
         Some(FrontierChunk::ToolCall {
             id: self.id,
             name: self.name,
+            // No such field on this wire, and no name to split. Anthropic's
+            // `tool_use` block carries one flat `name`, and a client that
+            // registered an MCP server folded the registration into it — so the
+            // flat spelling *is* the namespace here, and manufacturing a `Some`
+            // by splitting on `__` would invent a server boundary the provider
+            // never drew (M17, R-N6).
+            namespace: None,
             arguments,
         })
     }
@@ -1254,12 +1261,14 @@ mod tests {
                 FrontierChunk::ToolCall {
                     id: "toolu_01A".into(),
                     name: "Read".into(),
+                    namespace: None,
                     // Byte-exact reassembly of the two fragments, in order.
                     arguments: r#"{"path":"/etc/hosts"}"#.into(),
                 },
                 FrontierChunk::ToolCall {
                     id: "toolu_01B".into(),
                     name: "Grep".into(),
+                    namespace: None,
                     arguments: r#"{"pattern":"fn main"}"#.into(),
                 },
                 FrontierChunk::Done {
@@ -1318,6 +1327,7 @@ mod tests {
             FrontierChunk::ToolCall {
                 id: "toolu_01C".into(),
                 name: "Bash".into(),
+                namespace: None,
                 arguments: r#"{"command":"cargo test --workspace","timeout":900}"#.into(),
             }
         );
@@ -1370,6 +1380,7 @@ mod tests {
             FrontierChunk::ToolCall {
                 id: "toolu_01D".into(),
                 name: "Bash".into(),
+                namespace: None,
                 arguments: r#"{"command":"ls"}"#.into(),
             }
         );
@@ -1426,6 +1437,7 @@ mod tests {
             FrontierChunk::ToolCall {
                 id: "toolu_01F".into(),
                 name: "Bash".into(),
+                namespace: None,
                 arguments: r#"{ "command" : "ls -la" }"#.into(),
             },
             "a parseable-but-unusual argument string must pass through \
@@ -1472,6 +1484,7 @@ mod tests {
                 FrontierChunk::ToolCall {
                     id: "t".into(),
                     name: "Now".into(),
+                    namespace: None,
                     arguments: expected.to_string(),
                 },
                 "{why}"

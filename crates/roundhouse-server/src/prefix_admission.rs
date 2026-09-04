@@ -128,7 +128,7 @@ use roundhouse_core::context::Tokenizer;
 use roundhouse_core::control::Principal;
 use roundhouse_core::event::SessionEventKind;
 use roundhouse_core::ids::{ResponseId, SessionId};
-use roundhouse_core::item::Item;
+use roundhouse_core::item::{Item, ItemContent};
 use roundhouse_core::session::{ConfigurationCursor, turn_configuration_len};
 use roundhouse_core::store::{SessionStore, StoreError};
 
@@ -797,13 +797,77 @@ fn suffix_after(stored: &[Item], claimed: &[Item]) -> Option<Vec<Item>> {
 }
 
 /// Item equality as this surface sees it: role and content, never the response
-/// stamp.
+/// stamp, and asymmetrically on one field of one variant.
 ///
 /// Assistant history comes back as the model's own words with no id attached —
 /// the client has no field to put one in — so comparing stamps would fail the
-/// prefix check on every turn after the first.
+/// prefix check on every turn after the first. That is the first stated
+/// exception; [`same_namespace`] is the second and the only other one.
 fn same_item(stored: &Item, claimed: &Item) -> bool {
-    stored.role == claimed.role && stored.content == claimed.content
+    stored.role == claimed.role && same_content(&stored.content, &claimed.content)
+}
+
+/// Content equality, deferring to the derived `PartialEq` on everything but a
+/// tool call.
+///
+/// A `match` on the pair rather than a field-by-field comparison of every
+/// variant, so a variant added later is compared structurally by default: the
+/// safe answer for a shape nobody has thought about is "these differ", because
+/// a false *agreement* silently admits a claim that is not the stored
+/// conversation, while a false disagreement forks — visibly, into a generation
+/// that then continues.
+fn same_content(stored: &ItemContent, claimed: &ItemContent) -> bool {
+    match (stored, claimed) {
+        (
+            ItemContent::ToolCall {
+                call_id: stored_id,
+                name: stored_name,
+                arguments: stored_arguments,
+                namespace: stored_namespace,
+            },
+            ItemContent::ToolCall {
+                call_id: claimed_id,
+                name: claimed_name,
+                arguments: claimed_arguments,
+                namespace: claimed_namespace,
+            },
+        ) => {
+            stored_id == claimed_id
+                && stored_name == claimed_name
+                && stored_arguments == claimed_arguments
+                && same_namespace(stored_namespace.as_deref(), claimed_namespace.as_deref())
+        }
+        _ => stored == claimed,
+    }
+}
+
+/// The namespace rule, and **the single load-bearing edit of M17** (R-N8).
+///
+/// Neither blind nor symmetric, and each half is a decision:
+///
+/// - **Not blind.** A comparison that ignored the field would never notice a
+///   client changing which MCP server a tool name came from — which is a
+///   genuinely different call, dispatched to a different server, and should
+///   fork exactly as a changed name does. `same_item` is already blind to
+///   `response_id`; that is blindness to a stamp *we* wrote, not to something
+///   the client said.
+/// - **Not symmetric.** A stored `None` is a record written before the field
+///   existed, or by the Messages surface where the flat spelling is the
+///   namespace, so it agrees with any claim: a conversation whose early turns
+///   predate M17 and whose next request canonicalizes with a namespace
+///   continues instead of forking on the change. A stored `Some` is the
+///   client's own word for where the call went, and requires equality — an
+///   absent claim included, because "the client stopped sending the field" is
+///   not evidence that it means the same call.
+///
+/// The asymmetry is what makes the rung forward-only rather than a migration:
+/// every straddling conversation keeps its generation, and no stored byte was
+/// touched to achieve it.
+fn same_namespace(stored: Option<&str>, claimed: Option<&str>) -> bool {
+    match stored {
+        None => true,
+        Some(_) => stored == claimed,
+    }
 }
 
 /// [`same_item`], run over two runs of the same length.

@@ -471,6 +471,7 @@ mod tests {
                     call_id: "call_theirs".into(),
                     name: "grep".into(),
                     arguments: r#"{"q":"parser"}"#.into(),
+                    namespace: None,
                 },
                 response_id: None,
             },
