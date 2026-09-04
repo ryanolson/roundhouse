@@ -1611,13 +1611,27 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                     // projections emit this same stored string, so the round
                     // trip closes. See `canonical_arguments`.
                     //
-                    // The namespace crosses this join untouched (M17, R-N6):
-                    // it is the upstream's own word for which MCP server the
-                    // call goes to, the log is the only place it can be kept,
-                    // and the Responses projection reads it straight back out
-                    // — which is what makes a model's call to one of
-                    // roundhouse's own MCP tools resolvable at the client
-                    // instead of arriving bare.
+                    // The namespace crosses this join *scoped by dialect*
+                    // (M17 review, F7), not untouched: only a
+                    // `CodexResponses` session has anywhere for it to come
+                    // back through, since that surface resends a call's
+                    // `namespace` as its own wire field. The Messages surface
+                    // folds registration into the flat tool name and has no
+                    // such field — its wire can only ever resend `None` — so
+                    // storing a decoded `Some(_)` there durably as R-N6
+                    // promises `None` "by construction" is not a store that
+                    // stays untouched; it forks the session on the very next
+                    // tool-using turn, because prefix admission requires a
+                    // stored `Some` to match the claimed value exactly
+                    // (R-N8) and the claim can only ever be `None`. Reused
+                    // rather than respelled: the same `of_session_key` split
+                    // `run_turn`'s admission and `plan`'s `TurnSignals` already
+                    // read the session key through.
+                    let namespace =
+                        match ControlCallDialect::of_session_key(session.session_id().as_str()) {
+                            ControlCallDialect::CodexResponses => namespace,
+                            ControlCallDialect::ClaudeMessages => None,
+                        };
                     let call = Item::namespaced_tool_call(
                         id,
                         name,

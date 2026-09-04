@@ -846,8 +846,13 @@ impl MessageEmission {
             // nothing to project: Claude Code folds the registration into every
             // tool name it declares, calls and permits, so the flat `name`
             // already carries it and a Messages record's field is `None` by
-            // construction (M17, R-N6). A `tool_use` block has no namespace key
-            // for one to go in either.
+            // construction (M17, R-N6) — enforced at the one place a record is
+            // ever written, the engine's namespace join beside
+            // `Item::namespaced_tool_call`, which discards a decoded namespace
+            // rather than storing it on a `ClaudeMessages`-dialect session
+            // (M17 review, F7: nothing here forces that, so an unscoped join
+            // was free to store one and it did, until that review). A
+            // `tool_use` block has no namespace key for one to go in either.
             ItemContent::ToolCall {
                 call_id,
                 name,

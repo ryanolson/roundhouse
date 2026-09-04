@@ -186,8 +186,8 @@ pub enum ItemContent {
 /// hand this function such a string.** The decoder that produces the argument
 /// string in the first place — `ToolBlock::into_chunk` in
 /// `roundhouse-fleet`'s `anthropic_messages::stream`, reached through the same
-/// `Item::tool_call(id, name, canonical_arguments(&arguments))` call this
-/// function's callers make — drops a tool call outright when its reassembled
+/// `Item::namespaced_tool_call(id, name, namespace, canonical_arguments(&arguments))`
+/// call this function's callers make — drops a tool call outright when its reassembled
 /// `input_json_delta` fragments do not parse, rather than emitting one for this
 /// function to fall back on. What remains reachable on the non-JSON arm here is
 /// a log written before that guarantee existed, a dialect whose decoder does
@@ -460,6 +460,38 @@ impl Item {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M17 review F4: `canonical_arguments`'s doc comment (see the block
+    /// above this function) still describes the F7 decoder join as reached
+    /// through the pre-M17 `Item::tool_call(id, name,
+    /// canonical_arguments(&arguments))` three-argument call. M17 (R-N6)
+    /// added the namespace parameter and every caller — `engine.rs` and
+    /// `frontier.rs` — now spells `Item::namespaced_tool_call(id, name,
+    /// namespace, canonical_arguments(&arguments))`. This test reaches the
+    /// doc comment as data (via `include_str!`, since rustdoc text is not
+    /// otherwise inspectable at runtime) and fails while the stale
+    /// three-argument call shape is still the sentence describing the join.
+    #[test]
+    fn canonical_arguments_doc_names_current_join_call_shape() {
+        // Sliced up to (not including) `mod tests`: the whole-file version is
+        // a tautology — this very assertion's string literal retypes the
+        // three-argument call shape it searches for, so `include_str!`
+        // reading the whole file would find its own quotation of the stale
+        // shape however the doc comment above was mutated. `routing::stage`
+        // and `roundhouse-mcp`'s `lib.rs` learned that the expensive way; the
+        // slice is the fix, copied from there rather than rediscovered.
+        let src = include_str!("item.rs")
+            .split("\n#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(
+            !src.contains("Item::tool_call(id, name, canonical_arguments(&arguments))"),
+            "canonical_arguments' doc comment still spells the pre-M17 \
+             three-argument Item::tool_call join; callers now use \
+             Item::namespaced_tool_call(id, name, namespace, \
+             canonical_arguments(&arguments)) (engine.rs, frontier.rs)"
+        );
+    }
 
     #[test]
     fn rendering_is_stable_across_calls() {

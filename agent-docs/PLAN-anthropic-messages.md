@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Plan: the Anthropic Messages surface, the seat, and the launcher (M11)
 
-> **Status: shipped through M16.1; D2 ruled; M17 in flight (2026-09-04).** The rulings in §3 stand
+> **Status: shipped through M17; D2 ruled (2026-09-04).** The rulings in §3 stand
 > as written; where an implementation round moved one, the dated addenda at
 > the end of this document record the move and its reason, and win over §3
 > for the current tree. Direction set by the product owner on
@@ -2656,3 +2656,53 @@ counting control calls stays open by name.
   under the guards the rulings named and the two inspections confirmed
   the constant is reused and the oracle is codex's encoder, not a
   literal. `turn_depth` counting control calls stays open by name.
+
+### What the review round changed (2026-09-04, M17)
+
+The M17 thermo-nuclear review (seven findings after triage from eight,
+all valid; rulings in the commit message) ran two reviewers — one on the
+field as a change to the durable log, one on the three consumers that
+changed behaviour and the crate's surface — primed with the rung's own
+twelve mutations and inspections, and moved three things the rulings
+above state differently:
+
+- **R-N6′ — the engine's join is dialect-aware.** R-N6 said the Messages
+  surface stores no namespace by construction, and the rung's own join
+  broke that from the other direction (F7): a namespace decoded from an
+  upstream on a Messages-surface session was stored, the Messages wire
+  has no field to send it back through, and R-N8 then forked the session
+  into a new generation on every tool-using turn — unobserved only
+  because the translated Messages toolbox happens to keep an upstream
+  from returning one. The engine stores the decoded namespace only on the
+  Responses surface, the dialect it already derives from the session key,
+  and stores none on the Messages surface, where a value that cannot come
+  back is a fork trap rather than a fact. The Responses round trip — a
+  namespaced upstream call stored and re-emitted on the outbound frame,
+  which no fixture exercised (F3) — is pinned by a live guard that the
+  verifier reddened at both join sites.
+- **One reading of a stored `None`.** The fleet decoder's doc read an
+  absent namespace as the fact that the tool has no server; the item's
+  field doc read it as "this client did not spell one", an unknown — and
+  R-N8's stored-`None`-agrees rule is sound only under the second (F5).
+  The item doc owns the meaning, and the decoder's doc now points at it.
+  The README's two pre-M17 sentences and the canonical-arguments doc that
+  still named the old three-argument join are corrected (F1, F4), and the
+  control-plane plan's own account of the bare stored name carries a
+  dated superseded note. The refuter's guard for F4 was itself a
+  tautology — its assertion quoted the sentence it searched the whole
+  file for — and took the crate's slice-before-the-tests pattern before
+  it could go green; the verifier re-broke that half separately.
+- **Two guards the rung lacked.** The Relay exporters' deliberate drop of
+  the namespace was unguarded, since no exporter fixture ever carried a
+  namespaced call (F6): both exporters now have one. And the Responses
+  wire module's test half crossed the crate's size line (F2): it lives in
+  its own file, the prefix-admission precedent, with every test name
+  unchanged.
+
+Two process notes. The engine-join cluster verified red-before-green with
+a `git stash` on a tree carrying another cluster's uncommitted work — the
+M15 incident's shape; the stash was popped and the tree matched the
+verifier's snapshot, so nothing was lost this time, and the fix briefs now
+say byte backups only, on the write path as on the refute path. And the
+F5 guard is conjunctive: a reword of the item doc would disarm it rather
+than fail it, which M18 pins with a control.

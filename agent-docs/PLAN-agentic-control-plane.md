@@ -916,7 +916,11 @@ cannot collide; `arguments` minted once and stored in the item, never
 re-serialized, so the client's verbatim echo matches by construction.
 
 **The log stores the bare neutral name** (`ToolCall { name: "fetch_steer" }`,
-no namespace): `canonical_item` already ignores `namespace` and `id` on the
+no namespace) [2026-09-04, M17: superseded — the stored call now carries
+the namespace beside the bare name as a forward-only field left out of the
+render, the Responses canonicalisation keeps it, the projection re-emits it,
+and a flat resend is a different call (M12 review, F10); the rulings are
+R-N1..R-N10 in `PLAN-anthropic-messages.md`]: `canonical_item` already ignores `namespace` and `id` on the
 way in, so Codex's namespaced resend and a future Claude-Code-flat resend
 canonicalize to the same stored item, prefix admission cannot fork on a
 dialect, and `turn_id` hashing is untouched for every existing item. The

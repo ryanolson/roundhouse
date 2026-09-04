@@ -301,7 +301,11 @@ fn lines(event: &str) -> impl Iterator<Item = &str> {
 /// and re-emitted with no `namespace` for codex's exact
 /// `ToolName { name, namespace }` lookup to resolve. Optional here because it
 /// is optional on the wire: a plain function tool sends no such field, and an
-/// absent one means "this tool has no server", not "nobody said".
+/// absent one is not the fact that the tool has no server — it is the same
+/// unknown `ItemContent::ToolCall::namespace`'s doc (`roundhouse-core`)
+/// names and owns the reading of: this upstream model did not spell one,
+/// which is why a stored `None` here agrees with any claimed namespace at
+/// prefix admission (R-N8) rather than forking against one.
 fn function_call(item: Option<&Value>) -> Option<FrontierChunk> {
     let item = item?;
     if item.get("type").and_then(Value::as_str) != Some("function_call") {
@@ -400,6 +404,40 @@ fn error_message(error: Option<&Value>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M17 review F5: this file's `function_call` doc (stream.rs:302-304)
+    /// reads an absent `namespace` as "this tool has no server" — a
+    /// *definite* fact about the call. `roundhouse_core::item::ItemContent`'s
+    /// doc for the same stored field (item.rs:78-79) reads a stored `None`
+    /// as the opposite: "not \"no namespace\"; it is \"this client does not
+    /// spell one\"" — an *unknown*, not a fact. `prefix_admission.rs`'s
+    /// `same_namespace` (R-N8) justifies matching a stored `None` against
+    /// any claimed namespace by citing only the item.rs reading (a pre-M17
+    /// record, or the Messages surface's flat spelling) — never the fleet's
+    /// "no server" reading. Both doc comments are reachable as data via
+    /// `include_str!` (rustdoc text is not otherwise inspectable at
+    /// runtime); this test fails while both readings are asserted at once,
+    /// which is the on-its-face contradiction the finding names.
+    #[test]
+    fn fleet_and_core_namespace_docs_do_not_read_absence_oppositely() {
+        let fleet_doc = include_str!("stream.rs");
+        let core_doc = include_str!("../../../roundhouse-core/src/item.rs");
+
+        let fleet_reads_absence_as_a_fact =
+            fleet_doc.contains("means \"this tool has no server\", not \"nobody said\"");
+        let core_reads_absence_as_unknown =
+            core_doc.contains("is not \"no namespace\"; it is \"this client does not spell");
+
+        assert!(
+            !(fleet_reads_absence_as_a_fact && core_reads_absence_as_unknown),
+            "stream.rs's function_call doc and item.rs's ItemContent::ToolCall::namespace \
+             doc give opposite readings of a stored/absent namespace: the fleet decoder \
+             reads absence as the definite \"this tool has no server\", while the core item \
+             doc reads it as the unknown \"this client does not spell one\" -- R-N8's \
+             stored-None-agrees-with-any-claim admission rule (prefix_admission.rs) only \
+             holds under the core reading"
+        );
+    }
 
     /// Drive the decoder over `pieces` and collect what it yields.
     fn decode(pieces: &[&str]) -> Result<Vec<FrontierChunk>, FrontierError> {

@@ -511,6 +511,65 @@ mod tests {
         );
     }
 
+    /// F6: `response_payload` destructures `namespace: _` on purpose
+    /// (comment above the match arm), but `Log::tool_call_turn` never builds
+    /// a namespaced call, so that exact wrong edit — folding the namespace
+    /// into `function_name` — would pass this module's whole suite. `Log`
+    /// has no namespaced equivalent of `tool_call_turn`, so this test
+    /// assembles the turn by hand from `Item::namespaced_tool_call`, the
+    /// sibling of `atif.rs`'s
+    /// `a_namespaced_call_keeps_the_namespace_out_of_function_name`.
+    #[test]
+    fn a_namespaced_call_keeps_the_namespace_out_of_function_name() {
+        use roundhouse_core::event::SessionEventKind;
+        use roundhouse_core::ids::{ResponseId, TurnId};
+        use roundhouse_core::item::Item;
+
+        let mut log = Log::new("s1");
+        log.created(None);
+        let response = ResponseId::new("r1");
+        log.push(SessionEventKind::TurnStarted {
+            turn_id: TurnId::new("t1"),
+            response_id: response.clone(),
+        });
+        log.push(SessionEventKind::ItemAppended {
+            item: Item::user_text("ask t1"),
+        });
+        log.push(SessionEventKind::Routed {
+            response_id: response.clone(),
+            decision: fixtures::decision(fixtures::frontier("anthropic", "claude"), Vec::new()),
+        });
+        let call = Item {
+            response_id: Some(response.clone()),
+            ..Item::namespaced_tool_call("call_1", "status", Some("mcp__roundhouse".into()), "{}")
+        };
+        log.push(SessionEventKind::ItemAppended { item: call });
+        log.push(SessionEventKind::ResponseCompleted {
+            provider_reported_cost_usd: None,
+            stop_reason: None,
+            response_id: response,
+            usage: fixtures::usage(1_000, 0, 40),
+        });
+
+        let stream = stream(&log);
+        let end = stream
+            .iter()
+            .find(|event| {
+                event.category().map(EventCategory::as_str) == Some("llm") && event.is_scope_end()
+            })
+            .unwrap();
+        let call = &end.data().unwrap()["choices"][0]["message"]["tool_calls"][0];
+        assert_eq!(
+            call["function"]["name"], "status",
+            "the namespace must not be folded into the function name"
+        );
+        assert!(
+            call.get("namespace").is_none(),
+            "atof's chat-completions tool-call shape has no namespace field \
+             to publish it in: {call}"
+        );
+    }
+
     /// The one payload rule whose violation is a *hard* failure downstream.
     #[test]
     fn a_turn_with_no_answer_carries_no_payload_at_all() {

@@ -329,13 +329,15 @@ polling `status` or adjusting its preferences is talking to us, not stuck, and
 a genuinely unknown tool still counts as unrecognised. Recognising them takes
 two tests rather than one, because the two clients spell the same call
 differently by the time it reaches the log: the flat `mcp__roundhouse__<tool>`
-a Claude Code session stores, and the bare tool name left after the Responses
-wire has dropped the namespace into a field canonicalization discards. The bare
-half can only ever check a name against the list of the eight, so a third
-party's MCP server offering its own `status` is exempted too — an under-count
-of a call or two, chosen over the failure it replaced, which was counting every
-control call a Codex client made as work on the task and steering an agent that
-had done nothing wrong.
+a Claude Code session stores, and the bare name plus a separate `namespace`
+field the Responses wire keeps beside it since M17 (R-N6). The Responses
+recogniser reads the field first — `mcp__roundhouse` with a name in the eight
+is ours, and any other namespace is a third party's own tool, not ours — and
+falls back to the bare name only for a record written before the field
+existed, which is the one under-count still left: a call or two on those older
+records, chosen over the failure the fallback replaced, which was counting
+every control call a Codex client made as work on the task and steering an
+agent that had done nothing wrong.
 
 A signal states what it saw in the indicative and never suggests: "this call
 has produced identical output four times" is a fact the judge weighs, while
@@ -699,13 +701,17 @@ as a bare `name` plus a separate `namespace` field; Claude Code folds the two
 into one string, `mcp__roundhouse__status`, everywhere — in the `tools[]` it
 declares, in the `tool_use` block it emits, and in the `--allowedTools` grant
 that permits it. `ClientDialect` is one arm per surface saying which, and the
-Messages surface keeps the flat name whole: nothing renders a tool call
-outbound any more, so the only reader of a stored name is the validate loop's
-control-traffic exclusion, and splitting on the way in would move the `turn_id`
-of every already-stored tool-using session for no reader's benefit. The
-exclusion learned to recognise both spellings in the same change — before it,
-every control call made over the *Responses* wire was counted as the agent's
-work, because the namespace the flat prefix test looked for had been dropped at
+Messages surface keeps the flat name whole: it has no separate namespace field
+to render outbound, so the only reader of a stored name there is the validate
+loop's control-traffic exclusion, and splitting it on the way in would move the
+`turn_id` of every already-stored tool-using session for no reader's benefit.
+The Responses surface is different since M17 (R-N6): the canonicalisation
+keeps codex's `namespace` beside the bare name rather than discarding it, and
+the outbound projection re-emits it, so a resent call still resolves against
+codex's own `ToolName { name, namespace }` lookup. The exclusion learned to
+recognise both spellings in the same change — before it, every control call
+made over the *Responses* wire was counted as the agent's work, because the
+namespace the flat prefix test looked for had been dropped at
 canonicalization.
 
 **A call is correlated by the tool-use id it is answering.** Claude Code puts
