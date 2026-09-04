@@ -127,6 +127,39 @@ fn a_malformed_sha256_is_rejected() {
     }
 }
 
+/// **The file fingerprint is a hash of the bytes on disk** (M16.1, R-D9), and
+/// this is the assertion that keeps it from quietly becoming a hash of
+/// something else.
+///
+/// Checked against a digest computed here, from the same bytes, rather than
+/// against a hard-coded hex string: a pinned literal over the shipped example
+/// would fail the day somebody fixed a comma in it, and would be pinning the
+/// example rather than the function. What must hold is that the digest
+/// `load_fingerprinted` answers is the digest of what it read — because the
+/// whole divergence check is two nodes comparing this number, and a hash of
+/// the *parsed* config would call two visibly different files the same.
+#[test]
+fn the_file_fingerprint_is_the_sha256_of_the_bytes_that_were_parsed() {
+    use sha2::{Digest, Sha256};
+
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/control-plane.example.json");
+    let (_, sha256) = ControlPlaneConfig::load_fingerprinted(&path)
+        .unwrap_or_else(|error| panic!("the shipped example must validate: {error}"));
+    let bytes = std::fs::read(&path).expect("the example is readable");
+    assert_eq!(sha256, hex::encode(Sha256::digest(&bytes)));
+    assert_eq!(sha256.len(), 64, "hex, lowercase, unprefixed: {sha256}");
+
+    // And `load` is the same read with the digest dropped, rather than a
+    // second path through the file: two loaders would be two chances to
+    // disagree about what the file says.
+    let plain = ControlPlaneConfig::load(&path).expect("the shipped example must validate");
+    assert_eq!(plain.projects.len(), {
+        let (config, _) = ControlPlaneConfig::load_fingerprinted(&path).unwrap();
+        config.projects.len()
+    });
+}
+
 #[test]
 fn the_example_file_validates() {
     // From the crate root up to the workspace root, mirroring

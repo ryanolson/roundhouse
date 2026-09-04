@@ -52,10 +52,14 @@
 //! store with its own copy of the compare-and-set `commit` performs — three
 //! copies, two of which never had their `commit` driven by a test at all,
 //! because every fixture that needed a store double reached for `load` and
-//! `version` alone. This wraps the real [`MemoryDirectoryStore`] instead of
+//! `version` alone. This wraps the real production store instead of
 //! re-implementing it, so a fixture that scripts a stall, a count, a failure
 //! or a scripted write is still exercising the one compare-and-set this
-//! deployment actually ships.
+//! deployment actually ships — and, since M16.1 (R-D7), the real *codec* too:
+//! the store it wraps is [`DocumentDirectoryStore`] over a
+//! [`MemoryDocumentStore`], so every scripted fixture in the workspace round
+//! trips its records through the same JSON envelope a deployment writes to
+//! Redis.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -70,8 +74,10 @@ use roundhouse_core::routing::{AffinityPolicy, CacheModel, ProviderPricing};
 use roundhouse_core::store::SessionStore;
 use roundhouse_fleet::{FrontierClient, FrontierModelSpec, StaticFrontierCatalog, WireProtocol};
 
+use roundhouse_core::control::MemoryDocumentStore;
+
 use crate::control_config::directory::{
-    DirectoryRecords, DirectoryStore, MemoryDirectoryStore, StoreFailure, VersionedRecords,
+    DirectoryRecords, DirectoryStore, DocumentDirectoryStore, StoreFailure, VersionedRecords,
 };
 use crate::engine::{EchoLocalExecutor, Engine, EngineConfig};
 use roundhouse_core::ids::SessionId;
@@ -282,7 +288,7 @@ impl SeveredStore {
 }
 
 /// A [`DirectoryStore`] double that stalls, counts, fails and scripts writes
-/// -- over a real [`MemoryDirectoryStore`], never a copy of its own.
+/// -- over the real production store, never a copy of its own.
 ///
 /// # Why this wraps rather than re-implements (M16.0 review, F1)
 ///
@@ -298,17 +304,17 @@ impl SeveredStore {
 /// from. A commit guard nothing calls is a guard nothing protects.
 ///
 /// So this delegates `load`, `commit` and `version` to a real
-/// [`MemoryDirectoryStore`] it owns, behind a [`RwLock`] only so
-/// [`Self::set`] can swap in a fresh one -- the one operation a real store's
-/// own compare-and-set cannot express, because [`MemoryDirectoryStore`]'s
-/// version is monotone by contract and a scripted regression or an
-/// arbitrary starting version is neither. Everything else -- a stalled
+/// [`DocumentDirectoryStore`] over a [`MemoryDocumentStore`] that it owns,
+/// behind a [`RwLock`] only so [`Self::set`] can swap in a fresh one -- the
+/// one operation a real store's own compare-and-set cannot express, because
+/// a document store's version is monotone by contract and a scripted
+/// regression or an arbitrary starting version is neither. Everything else -- a stalled
 /// `load`, a stalled `commit`, a failed `version`, a write that lands on a
 /// scripted later read -- is scripted *around* that real store, so the
 /// compare-and-set every one of them eventually reaches is the one
 /// deployment ships, not a copy of it.
 pub struct ScriptedDirectoryStore {
-    inner: RwLock<MemoryDirectoryStore>,
+    inner: RwLock<DocumentDirectoryStore>,
     /// Every [`DirectoryStore::version`] and [`DirectoryStore::load`] call.
     /// Counted separately because the two answer different questions: one is
     /// the cheap half of a refresh and the other is the expensive half, and
@@ -354,7 +360,7 @@ pub struct ScriptedDirectoryStore {
 
 impl ScriptedDirectoryStore {
     /// A store at `version`, holding `records` -- reached the same way a real
-    /// deployment would reach it, one real [`MemoryDirectoryStore::commit`]
+    /// deployment would reach it, one real [`DocumentDirectoryStore::commit`]
     /// at a time, so `records` is what the *last* of those commits carried
     /// rather than a value this double invented some other way.
     pub async fn new(records: DirectoryRecords, version: u64) -> Self {
@@ -374,7 +380,8 @@ impl ScriptedDirectoryStore {
         }
     }
 
-    /// A fresh [`MemoryDirectoryStore`], committed up to `version` -- through
+    /// A fresh [`DocumentDirectoryStore`] over an empty [`MemoryDocumentStore`],
+    /// committed up to `version` -- through
     /// its own real compare-and-set, `version` times -- with `records` landing
     /// on the last of those commits. What a store `set`/`new` scripts to a
     /// version below zero commits (an empty, version-0 store) or above it
@@ -384,8 +391,8 @@ impl ScriptedDirectoryStore {
     /// no sequence of calls against a real store's own monotone `commit` could
     /// produce, which is exactly why this reaches for a fresh one rather than
     /// asking the current one to go backwards.
-    async fn store_at(records: DirectoryRecords, version: u64) -> MemoryDirectoryStore {
-        let store = MemoryDirectoryStore::new();
+    async fn store_at(records: DirectoryRecords, version: u64) -> DocumentDirectoryStore {
+        let store = DocumentDirectoryStore::over(Arc::new(MemoryDocumentStore::new()));
         for at in 0..version {
             let payload = if at + 1 == version {
                 records.clone()
@@ -532,6 +539,13 @@ impl ScriptedDirectoryStore {
     }
 }
 
+/// `compiled_under` is deliberately **not** overridden: every store this
+/// double wraps is built by [`ScriptedDirectoryStore::store_at`] through
+/// [`DocumentDirectoryStore::over`], which stamps the empty fingerprint, so
+/// the trait's default is already the wrapped store's own answer. Overriding
+/// it would need a blocking read of a `tokio` lock from a synchronous method,
+/// which is a deadlock waiting for the first fixture that calls it from inside
+/// the runtime.
 #[async_trait::async_trait]
 impl DirectoryStore for ScriptedDirectoryStore {
     async fn load(&self) -> Result<VersionedRecords, StoreFailure> {

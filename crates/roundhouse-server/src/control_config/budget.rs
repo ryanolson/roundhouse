@@ -21,7 +21,7 @@
 //! load, naming the project, the same choice [`super::config`] makes for a
 //! malformed glob or a widening override.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use roundhouse_core::control::{
     Allocation, Budget, BudgetTerms, BudgetWindow, DEFAULT_WARN_AT, Exhaustion,
@@ -79,7 +79,7 @@ fn not_positive(value: f64) -> bool {
 /// file (`{ "on_exhaustion": "degrade_to_local", "overflow_when_local_saturated": true }`),
 /// not nested under the tag. [`BudgetConfig::to_budget`] is what reunites
 /// the two into the real type, once it has seen both.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OnExhaustionConfig {
     DegradeToLocal,
@@ -87,7 +87,7 @@ pub enum OnExhaustionConfig {
 }
 
 /// One project's `"budget"` object.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BudgetConfig {
     pub limit_usd: f64,
@@ -166,7 +166,7 @@ impl BudgetConfig {
 /// field name serde reads — `{ "limit_usd": 5.0, "limit_used": 9.0 }` resolves
 /// silently to a $5 cap, and nothing in the file or the log ever says which of
 /// the two numbers won.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum AllocationConfig {
     /// No member ceiling -- this key may spend the whole project budget.

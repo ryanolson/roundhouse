@@ -15,6 +15,7 @@
 //! into with `--include-ignored`, and a missing `ROUNDHOUSE_TEST_REDIS_URL`
 //! fails loudly rather than skipping quietly.
 
+use roundhouse_core::control::directory::DocumentStore;
 use roundhouse_core::control::spend::contract::fresh_principal;
 use roundhouse_core::control::{
     Allocation, Balance, BalanceQuery, Budget, BudgetTerms, BudgetWindow, CorrelationMaps,
@@ -25,7 +26,8 @@ use roundhouse_core::ids::{ResponseId, SessionId};
 use roundhouse_core::store::SessionStore;
 use roundhouse_store_redis::test_support::url_from_env;
 use roundhouse_store_redis::{
-    KeyNamespace, RedisCorrelationMaps, RedisFairUseLedger, RedisSessionStore, RedisSpendLedger,
+    KeyNamespace, RedisCorrelationMaps, RedisDocumentStore, RedisFairUseLedger, RedisSessionStore,
+    RedisSpendLedger,
 };
 
 fn namespace(raw: &str) -> KeyNamespace {
@@ -219,4 +221,59 @@ async fn correlation_bound_under_one_namespace_is_absent_under_another() {
             .unwrap(),
         Some(session)
     );
+}
+
+/// **The directory.** A document committed under `"a"` leaves `"b"` at the
+/// empty directory — version zero, no document — which is exactly the answer
+/// a Redis nothing has ever written gives.
+///
+/// The sharpest of the five, because this family has one key for the whole
+/// deployment (R-D6) rather than one per tenant: a namespace that failed to
+/// partition here would not leak one project's row between deployments, it
+/// would hand one deployment the *entirety* of another's tenancy — every
+/// project, membership and key — and compile a plane from it.
+///
+/// The version half is asserted as well as the document half because they are
+/// two facts a backend can get differently right: a store that partitioned the
+/// document but shared the counter would leave `"b"` refusing its own first
+/// write as `Concurrent`, which is a deployment that cannot create its first
+/// project and cannot say why.
+#[tokio::test]
+#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
+async fn a_directory_committed_under_one_namespace_is_absent_under_another() {
+    let url = url_from_env();
+    // Fresh namespaces rather than the literal `"a"`/`"b"` the four tests
+    // above use: those four key on a fresh principal or a fresh session id
+    // *inside* the namespace, so re-running them under one Redis is harmless.
+    // This family's key is `<ns>:v1:dir:records` and nothing else, so a literal
+    // namespace would carry the previous run's document into this one.
+    let unique = uuid::Uuid::new_v4();
+    let a = RedisDocumentStore::connect_namespaced(&url, namespace(&format!("nsa-{unique}")))
+        .await
+        .expect("the test Redis must be reachable");
+    let b = RedisDocumentStore::connect_namespaced(&url, namespace(&format!("nsb-{unique}")))
+        .await
+        .expect("the test Redis must be reachable");
+
+    let document = b"{\"schema\":1,\"records\":{\"projects\":[\"acme\"]}}".to_vec();
+    let version = a.commit(0, document.clone()).await.unwrap();
+
+    let seen_from_b = b.load().await.unwrap();
+    assert_eq!(
+        seen_from_b.document, None,
+        "a directory committed under namespace a must be absent under b -- \
+         this family's one key holds the whole deployment's tenancy"
+    );
+    assert_eq!(
+        seen_from_b.version, 0,
+        "and b is still the empty directory, so its own first write is a \
+         first write rather than a stale one"
+    );
+    assert_eq!(b.version().await.unwrap(), 0);
+
+    // CONTROL: the same document, read back through the namespace that wrote
+    // it, is there in full.
+    let seen_from_a = a.load().await.unwrap();
+    assert_eq!(seen_from_a.document.as_deref(), Some(document.as_slice()));
+    assert_eq!(seen_from_a.version, version);
 }

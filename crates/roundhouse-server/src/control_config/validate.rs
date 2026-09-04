@@ -29,7 +29,7 @@
 //! tempting fallback — everything in one arm — is the failure the type exists
 //! to prevent; a placebo rate outside `0.0..=1.0` is a control that is not one.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use roundhouse_core::validate::{
     ActionPolicy, ArmShares, DEFAULT_PLACEBO_RATE, SteerChannel, ValidationTerms,
@@ -43,7 +43,7 @@ use super::config::ControlPlaneError;
 /// disabled, observing, never acting. The struct is `deny_unknown_fields` for
 /// the reason the policy config is — a mistyped knob that silently did nothing
 /// would be a deployment convinced it had configured an experiment.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ValidateConfig {
     /// Whether this project's sessions are enrolled at all.
@@ -112,7 +112,7 @@ impl Default for ValidateConfig {
 ///
 /// Weights rather than percentages so "one session in fifty is a placebo" is
 /// expressible without anybody writing `0.02` and wondering about rounding.
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ArmSharesConfig {
     pub live: u32,

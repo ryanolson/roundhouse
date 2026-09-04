@@ -42,7 +42,7 @@ use axum::middleware::Next;
 use axum::response::Response;
 use serde_json::Value;
 
-use roundhouse_core::control::Principal;
+use roundhouse_core::control::{MemoryDocumentStore, Principal};
 use roundhouse_core::event::SessionEventKind;
 use roundhouse_core::ids::SessionId;
 use roundhouse_core::item::Item;
@@ -57,7 +57,7 @@ use roundhouse_fleet::FrontierModelSpec;
 use roundhouse_server::codex_launch::DEFAULT_KEY_ENV;
 use roundhouse_server::control_config::{MembershipRole, MintedKey, TURN_KEY_HEADER};
 use roundhouse_server::{
-    ControlDirectory, Conversations, CrossChecks, DirectoryMutation, MemoryDirectoryStore,
+    ControlDirectory, Conversations, CrossChecks, DirectoryMutation, DocumentDirectoryStore,
 };
 
 /// The tenant every real-binary run authenticates as.
@@ -344,7 +344,9 @@ pub async fn bootstrap(
         ControlDirectory::new(
             file,
             "ROUNDHOUSE_CONTROL_PLANE",
-            Arc::new(MemoryDirectoryStore::new()),
+            Arc::new(DocumentDirectoryStore::over(Arc::new(
+                MemoryDocumentStore::new(),
+            ))),
             // A project whose `validate` block enrols its sessions promises a
             // judge, and the startup cross-check refuses a plane that promises
             // one with none reachable — so the judge spec travels with the

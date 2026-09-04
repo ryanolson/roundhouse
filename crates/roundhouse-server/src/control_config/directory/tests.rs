@@ -12,7 +12,9 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use roundhouse_core::control::{Allocation, BudgetWindow, Principal};
+use roundhouse_core::control::{
+    Allocation, BudgetWindow, DocumentStore, MemoryDocumentStore, Principal,
+};
 use roundhouse_core::routing::{Candidate, Target};
 
 use super::super::budget::{AllocationConfig, BudgetConfig, OnExhaustionConfig};
@@ -86,7 +88,13 @@ async fn directory(store: Arc<dyn DirectoryStore>, now_ms: u64) -> ControlDirect
 
 /// A directory over a store nobody else holds.
 async fn solo(now_ms: u64) -> ControlDirectory {
-    directory(Arc::new(MemoryDirectoryStore::new()), now_ms).await
+    directory(
+        Arc::new(DocumentDirectoryStore::over(Arc::new(
+            MemoryDocumentStore::new(),
+        ))),
+        now_ms,
+    )
+    .await
 }
 
 fn project(id: &str) -> ProjectEntry {
@@ -780,7 +788,9 @@ async fn an_admin_create_colliding_with_config_identity_is_refused() {
 /// other key on the node.
 #[tokio::test]
 async fn a_stale_view_refuses_a_revoked_key_after_one_ttl() {
-    let store: Arc<dyn DirectoryStore> = Arc::new(MemoryDirectoryStore::new());
+    let store: Arc<dyn DirectoryStore> = Arc::new(DocumentDirectoryStore::over(Arc::new(
+        MemoryDocumentStore::new(),
+    )));
     let writer = directory(Arc::clone(&store), 0).await;
     tenancy(&writer, "widgets", "bo", 0).await;
     let doomed = writer.mint_turn_key("widgets", "bo", 0).await.unwrap();
@@ -849,7 +859,9 @@ async fn a_stale_view_refuses_a_revoked_key_after_one_ttl() {
 /// seconds writes exactly this.
 #[tokio::test]
 async fn a_zero_ttl_refreshes_within_the_same_millisecond() {
-    let store: Arc<dyn DirectoryStore> = Arc::new(MemoryDirectoryStore::new());
+    let store: Arc<dyn DirectoryStore> = Arc::new(DocumentDirectoryStore::over(Arc::new(
+        MemoryDocumentStore::new(),
+    )));
     let writer = directory(Arc::clone(&store), 7).await;
     // Two readers over the same store, built at the same instant from the same
     // file, differing in one number.
@@ -1903,7 +1915,7 @@ async fn a_membership_naming_nothing_is_refused_before_anything_compiles() {
 
 /// The store double every guard below stalls, counts, moves and breaks is
 /// [`ScriptedDirectoryStore`] (M16.0 review, F1) -- one wrapper over a real
-/// `MemoryDirectoryStore` shared with the coherence guard above, rather than
+/// production store shared with the coherence guard above, rather than
 /// a second hand-rolled copy of the same `(records, version)` state and its
 /// compare-and-set: what changed with M16.0 is that a refresh is now a pair
 /// of *awaits*, so the question a double has to be able to answer moved from
@@ -1919,21 +1931,21 @@ async fn a_membership_naming_nothing_is_refused_before_anything_compiles() {
 /// the suite, which is what this repo's bounded-run rule wants of a lock test.
 
 /// M16.0 review, F1: a stale `expected_version` reaches
-/// [`MemoryDirectoryStore`]'s own compare-and-set through the double, not a
+/// the production store's own compare-and-set through the double, not a
 /// hand-rolled copy of it.
 ///
 /// Before this rung, three of this crate's `DirectoryStore` doubles each
 /// re-implemented the same `if state.1 != expected_version { Concurrent }`
-/// guard [`MemoryDirectoryStore::commit`] performs, and two of the three --
+/// guard [`DocumentDirectoryStore::commit`] performs, and two of the three --
 /// `WriteBetweenReads`, formerly here, and `ArmedStore`, formerly in
 /// `tests/admin_api.rs` -- never had that guard driven by any test at all:
 /// every fixture that reached for a double wanted `load` or `version`
 /// scripted, never `commit`. [`ScriptedDirectoryStore`] delegates `commit` to
-/// a real `MemoryDirectoryStore` instead of re-implementing it (see its own
+/// the real production store instead of re-implementing it (see its own
 /// doc), so this is what that delegation buys: a stale write against the
 /// double is refused by the same compare-and-set
 /// [`super::store::tests::commit_refuses_a_stale_expected_version`] pins
-/// directly against `MemoryDirectoryStore`, not by a second copy of it that
+/// directly against the shipped store, not by a second copy of it that
 /// could silently drop the guard while every other test here stayed green.
 #[tokio::test]
 async fn a_stale_commit_against_the_scripted_store_is_refused_by_the_real_compare_and_set() {
@@ -1965,7 +1977,7 @@ async fn a_stale_commit_against_the_scripted_store_is_refused_by_the_real_compar
         "a commit against a version the scripted double has moved past must answer \
          `Concurrent`, naming both the version it expected and the one actually found -- \
          the same refusal `commit_refuses_a_stale_expected_version` pins directly against \
-         `MemoryDirectoryStore`: {stale:?}"
+         the production store: {stale:?}"
     );
     assert_eq!(
         store.version().await.unwrap(),
@@ -2696,6 +2708,7 @@ impl DirectoryStore for GatedVersionStore {
         Ok(VersionedRecords {
             records: self.records.clone(),
             version: self.version,
+            compiled_under: CompiledUnder::default(),
         })
     }
 
@@ -2796,4 +2809,279 @@ async fn f5_refreshed_at_ms_is_stamped_at_claim_not_at_confirmation() {
 
     store.release();
     let _ = claimant.await.expect("the claimant's task does not panic");
+}
+
+// ---------------------------------------------------------------------------
+// Divergence: two nodes, one store, different inputs (M16.1, R-D9)
+// ---------------------------------------------------------------------------
+
+/// One node of a two-node deployment: its own fingerprint, its own
+/// cross-checks, and a directory over the document store both nodes share.
+///
+/// `file_with_ttl(0)` so every `plane()` call re-asks the store — the
+/// divergence check runs on a *refresh*, and a fixture that had to advance a
+/// clock to reach one would be measuring the TTL rather than the check.
+async fn node(
+    documents: Arc<dyn DocumentStore>,
+    stamp: CompiledUnder,
+    checks: CrossChecks,
+    now_ms: u64,
+) -> ControlDirectory {
+    ControlDirectory::new(
+        file_with_ttl(0),
+        PATH,
+        Arc::new(DocumentDirectoryStore::stamped(documents, stamp)),
+        checks,
+        now_ms,
+    )
+    .await
+    .expect("the file alone compiles, since it is what a boot would have loaded")
+}
+
+/// A fingerprint that declares one file and nothing else.
+fn stamped_file(sha256: &str) -> CompiledUnder {
+    CompiledUnder {
+        file_sha256: Some(sha256.to_string()),
+        ..CompiledUnder::default()
+    }
+}
+
+/// The cross-checks of a node whose one reachable model has this quality
+/// prior — the axis two nodes can disagree on while both hold a valid
+/// deployment, which is what makes "B cannot compile what A wrote" reachable
+/// without either node being misconfigured.
+fn checks_at_quality(quality_prior: f64) -> CrossChecks {
+    CrossChecks::new(
+        vec![Candidate {
+            quality_prior,
+            ..reachable()
+        }],
+        None,
+    )
+}
+
+/// **Divergence is named once per stored version, and names which input.**
+///
+/// Two nodes mid-rollout: the same directory, different control-plane files.
+/// The one that did not write a version is the one that can see the
+/// difference, so it says so — once, however many times it re-reads that
+/// version — and goes on serving the plane its own file compiles. The writer
+/// says nothing, which is the control that keeps this from being a check that
+/// fires on everything.
+#[tokio::test]
+async fn a_document_written_under_another_file_is_named_once_per_version() {
+    let documents: Arc<dyn DocumentStore> = Arc::new(MemoryDocumentStore::new());
+    let writer = node(Arc::clone(&documents), stamped_file("aaaa"), checks(), 0).await;
+    let reader = node(Arc::clone(&documents), stamped_file("bbbb"), checks(), 0).await;
+
+    // Version zero is not a divergence, and this is the assertion that says
+    // so: an empty store has no document, so nobody compiled it under
+    // anything, and comparing a stamped node against the default fingerprint
+    // would report every fresh deployment as divergent on its first boot.
+    assert_eq!(reader.status().divergences_named, 0);
+    assert_eq!(reader.status().divergence, None);
+
+    writer
+        .apply(
+            DirectoryMutation::CreateProject {
+                entry: project("one"),
+            },
+            1,
+        )
+        .await
+        .expect("a fresh project id");
+
+    // The reader's first sight of version 1.
+    reader.plane(2).await;
+    assert_eq!(
+        reader.status().divergence,
+        Some(DirectoryDivergence {
+            version: 1,
+            differs: vec![DivergentInput::File],
+        }),
+        "the one input these two nodes disagree about is the file, and the check must name \
+         that rather than reporting `different` and leaving an operator to guess"
+    );
+    assert_eq!(reader.status().divergences_named, 1);
+    assert_eq!(
+        reader.status().served_version,
+        1,
+        "divergence is a fact, never a refusal: the reader compiles what it loaded and keeps \
+         serving"
+    );
+
+    // Re-read the same version: nothing new to say. Here the refresh does not
+    // even load — the version read answers the version this node already
+    // serves, so it short-circuits — which is the cheap half of the promise
+    // and is what this asserts. The expensive half, a version genuinely
+    // re-loaded, is
+    // [`a_version_this_node_refuses_is_recorded_beside_the_one_it_serves`],
+    // and that is the test the `warned_version` guard itself is pinned by:
+    // deleting the guard leaves this one green and that one red.
+    reader.plane(3).await;
+    reader.plane(4).await;
+    assert_eq!(
+        reader.status().divergences_named,
+        1,
+        "once per *stored version*, not once per refresh"
+    );
+
+    // A new version is a new document, written under the same foreign file --
+    // and is named again, because it is a different document.
+    writer
+        .apply(
+            DirectoryMutation::CreateProject {
+                entry: project("two"),
+            },
+            5,
+        )
+        .await
+        .expect("a fresh project id");
+    reader.plane(6).await;
+    assert_eq!(reader.status().divergences_named, 2);
+    assert_eq!(reader.status().divergence.expect("named again").version, 2);
+
+    // The control. The writer's own documents carry the writer's own
+    // fingerprint, so the node that wrote them has nothing to report -- which
+    // is what proves the reader's two warnings are about the file rather than
+    // about any load at all.
+    assert_eq!(writer.status().divergences_named, 0);
+    assert_eq!(writer.status().divergence, None);
+}
+
+/// **Identical inputs are not a divergence.**
+///
+/// The other control, and the one that would catch a comparison written the
+/// wrong way round: two nodes of one deployment share a file, a catalog and a
+/// fleet, and a check that fired here would fire on every ordinary deployment
+/// and be turned off within a day.
+#[tokio::test]
+async fn two_nodes_compiled_from_the_same_inputs_never_diverge() {
+    let documents: Arc<dyn DocumentStore> = Arc::new(MemoryDocumentStore::new());
+    let writer = node(Arc::clone(&documents), stamped_file("same"), checks(), 0).await;
+    let reader = node(Arc::clone(&documents), stamped_file("same"), checks(), 0).await;
+
+    writer
+        .apply(
+            DirectoryMutation::CreateProject {
+                entry: project("one"),
+            },
+            1,
+        )
+        .await
+        .expect("a fresh project id");
+    reader.plane(2).await;
+
+    assert_eq!(reader.status().served_version, 1);
+    assert_eq!(reader.status().divergence, None);
+    assert_eq!(reader.status().divergences_named, 0);
+    assert_eq!(reader.status().refused_version, None);
+}
+
+/// **A version this node cannot compile is recorded beside the one it serves,
+/// and the old plane keeps serving.**
+///
+/// The reader's fleet admits less than the writer's, so a policy the writer
+/// can start under is one the reader's own cross-checks refuse — a real
+/// rolling-upgrade shape and not a misconfiguration on either side. The reader
+/// keeps the last plane that compiled, which is the only honest thing it can
+/// serve, and records the version it will not: without that number a node
+/// stuck behind a refusal and a node merely up to date look identical from
+/// `version` alone.
+///
+/// It is also where "once per stored version" stops being free. A refused
+/// version is never published, so the next refresh finds the store still ahead
+/// and loads the *same* document again — once per TTL, forever. The
+/// divergence count is asserted across two refreshes for exactly that reason.
+#[tokio::test]
+async fn a_version_this_node_refuses_is_recorded_beside_the_one_it_serves() {
+    let documents: Arc<dyn DocumentStore> = Arc::new(MemoryDocumentStore::new());
+    let writer = node(
+        Arc::clone(&documents),
+        stamped_file("aaaa"),
+        checks_at_quality(0.9),
+        0,
+    )
+    .await;
+    let reader = node(
+        Arc::clone(&documents),
+        stamped_file("bbbb"),
+        checks_at_quality(0.2),
+        0,
+    )
+    .await;
+
+    // Tenancy both nodes can compile, and a key under it, so the plane the
+    // reader keeps serving is one with something in it to observe.
+    tenancy(&writer, "gated", "gil", 1).await;
+    writer
+        .mint_turn_key("gated", "gil", 2)
+        .await
+        .expect("minting a turn key for a membership that exists");
+    reader.plane(3).await;
+    let good = reader.status().served_version;
+    assert!(good > 0, "the reader compiled and published what it read");
+    let named_before = reader.status().divergences_named;
+    let principal = Principal::new("gated".to_string(), "gil".to_string());
+    assert!(
+        reader.plane(4).await.membership(&principal).is_ok(),
+        "fixture premise: the reader resolves this membership before the refused write"
+    );
+
+    // A policy the writer's fleet admits and the reader's does not.
+    writer
+        .apply(
+            DirectoryMutation::PatchProject {
+                id: "gated".to_string(),
+                patch: ProjectPatch {
+                    policy: Some(Some(PolicyConfig {
+                        min_quality: Some(0.6),
+                        allow: None,
+                        frontier_cadence: None,
+                    })),
+                    ..Default::default()
+                },
+            },
+            5,
+        )
+        .await
+        .expect("the writer's own cross-checks admit a policy its fleet can serve");
+    let refused_at = writer.status().served_version;
+    assert!(refused_at > good, "the writer published a newer version");
+
+    reader.plane(6).await;
+    let status = reader.status();
+    assert_eq!(
+        status.served_version, good,
+        "the reader must keep serving the last plane that compiled on it, not stop \
+         authenticating because a neighbour wrote something it cannot serve"
+    );
+    assert_eq!(
+        status.refused_version,
+        Some(refused_at),
+        "and must record which version it will not serve, beside the one it does"
+    );
+    assert!(
+        reader.plane(7).await.membership(&principal).is_ok(),
+        "the old plane is still the served plane, keys and all"
+    );
+
+    // The reader loads the same refused version again on every refresh,
+    // because it never published it. It says so once.
+    let after_first = reader.status().divergences_named;
+    assert_eq!(
+        after_first,
+        named_before + 1,
+        "the refused version's own divergence is named -- the check runs on the load, before \
+         the compile, precisely so a document this node cannot serve is not the one document \
+         it says nothing about"
+    );
+    reader.plane(8).await;
+    reader.plane(9).await;
+    assert_eq!(
+        reader.status().divergences_named,
+        after_first,
+        "a version loaded again is not a version seen again"
+    );
+    assert_eq!(reader.status().refused_version, Some(refused_at));
 }

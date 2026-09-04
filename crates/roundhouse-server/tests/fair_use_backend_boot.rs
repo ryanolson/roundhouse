@@ -33,7 +33,9 @@ use std::sync::Arc;
 
 use roundhouse_core::context::ByteTokenizer;
 use roundhouse_core::control::spend::contract::fresh_principal;
-use roundhouse_core::control::{FairUseLedger, FairUseWindow, MemorySpendLedger, Principal};
+use roundhouse_core::control::{
+    FairUseLedger, FairUseWindow, MemoryDocumentStore, MemorySpendLedger, Principal,
+};
 use roundhouse_core::now_ms;
 use roundhouse_core::routing::AffinityPolicy;
 use roundhouse_core::store::MemoryStore;
@@ -42,7 +44,7 @@ use roundhouse_server::control_config::crosscheck::CrossChecks;
 use roundhouse_server::control_config::{FairUseConfig, FairUseWindowConfig, ProjectPatch};
 use roundhouse_server::shared_backend::open;
 use roundhouse_server::{
-    Conversations, DirectoryMutation, EchoLocalExecutor, Engine, MemoryDirectoryStore,
+    Conversations, DirectoryMutation, DocumentDirectoryStore, EchoLocalExecutor, Engine,
     responses_api,
 };
 use roundhouse_store_redis::RedisFairUseLedger;
@@ -125,7 +127,9 @@ async fn a_ceiling_patched_in_after_boot_is_counted_in_the_shared_buckets() {
         roundhouse_server::ControlDirectory::new(
             boot_file(),
             "ROUNDHOUSE_CONTROL_PLANE",
-            Arc::new(MemoryDirectoryStore::new()),
+            Arc::new(DocumentDirectoryStore::over(Arc::new(
+                MemoryDocumentStore::new(),
+            ))),
             CrossChecks::new(reachable(), None),
             now,
         )

@@ -39,7 +39,7 @@
 
 use std::fmt;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::routing::{Candidate, Target};
@@ -415,7 +415,12 @@ fn glob_match(pattern: &str, value: &str) -> bool {
 /// without this a stale or misspelled key *inside* a cadence object was
 /// accepted and dropped, and an operator got a cadence they did not write with
 /// nothing to tell them a line had been ignored.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+/// `Serialize` since M16.1 (R-D7) for the reason every other config shape in
+/// this workspace gained it in that rung: a project's policy is now written
+/// *back* — into the durable admin directory's document — as well as read out
+/// of an operator's file, and a cadence with no `Serialize` is a policy that
+/// cannot be stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FrontierCadence {
     pub max_frontier: u32,

@@ -24,6 +24,7 @@
 //! | `spend` — the committed-spend ledger | v1 | [`spend`] |
 //! | `fairuse` — the rolling fair-use windows | v1 | [`fair_use`] |
 //! | `corr` — the generation/call/thread correlation maps | v1 | [`correlation`] |
+//! | `dir` — the admin-created tenancy, as one versioned document | v1 | [`directory`] |
 //!
 //! The log's wire format is the load-bearing decision. Entries are added with
 //! *explicit* stream ids `<seq>-0`, so the entry id and the event's `seq` are
@@ -57,11 +58,14 @@
 //!
 //! That one variable selects every family this crate serves and nothing else
 //! selects any of them (R12, R-C4): the session log here, the spend ledger in
-//! `spend`, the fair-use buckets in `fair_use`, and — since M14.1 — the three
-//! correlation maps in `correlation`, which are what let a client's own name
-//! for a conversation reach the same session from any node.
+//! `spend`, the fair-use buckets in `fair_use`, the three correlation maps in
+//! `correlation` (M14.1), which are what let a client's own name for a
+//! conversation reach the same session from any node, and — since M16.1 — the
+//! admin directory in [`directory`], which is what lets a project created on
+//! one node exist on the next one and survive a restart.
 
 pub mod correlation;
+pub mod directory;
 pub mod fair_use;
 pub mod keys;
 mod scripts;
@@ -70,6 +74,7 @@ pub mod spend;
 pub mod test_support;
 
 pub use correlation::RedisCorrelationMaps;
+pub use directory::RedisDocumentStore;
 pub use fair_use::RedisFairUseLedger;
 pub use keys::{EmptyNamespace, KeyNamespace};
 pub use spend::RedisSpendLedger;

@@ -95,9 +95,10 @@ pub use catalog_config::{CatalogConfig, CatalogError};
 pub use claude_launch::{ClaudeAuthKind, ClaudeEnv, ClaudeLaunch, ClaudeLaunchError};
 pub use codex_launch::{CodexAuthKind, CodexLaunch};
 pub use control_config::{
-    Admission, AuthError, ControlDirectory, ControlPlane, ControlPlaneConfig, ControlPlaneError,
-    CrossChecks, DirectoryError, DirectoryMutation, DirectoryStore, DirectoryView, KeyScope,
-    MembershipError, MemoryDirectoryStore, PlaneSource, ValidateConfig, has_valid_key_shape,
+    Admission, AuthError, CompiledUnder, ControlDirectory, ControlPlane, ControlPlaneConfig,
+    ControlPlaneError, CrossChecks, DirectoryDivergence, DirectoryError, DirectoryMutation,
+    DirectoryStatus, DirectoryStore, DirectoryView, DivergentInput, DocumentDirectoryStore,
+    KeyScope, MembershipError, PlaneSource, ValidateConfig, has_valid_key_shape,
 };
 pub use conversations::Conversations;
 pub use dialect::{ClientDialect, DEFAULT_MCP_NAMESPACE};

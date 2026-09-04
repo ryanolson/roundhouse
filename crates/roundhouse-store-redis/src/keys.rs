@@ -44,7 +44,7 @@ use std::fmt;
 /// A `family: &str` at `build_key`'s call sites was four literals typed at
 /// eleven places with nothing to check them against — a typo or a fifth
 /// family both compiled. The variant is the check: a family that is not one
-/// of these four does not compile, and the module-doc table test
+/// of these five does not compile, and the module-doc table test
 /// (`tests/key_builder_convention.rs`) reads every name this enum's own
 /// `name` method produces out of `keys.rs`'s source rather than a second
 /// hand-copied list, so a doc-table row cannot drift from the variant it
@@ -55,6 +55,13 @@ pub(crate) enum KeyFamily {
     Spend,
     FairUse,
     Correlation,
+    /// The admin-created tenancy, as one versioned document (M16.1, R-D6).
+    ///
+    /// The fifth family, and the only one whose whole key space is a single
+    /// key: `<ns>:v1:dir:records`. See [`crate::directory`] for why one key
+    /// rather than one per entity, and why it carries no hash tag when the
+    /// other four do.
+    Directory,
 }
 
 impl KeyFamily {
@@ -64,11 +71,12 @@ impl KeyFamily {
     /// `name`'s match arms instead, since an integration test cannot see a
     /// `pub(crate)` item.
     #[cfg(test)]
-    const ALL: [KeyFamily; 4] = [
+    const ALL: [KeyFamily; 5] = [
         KeyFamily::Session,
         KeyFamily::Spend,
         KeyFamily::FairUse,
         KeyFamily::Correlation,
+        KeyFamily::Directory,
     ];
 
     /// The family segment [`build_key`] writes.
@@ -78,6 +86,7 @@ impl KeyFamily {
             KeyFamily::Spend => "spend",
             KeyFamily::FairUse => "fairuse",
             KeyFamily::Correlation => "corr",
+            KeyFamily::Directory => "dir",
         }
     }
 
@@ -89,13 +98,16 @@ impl KeyFamily {
     /// the durable session log to change a correlation binding's shape.
     /// Every family keeps `v1` today; the day `correlation`'s own module doc
     /// promise (a hash-shaped call binding is "a different key space") comes
-    /// due, this is the one match arm that changes.
+    /// due — or the day the directory document's field encoding changes
+    /// shape, which is the same argument for the same reason — this is the
+    /// one match arm that changes.
     pub(crate) fn version(self) -> &'static str {
         match self {
             KeyFamily::Session => "v1",
             KeyFamily::Spend => "v1",
             KeyFamily::FairUse => "v1",
             KeyFamily::Correlation => "v1",
+            KeyFamily::Directory => "v1",
         }
     }
 }

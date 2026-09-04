@@ -52,6 +52,7 @@ const FAMILY_FILES: &[&str] = &[
     "src/spend.rs",
     "src/fair_use.rs",
     "src/correlation.rs",
+    "src/directory.rs",
 ];
 
 /// Every `fn <name>(` a family file defines outside its own `#[cfg(test)]`

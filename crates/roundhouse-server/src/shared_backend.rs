@@ -30,26 +30,36 @@
 //! it. The two boot suites could only re-type the match by hand and rely on a
 //! reviewer noticing when the copies drifted; a mutation that wired the
 //! per-process correlation table into the *shared* arm left the whole
-//! workspace green. [`open`] is where the four families are built now, in one
+//! workspace green. [`open`] is where the families are built now, in one
 //! match, so a mutation of the wiring is a mutation of the thing the boot
 //! suites actually run.
+//!
+//! **And since M16.1 (R-D8) there are five.** The admin directory joined the
+//! four as an opaque document store, through the same one switch, because it
+//! is the family whose absence the other four made worst: a deployment with a
+//! durable ledger and a per-process directory re-grants an archived project's
+//! id on the next restart and silently joins the new tenant to the old one's
+//! spend. `tests/directory_backend_boot.rs` is its end-to-end assertion, in
+//! the shape the fair-use and correlation families already had.
 
 use std::sync::Arc;
 
 use anyhow::Context;
 use roundhouse_core::control::{
-    FairUseLedger, MemoryFairUseLedger, MemorySpendLedger, SpendLedger,
+    DocumentStore, FairUseLedger, MemoryDocumentStore, MemoryFairUseLedger, MemorySpendLedger,
+    SpendLedger,
 };
 use roundhouse_core::store::MemoryStore;
 use roundhouse_store_redis::{
-    EmptyNamespace, KeyNamespace, RedisCorrelationMaps, RedisFairUseLedger, RedisSessionStore,
-    RedisSpendLedger,
+    EmptyNamespace, KeyNamespace, RedisCorrelationMaps, RedisDocumentStore, RedisFairUseLedger,
+    RedisSessionStore, RedisSpendLedger,
 };
 
 use crate::Conversations;
 
-/// Where sessions, committed spend, fair-use windows and conversation
-/// correlation live, as a `redis://` URL. Absent means this process's memory.
+/// Where sessions, committed spend, fair-use windows, conversation correlation
+/// and the admin directory live, as a `redis://` URL. Absent means this
+/// process's memory.
 ///
 /// Named in this module rather than in the binary because this is the module
 /// that reads it and quotes it: every boot line and every connect failure
@@ -139,12 +149,12 @@ pub fn shared_backend(redis_url: Option<&str>) -> SharedBackend<'_> {
 
 /// Every backend a deployment names at once, opened together and logged once.
 ///
-/// **A two-arm enum rather than four separately-resolved handles**, because
-/// four handles is what the composition root had when M14.1's review found F1:
-/// nothing in the type system said the fair-use ledger, the correlation maps,
-/// the session store and the spend ledger had all answered the same question,
-/// and in fact three separate evaluations of that question were what produced
-/// them. Here the question is asked once and the answer is the value.
+/// **A two-arm enum rather than five separately-resolved handles**, because
+/// separate handles is what the composition root had when M14.1's review found
+/// F1: nothing in the type system said the fair-use ledger, the correlation
+/// maps, the session store and the spend ledger had all answered the same
+/// question, and in fact three separate evaluations of that question were what
+/// produced them. Here the question is asked once and the answer is the value.
 ///
 /// The store is concrete in each arm rather than an `Arc<dyn SessionStore>`
 /// because the binary's `serve` is generic over it — erasing it here would buy
@@ -154,7 +164,7 @@ pub enum Backends {
     /// Every family in the Redis this deployment named. A second node opening
     /// the same URL sees everything this one writes.
     Shared {
-        /// The URL all four were opened against.
+        /// The URL all five were opened against.
         ///
         /// Carried rather than re-read, so a caller that needs to name the
         /// Redis cannot name a *different* one than the handles beside it were
@@ -165,6 +175,13 @@ pub enum Backends {
         spend: Arc<dyn SpendLedger>,
         fair_use: Arc<dyn FairUseLedger>,
         conversations: Arc<Conversations>,
+        /// The opaque document the admin directory is stored as (M16.1,
+        /// R-D8). An `Arc<dyn DocumentStore>` and not the typed directory,
+        /// because this crate's config vocabulary has no business in the
+        /// choice of backend — the composition root wraps whichever of these
+        /// two it is handed in the one adapter that knows how to serialize
+        /// records (R-D5, R-D7).
+        directory: Arc<dyn DocumentStore>,
     },
     /// Every family in this process's own memory, dying with it.
     PerProcess {
@@ -172,6 +189,7 @@ pub enum Backends {
         spend: Arc<dyn SpendLedger>,
         fair_use: Arc<dyn FairUseLedger>,
         conversations: Arc<Conversations>,
+        directory: Arc<dyn DocumentStore>,
     },
 }
 
@@ -197,6 +215,22 @@ impl Backends {
             }
         }
     }
+
+    /// The document the admin directory lives in, whichever arm this is (M16.1,
+    /// R-D8). See [`fair_use`](Self::fair_use) for why this is an accessor.
+    ///
+    /// The composition root reads it *here*, before the match that wires the
+    /// store and the ledger, because the directory is built before either:
+    /// its first load is the boot check, and a Redis that serves the other
+    /// four families and cannot answer for this one has to stop the process
+    /// rather than be discovered on the first admin call.
+    pub fn directory(&self) -> &Arc<dyn DocumentStore> {
+        match self {
+            Backends::Shared { directory, .. } | Backends::PerProcess { directory, .. } => {
+                directory
+            }
+        }
+    }
 }
 
 /// Open every backend [`shared_backend`] chose, in one match.
@@ -208,7 +242,7 @@ impl Backends {
 ///
 /// The fair-use ledger is connected first on purpose: it is the first thing
 /// that touches the named Redis, so an unreachable one fails the boot with the
-/// message that names [`REDIS_VAR`] rather than three lines further down. Every
+/// message that names [`REDIS_VAR`] rather than four lines further down. Every
 /// connect's failure names that variable, because it is the part an operator
 /// acts on.
 ///
@@ -217,9 +251,9 @@ impl Backends {
 /// over* is precisely the decision F1 found untested, and returning the maps
 /// would leave that last step back in the binary where it started.
 ///
-/// One boot line per arm, naming all four families, rather than one line per
-/// family: a deployment reading three separate "shared in Redis" lines cannot
-/// tell whether the fourth is missing because it is per-process or because it
+/// One boot line per arm, naming every family, rather than one line per
+/// family: a deployment reading four separate "shared in Redis" lines cannot
+/// tell whether the fifth is missing because it is per-process or because it
 /// was never logged.
 ///
 /// `namespace` is taken already resolved rather than as a raw `Option<&str>`
@@ -247,14 +281,34 @@ pub async fn open(redis_url: Option<&str>, namespace: &KeyNamespace) -> anyhow::
                 .with_context(|| {
                     format!("opening the spend ledger in the Redis named by {REDIS_VAR}")
                 })?;
+            // The fifth family (M16.1, R-D8), in the same match as the other
+            // four and for the reason the module doc gives about the first
+            // four: a deployment whose sessions, spend, ceilings and threads
+            // are shared and whose *tenancy* is not is the shape M8's own
+            // deferral note described, where an archived project's tombstone
+            // dies with a process while the ledger row that gives its id
+            // meaning does not.
+            //
+            // `map_err` rather than `with_context`: `DocumentStoreError` is
+            // this seam's own error and not an `anyhow` chain, and the
+            // sentence an operator acts on is the one naming the variable.
+            let directory = RedisDocumentStore::connect_namespaced(url, namespace.clone())
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "opening the admin directory in the Redis named by {REDIS_VAR}: {error}"
+                    )
+                })?;
             // The URL itself is never logged -- a `redis://` URL may carry
             // credentials.
             tracing::info!(
                 var = REDIS_VAR,
-                "sessions, committed spend, fair-use windows and conversation correlation \
-                 are all shared in the Redis this deployment names: every node serving a \
-                 project shares one rolling ceiling, and a cache key, a tool call or a \
-                 client thread bound by one node resolves on every node"
+                "sessions, committed spend, fair-use windows, conversation correlation and \
+                 admin-created tenancy are all shared in the Redis this deployment names: \
+                 every node serving a project shares one rolling ceiling, a cache key, a \
+                 tool call or a client thread bound by one node resolves on every node, and \
+                 a project, member or key created through the admin plane outlives this \
+                 process and reaches every other node"
             );
             Ok(Backends::Shared {
                 url: url.to_string(),
@@ -262,22 +316,26 @@ pub async fn open(redis_url: Option<&str>, namespace: &KeyNamespace) -> anyhow::
                 spend: Arc::new(spend),
                 fair_use: Arc::new(fair_use),
                 conversations: Arc::new(Conversations::over(Arc::new(maps))),
+                directory: Arc::new(directory),
             })
         }
         SharedBackend::PerProcess => {
             tracing::warn!(
                 var = REDIS_VAR,
                 "no Redis configured; sessions and committed spend are in-memory and die \
-                 with this process, a fair-use ceiling configured here or added later \
-                 through the admin plane is enforced per node and says so when it first \
-                 enforces one, and a control call landing on a node that served none of \
-                 its conversation's turns falls back to a guess or refuses"
+                 with this process, admin-created projects, members and keys die with it \
+                 too -- including the tombstone that keeps an archived project's id \
+                 retired -- a fair-use ceiling configured here or added later through the \
+                 admin plane is enforced per node and says so when it first enforces one, \
+                 and a control call landing on a node that served none of its \
+                 conversation's turns falls back to a guess or refuses"
             );
             Ok(Backends::PerProcess {
                 store: Arc::new(MemoryStore::new()),
                 spend: Arc::new(MemorySpendLedger::new()),
                 fair_use: Arc::new(MemoryFairUseLedger::new()),
                 conversations: Arc::new(Conversations::new()),
+                directory: Arc::new(MemoryDocumentStore::new()),
             })
         }
     }

@@ -4857,6 +4857,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hex",
  "http-body-util",
+ "redis",
  "roundhouse-core",
  "roundhouse-fleet",
  "roundhouse-mcp",

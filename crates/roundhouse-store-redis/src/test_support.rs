@@ -139,6 +139,20 @@ pub fn correlation_thread_key(principal: &Principal, thread_id: &str) -> String 
     correlation_thread_key_impl(&default_namespace(), principal, thread_id)
 }
 
+/// The one key the directory family occupies, under a namespace the caller
+/// names.
+///
+/// **Takes its namespace explicitly, unlike every other helper here**, and
+/// that is the family's shape rather than an inconsistency: this family has a
+/// single key for the whole deployment (R-D6), so a gated test isolates itself
+/// by connecting under a fresh [`KeyNamespace`] instead of by minting a fresh
+/// principal or session id inside a shared one. A helper that assumed the
+/// default namespace would compute a key none of those tests' handles ever
+/// writes.
+pub fn directory_records_key(namespace: &KeyNamespace) -> String {
+    crate::directory::records_key(namespace)
+}
+
 /// The conformance suite's expiry lever. Deleting the key is exactly what
 /// Redis `PX` eventually does, so takeover behaves as if the TTL had elapsed.
 #[async_trait::async_trait]

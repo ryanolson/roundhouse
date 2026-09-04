@@ -57,10 +57,22 @@
 //! the server crate because a deployment of more than one node needs those
 //! three shared, and "shared" means a trait with a Redis implementation beside
 //! the spend and fair-use ledgers.
+//!
+//! [`directory`] is the same argument taken one step further and stopping
+//! deliberately short of the vocabulary. What an operator *created* — the
+//! projects, users, memberships and keys the admin plane mints — has to
+//! outlive a restart and be seen by every node, which again means a trait with
+//! a Redis implementation beside the ledgers. But unlike the five answers
+//! above, none of that vocabulary belongs here (see this doc's second
+//! decision: a key record arrives next to the resolver, not here), so what
+//! lands is the *storage* shape alone: one versioned opaque document,
+//! compare-and-set. The server crate keeps the records and does the serde at
+//! its own boundary.
 
 pub mod budget;
 pub mod correlation;
 pub mod credential;
+pub mod directory;
 pub mod fair_use;
 pub mod payer;
 pub mod policy;
@@ -82,6 +94,7 @@ pub use credential::{
     OauthEvidence, PresentedCredential, ProviderAccess, Reachable, Secret, TurnCredential,
     TurnCredentials,
 };
+pub use directory::{DocumentStore, DocumentStoreError, MemoryDocumentStore, VersionedDocument};
 pub use fair_use::{
     FairUseError, FairUseLedger, FairUseLimit, FairUseQuantity, FairUseRefusal, FairUseScope,
     FairUseTerms, FairUseWindow, MemoryFairUseLedger,

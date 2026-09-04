@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Plan: the Anthropic Messages surface, the seat, and the launcher (M11)
 
-> **Status: shipped through M16.0; D2 ruled (2026-09-04).** The rulings in §3 stand
+> **Status: shipped through M16.0; D2 ruled; M16.1 in flight (2026-09-04).** The rulings in §3 stand
 > as written; where an implementation round moved one, the dated addenda at
 > the end of this document record the move and its reason, and win over §3
 > for the current tree. Direction set by the product owner on
@@ -2345,3 +2345,146 @@ its publish loses the publish (the commit is in the store, and the next
 refresh picks it up); the claim guard covers the refresh only, and a
 give-back on the write path needs the tokio mutex's span reasoned about
 beside the durable store.
+
+## Addendum (2026-09-04): M16.1 — the durable directory, the rulings
+
+D2's R16, R18 and R19 said what the durable directory is; M16.0 landed the
+seam it needs. The five rulings below say precisely what lands, resolved
+in advance so the stage does not re-derive them.
+
+**R-D5 — the contract is a versioned opaque document in core, and the
+memory implementation is the specification.** `roundhouse_core::control::
+directory` carries `VersionedDocument { document: Option<Vec<u8>>,
+version: u64 }` — version zero with no document is the empty store — and
+a `DocumentStore` behind `#[async_trait]`: `load`, `commit(expected_version,
+document) -> version`, `version()`, with `DocumentStoreError::{Concurrent
+{ expected, found }, Unavailable }`, the two answers the directory's own
+`StoreFailure` already distinguishes, so the adapter maps them one for
+one. `MemoryDocumentStore` sits beside it as the specification, and a
+`document_store_contract_suite!` over `__contract_suite` pins what both
+backends must share: empty is version zero and no document; a commit
+against the version read returns the next version and the bytes come back
+exact; a commit against a stale version refuses `Concurrent` naming both
+versions and changes nothing; `version()` tracks commits without reading
+the document; identical bytes committed again still advance the version;
+two handles racing to commit against one version admit exactly one; a
+document of a few megabytes round-trips. Where the Redis instantiation
+needs isolation it takes a fresh namespace per test, because this family
+has one key.
+
+**R-D6 — `KeyFamily::Directory`: one key, and a compare-and-set in Lua.**
+Family `dir`, version `v1`, one hash key `<ns>:v1:dir:records` with fields
+`version` and `document` — no hash tag, because nothing here is a
+multi-key operation. `commit` is one script in `scripts.rs`'s idiom (read
+the stored version, compare with the expected one, write both fields and
+return the new version, or return the version found so Rust can name it);
+`load` is one `HMGET`; `version()` is one `HGET`; the connection comes
+through `connect_manager` like every other family's. The key-builder
+convention table gains the row, the two-namespace isolation test gains the
+family, and the contract suite is instantiated in the store crate's gated
+tests, serialized like the others.
+
+**R-D7 — the typed adapter serializes at the directory's boundary, and
+every test runs through it.** `DirectoryStore` in the server crate keeps
+its shape; `DocumentDirectoryStore` implements it over `Arc<dyn
+DocumentStore>`, serializing `DirectoryRecords` as a JSON envelope —
+`schema`, `records`, `compiled_under` — and `MemoryDirectoryStore` is
+deleted: every fixture that built one builds the adapter over
+`MemoryDocumentStore`, so the round trip is exercised by every directory
+test there is rather than by one. The wrapped config entries take
+`Serialize`, with defaults on every field a newer build might add so an
+older build still reads a newer document; a document whose `schema` is
+newer than the build knows is refused at load with a typed error, because
+compiling a plane from half a document admits and refuses the wrong keys
+silently, which is worse than a boot that stops and says why. A fully
+populated `DirectoryRecords` is pinned byte for byte in both directions,
+the way `a_pre_m11_log_record_still_deserializes` pins an item.
+
+**R-D8 — the one switch widens to the directory; the boot re-orders; a
+directory the store cannot read refuses the boot.** `shared_backend::open`
+builds the fifth family in the same match — `Backends::Shared` carries an
+`Arc<dyn DocumentStore>` over Redis, `PerProcess` a `MemoryDocumentStore`
+— and the composition root constructs `ControlDirectory` after `open`,
+over the adapter; the directory's first `load` is the boot check, as
+constructing it always was, so a Redis that serves sessions and refuses
+the directory read stops the boot with a reason naming
+`ROUNDHOUSE_REDIS_URL`. With no memory-backed Redis branch left,
+`control_plane_file_configured` and the warning it gates are deleted and
+the comments that explained them rewritten. The ignored
+`recreating_an_archived_project_after_a_restart_inherits_its_spend` goes
+live with its assertions unchanged and its rig sharing one document store
+across its two boots, its stale line numbers corrected; and a
+`directory_backend_boot.rs` in the boot-suite shape proves against a real
+Redis that a project archived through one directory is refused
+`identity_collision` by a second directory opened over the same Redis
+after the first is gone.
+
+**R-D9 — divergence is fingerprinted, warned once per stored version with
+a typed reason, and never refused.** The writer stamps `compiled_under`:
+the SHA-256 of the control-plane file's bytes, the sorted identities of
+the catalog and of the routing candidates the cross-checks were built from
+(`CrossChecks` gains a fingerprint), and the TTL. A reader whose own
+fingerprint differs — at boot or on refresh — warns once per stored
+version with `DirectoryDivergence` naming which input differs, and keeps
+serving the plane it compiles; refusing would make a rolling file change
+impossible. A refresh that loads but will not compile keeps the last good
+plane, as today, and records the version it could not take beside the
+version it serves, readable through the directory for tests and for the
+node-status surface D2 deferred by name. Nothing here refuses, and M8's
+"still deferred" list is unchanged.
+
+### What the implementation settled beyond the rulings (2026-09-04, M16.1)
+
+- **Unknown fields are tolerated at the envelope and refused inside a
+  record.** R-D7 said same-schema unknown fields are tolerated; the
+  wrapped config entries keep `deny_unknown_fields`, because that
+  attribute is what stops a mistyped key in an operator's file from
+  silently widening a policy, and softening it for a storage concern
+  would hand the file that failure mode back. So the envelope accepts a
+  key it does not know, a record does not, and a build that adds a field
+  to an entry has changed what a document can hold and bumps `schema`,
+  which an older node refuses by name. Pinned by one test that asserts
+  both halves.
+- **The fingerprint rides in the load.** `VersionedRecords` carries
+  `compiled_under`, `DirectoryStore::load` returns it, and the trait has a
+  defaulted `compiled_under()` for the reader's own — one round trip,
+  nothing thrown away. A second read to ask what a version was written
+  under would answer about whatever the store held by then: a node
+  warning about inputs belonging to a version it never compiled.
+- **`ControlDirectory::status()` exposes the served version, the refused
+  version and the divergence together**, out of one guard, rather than
+  three accessors a caller could assemble from three lock acquisitions.
+- **The R8 test could not keep every assertion aimed where it was.** The
+  fix makes recreating `shutco` impossible, which is the point; the
+  `identity_collision` refusal is now the assertion the test turns on,
+  and the two budget assertions are kept verbatim against a fresh tenant.
+  Its doc names `shared_backend`'s one match and the boot suite instead
+  of line numbers, which is how the old ones went stale.
+- **The boot composition is a library function.** The rung's own refute
+  stage found that a fail-open fallback in `main.rs` — retrying the
+  directory over a fresh memory store when the wired one refused — left
+  both boot suites green, because `main()` is a `[[bin]]` nothing calls
+  and the suites re-derived its composition. `control_config::boot_directory`
+  is now the one composition, `main.rs` only maps its error, and the boot
+  suite calls it — the M13 lesson applied a third time.
+- **The judge is not fingerprinted.** `CrossChecks::fingerprint()` covers
+  the routing candidates R-D9 named; two nodes differing only in
+  `ROUNDHOUSE_JUDGE_MODEL` will not report divergence although one
+  cross-check reads it. Documented at the function; open by name for the
+  review round.
+- **The memory store's compare-and-set is one critical section, and no
+  test can race it.** `MemoryDocumentStore::commit` has no await, so the
+  contract's racing test genuinely races only the Redis instantiation;
+  sixty-four barrier-synchronised threads over fifty rounds never landed
+  in a split-lock window on this platform, and the harness that tried
+  starved the Redis connection driver. The single lock scope is the
+  guarantee, the doc comment says so, and a model checker for a two-line
+  critical section is disproportionate.
+- **`redis` entered the server crate's dev-dependencies at the workspace
+  pin** so the boot suite can write a key no roundhouse handle would —
+  the watched dependency did not move. A `WRONGTYPE` from the store names
+  the family's key, because the boot refusal has to name what an operator
+  goes and looks at.
+- **The stage's disk kept running out**; the whole-crate integration run
+  was completed by the churn stage (fifty-nine server suites, the Redis
+  suites against a real server), and the gate below is the record.

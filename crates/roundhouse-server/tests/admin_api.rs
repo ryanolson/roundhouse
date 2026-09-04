@@ -37,8 +37,8 @@ use codex_utils_rustls_provider::ensure_rustls_crypto_provider;
 
 use roundhouse_core::context::ByteTokenizer;
 use roundhouse_core::control::{
-    Balance, BalanceQuery, Grant, GrantRequest, MemorySpendLedger, Settled, Settlement, SpendError,
-    SpendLedger,
+    Balance, BalanceQuery, DocumentStore, Grant, GrantRequest, MemoryDocumentStore,
+    MemorySpendLedger, Settled, Settlement, SpendError, SpendLedger,
 };
 use roundhouse_core::metrics::{MetricsConfig, MetricsRecorder, ReferenceModel, ShadowPricing};
 use roundhouse_core::now_ms;
@@ -54,8 +54,8 @@ use roundhouse_server::test_support::{
     ScriptedDirectoryStore, frontier_spec, single_model_catalog,
 };
 use roundhouse_server::{
-    ControlDirectory, Conversations, DirectoryStore, EchoLocalExecutor, Engine, EngineConfig,
-    MemoryDirectoryStore, admin_api, has_valid_key_shape, http, metrics_api, responses_api,
+    ControlDirectory, Conversations, DirectoryStore, DocumentDirectoryStore, EchoLocalExecutor,
+    Engine, EngineConfig, admin_api, has_valid_key_shape, http, metrics_api, responses_api,
 };
 
 mod common;
@@ -192,7 +192,21 @@ struct Rig {
 /// A deployment whose admin plane is real: a managed directory over a memory
 /// store, so writes compile and take effect on this node immediately.
 async fn rig(ledger: Arc<dyn SpendLedger>) -> Rig {
-    rig_over(file(), ledger).await
+    rig_over(file(), ledger, Arc::new(MemoryDocumentStore::new())).await
+}
+
+/// The same deployment, over a document store the caller already holds.
+///
+/// **For the one test that boots twice** —
+/// [`recreating_an_archived_project_after_a_restart_inherits_its_spend`] — and
+/// the sharing belongs here, in the rig, rather than in that test's body: what
+/// the test is about is that a restart inherits the directory the way it
+/// already inherits the ledger, and a fixture that assembled the second boot's
+/// directory by hand would be asserting against a wiring nothing else in the
+/// process uses. One argument, two boots, and the composition each boot
+/// performs is identical.
+async fn rig_sharing(ledger: Arc<dyn SpendLedger>, documents: Arc<dyn DocumentStore>) -> Rig {
+    rig_over(file(), ledger, documents).await
 }
 
 /// The same deployment over a caller-supplied control-plane file.
@@ -205,13 +219,14 @@ async fn rig(ledger: Arc<dyn SpendLedger>) -> Rig {
 async fn rig_over(
     file: roundhouse_server::ControlPlaneConfig,
     ledger: Arc<dyn SpendLedger>,
+    documents: Arc<dyn DocumentStore>,
 ) -> Rig {
     ensure_rustls_crypto_provider();
     let directory = Arc::new(
         ControlDirectory::new(
             file,
             "ROUNDHOUSE_CONTROL_PLANE",
-            Arc::new(MemoryDirectoryStore::new()),
+            Arc::new(DocumentDirectoryStore::over(documents)),
             CrossChecks::new(reachable(), None),
             now_ms(),
         )
@@ -318,7 +333,9 @@ async fn pass_through_rig() -> Rig {
         ControlDirectory::new(
             pass_through_file(),
             "ROUNDHOUSE_CONTROL_PLANE",
-            Arc::new(MemoryDirectoryStore::new()),
+            Arc::new(DocumentDirectoryStore::over(Arc::new(
+                MemoryDocumentStore::new(),
+            ))),
             CrossChecks::new(reachable(), None),
             now_ms(),
         )
@@ -737,7 +754,7 @@ async fn revoking_a_key_stops_it_within_one_cache_ttl() {
 
 /// The double this section arms is [`ScriptedDirectoryStore`]
 /// (`roundhouse_server::test_support`, M16.0 review, F1) -- the same wrapper
-/// over a real `MemoryDirectoryStore` the directory suite's own coherence and
+/// over the real production store the directory suite's own coherence and
 /// M16.0 guards use, rather than a second hand-rolled `(records, version)`
 /// double with its own copy of `commit`'s compare-and-set.
 ///
@@ -797,7 +814,9 @@ async fn budget_view_over_http_reads_plane_and_view_from_one_version() {
     // exactly what a real project, member and mint produce, rather than
     // hand-built records that could differ from one in the way that makes
     // this test pass for the wrong reason.
-    let seed_store = Arc::new(MemoryDirectoryStore::new());
+    let seed_store = Arc::new(DocumentDirectoryStore::over(Arc::new(
+        MemoryDocumentStore::new(),
+    )));
     let seed_directory = Arc::new(
         ControlDirectory::new(
             control_plane(
@@ -1214,11 +1233,13 @@ async fn drift_goes_negative_and_stays_visible_when_a_settle_is_lost() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_archived_project_id_stays_refused_without_a_restart() {
-    // The control for the ignored test below: within one process's lifetime,
+    // The control for the restart test below: within one process's lifetime,
     // `refuse_taken` really does keep an archived id retired, exactly as
-    // `ProjectRecord::archived_at_ms` documents. This is what proves the
-    // ignored test's failure is about the directory losing its tombstone on
-    // restart, and not about `refuse_taken` being broken in general.
+    // `ProjectRecord::archived_at_ms` documents. That is what makes the other
+    // test's subject the *restart* -- whether the tombstone survived it --
+    // rather than whether `refuse_taken` works at all. It was the control for
+    // a failing, ignored test for eight milestones; since M16.1 both are
+    // green, and it keeps exactly the same job.
     let rig = plain().await;
     let secret = budgeted_member(&rig.app, "shutco", "walt").await;
     turn(&rig.app, &secret, "shutco/walt/main").await;
@@ -1238,32 +1259,50 @@ async fn an_archived_project_id_stays_refused_without_a_restart() {
     );
 }
 
+/// **R8, closed by M16.1's durable directory (R-D8) — this test is its
+/// evidence and its unlock condition, both.**
+///
+/// It stayed `#[ignore]`d for eight milestones with a note that named exactly
+/// what would make it pass, and nothing about the test itself has changed
+/// since: for as long as the directory's only backing store was rebuilt fresh
+/// on every boot, independent of whether the session store and the spend
+/// ledger were Redis-backed and durable, an archived project's tombstone — the
+/// row `refuse_taken` reads to keep a closed id retired, see
+/// `ProjectRecord::archived_at_ms` — was erased on restart while a durable
+/// ledger's rows for the same `(project, user)` survived untouched. The
+/// ordinary admin API then let the id be re-created as if it were new, and the
+/// ledger silently handed the new tenant the old one's committed spend, with
+/// no field anywhere in the budget view saying so.
+///
+/// What closes it is that the directory is now the fifth family
+/// `shared_backend::open` chooses (`main.rs`, the `let backends` /
+/// `let directory` pair, and `shared_backend.rs`'s one match), so a deployment
+/// that names a Redis stores its tenancy in the same Redis its ledger is in.
+/// The rig models that by sharing one document store across the two boots
+/// below, exactly as it already shared the ledger — see [`rig_sharing`]. The
+/// end-to-end version, against a real Redis and through `open` itself, is
+/// `tests/directory_backend_boot.rs`.
+///
+/// [`an_archived_project_id_stays_refused_without_a_restart`] is the control
+/// that keeps this honest: it proves `refuse_taken` retires an id within one
+/// process, so a failure here is about what a restart inherits and not about
+/// the refusal being broken in general.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "R8: MemoryDirectoryStore is reconstructed fresh and unconditionally on every boot \
-            (main.rs ~341-353), independent of whether the session store and spend ledger are \
-            Redis-backed and durable (~396-427). An archived project's tombstone -- the row \
-            `refuse_taken` reads to keep a closed id retired, see `ProjectRecord::archived_at_ms` \
-            -- lives only in that store, so it is erased on restart while a durable ledger's rows \
-            for the same (project, user) survive untouched. The ordinary admin API then lets the \
-            id be re-created as if it were new, and the ledger silently hands the new tenant the \
-            old one's committed spend, with no field anywhere in the budget view saying so. Ship \
-            the honest signal (a loud boot warning when Redis is durable and the directory is not, \
-            main.rs ~396-427) rather than papering over the gap; the real fix, and this test's \
-            unlock condition, is a durable DirectoryStore replacing MemoryDirectoryStore -- see \
-            ControlDirectory's own module-doc deferral note for the placement decision it is \
-            waiting on. This is the one evidence test that stays #[ignore]'d rather than closed by \
-            a fix in this milestone: it goes green the day that store lands, with no change to the \
-            test itself."]
 async fn recreating_an_archived_project_after_a_restart_inherits_its_spend() {
     // Stands in for a durable, Redis-backed spend ledger: nothing about this
-    // test depends on `MemorySpendLedger` being in-memory, only on it being the
-    // one thing that survives the "restart" below unwiped -- which is exactly
-    // what a real deployment's Redis-backed ledger would do while its directory
-    // (M8's only backing store is `MemoryDirectoryStore`) does not.
+    // test depends on `MemorySpendLedger` being in-memory, only on it being one
+    // of the two things that survive the "restart" below unwiped -- which is
+    // what a real deployment's Redis-backed ledger and, since M16.1, its
+    // Redis-backed directory both do.
     let ledger: Arc<dyn SpendLedger> = Arc::new(MemorySpendLedger::new());
+    // The directory's durable half, standing in for the same real deployment's
+    // `dir` key exactly as `ledger` stands in for its spend keys: one store,
+    // two boots. Before M16.1 the rig had no way to be handed one, which is
+    // precisely what this test was ignored for.
+    let documents: Arc<dyn DocumentStore> = Arc::new(MemoryDocumentStore::new());
 
     // Boot 1: a real tenant spends real money and is then closed down.
-    let rig1 = rig(Arc::clone(&ledger)).await;
+    let rig1 = rig_sharing(Arc::clone(&ledger), Arc::clone(&documents)).await;
     let secret = budgeted_member(&rig1.app, "shutco", "walt").await;
     turn(&rig1.app, &secret, "shutco/walt/main").await;
     let before = read(&rig1.app, "/v1/admin/projects/shutco/budget").await;
@@ -1274,18 +1313,60 @@ async fn recreating_an_archived_project_after_a_restart_inherits_its_spend() {
     );
     admin(&rig1.app, "DELETE", "/v1/admin/projects/shutco", None).await;
 
-    // Boot 2: a fresh `ControlDirectory` over a fresh `MemoryDirectoryStore` --
-    // what `main.rs` builds on every boot regardless of `ROUNDHOUSE_REDIS_URL`
-    // -- but the same `ledger`, standing in for the durable backend that a real
-    // restart would not have wiped.
-    let rig2 = rig(Arc::clone(&ledger)).await;
+    // Boot 2: a fresh `ControlDirectory`, freshly compiled from the file, over
+    // the *same* document store -- what `main.rs` builds on every boot of a
+    // deployment that names a Redis, since M16.1 made the directory the fifth
+    // family that URL chooses. The ledger is shared for the same reason it
+    // always was: a restart does not wipe a durable backend.
+    let rig2 = rig_sharing(Arc::clone(&ledger), Arc::clone(&documents)).await;
 
     // A different tenant, through the ordinary admin API, happens to choose the
-    // same project id. Nothing refuses it: the tombstone that would have was
-    // only ever in the store this boot never inherited.
-    budgeted_member(&rig2.app, "shutco", "walt").await;
+    // same project id -- and is refused, because the tombstone is in the store
+    // this boot inherited. That refusal is the fix: the id stays retired, so
+    // no new tenant is ever joined to the old one's ledger rows, and the two
+    // assertions below are about what an operator who works *around* the
+    // refusal by re-reading the closed project still sees.
+    let (status, code) = refused(
+        &rig2.app,
+        "POST",
+        "/v1/admin/projects",
+        Some(json!({ "id": "shutco" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        code, "identity_collision",
+        "the archived row survived the restart, so its id is still taken -- this is the \
+         assertion the whole finding turns on, and the one line of it that is new: before \
+         the durable directory this create succeeded, and everything below described what \
+         the new tenant then inherited"
+    );
 
-    let after = read(&rig2.app, "/v1/admin/projects/shutco/budget").await;
+    // The user survived too, not just the project: the whole document did, so
+    // the new tenant below needs a fresh id on both axes. Asserted rather than
+    // worked around silently, because "which rows come back" is exactly what a
+    // durable directory is being trusted for.
+    let (status, code) = refused(
+        &rig2.app,
+        "POST",
+        "/v1/admin/users",
+        Some(json!({ "id": "walt" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(code, "identity_collision");
+
+    // So the new tenant takes ids of its own, which is the only route the
+    // fixed deployment leaves it -- and the two assertions this test has
+    // carried since M8 are what it is checked against. They no longer
+    // discriminate the defect (the refusal above does that now) and they are
+    // kept rather than deleted because they are the *end state* the finding
+    // was about: a tenant created moments ago owes nothing, and the document
+    // it is read out of says nothing that would let an operator tell
+    // otherwise.
+    budgeted_member(&rig2.app, "newco", "wilma").await;
+
+    let after = read(&rig2.app, "/v1/admin/projects/newco/budget").await;
     assert_eq!(
         keys_of(&after),
         keys_of(&before),
@@ -2738,7 +2819,12 @@ async fn a_members_own_fair_use_windows_are_readable_on_the_key_view() {
         }),
         "admin-api member fair-use fixture",
     );
-    let rig = rig_over(file, Arc::new(MemorySpendLedger::new())).await;
+    let rig = rig_over(
+        file,
+        Arc::new(MemorySpendLedger::new()),
+        Arc::new(MemoryDocumentStore::new()),
+    )
+    .await;
 
     let keys = read(&rig.app, "/v1/admin/keys").await;
     let declared = keys["data"]

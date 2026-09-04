@@ -70,31 +70,69 @@
 //! it moved. That bound is written in the same file the keys are, because it is
 //! the operator's choice of how long a leaked key survives its own revocation.
 //!
-//! # What is deferred, and what would unblock it
+//! # Where the records live (2026-09-04, M16.1)
 //!
-//! [`MemoryDirectoryStore`] is the only backing store in this milestone, which
-//! means admin-created tenancy dies with the process and a two-node deployment
-//! has two directories that never converge. That is honest for M8, whose admin
-//! plane is a single-node surface, and it is exactly the shape of the M2 choice
-//! between [`MemoryStore`](roundhouse_core::store::MemoryStore) and Redis.
+//! **The store is durable, and the deferral this section used to describe is
+//! discharged.** For eight milestones the only backing store was a `Mutex`
+//! over the records, so admin-created tenancy died with the process and a
+//! two-node deployment had two directories that never converged — honest for
+//! M8, whose admin plane was a single-node surface, and exactly the shape of
+//! the M2 choice between [`MemoryStore`](roundhouse_core::store::MemoryStore)
+//! and Redis. D2 ruled the placement and M16.0 landed the seam; M16.1 landed
+//! the store behind it.
 //!
-//! **The unlock condition, so the next person does not have to re-derive it:**
-//! a durable store is wanted the moment admin-created tenancy has to outlive a
-//! restart or be seen by a second node. D2 ruled the placement: the
-//! implementation lands in this crate over the Redis handle `main.rs` already
-//! opens, and the records stay next to the resolver — so
-//! `core/src/control/mod.rs`'s standing note that a key record "will arrive
-//! next to the resolver, not here" stands rather than needing an amendment.
+//! What the shape turned out to be, since it is not quite what the old
+//! "unlock condition" note predicted:
 //!
-//! # What M16.0 landed, and what M16.1 still owes (2026-09-03)
+//! - **the durable half is an *opaque document*, in `roundhouse-core`**
+//!   (R-D5). [`DocumentStore`](roundhouse_core::control::DocumentStore) holds
+//!   one versioned `Vec<u8>` with a compare-and-set, and knows nothing about a
+//!   project or a key. The note here used to say the implementation would land
+//!   "in this crate over the Redis handle `main.rs` already opens"; putting a
+//!   *typed* store in this crate would have meant either spelling the Redis
+//!   key format a second time here or dragging this crate's config vocabulary
+//!   into the storage crate, and an opaque document avoids both. The records
+//!   really do stay next to the resolver, which is what
+//!   `core/src/control/mod.rs`'s standing note asked for.
+//! - **the serde is at this crate's boundary** (R-D7). [`document`] is the one
+//!   place [`DirectoryRecords`] becomes bytes, in a `schema`/`records`/
+//!   `compiled_under` envelope; [`DocumentDirectoryStore`] is the only
+//!   [`DirectoryStore`] this deployment ships, and every fixture builds one
+//!   over an in-memory document store, so the round trip is on the path of
+//!   every directory test rather than beside them.
+//! - **the Redis family is `dir`** (R-D6): one hash key per namespace, holding
+//!   the version and the document, written by one Lua compare-and-set — built
+//!   through `roundhouse-store-redis`'s own key builder like every other
+//!   family, which is the half of the old note that survived intact.
+//!
+//! # Divergence, and why it is never a refusal (2026-09-04, M16.1, R-D9)
+//!
+//! A shared directory makes a question possible that a per-process one could
+//! not ask: *the node that wrote this document — was it compiled from the same
+//! inputs I am?* During a rolling config change the answer is no, for as long
+//! as the rollout takes, and that is ordinary rather than broken.
+//!
+//! So every commit stamps a [`CompiledUnder`] — the control-plane file's bytes
+//! by SHA-256, the catalog's identities, the routing candidates the
+//! cross-checks were built from, and the TTL — and a reader whose own
+//! fingerprint differs names the difference [once per stored
+//! version](Managed::note_divergence) and goes on serving the plane its own
+//! inputs compile. Refusing was considered and rejected: a node that stopped
+//! authenticating because a neighbour was one config ahead would turn every
+//! rollout into an outage, at exactly the moment an operator is changing
+//! something. What a node *can* honestly do is compile from the inputs it
+//! holds and say so, which is what [`ControlDirectory::status`] reports —
+//! beside the version it serves and, when its own cross-checks refuse what it
+//! loaded, the version it will not.
+//!
+//! # What M16.0 landed (2026-09-03)
 //!
 //! The constraint this doc used to state as a warning has been discharged.
 //! [`DirectoryStore`] *was* a synchronous trait called under `current`'s write
-//! lock alongside a full `compile()` — fine while `load()` was
-//! [`MemoryDirectoryStore`]'s in-memory clone, a real stall once it is a
-//! network round trip — and the warning was that a durable store needs two
-//! changes together, not one. Both landed here, in this rung, before any
-//! durable store exists to blame them on:
+//! lock alongside a full `compile()` — fine while `load()` was an in-memory
+//! clone, a real stall once it is a network round trip — and the warning was
+//! that a durable store needs two changes together, not one. Both landed in
+//! that rung, before any durable store existed to blame them on:
 //!
 //! - **the trait is async** (R-D1). `load`, `commit` and `version` are
 //!   `async fn` behind `#[async_trait]`, `PlaneSource::plane` is async with
@@ -108,26 +146,6 @@
 //!   the single-flight token, publication conditional on the loaded version
 //!   being newer, and one uniform TTL of backoff behind every kind of refresh
 //!   failure.
-//!
-//! **What M16.1 owes.** The seam is ready and the store behind it is still
-//! [`MemoryDirectoryStore`], so nothing about durability has changed yet:
-//! admin-created tenancy still dies with the process, and
-//! `recreating_an_archived_project_after_a_restart_inherits_its_spend` in
-//! `tests/admin_api.rs` is still ignored with its reason still true. Three
-//! things are left, and they are the whole of it:
-//!
-//! - **the Redis store itself**, over `roundhouse-store-redis`'s one key
-//!   builder rather than a key format spelled a second time in this crate —
-//!   which means `build_key` and `KeyFamily` become reachable from here, or the
-//!   implementation moves to where they already are;
-//! - **`Serialize` on the records**, which today they have only half of: the
-//!   config entries they wrap derive `Deserialize` because a file is read and
-//!   never written. Mechanical, and small;
-//! - **the boot re-order.** `main.rs` builds this directory before it opens any
-//!   backend, and the directory's construction *is* the boot check — so the
-//!   `Some` arm that picks between stores has to come after the backend
-//!   handle exists, and `control_plane_file_configured` (the flag the
-//!   memory-store warning branches on) has to move with it.
 //!
 //! [`AuthError::RevokedKey`]: super::AuthError::RevokedKey
 
@@ -145,16 +163,21 @@ use super::config::{
 use super::crosscheck::CrossChecks;
 use super::{ControlPlane, KeyKind, KeyRefusal, MintedKey, mint_key};
 
+pub mod document;
 pub mod mutation;
 pub mod records;
 pub mod store;
 
+pub use document::{
+    CompiledUnder, DIRECTORY_DOCUMENT_SCHEMA, DirectoryDivergence, DivergentInput,
+    DocumentDirectoryStore,
+};
 pub use mutation::{DirectoryError, DirectoryMutation, KeyFingerprint, ProjectPatch};
 pub use records::{
     ApiKeyRecord, DirectoryRecords, DirectoryView, EntityKind, KeyRecordScope, MembershipRecord,
     MembershipRole, ProjectRecord, Provenance, UserRecord, key_id,
 };
-pub use store::{DirectoryStore, MemoryDirectoryStore, StoreFailure, VersionedRecords};
+pub use store::{DirectoryStore, StoreFailure, VersionedRecords};
 
 // ---------------------------------------------------------------------------
 // Where a surface gets its plane
@@ -291,6 +314,51 @@ pub struct DirectoryRegression {
     pub to: u64,
 }
 
+/// What this node is serving, what it has refused, and what it has named as
+/// divergent (M16.1, R-D9).
+///
+/// **One accessor rather than three**, because the three are only meaningful
+/// together: "serving version 4" is reassuring on its own and alarming beside
+/// "refused version 5", and a divergence naming version 5 explains why. A
+/// caller that took them from three separate reads could also take them from
+/// three separate instants, which is the same two-facts-that-disagree shape
+/// [`ControlDirectory::snapshot`] exists to prevent one level down.
+///
+/// Read-only observability: nothing branches on this, and a node with a
+/// divergence serves exactly what a node without one serves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryStatus {
+    /// The version this node last compiled and is serving.
+    pub served_version: u64,
+    /// The newest version this node loaded but could not compile, if any. See
+    /// [`Compiled::refused_version`].
+    pub refused_version: Option<u64>,
+    /// The last divergence this node named, if any.
+    pub divergence: Option<DirectoryDivergence>,
+    /// How many divergences this node has named — one per *stored version*,
+    /// which is what makes "warned once" observable without a log harness.
+    pub divergences_named: u64,
+}
+
+/// The divergence bookkeeping: one warning per stored version, and the last
+/// one named.
+///
+/// **Keyed on the version rather than on the fingerprint**, because the
+/// question a reader has is "have I already told the operator about *this*
+/// document", and two different documents never share a version while one
+/// document can be loaded many times. A refresh that loads a version it cannot
+/// compile is exactly that case: it does not publish, so the next refresh past
+/// the TTL sees the store still ahead of the version it serves and loads the
+/// same document again, once per TTL, forever. Without this guard that node
+/// warns forever too.
+#[derive(Debug, Default)]
+struct DivergenceState {
+    /// The stored version the last warning was about.
+    warned_version: Option<u64>,
+    last: Option<DirectoryDivergence>,
+    named: u64,
+}
+
 /// One node's compiled answer, and what it was compiled from.
 struct Compiled {
     version: u64,
@@ -314,6 +382,23 @@ struct Compiled {
     /// The last time this node saw the store's version go *down*, if it ever
     /// has. Observability only — the regression is adopted either way.
     last_regression: Option<DirectoryRegression>,
+    /// The newest version this node loaded and could **not** compile, if there
+    /// is one (M16.1, R-D9).
+    ///
+    /// Beside the served version rather than instead of it, which is the whole
+    /// point: a refresh that loads a plane this node's cross-checks refuse
+    /// keeps serving the last good one, and without this field the only
+    /// evidence of that was a warning in a log that rotates. An operator who
+    /// asks "is this node current" needs both numbers — what it serves, and
+    /// what it has seen and cannot serve — because a node one version behind
+    /// because nothing has changed and a node one version behind because it
+    /// refuses what changed are opposite situations that look identical from
+    /// `version` alone.
+    ///
+    /// Cleared the moment a later version does compile: a refusal that has
+    /// been overtaken is history, and leaving it standing would report a node
+    /// as stuck long after it caught up.
+    refused_version: Option<u64>,
 }
 
 /// The file, the API's records, and the compiled plane the two produce.
@@ -377,6 +462,15 @@ struct Managed {
     store: Arc<dyn DirectoryStore>,
     checks: CrossChecks,
     ttl_ms: u64,
+    /// What *this* node compiles against, read once off the store handle at
+    /// construction (R-D9). Fixed for the life of the process, because the
+    /// file is read once at boot and the catalog and the fleet are what this
+    /// process was built with — a node whose inputs change gets a new process.
+    compiled_under: CompiledUnder,
+    /// Whose stored version this node has already complained about. A `std`
+    /// lock like [`Self::current`], and never held across an await for the
+    /// same reason.
+    divergence: RwLock<DivergenceState>,
     /// A `std` lock, and deliberately still one after M16.0 made the refresh
     /// async: nothing here is ever held across an await, which is a property
     /// the compiler checks rather than one a reader has to trust. A `std`
@@ -400,9 +494,12 @@ struct Managed {
 impl ControlDirectory {
     /// Compile the file and whatever the store already holds.
     ///
-    /// Fails if the two together do not compile — which, on a fresh
-    /// [`MemoryDirectoryStore`], can only mean the file itself does not, and
-    /// that has already stopped the boot by the time this is called.
+    /// Fails if the two together do not compile — which, on an empty store,
+    /// can only mean the file itself does not, and that has already stopped
+    /// the boot by the time this is called. On a store that already holds a
+    /// document, this call *is* the boot check: a directory the store cannot
+    /// read stops the process here rather than serving a plane compiled from
+    /// the file alone (R-D8).
     pub async fn new(
         file: ControlPlaneConfig,
         path: impl Into<String>,
@@ -573,6 +670,33 @@ impl ControlDirectory {
         }
     }
 
+    /// What this node serves, what it has refused, and what it has named as
+    /// divergent (M16.1, R-D9).
+    ///
+    /// **This is R-D9's `divergence()` accessor**, named for everything it
+    /// answers rather than for one of them: the ruling asks that the refused
+    /// version be exposed "beside the served version" *and* that the typed
+    /// divergence be readable, and three accessors over three lock
+    /// acquisitions would let a caller assemble those from three instants —
+    /// see [`DirectoryStatus`].
+    ///
+    /// Never refreshes, for the same reason [`Self::last_regression`] does
+    /// not: it reports what this node has already observed, and a read of past
+    /// events that went to the store could observe a new one on the way.
+    pub fn status(&self) -> DirectoryStatus {
+        match &self.backing {
+            // A fixed directory has no store, so nothing behind it can have
+            // moved, been refused, or been written by another node.
+            Backing::Fixed(_) => DirectoryStatus {
+                served_version: 0,
+                refused_version: None,
+                divergence: None,
+                divergences_named: 0,
+            },
+            Backing::Managed(managed) => managed.status(),
+        }
+    }
+
     /// The writable half, or the refusal that says there is none.
     ///
     /// **Defence in depth rather than a path.** The admin router refuses
@@ -601,24 +725,99 @@ impl Managed {
         let ttl_ms = file
             .admission_cache_ttl_ms
             .unwrap_or(DEFAULT_ADMISSION_CACHE_TTL_MS);
+        let compiled_under = store.compiled_under();
         let loaded = store.load().await?;
         let plane = compile(&file, &path, &checks, &loaded.records)?;
-        Ok(Self {
+        let managed = Self {
             file,
             path,
             config,
             store,
             checks,
             ttl_ms,
+            compiled_under,
+            divergence: RwLock::new(DivergenceState::default()),
             current: RwLock::new(Compiled {
                 version: loaded.version,
                 records: Arc::new(loaded.records),
                 plane,
                 refreshed_at_ms: now_ms,
                 last_regression: None,
+                refused_version: None,
             }),
             write: tokio::sync::Mutex::new(()),
-        })
+        };
+        // After the compile rather than before it, so a boot that is going to
+        // fail fails on the reason it will not start rather than on a warning
+        // about why it might be about to. A boot that *does* start and is
+        // divergent has said so before it serves its first request.
+        managed.note_divergence(loaded.version, &loaded.compiled_under);
+        Ok(managed)
+    }
+
+    /// Name a stored version whose writer's inputs are not this node's — once
+    /// (R-D9).
+    ///
+    /// **Never refuses, and that is the ruling rather than a softness here.**
+    /// The node compiles the plane from the inputs it holds, which are the
+    /// only inputs it can honestly compile against; refusing would convert
+    /// every rolling config change into a fleet-wide outage for the length of
+    /// the rollout, and would do it at exactly the moment an operator is
+    /// changing something.
+    ///
+    /// Version zero is skipped, and not as an optimisation: version zero is
+    /// the empty store, whose "fingerprint" is the default one nobody wrote.
+    /// Comparing a stamped node against it would report divergence on every
+    /// axis of every fresh deployment, on the first boot, before any document
+    /// exists to have been compiled under anything.
+    fn note_divergence(&self, version: u64, stored: &CompiledUnder) {
+        if version == 0 {
+            return;
+        }
+        let differs = self.compiled_under.differs_from(stored);
+        if differs.is_empty() {
+            return;
+        }
+        let divergence = DirectoryDivergence { version, differs };
+        {
+            let mut state = self
+                .divergence
+                .write()
+                .unwrap_or_else(|error| error.into_inner());
+            if state.warned_version == Some(version) {
+                return;
+            }
+            state.warned_version = Some(version);
+            state.named = state.named.saturating_add(1);
+            state.last = Some(divergence.clone());
+        }
+        tracing::warn!(
+            version = divergence.version,
+            differs = divergence
+                .differs
+                .iter()
+                .map(|input| input.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+            "the control directory at this version was written by a node compiled against \
+             different inputs; this node keeps serving the plane its own inputs compile, so \
+             the two nodes may admit different callers until the fleet agrees"
+        );
+    }
+
+    /// See [`ControlDirectory::status`].
+    fn status(&self) -> DirectoryStatus {
+        let current = self.read_current();
+        let state = self
+            .divergence
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        DirectoryStatus {
+            served_version: current.version,
+            refused_version: current.refused_version,
+            divergence: state.last.clone(),
+            divergences_named: state.named,
+        }
     }
 
     /// The compiled plane and the records it was compiled from, refreshed if it
@@ -807,6 +1006,12 @@ impl Managed {
                 return taken(&self.read_current());
             }
         };
+        // Before the compile, and deliberately: divergence is a fact about the
+        // *inputs* the document was written under, which is exactly as true of
+        // a document this node cannot compile as of one it can — and is very
+        // often the reason. A check that ran only on the success path would go
+        // quiet in the one case an operator most needs it (R-D9).
+        self.note_divergence(loaded.version, &loaded.compiled_under);
         let plane = match self.compile(&loaded.records) {
             Ok(plane) => plane,
             Err(error) => {
@@ -816,7 +1021,18 @@ impl Managed {
                     "the control directory changed but the new state does not compile on this \
                      node; serving the last compiled control plane"
                 );
-                return taken(&self.read_current());
+                // Recorded beside the served version rather than only logged:
+                // this node is now permanently behind until either the store
+                // moves again or this node's own inputs change, and that is a
+                // state an operator has to be able to read off the node. Under
+                // the same guard rule as a publish -- only if nobody has
+                // published past this claim -- so two refreshes that both
+                // refused do not overwrite each other with the same number.
+                let mut current = self.write_current();
+                if current.version == claimed_version {
+                    current.refused_version = Some(loaded.version);
+                }
+                return taken(&current);
             }
         };
         // Window three. Nothing below awaits, so the claim is honoured however
@@ -837,6 +1053,12 @@ impl Managed {
             current.version = loaded.version;
             current.records = Arc::new(loaded.records);
             current.plane = plane;
+            // A refusal that has been overtaken by a version that compiles is
+            // history: leaving it standing would report a node as stuck long
+            // after it caught up. Cleared on the publish and nowhere else, so
+            // the field means exactly "there is a version I have seen and
+            // cannot serve".
+            current.refused_version = None;
             if regression.is_some() {
                 current.last_regression = regression;
             }
@@ -1053,6 +1275,9 @@ impl Managed {
                     plane,
                     refreshed_at_ms: now_ms,
                     last_regression,
+                    // This node just compiled and published what it wrote, so
+                    // whatever it could not compile before is behind it.
+                    refused_version: None,
                 };
             }
         }

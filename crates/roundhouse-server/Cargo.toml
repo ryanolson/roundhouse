@@ -94,6 +94,14 @@ dynamo-mocker = { workspace = true }
 # `test-support` adds the canonical Redis test fixtures (env var + connect)
 # shared with the store's own integration tests. See tests/redis_store.rs.
 roundhouse-store-redis = { workspace = true, features = ["test-support"] }
+# A raw client, dev-only, for the one thing no roundhouse store handle can do:
+# write a key this deployment did not write. `directory_backend_boot.rs` puts a
+# value of the wrong type at the directory's own key to prove the boot refuses
+# it rather than clobbering it (M16.1, R-D8), and a store that offered a way to
+# do that would be a store that could do it by accident. The workspace pin is
+# taken as-is -- `redis` is a watched synergy dependency and this adds a
+# consumer, never a version.
+redis = { workspace = true }
 
 # The SSE tests drive the router as a `tower::Service` and read response bodies
 # frame by frame, which is the only way to assert on a stream that has not ended

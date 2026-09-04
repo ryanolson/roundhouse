@@ -41,7 +41,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use roundhouse_core::control::credential::access::ProviderKeys;
 use roundhouse_core::control::{
@@ -66,7 +67,7 @@ use super::validate::ValidateConfig;
 /// to a typo is unrestricted routing, and a dropped `budget` is unlimited
 /// spend. None of those is visible from any read surface afterwards, so the
 /// only place the mistake can be caught is the load that made it.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectEntry {
     pub id: String,
@@ -142,7 +143,7 @@ pub struct ProjectEntry {
 /// misspelt `capible` would resolve to an empty tier — which is not an error,
 /// because an empty tier is a legitimate one-sided recipe, and would therefore
 /// route every turn to the other tier forever with nothing anywhere saying why.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TiersConfig {
     /// Ordered [`Target::policy_identity`](roundhouse_core::routing::Target::policy_identity)
@@ -186,7 +187,7 @@ impl TiersConfig {
 /// beside `id` — a display name, a team, an email — is a field this shape does
 /// not have, and accepting them silently would let a whole vocabulary
 /// accumulate in a file that reads none of it.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserEntry {
     pub id: String,
@@ -199,7 +200,7 @@ pub struct UserEntry {
 /// its project's whole policy — the widest reading of the entry, produced by
 /// the one kind of mistake nothing downstream can distinguish from an operator
 /// who meant it.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KeyEntry {
     pub project: String,
@@ -251,7 +252,7 @@ pub struct KeyEntry {
 /// decided by which `to_*` conversion below is called, not by two parallel
 /// structs that would drift apart the first time a field is added to one and
 /// not the other.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PolicyConfig {
     pub min_quality: Option<f64>,
@@ -852,13 +853,41 @@ impl ControlPlaneConfig {
     }
 
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ControlPlaneError> {
+        Self::load_fingerprinted(path).map(|(config, _)| config)
+    }
+
+    /// The same load, also answering the SHA-256 of the bytes it read, hex
+    /// (M16.1, R-D9).
+    ///
+    /// **The bytes and not the parsed config**, which is the whole reason this
+    /// is one function rather than a hash taken later: two files that parse to
+    /// the same configuration are the same deployment intent, and what a node
+    /// comparing fingerprints wants to know is whether the stored directory
+    /// was written by a node holding *this document*. A hash of a re-read of
+    /// the path would answer about a file that may have been edited since, and
+    /// a hash of a canonical re-serialization would need this type to derive
+    /// `Serialize` for storage's benefit — which would then be a second
+    /// vocabulary the file's `deny_unknown_fields` no longer guards.
+    ///
+    /// One read, hashed on the way through, so the digest and the config can
+    /// never describe two different files.
+    pub fn load_fingerprinted(path: impl AsRef<Path>) -> Result<(Self, String), ControlPlaneError> {
         let path = path.as_ref();
         let display = path.display().to_string();
-        let json = std::fs::read_to_string(path).map_err(|source| ControlPlaneError::Read {
+        let bytes = std::fs::read(path).map_err(|source| ControlPlaneError::Read {
             path: display.clone(),
             source,
         })?;
-        Self::from_json(&json, &display)
+        let sha256 = hex::encode(Sha256::digest(&bytes));
+        // Answered as a read failure rather than a parse failure: a file this
+        // process cannot decode as text never reached `serde_json` at all, and
+        // reporting it as malformed JSON would send an operator hunting for a
+        // syntax error in a file whose problem is its encoding.
+        let json = String::from_utf8(bytes).map_err(|error| ControlPlaneError::Read {
+            path: display.clone(),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+        })?;
+        Ok((Self::from_json(&json, &display)?, sha256))
     }
 
     /// Refuse a config that cannot resolve a presented key to exactly one

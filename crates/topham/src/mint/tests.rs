@@ -18,12 +18,12 @@
 
 use std::sync::Arc;
 
-use roundhouse_core::control::{MemorySpendLedger, SpendLedger};
+use roundhouse_core::control::{MemoryDocumentStore, MemorySpendLedger, SpendLedger};
 use roundhouse_core::metrics::{MetricsConfig, MetricsRecorder, ShadowPricing};
 use roundhouse_core::now_ms;
 use roundhouse_core::routing::{Candidate, Target};
 use roundhouse_server::{
-    ControlDirectory, ControlPlaneConfig, CrossChecks, MemoryDirectoryStore, admin_api,
+    ControlDirectory, ControlPlaneConfig, CrossChecks, DocumentDirectoryStore, admin_api,
     has_valid_key_shape,
 };
 use serde_json::json;
@@ -70,7 +70,9 @@ async fn deployment() -> axum::Router {
         ControlDirectory::new(
             file,
             "ROUNDHOUSE_CONTROL_PLANE",
-            Arc::new(MemoryDirectoryStore::new()),
+            Arc::new(DocumentDirectoryStore::over(Arc::new(
+                MemoryDocumentStore::new(),
+            ))),
             CrossChecks::new(reachable(), None),
             now_ms(),
         )

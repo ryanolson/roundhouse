@@ -9,10 +9,32 @@
 //! file's vocabulary" true of the storage and not only of the compile step.
 //! Who may change them is [`super`]'s question; what they compile to is
 //! [`ControlDirectory::plane`](super::ControlDirectory::plane)'s.
+//!
+//! # R-D7 — these rows are what gets written down
+//!
+//! Every type here is `Serialize` as well as `Deserialize` since M16.1, and
+//! the asymmetry that preceded it is worth naming rather than quietly fixing:
+//! the wrapped config entries were read-only because a *file* is read and
+//! never written, and these rows had no serde at all because they lived in a
+//! `Mutex` that outlived nothing. Both stop being true the moment the
+//! directory is a durable document — the rows are the deployment's tenancy,
+//! and the entries they wrap go into the document with them.
+//!
+//! **Every optional field carries `#[serde(default)]`, and that is the
+//! forward-compatibility rule rather than tidiness.** A node runs whatever
+//! build it was deployed with, and two builds share one document during any
+//! rolling upgrade: a newer build reading an older document must not fail
+//! because a field it learned about last week is absent, or the older half of
+//! the fleet's writes become unreadable to the newer half. What the *reverse*
+//! direction costs — an older build meeting a field it has never heard of — is
+//! decided at the envelope, not here: see
+//! [`document`](super::document) on the `schema` number and on why these rows
+//! keep the file vocabulary's `deny_unknown_fields` instead of tolerating
+//! their way past a vocabulary change nobody declared.
 
 use std::fmt;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::super::budget::AllocationConfig;
 use super::super::config::{PolicyConfig, ProjectEntry, UserEntry};
@@ -24,7 +46,8 @@ use super::super::fair_use::FairUseConfig;
 /// boolean named `from_file` would carry the same information and none of the
 /// meaning: what this decides is *who may edit this*, and that reads as a
 /// question about ownership rather than about origin.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Provenance {
     /// Declared in `ROUNDHOUSE_CONTROL_PLANE`. Read-only to this API.
     Config,
@@ -82,7 +105,7 @@ impl fmt::Display for EntityKind {
 /// already config vocabulary: a project's policy and a member's allocation are
 /// shapes the file declares and the body reuses, and this is the exception the
 /// file has no spelling for at all.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MembershipRole {
     Owner,
@@ -104,7 +127,7 @@ impl fmt::Display for MembershipRole {
 /// "admin-created entities are expressed in the file's vocabulary" true of the
 /// storage and not only of the compile step: there is no second spelling of a
 /// project's policy for the two halves to disagree in.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectRecord {
     /// Exactly what the file's `"projects"` array would carry for this project.
     pub entry: ProjectEntry,
@@ -114,6 +137,7 @@ pub struct ProjectRecord {
     /// `None` rather than the epoch or the boot time: the file does not date its
     /// entries, and a timestamp invented here would be indistinguishable from
     /// one an operator could rely on.
+    #[serde(default)]
     pub created_at_ms: Option<u64>,
     /// When this project was archived, if it was.
     ///
@@ -128,6 +152,7 @@ pub struct ProjectRecord {
     /// taken. That is deliberate rather than unfinished: un-archiving has to
     /// decide what happens to the keys that were refused while the project was
     /// closed, and that question has no obviously right answer to guess at here.
+    #[serde(default)]
     pub archived_at_ms: Option<u64>,
 }
 
@@ -142,10 +167,11 @@ impl ProjectRecord {
 }
 
 /// One user, as the directory knows it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserRecord {
     pub entry: UserEntry,
     pub provenance: Provenance,
+    #[serde(default)]
     pub created_at_ms: Option<u64>,
 }
 
@@ -165,7 +191,7 @@ impl UserRecord {
 /// at all. Here the entitlements live on the membership and every one of its
 /// keys is compiled *from* it, so two keys of one membership cannot disagree —
 /// not by convention, but because there is only one place the answer is stored.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MembershipRecord {
     pub project: String,
     pub user: String,
@@ -176,6 +202,7 @@ pub struct MembershipRecord {
     /// rather than defaulted to [`MembershipRole::Member`], which would be a
     /// fact this deployment invented and then displayed as if an operator had
     /// written it.
+    #[serde(default)]
     pub role: Option<MembershipRole>,
     /// This membership's ceiling inside its project's budget, stamped onto
     /// every key compiled from it. `None` is [`Allocation::Pooled`] — no
@@ -186,14 +213,17 @@ pub struct MembershipRecord {
     /// among rows the file is entitled to disagree about.
     ///
     /// [`Allocation::Pooled`]: roundhouse_core::control::Allocation::Pooled
+    #[serde(default)]
     pub allocation: Option<AllocationConfig>,
     /// A narrowing overlay on the project's policy, stamped onto every key
     /// compiled from this membership. `None` touches nothing.
     ///
     /// Always `None` on a file-declared membership, for the reason
     /// [`Self::allocation`] is.
+    #[serde(default)]
     pub overrides: Option<PolicyConfig>,
     pub provenance: Provenance,
+    #[serde(default)]
     pub created_at_ms: Option<u64>,
 }
 
@@ -210,7 +240,8 @@ impl MembershipRecord {
 /// one carries a resolved [`Admission`](super::Admission), which is a fact
 /// about a *compiled plane* and would put a policy snapshot inside a stored
 /// row — where it would go stale the first time its membership was edited.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum KeyRecordScope {
     /// Pays for turns as one membership.
     Turn { project: String, user: String },
@@ -224,7 +255,7 @@ pub enum KeyRecordScope {
 /// "returned once and never again" a property of this type rather than of a
 /// handler that remembers. See [`MintedKey`], which is the only thing that ever
 /// holds a secret and which is dropped with the response that carried it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiKeyRecord {
     /// The public handle a revocation names: `key_` and the first sixteen
     /// characters of the hash. See [`key_id`].
@@ -240,11 +271,14 @@ pub struct ApiKeyRecord {
     /// characters of the *hash* instead would be a string that looks exactly
     /// like the one an operator is trying to match against their secret manager
     /// and never matches it.
+    #[serde(default)]
     pub display_tail: Option<String>,
     pub scope: KeyRecordScope,
     pub provenance: Provenance,
+    #[serde(default)]
     pub created_at_ms: Option<u64>,
     /// When this key was revoked, if it was. See the module doc on tombstones.
+    #[serde(default)]
     pub revoked_at_ms: Option<u64>,
     /// This member's own fair-use windows, as the file declared them.
     ///
@@ -253,6 +287,7 @@ pub struct ApiKeyRecord {
     /// comes from. Always `None` for an API-minted key and for an admin key:
     /// there is no route that writes a member window, and a value here that the
     /// admin plane invented would be a ceiling nobody wrote (G14).
+    #[serde(default)]
     pub fair_use: Option<FairUseConfig>,
 }
 
@@ -287,11 +322,19 @@ pub fn key_id(key_sha256: &str) -> String {
 /// deployment's projects and members, not its sessions), creation order is what
 /// a list route wants to show, and a map would need a second structure for the
 /// order anyway. Lookups are linear and deliberately so.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DirectoryRecords {
+    /// `#[serde(default)]` on all four, so a document written before a
+    /// collection existed still loads as "none of those" rather than failing
+    /// the whole directory. Four empty vectors is exactly the empty
+    /// directory, which is the value a first boot compiles from anyway.
+    #[serde(default)]
     pub projects: Vec<ProjectRecord>,
+    #[serde(default)]
     pub users: Vec<UserRecord>,
+    #[serde(default)]
     pub memberships: Vec<MembershipRecord>,
+    #[serde(default)]
     pub keys: Vec<ApiKeyRecord>,
 }
 

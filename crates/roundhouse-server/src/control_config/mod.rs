@@ -118,10 +118,11 @@ pub use config::{
 pub use credentials::{CredentialsConfig, ProviderCredentialConfig};
 pub use crosscheck::{CrossCheckRefusal, CrossChecks};
 pub use directory::{
-    ApiKeyRecord, ControlDirectory, DirectoryError, DirectoryMutation, DirectoryRecords,
-    DirectoryStore, DirectoryView, EntityKind, KeyFingerprint, KeyRecordScope, MembershipRecord,
-    MembershipRole, MemoryDirectoryStore, PlaneSource, ProjectPatch, ProjectRecord, Provenance,
-    StoreFailure, UserRecord,
+    ApiKeyRecord, CompiledUnder, ControlDirectory, DIRECTORY_DOCUMENT_SCHEMA, DirectoryDivergence,
+    DirectoryError, DirectoryMutation, DirectoryRecords, DirectoryStatus, DirectoryStore,
+    DirectoryView, DivergentInput, DocumentDirectoryStore, EntityKind, KeyFingerprint,
+    KeyRecordScope, MembershipRecord, MembershipRole, PlaneSource, ProjectPatch, ProjectRecord,
+    Provenance, StoreFailure, UserRecord,
 };
 pub use fair_use::{FairUseConfig, FairUseWindowConfig};
 pub use validate::{ArmSharesConfig, ValidateConfig};
@@ -148,14 +149,99 @@ pub const CONTROL_PLANE_VAR: &str = "ROUNDHOUSE_CONTROL_PLANE";
 /// The path travels with the config because every refusal names it: a `PATCH`
 /// refused because it collides with a file-declared project has to say which
 /// file, and by then the variable has long been read.
-pub fn config_from_env() -> Result<Option<(ControlPlaneConfig, String)>, ControlPlaneError> {
+pub fn config_from_env() -> Result<Option<ControlPlaneFile>, ControlPlaneError> {
     match std::env::var(CONTROL_PLANE_VAR) {
         Ok(path) if !path.trim().is_empty() => {
             let path = path.trim().to_string();
-            let config = ControlPlaneConfig::load(&path)?;
-            Ok(Some((config, path)))
+            let (config, sha256) = ControlPlaneConfig::load_fingerprinted(&path)?;
+            Ok(Some(ControlPlaneFile {
+                config,
+                path,
+                sha256,
+            }))
         }
         _ => Ok(None),
+    }
+}
+
+/// What `ROUNDHOUSE_CONTROL_PLANE` named, as one value.
+///
+/// A struct rather than the `(config, path)` tuple this used to be, because
+/// M16.1 (R-D9) added a third thing every caller of the pair also needs — the
+/// digest of the bytes the config was parsed from — and a three-tuple of two
+/// `String`s is a shape whose fields can be swapped at a call site without the
+/// compiler noticing.
+pub struct ControlPlaneFile {
+    pub config: ControlPlaneConfig,
+    /// The path as the operator wrote it, which is what every refusal names.
+    pub path: String,
+    /// SHA-256 of the file's bytes, hex — the `file` axis of a stored
+    /// directory document's [`CompiledUnder`] fingerprint.
+    pub sha256: String,
+}
+
+/// Compose the admin directory from what `shared_backend::open` handed back
+/// and what [`config_from_env`] named — `main.rs`'s whole R-D8 decision:
+/// build a [`ControlDirectory`] over the file plus whatever the store already
+/// holds when a file is configured, or an unmanaged one when it is not, and
+/// fail closed rather than fall back when the store cannot answer.
+///
+/// **Pulled out of the `[[bin]]` for the reason `shared_backend::open` was**
+/// (M14.1 review, F1, and now M16.1's own review of R-D8: a mutation that
+/// swapped this fail-closed `?` for a silent retry over a fresh in-memory
+/// store compiled and left every suite green, because nothing outside
+/// `main.rs` could call the code making the decision). `main.rs` now does
+/// nothing with the result but `map_err(boot_refusal)?` it, and
+/// `tests/directory_backend_boot.rs`'s own `boot()` helper calls this
+/// function rather than re-deriving the match — so a fallback added around
+/// either the `Some` or the `None` arm is a mutation of code a test actually
+/// runs, not a second copy of it.
+///
+/// `catalog_identities` and `now_ms` are taken as plain values rather than a
+/// `&StaticFrontierCatalog` and a clock read internally, so this module —
+/// which otherwise knows nothing about the fleet crate or wall-clock time —
+/// stays a pure function of its arguments and every test drives it with
+/// fixed ones.
+pub async fn boot_directory(
+    file: Option<ControlPlaneFile>,
+    directory_store: Arc<dyn roundhouse_core::control::DocumentStore>,
+    catalog_identities: Vec<String>,
+    checks: CrossChecks,
+    now_ms: u64,
+) -> Result<Arc<ControlDirectory>, DirectoryError> {
+    match file {
+        Some(file) => {
+            // The writer's fingerprint (R-D9): the file's bytes, the
+            // catalog and fleet identities the caller resolved, and the TTL
+            // this file itself sets.
+            let compiled_under = CompiledUnder {
+                file_sha256: Some(file.sha256),
+                catalog: catalog_identities,
+                fleet: checks.fingerprint(),
+                admission_cache_ttl_ms: Some(
+                    file.config
+                        .admission_cache_ttl_ms
+                        .unwrap_or(DEFAULT_ADMISSION_CACHE_TTL_MS),
+                ),
+            };
+            ControlDirectory::new(
+                file.config,
+                file.path,
+                Arc::new(DocumentDirectoryStore::stamped(
+                    directory_store,
+                    compiled_under,
+                )),
+                checks,
+                now_ms,
+            )
+            .await
+            .map(Arc::new)
+        }
+        // No file is no root of trust, so there is no admin plane, nothing to
+        // store and nothing a store could refuse. The document store the
+        // caller opened is simply not wired, which is honest: an open
+        // deployment has no tenancy to keep.
+        None => Ok(ControlDirectory::open()),
     }
 }
 

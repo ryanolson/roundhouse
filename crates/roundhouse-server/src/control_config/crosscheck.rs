@@ -509,6 +509,47 @@ impl CrossChecks {
         &self.reachable
     }
 
+    /// The fleet half of a stored document's fingerprint (M16.1, R-D9): every
+    /// routing candidate this deployment's cross-checks were built from, as
+    /// the identity a policy names it by, sorted and deduplicated.
+    ///
+    /// **The identities and not the quotes.** A [`Candidate`] carries an
+    /// expected cost, an expected TTFT and a cache-adjusted prefill, all of
+    /// which move between two calls to
+    /// [`reachable_candidates`](https://docs.rs/roundhouse-server) on one
+    /// unchanged deployment — a fingerprint over those would report every node
+    /// as divergent from every other, including from itself a second later,
+    /// which is a divergence check that has told an operator nothing. What the
+    /// cross-checks actually read off a candidate is *which target it is*, and
+    /// that is what a document is fingerprinted on.
+    ///
+    /// [`Target::policy_identity`] rather than [`Target::ledger_key`], because
+    /// `ledger_key` carries a local worker's id: two nodes quoting the same
+    /// model on two different workers would read as divergent fleets when they
+    /// route to the same thing. `policy_identity` is the name a policy's
+    /// `allow` list writes, which is the granularity a plane is compiled at.
+    ///
+    /// Sorted and deduplicated so the fingerprint is a property of the set,
+    /// not of the order the catalog happened to quote it in: two nodes with
+    /// identical fleets must produce identical vectors or the check fires on
+    /// every document.
+    ///
+    /// The judge is deliberately not in here. It is a *catalog* identity —
+    /// `ROUNDHOUSE_JUDGE_MODEL` resolved against the catalog — and R-D9's four
+    /// axes name the file, the catalog, the fleet and the TTL; folding a fifth
+    /// input into the fleet's list would report `Fleet` for a divergence that
+    /// is not about the fleet at all.
+    pub fn fingerprint(&self) -> Vec<String> {
+        let mut identities: Vec<String> = self
+            .reachable
+            .iter()
+            .map(|candidate| candidate.target.policy_identity())
+            .collect();
+        identities.sort();
+        identities.dedup();
+        identities
+    }
+
     /// Refuse a plane no boot of this deployment would have started under.
     ///
     /// **The one list**, called from the composition root at startup and from
@@ -851,5 +892,78 @@ mod tests {
         let reachable = vec![candidate(frontier("openrouter", "capable-m"), 0.9)];
         refuse_tier_recipes_naming_absent_targets(&plane, &reachable)
             .expect("the fleet is not the catalog's to answer for");
+    }
+
+    /// **The fleet fingerprint is the set of identities, not the quotes**
+    /// (M16.1, R-D9).
+    ///
+    /// Three claims in one test because they are one property, and each of
+    /// them is a way the divergence check goes silently useless:
+    ///
+    /// - **sorted**, so two nodes whose catalogs quote the same models in a
+    ///   different order agree. Unsorted, every node diverges from every other
+    ///   and the warning is turned off within a day.
+    /// - **identities only**, so a candidate's expected cost or TTFT — which
+    ///   move between two quotes of one unchanged deployment — cannot get
+    ///   into it. That is the version of this that diverges from *itself*.
+    /// - **`policy_identity`, not `ledger_key`**, so two nodes whose fleets
+    ///   scheduled the same model onto different workers agree about the model
+    ///   they can both route to.
+    #[test]
+    fn the_fleet_fingerprint_is_the_sorted_identity_set_and_nothing_priced() {
+        let checks = CrossChecks::new(
+            vec![
+                candidate(frontier("openrouter", "capable-m"), 0.9),
+                candidate(local("small"), 0.4),
+                candidate(frontier("anthropic", "big"), 0.95),
+            ],
+            None,
+        );
+        assert_eq!(
+            checks.fingerprint(),
+            vec![
+                "anthropic/big".to_string(),
+                "local/small".to_string(),
+                "openrouter/capable-m".to_string(),
+            ]
+        );
+
+        // The same fleet, quoted in another order and at other prices: one
+        // fingerprint, because nothing that moves got into it.
+        let requoted = CrossChecks::new(
+            vec![
+                Candidate {
+                    expected_cost_usd: 42.0,
+                    expected_ttft_ms: 999.0,
+                    matched_prefix_tokens: 7,
+                    ..candidate(frontier("anthropic", "big"), 0.95)
+                },
+                candidate(frontier("openrouter", "capable-m"), 0.9),
+                candidate(local("small"), 0.4),
+            ],
+            None,
+        );
+        assert_eq!(checks.fingerprint(), requoted.fingerprint());
+
+        // A worker id is not part of the identity: the same model on a second
+        // worker is the same routing target as far as a compiled plane is
+        // concerned, and a fingerprint that disagreed would report a fleet
+        // rebalance as a config divergence.
+        let rescheduled = CrossChecks::new(
+            vec![candidate(
+                Target::Local {
+                    worker_id: 77,
+                    dp_rank: 3,
+                    model: "small".into(),
+                },
+                0.4,
+            )],
+            None,
+        );
+        assert_eq!(rescheduled.fingerprint(), vec!["local/small".to_string()]);
+
+        // And a fleet that differs really does fingerprint differently, or
+        // none of the above would be worth asserting.
+        assert_ne!(checks.fingerprint(), rescheduled.fingerprint());
     }
 }

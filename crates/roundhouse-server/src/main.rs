@@ -9,12 +9,13 @@
 //! deployment concern leaked into the composition root.
 //!
 //! Durability is the one seam a deployment selects, and it selects every family
-//! of it at once — but the selecting does not happen here. `shared_backend::open`
-//! makes it, in the library, and this file wires whichever four backends it
-//! hands back. That split is M14.1's review, F1: the choice used to be spelled
-//! out three times in this function, inside a `[[bin]]` nothing else can call,
-//! so the boot suites could only re-type it by hand and a mutation of the real
-//! wiring went unnoticed.
+//! of it at once — sessions, committed spend, fair-use windows, conversation
+//! correlation and, since M16.1 (R-D8), the admin directory — but the
+//! selecting does not happen here. `shared_backend::open` makes it, in the
+//! library, and this file wires whichever backends it hands back. That split is
+//! M14.1's review, F1: the choice used to be spelled out three times in this
+//! function, inside a `[[bin]]` nothing else can call, so the boot suites could
+//! only re-type it by hand and a mutation of the real wiring went unnoticed.
 //!
 //! A URL
 //! that is set but unreachable stops the process at startup — falling back to
@@ -64,9 +65,9 @@ use roundhouse_server::catalog_config::{BUILT_IN_OPENAI, ProviderConfig};
 use roundhouse_server::control_config::crosscheck::CrossChecks;
 use roundhouse_server::{
     Backends, ControlDirectory, ControlPlane, ControlPlaneReads, Conversations, DirectoryError,
-    EchoLocalExecutor, Engine, EngineConfig, FleetJudge, JudgeConfig, MemoryDirectoryStore,
-    REDIS_NAMESPACE_VAR, REDIS_VAR, admin_api, catalog_config, control_config, http, mcp_api,
-    messages_api, metrics_api, relay_api, resolve_namespace, responses_api, shared_backend,
+    EchoLocalExecutor, Engine, EngineConfig, FleetJudge, JudgeConfig, REDIS_NAMESPACE_VAR,
+    REDIS_VAR, admin_api, catalog_config, control_config, http, mcp_api, messages_api, metrics_api,
+    relay_api, resolve_namespace, responses_api, shared_backend,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -515,6 +516,30 @@ const PROBE_OSL_TOKENS: u64 = 256;
 /// serve.
 ///
 /// [`LocalFleet`]: roundhouse_fleet::LocalFleet
+/// The catalog half of a stored directory document's fingerprint (M16.1,
+/// R-D9): every `(provider, model)` this deployment prices, sorted.
+///
+/// The identities and not the prices, for the reason
+/// [`CrossChecks::fingerprint`] gives about candidates: a fingerprint that
+/// moved with a rate card would report a node as divergent from a neighbour
+/// that had merely re-read the same file. What a divergence check is for is
+/// *which models exist here*, which is what the capability gate and every
+/// cross-check read.
+///
+/// Sorted so the fingerprint is a property of the set rather than of the order
+/// the catalog file happened to list it in; two nodes on one catalog must
+/// produce identical vectors or the check fires on every document.
+fn catalog_identities(catalog: &StaticFrontierCatalog) -> Vec<String> {
+    let mut identities: Vec<String> = catalog
+        .models()
+        .iter()
+        .map(|spec| format!("{}/{}", spec.provider, spec.model))
+        .collect();
+    identities.sort();
+    identities.dedup();
+    identities
+}
+
 fn reachable_candidates(catalog: &StaticFrontierCatalog) -> Vec<Candidate> {
     let mut ledger = CacheLedger::new();
     catalog.apply_to_ledger(&mut ledger);
@@ -556,6 +581,20 @@ fn judge_spec(catalog: &StaticFrontierCatalog) -> Option<FrontierModelSpec> {
 fn boot_refusal(error: DirectoryError) -> anyhow::Error {
     match error {
         DirectoryError::CrossCheckRefused { detail, .. } => anyhow::anyhow!("{detail}"),
+        // The one refusal whose remedy is not in the control-plane file at all
+        // (M16.1, R-D8). A store that cannot answer is a *deployment* fault --
+        // an unreachable Redis, a `dir` key some other writer owns, a version
+        // field that is not a number -- and the variable an operator goes and
+        // fixes is the one that chose the store, so it is named here rather
+        // than left to a message about "the directory store" that points at
+        // nothing. Fail closed: the alternative is serving a plane compiled
+        // from the file alone, which authenticates against a directory missing
+        // every project the admin plane ever created.
+        DirectoryError::Store(failure) => anyhow::anyhow!(
+            "the admin directory could not be read, so this node will not start: {failure}. \
+             It is stored in the Redis named by {REDIS_VAR} (or in this process's memory when \
+             that variable is unset)"
+        ),
         DirectoryError::Invalid(source) | DirectoryError::EnvironmentIncomplete(source) => {
             anyhow::anyhow!(source)
         }
@@ -683,45 +722,85 @@ async fn main() -> anyhow::Result<()> {
     // thing.
     let checks = CrossChecks::new(reachable.clone(), judge.clone());
 
+    // **One call, one match** (M14.1 review, F1). Which backends this
+    // deployment gets is `shared_backend::open`'s answer, taken in the library
+    // where the boot suites can call it and where a mutation of the wiring is
+    // therefore a mutation of something a test runs. This site does nothing
+    // but wire what it hands back: re-deriving any part of the choice here is
+    // exactly what put it beyond every test's reach, three spellings deep.
+    //
+    // One variable selects every family, and they are chosen together on
+    // purpose. The session log and the spend ledger answer two questions about
+    // the same turns, and a deployment that made one durable and left the other
+    // in memory would re-grant its whole budget on every restart while the log
+    // that proves it was already spent survives.
+    //
+    // The two arms monomorphize `serve` twice; that is the entire cost of
+    // keeping the engine generic over its store.
+    // Read and validated before anything connects: an empty
+    // ROUNDHOUSE_REDIS_NAMESPACE is a boot error, not a per-process quirk
+    // that surfaces as two deployments silently sharing a keyspace (R-S3).
+    // Names the variable, not the reason — `EmptyNamespace`'s own Display
+    // already says why (blank, or a character the key format itself
+    // reserves; M14.2 review, F5/F6), and repeating "must not be empty"
+    // here doubled a boot operator's one useful line into two identical
+    // ones instead of adding the one thing they don't already know: which
+    // variable to go fix.
+    let namespace = resolve_namespace(std::env::var(REDIS_NAMESPACE_VAR).ok().as_deref())
+        .with_context(|| format!("reading {REDIS_NAMESPACE_VAR}"))?;
+    let backends =
+        shared_backend::open(std::env::var(REDIS_VAR).ok().as_deref(), &namespace).await?;
+
     // The one thing every surface authenticates against, and the one thing the
-    // admin plane writes to. Built here rather than beside the catalog because
-    // constructing it *is* the boot check: it compiles the file, runs
-    // `checks.refuse` on the result, and refuses to exist if either says no —
-    // the same two judgements every later admin write goes through.
+    // admin plane writes to. Constructing it *is* the boot check: it loads
+    // whatever the store already holds, compiles it with the file, runs
+    // `checks.refuse` on the result, and refuses to exist if any of the three
+    // says no — the same judgements every later admin write goes through.
     //
-    // `MemoryDirectoryStore` is this milestone's only backing store, so
-    // admin-created tenancy dies with the process; the unlock condition for a
-    // durable one is written at `ControlDirectory`.
+    // # Why this is now *after* `open` (2026-09-04, M16.1, R-D8)
     //
-    // Captured before `file` moves into the match below: it is what decides,
-    // once the Redis branch is chosen further down, whether this deployment's
-    // durability is actually one thing or secretly two — see the warning
-    // there. A `None` file means [`ControlDirectory::open`] below, which has
-    // no admin plane at all, so nothing about it can be mismatched with
-    // anything.
+    // Until this rung the directory was built here, several dozen lines
+    // earlier, over an in-memory store that was this crate's only backing
+    // store — so admin-created tenancy died with the process no
+    // matter what `ROUNDHOUSE_REDIS_URL` said, and what stood in this file
+    // instead was a `control_plane_file_configured` flag and a long boot
+    // warning describing the gap: sessions and spend durable, tenancy not,
+    // and an archived project's tombstone therefore lost on restart while
+    // the ledger row that gives its id meaning survived. Both are deleted,
+    // because the gap is closed rather than because it stopped mattering.
+    // The directory is the fifth family `open` chooses, and it is built from
+    // what `open` returns, which is exactly why this construction had to move
+    // below it.
     //
-    // Named for what it reads (a file was configured), not for the store
-    // that follows from it, because those are two facts today only because
-    // `MemoryDirectoryStore` is this branch's *only* store. The day a
-    // durable `DirectoryStore` lands and the `Some` arm below picks between
-    // stores, this flag has to move with it — to whichever branch is still
-    // memory-backed — or the warning below keeps firing after the gap it
-    // describes is closed.
-    let control_plane_file_configured = file.is_some();
-    let directory = match file {
-        Some((file, path)) => Arc::new(
-            ControlDirectory::new(
-                file,
-                path,
-                Arc::new(MemoryDirectoryStore::new()),
-                checks,
-                roundhouse_core::now_ms(),
-            )
-            .await
-            .map_err(boot_refusal)?,
-        ),
-        None => ControlDirectory::open(),
-    };
+    // The order is load-bearing in one more way. A Redis that answers for
+    // sessions, spend, ceilings and threads and cannot answer for the
+    // directory — a `dir` key of the wrong type, a hand-edited version field,
+    // a foreign writer — stops the process *here*, with a reason naming
+    // ROUNDHOUSE_REDIS_URL, rather than starting and serving a plane compiled
+    // from the file alone. Failing closed is the only honest answer: a node
+    // that ignored an unreadable directory would authenticate against a plane
+    // missing every project, member and key the admin plane ever created,
+    // and the first admin write would then commit that emptiness over the
+    // top of whatever is really there.
+    // The decision itself — file present or not, and fail closed rather than
+    // fall back when the store cannot answer — is `control_config::
+    // boot_directory`, not this call site (2026-09-04, M16.1 review, F1: the
+    // same class of bug M14.1's review found in `shared_backend`, one seam
+    // later. A `[[bin]]` is not something a test can call, so the fail-closed
+    // `?` below used to be the only thing standing between a refused store
+    // and a silent fallback, and nothing outside this file could tell the two
+    // apart). What is left here is wiring the result, and `map_err
+    // (boot_refusal)` for the one thing this call site does that the library
+    // function cannot: choose the sentence a boot log prints.
+    let directory = control_config::boot_directory(
+        file,
+        Arc::clone(backends.directory()),
+        catalog_identities(&catalog),
+        checks,
+        roundhouse_core::now_ms(),
+    )
+    .await
+    .map_err(boot_refusal)?;
     match &*directory.plane(roundhouse_core::now_ms()).await {
         // Counted through the accessor rather than by reaching into
         // `Configured { turn_keys, .. }`: the table's layout has exactly one
@@ -769,35 +848,6 @@ async fn main() -> anyhow::Result<()> {
         listener.local_addr()?
     );
 
-    // **One call, one match** (M14.1 review, F1). Which four backends this
-    // deployment gets is `shared_backend::open`'s answer, taken in the library
-    // where the boot suites can call it and where a mutation of the wiring is
-    // therefore a mutation of something a test runs. This site does nothing
-    // but wire what it hands back: re-deriving any part of the choice here is
-    // exactly what put it beyond every test's reach, three spellings deep.
-    //
-    // One variable selects every family, and they are chosen together on
-    // purpose. The session log and the spend ledger answer two questions about
-    // the same turns, and a deployment that made one durable and left the other
-    // in memory would re-grant its whole budget on every restart while the log
-    // that proves it was already spent survives.
-    //
-    // The two arms monomorphize `serve` twice; that is the entire cost of
-    // keeping the engine generic over its store.
-    // Read and validated before anything connects: an empty
-    // ROUNDHOUSE_REDIS_NAMESPACE is a boot error, not a per-process quirk
-    // that surfaces as two deployments silently sharing a keyspace (R-S3).
-    // Names the variable, not the reason — `EmptyNamespace`'s own Display
-    // already says why (blank, or a character the key format itself
-    // reserves; M14.2 review, F5/F6), and repeating "must not be empty"
-    // here doubled a boot operator's one useful line into two identical
-    // ones instead of adding the one thing they don't already know: which
-    // variable to go fix.
-    let namespace = resolve_namespace(std::env::var(REDIS_NAMESPACE_VAR).ok().as_deref())
-        .with_context(|| format!("reading {REDIS_NAMESPACE_VAR}"))?;
-    let backends =
-        shared_backend::open(std::env::var(REDIS_VAR).ok().as_deref(), &namespace).await?;
-
     match backends {
         Backends::Shared {
             store,
@@ -806,22 +856,6 @@ async fn main() -> anyhow::Result<()> {
             conversations,
             ..
         } => {
-            if control_plane_file_configured {
-                tracing::warn!(
-                    var = control_config::CONTROL_PLANE_VAR,
-                    "sessions and committed spend just became durable in Redis, but \
-                     admin-created tenancy -- every project, user and turn key an \
-                     operator creates or archives through the admin plane -- still \
-                     lives only in memory and does not survive this process's \
-                     restart. Concretely: an archived project's tombstone is what \
-                     keeps its id retired (see ProjectRecord::archived_at_ms); lose \
-                     it on restart and the ordinary admin API will let that id be \
-                     recreated as if it were new, silently joining the new tenant \
-                     to the old one's spend history in the ledger that DID survive. \
-                     The fix is a durable DirectoryStore, not yet built -- see \
-                     ControlDirectory's own deferral note for the unlock condition"
-                );
-            }
             serve(
                 store,
                 spend,
@@ -842,6 +876,7 @@ async fn main() -> anyhow::Result<()> {
             spend,
             fair_use,
             conversations,
+            ..
         } => {
             serve(
                 store,
@@ -1127,6 +1162,59 @@ mod tests {
             base_ttft_ms: 1.0,
             ttft_ms_per_uncached_token: 0.0,
         }
+    }
+
+    /// **The catalog fingerprint is the sorted identity set** (M16.1, R-D9).
+    ///
+    /// The companion to `CrossChecks::fingerprint`'s own test, and it exists
+    /// for the same reason: two nodes whose catalog files list the same models
+    /// in a different order must fingerprint identically, or the divergence
+    /// warning fires on every document of every healthy deployment and gets
+    /// switched off. The identity is `provider/model` and carries no price,
+    /// because a rate card that moved would otherwise read as a config
+    /// divergence.
+    #[test]
+    fn the_catalog_fingerprint_is_the_sorted_provider_model_set() {
+        let catalog = StaticFrontierCatalog::new(vec![
+            entry(
+                "openrouter",
+                "capable-m",
+                WireProtocol::OpenAiChatCompletions,
+            ),
+            entry("anthropic", "big", WireProtocol::AnthropicMessages),
+        ]);
+        assert_eq!(
+            catalog_identities(&catalog),
+            vec![
+                "anthropic/big".to_string(),
+                "openrouter/capable-m".to_string()
+            ]
+        );
+
+        // The same two models, listed the other way round and priced
+        // differently: one fingerprint.
+        let reordered = StaticFrontierCatalog::new(vec![
+            FrontierModelSpec {
+                quality_prior: 0.99,
+                base_ttft_ms: 500.0,
+                ..entry("anthropic", "big", WireProtocol::AnthropicMessages)
+            },
+            entry(
+                "openrouter",
+                "capable-m",
+                WireProtocol::OpenAiChatCompletions,
+            ),
+        ]);
+        assert_eq!(catalog_identities(&catalog), catalog_identities(&reordered));
+
+        // A catalog that genuinely differs fingerprints differently, or none
+        // of the above is worth asserting.
+        let smaller = StaticFrontierCatalog::new(vec![entry(
+            "anthropic",
+            "big",
+            WireProtocol::AnthropicMessages,
+        )]);
+        assert_ne!(catalog_identities(&catalog), catalog_identities(&smaller));
     }
 
     fn responses_provider(base_url: &str) -> ProviderConfig {
