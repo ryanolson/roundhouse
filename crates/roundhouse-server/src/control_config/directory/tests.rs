@@ -77,14 +77,15 @@ fn file_with_ttl(ttl_ms: u64) -> ControlPlaneConfig {
     ControlPlaneConfig::from_json(&json, PATH).expect("the fixture config validates")
 }
 
-fn directory(store: Arc<dyn DirectoryStore>, now_ms: u64) -> ControlDirectory {
+async fn directory(store: Arc<dyn DirectoryStore>, now_ms: u64) -> ControlDirectory {
     ControlDirectory::new(file(), PATH, store, checks(), now_ms)
+        .await
         .expect("the file alone compiles, since it is what a boot would have loaded")
 }
 
 /// A directory over a store nobody else holds.
-fn solo(now_ms: u64) -> ControlDirectory {
-    directory(Arc::new(MemoryDirectoryStore::new()), now_ms)
+async fn solo(now_ms: u64) -> ControlDirectory {
+    directory(Arc::new(MemoryDirectoryStore::new()), now_ms).await
 }
 
 fn project(id: &str) -> ProjectEntry {
@@ -106,7 +107,7 @@ fn user(id: &str) -> UserEntry {
 
 /// Project, user and membership in three writes — what every mint below needs
 /// to exist first.
-fn tenancy(directory: &ControlDirectory, project_id: &str, user_id: &str, now_ms: u64) {
+async fn tenancy(directory: &ControlDirectory, project_id: &str, user_id: &str, now_ms: u64) {
     directory
         .apply(
             DirectoryMutation::CreateProject {
@@ -114,6 +115,7 @@ fn tenancy(directory: &ControlDirectory, project_id: &str, user_id: &str, now_ms
             },
             now_ms,
         )
+        .await
         .expect("a fresh project id");
     directory
         .apply(
@@ -122,6 +124,7 @@ fn tenancy(directory: &ControlDirectory, project_id: &str, user_id: &str, now_ms
             },
             now_ms,
         )
+        .await
         .expect("a fresh user id");
     directory
         .apply(
@@ -134,12 +137,17 @@ fn tenancy(directory: &ControlDirectory, project_id: &str, user_id: &str, now_ms
             },
             now_ms,
         )
+        .await
         .expect("a membership neither half declares");
 }
 
 /// What a presented secret resolves to, through the whole header seam.
-fn resolve(directory: &ControlDirectory, secret: &str, now_ms: u64) -> Result<KeyScope, AuthError> {
-    directory.plane(now_ms).scope(&bearer_headers(secret))
+async fn resolve(
+    directory: &ControlDirectory,
+    secret: &str,
+    now_ms: u64,
+) -> Result<KeyScope, AuthError> {
+    directory.plane(now_ms).await.scope(&bearer_headers(secret))
 }
 
 /// The row a presented secret is refused by, or `None` if it was admitted.
@@ -148,8 +156,8 @@ fn resolve(directory: &ControlDirectory, secret: &str, now_ms: u64) -> Result<Ke
 /// deliberately does not derive `PartialEq` — comparing two of them would be
 /// comparing two resolved policies, which is not what any assertion here is
 /// about. See the note on `Resolved` in the resolver's own tests.
-fn refusal(directory: &ControlDirectory, secret: &str, now_ms: u64) -> Option<AuthError> {
-    resolve(directory, secret, now_ms).err()
+async fn refusal(directory: &ControlDirectory, secret: &str, now_ms: u64) -> Option<AuthError> {
+    resolve(directory, secret, now_ms).await.err()
 }
 
 fn principal_of(scope: Result<KeyScope, AuthError>) -> Option<Principal> {
@@ -163,22 +171,23 @@ fn principal_of(scope: Result<KeyScope, AuthError>) -> Option<Principal> {
 // Minting
 // ---------------------------------------------------------------------------
 
-#[test]
-fn minting_stores_only_the_hash_and_tail() {
-    let directory = solo(0);
-    tenancy(&directory, "widgets", "bo", 1_000);
+#[tokio::test]
+async fn minting_stores_only_the_hash_and_tail() {
+    let directory = solo(0).await;
+    tenancy(&directory, "widgets", "bo", 1_000).await;
     let minted = directory
         .mint_turn_key("widgets", "bo", 2_000)
+        .await
         .expect("the membership exists and the policy admits the catalog");
 
     // The secret works, which is what makes the rest of this test about a key
     // rather than about a string.
     assert_eq!(
-        principal_of(resolve(&directory, &minted.secret, 2_000)),
+        principal_of(resolve(&directory, &minted.secret, 2_000).await),
         Some(Principal::new("widgets", "bo"))
     );
 
-    let view = directory.view(2_000);
+    let view = directory.view(2_000).await;
     let record = view
         .keys
         .iter()
@@ -217,8 +226,8 @@ fn minting_stores_only_the_hash_and_tail() {
 /// one mint in sixty-two is refused by its own deployment as `malformed_key` —
 /// which reads to an operator like a paste error at the one moment there was
 /// none. A single-draw test passes 98% of the time.
-#[test]
-fn every_minted_secret_passes_the_shape_check_this_deployment_applies() {
+#[tokio::test]
+async fn every_minted_secret_passes_the_shape_check_this_deployment_applies() {
     let mut seen: HashSet<String> = HashSet::new();
     for _ in 0..200 {
         for kind in [KeyKind::Turn, KeyKind::Admin] {
@@ -261,25 +270,29 @@ fn every_minted_secret_passes_the_shape_check_this_deployment_applies() {
 // Tombstones
 // ---------------------------------------------------------------------------
 
-#[test]
-fn a_revoked_key_compiles_to_a_named_refusal() {
-    let directory = solo(0);
-    tenancy(&directory, "widgets", "bo", 1_000);
-    let minted = directory.mint_turn_key("widgets", "bo", 2_000).unwrap();
+#[tokio::test]
+async fn a_revoked_key_compiles_to_a_named_refusal() {
+    let directory = solo(0).await;
+    tenancy(&directory, "widgets", "bo", 1_000).await;
+    let minted = directory
+        .mint_turn_key("widgets", "bo", 2_000)
+        .await
+        .unwrap();
     let id = key_id(&minted.key_sha256);
 
     assert!(
-        principal_of(resolve(&directory, &minted.secret, 2_000)).is_some(),
+        principal_of(resolve(&directory, &minted.secret, 2_000).await).is_some(),
         "the probe has to work before it is revoked, or the assertion below is \
          satisfied by a key that never resolved"
     );
 
     directory
         .apply(DirectoryMutation::RevokeKey { id: id.clone() }, 3_000)
+        .await
         .expect("an API-minted key is the API's to revoke");
 
     assert_eq!(
-        refusal(&directory, &minted.secret, 3_000),
+        refusal(&directory, &minted.secret, 3_000).await,
         Some(AuthError::RevokedKey),
         "revoked, and told apart from a key this deployment never had"
     );
@@ -289,14 +302,14 @@ fn a_revoked_key_compiles_to_a_named_refusal() {
     // reading a log needs those two to be different words.
     let never_issued = "rh_turn_ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ";
     assert_eq!(
-        refusal(&directory, never_issued, 3_000),
+        refusal(&directory, never_issued, 3_000).await,
         Some(AuthError::UnknownKey)
     );
     assert_ne!(AuthError::RevokedKey.code(), AuthError::UnknownKey.code());
 
     // And the row survives its own revocation, which is what a tombstone is
     // for: the operator who revoked it can still see that it existed.
-    let view = directory.view(3_000);
+    let view = directory.view(3_000).await;
     let record = view
         .keys
         .iter()
@@ -308,16 +321,23 @@ fn a_revoked_key_compiles_to_a_named_refusal() {
     // retry after a dropped response is not a mistake.
     directory
         .apply(DirectoryMutation::RevokeKey { id }, 4_000)
+        .await
         .expect("revoking a revoked key is the state it is already in");
 }
 
-#[test]
-fn an_archived_projects_key_refuses_project_archived() {
-    let directory = solo(0);
-    tenancy(&directory, "widgets", "bo", 1_000);
-    tenancy(&directory, "gadgets", "cy", 1_000);
-    let closing = directory.mint_turn_key("widgets", "bo", 2_000).unwrap();
-    let staying = directory.mint_turn_key("gadgets", "cy", 2_000).unwrap();
+#[tokio::test]
+async fn an_archived_projects_key_refuses_project_archived() {
+    let directory = solo(0).await;
+    tenancy(&directory, "widgets", "bo", 1_000).await;
+    tenancy(&directory, "gadgets", "cy", 1_000).await;
+    let closing = directory
+        .mint_turn_key("widgets", "bo", 2_000)
+        .await
+        .unwrap();
+    let staying = directory
+        .mint_turn_key("gadgets", "cy", 2_000)
+        .await
+        .unwrap();
 
     directory
         .apply(
@@ -326,23 +346,24 @@ fn an_archived_projects_key_refuses_project_archived() {
             },
             3_000,
         )
+        .await
         .expect("an API-created project is the API's to close");
 
     assert_eq!(
-        refusal(&directory, &closing.secret, 3_000),
+        refusal(&directory, &closing.secret, 3_000).await,
         Some(AuthError::ProjectArchived),
         "the key is intact and its project is closed, which is a different \
          remedy from a revoked key and so a different row"
     );
     // CONTROL: archiving one project closed one project.
     assert_eq!(
-        principal_of(resolve(&directory, &staying.secret, 3_000)),
+        principal_of(resolve(&directory, &staying.secret, 3_000).await),
         Some(Principal::new("gadgets", "cy"))
     );
 
     // Archived, not deleted: the row keeps the id, so nothing else can be
     // created under it and join two tenants' spend histories.
-    let view = directory.view(3_000);
+    let view = directory.view(3_000).await;
     let record = view
         .projects
         .iter()
@@ -350,12 +371,14 @@ fn an_archived_projects_key_refuses_project_archived() {
         .expect("an archived project is still listed");
     assert_eq!(record.archived_at_ms, Some(3_000));
     assert!(matches!(
-        directory.apply(
-            DirectoryMutation::CreateProject {
-                entry: project("widgets")
-            },
-            4_000
-        ),
+        directory
+            .apply(
+                DirectoryMutation::CreateProject {
+                    entry: project("widgets")
+                },
+                4_000
+            )
+            .await,
         Err(DirectoryError::IdentityCollision {
             kind: EntityKind::Project,
             ..
@@ -383,8 +406,8 @@ fn an_archived_projects_key_refuses_project_archived() {
 /// stays present in `merged.projects` no matter what its own
 /// `archived_at_ms` says. With the direct check gone, nothing else refuses
 /// the key: `merged.validate` finds `acme` right there and admits it.
-#[test]
-fn the_direct_archived_key_refusal_is_not_the_projects_exclusion_in_disguise() {
+#[tokio::test]
+async fn the_direct_archived_key_refusal_is_not_the_projects_exclusion_in_disguise() {
     let minted = mint_key(KeyKind::Turn).expect("the system CSPRNG answers");
     let mut records = DirectoryRecords {
         projects: vec![ProjectRecord {
@@ -454,9 +477,9 @@ fn the_direct_archived_key_refusal_is_not_the_projects_exclusion_in_disguise() {
 // Ownership
 // ---------------------------------------------------------------------------
 
-#[test]
-fn a_config_owned_entity_refuses_mutation() {
-    let directory = solo(0);
+#[tokio::test]
+async fn a_config_owned_entity_refuses_mutation() {
+    let directory = solo(0).await;
     // `acme`, `ada` and both hashes come from the file — see `sample_config`.
     let mutations: Vec<(&str, DirectoryMutation)> = vec![
         (
@@ -515,7 +538,7 @@ fn a_config_owned_entity_refuses_mutation() {
         ),
     ];
     for (what, mutation) in mutations {
-        let error = match directory.apply(mutation, 1_000) {
+        let error = match directory.apply(mutation, 1_000).await {
             Err(error) => error,
             Ok(_) => panic!("{what}: the file owns it, so this must be refused"),
         };
@@ -537,6 +560,7 @@ fn a_config_owned_entity_refuses_mutation() {
     // nothing to say about it.
     directory
         .apply(DirectoryMutation::CreateUser { entry: user("bo") }, 1_000)
+        .await
         .expect("a user id the file does not declare");
     directory
         .apply(
@@ -549,17 +573,19 @@ fn a_config_owned_entity_refuses_mutation() {
             },
             1_000,
         )
+        .await
         .expect("a membership in a configured project is a create, not an edit");
     let minted = directory
         .mint_turn_key("acme", "bo", 1_000)
+        .await
         .expect("and its keys are the API's to mint");
     assert_eq!(
-        principal_of(resolve(&directory, &minted.secret, 1_000)),
+        principal_of(resolve(&directory, &minted.secret, 1_000).await),
         Some(Principal::new("acme", "bo"))
     );
     // The file's own key is untouched by any of it.
     assert_eq!(
-        principal_of(resolve(&directory, TURN_SECRET, 1_000)),
+        principal_of(resolve(&directory, TURN_SECRET, 1_000).await),
         Some(Principal::new("acme", "ada"))
     );
 }
@@ -577,9 +603,9 @@ fn a_config_owned_entity_refuses_mutation() {
 /// Calling `mutate` directly, on a hand-built records table that *does* hold
 /// such a row, proves the ownership check runs before that row is ever
 /// consulted, rather than merely being one of two paths to the same refusal.
-#[test]
-fn patch_project_refuses_ownership_before_it_ever_looks_at_the_records_table() {
-    let directory = solo(0);
+#[tokio::test]
+async fn patch_project_refuses_ownership_before_it_ever_looks_at_the_records_table() {
+    let directory = solo(0).await;
     let mut records = DirectoryRecords {
         projects: vec![
             // A row that could not exist through the real API — nothing may
@@ -661,9 +687,9 @@ fn patch_project_refuses_ownership_before_it_ever_looks_at_the_records_table() {
     );
 }
 
-#[test]
-fn an_admin_create_colliding_with_config_identity_is_refused() {
-    let directory = solo(0);
+#[tokio::test]
+async fn an_admin_create_colliding_with_config_identity_is_refused() {
+    let directory = solo(0).await;
 
     // Against the file: reported as config-owned rather than as a bare
     // collision, because the remedy is to edit the file and a "already exists"
@@ -680,7 +706,7 @@ fn an_admin_create_colliding_with_config_identity_is_refused() {
             DirectoryMutation::CreateUser { entry: user("ada") },
         ),
     ] {
-        let error = directory.apply(mutation, 1_000).expect_err(what);
+        let error = directory.apply(mutation, 1_000).await.expect_err(what);
         assert!(
             matches!(error, DirectoryError::ConfigOwned { .. }),
             "{what}: got {error:?}"
@@ -699,6 +725,7 @@ fn an_admin_create_colliding_with_config_identity_is_refused() {
             },
             1_000,
         )
+        .await
         .expect_err("one secret must resolve to exactly one scope");
     assert!(matches!(
         error,
@@ -717,14 +744,17 @@ fn an_admin_create_colliding_with_config_identity_is_refused() {
             },
             1_000,
         )
+        .await
         .unwrap();
     assert!(matches!(
-        directory.apply(
-            DirectoryMutation::CreateProject {
-                entry: project("widgets")
-            },
-            1_000
-        ),
+        directory
+            .apply(
+                DirectoryMutation::CreateProject {
+                    entry: project("widgets")
+                },
+                1_000
+            )
+            .await,
         Err(DirectoryError::IdentityCollision {
             kind: EntityKind::Project,
             ..
@@ -747,18 +777,18 @@ fn an_admin_create_colliding_with_config_identity_is_refused() {
 /// and recompiled from nothing would also stop admitting the revoked key, and
 /// would pass a test written only around it — while quietly taking down every
 /// other key on the node.
-#[test]
-fn a_stale_view_refuses_a_revoked_key_after_one_ttl() {
+#[tokio::test]
+async fn a_stale_view_refuses_a_revoked_key_after_one_ttl() {
     let store: Arc<dyn DirectoryStore> = Arc::new(MemoryDirectoryStore::new());
-    let writer = directory(Arc::clone(&store), 0);
-    tenancy(&writer, "widgets", "bo", 0);
-    let doomed = writer.mint_turn_key("widgets", "bo", 0).unwrap();
-    let untouched = writer.mint_turn_key("widgets", "bo", 0).unwrap();
+    let writer = directory(Arc::clone(&store), 0).await;
+    tenancy(&writer, "widgets", "bo", 0).await;
+    let doomed = writer.mint_turn_key("widgets", "bo", 0).await.unwrap();
+    let untouched = writer.mint_turn_key("widgets", "bo", 0).await.unwrap();
 
     // The reader compiles the same state, at the same instant.
-    let reader = directory(Arc::clone(&store), 0);
+    let reader = directory(Arc::clone(&store), 0).await;
     let ttl = DEFAULT_ADMISSION_CACHE_TTL_MS;
-    assert!(principal_of(resolve(&reader, &doomed.secret, 0)).is_some());
+    assert!(principal_of(resolve(&reader, &doomed.secret, 0).await).is_some());
 
     writer
         .apply(
@@ -767,12 +797,13 @@ fn a_stale_view_refuses_a_revoked_key_after_one_ttl() {
             },
             100,
         )
+        .await
         .unwrap();
 
     // The writing node: immediate. A write recompiles and swaps in the same
     // call, so there is no window at all on the node the operator used.
     assert_eq!(
-        refusal(&writer, &doomed.secret, 100),
+        refusal(&writer, &doomed.secret, 100).await,
         Some(AuthError::RevokedKey)
     );
 
@@ -781,26 +812,26 @@ fn a_stale_view_refuses_a_revoked_key_after_one_ttl() {
     // lengthening it is a decision somebody makes rather than a behavior that
     // drifts.
     assert!(
-        principal_of(resolve(&reader, &doomed.secret, ttl - 1)).is_some(),
+        principal_of(resolve(&reader, &doomed.secret, ttl - 1).await).is_some(),
         "inside the TTL a second node is allowed to be behind"
     );
 
     // And at the bound: refreshed, and refusing by name.
     assert_eq!(
-        refusal(&reader, &doomed.secret, ttl),
+        refusal(&reader, &doomed.secret, ttl).await,
         Some(AuthError::RevokedKey),
         "one TTL is the whole of the staleness window"
     );
 
     // CONTROL: the refresh is a recompile, not a wipe.
     assert_eq!(
-        principal_of(resolve(&reader, &untouched.secret, ttl)),
+        principal_of(resolve(&reader, &untouched.secret, ttl).await),
         Some(Principal::new("widgets", "bo")),
         "a key nobody revoked must survive the refresh that removed one that was"
     );
     // And the file's own key, which no admin write ever touched.
     assert_eq!(
-        principal_of(resolve(&reader, TURN_SECRET, ttl)),
+        principal_of(resolve(&reader, TURN_SECRET, ttl).await),
         Some(Principal::new("acme", "ada"))
     );
 }
@@ -815,27 +846,28 @@ fn a_stale_view_refuses_a_revoked_key_after_one_ttl() {
 /// It is a real setting rather than a curiosity: a deployment that would rather
 /// pay a store read per admission than leave a leaked key working for thirty
 /// seconds writes exactly this.
-#[test]
-fn a_zero_ttl_refreshes_within_the_same_millisecond() {
+#[tokio::test]
+async fn a_zero_ttl_refreshes_within_the_same_millisecond() {
     let store: Arc<dyn DirectoryStore> = Arc::new(MemoryDirectoryStore::new());
-    let writer = directory(Arc::clone(&store), 7);
+    let writer = directory(Arc::clone(&store), 7).await;
     // Two readers over the same store, built at the same instant from the same
     // file, differing in one number.
-    let eager =
-        ControlDirectory::new(file_with_ttl(0), PATH, Arc::clone(&store), checks(), 7).unwrap();
-    let patient = directory(Arc::clone(&store), 7);
+    let eager = ControlDirectory::new(file_with_ttl(0), PATH, Arc::clone(&store), checks(), 7)
+        .await
+        .unwrap();
+    let patient = directory(Arc::clone(&store), 7).await;
 
-    tenancy(&writer, "widgets", "bo", 7);
-    let minted = writer.mint_turn_key("widgets", "bo", 7).unwrap();
+    tenancy(&writer, "widgets", "bo", 7).await;
+    let minted = writer.mint_turn_key("widgets", "bo", 7).await.unwrap();
 
     assert!(
-        principal_of(resolve(&eager, &minted.secret, 7)).is_some(),
+        principal_of(resolve(&eager, &minted.secret, 7).await).is_some(),
         "a zero-TTL node picks up a write made in the same millisecond"
     );
     // CONTROL: the same store, the same instant, the default TTL. Without this
     // the assertion above would be satisfied by a store that is simply fast.
     assert_eq!(
-        refusal(&patient, &minted.secret, 7),
+        refusal(&patient, &minted.secret, 7).await,
         Some(AuthError::UnknownKey),
         "a default-TTL node has not looked yet, which is what the TTL means"
     );
@@ -848,9 +880,10 @@ fn a_zero_ttl_refreshes_within_the_same_millisecond() {
             },
             7,
         )
+        .await
         .unwrap();
     assert_eq!(
-        refusal(&eager, &minted.secret, 7),
+        refusal(&eager, &minted.secret, 7).await,
         Some(AuthError::RevokedKey)
     );
 }
@@ -859,9 +892,9 @@ fn a_zero_ttl_refreshes_within_the_same_millisecond() {
 // What a mutation may not do
 // ---------------------------------------------------------------------------
 
-#[test]
-fn a_window_change_is_refused_naming_the_mechanism() {
-    let directory = solo(0);
+#[tokio::test]
+async fn a_window_change_is_refused_naming_the_mechanism() {
+    let directory = solo(0).await;
     directory
         .apply(
             DirectoryMutation::CreateProject {
@@ -882,6 +915,7 @@ fn a_window_change_is_refused_naming_the_mechanism() {
             },
             1_000,
         )
+        .await
         .unwrap();
 
     let error = directory
@@ -901,6 +935,7 @@ fn a_window_change_is_refused_naming_the_mechanism() {
             },
             2_000,
         )
+        .await
         .expect_err("moving a window either zeroes committed spend or reinterprets it");
     assert!(matches!(
         error,
@@ -937,8 +972,9 @@ fn a_window_change_is_refused_naming_the_mechanism() {
             },
             3_000,
         )
+        .await
         .expect("a limit change on the same window is an ordinary edit");
-    let view = directory.view(3_000);
+    let view = directory.view(3_000).await;
     let budget = view
         .projects
         .iter()
@@ -955,9 +991,9 @@ fn a_window_change_is_refused_naming_the_mechanism() {
 /// to keep passing unchanged through the R7 fix — the double-`Option` seam is
 /// wrong if it needed touching, because an absent field never reaches the
 /// deserializer at all.
-#[test]
-fn omitting_the_budget_field_leaves_a_populated_budget_alone() {
-    let directory = solo(0);
+#[tokio::test]
+async fn omitting_the_budget_field_leaves_a_populated_budget_alone() {
+    let directory = solo(0).await;
     directory
         .apply(
             DirectoryMutation::CreateProject {
@@ -974,6 +1010,7 @@ fn omitting_the_budget_field_leaves_a_populated_budget_alone() {
             },
             1_000,
         )
+        .await
         .unwrap();
 
     // What a `PATCH .../widgets` body of `{"name": "Widgets Inc"}` parses to:
@@ -990,8 +1027,9 @@ fn omitting_the_budget_field_leaves_a_populated_budget_alone() {
             },
             2_000,
         )
+        .await
         .expect("touching only `name` is an ordinary edit");
-    let view = directory.view(2_000);
+    let view = directory.view(2_000).await;
     let budget = view
         .projects
         .iter()
@@ -1014,9 +1052,9 @@ fn omitting_the_budget_field_leaves_a_populated_budget_alone() {
 /// Both halves are asserted here, because closing only the second would leave
 /// a `mutate` that guesses: the seam has to preserve the distinction before
 /// anything can act on it.
-#[test]
-fn explicit_json_null_on_a_populated_budget_is_refused() {
-    let directory = solo(0);
+#[tokio::test]
+async fn explicit_json_null_on_a_populated_budget_is_refused() {
+    let directory = solo(0).await;
     directory
         .apply(
             DirectoryMutation::CreateProject {
@@ -1033,6 +1071,7 @@ fn explicit_json_null_on_a_populated_budget_is_refused() {
             },
             1_000,
         )
+        .await
         .unwrap();
 
     // Exactly what a `PATCH .../widgets` body of `{"budget": null}` parses
@@ -1062,6 +1101,7 @@ fn explicit_json_null_on_a_populated_budget_is_refused() {
             },
             2_000,
         )
+        .await
         .expect_err("an explicit `null` on a populated budget is refused");
     assert!(
         matches!(
@@ -1079,7 +1119,7 @@ fn explicit_json_null_on_a_populated_budget_is_refused() {
     // And nothing was written on the way to the refusal: `apply` validates
     // before it commits, so a refused patch leaves the budget exactly as it
     // was.
-    let view = directory.view(2_000);
+    let view = directory.view(2_000).await;
     let budget = view
         .projects
         .iter()
@@ -1097,9 +1137,9 @@ fn explicit_json_null_on_a_populated_budget_is_refused() {
 /// covered `budget` alone (the axis the finding was written against) would
 /// leave `credentials` -- the one whose removal silently un-gates a project --
 /// still taking the "leave alone" branch.
-#[test]
-fn an_explicit_null_is_refused_on_every_axis_and_an_absent_one_is_not() {
-    let directory = solo(0);
+#[tokio::test]
+async fn an_explicit_null_is_refused_on_every_axis_and_an_absent_one_is_not() {
+    let directory = solo(0).await;
     directory
         .apply(
             DirectoryMutation::CreateProject {
@@ -1116,6 +1156,7 @@ fn an_explicit_null_is_refused_on_every_axis_and_an_absent_one_is_not() {
             },
             1_000,
         )
+        .await
         .unwrap();
 
     for axis in ["name", "policy", "budget", "validate", "credentials"] {
@@ -1130,6 +1171,7 @@ fn an_explicit_null_is_refused_on_every_axis_and_an_absent_one_is_not() {
                 },
                 2_000,
             )
+            .await
             .expect_err(&format!("`{body}` must be refused"));
         match error {
             DirectoryError::NullPatchUnsupported { axis: named, .. } => {
@@ -1153,8 +1195,9 @@ fn an_explicit_null_is_refused_on_every_axis_and_an_absent_one_is_not() {
             },
             3_000,
         )
+        .await
         .expect("touching only `name` is an ordinary edit");
-    let view = directory.view(3_000);
+    let view = directory.view(3_000).await;
     let project = view
         .projects
         .iter()
@@ -1177,9 +1220,9 @@ fn an_explicit_null_is_refused_on_every_axis_and_an_absent_one_is_not() {
 /// The failure this closes: an admin plane is a way to write a configuration
 /// the process refuses to *start* under, and the symptom arrives at the next
 /// restart — the furthest point in time from the cause.
-#[test]
-fn a_mutation_that_admits_no_model_is_refused() {
-    let directory = solo(0);
+#[tokio::test]
+async fn a_mutation_that_admits_no_model_is_refused() {
+    let directory = solo(0).await;
     let narrow = ProjectEntry {
         policy: Some(PolicyConfig {
             allow: Some(vec!["nowhere/*".into()]),
@@ -1192,9 +1235,11 @@ fn a_mutation_that_admits_no_model_is_refused() {
     // is about *keys*, and it fires the moment one exists.
     directory
         .apply(DirectoryMutation::CreateProject { entry: narrow }, 1_000)
+        .await
         .expect("a policy with no key under it refuses no turns");
     directory
         .apply(DirectoryMutation::CreateUser { entry: user("bo") }, 1_000)
+        .await
         .unwrap();
     directory
         .apply(
@@ -1207,15 +1252,17 @@ fn a_mutation_that_admits_no_model_is_refused() {
             },
             1_000,
         )
+        .await
         .unwrap();
 
     // Read at 1_000, well inside the default TTL, so this is the version this
     // node has *compiled* rather than one a refresh went and fetched. A fixture
     // edit that pushed these timestamps past the TTL would turn the assertion
     // below into a store read and stop it being about the write path at all.
-    let before = directory.version(1_000);
+    let before = directory.version(1_000).await;
     let error = directory
         .mint_turn_key("narrow", "bo", 2_000)
+        .await
         .expect_err("every turn of that key's would end in policy_refused");
     match &error {
         DirectoryError::CrossCheckRefused { check, detail } => {
@@ -1230,9 +1277,9 @@ fn a_mutation_that_admits_no_model_is_refused() {
 
     // **Nothing was written.** A refused mutation that had already committed
     // would leave the deployment holding a key it refuses to boot with.
-    assert_eq!(directory.version(2_000), before);
+    assert_eq!(directory.version(2_000).await, before);
     assert!(
-        directory.view(2_000).keys.iter().all(|key| key.scope
+        directory.view(2_000).await.keys.iter().all(|key| key.scope
             != KeyRecordScope::Turn {
                 project: "narrow".into(),
                 user: "bo".into()
@@ -1241,7 +1288,7 @@ fn a_mutation_that_admits_no_model_is_refused() {
     );
 
     // CONTROL: the same three writes under a policy that does name the catalog.
-    tenancy(&directory, "wide", "cy", 3_000);
+    tenancy(&directory, "wide", "cy", 3_000).await;
     directory
         .apply(
             DirectoryMutation::PatchProject {
@@ -1256,22 +1303,31 @@ fn a_mutation_that_admits_no_model_is_refused() {
             },
             3_000,
         )
+        .await
         .unwrap();
     directory
         .mint_turn_key("wide", "cy", 3_000)
+        .await
         .expect("a policy that names the one model this deployment has");
 }
 
-#[test]
-fn deleting_a_membership_revokes_its_minted_keys() {
-    let directory = solo(0);
-    tenancy(&directory, "widgets", "bo", 1_000);
-    let first = directory.mint_turn_key("widgets", "bo", 1_000).unwrap();
-    let second = directory.mint_turn_key("widgets", "bo", 1_000).unwrap();
+#[tokio::test]
+async fn deleting_a_membership_revokes_its_minted_keys() {
+    let directory = solo(0).await;
+    tenancy(&directory, "widgets", "bo", 1_000).await;
+    let first = directory
+        .mint_turn_key("widgets", "bo", 1_000)
+        .await
+        .unwrap();
+    let second = directory
+        .mint_turn_key("widgets", "bo", 1_000)
+        .await
+        .unwrap();
     // A neighbour in the same project, to prove the cascade follows the
     // membership rather than the project.
     directory
         .apply(DirectoryMutation::CreateUser { entry: user("cy") }, 1_000)
+        .await
         .unwrap();
     directory
         .apply(
@@ -1284,8 +1340,12 @@ fn deleting_a_membership_revokes_its_minted_keys() {
             },
             1_000,
         )
+        .await
         .unwrap();
-    let neighbour = directory.mint_turn_key("widgets", "cy", 1_000).unwrap();
+    let neighbour = directory
+        .mint_turn_key("widgets", "cy", 1_000)
+        .await
+        .unwrap();
 
     directory
         .apply(
@@ -1295,11 +1355,12 @@ fn deleting_a_membership_revokes_its_minted_keys() {
             },
             2_000,
         )
+        .await
         .expect("an API-created membership is the API's to remove");
 
     for secret in [&first.secret, &second.secret] {
         assert_eq!(
-            refusal(&directory, secret, 2_000),
+            refusal(&directory, secret, 2_000).await,
             Some(AuthError::RevokedKey),
             "a key whose membership is gone resolves to nothing, and `revoked` \
              is the answer that stays explicable to whoever removed the member"
@@ -1307,11 +1368,11 @@ fn deleting_a_membership_revokes_its_minted_keys() {
     }
     // CONTROL: the neighbour is untouched.
     assert_eq!(
-        principal_of(resolve(&directory, &neighbour.secret, 2_000)),
+        principal_of(resolve(&directory, &neighbour.secret, 2_000).await),
         Some(Principal::new("widgets", "cy"))
     );
 
-    let view = directory.view(2_000);
+    let view = directory.view(2_000).await;
     assert!(
         !view
             .memberships
@@ -1344,9 +1405,9 @@ fn deleting_a_membership_revokes_its_minted_keys() {
 /// if that invariant were ever loosened. Calling `mutate` directly checks the
 /// cascade's own effect on `records.keys` before `compile` gets anywhere near
 /// it.
-#[test]
-fn delete_membership_s_cascade_revokes_keys_inside_mutate_before_any_compile_runs() {
-    let directory = solo(0);
+#[tokio::test]
+async fn delete_membership_s_cascade_revokes_keys_inside_mutate_before_any_compile_runs() {
+    let directory = solo(0).await;
     let key_sha256 = "b".repeat(64);
     let mut records = DirectoryRecords {
         memberships: vec![MembershipRecord {
@@ -1418,9 +1479,9 @@ fn delete_membership_s_cascade_revokes_keys_inside_mutate_before_any_compile_run
 ///
 /// So the keys carry no copy: every compile reads the membership. This is the
 /// test that says so.
-#[test]
-fn two_keys_of_one_membership_never_disagree_after_an_upsert() {
-    let directory = solo(0);
+#[tokio::test]
+async fn two_keys_of_one_membership_never_disagree_after_an_upsert() {
+    let directory = solo(0).await;
     directory
         .apply(
             DirectoryMutation::CreateProject {
@@ -1437,9 +1498,11 @@ fn two_keys_of_one_membership_never_disagree_after_an_upsert() {
             },
             1_000,
         )
+        .await
         .unwrap();
     directory
         .apply(DirectoryMutation::CreateUser { entry: user("bo") }, 1_000)
+        .await
         .unwrap();
     directory
         .apply(
@@ -1452,9 +1515,13 @@ fn two_keys_of_one_membership_never_disagree_after_an_upsert() {
             },
             1_000,
         )
+        .await
         .unwrap();
 
-    let first = directory.mint_turn_key("widgets", "bo", 1_000).unwrap();
+    let first = directory
+        .mint_turn_key("widgets", "bo", 1_000)
+        .await
+        .unwrap();
     // The edit lands between the two mints, which is the ordering that would
     // leave a cached copy stale.
     directory
@@ -1468,10 +1535,14 @@ fn two_keys_of_one_membership_never_disagree_after_an_upsert() {
             },
             2_000,
         )
+        .await
         .unwrap();
-    let second = directory.mint_turn_key("widgets", "bo", 3_000).unwrap();
+    let second = directory
+        .mint_turn_key("widgets", "bo", 3_000)
+        .await
+        .unwrap();
 
-    let plane = directory.plane(3_000);
+    let plane = directory.plane(3_000).await;
     for secret in [&first.secret, &second.secret] {
         let admission = plane
             .turn_admission(&bearer_headers(secret))
@@ -1501,13 +1572,16 @@ fn two_keys_of_one_membership_never_disagree_after_an_upsert() {
 /// lookup tables — deliberately, so no second copy of a deployment's keys is
 /// live for the life of the process — which is exactly why the admin plane's
 /// `GET` routes are served from here and not from the plane.
-#[test]
-fn the_view_lists_both_halves_and_marks_which_is_which() {
-    let directory = solo(0);
-    tenancy(&directory, "widgets", "bo", 1_000);
-    directory.mint_turn_key("widgets", "bo", 1_000).unwrap();
+#[tokio::test]
+async fn the_view_lists_both_halves_and_marks_which_is_which() {
+    let directory = solo(0).await;
+    tenancy(&directory, "widgets", "bo", 1_000).await;
+    directory
+        .mint_turn_key("widgets", "bo", 1_000)
+        .await
+        .unwrap();
 
-    let view = directory.view(1_000);
+    let view = directory.view(1_000).await;
     let owner = |provenance: Provenance| {
         view.projects
             .iter()
@@ -1594,8 +1668,9 @@ impl WriteBetweenReads {
     }
 }
 
+#[async_trait::async_trait]
 impl DirectoryStore for WriteBetweenReads {
-    fn load(&self) -> Result<VersionedRecords, StoreFailure> {
+    async fn load(&self) -> Result<VersionedRecords, StoreFailure> {
         let state = self.locked();
         Ok(VersionedRecords {
             records: state.0.clone(),
@@ -1603,7 +1678,7 @@ impl DirectoryStore for WriteBetweenReads {
         })
     }
 
-    fn commit(
+    async fn commit(
         &self,
         expected_version: u64,
         records: DirectoryRecords,
@@ -1620,7 +1695,7 @@ impl DirectoryStore for WriteBetweenReads {
         Ok(state.1)
     }
 
-    fn version(&self) -> Result<u64, StoreFailure> {
+    async fn version(&self) -> Result<u64, StoreFailure> {
         let mut reads = self.reads.lock().unwrap_or_else(|error| error.into_inner());
         *reads += 1;
         if *reads == 2
@@ -1646,9 +1721,9 @@ impl DirectoryStore for WriteBetweenReads {
 /// real write on another node would have committed — a fixture that assembled
 /// the "after" records itself could differ from one in the way that made the
 /// test pass.
-fn staged_mint() -> (DirectoryRecords, DirectoryRecords) {
-    let staged = solo(0);
-    tenancy(&staged, "widgets", "bo", 0);
+async fn staged_mint() -> (DirectoryRecords, DirectoryRecords) {
+    let staged = solo(0).await;
+    tenancy(&staged, "widgets", "bo", 0).await;
     // `apply` hands back the records it wrote. The upsert is repeated rather
     // than reached for through a listing because a listing is a projection, and
     // what a store holds is records.
@@ -1663,6 +1738,7 @@ fn staged_mint() -> (DirectoryRecords, DirectoryRecords) {
             },
             0,
         )
+        .await
         .expect("an upsert of the membership that is already there");
     let minted = mint_key(KeyKind::Turn).expect("the process has an RNG");
     let after = staged
@@ -1674,6 +1750,7 @@ fn staged_mint() -> (DirectoryRecords, DirectoryRecords) {
             },
             0,
         )
+        .await
         .expect("a fresh hash under an existing membership");
     ((*before).clone(), (*after).clone())
 }
@@ -1727,20 +1804,21 @@ fn assert_coherent(plane: &ControlPlane, view: &DirectoryView, when: &str) {
 /// Reproduced at the seam the two reads share rather than over HTTP, and with
 /// the other node's write timed by the store — see [`WriteBetweenReads`] — so
 /// that the failure is deterministic instead of a race the test hopes to lose.
-#[test]
-fn budget_view_s_plane_and_view_must_describe_the_same_version() {
-    let (before, after) = staged_mint();
+#[tokio::test]
+async fn budget_view_s_plane_and_view_must_describe_the_same_version() {
+    let (before, after) = staged_mint().await;
     let store = Arc::new(WriteBetweenReads::new(before, after));
     // TTL zero, because a directory inside its TTL never reaches for the store
     // at all: with a live cache both reads answer from the same `Compiled` by
     // luck rather than by design, and this test would pass on the defect.
     let directory = ControlDirectory::new(file_with_ttl(0), PATH, store, checks(), 0)
+        .await
         .expect("the file alone compiles, since it is what a boot would have loaded");
 
     // The other node's write lands during this call if — and only if — it
     // refreshes twice. One refresh, and this snapshot is coherently the older
     // version; two, and its listing is a version ahead of its plane.
-    let (plane, view) = directory.snapshot(0);
+    let (plane, view) = directory.snapshot(0).await;
     assert_coherent(
         &plane,
         &view,
@@ -1750,7 +1828,7 @@ fn budget_view_s_plane_and_view_must_describe_the_same_version() {
     // And the write really did land, seen coherently by the next snapshot.
     // Without this the test would also pass on a directory that had simply
     // stopped refreshing — which is coherent, and useless.
-    let (plane, view) = directory.snapshot(0);
+    let (plane, view) = directory.snapshot(0).await;
     assert_coherent(&plane, &view, "the snapshot after that write");
     assert!(
         lists_bos_live_key(&view),
@@ -1763,17 +1841,17 @@ fn budget_view_s_plane_and_view_must_describe_the_same_version() {
 /// happens before the snapshot, so there is one unmoving version to read. It
 /// must pass — and the live-key assertion is what stops it passing vacuously,
 /// which is what proves the coherence check is capable of firing at all.
-#[test]
-fn plane_and_view_agree_when_nothing_writes_between_them() {
-    let directory = solo(0);
-    tenancy(&directory, "widgets", "bo", 0);
-    directory.mint_turn_key("widgets", "bo", 0).unwrap();
+#[tokio::test]
+async fn plane_and_view_agree_when_nothing_writes_between_them() {
+    let directory = solo(0).await;
+    tenancy(&directory, "widgets", "bo", 0).await;
+    directory.mint_turn_key("widgets", "bo", 0).await.unwrap();
 
-    let version_before = directory.version(0);
-    let (plane, view) = directory.snapshot(0);
+    let version_before = directory.version(0).await;
+    let (plane, view) = directory.snapshot(0).await;
     assert_eq!(
         version_before,
-        directory.version(0),
+        directory.version(0).await,
         "sanity: nothing writes across the snapshot in this control"
     );
     assert!(
@@ -1788,13 +1866,13 @@ fn plane_and_view_agree_when_nothing_writes_between_them() {
 /// The fix for R2 is a shared snapshot, not a `plane()` that stops reporting
 /// absent admissions — this pins that a member nobody ever minted a key for is
 /// still, correctly, unresolvable.
-#[test]
-fn a_membership_with_no_key_at_all_is_still_unknown_to_the_plane() {
-    let directory = solo(0);
-    tenancy(&directory, "widgets", "bo", 0);
+#[tokio::test]
+async fn a_membership_with_no_key_at_all_is_still_unknown_to_the_plane() {
+    let directory = solo(0).await;
+    tenancy(&directory, "widgets", "bo", 0).await;
     let principal = Principal::new("widgets", "bo");
 
-    let (plane, view) = directory.snapshot(0);
+    let (plane, view) = directory.snapshot(0).await;
     assert!(
         view.memberships
             .iter()
@@ -1816,20 +1894,22 @@ fn a_membership_with_no_key_at_all_is_still_unknown_to_the_plane() {
 /// The split the error type exists for: "there is no such project" is a fact
 /// about this request, and it must not arrive as the compiler's
 /// `UnknownProject`, whose message is about a *file* the caller never wrote.
-#[test]
-fn a_membership_naming_nothing_is_refused_before_anything_compiles() {
-    let directory = solo(0);
+#[tokio::test]
+async fn a_membership_naming_nothing_is_refused_before_anything_compiles() {
+    let directory = solo(0).await;
     assert!(matches!(
-        directory.apply(
-            DirectoryMutation::UpsertMembership {
-                project: "nowhere".into(),
-                user: "ada".into(),
-                role: MembershipRole::Member,
-                allocation: None,
-                overrides: None,
-            },
-            1_000
-        ),
+        directory
+            .apply(
+                DirectoryMutation::UpsertMembership {
+                    project: "nowhere".into(),
+                    user: "ada".into(),
+                    role: MembershipRole::Member,
+                    allocation: None,
+                    overrides: None,
+                },
+                1_000
+            )
+            .await,
         Err(DirectoryError::UnknownProject { .. })
     ));
     directory
@@ -1839,37 +1919,646 @@ fn a_membership_naming_nothing_is_refused_before_anything_compiles() {
             },
             1_000,
         )
+        .await
         .unwrap();
     assert!(matches!(
-        directory.apply(
-            DirectoryMutation::UpsertMembership {
-                project: "widgets".into(),
-                user: "nobody".into(),
-                role: MembershipRole::Member,
-                allocation: None,
-                overrides: None,
-            },
-            1_000
-        ),
+        directory
+            .apply(
+                DirectoryMutation::UpsertMembership {
+                    project: "widgets".into(),
+                    user: "nobody".into(),
+                    role: MembershipRole::Member,
+                    allocation: None,
+                    overrides: None,
+                },
+                1_000
+            )
+            .await,
         Err(DirectoryError::UnknownUser { .. })
     ));
     assert!(matches!(
-        directory.apply(
-            DirectoryMutation::RevokeKey {
-                id: "key_0000000000000000".into()
-            },
-            1_000
-        ),
+        directory
+            .apply(
+                DirectoryMutation::RevokeKey {
+                    id: "key_0000000000000000".into()
+                },
+                1_000
+            )
+            .await,
         Err(DirectoryError::UnknownKey { .. })
     ));
     assert!(matches!(
-        directory.apply(
-            DirectoryMutation::DeleteMembership {
-                project: "widgets".into(),
-                user: "nobody".into(),
-            },
-            1_000
-        ),
+        directory
+            .apply(
+                DirectoryMutation::DeleteMembership {
+                    project: "widgets".into(),
+                    user: "nobody".into(),
+                },
+                1_000
+            )
+            .await,
         Err(DirectoryError::UnknownMembership { .. })
     ));
+}
+
+// ---------------------------------------------------------------------------
+// M16.0 — the refresh runs outside every lock (R-D2, R-D3)
+// ---------------------------------------------------------------------------
+
+/// A store a test can stall, count, move and break.
+///
+/// One double for all four guards below rather than four, extending
+/// [`WriteBetweenReads`]'s pattern rather than inventing a second: what changed
+/// with M16.0 is that a refresh is now a pair of *awaits*, so the question a
+/// double has to be able to answer moved from "how many reads did this call
+/// make" to "what was another caller allowed to do while one read was in
+/// flight". [`WriteBetweenReads`] scripts a write between two reads and is
+/// exactly right for the coherence property it was written for; it has no way
+/// to hold a read open, which is the whole subject here.
+///
+/// Nothing sleeps to order anything: a blocked `load` announces itself on a
+/// semaphore and is released on another, so the interleavings below are decided
+/// by signals rather than by how busy the machine is. The only clock is
+/// [`tokio::time::timeout`], and it is a *bound* on a stall rather than an
+/// ordering device — a test that stalls fails in a second instead of hanging
+/// the suite, which is what this repo's bounded-run rule wants of a lock test.
+struct ScriptedStore {
+    state: Mutex<(DirectoryRecords, u64)>,
+    /// Every [`DirectoryStore::version`] and [`DirectoryStore::load`] call.
+    /// Counted separately because the two answer different questions: one is
+    /// the cheap half of a refresh and the other is the expensive half, and
+    /// "how many callers paid anything at all" is the single-flight property.
+    versions: std::sync::atomic::AtomicUsize,
+    loads: std::sync::atomic::AtomicUsize,
+    /// When set, every `version` read moves the store on one — a stand-in for
+    /// a neighbour node committing continuously, which is what makes "did this
+    /// caller refresh" observable without any blocking at all.
+    moving: std::sync::atomic::AtomicBool,
+    /// When set, `version` answers [`StoreFailure::Unavailable`].
+    version_fails: std::sync::atomic::AtomicBool,
+    /// Taken by the *next* `load` to arrive, which then waits on it. One load
+    /// at a time, so a test can hold one refresh open and let a later one run
+    /// to completion past it.
+    gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    /// A permit per `load` that has begun, so a test can wait for one to be in
+    /// flight instead of guessing.
+    entered: tokio::sync::Semaphore,
+    /// Taken by the *next* `commit` to arrive, held **after** the store's
+    /// state has already been mutated and **before** the call returns to its
+    /// caller. Where `gate` opens a window before a read, this one opens a
+    /// window after a write has already landed -- the only place `apply`'s
+    /// own commit-to-publish race (guard 5, below) can be driven under test
+    /// control, since nothing else in `apply` awaits between `commit`
+    /// returning and its own publish.
+    commit_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    /// A permit per `commit` that has already mutated the store and is
+    /// waiting on `commit_gate`.
+    commit_entered: tokio::sync::Semaphore,
+}
+
+impl ScriptedStore {
+    fn new(records: DirectoryRecords, version: u64) -> Self {
+        Self {
+            state: Mutex::new((records, version)),
+            versions: std::sync::atomic::AtomicUsize::new(0),
+            loads: std::sync::atomic::AtomicUsize::new(0),
+            moving: std::sync::atomic::AtomicBool::new(false),
+            version_fails: std::sync::atomic::AtomicBool::new(false),
+            gate: Mutex::new(None),
+            entered: tokio::sync::Semaphore::new(0),
+            commit_gate: Mutex::new(None),
+            commit_entered: tokio::sync::Semaphore::new(0),
+        }
+    }
+
+    fn locked(&self) -> std::sync::MutexGuard<'_, (DirectoryRecords, u64)> {
+        self.state.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// What another node just committed.
+    fn set(&self, records: DirectoryRecords, version: u64) {
+        let mut state = self.locked();
+        state.0 = records;
+        state.1 = version;
+    }
+
+    /// Forget the store traffic the boot itself made.
+    ///
+    /// `ControlDirectory::new` loads once to compile what it starts serving, and
+    /// every count below is about what a *refresh* costs — so the boot's read is
+    /// subtracted here rather than added to each guard's expected number, where
+    /// it would read as an unexplained off-by-one.
+    fn forget_boot(&self) {
+        self.versions.store(0, std::sync::atomic::Ordering::SeqCst);
+        self.loads.store(0, std::sync::atomic::Ordering::SeqCst);
+        while let Ok(stale) = self.entered.try_acquire() {
+            stale.forget();
+        }
+    }
+
+    fn versions(&self) -> usize {
+        self.versions.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn loads(&self) -> usize {
+        self.loads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// A neighbour that never stops writing.
+    fn keep_moving(&self) {
+        self.moving.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn fail_versions(&self) {
+        self.version_fails
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Hold the next `load` open. The returned handle releases it.
+    ///
+    /// Drains the in-flight signal first, because construction already read
+    /// the store once: a test that waited on a permit left over from
+    /// `ControlDirectory::new` would be told a refresh was in flight before one
+    /// had started, and would then race the very caller it means to observe.
+    fn block_next_load(&self) -> Arc<tokio::sync::Semaphore> {
+        while let Ok(stale) = self.entered.try_acquire() {
+            stale.forget();
+        }
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *self.gate.lock().unwrap_or_else(|error| error.into_inner()) = Some(Arc::clone(&gate));
+        gate
+    }
+
+    /// Returns once a `load` has begun. The signal, never a sleep.
+    async fn load_in_flight(&self) {
+        self.entered
+            .acquire()
+            .await
+            .expect("the store outlives the loads it counts")
+            .forget();
+    }
+
+    /// Hold the next `commit` open, *after* it has mutated the store's
+    /// state. The returned handle releases it.
+    fn block_next_commit(&self) -> Arc<tokio::sync::Semaphore> {
+        while let Ok(stale) = self.commit_entered.try_acquire() {
+            stale.forget();
+        }
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *self
+            .commit_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(Arc::clone(&gate));
+        gate
+    }
+
+    /// Returns once a `commit` has already mutated the store and is waiting
+    /// on the gate `block_next_commit` armed. The signal, never a sleep.
+    async fn commit_in_flight(&self) {
+        self.commit_entered
+            .acquire()
+            .await
+            .expect("the store outlives the commits it gates")
+            .forget();
+    }
+}
+
+#[async_trait::async_trait]
+impl DirectoryStore for ScriptedStore {
+    async fn load(&self) -> Result<VersionedRecords, StoreFailure> {
+        self.loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let gate = self
+            .gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        // Read before the gate, never after. A load held open is a request
+        // already in flight, and what comes back is what the store held when it
+        // was made — not what a commit that landed while it was open changed it
+        // to. Reading after the gate would make every blocked load answer with
+        // the newest records, which is the one thing the out-of-order publish
+        // guard needs it not to do.
+        let answer = {
+            let state = self.locked();
+            VersionedRecords {
+                records: state.0.clone(),
+                version: state.1,
+            }
+        };
+        self.entered.add_permits(1);
+        if let Some(gate) = gate {
+            gate.acquire()
+                .await
+                .expect("the gate outlives the load waiting on it")
+                .forget();
+        }
+        Ok(answer)
+    }
+
+    async fn commit(
+        &self,
+        expected_version: u64,
+        records: DirectoryRecords,
+    ) -> Result<u64, StoreFailure> {
+        let new_version = {
+            let mut state = self.locked();
+            if state.1 != expected_version {
+                return Err(StoreFailure::Concurrent {
+                    expected: expected_version,
+                    found: state.1,
+                });
+            }
+            state.0 = records;
+            state.1 += 1;
+            state.1
+        };
+        // The store's state is already advanced by the time this gate is
+        // taken -- a caller that reads the store from here on (a concurrent
+        // refresh's `version`/`load`) sees this commit's own result, not a
+        // stale one. That is what makes this the seam guard 5 needs: `apply`
+        // has no await between `commit` returning and its own publish, so
+        // this is the only place a test can hold a *successful* commit open
+        // long enough for another writer to publish past it first.
+        let gate = self
+            .commit_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        self.commit_entered.add_permits(1);
+        if let Some(gate) = gate {
+            gate.acquire()
+                .await
+                .expect("the gate outlives the commit waiting on it")
+                .forget();
+        }
+        Ok(new_version)
+    }
+
+    async fn version(&self) -> Result<u64, StoreFailure> {
+        self.versions
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.version_fails.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(StoreFailure::Unavailable(
+                "the scripted store is refusing version reads".into(),
+            ));
+        }
+        let mut state = self.locked();
+        if self.moving.load(std::sync::atomic::Ordering::SeqCst) {
+            state.1 += 1;
+        }
+        Ok(state.1)
+    }
+}
+
+/// The TTL every guard below runs at.
+///
+/// Deliberately **not** zero. Zero means "refresh on every call" — the one
+/// setting under which the `refreshed_at_ms` stamp cannot be a single-flight
+/// token, because every caller is past a zero TTL by definition — so a suite
+/// that pinned single flight at zero would be pinning nothing. A real TTL is
+/// also what a deployment runs; the number itself is arbitrary because every
+/// clock here is a number passed in.
+const GUARD_TTL_MS: u64 = 1_000;
+
+/// A managed directory over a scripted store, booted at instant zero.
+async fn scripted(store: Arc<ScriptedStore>) -> Arc<ControlDirectory> {
+    let directory = Arc::new(
+        ControlDirectory::new(
+            file_with_ttl(GUARD_TTL_MS),
+            PATH,
+            Arc::clone(&store) as Arc<dyn DirectoryStore>,
+            checks(),
+            0,
+        )
+        .await
+        .expect("the file alone compiles, since it is what a boot would have loaded"),
+    );
+    store.forget_boot();
+    directory
+}
+
+/// Whether a compiled plane has an admission for bo — the difference between
+/// the `before` and `after` records [`staged_mint`] produces.
+fn admits_bo(plane: &ControlPlane) -> bool {
+    plane.membership(&Principal::new("widgets", "bo")).is_ok()
+}
+
+/// R-D2, guard 1: **a refresh in flight stalls nobody.**
+///
+/// The load is the expensive half of a refresh and, once the store is durable,
+/// a network round trip. A refresh that held the snapshot lock across it would
+/// put every concurrent admission behind that round trip — the exact trade the
+/// module doc named as the thing a durable store must not be landed without.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refresh_in_flight_does_not_stall_a_concurrent_admission() {
+    let (_before, after) = staged_mint().await;
+    let store = Arc::new(ScriptedStore::new(DirectoryRecords::default(), 1));
+    let directory = scripted(Arc::clone(&store)).await;
+
+    // Another node's write, and a load that will not come back until this test
+    // says so.
+    store.set(after, 2);
+    let release = store.block_next_load();
+
+    let refresher = tokio::spawn({
+        let directory = Arc::clone(&directory);
+        async move { directory.plane(GUARD_TTL_MS).await }
+    });
+    store.load_in_flight().await;
+
+    // The admission under test, taken while that load is open.
+    let served = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        directory.plane(GUARD_TTL_MS),
+    )
+    .await
+    .expect(
+        "an admission taken while another caller's refresh is blocked in the store must be \
+         answered from the plane this node already has, not queued behind a round trip",
+    );
+    assert!(
+        !admits_bo(&served),
+        "the refresh has not returned yet, so the plane served beside it is still the one \
+         this node compiled at boot"
+    );
+
+    release.add_permits(1);
+    let refreshed = refresher.await.expect("the refreshing task does not panic");
+    assert!(
+        admits_bo(&refreshed),
+        "once the load returns, the caller that paid for it sees the new plane"
+    );
+}
+
+/// R-D2, guard 2: **N callers past the TTL cost one refresh, not N.**
+///
+/// The stamp is the token: the first caller past the TTL writes
+/// `refreshed_at_ms` and goes to the store, and every caller behind it sees a
+/// fresh stamp and serves the plane this node already has. Without that, a
+/// busy node answers one expired TTL with one store round trip per in-flight
+/// request — which is worse the busier the node is, and worst exactly when the
+/// store is already unwell.
+///
+/// The first caller's load is **held open** for the whole of the measurement,
+/// and that is what makes the count a fact rather than a race: with the refresh
+/// still in flight, every later caller is decided by the stamp alone. Letting
+/// the first one finish first would let the others take the plain TTL branch
+/// and count one refresh whatever the code did. The store also moves on every
+/// `version` read, standing in for a neighbour committing continuously, so a
+/// caller that *did* go to the store would find a reason to load.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_callers_past_the_ttl_cost_exactly_one_refresh() {
+    let store = Arc::new(ScriptedStore::new(DirectoryRecords::default(), 1));
+    let directory = scripted(Arc::clone(&store)).await;
+    store.keep_moving();
+
+    let release = store.block_next_load();
+    let refresher = tokio::spawn({
+        let directory = Arc::clone(&directory);
+        async move { directory.plane(GUARD_TTL_MS).await }
+    });
+    store.load_in_flight().await;
+
+    let callers: Vec<_> = (0..7)
+        .map(|_| {
+            let directory = Arc::clone(&directory);
+            tokio::spawn(async move { directory.plane(GUARD_TTL_MS).await })
+        })
+        .collect();
+    for caller in callers {
+        tokio::time::timeout(std::time::Duration::from_secs(5), caller)
+            .await
+            .expect("no admission queues behind the one refresh in flight")
+            .expect("no caller panics");
+    }
+
+    assert_eq!(
+        store.loads(),
+        1,
+        "eight admissions arriving on one expired TTL are one refresh, not eight"
+    );
+    assert_eq!(
+        store.versions(),
+        1,
+        "and the cheap half is single-flighted too: a caller that serves the current plane \
+         must not pay for a version read to find that out"
+    );
+
+    release.add_permits(1);
+    refresher.await.expect("the refreshing task does not panic");
+}
+
+/// R-D2, guard 3: **a refresh publishes only if it loaded something newer.**
+///
+/// With the load outside the lock, two refreshes can be in flight at once and
+/// they can finish out of order. The one that started first may carry the
+/// older records, and a publish that only knew "I have finished" would install
+/// them over the newer plane — a revocation that arrives and then un-arrives,
+/// which is worse than one that arrives a TTL late.
+///
+/// **Scoped to the version comparison alone, and not a stand-in for the other
+/// three guards.** This exercises only the `if loaded.version > current.version`
+/// arithmetic — it says nothing about *when* `refreshed_at_ms` gets stamped,
+/// so it stays green under a change that moves the stamp (guard 1's and
+/// guard 2's subject) or merges the stamp into this same publish step (which
+/// would collapse single flight into the version check this test already
+/// exercises). Reading this test alone as evidence that a stamp-timing change
+/// was safe would be reading a green light this test never turned on; guards
+/// 1, 2 and 4 are what watch the stamp.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refresh_that_loaded_an_older_version_does_not_replace_a_newer_one() {
+    let (before, after) = staged_mint().await;
+    let store = Arc::new(ScriptedStore::new(DirectoryRecords::default(), 1));
+    let directory = scripted(Arc::clone(&store)).await;
+
+    // The first refresh reads version 2 — bo has a membership and no key — and
+    // is held open there.
+    store.set(before, 2);
+    let release = store.block_next_load();
+    let slow = tokio::spawn({
+        let directory = Arc::clone(&directory);
+        async move { directory.plane(GUARD_TTL_MS).await }
+    });
+    store.load_in_flight().await;
+
+    // A second node commits bo's key while that read is open, and a later
+    // caller — one TTL on — refreshes past it and finishes first.
+    store.set(after, 3);
+    let fast = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        directory.plane(2 * GUARD_TTL_MS),
+    )
+    .await
+    .expect("the second refresh must not queue behind the first one's open load");
+    assert!(
+        admits_bo(&fast),
+        "the caller that loaded version 3 sees bo's minted key"
+    );
+
+    // Now the older refresh completes. Its records are a version behind, and a
+    // publish that ignored that would take bo's key away again.
+    release.add_permits(1);
+    let late = slow.await.expect("the slow task does not panic");
+    assert!(
+        admits_bo(&late),
+        "the refresh that loaded version 2 finished last, and answered with the newer plane \
+         rather than with its own stale one"
+    );
+    assert_eq!(
+        directory.version(2 * GUARD_TTL_MS).await,
+        3,
+        "version 3 is what this node serves: an older load finishing later must not \
+         overwrite it"
+    );
+    let served = directory.plane(2 * GUARD_TTL_MS).await;
+    assert!(
+        admits_bo(&served),
+        "and the plane published beside that version is the one compiled from it"
+    );
+}
+
+/// R-D3, guard 4: **every refresh failure backs off one TTL, `version()`
+/// included.**
+///
+/// A failed `load` and a failed `compile` already waited a TTL before trying
+/// again, and the doc called that deliberate: both are failures that *last*, so
+/// retrying per request turns a degraded store into a CPU incident on the node
+/// in front of it. A failed `version()` was the exception — it returned before
+/// the stamp — which meant the cheapest thing to get wrong was the one thing
+/// retried on every admission, and the warning it logs fired once per request
+/// rather than once per TTL.
+#[tokio::test]
+async fn a_failed_version_read_backs_off_one_ttl_like_every_other_failure() {
+    let store = Arc::new(ScriptedStore::new(DirectoryRecords::default(), 1));
+    let directory = scripted(Arc::clone(&store)).await;
+    store.fail_versions();
+
+    let first = directory.plane(GUARD_TTL_MS).await;
+    assert!(
+        !admits_bo(&first),
+        "a store that cannot answer leaves this node serving the plane it has"
+    );
+    assert_eq!(
+        store.versions(),
+        1,
+        "the first attempt does reach the store"
+    );
+
+    // The same instant again: the failure stamped, so this admission is inside
+    // the TTL and must not re-ask.
+    let _ = directory.plane(GUARD_TTL_MS).await;
+    assert_eq!(
+        store.versions(),
+        1,
+        "a version read that failed backs off one TTL, exactly as a failed load and a failed \
+         compile already did — otherwise the cheapest failure is the one retried hardest"
+    );
+
+    // One TTL on, the retry is due.
+    let _ = directory.plane(2 * GUARD_TTL_MS).await;
+    assert_eq!(
+        store.versions(),
+        2,
+        "and the backoff is one TTL, not a latch: the next TTL boundary tries again"
+    );
+}
+
+/// R-D2, guard 5: **`apply`'s own publish is guarded by the same version rule
+/// a refresh's is.**
+///
+/// `apply` holds a `tokio` mutex across its own load and commit, so nothing
+/// else can move the *store* out from under its compare-and-set: whatever
+/// version its `commit` returns is, at that instant, the true version the
+/// store is at. But `apply` has no await between `commit` returning and its
+/// own `write_current()` — so on this node, a concurrent *refresh* (which
+/// takes no such mutex) can load that very state via the store, publish it to
+/// `current`, and then a *second* write can land and get published by a later
+/// refresh, all before `apply`'s own publish ever runs. `apply`'s publish must
+/// see that `current` has already moved past its own version and stand down,
+/// the same as [`a_refresh_that_loaded_an_older_version_does_not_replace_a_newer_one`]
+/// requires of a slow refresh — dropping `apply`'s `if version >
+/// current.version` guard would let it clobber that newer state with its own,
+/// now-stale one.
+///
+/// [`ScriptedStore::block_next_commit`] is what makes this constructible:
+/// `apply`'s `commit` succeeds and mutates the store, then blocks *before
+/// returning*, which is the only window in the source with no await to hook —
+/// so the test opens one inside the double instead of inside `apply`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn apply_s_publish_does_not_clobber_a_newer_version_a_concurrent_refresh_already_installed() {
+    let store = Arc::new(ScriptedStore::new(DirectoryRecords::default(), 1));
+    let directory = scripted(Arc::clone(&store)).await;
+
+    let release_commit = store.block_next_commit();
+    let applier = tokio::spawn({
+        let directory = Arc::clone(&directory);
+        async move {
+            directory
+                .apply(
+                    DirectoryMutation::CreateProject {
+                        entry: project("widgets"),
+                    },
+                    GUARD_TTL_MS,
+                )
+                .await
+                .expect("a fresh project id")
+        }
+    });
+    // `apply`'s commit has already landed in the store and is now blocked
+    // before returning: from here on the store answers with `apply`'s own
+    // new version, but `apply` itself has not published it yet.
+    store.commit_in_flight().await;
+
+    // A refresh, past the TTL, reads that state through the store — not
+    // through `apply` — and publishes it to `current` first.
+    directory.plane(GUARD_TTL_MS).await;
+    let applys_version = directory.version(GUARD_TTL_MS).await;
+
+    // A second write lands directly on the store (a stand-in for another
+    // node), and a later refresh picks it up and publishes it too — strictly
+    // ahead of `apply`'s own publish, which is still blocked.
+    let mut newer = DirectoryRecords::default();
+    newer.projects.push(ProjectRecord {
+        entry: project("gadgets"),
+        provenance: Provenance::Admin,
+        created_at_ms: Some(0),
+        archived_at_ms: None,
+    });
+    store.set(newer, applys_version + 1);
+    directory.plane(2 * GUARD_TTL_MS).await;
+    let advanced_version = directory.version(2 * GUARD_TTL_MS).await;
+    assert_eq!(
+        advanced_version,
+        applys_version + 1,
+        "sanity: the second write really did get published ahead of `apply`"
+    );
+
+    // Only now does `apply`'s own commit return, and it races to publish a
+    // version that is, by this point, already stale.
+    release_commit.add_permits(1);
+    applier.await.expect("the applying task does not panic");
+
+    // Read at `apply`'s own `now_ms`, deliberately, and not a TTL further on:
+    // a later read would fall past `current.refreshed_at_ms` again and
+    // trigger a fresh refresh of its own, which would reload the newer state
+    // straight from the store and quietly repair exactly the clobber this
+    // guard exists to prevent — a self-healing read that would pass on the
+    // mutation this test exists to catch. Reading immediately, at the instant
+    // `apply` itself used, is what makes the assertion about `apply`'s own
+    // publish rather than about the next refresh's.
+    assert_eq!(
+        directory.version(GUARD_TTL_MS).await,
+        advanced_version,
+        "apply's own publish must not overwrite a newer version a concurrent \
+         refresh already installed while apply's commit was blocked"
+    );
+    let served = directory.view(GUARD_TTL_MS).await;
+    assert!(
+        served
+            .projects
+            .iter()
+            .any(|project| project.id() == "gadgets"),
+        "the newer state must still be what this node serves, not the older \
+         one apply's own write would have installed"
+    );
 }

@@ -80,42 +80,61 @@
 //!
 //! **The unlock condition, so the next person does not have to re-derive it:**
 //! a durable store is wanted the moment admin-created tenancy has to outlive a
-//! restart or be seen by a second node. Two placements are available and the
-//! choice is not obvious, which is why it is being deferred rather than guessed
-//! at:
+//! restart or be seen by a second node. D2 ruled the placement: the
+//! implementation lands in this crate over the Redis handle `main.rs` already
+//! opens, and the records stay next to the resolver — so
+//! `core/src/control/mod.rs`'s standing note that a key record "will arrive
+//! next to the resolver, not here" stands rather than needing an amendment.
 //!
-//! - the records move into `roundhouse-core` beside the session and spend
-//!   contracts, and `roundhouse-store-redis` implements
-//!   [`DirectoryStore`] the way it implements the other two. That contradicts
-//!   `core/src/control/mod.rs`'s standing note that a key record "will arrive
-//!   next to the resolver, not here", so it needs a dated amendment of that
-//!   note rather than a quiet move;
-//! - or the implementation lands in this crate, over the Redis handle
-//!   `main.rs` already opens, and the records stay where the resolver is.
+//! # What M16.0 landed, and what M16.1 still owes (2026-09-03)
 //!
-//! Either way the records need `Serialize`/`Deserialize`, which today they have
-//! only half of: the config entries they wrap derive `Deserialize` because a
-//! file is read and never written. Adding the other half is the first
-//! mechanical step, and it is small; the placement is the decision.
-//!
-//! One more constraint the placement decision inherits, not yet written down
-//! anywhere else: [`DirectoryStore`] today is a synchronous trait, called
-//! under `current`'s write lock alongside a full `compile()` (see
-//! [`Managed::compiled`]'s refresh path) — fine when `load()` is
+//! The constraint this doc used to state as a warning has been discharged.
+//! [`DirectoryStore`] *was* a synchronous trait called under `current`'s write
+//! lock alongside a full `compile()` — fine while `load()` was
 //! [`MemoryDirectoryStore`]'s in-memory clone, a real stall once it is a
-//! network round-trip to Redis. A durable store needs two changes together,
-//! not one: `DirectoryStore` becomes an async trait, *and* the refresh path
-//! stops compiling under the write guard — compile into a fresh value first,
-//! then swap it in under a lock held only long enough to publish it. Landing
-//! the trait change without the lock-span change would durable-back the store
-//! and then hold every concurrent admission behind one Redis round-trip on
-//! every TTL-driven refresh.
+//! network round trip — and the warning was that a durable store needs two
+//! changes together, not one. Both landed here, in this rung, before any
+//! durable store exists to blame them on:
+//!
+//! - **the trait is async** (R-D1). `load`, `commit` and `version` are
+//!   `async fn` behind `#[async_trait]`, `PlaneSource::plane` is async with
+//!   them, and every surface awaits its plane. `current` is still a `std`
+//!   lock and is never held across an await — which the compiler enforces,
+//!   because a `std` guard is not `Send` and a [`PlaneSource`] future must be.
+//!   The write mutex, which *is* held across the store's `load` and `commit`,
+//!   is a `tokio` one.
+//! - **the refresh runs outside every lock** (R-D2, R-D3). See
+//!   [`Managed::compiled`]: three brief windows, the `refreshed_at_ms` stamp as
+//!   the single-flight token, publication conditional on the loaded version
+//!   being newer, and one uniform TTL of backoff behind every kind of refresh
+//!   failure.
+//!
+//! **What M16.1 owes.** The seam is ready and the store behind it is still
+//! [`MemoryDirectoryStore`], so nothing about durability has changed yet:
+//! admin-created tenancy still dies with the process, and
+//! `recreating_an_archived_project_after_a_restart_inherits_its_spend` in
+//! `tests/admin_api.rs` is still ignored with its reason still true. Three
+//! things are left, and they are the whole of it:
+//!
+//! - **the Redis store itself**, over `roundhouse-store-redis`'s one key
+//!   builder rather than a key format spelled a second time in this crate —
+//!   which means `build_key` and `KeyFamily` become reachable from here, or the
+//!   implementation moves to where they already are;
+//! - **`Serialize` on the records**, which today they have only half of: the
+//!   config entries they wrap derive `Deserialize` because a file is read and
+//!   never written. Mechanical, and small;
+//! - **the boot re-order.** `main.rs` builds this directory before it opens any
+//!   backend, and the directory's construction *is* the boot check — so the
+//!   `Some` arm that picks between stores has to come after the backend
+//!   handle exists, and `control_plane_file_configured` (the flag the
+//!   memory-store warning branches on) has to move with it.
 //!
 //! [`AuthError::RevokedKey`]: super::AuthError::RevokedKey
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 
+use async_trait::async_trait;
 use roundhouse_core::control::BudgetTerms;
 
 use super::budget::budget_terms;
@@ -156,19 +175,26 @@ pub use store::{DirectoryStore, MemoryDirectoryStore, StoreFailure, VersionedRec
 /// weak one behind a feature is what makes "this call site silently lost
 /// revocation" a build error in production rather than a property nobody
 /// notices: a bare plane handed to a router in `main.rs` does not compile.
+#[async_trait]
 pub trait PlaneSource: Send + Sync + 'static {
     /// The plane this request is judged against.
     ///
     /// `now_ms` is the caller's clock rather than one read inside, for the
     /// reason every other seam in this crate takes it: a staleness bound that
     /// cannot be moved from a test is a staleness bound nothing pins.
-    fn plane(&self, now_ms: u64) -> Arc<ControlPlane>;
+    ///
+    /// `async` since M16.0 (R-D1), because the refresh behind it may be a
+    /// round trip to a durable [`DirectoryStore`]. `#[async_trait]` for the
+    /// reason that trait gives: every surface holds this as
+    /// `Arc<dyn PlaneSource>`, and a native `async fn` is not dyn compatible.
+    async fn plane(&self, now_ms: u64) -> Arc<ControlPlane>;
 }
 
+#[async_trait]
 impl PlaneSource for ControlDirectory {
     /// The live implementation, and production's only one.
-    fn plane(&self, now_ms: u64) -> Arc<ControlPlane> {
-        ControlDirectory::plane(self, now_ms)
+    async fn plane(&self, now_ms: u64) -> Arc<ControlPlane> {
+        ControlDirectory::plane(self, now_ms).await
     }
 }
 
@@ -195,8 +221,9 @@ impl PlaneSource for ControlDirectory {
 /// refresh, and a value that is its own source has nothing to hand back but a
 /// copy.
 #[cfg(feature = "test-support")]
+#[async_trait]
 impl PlaneSource for ControlPlane {
-    fn plane(&self, _now_ms: u64) -> Arc<ControlPlane> {
+    async fn plane(&self, _now_ms: u64) -> Arc<ControlPlane> {
         Arc::new(self.clone())
     }
 }
@@ -321,13 +348,24 @@ struct Managed {
     store: Arc<dyn DirectoryStore>,
     checks: CrossChecks,
     ttl_ms: u64,
+    /// A `std` lock, and deliberately still one after M16.0 made the refresh
+    /// async: nothing here is ever held across an await, which is a property
+    /// the compiler checks rather than one a reader has to trust. A `std`
+    /// guard is not `Send`, a [`PlaneSource`] future must be, so a refresh that
+    /// tried to hold this across `load` would not compile — see
+    /// [`Self::compiled`] for the three windows it is taken in.
     current: RwLock<Compiled>,
     /// Held across read-validate-commit, so a single node never races itself.
     ///
     /// With this, [`StoreFailure::Concurrent`] can only be another *node*, which
     /// is what makes it a meaningful answer rather than a lock this process
     /// forgot to take.
-    write: Mutex<()>,
+    ///
+    /// A `tokio` mutex since M16.0 (R-D1): the span it guards now contains two
+    /// awaits — the store's `load` and its `commit` — and a `std` guard held
+    /// across an await parks a runtime worker on a lock a task, not a thread,
+    /// is waiting for.
+    write: tokio::sync::Mutex<()>,
 }
 
 impl ControlDirectory {
@@ -336,7 +374,7 @@ impl ControlDirectory {
     /// Fails if the two together do not compile — which, on a fresh
     /// [`MemoryDirectoryStore`], can only mean the file itself does not, and
     /// that has already stopped the boot by the time this is called.
-    pub fn new(
+    pub async fn new(
         file: ControlPlaneConfig,
         path: impl Into<String>,
         store: Arc<dyn DirectoryStore>,
@@ -344,7 +382,9 @@ impl ControlDirectory {
         now_ms: u64,
     ) -> Result<Self, DirectoryError> {
         Ok(Self {
-            backing: Backing::Managed(Box::new(Managed::new(file, path, store, checks, now_ms)?)),
+            backing: Backing::Managed(Box::new(
+                Managed::new(file, path, store, checks, now_ms).await?,
+            )),
         })
     }
 
@@ -376,10 +416,10 @@ impl ControlDirectory {
     /// See [`Managed::compiled`] for the refresh rule. A fixed directory answers
     /// the one plane it was built with, and the clock is ignored rather than
     /// consulted: there is nothing behind it that could have moved.
-    pub fn plane(&self, now_ms: u64) -> Arc<ControlPlane> {
+    pub async fn plane(&self, now_ms: u64) -> Arc<ControlPlane> {
         match &self.backing {
             Backing::Fixed(plane) => Arc::clone(plane),
-            Backing::Managed(managed) => managed.plane(now_ms),
+            Backing::Managed(managed) => managed.plane(now_ms).await,
         }
     }
 
@@ -388,8 +428,8 @@ impl ControlDirectory {
     /// Empty for a fixed directory, which is the accurate answer and not a
     /// placeholder: nothing can reach this on an open deployment, because the
     /// admin surface refuses that mode before any route runs.
-    pub fn view(&self, now_ms: u64) -> DirectoryView {
-        self.snapshot(now_ms).1
+    pub async fn view(&self, now_ms: u64) -> DirectoryView {
+        self.snapshot(now_ms).await.1
     }
 
     /// The compiled plane and the entity listing, **at one version**.
@@ -408,7 +448,7 @@ impl ControlDirectory {
     /// a write describes the state before it, and that is a correct answer to
     /// "what was true when this request arrived". What cannot happen is a
     /// document assembled from two of them.
-    pub fn snapshot(&self, now_ms: u64) -> (Arc<ControlPlane>, DirectoryView) {
+    pub async fn snapshot(&self, now_ms: u64) -> (Arc<ControlPlane>, DirectoryView) {
         match &self.backing {
             Backing::Fixed(plane) => (
                 Arc::clone(plane),
@@ -419,7 +459,7 @@ impl ControlDirectory {
                     keys: Vec::new(),
                 },
             ),
-            Backing::Managed(managed) => managed.snapshot(now_ms),
+            Backing::Managed(managed) => managed.snapshot(now_ms).await,
         }
     }
 
@@ -454,35 +494,35 @@ impl ControlDirectory {
 
     /// Apply one change: validate it, compile the whole control plane it would
     /// produce, and only then write. See [`Managed::apply`].
-    pub fn apply(
+    pub async fn apply(
         &self,
         mutation: DirectoryMutation,
         now_ms: u64,
     ) -> Result<Arc<DirectoryRecords>, DirectoryError> {
-        self.managed()?.apply(mutation, now_ms)
+        self.managed()?.apply(mutation, now_ms).await
     }
 
     /// Mint a turn key for one membership and record it in one write.
-    pub fn mint_turn_key(
+    pub async fn mint_turn_key(
         &self,
         project: &str,
         user: &str,
         now_ms: u64,
     ) -> Result<MintedKey, DirectoryError> {
-        self.managed()?.mint_turn_key(project, user, now_ms)
+        self.managed()?.mint_turn_key(project, user, now_ms).await
     }
 
     /// Mint an admin key. See [`Managed::mint_turn_key`] on why this is one call.
-    pub fn mint_admin_key(&self, now_ms: u64) -> Result<MintedKey, DirectoryError> {
-        self.managed()?.mint_admin_key(now_ms)
+    pub async fn mint_admin_key(&self, now_ms: u64) -> Result<MintedKey, DirectoryError> {
+        self.managed()?.mint_admin_key(now_ms).await
     }
 
     /// The version this node last compiled, or `0` for a directory with nothing
     /// behind it to version.
-    pub fn version(&self, now_ms: u64) -> u64 {
+    pub async fn version(&self, now_ms: u64) -> u64 {
         match &self.backing {
             Backing::Fixed(_) => 0,
-            Backing::Managed(managed) => managed.version(now_ms),
+            Backing::Managed(managed) => managed.version(now_ms).await,
         }
     }
 
@@ -502,7 +542,7 @@ impl ControlDirectory {
 }
 
 impl Managed {
-    fn new(
+    async fn new(
         file: ControlPlaneConfig,
         path: impl Into<String>,
         store: Arc<dyn DirectoryStore>,
@@ -514,7 +554,7 @@ impl Managed {
         let ttl_ms = file
             .admission_cache_ttl_ms
             .unwrap_or(DEFAULT_ADMISSION_CACHE_TTL_MS);
-        let loaded = store.load()?;
+        let loaded = store.load().await?;
         let plane = compile(&file, &path, &checks, &loaded.records)?;
         Ok(Self {
             file,
@@ -529,7 +569,7 @@ impl Managed {
                 plane,
                 refreshed_at_ms: now_ms,
             }),
-            write: Mutex::new(()),
+            write: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -553,6 +593,43 @@ impl Managed {
     /// an operator writing zero means — refresh on every call — rather than
     /// "refresh on every call after the first millisecond".
     ///
+    /// # Three windows, and no lock across a round trip (M16.0, R-D2)
+    ///
+    /// Until M16.0 the whole refresh — the version read, the load and the
+    /// compile — ran under one write guard, and the doc here argued that was
+    /// the cheaper side of a trade: compiling outside the lock would have every
+    /// request that arrived during a refresh compile its own copy of the same
+    /// plane. **That trade inverts the moment `load()` is a network round
+    /// trip.** What the guard was buying was single flight; what it now costs
+    /// is every concurrent admission queued behind one store request. So the
+    /// two are separated: single flight is kept, and the lock is not what
+    /// provides it.
+    ///
+    /// `current` is therefore taken three times and never held across an await:
+    ///
+    /// 1. a read, to answer "is a refresh even due";
+    /// 2. a write, to re-ask that question and — if it is still true — stamp
+    ///    `refreshed_at_ms`;
+    /// 3. a write, to publish what was loaded.
+    ///
+    /// **The stamp is the single-flight token.** The first caller past the TTL
+    /// writes it and goes to the store; every caller behind it re-reads the
+    /// stamp in window two, finds it fresh, and serves the plane this node
+    /// already has. That is the same one-refresh-per-TTL the old write guard
+    /// enforced, without anything waiting on the store to learn it. A caller
+    /// that arrives while a refresh is in flight is *deliberately* answered
+    /// from the current plane rather than made to wait for the newer one: it
+    /// was going to be answered from a plane up to one TTL old anyway, and the
+    /// staleness bound is the promise, not the freshness.
+    ///
+    /// **Publishing is conditional on the version.** With the load outside the
+    /// lock, two refreshes can be in flight at once and can finish out of
+    /// order, so "I have finished" is not a reason to install anything: the
+    /// slower one may be carrying the older records. A publish that ignored
+    /// that would let a revocation arrive and then un-arrive, which is worse
+    /// than one that arrives a TTL late. Newer wins, whoever got back first.
+    /// [`Self::apply`] publishes under the same rule.
+    ///
     /// **A refresh that fails keeps serving the last good plane**, and says so
     /// in the log. The alternative is a node that stops authenticating anything
     /// because the store blinked or because a variable moved out of the
@@ -560,29 +637,45 @@ impl Managed {
     /// it costs is that a revocation does not propagate while the failure lasts
     /// — which is why it is a warning and not a debug line.
     ///
-    /// A failed refresh still stamps `refreshed_at_ms`, so the next attempt is
-    /// one TTL away rather than one request away. That is a deliberate backoff
-    /// and not an oversight: the two ways a refresh fails here are a store
+    /// **Every failure backs off one TTL, and that is now uniform** (R-D3). The
+    /// stamp lands in window two, ahead of the first fallible call, so a failed
+    /// `version()`, a failed `load()` and a plane that will not compile all
+    /// wait the same TTL before the next attempt. Before M16.0 the version read
+    /// returned ahead of the stamp and was retried on *every* admission — the
+    /// cheapest failure was the one retried hardest, and its warning fired once
+    /// per request instead of once per TTL. The backoff is deliberate for the
+    /// same reason it always was: the two ways a refresh fails here are a store
     /// outage and a config the environment can no longer satisfy, and both are
-    /// failures that *last*. Retrying per request would recompile the whole
-    /// control plane on every admission for the duration — turning a degraded
-    /// directory into a CPU incident precisely when the store is already
-    /// unwell. The price is that a revocation made during the failure can take
-    /// up to two TTLs instead of one.
-    ///
-    /// The recompile happens **under the write lock**, which briefly stalls
-    /// concurrent admissions. That is the cheaper side of the trade: compiling
-    /// outside the lock would have every request that arrived during a refresh
-    /// compile its own copy of the same plane, so the busier the node, the more
-    /// work one revocation would cost it.
-    fn compiled(&self, now_ms: u64) -> (Arc<ControlPlane>, Arc<DirectoryRecords>) {
+    /// failures that *last*. The price is unchanged — a revocation made during
+    /// the failure can take up to two TTLs instead of one.
+    async fn compiled(&self, now_ms: u64) -> (Arc<ControlPlane>, Arc<DirectoryRecords>) {
+        // Window one. A read, because the common answer is "not due" and that
+        // answer must not serialize a node's admissions against each other.
         {
             let current = self.read_current();
             if now_ms.saturating_sub(current.refreshed_at_ms) < self.ttl_ms {
                 return taken(&current);
             }
         }
-        let version = match self.store.version() {
+        // Window two: claim the refresh, or discover somebody else has. The
+        // same test as window one, re-asked under a write guard — which is what
+        // makes exactly one of a burst of concurrent callers the one that pays.
+        // The re-ask guards a scheduling gap no scripted clock can reach (two
+        // callers both past window one before either stamps), so no test
+        // drives it: deleting it leaves the suite green and the race open.
+        let claimed_version = {
+            let mut current = self.write_current();
+            if now_ms.saturating_sub(current.refreshed_at_ms) < self.ttl_ms {
+                return taken(&current);
+            }
+            current.refreshed_at_ms = now_ms;
+            current.version
+        };
+        // From here to window three no guard is held, which is the whole point:
+        // both of the calls below may be round trips, and the compile between
+        // them is the CPU cost this used to make every concurrent admission
+        // wait behind.
+        let version = match self.store.version().await {
             Ok(version) => version,
             Err(error) => {
                 tracing::warn!(
@@ -593,37 +686,47 @@ impl Managed {
                 return taken(&self.read_current());
             }
         };
-        let mut current = self.write_current();
-        current.refreshed_at_ms = now_ms;
-        if version == current.version {
-            return taken(&current);
+        if version == claimed_version {
+            return taken(&self.read_current());
         }
-        match self.store.load() {
-            Ok(loaded) => match self.compile(&loaded.records) {
-                Ok(plane) => {
-                    current.version = loaded.version;
-                    current.records = Arc::new(loaded.records);
-                    current.plane = plane;
-                }
-                Err(error) => tracing::warn!(
+        let loaded = match self.store.load().await {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "the control directory's version moved but its records could not be read; \
+                     serving the last compiled control plane"
+                );
+                return taken(&self.read_current());
+            }
+        };
+        let plane = match self.compile(&loaded.records) {
+            Ok(plane) => plane,
+            Err(error) => {
+                tracing::warn!(
                     %error,
                     "the control directory changed but the new state does not compile on this \
                      node; serving the last compiled control plane"
-                ),
-            },
-            Err(error) => tracing::warn!(
-                %error,
-                "the control directory's version moved but its records could not be read; \
-                 serving the last compiled control plane"
-            ),
+                );
+                return taken(&self.read_current());
+            }
+        };
+        // Window three. `>` and not `!=`: a refresh that finished late with
+        // older records must leave the newer plane where it is, and hand its
+        // own caller the newer one too.
+        let mut current = self.write_current();
+        if loaded.version > current.version {
+            current.version = loaded.version;
+            current.records = Arc::new(loaded.records);
+            current.plane = plane;
         }
         taken(&current)
     }
 
     /// The plane alone, for the surfaces that only authenticate. See
     /// [`Self::compiled`].
-    fn plane(&self, now_ms: u64) -> Arc<ControlPlane> {
-        self.compiled(now_ms).0
+    async fn plane(&self, now_ms: u64) -> Arc<ControlPlane> {
+        self.compiled(now_ms).await.0
     }
 
     /// Every entity this deployment has, whoever owns it.
@@ -644,8 +747,8 @@ impl Managed {
     /// second one taken at the same instant: a caller that reads both — see
     /// [`ControlDirectory::snapshot`] — must not be able to get them from two
     /// versions, and the only way to promise that is to hand them over together.
-    fn snapshot(&self, now_ms: u64) -> (Arc<ControlPlane>, DirectoryView) {
-        let (plane, records) = self.compiled(now_ms);
+    async fn snapshot(&self, now_ms: u64) -> (Arc<ControlPlane>, DirectoryView) {
+        let (plane, records) = self.compiled(now_ms).await;
         (plane, self.listing(&records))
     }
 
@@ -748,24 +851,35 @@ impl Managed {
     /// secret that authenticates as nothing. It is *revoked* rather than
     /// deleted, so the operator who removed the member can still see that the
     /// key existed and stopped working, which is the question they will have.
-    fn apply(
+    async fn apply(
         &self,
         mutation: DirectoryMutation,
         now_ms: u64,
     ) -> Result<Arc<DirectoryRecords>, DirectoryError> {
-        let _write = self.write.lock().unwrap_or_else(|error| error.into_inner());
-        let loaded = self.store.load()?;
+        let _write = self.write.lock().await;
+        let loaded = self.store.load().await?;
         let mut next = loaded.records.clone();
         self.mutate(&mut next, mutation, now_ms)?;
         let plane = self.compile(&next)?;
-        let version = self.store.commit(loaded.version, next.clone())?;
+        let version = self.store.commit(loaded.version, next.clone()).await?;
         let records = Arc::new(next);
-        *self.write_current() = Compiled {
-            version,
-            records: Arc::clone(&records),
-            plane,
-            refreshed_at_ms: now_ms,
-        };
+        // Published under the same version rule a refresh uses, and for the
+        // same reason: a refresh started before this write may still be in
+        // flight with older records, and whichever of the two finishes last
+        // must not be the one that decides. The commit above is what makes
+        // this write the newer of the pair — a store that had moved under it
+        // would have answered `Concurrent` rather than a version.
+        {
+            let mut current = self.write_current();
+            if version > current.version {
+                *current = Compiled {
+                    version,
+                    records: Arc::clone(&records),
+                    plane,
+                    refreshed_at_ms: now_ms,
+                };
+            }
+        }
         Ok(records)
     }
 
@@ -775,7 +889,7 @@ impl Managed {
     /// one call rather than two so a caller cannot hand a secret to an operator
     /// and then fail to store its hash — which is a key that works nowhere and
     /// looks, from the operator's side, exactly like one that works.
-    fn mint_turn_key(
+    async fn mint_turn_key(
         &self,
         project: &str,
         user: &str,
@@ -789,19 +903,21 @@ impl Managed {
                 key: KeyFingerprint::from(&minted),
             },
             now_ms,
-        )?;
+        )
+        .await?;
         Ok(minted)
     }
 
     /// Mint an admin key. See [`Self::mint_turn_key`] on why this is one call.
-    fn mint_admin_key(&self, now_ms: u64) -> Result<MintedKey, DirectoryError> {
+    async fn mint_admin_key(&self, now_ms: u64) -> Result<MintedKey, DirectoryError> {
         let minted = mint_key(KeyKind::Admin)?;
         self.apply(
             DirectoryMutation::MintAdminKey {
                 key: KeyFingerprint::from(&minted),
             },
             now_ms,
-        )?;
+        )
+        .await?;
         Ok(minted)
     }
 
@@ -837,8 +953,8 @@ impl Managed {
 
     /// The version this node last compiled. Observability, and the seam the
     /// staleness tests read.
-    fn version(&self, now_ms: u64) -> u64 {
-        let _ = self.plane(now_ms);
+    async fn version(&self, now_ms: u64) -> u64 {
+        let _ = self.plane(now_ms).await;
         self.read_current().version
     }
 

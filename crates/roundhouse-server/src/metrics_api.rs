@@ -92,7 +92,7 @@ async fn snapshot(
     State(state): State<MetricsState>,
     headers: HeaderMap,
 ) -> Result<Response, AuthError> {
-    let snapshot = scoped_snapshot(&state, &headers)?;
+    let snapshot = scoped_snapshot(&state, &headers).await?;
     Ok(match serde_json::to_vec(&snapshot) {
         Ok(body) => (
             StatusCode::OK,
@@ -135,7 +135,7 @@ async fn snapshot(
 /// deployment's — see `MetricsSnapshot::build`, which scopes the session count,
 /// the turn count and the event window too. Filtering only the money would
 /// leave three fields quietly describing the neighbours.
-fn scoped_snapshot(
+async fn scoped_snapshot(
     state: &MetricsState,
     headers: &HeaderMap,
 ) -> Result<MetricsSnapshot, AuthError> {
@@ -143,7 +143,7 @@ fn scoped_snapshot(
     // One snapshot, taken at the same instant the document is stamped with:
     // the mode branch below and the key resolution inside it have to be two
     // questions about one compiled plane.
-    let plane = state.planes.plane(at_ms);
+    let plane = state.planes.plane(at_ms).await;
     match &*plane {
         // Short-circuited rather than resolved and scoped to the one principal
         // `Open` would hand back, and the difference matters on exactly one

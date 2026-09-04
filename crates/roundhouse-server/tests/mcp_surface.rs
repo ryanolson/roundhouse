@@ -420,6 +420,7 @@ async fn build(
         )),
         Arc::clone(&control),
     )
+    .await
     .merge(responses_router(
         plane,
         Arc::clone(&engine),

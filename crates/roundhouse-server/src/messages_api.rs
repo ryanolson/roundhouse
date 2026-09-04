@@ -349,7 +349,7 @@ where
     S: SessionStore,
     T: Tokenizer + Clone + Send + Sync + 'static,
 {
-    let plane = state.planes.plane(now_ms());
+    let plane = state.planes.plane(now_ms()).await;
     let admission = plane.turn_admission(&headers)?;
     refuse_over_fair_use(&*state.engine, &admission).await?;
     let mut params: CreateMessageParams = parse_body(&body)?;
@@ -586,7 +586,7 @@ where
     S: SessionStore,
     T: Tokenizer + Clone + Send + Sync + 'static,
 {
-    let plane = state.planes.plane(now_ms());
+    let plane = state.planes.plane(now_ms()).await;
     plane.turn_admission(&headers)?;
     let params: CreateMessageParams = parse_body(&body)?;
     let claimed = canonicalize(&params)?;

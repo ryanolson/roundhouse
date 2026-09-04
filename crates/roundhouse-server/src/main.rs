@@ -717,11 +717,12 @@ async fn main() -> anyhow::Result<()> {
                 checks,
                 roundhouse_core::now_ms(),
             )
+            .await
             .map_err(boot_refusal)?,
         ),
         None => ControlDirectory::open(),
     };
-    match &*directory.plane(roundhouse_core::now_ms()) {
+    match &*directory.plane(roundhouse_core::now_ms()).await {
         // Counted through the accessor rather than by reaching into
         // `Configured { turn_keys, .. }`: the table's layout has exactly one
         // reader outside its own module, and this is not going to be the
@@ -747,6 +748,7 @@ async fn main() -> anyhow::Result<()> {
     // gone stale (M13 thermo-nuclear review, F1).
     let fair_use_configured = directory
         .plane(roundhouse_core::now_ms())
+        .await
         .configured_admissions()
         .any(|admission| !admission.fair_use.is_empty());
     if fair_use_configured {
@@ -941,12 +943,14 @@ async fn serve<S: SessionStore>(
         // deployment could re-randomize a study already in flight.
         arm_salt: directory
             .plane(roundhouse_core::now_ms())
+            .await
             .arm_salt()
             .to_string(),
         ..EngineConfig::default()
     };
 
-    let tiers_configured = composes_the_stage_router(&directory.plane(roundhouse_core::now_ms()));
+    let booted_plane = directory.plane(roundhouse_core::now_ms()).await;
+    let tiers_configured = composes_the_stage_router(&booted_plane);
     if tiers_configured {
         tracing::info!(
             "a project configures a tier recipe; the stage router is composed over the \
@@ -1048,22 +1052,25 @@ async fn serve<S: SessionStore>(
         Arc::clone(&store),
         metrics_config,
     ))
-    .merge(mcp_api::mcp_router(
-        Arc::clone(&directory),
-        Arc::new(ControlPlaneReads::new(
+    .merge(
+        mcp_api::mcp_router(
             Arc::clone(&directory),
-            Arc::clone(&store),
-            spend,
-            Arc::clone(&conversations),
-            // The same list the startup cross-checks above are built on, and
-            // it is right for the same reason: this binary attaches no
-            // fleet, so the catalog is everything a turn of its could be
-            // routed to. A deployment that attaches one adds its local model
-            // here at the same site — see `reachable_candidates`.
-            reachable,
-        )),
-        control,
-    ))
+            Arc::new(ControlPlaneReads::new(
+                Arc::clone(&directory),
+                Arc::clone(&store),
+                spend,
+                Arc::clone(&conversations),
+                // The same list the startup cross-checks above are built on, and
+                // it is right for the same reason: this binary attaches no
+                // fleet, so the catalog is everything a turn of its could be
+                // routed to. A deployment that attaches one adds its local model
+                // here at the same site — see `reachable_candidates`.
+                reachable,
+            )),
+            control,
+        )
+        .await,
+    )
     .merge(responses_api::responses_router(
         Arc::clone(&directory),
         Arc::clone(&engine),

@@ -216,6 +216,7 @@ async fn rig_over(
             CrossChecks::new(reachable(), None),
             now_ms(),
         )
+        .await
         .expect("the file alone compiles, since it is what a boot would have loaded"),
     );
     let store = Arc::new(MemoryStore::new());
@@ -322,6 +323,7 @@ async fn pass_through_rig() -> Rig {
             CrossChecks::new(reachable(), None),
             now_ms(),
         )
+        .await
         .expect("the file alone compiles, since it is what a boot would have loaded"),
     );
     let store = Arc::new(MemoryStore::new());
@@ -813,8 +815,9 @@ impl ArmedStore {
     }
 }
 
+#[async_trait::async_trait]
 impl DirectoryStore for ArmedStore {
-    fn load(&self) -> Result<VersionedRecords, StoreFailure> {
+    async fn load(&self) -> Result<VersionedRecords, StoreFailure> {
         let state = self.locked();
         Ok(VersionedRecords {
             records: state.0.clone(),
@@ -822,7 +825,7 @@ impl DirectoryStore for ArmedStore {
         })
     }
 
-    fn commit(
+    async fn commit(
         &self,
         expected_version: u64,
         records: DirectoryRecords,
@@ -839,7 +842,7 @@ impl DirectoryStore for ArmedStore {
         Ok(state.1)
     }
 
-    fn version(&self) -> Result<u64, StoreFailure> {
+    async fn version(&self) -> Result<u64, StoreFailure> {
         let mut countdown = self
             .countdown
             .lock()
@@ -908,6 +911,7 @@ async fn budget_view_over_http_reads_plane_and_view_from_one_version() {
             CrossChecks::new(reachable(), None),
             now_ms(),
         )
+        .await
         .expect("admin_keys alone compiles"),
     );
     let seed_app = admin_api::admin_router(
@@ -932,6 +936,7 @@ async fn budget_view_over_http_reads_plane_and_view_from_one_version() {
     .await;
     let before = seed_store
         .load()
+        .await
         .expect("the seed store answers its own writes")
         .records;
     admin(
@@ -950,6 +955,7 @@ async fn budget_view_over_http_reads_plane_and_view_from_one_version() {
     .await;
     let after = seed_store
         .load()
+        .await
         .expect("the seed store answers its own writes")
         .records;
 
@@ -972,6 +978,7 @@ async fn budget_view_over_http_reads_plane_and_view_from_one_version() {
             CrossChecks::new(reachable(), None),
             now_ms(),
         )
+        .await
         .expect("admin_keys alone compiles"),
     );
     let app = admin_api::admin_router(
@@ -3181,10 +3188,10 @@ async fn a_directory_write_reaches_every_surface_and_not_just_the_admin_one() {
     // metrics one -- because all of them resolve through the same directory per
     // request rather than through a plane captured when the router was mounted.
     let rig = plain().await;
-    let before = rig.directory.version(now_ms());
+    let before = rig.directory.version(now_ms()).await;
     let secret = budgeted_member(&rig.app, "globex", "bob").await;
     assert!(
-        rig.directory.version(now_ms()) > before,
+        rig.directory.version(now_ms()).await > before,
         "the writes must have moved the store's version"
     );
 

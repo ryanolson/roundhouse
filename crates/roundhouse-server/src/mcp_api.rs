@@ -119,15 +119,19 @@ impl<S: SessionStore> ControlPlaneReads<S> {
     /// authenticated caller always has a membership, and one whose keys disagree
     /// is a file an operator has to go and edit. The startup cross-check is what
     /// makes the second arm unreachable in a deployment that booted.
-    fn membership(&self, principal: &Principal) -> Result<crate::Admission, SurfaceError> {
+    async fn membership(&self, principal: &Principal) -> Result<crate::Admission, SurfaceError> {
         self.plane()
+            .await
             .membership(principal)
             .map_err(|error| SurfaceError::Internal(error.to_string()))
     }
 
     /// This node's current compiled plane. See [`Self::planes`].
-    fn plane(&self) -> Arc<ControlPlane> {
-        self.planes.plane(self.now_ms())
+    ///
+    /// `async` since M16.0 (R-D1): resolving the plane may refresh it, and a
+    /// refresh may be a round trip to the directory's store.
+    async fn plane(&self) -> Arc<ControlPlane> {
+        self.planes.plane(self.now_ms()).await
     }
 }
 
@@ -168,7 +172,7 @@ impl<S: SessionStore> ControlReads for ControlPlaneReads<S> {
         // map is in the deployment's Redis.
         let Some(session) = self
             .conversations
-            .resolve(&self.plane().qualify(principal, named))
+            .resolve(&self.plane().await.qualify(principal, named))
             .await
             .map_err(|error| SurfaceError::Internal(error.to_string()))?
         else {
@@ -245,7 +249,7 @@ impl<S: SessionStore> ControlReads for ControlPlaneReads<S> {
     }
 
     async fn ceiling_policy(&self, principal: &Principal) -> Result<TurnPolicy, SurfaceError> {
-        Ok((*self.membership(principal)?.policy).clone())
+        Ok((*self.membership(principal).await?.policy).clone())
     }
 
     async fn admissible_targets(
@@ -262,7 +266,7 @@ impl<S: SessionStore> ControlReads for ControlPlaneReads<S> {
         // that provider through to a turn the router then withholds it from.
         // Two answers to one question, and the disagreement is invisible from
         // either side.
-        let credentials = self.membership(principal)?.credentials;
+        let credentials = self.membership(principal).await?.credentials;
 
         // `permits` and deliberately not `admits`: this asks what a turn of this
         // key's could *ever* be routed to, and a cadence-rationed model is one
@@ -299,7 +303,7 @@ impl<S: SessionStore> ControlReads for ControlPlaneReads<S> {
     }
 
     async fn balance(&self, principal: &Principal) -> Result<Option<Balance>, SurfaceError> {
-        let Some(terms) = self.membership(principal)?.budget else {
+        let Some(terms) = self.membership(principal).await?.budget else {
             // No budget configured: the engine never calls the ledger for this
             // membership, so there is no position to read and none to invent.
             return Ok(None);
@@ -373,7 +377,7 @@ pub const MCP_MOUNT_PATH: &str = "/mcp";
 /// a parameter typed `Arc<dyn PlaneSource>` would not accept either through the
 /// `Arc::clone(&plane)` a caller naturally writes, because the clone's own
 /// return type is inferred before any coercion could apply.
-pub fn mcp_router<R: ControlReads, P: PlaneSource>(
+pub async fn mcp_router<R: ControlReads, P: PlaneSource>(
     planes: Arc<P>,
     reads: Arc<R>,
     store: Arc<ControlStore>,
@@ -398,7 +402,7 @@ pub fn mcp_router<R: ControlReads, P: PlaneSource>(
     // `Open`, and a fixed source cannot move at all — so no admin write and no
     // refresh can change it. A guard re-derived per request would suggest
     // otherwise.
-    let hosts = match planes.plane(now_ms()).as_ref() {
+    let hosts = match planes.plane(now_ms()).await.as_ref() {
         ControlPlane::Open => HostGuard::Loopback,
         ControlPlane::Configured { .. } => HostGuard::AnyHost,
     };
@@ -423,7 +427,7 @@ async fn auth_layer(
     mut request: Request,
     next: Next,
 ) -> Response {
-    let principal = match planes.plane(now_ms()).scope(request.headers()) {
+    let principal = match planes.plane(now_ms()).await.scope(request.headers()) {
         Ok(KeyScope::Turn(admission)) => admission.principal,
         Ok(KeyScope::Admin) => return ApiError::from(AuthError::WrongKeyKind).into_response(),
         Err(error) => return ApiError::from(error).into_response(),

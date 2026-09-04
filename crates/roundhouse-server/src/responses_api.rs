@@ -307,7 +307,7 @@ where
     // One snapshot for the whole request: the namespace a cache key is
     // qualified into and the dialect the reply is rendered in are read off it
     // too, and two of them could disagree across a refresh.
-    let plane = state.planes.plane(now_ms());
+    let plane = state.planes.plane(now_ms()).await;
     let admission = plane.turn_admission(&headers)?;
     // Immediately after the key lookup and before anything is parsed, bound or
     // granted. A rolling fair-use window is the one refusal an *agent* rather

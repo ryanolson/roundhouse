@@ -113,7 +113,7 @@ fn plane(secret: &str) -> Arc<ControlPlane> {
 /// frontier client are needed to reach it — only a store that can answer
 /// `named_session`'s existence check, and the correlation maps underneath
 /// `Conversations` that carry the three correlators.
-fn app_for(
+async fn app_for(
     plane: &Arc<ControlPlane>,
     store: &Arc<MemoryStore>,
     conversations: Arc<Conversations>,
@@ -126,7 +126,7 @@ fn app_for(
         conversations,
         Vec::new(),
     ));
-    mcp_router(Arc::clone(plane), reads, Arc::new(ControlStore::new()))
+    mcp_router(Arc::clone(plane), reads, Arc::new(ControlStore::new())).await
 }
 
 /// Opens a conversation with [`bind_conversation`] alone (M14.0's "fixture
@@ -213,7 +213,7 @@ async fn the_family_cache_key_outranks_a_bound_tool_use_id() {
     let ada = Principal::new("acme", "ada");
 
     let conversations = Arc::new(node().await);
-    let app = app_for(&plane, &store, Arc::clone(&conversations));
+    let app = app_for(&plane, &store, Arc::clone(&conversations)).await;
 
     let main_session = open_conversation(&conversations, &store, &ada, "acme/ada/main").await;
     let other_session = open_conversation(&conversations, &store, &ada, "acme/ada/other").await;
@@ -287,7 +287,7 @@ async fn control_the_cache_key_alone_resolves_the_unbound_thread() {
     let ada = Principal::new("acme", "ada");
 
     let conversations = Arc::new(node().await);
-    let app = app_for(&plane, &store, Arc::clone(&conversations));
+    let app = app_for(&plane, &store, Arc::clone(&conversations)).await;
 
     let main_session = open_conversation(&conversations, &store, &ada, "acme/ada/main").await;
 

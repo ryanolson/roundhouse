@@ -54,7 +54,7 @@ fn sha256_hex(secret: &str) -> String {
     hex::encode(Sha256::digest(secret.as_bytes()))
 }
 
-fn deployment() -> axum::Router {
+async fn deployment() -> axum::Router {
     let file = ControlPlaneConfig::from_json(
         &json!({
             "projects": [],
@@ -74,6 +74,7 @@ fn deployment() -> axum::Router {
             CrossChecks::new(reachable(), None),
             now_ms(),
         )
+        .await
         .expect("a file that compiles at boot compiles here"),
     );
     let ledger: Arc<dyn SpendLedger> = Arc::new(MemorySpendLedger::new());
@@ -113,7 +114,7 @@ fn serve() -> Served {
         .build()
         .expect("a runtime");
     let root = runtime.block_on(async {
-        let app = deployment();
+        let app = deployment().await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("a loopback port");

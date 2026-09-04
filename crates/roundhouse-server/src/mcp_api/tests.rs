@@ -947,8 +947,9 @@ struct CountingPlaneSource {
     plane_calls: Arc<std::sync::atomic::AtomicUsize>,
 }
 
+#[async_trait::async_trait]
 impl PlaneSource for CountingPlaneSource {
-    fn plane(&self, _now_ms: u64) -> Arc<ControlPlane> {
+    async fn plane(&self, _now_ms: u64) -> Arc<ControlPlane> {
         self.plane_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Arc::new(self.inner.clone())

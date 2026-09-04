@@ -174,7 +174,7 @@ where
     S: SessionStore,
 {
     let session_id = SessionId::new(session_id);
-    let plane = state.planes.plane(now_ms());
+    let plane = state.planes.plane(now_ms()).await;
     let principal = plane.turn_principal(headers)?;
     in_namespace(&plane, &principal, &session_id)?;
     read_all(&*state.store, &session_id).await

@@ -485,7 +485,8 @@ impl Rig {
                         },
             }),
             Some(judge_spec()),
-        );
+        )
+        .await;
         let directory = deployment.directory;
         let minted = deployment.minted;
 
@@ -493,7 +494,7 @@ impl Rig {
         let control = Arc::new(ControlStore::new());
         let conversations = Arc::new(Conversations::new());
         let judge = ScriptedJudge::always(OFF_TRACK);
-        let arm_salt = directory.plane(now_ms()).arm_salt().to_string();
+        let arm_salt = directory.plane(now_ms()).await.arm_salt().to_string();
         let validator = Validator::new(
             Arc::clone(&judge) as Arc<dyn roundhouse_core::validate::JudgeClient>,
             ValidatorConfig {
@@ -532,17 +533,20 @@ impl Rig {
             Arc::clone(&store),
             Arc::clone(&conversations),
         )
-        .merge(mcp_router(
-            Arc::clone(&directory),
-            Arc::new(ControlPlaneReads::new(
+        .merge(
+            mcp_router(
                 Arc::clone(&directory),
-                Arc::clone(&store),
-                Arc::new(MemorySpendLedger::new()),
-                Arc::clone(&conversations),
-                reachable(),
-            )),
-            control,
-        ))
+                Arc::new(ControlPlaneReads::new(
+                    Arc::clone(&directory),
+                    Arc::clone(&store),
+                    Arc::new(MemorySpendLedger::new()),
+                    Arc::clone(&conversations),
+                    reachable(),
+                )),
+                control,
+            )
+            .await,
+        )
         .layer(axum::middleware::from_fn_with_state(
             recorder.clone(),
             record,
@@ -664,7 +668,7 @@ impl Rig {
     /// plane swaps immediately (module doc, "Revocation, staleness, and the
     /// two clocks") — no TTL wait is needed on this single-node rig, which is
     /// the property F15 exists to exercise.
-    fn revoke_turn_key(&self) {
+    async fn revoke_turn_key(&self) {
         self.directory
             .apply(
                 DirectoryMutation::RevokeKey {
@@ -672,6 +676,7 @@ impl Rig {
                 },
                 now_ms(),
             )
+            .await
             .expect("the API-minted turn key is this API's to revoke");
     }
 
@@ -1383,7 +1388,7 @@ async fn a_key_revoked_between_runs_fails_the_next_turn_and_leaves_no_half_writt
         .await
         .expect("the first run's session exists");
 
-    rig.revoke_turn_key();
+    rig.revoke_turn_key().await;
 
     // Same `CODEX_HOME`, same secret in the child's environment (`spawn`
     // resolves it once, in `Rig::start`, and every run reuses it) — the only

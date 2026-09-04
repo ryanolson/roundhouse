@@ -189,7 +189,7 @@ async fn admin_auth_layer(
     request: Request,
     next: Next,
 ) -> Response {
-    let plane = directory.plane(now_ms());
+    let plane = directory.plane(now_ms()).await;
     if matches!(plane.as_ref(), ControlPlane::Open) {
         return ApiError::from(AuthError::AdminRequiresControlPlane).into_response();
     }
@@ -408,7 +408,8 @@ async fn create_project(
     let id = entry.id.clone();
     let records = state
         .directory
-        .apply(DirectoryMutation::CreateProject { entry }, now_ms())?;
+        .apply(DirectoryMutation::CreateProject { entry }, now_ms())
+        .await?;
     let created = records
         .projects
         .iter()
@@ -428,7 +429,7 @@ async fn create_project(
 /// lists would be the shape that lets an operator miss the half they cannot
 /// edit until a `PATCH` refuses them.
 async fn list_projects(State(state): State<AdminState>) -> Response {
-    let view = state.directory.view(now_ms());
+    let view = state.directory.view(now_ms()).await;
     axum::Json(ListDto {
         data: view
             .projects
@@ -443,7 +444,7 @@ async fn get_project(
     State(state): State<AdminState>,
     Path(project): Path<String>,
 ) -> Result<Response, ApiError> {
-    let view = state.directory.view(now_ms());
+    let view = state.directory.view(now_ms()).await;
     let record = find_project(&view, &project)?;
     Ok(axum::Json(ProjectDto::from(record)).into_response())
 }
@@ -465,13 +466,16 @@ async fn patch_project(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let patch: ProjectPatch = parse_body(&body)?;
-    let records = state.directory.apply(
-        DirectoryMutation::PatchProject {
-            id: project.clone(),
-            patch,
-        },
-        now_ms(),
-    )?;
+    let records = state
+        .directory
+        .apply(
+            DirectoryMutation::PatchProject {
+                id: project.clone(),
+                patch,
+            },
+            now_ms(),
+        )
+        .await?;
     let patched = records
         .projects
         .iter()
@@ -496,7 +500,8 @@ async fn archive_project(
 ) -> Result<Response, ApiError> {
     state
         .directory
-        .apply(DirectoryMutation::ArchiveProject { id: project }, now_ms())?;
+        .apply(DirectoryMutation::ArchiveProject { id: project }, now_ms())
+        .await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
@@ -517,7 +522,8 @@ async fn create_user(State(state): State<AdminState>, body: Bytes) -> Result<Res
     let id = entry.id.clone();
     let records = state
         .directory
-        .apply(DirectoryMutation::CreateUser { entry }, now_ms())?;
+        .apply(DirectoryMutation::CreateUser { entry }, now_ms())
+        .await?;
     let created = records
         .users
         .iter()
@@ -532,7 +538,7 @@ async fn create_user(State(state): State<AdminState>, body: Bytes) -> Result<Res
 }
 
 async fn list_users(State(state): State<AdminState>) -> Response {
-    let view = state.directory.view(now_ms());
+    let view = state.directory.view(now_ms()).await;
     axum::Json(ListDto {
         data: view.users.iter().map(UserDto::from).collect::<Vec<_>>(),
     })
@@ -571,16 +577,19 @@ async fn upsert_member(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let request: MembershipBody = parse_body(&body)?;
-    let records = state.directory.apply(
-        DirectoryMutation::UpsertMembership {
-            project: project.clone(),
-            user: user.clone(),
-            role: request.role,
-            allocation: request.allocation,
-            overrides: request.overrides,
-        },
-        now_ms(),
-    )?;
+    let records = state
+        .directory
+        .apply(
+            DirectoryMutation::UpsertMembership {
+                project: project.clone(),
+                user: user.clone(),
+                role: request.role,
+                allocation: request.allocation,
+                overrides: request.overrides,
+            },
+            now_ms(),
+        )
+        .await?;
     let membership = records
         .memberships
         .iter()
@@ -598,7 +607,7 @@ async fn list_members(
     State(state): State<AdminState>,
     Path(project): Path<String>,
 ) -> Result<Response, ApiError> {
-    let view = state.directory.view(now_ms());
+    let view = state.directory.view(now_ms()).await;
     find_project(&view, &project)?;
     Ok(axum::Json(ListDto {
         data: view
@@ -621,10 +630,13 @@ async fn delete_member(
     State(state): State<AdminState>,
     Path((project, user)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    state.directory.apply(
-        DirectoryMutation::DeleteMembership { project, user },
-        now_ms(),
-    )?;
+    state
+        .directory
+        .apply(
+            DirectoryMutation::DeleteMembership { project, user },
+            now_ms(),
+        )
+        .await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
@@ -642,8 +654,11 @@ async fn mint_turn_key(
     State(state): State<AdminState>,
     Path((project, user)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    let minted = state.directory.mint_turn_key(&project, &user, now_ms())?;
-    let view = state.directory.view(now_ms());
+    let minted = state
+        .directory
+        .mint_turn_key(&project, &user, now_ms())
+        .await?;
+    let view = state.directory.view(now_ms()).await;
     let record = find_key_by_hash(&view, &minted.key_sha256)?;
     Ok((
         StatusCode::CREATED,
@@ -657,8 +672,8 @@ async fn mint_turn_key(
 
 /// `POST /v1/admin/keys` — mint an admin key.
 async fn mint_admin_key(State(state): State<AdminState>) -> Result<Response, ApiError> {
-    let minted = state.directory.mint_admin_key(now_ms())?;
-    let view = state.directory.view(now_ms());
+    let minted = state.directory.mint_admin_key(now_ms()).await?;
+    let view = state.directory.view(now_ms()).await;
     let record = find_key_by_hash(&view, &minted.key_sha256)?;
     Ok((
         StatusCode::CREATED,
@@ -671,7 +686,7 @@ async fn mint_admin_key(State(state): State<AdminState>) -> Result<Response, Api
 }
 
 async fn list_keys(State(state): State<AdminState>) -> Response {
-    let view = state.directory.view(now_ms());
+    let view = state.directory.view(now_ms()).await;
     axum::Json(ListDto {
         data: view.keys.iter().map(KeyDto::from).collect::<Vec<_>>(),
     })
@@ -682,7 +697,7 @@ async fn get_key(
     State(state): State<AdminState>,
     Path(key_id): Path<String>,
 ) -> Result<Response, ApiError> {
-    let view = state.directory.view(now_ms());
+    let view = state.directory.view(now_ms()).await;
     let record = view
         .keys
         .iter()
@@ -702,7 +717,8 @@ async fn revoke_key(
 ) -> Result<Response, ApiError> {
     state
         .directory
-        .apply(DirectoryMutation::RevokeKey { id: key_id }, now_ms())?;
+        .apply(DirectoryMutation::RevokeKey { id: key_id }, now_ms())
+        .await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 

@@ -5,6 +5,8 @@
 
 use std::sync::Mutex;
 
+use async_trait::async_trait;
+
 use super::records::DirectoryRecords;
 
 /// The records as they stood, and the version they stood at.
@@ -52,21 +54,44 @@ pub enum StoreFailure {
 /// implement this trait, which is the right requirement: two nodes writing
 /// tenancy without one is how a revocation gets overwritten by a concurrent
 /// rename.
-pub trait DirectoryStore: Send + Sync {
+///
+/// # Why every method is `async` (M16.0, R-D1)
+///
+/// The three were synchronous for as long as [`MemoryDirectoryStore`] was the
+/// only implementation, and a clone of a `Vec` behind a `Mutex` is not
+/// something a caller can usefully await. A durable store makes each of them a
+/// network round trip, and a synchronous trait leaves exactly two ways to call
+/// one from the async surfaces above: block a runtime worker on it, or hand it
+/// to `spawn_blocking` and pay a thread per admission. Both are worse than the
+/// honest shape, and neither could be swapped for it later without touching
+/// every caller anyway — so the seam moves once, here, while the only
+/// implementation is still the in-memory one and nothing about the move can be
+/// blamed on a backend that does not exist yet.
+///
+/// `#[async_trait]` rather than a native `async fn` in a trait, matching
+/// `roundhouse_core::control::CorrelationMaps` one crate over: a native
+/// `async fn` is not dyn compatible at this toolchain, and this trait exists to
+/// be held as `Arc<dyn DirectoryStore>` — one directory, whichever backing
+/// store the boot chose.
+#[async_trait]
+pub trait DirectoryStore: Send + Sync + 'static {
     /// Every admin-created record, and the version they were read at.
-    fn load(&self) -> Result<VersionedRecords, StoreFailure>;
+    async fn load(&self) -> Result<VersionedRecords, StoreFailure>;
 
     /// Replace the records, if and only if the store is still at
     /// `expected_version`. Returns the new version.
-    fn commit(&self, expected_version: u64, records: DirectoryRecords)
-    -> Result<u64, StoreFailure>;
+    async fn commit(
+        &self,
+        expected_version: u64,
+        records: DirectoryRecords,
+    ) -> Result<u64, StoreFailure>;
 
     /// The current version, without paying to read the records.
     ///
     /// The cheap half of [`ControlDirectory::plane`]'s refresh: a node past its
     /// TTL asks this first and recompiles only if the answer moved, so a quiet
     /// deployment costs one version read per TTL rather than a compile.
-    fn version(&self) -> Result<u64, StoreFailure>;
+    async fn version(&self) -> Result<u64, StoreFailure>;
 }
 
 /// The single-node store: a `Mutex` over the records and a counter.
@@ -85,8 +110,9 @@ impl MemoryDirectoryStore {
     }
 }
 
+#[async_trait]
 impl DirectoryStore for MemoryDirectoryStore {
-    fn load(&self) -> Result<VersionedRecords, StoreFailure> {
+    async fn load(&self) -> Result<VersionedRecords, StoreFailure> {
         // Poisoning is recovered rather than propagated, as everywhere else in
         // this process that holds a `std` lock over plain data: these are
         // records, not an invariant another thread's panic could have left
@@ -99,7 +125,7 @@ impl DirectoryStore for MemoryDirectoryStore {
         })
     }
 
-    fn commit(
+    async fn commit(
         &self,
         expected_version: u64,
         records: DirectoryRecords,
@@ -116,8 +142,75 @@ impl DirectoryStore for MemoryDirectoryStore {
         Ok(state.1)
     }
 
-    fn version(&self) -> Result<u64, StoreFailure> {
+    async fn version(&self) -> Result<u64, StoreFailure> {
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         Ok(state.1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! [`MemoryDirectoryStore`]'s own compare-and-set, direct.
+    //!
+    //! Every `Concurrent` path exercised elsewhere in this crate
+    //! (`WriteBetweenReads`, `ScriptedStore`, `ArmedStore` in
+    //! `tests/admin_api.rs`) is a hand-rolled double with its own
+    //! independently-written `commit`, and none of them delegate to this type
+    //! -- so the one production `DirectoryStore` this deployment actually
+    //! ships had never had its own CAS check driven by a test. A `commit`
+    //! that silently dropped the `expected_version` guard read every existing
+    //! suite as green, because nothing asked this store, directly, to refuse
+    //! a stale write.
+
+    use super::*;
+
+    #[tokio::test]
+    async fn commit_refuses_a_stale_expected_version() {
+        let store = MemoryDirectoryStore::new();
+        assert_eq!(
+            store.version().await.unwrap(),
+            0,
+            "a fresh store is version 0"
+        );
+
+        let first = store
+            .commit(0, DirectoryRecords::default())
+            .await
+            .expect("the store is still at the version this write read");
+        assert_eq!(first, 1, "the first successful commit is version 1");
+
+        // The version this store is actually at has moved to 1. A second
+        // write that still thinks it is 0 -- the shape of a second node that
+        // read before the first node's commit landed -- must be refused
+        // rather than silently accepted and overwritten.
+        let stale = store.commit(0, DirectoryRecords::default()).await;
+        assert!(
+            matches!(
+                stale,
+                Err(StoreFailure::Concurrent {
+                    expected: 0,
+                    found: 1,
+                })
+            ),
+            "a commit against a version the store has moved past must answer \
+             `Concurrent`, naming both the version it expected and the one \
+             actually found: {stale:?}"
+        );
+        // And the refused write changed nothing: the store is still at the
+        // version its own successful commit left it at.
+        assert_eq!(
+            store.version().await.unwrap(),
+            1,
+            "a refused commit must not have advanced the store"
+        );
+
+        // CONTROL: a commit against the version the store is genuinely at
+        // succeeds and advances it -- so the refusal above is about the
+        // version comparison and not about this store refusing every write.
+        let second = store
+            .commit(1, DirectoryRecords::default())
+            .await
+            .expect("a commit against the current version succeeds");
+        assert_eq!(second, 2);
     }
 }

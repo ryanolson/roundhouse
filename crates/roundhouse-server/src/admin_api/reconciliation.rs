@@ -405,7 +405,7 @@ pub(super) async fn budget_view(
     // read under have to come from one compiled plane, and two calls would be two
     // lock acquisitions with a write free to land between them — a member with a
     // live key resolving to no admission, reported here as a row with no figures.
-    let (plane, view) = state.directory.snapshot(at_ms);
+    let (plane, view) = state.directory.snapshot(at_ms).await;
     let record = find_project(&view, &project)?;
     let archived = record.is_archived();
 

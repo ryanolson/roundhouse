@@ -726,7 +726,7 @@ where
     // request asks about tenancy has to be answered by one compiled plane, or a
     // session could be minted inside a namespace the very next check no longer
     // recognises.
-    let plane = state.planes.plane(now_ms());
+    let plane = state.planes.plane(now_ms()).await;
     let principal = plane.turn_principal(&headers)?;
     let request: CreateSessionBody = if body.is_empty() {
         CreateSessionBody::default()
@@ -780,7 +780,7 @@ where
     // a turn: the same key lookup answers "who pays" and "what may be routed
     // to", and resolving them once here is what makes the policy immutable for
     // the whole turn rather than something re-read mid-dispatch.
-    let plane = state.planes.plane(now_ms());
+    let plane = state.planes.plane(now_ms()).await;
     let admission = plane.turn_admission(&headers)?;
     in_namespace(&plane, &admission.principal, &session_id)?;
     // Before the body is parsed and before the store is touched: a refused turn
@@ -849,7 +849,7 @@ where
     let session_id = SessionId::new(session_id);
     // This endpoint streams the raw log — items, routing decisions, prices —
     // so the namespace check is the whole of its authorization.
-    let plane = state.planes.plane(now_ms());
+    let plane = state.planes.plane(now_ms()).await;
     let principal = plane.turn_principal(&headers)?;
     in_namespace(&plane, &principal, &session_id)?;
     let cursor = resume_cursor(&params, &headers)?;

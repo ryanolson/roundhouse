@@ -129,6 +129,7 @@ async fn a_ceiling_patched_in_after_boot_is_counted_in_the_shared_buckets() {
             CrossChecks::new(reachable(), None),
             now,
         )
+        .await
         .expect("the file alone compiles, since it is what a boot would have loaded"),
     );
 
@@ -152,6 +153,7 @@ async fn a_ceiling_patched_in_after_boot_is_counted_in_the_shared_buckets() {
             },
             now,
         )
+        .await
         .expect("a fresh project id");
     directory
         .apply(
@@ -160,6 +162,7 @@ async fn a_ceiling_patched_in_after_boot_is_counted_in_the_shared_buckets() {
             },
             now,
         )
+        .await
         .expect("a fresh user id");
     directory
         .apply(
@@ -172,9 +175,11 @@ async fn a_ceiling_patched_in_after_boot_is_counted_in_the_shared_buckets() {
             },
             now,
         )
+        .await
         .expect("a membership neither half declares yet");
     let turn_key = directory
         .mint_turn_key(&project, &user, now)
+        .await
         .expect("minting a turn key for a membership that exists");
 
     // The premise, stated as an assertion rather than taken on faith: the
@@ -182,6 +187,7 @@ async fn a_ceiling_patched_in_after_boot_is_counted_in_the_shared_buckets() {
     // plane. That snapshot is what used to decide the ledger.
     let fair_use_configured_at_boot = directory
         .plane(now)
+        .await
         .configured_admissions()
         .any(|admission| !admission.fair_use.is_empty());
     assert!(
@@ -239,6 +245,7 @@ async fn a_ceiling_patched_in_after_boot_is_counted_in_the_shared_buckets() {
             },
             now_ms(),
         )
+        .await
         .expect("patching a live project's fair_use block is exactly what the admin plane allows");
 
     // The window is live: the very next admission already carries it, with no
@@ -246,6 +253,7 @@ async fn a_ceiling_patched_in_after_boot_is_counted_in_the_shared_buckets() {
     let principal = Principal::new(project.clone(), user.clone());
     let admission_after_patch = directory
         .plane(now_ms())
+        .await
         .membership(&principal)
         .expect("the membership just provisioned still resolves");
     assert!(

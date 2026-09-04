@@ -324,7 +324,7 @@ pub struct Bootstrapped {
 /// is the *file* vocabulary for enrolment, so a suite that wants a steered turn
 /// and a suite that wants none differ in exactly that document and in nothing
 /// else here.
-pub fn bootstrap(
+pub async fn bootstrap(
     label: &str,
     arm_salt: &str,
     project: Value,
@@ -352,6 +352,7 @@ pub fn bootstrap(
             CrossChecks::new(reachable(), judge),
             now_ms(),
         )
+        .await
         .expect("the bootstrap file alone compiles"),
     );
     directory
@@ -362,6 +363,7 @@ pub fn bootstrap(
             },
             now_ms(),
         )
+        .await
         .expect("creating a project");
     directory
         .apply(
@@ -371,6 +373,7 @@ pub fn bootstrap(
             },
             now_ms(),
         )
+        .await
         .expect("creating a user");
     directory
         .apply(
@@ -383,9 +386,11 @@ pub fn bootstrap(
             },
             now_ms(),
         )
+        .await
         .expect("enrolling the member");
     let minted = directory
         .mint_turn_key(PROJECT, USER, now_ms())
+        .await
         .expect("the admin plane mints");
 
     Bootstrapped { directory, minted }

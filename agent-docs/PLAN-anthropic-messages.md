@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Plan: the Anthropic Messages surface, the seat, and the launcher (M11)
 
-> **Status: shipped through M15; D2 ruled (2026-09-03).** The rulings in §3 stand
+> **Status: shipped through M15; D2 ruled; M16.0 in flight (2026-09-03).** The rulings in §3 stand
 > as written; where an implementation round moved one, the dated addenda at
 > the end of this document record the move and its reason, and win over §3
 > for the current tree. Direction set by the product owner on
@@ -2174,3 +2174,102 @@ M16.0 goes first: it is small, behaviour-preserving, and the prerequisite
 of the rung that closes the one restart loss that corrupts a surviving
 ledger. M17 is independent of both and can be taken whenever the cadence
 has room.
+
+## Addendum (2026-09-03): M16.0 — the directory seam, the rulings
+
+D2's R17 put the seam first and alone: `DirectoryStore` becomes async and
+`Managed::compiled` stops compiling under the write guard, as one rung
+with no Redis in it, judged under the memory store by the directory's
+existing tests. The four rulings below are what "stops compiling under
+the guard" means precisely, resolved in advance so the stage does not
+re-derive them.
+
+**R-D1 — the store trait is async the way `CorrelationMaps` is, and a
+`std` guard never crosses an await.** `DirectoryStore::{load, commit,
+version}` become `async fn` on a `Send + Sync + 'static` trait held as
+`Arc<dyn DirectoryStore>`, the shape M14.1 gave the correlation maps;
+`PlaneSource::plane` and `ControlDirectory`'s `new`, `plane`, `view`,
+`snapshot`, `apply`, the two mints and `version` become async, and every
+caller awaits — the two Messages handlers, the admin auth layer and its
+routes, the boot, the fixtures and the test doubles. `current:
+RwLock<Compiled>` stays a `std` lock and is never held across an await:
+that is the rung's whole point, and the compiler enforces it, because a
+`std` guard is not `Send` and a `PlaneSource` future has to be. The write
+mutex, which *is* held across the load and the commit in `apply`, becomes
+a `tokio::sync::Mutex`, because a lock held across an await has to be one
+the runtime knows about.
+
+**R-D2 — a refresh runs outside every lock and publishes by version.**
+`Managed::compiled` takes the write guard twice and briefly. Once to
+re-check the TTL and stamp `refreshed_at_ms`: the stamp is the
+single-flight token — the first caller past the TTL stamps and refreshes,
+every later caller sees a fresh stamp and serves the current plane — so
+one revocation costs one compile however busy the node, which is the cost
+the old comment feared from compiling outside the lock, and the reason it
+held the lock. Once more to publish the compiled value, and only if the
+loaded version is newer than the version already published, so two
+refreshes that raced cannot let the older overwrite the newer.
+`version()`, `load()` and `compile()` all run between the two, with no
+guard held. `apply` keeps its order — load, mutate, compile, commit —
+under the tokio write mutex, and publishes under the same version rule.
+
+**R-D3 — the backoff is uniform: every refresh failure waits one TTL,
+`version()` included.** Today a `version()` failure returns before the
+stamp and is retried on every request for the length of the outage, while
+a `load` or compile failure backs off one TTL; the doc already describes
+the second as the rule and calls it deliberate. The stamp lands before
+any fallible call, so all three back off alike: the price the doc names —
+a revocation made during a failure can take two TTLs — is the same for
+all three, and the warning fires once per TTL rather than once per
+admission.
+
+**R-D4 — what proves it.** Four guards over a scripted store double (a
+`load` that waits on a signal, a counting `version` and `load`, failures
+on demand) under a zero TTL, written against the ported shape before the
+restructure so each is red first: *no stall* — while one caller's refresh
+is blocked in `load`, a second caller's `plane()` returns the current plane
+inside a short bound; *single flight* — N concurrent callers past the TTL
+cost exactly one `load`; *publish by version* — a refresh that loaded
+version 2 and finished after one that loaded version 3 does not replace
+it; *uniform backoff* — a `version()` failure is retried one TTL later, not
+on the next request. Every existing directory test and the admin-plane
+suite pass unchanged; the R8 ignored test stays ignored with its reason
+still true; no Redis, no serde, no boot re-order — those are M16.1's.
+
+### What the implementation settled beyond the rulings (2026-09-04, M16.0)
+
+- **The traits are async behind `#[async_trait]`, as the correlation maps
+  already are.** A native `async fn` in a trait is not dyn-compatible on
+  this toolchain, and both `Arc<dyn DirectoryStore>` and `Arc<dyn
+  PlaneSource>` are held erased at their boundaries; the stage brief had
+  misdescribed `CorrelationMaps` as native, and the store's trait doc now
+  says which it is and why.
+- **The guards run at a nonzero TTL under a scripted clock, not at zero.**
+  A zero TTL has meant "refresh on every call" since M8, and the `>=`
+  elapsed test exists to make it mean that — so at zero every caller is
+  past the TTL by definition, the stamp cannot be a single-flight token,
+  and three of the four guards would pin nothing. R-D4 said zero; the
+  guards say `GUARD_TTL_MS` and carry the reason. The three pre-existing
+  zero-TTL tests are unchanged and green: zero still refreshes per call,
+  with each caller's compile made safe by publish-by-version.
+- **`membership_terms` stayed synchronous** — it reads no store, only the
+  records the caller already holds — under R-D1's own qualifier.
+- **`current` is taken in three brief windows**: the read-guard TTL check,
+  the write-guard re-check and stamp, and the write-guard publish. The
+  re-check in the second window is defence for the scheduling gap between
+  the first two, which no scripted clock can reach without a hook inside
+  the directory; deleting it leaves every test green. It stays, and its
+  comment says what it is for and that no test drives it.
+- **Two gaps the refute stage found and the fix stage closed test-first**:
+  `apply`'s version-guarded publish was correct and untested (a scripted
+  commit-side gate now drives a refresh racing an apply, and the older of
+  the two does not win); and `MemoryDirectoryStore::commit`'s own
+  compare-and-set had never been exercised directly, because every
+  Concurrent-path test used a hand-rolled double — the store has its own
+  test now.
+- **Every caller across the workspace awaits** — the two Messages
+  handlers, the admin auth layer and routes, the MCP, metrics, Relay and
+  Responses surfaces, the boot, topham's mint and CLI tests, both e2e rigs;
+  the feature-gated real-binary suites compile; the doc-warning count did
+  not move. Nothing in this rung touches Redis, serde or the boot order:
+  those are M16.1's.

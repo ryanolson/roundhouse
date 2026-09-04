@@ -510,7 +510,8 @@ impl Rig {
             "m11-claude-e2e",
             serde_json::json!({ "id": PROJECT }),
             None,
-        );
+        )
+        .await;
         let directory = deployment.directory;
         let minted = deployment.minted;
 
@@ -522,7 +523,7 @@ impl Rig {
         // deployment adjacent to the one serving turns.
         let control = Arc::new(ControlStore::new());
         let spend: Arc<dyn SpendLedger> = Arc::new(MemorySpendLedger::new());
-        let arm_salt = directory.plane(now_ms()).arm_salt().to_string();
+        let arm_salt = directory.plane(now_ms()).await.arm_salt().to_string();
         let engine = Arc::new(
             Engine::new(
                 Arc::clone(&store),
@@ -575,7 +576,8 @@ impl Rig {
                 reachable(),
             )),
             Arc::clone(&control),
-        );
+        )
+        .await;
         if let Some(rival) = &rival {
             mcp = mcp.layer(axum::middleware::from_fn_with_state(
                 Arc::clone(rival),
