@@ -1,0 +1,20 @@
+{"q": "In one sentence, what does the Ledgerline service do?"}
+{"q": "List the four layers of the service and the directory each lives in."}
+{"q": "Which PaymentState is described as 'the billable moment', and why?"}
+{"q": "Enumerate every legal state transition exactly as defined by can_transition_to."}
+{"q": "Which states are terminal?"}
+{"q": "If code attempts a transition from Created directly to Captured, what happens?"}
+{"q": "Why are amounts stored as integer minor units instead of floats?"}
+{"q": "Explain how Money::allocate avoids losing or inventing a cent when splitting."}
+{"q": "What are the three idempotency outcomes, keyed on the Idempotency-Key header and body hash?"}
+{"q": "Why is the idempotency record written before the domain mutation and completed after?"}
+{"q": "How long do idempotency keys live in Redis?"}
+{"q": "Describe how authorization holds expire and which job handles it."}
+{"q": "What error is returned if you try to capture an expired authorization?"}
+{"q": "Under what conditions does the CardNetwork adapter retry, and when does it refuse to?"}
+{"q": "Given a 4s timeout and a 3-attempt cap, roughly bound the worst-case latency of a single capture."}
+{"q": "How does settlement reconciliation match a bank line to a payment, and what happens to unmatched lines?"}
+{"q": "Why are unmatched reconciliation lines never auto-resolved?"}
+{"q": "Map each DomainError variant to its HTTP status as the ingress layer does."}
+{"q": "Why does the service forbid runtime config reloads?"}
+{"q": "Which two configuration variables have no defaults, and what happens if they are unset at boot?"}

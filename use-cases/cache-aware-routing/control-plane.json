@@ -1,0 +1,50 @@
+{
+  "$comment": [
+    "cache-aware-routing control plane. Frontier-only-safe: no frontier_cadence and no",
+    "degrade_to_local budget, because both need a local fleet to fall back to and this",
+    "deployment has none (it would refuse to start otherwise). See PLAN.md Phase 2 for",
+    "when to add these. The turn key's SECRET is never in this file -- only sha256(secret).",
+    "Run mint_keys.py to fill in the key_sha256 fields. Set the plain secret as",
+    "ROUNDHOUSE_API_KEY in the agent environment so it sends it on x-roundhouse-key.",
+    "credentials.providers.nvidia.env_var names the variable the server reads at startup;",
+    "it must be exported (INFERENCE_API_KEY) or the server refuses to load.",
+    "To enable Tax B (cross-session cache hit), add a second user and key entry here.",
+    "See PLAN.md Phase 1 for the exact diff."
+  ],
+  "projects": [
+    {
+      "id": "kv-cache-demo",
+      "name": "KV Cache Reuse Demo",
+      "policy": {
+        "min_quality": 0.0,
+        "allow": [
+          "*"
+        ]
+      },
+      "credentials": {
+        "mode": "project_only",
+        "providers": {
+          "nvidia": {
+            "env_var": "INFERENCE_API_KEY",
+            "kind": "api_key"
+          }
+        }
+      }
+    }
+  ],
+  "users": [
+    {
+      "id": "dev"
+    }
+  ],
+  "keys": [
+    {
+      "project": "kv-cache-demo",
+      "user": "dev",
+      "key_sha256": "d60d7a41fbbb0c99ca47acc879cd69f898cb89015291ee524c2a26f5d91742ee"
+    }
+  ],
+  "admin_keys": [
+    "ba6a9c30b322e7a4c8f94c976cfc2d6d2b23d1bba3440fbddffb40bc52fafe37"
+  ]
+}
