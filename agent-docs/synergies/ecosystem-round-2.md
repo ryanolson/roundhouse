@@ -395,3 +395,40 @@ with the exit-code accessor and the `reads_as_failure` finding ruled
 test-first in the same PR; the SLO headers, when they land, under the
 `x-llm-d-` spelling with aliases. Four evidence citations retired by Relay's
 deletion are bracketed, not rewritten.
+
+---
+
+## Addendum (2026-09-05): NeMo Fabric is a fourth launch-surface implementation
+
+Ruled in `nemo-fabric.md`, which extends this document and wins where the two
+disagree on Fabric. Two corrections to the launch-surface dedup above, and one
+new fact.
+
+**The sentence the dedup rests on names a test that no longer exists.** "The
+one test M9 exists for — a real codex binary executing our synthetic tool
+call" was deleted by M10.0 T7 when the steer became text
+(`crates/roundhouse-server/tests/codex_e2e.rs:21-33`). The ownership case is
+restated: three of the nine gated tests are bound to `codex exec` and
+`CODEX_HOME` semantics (`resume --last`, `$CODEX_HOME/skills`, the crafted
+`auth.json` for the forwarded login), the forwarded-login stanza is
+inexpressible in any launcher that always writes `env_key`, four of the
+generated lines exist because their absence fails silently, and the suite's
+version identity is against a binary the operator installs. The Direct
+topology remains the reference for those reasons, not for the deleted one.
+The same stale sentence is in `codex_launch.rs`'s module doc; correcting it is
+a follow-up.
+
+**NeMo Fabric's Codex adapter is a fourth implementation of the surface**,
+beside Relay's Rust launchers, Switchyard's deleted Python launcher, and ours
+— and the only one that never writes a `config.toml`: it hands a config dict to
+the Codex Python SDK, which spawns its own pinned app-server
+(`openai-codex==0.144.4`). Measured against that app-server, not read: it
+sends `prompt_cache_key` on every turn, keeps it stable, and resends history
+as a byte-identical prefix, so a Fabric-driven Codex meets this surface's
+admission contract. With a real OpenAI slug it also adds `tool_search` to
+every request, on a custom provider as on the built-in one — the trap
+`DEFAULT_MODEL_SLUG` exists for, now with the mechanism observed at 0.144.4.
+Fabric-driven is ruled a third supported topology with that requirement list;
+`nemo-fabric-core` is refused as a runtime dependency (one serde type for
+twenty crates, no published `0.3.0`) and admitted, if at all, as a dev-only
+conformance oracle the way the codex crates are.

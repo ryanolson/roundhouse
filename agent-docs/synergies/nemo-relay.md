@@ -459,3 +459,40 @@ contradiction dissolves into a route-property hypothesis M7 tests
 (Switchyard's launcher sets it conditionally on auth mode); and a
 version-identity rule binds every pre-1.0 adoption to a git rev, never a
 version or tag.
+
+---
+
+## Addendum (2026-09-05): a third topology, and the dependency rule re-read for NeMo Fabric
+
+Ruled in `nemo-fabric.md`, which extends this document and wins where the two
+disagree on Fabric. Three deltas to this ruling.
+
+**The division of labor gains a clause.** NeMo Fabric launches harnesses —
+Codex, Claude Code, Hermes, Deep Agents, mini-SWE-agent, Pi — from one typed
+config, and places Relay as its telemetry sink. It is a second occupant of the
+harness box this ruling assigned to Relay, not an occupant of the turn: it has
+no price, quality, cache, budget, log, lease, routing, steer, or judge
+vocabulary. "Fabric launches the harness, Relay instruments it, roundhouse
+owns the turn, Dynamo owns the metal."
+
+**A third topology beside Direct and Chained: Fabric-driven.** Codex-SDK
+app-server → Fabric → roundhouse → {Dynamo | frontier}, supported once a
+deployment wants it, never required to build roundhouse. When Fabric's
+`telemetry.providers.relay` is on, Fabric assembles the Chained topology
+itself — a Relay gateway sidecar in front of roundhouse — and S3's four chain
+guards apply unchanged. One of them is now evidenced rather than assumed:
+Fabric points codex at the gateway with no `/v1`, and Relay's gateway
+reconstitutes exactly one `/v1` for every base-and-path combination
+(`normalize_openai_path_for_base`, read at Relay `ba60230`, main; the 0.7 line
+was not read).
+
+**The dependency rule stays "`nemo-relay-types`, and `switchyard-protocol` by
+round 2" — `nemo-fabric-core` is not admitted at run time.** Both admissions
+so far are typed-contract crates, admitted by weight and for one role, and the
+second has never been exercised in a manifest. `nemo-fabric-core` is an
+execution crate (a process supervisor for Python and Node adapter hosts) whose
+usable half from Rust is one serde type; it would cost twenty new crates and
+a sixth watched dependency, on a project with no published `0.3.0`. Where
+roundhouse emits a `FabricConfig` (with the deferred operator entry point),
+conformance is checked by a dev-only oracle pin — the codex-crates precedent —
+that never reaches the shipped binary.
