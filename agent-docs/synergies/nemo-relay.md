@@ -471,9 +471,13 @@ disagree on Fabric. Three deltas to this ruling.
 Codex, Claude Code, Hermes, Deep Agents, mini-SWE-agent, Pi — from one typed
 config, and places Relay as its telemetry sink. It is a second occupant of the
 harness box this ruling assigned to Relay, not an occupant of the turn: it has
-no price, quality, cache, budget, log, lease, routing, steer, or judge
-vocabulary. "Fabric launches the harness, Relay instruments it, roundhouse
-owns the turn, Dynamo owns the metal."
+no price, quality, cache, log, lease, routing, steer, or judge vocabulary, and
+no budget it enforces. "Fabric launches the harness, Relay instruments it,
+roundhouse owns the turn, Dynamo owns the metal" — which amends this
+document's "Relay owns the harness": Relay keeps the instrumentation, Fabric
+takes the launching. Of Fabric's harness list, only Codex reaches roundhouse
+today; its Claude adapter needs an Anthropic Messages endpoint, and the
+Messages-surface ruling in `ecosystem-round-2.md` stands.
 
 **A third topology beside Direct and Chained: Fabric-driven.** Codex-SDK
 app-server → Fabric → roundhouse → {Dynamo | frontier}, supported once a
@@ -482,17 +486,23 @@ deployment wants it, never required to build roundhouse. When Fabric's
 itself — a Relay gateway sidecar in front of roundhouse — and S3's four chain
 guards apply unchanged. One of them is now evidenced rather than assumed:
 Fabric points codex at the gateway with no `/v1`, and Relay's gateway
-reconstitutes exactly one `/v1` for every base-and-path combination
-(`normalize_openai_path_for_base`, read at Relay `ba60230`, main; the 0.7 line
-was not read).
+reconstitutes exactly one `/v1` for every configured-base and path
+combination on the API-key chain (`normalize_openai_path_for_base`, read at
+Relay `ba60230`, main, the 0.9 line). The ChatGPT-OAuth upstream override and
+the named-base path bypass that normalization, and neither is on the chain
+Fabric assembles; the `>=0.7.2,<0.8` line Fabric's Harbor image requires was
+not read.
 
 **The dependency rule stays "`nemo-relay-types`, and `switchyard-protocol` by
 round 2" — `nemo-fabric-core` is not admitted at run time.** Both admissions
 so far are typed-contract crates, admitted by weight and for one role, and the
 second has never been exercised in a manifest. `nemo-fabric-core` is an
 execution crate (a process supervisor for Python and Node adapter hosts) whose
-usable half from Rust is one serde type; it would cost twenty new crates and
-a sixth watched dependency, on a project with no published `0.3.0`. Where
-roundhouse emits a `FabricConfig` (with the deferred operator entry point),
-conformance is checked by a dev-only oracle pin — the codex-crates precedent —
-that never reaches the shipped binary.
+usable half from Rust is one serde type; it would cost twenty new crates, two
+version splits (`strum`, `bit-vec`) and a sixth watched dependency, on a
+project with no published `0.3.0`. Where roundhouse emits a `FabricConfig`
+(with the deferred operator entry point), conformance is checked by a
+dev-only oracle pin — the codex-crates precedent — that never reaches the
+shipped binary. The precedent cuts both ways: the codex crates are on
+`CLAUDE.md`'s watched list, so the day that dev pin lands Fabric is watched
+by manifest, not only by role, and its unlock condition goes beside the pin.

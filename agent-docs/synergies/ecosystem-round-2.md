@@ -408,27 +408,37 @@ new fact.
 one test M9 exists for — a real codex binary executing our synthetic tool
 call" was deleted by M10.0 T7 when the steer became text
 (`crates/roundhouse-server/tests/codex_e2e.rs:21-33`). The ownership case is
-restated: three of the nine gated tests are bound to `codex exec` and
-`CODEX_HOME` semantics (`resume --last`, `$CODEX_HOME/skills`, the crafted
-`auth.json` for the forwarded login), the forwarded-login stanza is
-inexpressible in any launcher that always writes `env_key`, four of the
-generated lines exist because their absence fails silently, and the suite's
-version identity is against a binary the operator installs. The Direct
-topology remains the reference for those reasons, not for the deleted one.
-The same stale sentence is in `codex_launch.rs`'s module doc; correcting it is
-a follow-up.
+restated honestly: twelve tests sit under the `e2e-codex` feature, nine spawn
+the binary, and six of those nine assert claims any conversation-continuing,
+body-recording driver could satisfy. The ownership case rests on the other
+three (`resume --last`, `$CODEX_HOME/skills`, the crafted `auth.json` for the
+forwarded login), on the forwarded-login stanza being inexpressible in any
+launcher that always writes `env_key`, on four generated lines whose absence
+fails silently (`requires_openai_auth` beside `env_key`, `model_catalog_json`,
+`default_tools_approval_mode`, `bearer_token_env_var`), and on the suite's
+version identity against a binary the operator installs. The Direct topology
+remains the reference for those reasons, not for the deleted one — and
+"cannot be delegated" is retired as the wording. The same stale sentence is
+in `codex_launch.rs`'s module doc, and `DEFAULT_MODEL_SLUG`'s comment now
+describes only one of two measured mechanisms; correcting both is a
+follow-up.
 
 **NeMo Fabric's Codex adapter is a fourth implementation of the surface**,
 beside Relay's Rust launchers, Switchyard's deleted Python launcher, and ours
 — and the only one that never writes a `config.toml`: it hands a config dict to
 the Codex Python SDK, which spawns its own pinned app-server
-(`openai-codex==0.144.4`). Measured against that app-server, not read: it
-sends `prompt_cache_key` on every turn, keeps it stable, and resends history
-as a byte-identical prefix, so a Fabric-driven Codex meets this surface's
-admission contract. With a real OpenAI slug it also adds `tool_search` to
-every request, on a custom provider as on the built-in one — the trap
-`DEFAULT_MODEL_SLUG` exists for, now with the mechanism observed at 0.144.4.
-Fabric-driven is ruled a third supported topology with that requirement list;
+(`openai-codex==0.144.4`). Measured against that app-server, driven through
+the SDK with the provider dict Fabric builds and a mock Responses peer (not
+Fabric's adapter, not a real roundhouse): it sends `prompt_cache_key` on every
+turn, keeps it stable, and resends history as a byte-identical prefix, so a
+Fabric-driven Codex meets this surface's admission preconditions. With a real
+OpenAI slug it also adds a `tool_search` tool definition to every request, on
+a custom provider as on the built-in one; roundhouse ignores `tools`, but the
+`tool_search_call` item a later turn resends is one of the eleven this surface
+422s — the trap `DEFAULT_MODEL_SLUG` exists for, now with a second mechanism
+observed at 0.144.4. Fabric-driven is ruled a third supported topology, Codex
+only (Fabric's Claude adapter needs a Messages endpoint roundhouse does not
+serve), with that requirement list;
 `nemo-fabric-core` is refused as a runtime dependency (one serde type for
 twenty crates, no published `0.3.0`) and admitted, if at all, as a dev-only
 conformance oracle the way the codex crates are.

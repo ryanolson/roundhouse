@@ -115,8 +115,9 @@ that created it. The crate is fully synchronous: `rg -n 'async fn|\.await'
 crates/fabric-core/src/*.rs` (fabric) → 0, and the 93-crate transitive tree
 (`cargo tree -p nemo-fabric-core --edges normal`) has zero matches for
 `tokio|reqwest|axum|async-std|smol|futures`. Core never binds a socket:
-non-test `std::net` matches → 0 (the two hits are inside `#[cfg(test)]` from
-`runtime.rs:2940`).
+non-test `std::net` matches → 0 (the one literal `std::net` hit at
+`runtime.rs:2944`, and the one `TcpListener::bind` call at `:3228` that relies
+on it, are both inside `#[cfg(test)] mod tests`, which starts at `:2940`).
 
 **The OpenAI stream surface faces the other way.** `invoke_openai_stream`
 takes an `OpenAiStreamTransport { port, token }` the *caller* supplies
@@ -170,7 +171,8 @@ files; ten are the MCP surface and its tests, and the two that produce
 harness-facing config are `codex_launch.rs` and `skills.rs`. Their test
 modules start at `:613` of 1080 and `:357` of 609, so the overlap is **968
 non-test lines** against roughly 71,000 lines of crate source. Roundhouse has
-never referenced Fabric: `rg -n 'nemo-fabric' --glob '!target/**' .` (rh) → 0.
+never referenced Fabric outside this round's own documents:
+`rg -n 'nemo-fabric' --glob '!target/**' --glob '!agent-docs/**' .` (rh) → 0.
 
 ---
 
@@ -253,8 +255,9 @@ non-`anthropic` provider (`fabric:adapters/python/claude/src/nemo_fabric_adapter
 `:270-274`); "The configured endpoint must implement the Anthropic Messages
 protocol" (`fabric:docs/integrations/harness/claude.mdx:127-129`). Roundhouse
 serves no `/v1/messages`: a sweep of every `.route(` literal in
-`rh:crates/roundhouse-server/src` (20 of them) finds no `messages` and no
-`models`, and the binary asserts `expect_err("this build has no Anthropic
+`rh:crates/roundhouse-server/src` (21 raw matches, 20 of them real axum
+registrations — the hit at `codex_launch.rs:887` is a doc comment naming a
+route) finds no `messages` and no `models`, and the binary asserts `expect_err("this build has no Anthropic
 Messages client")` (`rh:crates/roundhouse-server/src/main.rs:1021-1043`).
 Claude Code via Fabric hits a 404 on its first turn. This is the standing
 Messages-surface ruling (`../synergies/ecosystem-round-2.md`), unchanged.
@@ -268,8 +271,11 @@ for — a real codex binary executing our synthetic tool call — cannot be
 delegated to a launcher we do not own" (`rh:codex_launch.rs:19-28`;
 `../synergies/ecosystem-round-2.md`) — names a test that no longer exists.
 M10.0 T7 deleted both tool-call tests because the steer became text
-(`rh:crates/roundhouse-server/tests/codex_e2e.rs:21-33`). Of the nine gated
-tests today, three are bound to `codex exec` + `CODEX_HOME` semantics —
+(`rh:crates/roundhouse-server/tests/codex_e2e.rs:21-33`). Twelve tests sit
+under the `e2e-codex` feature; nine spawn the binary and three (the
+env-allowlist guard at `:1296`, the injection sweep at `:2706`, the fork
+probe at `:2778`) spawn nothing. Of the nine, three are bound to `codex exec`
++ `CODEX_HOME` semantics —
 `exec resume --last` (`:1464`), `$CODEX_HOME/skills` (`:1959`), a crafted
 `auth.json` for the forwarded login (`:2036`) — and the other six assert
 claims any driver that continues a conversation and records request bodies
@@ -306,25 +312,33 @@ of the agent that ran them.
 | Is `prompt_cache_key` sent? | **Yes**, on both turns. |
 | Same value across turns? | **Yes** — one UUID, equal to `client_metadata.thread_id` / `session_id`. |
 | Is history resent as a prefix? | **Yes.** Turn 2's `input` begins with turn 1's `input` byte-for-byte (3 items), then the assistant reply and the new user message (5 items). `previous_response_id` absent; `store: false`; `stream: true`. |
-| Which credential? | `authorization: Bearer <value of env_key>`. `user-agent: codex_python_sdk/0.144.4`. |
+| Which credential? | `authorization: Bearer <value of env_key>` on the two custom-provider runs. The built-in `openai` provider run sent **no** `authorization` header at all, despite `OPENAI_API_KEY` being set in the child env — a built-in-provider fact this round did not chase, recorded so nobody reads the row as universal. `user-agent: codex_python_sdk/0.144.4` on all three. |
 | `GET /v1/models`? | **0 hits** in all three runs — env-key auth, fresh `CODEX_HOME`, no catalog pin. Not tested: the ChatGPT-login ambient mode, which is the mode `rh:codex_launch.rs:51-59` says gates the fetch differently. |
-| `tool_search` in `tools`? | **Keyed on the model slug, not the provider.** `mock-model`: 10 tools, no `tool_search`. `gpt-5.4`: 11 tools including `{"type": "tool_search"}` and `web_search` — identically on the custom `roundhouse` provider and on the built-in one. |
+| `tool_search` in `tools`? | **Keyed on the model slug, not the provider.** `mock-model`: 10 tools, no `tool_search`. `gpt-5.4`: 11 tools, the eleventh being `{"type": "tool_search"}` — identically on the custom `roundhouse` provider and on the built-in one. (`web_search` is present in all three runs; only `tool_search` is the difference.) |
 
 What this settles, and what it does not:
 
-- **A Fabric-driven Codex meets roundhouse's admission contract.** The
-  session is named; the resent history is a prefix. The Fabric-driven shape
-  is viable on the wire.
+- **A Fabric-driven Codex meets roundhouse's admission preconditions on the
+  wire.** The session is named; the resent history is a prefix. What was
+  driven is the SDK with Fabric's provider dict, not Fabric's adapter — the
+  adapter's `AsyncCodex`, its `thread_config` (MCP servers, Relay layer,
+  overrides), its replace-mode system instruction, sandbox, skill roots and
+  `thread.turn(effort, output_schema)` were not exercised — and the peer was
+  a mock, not roundhouse. An end-to-end run against a real roundhouse is
+  still unmeasured.
 - **The `roundhouse-local` slug is load-bearing under Fabric.** Fabric passes
   the slug verbatim and has no default; a natural `ModelConfig(model="gpt-5.4")`
-  puts `tool_search` in `tools` on every turn against roundhouse, and a
-  `tool_search_call` item is one of the eleven this surface 422s
-  (`rh:crates/roundhouse-server/src/responses_api/wire.rs:531-565`). The
-  mechanism differs from the one `rh:codex_launch.rs:108-115` describes
-  (`use_responses_lite` → `AdditionalTools` in `input`): what was observed at
-  0.144.4 is a tool *definition* in `tools`, gated by catalog metadata for a
-  recognized slug. Both land in the same 422 once the routed model answers
-  with the tool.
+  puts a `tool_search` tool *definition* in `tools` on every turn against
+  roundhouse. That definition is inert by itself — the Responses request type
+  does not parse `tools` (`rg -n 'tools' rh:crates/roundhouse-server/src/responses_api/wire.rs`
+  → one comment at `:406`, no field). The refusal comes one turn later: if
+  the routed model answers with the tool, codex resends a `tool_search_call` /
+  `tool_search_output` pair, and that item type is one of the eleven this
+  surface 422s (`rh:crates/roundhouse-server/src/responses_api/wire.rs:531-565`),
+  which takes the whole turn down. The mechanism differs from the one
+  `rh:codex_launch.rs:108-115` describes (`use_responses_lite` →
+  `AdditionalTools` in `input`): what was observed at 0.144.4 is gated by
+  catalog metadata for a recognized slug, on any provider.
 - **The catalog pin's `/models` half is moot for env-key auth at 0.144.4**,
   and its `supports_search_tool: false` half is replaced by the slug rule.
 - **Unverified at 0.144.4**: `resolve_provider_auth` ignoring
@@ -371,9 +385,14 @@ case: `openai_upstream_url_accepts_origin_or_v1_base`
 (`relay:crates/cli/tests/coverage/shared/gateway_tests.rs:536-568`). The
 override that bypasses normalization fires only for a ChatGPT-OAuth-shaped
 credential (`relay:crates/cli/src/agents/shared/alignment.rs:447-459`), not the
-API-key auth this chain uses. Caveat: read at main (the 0.8 line); Fabric's
-Harbor image requires a Relay CLI `>=0.7.2,<0.8`
-(`fabric:examples/harbor/README.md:76-77`), and the 0.7 line was not read.
+API-key auth this chain uses; a *named* base is composed by plain
+concatenation, deliberately outside the helper (`routes.rs:234-238`), and the
+Fabric chain uses a configured base, not a named one. So the guarantee is for
+every configured-base and path combination on the API-key chain, which is
+the chain Fabric assembles. Caveat: read at main, which is the **0.9** line
+(`relay:Cargo.toml:23` states `version = "0.9.0"`); Fabric's Harbor image
+requires a Relay CLI `>=0.7.2,<0.8` (`fabric:examples/harbor/README.md:76-77`),
+and neither the 0.7 nor the 0.8 line was read.
 
 ---
 
@@ -383,9 +402,13 @@ Harbor image requires a Relay CLI `>=0.7.2,<0.8`
   the `jsonschema` 0.49 subtree: `jsonschema`, `jsonschema-regex`,
   `jsonschema-value`, `referencing`, `fancy-regex`, `fluent-uri`, `fraction`,
   `num*`, `uuid-simd`, `vsimd`, …), 50 present at the identical version, 23 at
-  a different version that unifies, and one genuine split: `strum` 0.28
-  beside rh's 0.27.2. `schemars` unifies (fabric locks 1.2.1, rh carries
-  1.2.2; both `1.x`). No MSRV to honor; CI is `toolchain: stable`.
+  a different version — 21 of which unify, and two genuine splits: `strum`
+  0.28 (fabric) beside rh's 0.27.2, and `bit-vec` 0.8.0 (fabric, via
+  `jsonschema` → `fancy-regex` → `bit-set 0.8.0`, which pins `bit-vec =
+  "0.8.0"`) beside rh's 0.9.1 (via `yasna`, which pins `0.9.1`); the two
+  requirement ranges do not overlap, so Cargo keeps both. `schemars` unifies
+  (fabric locks 1.2.1, rh carries 1.2.2; both `1.x`). No MSRV to honor; CI is
+  `toolchain: stable`.
 - **Publication.** `crates.io/api/v1/crates/nemo-fabric-core`, fetched twice:
   `max_version = 0.3.0-beta.2` (2026-09-04), `max_stable_version = 0.2.0`
   (2026-08-19); `0.1.0` yanked. **`0.3.0` is not published**; alpha tags are
@@ -460,10 +483,13 @@ remote by construction. This is the first check before a Fabric arm is planned.
   bumped its contract version and renamed two public types inside one month.
 - **The launch-surface dedup** kept Direct with roundhouse's own minimal
   config. Fabric's Codex adapter is a fourth implementation of that surface.
-  The test the dedup's sentence names is gone (§E); the ownership case now
-  rests on the three `CODEX_HOME`-bound tests, the forwarded-login stanza
-  Fabric cannot express, the four safety lines Fabric has no field for, and
-  version identity against a binary an operator installs.
+  The test the dedup's sentence names is gone (§E), and six of the nine
+  binary-spawning tests are driver-agnostic; the ownership case now rests on
+  the three `CODEX_HOME`-bound tests, the forwarded-login stanza Fabric
+  cannot express, the four silent-failure lines Fabric has no field for
+  (`requires_openai_auth` beside `env_key`, `model_catalog_json`,
+  `default_tools_approval_mode`, `bearer_token_env_var`), and version
+  identity against a binary an operator installs.
 - **The Messages-surface ruling** is unchanged by anything in Fabric (§D).
 - **"The agent's own stack is not modified"** (`rh:CLAUDE.md`) does not
   survive the Fabric Codex adapter unamended: the operator runs the
