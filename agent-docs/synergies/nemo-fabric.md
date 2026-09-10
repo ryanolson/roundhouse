@@ -380,3 +380,22 @@ harness" amendment is now `CLAUDE.md`'s wording too.
 with the weaker transparency claim, and still not required to build or test
 roundhouse. F3 (Harbor), F4 (the seven contributions) and F5 (skills,
 degraded by the missing catalog) are as ruled above.
+
+**The end-to-end run, later the same day.** The gap the experiment left —
+Fabric's adapter itself, against a real roundhouse — is closed.
+`examples/fabric-driven/run.py` planned the emitted `FabricConfig` through
+Fabric's real Codex adapter (`nemo-fabric 0.2.0` and
+`nemo-fabric-adapters-codex 0.2.0` from PyPI, `openai-codex 0.144.4`), started
+one runtime, and ran two ordered turns against a roundhouse built at the
+commit that added `fabric_config`, in offline Open mode. Both turns
+succeeded; both carried one thread id; roundhouse's metrics moved by one
+session and two turns; `GET /v1/sessions/{thread_id}/trajectory` and `/atof`
+answered 200 for that id, with seven trajectory steps; the app-server
+completed the MCP handshake against `/mcp` with the bearer the
+`bearer_token_env_var` override names; the server logged no 4xx or 5xx.
+`doctor` reported `warn` twice, both benign (no resolution strategy, no
+environment block). The zero cached-input figure is the echo stub's constant.
+So "meets the admission preconditions on the wire" is now "runs end to end",
+and the first vigilance trigger above is satisfied once, at these versions —
+it re-arms when Fabric moves its `openai-codex` pin. Still unverified on the
+app-server: the three `codex-cli 0.146.0` rulings the trigger names.

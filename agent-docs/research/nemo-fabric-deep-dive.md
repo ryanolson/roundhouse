@@ -325,7 +325,19 @@ What this settles, and what it does not:
   overrides), its replace-mode system instruction, sandbox, skill roots and
   `thread.turn(effort, output_schema)` were not exercised — and the peer was
   a mock, not roundhouse. An end-to-end run against a real roundhouse is
-  still unmeasured.
+  still unmeasured. *[2026-09-10: now measured. Fabric's real Codex adapter
+  (`nemo-fabric 0.2.0`, `nemo-fabric-adapters-codex 0.2.0`, `openai-codex
+  0.144.4`, from PyPI) drove two ordered turns from the `FabricConfig`
+  roundhouse emits against a roundhouse in offline Open mode: both turns
+  succeeded, both carried the same thread id, roundhouse's metrics moved by
+  one session and two turns, and `GET /v1/sessions/{thread_id}/trajectory`
+  answered 200 with seven steps — the session is named by the
+  `prompt_cache_key` the app-server sends, and the second turn's resent
+  history was admitted as a prefix. The MCP handshake against `/mcp`
+  completed with the `bearer_token_env_var` override. `cached_input` read 0
+  because the echo stub reports no cache reads (`EchoFrontierClient`'s
+  `whole_response(..., 0, ...)`), not because admission failed. Driver and
+  recipe: `examples/fabric-driven/`.]*
 - **The `roundhouse-local` slug is load-bearing under Fabric.** Fabric passes
   the slug verbatim and has no default; a natural `ModelConfig(model="gpt-5.4")`
   puts a `tool_search` tool *definition* in `tools` on every turn against
