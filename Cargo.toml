@@ -48,6 +48,28 @@ dynamo-mocker = { git = "https://github.com/ai-dynamo/dynamo.git", rev = "ac7b75
     "zmq-events",
 ] }
 
+# NeMo Fabric's Rust core, pinned to the upstream commit the synergy round read
+# (`agent-docs/research/nemo-fabric-deep-dive.md`, `agent-docs/synergies/nemo-fabric.md`).
+#
+# A git rev rather than a version: the version-identity rule binds every
+# pre-1.0 neighbor to a rev, and `0.3.0` is not published (newest stable is
+# `0.2.0`, newest prerelease `0.3.0-beta.2`). What roundhouse takes from the
+# crate is its *types* -- `FabricConfig` and the config structs under it -- so
+# the `FabricConfig` an operator hands a Fabric consumer is typed by Fabric's
+# own definitions and a pin bump that changes a field is a compile error here,
+# not a schema mismatch found by the consumer. Plan resolution against
+# Fabric's own Codex adapter descriptor runs in tests only. Nothing here calls
+# the lifecycle half of the crate (`start_runtime` and friends spawn a Python
+# adapter host); roundhouse launches no harness.
+#
+# Weight, recorded so nobody rediscovers it: ~20 crates new to the tree, all
+# under `jsonschema 0.49`, plus two version splits (`strum` 0.28 beside 0.27.2,
+# `bit-vec` 0.8 beside 0.9.1) the resolver cannot unify. **Unlock condition:**
+# when `nemo-fabric-core 0.3.0` publishes, re-diff `FabricConfig`,
+# `HarnessConfig`, `ModelConfig`, `RuntimeConfig`, `McpServerConfig` and
+# `SkillConfig` against this rev and move to `= "0.3.0"`.
+nemo-fabric-core = { git = "https://github.com/NVIDIA/NeMo-Fabric.git", rev = "6d9ebc35bf00c28c322d61b6aba16be5c819ef89" }
+
 # Same major/minor and feature shape as Dynamo's own `lib/llm` pin, minus the
 # network-facing features: tokenizer files are loaded from disk only.
 tokenizers = { version = "0.21.4", default-features = false, features = [

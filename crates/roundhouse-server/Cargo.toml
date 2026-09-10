@@ -43,6 +43,12 @@ thiserror = { workspace = true }
 # Quoting and parse-back for the generated Codex `config.toml`. See
 # `src/codex_launch.rs`.
 toml = { workspace = true }
+# NeMo Fabric's config types, for the `FabricConfig` artifact the launch
+# surface emits beside `config.toml`. Types only -- see the pin's comment in
+# the workspace manifest for what is deliberately not called, and
+# `src/codex_launch/fabric.rs` for why the emitted document is typed by the
+# consumer's own definitions rather than hand-written JSON.
+nemo-fabric-core = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tracing = { workspace = true }

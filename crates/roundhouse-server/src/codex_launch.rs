@@ -21,12 +21,19 @@
 //! `agent-docs/synergies/ecosystem-round-2.md`'s launch-surface dedup found
 //! three implementations of one surface (Relay's Rust launchers, Switchyard's
 //! Python launcher, this) and kept Direct as the reference with roundhouse
-//! generating its own minimal config, because the one test M9 exists for — a
-//! real codex binary executing our synthetic tool call — cannot be delegated
-//! to a launcher we do not own. Relay's CLI stays the supported instrumented
-//! front end for the *chained* topology; Switchyard's launcher is reference
-//! and evidence — its `caller_auth_kind` conditional is exactly what
-//! [`CodexAuthKind`] mirrors — and not a blessed front end.
+//! generating its own minimal config. The reason as first written — a test in
+//! which a real codex binary executed our synthetic tool call — went with the
+//! tool-call steer in M10.0; the reason as it stands is in the 2026-09-05
+//! addendum there: three of the gated tests are bound to `codex exec` and
+//! `CODEX_HOME` semantics, the forwarded-login stanza is inexpressible in a
+//! launcher that always writes `env_key`, four lines below fail silently when
+//! absent, and the suite's version identity is against a binary the operator
+//! installs. Relay's CLI stays the supported instrumented front end for the
+//! *chained* topology; Switchyard's launcher is reference and evidence — its
+//! `caller_auth_kind` conditional is exactly what [`CodexAuthKind`] mirrors —
+//! and not a blessed front end. A fourth implementation, NeMo Fabric's Codex
+//! adapter, is the *Fabric-driven* topology, and [`fabric`] is what this
+//! module hands it: the same deployment, typed by Fabric's own definitions.
 //!
 //! **Two lines here look like belt-and-braces and are not.** Both are facts
 //! about `codex-cli 0.146.0` that a later client could change, and deleting
@@ -90,6 +97,7 @@
 //! into a hermetic `CODEX_HOME` and drives the real binary against a real
 //! roundhouse.
 
+pub mod fabric;
 pub mod skills;
 
 use std::path::Path;
@@ -112,6 +120,14 @@ pub const DEFAULT_KEY_ENV: &str = "ROUNDHOUSE_API_KEY";
 /// On the client's side it is not: naming a real slug can resolve metadata with
 /// `use_responses_lite: true`, which puts `ResponseItem::AdditionalTools` into
 /// `input`, and that is an item type this surface refuses with a 422.
+///
+/// Measured a second way at the `openai-codex==0.144.4` app-server, the binary
+/// NeMo Fabric drives (`agent-docs/research/nemo-fabric-deep-dive.md` §6): a
+/// real slug puts a `tool_search` tool definition on every request, on a
+/// custom provider exactly as on the built-in one, and the `tool_search_call`
+/// item a later turn resends is refused the same way. Both mechanisms key on
+/// the slug and neither on the provider, which is why the safety lives in this
+/// default and not in any stanza around it.
 pub const DEFAULT_MODEL_SLUG: &str = "roundhouse-local";
 
 /// The provider table key, which is also the value of `model_provider`.

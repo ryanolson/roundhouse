@@ -326,3 +326,57 @@ its own requirement list; and two things for the owner to decide: whether
 `CLAUDE.md`'s watched-dependency paragraph should name NeMo Fabric beside
 Relay (this ruling recommends it), and whether the product paragraph's
 "Relay owns the harness" is reworded to the four-clause division above.
+
+---
+
+## Addendum (2026-09-10): the owner's decision — a first-class dependency, in the shape that fits
+
+The product owner read the V5 refusal above and decided the other way:
+`nemo-fabric-core` is a first-class dependency of roundhouse, and the
+division-of-labor clause stands as written. Recorded here as the owner's
+call, with what it changed and what it did not.
+
+**The shape.** Three readings of "first-class" were priced — a runtime pin
+used for types and conformance; a dev-only oracle; Fabric as the harness
+driver — and the owner chose the first. The pin lands in the workspace
+manifest by git rev (`6d9ebc3`, the revision the deep dive read), with the
+weight and the unlock condition written beside it the way the redis and
+Dynamo pins do it. What roundhouse calls is Fabric's *types* — `FabricConfig`
+and the config structs under it — and, in tests only, plan resolution against
+Fabric's own Codex adapter descriptor. Nothing calls the lifecycle half of the
+crate; roundhouse still launches no harness, and the ruling's refusal of the
+harness-driver shape stands.
+
+**What landed (F2, earlier than planned, as a library function).**
+`crates/roundhouse-server/src/codex_launch/fabric.rs` emits the Fabric-driven
+artifact for a `CodexLaunch`: `nvidia.fabric.codex`, `models.default` at the
+deployment's `/v1` with `roundhouse-local` as the slug, the MCP mount as a
+`streamable-http` server with `harness_native` exposure, the generated skill
+leaf directories as `skills.paths`, and the four silent-failure lines as
+`config_overrides` with the same values the TOML writes, read from the same
+constants. The forwarded login is refused by name; a relative skills root is
+refused for the reason a relative catalog path is. The descriptor is vendored
+at `crates/roundhouse-server/tests/fixtures/nemo-fabric/codex.fabric-adapter.json`
+from the pinned rev, and the tests prove it is load-bearing: the emitted
+document plans, an undeclared `harness.settings` key fails planning, and
+`runtime.max_turns` — the Hermes quickstart's field — fails planning against
+Codex exactly as Fabric's compatibility matrix says it does. The operator
+entry point that *writes* the three artifacts stays deferred as before.
+
+**What the pin costs, now paid.** The `jsonschema` subtree and the two
+version splits are in `Cargo.lock`; a pin bump that renames a field is a
+compile error in `fabric.rs`, which is the point. NeMo Fabric joins the
+watched list in `CLAUDE.md` by manifest, with the read-upstream-before-it-lands
+and re-verify-before-milestones obligations. The vigilance triggers above are
+unchanged, and the `0.3.0` unlock is the one written beside the pin.
+
+**The record, corrected in source.** The `codex_launch.rs` module doc no
+longer cites the deleted M9 test; it cites the addendum's ownership case.
+`DEFAULT_MODEL_SLUG`'s comment carries the second, measured mechanism. F1's
+two source follow-ups are therefore closed, and the ruling's "Relay owns the
+harness" amendment is now `CLAUDE.md`'s wording too.
+
+**What did not change.** Fabric-driven is still Codex-only, still documented
+with the weaker transparency claim, and still not required to build or test
+roundhouse. F3 (Harbor), F4 (the seven contributions) and F5 (skills,
+degraded by the missing catalog) are as ruled above.

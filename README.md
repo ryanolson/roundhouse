@@ -464,6 +464,25 @@ is an **operator entry point**: no CLI subcommand or admin route produces
 these files, and whether that is a subcommand or an admin read beside key
 minting is deferred by name.
 
+**A Fabric consumer gets the same deployment as a typed document.**
+`roundhouse_server::fabric_config` emits a NeMo Fabric `FabricConfig` for the
+same launch — `nvidia.fabric.codex`, the model at this deployment's `/v1`, the
+MCP mount, and the generated skill directories — built from `nemo-fabric-core`'s
+own types rather than hand-written JSON, so a field rename upstream is a compile
+error at the pin bump here and not a planning error on the consumer's machine.
+The four lines Fabric has no field for (`requires_openai_auth`, the
+`x-roundhouse-key` header, `bearer_token_env_var`, `default_tools_approval_mode`)
+ride `harness.settings.config_overrides` with the values the TOML writes, from
+the same constants. The forwarded-login stanza is refused for this artifact,
+because Fabric always writes `env_key` and that pair silently disables the
+forwarding. The tests plan the emitted document against Fabric's own Codex
+adapter descriptor, vendored at the pinned rev, and prove the descriptor is
+load-bearing by watching it refuse `runtime.max_turns` — the field the Hermes
+quickstart carries and Codex does not implement. This is the *Fabric-driven*
+topology of `agent-docs/synergies/nemo-fabric.md`: Codex-only today, with a
+weaker transparency claim than Direct (the operator runs the app-server Fabric
+pins, not the `codex` they had), and never required to build or test roundhouse.
+
 ### The gated real-binary suite
 
 `crates/roundhouse-server/tests/codex_e2e.rs` spawns `codex exec` against a

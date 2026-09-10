@@ -72,6 +72,7 @@ pub mod tokenizer;
 
 pub use admin_api::admin_router;
 pub use catalog_config::{CatalogConfig, CatalogError};
+pub use codex_launch::fabric::{FabricLaunchError, fabric_config, fabric_config_json};
 pub use codex_launch::{CodexAuthKind, CodexLaunch};
 pub use control_config::{
     Admission, AuthError, ControlDirectory, ControlPlane, ControlPlaneConfig, ControlPlaneError,

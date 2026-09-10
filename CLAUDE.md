@@ -19,10 +19,9 @@ endpoints, co-optimizing function, cost, and time to solution.**
 
 Every word is load-bearing. *Transparently*: the agent's own stack is not
 modified — pass-through auth, prefix admission of resent history, and the
-MCP surface are what make hooking up invisible. *Through it*: roundhouse
-owns the turn (the durable log, policy, budgets, routing, steering);
-Relay owns the harness; Switchyard contributes routing ideas and judge
-prompts; Dynamo owns the metal. *Co-optimizing all three*: a router that
+MCP surface are what make hooking up invisible. *Through it*: roundhouse owns the turn (the durable log, policy, budgets, routing, steering);
+Fabric launches the harness and Relay instruments it; Switchyard contributes
+routing ideas and judge prompts; Dynamo owns the metal. *Co-optimizing all three*: a router that
 optimizes cost alone ships worse answers, one that optimizes quality
 alone is a thin proxy to a frontier lab, and one that ignores latency
 loses the agent loop — which is why routing decisions carry quality
@@ -42,7 +41,9 @@ plan or deep dive that lands at the repo root is in the wrong place.
 ## Synergy dependencies are watched, not just pinned
 
 Some dependencies are not mere libraries but the other half of the
-product: **NeMo Relay** (the harness we interoperate with), **Switchyard**
+product: **NeMo Fabric** (`nemo-fabric-core`, the harness launcher whose own
+config types the Fabric-driven launch artifact is built from), **NeMo Relay**
+(the harness instrumentation we interoperate with), **Switchyard**
 (routing algorithms and judge prompts we adopt ideas from), **Dynamo**
 (the serving plane, including its pinned crates and their transitive
 pins), the **codex** crates (our wire-conformance oracle), and **redis**
