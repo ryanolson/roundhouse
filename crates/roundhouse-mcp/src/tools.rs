@@ -85,7 +85,7 @@ pub struct ToolCall {
 fn conversation_property() -> Value {
     json!({
         "type": "string",
-        "description": "The conversation this concerns, as the client's own prompt_cache_key. Omit it and the most recent conversation on this key is used."
+        "description": "The conversation this concerns, as the client's thread-id, session-id, or explicit prompt_cache_key, in that order. Omit it and the most recent conversation on this key is used."
     })
 }
 

@@ -536,6 +536,8 @@ impl<T: Tokenizer + Clone> FleetJudge<T> {
             // The isolation, and the one line of this file that would be
             // easiest to get subtly wrong: the *conversation's* key here would
             // cool the hit the router priced for the next real turn.
+            session_id: None,
+            thread_id: None,
             prompt_cache_key: format!("{}{VALIDATE_CACHE_SUFFIX}", side_call.session_id),
             expected_output_tokens: Some(self.config.expected_output_tokens),
             // **Deliberately unresolved, and this is the honest state rather

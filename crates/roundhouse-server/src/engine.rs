@@ -1366,10 +1366,19 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                     target: decision.target.clone(),
                     wire_protocol: spec.wire_protocol,
                     prompt: assembler.rendered(),
-                    // Stable for the life of the session: providers use it to
-                    // steer requests to the same cache node, so varying it
-                    // would defeat the hit we just routed on.
-                    prompt_cache_key: session.session_id().to_string(),
+                    session_id: admission
+                        .request_context
+                        .as_ref()
+                        .and_then(|context| context.session_id.clone()),
+                    thread_id: admission
+                        .request_context
+                        .as_ref()
+                        .and_then(|context| context.thread_id.clone()),
+                    prompt_cache_key: admission
+                        .request_context
+                        .as_ref()
+                        .map(|context| context.prompt_cache_key.clone())
+                        .unwrap_or_else(|| session.session_id().to_string()),
                     expected_output_tokens: Some(self.config.expected_output_tokens),
                     // The credential travels here for the same reason the
                     // dialect above does: this is the only argument `execute`

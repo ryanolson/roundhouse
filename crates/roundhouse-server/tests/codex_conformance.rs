@@ -66,13 +66,20 @@ fn surface() -> (Router, Arc<MemoryStore>) {
 /// An empty one leaves an engine with nowhere to route, which is how a
 /// post-admission failure is produced without a stub provider.
 fn surface_with(catalog: StaticFrontierCatalog) -> (Router, Arc<MemoryStore>) {
+    surface_with_client(catalog, Arc::new(EchoFrontierClient::new(ANSWER)))
+}
+
+fn surface_with_client(
+    catalog: StaticFrontierCatalog,
+    client: Arc<dyn roundhouse_fleet::FrontierClient>,
+) -> (Router, Arc<MemoryStore>) {
     let store = Arc::new(MemoryStore::new());
     let engine = Arc::new(Engine::new(
         Arc::clone(&store),
         ByteTokenizer,
         Arc::new(EchoLocalExecutor::new("local answer")),
         catalog,
-        Arc::new(EchoFrontierClient::new(ANSWER)),
+        client,
         Arc::new(AffinityPolicy::new()),
         EngineConfig::default(),
     ));
@@ -645,4 +652,162 @@ async fn a_live_socket_round_trip() {
     );
     assert_eq!(answer(&events), ANSWER);
     assert!(!response_id(&events).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_header_does_not_require_a_cache_key() {
+    let client = Arc::new(CaptureClient::default());
+    let (app, store) = surface_with_client(frontier_catalog(), client.clone());
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header(CONTENT_TYPE, "application/json")
+                .header("session-id", "client-session")
+                .header("thread-id", "client-thread")
+                .body(Body::from(
+                    serde_json::json!({
+                        "stream": true, "instructions": "system",
+                        "input": [{"type":"message", "role":"user", "content":"hello"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert!(!body.is_empty());
+    {
+        let quotes = client.0.lock().unwrap();
+        assert_eq!(quotes.len(), 1);
+        assert_eq!(quotes[0].session_id.as_deref(), Some("client-session"));
+        assert_eq!(quotes[0].thread_id.as_deref(), Some("client-thread"));
+        assert_eq!(quotes[0].prompt_cache_key.len(), 64);
+        assert_ne!(quotes[0].prompt_cache_key, "client-thread");
+    }
+    assert!(
+        store
+            .last_seq(&SessionId::new("client-thread"))
+            .await
+            .unwrap()
+            > 0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn threads_with_a_shared_cache_key_have_separate_histories() {
+    let (app, store) = surface();
+    for thread in ["parent-thread", "child-thread"] {
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("session-id", "shared-session")
+                    .header("thread-id", thread)
+                    .body(Body::from(
+                        serde_json::json!({
+                            "stream": true, "prompt_cache_key": "shared-cache",
+                            "input": [{"type":"message", "role":"user", "content":thread}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response.into_body().collect().await.unwrap();
+    }
+    for thread in ["parent-thread", "child-thread"] {
+        assert!(
+            store.last_seq(&SessionId::new(thread)).await.is_ok(),
+            "missing {thread}"
+        );
+    }
+}
+
+#[derive(Default)]
+struct CaptureClient(std::sync::Mutex<Vec<roundhouse_fleet::FrontierQuote>>);
+
+#[async_trait::async_trait]
+impl roundhouse_fleet::FrontierClient for CaptureClient {
+    async fn execute(
+        &self,
+        quote: &roundhouse_fleet::FrontierQuote,
+    ) -> Result<roundhouse_fleet::FrontierStream, roundhouse_fleet::FrontierError> {
+        self.0.lock().unwrap().push(quote.clone());
+        roundhouse_fleet::FrontierClient::execute(&EchoFrontierClient::new(ANSWER), quote).await
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supplied_cache_key_survives_a_history_rewrite() {
+    let client = Arc::new(CaptureClient::default());
+    let (app, _) = surface_with_client(frontier_catalog(), client.clone());
+    drive(&app, request("caller-key", vec![user_message("before")]))
+        .await
+        .unwrap();
+    drive(&app, request("caller-key", vec![user_message("after")]))
+        .await
+        .unwrap();
+    let quotes = client.0.lock().unwrap();
+    assert_eq!(quotes.len(), 2);
+    assert_eq!(quotes[0].prompt_cache_key, "caller-key");
+    assert_eq!(quotes[1].prompt_cache_key, "caller-key");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn context_signals_distinguish_prefix_changes_and_window_changes() {
+    let (app, _) = surface();
+    for (instructions, window, expected) in [
+        ("system", "thread:0", "first_seen"),
+        ("system", "thread:0", "prefix_unchanged"),
+        ("edited system", "thread:0", "prefix_changed"),
+        ("edited system", "thread:1", "window_changed"),
+        ("edited system", "thread:1", "history_rewritten"),
+    ] {
+        let mut input = vec![
+            serde_json::json!({"type":"message", "role":"user", "content":"first user retained"}),
+        ];
+        if expected == "history_rewritten" {
+            input.push(serde_json::json!({"type":"message", "role":"assistant", "content":"rewritten prior answer"}));
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("session-id", "context-session")
+                    .header("thread-id", "thread")
+                    .header("x-codex-window-id", window)
+                    .body(Body::from(
+                        serde_json::json!({
+                            "stream": true, "prompt_cache_key": "context-cache",
+                            "instructions": instructions,
+                            "input": input
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-roundhouse-context-signal")
+                .and_then(|v| v.to_str().ok()),
+            Some(expected)
+        );
+        response.into_body().collect().await.unwrap();
+    }
 }

@@ -113,7 +113,7 @@ pub trait ControlSurface: Send + Sync + 'static {
 
 /// Which conversation a session-scoped tool concerns.
 ///
-/// The client's own `prompt_cache_key`, resolved through the same
+/// The client's conversation name (`thread-id`, then `session-id`, then `prompt_cache_key`), resolved through the same
 /// `bound_session` namespacing the Responses surface uses, so the two surfaces
 /// agree by construction. Omitted, it means the principal's most recent
 /// session — which is the right default for the overwhelmingly common case of
@@ -324,7 +324,7 @@ pub struct OverlayResponse {
 /// M5 ships the write half: an id is minted, recorded against
 /// `(principal, session)`, and returned in a form a client will keep. Nothing
 /// in the deployment *reads* it back — `mcp_api::resolve_session` answers from
-/// the client's `prompt_cache_key` and from the node's conversation table, and
+/// the client's conversation name and from the node's conversation table, and
 /// never from a binding. The read side is M7's, per the plan's §3. Both this
 /// type's [`Self::note`] and the tool description are written to match: they
 /// ask the client to keep the token and say what keeping it makes possible,

@@ -54,6 +54,7 @@ pub mod http;
 pub mod judge;
 pub mod mcp_api;
 pub mod metrics_api;
+pub mod request_context;
 pub mod responses_api;
 pub mod tokenizer;
 

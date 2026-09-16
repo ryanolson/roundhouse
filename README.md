@@ -346,14 +346,13 @@ semantics (`response.completed` ends the stream; `response.failed` and
 (`cached_input_tokens` lands in Codex's `input_tokens_details.cached_tokens`),
 and a real-socket round trip through Codex's HTTP stack.
 
-The integration is also the thesis in miniature. Codex-over-HTTP re-sends the
-whole conversation every turn (`previous_response_id` is a websocket feature),
-and it names the conversation with `prompt_cache_key`. Against an append-only
-log that resent history is a *claim*, not input: the surface checks it as a
-prefix of the session named by the cache key and admits only the suffix — so a
-stateless client gets stateful routing, one accumulated warm prefix, and
-idempotent retries (the turn id is a content hash of the conversation) without
-knowing any of it is happening.
+The Responses surface accepts a complete conversation on each request. It binds that history to `thread-id`, then `session-id`, then an explicit `prompt_cache_key`, in that order. These names remain inside the authenticated caller's namespace. It compares the resent history with the stored prefix and admits only the suffix. A history rewrite starts a new internal generation.
+
+Roundhouse forwards the supplied `session-id`, `thread-id`, and `prompt_cache_key` to its OpenAI Responses provider. The cache key remains independent of the internal history generation. If no cache key is supplied, Roundhouse computes a 64-character SHA-256 digest. Its input includes canonical system/developer messages before the first user message, followed by that user message. A content hash cannot identify a conversation: requests without any explicit conversation identity are refused.
+
+The response header `x-roundhouse-context-signal` reports `first_seen`, `prefix_unchanged`, `prefix_changed`, `history_rewritten`, or `window_changed`. The last value compares Codex's `x-codex-window-id`. These are context observations, not proof that compaction occurred. Compaction can preserve the first user message, and prompt edits can change it.
+
+Observations are node-local and reset on restart. Structured logs report the signal without prompt content. Roundhouse still refuses opaque compaction input items and does not serve `/v1/responses/compact` or Anthropic Messages. See the [session research](agent-docs/research/agent-session-context.md) for protocol evidence and remaining work.
 
 ## Not yet built
 

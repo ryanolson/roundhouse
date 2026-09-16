@@ -509,6 +509,7 @@ mod the_live_admission_cannot_move_a_finished_turns_charge {
 
     fn budgeted_admission(budget_counts: BudgetCounts) -> Admission {
         Admission {
+            request_context: None,
             principal: Principal::new("acme", "ada"),
             policy: Arc::new(TurnPolicy::unrestricted()),
             budget: Some(BudgetTerms {

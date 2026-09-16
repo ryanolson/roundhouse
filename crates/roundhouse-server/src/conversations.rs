@@ -10,7 +10,7 @@
 //! state, because that surface was the only thing that named a conversation.
 //! The MCP control surface names one too — `prefer`, `status` and
 //! `declare_intent` all take an optional `conversation`, spelled as the client's
-//! own `prompt_cache_key` — and it has to arrive at the *same* session id, or an
+//! own conversation name — and it has to arrive at the *same* session id, or an
 //! agent narrows the routing of a session no turn will ever run in. Two maps
 //! would agree only while nothing had forked; one map cannot disagree at all.
 //!
@@ -19,7 +19,7 @@
 //! A client names a conversation in one of two ways, and both are answered from
 //! the same node-local state:
 //!
-//! - **By cache key.** `{project}/{user}/{key}` at generation zero, plus a
+//! - **By conversation key.** `{project}/{user}/{key}` at generation zero, plus a
 //!   `#g{n}` suffix once a client has edited its own history out from under a
 //!   session. Only this table knows what `n` is.
 //! - **Not at all.** The MCP surface's `conversation` argument is optional, and
@@ -32,7 +32,7 @@
 //! A `HashMap` behind a `Mutex` in one process, exactly as the generations map
 //! it grew out of always was: process state standing in for a durable mapping
 //! the Redis store will own (M8). What the choice costs, said plainly: a client
-//! that reconnects to another node keeps its cache key and loses its generation,
+//! that reconnects to another node keeps its conversation key and loses its generation,
 //! which re-derives on the first request that disagrees with the log; and an MCP
 //! call that omits `conversation` on a node that has served none of this
 //! principal's turns is refused as [`SurfaceError::NoSession`] rather than
@@ -53,12 +53,12 @@ pub struct Conversations {
 
 #[derive(Debug, Default)]
 struct Inner {
-    /// How many times each *namespaced* cache key's history has failed the
+    /// How many times each *namespaced* conversation key's history has failed the
     /// prefix check.
     ///
-    /// Keyed by the whole namespaced string — `{project}/{user}/{cache_key}`
-    /// where there is a namespace, the bare cache key where there is not —
-    /// rather than by the cache key the client sent. Two tenants both naming a
+    /// Keyed by the whole namespaced string — `{project}/{user}/{conversation_key}`
+    /// where there is a namespace, the bare conversation key where there is not —
+    /// rather than by the conversation key the client sent. Two tenants both naming a
     /// conversation `main` own separate logs, and a shared fork counter would
     /// let an edited history in one of them cold-start the other: the second
     /// tenant's next request would compute a session id at a generation it
@@ -69,6 +69,7 @@ struct Inner {
     generations: HashMap<String, u32>,
     /// The session each principal most recently drove a turn on.
     latest: HashMap<Principal, SessionId>,
+    contexts: HashMap<String, (String, Option<String>)>,
 }
 
 impl Conversations {
@@ -147,6 +148,37 @@ impl Conversations {
         self.lock().latest.get(principal).cloned()
     }
 
+    /// Compare requests within a namespaced thread. These observations are
+    /// node-local, like the generation binding. A restart loses this baseline.
+    pub(crate) fn observe_context(
+        &self,
+        key: &str,
+        context: &crate::request_context::RequestContext,
+        history_rewritten: bool,
+    ) -> &'static str {
+        let previous = self.lock().contexts.insert(
+            key.to_owned(),
+            (
+                context.prefix_fingerprint.clone(),
+                context.window_id.clone(),
+            ),
+        );
+        match previous {
+            Some((_, Some(window)))
+                if context
+                    .window_id
+                    .as_ref()
+                    .is_some_and(|current| current != &window) =>
+            {
+                "window_changed"
+            }
+            Some((prefix, _)) if prefix != context.prefix_fingerprint => "prefix_changed",
+            _ if history_rewritten => "history_rewritten",
+            Some(_) => "prefix_unchanged",
+            None => "first_seen",
+        }
+    }
+
     /// The lock, in one place.
     ///
     /// Recovering a poisoned guard rather than propagating the panic: every
@@ -161,7 +193,7 @@ impl Conversations {
     }
 }
 
-/// This node's session id for a namespaced cache key at a given generation.
+/// This node's session id for a namespaced conversation key at a given generation.
 ///
 /// Generation zero is the key verbatim, so a session survives a process
 /// restart that loses the generation map: the common case is a conversation
@@ -186,7 +218,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reader_and_a_turn_resolve_one_cache_key_to_one_session() {
+    fn a_reader_and_a_turn_resolve_one_conversation_key_to_one_session() {
         // The whole reason this table is shared rather than owned by the
         // Responses surface: an overlay installed against `resolve`'s answer
         // has to reach the session `bind` hands the engine, generation and all.

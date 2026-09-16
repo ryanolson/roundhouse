@@ -52,7 +52,7 @@
 //!
 //! # A leak the sweep bounds rather than closes
 //!
-//! `Conversations::fork` rebinds a client's cache key to a fresh `SessionId`
+//! `Conversations::fork` rebinds a client's conversation name to a fresh `SessionId`
 //! when the client's resent history disagrees with the log — a client editing
 //! its own history mid-session. Every family here is keyed by the *pre-fork*
 //! id, so the agent's standing narrowing silently stops applying (the engine
@@ -508,7 +508,7 @@ impl ControlStore {
     ///
     /// **This is the read side of the correlation trick, and in M5 it has no
     /// production caller.** `mcp_api::resolve_session` answers "which
-    /// conversation is this?" from the client's `prompt_cache_key` and from
+    /// conversation is this?" from the client's conversation name and from
     /// `Conversations::latest`, never from a binding — which is why the tool
     /// that mints an id is honest about recording it rather than about using
     /// it. M7 is where the read lands, per the plan's §3: it is the milestone

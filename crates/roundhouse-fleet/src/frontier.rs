@@ -237,8 +237,10 @@ pub struct FrontierQuote {
     /// deployment.
     pub wire_protocol: WireProtocol,
     pub prompt: String,
-    /// Stable per-session key. Providers use it to steer requests to the same
-    /// cache node, so it must not vary turn to turn.
+    /// Caller-supplied identity, independent of the cache-routing hint.
+    pub session_id: Option<String>,
+    pub thread_id: Option<String>,
+    /// Cache-routing hint. Actual reuse still requires a matching token prefix.
     pub prompt_cache_key: String,
     pub expected_output_tokens: Option<u32>,
     /// What this request authenticates with.
@@ -426,6 +428,8 @@ mod tests {
             },
             wire_protocol: WireProtocol::AnthropicMessages,
             prompt: "some prompt".into(),
+            session_id: None,
+            thread_id: None,
             prompt_cache_key: "sess_x".into(),
             expected_output_tokens: None,
             credential,

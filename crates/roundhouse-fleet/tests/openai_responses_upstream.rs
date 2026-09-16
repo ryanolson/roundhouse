@@ -128,6 +128,8 @@ fn quote(credential: TurnCredential) -> FrontierQuote {
         },
         wire_protocol: WireProtocol::OpenAiResponses,
         prompt: "how many tokens did that turn bill?".into(),
+        session_id: None,
+        thread_id: None,
         prompt_cache_key: "sess_upstream".into(),
         expected_output_tokens: Some(512),
         credential,
@@ -343,4 +345,19 @@ async fn a_forwarded_credential_never_follows_a_redirect_to_another_origin() {
         panic!("a redirect is not a response this client accepts")
     };
     assert!(error.to_string().contains("307"), "{error}");
+}
+
+#[tokio::test]
+async fn client_session_and_thread_ids_reach_the_upstream() {
+    let (base, seen) = Upstream::spawn(Behaviour::Stream).await;
+    let client = OpenAiResponsesClient::with_bases(&base, &base).unwrap();
+    let mut request = quote(stored());
+    request.session_id = Some("client-session".into());
+    request.thread_id = Some("client-thread".into());
+    drain(client.execute(&request).await.unwrap())
+        .await
+        .unwrap();
+    let headers = seen.lock().unwrap();
+    assert_eq!(headers[0].get("session-id").unwrap(), "client-session");
+    assert_eq!(headers[0].get("thread-id").unwrap(), "client-thread");
 }

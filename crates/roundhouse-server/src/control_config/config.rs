@@ -952,6 +952,7 @@ impl ControlPlaneConfig {
             turn_keys.insert(
                 key.key_sha256.clone(),
                 Admission {
+                    request_context: None,
                     principal: Principal::new(key.project.clone(), key.user.clone()),
                     policy: Arc::new(project_policy.narrow(&overrides)),
                     budget,

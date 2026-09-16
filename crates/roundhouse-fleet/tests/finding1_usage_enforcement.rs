@@ -62,6 +62,8 @@ fn quote_as_the_engine_builds_it(catalog: &StaticFrontierCatalog) -> FrontierQuo
         wire_protocol: spec.wire_protocol,
         target: candidate.target,
         prompt: "how many tokens did that turn bill?".into(),
+        session_id: None,
+        thread_id: None,
         prompt_cache_key: "sess_finding1".into(),
         expected_output_tokens: Some(512),
         // This test is about the dialect the quote carries, not about

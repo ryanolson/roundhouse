@@ -51,7 +51,7 @@ pub struct SessionFacts {
 pub trait ControlReads: Send + Sync + 'static {
     /// Which conversation this call concerns.
     ///
-    /// `conversation` is the client's own `prompt_cache_key`, resolved through
+    /// `conversation` is the client's conversation name (`thread-id`, then `session-id`, then `prompt_cache_key`), resolved through
     /// the same namespacing the Responses surface uses. Omitted, the
     /// principal's most recent session. Two failures are distinct and both are
     /// errors rather than defaults: a principal with no session at all is

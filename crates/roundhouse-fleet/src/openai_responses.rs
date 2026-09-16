@@ -281,7 +281,18 @@ impl FrontierClient for OpenAiResponsesClient {
             });
         }
 
-        let route = self.route(&quote.credential, provider)?;
+        let mut route = self.route(&quote.credential, provider)?;
+        for (name, value) in [
+            ("session-id", &quote.session_id),
+            ("thread-id", &quote.thread_id),
+        ] {
+            if let Some(value) = value {
+                let value = HeaderValue::from_str(value).map_err(|_| {
+                    FrontierError::Upstream(format!("invalid `{name}` request metadata"))
+                })?;
+                route.headers.insert(HeaderName::from_static(name), value);
+            }
+        }
         let response = route
             .client
             .post(format!("{}/responses", route.base))
@@ -412,6 +423,8 @@ mod tests {
             },
             wire_protocol,
             prompt: "how many tokens did that turn bill?".into(),
+            session_id: None,
+            thread_id: None,
             prompt_cache_key: "sess_openai".into(),
             expected_output_tokens: Some(512),
             credential,
