@@ -1,0 +1,4 @@
+interface:
+  display_name: "Measure MoE Routing"
+  short_description: "Onboard a model's measured MoE routing"
+  default_prompt: "Use $measure-moe-routing to onboard a model by measuring real expert selections and fitting its synthetic routing distribution."
