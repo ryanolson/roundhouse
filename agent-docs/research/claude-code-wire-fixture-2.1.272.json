@@ -1,0 +1,150 @@
+{
+  "fixture_schema": "roundhouse.claude_code_wire_fixture.v2",
+  "captured_on": "2026-09-16",
+  "client": {
+    "version": "2.1.272",
+    "binary_sha256": "214a90efdd16ee0ea81132ffecced588dba394d178cc494f285ba04b5288c8de"
+  },
+  "isolation": "One synthetic prompt sent to a loopback mock. The mock discarded authorization values and all message text.",
+  "claude_exit_code": 0,
+  "request_count": 4,
+  "shared_request_properties": {
+    "method": "POST",
+    "path": "/v1/messages?beta=true",
+    "authorization_present": true,
+    "identity_header_matches_root_session_id": {
+      "x-claude-code-session-id": true
+    },
+    "metadata_user_id": {
+      "present": true,
+      "encoding": "json_encoded_string_object",
+      "json_key_names": [
+        "account_uuid",
+        "device_id",
+        "session_id"
+      ],
+      "root_session_id_key_names": [
+        "session_id"
+      ],
+      "request_header_session_id_key_names": [
+        "session_id"
+      ]
+    },
+    "model": "claude-fable-5-1",
+    "top_level_keys_do_not_include": [
+      "prompt_cache_key"
+    ],
+    "identity_headers_absent": [
+      "session-id",
+      "thread-id",
+      "x-client-request-id"
+    ],
+    "parent_tool_use_id_present": false
+  },
+  "non_sensitive_header_names": [
+    "accept",
+    "accept-encoding",
+    "anthropic-beta",
+    "anthropic-dangerous-direct-browser-access",
+    "anthropic-version",
+    "connection",
+    "content-length",
+    "content-type",
+    "host",
+    "user-agent",
+    "x-app",
+    "x-claude-code-session-id",
+    "x-stainless-arch",
+    "x-stainless-lang",
+    "x-stainless-os",
+    "x-stainless-package-version",
+    "x-stainless-retry-count",
+    "x-stainless-runtime",
+    "x-stainless-runtime-version",
+    "x-stainless-timeout"
+  ],
+  "request_shapes_in_order": [
+    {
+      "message_roles": [
+        "user"
+      ],
+      "stream": true,
+      "cache_breakpoints": [],
+      "context_management_edit_types": []
+    },
+    {
+      "message_roles": [
+        "user",
+        "system"
+      ],
+      "stream": true,
+      "cache_breakpoints": [
+        {
+          "location": "system[1]",
+          "cache_control": {
+            "type": "ephemeral",
+            "ttl": "1h"
+          }
+        },
+        {
+          "location": "system[3]",
+          "cache_control": {
+            "type": "ephemeral",
+            "ttl": "1h"
+          }
+        },
+        {
+          "location": "messages[1].content[0]",
+          "cache_control": {
+            "type": "ephemeral",
+            "ttl": "1h"
+          }
+        }
+      ],
+      "context_management_edit_types": [
+        "clear_thinking_20251015"
+      ]
+    },
+    {
+      "message_roles": [
+        "user"
+      ],
+      "stream": false,
+      "cache_breakpoints": [],
+      "context_management_edit_types": []
+    },
+    {
+      "message_roles": [
+        "user",
+        "system"
+      ],
+      "stream": false,
+      "cache_breakpoints": [
+        {
+          "location": "system[1]",
+          "cache_control": {
+            "type": "ephemeral",
+            "ttl": "1h"
+          }
+        },
+        {
+          "location": "system[3]",
+          "cache_control": {
+            "type": "ephemeral",
+            "ttl": "1h"
+          }
+        },
+        {
+          "location": "messages[1].content[0]",
+          "cache_control": {
+            "type": "ephemeral",
+            "ttl": "1h"
+          }
+        }
+      ],
+      "context_management_edit_types": [
+        "clear_thinking_20251015"
+      ]
+    }
+  ]
+}

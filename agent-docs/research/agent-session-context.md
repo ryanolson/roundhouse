@@ -73,6 +73,8 @@ For the Messages API, compaction is explicit. When `pause_after_compaction: true
 
 This research did not confirm one stable Claude Code HTTP session header. The probe did not capture a `metadata.user_id` session mapping. Do not infer one from `cache_control`, a cache key, prompt content, a request ID, or Claude's CLI transcript ID. A future Messages adapter needs a captured wire fixture before it assigns a Claude header precedence rule.
 
+> **2026-09-16 wire addendum.** [Claude Code wire signals for cache-aware routing](agent-session-context-claude-wire-addendum-2026-09-16.md) captures version-specific root-request evidence for `x-claude-code-session-id` and the JSON `metadata.user_id` mapping. It also records mixed request shapes under one root session and leaves child-request identity unresolved.
+
 ## 4. Probe results
 
 | Probe | Observation | What it establishes | What it does not establish |
