@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use dynamo_kv_router::services::selection::{
@@ -29,6 +30,19 @@ pub enum FleetError {
     NoWorker(String),
     #[error("selection service rejected the request: {0}")]
     Rejected(String),
+    /// `upsert_worker` returning does not mean the scheduler's own topology
+    /// view has caught up (see [`EmbeddedFleet::register_worker`]); this is
+    /// what the bounded wait for that reports if it never catches up.
+    #[error(
+        "worker {worker_id} in {model_name}/{routing_group} did not become \
+         routable within {waited:?}"
+    )]
+    NotRoutable {
+        worker_id: u64,
+        model_name: String,
+        routing_group: String,
+        waited: Duration,
+    },
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -266,7 +280,15 @@ impl EmbeddedFleet {
     }
 
     /// Register a worker with the embedded catalog.
+    ///
+    /// Does not return until the worker is routable, not just catalogued —
+    /// see [`Self::wait_until_routable`] for why the two are different
+    /// moments and why every caller needs the wait rather than just the
+    /// ones that happen to hit the gap in a test.
     pub async fn register_worker(&self, worker: WorkerRegistration) -> Result<(), FleetError> {
+        let worker_id = worker.worker_id;
+        let model_name = worker.model_name.clone();
+        let routing_group = worker.routing_group.clone();
         let request = WorkerRequest {
             worker_id: worker.worker_id,
             model_name: worker.model_name,
@@ -292,7 +314,62 @@ impl EmbeddedFleet {
             .upsert_worker(request)
             .await
             .map_err(|error| FleetError::Rejected(error.to_string()))?;
-        Ok(())
+        self.wait_until_routable(&model_name, &routing_group, worker_id)
+            .await
+    }
+
+    /// Block until `worker_id` shows up on the scheduler's own booking table,
+    /// bounded so a genuine failure to converge is a clear error rather than
+    /// a hang.
+    ///
+    /// `upsert_worker` marks the worker schedulable in the catalog and pushes
+    /// the new topology onto a `watch` channel synchronously -- both visible
+    /// to `select` the instant `upsert_worker` returns. But the table a
+    /// *reservation* books against (`ActiveSequencesMultiWorker::workers`,
+    /// what `add_request_if_registered` checks) is kept current by a
+    /// separate task that only *consumes* that channel, on the executor's own
+    /// schedule. Under ordinary load that task runs before this function
+    /// would otherwise return; under the CPU contention a full
+    /// `cargo test --workspace` gate produces, it sometimes has not, and a
+    /// `select` immediately followed by `reserve` can name this worker and
+    /// then be told by the reservation path that it does not exist
+    /// (`SequenceError::WorkerNotFound`). `loads()` reads the same
+    /// eventually-consistent table the booking path does, so polling it here
+    /// once -- the one place every caller registers a worker -- is what
+    /// closes the window; the alternative was a sleep of unknown length
+    /// duplicated into every fixture (and every future production caller)
+    /// that registers a worker and then immediately serves it.
+    async fn wait_until_routable(
+        &self,
+        model_name: &str,
+        routing_group: &str,
+        worker_id: u64,
+    ) -> Result<(), FleetError> {
+        const BUDGET: Duration = Duration::from_secs(2);
+        const MAX_BACKOFF: Duration = Duration::from_millis(10);
+        let deadline = tokio::time::Instant::now() + BUDGET;
+        let mut backoff = Duration::from_micros(50);
+        loop {
+            let routable = self
+                .service
+                .loads(Some(model_name), Some(routing_group))
+                .into_iter()
+                .flat_map(|model| model.loads)
+                .any(|load| load.worker_id == worker_id);
+            if routable {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(FleetError::NotRoutable {
+                    worker_id,
+                    model_name: model_name.to_string(),
+                    routing_group: routing_group.to_string(),
+                    waited: BUDGET,
+                });
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(MAX_BACKOFF);
+        }
     }
 
     /// Current pressure on a worker, or `None` if it has no load entry yet.

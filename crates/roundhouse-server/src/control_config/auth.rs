@@ -40,7 +40,25 @@ use serde_json::json;
 /// [`ControlPlane::turn_principal`]: super::ControlPlane::turn_principal
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AuthError {
-    #[error("missing Authorization header")]
+    /// No roundhouse key was presented at all.
+    ///
+    /// The message names the *dedicated* header and the mechanism that fills
+    /// it, rather than saying "missing Authorization header", because of F07:
+    /// the commonest way to land on this row is not a client that forgot a key
+    /// but codex silently dropping the `env_http_headers` entry that carries
+    /// it — its `build_header_map` omits the header without an error when the
+    /// named variable is unset, blank, or holds a value `HeaderValue` rejects
+    /// (a trailing newline from `$(cat key)`), unlike the loud `EnvVar` error
+    /// its `env_key` sibling raises for the identical case. An operator told
+    /// "missing Authorization header" in pass-through mode goes and inspects
+    /// an `Authorization` that is present and correct — it is their upstream
+    /// seat token — and never looks at the variable that actually broke.
+    #[error(
+        "no roundhouse key: send it in the `x-roundhouse-key` header — codex fills that \
+         header from `env_http_headers`, which it drops without an error when the named \
+         variable is unset, blank, or holds a value a header cannot carry — or as \
+         `Authorization: Bearer rh_turn_<43 base62 chars>`"
+    )]
     MissingKey,
     #[error("Authorization header is not `Bearer rh_(turn|admin)_<43 base62 chars>`")]
     MalformedKey,

@@ -128,31 +128,124 @@ impl ProviderPricing {
         }
     }
 
-    /// Price a call from its token counts.
+    /// Price a call from its four billable token axes.
     ///
-    /// The one definition of what a call costs. Both the routing quote, which
-    /// works in fractional expected tokens, and the metrics rollup, which works
-    /// in measured integer counts, go through here — a second copy of this
-    /// arithmetic would let the dashboard's "what we paid" drift from the
+    /// **The one definition of what a call costs.** Both the routing quote,
+    /// which works in fractional expected tokens, and the metrics rollup, which
+    /// works in measured integer counts, reach the arithmetic through here — a
+    /// second copy would let the dashboard's "what we paid" drift from the
     /// router's "what we thought it would cost", and the gap between those two
     /// numbers is exactly what tells you the cache model is wrong.
-    pub fn price_tokens(&self, uncached_input: f64, cached_input: f64, output: f64) -> f64 {
+    ///
+    /// The two public entry points differ only in how they *split* the uncached
+    /// prompt between `cache_write` and `plain_input`, never in what a token of
+    /// each costs. That is the whole reason this takes four axes instead of
+    /// three: it makes the conservative convention and the measured split two
+    /// arguments to one formula rather than two formulas.
+    fn price_axes(
+        &self,
+        cache_write: f64,
+        cached_input: f64,
+        plain_input: f64,
+        output: f64,
+    ) -> f64 {
         const PER_MTOK: f64 = 1e-6;
-        uncached_input * self.effective_write_per_mtok_usd() * PER_MTOK
+        cache_write * self.effective_write_per_mtok_usd() * PER_MTOK
             + cached_input * self.cached_input_per_mtok_usd * PER_MTOK
+            + plain_input * self.input_per_mtok_usd * PER_MTOK
             + output * self.output_per_mtok_usd * PER_MTOK
+    }
+
+    /// Price a call from token counts nobody measured a cache write on.
+    ///
+    /// **The quote-time estimator, and it stays conservative on purpose.** It
+    /// bills the *whole* uncached share at [`Self::effective_write_per_mtok_usd`]
+    /// — the premium rate — because at quote time nothing knows how much of the
+    /// prompt the provider will actually write into its cache, and D16's trade
+    /// resolves the safe way: overstating our own cost understates the saving we
+    /// claim, and a savings dashboard that errs must err downwards.
+    ///
+    /// M11.0 gave [`Self::price`] the measured split this cannot have. The two
+    /// now differ on a turn whose provider reported a cache write, and that
+    /// difference is a feature: the router's quote is a prediction and the
+    /// rollup's price is a bill, and comparing them is how the cache model gets
+    /// checked. Making this one measured-aware is not possible — there is no
+    /// measurement yet — and making [`Self::price`] conservative would throw away
+    /// one that exists.
+    pub fn price_tokens(&self, uncached_input: f64, cached_input: f64, output: f64) -> f64 {
+        self.price_axes(uncached_input, cached_input, 0.0, output)
+    }
+
+    /// How many of one call's uncached prompt tokens bill at the write rate.
+    ///
+    /// **The whole of what pricing decides per *call* rather than per token**,
+    /// and therefore the one quantity a pot of calls cannot recover from its
+    /// summed counts. Rate-card-free on purpose: this is a question about
+    /// tokens, which is what lets [`PooledUsage`] take the decision at fold
+    /// time without the fold ever seeing a price.
+    ///
+    /// **Where the measurement exists, it is used.** A provider that reports
+    /// `cache_creation_input_tokens` has told us which uncached tokens carried
+    /// the write premium and, by subtraction, which were ordinary input — so
+    /// those two are billed at their two rates instead of all of them at the
+    /// premium. That is the correction `ledger.rs` has carried as a known
+    /// overcharge since M8 and could not make until `Usage` had somewhere to
+    /// store the count.
+    ///
+    /// **A zero write count takes the conservative path, and that is not a
+    /// rounding decision.** The log stores `0` both for "the provider reported
+    /// no cache write" and for "this dialect reports no cache write at all", and
+    /// nothing distinguishes them at this seam. Treating zero as measured would
+    /// re-price every Responses turn ever recorded at the plain input rate —
+    /// silently cutting our own recorded cost, which inflates the saving. So the
+    /// measured split is taken only when there is a positive measurement to take
+    /// it from.
+    fn write_rate_tokens(usage: &Usage) -> u64 {
+        let uncached = usage.uncached_input_tokens();
+        // Clamped because the arithmetic in `price_pooled` must not produce a
+        // negative `plain` share. On the Anthropic wire it cannot: the client
+        // folds three disjoint counters, so `cache_creation` is inside
+        // `input - cache_read` by construction. The clamp is against a *later*
+        // dialect whose decoder gets the fold wrong, where the alternative is a
+        // negative price that reads as a credit in every rollup downstream.
+        let written = usage.cache_write_tokens.min(uncached);
+        if written == 0 { uncached } else { written }
     }
 
     /// Price a measured call.
     ///
-    /// Reasoning tokens are not added: they are already inside
-    /// `output_tokens`, and every provider that reports them bills them as
-    /// ordinary output.
+    /// Reasoning tokens are not added: they are already inside `output_tokens`,
+    /// and every provider that reports them bills them as ordinary output.
+    ///
+    /// One call is a pot of one, spelled that way rather than duplicated:
+    /// a second copy of the arithmetic is how the per-turn dollars a spend
+    /// ledger commits come to disagree with the rollup's, which is the whole
+    /// of what [`PooledUsage`] exists to prevent.
     pub fn price(&self, usage: &Usage) -> f64 {
-        self.price_tokens(
-            usage.uncached_input_tokens() as f64,
-            usage.cached_input_tokens as f64,
-            usage.output_tokens as f64,
+        self.price_pooled(&PooledUsage::of(usage))
+    }
+
+    /// Price many calls whose write share was decided one call at a time.
+    ///
+    /// **The rollup's entry point, and where "a rollup's dollars are the sum of
+    /// its calls' dollars" stops being an assumption.** Given a
+    /// [`PooledUsage`], every axis below is a plain sum over the pot's calls and
+    /// `price_axes` is linear in each, so this returns exactly what
+    /// pricing those calls one at a time and adding the dollars would — for any
+    /// mix of measured and unmeasured writes, which is what
+    /// [`Self::price`] on a summed [`Usage`] cannot do and must not be asked to.
+    pub fn price_pooled(&self, pooled: &PooledUsage) -> f64 {
+        let uncached = pooled.tokens.uncached_input_tokens();
+        // Already true by construction — every call contributes at most its own
+        // uncached share — and asserted anyway because the subtraction below is
+        // over `u64`: the failure of a broken invariant here would be a panic in
+        // a dashboard poll rather than a wrong number.
+        let at_write_rate = pooled.write_rate_tokens.min(uncached);
+        self.price_axes(
+            at_write_rate as f64,
+            pooled.tokens.cached_input_tokens as f64,
+            (uncached - at_write_rate) as f64,
+            pooled.tokens.output_tokens as f64,
         )
     }
 
@@ -167,6 +260,78 @@ impl ProviderPricing {
         let discount =
             (self.effective_write_per_mtok_usd() - self.cached_input_per_mtok_usd).max(0.0);
         usage.cached_input_tokens as f64 * discount * PER_MTOK
+    }
+}
+
+/// Many calls' usage, pooled so that pricing the pot still costs what pricing
+/// the calls did.
+///
+/// [`Usage::add`] sums every count a provider reports, and for three of the four
+/// axes [`ProviderPricing::price_pooled`] bills, a sum is all a price needs. The
+/// fourth is not a reported count at all: it is the decision
+/// `ProviderPricing::write_rate_tokens` takes per call about how much of the
+/// uncached prompt carries the cache-write premium, and the conservative branch
+/// it takes when nothing measured a write makes that decision a fact about the
+/// *call* rather than about its tokens. Sum two calls that disagree and the
+/// decision is gone — the pot's `cache_write_tokens` says nothing about what the
+/// unmeasured call was entitled to — so the pot prices for less than its calls
+/// did, and the metrics rollup's `frontier_spend_usd` silently stops matching
+/// the per-turn dollars the spend ledger commits. That divergence was M11.0
+/// review finding F2, and it surfaced as a permanent phantom `drift_usd` in the
+/// admin reconciliation view, whose three documented causes did not include a
+/// pricing artifact.
+///
+/// So the decision is taken once, on the way in, and only its *result* is
+/// accumulated. That makes "a rollup's dollars are the sum of its calls'
+/// dollars" a property of this type rather than an assumption about `price`
+/// being linear in tokens — the assumption M11.0's measured split retired.
+///
+/// **Holds no dollars, deliberately.** The split is a question about tokens, so
+/// the metrics fold can accumulate one while staying money-free (see
+/// `metrics::fold`, which keeps rate cards out of the fold so a corrected price
+/// can reprice history without replaying it); only
+/// [`ProviderPricing::price_pooled`] turns a pot into money.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PooledUsage {
+    tokens: Usage,
+    /// Uncached prompt tokens this pot bills at the cache-write rate, summed
+    /// over each call's own decision and never re-derived from `tokens`.
+    ///
+    /// Private, and that is the enforcement: a consumer cannot price a pot by
+    /// reaching past [`ProviderPricing::price_pooled`] for the tokens and
+    /// splitting them itself, which is the shape of the defect this type
+    /// replaces.
+    write_rate_tokens: u64,
+}
+
+impl PooledUsage {
+    /// A pot holding exactly one call.
+    pub fn of(usage: &Usage) -> Self {
+        let mut pooled = Self::default();
+        pooled.add(usage);
+        pooled
+    }
+
+    /// Book one call, taking its cache-write decision before it is pooled.
+    pub fn add(&mut self, usage: &Usage) {
+        self.write_rate_tokens += ProviderPricing::write_rate_tokens(usage);
+        self.tokens.add(usage);
+    }
+
+    /// Merge another pot, its calls' decisions included.
+    ///
+    /// The reason a deployment-wide row can be derived from its tenants' rather
+    /// than accumulated beside them: merging pots is exact, so there is nothing
+    /// for the two to drift on.
+    pub fn absorb(&mut self, other: &PooledUsage) {
+        self.tokens.add(&other.tokens);
+        self.write_rate_tokens += other.write_rate_tokens;
+    }
+
+    /// The tokens themselves, for every reader that asks about volume rather
+    /// than money.
+    pub fn tokens(&self) -> &Usage {
+        &self.tokens
     }
 }
 
@@ -270,6 +435,7 @@ impl CacheLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::Accounting;
 
     const MINUTE: u64 = 60_000;
 
@@ -278,6 +444,172 @@ mod tests {
             provider: provider.into(),
             model: "m".into(),
         }
+    }
+
+    /// A Claude-shaped rate card: the read is a tenth of input and the write is
+    /// 1.25x it, which is the relationship the split below is about. All four
+    /// figures differ, so a term billed at the wrong rate cannot cancel out.
+    const CLAUDE: ProviderPricing = ProviderPricing {
+        input_per_mtok_usd: 3.0,
+        cached_input_per_mtok_usd: 0.3,
+        cache_write_per_mtok_usd: 3.75,
+        output_per_mtok_usd: 15.0,
+    };
+
+    /// **A measured cache write is billed at the write rate and the rest of the
+    /// uncached prompt at the input rate.**
+    ///
+    /// The overcharge `ledger.rs` has documented since M8: every uncached token
+    /// was billed at `effective_write_per_mtok_usd` because nothing measured the
+    /// write. On a provider that prices cache *creation* separately from
+    /// ordinary uncached input — Anthropic's model, which is the one
+    /// `CacheModel::Deterministic` was written for — that overstates the bill by
+    /// the premium on every token that was never written.
+    #[test]
+    fn a_measured_cache_write_is_priced_apart_from_the_uncached_input_beside_it() {
+        // 1M input of which 600k read from cache, 100k newly written, and so
+        // 300k ordinary uncached prompt.
+        let measured = Usage {
+            input_tokens: 1_000_000,
+            cached_input_tokens: 600_000,
+            cache_write_tokens: 100_000,
+            output_tokens: 0,
+            reasoning_tokens: 0,
+            accounting: Accounting::Reported,
+        };
+        // 0.1 M * 3.75 + 0.6 M * 0.3 + 0.3 M * 3.0 = 0.375 + 0.18 + 0.90
+        assert!((CLAUDE.price(&measured) - 1.455).abs() < 1e-9);
+
+        // And it is strictly cheaper than the convention it replaces, which is
+        // the direction that matters: the correction can only ever *lower* a
+        // recorded cost, so a deployment's committed spend does not grow when
+        // this lands.
+        let conventional = CLAUDE.price_tokens(400_000.0, 600_000.0, 0.0);
+        assert!((conventional - 1.68).abs() < 1e-9);
+        assert!(CLAUDE.price(&measured) < conventional);
+    }
+
+    /// **A zero write count is not a measurement, and takes the conservative
+    /// path.**
+    ///
+    /// The log stores `0` both for "this provider reported no cache write" and
+    /// for "this dialect has no such counter", and nothing at this seam tells
+    /// them apart. Reading zero as a measurement would re-price every Responses
+    /// turn ever recorded at the plain input rate — cutting our own recorded
+    /// cost, which *inflates* the saving, which is the one direction this
+    /// codebase refuses to err in.
+    #[test]
+    fn an_unmeasured_call_still_bills_every_uncached_token_at_the_write_rate() {
+        let unmeasured = Usage {
+            input_tokens: 1_000_000,
+            cached_input_tokens: 600_000,
+            cache_write_tokens: 0,
+            output_tokens: 0,
+            reasoning_tokens: 0,
+            accounting: Accounting::Reported,
+        };
+        // 0.4 M * 3.75 + 0.6 M * 0.3 — unchanged from before M11.0.
+        assert!((CLAUDE.price(&unmeasured) - 1.68).abs() < 1e-9);
+        assert!(
+            (CLAUDE.price(&unmeasured) - CLAUDE.price_tokens(400_000.0, 600_000.0, 0.0)).abs()
+                < 1e-9,
+            "the two entry points must still agree on a call with no measurement, or the \
+             router's quote and the rollup's bill diverge for a reason nobody chose"
+        );
+
+        // CONTROL: one field different — a single measured write token — and
+        // the price moves. Without this the assertion above would also pass on
+        // a build that had lost the measured split entirely.
+        let barely = Usage {
+            cache_write_tokens: 1,
+            ..unmeasured.clone()
+        };
+        assert!(CLAUDE.price(&barely) < CLAUDE.price(&unmeasured));
+    }
+
+    /// A decoder that reported more cache creation than there was uncached
+    /// prompt must not produce a negative bill.
+    ///
+    /// Unreachable on the Anthropic wire — the client folds three disjoint
+    /// counters, so the write is inside `input - cache_read` by construction —
+    /// and asserted anyway, because the failure mode is a *credit* appearing in
+    /// every rollup downstream rather than an error anyone would see.
+    #[test]
+    fn an_impossible_write_count_clamps_rather_than_paying_us_back() {
+        let broken = Usage {
+            input_tokens: 1_000,
+            cached_input_tokens: 900,
+            // 900 read + 500 written is more input than there was.
+            cache_write_tokens: 500,
+            output_tokens: 0,
+            reasoning_tokens: 0,
+            accounting: Accounting::Reported,
+        };
+        let price = CLAUDE.price(&broken);
+        assert!(price > 0.0, "a call cannot cost less than nothing: {price}");
+        // The whole uncached remainder at the write rate, and nothing negative
+        // beside it: 100 * 3.75 + 900 * 0.3, per million.
+        assert!((price - (100.0 * 3.75 + 900.0 * 0.3) * 1e-6).abs() < 1e-12);
+    }
+
+    /// **A pot costs what its calls cost, however they disagree.**
+    ///
+    /// The invariant the metrics rollup rests on, and the one a summed [`Usage`]
+    /// cannot provide: an unmeasured call bills its whole uncached share at the
+    /// write rate, a measured one splits, and a sum of the two counts has no way
+    /// to say which tokens were which. Asserted over a deliberately mixed pot,
+    /// and over a merge of two pots, because [`Counters::absorb`] in the metrics
+    /// fold derives every deployment-wide row that way.
+    ///
+    /// [`Counters::absorb`]: crate::metrics
+    #[test]
+    fn a_pot_of_calls_prices_exactly_what_pricing_them_one_at_a_time_does() {
+        let call = |uncached: u64, write: u64| Usage {
+            input_tokens: uncached,
+            cached_input_tokens: 0,
+            cache_write_tokens: write,
+            output_tokens: 0,
+            reasoning_tokens: 0,
+            accounting: Accounting::Reported,
+        };
+        // A short prompt under the cacheable minimum (nothing measured), a long
+        // one written whole, and one that was partly written — all three
+        // branches of the split in one pot.
+        let calls = [call(1_000, 0), call(2_000, 2_000), call(4_000, 1_000)];
+
+        let one_at_a_time: f64 = calls.iter().map(|usage| CLAUDE.price(usage)).sum();
+        let mut pooled = PooledUsage::default();
+        for usage in &calls {
+            pooled.add(usage);
+        }
+        assert!(
+            (CLAUDE.price_pooled(&pooled) - one_at_a_time).abs() < 1e-12,
+            "pot = {}, one at a time = {one_at_a_time}",
+            CLAUDE.price_pooled(&pooled),
+        );
+
+        // Merging pots is the same arithmetic, which is what lets a
+        // deployment-wide row be derived from its tenants' rather than
+        // accumulated beside them.
+        let mut first = PooledUsage::of(&calls[0]);
+        let mut second = PooledUsage::of(&calls[1]);
+        second.add(&calls[2]);
+        first.absorb(&second);
+        assert_eq!(first, pooled);
+
+        // CONTROL: the summed-`Usage` route this replaced still disagrees, and
+        // by a figure large enough that the assertion above is not a tolerance
+        // artifact. It is also the guard on the conservative unmeasured branch:
+        // if this ever agrees, that branch has been flattened and every
+        // unmeasured turn on record has been re-priced downwards.
+        let mut summed = calls[0].clone();
+        summed.add(&calls[1]);
+        summed.add(&calls[2]);
+        assert!(
+            one_at_a_time - CLAUDE.price(&summed) > 1e-6,
+            "summing before pricing must still understate: {one_at_a_time} vs {}",
+            CLAUDE.price(&summed),
+        );
     }
 
     #[test]

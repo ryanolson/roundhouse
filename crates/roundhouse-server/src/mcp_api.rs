@@ -119,62 +119,73 @@ impl<S: SessionStore> ControlPlaneReads<S> {
     /// authenticated caller always has a membership, and one whose keys disagree
     /// is a file an operator has to go and edit. The startup cross-check is what
     /// makes the second arm unreachable in a deployment that booted.
-    fn membership(&self, principal: &Principal) -> Result<crate::Admission, SurfaceError> {
+    async fn membership(&self, principal: &Principal) -> Result<crate::Admission, SurfaceError> {
         self.plane()
+            .await
             .membership(principal)
             .map_err(|error| SurfaceError::Internal(error.to_string()))
     }
 
     /// This node's current compiled plane. See [`Self::planes`].
-    fn plane(&self) -> Arc<ControlPlane> {
-        self.planes.plane(self.now_ms())
+    ///
+    /// `async` since M16.0 (R-D1): resolving the plane may refresh it, and a
+    /// refresh may be a round trip to the directory's store.
+    async fn plane(&self) -> Arc<ControlPlane> {
+        self.planes.plane(self.now_ms()).await
     }
 }
 
 #[async_trait]
 impl<S: SessionStore> ControlReads for ControlPlaneReads<S> {
-    async fn resolve_session(
+    /// **One function for both named inputs** (M12.1, R-M7). The model's
+    /// `conversation` argument and the client's `_meta.threadId` are the same
+    /// kind of thing — a `prompt_cache_key`-shaped name — and the only
+    /// difference between them is what a failure *means*, which the shared
+    /// [`resolve_session`](ControlReads::resolve_session) decides. Two copies
+    /// would be two chances for one of them to skip the qualification, and a
+    /// threadId resolved without it would read a bare cache key straight out
+    /// of another tenant's namespace.
+    ///
+    /// Through `qualify`, so the id a name resolves to is the id the Responses
+    /// surface minted for the same cache key. Two spellings of the namespace is
+    /// how a namespace stops being one.
+    async fn named_session(
         &self,
         principal: &Principal,
-        conversation: Option<&str>,
+        named: &str,
     ) -> Result<SessionId, SurfaceError> {
-        let Some(named) = conversation else {
-            // The principal's most recent conversation *on this node*. A
-            // principal this node has served no turn for gets the error rather
-            // than somebody else's session or an empty status.
-            return self
-                .conversations
-                .latest(principal)
-                .ok_or(SurfaceError::NoSession);
-        };
-
-        // Through `qualify`, so the id an agent's `conversation` argument
-        // resolves to is the id the Responses surface minted for the same cache
-        // key. Two spellings of the namespace is how a namespace stops being
-        // one.
-        let session = self
-            .conversations
-            .resolve(&self.plane().qualify(principal, named));
-        // Existence is the whole of the check, and it is enough because the name
-        // was qualified into *this* caller's namespace first: a conversation
-        // that resolves to nothing either never existed or belongs to another
-        // tenant, and those two are indistinguishable from here on purpose —
-        // telling them apart would make the argument an enumeration oracle, the
-        // same reasoning `fetch_steer` refuses an unknown steer under.
+        // A key nothing has bound anywhere refuses with the *same* variant an
+        // unknown or another tenant's name does (M12.1 review, F9). Three
+        // distinguishable answers would make the argument an enumeration
+        // oracle, which the trait's own doc refuses; and the third state is
+        // not "somebody else's" anyway but "never bound", which the caller
+        // can do nothing with either. What it must not do is fall through to
+        // generation zero: the store is shared between nodes, so that id
+        // exists whenever any node minted it, and answering with it hands back
+        // a log another node has already forked away from.
         //
-        // **On the variant and not on `Err(_)`.** That oracle argument is about
-        // one question — does this session exist — and it justifies collapsing
-        // only the answers to it. Every other [`StoreError`] is a fact about the
-        // *store*: `RedisSessionStore::last_seq` returns
+        // A store that could not be *reached* is none of those three and is
+        // rendered as an internal fault, for the reason the trait's own doc
+        // gives: "not yours" about a conversation that is the caller's own is
+        // both wrong and the least actionable answer available. Since M14.1
+        // this is a real arm rather than a theoretical one — the generation
+        // map is in the deployment's Redis.
+        let Some(session) = self
+            .conversations
+            .resolve(&self.plane().await.qualify(principal, named))
+            .await
+            .map_err(|error| SurfaceError::Internal(error.to_string()))?
+        else {
+            return Err(SurfaceError::ForeignConversation(named.to_string()));
+        };
+        // Existence is the whole of the check, and it is enough because the name
+        // was qualified into *this* caller's namespace first — see the trait's
+        // own doc for why unknown and foreign collapse, and why every other
+        // `StoreError` must not. `RedisSessionStore::last_seq` returns
         // [`StoreError::Backend`] for a transport failure and for its
-        // foreign-writer contiguity check, and rendering either as "not yours"
-        // would tell an agent, in its own context, that its own conversation
-        // belongs to somebody else. That is the least actionable answer
-        // available — it invites a re-`init_session` or a give-up, where an
-        // `Internal` invites the retry an outage actually calls for — and it is
-        // wrong besides. `MemoryStore` only ever produces `SessionNotFound`,
-        // which is why the catch-all read as harmless for as long as no durable
-        // store was under a test.
+        // foreign-writer contiguity check; `MemoryStore` only ever produces
+        // `SessionNotFound`, which is why a catch-all read as harmless for as
+        // long as no durable store was under a test.
         match self.store.last_seq(&session).await {
             Ok(_) => Ok(session),
             Err(StoreError::SessionNotFound(_)) => {
@@ -182,6 +193,45 @@ impl<S: SessionStore> ControlReads for ControlPlaneReads<S> {
             }
             Err(error) => Err(SurfaceError::Internal(error.to_string())),
         }
+    }
+
+    /// No existence check on this one, unlike [`Self::named_session`]. The
+    /// binding is written at the moment the call was appended to that very log,
+    /// so "the session exists" is not in question; a `last_seq` here would
+    /// spend a store round trip to re-ask something *some* node observed
+    /// itself.
+    ///
+    /// The `Result` carries only the one thing a shared table can fail with,
+    /// and it is deliberately not collapsed into the `None` that means
+    /// "nothing of yours" — see the trait's doc.
+    async fn session_of_call(
+        &self,
+        principal: &Principal,
+        tool_use_id: &str,
+    ) -> Result<Option<SessionId>, SurfaceError> {
+        self.conversations
+            .session_of_call(principal, tool_use_id)
+            .await
+            .map_err(|error| SurfaceError::Internal(error.to_string()))
+    }
+
+    /// No existence check here either, and for [`Self::session_of_call`]'s
+    /// reason: the binding is written by the ingest at the moment it decided
+    /// which session that turn's history belongs to, so the session exists
+    /// because the node that served that turn created it.
+    async fn session_of_thread(
+        &self,
+        principal: &Principal,
+        thread_id: &str,
+    ) -> Result<Option<SessionId>, SurfaceError> {
+        self.conversations
+            .session_of_thread(principal, thread_id)
+            .await
+            .map_err(|error| SurfaceError::Internal(error.to_string()))
+    }
+
+    async fn latest_session(&self, principal: &Principal) -> Option<SessionId> {
+        self.conversations.latest(principal)
     }
 
     /// The log's end for `session`, which is what arms the surface's memo of
@@ -199,7 +249,7 @@ impl<S: SessionStore> ControlReads for ControlPlaneReads<S> {
     }
 
     async fn ceiling_policy(&self, principal: &Principal) -> Result<TurnPolicy, SurfaceError> {
-        Ok((*self.membership(principal)?.policy).clone())
+        Ok((*self.membership(principal).await?.policy).clone())
     }
 
     async fn admissible_targets(
@@ -216,7 +266,7 @@ impl<S: SessionStore> ControlReads for ControlPlaneReads<S> {
         // that provider through to a turn the router then withholds it from.
         // Two answers to one question, and the disagreement is invisible from
         // either side.
-        let credentials = self.membership(principal)?.credentials;
+        let credentials = self.membership(principal).await?.credentials;
 
         // `permits` and deliberately not `admits`: this asks what a turn of this
         // key's could *ever* be routed to, and a cadence-rationed model is one
@@ -253,7 +303,7 @@ impl<S: SessionStore> ControlReads for ControlPlaneReads<S> {
     }
 
     async fn balance(&self, principal: &Principal) -> Result<Option<Balance>, SurfaceError> {
-        let Some(terms) = self.membership(principal)?.budget else {
+        let Some(terms) = self.membership(principal).await?.budget else {
             // No budget configured: the engine never calls the ledger for this
             // membership, so there is no position to read and none to invent.
             return Ok(None);
@@ -271,17 +321,25 @@ impl<S: SessionStore> ControlReads for ControlPlaneReads<S> {
 
     async fn session_facts(&self, session: &SessionId) -> Result<SessionFacts, SurfaceError> {
         // Lease-free, through the engine's own fold. A second projection written
-        // here would be a second opinion about which steers are open, and the
-        // first time it disagreed the disagreement would be invisible.
+        // here would be a second opinion about what roundhouse last said to this
+        // conversation, and the first time it disagreed the disagreement would
+        // be invisible.
+        //
+        // **Since M10.0 this is the only way to answer `fetch_steer` at all.**
+        // The guidance used to be a node-local deposit keyed by the synthetic
+        // call's id, so serving it needed no log read and lost it on restart.
+        // The correction is a conversation item now and the fold is what says
+        // which item it is — which is why the tool became a read of the session
+        // rather than of a store.
         //
         // The ledger is empty because nothing here reads it: the cache-model
         // configuration only affects `SessionState::ledger`, and this projection
-        // is asked for open steers and a routing decision.
+        // is asked for the last guidance and the last routing decision.
         let state = SessionState::project(self.store.as_ref(), session, CacheLedger::new(), None)
             .await
             .map_err(|error| SurfaceError::Internal(error.to_string()))?;
         Ok(SessionFacts {
-            open_steers: state.open_steer_ids(),
+            latest_guidance: state.last_guidance().map(str::to_string),
             last_decision: state.last_decision().cloned(),
         })
     }
@@ -290,6 +348,17 @@ impl<S: SessionStore> ControlReads for ControlPlaneReads<S> {
         now_ms()
     }
 }
+
+/// The path this router mounts the control surface at.
+///
+/// A constant because two unrelated things have to agree on it and only one of
+/// them is in this file: the route below, and the `url` in the
+/// `[mcp_servers.roundhouse]` stanza [`crate::codex_launch`] generates for a
+/// client. A literal in each would be one edit away from a deployment whose
+/// generated config points a real agent at a path this router does not serve —
+/// which surfaces as a startup timeout in the agent, with nothing on our side
+/// logging a miss.
+pub const MCP_MOUNT_PATH: &str = "/mcp";
 
 /// The `/mcp` route, gated by the same bearer-key resolution as the turn
 /// surfaces.
@@ -308,7 +377,7 @@ impl<S: SessionStore> ControlReads for ControlPlaneReads<S> {
 /// a parameter typed `Arc<dyn PlaneSource>` would not accept either through the
 /// `Arc::clone(&plane)` a caller naturally writes, because the clone's own
 /// return type is inferred before any coercion could apply.
-pub fn mcp_router<R: ControlReads, P: PlaneSource>(
+pub async fn mcp_router<R: ControlReads, P: PlaneSource>(
     planes: Arc<P>,
     reads: Arc<R>,
     store: Arc<ControlStore>,
@@ -333,13 +402,13 @@ pub fn mcp_router<R: ControlReads, P: PlaneSource>(
     // `Open`, and a fixed source cannot move at all — so no admin write and no
     // refresh can change it. A guard re-derived per request would suggest
     // otherwise.
-    let hosts = match planes.plane(now_ms()).as_ref() {
+    let hosts = match planes.plane(now_ms()).await.as_ref() {
         ControlPlane::Open => HostGuard::Loopback,
         ControlPlane::Configured { .. } => HostGuard::AnyHost,
     };
     Router::new()
         .route(
-            "/mcp",
+            MCP_MOUNT_PATH,
             post_service(roundhouse_mcp::transport::mcp_service(surface, hosts)),
         )
         .layer(axum::middleware::from_fn_with_state(planes, auth_layer))
@@ -358,7 +427,7 @@ async fn auth_layer(
     mut request: Request,
     next: Next,
 ) -> Response {
-    let principal = match planes.plane(now_ms()).scope(request.headers()) {
+    let principal = match planes.plane(now_ms()).await.scope(request.headers()) {
         Ok(KeyScope::Turn(admission)) => admission.principal,
         Ok(KeyScope::Admin) => return ApiError::from(AuthError::WrongKeyKind).into_response(),
         Err(error) => return ApiError::from(error).into_response(),
@@ -396,380 +465,4 @@ pub fn describe_ambiguous_memberships(plane: &ControlPlane) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::ControlPlaneConfig;
-    use crate::control_config::MembershipError;
-    use roundhouse_core::control::MemorySpendLedger;
-    use roundhouse_core::event::{SessionEvent, SessionEventKind};
-    use roundhouse_core::store::{Lease, MemoryStore};
-
-    /// A one-project plane whose `keys` array is whatever the caller writes.
-    fn plane_with_keys(keys: serde_json::Value) -> ControlPlane {
-        plane_with(serde_json::json!({ "min_quality": 0.1 }), keys)
-    }
-
-    /// The same, with the project's policy the caller's to write too.
-    fn plane_with(policy: serde_json::Value, keys: serde_json::Value) -> ControlPlane {
-        let json = serde_json::json!({
-            "projects": [{ "id": "acme", "policy": policy }],
-            "users": [{ "id": "ada" }],
-            "keys": keys,
-        })
-        .to_string();
-        ControlPlane::configured(
-            ControlPlaneConfig::from_json(&json, "membership fixture")
-                .expect("the fixture config must validate"),
-        )
-    }
-
-    fn hash(seed: char) -> String {
-        seed.to_string().repeat(64)
-    }
-
-    #[test]
-    fn two_keys_that_mean_different_things_leave_a_membership_with_no_answer() {
-        // The probe. Both keys name `acme/ada`; one narrows the project's floor
-        // and the other does not. There is no such thing as "ada's policy", so
-        // the surface must refuse rather than tell an agent about whichever key
-        // the hash map happened to yield first.
-        let plane = plane_with_keys(serde_json::json!([
-            { "project": "acme", "user": "ada", "key_sha256": hash('a') },
-            {
-                "project": "acme", "user": "ada", "key_sha256": hash('b'),
-                "overrides": { "min_quality": 0.9 }
-            },
-        ]));
-        let ada = Principal::new("acme", "ada");
-        assert_eq!(
-            plane.membership(&ada).err(),
-            Some(MembershipError::Ambiguous(ada.clone()))
-        );
-        assert_eq!(plane.ambiguous_memberships(), vec![ada.clone()]);
-        let refusal =
-            describe_ambiguous_memberships(&plane).expect("a startup refusal names the membership");
-        assert!(
-            refusal.contains("`acme/ada`"),
-            "the refusal has to name the membership an operator would go and \
-             fix: {refusal}"
-        );
-
-        // The control: two keys that mean the *same* thing are a rotation, not
-        // an ambiguity, and refusing them would make rotating a secret an
-        // outage.
-        let rotating = plane_with_keys(serde_json::json!([
-            { "project": "acme", "user": "ada", "key_sha256": hash('a') },
-            { "project": "acme", "user": "ada", "key_sha256": hash('b') },
-        ]));
-        assert_eq!(
-            rotating
-                .membership(&ada)
-                .expect("agreeing keys resolve")
-                .principal,
-            ada
-        );
-        assert!(rotating.ambiguous_memberships().is_empty());
-        assert!(describe_ambiguous_memberships(&rotating).is_none());
-    }
-
-    #[test]
-    fn two_keys_that_restate_one_policy_are_a_rotation_and_not_an_ambiguity() {
-        // The operator move this has to survive: rotating a secret, and copying
-        // the policy that is already in force onto the new key so the new row
-        // says out loud what it may do. Key A inherits `["local/*"]` from the
-        // project; key B restates it as its own override, which *intersects*
-        // with the project's — two identical layers where A has one. The two
-        // admit exactly the same targets and always will.
-        //
-        // A digest is a fingerprint of how a policy was written, which is what
-        // makes it the right thing to stamp on a `DecisionRecord` and the wrong
-        // thing to compare two keys by. Comparing spellings turns this rotation
-        // into a boot failure whose message — "different policies or budgets" —
-        // is not merely unhelpful but untrue.
-        let rotating = plane_with(
-            serde_json::json!({ "allow": ["local/*"] }),
-            serde_json::json!([
-                { "project": "acme", "user": "ada", "key_sha256": hash('a') },
-                {
-                    "project": "acme", "user": "ada", "key_sha256": hash('b'),
-                    "overrides": { "allow": ["local/*"] }
-                },
-            ]),
-        );
-        let ada = Principal::new("acme", "ada");
-
-        // The premise, checked rather than assumed: the two really do admit the
-        // same set, so what follows is about the comparison and not about the
-        // fixture.
-        let admissions: Vec<_> = rotating.configured_admissions().collect();
-        assert_eq!(admissions.len(), 2);
-        for candidate in [
-            Candidate {
-                target: Target::Local {
-                    worker_id: 1,
-                    dp_rank: 0,
-                    model: "llama".into(),
-                },
-                expected_prefill_tokens: 0.0,
-                matched_prefix_tokens: 0,
-                expected_ttft_ms: 0.0,
-                expected_cost_usd: 0.0,
-                quality_prior: 0.6,
-                load: None,
-            },
-            Candidate {
-                target: Target::Frontier {
-                    provider: "anthropic".into(),
-                    model: "claude".into(),
-                },
-                expected_prefill_tokens: 0.0,
-                matched_prefix_tokens: 0,
-                expected_ttft_ms: 0.0,
-                expected_cost_usd: 0.0,
-                quality_prior: 0.95,
-                load: None,
-            },
-        ] {
-            assert_eq!(
-                admissions[0].policy.permits(&candidate),
-                admissions[1].policy.permits(&candidate),
-                "the fixture is only about spelling if both keys agree on \
-                 `{:?}`",
-                candidate.target
-            );
-        }
-
-        assert_eq!(
-            rotating
-                .membership(&ada)
-                .expect("two spellings of one policy resolve")
-                .principal,
-            ada
-        );
-        assert!(rotating.ambiguous_memberships().is_empty());
-        assert!(describe_ambiguous_memberships(&rotating).is_none());
-
-        // The same shape one step further out: a project that narrows nothing
-        // and a key whose override says `*` out loud. Both admit everything.
-        let spelled_out = plane_with(
-            serde_json::json!({}),
-            serde_json::json!([
-                { "project": "acme", "user": "ada", "key_sha256": hash('a') },
-                {
-                    "project": "acme", "user": "ada", "key_sha256": hash('b'),
-                    "overrides": { "allow": ["*"] }
-                },
-            ]),
-        );
-        assert!(
-            spelled_out.membership(&ada).is_ok(),
-            "a layer that names `*` admits every target, so it constrains \
-             nothing and cannot make two keys disagree"
-        );
-
-        // The control, and the whole reason the check exists: two keys that
-        // really do mean different things still have no resolvable membership.
-        // Without this the assertions above would pass for a comparison that
-        // had simply been deleted.
-        let disagreeing = plane_with(
-            serde_json::json!({ "allow": ["local/*"] }),
-            serde_json::json!([
-                { "project": "acme", "user": "ada", "key_sha256": hash('a') },
-                {
-                    "project": "acme", "user": "ada", "key_sha256": hash('b'),
-                    "overrides": { "min_quality": 0.9 }
-                },
-            ]),
-        );
-        assert_eq!(
-            disagreeing.membership(&ada).err(),
-            Some(MembershipError::Ambiguous(ada.clone()))
-        );
-    }
-
-    /// A store that is up enough to be called and down enough to answer
-    /// nothing.
-    ///
-    /// [`MemoryStore`] can only ever produce [`StoreError::SessionNotFound`],
-    /// which is why no existing test could tell a store outage apart from a
-    /// tenancy verdict: the one arm that renders as "not yours" was also the
-    /// only arm reachable. `RedisSessionStore::last_seq` returns
-    /// [`StoreError::Backend`] for a transport failure *and* for its
-    /// foreign-writer contiguity check, so this is the shape a real deployment
-    /// hits on a connection reset, not an invented one.
-    struct OutageStore;
-
-    #[async_trait]
-    impl SessionStore for OutageStore {
-        async fn create_session(&self, _: &SessionId, _: &str) -> Result<bool, StoreError> {
-            unreachable!("the control surface never writes to a session log")
-        }
-        async fn acquire_lease(
-            &self,
-            _: &SessionId,
-            _: &str,
-            _: u64,
-        ) -> Result<Option<Lease>, StoreError> {
-            unreachable!("the control surface takes no lease -- see this module's doc")
-        }
-        async fn renew_lease(&self, _: &Lease, _: u64) -> Result<Option<Lease>, StoreError> {
-            unreachable!("the control surface takes no lease -- see this module's doc")
-        }
-        async fn release_lease(&self, _: &Lease) -> Result<(), StoreError> {
-            unreachable!("the control surface takes no lease -- see this module's doc")
-        }
-        async fn append_events(
-            &self,
-            _: &Lease,
-            _: Vec<SessionEventKind>,
-        ) -> Result<Vec<SessionEvent>, StoreError> {
-            unreachable!("the control surface never writes to a session log")
-        }
-        async fn read_events(
-            &self,
-            _: &SessionId,
-            _: u64,
-            _: usize,
-        ) -> Result<Vec<SessionEvent>, StoreError> {
-            Err(StoreError::Backend(anyhow::anyhow!(
-                "redis connection reset"
-            )))
-        }
-        async fn last_seq(&self, _: &SessionId) -> Result<u64, StoreError> {
-            Err(StoreError::Backend(anyhow::anyhow!(
-                "redis connection reset"
-            )))
-        }
-    }
-
-    fn reads_over<S: SessionStore>(plane: ControlPlane, store: Arc<S>) -> ControlPlaneReads<S> {
-        ControlPlaneReads::new(
-            Arc::new(plane),
-            store,
-            Arc::new(MemorySpendLedger::new()),
-            Arc::new(Conversations::new()),
-            Vec::new(),
-        )
-    }
-
-    #[tokio::test]
-    async fn a_store_outage_is_reported_as_infrastructure_rather_than_as_tenancy() {
-        // The enumeration-oracle argument above justifies collapsing "never
-        // existed" and "belongs to another tenant" into one answer. It does not
-        // justify collapsing "the store is down" into the same one: an outage is
-        // not a per-conversation signal, so answering it as one tells an agent —
-        // in its own context, about its own conversation — that the conversation
-        // is somebody else's. That is the least actionable answer available,
-        // because it invites a re-`init_session` or a give-up where an
-        // `Internal` invites a retry.
-        let plane = plane_with_keys(serde_json::json!([
-            { "project": "acme", "user": "ada", "key_sha256": hash('a') },
-        ]));
-        let reads = reads_over(plane, Arc::new(OutageStore));
-
-        let error = reads
-            .resolve_session(&Principal::new("acme", "ada"), Some("main"))
-            .await
-            .expect_err("a store that cannot answer has not answered");
-        assert!(
-            matches!(error, SurfaceError::Internal(_)),
-            "a store outage must reach the agent as an internal error it can \
-             retry, not as a verdict about whose conversation this is: {error}"
-        );
-        assert!(
-            error.to_string().contains("redis connection reset"),
-            "and it must carry the backend's own diagnosis, or an operator \
-             reading the agent's transcript learns nothing: {error}"
-        );
-
-        // The control, and the reason the collapse is right for the case it was
-        // written for: a store that is up and simply holds no such session still
-        // answers with the tenancy verdict, so `SessionNotFound` and "another
-        // tenant's" stay indistinguishable from here.
-        let closed = reads_over(
-            plane_with_keys(serde_json::json!([
-                { "project": "acme", "user": "ada", "key_sha256": hash('a') },
-            ])),
-            Arc::new(MemoryStore::new()),
-        );
-        let refused = closed
-            .resolve_session(&Principal::new("acme", "ada"), Some("main"))
-            .await
-            .expect_err("a session nobody created is not this caller's");
-        assert!(
-            matches!(refused, SurfaceError::ForeignConversation(ref named) if named == "main"),
-            "{refused}"
-        );
-    }
-
-    #[tokio::test]
-    async fn the_server_reads_arm_answers_the_cursor_so_the_status_memo_can_fire() {
-        // The surface memoises `session_facts` behind `session_cursor`, but a
-        // memo whose cursor is always `None` never fires — every `status` and
-        // `explain_last_route` a model calls replays the whole log. The trait's
-        // default answers `None`; this arm must override it over the same
-        // `last_seq` `resolve_session` already reads, or the memo is dead on the
-        // shipped deployment. Dropping the override regresses this to `None`.
-        let store = Arc::new(MemoryStore::new());
-        let session = SessionId::new("acme/ada/main");
-        store
-            .create_session(&session, "gpt-4")
-            .await
-            .expect("a session to read a cursor from");
-        let reads = reads_over(
-            plane_with_keys(serde_json::json!([
-                { "project": "acme", "user": "ada", "key_sha256": hash('a') },
-            ])),
-            store,
-        );
-        assert_eq!(
-            reads.session_cursor(&session).await.expect("a cursor read"),
-            Some(0),
-            "a created session's cursor is its last seq, not the `None` that \
-             leaves the memo inert"
-        );
-
-        // And a store that cannot answer becomes `None`, never an error: the
-        // cursor is only an optimization, so an outage falls back to
-        // project-every-time rather than failing a tool that would have worked.
-        let downed = reads_over(
-            plane_with_keys(serde_json::json!([
-                { "project": "acme", "user": "ada", "key_sha256": hash('a') },
-            ])),
-            Arc::new(OutageStore),
-        );
-        assert_eq!(
-            downed
-                .session_cursor(&SessionId::new("acme/ada/main"))
-                .await
-                .expect("a cursor read never errors -- it degrades to None"),
-            None,
-        );
-    }
-
-    #[test]
-    fn an_unconfigured_deployment_answers_for_every_principal_and_a_configured_one_does_not() {
-        // Open mode admits every request as one membership, so asking about it
-        // backwards has to give the same value asking forwards does — one
-        // definition of what an unconfigured deployment allows.
-        let open = ControlPlane::Open;
-        let admission = open
-            .membership(&Principal::new("anyone", "at-all"))
-            .expect("open mode never refuses");
-        assert_eq!(admission.principal, Principal::default_open());
-        assert_eq!(*admission.policy, TurnPolicy::unrestricted());
-        assert!(admission.budget.is_none());
-
-        // A configured deployment refuses a principal no key names, rather than
-        // falling back to the unrestricted policy — which is the one answer that
-        // would be a privilege escalation rather than an error.
-        let plane = plane_with_keys(serde_json::json!([
-            { "project": "acme", "user": "ada", "key_sha256": hash('a') },
-        ]));
-        let stranger = Principal::new("acme", "nobody");
-        assert_eq!(
-            plane.membership(&stranger).err(),
-            Some(MembershipError::Unknown(stranger))
-        );
-    }
-}
+mod tests;

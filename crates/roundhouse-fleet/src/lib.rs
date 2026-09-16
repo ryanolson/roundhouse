@@ -16,19 +16,30 @@
 //! serialization is the dominant per-call cost for long agentic contexts, which
 //! is precisely the case this design targets.
 
+pub mod anthropic_messages;
 pub mod frontier;
 pub mod local;
 pub mod openai_responses;
 pub mod usage;
 
+/// The Anthropic client's own `DEFAULT_API_BASE` and `DEFAULT_PASS_THROUGH_BASE`
+/// are deliberately *not* re-exported here: they collide by name with the
+/// Responses client's, and a crate root where `DEFAULT_API_BASE` means whichever
+/// dialect was imported first is a composition root waiting to point the wrong
+/// transport at the wrong origin. Reach them through the module.
+pub use anthropic_messages::{
+    ANTHROPIC_VERSION, AnthropicMessagesClient, DEFAULT_MAX_TOKENS, DEFAULT_MESSAGES_PATH,
+};
 pub use frontier::{
-    EchoFrontierClient, FrontierChunk, FrontierClient, FrontierError, FrontierModelSpec,
-    FrontierQuote, FrontierStream, StaticFrontierCatalog,
+    EchoFrontierClient, FrontierChunk, FrontierClient, FrontierClients, FrontierError,
+    FrontierModelSpec, FrontierQuote, FrontierStream, StaticFrontierCatalog,
 };
 pub use local::{
     EmbeddedFleet, FleetError, FleetQuery, LocalFleet, LocalQuote, Reservation, WorkerRegistration,
 };
-pub use openai_responses::{DEFAULT_API_BASE, DEFAULT_PASS_THROUGH_BASE, OpenAiResponsesClient};
+pub use openai_responses::{
+    DEFAULT_API_BASE, DEFAULT_PASS_THROUGH_BASE, DEFAULT_RESPONSES_PATH, OpenAiResponsesClient,
+};
 pub use usage::WireProtocol;
 
 /// Re-exported so callers can configure and own the embedded service without

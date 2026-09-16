@@ -1,0 +1,33 @@
+{
+  "$comment": [
+    "The smallest control plane that makes roundhouse's /mcp route require a",
+    "bearer key -- which is the whole point of this example. An unconfigured",
+    "deployment resolves every caller to the open principal and would prove",
+    "nothing about whether agentic-api actually forwards the request's",
+    "`authorization` field onto the MCP leg.",
+    "The secret is NOT a placeholder: it is the literal",
+    "`rh_turn_compatAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA` -- the same shape",
+    "the integration-test fixtures mint (`rh_turn_` plus 43 base62 characters,",
+    "see crates/roundhouse-server/tests/common/mod.rs:54), padded with `A` so",
+    "it passes `has_valid_key_shape`. `key_sha256` below is sha256 of exactly",
+    "those 51 bytes. It is written down because this example is a demo against",
+    "a loopback process holding no provider credentials and spending nothing;",
+    "a deployment reachable by anything else mints its own.",
+    "No `policy` and no `budget`: this example is about whether the MCP",
+    "handshake survives a second gateway, not about routing, so the project is",
+    "deliberately unrestricted -- the same admission a deployment with no",
+    "control plane at all would produce, minus the anonymity."
+  ],
+
+  "projects": [{ "id": "demo", "name": "agentic-api MCP compatibility demo" }],
+
+  "users": [{ "id": "script" }],
+
+  "keys": [
+    {
+      "project": "demo",
+      "user": "script",
+      "key_sha256": "e37f9a0cabf957ab41c32539bf42c147fe8c7db2f1690fc3985cc6652ebe2804"
+    }
+  ]
+}

@@ -47,14 +47,17 @@ use codex_utils_rustls_provider::ensure_rustls_crypto_provider;
 
 use roundhouse_core::context::ByteTokenizer;
 use roundhouse_core::control::{MemorySpendLedger, Principal, SpendLedger};
-use roundhouse_core::event::{Accounting, ControlRecord, SessionEventKind, Usage};
-use roundhouse_core::ids::SessionId;
+use roundhouse_core::event::{
+    Accounting, ControlRecord, SessionEventKind, Usage, ValidationOutcome,
+};
+use roundhouse_core::ids::{SessionId, SideCallId, ValidationId};
 use roundhouse_core::interject::{Interjection, InterjectionContext, Interjector};
-use roundhouse_core::item::{Item, ItemContent};
+use roundhouse_core::item::Item;
 use roundhouse_core::routing::{
     AffinityPolicy, CacheLedger, CacheModel, Candidate, DecisionRecord, ProviderPricing, Target,
 };
 use roundhouse_core::store::{MemoryStore, SessionStore};
+use roundhouse_core::validate::{Arm, Divergence, SteerAction, TriggerRecord, Verdict};
 use roundhouse_fleet::{
     EchoFrontierClient, FrontierChunk, FrontierClient, FrontierError, FrontierModelSpec,
     FrontierQuote, FrontierStream, StaticFrontierCatalog, WireProtocol,
@@ -66,7 +69,7 @@ use roundhouse_server::{
 };
 
 mod common;
-use common::codex::{function_call_output_item, request, user_message};
+use common::codex::{assistant_message, function_call_output_item, request, user_message};
 use common::{BLOCK_SIZE, LOCAL_MODEL, MINUTE, admin_key, embedded_fleet, key, sha256_hex};
 
 /// What each executor answers with, so a target is legible in the answer as
@@ -204,6 +207,38 @@ enum Plan {
     Proceed,
 }
 
+/// The decision record a steering occupant owes the log.
+///
+/// One helper rather than an inline literal per call site, because the shape is
+/// load-bearing in a way a literal invites forgetting: `SteerAction::Steer` is
+/// what the session fold keys `steered_on_turn` and `last_guidance` off, so an
+/// occupant that completed with guidance and recorded `Continue` would emit the
+/// correction and leave nothing able to re-read it.
+fn steer_record(directive: &str) -> ControlRecord {
+    let mut record = ControlRecord::default();
+    record.validation_decided(
+        ValidationId::new("val_1"),
+        TriggerRecord::new(2, 4_000, Vec::new()),
+        Arm::Live,
+        ValidationOutcome::Judged {
+            side_call_id: SideCallId::new("side_1"),
+            verdict: Verdict {
+                on_track: false,
+                confidence: 0.7,
+                divergence: Some(Divergence {
+                    at_step: 3,
+                    description: "the judge's own prose, which never travels".into(),
+                }),
+                missing_context: None,
+            },
+            action: SteerAction::Steer {
+                directive: directive.to_string(),
+            },
+        },
+    );
+    record
+}
+
 /// A scripted occupant, as in `steering_emission.rs`: what this suite is about
 /// is what happens *after* something decides to steer.
 struct TestInterjector {
@@ -229,29 +264,37 @@ impl Interjector for TestInterjector {
             .unwrap_or(Plan::Proceed);
         match plan {
             Plan::Proceed => Interjection::proceed(),
-            Plan::Steer => {
-                let call_id = format!("rhsteer_{}", context.response_id);
-                Interjection::Complete {
-                    item: Item::tool_call(
-                        call_id.as_str(),
-                        "fetch_steer",
-                        json!({ "steer_id": call_id }).to_string().as_str(),
-                    ),
-                    usage: Usage {
-                        input_tokens: 96,
-                        cached_input_tokens: 32,
-                        output_tokens: 24,
-                        reasoning_tokens: 8,
-                        accounting: Accounting::Reported,
-                    },
-                    // The payload, which never reaches the wire: the client is
-                    // handed the call, and the correction is fetched separately.
-                    guidance: STEER_GUIDANCE.to_string(),
-                    // Empty: this double stands in for the interjector, not for
-                    // the validate loop behind it.
-                    record: ControlRecord::default(),
-                }
-            }
+            // **The whole of the correction, in the item.** Before M10.0 this
+            // arm minted a synthetic `fetch_steer` call and put the guidance in
+            // a `guidance` field beside it, for the engine to deposit in the
+            // control store. The steer is the turn's answer now, so the text
+            // goes in the item and there is nothing beside it -- which is what
+            // `the_steer_this_deployment_wrote_is_what_fetch_steer_re_reads`
+            // below is really asserting about.
+            Plan::Steer => Interjection::Complete {
+                item: Item::assistant_text(STEER_GUIDANCE, context.response_id.clone()),
+                usage: Usage {
+                    input_tokens: 96,
+                    cached_input_tokens: 32,
+                    // Nothing was dispatched, so nothing was written into any
+                    // provider's cache.
+                    cache_write_tokens: 0,
+                    output_tokens: 24,
+                    reasoning_tokens: 8,
+                    accounting: Accounting::Reported,
+                },
+                // **No longer empty, and that is M10.0's fold rule showing up in
+                // a test double.** The record used to carry nothing here,
+                // because the *item* said a steer had happened -- it was a tool
+                // call bearing a response id, a shape no client can produce. A
+                // steer is assistant text now, indistinguishable from every
+                // dispatched turn's answer, so `ValidationDecided` is the only
+                // event that can say one happened. A double that steers without
+                // saying so leaves `last_guidance` empty and `fetch_steer` with
+                // nothing to serve -- which is the same thing a *production*
+                // occupant skipping the record would do.
+                record: steer_record(STEER_GUIDANCE),
+            },
         }
     }
 }
@@ -296,6 +339,11 @@ struct Rig {
     /// The one control store, shared with the engine. Held so a test can look
     /// at what the surface wrote without going back through the wire.
     control: Arc<ControlStore>,
+    /// The one conversation table, shared with both routers exactly as the
+    /// composition root shares it. Held so a test can write the binding a
+    /// dispatched turn writes (`Conversations::bind_call`) without needing the
+    /// Messages surface mounted here too.
+    conversations: Arc<Conversations>,
     /// A `Host` this deployment answers to, given its mode.
     ///
     /// Carried on the rig rather than fixed as one constant because the
@@ -372,17 +420,19 @@ async fn build(
         )),
         Arc::clone(&control),
     )
+    .await
     .merge(responses_router(
         plane,
         Arc::clone(&engine),
         Arc::clone(&store),
-        conversations,
+        Arc::clone(&conversations),
     ));
 
     Rig {
         app,
         store,
         control,
+        conversations,
         host,
     }
 }
@@ -405,6 +455,15 @@ async fn build(
 struct Conversation {
     secret: String,
     cache_key: String,
+    /// The thread this client says its turns come from, stamped on every
+    /// request as codex's `x-codex-turn-metadata` header.
+    ///
+    /// Separate from [`Self::cache_key`] because that is exactly what the
+    /// oracle makes it (M12.1 review, F2): an agent family shares one
+    /// `prompt_cache_key` and stamps a different `thread_id` per member, so a
+    /// fixture that derived one from the other could only ever re-prove the
+    /// root-thread case.
+    thread_id: Option<String>,
     history: Vec<Value>,
 }
 
@@ -413,7 +472,16 @@ impl Conversation {
         Self {
             secret: secret.to_string(),
             cache_key: cache_key.to_string(),
+            thread_id: None,
             history: Vec::new(),
+        }
+    }
+
+    /// The same, from a codex thread that declares itself on every turn.
+    fn from_thread(secret: &str, cache_key: &str, thread_id: &str) -> Self {
+        Self {
+            thread_id: Some(thread_id.to_string()),
+            ..Self::new(secret, cache_key)
         }
     }
 
@@ -432,13 +500,36 @@ impl Conversation {
     async fn send(&mut self, rig: &Rig) -> String {
         let mut body = request_value(&self.cache_key);
         body["input"] = Value::Array(self.history.clone());
-        let (status, text) = post(
+        // The whole header codex sends, not just the field under test: the
+        // payload carries `session_id` (the family's, and the cache key)
+        // beside `thread_id` (this member's own), so a reader that took the
+        // wrong one would resolve every subagent to its parent and this
+        // fixture would not notice.
+        let metadata = self.thread_id.as_ref().map(|thread_id| {
+            json!({
+                "session_id": self.cache_key,
+                "thread_id": thread_id,
+                "turn_id": "0199a0f0-0000-7000-8000-00000000turn",
+            })
+            .to_string()
+        });
+        let extra: Vec<(HeaderName, &str)> = metadata
+            .iter()
+            .map(|json| {
+                (
+                    HeaderName::from_static("x-codex-turn-metadata"),
+                    json.as_str(),
+                )
+            })
+            .collect();
+        let (status, _headers, text) = post_with_extra_headers(
             &rig.app,
             rig.host,
             "/v1/responses",
             Some(&self.secret),
             &body.to_string(),
             "application/json",
+            &extra,
         )
         .await;
         assert_eq!(status, StatusCode::OK, "the turn must be admitted: {text}");
@@ -484,6 +575,106 @@ fn completed_items(sse: &str) -> Vec<Value> {
 /// admin key, a 405 for a stream nobody offers — and a client library's job is
 /// to turn those into one uniform outcome.
 async fn tools_call(rig: &Rig, secret: Option<&str>, tool: &str, arguments: Value) -> Value {
+    tools_call_with_meta(rig, secret, tool, arguments, None).await
+}
+
+/// The same, from inside a Claude Code tool loop.
+///
+/// `tool_use_id` goes on `params._meta` under the key Claude Code spells,
+/// exactly as the 2.1.257 capture shows it
+/// (`fixtures/claude-2.1.257-mcp-wire.json`, request 5).
+async fn tools_call_answering(
+    rig: &Rig,
+    secret: Option<&str>,
+    tool: &str,
+    arguments: Value,
+    tool_use_id: &str,
+) -> Value {
+    tools_call_with_meta(
+        rig,
+        secret,
+        tool,
+        arguments,
+        Some(json!({ "claudecode/toolUseId": tool_use_id, "progressToken": 2 })),
+    )
+    .await
+}
+
+/// The same, from inside a Codex thread.
+///
+/// **The whole `_meta` object codex sends, and not just the key under test**
+/// (M12.1, R-M8). `with_mcp_tool_call_thread_id_meta` inserts `threadId`
+/// beside an `x-codex-turn-metadata` object carrying the client's own
+/// `session_id`, and a fixture that sent the one key alone would pass over a
+/// transport that read `_meta` as a string, that refused unknown siblings, or
+/// that mistook the *client's* session id for ours. The sibling is what makes
+/// the shape the client's rather than the test's.
+async fn tools_call_in_thread(
+    rig: &Rig,
+    secret: Option<&str>,
+    tool: &str,
+    arguments: Value,
+    thread_id: &str,
+) -> Value {
+    tools_call_in_codex_turn(
+        rig,
+        secret,
+        tool,
+        arguments,
+        thread_id,
+        // A client session id that is nobody's cache key here, so this helper
+        // keeps exercising the *thread* arm alone. R-C5 made the sibling a
+        // correlator in its own right, and a helper that sent the cache key
+        // under test would let every assertion above pass through the wrong
+        // arm.
+        "0199a0f0-0000-7000-8000-000000000000",
+    )
+    .await
+}
+
+/// The same, with both halves of the codex `_meta` chosen by the caller.
+///
+/// One helper behind [`tools_call_in_thread`] rather than a second copy of the
+/// JSON: the two ids travel together on every real call, and a fixture that
+/// could send them in two shapes is a fixture that can drift from the client.
+async fn tools_call_in_codex_turn(
+    rig: &Rig,
+    secret: Option<&str>,
+    tool: &str,
+    arguments: Value,
+    thread_id: &str,
+    session_id: &str,
+) -> Value {
+    tools_call_with_meta(
+        rig,
+        secret,
+        tool,
+        arguments,
+        Some(json!({
+            "threadId": thread_id,
+            "x-codex-turn-metadata": { "session_id": session_id },
+        })),
+    )
+    .await
+}
+
+/// One `tools/call` carrying whatever `_meta` the client would have sent.
+///
+/// Sent as raw JSON-RPC so the assertions cover `rmcp`'s own `_meta` handling:
+/// the SDK strips `params._meta` into the message envelope on the way in and
+/// hands it to a tool through the request *context*, and a reader that took the
+/// typed params' `meta` field instead would compile and be empty forever.
+async fn tools_call_with_meta(
+    rig: &Rig,
+    secret: Option<&str>,
+    tool: &str,
+    arguments: Value,
+    meta: Option<Value>,
+) -> Value {
+    let mut params = json!({ "name": tool, "arguments": arguments });
+    if let Some(meta) = meta {
+        params["_meta"] = meta;
+    }
     let (status, text) = post(
         &rig.app,
         rig.host,
@@ -493,7 +684,7 @@ async fn tools_call(rig: &Rig, secret: Option<&str>, tool: &str, arguments: Valu
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/call",
-            "params": { "name": tool, "arguments": arguments },
+            "params": params,
         })
         .to_string(),
         "application/json",
@@ -621,6 +812,23 @@ async fn post_with_extra_headers(
 // Reading the log
 // ---------------------------------------------------------------------------
 
+/// The session this deployment has bound `key` to, which a turn must already
+/// have established.
+///
+/// `Conversations::resolve` answers `Option` since M12.1 review F9 — a
+/// deployment that bound nothing says so rather than minting the
+/// generation-zero id another node's first turn would have minted. Every call
+/// site here follows a turn on that key, so the `None` is a fixture mistake and
+/// worth naming as one. The `Err` arm is the store being unreachable, which
+/// these maps (in this process) cannot be.
+async fn bound(rig: &Rig, key: &str) -> SessionId {
+    rig.conversations
+        .resolve(key)
+        .await
+        .expect("in-process correlation maps cannot fail to answer")
+        .unwrap_or_else(|| panic!("a turn on `{key}` must have bound it before this read"))
+}
+
 async fn events(store: &MemoryStore, session: &str) -> Vec<roundhouse_core::event::SessionEvent> {
     store
         .read_events(&SessionId::new(session), 0, 4096)
@@ -649,24 +857,6 @@ async fn items(store: &MemoryStore, session: &str) -> Vec<Item> {
             _ => None,
         })
         .collect()
-}
-
-/// The `call_id` of the one synthetic call this session emitted.
-///
-/// Provenance, not shape: an item on the input path canonicalizes with no
-/// response stamp, so this cannot pick up a call the client sent.
-async fn emitted_call_id(store: &MemoryStore, session: &str) -> String {
-    let calls: Vec<String> = items(store, session)
-        .await
-        .into_iter()
-        .filter(|item| item.response_id.is_some())
-        .filter_map(|item| match item.content {
-            ItemContent::ToolCall { call_id, .. } => Some(call_id),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(calls.len(), 1, "these fixtures emit exactly one steer");
-    calls[0].clone()
 }
 
 // ---------------------------------------------------------------------------
@@ -1255,10 +1445,9 @@ async fn a_steered_turn_does_not_spend_the_agents_ration() {
         .await,
     );
 
-    // The steered turn. It commits a synthetic call and answers the client
-    // without ever reaching the router.
+    // The steered turn. It commits its correction as the answer and never
+    // reaches the router.
     agent.say(&rig, "keep editing whatever").await;
-    let call_id = emitted_call_id(&rig.store, session).await;
     assert_eq!(
         decisions(&rig.store, session).await.len(),
         1,
@@ -1287,10 +1476,12 @@ async fn a_steered_turn_does_not_spend_the_agents_ration() {
          before the steer"
     );
 
-    // The client answers the call, exactly as Codex does, and the next turn
-    // routes — under the overlay, which is what the agent asked for and has not
-    // yet had.
-    agent.append(as_value(function_call_output_item(&call_id, "{}")));
+    // The agent reads the correction and carries on, exactly as Codex does with
+    // any other answer, and the next turn routes — under the overlay, which is
+    // what the agent asked for and has not yet had. **No tool result is
+    // appended, and that is the M10.0 difference**: the client answered nothing,
+    // because it was handed an answer rather than a call to run.
+    agent.append(as_value(assistant_message(STEER_GUIDANCE)));
     agent.say(&rig, "back to the parser, then").await;
 
     let routed = decisions(&rig.store, session).await;
@@ -1415,26 +1606,33 @@ async fn an_mcp_call_during_a_running_turn_does_not_take_the_session_gate() {
 }
 
 // ---------------------------------------------------------------------------
-// The steer payload
+// The steer, re-readable
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn the_steer_payload_deposited_at_emission_is_what_fetch_steer_returns() {
-    // The round trip M6 will use for real: the interjector supplies a
-    // correction, the engine commits the call to the log and *then* deposits
-    // the payload, and the agent fetches it by the id the call named. One id,
-    // written once, joined without a mapping table.
+async fn the_steer_this_deployment_wrote_is_what_fetch_steer_re_reads() {
+    // **The round trip M10.0 rebuilt.** It used to be: the interjector supplied
+    // a correction, the engine committed a synthetic call to the log and *then*
+    // deposited the payload in a node-local store, and the agent fetched it by
+    // the id the call named. The correction is the turn's answer now, so there
+    // is no id, no deposit and no store -- `fetch_steer` is a fold of the
+    // session's own log, and the property worth asserting is that the two agree.
+    //
+    // What that buys, said plainly because it is the reason the tool was
+    // re-purposed rather than removed: the guidance survives a restart, because
+    // it never lived anywhere but the log; and the tool is a convenience for an
+    // agent that compacted or resumed, not a channel the correction depends on.
     let rig = steering_rig(control_plane(), [Plan::Steer]).await;
     let session = "acme/ada/main";
     let mut agent = Conversation::new(&key("ada"), "main");
     agent.say(&rig, "keep editing whatever").await;
 
-    let call_id = emitted_call_id(&rig.store, session).await;
+    // The inverse of the old assertion, and the pivot in one line: the
+    // correction *is* in the log now, as the item the client was handed.
     let log = serde_json::to_string(&events(&rig.store, session).await).expect("events serialize");
     assert!(
-        !log.contains(STEER_GUIDANCE),
-        "the correction is fetched, never pushed: nothing in the log — and so \
-         nothing on the wire — carries it: {log}"
+        log.contains(STEER_GUIDANCE),
+        "the correction is the turn's answer, so it is in the conversation: {log}"
     );
 
     let answer = served(
@@ -1442,15 +1640,15 @@ async fn the_steer_payload_deposited_at_emission_is_what_fetch_steer_returns() {
             &rig,
             Some(&key("ada")),
             "fetch_steer",
-            json!({ "steer_id": call_id }),
+            json!({ "conversation": "main" }),
         )
         .await,
     );
-    assert_eq!(answer["steer_id"], json!(call_id));
+    assert_eq!(answer["conversation"], json!(session));
     assert_eq!(
         answer["guidance"],
         json!(STEER_GUIDANCE),
-        "what the agent reads is what the decision wrote, byte for byte"
+        "what the agent re-reads is what the decision wrote, byte for byte"
     );
 
     // Pure: a second call is the same bytes, and did no work to produce them.
@@ -1459,46 +1657,48 @@ async fn the_steer_payload_deposited_at_emission_is_what_fetch_steer_returns() {
             &rig,
             Some(&key("ada")),
             "fetch_steer",
-            json!({ "steer_id": call_id }),
+            json!({ "conversation": "main" }),
         )
         .await,
     );
-    assert_eq!(again, answer, "a fetch is a read of a committed record");
+    assert_eq!(
+        again, answer,
+        "a fetch is a read of the log, not a judge call"
+    );
 
-    // Another tenant's key gets the refusal that names nothing.
+    // Another tenant's key gets the refusal that names nothing -- through
+    // `ForeignConversation` now rather than through a principal comparison the
+    // tool made for itself, which is T4's "one door" in an assertion.
     let denial = refused(
         &tools_call(
             &rig,
             Some(&key("bob")),
             "fetch_steer",
-            json!({ "steer_id": &call_id }),
+            json!({ "conversation": session }),
         )
         .await,
     );
     assert!(
-        !denial.contains("acme") && !denial.contains("ada"),
-        "a refusal that named the owner would make the tool an enumeration \
-         oracle: {denial}"
+        !denial.contains(STEER_GUIDANCE),
+        "a refusal that leaked the correction would hand another tenant the \
+         contents of the conversation it was refused: {denial}"
     );
 
-    // The advisory write lands, and the agent's answer to the call extends the
-    // session rather than forking it — the M4 round trip, now with a payload
-    // behind it.
+    // The advisory write lands, and the agent carrying on extends the session
+    // rather than forking it -- the resend that used to be a tool result and is
+    // now the guidance item itself.
     let reported = served(
         &tools_call(
             &rig,
             Some(&key("ada")),
             "report_outcome",
-            json!({ "steer_id": call_id, "outcome": "applied", "note": "back on the parser" }),
+            json!({ "conversation": "main", "outcome": "applied", "note": "back on the parser" }),
         )
         .await,
     );
     assert_eq!(reported["recorded"], json!(true));
 
-    agent.append(as_value(function_call_output_item(
-        &call_id,
-        &serde_json::to_string(&answer).expect("the tool output re-encodes"),
-    )));
+    agent.append(as_value(assistant_message(STEER_GUIDANCE)));
     agent.say(&rig, "back to the parser, then").await;
     assert_eq!(
         decisions(&rig.store, session).await.len(),
@@ -1658,11 +1858,15 @@ async fn open_mode_serves_the_mcp_surface_under_the_default_principal() {
         "the overlay an unauthenticated agent set was spent by the next turn"
     );
 
-    // And an id nobody minted is refused rather than served an empty payload,
-    // in open mode exactly as in a configured one.
-    let denial =
-        refused(&tools_call(&rig, None, "fetch_steer", json!({ "steer_id": "fc_nope" })).await);
-    assert!(denial.contains("fc_nope"), "{denial}");
+    // And a conversation with no correction in it is refused rather than served
+    // an empty payload.
+    let denial = refused(&tools_call(&rig, None, "fetch_steer", json!({})).await);
+    assert!(
+        denial.contains("no correction"),
+        "a conversation roundhouse has never steered is refused rather than \
+         served empty guidance, in open mode exactly as in a configured one: \
+         {denial}"
+    );
 }
 
 #[tokio::test]
@@ -1782,4 +1986,449 @@ async fn open_mode_refuses_a_tools_call_from_a_host_it_does_not_serve() {
     )
     .await;
     assert_eq!(unkeyed_status, StatusCode::UNAUTHORIZED);
+}
+
+/// R-M2 (M12): a `tools/call` carrying `_meta["claudecode/toolUseId"]` is
+/// answered about the conversation that emitted that block.
+///
+/// **Through the real adapter, because the `_meta` half is `rmcp`'s and not
+/// ours.** The SDK strips `params._meta` off the wire into the message
+/// envelope and hands it to a tool through the request *context*, leaving the
+/// typed params' own `meta` field empty; a transport that read the obvious
+/// field would compile, would find nothing on every real request, and would
+/// leave every MCP call on the pre-R-M2 guess. Only a request that actually
+/// travelled the transport can tell those apart, which is why this is here and
+/// not in `roundhouse-mcp`'s own suite.
+///
+/// **The race, made deterministic.** One principal, two conversations — the
+/// shape an agent running subagents produces. `other` drives a turn last, so
+/// `latest` names it; the id belongs to `main`. Without the correlation the
+/// answer is `other` and it is *plausible*, which is the failure worth a test.
+#[tokio::test]
+async fn a_tools_call_is_correlated_by_the_tool_use_id_the_client_quotes_back() {
+    let rig = rig(control_plane()).await;
+    let ada = Principal::new("acme", "ada");
+
+    let mut main = Conversation::new(&key("ada"), "main");
+    main.say(&rig, "start the parser").await;
+    let mut other = Conversation::new(&key("ada"), "other");
+    other.say(&rig, "start the linter").await;
+
+    // What a dispatched turn on `main` writes as it streams a tool call: the
+    // same call `Conversations::bind_call` records from the Messages
+    // follower. Written here rather than driven through a second surface
+    // because the claim under test is the *resolution*, and mounting a third
+    // router would make the failure ambiguous between the two halves.
+    let main_session = bound(&rig, "acme/ada/main").await;
+    rig.conversations
+        .bind_call(&ada, "toolu_from_main", main_session.clone())
+        .await;
+
+    let answered = served(
+        &tools_call_answering(
+            &rig,
+            Some(&key("ada")),
+            "status",
+            json!({}),
+            "toolu_from_main",
+        )
+        .await,
+    );
+    assert_eq!(
+        answered["conversation"],
+        json!(main_session.as_str()),
+        "the call answers the block it was made from"
+    );
+
+    // The control, and the Codex path: with no id the guess stands, and it is
+    // a different conversation — which is what makes the assertion above
+    // about the id rather than about there being only one answer available.
+    let guessed = served(&tools_call(&rig, Some(&key("ada")), "status", json!({})).await);
+    assert_eq!(
+        guessed["conversation"],
+        json!(bound(&rig, "acme/ada/other").await.as_str()),
+    );
+
+    // And another tenant quoting the same id learns nothing from it: bob has
+    // driven no turn on this node, so the answer is the refusal he would have
+    // got with no id at all.
+    let refused = refused(
+        &tools_call_answering(
+            &rig,
+            Some(&key("bob")),
+            "status",
+            json!({}),
+            "toolu_from_main",
+        )
+        .await,
+    );
+    assert!(
+        refused.contains("this key has no conversation yet"),
+        "another tenant's id must answer exactly as an id nobody emitted — the \
+         refusal a caller with no conversation of their own already gets: \
+         {refused}"
+    );
+    assert!(
+        !refused.contains("acme"),
+        "and it must not name the tenant that does own the id: {refused}"
+    );
+}
+
+/// R-M7 (M12.1): a `tools/call` carrying a Codex-shaped `_meta.threadId` is
+/// answered about the conversation that thread id names.
+///
+/// **Through the real adapter, because the `_meta` half is `rmcp`'s and not
+/// ours** — the same reason the tool-use id test above is here. The SDK strips
+/// `params._meta` off the wire into the message envelope and hands it to a tool
+/// through the request *context*; a transport that read the obvious field would
+/// compile, find nothing on every real request, and leave every Codex call on
+/// the `latest` guess. Only a request that actually travelled the transport can
+/// tell those apart.
+///
+/// **The race, made deterministic.** One principal, two conversations — the
+/// shape a parent agent running subagents produces. `other` drives a turn last,
+/// so `latest` names it; the thread id names `main`. Without the correlation the
+/// answer is `other` and it is *plausible*, which is the failure worth a test.
+#[tokio::test]
+async fn a_tools_call_is_correlated_by_the_thread_id_a_codex_client_stamps() {
+    let rig = rig(control_plane()).await;
+
+    let mut main = Conversation::new(&key("ada"), "main");
+    main.say(&rig, "start the parser").await;
+    let mut other = Conversation::new(&key("ada"), "other");
+    other.say(&rig, "start the linter").await;
+
+    let main_session = bound(&rig, "acme/ada/main").await;
+    // The thread id codex sends is the turn's own `prompt_cache_key`, which is
+    // the *unqualified* name — the qualification into `acme/ada/…` is
+    // roundhouse's, and doing it here would test the fixture rather than the
+    // resolver.
+    let answered =
+        served(&tools_call_in_thread(&rig, Some(&key("ada")), "status", json!({}), "main").await);
+    assert_eq!(
+        answered["conversation"],
+        json!(main_session.as_str()),
+        "the call answers the thread it was made from"
+    );
+
+    // The control: with no `_meta` the guess stands, and it is the other
+    // conversation — which is what makes the assertion above about the thread
+    // id rather than about there being only one answer available.
+    let guessed = served(&tools_call(&rig, Some(&key("ada")), "status", json!({})).await);
+    assert_eq!(
+        guessed["conversation"],
+        json!(bound(&rig, "acme/ada/other").await.as_str()),
+    );
+
+    // An unknown thread id falls through to that same guess rather than
+    // refusing: a correlator is context the client volunteered, and telling
+    // "never existed" from "somebody else's" would make the key a probe.
+    let unknown = served(
+        &tools_call_in_thread(
+            &rig,
+            Some(&key("ada")),
+            "status",
+            json!({}),
+            "no-such-thread",
+        )
+        .await,
+    );
+    assert_eq!(unknown["conversation"], guessed["conversation"]);
+
+    // And another tenant quoting the same thread id learns nothing from it:
+    // bob has driven no turn on this node, so the answer is the refusal he
+    // would have got with no `_meta` at all.
+    let refused =
+        refused(&tools_call_in_thread(&rig, Some(&key("bob")), "status", json!({}), "main").await);
+    assert!(
+        refused.contains("this key has no conversation yet"),
+        "another tenant's thread id must answer exactly as a thread id nobody \
+         ran — the refusal a caller with no conversation of their own already \
+         gets: {refused}"
+    );
+    assert!(
+        !refused.contains("acme"),
+        "and it must not name the tenant that does own it: {refused}"
+    );
+}
+
+/// F2 (M12.1 review), R-M9: an agent family sharing one `prompt_cache_key`
+/// is told apart by the per-thread header its turns carry, end to end.
+///
+/// **Why the previous test is not this test.** The one above pins the
+/// root-thread case, where `_meta.threadId` and the turn's
+/// `prompt_cache_key` are the same string — and that identity is the whole of
+/// what R-M7 assumed. At the pinned oracle it holds for a root thread and
+/// nothing else: `AgentControl`'s session id "is shared by the whole agent
+/// control session ... every sub-agents from a common root share the same
+/// session ID" (`core/src/agent/control.rs:104-110`), it is what becomes
+/// `prompt_cache_key` (`core/src/client.rs`), and the per-member id rides the
+/// turn separately as `x-codex-turn-metadata`'s `thread_id`
+/// (`core/src/responses_metadata.rs:281`, built from
+/// `core/src/session/turn_context.rs:618-622`). So the topology this drives is
+/// the one the rung exists for and the one every M12.1 fixture missed.
+///
+/// **The whole path, not the resolver's half.** Three turns arrive on the
+/// Responses router under one cache key, each carrying its own thread header;
+/// the header is what the ingest binds, and the `tools/call` arrives on the
+/// MCP router afterwards. `f2_a_subagents_thread_id_resolves_its_own_fork_and_not_the_parents`
+/// (`src/mcp_api.rs`) is the resolver-level twin, and it would keep passing if
+/// nothing on the wire ever wrote the binding — which is exactly what this
+/// covers.
+///
+/// **Made deterministic.** Two histories under one cache key is, to
+/// roundhouse, a client rewriting its own history, so the subagent's first
+/// turn diverges from the parent's and opens generation 1. The parent's next
+/// turn resends the history it actually has, and prefix admission puts it back
+/// on generation 0 — a claim's home is the generation that agrees with it,
+/// whichever direction from this node's counter that lies in (M14.0 review,
+/// F11). Either way `latest` ends up off the subagent while its tool loop is
+/// still in flight, which is the condition this test needs: without the
+/// binding the subagent's call is answered about the parent's conversation,
+/// plausibly and wrongly.
+#[tokio::test]
+async fn a_codex_subagents_thread_id_resolves_its_own_fork() {
+    let rig = rig(control_plane()).await;
+
+    // One `prompt_cache_key` for the whole family, one thread id each.
+    let mut parent = Conversation::from_thread(&key("ada"), "main", "thread-parent");
+    parent.say(&rig, "plan the refactor").await;
+    let mut subagent = Conversation::from_thread(&key("ada"), "main", "thread-child");
+    subagent.say(&rig, "grep for the callers").await;
+    parent.say(&rig, "and now write it up").await;
+
+    let latest = bound(&rig, "acme/ada/main").await;
+    assert_eq!(
+        latest.as_str(),
+        "acme/ada/main",
+        "the fixture must really have split the shared key into two \
+         generations, with `latest` on the parent's rather than the \
+         subagent's, or the assertions below are about one session"
+    );
+
+    let subagents_call = served(
+        &tools_call_in_thread(&rig, Some(&key("ada")), "status", json!({}), "thread-child").await,
+    );
+    assert_eq!(
+        subagents_call["conversation"],
+        json!("acme/ada/main#g1"),
+        "the subagent's tools/call must reach the fork its own turn produced, \
+         not the parent's newest one ({latest:?})"
+    );
+
+    // The parent's own call still reaches the parent, so the thread table is
+    // telling two threads apart rather than merely preferring an older fork.
+    let parents_call = served(
+        &tools_call_in_thread(
+            &rig,
+            Some(&key("ada")),
+            "status",
+            json!({}),
+            "thread-parent",
+        )
+        .await,
+    );
+    assert_eq!(parents_call["conversation"], json!(latest.as_str()));
+
+    // The control: with no `_meta` at all the guess stands, and it is the
+    // parent's fork — so the first assertion is about the thread id carrying
+    // information and not about there being one answer available.
+    let guessed = served(&tools_call(&rig, Some(&key("ada")), "status", json!({})).await);
+    assert_eq!(guessed["conversation"], json!(latest.as_str()));
+
+    // And the second control, which is why the thread table had to exist: the
+    // subagent's thread id is not a name. A model passing it as the
+    // `conversation` argument is refused, because it was never anyone's cache
+    // key -- the R-M7 named path could not have answered the call above.
+    let refused = refused(
+        &tools_call(
+            &rig,
+            Some(&key("ada")),
+            "status",
+            json!({ "conversation": "thread-child" }),
+        )
+        .await,
+    );
+    assert!(
+        refused.contains("does not belong to this key"),
+        "a subagent's thread id names no conversation of this deployment's; \
+         only the binding its own turn wrote can answer for it: {refused}"
+    );
+}
+
+/// R-C5 (M14.1): the third correlator the codex `_meta` was already carrying —
+/// `x-codex-turn-metadata.session_id`, which is the turn's `prompt_cache_key`.
+///
+/// **Through the real adapter, and one level deeper than the other two.** The
+/// value is a *field of an object* on `params._meta` rather than a top-level
+/// string, so a reader that took the whole object, or that reached for
+/// `thread_id` beside it, would compile and be wrong on every real request.
+/// Only a request that actually travelled `rmcp`'s `_meta` handling can tell
+/// those apart.
+///
+/// **What it is for, and the fixture says so.** The thread id here is a
+/// subagent's own — nobody's cache key, and with no binding recorded, which is
+/// what a node sees when the binding has aged past its staleness bound or was
+/// never written. Both halves of the thread arm therefore miss, and before
+/// this arm the call fell to `latest`: a conversation of the same principal's
+/// that has nothing to do with the caller. The family's cache key is on the
+/// call already.
+#[tokio::test]
+async fn a_codex_call_falls_back_to_the_cache_key_its_turn_metadata_carries() {
+    let rig = rig(control_plane()).await;
+
+    let mut parent = Conversation::from_thread(&key("ada"), "main", "thread-parent");
+    parent.say(&rig, "plan the refactor").await;
+    // Driven last, so `latest` names it: without the new arm this is the
+    // answer, and it is *plausible*, which is the failure worth a test.
+    let mut other = Conversation::new(&key("ada"), "other");
+    other.say(&rig, "start the linter").await;
+
+    let main_session = bound(&rig, "acme/ada/main").await;
+    let other_session = bound(&rig, "acme/ada/other").await;
+    assert_ne!(main_session, other_session, "sanity: two conversations");
+
+    let answered = served(
+        &tools_call_in_codex_turn(
+            &rig,
+            Some(&key("ada")),
+            "status",
+            json!({}),
+            "thread-nothing-bound",
+            "main",
+        )
+        .await,
+    );
+    assert_eq!(
+        answered["conversation"],
+        json!(main_session.as_str()),
+        "a thread id nothing bound must fall through to the cache key the same          `_meta` carries, not to whatever this principal did most recently"
+    );
+
+    // CONTROL: the same unbound thread id with *no* turn metadata beside it is
+    // the guess, so the assertion above is about the sibling being read rather
+    // than about there being one answer available.
+    let guessed = served(
+        &tools_call_with_meta(
+            &rig,
+            Some(&key("ada")),
+            "status",
+            json!({}),
+            Some(json!({ "threadId": "thread-nothing-bound" })),
+        )
+        .await,
+    );
+    assert_eq!(guessed["conversation"], json!(other_session.as_str()));
+
+    // CONTROL: the ordering, which is F2 restated. A thread the deployment
+    // *did* bind outranks the cache key its whole family shares — reading the
+    // cache key first would answer every subagent about its parent.
+    let bound_thread = served(
+        &tools_call_in_codex_turn(
+            &rig,
+            Some(&key("ada")),
+            "status",
+            json!({}),
+            "thread-parent",
+            "other",
+        )
+        .await,
+    );
+    assert_eq!(
+        bound_thread["conversation"],
+        json!(main_session.as_str()),
+        "the thread binding is exact and the cache key is the family's, so the          binding decides"
+    );
+
+    // CONTROL: another tenant sending the same cache key learns nothing. It is
+    // qualified into *their* namespace before it is looked up, so it names
+    // nothing and the call is refused exactly as one with no `_meta` is.
+    let refused = refused(
+        &tools_call_in_codex_turn(
+            &rig,
+            Some(&key("bob")),
+            "status",
+            json!({}),
+            "thread-nothing-bound",
+            "main",
+        )
+        .await,
+    );
+    assert!(
+        refused.contains("this key has no conversation yet"),
+        "another tenant's cache key must answer as a name nobody holds: {refused}"
+    );
+    assert!(
+        !refused.contains("acme"),
+        "and it must not name the tenant that does own it: {refused}"
+    );
+}
+
+/// R-M7's refusal, over the real adapter: the model named one conversation and
+/// the client correlated the call to another.
+///
+/// Both correlators are exercised, because the ruling is about a caller
+/// contradicting itself and not about one `_meta` key. The two conversations
+/// both exist and both belong to this caller, so neither half is refused by the
+/// foreign-name door — the refusal can only be the contradiction.
+#[tokio::test]
+async fn a_tools_call_whose_argument_fights_its_own_meta_is_refused_naming_both() {
+    let rig = rig(control_plane()).await;
+    let ada = Principal::new("acme", "ada");
+
+    let mut main = Conversation::new(&key("ada"), "main");
+    main.say(&rig, "start the parser").await;
+    let mut other = Conversation::new(&key("ada"), "other");
+    other.say(&rig, "start the linter").await;
+
+    let main_session = bound(&rig, "acme/ada/main").await;
+    let other_session = bound(&rig, "acme/ada/other").await;
+    rig.conversations
+        .bind_call(&ada, "toolu_from_main", main_session.clone())
+        .await;
+
+    let by_thread = refused(
+        &tools_call_in_thread(
+            &rig,
+            Some(&key("ada")),
+            "status",
+            json!({ "conversation": "other" }),
+            "main",
+        )
+        .await,
+    );
+    let by_call = refused(
+        &tools_call_answering(
+            &rig,
+            Some(&key("ada")),
+            "status",
+            json!({ "conversation": "other" }),
+            "toolu_from_main",
+        )
+        .await,
+    );
+
+    for refusal in [&by_thread, &by_call] {
+        assert!(
+            refusal.contains(main_session.as_str()) && refusal.contains(other_session.as_str()),
+            "the refusal must name both conversations the caller pointed at, \
+             or the agent cannot tell which of its own two inputs to change: \
+             {refusal}"
+        );
+    }
+
+    // The control, and the ordinary case: an argument that *agrees* with the
+    // correlator is served, so the refusals above are about the disagreement
+    // and not about sending an argument and a `_meta` key at once.
+    let served = served(
+        &tools_call_in_thread(
+            &rig,
+            Some(&key("ada")),
+            "status",
+            json!({ "conversation": "main" }),
+            "main",
+        )
+        .await,
+    );
+    assert_eq!(served["conversation"], json!(main_session.as_str()));
 }

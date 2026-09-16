@@ -890,9 +890,12 @@ macro_rules! spend_ledger_contract_suite {
         $crate::spend_ledger_contract_suite!(@list () $make);
     };
     // The single list. Both public arms land here, so gated and ungated
-    // backends cannot drift apart in coverage.
+    // backends cannot drift apart in coverage. The recursion that turns this
+    // list into one `#[tokio::test]` per name is
+    // [`__contract_suite!`](crate::__contract_suite), shared with the other
+    // three families (M14.1 review, F6).
     (@list $attrs:tt $make:expr) => {
-        $crate::spend_ledger_contract_suite!(@tests $attrs $make;
+        $crate::__contract_suite!(ledger, $crate::control::spend::contract, $attrs, $make;
             a_grant_never_exceeds_the_project_remaining,
             a_grant_never_exceeds_the_member_ceiling_even_when_the_project_has_room,
             concurrent_grants_cannot_jointly_exceed_the_limit,
@@ -908,17 +911,4 @@ macro_rules! spend_ledger_contract_suite {
             share_allocations_summing_past_one_are_accepted_and_the_project_limit_still_binds,
         );
     };
-    // One test per recursion step rather than one repetition over the names:
-    // the attribute group is captured at depth one, and macro_rules cannot
-    // re-expand it inside a second repetition.
-    (@tests ($(#[$attr:meta])*) $make:expr; $name:ident $(, $rest:ident)* $(,)?) => {
-        #[tokio::test]
-        $(#[$attr])*
-        async fn $name() {
-            let ledger = $make;
-            $crate::control::spend::contract::$name(&ledger).await;
-        }
-        $crate::spend_ledger_contract_suite!(@tests ($(#[$attr])*) $make; $($rest),*);
-    };
-    (@tests ($(#[$attr:meta])*) $make:expr; ) => {};
 }

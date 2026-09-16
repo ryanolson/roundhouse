@@ -126,6 +126,13 @@ pub async fn unknown_sessions_are_not_found<S: SessionStore>(store: &S) {
         store.last_seq(&sid).await,
         Err(StoreError::SessionNotFound(_))
     ));
+    // Not-found rather than "idle": a session that was never created has no
+    // lease, but answering `false` would let a caller read a typo'd id as an
+    // ordinary quiet session and act on its empty history.
+    assert!(matches!(
+        store.is_leased(&sid).await,
+        Err(StoreError::SessionNotFound(_))
+    ));
     // Release alone is lenient. It is the cleanup path, and a shutdown racing
     // a session's disappearance should not turn into an error report.
     store.release_lease(&ghost).await.unwrap();
@@ -183,6 +190,54 @@ pub async fn an_expired_lease_is_takeable_and_the_loser_cannot_append<S: LeaseCo
         .await
         .expect_err("a displaced writer must not interleave with its successor");
     assert!(matches!(err, StoreError::LeaseLost { .. }));
+}
+
+/// **A lease reads as live exactly while somebody is writing under it.**
+///
+/// The property [`SessionStore::is_leased`] exists for, and every backend owes
+/// it the *dead* half as much as the live one: a reader asks this to tell a
+/// turn in flight from a turn whose writer died, and the two leave identical
+/// traces in the log. A backend that answered "leased" for a record its owner
+/// abandoned would freeze every such session's history as permanently
+/// unsupersedable; one that answered "idle" for a live turn would let a reader
+/// supersede items still being committed.
+pub async fn a_lease_reads_as_live_only_while_someone_holds_it<S: LeaseControl>(store: &S) {
+    let sid = fresh_session(store).await;
+    assert!(
+        !store.is_leased(&sid).await.unwrap(),
+        "nobody has claimed a fresh session"
+    );
+
+    store
+        .acquire_lease(&sid, "node-a", TTL_MS)
+        .await
+        .unwrap()
+        .expect("nothing contends for a fresh session's lease");
+    assert!(
+        store.is_leased(&sid).await.unwrap(),
+        "a held lease must be visible to a reader that is not the holder"
+    );
+
+    // A node that died rather than released: the record may survive, the
+    // tenure does not.
+    store.force_expire_lease(&sid).await;
+    assert!(
+        !store.is_leased(&sid).await.unwrap(),
+        "an expired tenure is nobody writing, which is what the caller asked"
+    );
+
+    let successor = store
+        .acquire_lease(&sid, "node-b", TTL_MS)
+        .await
+        .unwrap()
+        .expect("an expired lease must be takeable");
+    assert!(store.is_leased(&sid).await.unwrap());
+    store.release_lease(&successor).await.unwrap();
+    assert!(
+        !store.is_leased(&sid).await.unwrap(),
+        "release ends the tenure here too, or a finished turn would look live \
+         until its TTL lapsed"
+    );
 }
 
 pub async fn a_released_lease_is_gone_not_renewable<S: SessionStore>(store: &S) {
@@ -325,10 +380,20 @@ pub async fn read_events_pages_oldest_first_and_reproduces_the_append<S: Session
             usage: Usage {
                 input_tokens: 10,
                 cached_input_tokens: 4,
+                // Non-zero for the same reason the principal above is
+                // populated: a backend that took the usage object apart and
+                // dropped the newest counter would still pass this round trip
+                // if the fixture left it at its default.
+                cache_write_tokens: 2,
                 output_tokens: 3,
                 reasoning_tokens: 1,
                 accounting: Accounting::Estimated,
             },
+            provider_reported_cost_usd: None,
+            // Populated for the same reason the counters above are: a backend
+            // that dropped the newest field would still pass this round trip if
+            // the fixture left it at its default.
+            stop_reason: Some("tool_use".into()),
         },
         text_event("tail"),
     ];
@@ -435,13 +500,17 @@ macro_rules! store_contract_suite {
         $crate::store_contract_suite!(@list () $make);
     };
     // The single list. Both public arms land here, so gated and ungated
-    // backends cannot drift apart in coverage.
+    // backends cannot drift apart in coverage. The recursion that turns this
+    // list into one `#[tokio::test]` per name is
+    // [`__contract_suite!`](crate::__contract_suite), shared with the other
+    // three families (M14.1 review, F6).
     (@list $attrs:tt $make:expr) => {
-        $crate::store_contract_suite!(@tests $attrs $make;
+        $crate::__contract_suite!(store, $crate::store::contract, $attrs, $make;
             create_is_idempotent_and_reports_existing,
             unknown_sessions_are_not_found,
             a_live_lease_blocks_others_and_retakes_with_a_fresh_fence,
             an_expired_lease_is_takeable_and_the_loser_cannot_append,
+            a_lease_reads_as_live_only_while_someone_holds_it,
             a_released_lease_is_gone_not_renewable,
             release_by_a_non_holder_leaves_the_lease_standing,
             a_stale_handle_works_while_the_record_is_live,
@@ -451,17 +520,4 @@ macro_rules! store_contract_suite {
             renew_fails_once_the_lease_was_taken_over,
         );
     };
-    // One test per recursion step rather than one repetition over the names:
-    // the attribute group is captured at depth one, and macro_rules cannot
-    // re-expand it inside a second repetition.
-    (@tests ($(#[$attr:meta])*) $make:expr; $name:ident $(, $rest:ident)* $(,)?) => {
-        #[tokio::test]
-        $(#[$attr])*
-        async fn $name() {
-            let store = $make;
-            $crate::store::contract::$name(&store).await;
-        }
-        $crate::store_contract_suite!(@tests ($(#[$attr])*) $make; $($rest),*);
-    };
-    (@tests ($(#[$attr:meta])*) $make:expr; ) => {};
 }

@@ -27,7 +27,7 @@
 
 use std::collections::BTreeMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use roundhouse_core::control::credential::access::ProviderKeys;
 use roundhouse_core::control::{
@@ -37,7 +37,7 @@ use roundhouse_core::control::{
 use super::config::ControlPlaneError;
 
 /// A `"credentials"` object, as any of the three tiers may write it.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CredentialsConfig {
     /// Whose credential a turn of this project's is paid with. Project-only —
@@ -54,7 +54,7 @@ pub struct CredentialsConfig {
 }
 
 /// Where one provider's key lives.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderCredentialConfig {
     /// The environment variable holding the secret. **Not the secret.**

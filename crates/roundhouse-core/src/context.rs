@@ -230,6 +230,36 @@ impl<T: Tokenizer> ContextAssembler<T> {
         self.items.iter().map(Item::render).collect()
     }
 
+    /// [`Self::rendered`], and the byte offsets its item boundaries fall on.
+    ///
+    /// **The same string, plus the structure that was already implicit in it.**
+    /// A provider whose prompt cache only works with explicit breakpoints —
+    /// Anthropic is the one roundhouse speaks — has to be told where a stable
+    /// prefix ends, and the only honest answer is the place one item's render
+    /// stops and the next begins. Deriving that here rather than in a client is
+    /// what keeps it a *slicing* of the canonical render instead of a second
+    /// projection of the item list: re-rendering items anywhere else would give
+    /// something able to disagree with `rendered()`, and therefore with
+    /// `turn_id_for` and every block hash.
+    ///
+    /// The offsets are interior: `n` items give `n - 1` boundaries, never `0`
+    /// and never `len()`, because a boundary at either edge would name an empty
+    /// segment — and an empty content block is a request the Messages schema
+    /// rejects outright. An empty assembler and a one-item one both give none,
+    /// which reads downstream as "no structure known" and costs nothing: with a
+    /// single item there is no stable prefix to mark yet anyway.
+    pub fn rendered_with_boundaries(&self) -> (String, Vec<usize>) {
+        let mut rendered = String::new();
+        let mut boundaries = Vec::with_capacity(self.items.len().saturating_sub(1));
+        for (index, item) in self.items.iter().enumerate() {
+            if index > 0 {
+                boundaries.push(rendered.len());
+            }
+            rendered.push_str(&item.render());
+        }
+        (rendered, boundaries)
+    }
+
     pub fn buffer(&self) -> &TokenBuffer {
         &self.buffer
     }
@@ -344,33 +374,121 @@ mod tests {
         );
     }
 
+    /// **The boundaries are a slicing of the render, not a second rendering.**
+    ///
+    /// Everything a cache breakpoint buys depends on this: a client cuts the
+    /// prompt at these offsets and sends the pieces, so if the pieces did not
+    /// rejoin to the exact string `turn_id_for` hashed, the provider would be
+    /// prefilling a prompt the router priced something else for — silently, and
+    /// on every turn.
     #[test]
-    fn a_rehydrated_log_containing_an_emitted_tool_call_needs_no_new_branch() {
+    fn item_boundaries_slice_the_rendered_prompt_and_change_nothing_about_it() {
+        let mut assembler = ContextAssembler::new(ByteTokenizer, BLOCK);
+        let items = [
+            Item::system_text("you are a careful assistant"),
+            Item::user_text("first question"),
+            Item::assistant_text("first answer", ResponseId::new("r1")),
+            // A multi-byte item, because a boundary that landed inside a
+            // codepoint would panic the client that sliced on it.
+            Item::user_text("¿segunda pregunta?"),
+        ];
+        for item in items.clone() {
+            assembler.push(item);
+        }
+
+        let (rendered, boundaries) = assembler.rendered_with_boundaries();
+        assert_eq!(
+            rendered,
+            assembler.rendered(),
+            "the accessor must not change the canonical render"
+        );
+        assert_eq!(boundaries.len(), items.len() - 1, "interior offsets only");
+
+        let mut cut = Vec::new();
+        let mut start = 0;
+        for &boundary in &boundaries {
+            assert!(rendered.is_char_boundary(boundary));
+            assert!(boundary > 0 && boundary < rendered.len());
+            cut.push(&rendered[start..boundary]);
+            start = boundary;
+        }
+        cut.push(&rendered[start..]);
+
+        assert_eq!(cut.concat(), rendered, "the segments rejoin byte-exactly");
+        assert_eq!(
+            cut,
+            items.iter().map(Item::render).collect::<Vec<_>>(),
+            "and each segment is exactly one item's render"
+        );
+        assert!(boundaries.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn a_context_with_fewer_than_two_items_names_no_boundary() {
+        // Not an edge case to tolerate but the honest answer: with one item
+        // there is no *stable prefix* distinct from this turn's input, so there
+        // is nothing a breakpoint could usefully mark.
+        let mut assembler = ContextAssembler::new(ByteTokenizer, BLOCK);
+        assert_eq!(
+            assembler.rendered_with_boundaries(),
+            (String::new(), Vec::new())
+        );
+
+        assembler.push(Item::user_text("hello"));
+        let (rendered, boundaries) = assembler.rendered_with_boundaries();
+        assert_eq!(rendered, "<|user|>hello");
+        assert!(boundaries.is_empty());
+
+        // The second item is the first boundary, and it is the length of the
+        // first render rather than a count of anything.
+        assembler.push(Item::user_text("again"));
+        let (_, boundaries) = assembler.rendered_with_boundaries();
+        assert_eq!(boundaries, vec!["<|user|>hello".len()]);
+    }
+
+    #[test]
+    fn a_rehydrated_log_containing_a_tool_call_needs_no_new_branch() {
         // The other half of "reusing `ItemAppended` costs zero changes here",
-        // checked rather than asserted. An emitted tool call is an ordinary
-        // `Item` whose content already has a rendering, so the assembler sees
-        // nothing new; had it needed a branch, a steered session's successor
-        // would rehydrate a different prompt than the node it replaced and
-        // every block hash after the steer would move.
+        // checked rather than asserted. A tool call is an ordinary `Item` whose
+        // content already has a rendering, so the assembler sees nothing new;
+        // had it needed a branch, such a session's successor would rehydrate a
+        // different prompt than the node it replaced and every block hash after
+        // the call would move.
+        //
+        // **The call is the agent's own now (M10.0).** It used to be a synthetic
+        // `fetch_steer` this deployment emitted, stamped with its response id;
+        // no verdict maps to a tool call any more, so the only tool calls in a
+        // log are the ones a client ran of its own accord — and the stamped
+        // assistant *text* below is what a steer looks like instead. Both are in
+        // the fixture, because the claim is about every content shape passing
+        // through the assembler unbranched.
         let items = vec![
             Item::system_text("you are a careful assistant"),
             Item::user_text("first question"),
             Item {
                 role: Role::Assistant,
                 content: ItemContent::ToolCall {
-                    call_id: "rhsteer_resp_1".into(),
-                    name: "fetch_steer".into(),
-                    arguments: r#"{"steer_id":"rhsteer_resp_1"}"#.into(),
+                    call_id: "call_theirs".into(),
+                    name: "grep".into(),
+                    arguments: r#"{"q":"parser"}"#.into(),
+                    namespace: None,
                 },
-                response_id: Some(ResponseId::new("resp_1")),
+                response_id: None,
             },
             Item {
                 role: Role::Tool,
                 content: ItemContent::ToolResult {
-                    call_id: "rhsteer_resp_1".into(),
-                    output: r#"{"directive":"narrow the search"}"#.into(),
+                    call_id: "call_theirs".into(),
+                    output: "3 hits".into(),
                 },
                 response_id: None,
+            },
+            Item {
+                role: Role::Assistant,
+                content: ItemContent::Text {
+                    text: "narrow the search\n\n> first question".into(),
+                },
+                response_id: Some(ResponseId::new("resp_1")),
             },
             Item::user_text("second question"),
         ];

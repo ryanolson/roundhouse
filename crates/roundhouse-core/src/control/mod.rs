@@ -49,9 +49,31 @@
 //! renders as a fingerprint everywhere but the one seam that reveals it.
 //! [`payer`] holds whose money that was — and the rule that stops roundhouse
 //! naming a price it did not pay.
+//!
+//! Which *conversation* a turn or a control call belongs to is a fifth answer,
+//! and [`correlation`] holds the three maps that give it: the generation a
+//! cache key was last committed at, the session a tool-use id was emitted by,
+//! and the session a client-declared thread is in. It sits here rather than in
+//! the server crate because a deployment of more than one node needs those
+//! three shared, and "shared" means a trait with a Redis implementation beside
+//! the spend and fair-use ledgers.
+//!
+//! [`directory`] is the same argument taken one step further and stopping
+//! deliberately short of the vocabulary. What an operator *created* — the
+//! projects, users, memberships and keys the admin plane mints — has to
+//! outlive a restart and be seen by every node, which again means a trait with
+//! a Redis implementation beside the ledgers. But unlike the five answers
+//! above, none of that vocabulary belongs here (see this doc's second
+//! decision: a key record arrives next to the resolver, not here), so what
+//! lands is the *storage* shape alone: one versioned opaque document,
+//! compare-and-set. The server crate keeps the records and does the serde at
+//! its own boundary.
 
 pub mod budget;
+pub mod correlation;
 pub mod credential;
+pub mod directory;
+pub mod fair_use;
 pub mod payer;
 pub mod policy;
 pub mod spend;
@@ -63,10 +85,21 @@ use serde::{Deserialize, Serialize};
 pub use budget::{
     Allocation, Budget, BudgetState, BudgetWindow, DEFAULT_WARN_AT, Exhaustion, TurnBudget,
 };
+pub use correlation::{
+    CALL_BINDING_STALENESS_MS, CorrelationError, CorrelationMaps, MemoryCorrelationMaps,
+    THREAD_BINDING_STALENESS_MS,
+};
 pub use credential::{
     CredentialError, CredentialKind, CredentialMode, CredentialRef, ForwardedCredential,
     OauthEvidence, PresentedCredential, ProviderAccess, Reachable, Secret, TurnCredential,
     TurnCredentials,
+};
+pub use directory::{
+    DocumentStore, DocumentStoreError, DocumentVersion, MemoryDocumentStore, VersionedDocument,
+};
+pub use fair_use::{
+    FairUseError, FairUseLedger, FairUseLimit, FairUseQuantity, FairUseRefusal, FairUseScope,
+    FairUseTerms, FairUseWindow, MemoryFairUseLedger,
 };
 pub use payer::{Billing, BudgetCounts, Payer, SettledSpend};
 pub use policy::{

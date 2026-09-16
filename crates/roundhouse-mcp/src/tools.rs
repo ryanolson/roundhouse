@@ -17,6 +17,16 @@
 //! names *and* schema shape — and the pin is what a change to it has to argue
 //! with.
 //!
+//! **The pin has been paid once on purpose, and this is the entry** (M12,
+//! R-M4). Making the `conversation` argument dialect-neutral moved the digest,
+//! which re-primes the prompt cache of every session in a deployment at the
+//! moment it lands. That cost was accepted rather than deferred because the
+//! alternative is worse and does not expire: a second client now reads this
+//! list on every turn, the old sentence told it to pass a field its own API
+//! does not have, and a description that misdirects one of two clients costs a
+//! wrong argument on every call for as long as it stands. One cache miss per
+//! session, once, against a permanent misinstruction.
+//!
 //! # Schemas by hand
 //!
 //! The schemas below are written out rather than derived. A derive would make
@@ -27,6 +37,32 @@
 //! other than beside the schema they describe. [`descriptors_match_their_request_types`]
 //! is what keeps the hand-written half honest: every declared property has to
 //! deserialize into the request type it claims to describe.
+//!
+//! # Annotations are not decoration
+//!
+//! Every descriptor states all three MCP hints — `readOnlyHint`,
+//! `destructiveHint`, `openWorldHint` — as plain `bool`s rather than leaving
+//! them absent, because absent is not neutral. Codex's
+//! `requires_mcp_tool_approval` (`core/src/mcp_tool_call.rs:2156-2173`
+//! @ `e363b08`; the same function at `2182-2199` @ the Cargo pin `6344a65`)
+//! reads a missing `readOnlyHint` as `false` and a missing
+//! `destructiveHint`/`openWorldHint` as `true`, so a tool that says nothing
+//! is read as destructive-and-open-world. Under `codex exec`'s forced
+//! `approval_policy = "never"` the approval that then gets demanded cannot be
+//! asked of anyone, and the call is *cancelled* — the agent sees a
+//! cancellation where the output should have been.
+//!
+//! They are written out per tool rather than defaulted from a shared constant
+//! for the same reason the list is pinned: a ninth tool must state what it
+//! does. A `CLOSED_WORLD_READ` const the new entry copied would let it inherit
+//! two claims nobody checked against what it actually does, which is the
+//! review the size tripwire in `codex_launch.rs` exists to force.
+//!
+//! `destructiveHint: false` and `openWorldHint: false` hold for all eight:
+//! the two overlay writers can only narrow (see the crate doc), the other
+//! writers append records, and the whole surface reaches roundhouse's own
+//! control plane and nothing beyond it. Only `readOnlyHint` varies, and it
+//! varies exactly along the crate's read/write split.
 //!
 //! # Dispatch is not transport
 //!
@@ -41,19 +77,24 @@ use serde_json::{Value, json};
 
 use roundhouse_core::control::Principal;
 
-use crate::surface::{ControlSurface, SurfaceError, ToolOutcome};
+use crate::surface::{Caller, ControlSurface, Correlators, SurfaceError, ToolOutcome};
 
 /// Every tool this surface serves, in the order it lists them.
-pub const TOOL_NAMES: [&str; 8] = [
-    "status",
-    "init_session",
-    "declare_intent",
-    "prefer",
-    "set_quality_floor",
-    "fetch_steer",
-    "report_outcome",
-    "explain_last_route",
-];
+///
+/// Re-exported from `roundhouse-core` rather than spelled here (M12, R-M0),
+/// for the reason [`roundhouse_core::validate::CONTROL_TOOL_NAMESPACE`] is:
+/// the validate fold has to *recognise* one of these names as roundhouse's own
+/// control traffic even when the wire has dropped the namespace that would
+/// have identified it, that fold lives a crate below this one, and two lists
+/// that must agree across a crate boundary is a rename that goes silently
+/// half-done — a tool added here alone would be counted as the agent's work
+/// forever, and nothing would be red.
+///
+/// [`descriptors`] is still the list that goes on the wire;
+/// `the_names_and_the_descriptors_are_one_list` holds the two together, and the
+/// transport's `the_adapter_lists_exactly_what_the_surface_declares` carries
+/// that agreement out to the wire.
+pub const TOOL_NAMES: [&str; 8] = roundhouse_core::validate::CONTROL_TOOL_NAMES;
 
 /// One entry of the tool list.
 #[derive(Debug, Clone, PartialEq)]
@@ -66,6 +107,16 @@ pub struct ToolDescriptor {
     pub description: &'static str,
     /// JSON Schema for the arguments object.
     pub input_schema: Value,
+    /// MCP's `readOnlyHint`: true for a tool that changes nothing.
+    ///
+    /// See the module doc's *Annotations are not decoration* for why all three
+    /// hints are stated on every tool rather than defaulted.
+    pub read_only_hint: bool,
+    /// MCP's `destructiveHint`: false for a tool whose writes are additive.
+    pub destructive_hint: bool,
+    /// MCP's `openWorldHint`: false for a tool that reaches nothing outside
+    /// this deployment.
+    pub open_world_hint: bool,
 }
 
 /// A named call with its arguments, before it has a type.
@@ -75,6 +126,17 @@ pub struct ToolCall {
     /// The raw arguments object. `Value::Null` for a call that sent none,
     /// which every tool with only optional fields accepts.
     pub arguments: Value,
+    /// Whatever the client attached on `params._meta` (M12, R-M2; M12.1,
+    /// R-M7).
+    ///
+    /// **Beside the arguments and not inside them.** The arguments are what
+    /// the *model* wrote and are checked against a published schema; these are
+    /// what the *client* attached, one naming the `tool_use` block roundhouse
+    /// emitted and is now being answered for, one naming the thread it is
+    /// running. Folding either into `arguments` would put a property in eight
+    /// schemas that no model should ever fill in — and `deny_unknown_fields`
+    /// would refuse the honest client that sent it.
+    pub correlators: Correlators,
 }
 
 /// The conversation property, repeated by every session-scoped tool.
@@ -82,11 +144,43 @@ pub struct ToolCall {
 /// One function rather than a copied literal: the description is the sentence
 /// that tells a model it may omit the field, and eight slightly different
 /// spellings of it is how a model learns that the field means eight things.
+///
+/// **Dialect-neutral, and it names no wire field** (M12, R-M4). It used to say
+/// "as the client's own `prompt_cache_key`", which is a Responses word: a
+/// Claude Code model reading it looks for a field its own API does not have,
+/// and the likeliest thing it then passes is a session id from a namespace this
+/// surface does not resolve — a `ForeignConversation` refusal in place of an
+/// answer the omitted argument would have got right. What replaces it says what
+/// the omission *does*, which is the same on both surfaces and is now the
+/// accurate order (R-M2): the tool call this call answers first, the key's most
+/// recent conversation second.
 fn conversation_property() -> Value {
     json!({
         "type": "string",
-        "description": "The conversation this concerns, as the client's thread-id, session-id, or explicit prompt_cache_key, in that order. Omit it and the most recent conversation on this key is used."
+        "description": "The conversation this concerns, spelled the way this client names a conversation to roundhouse. Omitting it is the ordinary case: the call is matched to the conversation whose tool call it is answering, and failing that to the most recent conversation on this key."
     })
+}
+
+/// The one descriptor named `tool`, or `None` for a name this deployment does
+/// not serve.
+///
+/// **Here rather than in each launcher** (M12 review, F12). `codex_launch`'s
+/// skill generator and `claude_launch`'s signage each carried their own scan of
+/// [`descriptors`] — one list, two private lookups, in a crate that neither
+/// owns. What each of them wants from the answer differs (a skill file quotes
+/// the description; the signage wants only the assurance that the name
+/// resolves), and that is the argument for one accessor and two call sites
+/// rather than one shared renderer: the lookup is the part that is the same.
+///
+/// An `Option`, so the caller decides what a missing tool costs. Both of
+/// today's callers panic, for a reason each states beside its own call — a
+/// generated file or an appended prompt that silently omits a tool is still a
+/// valid one, is still read on every turn, and costs the fleet context
+/// forever.
+pub fn descriptor(tool: &str) -> Option<ToolDescriptor> {
+    descriptors()
+        .into_iter()
+        .find(|candidate| candidate.name == tool)
 }
 
 /// The tool list, exactly as it goes on the wire.
@@ -100,15 +194,23 @@ pub fn descriptors() -> Vec<ToolDescriptor> {
     vec![
         ToolDescriptor {
             name: "status",
-            // Not "costs nothing": answering this reads the conversation's log,
-            // and a description that told a model the call was free would be
-            // inviting the loop the surface then has to absorb.
-            description: "What this key may be routed to right now: the effective policy fingerprint, the admissible model names, budget remaining, and any steer awaiting an answer. Changes nothing; it reads this conversation's log to answer, so it is cheap between turns and not free in a loop.",
+            // Still not "costs nothing", even though M10.0 removed the one
+            // field that needed the log replay: resolving the conversation and
+            // quoting the admissible catalog are both work, and a description
+            // that told a model the call was free would invite the loop the
+            // surface then has to absorb. The retired field was `open_steers`,
+            // which listed synthetic tool calls awaiting an answer — there are
+            // none now, and a permanently empty list in a model's context is a
+            // question it keeps asking and always gets `[]` to.
+            description: "What this key may be routed to right now: the effective policy fingerprint, the admissible model names, and budget remaining. Changes nothing; it resolves this conversation and quotes the catalog to answer, so it is cheap between turns and not free in a loop.",
             input_schema: json!({
                 "type": "object",
                 "properties": { "conversation": conversation_property() },
                 "additionalProperties": false
             }),
+            read_only_hint: true,
+            destructive_hint: false,
+            open_world_hint: false,
         },
         ToolDescriptor {
             name: "init_session",
@@ -124,6 +226,9 @@ pub fn descriptors() -> Vec<ToolDescriptor> {
                 "properties": { "conversation": conversation_property() },
                 "additionalProperties": false
             }),
+            read_only_hint: false,
+            destructive_hint: false,
+            open_world_hint: false,
         },
         ToolDescriptor {
             name: "declare_intent",
@@ -143,6 +248,9 @@ pub fn descriptors() -> Vec<ToolDescriptor> {
                 "required": ["goal", "done_when"],
                 "additionalProperties": false
             }),
+            read_only_hint: false,
+            destructive_hint: false,
+            open_world_hint: false,
         },
         ToolDescriptor {
             name: "prefer",
@@ -171,6 +279,9 @@ pub fn descriptors() -> Vec<ToolDescriptor> {
                 "required": ["mode", "scope", "reason"],
                 "additionalProperties": false
             }),
+            read_only_hint: false,
+            destructive_hint: false,
+            open_world_hint: false,
         },
         ToolDescriptor {
             name: "set_quality_floor",
@@ -191,26 +302,29 @@ pub fn descriptors() -> Vec<ToolDescriptor> {
                 "required": ["floor", "turns", "reason"],
                 "additionalProperties": false
             }),
+            read_only_hint: false,
+            destructive_hint: false,
+            open_world_hint: false,
         },
         ToolDescriptor {
             name: "fetch_steer",
-            description: "Read the correction a roundhouse tool call named. Returns exactly what was written when the call was emitted; calling it twice returns the same bytes and does no work.",
+            description: "Re-read roundhouse's most recent correction for this conversation. It was already delivered as an assistant message; use this if you no longer have it. Calling it twice returns the same bytes and does no work.",
             input_schema: json!({
                 "type": "object",
-                "properties": {
-                    "steer_id": { "type": "string", "description": "The id the tool call named." }
-                },
-                "required": ["steer_id"],
+                "properties": { "conversation": conversation_property() },
                 "additionalProperties": false
             }),
+            read_only_hint: true,
+            destructive_hint: false,
+            open_world_hint: false,
         },
         ToolDescriptor {
             name: "report_outcome",
-            description: "Say what you did about a steer. Advisory: not reporting is never an error and never blocks a turn.",
+            description: "Say what you did about roundhouse's correction for this conversation. Advisory: not reporting is never an error and never blocks a turn.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "steer_id": { "type": "string", "description": "The steer you are reporting on." },
+                    "conversation": conversation_property(),
                     "outcome": {
                         "type": "string",
                         "enum": ["applied", "rejected", "not_applicable"],
@@ -218,9 +332,12 @@ pub fn descriptors() -> Vec<ToolDescriptor> {
                     },
                     "note": { "type": "string", "description": "Anything worth recording alongside." }
                 },
-                "required": ["steer_id", "outcome"],
+                "required": ["outcome"],
                 "additionalProperties": false
             }),
+            read_only_hint: false,
+            destructive_hint: false,
+            open_world_hint: false,
         },
         ToolDescriptor {
             name: "explain_last_route",
@@ -230,6 +347,9 @@ pub fn descriptors() -> Vec<ToolDescriptor> {
                 "properties": { "conversation": conversation_property() },
                 "additionalProperties": false
             }),
+            read_only_hint: true,
+            destructive_hint: false,
+            open_world_hint: false,
         },
     ]
 }
@@ -257,6 +377,12 @@ async fn dispatch_inner(
     principal: &Principal,
     call: ToolCall,
 ) -> Result<ToolOutcome, SurfaceError> {
+    // Every half of "who is asking, about what" joined once, here, rather than
+    // at each of the eight arms below: a tool that forgot to carry a correlator
+    // would answer about the principal's most recent conversation instead of
+    // the one it was called from, and it would answer *plausibly* — which is
+    // the failure R-M2 exists to remove and the hardest kind to notice.
+    let caller = Caller::correlated(principal.clone(), call.correlators);
     // An absent arguments object and an empty one mean the same thing, and a
     // client is free to send either. Normalizing here rather than in eight
     // `#[serde(default)]`-shaped workarounds keeps the request types describing
@@ -266,44 +392,36 @@ async fn dispatch_inner(
         other => other,
     };
     match call.name.as_str() {
-        "status" => {
-            surface
-                .status(principal, decode("status", arguments)?)
-                .await
-        }
+        "status" => surface.status(&caller, decode("status", arguments)?).await,
         "init_session" => {
             surface
-                .init_session(principal, decode("init_session", arguments)?)
+                .init_session(&caller, decode("init_session", arguments)?)
                 .await
         }
         "declare_intent" => {
             surface
-                .declare_intent(principal, decode("declare_intent", arguments)?)
+                .declare_intent(&caller, decode("declare_intent", arguments)?)
                 .await
         }
-        "prefer" => {
-            surface
-                .prefer(principal, decode("prefer", arguments)?)
-                .await
-        }
+        "prefer" => surface.prefer(&caller, decode("prefer", arguments)?).await,
         "set_quality_floor" => {
             surface
-                .set_quality_floor(principal, decode("set_quality_floor", arguments)?)
+                .set_quality_floor(&caller, decode("set_quality_floor", arguments)?)
                 .await
         }
         "fetch_steer" => {
             surface
-                .fetch_steer(principal, decode("fetch_steer", arguments)?)
+                .fetch_steer(&caller, decode("fetch_steer", arguments)?)
                 .await
         }
         "report_outcome" => {
             surface
-                .report_outcome(principal, decode("report_outcome", arguments)?)
+                .report_outcome(&caller, decode("report_outcome", arguments)?)
                 .await
         }
         "explain_last_route" => {
             surface
-                .explain_last_route(principal, decode("explain_last_route", arguments)?)
+                .explain_last_route(&caller, decode("explain_last_route", arguments)?)
                 .await
         }
         unknown => Err(SurfaceError::UnknownTool(unknown.to_string())),
@@ -361,6 +479,9 @@ mod tests {
             let call = ToolCall {
                 name: tool.name.to_string(),
                 arguments: Value::Object(probe),
+                // The schemas are what a *model* fills in; the correlation ids
+                // are not among their properties and never should be.
+                correlators: Correlators::default(),
             };
             let decoded = decode_probe(&call);
             assert!(
@@ -434,6 +555,7 @@ mod tests {
             let empty = ToolCall {
                 name: tool.name.to_string(),
                 arguments: json!({}),
+                correlators: Correlators::default(),
             };
             assert_eq!(
                 decode_probe(&empty).is_err(),

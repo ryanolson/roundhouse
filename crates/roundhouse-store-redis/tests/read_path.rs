@@ -107,3 +107,41 @@ async fn a_corrupted_log_fails_loudly_rather_than_dropping_events() {
         Err(StoreError::Backend(_))
     ));
 }
+
+/// **F12 (M14.0 review).** The finding: `create_session`'s Redis-side
+/// coverage in this crate only ever calls it once per session id (this
+/// file's other tests, `common::Rig::fresh_session`), so the `SET ... NX`
+/// reply is never checked in the direction that matters for R13 -- a
+/// second `create_session` on a name the store already holds must report
+/// `false`, not `true`. A mutation that drops the NX check (`Ok(true)`
+/// unconditionally at `lib.rs:234`) would then read every re-creation as
+/// fresh, which is the pre-R13 duplicated-prefix bug reintroduced under
+/// exactly the backend the ruling names as its cause.
+///
+/// Proven false: this crate already carries a false-on-second-create
+/// assertion against real Redis --
+/// `roundhouse_core::store::contract::create_is_idempotent_and_reports_existing`,
+/// run here through `store_contract_suite!` in `contract.rs` -- and it
+/// fails under the `Ok(true)` mutation (`cargo test -p roundhouse-store-redis
+/// -- --include-ignored` goes red, not green, contradicting the finding's
+/// own proof instructions). This second, file-local assertion closes the
+/// specific gap the finding points at in *this* file, so the guard is not
+/// resting on `contract.rs` alone.
+#[tokio::test]
+#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
+async fn f12_recreating_an_existing_session_reports_false_not_fresh() {
+    let rig = rig().await;
+    let sid = SessionId::generate();
+
+    assert!(
+        rig.store.create_session(&sid, "affinity").await.unwrap(),
+        "F12: the first create on a never-seen id must report fresh"
+    );
+    assert!(
+        !rig.store.create_session(&sid, "affinity").await.unwrap(),
+        "F12: re-creating the same id must report `false` -- the NX reply \
+         prefix admission (R13) depends on to tell a generation nothing \
+         has ever held -- one that takes a claim whole -- from one the \
+         store remembers and the claim must be checked against"
+    );
+}

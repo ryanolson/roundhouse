@@ -7,11 +7,27 @@
 //! can prove the wire format without turning storage internals into production
 //! API. This module only exists under the `test-support` feature.
 
-use roundhouse_core::control::ProjectId;
+use roundhouse_core::control::{Principal, ProjectId};
 use roundhouse_core::ids::SessionId;
 
+use crate::KeyNamespace;
+use crate::correlation::call_key as correlation_call_key_impl;
+use crate::correlation::thread_key as correlation_thread_key_impl;
+use crate::fair_use::{
+    bucket_fields, bucket_index, member_scope_key, project_scope_key, window_sum_fields,
+};
 use crate::spend::holds_key as spend_holds_key_impl;
 use crate::{RedisSessionStore, lease_key as store_lease_key, log_key as store_log_key};
+
+/// The namespace every helper in this module builds a key under.
+///
+/// Every gated test in this crate connects through [`connect_from_env`] or
+/// the family-specific analogues, none of which have opted into a namespace
+/// of their own — so the raw key a test computes to inspect a handle's state
+/// must agree with the default the handle itself connected under.
+fn default_namespace() -> KeyNamespace {
+    KeyNamespace::default()
+}
 
 /// The one variable every Redis-gated integration test reads.
 pub const URL_VAR: &str = "ROUNDHOUSE_TEST_REDIS_URL";
@@ -35,12 +51,12 @@ pub async fn connect_from_env() -> RedisSessionStore {
 
 /// The raw lease key used by adversarial tests.
 pub fn lease_key(session_id: &SessionId) -> String {
-    store_lease_key(session_id)
+    store_lease_key(&default_namespace(), session_id)
 }
 
 /// The raw log key used by wire-format tests.
 pub fn log_key(session_id: &SessionId) -> String {
-    store_log_key(session_id)
+    store_log_key(&default_namespace(), session_id)
 }
 
 /// The raw holds key, for the one test that inspects the hash field a hold
@@ -52,7 +68,89 @@ pub fn log_key(session_id: &SessionId) -> String {
 /// the key format it pins is already pinned by
 /// `the_project_and_member_keys_share_one_hash_tag` beside the real functions.
 pub fn spend_holds_key(project: &ProjectId) -> String {
-    spend_holds_key_impl(project)
+    spend_holds_key_impl(&default_namespace(), project)
+}
+
+/// The two raw hashes one draw touches, for the tests that assert on the
+/// storage mechanism rather than only on the refusal derived from it.
+///
+/// Returned as a pair because that is the fact under test: `record_draw` takes
+/// one [`Principal`] and moves *both* scopes' counters, so a helper that
+/// handed back one key at a time would let a test assert half of it and look
+/// green.
+pub fn fair_use_scope_keys(principal: &Principal) -> (String, String) {
+    let namespace = default_namespace();
+    (
+        project_scope_key(&namespace, &principal.project),
+        member_scope_key(&namespace, &principal.project, &principal.user),
+    )
+}
+
+/// The two field names a draw at `at_ms` lands in.
+///
+/// The bucket index is derived from `at_ms` here exactly as the script derives
+/// it server-side; a test that computed the index itself would be pinning its
+/// own arithmetic rather than the ledger's.
+pub fn fair_use_bucket_fields(at_ms: u64) -> (String, String) {
+    bucket_fields(bucket_index(at_ms))
+}
+
+/// One window's four running-sum field names: tokens, micro-dollars, and the
+/// oldest and newest bucket index the sum covers.
+///
+/// Exported because the running sums are the whole of M13.1: a test that only
+/// read the per-bucket fields would pass against a ledger that maintained no
+/// sum at all and re-scanned every bucket, which is exactly the read path this
+/// rung replaced.
+pub fn fair_use_window_sum_fields(
+    window: roundhouse_core::control::FairUseWindow,
+) -> (String, String, String, String) {
+    window_sum_fields(window)
+}
+
+/// The `would_exceed` script's own text.
+///
+/// Exported for the one gated test that has to invoke it with a window group
+/// past the ones `FairUseWindow::ALL` names — an argument list the production
+/// `WouldExceedArgs` deliberately cannot build. Handing out the real script
+/// rather than letting the test carry a copy is the whole point: a copy drifts
+/// from what ships, and a test green against a stale copy proves nothing.
+pub fn fair_use_would_exceed_source() -> &'static str {
+    crate::fair_use::scripts::would_exceed_source()
+}
+
+/// The raw key one call binding occupies, for the test that reads the
+/// ambiguous marker itself rather than only the `None` it decodes to.
+///
+/// Its generation sibling is pinned by
+/// `every_key_carries_the_namespace_the_version_and_its_family` beside the
+/// functions that build them, and exporting it here with no caller would be
+/// an untested surface reading as a supported one. The thread key gained a
+/// caller of its own (M14.2 review, F1) — see [`correlation_thread_key`].
+pub fn correlation_call_key(principal: &Principal, call_id: &str) -> String {
+    correlation_call_key_impl(&default_namespace(), principal, call_id)
+}
+
+/// The raw key one thread binding occupies, for the gated test that reads
+/// the shipped `PTTL` a production handle's default arms — the half of R-S1
+/// no unit test can reach, since a unit test never touches a real Redis
+/// clock (M14.2 review, F1).
+pub fn correlation_thread_key(principal: &Principal, thread_id: &str) -> String {
+    correlation_thread_key_impl(&default_namespace(), principal, thread_id)
+}
+
+/// The one key the directory family occupies, under a namespace the caller
+/// names.
+///
+/// **Takes its namespace explicitly, unlike every other helper here**, and
+/// that is the family's shape rather than an inconsistency: this family has a
+/// single key for the whole deployment (R-D6), so a gated test isolates itself
+/// by connecting under a fresh [`KeyNamespace`] instead of by minting a fresh
+/// principal or session id inside a shared one. A helper that assumed the
+/// default namespace would compute a key none of those tests' handles ever
+/// writes.
+pub fn directory_records_key(namespace: &KeyNamespace) -> String {
+    crate::directory::records_key(namespace)
 }
 
 /// The conformance suite's expiry lever. Deleting the key is exactly what
@@ -61,7 +159,7 @@ pub fn spend_holds_key(project: &ProjectId) -> String {
 impl roundhouse_core::store::contract::LeaseControl for RedisSessionStore {
     async fn force_expire_lease(&self, session_id: &SessionId) {
         let _: i64 = redis::cmd("DEL")
-            .arg(store_lease_key(session_id))
+            .arg(store_lease_key(&self.namespace, session_id))
             .query_async(&mut self.conn.clone())
             .await
             .expect("the test Redis must accept a DEL");

@@ -6,7 +6,11 @@
 //! One canonical copy: the every-variant event list and its coverage guard
 //! live here rather than one copy per test binary; the connection helpers
 //! come from the crate's own `test_support` module, which the server's
-//! durability test shares too.
+//! durability test shares too. `raw_from_env` below is the same idea applied
+//! to the raw (non-`test_support`) connection every adversarial test opens to
+//! write what the store under test must then read: it used to be pasted into
+//! `fair_use_contract.rs` and `spend_contract.rs` separately (M13.1 review
+//! F1), which is exactly the copy this module exists to hold instead.
 //! Each binary compiles its own copy via `mod common;`, and none uses every
 //! item, so the module opts out of dead-code analysis rather than sprinkling
 //! `allow`s per item.
@@ -16,6 +20,8 @@
 //! of skipping: it is a runner error to report, not infrastructure to wait
 //! for.
 #![allow(dead_code)]
+
+pub mod fair_use;
 
 use roundhouse_core::control::{BudgetState, Principal};
 use roundhouse_core::event::{
@@ -59,6 +65,18 @@ pub async fn connect_from_env() -> RedisSessionStore {
 
 pub fn url_from_env() -> String {
     test_support::url_from_env()
+}
+
+/// A raw connection alongside (or instead of) the store under test, for
+/// writing what a test must then read back through the store, or for
+/// asserting on the storage mechanism directly rather than only on a
+/// refusal derived from it.
+pub async fn raw_from_env() -> redis::aio::MultiplexedConnection {
+    redis::Client::open(url_from_env().as_str())
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap()
 }
 
 pub fn lease_key(session_id: &SessionId) -> String {
@@ -194,6 +212,8 @@ pub fn every_event_kind() -> Vec<SessionEventKind> {
                 billing: Default::default(),
                 budget_draw: None,
                 withheld_providers: Vec::new(),
+                declared_baseline: None,
+                attempts: Vec::new(),
             },
         },
         SessionEventKind::OutputTextDelta {
@@ -205,10 +225,17 @@ pub fn every_event_kind() -> Vec<SessionEventKind> {
             usage: Usage {
                 input_tokens: 128,
                 cached_input_tokens: 112,
+                // Non-zero for the same reason every other count here is: a
+                // backend that took the usage object apart and dropped the
+                // newest counter would still pass a round trip whose fixture
+                // left it at its default.
+                cache_write_tokens: 9,
                 output_tokens: 5,
                 reasoning_tokens: 2,
                 accounting: Accounting::Reported,
             },
+            provider_reported_cost_usd: None,
+            stop_reason: None,
         },
         SessionEventKind::ResponseIncomplete {
             response_id: response_id.clone(),
@@ -217,6 +244,7 @@ pub fn every_event_kind() -> Vec<SessionEventKind> {
                 accounting: Accounting::Estimated,
                 ..Usage::default()
             },
+            terminal_attempt: None,
         },
         SessionEventKind::TurnDeduplicated {
             turn_id: TurnId::generate(),

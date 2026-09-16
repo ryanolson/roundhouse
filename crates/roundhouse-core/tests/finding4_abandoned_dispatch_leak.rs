@@ -73,6 +73,8 @@ fn decision(chosen: Target) -> DecisionRecord {
         billing: Default::default(),
         budget_draw: None,
         withheld_providers: Vec::new(),
+        declared_baseline: None,
+        attempts: Vec::new(),
     }
 }
 
@@ -80,6 +82,7 @@ fn usage(input: u64, output: u64) -> Usage {
     Usage {
         input_tokens: input,
         cached_input_tokens: 0,
+        cache_write_tokens: 0,
         output_tokens: output,
         reasoning_tokens: 0,
         accounting: Accounting::Reported,
@@ -152,6 +155,8 @@ impl Log {
         self.push(SessionEventKind::ResponseCompleted {
             response_id: response.clone(),
             usage: usage(4_000, 300),
+            provider_reported_cost_usd: None,
+            stop_reason: None,
         });
         response
     }
@@ -171,6 +176,7 @@ impl Log {
             response_id: response.clone(),
             reason: IncompleteReason::UpstreamError,
             usage: usage(4_000, 12),
+            terminal_attempt: None,
         });
         response
     }
@@ -277,6 +283,7 @@ fn settled_dispatches_are_retired_by_either_terminal_event() {
         response_id: response,
         reason: IncompleteReason::UpstreamError,
         usage: Usage::default(),
+        terminal_attempt: None,
     });
 
     let mut fold = MetricsFold::new();

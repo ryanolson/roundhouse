@@ -285,6 +285,17 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
 /// never reached a provider, and a genuinely free rate card is free. A frontier
 /// dispatch whose decision recorded no card at all is none of those — see
 /// [`EngineError::UnpricedSettlement`].
+///
+/// **One turn at a time, and the metrics rollup agrees with it by
+/// construction.** What this returns is summed into `Account::committed_usd`,
+/// while `/v1/metrics` prices the same turns out of its own fold — two routes
+/// to one number, and the admin reconciliation view publishes their difference
+/// as evidence about *settlement*. They stayed equal only while pricing was
+/// linear in tokens, which M11.0's measured cache-write split ended: the fold
+/// now accumulates each turn's own split (`routing::PooledUsage`) instead of
+/// summing tokens and pricing once, so a drift is again a settle that failed,
+/// a restart, or a turn still in flight, and never an artifact of where the
+/// arithmetic happened (M11.0 review F2).
 pub(super) fn settled_cost_usd(settlement: &TerminalSettlement) -> Result<f64, EngineError> {
     match (&settlement.target, &settlement.rate_card) {
         // Order matters: a local dispatch is free whatever a card says, and a
@@ -309,6 +320,7 @@ mod tests {
         Usage {
             input_tokens: 0,
             cached_input_tokens: 0,
+            cache_write_tokens: 0,
             output_tokens: 1_000_000,
             reasoning_tokens: 0,
             accounting: Accounting::Reported,
@@ -342,6 +354,9 @@ mod tests {
             billing: Billing::Billed,
             budget_draw: Some(BudgetCounts::AllFrontierSpend),
             usage: one_mtok_out(),
+            // Never an input to a settle, which is exactly what this fixture's
+            // subject is; see the field's own note on why it rides here at all.
+            provider_reported_cost_usd: None,
         }
     }
 
@@ -439,8 +454,8 @@ mod the_live_admission_cannot_move_a_finished_turns_charge {
     use roundhouse_core::context::ByteTokenizer;
     use roundhouse_core::control::{
         Allocation, Balance, BalanceQuery, Billing, Budget, BudgetCounts, BudgetTerms,
-        BudgetWindow, DEFAULT_WARN_AT, Exhaustion, Grant, Payer, Principal, Settled, SpendError,
-        SpendLedger, TurnCredentials, TurnPolicy,
+        BudgetWindow, DEFAULT_WARN_AT, Exhaustion, FairUseTerms, Grant, Payer, Principal, Settled,
+        SpendError, SpendLedger, TurnCredentials, TurnPolicy,
     };
     use roundhouse_core::event::{Accounting, Usage};
     use roundhouse_core::ids::{SessionId, TurnId};
@@ -501,6 +516,7 @@ mod the_live_admission_cannot_move_a_finished_turns_charge {
         Usage {
             input_tokens: 0,
             cached_input_tokens: 0,
+            cache_write_tokens: 0,
             output_tokens: 1_000_000,
             reasoning_tokens: 0,
             accounting: Accounting::Reported,
@@ -521,9 +537,15 @@ mod the_live_admission_cannot_move_a_finished_turns_charge {
                 },
                 allocation: Allocation::Pooled,
             }),
+            // These tests are about the *settle*, which fair use does not
+            // touch: draws are recorded one seam out, in `run_turn`'s tail,
+            // precisely so that a project with windows and no budget is
+            // counted at all.
+            fair_use: Arc::new(FairUseTerms::default()),
             validation: None,
             credentials: TurnCredentials::unrestricted(),
             budget_counts,
+            tiers: None,
         }
     }
 
@@ -592,12 +614,14 @@ mod the_live_admission_cannot_move_a_finished_turns_charge {
                     billing: Billing::Billed,
                     budget_draw: logged,
                     withheld_providers: Vec::new(),
+                    declared_baseline: None,
+                    attempts: Vec::new(),
                 },
             )
             .await
             .unwrap();
         session
-            .complete(&response_id, "hi", frontier_usage())
+            .complete(&response_id, Some("hi"), frontier_usage(), None, None)
             .await
             .unwrap();
 

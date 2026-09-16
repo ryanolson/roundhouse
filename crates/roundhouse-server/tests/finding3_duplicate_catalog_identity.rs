@@ -22,6 +22,13 @@ use roundhouse_server::CatalogConfig;
 /// One catalog file, two entries for the same `(provider, model)`, different
 /// prices. Nothing else about the two entries differs.
 const DUPLICATE_IDENTITY: &str = r#"{
+  "providers": {
+    "anthropic": {
+      "base_url": "https://api.anthropic.test/v1",
+      "routes": { "messages": "/messages" },
+      "auth": { "env": "ANTHROPIC_API_KEY" }
+    }
+  },
   "models": [
     {
       "provider": "anthropic",
@@ -83,6 +90,10 @@ fn one_mtok_of_uncached_input() -> Usage {
     Usage {
         input_tokens: 1_000_000,
         cached_input_tokens: 0,
+        // Zero so "uncached" in this fixture's name stays literally true: a
+        // cache write is uncached input the provider also kept, and this test
+        // reads a rate back out of a dollar figure.
+        cache_write_tokens: 0,
         output_tokens: 0,
         reasoning_tokens: 0,
         accounting: Accounting::Reported,
@@ -119,6 +130,8 @@ fn one_frontier_call(usage: Usage) -> Vec<SessionEvent> {
                     billing: Default::default(),
                     budget_draw: None,
                     withheld_providers: Vec::new(),
+                    declared_baseline: None,
+                    attempts: Vec::new(),
                 },
             },
         },
@@ -129,6 +142,8 @@ fn one_frontier_call(usage: Usage) -> Vec<SessionEvent> {
             kind: SessionEventKind::ResponseCompleted {
                 response_id: response,
                 usage,
+                provider_reported_cost_usd: None,
+                stop_reason: None,
             },
         },
     ]

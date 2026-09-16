@@ -9,6 +9,8 @@
 //! one turn and a frontier model on the next without the history changing shape.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::ids::ResponseId;
 
@@ -36,9 +38,20 @@ impl Role {
 
 /// The payload of an item.
 ///
-/// Deliberately small for the walking skeleton: text plus the two tool shapes
-/// an agentic loop cannot do without. Images and audio slot in as further
-/// variants without disturbing the session or routing layers.
+/// Text plus the two tool shapes an agentic loop cannot do without, and — since
+/// M11.1 — the three shapes the Anthropic Messages surface resends that none of
+/// those three can hold. Images and audio still slot in as further variants
+/// without disturbing the session or routing layers.
+///
+/// **The three new variants are additive and nothing above them moved.** The
+/// durable log holds records written before they existed, and the tag values
+/// `text`, `tool_call` and `tool_result` still mean exactly what they meant;
+/// `a_pre_m11_log_record_still_deserializes` pins that against literal stored
+/// JSON rather than against an argument. The alternative — widening
+/// [`Self::ToolResult`] with the `is_error` flag the Messages wire carries, or
+/// folding thinking into `Text` — would have changed a shape every existing
+/// record is written in, and a log that no longer reads is not recoverable by a
+/// rollback.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ItemContent {
@@ -49,11 +62,141 @@ pub enum ItemContent {
         call_id: String,
         name: String,
         arguments: String,
+        /// The MCP server this tool was registered under, when the client that
+        /// sent the call spelled it as a field of its own.
+        ///
+        /// **Forward-only, and last on purpose** (M17, R-N6). A record written
+        /// before this field existed carries no `namespace` key, `default`
+        /// reads it back as `None`, and `skip_serializing_if` writes it back
+        /// out with the key still absent — so every stored byte of every
+        /// pre-M17 tool call is unchanged, which is the property
+        /// `a_pre_m11_log_record_still_deserializes` pins. An older build
+        /// reading a newer record sees an unknown key and ignores it, which is
+        /// the same one-way door `SessionCreated::principal` and `::arm`
+        /// already walked through.
+        ///
+        /// **`None` is not "no namespace"; it is "this client does not spell
+        /// one".** Codex sends `{"name":"status","namespace":"mcp__roundhouse"}`
+        /// — two wire fields — so its calls arrive with `Some`. Claude Code
+        /// folds the registration into every tool name it declares, calls and
+        /// permits, so `mcp__roundhouse__status` arrives as one flat `name` and
+        /// the field stays `None`: on that surface the flat spelling *is* the
+        /// namespace, and inventing a `Some` here by splitting the name would
+        /// move the canonical form of every already-stored Messages session.
+        /// The two consumers that care read the asymmetry directly —
+        /// `validate::is_control_call_on` falls back to the bare-name arm on
+        /// `None`, and prefix admission treats a stored `None` as agreeing with
+        /// any claim.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
     },
     ToolResult {
         call_id: String,
         output: String,
     },
+    /// Extended thinking, with the signature that makes it resendable.
+    ///
+    /// The signature is carried rather than dropped because dropping it does
+    /// not merely lose provenance: an upstream rejects a resent thinking block
+    /// whose signature is missing or altered, so a conversation that passed
+    /// through here without it stops being continuable at all. It is a separate
+    /// field rather than part of the text for the same reason the wire keeps it
+    /// separate — the model reads one and validates the other.
+    Thinking {
+        thinking: String,
+        signature: String,
+    },
+    /// Thinking the provider encrypted, which nothing here can read.
+    ///
+    /// Stored because the client resends it and the prefix has to match, not
+    /// because anything downstream inspects it. `data` is opaque by
+    /// construction: treating it as text and, say, scanning it for tool ids
+    /// would be reading ciphertext as prose.
+    RedactedThinking {
+        data: String,
+    },
+    /// A content block this build does not model, kept verbatim.
+    ///
+    /// The opaque-first ruling (plan R5): images, documents, server-tool calls
+    /// and their results, container uploads — a dozen block types today and a
+    /// thirteenth next quarter — all ride through as the JSON the client sent.
+    /// A typed variant per shape is future work and would buy something real
+    /// (an image the router could price, a server-tool result the validate loop
+    /// could pair), but each one is a decision about *semantics*, and until
+    /// somebody makes it the honest reading of a block is "the client's bytes".
+    /// The cost of guessing instead is paid at the prefix check: a block
+    /// flattened into text canonicalizes differently the day the flattening
+    /// changes, and every warm session forks at once.
+    Opaque {
+        /// The block's own `type`, lifted out so a reader — a refusal message,
+        /// an operator grepping a log — can say *which* block this is without
+        /// re-parsing `block`. Never derived from `block` at read time: the two
+        /// are written together by the one canonicalization that refuses a
+        /// block with no type at all.
+        block_type: String,
+        /// The whole block, as a parsed value rather than as the client's bytes.
+        ///
+        /// **Parsed, deliberately, and this is the variant's load-bearing
+        /// choice.** Keeping the raw text would round-trip byte-exactly, but a
+        /// chained NeMo Relay re-serializes every intercepted body through an
+        /// alphabetizing `serde_json::Map` (synergy ruling S3, guard 1), so the
+        /// bytes a client sent and the bytes that reach us differ by key order
+        /// on the very next turn — and a prefix check over raw text would fork
+        /// every session behind a Relay, silently, while every turn still
+        /// answered. Two values parsed from differently ordered JSON compare
+        /// equal, and `serde_json`'s default map is a `BTreeMap`, so
+        /// [`ItemContent::render`] re-serializes in one canonical key order for
+        /// any given value. Order-insensitivity and render determinism come
+        /// from the same decision.
+        block: Value,
+    },
+}
+
+/// The one spelling of a tool call's arguments in this log.
+///
+/// **A canonical form, and it is what stops every tool-using session forking on
+/// its second turn (M11.2).** The argument string reaches this log from two
+/// directions that do not agree byte for byte on their own:
+///
+/// - The *model* produces it, and produces whatever it likes — keys in the order
+///   it thought of them, spaces after the colons.
+/// - The *client* sends the same call back on the next turn as history, and the
+///   Messages wire carries it as a JSON **object**, so canonicalizing that
+///   resend means serializing a parsed value: `serde_json`'s map is a
+///   `BTreeMap`, so the result is compact and key-sorted. A chained NeMo Relay
+///   re-serializes intercepted bodies through the same alphabetizing map
+///   (synergy S3, guard 1), so nothing upstream of here can preserve the model's
+///   spacing anyway.
+///
+/// Storing the model's bytes and comparing them against that resend fails on the
+/// very first tool call with more than one key — `{"pattern": …, "path": …}`
+/// against `{"path":…,"pattern":…}` — and prefix admission then forks the
+/// conversation into a fresh session, silently, while every turn still answers.
+/// So an emitted call is stored in the form its own resend will canonicalize to,
+/// and the serve projections put *that* string on the wire, which is what makes
+/// the round trip closed rather than merely likely.
+///
+/// A string that is not JSON at all passes through unchanged. It is not
+/// representable on either dialect's wire — the Messages `input` is an object
+/// and the client's accumulator throws on fragments that do not parse — so this
+/// is the honest fallback for a corrupt log rather than a supported shape, and
+/// silently replacing it with `{}` would hide the corruption.
+///
+/// **Since M11.2a's F7, an ordinary Anthropic-dialect dispatch can no longer
+/// hand this function such a string.** The decoder that produces the argument
+/// string in the first place — `ToolBlock::into_chunk` in
+/// `roundhouse-fleet`'s `anthropic_messages::stream`, reached through the same
+/// `Item::namespaced_tool_call(id, name, namespace, canonical_arguments(&arguments))`
+/// call this function's callers make — drops a tool call outright when its reassembled
+/// `input_json_delta` fragments do not parse, rather than emitting one for this
+/// function to fall back on. What remains reachable on the non-JSON arm here is
+/// a log written before that guarantee existed, a dialect whose decoder does
+/// not share it, or literal corruption — not a live turn on this one.
+pub fn canonical_arguments(raw: &str) -> String {
+    match serde_json::from_str::<Value>(raw) {
+        Ok(value) => value.to_string(),
+        Err(_) => raw.to_string(),
+    }
 }
 
 impl ItemContent {
@@ -67,13 +210,84 @@ impl ItemContent {
     pub fn render(&self) -> String {
         match self {
             ItemContent::Text { text } => text.clone(),
+            // **The namespace is left out, and that is the opposite of the
+            // `Thinking::signature` call below — deliberately, and for the same
+            // reasoning read the other way.** The signature is included because
+            // excluding it would let two genuinely different conversations hash
+            // to one turn id, and a turn id collision is a *second billed
+            // answer* attributed to the first. Here there is no such collision
+            // to buy: `call_id` already separates any two calls in one
+            // conversation, so a namespace in the render would distinguish
+            // nothing the id does not. What including it *would* buy is the
+            // failure in the other direction — every conversation already
+            // holding a control call would hash differently the day the field
+            // landed, and a client's in-flight retry would miss its own
+            // completed response and pay for the answer twice (M17, R-N6/R-N7).
+            // `the_turn_id_of_a_control_call_conversation_is_pinned_bare_and_namespaced`
+            // in `responses_api::wire` is the guard: one literal, two fixtures
+            // differing only in this field.
             ItemContent::ToolCall {
                 call_id,
                 name,
                 arguments,
+                namespace: _,
             } => format!("<tool_call id=\"{call_id}\" name=\"{name}\">{arguments}</tool_call>"),
             ItemContent::ToolResult { call_id, output } => {
                 format!("<tool_result id=\"{call_id}\">{output}</tool_result>")
+            }
+            // The signature rides the render, and it is not free: it is a few
+            // hundred base64 characters that the turn id needs and no model
+            // does. Excluding it would make two conversations that differ only
+            // in their signatures hash to one turn id, and the turn id is what
+            // makes a client's retry replay instead of paying twice — so the
+            // collision would be a *second billed answer* attributed to the
+            // first. The waste is bounded and visible; the collision would be
+            // neither. The day per-model chat templates land (see this
+            // function's own note), the prompt encoding and the identity
+            // encoding part company and this is the line that splits.
+            ItemContent::Thinking {
+                thinking,
+                signature,
+            } => format!("<thinking signature=\"{signature}\">{thinking}</thinking>"),
+            ItemContent::RedactedThinking { data } => {
+                format!("<redacted_thinking>{data}</redacted_thinking>")
+            }
+            // **A digest of the block, never the block.** This is the one
+            // variant whose body is unbounded: a pasted screenshot arrives as a
+            // `source.data` of roughly 1.35 base64 characters per image byte,
+            // so rendering it verbatim put a megabyte of base64 into all three
+            // things this function feeds at once — the prompt the provider is
+            // sent, the string [`crate::context`] tokenizes and the turn is
+            // billed for, and the input to `turn_id_for`. A 1 MB paste was
+            // therefore quoted, priced and dispatched as ~1.35M tokens of prose
+            // that no model can read back as a picture (M11.1 review, F5).
+            //
+            // What the digest keeps is everything the three readers need:
+            // *deterministic*, because `Display` for a `Value` is compact JSON
+            // over a `BTreeMap`, so the key order is the sorted one for every
+            // value alike — which is also what makes it order-insensitive, and
+            // a body re-encoded by a chained Relay digests identically;
+            // *identity-preserving*, because a block that changes changes its
+            // digest, so turn ids and prefix admission still move when the
+            // block moves; and *honest about size*, which the verbatim render
+            // was not. What it drops is the payload, which no reader of this
+            // string could use — a typed content-block path from
+            // [`ItemContent`] through the dispatch is what would let a model
+            // actually see the image, and that is the future work R5 names.
+            //
+            // `block_type` stays in the tag rather than inside the digest so
+            // two blocks whose bodies match but whose types differ cannot
+            // render alike, and so a refusal or a log line still says *which*
+            // block this is without a second parse.
+            //
+            // **Safe to change here and only here**: `Opaque` is new in M11.1,
+            // so no production log carries a turn id derived from the old
+            // render, and the stored `Value` is untouched — serde is not on
+            // this path, and a session that replays gets the same items it
+            // always did.
+            ItemContent::Opaque { block_type, block } => {
+                let digest = hex::encode(Sha256::digest(block.to_string().as_bytes()));
+                format!("<block type=\"{block_type}\" sha256=\"{digest}\">")
             }
         }
     }
@@ -85,12 +299,23 @@ pub struct Item {
     pub role: Role,
     pub content: ItemContent,
     /// Set on assistant items so `previous_response_id` can resolve to the
-    /// exact prefix a client is continuing from — and, since M4, the
-    /// provenance stamp on a server-emitted tool call. Client input always
-    /// canonicalizes with `None` and only the emission act
-    /// (`Session::complete_with_item`) sets it, so a stamped `ToolCall` in the
-    /// log means *we* emitted it and a client cannot forge one; `open_steers`
-    /// and the steering projection both key on exactly this distinction.
+    /// exact prefix a client is continuing from, and the provenance stamp on
+    /// anything this deployment produced. Client input always canonicalizes with
+    /// `None` and only the emission act (`Session::complete_with_item`) sets it,
+    /// so a stamped item in the log is one *we* wrote and a client cannot forge
+    /// one — which is what the wire projection's "may this go out on this
+    /// response" check reads.
+    ///
+    /// **What that no longer distinguishes, since M10.0.** While the steer was a
+    /// synthetic tool call, the stamp was also a free discriminator for *which*
+    /// item was the correction: a `ToolCall` bearing a response id could only be
+    /// ours, so the session fold read the shape and knew. A steer is assistant
+    /// text now — the same shape every dispatched turn's answer has — so nothing
+    /// about an item says it is a correction, and
+    /// `SessionState::steered_on_turn` is folded from `ValidationDecided`
+    /// instead. That is deliberate: it is also what keeps a resent history
+    /// carrying the guidance admitting as an ordinary prefix, with no exclusion
+    /// rule anywhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_id: Option<ResponseId>,
 }
@@ -123,21 +348,59 @@ impl Item {
     /// A tool call, with no provenance.
     ///
     /// `response_id` is deliberately `None`, and it is the constructor's whole
-    /// point: a call built here is just a call. Only
+    /// point: a call built here is just a call. Two sites stamp a response onto
+    /// one —
     /// [`Session::complete_with_item`](crate::session::Session::complete_with_item)
-    /// stamps a response onto one, which is what lets a stamped `ToolCall` in
-    /// the log mean "this deployment emitted it" rather than "somebody set a
-    /// field". The input path cannot produce a stamp — the wire layer's
-    /// canonicalization sets `None` on everything a client sends — so the
-    /// provenance marker is not something a client can forge.
+    /// for a turn answered at the interjection seam, and
+    /// [`Session::append_emitted`](crate::session::Session::append_emitted) for
+    /// an ordinary dispatched turn's tool calls, committed as each is produced
+    /// rather than held for the completion (M11.2) — and no third path exists,
+    /// which is what lets a stamped `ToolCall` in the log mean "this deployment
+    /// emitted it" rather than "somebody set a field". The input path cannot
+    /// produce a stamp — the wire layer's canonicalization sets `None` on
+    /// everything a client sends — so the provenance marker is not something a
+    /// client can forge.
     ///
-    /// The name is the bare one. A namespace belongs to a client dialect and
-    /// lives in the wire projection: canonicalization ignores it on the way
-    /// in, so a namespaced resend and a flat one arrive as this same item, and
-    /// the log keeps one spelling per tool.
+    /// **The name is the one its own client sent, and this constructor means
+    /// "no namespace field"** — see [`Item::namespaced_tool_call`] for the two
+    /// inbound paths that have one.
+    ///
+    /// The doc this replaces claimed the name was always the bare one and that
+    /// "a namespaced resend and a flat one arrive as this same item". Both
+    /// halves were false, and M12's review found the second one (F10):
+    /// `responses_api::wire`'s
+    /// `a_flat_spelling_is_a_different_canonical_call_until_the_wire_learns_to_split_it`
+    /// pins the divergence with an `assert_ne!`, and the Messages surface
+    /// stores `mcp__roundhouse__status` rather than a bare name at all. The
+    /// sentence was left standing on the one doc a migration author reads
+    /// first, which is exactly the reasoning-by-stale-doc that gets a future
+    /// change waved through — so M17 (R-N10) corrects it here rather than only
+    /// in the two modules that already knew.
     pub fn tool_call(
         call_id: impl Into<String>,
         name: impl Into<String>,
+        arguments: impl Into<String>,
+    ) -> Self {
+        Self::namespaced_tool_call(call_id, name, None, arguments)
+    }
+
+    /// A tool call whose client spelled the MCP namespace as its own field.
+    ///
+    /// Two inbound paths reach this and no third exists: the Responses
+    /// canonicalization, reading the `namespace` a codex client sends beside
+    /// the name, and the fleet's Responses decoder, reading the one an upstream
+    /// model sends back. Everything else keeps meaning [`Self::tool_call`] —
+    /// the Messages surface most of all, where the flat spelling *is* the
+    /// namespace (see [`ItemContent::ToolCall::namespace`](ItemContent)).
+    ///
+    /// `Option<String>` rather than two constructors because the field is
+    /// optional *on the wire*: a plain (non-MCP) function tool sends no
+    /// `namespace` at all, and a caller that had to choose a constructor per
+    /// call would be deciding at the call site what the client already said.
+    pub fn namespaced_tool_call(
+        call_id: impl Into<String>,
+        name: impl Into<String>,
+        namespace: Option<String>,
         arguments: impl Into<String>,
     ) -> Self {
         Self {
@@ -146,6 +409,7 @@ impl Item {
                 call_id: call_id.into(),
                 name: name.into(),
                 arguments: arguments.into(),
+                namespace,
             },
             response_id: None,
         }
@@ -170,10 +434,25 @@ impl Item {
     /// `match` at that site would work today and would answer wrongly the day
     /// a third completion shape is added, because the *default* it would have
     /// to pick is the unsafe one.
+    ///
+    /// **Thinking is not spoken output**, and that is the one arm here worth
+    /// arguing about. A thinking block is text, it is the assistant's, and a
+    /// caller reaching for "what did the model say" could plausibly want it —
+    /// but the callers are the interjection seam's completion and the validate
+    /// loop's signals, and both ask this question in order to *judge the
+    /// answer*. Reading reasoning as answer text would make a turn that
+    /// deliberated at length and then said nothing look like a turn that
+    /// answered, which is precisely the failure the no-progress and
+    /// empty-answer signals exist to catch. Redacted thinking is ciphertext and
+    /// an opaque block is a shape nobody has read; neither is prose either.
     pub fn spoken_text(&self) -> &str {
         match &self.content {
             ItemContent::Text { text } => text,
-            ItemContent::ToolCall { .. } | ItemContent::ToolResult { .. } => "",
+            ItemContent::ToolCall { .. }
+            | ItemContent::ToolResult { .. }
+            | ItemContent::Thinking { .. }
+            | ItemContent::RedactedThinking { .. }
+            | ItemContent::Opaque { .. } => "",
         }
     }
 }
@@ -181,6 +460,38 @@ impl Item {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M17 review F4: `canonical_arguments`'s doc comment (see the block
+    /// above this function) still describes the F7 decoder join as reached
+    /// through the pre-M17 `Item::tool_call(id, name,
+    /// canonical_arguments(&arguments))` three-argument call. M17 (R-N6)
+    /// added the namespace parameter and every caller — `engine.rs` and
+    /// `frontier.rs` — now spells `Item::namespaced_tool_call(id, name,
+    /// namespace, canonical_arguments(&arguments))`. This test reaches the
+    /// doc comment as data (via `include_str!`, since rustdoc text is not
+    /// otherwise inspectable at runtime) and fails while the stale
+    /// three-argument call shape is still the sentence describing the join.
+    #[test]
+    fn canonical_arguments_doc_names_current_join_call_shape() {
+        // Sliced up to (not including) `mod tests`: the whole-file version is
+        // a tautology — this very assertion's string literal retypes the
+        // three-argument call shape it searches for, so `include_str!`
+        // reading the whole file would find its own quotation of the stale
+        // shape however the doc comment above was mutated. `routing::stage`
+        // and `roundhouse-mcp`'s `lib.rs` learned that the expensive way; the
+        // slice is the fix, copied from there rather than rediscovered.
+        let src = include_str!("item.rs")
+            .split("\n#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(
+            !src.contains("Item::tool_call(id, name, canonical_arguments(&arguments))"),
+            "canonical_arguments' doc comment still spells the pre-M17 \
+             three-argument Item::tool_call join; callers now use \
+             Item::namespaced_tool_call(id, name, namespace, \
+             canonical_arguments(&arguments)) (engine.rs, frontier.rs)"
+        );
+    }
 
     #[test]
     fn rendering_is_stable_across_calls() {
@@ -197,10 +508,404 @@ mod tests {
                 call_id: "c1".into(),
                 name: "grep".into(),
                 arguments: "{\"q\":\"x\"}".into(),
+                namespace: None,
             },
             response_id: None,
         };
         assert_eq!(call.render(), call.render());
         assert!(call.render().contains("name=\"grep\""));
+    }
+
+    fn item(content: ItemContent) -> Item {
+        Item {
+            role: Role::Assistant,
+            content,
+            response_id: None,
+        }
+    }
+
+    /// **A record written before M11.1 still reads, and still writes back the
+    /// same way.**
+    ///
+    /// The literals are the point. An argument that three added variants cannot
+    /// disturb three existing ones is true of every additive change right up
+    /// until someone reorders a field, renames a tag, or reaches for
+    /// `#[serde(untagged)]` — and the log is durable, so the first symptom of
+    /// getting it wrong is a session that can no longer be replayed at all.
+    /// Both directions are asserted: reading proves an old record still
+    /// deserializes, writing proves a *new* build does not start emitting a
+    /// shape an older build could not read back.
+    #[test]
+    fn a_pre_m11_log_record_still_deserializes() {
+        for stored in [
+            r#"{"role":"user","content":{"type":"text","text":"hello"}}"#,
+            r#"{"role":"assistant","content":{"type":"text","text":"hi"},"response_id":"resp_1"}"#,
+            r#"{"role":"assistant","content":{"type":"tool_call","call_id":"c1","name":"grep","arguments":"{}"}}"#,
+            r#"{"role":"tool","content":{"type":"tool_result","call_id":"c1","output":"3 hits"}}"#,
+        ] {
+            let item: Item = serde_json::from_str(stored).unwrap_or_else(|error| {
+                panic!("pre-M11.1 record must still read: {stored} ({error})")
+            });
+            assert_eq!(
+                serde_json::to_string(&item).expect("an item serializes"),
+                stored,
+                "a new build must write the old shape byte for byte"
+            );
+        }
+    }
+
+    /// **M17: a tool call written before the namespace field existed still
+    /// reads and still writes back without it, and one written with it round
+    /// trips.**
+    ///
+    /// The pair is the guard on `skip_serializing_if`, and each half fails a
+    /// different way. Drop the attribute and the first literal starts writing
+    /// back `"namespace":null` — a byte-for-byte change to a shape every stored
+    /// record is in, and the failure
+    /// `a_pre_m11_log_record_still_deserializes` exists to catch. Drop
+    /// `default` and the same literal stops *reading* at all, which is a log
+    /// that can no longer be replayed. Write the field under any other key, or
+    /// anywhere but last, and the second literal moves — and a record a running
+    /// node already wrote is a record its successor cannot round trip.
+    ///
+    /// Pinned against literals rather than round-tripped through this build's
+    /// own encoder for the reason the two neighbours are: an encode-then-decode
+    /// with the same code is self-consistent by construction and would stay
+    /// green through a rename of the key it is meant to pin.
+    #[test]
+    fn a_tool_call_reads_and_writes_the_same_way_with_and_without_a_namespace() {
+        for stored in [
+            r#"{"role":"assistant","content":{"type":"tool_call","call_id":"c1","name":"status","arguments":"{}"}}"#,
+            r#"{"role":"assistant","content":{"type":"tool_call","call_id":"c1","name":"status","arguments":"{}","namespace":"mcp__roundhouse"}}"#,
+        ] {
+            let item: Item = serde_json::from_str(stored)
+                .unwrap_or_else(|error| panic!("a stored tool call must read: {stored} ({error})"));
+            assert_eq!(
+                serde_json::to_string(&item).expect("an item serializes"),
+                stored,
+                "a tool call must write back the shape it was read from, byte \
+                 for byte"
+            );
+        }
+
+        // What each literal became, so a failure above says *which* half of the
+        // asymmetry moved rather than only that the bytes did.
+        let bare: Item = serde_json::from_str(
+            r#"{"role":"assistant","content":{"type":"tool_call","call_id":"c1","name":"status","arguments":"{}"}}"#,
+        )
+        .expect("the pre-M17 record reads");
+        assert_eq!(bare, Item::tool_call("c1", "status", "{}"));
+
+        let namespaced: Item = serde_json::from_str(
+            r#"{"role":"assistant","content":{"type":"tool_call","call_id":"c1","name":"status","arguments":"{}","namespace":"mcp__roundhouse"}}"#,
+        )
+        .expect("the namespaced record reads");
+        assert_eq!(
+            namespaced,
+            Item::namespaced_tool_call("c1", "status", Some("mcp__roundhouse".into()), "{}")
+        );
+        assert_ne!(
+            bare, namespaced,
+            "a stored `None` and a stored `Some` are different records, which \
+             is what prefix admission's asymmetric rule is about: they compare \
+             unequal here and the admission check is the one place that \
+             deliberately does not"
+        );
+    }
+
+    /// **The render is blind to the namespace, and the two halves above are
+    /// not.**
+    ///
+    /// `responses_api::wire` pins the resulting turn id; this pins the input to
+    /// it, one crate down and against the shape a caller can see, so an edit
+    /// that folded the field into the render says *which* rendering moved
+    /// rather than only that a hash did.
+    #[test]
+    fn the_namespace_is_not_in_the_render() {
+        let bare = Item::tool_call("c1", "status", "{}");
+        let namespaced =
+            Item::namespaced_tool_call("c1", "status", Some("mcp__roundhouse".into()), "{}");
+
+        assert_eq!(
+            bare.render(),
+            "<|assistant|><tool_call id=\"c1\" name=\"status\">{}</tool_call>"
+        );
+        assert_eq!(
+            namespaced.render(),
+            bare.render(),
+            "carrying the namespace must not move the turn id of any \
+             conversation holding a control call — an in-flight retry that \
+             missed its own completed response would buy a second billed answer"
+        );
+    }
+
+    /// **The three M11.1 variants' own shipped tags, pinned against literal
+    /// JSON — the same discipline `a_pre_m11_log_record_still_deserializes`
+    /// applies to the three shapes that predate them.**
+    ///
+    /// "Three added variants don't disturb three existing ones" stops being
+    /// true the moment someone renames a tag, and that argument does not stop
+    /// applying to Thinking, RedactedThinking and Opaque themselves the instant
+    /// they ship: a record already durably stored under today's tag spelling
+    /// (`"thinking"`, `"redacted_thinking"`, `"opaque"`) has to keep reading
+    /// tomorrow, not only today. Pinned against literals rather than
+    /// round-tripped through this build's own encoder, for the reason the
+    /// pre-M11.1 test is: `the_new_variants_round_trip_through_the_log_encoding`
+    /// encodes and decodes with the *same* code in one call, so it is
+    /// self-consistent by construction and cannot see a tag drift — it would
+    /// stay green even if every one of these three tags were renamed at once.
+    #[test]
+    fn the_m11_1_variants_shipped_tags_still_read() {
+        for stored in [
+            r#"{"role":"assistant","content":{"type":"thinking","thinking":"step one","signature":"sig"},"response_id":"resp_1"}"#,
+            r#"{"role":"assistant","content":{"type":"redacted_thinking","data":"opaque"},"response_id":"resp_1"}"#,
+            r#"{"role":"assistant","content":{"type":"opaque","block_type":"image","block":{"type":"image"}},"response_id":"resp_1"}"#,
+        ] {
+            let item: Item = serde_json::from_str(stored).unwrap_or_else(|error| {
+                panic!("a record already stored under today's M11.1 tags must still read: {stored} ({error})")
+            });
+            assert_eq!(
+                serde_json::to_string(&item).expect("an item serializes"),
+                stored,
+                "a later build must write the same shape it reads, byte for byte"
+            );
+        }
+    }
+
+    /// The renders of the three pre-M11.1 shapes, pinned as literals.
+    ///
+    /// Turn ids are FNV over exactly these strings and a client's retry is
+    /// deduplicated by hashing to the same one, so a render that moved would
+    /// orphan every in-flight retry in the fleet. `responses_api::wire` pins the
+    /// resulting hash; this pins the input to it, so a change that moves the
+    /// hash says *which* rendering moved instead of only that one did.
+    #[test]
+    fn the_pre_m11_renders_are_pinned() {
+        assert_eq!(Item::user_text("hello").render(), "<|user|>hello");
+        assert_eq!(
+            item(ItemContent::ToolCall {
+                call_id: "c1".into(),
+                name: "grep".into(),
+                arguments: "{\"q\":\"x\"}".into(),
+                namespace: None,
+            })
+            .render(),
+            "<|assistant|><tool_call id=\"c1\" name=\"grep\">{\"q\":\"x\"}</tool_call>"
+        );
+        assert_eq!(
+            item(ItemContent::ToolResult {
+                call_id: "c1".into(),
+                output: "3 hits".into(),
+            })
+            .render(),
+            "<|assistant|><tool_result id=\"c1\">3 hits</tool_result>"
+        );
+    }
+
+    /// Every new variant renders, renders the same way twice, and renders
+    /// differently from the others.
+    ///
+    /// "Injective enough" is the standard `render` has always held itself to —
+    /// a `Text` item whose text is literally `<tool_call …>` collides with a
+    /// real call, and has since M0 — so what is asserted is the property the
+    /// turn id actually needs: no two *shapes* collapse, and no field a variant
+    /// carries is dropped on the floor where two values differing only in it
+    /// would hash alike.
+    #[test]
+    fn the_new_variants_render_deterministically_and_distinctly() {
+        let renders: Vec<String> = [
+            ItemContent::Thinking {
+                thinking: "step one".into(),
+                signature: "sig_a".into(),
+            },
+            // Same reasoning, different signature: a different block upstream,
+            // and it must be a different render or two conversations collide on
+            // one turn id.
+            ItemContent::Thinking {
+                thinking: "step one".into(),
+                signature: "sig_b".into(),
+            },
+            ItemContent::RedactedThinking {
+                data: "step one".into(),
+            },
+            ItemContent::Opaque {
+                block_type: "image".into(),
+                block: serde_json::json!({ "type": "image", "source": { "type": "base64" } }),
+            },
+            // The same body under a different block type. The type is in the
+            // tag precisely so this pair does not collapse.
+            ItemContent::Opaque {
+                block_type: "document".into(),
+                block: serde_json::json!({ "type": "image", "source": { "type": "base64" } }),
+            },
+            ItemContent::Text {
+                text: "step one".into(),
+            },
+        ]
+        .iter()
+        .map(|content| {
+            let rendered = content.render();
+            // Eight calls, not two. `Value`'s own `Display` is deterministic
+            // (a `BTreeMap` underneath — see `ItemContent::render`'s doc), so
+            // this is redundant against the shipped implementation, but it is
+            // the direct guard for that property and it must actually hold
+            // one on its own: an implementation that rebuilt the rendered
+            // string from a fresh `HashMap` per call (a regression this
+            // module's own review history has seen — a chained Relay
+            // re-encodes intercepted bodies, so key order is not something a
+            // future edit gets to assume away) would have its default
+            // per-thread `RandomState` seed only one increment apart between
+            // two back-to-back calls, which for a handful of keys lands on
+            // the same iteration order often enough that two calls alone
+            // pass by chance a third of the time. Eight independent calls
+            // agreeing by that same chance is far less likely, without
+            // asserting anything about `HashMap` internals directly.
+            for _ in 0..8 {
+                assert_eq!(rendered, content.render(), "render must be a function");
+            }
+            rendered
+        })
+        .collect();
+
+        for (i, left) in renders.iter().enumerate() {
+            for right in &renders[i + 1..] {
+                assert_ne!(left, right, "two distinct blocks rendered alike");
+            }
+        }
+    }
+
+    /// **Key order in an opaque block changes nothing.**
+    ///
+    /// The guard for synergy ruling S3's first chain hazard: a chained NeMo
+    /// Relay re-serializes intercepted bodies through an alphabetizing
+    /// `serde_json::Map`, so the second turn of a conversation arrives with its
+    /// object keys in a different order than the first. Storing the client's
+    /// raw bytes would make that a prefix disagreement — every session behind a
+    /// Relay forking on turn two, while every turn still answered.
+    #[test]
+    fn an_opaque_block_is_insensitive_to_key_order() {
+        let sent = r#"{"type":"image","source":{"type":"base64","data":"AA"},"index":2}"#;
+        let relayed = r#"{"index":2,"source":{"data":"AA","type":"base64"},"type":"image"}"#;
+
+        let block = |json: &str| ItemContent::Opaque {
+            block_type: "image".into(),
+            block: serde_json::from_str(json).expect("the fixture is JSON"),
+        };
+        assert_eq!(
+            block(sent),
+            block(relayed),
+            "prefix admission compares content, and a re-encoded body must compare equal"
+        );
+        assert_eq!(
+            block(sent).render(),
+            block(relayed).render(),
+            "and the turn id is over the render, so it must agree too"
+        );
+    }
+
+    /// **An opaque block renders as a digest, never as its payload.**
+    ///
+    /// The guard for M11.1's F5. `render` is the prompt encoding, the
+    /// token-count encoding and the identity encoding at once, and an opaque
+    /// block is the only variant whose body has no bound — a pasted screenshot
+    /// is base64 in `source.data`. Rendering it verbatim billed and dispatched
+    /// the image as prose at roughly one token per base64 character.
+    ///
+    /// Three assertions, because the fix has to keep two properties while
+    /// dropping one: the payload is *gone* from the string, the string's length
+    /// does not move with the payload's, and the identity still does — a
+    /// digest that ignored the body would make every image in a conversation
+    /// the same block and hand a client somebody else's cached answer.
+    #[test]
+    fn an_opaque_block_renders_as_a_digest_rather_than_its_bytes() {
+        let image = |data: &str| ItemContent::Opaque {
+            block_type: "image".into(),
+            block: serde_json::json!({
+                "type": "image",
+                "source": { "type": "base64", "media_type": "image/png", "data": data },
+            }),
+        };
+        let payload = "A".repeat(4096);
+        let rendered = image(&payload).render();
+
+        assert!(
+            !rendered.contains(&payload),
+            "the payload is in the prompt, the token count and the turn id: {rendered}"
+        );
+        assert_eq!(
+            rendered.len(),
+            image("AA").render().len(),
+            "a render whose length moves with the payload is one the tokenizer \
+             bills for the payload: {rendered}"
+        );
+        assert_ne!(
+            rendered,
+            image(&format!("{payload}B")).render(),
+            "two different blocks must render differently, or prefix admission \
+             and `turn_id_for` stop moving when the block moves"
+        );
+    }
+
+    /// None of the three is answer text.
+    ///
+    /// The control is the arm that *is*: without it a `spoken_text` that
+    /// returned `""` unconditionally would pass, and the claim would be
+    /// tautological.
+    #[test]
+    fn thinking_is_never_spoken_output() {
+        for content in [
+            ItemContent::Thinking {
+                thinking: "the user probably wants X".into(),
+                signature: "sig".into(),
+            },
+            ItemContent::RedactedThinking {
+                data: "opaque".into(),
+            },
+            ItemContent::Opaque {
+                block_type: "image".into(),
+                block: serde_json::json!({ "type": "image" }),
+            },
+        ] {
+            assert_eq!(
+                item(content).spoken_text(),
+                "",
+                "the validate loop's signals must not read reasoning as an answer"
+            );
+        }
+        assert_eq!(
+            item(ItemContent::Text {
+                text: "the answer".into()
+            })
+            .spoken_text(),
+            "the answer"
+        );
+    }
+
+    /// The three new variants round-trip through the durable log's encoding.
+    #[test]
+    fn the_new_variants_round_trip_through_the_log_encoding() {
+        for content in [
+            ItemContent::Thinking {
+                thinking: "step one".into(),
+                signature: "sig".into(),
+            },
+            ItemContent::RedactedThinking {
+                data: "opaque".into(),
+            },
+            ItemContent::Opaque {
+                block_type: "server_tool_use".into(),
+                block: serde_json::json!({
+                    "type": "server_tool_use",
+                    "id": "srvtoolu_1",
+                    "name": "web_search",
+                    "input": { "query": "rust" },
+                }),
+            },
+        ] {
+            let original = item(content);
+            let encoded = serde_json::to_string(&original).expect("an item serializes");
+            let decoded: Item = serde_json::from_str(&encoded).expect("what we wrote, we can read");
+            assert_eq!(decoded, original, "round trip changed the item: {encoded}");
+        }
     }
 }

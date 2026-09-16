@@ -74,11 +74,17 @@ All keys for a session share a Redis Cluster hash tag so the multi-key lease
 and append operations stay single-slot — cluster-safe from day one even though
 the first client is single-node:
 
+<!-- Updated 2026-09-03 (M14.2, R-S3): every key gained a namespace and a
+     schema-version segment through the crate's one build_key. `rh` below is
+     the default KeyNamespace — an operator names their own with
+     ROUNDHOUSE_REDIS_NAMESPACE — and `v1` is this family's KeyFamily::version.
+     No deployment held the pre-rule shape below; none had shipped yet. -->
+
 | Key | Type | Holds |
 |---|---|---|
-| `rh:{<session_id>}:meta` | string | JSON `{model_policy, created_at_ms}`, written with `SET NX` |
-| `rh:{<session_id>}:lease` | hash | holder's `node_id` and fencing token, with key expiry |
-| `rh:{<session_id>}:log` | stream | one entry per event, explicit ID `<seq>-0` |
+| `rh:v1:sess:{<session_id>}:meta` | string | JSON `{model_policy, created_at_ms}`, written with `SET NX` |
+| `rh:v1:sess:{<session_id>}:lease` | hash | holder's `node_id` and fencing token, with key expiry |
+| `rh:v1:sess:{<session_id>}:log` | stream | one entry per event, explicit ID `<seq>-0` |
 
 `create_session` is `SET NX` on `meta`; the reply distinguishes created from
 already-existed. Session ids are minted as `sess_<uuid-simple>` so they are

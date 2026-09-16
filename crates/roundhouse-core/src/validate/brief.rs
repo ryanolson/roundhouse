@@ -91,17 +91,34 @@ impl Objective {
     /// and not in the log, so it reaches the brief from the interjection
     /// context. This is the fallback every session has.
     pub fn from_items(items: &[Item]) -> Objective {
-        items
-            .iter()
-            .rev()
-            .find_map(|item| match (&item.role, &item.content) {
-                (Role::User, ItemContent::Text { text }) if !text.trim().is_empty() => {
-                    Some(Objective::LastUserMessage(text.clone()))
-                }
-                _ => None,
-            })
+        trailing_user_request(items)
+            .map(|text| Objective::LastUserMessage(text.to_string()))
             .unwrap_or(Objective::Unknown)
     }
+}
+
+/// The last thing the human asked for, as the log has it.
+///
+/// **One definition, two readers.** The brief calls it the objective's fallback
+/// and the text steer calls it the pending request, and they must be the same
+/// span of bytes: a steer that restated one request while the judge was briefed
+/// on another would be correcting an agent against a task nobody set. Extracted
+/// as a function rather than left inline in [`Objective::from_items`] for
+/// exactly that reason — the second caller arrived with M10.0 and the two
+/// answers have to be one answer by construction.
+///
+/// `None` where the trailing input is not user text: a resent history ending in
+/// a tool result, or a session whose only user messages are whitespace. Callers
+/// render that absence rather than an empty string — see
+/// [`render_steer_answer`](crate::validate::render_steer_answer).
+pub fn trailing_user_request(items: &[Item]) -> Option<&str> {
+    items
+        .iter()
+        .rev()
+        .find_map(|item| match (&item.role, &item.content) {
+            (Role::User, ItemContent::Text { text }) if !text.trim().is_empty() => Some(&**text),
+            _ => None,
+        })
 }
 
 /// How much of a session the judge is shown.
@@ -179,7 +196,7 @@ impl ValidationBrief {
             .collect();
         ValidationBrief {
             instructions: instructions_of(items)
-                .map(|text| truncate(text, config.instruction_chars)),
+                .map(|text| truncate(&text, config.instruction_chars)),
             objective: truncate_objective(objective, config.objective_chars),
             steps,
             facts,
@@ -319,14 +336,43 @@ fn compact(index: u32, call: &Exchange, head: usize) -> BriefStep {
     }
 }
 
-/// The first system or developer text in the session.
-fn instructions_of(items: &[Item]) -> Option<&str> {
-    items
+/// The session's instruction block: its **leading run** of system or developer
+/// text, oldest first.
+///
+/// **The run, not the first item of it** (M11.1 review, finding F4). A dialect
+/// whose clients send instructions as one string produces one item and this is
+/// unchanged for them. Anthropic's Messages clients send `system` as a *list of
+/// blocks*, and the shipping Claude Code puts a ~70-byte billing attribution
+/// pseudo-header in block 0, its own identity line in block 1, and the actual
+/// multi-KB system prompt in block 2 — so a reader that took the first item
+/// handed the judge billing metadata and called it the task. Every drift,
+/// no-progress and steer verdict for every such session was then decided
+/// against a header.
+///
+/// Concatenated rather than searched for the "real" one, and that is the
+/// client-agnostic reading: nothing here knows what an attribution header looks
+/// like, and a rule that did would be a rule that breaks the next time the
+/// client re-orders its blocks or another client ships a different preamble.
+/// The instruction budget the caller already applies does the bounding — the
+/// first blocks are small, so the budget spends almost all of itself on the
+/// prompt that matters.
+///
+/// The run stops at the first item that is not system/developer *text*, which
+/// is what keeps a mid-conversation system message — history, at a position the
+/// conversation agrees on — out of the instructions. It is the same boundary
+/// prefix admission draws (see
+/// [`is_turn_configuration`](crate::session::is_turn_configuration)), and it is
+/// drawn the same way here so the judge is briefed on exactly the block the
+/// session treats as its configuration.
+fn instructions_of(items: &[Item]) -> Option<String> {
+    let run: Vec<&str> = items
         .iter()
-        .find_map(|item| match (&item.role, &item.content) {
+        .map_while(|item| match (&item.role, &item.content) {
             (Role::System | Role::Developer, ItemContent::Text { text }) => Some(text.as_str()),
             _ => None,
         })
+        .collect();
+    (!run.is_empty()).then(|| run.join("\n"))
 }
 
 fn truncate_objective(objective: Objective, limit: usize) -> Objective {
@@ -430,6 +476,8 @@ mod tests {
             billing: Default::default(),
             budget_draw: None,
             withheld_providers: Vec::new(),
+            declared_baseline: None,
+            attempts: Vec::new(),
         };
 
         let items = vec![
@@ -439,14 +487,43 @@ mod tests {
             result("c1", "ImportError: no module named app"),
             call("c2", "pytest", r#"{"path":"tests/"}"#),
             result("c2", "ImportError: no module named app"),
+            // Four rather than two, so every signal in the default set that can
+            // fire on this shape does: the repeat needs three occurrences and
+            // the build pit four consecutive uncategorised calls.
+            call("c3", "pytest", r#"{"path":"tests/"}"#),
+            result("c3", "ImportError: no module named app"),
+            call("c4", "pytest", r#"{"path":"tests/"}"#),
+            result("c4", "ImportError: no module named app"),
         ];
+        // Every fact the default signal set would state about these items, the
+        // two ported ones included — taken from the signals themselves rather
+        // than typed out, so a signal whose wording later grows a model name or
+        // a number that looks like a price is caught here and not in review.
+        let evidence = crate::validate::Evidence {
+            exchanges: crate::validate::exchanges(&items),
+            turn_tokens: &[],
+            dialect: crate::validate::ControlCallDialect::ClaudeMessages,
+        };
+        let facts: Vec<String> = crate::validate::default_signals()
+            .iter()
+            .filter_map(|signal| signal.detect(&evidence))
+            .collect();
+        // A tripwire on the default set, not a loose sanity check: an exact
+        // count is what makes a *new* signal's wording arrive here to be
+        // scanned rather than slipping into the brief unexamined. If a fifth
+        // signal starts firing on this fixture, add its assertion below — do
+        // not loosen this to `>=`, which is how the guard stops covering the
+        // thing it exists for.
+        assert_eq!(
+            facts.len(),
+            3,
+            "the repeat and both ported signals fire on this fixture, which is \
+             what makes their wording part of what this guard covers: {facts:?}"
+        );
         let brief = ValidationBrief::build(
             &items,
             Objective::from_items(&items),
-            vec![
-                "the call `pytest` has produced identical output 2 times in the last 2 tool calls"
-                    .into(),
-            ],
+            facts,
             BriefConfig::default(),
         );
         let rendered = brief.render();
@@ -494,7 +571,11 @@ mod tests {
         assert!(rendered.contains("the parser drops trailing commas"));
         assert!(rendered.contains("pytest"));
         assert!(rendered.contains(&brief.steps[0].argument_hash));
-        assert!(rendered.contains("produced identical output 2 times"));
+        assert!(rendered.contains("produced identical output 4 times"));
+        // The two ported signals' wording reaches the judge too, and is scanned
+        // for the same forbidden strings as everything else above.
+        assert!(rendered.contains("carried a recognised failure"));
+        assert!(rendered.contains("with no file read, written or edited"));
         assert!(
             !rendered.contains("consider") && !rendered.contains("recommend"),
             "facts, never suggestions"

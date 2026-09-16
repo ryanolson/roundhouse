@@ -12,6 +12,7 @@
 mod common;
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering::SeqCst;
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -19,7 +20,6 @@ use sha2::{Digest, Sha256};
 use roundhouse_core::control::{Principal, TurnPolicy};
 use roundhouse_core::ids::SessionId;
 use roundhouse_mcp::reads::SessionFacts;
-use roundhouse_mcp::store::SteerRecord;
 use roundhouse_mcp::surface::ControlSurface;
 use roundhouse_mcp::{
     ControlPlaneSurface, ControlStore, ToolCall, ToolOutcome, descriptors, dispatch,
@@ -34,12 +34,94 @@ async fn call(
     name: &str,
     arguments: Value,
 ) -> ToolOutcome {
+    call_correlated(surface, principal, name, arguments, None, None).await
+}
+
+/// The same, from inside a Claude Code tool loop.
+///
+/// `tool_use_id` is what Claude Code puts in `_meta["claudecode/toolUseId"]`
+/// on a `tools/call` — the id of the `tool_use` block roundhouse emitted and
+/// this call is answering (M12, R-M2).
+async fn call_answering(
+    surface: &dyn ControlSurface,
+    principal: &Principal,
+    name: &str,
+    arguments: Value,
+    tool_use_id: &str,
+) -> ToolOutcome {
+    call_correlated(surface, principal, name, arguments, None, Some(tool_use_id)).await
+}
+
+/// The same, from inside a Codex thread.
+///
+/// `thread_id` is what Codex puts in `_meta.threadId` on **every**
+/// `tools/call`, and it is that turn's `prompt_cache_key` — so the surface
+/// resolves it as a *name* in the caller's own namespace (M12.1, R-M7).
+async fn call_in_thread(
+    surface: &dyn ControlSurface,
+    principal: &Principal,
+    name: &str,
+    arguments: Value,
+    thread_id: &str,
+) -> ToolOutcome {
+    call_correlated(surface, principal, name, arguments, Some(thread_id), None).await
+}
+
+/// One dispatched call, with whichever correlators the client attached.
+///
+/// The three helpers above are the three real clients — none, one, the other —
+/// and they all land here so that "which correlators were sent" is a property
+/// of the call site rather than of which wrapper someone reached for.
+async fn call_correlated(
+    surface: &dyn ControlSurface,
+    principal: &Principal,
+    name: &str,
+    arguments: Value,
+    thread_id: Option<&str>,
+    tool_use_id: Option<&str>,
+) -> ToolOutcome {
     dispatch(
         surface,
         principal,
         ToolCall {
             name: name.to_string(),
             arguments,
+            correlators: roundhouse_mcp::Correlators {
+                thread_id: thread_id.map(str::to_string),
+                tool_use_id: tool_use_id.map(str::to_string),
+                cache_key: None,
+            },
+        },
+    )
+    .await
+}
+
+/// One dispatched call carrying all three correlators at once — the shape
+/// none of the three callers above can produce, and the one an ordering
+/// claim needs: `resolve_session`'s thread arm, cache-key arm and
+/// tool-use-id arm are each consulted only when every one before it
+/// answered nothing, so proving the thread arm wins requires the other two
+/// to be *answerable*, not merely absent.
+async fn call_with_every_correlator(
+    surface: &dyn ControlSurface,
+    principal: &Principal,
+    name: &str,
+    arguments: Value,
+    thread_id: &str,
+    cache_key: &str,
+    tool_use_id: &str,
+) -> ToolOutcome {
+    dispatch(
+        surface,
+        principal,
+        ToolCall {
+            name: name.to_string(),
+            arguments,
+            correlators: roundhouse_mcp::Correlators {
+                thread_id: Some(thread_id.to_string()),
+                cache_key: Some(cache_key.to_string()),
+                tool_use_id: Some(tool_use_id.to_string()),
+            },
         },
     )
     .await
@@ -53,19 +135,6 @@ fn served(outcome: &ToolOutcome) -> Value {
         outcome.text()
     );
     serde_json::from_str(outcome.text()).expect("a served tool answers with JSON")
-}
-
-fn steer_for(principal: Principal, id: &str) -> SteerRecord {
-    let session = SessionId::new(format!("{}sess_1", principal.namespace_prefix()));
-    SteerRecord {
-        steer_id: id.into(),
-        session,
-        principal,
-        guidance: "the task named src/parser.rs; you are editing src/main.rs".into(),
-        emitted_at_ms: 1_700_000_000_123,
-        outcome: None,
-        outcome_note: None,
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -85,6 +154,16 @@ fn the_tool_list_is_stable_and_golden_pinned() {
     // folds it into the prompt, so every session in a deployment re-primes its
     // prompt cache the moment it moves. Update the literal only once the change
     // is the intended one.
+    //
+    // **What the digest covers is name, description and schema, and not the
+    // MCP annotations**, which also go on the wire in `tools/list`. They are
+    // pinned instead by
+    // `every_tool_states_what_it_does_to_a_client_that_was_handed_no_config`,
+    // which asserts the exact triple per tool rather than hashing it, because
+    // the useful failure there names the tool and the hint rather than saying
+    // a digest moved. The split is why adding the hints (F06) left this
+    // literal untouched -- worth knowing before reading the digest as a pin on
+    // everything a client sees.
     let list: Vec<Value> = descriptors()
         .into_iter()
         .map(|tool| {
@@ -98,12 +177,38 @@ fn the_tool_list_is_stable_and_golden_pinned() {
     let canonical = serde_json::to_string(&list).expect("the tool list serializes");
     assert_eq!(
         hex_digest(&canonical),
-        // Moved once since M5 shipped, deliberately and for one reason: two
-        // descriptions said things the deployment does not do. `status` was
-        // advertised as costing nothing when every call replayed the session
-        // log, and `init_session` was advertised as performing a correlation
-        // whose read side does not land until M7.
-        "d0b5d081c87295ad3362d71f19f7111e6ccf79bd62ee5c81d5e351e33911f94a",
+        // Moved twice since M5 shipped, both times deliberately.
+        //
+        // The first: two descriptions said things the deployment does not do.
+        // `status` was advertised as costing nothing when every call replayed
+        // the session log, and `init_session` was advertised as performing a
+        // correlation whose read side does not land until M7.
+        //
+        // The second is **M10.0 (T4)**, and it is the larger of the two: the
+        // steer became a text instruction, so the two steer tools stopped being
+        // keyed by a synthetic call's id. `fetch_steer` and `report_outcome`
+        // both take a `conversation` now — optional, like every other
+        // session-scoped tool — instead of a required `steer_id`, and their
+        // descriptions say what they are for now that the correction arrives as
+        // the turn's own answer: re-reading it, not receiving it. `status` lost
+        // `open_steers` from its description for the same reason, and gained an
+        // honest account of what it *does* cost. **The tool count is unchanged
+        // at eight**, and that is a decision rather than an accident: a surface
+        // that shrank would re-prime every prompt cache in the deployment to
+        // delete a read that still answers a real question.
+        //
+        // The third is **M12 (R-M4)**, and it is one sentence: the
+        // `conversation` argument's description, repeated by all eight tools,
+        // stopped naming `prompt_cache_key`. That word belongs to one of the
+        // two surfaces this deployment now serves, and a Claude Code model
+        // reading it goes looking for a field its own API does not have. The
+        // replacement names no wire field and states what omitting the argument
+        // does — which is also the half that had gone stale, since a call is
+        // now matched to the tool call it answers before falling back to the
+        // key's most recent conversation. Names, count and schema *shape* are
+        // untouched; `tools.rs`'s module doc carries why the cache miss was
+        // accepted rather than deferred.
+        "e1c17fd315c32d05417d76325d722caad56f4ffee8eb5e99de8c876557ab6174",
         "the published tool list changed; see this test's comment before editing the literal"
     );
 
@@ -152,11 +257,11 @@ fn the_tool_list_is_stable_and_golden_pinned() {
             vec!["conversation", "floor", "reason", "turns"],
             vec!["floor", "turns", "reason"],
         ),
-        ("fetch_steer", vec!["steer_id"], vec!["steer_id"]),
+        ("fetch_steer", vec!["conversation"], vec![]),
         (
             "report_outcome",
-            vec!["note", "outcome", "steer_id"],
-            vec!["steer_id", "outcome"],
+            vec!["conversation", "note", "outcome"],
+            vec!["outcome"],
         ),
         ("explain_last_route", vec!["conversation"], vec![]),
     ];
@@ -197,8 +302,17 @@ async fn every_tool_result_is_a_single_text_block() {
     // through its string branch. Two blocks, or a structured object beside the
     // text, and the bytes the client resends next turn are not the bytes we
     // emitted.
-    let (surface, store) = FakeDeployment::default().surface();
-    store.deposit_steer(steer_for(ada(), "fc_1"));
+    // The conversation is one roundhouse has corrected, so the served path of
+    // `fetch_steer` is in the sweep rather than only its refusal.
+    let (surface, _store) = FakeDeployment::default()
+        .with_facts(
+            &adas_session(),
+            SessionFacts {
+                latest_guidance: Some("re-read the task".into()),
+                last_decision: None,
+            },
+        )
+        .surface();
 
     let calls = vec![
         ("status", json!({})),
@@ -215,15 +329,12 @@ async fn every_tool_result_is_a_single_text_block() {
             "set_quality_floor",
             json!({"floor": 0.5, "turns": 3, "reason": "hard work"}),
         ),
-        ("fetch_steer", json!({"steer_id": "fc_1"})),
-        (
-            "report_outcome",
-            json!({"steer_id": "fc_1", "outcome": "applied"}),
-        ),
+        ("fetch_steer", json!({})),
+        ("report_outcome", json!({"outcome": "applied"})),
         ("explain_last_route", json!({})),
         // The refusal paths travel the same way, which is the half a happy-path
         // sweep would miss.
-        ("fetch_steer", json!({"steer_id": "fc_nope"})),
+        ("fetch_steer", json!({"conversation": "other/bob/sess_1"})),
         ("prefer", json!({"mode": "local"})),
         ("no_such_tool", json!({})),
     ];
@@ -546,12 +657,24 @@ struct RacingReads {
 
 #[async_trait::async_trait]
 impl roundhouse_mcp::reads::ControlReads for RacingReads {
-    async fn resolve_session(
+    async fn named_session(
         &self,
         principal: &Principal,
-        conversation: Option<&str>,
+        named: &str,
     ) -> Result<SessionId, roundhouse_mcp::SurfaceError> {
-        self.inner.resolve_session(principal, conversation).await
+        self.inner.named_session(principal, named).await
+    }
+
+    async fn session_of_call(
+        &self,
+        principal: &Principal,
+        tool_use_id: &str,
+    ) -> Result<Option<SessionId>, roundhouse_mcp::SurfaceError> {
+        self.inner.session_of_call(principal, tool_use_id).await
+    }
+
+    async fn latest_session(&self, principal: &Principal) -> Option<SessionId> {
+        self.inner.latest_session(principal).await
     }
 
     async fn ceiling_policy(
@@ -719,12 +842,24 @@ impl MemoProbeReads {
 
 #[async_trait::async_trait]
 impl roundhouse_mcp::reads::ControlReads for MemoProbeReads {
-    async fn resolve_session(
+    async fn named_session(
         &self,
         principal: &Principal,
-        conversation: Option<&str>,
+        named: &str,
     ) -> Result<SessionId, roundhouse_mcp::SurfaceError> {
-        self.inner.resolve_session(principal, conversation).await
+        self.inner.named_session(principal, named).await
+    }
+
+    async fn session_of_call(
+        &self,
+        principal: &Principal,
+        tool_use_id: &str,
+    ) -> Result<Option<SessionId>, roundhouse_mcp::SurfaceError> {
+        self.inner.session_of_call(principal, tool_use_id).await
+    }
+
+    async fn latest_session(&self, principal: &Principal) -> Option<SessionId> {
+        self.inner.latest_session(principal).await
     }
 
     async fn ceiling_policy(
@@ -783,20 +918,27 @@ impl roundhouse_mcp::reads::ControlReads for MemoProbeReads {
     }
 }
 
-async fn facts_with(steer: &str) -> SessionFacts {
+async fn facts_with(guidance: &str) -> SessionFacts {
     SessionFacts {
-        open_steers: vec![steer.to_string()],
+        latest_guidance: Some(guidance.to_string()),
         last_decision: Some(decision().await),
     }
 }
 
 #[tokio::test]
-async fn a_repeat_status_between_turns_reads_the_cursor_rather_than_the_whole_log() {
-    // `status` and `explain_last_route` are called from a model's context, and
-    // on a real deployment each answer is a replay of the whole session log —
-    // a store round trip per batch plus a clone of every item and every routing
-    // decision. Nothing rate-limits either tool, so the cost is bounded here or
-    // it is not bounded at all.
+async fn a_repeat_read_between_turns_reads_the_cursor_rather_than_the_whole_log() {
+    // `explain_last_route` and `fetch_steer` are called from a model's context,
+    // and on a real deployment each answer is a replay of the whole session log
+    // — a store round trip per batch plus a clone of every item and every
+    // routing decision. Nothing rate-limits either tool, so the cost is bounded
+    // here or it is not bounded at all.
+    //
+    // **`status` used to be the third, and M10.0 took it out of the projection
+    // entirely.** Its one log-derived field was `open_steers`, which listed
+    // synthetic calls awaiting an answer; there are none, so the tool now
+    // resolves the conversation and quotes the catalog and never replays. That
+    // makes it the *control* below rather than a subject — a call that pays
+    // nothing here must not move the counter the memo is measured on.
     let mut sessions = std::collections::HashMap::new();
     sessions.insert(ada(), adas_session());
     let bobs_session = SessionId::new("other/bob/sess_1");
@@ -810,48 +952,60 @@ async fn a_repeat_status_between_turns_reads_the_cursor_rather_than_the_whole_lo
         logs: std::sync::Mutex::new(std::collections::HashMap::new()),
         projections: std::sync::atomic::AtomicUsize::new(0),
     });
-    reads.advance(&adas_session(), facts_with("fc_1").await);
-    reads.advance(&bobs_session, facts_with("fc_bob").await);
+    reads.advance(&adas_session(), facts_with("re-read the parser task").await);
+    reads.advance(
+        &bobs_session,
+        facts_with("bob was told something else").await,
+    );
     let surface = ControlPlaneSurface::new(Arc::clone(&reads), Arc::new(ControlStore::new()));
 
-    let first = served(&call(&surface, &ada(), "status", json!({})).await);
-    assert_eq!(first["open_steers"], json!(["fc_1"]));
+    let first = served(&call(&surface, &ada(), "fetch_steer", json!({})).await);
+    assert_eq!(first["guidance"], json!("re-read the parser task"));
     assert_eq!(reads.projections(), 1);
 
-    let repeat = served(&call(&surface, &ada(), "status", json!({})).await);
+    let repeat = served(&call(&surface, &ada(), "fetch_steer", json!({})).await);
     assert_eq!(
         reads.projections(),
         1,
-        "a second status with no turn in between replayed the log again"
+        "a second read with no turn in between replayed the log again"
     );
-    assert_eq!(repeat["open_steers"], json!(["fc_1"]));
+    assert_eq!(repeat["guidance"], json!("re-read the parser task"));
 
-    // The other tool that pays the same cost shares the same answer.
+    // The other tool that pays the same cost shares the same memo.
     let explained = served(&call(&surface, &ada(), "explain_last_route", json!({})).await);
     assert_eq!(explained["chosen"], json!("anthropic/claude-opus-4"));
     assert_eq!(reads.projections(), 1);
 
+    // The control on the other side: `status` no longer reads the projection at
+    // all, so it must not move the counter either.
+    assert!(!call(&surface, &ada(), "status", json!({})).await.is_error());
+    assert_eq!(
+        reads.projections(),
+        1,
+        "`status` replayed a log it has no field left to read from"
+    );
+
     // A different conversation is a different memo, not a hit: a cache keyed on
-    // the cursor alone would answer bob with ada's steers.
-    let bobs = served(&call(&surface, &bob(), "status", json!({})).await);
-    assert_eq!(bobs["open_steers"], json!(["fc_bob"]));
+    // the cursor alone would answer bob with ada's correction.
+    let bobs = served(&call(&surface, &bob(), "fetch_steer", json!({})).await);
+    assert_eq!(bobs["guidance"], json!("bob was told something else"));
     assert_eq!(reads.projections(), 2);
     assert_eq!(
-        served(&call(&surface, &ada(), "status", json!({})).await)["open_steers"],
-        json!(["fc_1"]),
+        served(&call(&surface, &ada(), "fetch_steer", json!({})).await)["guidance"],
+        json!("re-read the parser task"),
         "and ada's memo survived bob's call rather than being overwritten by it"
     );
     assert_eq!(reads.projections(), 2);
 
     // The control that keeps every assertion above from being a study of a
     // frozen cache: a turn moves the log, and the next call sees it.
-    reads.advance(&adas_session(), facts_with("fc_2").await);
-    let after_turn = served(&call(&surface, &ada(), "status", json!({})).await);
+    reads.advance(&adas_session(), facts_with("and now something newer").await);
+    let after_turn = served(&call(&surface, &ada(), "fetch_steer", json!({})).await);
     assert_eq!(
-        after_turn["open_steers"],
-        json!(["fc_2"]),
-        "a memo that outlived the turn it was taken before would report a steer \
-         that has already been answered"
+        after_turn["guidance"],
+        json!("and now something newer"),
+        "a memo that outlived the turn it was taken before would serve a \
+         correction the deployment has already replaced"
     );
     assert_eq!(reads.projections(), 3);
 }
@@ -860,27 +1014,44 @@ async fn a_repeat_status_between_turns_reads_the_cursor_rather_than_the_whole_lo
 // Steers
 // ---------------------------------------------------------------------------
 
+/// A conversation roundhouse has corrected, as the log's own fold reports it.
+fn steered(guidance: &str) -> SessionFacts {
+    SessionFacts {
+        latest_guidance: Some(guidance.to_string()),
+        last_decision: None,
+    }
+}
+
+/// The guidance the fixtures below re-read, distinctive enough that a rendering
+/// which leaked it somewhere else is visible as a literal.
+const GUIDANCE: &str = "the task named src/parser.rs; you are editing src/main.rs";
+
 #[tokio::test]
 async fn fetch_steer_is_byte_identical_on_a_second_call() {
-    // The tool the synthetic call names, and the reason it is a pure read: a
-    // handler that ran the judge on invocation would let a model -- or a prompt
-    // injection reading the tool's own description -- drain the validate budget
-    // by calling it in a loop.
-    let (surface, store) = FakeDeployment::default().surface();
-    store.deposit_steer(steer_for(ada(), "fc_1"));
+    // The reason the tool is a pure read: a handler that ran the judge on
+    // invocation would let a model -- or a prompt injection reading the tool's
+    // own description -- drain the validate budget by calling it in a loop.
+    //
+    // **What changed with M10.0 is where the bytes come from, not that they are
+    // fixed.** They used to be a record deposited when the synthetic call was
+    // emitted; they are now a fold of the conversation's own log, which is
+    // strictly more stable -- a node restart used to lose the deposit and leave
+    // `fetch_steer` refusing an id the log still named.
+    let (surface, _store) = FakeDeployment::default()
+        .with_facts(&adas_session(), steered(GUIDANCE))
+        .surface();
 
-    let first = call(&surface, &ada(), "fetch_steer", json!({"steer_id": "fc_1"})).await;
-    let second = call(&surface, &ada(), "fetch_steer", json!({"steer_id": "fc_1"})).await;
+    let first = call(&surface, &ada(), "fetch_steer", json!({})).await;
+    let second = call(&surface, &ada(), "fetch_steer", json!({})).await;
     assert_eq!(
         first.text(),
         second.text(),
-        "a retry has to see the payload committed at emit time, byte for byte"
+        "a retry has to see the same correction, byte for byte"
     );
     assert_eq!(first, second);
 
     let payload = served(&first);
-    assert_eq!(payload["steer_id"], json!("fc_1"));
-    assert_eq!(payload["emitted_at_ms"], json!(1_700_000_000_123u64));
+    assert_eq!(payload["conversation"], json!("acme/ada/sess_1"));
     assert!(
         payload["guidance"]
             .as_str()
@@ -889,70 +1060,69 @@ async fn fetch_steer_is_byte_identical_on_a_second_call() {
         "the corrective text is what the tool exists to deliver"
     );
 
-    // A third call after an unrelated write to the same store still matches:
-    // the payload is not derived from anything a later call can move.
-    store.deposit_steer(steer_for(ada(), "fc_2"));
-    let third = call(&surface, &ada(), "fetch_steer", json!({"steer_id": "fc_1"})).await;
-    assert_eq!(first, third);
+    // Naming the conversation explicitly is the same answer as letting it
+    // default, which is what makes the defaulted form safe for an agent that
+    // holds one conversation and never learned its id.
+    assert_eq!(
+        served(
+            &call(
+                &surface,
+                &ada(),
+                "fetch_steer",
+                json!({"conversation": "sess_1"})
+            )
+            .await
+        ),
+        payload
+    );
 }
 
 #[tokio::test]
-async fn fetch_steer_makes_no_calls_into_control_reads() {
-    // The module doc's "no clock, no fleet, no judge" claim, made checkable:
-    // a handler that quietly grew a `ceiling_policy` or `admissible_targets`
-    // call before the steer lookup would change nothing a served-payload
-    // assertion catches, since the payload it reads never depended on either.
-    // A counting `ControlReads` is what turns "reads nothing else" into an
-    // assertion instead of a sentence.
-    let reads = Arc::new(CountingReads::new(FakeDeployment::default()));
-    let store = Arc::new(ControlStore::new());
-    let surface = ControlPlaneSurface::new(Arc::clone(&reads), Arc::clone(&store));
-    store.deposit_steer(steer_for(ada(), "fc_1"));
+async fn fetch_steer_quotes_nothing_but_the_fold_and_pays_for_no_side_read() {
+    // The module doc's "no clock, no fleet, no judge" claim, made checkable. It
+    // is a *narrower* claim than it was: before M10.0 the payload lived in a
+    // node-local store, so the honest assertion was `total_calls() == 0`. The
+    // correction is a conversation item now, so the tool must read the log --
+    // and what it must still never do is quote the fleet, ask the ledger, or
+    // touch the policy, any of which would put a price or a candidate list one
+    // tool call away from a model.
+    let reads = Arc::new(CountingReads::new(
+        FakeDeployment::default().with_facts(&adas_session(), steered(GUIDANCE)),
+    ));
+    let surface = ControlPlaneSurface::new(Arc::clone(&reads), Arc::new(ControlStore::new()));
 
-    let outcome = call(&surface, &ada(), "fetch_steer", json!({"steer_id": "fc_1"})).await;
+    let outcome = call(&surface, &ada(), "fetch_steer", json!({})).await;
     assert!(!outcome.is_error(), "{}", outcome.text());
     assert_eq!(
-        reads.total_calls(),
+        reads.admissible_targets_calls.load(SeqCst),
         0,
-        "fetch_steer must be a pure read of the store, never a round trip \
-         into the deployment"
+        "fetch_steer must never quote the fleet"
+    );
+    assert_eq!(reads.ceiling_policy_calls.load(SeqCst), 0);
+    assert_eq!(
+        reads.balance_calls.load(SeqCst),
+        0,
+        "and never read the ledger: a correction is not a place to learn what is left to spend"
+    );
+    assert_eq!(
+        reads.session_facts_calls.load(SeqCst),
+        1,
+        "exactly one projection, which is the read the correction lives in"
     );
 
-    // The control: a refusal (unknown id) is equally free of side reads, so
-    // the zero above is about the tool and not about the happy path alone.
-    let refused = call(
-        &surface,
-        &ada(),
-        "fetch_steer",
-        json!({"steer_id": "fc_nope"}),
-    )
-    .await;
-    assert!(refused.is_error());
-    assert_eq!(reads.total_calls(), 0);
-
-    // And the counter itself is live: a tool that does read through the seam
-    // moves it, so a wrapper that silently counted nothing would not make the
-    // assertions above vacuously true.
+    // The control: a tool that legitimately quotes the fleet moves the counters
+    // the zeroes above are asserted on, so those zeroes are not vacuous.
     let _ = call(&surface, &ada(), "status", json!({})).await;
-    assert!(
-        reads.total_calls() > 0,
-        "the counting wrapper must observe a tool that legitimately reads \
-         through ControlReads, or the zero counts above prove nothing"
-    );
+    assert!(reads.admissible_targets_calls.load(SeqCst) > 0);
+    assert!(reads.balance_calls.load(SeqCst) > 0);
 }
 
 #[tokio::test]
-async fn fetch_steer_for_an_unknown_id_is_an_error_not_an_empty_payload() {
+async fn fetch_steer_on_an_uncorrected_conversation_is_an_error_not_an_empty_payload() {
     // No fail-open. An empty payload reads to an agent as "there was nothing to
     // correct", which is the one thing a steer must never be mistaken for.
-    let (surface, store) = FakeDeployment::default().surface();
-    let refused = call(
-        &surface,
-        &ada(),
-        "fetch_steer",
-        json!({"steer_id": "fc_nope"}),
-    )
-    .await;
+    let (surface, _store) = FakeDeployment::default().surface();
+    let refused = call(&surface, &ada(), "fetch_steer", json!({})).await;
     assert!(refused.is_error());
     assert!(
         serde_json::from_str::<Value>(refused.text()).is_err()
@@ -960,43 +1130,42 @@ async fn fetch_steer_for_an_unknown_id_is_an_error_not_an_empty_payload() {
         "a refusal must not be parseable as a payload with empty guidance"
     );
 
-    // The control: the same call for an id that exists is served.
-    store.deposit_steer(steer_for(ada(), "fc_1"));
+    // The control: the same call against a conversation that *was* corrected is
+    // served, so the refusal is about the fold and not about the tool.
+    let (steered_surface, _) = FakeDeployment::default()
+        .with_facts(&adas_session(), steered(GUIDANCE))
+        .surface();
     assert!(
-        !call(&surface, &ada(), "fetch_steer", json!({"steer_id": "fc_1"}))
+        !call(&steered_surface, &ada(), "fetch_steer", json!({}))
             .await
             .is_error()
     );
 }
 
 #[tokio::test]
-async fn fetch_steer_for_another_principals_steer_is_refused_without_naming_it() {
-    // The id travels through a model's context, and a context is where ids get
-    // copied between conversations. Refusing is half the requirement; refusing
-    // in words that reveal nothing is the other half, or the tool becomes an
-    // enumeration oracle for other tenants' sessions.
-    let (surface, store) = FakeDeployment::default().surface();
-    // An id that carries nothing of its owner in it, so that what the refusal
-    // may echo and what it may not are separable: the id came from the caller
-    // and telling it back reveals nothing, while every field of the *record* is
-    // a fact about another tenant.
-    store.deposit_steer(steer_for(bob(), "fc_9f2c"));
+async fn fetch_steer_for_another_tenants_conversation_is_refused_without_naming_it() {
+    // **T4 moved this boundary rather than removing it.** The tool used to take
+    // a `steer_id`, compare principals itself, and refuse an unknown id and
+    // another tenant's id in identical words -- or a caller could enumerate ids
+    // and learn which ones exist in somebody else's session. There is no id any
+    // more: both steer tools name a *conversation* and resolve it through
+    // `resolve_session`, so the refusal is `ForeignConversation`, the same door
+    // every other session-scoped tool already sits behind. What has to hold is
+    // unchanged: the refusal must reveal nothing about the tenant that does own
+    // the conversation.
+    let (surface, _store) = FakeDeployment::default()
+        .with_facts(&SessionId::new("other/bob/sess_1"), steered(GUIDANCE))
+        .surface();
 
     let refused = call(
         &surface,
         &ada(),
         "fetch_steer",
-        json!({"steer_id": "fc_9f2c"}),
+        json!({"conversation": "other/bob/sess_1"}),
     )
     .await;
     assert!(refused.is_error());
-    assert!(
-        refused.text().contains("fc_9f2c"),
-        "the caller's own id is the one thing the refusal should name, or the \
-         agent cannot tell which of its calls failed: {}",
-        refused.text()
-    );
-    for leak in ["other", "bob", "sess_1", "parser.rs", "1700000000123"] {
+    for leak in ["parser.rs", "main.rs"] {
         assert!(
             !refused.text().contains(leak),
             "the refusal named `{leak}`: {}",
@@ -1004,159 +1173,133 @@ async fn fetch_steer_for_another_principals_steer_is_refused_without_naming_it()
         );
     }
 
-    // And it reads identically to an id nobody minted, which is what stops the
-    // difference being measurable.
+    // And it reads identically to a conversation nobody has ever started, which
+    // is what stops the difference being measurable.
     let unknown = call(
         &surface,
         &ada(),
         "fetch_steer",
-        json!({"steer_id": "fc_never_minted"}),
+        json!({"conversation": "other/bob/never_started"}),
     )
     .await;
     assert_eq!(
-        refused.text().replace("fc_9f2c", "ID"),
-        unknown.text().replace("fc_never_minted", "ID")
+        refused.text().replace("sess_1", "NAME"),
+        unknown.text().replace("never_started", "NAME"),
+        "a foreign conversation must read exactly like one nobody started"
     );
 
-    // The control: bob reads his own.
+    // The control: within her own namespace ada is served, so the refusal is
+    // about the namespace and not about the argument being spelled out.
+    let (hers, _) = FakeDeployment::default()
+        .with_facts(&adas_session(), steered(GUIDANCE))
+        .surface();
     assert!(
         !call(
-            &surface,
-            &bob(),
+            &hers,
+            &ada(),
             "fetch_steer",
-            json!({"steer_id": "fc_9f2c"})
+            json!({"conversation": "sess_1"})
         )
         .await
-        .is_error(),
-        "the refusal is about the caller, not about the record"
+        .is_error()
     );
 }
 
 #[tokio::test]
-async fn report_outcome_for_an_unknown_steer_errors_but_blocks_nothing() {
-    // Advisory in the strongest sense: the report is refused, and the session
-    // it was reported against carries on exactly as it would have.
+async fn report_outcome_is_filed_for_any_conversation_and_blocks_nothing() {
+    // Advisory in the strongest sense, and M10.0 made it more so. The old tool
+    // refused a report against an unknown `steer_id`; there is no id now, and a
+    // refusal keyed on "has this conversation been steered" would make the
+    // tool's answer depend on a fact the agent cannot see. So it files, and the
+    // session carries on exactly as it would have.
     let (surface, store) = FakeDeployment::default().surface();
-    store.deposit_steer(steer_for(ada(), "fc_1"));
 
-    let refused = call(
-        &surface,
-        &ada(),
-        "report_outcome",
-        json!({"steer_id": "fc_nope", "outcome": "applied"}),
-    )
-    .await;
-    assert!(refused.is_error());
-
-    // Nothing about the session moved: the real steer is still fetchable
-    // unchanged, the overlay is still absent, and status still answers.
-    let payload = served(&call(&surface, &ada(), "fetch_steer", json!({"steer_id": "fc_1"})).await);
-    assert_eq!(payload["steer_id"], json!("fc_1"));
-    assert!(store.overlay(&adas_session()).is_none());
-    assert!(!call(&surface, &ada(), "status", json!({})).await.is_error());
-
-    // The control: a report against a real steer is recorded.
-    let recorded = served(
+    let filed = served(
         &call(
             &surface,
             &ada(),
             "report_outcome",
-            json!({"steer_id": "fc_1", "outcome": "not_applicable", "note": "already fixed"}),
+            json!({"outcome": "not_applicable", "note": "already fixed"}),
         )
         .await,
     );
-    assert_eq!(recorded["outcome"], json!("not_applicable"));
-    assert_eq!(recorded["recorded"], json!(true));
+    assert_eq!(filed["conversation"], json!("acme/ada/sess_1"));
+    assert_eq!(filed["outcome"], json!("not_applicable"));
+    assert_eq!(filed["recorded"], json!(true));
+    assert_eq!(
+        store.outcome_for(&adas_session()).unwrap().note.as_deref(),
+        Some("already fixed"),
+        "the report reaches the store, not just the answer"
+    );
+
+    // Nothing about the session moved: no overlay was written and status still
+    // answers, which is the "blocks nothing" half.
+    assert!(store.overlay(&adas_session()).is_none());
+    assert!(!call(&surface, &ada(), "status", json!({})).await.is_error());
 }
 
 #[tokio::test]
-async fn report_outcome_for_another_principals_steer_is_refused_without_naming_it() {
-    // The mirror of `fetch_steer_for_another_principals_steer_is_refused_...`:
-    // `record_outcome` carries the identical `principal` filter `steer_for`
-    // does, but nothing exercised the write side of it. A cross-tenant *write*
-    // — attaching an outcome to a steer that is not the caller's — is strictly
-    // worse than the read-only enumeration `fetch_steer` already guards
-    // against, so the refusal has to read the same and ada's record has to
-    // come out untouched.
+async fn report_outcome_cannot_write_against_another_tenants_conversation() {
+    // The write-side mirror of the read guard above, and the more consequential
+    // half: attaching an outcome to somebody else's conversation is a
+    // cross-tenant *write*, so it has to be refused at the same door and leave
+    // the other tenant's record untouched.
+    let bobs = SessionId::new("other/bob/sess_1");
     let (surface, store) = FakeDeployment::default().surface();
-    store.deposit_steer(steer_for(bob(), "fc_9f2c"));
-    store.deposit_steer(steer_for(ada(), "fc_1"));
 
     let refused = call(
         &surface,
         &ada(),
         "report_outcome",
-        json!({"steer_id": "fc_9f2c", "outcome": "applied"}),
+        json!({"conversation": "other/bob/sess_1", "outcome": "applied"}),
     )
     .await;
     assert!(
         refused.is_error(),
-        "ada must not be able to attach an outcome to bob's steer"
+        "ada must not be able to file against bob's conversation"
     );
-    for leak in ["other", "bob", "sess_1", "parser.rs", "1700000000123"] {
-        assert!(
-            !refused.text().contains(leak),
-            "the refusal named `{leak}`: {}",
-            refused.text()
-        );
-    }
-
-    // Textually identical to the unknown-id refusal, the same property
-    // `fetch_steer`'s refusal holds.
+    assert!(
+        store.outcome_for(&bobs).is_none(),
+        "a refused report must not have written anything"
+    );
+    // Textually identical to a conversation nobody started -- the same
+    // no-oracle property the read side holds.
     let unknown = call(
         &surface,
         &ada(),
         "report_outcome",
-        json!({"steer_id": "fc_never_minted", "outcome": "applied"}),
+        json!({"conversation": "other/bob/never_started", "outcome": "applied"}),
     )
     .await;
     assert_eq!(
-        refused.text().replace("fc_9f2c", "ID"),
-        unknown.text().replace("fc_never_minted", "ID"),
-        "a cross-tenant steer id must read exactly like one nobody minted"
+        refused.text().replace("sess_1", "NAME"),
+        unknown.text().replace("never_started", "NAME")
     );
 
-    // Bob's real record is unchanged: still fetchable by bob, still carrying
-    // no outcome.
-    let bobs_record = served(
-        &call(
-            &surface,
-            &bob(),
-            "fetch_steer",
-            json!({"steer_id": "fc_9f2c"}),
-        )
-        .await,
+    // The control: each tenant may file against their own, and the two records
+    // are separate.
+    let mut sessions = std::collections::HashMap::new();
+    sessions.insert(ada(), adas_session());
+    sessions.insert(bob(), bobs.clone());
+    let (shared, shared_store) = FakeDeployment {
+        sessions,
+        ..FakeDeployment::default()
+    }
+    .surface();
+    for (who, outcome) in [(ada(), "rejected"), (bob(), "applied")] {
+        assert!(
+            !call(&shared, &who, "report_outcome", json!({"outcome": outcome}),)
+                .await
+                .is_error()
+        );
+    }
+    assert_eq!(
+        shared_store.outcome_for(&adas_session()).unwrap().outcome,
+        roundhouse_mcp::surface::SteerOutcome::Rejected
     );
-    assert_eq!(bobs_record["steer_id"], json!("fc_9f2c"));
-    assert!(
-        store
-            .steer_for(&bob(), "fc_9f2c")
-            .unwrap()
-            .outcome
-            .is_none(),
-        "ada's refused report must not have written to bob's steer"
-    );
-
-    // The control: bob may report his own, and ada may report her own.
-    assert!(
-        !call(
-            &surface,
-            &bob(),
-            "report_outcome",
-            json!({"steer_id": "fc_9f2c", "outcome": "applied"}),
-        )
-        .await
-        .is_error()
-    );
-    assert!(
-        !call(
-            &surface,
-            &ada(),
-            "report_outcome",
-            json!({"steer_id": "fc_1", "outcome": "rejected"}),
-        )
-        .await
-        .is_error()
+    assert_eq!(
+        shared_store.outcome_for(&bobs).unwrap().outcome,
+        roundhouse_mcp::surface::SteerOutcome::Applied
     );
 }
 
@@ -1171,7 +1314,7 @@ async fn status_reports_names_not_prices() {
     // and the argument is with a component that cannot check whether the agent
     // is quoting its own context back at it.
     let facts = SessionFacts {
-        open_steers: vec!["fc_1".into()],
+        latest_guidance: None,
         last_decision: Some(decision().await),
     };
     let (surface, _store) = FakeDeployment::default()
@@ -1191,7 +1334,12 @@ async fn status_reports_names_not_prices() {
             "openai/gpt-5"
         ])
     );
-    assert_eq!(answer["open_steers"], json!(["fc_1"]));
+    assert!(
+        answer.get("open_steers").is_none(),
+        "M10.0 retired the field: there are no synthetic calls to await, and a \
+         permanently empty list in a model's context is a question it keeps \
+         asking and always gets `[]` to"
+    );
     assert_eq!(
         answer["policy_digest"],
         json!(TurnPolicy::unrestricted().digest())
@@ -1265,7 +1413,7 @@ async fn explain_last_route_reports_the_decision_without_its_prices() {
     // where the free local worker always wins produces `$0.00000`, and an
     // assertion about `7.77` would then hold for a producer that prints prices.
     let facts = SessionFacts {
-        open_steers: Vec::new(),
+        latest_guidance: None,
         last_decision: Some(decision().await),
     };
     let (surface, _store) = FakeDeployment::default()
@@ -1531,4 +1679,740 @@ async fn two_surfaces_over_one_store_see_one_control_plane() {
     .await;
     let seen = served(&call(&reader, &ada(), "status", json!({})).await);
     assert_eq!(seen["overlay"]["mode"], json!("local"));
+}
+
+/// F06: a client that was never handed the generated launch config -- an
+/// operator's own `codex` install, a bare MCP inspector, any client that
+/// speaks the protocol without `default_tools_approval_mode = "approve"` in
+/// its `[mcp_servers.*]` stanza -- sees exactly what `RoundhouseMcp::tools()`
+/// serializes over the wire. codex 0.146.0's `requires_mcp_tool_approval`
+/// (`core/src/mcp_tool_call.rs:2156-2173` @ `e363b08`, identical at
+/// `2182-2199` @ the Cargo pin `6344a65`) treats an absent `read_only_hint`
+/// as `false` and an absent `destructive_hint`/`open_world_hint` as `true`,
+/// so a tool with no `annotations` at all reads as destructive-and-open-world
+/// regardless of what it actually does -- and under `approval_policy = never`
+/// an approval nobody can be asked for resolves to *cancelled*.
+///
+/// This asserts the exact triple per tool rather than merely that annotations
+/// exist, because `ToolAnnotations::default()` is `Some(..)` and serializes to
+/// `{}`: it would satisfy an `is_some()` check while leaving codex's
+/// arithmetic reading exactly what it reads today. The read set is spelled out
+/// here as a literal so a ninth tool arrives unclassified and fails, which is
+/// the review F16's tripwire demands.
+#[test]
+fn every_tool_states_what_it_does_to_a_client_that_was_handed_no_config() {
+    use roundhouse_mcp::transport::RoundhouseMcp;
+
+    // The crate's own read/write split (see the module doc's "No tool appends
+    // to a session log"): these three answer out of committed state, the other
+    // five write to the node-local `ControlStore`.
+    let reads = ["status", "fetch_steer", "explain_last_route"];
+
+    for tool in RoundhouseMcp::tools() {
+        let annotations = tool.annotations.as_ref().unwrap_or_else(|| {
+            panic!(
+                "`{}` ships with no ToolAnnotations at all; a client that was \
+                 not handed the generated launch config (which papers over \
+                 this with `default_tools_approval_mode = \"approve\"`) reads \
+                 it as destructive and open-world",
+                tool.name
+            )
+        });
+        let expected_read_only = reads.contains(&tool.name.as_ref());
+        assert_eq!(
+            annotations.read_only_hint,
+            Some(expected_read_only),
+            "`{}` must say whether it writes: codex defaults an absent \
+             read_only_hint to false, and a read that stays silent buys an \
+             approval it never needed",
+            tool.name
+        );
+        // Both false for all eight: an overlay only ever narrows (nothing here
+        // destroys committed state) and the whole surface reaches roundhouse's
+        // own control plane and nothing outside it.
+        assert_eq!(
+            annotations.destructive_hint,
+            Some(false),
+            "`{}` must deny destructiveness explicitly; absent, codex reads it \
+             as true and demands an approval `codex exec` can never give",
+            tool.name
+        );
+        assert_eq!(
+            annotations.open_world_hint,
+            Some(false),
+            "`{}` must deny an open world explicitly; absent, codex reads it \
+             as true and demands an approval `codex exec` can never give",
+            tool.name
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// R-M2 (M12): which conversation a call is about
+// ---------------------------------------------------------------------------
+
+/// The tool-use id the client attaches reaches [`ControlReads::resolve_session`]
+/// and decides the answer.
+///
+/// **What this proves that the server's own unit tests do not.** The id enters
+/// at the transport, is carried on [`ToolCall`], is joined to the principal by
+/// `dispatch`, and is handed to the seam by *every* session-scoped tool. Any
+/// one of those four hops could drop it and the deployment would keep working —
+/// it would simply answer about the principal's most recent conversation
+/// instead of the one the agent is standing in, which is a plausible answer
+/// and therefore an invisible bug. Asserting through the dispatched tool's own
+/// output is what makes the whole chain load-bearing.
+#[tokio::test]
+async fn a_calls_tool_use_id_decides_which_conversation_the_answer_is_about() {
+    let subagent = SessionId::new("acme/ada/sess_subagent");
+    let mut deployment = FakeDeployment::default();
+    deployment
+        .tool_use_ids
+        .insert("toolu_sub".to_string(), (ada(), subagent.clone()));
+    let (surface, _store) = deployment.surface();
+
+    // `adas_session()` is the fake's "most recent", so an answer naming the
+    // subagent's log can only have come from the id.
+    let answered =
+        served(&call_answering(&surface, &ada(), "status", json!({}), "toolu_sub").await);
+    assert_eq!(answered["conversation"], json!(subagent.as_str()));
+
+    // The control, which is also the Codex path: no id, the guess stands.
+    let guessed = served(&call(&surface, &ada(), "status", json!({})).await);
+    assert_eq!(guessed["conversation"], json!(adas_session().as_str()));
+
+    // And an argument the model wrote *agreeing* with the id is served, on the
+    // argument's own terms.
+    //
+    // **This assertion used to say the argument outranked the id** — R-M2 read
+    // the order as a precedence rule all the way up. R-M7 narrowed it: an
+    // argument naming a *different* conversation than the client's correlator
+    // is now refused rather than preferred (see
+    // `an_argument_that_contradicts_the_clients_correlator_is_refused`), so
+    // what stays true here is only that a name and a correlator pointing at one
+    // conversation answer about that conversation.
+    let mut agreeing = FakeDeployment::default();
+    agreeing
+        .tool_use_ids
+        .insert("toolu_main".to_string(), (ada(), adas_session()));
+    let (agreeing, _store) = agreeing.surface();
+    let named = served(
+        &call_answering(
+            &agreeing,
+            &ada(),
+            "status",
+            json!({ "conversation": "sess_1" }),
+            "toolu_main",
+        )
+        .await,
+    );
+    assert_eq!(named["conversation"], json!(adas_session().as_str()));
+}
+
+/// R-M7: a Codex-shaped `_meta.threadId` names the conversation, and it beats
+/// a rival holding the `latest` slot.
+///
+/// **What this proves that the resolver's own unit tests do not.** The thread
+/// id enters at the transport, is carried on [`ToolCall`], is joined to the
+/// principal by `dispatch`, and is handed to the seam by *every* session-scoped
+/// tool. Any one of those hops could drop it and the deployment would keep
+/// working — it would answer about the principal's most recent conversation,
+/// which is a plausible answer and therefore an invisible bug. The rival in
+/// front of it is what makes the assertion about the thread id rather than
+/// about there being only one answer available.
+#[tokio::test]
+async fn a_codex_thread_id_names_the_conversation_and_outranks_the_latest_guess() {
+    let thread = SessionId::new("acme/ada/sess_thread");
+    let mut deployment = FakeDeployment::default();
+    // The conversation the client is in. `adas_session()` is the fake's "most
+    // recent", so an answer naming this one can only have come from the
+    // thread id.
+    deployment.conversations.insert(thread.clone());
+    let (surface, _store) = deployment.surface();
+
+    let answered =
+        served(&call_in_thread(&surface, &ada(), "status", json!({}), "sess_thread").await);
+    assert_eq!(answered["conversation"], json!(thread.as_str()));
+
+    // The control: the same call with no thread id falls to the guess, which
+    // is a different conversation.
+    let guessed = served(&call(&surface, &ada(), "status", json!({})).await);
+    assert_eq!(guessed["conversation"], json!(adas_session().as_str()));
+}
+
+/// H5 (M15 hygiene rung): [`FakeDeployment::thread_ids`] is wired into
+/// [`ControlReads::session_of_thread`](roundhouse_mcp::reads::ControlReads::session_of_thread)
+/// but nothing in this file had ever populated it.
+///
+/// Every thread-shaped case above resolves through the *name* fallback —
+/// `deployment.conversations` holds a session whose id is the qualified
+/// thread id string, which is R-M9's second arm and the only one a codex
+/// *root* thread ever needs, since its thread id and its cache key are one
+/// string. This is the case that fell through the cracks: an ingest's own
+/// binding — the table a *subagent's* thread resolves through, since a
+/// subagent's thread id is nobody's cache key (R-M9) — with a cache-key
+/// name and a tool-use id both bound to *different* conversations besides,
+/// so an answer naming the thread table's session is proof the table was
+/// actually consulted and not merely the only thing that could have
+/// answered.
+#[tokio::test]
+async fn a_threads_own_binding_resolves_ahead_of_the_cache_key_and_the_tool_use_id() {
+    let bound_by_thread = SessionId::new("acme/ada/sess_thread_table");
+    let bound_by_cache_key = SessionId::new("acme/ada/sess_cache_key");
+    let bound_by_tool_use = SessionId::new("acme/ada/sess_tool_use");
+
+    let mut deployment = FakeDeployment::default();
+    deployment.thread_ids.insert(
+        "subagent-thread".to_string(),
+        (ada(), bound_by_thread.clone()),
+    );
+    // Reachable only through the name fallback (R-M9's second arm) — present
+    // so that arm has something to answer with, proving the table above it
+    // is what actually decided this call rather than the fallback losing by
+    // default.
+    deployment.conversations.insert(bound_by_cache_key.clone());
+    deployment
+        .tool_use_ids
+        .insert("toolu_1".to_string(), (ada(), bound_by_tool_use));
+    let (surface, _store) = deployment.surface();
+
+    let answered = served(
+        &call_with_every_correlator(
+            &surface,
+            &ada(),
+            "status",
+            json!({}),
+            "subagent-thread",
+            "sess_cache_key",
+            "toolu_1",
+        )
+        .await,
+    );
+    assert_eq!(
+        answered["conversation"],
+        json!(bound_by_thread.as_str()),
+        "H5: the thread table's own binding must decide this call ahead of \
+         both the cache-key name lookup and the tool-use id, which the \
+         deployment could also have answered from -- resolve_session's own \
+         doc orders the three this way and nothing here had proved it"
+    );
+}
+
+/// M15 review F2: [`a_threads_own_binding_resolves_ahead_of_the_cache_key_and_the_tool_use_id`]
+/// pins the thread arm ahead of *both* rivals, but says nothing about the
+/// order of the two arms behind it. Arm (3) (the cache-key name) and arm (4)
+/// (the tool-use id) were each independently `is_none()`-guarded, so
+/// reordering them only changes an answer when both are answerable and the
+/// thread arm answered nothing — a topology no other test in this file or in
+/// `reads/tests.rs` builds: the thread id here is deliberately unbound, so
+/// the thread arm falls through and leaves the two rivals to settle it.
+#[tokio::test]
+async fn a_cache_key_binding_resolves_ahead_of_the_tool_use_id_when_the_thread_arm_answers_nothing()
+{
+    let bound_by_cache_key = SessionId::new("acme/ada/sess_cache_key");
+    let bound_by_tool_use = SessionId::new("acme/ada/sess_tool_use");
+
+    let mut deployment = FakeDeployment::default();
+    // Deliberately absent from `thread_ids`: the thread arm must answer
+    // nothing so the call reaches the two arms this test is about.
+    deployment.conversations.insert(bound_by_cache_key.clone());
+    deployment
+        .tool_use_ids
+        .insert("toolu_1".to_string(), (ada(), bound_by_tool_use));
+    let (surface, _store) = deployment.surface();
+
+    let answered = served(
+        &call_with_every_correlator(
+            &surface,
+            &ada(),
+            "status",
+            json!({}),
+            "unbound-thread",
+            "sess_cache_key",
+            "toolu_1",
+        )
+        .await,
+    );
+    assert_eq!(
+        answered["conversation"],
+        json!(bound_by_cache_key.as_str()),
+        "F2: with the thread arm answering nothing, the cache-key arm must \
+         decide this call ahead of the tool-use id, which the deployment \
+         could also have answered from -- resolve_session orders arm (3) \
+         ahead of arm (4) and nothing here had proved it"
+    );
+}
+
+/// R-M7's tenancy half: a thread id naming nothing of this caller's is worth
+/// exactly what an unknown tool-use id is worth — the caller's own `latest`,
+/// or the refusal, and never the conversation the id actually belongs to.
+///
+/// Foreign and unknown are one assertion on purpose: an answer that
+/// distinguished them would make `_meta.threadId` an enumeration oracle for
+/// conversations the caller does not hold. Note what this is *not*: the same
+/// string in the `conversation` **argument** refuses with
+/// `ForeignConversation`, because a model that wrote a name asked about that
+/// name. A correlator is context the client volunteered, so it falls through.
+#[tokio::test]
+async fn a_foreign_or_unknown_thread_id_falls_through_as_any_unknown_correlator_does() {
+    let adas = adas_session();
+    let mut deployment = FakeDeployment::default();
+    // Deliberately *not* `sess_1`: bob's own cache key has to differ from
+    // ada's, or "ada's name qualified into bob's namespace" lands on bob's own
+    // conversation and the probe this test is about cannot be spelled.
+    deployment
+        .sessions
+        .insert(bob(), SessionId::new("other/bob/sess_bob"));
+    let (surface, _store) = deployment.surface();
+
+    // `sess_1` is ada's cache key. Qualified into bob's namespace it names
+    // nothing, which is exactly the shape of a probe.
+    let with_stolen_name =
+        served(&call_in_thread(&surface, &bob(), "status", json!({}), "sess_1").await);
+    let with_unknown_name =
+        served(&call_in_thread(&surface, &bob(), "status", json!({}), "sess_nobody").await);
+    assert_eq!(
+        with_stolen_name["conversation"],
+        json!("other/bob/sess_bob")
+    );
+    assert_eq!(
+        with_stolen_name["conversation"], with_unknown_name["conversation"],
+        "a thread id belonging to somebody else must answer exactly as one \
+         belonging to nobody, or the key becomes a probe"
+    );
+    assert_ne!(with_stolen_name["conversation"], json!(adas.as_str()));
+
+    // The contrast that makes the fall-through a ruling rather than an
+    // accident: the same string, written by the model as an argument, refuses.
+    let refused = call(
+        &surface,
+        &bob(),
+        "status",
+        json!({ "conversation": "sess_1" }),
+    )
+    .await;
+    assert!(refused.is_error());
+    assert!(refused.text().contains("does not belong"));
+
+    // And a caller with no conversation of their own gets the refusal a caller
+    // with no correlator gets — never somebody else's session.
+    let mut nothing_of_their_own = FakeDeployment::default();
+    nothing_of_their_own.sessions.remove(&bob());
+    let (nothing_of_their_own, _store) = nothing_of_their_own.surface();
+    let refused =
+        call_in_thread(&nothing_of_their_own, &bob(), "status", json!({}), "sess_1").await;
+    assert!(refused.is_error());
+    assert!(
+        refused.text().contains("no conversation yet"),
+        "the refusal must be the one a caller with nothing gets, and must not \
+         name the tenant that owns the id: {}",
+        refused.text()
+    );
+    assert!(!refused.text().contains("acme"), "{}", refused.text());
+}
+
+/// M12.1 review, F7: the fake's two tables are orthogonal, as the
+/// deployment's are — a conversation the store holds is named whether or not
+/// anyone's `latest` points at it.
+///
+/// `named_session` used to union the `latest` map with the store, which made
+/// "is somebody's most recent" double as "exists". This is the half that
+/// already behaved: strip ada's `latest` entirely and leave `adas_session()`
+/// reachable only through the store, and a call naming it is still served.
+#[tokio::test]
+async fn f7_store_only_conversation_is_still_named_with_no_latest_at_all() {
+    let mut deployment = FakeDeployment::default();
+    deployment.sessions.remove(&ada());
+    let (surface, _store) = deployment.surface();
+
+    let answered = served(
+        &call(
+            &surface,
+            &ada(),
+            "status",
+            json!({ "conversation": "sess_1" }),
+        )
+        .await,
+    );
+    assert_eq!(answered["conversation"], json!(adas_session().as_str()));
+}
+
+/// M12.1 review, F7, the half the union made unrepresentable: a session that
+/// is still somebody's `latest` but that the store no longer holds.
+///
+/// The server's named path is two independent reads — `Conversations::resolve`
+/// and then `SessionStore::last_seq` — and they can disagree about exactly
+/// this session. While the fake unioned its two tables there was no way to
+/// construct the disagreement at all: every `latest` was served by name, so a
+/// closed conversation was indistinguishable from an open one and the refusal
+/// the server would raise had no test.
+#[tokio::test]
+async fn f7_a_latest_session_the_store_has_closed_is_refused_by_name() {
+    let mut deployment = FakeDeployment::default();
+    // ada's `latest` still points at it; the store no longer holds it.
+    deployment.conversations.remove(&adas_session());
+    let (surface, _store) = deployment.surface();
+
+    let refused = call(
+        &surface,
+        &ada(),
+        "status",
+        json!({ "conversation": "sess_1" }),
+    )
+    .await;
+    assert!(
+        refused.is_error(),
+        "a name the store cannot answer for must be refused, not served off \
+         the `latest` table: {}",
+        refused.text()
+    );
+    assert!(
+        refused.text().contains("does not belong"),
+        "{}",
+        refused.text()
+    );
+
+    // The control that makes the refusal about the *store* and not about ada
+    // having nothing: with no name at all she still gets her `latest`.
+    let answered = served(&call(&surface, &ada(), "status", json!({})).await);
+    assert_eq!(answered["conversation"], json!(adas_session().as_str()));
+}
+
+/// M12.1 review, F1, through a dispatched tool: a deployment that cannot
+/// answer says so, even when the question arrived as a *correlator*.
+///
+/// The thread arm swallows `ForeignConversation` and nothing else, and that
+/// asymmetry now lives once, in the provided `resolve_session`. Before it did,
+/// every implementor spelled it for itself and both test doubles spelled it
+/// `.ok()` — which also eats an outage, handing the caller its `latest`: a
+/// plausible answer about the wrong conversation. Nothing was red, because
+/// neither double had a store that could fail; the fake can be asked now.
+#[tokio::test]
+async fn a_store_outage_reached_through_a_thread_id_is_not_an_unknown_correlator() {
+    let mut deployment = FakeDeployment::default();
+    deployment.store_outage = Some("redis connection reset".to_string());
+    let (surface, _store) = deployment.surface();
+
+    let refused = call_in_thread(&surface, &ada(), "status", json!({}), "sess_1").await;
+    assert!(refused.is_error(), "{}", refused.text());
+    assert!(
+        refused.text().contains("redis connection reset"),
+        "an outage must reach the agent as the retryable failure it is, not be \
+         swallowed into a fall-back onto `latest`: {}",
+        refused.text()
+    );
+
+    // The control: the same correlator over a healthy deployment that simply
+    // does not hold the name *does* fall through, so the assertion above is
+    // about the error and not about thread ids refusing in general.
+    let (healthy, _store) = FakeDeployment::default().surface();
+    let answered =
+        served(&call_in_thread(&healthy, &ada(), "status", json!({}), "sess_nobody").await);
+    assert_eq!(answered["conversation"], json!(adas_session().as_str()));
+}
+
+/// R-M7's refusal, through a dispatched tool: the model named one
+/// conversation and the client correlated the call to another.
+#[tokio::test]
+async fn an_argument_that_contradicts_the_clients_correlator_is_refused() {
+    let thread = SessionId::new("acme/ada/sess_thread");
+    let mut deployment = FakeDeployment::default();
+    deployment.conversations.insert(thread.clone());
+    let (surface, _store) = deployment.surface();
+
+    let refused = call_correlated(
+        &surface,
+        &ada(),
+        "status",
+        // `sess_1` is ada's other conversation, and it exists — so this is not
+        // a foreign name being refused by the old door. Both halves resolve;
+        // they resolve to different conversations.
+        json!({ "conversation": "sess_1" }),
+        Some("sess_thread"),
+        None,
+    )
+    .await;
+    assert!(refused.is_error(), "{}", refused.text());
+    assert!(
+        refused.text().contains(adas_session().as_str())
+            && refused.text().contains(thread.as_str()),
+        "the refusal must name both conversations the caller pointed at, or \
+         the agent cannot tell which of its own two inputs to change: {}",
+        refused.text()
+    );
+
+    // The same shape with the *other* correlator, because R-M7 is about a
+    // caller contradicting itself and not about one `_meta` key.
+    let mut with_a_call = FakeDeployment::default();
+    with_a_call
+        .tool_use_ids
+        .insert("toolu_sub".to_string(), (ada(), thread.clone()));
+    let (with_a_call, _store) = with_a_call.surface();
+    let refused = call_answering(
+        &with_a_call,
+        &ada(),
+        "status",
+        json!({ "conversation": "sess_1" }),
+        "toolu_sub",
+    )
+    .await;
+    assert!(refused.is_error(), "{}", refused.text());
+    assert!(refused.text().contains(thread.as_str()));
+}
+
+/// A Claude-shaped call is untouched by R-M7: no `threadId`, and the tool-use
+/// id decides exactly as it did.
+///
+/// The narrow guard the ruling's "existing tests stay green" clause deserves
+/// on its own, rather than only as a side effect of the M12 tests above: a
+/// resolver that read the *wrong* correlator first would still pass those, as
+/// long as it happened to reach the same session. Here the thread id is absent
+/// and the tool-use id names a conversation `latest` does not, so only the
+/// tool-use id can produce this answer.
+#[tokio::test]
+async fn a_client_that_sends_no_thread_id_is_served_exactly_as_before() {
+    let subagent = SessionId::new("acme/ada/sess_subagent");
+    let mut deployment = FakeDeployment::default();
+    deployment
+        .tool_use_ids
+        .insert("toolu_sub".to_string(), (ada(), subagent.clone()));
+    let (surface, _store) = deployment.surface();
+
+    let answered =
+        served(&call_answering(&surface, &ada(), "status", json!({}), "toolu_sub").await);
+    assert_eq!(answered["conversation"], json!(subagent.as_str()));
+}
+
+/// R-M7's order, proved through the dispatcher rather than only at
+/// [`ControlReads::resolve_session`]'s own unit level —
+/// and, in the same assertion, the silent half of that ordering: a
+/// Claude-shaped call (the ordinary `claudecode/toolUseId` correlator a real
+/// Claude Code client sends) that also carries a `threadId` resolving
+/// elsewhere is served the thread's conversation with no error and no signal
+/// that its two correlators disagreed.
+///
+/// **Why through [`dispatch`] and not the resolver's unit tests again.**
+/// The order lives in one shared function and its unit tests already pin it
+/// (`the_thread_id_is_weighed_ahead_of_the_tool_use_id_and_both_ahead_of_latest`
+/// in `reads.rs`) — but nothing above that function ever constructed a single
+/// `tools/call` carrying *both* a resolvable thread id and a resolvable
+/// tool-use id pointing at two different sessions and walked it through the
+/// transport's `ToolCall`, `dispatch`, and the seam the way a client's call
+/// actually travels. Swap the order inside `resolve_session` (`thread.or(call)`
+/// to `call.or(thread)`) and this crate's other suites —
+/// `tool_surface`, and `roundhouse-server`'s `mcp_api` lib tests and
+/// `mcp_surface` — stayed green, because none of them built a call shaped
+/// this way; this is that call.
+///
+/// **Why it doubles as the silent-priority guard.** The scenario is not
+/// hypothetical: a real Claude Code client sends exactly the shape here —
+/// its own `claudecode/toolUseId` — and nothing on the resolution path
+/// (transport, `Caller`, or the resolver) checks which
+/// *client* sent a `threadId` before reading it, so a stray or unexpected
+/// `threadId` key on an otherwise Claude-shaped call is read exactly as
+/// Codex's own. That is the documented rule ("a client that spelled both is
+/// naming one call in two vocabularies") rather than a defect, but until this
+/// test the specific case of a toolUseId-bearing call *also* carrying a
+/// threadId that resolves to a different session had never been dispatched
+/// and observed to answer without error.
+#[tokio::test]
+async fn a_thread_id_beside_a_claude_shaped_tool_use_id_wins_silently_when_they_disagree() {
+    let thread = SessionId::new("acme/ada/sess_thread");
+    let subagent = SessionId::new("acme/ada/sess_subagent");
+    let mut deployment = FakeDeployment::default();
+    // Two *different* conversations, each reachable by exactly one
+    // correlator — if the assertion below reads the thread's session it can
+    // only have come from `threadId`, and if it reads the subagent's it can
+    // only have come from `claudecode/toolUseId`.
+    deployment.conversations.insert(thread.clone());
+    deployment
+        .tool_use_ids
+        .insert("toolu_sub".to_string(), (ada(), subagent.clone()));
+    let (surface, _store) = deployment.surface();
+
+    let outcome = call_correlated(
+        &surface,
+        &ada(),
+        "status",
+        json!({}),
+        Some("sess_thread"),
+        Some("toolu_sub"),
+    )
+    .await;
+    assert!(
+        !outcome.is_error(),
+        "two correlators naming two conversations of the caller's own is not \
+         a contradiction — only a `conversation` argument disagreeing with the \
+         client's own correlator refuses; two client-supplied correlators \
+         disagreeing with each other is ordered, not refused: {}",
+        outcome.text()
+    );
+    let answered = served(&outcome);
+    assert_eq!(
+        answered["conversation"],
+        json!(thread.as_str()),
+        "R-M7: threadId is weighed ahead of the tool-use id, end to end \
+         through dispatch and not only inside the resolver's own tests"
+    );
+}
+
+/// An id another tenant's session emitted is worth exactly as much as an id
+/// nobody emitted, and neither is worth another tenant's conversation.
+///
+/// The two are one assertion on purpose: an answer that distinguished them
+/// would make the `_meta` key an enumeration oracle for ids the caller does not
+/// hold, which is the same reasoning `fetch_steer`'s refusal is written under.
+#[tokio::test]
+async fn another_tenants_tool_use_id_is_worth_no_more_than_an_unknown_one() {
+    let adas = adas_session();
+    let mut deployment = FakeDeployment::default();
+    deployment
+        .tool_use_ids
+        .insert("toolu_ada".to_string(), (ada(), adas.clone()));
+    deployment
+        .sessions
+        .insert(bob(), SessionId::new("other/bob/sess_1"));
+    let (surface, _store) = deployment.surface();
+
+    let with_stolen_id =
+        served(&call_answering(&surface, &bob(), "status", json!({}), "toolu_ada").await);
+    let with_unknown_id =
+        served(&call_answering(&surface, &bob(), "status", json!({}), "toolu_nobody").await);
+
+    assert_eq!(with_stolen_id["conversation"], json!("other/bob/sess_1"));
+    assert_eq!(
+        with_stolen_id["conversation"], with_unknown_id["conversation"],
+        "an id belonging to somebody else must answer exactly as an id \
+         belonging to nobody, or the key becomes a probe"
+    );
+    assert_ne!(with_stolen_id["conversation"], json!(adas.as_str()));
+}
+
+/// A [`ControlReads`] written the way a third one would be: its own lookups
+/// over its own tables, independent of [`FakeDeployment`] and of
+/// `roundhouse-server`'s `ControlPlaneReads`, with the R-M2 order taken from the
+/// provided `ControlReads::resolve_session` rather than typed out again. Every
+/// other method forwards to `inner`.
+struct IndependentReads {
+    inner: FakeDeployment,
+}
+
+#[async_trait::async_trait]
+impl roundhouse_mcp::reads::ControlReads for IndependentReads {
+    /// The lookups are this implementor's; the order, the refusals and the
+    /// swallow between them are not. Supplying them in the other order is not
+    /// a thing this arm can express — these are a name read, a call-table read
+    /// and a most-recent read, three separate methods, not a first choice and
+    /// a second — so the inversion F4 demonstrated has no spelling here, and
+    /// neither does the `.ok()` that F1 found swallowing a store outage.
+    async fn named_session(
+        &self,
+        principal: &Principal,
+        named: &str,
+    ) -> Result<SessionId, roundhouse_mcp::SurfaceError> {
+        // Its own table read, spelled out rather than delegated: the point of
+        // this implementor is that it shares nothing with `FakeDeployment` but
+        // the trait itself.
+        let qualified = format!("{}{named}", principal.namespace_prefix());
+        if self
+            .inner
+            .conversations
+            .iter()
+            .any(|id| id.as_str() == qualified)
+        {
+            Ok(SessionId::new(qualified))
+        } else {
+            Err(roundhouse_mcp::SurfaceError::ForeignConversation(
+                named.to_string(),
+            ))
+        }
+    }
+
+    async fn session_of_call(
+        &self,
+        principal: &Principal,
+        tool_use_id: &str,
+    ) -> Result<Option<SessionId>, roundhouse_mcp::SurfaceError> {
+        Ok(self
+            .inner
+            .tool_use_ids
+            .get(tool_use_id)
+            .filter(|(owner, _)| owner == principal)
+            .map(|(_, session)| session.clone()))
+    }
+
+    async fn latest_session(&self, principal: &Principal) -> Option<SessionId> {
+        self.inner.sessions.get(principal).cloned()
+    }
+
+    async fn ceiling_policy(
+        &self,
+        principal: &Principal,
+    ) -> Result<TurnPolicy, roundhouse_mcp::SurfaceError> {
+        self.inner.ceiling_policy(principal).await
+    }
+
+    async fn admissible_targets(
+        &self,
+        principal: &Principal,
+        policy: &TurnPolicy,
+    ) -> Result<Vec<roundhouse_core::routing::Target>, roundhouse_mcp::SurfaceError> {
+        self.inner.admissible_targets(principal, policy).await
+    }
+
+    async fn balance(
+        &self,
+        principal: &Principal,
+    ) -> Result<Option<roundhouse_core::control::Balance>, roundhouse_mcp::SurfaceError> {
+        self.inner.balance(principal).await
+    }
+
+    async fn session_facts(
+        &self,
+        session: &SessionId,
+    ) -> Result<SessionFacts, roundhouse_mcp::SurfaceError> {
+        self.inner.session_facts(session).await
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.inner.now_ms()
+    }
+}
+
+/// F4 (M12 review): the R-M2 order is a shared function every implementor
+/// calls, not a doc contract each one re-types.
+///
+/// This is the same assertion as
+/// `a_calls_tool_use_id_decides_which_conversation_the_answer_is_about`, run
+/// against [`IndependentReads`] instead of `FakeDeployment` — a *second*
+/// implementor, standing in for `roundhouse-server`'s `ControlPlaneReads`,
+/// which this crate's tests cannot reach. Before the fix its predecessor
+/// inverted the order by hand, type-checked, satisfied the trait, ran
+/// unmodified through `ControlPlaneSurface`, and failed this assertion; with
+/// the order behind the provided `resolve_session` an implementor supplies only
+/// its own three lookups and the answer is R-M2's whichever way it was
+/// written.
+#[tokio::test]
+async fn an_independent_reads_impl_cannot_invert_the_shared_resolution_order() {
+    let subagent = SessionId::new("acme/ada/sess_subagent");
+    let mut deployment = FakeDeployment::default();
+    deployment
+        .tool_use_ids
+        .insert("toolu_sub".to_string(), (ada(), subagent.clone()));
+    let store = Arc::new(ControlStore::new());
+    let surface = ControlPlaneSurface::new(Arc::new(IndependentReads { inner: deployment }), store);
+
+    // R-M2: a call answering `toolu_sub` must resolve to the subagent's
+    // conversation, not to the principal's most recent one — from an
+    // implementor that shares no resolution code with `FakeDeployment` beyond
+    // the one function that holds the ruling.
+    let answered =
+        served(&call_answering(&surface, &ada(), "status", json!({}), "toolu_sub").await);
+    assert_eq!(
+        answered["conversation"],
+        json!(subagent.as_str()),
+        "the tool-use id must decide the conversation even though a fallback \
+         'most recent session' exists — R-M2's ordering, enforced by the \
+         shared function rather than by this implementor's own care"
+    );
 }

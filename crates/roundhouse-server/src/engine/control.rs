@@ -15,24 +15,27 @@
 //! is a *narrowing*, so an overlay lost to a restart widens routing back to the
 //! deployment's ceiling and never past it — the failure is a turn that was not
 //! as cheap as an agent asked for, which is visible in the audit trail either
-//! way. A steer payload lost to a restart is the one real hole, and it is
-//! bounded the same way: the log holds the emitted call, so `fetch_steer`
-//! refuses rather than inventing, and the turn continues. Neither loss can
-//! produce a turn routed somewhere its key does not allow, which is the only
-//! failure that would not be survivable.
+//! way.
+//!
+//! **The steer payload used to be the one real hole here, and M10.0 closed it
+//! by moving the payload.** A correction deposited in this store was lost on
+//! restart, and `fetch_steer` then refused an id the log still named. The
+//! correction is a conversation item now, so it is in the session log with
+//! everything else and this store no longer holds it — which is why
+//! `deposit_steer` and `steer_for_completion` are gone rather than kept. Nothing
+//! left here can produce a turn routed somewhere its key does not allow, which
+//! is the only failure that would not be survivable.
 
 use std::sync::Arc;
 
 use roundhouse_core::context::Tokenizer;
-use roundhouse_core::control::{PolicyOverrides, Principal, TurnPolicy};
+use roundhouse_core::control::{PolicyOverrides, TurnPolicy};
 use roundhouse_core::ids::SessionId;
-use roundhouse_core::item::{Item, ItemContent};
-use roundhouse_core::now_ms;
 use roundhouse_core::routing::Candidate;
 use roundhouse_core::session::SessionState;
 use roundhouse_core::store::SessionStore;
 use roundhouse_core::validate::{Arm, EscalationOverrides, Objective};
-use roundhouse_mcp::{ControlStore, SteerRecord};
+use roundhouse_mcp::ControlStore;
 
 use crate::control_config::Admission;
 use crate::engine::Engine;
@@ -170,32 +173,6 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             })
             .unwrap_or_else(|| Objective::from_items(&state.items))
     }
-
-    /// Commit the corrective payload behind a steer this turn just emitted.
-    ///
-    /// **After the log commit, always.** The log is the truth and this store is
-    /// a projection of it, so the ordering decides which way a crash between the
-    /// two fails: this way leaves a call in the log with no payload here and
-    /// `fetch_steer` refuses an id it cannot resolve, which the agent reports and
-    /// the turn survives. The other way would leave a payload for a call that
-    /// was never emitted — a steer an agent can fetch and answer against a
-    /// session that never asked for it.
-    ///
-    /// What to deposit is [`steer_for_completion`]'s question; this only writes
-    /// it, and only where there is a store to write to.
-    pub(super) fn deposit_steer(
-        &self,
-        session_id: &SessionId,
-        principal: &Principal,
-        item: &Item,
-        guidance: String,
-    ) {
-        let Some(control) = &self.control else { return };
-        if let Some(record) = steer_for_completion(session_id, principal, item, guidance, now_ms())
-        {
-            control.deposit_steer(record);
-        }
-    }
 }
 
 /// What the audit trail is told when an escalation asked for more than the pool
@@ -243,11 +220,13 @@ pub(super) struct Escalated {
 
 /// Compose the escalation onto `admission`, then clamp it into reach.
 ///
-/// A free function with no `&self`, for the reason [`steer_for_completion`] is
-/// one: what a floor composes to is separable from the engine that quoted the
-/// pool, and separating them is what makes the degenerate cases — an empty
-/// pool, a floor already met, a floor nothing can meet — checkable without an
-/// engine to build.
+/// A free function with no `&self`, and the reason is its own: what a floor
+/// composes to is separable from the engine that quoted the pool, and separating
+/// them is what makes the degenerate cases — an empty pool, a floor already met,
+/// a floor nothing can meet — checkable without an engine to build. (This
+/// sentence used to borrow `steer_for_completion`'s reasoning by reference;
+/// M10.0 T4 deleted that function, so the argument is spelled out here rather
+/// than pointing at something a reader cannot find.)
 ///
 /// **The order is composition, then reachability, and it cannot be the other
 /// way.** `admission.policy` already carries the membership's own floor and any
@@ -288,87 +267,9 @@ pub(super) fn escalate_within_reach(
     }
 }
 
-/// The steer record a completing interjection leaves behind, if it left one.
-///
-/// A free function with no `&self`, for the reason
-/// [`settled_cost_usd`](spend::settled_cost_usd) is one: the decision about
-/// *what* is deposited is separable from the store it is deposited into, and
-/// separating them is what makes the degenerate case checkable without an
-/// engine to build.
-///
-/// **The id comes off the item and from nowhere else.** The item is what the log
-/// committed and what the client will resend, so reading the id from it makes
-/// "the call an agent fetches by" and "the call its client answers" one string
-/// written once — a `steer_id` supplied beside the item would be a second place
-/// for them to disagree, and a disagreement there is a steer nobody can fetch.
-///
-/// `None` for a completion carrying anything but a tool call. That is not an
-/// error: such a completion emitted no call, so there is nothing for an agent to
-/// fetch and nothing to key a record by. Depositing one anyway would need an
-/// invented id, which is a payload an agent could reach only by guessing.
-fn steer_for_completion(
-    session_id: &SessionId,
-    principal: &Principal,
-    item: &Item,
-    guidance: String,
-    now_ms: u64,
-) -> Option<SteerRecord> {
-    let ItemContent::ToolCall { call_id, .. } = &item.content else {
-        return None;
-    };
-    Some(SteerRecord {
-        steer_id: call_id.clone(),
-        session: session_id.clone(),
-        principal: principal.clone(),
-        guidance,
-        emitted_at_ms: now_ms,
-        outcome: None,
-        outcome_note: None,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_steer_is_keyed_by_the_call_the_committed_item_names_and_by_nothing_else() {
-        let session = SessionId::new("acme/ada/main");
-        let principal = roundhouse_core::control::Principal::new("acme", "ada");
-
-        // The probe: the id comes off the item, so the tool an agent calls and
-        // the item its client resends name one string.
-        let deposited = steer_for_completion(
-            &session,
-            &principal,
-            &Item::tool_call("rhsteer_resp_1", "fetch_steer", "{}"),
-            "go back to the parser".into(),
-            7,
-        )
-        .expect("a completion carrying a call is a steer");
-        assert_eq!(deposited.steer_id, "rhsteer_resp_1");
-        assert_eq!(deposited.guidance, "go back to the parser");
-        assert_eq!(deposited.session, session);
-        assert_eq!(deposited.principal, principal);
-        assert_eq!(deposited.emitted_at_ms, 7);
-        assert!(
-            deposited.outcome.is_none() && deposited.outcome_note.is_none(),
-            "an outcome is the agent's to report, not the emitter's to assume"
-        );
-
-        // The control: a completion that emitted no call has nothing an agent
-        // could fetch, so nothing is deposited under an id nobody named.
-        assert!(
-            steer_for_completion(
-                &session,
-                &principal,
-                &Item::user_text("not a call"),
-                "unreachable".into(),
-                7,
-            )
-            .is_none()
-        );
-    }
 
     /// A quoted candidate at `quality_prior`, with the axes the clamp does not
     /// read left at zero.

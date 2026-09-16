@@ -33,7 +33,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::HeaderMap;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -45,24 +45,81 @@ use tokio::task::JoinHandle;
 
 use roundhouse_core::context::Tokenizer;
 use roundhouse_core::control::Principal;
-use roundhouse_core::event::{IncompleteReason, SessionEvent, SessionEventKind};
+use roundhouse_core::event::{IncompleteReason, SessionEvent, SessionEventKind, Usage};
 use roundhouse_core::ids::{ResponseId, SessionId, TurnId};
 use roundhouse_core::item::{Item, ItemContent};
 use roundhouse_core::now_ms;
 use roundhouse_core::store::SessionStore;
 
+use roundhouse_fleet::WireProtocol;
+
 use crate::control_config::{ControlPlane, PlaneSource};
 use crate::conversations::Conversations;
-use crate::dialect::ClientDialect;
-use crate::engine::Engine;
-use crate::http::{ApiError, LogTail, POLL_INTERVAL, READ_BATCH, parse_body, store_error};
-
-mod wire;
-use wire::{
-    EmittedCall, canonicalize, completed_frame, created_frame, delta_frame, failed_frame,
-    incomplete_frame, item_added_frame, item_done_frame, tool_call_added_frame,
-    tool_call_done_frame, turn_id_for,
+use crate::engine::{Engine, TurnInput};
+use crate::http::{
+    ApiError, LogTail, POLL_INTERVAL, parse_body, refuse_over_fair_use, store_error,
 };
+use crate::messages_api::MAX_REQUEST_BYTES;
+use crate::prefix_admission::bind_prefix;
+
+/// **Public for one function and one reason** (M17, R-N10):
+/// [`wire::function_call_item`] is the outbound projection of a stored tool
+/// call, and the suite that pins it against codex's own encoder —
+/// `tests/codex_wire_shapes.rs`, this repo's wire oracle — is an integration
+/// test and cannot see a private helper. Every other item here stays
+/// `pub(super)` or `pub(crate)`, so the surface this exposes is exactly the one
+/// value the oracle has to compare.
+///
+/// The alternative was to assert the *frames* instead, which is how this
+/// projection went unpinned for its whole life: an axum `Event` is write-only,
+/// so nothing outside this module could ever read back what it emitted.
+pub mod wire;
+use wire::{
+    call_added_frame, call_arguments_delta_frame, call_done_frame, canonicalize, completed_frame,
+    created_frame, delta_frame, failed_frame, incomplete_frame, item_added_frame, item_done_frame,
+    message_item_id,
+};
+
+/// What a committed item becomes on this wire, if anything.
+///
+/// Two shapes and not an `Option<&str>`, because the second one is not text: a
+/// tool call is three fields, three frames, and — unlike a seam answer — the
+/// product of a turn that really did dispatch. Making them one type is what
+/// keeps [`ResponsesFollower::emitted`] the single narrowing that both `concerns` and
+/// `project` read, which is the property that doc insists on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Emitted<'a> {
+    /// An answer committed whole rather than streamed: the interjection seam's.
+    SeamText(&'a str),
+    /// A call this turn's model asked the client to run.
+    ToolCall {
+        call_id: &'a str,
+        name: &'a str,
+        /// The MCP server the stored call named, when its client named one.
+        ///
+        /// Carried through the projection since M17 (R-N10) so the frames
+        /// re-emit what the log holds rather than a bare name codex's exact
+        /// `ToolName { name, namespace }` lookup cannot resolve.
+        namespace: Option<&'a str>,
+        arguments: &'a str,
+    },
+}
+
+/// The one answer to "what is this conversation's turn id".
+///
+/// Re-exported rather than left private because
+/// [`messages_api`](crate::messages_api) mints turn ids too, and a second FNV
+/// over `Item::render` would be a second answer: the id is what deduplicates a
+/// client's retry onto the response it already paid for, so two dialects that
+/// hashed differently would each be idempotent alone and neither across a
+/// client that switched — or across the chained topology, where a roundhouse
+/// serving this surface is a roundhouse dispatching the other.
+///
+/// It lives here because this is where it was written and because the pinned
+/// hash literal that guards it lives beside it. Its natural home is
+/// `roundhouse-core` beside `Item::render`, and the day a third dialect wants
+/// it, moving it there — with the pin — is the change to make.
+pub(crate) use wire::turn_id_for;
 
 /// Engine and store handles, plus this node's conversation bindings.
 ///
@@ -99,6 +156,25 @@ impl<S: SessionStore, T: Tokenizer + Clone> Clone for Compat<S, T> {
     }
 }
 
+/// The version segment every route on this surface is served under.
+///
+/// A constant for the same reason [`MCP_MOUNT_PATH`](crate::mcp_api::MCP_MOUNT_PATH)
+/// is one, and F14 is the miss that earned it: two unrelated places have to
+/// agree on this string and only one of them is in this file. The route below
+/// is where it is *served*; [`codex_launch::mcp_endpoint`](crate::codex_launch)
+/// strips it off a deployment's `base_url` to recover the root the MCP surface
+/// is mounted at, because `base_url` is defined as where this deployment serves
+/// the Responses API. A literal in each would make a version rung — `/v2` — a
+/// change that compiles, serves turns perfectly, and hands the generated config
+/// an MCP url with a bogus version segment on it. The client then starts, times
+/// out on MCP, and runs every turn with every steer silently unresolvable.
+///
+/// Deliberately *not* shared with the admin, metrics, and session routes, which
+/// spell their own `/v1` in their own files: those are a separate versioning
+/// surface with no coupling to `base_url`, and one constant across all of them
+/// would claim a site-wide policy nobody has decided on.
+pub const API_PREFIX: &str = "/v1";
+
 /// The compatibility surface's route, gated by a control plane.
 ///
 /// Separate from [`http::router`](crate::http::router) rather than folded into
@@ -130,7 +206,18 @@ where
 {
     let planes: Arc<dyn PlaneSource> = planes;
     Router::new()
-        .route("/v1/responses", post(create_response::<S, T>))
+        .route(
+            &format!("{API_PREFIX}/responses"),
+            post(create_response::<S, T>),
+        )
+        // The same 32 MB ceiling the Messages surface takes from the platform,
+        // for the same reason and against the same axum default: a `Bytes`
+        // extractor with no layer caps every request at an undisclosed 2 MiB,
+        // and an agentic client resending its history crosses that long before
+        // any provider would refuse it (M11.1 review, F3). This surface keeps
+        // axum's own plain-text refusal shape — its clients read a status, not
+        // a dialect-specific error envelope — so only the limit moves here.
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .with_state(Compat {
             engine,
             store,
@@ -145,18 +232,37 @@ where
 
 /// The part of a Responses request this surface reads.
 ///
-/// Everything else a client sends — `model`, `tools`, `tool_choice`,
-/// `parallel_tool_calls`, `reasoning`, `text`, `include`, `store`,
-/// `client_metadata` — is accepted and ignored. Ignoring rather than rejecting
-/// is the point of a compatibility surface: v1 chooses its target by routing
-/// policy rather than by requested model and runs no tool loop, and a client
-/// that had to strip fields before talking to us would not be a client of the
-/// same API.
+/// Everything else a client sends — `parallel_tool_calls`, `reasoning`, `text`,
+/// `include`, `store`, `client_metadata` — is accepted and ignored. Ignoring
+/// rather than rejecting is the point of a compatibility surface: v1 chooses its
+/// target by routing policy rather than by requested model, and a client that
+/// had to strip fields before talking to us would not be a client of the same
+/// API. Roundhouse still runs no tool *itself*: the client does, which is why
+/// `tools` is forwarded rather than acted on.
+///
+/// **`tools` and `tool_choice` left that list in M11.2**, and their absence from
+/// it had a cost worth naming: a codex client's whole toolbox was parsed by
+/// nothing, so every turn reached the model with no tools declared and could
+/// only answer in prose — on the surface whose clients are agents.
+///
+/// **`model` was on that list until M10 and is now accepted, *recorded*, and
+/// still never routed on.** The change is one word and it is the one word that
+/// matters: nothing below reads it to pick a target, and the router cannot —
+/// it never receives it. What it becomes is the turn's *declared baseline*, the
+/// name the savings figure prices its counterfactual against, which is a
+/// question only the client can answer and which ignoring the field threw away.
 #[derive(Debug, Deserialize)]
 struct ResponsesRequest {
     /// The system prompt, sent whole on every turn.
     #[serde(default)]
     instructions: String,
+    /// What the client believes it is talking to.
+    ///
+    /// Recorded verbatim on the decision and read only by pricing. A client
+    /// that names nothing is not a client that named the default: the
+    /// counterfactual is inferred for that turn, and the log says which.
+    #[serde(default)]
+    model: Option<String>,
     /// The conversation so far, this turn's new items included.
     ///
     /// Held as raw JSON so an unsupported item type can be named in the refusal
@@ -166,6 +272,25 @@ struct ResponsesRequest {
     #[serde(default)]
     stream: bool,
     prompt_cache_key: Option<String>,
+    /// What the client's own process can run.
+    ///
+    /// **New in M11.2, and until then this surface parsed no tools at all** —
+    /// so a codex client's whole toolbox was accepted, ignored, and never
+    /// reached the upstream, which is why a turn served through here could only
+    /// answer in prose. Threaded to
+    /// [`FrontierQuote::tools`](roundhouse_fleet::FrontierQuote) and nothing
+    /// else; roundhouse still runs no tool itself.
+    ///
+    /// Raw JSON, forwarded verbatim, for the reason the Messages surface's twin
+    /// field gives: roundhouse defines none of these schemas, so a typed
+    /// projection could only lose what it did not model — a freeform tool's
+    /// grammar, a server-tool type, whatever the next API version adds.
+    #[serde(default)]
+    tools: Option<Value>,
+    /// How the client wants the model to choose among [`Self::tools`]. A string
+    /// on some requests and an object on others, hence `Value`.
+    #[serde(default)]
+    tool_choice: Option<Value>,
 }
 
 /// `POST /v1/responses`
@@ -193,8 +318,15 @@ where
     // One snapshot for the whole request: the namespace a cache key is
     // qualified into and the dialect the reply is rendered in are read off it
     // too, and two of them could disagree across a refresh.
-    let plane = state.planes.plane(now_ms());
+    let plane = state.planes.plane(now_ms()).await;
     let mut admission = plane.turn_admission(&headers)?;
+    // Immediately after the key lookup and before anything is parsed, bound or
+    // granted. A rolling fair-use window is the one refusal an *agent* rather
+    // than an operator acts on, so it has to arrive as a status code with a
+    // retry time — which this is the last point in the request able to produce,
+    // since everything below spawns the turn and answers with a stream. See
+    // `http::refuse_over_fair_use`.
+    refuse_over_fair_use(&*state.engine, &admission).await?;
     let request: ResponsesRequest = parse_body(&body)?;
     if !request.stream {
         return Err(ApiError::unprocessable(
@@ -210,8 +342,34 @@ where
     let conversation_key = context.conversation_key().to_owned();
     admission.request_context = Some(Arc::new(context));
     let turn_id = turn_id_for(&claimed);
+    // Before `bind` consumes it, and off the *claimed* conversation rather than
+    // off the session's items afterwards: the two are equal by construction —
+    // `bind` admits only the suffix that makes them so — and reading it here
+    // needs no second trip to the store. This is the number the wire reports if
+    // the interjection seam answers this turn; see
+    // [`Engine::context_contribution`] for why the wire cannot just forward what
+    // the log books.
+    // Borrowed rather than moved, because the same declarations are handed to
+    // the turn below: they are part of the request's size (M11.2a's F4) and
+    // reporting an input count that omitted them would understate the largest
+    // part of an agentic client's request.
+    let admitted_input_tokens = state.engine.admitted_input_tokens(
+        &claimed,
+        request.tools.as_ref(),
+        request.tool_choice.as_ref(),
+    );
     let (session_id, input, history_rewritten) = state
-        .bind(&plane, &admission.principal, &conversation_key, claimed)
+        .bind(
+            &plane,
+            &admission.principal,
+            &conversation_key,
+            admission
+                .request_context
+                .as_ref()
+                .and_then(|context| context.thread_id.as_deref())
+                .or(codex_thread_id(&headers).as_deref()),
+            claimed,
+        )
         .await?;
 
     let context = admission.request_context.as_ref().expect("parsed context");
@@ -243,9 +401,47 @@ where
         let session_id = session_id.clone();
         let turn_id = turn_id.clone();
         let admission = admission.clone();
+        // Empty is treated as absent. A client that sends `"model": ""` has
+        // named nothing, and recording the empty string would put a baseline
+        // in the log that no catalog can resolve and no reader can act on.
+        let declared_baseline = request.model.filter(|model| !model.trim().is_empty());
+        // Moved out of the request here, next to the baseline, because both are
+        // properties of *this* request rather than of the conversation the log
+        // holds — nothing replays them, and nothing downstream reads them again.
+        let (tools, tool_choice) = (request.tools, request.tool_choice);
         async move {
             engine
-                .run_turn(&session_id, turn_id, input, &admission)
+                .run_turn(
+                    &session_id,
+                    turn_id,
+                    TurnInput {
+                        items: input,
+                        declared_baseline,
+                        // This surface reads no ceiling off the request. The
+                        // field exists because the Messages surface has one to
+                        // pass (M11.1, F1); `max_output_tokens` on a Responses
+                        // request stays accepted-and-ignored like the rest of
+                        // the fields this compatibility surface does not read,
+                        // and honouring it is a separate decision with its own
+                        // test.
+                        output_token_cap: None,
+                        // The tools are *not* in that category any more, and
+                        // the asymmetry is deliberate: a ceiling the client
+                        // declared changes how much of an answer it gets, while
+                        // tools it declared change whether an agentic turn can
+                        // be answered at all. Dropping them made every codex
+                        // turn a prose turn.
+                        tools,
+                        tool_choice,
+                        // The mirror of the Messages surface's stamp: this
+                        // surface accepted Responses-shaped tools, so that is
+                        // what it declares, and a turn routed to an
+                        // `anthropic_messages` catalog entry is restated by the
+                        // dispatch client rather than posted as-is (M11.2a, F1).
+                        tools_dialect: Some(WireProtocol::OpenAiResponses),
+                    },
+                    &admission,
+                )
                 .await
                 .map(|_| ())
                 .map_err(|error| error.to_string())
@@ -254,16 +450,16 @@ where
 
     let follower = ResponsesFollower {
         tail: LogTail::new(Arc::clone(&state.store), session_id, start),
+        engine: Arc::clone(&state.engine),
+        admitted_input_tokens,
+        context_contribution: None,
         turn_id,
         response_id: None,
         turn,
         queued: VecDeque::new(),
         item_open: false,
         text: String::new(),
-        // Read once and carried, rather than consulted per frame: a
-        // reconfiguration must not be able to change a namespace half way
-        // through a response the client is still reading.
-        dialect: plane.client_dialect().clone(),
+        message_index: 0,
         phase: Phase::Tailing,
     };
 
@@ -281,132 +477,96 @@ where
 // Binding a conversation name to a session
 // ---------------------------------------------------------------------------
 
-impl<S: SessionStore, T: Tokenizer + Clone> Compat<S, T> {
-    /// Resolve a conversation name to the session holding its history, and to the part
-    /// of `claimed` that session does not have yet.
-    ///
-    /// The read is unleased and therefore a snapshot: a second request on the
-    /// same conversation name arriving before the first has appended would compute its
-    /// delta against a prefix that is about to grow. Serializing turns within a
-    /// conversation is the client's job — this API has no other way to order
-    /// them, since a turn's input is defined by the one before it — and the
-    /// engine's per-session gate keeps the log itself consistent regardless.
+impl<S: SessionStore, T: Tokenizer + Clone + Send + Sync + 'static> Compat<S, T> {
     async fn bind(
         &self,
         plane: &ControlPlane,
         principal: &Principal,
         conversation_key: &str,
+        thread_id: Option<&str>,
         claimed: Vec<Item>,
     ) -> Result<(SessionId, Vec<Item>, bool), ApiError> {
-        // Computed once and used for both the fork counter and the session id,
-        // so the two cannot key on different strings. See [`Conversations`].
-        let key = self.namespaced_key(plane, principal, conversation_key);
-        let session_id = self.conversations.bind(principal, &key);
-        self.create(&session_id).await?;
-        if let Some(delta) = suffix_after(&self.stored_items(&session_id).await?, &claimed) {
-            return Ok((session_id, delta, false));
-        }
-
-        // The client's history disagrees with what we stored — it edited or
-        // compacted the conversation, so what it is asking for is not a
-        // continuation of this session and appending the difference would
-        // produce a conversation neither side believes in. It gets a fresh
-        // internal session, which is empty and so agrees trivially; no second
-        // check is needed.
+        let (session_id, delta, history_rewritten) = bind_prefix(
+            &self.engine,
+            &self.store,
+            &self.conversations,
+            plane,
+            principal,
+            conversation_key,
+            claimed,
+        )
+        .await?;
+        // R-M9 (M12.1 review, F2): the one moment the client's thread and the
+        // session it is in are both in hand. `bind_prefix` has just decided
+        // which session this turn's history belongs to — including the fork,
+        // which is what makes recording it here rather than before the call
+        // load-bearing — and the request that carried the history also carried
+        // the thread it came from.
         //
-        // The honest cost: the new session starts with no history, so the
-        // routing ledger no longer knows any provider is warm for it and the
-        // next turn is priced cold. That is the conservative direction — a
-        // ledger that claimed a warm prefix for a conversation that just
-        // changed shape would be claiming a cache hit nobody can serve.
-        let session_id = self.conversations.fork(principal, &key);
-        self.create(&session_id).await?;
-        Ok((session_id, claimed, true))
-    }
-
-    /// The client's conversation name inside its caller's namespace.
-    ///
-    /// A conversation name is chosen by the client and nothing stops two of them
-    /// choosing `main`. Before namespacing, both got the session called `main`:
-    /// one log, one lease, one warm prefix, and each tenant's conversation
-    /// visible in the other's prompt.
-    ///
-    /// Deferred to [`ControlPlane::qualify`] rather than spelled here, because
-    /// the id this mints is the id the native surface's namespace check will
-    /// later be asked about: minting and checking are one function pair, and
-    /// two spellings of the convention is how a namespace stops being one. The
-    /// prefix it produces is unambiguous because a project or user id may not
-    /// contain `/` — the config's slug rule is what buys that, and it is why
-    /// the rule is at the config boundary rather than here.
-    /// The plane is the handler's snapshot rather than a fresh read: a session
-    /// id minted under one compiled plane and checked under another is a
-    /// session created and immediately unreachable.
-    fn namespaced_key(
-        &self,
-        plane: &ControlPlane,
-        principal: &Principal,
-        conversation_key: &str,
-    ) -> String {
-        plane.qualify(principal, conversation_key)
-    }
-
-    async fn create(&self, session_id: &SessionId) -> Result<(), ApiError> {
-        self.engine
-            .create_session(session_id)
-            .await
-            .map(|_| ())
-            .map_err(|error| ApiError::internal("engine_error", error.to_string()))
-    }
-
-    /// The session's committed conversation, projected from the log.
-    ///
-    /// A projection rather than a [`Session`](roundhouse_core::session::Session):
-    /// opening one takes the lease, and a read that took the lease would evict
-    /// the turn it is about to start.
-    async fn stored_items(&self, session_id: &SessionId) -> Result<Vec<Item>, ApiError> {
-        let mut items = Vec::new();
-        let mut cursor = 0u64;
-        loop {
-            let batch = self
-                .store
-                .read_events(session_id, cursor, READ_BATCH)
-                .await
-                .map_err(|error| store_error(session_id, error))?;
-            let Some(last) = batch.last() else { break };
-            cursor = last.seq;
-            items.extend(batch.into_iter().filter_map(|event| match event.kind {
-                SessionEventKind::ItemAppended { item } => Some(item),
-                _ => None,
-            }));
+        // Here rather than inside `bind_prefix`, which the Messages surface
+        // shares: a thread id is a *codex* correlator arriving on a codex
+        // header, and the other dialect's clients correlate by the tool-use id
+        // this deployment emitted. Threading an always-`None` argument through
+        // the shared prefix-admission function would put one dialect's
+        // vocabulary in the one place both dialects have to agree.
+        if let Some(thread_id) = thread_id {
+            self.conversations
+                .bind_thread(principal, thread_id, session_id.clone())
+                .await;
         }
-        Ok(items)
+        Ok((session_id, delta, history_rewritten))
     }
 }
 
-/// The part of `claimed` that `stored` does not already contain.
-///
-/// `None` when the two disagree anywhere they overlap. A `claimed` shorter than
-/// `stored` is not a disagreement but the ordinary retry: the client is
-/// re-sending a turn whose answer we already appended and it never saw, and the
-/// empty suffix it yields is exactly right — the turn id will deduplicate it
-/// onto the response that answer belongs to.
-fn suffix_after(stored: &[Item], claimed: &[Item]) -> Option<Vec<Item>> {
-    let overlap = stored.len().min(claimed.len());
-    stored[..overlap]
-        .iter()
-        .zip(&claimed[..overlap])
-        .all(|(stored, claimed)| same_item(stored, claimed))
-        .then(|| claimed[overlap..].to_vec())
-}
+/// The header codex carries its per-turn metadata in.
+const CODEX_TURN_METADATA_HEADER: &str = "x-codex-turn-metadata";
 
-/// Item equality as this surface sees it: role and content, never the response
-/// stamp.
+/// The largest turn-metadata header this surface will parse.
 ///
-/// Assistant history comes back as the model's own words with no id attached —
-/// the client has no field to put one in — so comparing stamps would fail the
-/// prefix check on every turn after the first.
-fn same_item(stored: &Item, claimed: &Item) -> bool {
-    stored.role == claimed.role && stored.content == claimed.content
+/// Untrusted input: anything may set this header, so the work of parsing it is
+/// work an unauthenticated-shaped request could ask for repeatedly. Real ones
+/// are well under this — codex omits its unbounded tool inventory from the
+/// header form precisely to keep it bounded
+/// (`core/src/responses_metadata.rs::compatibility_headers` @ `6344a65`) — and
+/// what a client loses by exceeding it is one exact correlation, falling back
+/// to the R-M7 name path and then to `latest`.
+const MAX_TURN_METADATA_BYTES: usize = 16 * 1024;
+
+/// The longest thread id worth remembering. Codex's are UUIDs; this is a bound
+/// on what a caller can make this node store as a map key, not a format check.
+const MAX_THREAD_ID_BYTES: usize = 256;
+
+/// The thread this turn belongs to, as codex declares it.
+///
+/// **Why a header rather than the body's `prompt_cache_key`** (M12.1 review,
+/// F2, R-M9). At the pinned oracle (`6344a65`) the cache key is
+/// `responses_metadata.session_id` (`core/src/client.rs`'s `prompt_cache_key`),
+/// and every subagent of an agent family shares the root's — `AgentControl`'s
+/// own comment says so (`core/src/agent/control.rs:104-110`), and
+/// `core/src/session/session.rs:671-676` is where a non-root source takes it.
+/// The per-thread id rides the turn separately: `THREAD_ID_KEY` puts
+/// `self.thread_id` into the `x-codex-turn-metadata` payload
+/// (`core/src/responses_metadata.rs:281`, built from the per-session
+/// `TurnMetadataState` at `core/src/session/turn_context.rs:618-622`). So this
+/// header is the only thing on the wire that tells a subagent's turn from its
+/// parent's, and it is exactly what `_meta.threadId` will later quote back.
+///
+/// **Read leniently and used only as a lookup key.** Absent, non-UTF-8,
+/// oversized, not JSON, no `thread_id`, or a `thread_id` that is not a
+/// non-empty bounded string all mean the same thing — bind nothing — because
+/// this is an optimization over a fall-back that already works, and a turn
+/// must never be refused over metadata it did not have to send. It is never a
+/// tenancy claim and never part of a session id: the binding it makes is
+/// partitioned by the principal the *bearer key* resolved to, so a forged
+/// header can only name a thread inside its own sender's namespace.
+fn codex_thread_id(headers: &HeaderMap) -> Option<String> {
+    let raw = headers.get(CODEX_TURN_METADATA_HEADER)?.to_str().ok()?;
+    if raw.len() > MAX_TURN_METADATA_BYTES {
+        return None;
+    }
+    let metadata: Value = serde_json::from_str(raw).ok()?;
+    let thread_id = metadata.get("thread_id")?.as_str()?;
+    (!thread_id.is_empty() && thread_id.len() <= MAX_THREAD_ID_BYTES).then(|| thread_id.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -442,29 +602,32 @@ enum Step {
     End,
 }
 
-/// An item this response emitted, in the two shapes a response can emit one.
-///
-/// An enum rather than two predicates because the choice is exclusive and the
-/// exclusivity is load-bearing: an item is a call or a message, never both, and
-/// a stream that projected it twice would hand a client one answer in two
-/// shapes. Named here rather than in [`wire`] because what it decides is which
-/// frames to build, not how to build them.
-enum Emitted<'a> {
-    /// A synthetic tool call — the steered turn's outcome B.
-    Call(EmittedCall<'a>),
-    /// Assistant text committed whole, with no deltas behind it — the halted
-    /// turn's outcome C.
-    Message(&'a str),
-}
-
 /// Streams one turn as a Responses API response.
 ///
 /// The turn runs in a task this follower never aborts, for the reason
 /// [`http`](crate::http) gives: dropping the handle detaches rather than
 /// cancels, and a client that hangs up must not take down a turn the log has
 /// already admitted.
-struct ResponsesFollower<S: SessionStore> {
+struct ResponsesFollower<S: SessionStore, T: Tokenizer + Clone> {
     tail: LogTail<S>,
+    /// Only ever asked what this deployment's tokenizer makes of an item; the
+    /// turn itself runs in the task below. Held rather than a cloned tokenizer
+    /// so the two estimates a seam answer reports come from the same pair of
+    /// functions [`Engine::plan`] prices a dispatched turn with.
+    engine: Arc<Engine<S, T>>,
+    /// The input this request admitted, as [`Engine::admitted_input_tokens`]
+    /// counts it. Computed once in the handler because it is a fact about the
+    /// request, not about any frame.
+    admitted_input_tokens: u64,
+    /// Set when this response answered at the interjection seam instead of
+    /// dispatching, and then reported in place of what the log booked.
+    ///
+    /// Carried on the follower rather than recomputed at the completion,
+    /// because the item it is derived from arrives in an earlier event and the
+    /// completion carries no trace of it. `None` means an ordinary dispatched
+    /// turn, whose booked usage *is* its context contribution — see
+    /// [`Engine::context_contribution`] for why the two part company only here.
+    context_contribution: Option<Usage>,
     turn_id: TurnId,
     /// Set by the `turn_started` naming this request's turn, or by the response
     /// a `turn_deduplicated` points at.
@@ -478,14 +641,19 @@ struct ResponsesFollower<S: SessionStore> {
     /// empty message the client would have to interpret.
     item_open: bool,
     /// Deltas so far, which `response.output_item.done` repeats in full.
+    ///
+    /// Cleared when a message item is closed, because a response can have more
+    /// than one: a turn that speaks, calls a tool and speaks again produces two,
+    /// and a `done` repeating the whole turn's prose would hand the client the
+    /// first run twice.
     text: String,
-    /// How an emitted tool call is spelled for this client, fixed for the life
-    /// of the response. See [`ClientDialect`].
-    dialect: ClientDialect,
+    /// How many message items this response has closed, which is what names the
+    /// next one. See [`message_item_id`].
+    message_index: usize,
     phase: Phase,
 }
 
-impl<S: SessionStore> ResponsesFollower<S> {
+impl<S: SessionStore, T: Tokenizer + Clone + Send + Sync + 'static> ResponsesFollower<S, T> {
     async fn next_frame(&mut self) -> Option<Event> {
         loop {
             if let Some(frame) = self.queued.pop_front() {
@@ -627,44 +795,65 @@ impl<S: SessionStore> ResponsesFollower<S> {
     /// may go out. An item a client sent never has a stamp at all, because
     /// canonicalization sets `None` on everything on the input path.
     ///
-    /// The two arms then differ in what else they have to be sure of:
+    /// Beyond provenance there is one further condition, and it is the whole of
+    /// the narrowing: `item_open` must be false. An ordinary dispatched turn
+    /// puts its answer on the wire through the delta path and *then* commits the
+    /// same text as an item, so claiming it here too would emit a second
+    /// `response.output_item.done` for one message — the answer arriving twice.
+    /// `item_open` is true exactly when a delta has already announced that item,
+    /// so the only message this arm ever claims is one no delta preceded: a
+    /// completion from the interjection seam, whose text is committed whole and
+    /// never streamed. Before this arm existed a halted turn streamed `created`
+    /// then `completed` with no text at all — the correction sat in the log and
+    /// the agent, whose loop the halt is meant to end, was handed an empty
+    /// answer.
     ///
-    /// - **A call** needs nothing more. Only a `ToolCall` has a `call_id`, a
-    ///   `name` and `arguments` to render, so the frame builders would not
-    ///   compile against anything else.
-    /// - **A message** needs `item_open` to be false, and that is the whole of
-    ///   the narrowing. An ordinary dispatched turn puts its answer on the wire
-    ///   through the delta path and *then* commits the same text as an item, so
-    ///   claiming it here too would emit a second
-    ///   `response.output_item.done` for one message — the answer arriving
-    ///   twice. `item_open` is true exactly when a delta has already announced
-    ///   that item, so the only message this arm ever claims is one no delta
-    ///   preceded: the validate loop's halt (outcome C), whose guidance text is
-    ///   committed whole and never streamed. Before this arm existed a halted
-    ///   turn streamed `created` then `completed` with no text at all — the
-    ///   correction sat in the log and the agent, whose loop the halt is meant
-    ///   to end, was handed an empty answer.
-    fn emitted<'a>(&'a self, item: &'a Item) -> Option<Emitted<'a>> {
+    /// **A second arm used to live here, went away in M10.0's T4, and is back
+    /// for a different reason.** It was removed because the only `ToolCall` a
+    /// response could stamp was the *synthetic* one an interjection emitted, and
+    /// no seam produced one any more — an unreachable arm in the one predicate
+    /// that decides what goes on the wire. What is stamped now is not synthetic:
+    /// since M11.2 a dispatched turn's own tool calls are committed as items as
+    /// the model produces them, so this arm is the ordinary agentic turn and the
+    /// alternative to having it is a codex client whose tools never fire. A
+    /// client's *own* tool call is still never projected — it carries no stamp,
+    /// which is the first condition below and what
+    /// `a_clients_own_tool_call_is_not_projected_as_an_emitted_one` asserts.
+    fn emitted<'a>(&self, item: &'a Item) -> Option<Emitted<'a>> {
         let response_id = item.response_id.as_ref()?;
         if self.response_id.as_ref() != Some(response_id) {
             return None;
         }
         match &item.content {
+            ItemContent::Text { text } if !self.item_open && !text.is_empty() => {
+                Some(Emitted::SeamText(text))
+            }
             ItemContent::ToolCall {
                 call_id,
                 name,
                 arguments,
-            } => Some(Emitted::Call(EmittedCall {
-                dialect: &self.dialect,
-                response_id,
+                namespace,
+            } => Some(Emitted::ToolCall {
                 call_id,
                 name,
+                namespace: namespace.as_deref(),
                 arguments,
-            })),
-            ItemContent::Text { text } if !self.item_open && !text.is_empty() => {
-                Some(Emitted::Message(text))
-            }
-            ItemContent::Text { .. } | ItemContent::ToolResult { .. } => None,
+            }),
+            // The three M11.1 variants join `ToolResult` here rather than
+            // getting arms of their own, and the reason is the same for all
+            // four: this dialect has no frame for them. A Responses client
+            // asked for `response.output_text`, and a thinking block relayed as
+            // one would put reasoning in the answer; relayed as anything else
+            // it would be an item type the client drops in silence. A
+            // `ToolResult` is the client's own work coming back, never
+            // something this deployment emitted. They can only reach a session
+            // through the Messages surface's canonicalization, and that surface
+            // is where they go back out.
+            ItemContent::Text { .. }
+            | ItemContent::ToolResult { .. }
+            | ItemContent::Thinking { .. }
+            | ItemContent::RedactedThinking { .. }
+            | ItemContent::Opaque { .. } => None,
         }
     }
 
@@ -685,18 +874,26 @@ impl<S: SessionStore> ResponsesFollower<S> {
                 // text for an item the client was never told about has nowhere
                 // to go, and clients treat that as a protocol violation rather
                 // than as something to recover from.
+                let id = message_item_id(self.message_index);
                 if !self.item_open {
                     self.item_open = true;
-                    self.queued.push_back(item_added_frame());
+                    self.queued.push_back(item_added_frame(&id));
                 }
                 self.text.push_str(text);
-                self.queued.push_back(delta_frame(text));
+                self.queued.push_back(delta_frame(&id, text));
                 Step::Continue
             }
-            SessionEventKind::ResponseCompleted { response_id, usage } => {
-                if self.item_open {
-                    self.queued.push_back(item_done_frame(&self.text));
-                }
+            SessionEventKind::ResponseCompleted {
+                response_id, usage, ..
+            } => {
+                self.close_message_item();
+                // The log's number unless this response answered at the seam.
+                // `unwrap_or` and not `expect`: the emission and the completion
+                // land in one append batch, so a completion with no emission
+                // before it is an ordinary dispatched turn and not an ordering
+                // bug — and if the batch ever did arrive out of order, falling
+                // back to what the log booked is the answer that still balances.
+                let usage = self.context_contribution.as_ref().unwrap_or(usage);
                 self.queued.push_back(completed_frame(response_id, usage));
                 Step::End
             }
@@ -725,6 +922,7 @@ impl<S: SessionStore> ResponsesFollower<S> {
                 // when there is some. Bound by name so a field added here
                 // cannot be dropped without someone reading this line.
                 usage: _,
+                ..
             } => {
                 let message = match reason {
                     IncompleteReason::BudgetExhausted => {
@@ -744,41 +942,107 @@ impl<S: SessionStore> ResponsesFollower<S> {
                 // usage in this dialect, and the log is where the accounting
                 // for a truncated turn is read from.
                 usage: _,
+                ..
             } => {
                 self.queued.push_back(incomplete_frame(response_id, reason));
                 Step::End
             }
-            // A tool call this response emitted, which `concerns` has already
-            // narrowed to exactly that. Two frames, both carrying the whole
-            // item: the client dispatches off the `done`, and no argument
-            // deltas go out at all because the pinned parser traces and drops
-            // them — so anything not in these two frames is not on the wire.
+            // An answer this response produced at the interjection seam, which
+            // `concerns` has already narrowed to exactly that. Two frames, both
+            // carrying the whole message: it was committed whole rather than
+            // streamed, so there are no deltas for a client to assemble it from
+            // and anything not in these two frames is not on the wire.
             //
-            // `item_open` is deliberately untouched. It tracks the *message*
-            // item, whose `done` the completion below emits; a steered turn
-            // produces no deltas and so leaves it false, which is what makes
-            // the four-frame sequence four frames rather than five with an
-            // empty message on the end.
+            // `item_open` is deliberately untouched. It tracks the *streamed*
+            // message, whose `done` the completion below emits; a seam answer
+            // produces no deltas and so leaves it false, which is what makes the
+            // four-frame sequence four frames rather than five with an empty
+            // message on the end.
+            //
+            // **Both seam answers take this path since M10.0**, and that is the
+            // point of T5: a steer and a halt are one shape now — assistant text,
+            // nothing dispatched, the judge's usage booked — so the usage
+            // substitution below covers the steer by riding the seam the halt
+            // already rode, rather than by a second arm that could drift from it.
             SessionEventKind::ItemAppended { item } => {
-                // Built before either is queued, because the borrow is on this
-                // follower and the queue needs it back mutably. Each pair is
-                // built together for a second reason too: a client announced
-                // one item and handed another has no way to reconcile them.
-                let frames = match self.emitted(item) {
-                    Some(Emitted::Call(call)) => {
-                        Some([tool_call_added_frame(&call), tool_call_done_frame(&call)])
+                // One `emitted` call decides everything this arm does, for the
+                // reason that predicate's own doc gives: a narrowing written
+                // twice has neither copy load-bearing, and a test that removed
+                // one would stay green.
+                match self.emitted(item) {
+                    // An answer this response produced at the interjection seam.
+                    // Two frames, both carrying the whole message: it was
+                    // committed whole rather than streamed, so there are no
+                    // deltas for a client to assemble it from and anything not
+                    // in these two frames is not on the wire.
+                    //
+                    // **Both seam answers take this path since M10.0**, and that
+                    // is the point of T5: a steer and a halt are one shape now —
+                    // assistant text, nothing dispatched, the judge's usage
+                    // booked — so the usage substitution below covers the steer
+                    // by riding the seam the halt already rode, rather than by a
+                    // second arm that could drift from it.
+                    Some(Emitted::SeamText(text)) => {
+                        // Built before either is queued, because the borrow is on
+                        // this follower and the queue needs it back mutably. The
+                        // pair is built together for a second reason too: a
+                        // client announced one item and handed another has no way
+                        // to reconcile them.
+                        let contribution = self
+                            .engine
+                            .context_contribution(self.admitted_input_tokens, item);
+                        let id = message_item_id(self.message_index);
+                        // The id is spent whether or not a delta ever used it, so
+                        // a later message item of the same response cannot be
+                        // handed the same one.
+                        self.message_index += 1;
+                        self.context_contribution = Some(contribution);
+                        self.queued.push_back(item_added_frame(&id));
+                        self.queued.push_back(item_done_frame(&id, text));
                     }
-                    // A halt: guidance committed whole, with no deltas behind
-                    // it. `item_open` stays false — it tracks the *streamed*
-                    // message, whose `done` the completion below emits — so
-                    // the completion adds only its own frame and the sequence
-                    // is the same four a steered turn is.
-                    Some(Emitted::Message(text)) => {
-                        Some([item_added_frame(), item_done_frame(text)])
+                    // **A dispatched turn's own call, and deliberately no
+                    // context substitution.** The seam answer above replaces the
+                    // reported usage because its turn dispatched nothing and the
+                    // log booked the judge's side call instead; this turn *did*
+                    // dispatch, and what the log booked is the provider's own
+                    // measured counts — exactly what the client should be told.
+                    //
+                    // **The open message item is closed first, and the order is
+                    // the contract rather than a courtesy.** The log holds this
+                    // turn's items in the order the model produced them — text,
+                    // then the call — and a client rebuilds its history from the
+                    // items it was handed, in the order it was handed them.
+                    // Emitting the call while the message is still open would
+                    // hand back `[call, message]`; the client would resend that,
+                    // and the prefix check would disagree with the log at the
+                    // first item, so every tool-using session forks on its second
+                    // turn while every turn still answers.
+                    //
+                    // Three frames because the pinned codex parser reads the
+                    // whole call off `output_item.done` and explicitly ignores
+                    // `function_call_arguments.delta`
+                    // (`codex-api/src/sse/responses.rs` @ `6344a65`, the
+                    // unhandled arm), so `done` is what makes the call real; the
+                    // `added` announcement and the argument delta are sent
+                    // because a *streaming* consumer of this dialect renders from
+                    // them, and sending only what one parser reads is how a
+                    // surface stops working for the next client.
+                    Some(Emitted::ToolCall {
+                        call_id,
+                        name,
+                        namespace,
+                        arguments,
+                    }) => {
+                        let call = [
+                            call_added_frame(call_id, name, namespace),
+                            call_arguments_delta_frame(call_id, arguments),
+                            call_done_frame(call_id, name, namespace, arguments),
+                        ];
+                        self.close_message_item();
+                        self.queued.extend(call);
                     }
-                    None => None,
-                };
-                self.queued.extend(frames.into_iter().flatten());
+                    None => {}
+                }
                 Step::Continue
             }
             SessionEventKind::SessionCreated { .. }
@@ -788,6 +1052,25 @@ impl<S: SessionStore> ResponsesFollower<S> {
             | SessionEventKind::ValidationDecided { .. }
             | SessionEventKind::Error { .. } => Step::Continue,
         }
+    }
+
+    /// Close the open message item, if there is one.
+    ///
+    /// **Called from two places and it is the same act in both**: a tool call
+    /// arriving mid-answer, and the completion. A message item is closed by
+    /// repeating its whole text in a `response.output_item.done`, and the text
+    /// buffer is emptied with it — a response can have more than one message
+    /// item since M11.2, and a second `done` repeating the first run as well
+    /// would hand the client the answer's opening twice.
+    fn close_message_item(&mut self) {
+        if !self.item_open {
+            return;
+        }
+        let id = message_item_id(self.message_index);
+        let text = std::mem::take(&mut self.text);
+        self.item_open = false;
+        self.message_index += 1;
+        self.queued.push_back(item_done_frame(&id, &text));
     }
 
     /// End a stream whose turn is gone but whose response never terminated.
@@ -823,48 +1106,109 @@ impl<S: SessionStore> ResponsesFollower<S> {
 
 #[cfg(test)]
 mod tests {
-    use roundhouse_core::item::Role;
+    use axum::http::HeaderValue;
 
     use super::*;
 
-    fn user(text: &str) -> Item {
-        Item::user_text(text)
+    fn turn_metadata(raw: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CODEX_TURN_METADATA_HEADER,
+            HeaderValue::from_str(raw).expect("a header value fixture"),
+        );
+        headers
     }
 
-    fn assistant(text: &str) -> Item {
-        Item::assistant_text(text, ResponseId::new("resp_1"))
-    }
-
+    /// R-M9 (M12.1 review, F2): the ingest reads the turn's *own* thread out of
+    /// codex's header, and reads nothing else out of it.
+    ///
+    /// The first assertion is the one with teeth. The payload carries
+    /// `session_id` — the whole agent family's, and the string that becomes
+    /// `prompt_cache_key` — right beside `thread_id`, so a reader that took
+    /// the wrong field would bind every subagent to its parent and F2 would be
+    /// re-openable with everything green.
     #[test]
-    fn a_grown_history_yields_only_what_the_session_lacks() {
-        let stored = vec![user("hello"), assistant("hi")];
-        let claimed = vec![
-            user("hello"),
-            // The client's copy carries no response stamp; ours does.
-            Item {
-                role: Role::Assistant,
-                content: ItemContent::Text { text: "hi".into() },
-                response_id: None,
-            },
-            user("again"),
-        ];
+    fn the_turn_metadata_header_yields_this_turns_own_thread_and_only_that() {
+        let headers = turn_metadata(
+            &serde_json::json!({
+                "session_id": "shared-family-session",
+                "thread_id": "this-agents-thread",
+                "turn_id": "t1",
+            })
+            .to_string(),
+        );
         assert_eq!(
-            suffix_after(&stored, &claimed),
-            Some(vec![user("again")]),
-            "a stamped assistant item must still match the client's copy of it"
+            codex_thread_id(&headers).as_deref(),
+            Some("this-agents-thread"),
+            "the per-thread field, never the family-wide `session_id` sitting \
+             next to it"
+        );
+    }
+
+    /// The same header, read leniently: everything malformed binds nothing,
+    /// and nothing refuses a turn.
+    ///
+    /// **Untrusted input, and the cost of getting it wrong is asymmetric.**
+    /// The binding is an optimization over a fall-back that already works, so
+    /// a header this function cannot make sense of must cost the client its
+    /// exactness and never its turn. Each case below is a way an attacker — or
+    /// a future codex — could send one.
+    #[test]
+    fn a_turn_metadata_header_this_surface_cannot_read_binds_nothing_and_refuses_nothing() {
+        assert_eq!(codex_thread_id(&HeaderMap::new()), None, "absent");
+        assert_eq!(codex_thread_id(&turn_metadata("not json")), None);
+        assert_eq!(
+            codex_thread_id(&turn_metadata(r#"{"session_id":"s"}"#)),
+            None,
+            "a payload with no `thread_id` at all"
+        );
+        assert_eq!(
+            codex_thread_id(&turn_metadata(r#"{"thread_id":42}"#)),
+            None,
+            "a `thread_id` that is not a string"
+        );
+        assert_eq!(
+            codex_thread_id(&turn_metadata(r#"{"thread_id":""}"#)),
+            None,
+            "an empty one, which would otherwise be a name every client shares"
+        );
+        assert_eq!(
+            codex_thread_id(&turn_metadata(
+                &serde_json::json!({ "thread_id": "t".repeat(MAX_THREAD_ID_BYTES + 1) })
+                    .to_string()
+            )),
+            None,
+            "and one longer than this node will store as a map key"
+        );
+
+        // The oversized-payload arm, which is the one that bounds *work* rather
+        // than storage: a caller must not be able to make this surface parse
+        // an arbitrarily large JSON document per turn.
+        let bloat = serde_json::json!({
+            "thread_id": "real-thread",
+            "workspaces": "w".repeat(MAX_TURN_METADATA_BYTES),
+        })
+        .to_string();
+        assert!(bloat.len() > MAX_TURN_METADATA_BYTES);
+        assert_eq!(
+            codex_thread_id(&turn_metadata(&bloat)),
+            None,
+            "over the cap the header is not parsed at all, even though a valid \
+             `thread_id` is in there — the client loses one exact correlation \
+             and keeps its turn"
         );
     }
 
     #[test]
-    fn a_retry_of_an_answered_turn_yields_nothing_to_append() {
-        let stored = vec![user("hello"), assistant("hi")];
-        // The retry predates the answer, because the client never saw it.
-        assert_eq!(suffix_after(&stored, &[user("hello")]), Some(Vec::new()));
-    }
-
-    #[test]
-    fn an_edited_history_is_refused_rather_than_appended() {
-        let stored = vec![user("hello"), assistant("hi")];
-        assert_eq!(suffix_after(&stored, &[user("goodbye")]), None);
+    fn the_api_prefix_is_shaped_the_way_its_two_consumers_read_it() {
+        // Both sides concatenate rather than join: this file writes
+        // `{API_PREFIX}/responses`, and `codex_launch::mcp_endpoint` strips the
+        // same string off the tail of a deployment's `base_url`. A missing
+        // leading slash would build `v1/responses`, and a trailing one
+        // `/v1//responses` — each of which serves and strips a path the other
+        // side does not, which is F14's failure mode reached by a different
+        // route.
+        assert!(API_PREFIX.starts_with('/'), "{API_PREFIX}");
+        assert!(!API_PREFIX.ends_with('/'), "{API_PREFIX}");
     }
 }

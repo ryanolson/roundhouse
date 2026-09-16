@@ -197,6 +197,43 @@ the ~15 ATIF structs are re-implementable in an afternoon — the spec is
 published — but start with the crate: a shared type is a conversation,
 a copy is a fork.
 
+> **[2026-08-21] S2 landed**, in `crates/roundhouse-relay` (the crate depends on
+> `roundhouse-core` and `nemo-relay-types = "=0.7.3"` and nothing else of ours)
+> and three routes in `roundhouse-server/src/relay_api.rs`: `GET
+> /v1/sessions/{id}/{atof,trajectory,optimization}`. Five corrections to the text
+> above, from the round-3 re-read and from building it:
+>
+> - **twelve ATIF structs, not ~15**, and they are not "re-implementable from a
+>   published spec" — the normative definition *is* Apache-2.0 Rust source
+>   (`crates/core/src/observability/atif.rs`), so the port carries an attribution
+>   header in the form the M6 judge-prompt port set, plus a test pinning every
+>   field name against rev `1a548124`.
+> - **the mark path does not work as written.** The shipped converter's
+>   `MARK_EXTRACTOR_REGISTRY` is empty and an unregistered `(name, version)`
+>   falls through to a default that stringifies the payload into a system step
+>   with no `extra` and no `data_schema` at all. Routing decisions are emitted as
+>   `category: "context"` **scope-ends** instead, the one path that copies a
+>   producer's `data_schema` into the ATIF step's `extra` verbatim. Registering a
+>   mark extractor upstream (~20 lines of Python, their repo) stays on the S4
+>   contribution list; until it lands, our export has to be consumable by the
+>   converter people actually have.
+> - **the pin is `=0.7.3` for a new reason.** 0.8.0-rc.1 published on
+>   2026-08-21, so "0.8 is unpublished" is dead; what holds the pin is that
+>   `codec/optimization.rs` and the whole ATOF envelope are byte-identical from
+>   0.7.3 through HEAD. It costs `uuid = "=1.18.1"` graph-wide — a six-release
+>   downgrade from the 1.24.0 our caret resolved to, verified by a resolver run,
+>   and a ceiling whose unlock condition is recorded beside the pin.
+> - **`Partial` is the common case, not the exception.** Relay derives `status`
+>   from `limitations`, and carrying the capability gate's band there (the
+>   round-2 ruling's requirement) makes every locally-served turn `Partial`.
+>   That is intended: a routing saving is a gated counterfactual, and `Complete`
+>   is reserved for a hosted turn on our own key whose usage the provider
+>   reported.
+> - **a fourth limitation exists**, `roundhouse_seat_forwarded`, beyond the three
+>   the ruling named. A forwarded seat publishes no cost field at all, and a
+>   money-free summary claiming `Complete` would say every calculation was
+>   available.
+
 ### S3 — Rule the topology (with M7)
 
 Two supported deployments, one of them guarded:
@@ -422,3 +459,81 @@ contradiction dissolves into a route-property hypothesis M7 tests
 (Switchyard's launcher sets it conditionally on auth mode); and a
 version-identity rule binds every pre-1.0 adoption to a git rev, never a
 version or tag.
+
+
+## Addendum (2026-09-01): Relay 0.8.2, and S3's chain guards instantiated for the Anthropic surface
+
+`PLAN-anthropic-messages.md`'s R9 requires the then-current Relay release to
+be re-read before any chained-topology work. Relay published 0.8.1-rc.1 on
+2026-08-27 and **0.8.2** since; the delta read against the 0.8.0 tarballs is
+`research/nemo-relay-0.8.0-published-read.md`'s 2026-09-01 addendum, and its
+findings map into this ruling as follows.
+
+**The five Anthropic hazards R7 pinned all hold at 0.8.2**, byte-for-byte:
+the alphabetizing `serde_json::Map` re-encode, the SSE re-encoder dropping
+`id:` lines, `?beta=true` passing through `upstream_url` untouched, a
+configured `anthropic_auth_header` cleared on a layer-inconsistent base-URL
+change, and the plugin dispatch-override stripping provider credentials. The
+files carrying them did not change; where a file did change, the function
+did not.
+
+**S3's four guards, instantiated for `/v1/messages` (M11.2b):**
+
+1. *Roundhouse as the upstream, no routing around us.* `[upstream]
+   anthropic_base_url` is the whole aim; the `alignment.rs` ChatGPT redirect
+   is OpenAI-route only and the Anthropic arm has no analog. The real-Relay
+   e2e asserts that the request Relay forwards arrives at roundhouse at all.
+2. *Which credential actually went upstream.* Settled differently from the
+   codex case, and the difference is the ruling: Relay's `already_authed`
+   short-circuit means a configured upstream auth header is injected only
+   for a credential-less client, and its proxy token is **merged** into the
+   client's `ANTHROPIC_CUSTOM_HEADERS`, not substituted for it. So the turn
+   key rides the client's own environment through Relay onto the dedicated
+   header, Relay's `x-nemo-relay-proxy-token` is consumed at its gateway and
+   never reaches roundhouse, and chained turns carry exactly Direct's
+   attribution. The upstream-layer carrier is the documented fallback for a
+   credential-less client and is key-authed only.
+3. *Prefix admission survives the re-encode.* M11.1's `wire.rs` guard
+   (a Relay-alphabetized resend canonicalizes to the same items) made it a
+   fact at the unit seam; M11.2b's `--continue` through a real Relay makes
+   it a fact on the wire.
+4. *One authoritative accounting log.* Unchanged; Relay's ATOF stream is
+   observability. Relay's SSE re-encoder drops `id:` lines, which is one of
+   the two reasons this surface offers no in-band resumption cursor.
+
+**Two 0.8.2 changes a chained deployment must know**, neither on the
+Anthropic route: the gateway **refuses a non-loopback bind**
+(`server/mod.rs:92-97`) — a Relay reached from another container cannot be
+stood up as 0.8.0 allowed — and a hook-request authorization gate now fronts
+the coding-agent hook endpoints (§A.8), which only matters to Relay's own
+hooks. One argv change (§A.7): `--settings` is now spliced before the first
+bare `--` rather than beside `--plugin-dir`; a well-formed launch is
+unaffected.
+
+**Pins.** `nemo-relay-types` 0.8.2 is byte-identical to 0.8.0 and still pins
+`uuid = "=1.18.1"`; the `=0.7.3` pin and its written unlock condition stand,
+with a dated note in the manifest. Moving would cost nothing and free
+nothing.
+
+**Run for real (M11.2b).** The chained suite drives claude 2.1.257 through
+a `nemo-relay` 0.8.2 built from the published crate and asserts at
+roundhouse's edge: turn key on the dedicated header, `x-nemo-relay-source:
+gateway`, no Relay proxy token, `?beta=true` intact, sentinel not a seat,
+and a `--continue` through the re-encoder in the same session. Guards 1–3
+above are therefore observed, not argued. One more fact for a later rung:
+Relay's gateway stamps eight identity headers onto the dispatched request
+(`traceparent`, `x-nemo-relay-{agent-kind, identity-quality,
+parent-scope-id, request-id, root-scope-id, session-id, source, turn-id}`);
+roundhouse ignores them today, and a correlation ruling would start there.
+
+**Addendum (2026-09-02, M11.3):** the chained handoff for Claude Code is
+now a launcher subcommand (`topham relay`) over one rendering the e2e rig
+shares, verified against a real Relay 0.8.2 before the client is spawned
+(the published binary cannot exclude its system config layer, so the
+launcher verifies Relay's resolved upstream by dry-run and refuses when a
+system file or an ambient `NEMO_RELAY_*_BASE_URL` re-aims it). The Codex
+half is rendered but a documented limit: Relay splices a `--config
+model_provider=` override onto codex's argv that outranks the generated
+`config.toml` (`research/nemo-relay-0.8.0-published-read.md` §A.14), so a
+chained Codex turn arrives credential-less until Relay's upstream-layer
+carrier is used for it.

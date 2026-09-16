@@ -7,8 +7,10 @@ members = [
     "crates/roundhouse-core",
     "crates/roundhouse-fleet",
     "crates/roundhouse-mcp",
+    "crates/roundhouse-relay",
     "crates/roundhouse-store-redis",
     "crates/roundhouse-server",
+    "crates/topham",
 ]
 
 [workspace.package]
@@ -20,6 +22,13 @@ license = "Apache-2.0"
 roundhouse-core = { path = "crates/roundhouse-core" }
 roundhouse-fleet = { path = "crates/roundhouse-fleet" }
 roundhouse-mcp = { path = "crates/roundhouse-mcp" }
+roundhouse-relay = { path = "crates/roundhouse-relay" }
+# The composition root, depended on *upwards* by `crates/topham`: the launcher
+# reads the two client-launch generators and the constants they need, and the
+# direction is the right one -- a launcher sits above the server it points a
+# client at, which is also what keeps `roundhouse-server/src/main.rs` free of a
+# flag parser.
+roundhouse-server = { path = "crates/roundhouse-server" }
 roundhouse-store-redis = { path = "crates/roundhouse-store-redis" }
 
 # Dynamo crates, pinned to an upstream commit of ai-dynamo/dynamo.
@@ -56,6 +65,20 @@ tokenizers = { version = "0.21.4", default-features = false, features = [
 anyhow = "1"
 async-trait = "0.1"
 axum = { version = "=0.8.4", features = ["macros", "ws"] }
+# The operator launcher's three, and all three are ordinary libraries rather
+# than synergy dependencies: none of them is the other half of the product, none
+# is read for wire conformance, and a bump is a bump. Exact-pinned anyway,
+# because `crates/topham` is the one binary an operator runs by hand and a
+# floating CLI parser changes what their muscle memory does.
+#
+# Scope check before they landed: none of the three constrains `tokio` or
+# `uuid`, which is what would have collided with the Dynamo pins, and toolchain
+# 1.96.1 clears ratatui's 1.88 rust-version floor. `crossterm` is ratatui's own
+# backend and is named here rather than left transitive because the TUI reads
+# key events from it directly.
+clap = { version = "=4.6.6", features = ["derive"] }
+crossterm = "=0.29.0"
+ratatui = "=0.30.2"
 futures = "0.3"
 # Minting a control-plane key (`roundhouse-server/src/control_config.rs`): 32
 # bytes straight from the system CSPRNG. `getrandom` rather than `rand`
@@ -74,9 +97,36 @@ getrandom = "0.3"
 # reader would otherwise "fix" it.
 hex = "0.4"
 serde = { version = "1", features = ["derive", "rc"] }
+# Default features, and one of the defaults is load-bearing: `preserve_order`
+# is OFF, so `serde_json::Map` is a `BTreeMap` and every `Value` renders in one
+# sorted key order. `ItemContent::Opaque` (`roundhouse-core/src/item.rs`) rests
+# on exactly that -- a content block this build does not model is stored as a
+# parsed `Value` and rendered as a digest of its canonical JSON, so two
+# encodings of the same block must digest alike. That is not a nicety: a
+# chained NeMo Relay re-serializes every intercepted body through an
+# alphabetizing map (synergy ruling S3, guard 1), so turn two of a conversation
+# arrives with its keys reordered, and a render that followed insertion order
+# would fork every session behind a Relay on its second turn -- silently, while
+# every turn still answered.
+# The guard is `an_opaque_block_is_insensitive_to_key_order`, whose second
+# assertion (the two renders agree) goes red the moment the order becomes
+# insertion order. Note that its *first* assertion would not: `IndexMap`'s
+# `PartialEq` ignores order, so `Value` equality alone would keep passing.
+# Unlock condition: anything in this graph turning `preserve_order` on --
+# Cargo features are unified crate-wide, so a transitive dependency enabling it
+# changes this crate's `Map` too. Re-check `ItemContent::render` and the prefix
+# admission it feeds before accepting such a dependency.
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2.0.17"
+# The client-launch config generator (`roundhouse-server/src/codex_launch.rs`)
+# emits a `config.toml` for Codex and parses it back in its own unit tests.
+# Already resolved in the tree at 0.8.23 (via the pinned Dynamo crates), so
+# naming it here adds a dependency edge rather than a crate. Hand-templated
+# emission with `toml` used only to *quote* free strings and to parse back:
+# serializing a struct would drop the operator-facing WHY comments, which are
+# the reason anyone reads a generated config at all.
+toml = "0.8.23"
 # Caret, resolving to 1.48.0 today: the pinned Dynamo rev's `dynamo-mocker`
 # pins tokio exactly, and an exact pin here would just restate that constraint
 # where nobody can see whose it is. When Dynamo relaxes, this floats.

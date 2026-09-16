@@ -27,8 +27,15 @@
     "the same three axes. Narrowing only: an override that would raise the",
     "admissible set on any axis -- a lower min_quality, a looser cadence -- is",
     "rejected at load, naming both the key and the project it belongs to, rather",
-    "than silently clamped. Ada's key below tightens the floor from 0.5 to 0.8",
+    "than silently clamped. Ada's key below tightens the floor from 0.5 to 0.6",
     "and the cadence from 2-per-10 to 1-per-10; it could not loosen either.",
+    "Why 0.6 and not something higher: a floor above the local model's declared",
+    "local_quality (0.62 in the catalog example beside this file) takes the",
+    "cadence's own fallback away -- the spent window promises local service and",
+    "the floor has just made the only local model inadmissible for this key --",
+    "and the boot cross-check refuses exactly that, naming ada. Two narrowings",
+    "that are each fine alone can be unkeepable together, which is the whole",
+    "reason the check compares the two files rather than validating each.",
     "A project's \"budget\" sets its spending ceiling: limit_usd, a window",
     "(\"total\" for the life of the project, \"monthly\" resetting each UTC",
     "calendar month), on_exhaustion (\"degrade_to_local\" keeps serving from",
@@ -54,6 +61,70 @@
     "together -- validation does not refuse an over-subscribed set of shares.",
     "Bob's key below is capped at a flat $100; Cara's is a 25% share of",
     "whatever acme's limit currently is.",
+    "A project's or a key's \"fair_use\" caps token and/or dollar draws over a",
+    "rolling window -- \"5h\", \"24h\" or \"7d\" -- shaped like a frontier lab's own",
+    "session limits, not a calendar reset like \"budget\" above. Each window needs",
+    "at least one of max_tokens or max_usd; an entry naming neither reads like a",
+    "limit and enforces nothing, and is rejected at load rather than silently",
+    "kept. It is a second axis from \"budget\", never a variant of it: a budget is",
+    "a ledger with a hold and a settlement, fair use is a rolling counter with",
+    "neither, and the two compose -- a project may carry both, either, or",
+    "neither. A key's own fair_use is a second ceiling on top of its project's,",
+    "never an overlay on it: both bind independently, and whichever is tighter",
+    "refuses first, naming its own scope (\"project\" or \"member\") and window in",
+    "the 429 rather than leaving a client to guess which one to raise. Acme's",
+    "project-level window below caps the whole project at 2,000,000 tokens per",
+    "rolling 5 hours; Bob's own window on top of it caps him individually at",
+    "400,000 tokens per rolling 24 hours, so his personal ceiling can refuse him",
+    "on a busy day even while Acme as a whole still has room. This milestone's",
+    "enforcement is single-node only -- see roundhouse_core::control::fair_use for",
+    "the unlock condition -- so a deployment running more than one process behind",
+    "ROUNDHOUSE_REDIS_URL gets two independent ceilings out of this, not one",
+    "shared one, until that lands; the process warns at boot when both apply.",
+    "A project's \"tiers\" turns routing into a two-tier choice: \"capable\" and",
+    "\"efficient\" are ordered lists of target identities (\"provider/model\" for a",
+    "hosted model, \"local/model\" for one of the fleet's own), \"picker\" says",
+    "where an undecided turn lands (\"efficient_first\", the default and the only",
+    "operating point anyone has calibrated, or \"capable_first\", which the",
+    "process warns about at boot), and \"confidence_threshold\" (0.0..=1.0,",
+    "default 0.5) is how sure the scorer must be before it overrules the picker.",
+    "The scorer reads the session's own recent tool results -- error severity,",
+    "whether the agent is producing work or spinning, how deep the session is --",
+    "so an agent that starts looping is moved up a tier and one that just made",
+    "its tests pass is moved back down, with no model call anywhere in the",
+    "decision. Absent \"tiers\" is the shipped answer: the project routes exactly",
+    "as it did before this existed.",
+    "Three things about the lists. Admission runs first and a tier can only",
+    "narrow -- a target this key's policy or credentials do not admit is skipped,",
+    "never resurrected, and a tier that empties entirely falls to the other one",
+    "with the decision's rationale saying so. Order is the operator's: the first",
+    "admitted entry of the picked tier serves the turn, and the rest of that",
+    "same tier are its ordered fallbacks, so acme's capable tier below reads",
+    "\"send it to sol, and if sol is unreachable send it to kimi\" -- a fallback",
+    "fires only on a hosted dispatch that never reached a model (transport,",
+    "timeout, 408, 429, 5xx), under the same turn deadline and the same single",
+    "budget grant; a refusal or a content filter is an answer and is not",
+    "retried, and a local target does not fail over at all. Note how that",
+    "composes with acme's own cadence below: each attempt writes its own routing",
+    "record, so a fallback spends a second ration, and one fall-forward exhausts",
+    "acme's 2-per-10 window on a single turn. That is the conservative direction",
+    "-- a dispatch that failed on the way out really did reach for a hosted",
+    "model -- but a project that expects to fail over should size max_frontier",
+    "for attempts rather than for turns. And a target may not",
+    "be named twice, within a tier or across both: a repeat inside one tier is a",
+    "retry of the model that just failed wearing a failover's clothes, and a",
+    "name in both tiers makes the scorer's choice a no-op that still reads like",
+    "a decision. Both are rejected at load rather than deduplicated.",
+    "One thing about this file as a whole. Acme's efficient tier names",
+    "\"local/REPLACE-with-your-local-model\" and its cadence promises local service",
+    "once the window is spent, and both are promises only a deployment with a local",
+    "fleet can keep. The shipped roundhouse binary attaches none -- it quotes the",
+    "catalog and nothing else -- so this file describes a deployment that has one,",
+    "and pointing ROUNDHOUSE_CONTROL_PLANE at it from a fleetless process is refused",
+    "at boot, naming acme's keys and the local capacity they do not have. The",
+    "refusal is the design working rather than a rough edge: what it buys is that",
+    "nobody ever runs a two-tier example whose cheap tier is empty on every turn",
+    "while the rationale blames the key's admission for it.",
     "Point ROUNDHOUSE_CONTROL_PLANE at your copy."
   ],
 
@@ -63,8 +134,14 @@
       "name": "Acme Corp",
       "policy": {
         "min_quality": 0.5,
-        "allow": ["anthropic/*", "local/*"],
+        "allow": ["anthropic/*", "openrouter/*", "local/*"],
         "frontier_cadence": { "max_frontier": 2, "per_turns": 10 }
+      },
+      "tiers": {
+        "capable": ["openrouter/openai/gpt-5.6-sol", "openrouter/moonshotai/kimi-k3"],
+        "efficient": ["local/REPLACE-with-your-local-model"],
+        "picker": "efficient_first",
+        "confidence_threshold": 0.5
       },
       "budget": {
         "limit_usd": 500.0,
@@ -72,6 +149,11 @@
         "on_exhaustion": "degrade_to_local",
         "overflow_when_local_saturated": true,
         "warn_at": 0.8
+      },
+      "fair_use": {
+        "windows": [
+          { "window": "5h", "max_tokens": 2000000 }
+        ]
       }
     }
   ],
@@ -88,7 +170,7 @@
       "user": "ada",
       "key_sha256": "bd7419bcfc5b931146425c95c682a5194d389c26329672f651fc2eefbd9d95c1",
       "overrides": {
-        "min_quality": 0.8,
+        "min_quality": 0.6,
         "frontier_cadence": { "max_frontier": 1, "per_turns": 10 }
       }
     },
@@ -96,7 +178,12 @@
       "project": "acme",
       "user": "bob",
       "key_sha256": "f18332befc03bf721896be34b6707c92110ec9a26ce4f9f9072538d982cee696",
-      "allocation": { "capped": { "limit_usd": 100.0 } }
+      "allocation": { "capped": { "limit_usd": 100.0 } },
+      "fair_use": {
+        "windows": [
+          { "window": "24h", "max_tokens": 400000 }
+        ]
+      }
     },
     {
       "project": "acme",

@@ -15,18 +15,23 @@ use serde::{Deserialize, Serialize};
 use crate::control::Principal;
 use crate::ids::{ResponseId, SessionId, SideCallId, TurnId, ValidationId};
 use crate::item::Item;
-use crate::routing::{DecisionRecord, Target};
+use crate::routing::{DecisionRecord, DispatchAttempt, Target};
 use crate::validate::{Arm, SteerAction, TriggerRecord, Verdict};
 
 /// Token accounting for one completed model call.
 ///
-/// Two of these four fields are *components* of the other two rather than
-/// additions to them: `cached_input_tokens` is part of `input_tokens`, and
-/// `reasoning_tokens` is part of `output_tokens`. Both providers Roundhouse
-/// targets report them that way — OpenAI nests them under
-/// `input_tokens_details` / `output_tokens_details`, and Anthropic bills
+/// Three of these five counts are *components* of the other two rather than
+/// additions to them: `cached_input_tokens` and `cache_write_tokens` are each
+/// part of `input_tokens`, and `reasoning_tokens` is part of `output_tokens`.
+/// Both providers Roundhouse targets report them that way — OpenAI nests them
+/// under `input_tokens_details` / `output_tokens_details`, and Anthropic bills
 /// thinking as ordinary output — so storing them as separate addends would
 /// double-count every total downstream, including the one billed to a client.
+///
+/// Anthropic is the exception that proves the rule and the reason
+/// `cache_write_tokens` exists: on *its* wire the three input counters are
+/// disjoint, and the client that speaks it converts them into these axes once,
+/// at the decoder. By the time a `Usage` exists the conversion has happened.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u64,
@@ -36,6 +41,24 @@ pub struct Usage {
     /// providers it is whatever the provider reports. It is the number the
     /// whole design exists to maximize.
     pub cached_input_tokens: u64,
+    /// Portion of `input_tokens` the provider *wrote* into its cache.
+    ///
+    /// **A measurement, and only ever a measurement.** Roundhouse already
+    /// *prices* every uncached input token at the cache-write rate — a
+    /// deliberate conservative approximation in `routing::ledger` — and three
+    /// separate surfaces document the gap this field closes: the Responses
+    /// wire's hardcoded `"cache_write_tokens": 0`, the relay summary's
+    /// deliberately-absent field whose doc says it awaits a measurement, and the
+    /// ledger's own note. A field named for a measurement must never be filled
+    /// from a pricing convention, so it stays zero on every dialect that does
+    /// not report one rather than being back-derived from `uncached_input`.
+    ///
+    /// `#[serde(default)]` because the durable log already holds entries written
+    /// before this field existed, and they must keep deserializing. Zero is also
+    /// the right reading for them: at the time they were written the only
+    /// routable dialects reported no cache write at all.
+    #[serde(default)]
+    pub cache_write_tokens: u64,
     pub output_tokens: u64,
     /// Portion of `output_tokens` spent on reasoning the client never sees.
     ///
@@ -108,6 +131,9 @@ impl Usage {
         self.cached_input_tokens = self
             .cached_input_tokens
             .saturating_add(other.cached_input_tokens);
+        self.cache_write_tokens = self
+            .cache_write_tokens
+            .saturating_add(other.cache_write_tokens);
         self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
         self.reasoning_tokens = self.reasoning_tokens.saturating_add(other.reasoning_tokens);
         // Provenance degrades on contact: a total that mixes reported and
@@ -262,11 +288,103 @@ pub enum SessionEventKind {
     ResponseCompleted {
         response_id: ResponseId,
         usage: Usage,
+        /// What the provider itself said this call cost, in its own dollars.
+        ///
+        /// **A sidecar, never an addend.** It sits beside `usage` rather than
+        /// inside it because the two answer different questions: `usage` is
+        /// tokens this deployment prices from its own catalog, and this is the
+        /// other side of the reconciliation — the external bill our
+        /// `committed_usd` is to be checked against. Folded into `Usage` it
+        /// would put a number nobody derived from the rate card into the column
+        /// the savings claim is computed from, and the drift figure that exists
+        /// to surface the gap between the two would be computed against itself.
+        ///
+        /// Recorded here rather than on the `Routed` decision, and that is a
+        /// fact about ordering rather than a preference: `Routed` is written
+        /// before the dispatch is attempted, and the provider's price arrives
+        /// on the stream's final frame. An event is immutable once committed,
+        /// so the decision record cannot learn it. (Review finding G11: before
+        /// this field the value was parsed, carried to the engine, and spent on
+        /// a `tracing::debug!` the binary's own default `info` filter drops.)
+        ///
+        /// `None` for every provider that reports nothing, which is most of
+        /// them, and for every log written before this field existed. Skipped
+        /// on the wire when absent, so a deployment whose upstreams stay silent
+        /// writes the bytes it wrote before.
+        ///
+        /// `default` below is redundant for that last guarantee — see
+        /// `stop_reason`'s note on the identical attribute, the next field in
+        /// this variant, for why, and for why it stays anyway.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_reported_cost_usd: Option<f64>,
+        /// Why the provider stopped, in the provider's own word.
+        ///
+        /// **The durable half of M11.1's F1, and the reason it is durable at
+        /// all is that only the log can carry it to the reader who needs it.**
+        /// A serve surface streams by tailing this log; the turn task that held
+        /// the dispatch's `FrontierChunk::Done` is a different task and is
+        /// already gone by the time the follower reaches the terminal event. So
+        /// a stop reason that stayed in the fold reached no client, and an
+        /// operator reading the log afterwards could not tell a turn cut off at
+        /// the dispatch ceiling from one that finished on its own — the two are
+        /// otherwise byte-identical here.
+        ///
+        /// An open string, not an enum, for the reason
+        /// [`FrontierChunk::Done::stop_reason`](https://docs.rs/roundhouse-fleet)
+        /// gives at length: this is the *provider's* vocabulary, Anthropic
+        /// added two values to it after the crates that closed the enum
+        /// shipped, and the Responses wire spells the same facts differently
+        /// again. Translating into whatever a client is owed belongs to the
+        /// emit layer that knows which dialect it is answering in.
+        ///
+        /// `None` means the provider named no reason — the ordinary answer on
+        /// a wire that has no such field for an ordinary completion, on every
+        /// turn answered at the interjection seam, and in every log written
+        /// before this field existed. It is emphatically not "it finished
+        /// normally". Skipped when absent, so a deployment whose upstreams stay
+        /// silent writes the bytes it wrote before.
+        ///
+        /// That last guarantee — an old log missing this key still reads —
+        /// is not what `default` buys below. `Option<T>` reads a missing key
+        /// as `None` on its own, attribute or not; mutation-testing this
+        /// field (M11.2 Stage 5) dropped `default` and replayed a
+        /// pre-M11.2-shaped event with the key entirely absent, and nothing
+        /// broke. It stays anyway as the marker this variant's fields carry
+        /// for "reads through an old log", so a reader would find its
+        /// absence a gap rather than the redundancy it actually is. (Same
+        /// attribute, same reasoning, on `provider_reported_cost_usd` above.)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stop_reason: Option<String>,
     },
     ResponseIncomplete {
         response_id: ResponseId,
         reason: IncompleteReason,
         usage: Usage,
+        /// The dispatch that failed last, when this turn failed by exhausting
+        /// its targets.
+        ///
+        /// **The one attempt with no successor `Routed` to ride on.** Every
+        /// other failed dispatch of a turn is carried by
+        /// [`DecisionRecord::attempts`] on the record of the dispatch it caused;
+        /// the final one caused no further dispatch, so without this field it
+        /// reached no projection at all — and a single-provider deployment in
+        /// an outage reported *zero* failed attempts for as long as the outage
+        /// lasted, which is exactly inverted from when the number matters
+        /// (review finding G03).
+        ///
+        /// It is deliberately not merged into `usage`'s evidence rule. "Was
+        /// there a failed attempt to attribute" and "was there billable usage
+        /// to consume" are different questions, and the settle path's
+        /// `input_tokens > 0` gate — which correctly keeps a dispatch that
+        /// reached nobody out of the call-count denominator — was answering the
+        /// first with the second.
+        ///
+        /// `None` when the turn failed for a reason that names no target (a
+        /// refusal, a deadline before any dispatch, a body that died
+        /// mid-stream), and for every log written before this field existed.
+        /// Skipped on the wire when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        terminal_attempt: Option<DispatchAttempt>,
     },
     /// A turn was re-sent after reconnect and served from the existing result.
     TurnDeduplicated {
@@ -634,6 +752,8 @@ mod tests {
             kind: SessionEventKind::ResponseCompleted {
                 response_id: ResponseId::new("r"),
                 usage: Usage::default(),
+                provider_reported_cost_usd: None,
+                stop_reason: None,
             },
         };
         assert!(done.is_terminal());
@@ -685,6 +805,53 @@ mod tests {
         );
     }
 
+    /// **A usage record written before the cache-write count existed still
+    /// reads, and reads as zero.**
+    ///
+    /// The durable log is the source of truth and it is replayed, not migrated.
+    /// A `Usage` that refused to deserialize without the new field would take
+    /// every deployment's whole billing history with it on upgrade — and the
+    /// reading it gets has to be right as well as parseable: at the time these
+    /// entries were written the only routable dialects reported no cache write
+    /// at all, so "zero written" is what actually happened rather than a
+    /// placeholder.
+    #[test]
+    fn a_usage_written_before_the_cache_write_count_existed_still_reads() {
+        // Byte-for-byte what `Usage` serialized to before this widening.
+        let json = r#"{"input_tokens":9512,"cached_input_tokens":9000,"output_tokens":64,"reasoning_tokens":0,"accounting":"reported"}"#;
+        let usage: Usage = serde_json::from_str(json).unwrap();
+        assert_eq!(usage.input_tokens, 9_512);
+        assert_eq!(usage.cached_input_tokens, 9_000);
+        assert_eq!(usage.cache_write_tokens, 0);
+        assert_eq!(usage.accounting, Accounting::Reported);
+
+        // The count is a *component* of `input_tokens`, exactly as the cached
+        // count is, so widening changes no total anywhere.
+        let written = Usage {
+            cache_write_tokens: 500,
+            ..usage.clone()
+        };
+        assert_eq!(written.total(), usage.total());
+        assert_eq!(
+            written.uncached_input_tokens(),
+            usage.uncached_input_tokens(),
+            "a cache write is not a second kind of input token"
+        );
+
+        // And it folds like every other count: saturating, and additive across
+        // calls. A rollup that dropped it would report a fleet that never
+        // writes a cache while paying the write premium on every turn.
+        let mut total = written.clone();
+        total.add(&written);
+        assert_eq!(total.cache_write_tokens, 1_000);
+        let mut saturating = Usage {
+            cache_write_tokens: u64::MAX,
+            ..Usage::default()
+        };
+        saturating.add(&written);
+        assert_eq!(saturating.cache_write_tokens, u64::MAX);
+    }
+
     #[test]
     fn three_refusals_name_three_systems() {
         // The blame vocabulary, pinned as wire strings because a surface
@@ -715,6 +882,7 @@ mod tests {
             response_id: ResponseId::new("resp_1"),
             reason: IncompleteReason::BudgetExhausted,
             usage: Usage::default(),
+            terminal_attempt: None,
         };
         assert_eq!(
             serde_json::from_str::<SessionEventKind>(&serde_json::to_string(&event).unwrap())

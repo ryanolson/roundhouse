@@ -50,7 +50,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::session::SessionState;
+use crate::validate::control_call::{ControlCallDialect, task_exchanges_on};
 use crate::validate::exchange::{Exchange, exchanges};
+use crate::validate::tool_signals::{ErrorSeverity, PureBashStreak};
 
 /// Which of the trigger's observations fired.
 ///
@@ -68,6 +70,12 @@ pub enum SignalKind {
     ToolFailureStreak,
     /// A turn far outside this session's own trailing distribution.
     CostAnomaly,
+    /// A named failure in the recent tool output — a traceback, an import
+    /// error, a timeout — at or above a severity threshold.
+    ErrorSeverity,
+    /// Consecutive shell or unrecognised calls with nothing read, written or
+    /// edited between them.
+    PureBashStreak,
 }
 
 /// One observation, and the sentence that states it as a fact.
@@ -133,14 +141,41 @@ pub struct Evidence<'a> {
     pub exchanges: Vec<Exchange>,
     /// Billable tokens per completed turn, oldest first.
     pub turn_tokens: &'a [u64],
+    /// Which client wrote this session, and therefore how one of roundhouse's
+    /// own control calls is spelled in it (M12 review, F8).
+    ///
+    /// Carried on the shared read rather than asked of each signal for the same
+    /// reason [`Self::task_exchanges`] is a method: one answer per session, so
+    /// two signals cannot disagree about whose call a name belongs to.
+    pub dialect: ControlCallDialect,
 }
 
 impl<'a> Evidence<'a> {
-    pub fn of(state: &'a SessionState) -> Self {
+    pub fn of(state: &'a SessionState, dialect: ControlCallDialect) -> Self {
         Self {
             exchanges: exchanges(&state.items),
             turn_tokens: state.recent_turn_tokens(),
+            dialect,
         }
+    }
+
+    /// The exchanges that are the agent working on its task — every signal's
+    /// input (G04).
+    ///
+    /// A method on the shared read rather than a filter inside each signal, and
+    /// the difference is the finding: `NoProgressRepeat` was the limb that was
+    /// reported, but `PingPong` alternates just as happily between two control
+    /// tools, and a `fetch_steer` answered `NoGuidanceYet` reads as a failure to
+    /// [`reads_as_failure`](super::exchange::reads_as_failure) and feeds
+    /// [`ToolFailureStreak`]. Fixing the reported limb and leaving the others is
+    /// exactly what one shared read makes impossible.
+    ///
+    /// `exchanges` stays whole, because the brief still has to *render* what
+    /// happened: a judge reading a trajectory with our own calls silently
+    /// deleted would be shown a session that skips from one command to another
+    /// with no account of the gap.
+    pub fn task_exchanges(&self) -> Vec<&Exchange> {
+        task_exchanges_on(&self.exchanges, self.dialect)
     }
 }
 
@@ -181,13 +216,8 @@ impl Signal for NoProgressRepeat {
     }
 
     fn detect(&self, evidence: &Evidence<'_>) -> Option<String> {
-        let window: Vec<&Exchange> = evidence
-            .exchanges
-            .iter()
-            .rev()
-            .take(self.window)
-            .rev()
-            .collect();
+        let task = evidence.task_exchanges();
+        let window = &task[task.len().saturating_sub(self.window)..];
         let latest = window.last()?;
         // An unanswered call is not a repeat of anything yet: the output is
         // half the comparison and it has not arrived.
@@ -225,10 +255,11 @@ impl Signal for PingPong {
 
     fn detect(&self, evidence: &Evidence<'_>) -> Option<String> {
         let span = self.cycles.checked_mul(2)?;
-        if span < 4 || evidence.exchanges.len() < span {
+        let task = evidence.task_exchanges();
+        if span < 4 || task.len() < span {
             return None;
         }
-        let names: Vec<&str> = evidence.exchanges[evidence.exchanges.len() - span..]
+        let names: Vec<&str> = task[task.len() - span..]
             .iter()
             .map(|call| call.name.as_str())
             .collect();
@@ -258,10 +289,11 @@ impl Signal for ToolFailureStreak {
     }
 
     fn detect(&self, evidence: &Evidence<'_>) -> Option<String> {
-        if self.length == 0 || evidence.exchanges.len() < self.length {
+        let task = evidence.task_exchanges();
+        if self.length == 0 || task.len() < self.length {
             return None;
         }
-        let tail = &evidence.exchanges[evidence.exchanges.len() - self.length..];
+        let tail = &task[task.len() - self.length..];
         // Answered *and* failed. An unanswered call is not a failure — the most
         // recent call of a turn still in flight would otherwise end every
         // streak in a fire.
@@ -343,6 +375,14 @@ pub fn default_signals() -> Vec<Box<dyn Signal>> {
             min_samples: 4,
             multiple: 3.0,
         }),
+        // The two ported ones, registered here rather than left opt-in for the
+        // reason the other four are: `with_signals` exists so a deployment can
+        // *narrow* the set, and a signal nobody enables is a signal nobody
+        // measures. Their thresholds are named constants beside their types
+        // rather than literals here, because unlike the four above they are
+        // upstream's numbers and the provenance travels with them.
+        Box::new(ErrorSeverity::default()),
+        Box::new(PureBashStreak::default()),
     ]
 }
 
@@ -404,11 +444,15 @@ impl Trigger {
     /// interjection seam makes about supplying a field before an occupant
     /// consults it. The policy's real consumer is the action map, which needs
     /// it as the ceiling every narrowing composes through.
-    pub fn evaluate(&self, state: &SessionState) -> Option<TriggerRecord> {
+    pub fn evaluate(
+        &self,
+        state: &SessionState,
+        dialect: ControlCallDialect,
+    ) -> Option<TriggerRecord> {
         if !self.gate_open(state) {
             return None;
         }
-        let evidence = Evidence::of(state);
+        let evidence = Evidence::of(state, dialect);
         let signals: Vec<SignalFired> = self
             .signals
             .iter()
@@ -440,7 +484,7 @@ impl Trigger {
         if state.turn_index <= 1 {
             return false;
         }
-        if state.this_turn_fulfilled_a_steer() {
+        if state.this_turn_fulfils_a_steer() {
             return false;
         }
         if state.consecutive_interventions() >= self.config.max_consecutive_interventions {
@@ -510,7 +554,54 @@ mod tests {
         Evidence {
             exchanges: exchanges(items),
             turn_tokens,
+            dialect: ControlCallDialect::ClaudeMessages,
         }
+    }
+
+    /// G04 (review finding): `NoProgressRepeat` matches on
+    /// `name + arguments + output_hash` alone, with no exception for
+    /// roundhouse's own control surface — and `fetch_steer`,
+    /// `explain_last_route`, and `status` are deliberately pure per
+    /// `roundhouse-mcp/src/surface.rs`'s `SteerResponse` doc ("every field is
+    /// a fold of the conversation's own log, so two calls produce identical
+    /// bytes"), which is exactly the shape this signal is built to catch. An
+    /// agent that calls `status` three times with nothing else changing (a
+    /// legitimate idempotent poll of its own budget) used to read as the same
+    /// stuck loop as three identical `pytest` failures. The signal reads
+    /// [`Evidence::task_exchanges`] now, and the control below is what proves
+    /// it still finds a real loop with our own calls sitting on top of it.
+    #[test]
+    fn three_identical_reads_of_our_own_surface_are_not_a_no_progress_repeat() {
+        let signal = NoProgressRepeat {
+            occurrences: 3,
+            window: 8,
+        };
+
+        let mut polling = Vec::new();
+        for n in 0..3 {
+            polling.push(call(&format!("s{n}"), "mcp__roundhouse__status", "{}"));
+            polling.push(result(&format!("s{n}"), r#"{"budget_remaining_usd":4.2}"#));
+        }
+        assert_eq!(
+            signal.detect(&evidence_of(&polling, &[])),
+            None,
+            "an idempotent poll of roundhouse's own control surface is not a no-progress repeat"
+        );
+
+        // Control, live: the same three polls with a real stuck loop *behind*
+        // them. The repeat is still found, which is what says the exemption
+        // dropped our calls from the walk rather than blinding the signal to
+        // whatever happens to sit at the end of it.
+        let mut mixed = Vec::new();
+        for n in 0..3 {
+            mixed.push(call(&format!("p{n}"), "pytest", r#"{"path":"tests/"}"#));
+            mixed.push(result(&format!("p{n}"), "ImportError: no module named app"));
+        }
+        mixed.extend(polling);
+        let fact = signal
+            .detect(&evidence_of(&mixed, &[]))
+            .expect("the pytest loop is still a loop with our own calls after it");
+        assert!(fact.contains("pytest"), "{fact}");
     }
 
     /// The sharpest of the four, and the one a naive implementation gets wrong.
@@ -578,6 +669,129 @@ mod tests {
             None,
             "an unanswered call is not yet a repeat of anything"
         );
+    }
+
+    /// F04: the same loop, seen through a real codex client's wrapper.
+    ///
+    /// Codex prepends `Wall time: N.NNNN seconds\nOutput:` to every MCP tool
+    /// result before echoing it back as the `function_call_output` this
+    /// canonicalizes into an `Exchange` (codex-rs
+    /// `core/src/tools/context.rs::McpToolOutput::response_payload`, lines
+    /// 124-126, identical at `e363b08` and pin `6344a65`). Hashing the whole
+    /// stored string turned four textually-identical answers into four
+    /// different hashes purely from wall-clock jitter — the exact
+    /// false-progress shape the adjacent test proves this signal rejects,
+    /// except the "different output" was the client's wrapper and not
+    /// progress. `Exchange::output_hash` now hashes
+    /// `exchange::tool_output_body`, so the wrapper is invisible to the
+    /// comparison and the stored item stays verbatim.
+    #[test]
+    fn a_codex_wrapped_repeat_still_fires() {
+        let signal = NoProgressRepeat {
+            occurrences: 3,
+            window: 8,
+        };
+
+        // Four calls, identical name/arguments/underlying answer — the exact
+        // loop `a_repeat_with_a_different_output_does_not_fire` proves this
+        // signal catches when the output is a bare string. Here each output is
+        // wrapped the way a real codex client wraps it: a wall-time header
+        // whose only variation is unavoidable per-call jitter, then the same
+        // `Output:` body every time.
+        let mut stuck = Vec::new();
+        for (n, wall_time) in [0.0421, 0.0398, 0.0512, 0.0407].into_iter().enumerate() {
+            stuck.push(call(&format!("c{n}"), "pytest", r#"{"path":"tests/"}"#));
+            stuck.push(result(
+                &format!("c{n}"),
+                &format!(
+                    "Wall time: {wall_time:.4} seconds\nOutput:\nImportError: no module named app"
+                ),
+            ));
+        }
+        let fact = signal
+            .detect(&evidence_of(&stuck, &[]))
+            .expect("four codex-wrapped identical answers is still the same loop");
+        assert!(fact.contains("identical output 4 times"), "{fact}");
+    }
+
+    /// F04: the same streak, seen through codex's exec wrapper.
+    ///
+    /// `exchange::reads_as_failure` is anchored on the head of the output on
+    /// purpose — an unanchored scan flags every result that *mentions* an error
+    /// it had just fixed. Codex's exec wrapper (`response_text`,
+    /// context.rs:446-465) puts `Chunk ID:` / `Wall time:` / `Output:` ahead of
+    /// the tool's own text unconditionally, so against a real client the
+    /// anchored check was not a probabilistic miss but a hard never. Anchoring
+    /// on the *body* keeps the narrow test and gives it something to anchor to.
+    /// Note the two-decimal wall time here: the recogniser prefix-matches
+    /// `Wall time: ` and never parses the number, so it does not care that
+    /// upstream formats it to four.
+    #[test]
+    fn a_codex_wrapped_failure_streak_still_fires() {
+        let streak = ToolFailureStreak { length: 3 };
+
+        let mut failing = Vec::new();
+        for n in 0..3 {
+            failing.push(call(&format!("c{n}"), "cargo", "{}"));
+            failing.push(result(
+                &format!("c{n}"),
+                &format!(
+                    "Chunk ID: chunk-{n}\nWall time: 0.{n:02} seconds\nOutput:\nError: build failed"
+                ),
+            ));
+        }
+        let fact = streak
+            .detect(&evidence_of(&failing, &[]))
+            .expect("three codex-wrapped failures in a row is still a failure streak");
+        assert!(fact.contains("all returned failures"), "{fact}");
+    }
+
+    /// The consequence of the exit-code claim, at the level where it costs
+    /// something.
+    ///
+    /// `exchange::reads_as_failure`'s own test pins the accessor; this one pins
+    /// what the accessor is *for*. Three `cargo test` runs that exited non-zero
+    /// and printed nothing to stdout is a session in trouble, and if the exit
+    /// code is invisible the streak signal is not merely quiet against codex
+    /// exec traffic — it is dead, the same way F04 killed it before the body
+    /// was anchored.
+    #[test]
+    fn a_streak_of_silent_nonzero_exits_still_fires() {
+        let streak = ToolFailureStreak { length: 3 };
+
+        let mut failing = Vec::new();
+        for n in 0..3 {
+            failing.push(call(
+                &format!("c{n}"),
+                "shell_command",
+                r#"{"command":"./ci"}"#,
+            ));
+            failing.push(result(
+                &format!("c{n}"),
+                &format!("Chunk ID: chunk-{n}\nWall time: 0.0{n}10 seconds\nProcess exited with code 1\nOutput:\n"),
+            ));
+        }
+        let fact = streak
+            .detect(&evidence_of(&failing, &[]))
+            .expect("three non-zero exits in a row is a failure streak whatever stdout said");
+        assert!(fact.contains("all returned failures"), "{fact}");
+
+        // The control that keeps this about the exit code and not about the
+        // header: the identical shape at exit 0 is three successes, and a
+        // streak that fired here would fire on every exec session there is.
+        let mut succeeding = Vec::new();
+        for n in 0..3 {
+            succeeding.push(call(
+                &format!("c{n}"),
+                "shell_command",
+                r#"{"command":"./ci"}"#,
+            ));
+            succeeding.push(result(
+                &format!("c{n}"),
+                &format!("Chunk ID: chunk-{n}\nWall time: 0.0{n}10 seconds\nProcess exited with code 0\nOutput:\nok\n"),
+            ));
+        }
+        assert_eq!(streak.detect(&evidence_of(&succeeding, &[])), None);
     }
 
     #[test]
@@ -666,7 +880,7 @@ mod tests {
         }
         let healthy = wide_open(healthy_items.clone());
         assert_eq!(
-            trigger.evaluate(&healthy),
+            trigger.evaluate(&healthy, ControlCallDialect::ClaudeMessages),
             None,
             "a cadence that has come due is permission to ask, never a reason to"
         );
@@ -678,40 +892,84 @@ mod tests {
         items.extend(stuck_items());
         let stuck = wide_open(items);
         let fired = trigger
-            .evaluate(&stuck)
+            .evaluate(&stuck, ControlCallDialect::ClaudeMessages)
             .expect("an open gate plus evidence is the one case that consults");
-        assert_eq!(fired.signals.len(), 1);
-        assert_eq!(fired.signals[0].kind, SignalKind::NoProgressRepeat);
+        // Named exhaustively rather than counted loosely, because *which*
+        // signals a fixture trips is the thing that silently changes when the
+        // default set grows. Four identical failing `pytest` runs are three
+        // separate observations, and each is about a different property of the
+        // same four exchanges: the same answer four times over (the repeat),
+        // `no module named ` in the body (a hard error in the window), and four
+        // consecutive calls to a tool none of the ported tables recognise with
+        // nothing read, written or edited between them (the build pit). The
+        // failure streak stays quiet — `ImportError:` is not one of
+        // `reads_as_failure`'s anchored markers — which is the disagreement
+        // `ErrorSeverity`'s doc says the two signals exist to have.
+        let kinds: Vec<SignalKind> = fired.signals.iter().map(|signal| signal.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                SignalKind::NoProgressRepeat,
+                SignalKind::ErrorSeverity,
+                SignalKind::PureBashStreak,
+            ]
+        );
         assert_eq!(fired.turn_index, stuck.turn_index);
     }
 
     /// The hysteresis, which is the difference between a validator and a loop.
+    ///
+    /// Renamed with M10.0: the correction is the previous turn's *answer* now,
+    /// not this turn's tool result, so the turn that fulfils a steer is the one
+    /// after the steered one. The two controls are what pin the off-by-one from
+    /// both sides.
     #[test]
-    fn a_turn_fulfilling_an_open_steer_never_fires() {
+    fn the_turn_after_a_steer_never_fires() {
         let trigger = Trigger::new(TriggerConfig::default(), default_signals());
 
         // A session that would fire on its own evidence.
         let stuck = wide_open(stuck_items());
         assert!(
-            trigger.evaluate(&stuck).is_some(),
+            trigger
+                .evaluate(&stuck, ControlCallDialect::ClaudeMessages)
+                .is_some(),
             "the control: this session's evidence is what makes the next \
              assertion about the steer and not about the evidence"
         );
 
-        // The same session, on the turn whose input answered the steer we
-        // emitted. Every signal still reads exactly as it did — the correction
-        // has not had a chance to change anything yet — so without this rule a
-        // steer re-triggers the validation that emitted it, forever.
+        // The same session, on the turn after the steered one. Every signal
+        // still reads exactly as it did — the correction has not had a chance to
+        // change anything yet — so without this rule a steer re-triggers the
+        // validation that emitted it, forever.
         let mut fulfilling = wide_open(stuck_items());
-        fulfilling.steer_fulfilled_on_turn = Some(fulfilling.turn_index);
-        assert!(fulfilling.this_turn_fulfilled_a_steer());
-        assert_eq!(trigger.evaluate(&fulfilling), None);
+        fulfilling.steered_on_turn = Some(fulfilling.turn_index - 1);
+        assert!(fulfilling.this_turn_fulfils_a_steer());
+        assert_eq!(
+            trigger.evaluate(&fulfilling, ControlCallDialect::ClaudeMessages),
+            None
+        );
 
-        // The control on the *other* side of the rule: a steer fulfilled on an
-        // earlier turn does not disable validation for the rest of the session.
+        // The control on the *other* side of the rule: a steer two turns back
+        // does not disable validation for the rest of the session.
         let mut earlier = wide_open(stuck_items());
-        earlier.steer_fulfilled_on_turn = Some(earlier.turn_index - 1);
-        assert!(trigger.evaluate(&earlier).is_some());
+        earlier.steered_on_turn = Some(earlier.turn_index - 2);
+        assert!(
+            trigger
+                .evaluate(&earlier, ControlCallDialect::ClaudeMessages)
+                .is_some()
+        );
+
+        // And the third position, which is the one a fold comparing against
+        // `turn_index` would get wrong: the turn that *emitted* the steer is
+        // already past this gate, so recording it as suppressed there would be
+        // invisible — and would shift the suppression onto the wrong turn.
+        let mut emitting = wide_open(stuck_items());
+        emitting.steered_on_turn = Some(emitting.turn_index);
+        assert!(
+            trigger
+                .evaluate(&emitting, ControlCallDialect::ClaudeMessages)
+                .is_some()
+        );
     }
 
     #[test]
@@ -720,7 +978,14 @@ mod tests {
         let config = TriggerConfig::default();
 
         // The base case: open, with evidence.
-        assert!(trigger.evaluate(&wide_open(stuck_items())).is_some());
+        assert!(
+            trigger
+                .evaluate(
+                    &wide_open(stuck_items()),
+                    ControlCallDialect::ClaudeMessages
+                )
+                .is_some()
+        );
 
         // Turn 0 and turn 1: there is no trajectory to judge before there is a
         // trajectory.
@@ -728,7 +993,7 @@ mod tests {
             let mut early = wide_open(stuck_items());
             early.turn_index = index;
             assert_eq!(
-                trigger.evaluate(&early),
+                trigger.evaluate(&early, ControlCallDialect::ClaudeMessages),
                 None,
                 "turn {index} has no history"
             );
@@ -743,7 +1008,13 @@ mod tests {
         ] {
             let mut state = wide_open(stuck_items());
             state.tokens_since_last_validation = tokens;
-            assert_eq!(trigger.evaluate(&state).is_some(), open, "{tokens} tokens");
+            assert_eq!(
+                trigger
+                    .evaluate(&state, ControlCallDialect::ClaudeMessages)
+                    .is_some(),
+                open,
+                "{tokens} tokens"
+            );
         }
 
         // The cooldown, measured on the log's own timestamps rather than on a
@@ -753,7 +1024,9 @@ mod tests {
             state.last_validation_at_ms = Some(1_000_000);
             state.last_event_at_ms = 1_000_000 + elapsed;
             assert_eq!(
-                trigger.evaluate(&state).is_some(),
+                trigger
+                    .evaluate(&state, ControlCallDialect::ClaudeMessages)
+                    .is_some(),
                 open,
                 "{elapsed}ms elapsed"
             );
@@ -767,7 +1040,12 @@ mod tests {
         ] {
             let mut state = wide_open(stuck_items());
             state.consecutive_interventions = interventions;
-            assert_eq!(trigger.evaluate(&state).is_some(), open);
+            assert_eq!(
+                trigger
+                    .evaluate(&state, ControlCallDialect::ClaudeMessages)
+                    .is_some(),
+                open
+            );
         }
 
         // The per-session review cap: the log-derived half of the review
@@ -778,7 +1056,12 @@ mod tests {
         ] {
             let mut state = wide_open(stuck_items());
             state.validations_run = run;
-            assert_eq!(trigger.evaluate(&state).is_some(), open);
+            assert_eq!(
+                trigger
+                    .evaluate(&state, ControlCallDialect::ClaudeMessages)
+                    .is_some(),
+                open
+            );
         }
     }
 }

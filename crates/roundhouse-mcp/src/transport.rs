@@ -50,6 +50,7 @@ use rmcp::ErrorData as McpError;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
     ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
+    ToolAnnotations,
 };
 use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
@@ -58,7 +59,7 @@ use rmcp::{RoleServer, ServerHandler};
 
 use roundhouse_core::control::Principal;
 
-use crate::surface::{ControlSurface, ToolOutcome};
+use crate::surface::{ControlSurface, Correlators, ToolOutcome};
 use crate::tools::{ToolCall, descriptors};
 
 /// The MCP endpoint, bound to one [`ControlSurface`].
@@ -78,6 +79,15 @@ impl RoundhouseMcp {
     /// is on the descriptors, and
     /// `the_adapter_lists_exactly_what_the_surface_declares` is what keeps this
     /// function from becoming a place a tool can be added or renamed.
+    ///
+    /// The three MCP hints ride along because the *client* reads them, not us:
+    /// an absent annotation is not a neutral one, and codex resolves the
+    /// absence to destructive-and-open-world (see [`crate::tools`]'s
+    /// *Annotations are not decoration*). They are projected here rather than
+    /// restated because [`get_tool`](ServerHandler::get_tool) and
+    /// [`list_tools`](ServerHandler::list_tools) both answer out of this one
+    /// function, so there is exactly one place the wire form can drift from
+    /// the descriptor.
     pub fn tools() -> Vec<Tool> {
         descriptors()
             .into_iter()
@@ -92,8 +102,153 @@ impl RoundhouseMcp {
                     Cow::Borrowed(tool.description),
                     Arc::new(schema),
                 )
+                .with_annotations(
+                    // `idempotent_hint` is deliberately left unset. It is the
+                    // one hint whose honest answer differs per tool -- the
+                    // reads are idempotent, `declare_intent` and the overlay
+                    // writers are not -- and codex's approval arithmetic never
+                    // consults it, so a value here would be a claim made for
+                    // no reader.
+                    ToolAnnotations::new()
+                        .read_only(tool.read_only_hint)
+                        .destructive(tool.destructive_hint)
+                        .open_world(tool.open_world_hint),
+                )
             })
             .collect()
+    }
+
+    /// The `_meta` key Claude Code puts the id of the `tool_use` block it is
+    /// answering under.
+    ///
+    /// Spelled by the client, not by us: read off the 2.1.257 capture in
+    /// `roundhouse-server`'s `tests/fixtures/claude-2.1.257-mcp-wire.json`,
+    /// where a `tools/call` carries
+    /// `"_meta": {"claudecode/toolUseId": "toolu_…", "progressToken": 2}`.
+    /// A namespaced key like this one is exactly what MCP's `_meta` is for, so
+    /// nothing here is reaching into a field that was not offered.
+    const TOOL_USE_ID_META: &'static str = "claudecode/toolUseId";
+
+    /// The `_meta` key Codex puts the id of the thread it is running under.
+    ///
+    /// Spelled by the client, not by us, and unnamespaced because that is how
+    /// the client spells it: `with_mcp_tool_call_thread_id_meta`
+    /// (codex `core/src/mcp_tool_call.rs:1198-1220` @ `e363b08`, called at line
+    /// 442 with no conditional guard) inserts `sess.thread_id` under this exact
+    /// key on **every** `tools/call`, beside an `x-codex-turn-metadata` object
+    /// carrying the client's own `session_id`. The M9 capture shows the value
+    /// byte-identical to the `prompt_cache_key` on the same turn's
+    /// `/v1/responses` bodies, which is why the resolver treats it as a *name*
+    /// (M12.1, R-M7) and not as a second kind of opaque correlator.
+    ///
+    /// A bare key rather than a namespaced one is worth noting, not fixing:
+    /// MCP's `_meta` reserves namespaced keys for the sender's own use, and an
+    /// unnamespaced one is a name any client could collide with. Reading it is
+    /// safe regardless, for the reason
+    /// [`ControlReads::resolve_session`](crate::reads::ControlReads::resolve_session)
+    /// states about a correlator that names nothing of this caller's.
+    const THREAD_ID_META: &'static str = "threadId";
+
+    /// The `_meta` key Codex puts its whole turn-metadata object under, and the
+    /// one field of it this deployment reads.
+    ///
+    /// Spelled by the client: `build_mcp_tool_call_request_meta`
+    /// (codex `core/src/mcp_tool_call.rs:1175-1221` @ `6344a65`) inserts the
+    /// turn metadata under this exact key on every `tools/call`, built by
+    /// `current_meta_value_for_mcp_request` (`core/src/turn_metadata.rs:183-222`),
+    /// which keeps `session_id` — the id shared by a whole agent family and
+    /// therefore that family's `prompt_cache_key` (`core/src/client.rs`, from
+    /// `core/src/agent/control.rs:104-110`).
+    ///
+    /// **Read as a name and not as an id** (M14.1, R-C5). It is the client's
+    /// own session id, and this deployment's session id for a never-forked
+    /// conversation is a pure function of the caller and that string — which
+    /// is what makes a codex root thread answerable on a node that recorded
+    /// nothing. The sibling field `thread_id` is deliberately *not* read here:
+    /// the per-thread correlator arrives as the top-level `threadId` above,
+    /// and taking it from two places would be two spellings of one
+    /// correlator.
+    const TURN_METADATA_META: &'static str = "x-codex-turn-metadata";
+
+    /// The one field of that object this deployment reads. See
+    /// [`Self::TURN_METADATA_META`] for why it is this field and not
+    /// `thread_id` beside it.
+    const TURN_METADATA_SESSION_ID: &'static str = "session_id";
+
+    /// The `tool_use` block this call is answering, if the client named one.
+    ///
+    /// **Read from the request *context* and not from `request.meta`.** `rmcp`
+    /// strips the wire's `params._meta` into the message envelope's extensions
+    /// during deserialization and its service loop moves it onto
+    /// [`RequestContext::meta`] before dispatch — the typed params' own `meta`
+    /// field stays empty on the way in. A reader that took `request.meta` would
+    /// compile, would be `None` on every real request, and would silently
+    /// return every MCP call to the pre-R-M2 `latest` guess.
+    ///
+    /// A non-string value is `None` rather than a refusal. This is a
+    /// correlation hint on a call the deployment can serve without it, so a
+    /// client that spells it oddly gets the fallback and its answer, not a
+    /// protocol error mid-turn.
+    fn tool_use_id(context: &RequestContext<RoleServer>) -> Option<String> {
+        Self::meta_string(context, Self::TOOL_USE_ID_META)
+    }
+
+    /// The thread the client says this call is in, if it named one.
+    ///
+    /// Read from the same place and on the same terms as [`Self::tool_use_id`]
+    /// — see that function for why the request *context* and not
+    /// `request.meta`, and why a non-string value is `None` rather than a
+    /// refusal.
+    fn thread_id(context: &RequestContext<RoleServer>) -> Option<String> {
+        Self::meta_string(context, Self::THREAD_ID_META)
+    }
+
+    /// The cache key the client's turns carry, if it sent its turn metadata.
+    ///
+    /// One level deeper than the other two — the value under
+    /// [`Self::TURN_METADATA_META`] is an object, not a string — and read on
+    /// exactly the same terms otherwise: a value of the wrong shape at either
+    /// level is `None` rather than a refusal, because this is a correlation
+    /// hint on a call the deployment can serve without it.
+    fn cache_key(context: &RequestContext<RoleServer>) -> Option<String> {
+        Self::as_id(
+            context
+                .meta
+                .get(Self::TURN_METADATA_META)
+                .and_then(|metadata| metadata.get(Self::TURN_METADATA_SESSION_ID)),
+        )
+    }
+
+    /// One top-level `_meta` string, or `None`.
+    ///
+    /// The two top-level correlators read through one function rather than two
+    /// copies of four lines: the copies would be identical the day they were
+    /// written and the interesting way for them to diverge is silent — one
+    /// reading `context.meta` and the other `request.meta`, which is exactly
+    /// the mistake the doc above exists to warn about and which no test on
+    /// either key alone would catch.
+    ///
+    /// The *shape* is here; what makes a value an id is [`Self::as_id`], which
+    /// the nested reader shares — see F5 below.
+    fn meta_string(context: &RequestContext<RoleServer>, key: &str) -> Option<String> {
+        Self::as_id(context.meta.get(key))
+    }
+
+    /// One `_meta` value as a correlator id, or `None`.
+    ///
+    /// **The empty-string normalisation is here and nowhere else** (M12.1
+    /// review, F5). An empty value is not an id, and it is what a client
+    /// sending the key with nothing in it would otherwise resolve *by*: an
+    /// empty lookup key can only miss, but it would have looked deliberate in
+    /// a trace. Normalised to absence at the one door these ids enter by,
+    /// rather than once per correlator further in — which is why the third
+    /// correlator, which lives one level deeper in the same object, comes
+    /// through this function rather than repeating its tail (M14.1, R-C5).
+    fn as_id(value: Option<&serde_json::Value>) -> Option<String> {
+        value
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+            .filter(|id| !id.is_empty())
     }
 
     /// Who is calling, from the extensions the HTTP layer filled in.
@@ -191,6 +346,11 @@ impl ServerHandler for RoundhouseMcp {
                 .arguments
                 .map(serde_json::Value::Object)
                 .unwrap_or(serde_json::Value::Null),
+            correlators: Correlators {
+                thread_id: Self::thread_id(&context),
+                tool_use_id: Self::tool_use_id(&context),
+                cache_key: Self::cache_key(&context),
+            },
         };
         let outcome = crate::tools::dispatch(self.surface.as_ref(), &principal, call).await;
         Ok(CallToolResponse::Complete(into_result(outcome)))
@@ -288,6 +448,28 @@ mod tests {
                  block is what round-trips through the conversation",
                 declared.name
             );
+            // The hints are the half of the contract the *client* acts on
+            // before it ever calls anything, so an adapter that dropped them
+            // would restore F06 silently: the descriptor would still read
+            // truthfully and the wire would still say destructive-and-open-world.
+            let annotations = published
+                .annotations
+                .as_ref()
+                .unwrap_or_else(|| panic!("`{}` publishes no annotations", declared.name));
+            assert_eq!(
+                (
+                    annotations.read_only_hint,
+                    annotations.destructive_hint,
+                    annotations.open_world_hint
+                ),
+                (
+                    Some(declared.read_only_hint),
+                    Some(declared.destructive_hint),
+                    Some(declared.open_world_hint)
+                ),
+                "`{}`'s published hints are not the ones it declares",
+                declared.name
+            );
         }
     }
 
@@ -296,11 +478,10 @@ mod tests {
         // MCP's own distinction, and the one that matters mid-turn: a protocol
         // error is rendered opaquely by a client -- "tool result missing" --
         // while a tool error's content reaches the model, which is the only
-        // form in which "no steer by that id" is useful.
+        // form in which "roundhouse has not corrected this conversation" is
+        // useful.
         let refused = into_result(ToolOutcome::refused(
-            &crate::surface::SurfaceError::UnknownSteer {
-                steer_id: "fc_nope".into(),
-            },
+            &crate::surface::SurfaceError::NoGuidanceYet("acme/ada/main".into()),
         ));
         assert_eq!(refused.is_error, Some(true));
         assert_eq!(refused.content.len(), 1);

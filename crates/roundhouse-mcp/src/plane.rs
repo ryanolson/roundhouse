@@ -237,13 +237,24 @@ impl<R: ControlReads> ControlPlaneSurface<R> {
     }
 
     /// Resolve the conversation a session-scoped tool concerns.
+    ///
+    /// One function for all eight tools, and the only place any part of the
+    /// caller's identity is turned into a session: the argument the model wrote
+    /// and both correlators the client attached are weighed by
+    /// [`ControlReads::resolve_session`], which states the order. Eight copies
+    /// of that decision is how two tools in one turn come to disagree about
+    /// which conversation they are in.
     async fn session_of(
         &self,
-        principal: &Principal,
+        caller: &Caller,
         conversation: &Conversation,
     ) -> Result<SessionId, SurfaceError> {
         self.reads
-            .resolve_session(principal, conversation.as_deref())
+            .resolve_session(
+                caller.principal(),
+                conversation.as_deref(),
+                caller.correlators(),
+            )
             .await
     }
 }
@@ -347,33 +358,33 @@ fn lifetime(scope: OverlayScope, turns: Option<u32>) -> Result<Option<u32>, Surf
 impl<R: ControlReads> ControlSurface for ControlPlaneSurface<R> {
     async fn status(
         &self,
-        principal: &Principal,
+        caller: &Caller,
         request: StatusRequest,
     ) -> Result<ToolOutcome, SurfaceError> {
-        let session = self.session_of(principal, &request.conversation).await?;
+        let principal = caller.principal();
+        let session = self.session_of(caller, &request.conversation).await?;
         let ceiling = self.reads.ceiling_policy(principal).await?;
         let overlay = self.store.overlay(&session).unwrap_or_default();
         let effective = overlay.apply_to(&ceiling);
         let targets = self.reads.admissible_targets(principal, &effective).await?;
         let balance = self.reads.balance(principal).await?;
-        let facts = self.session_facts(&session).await?;
 
         ToolOutcome::ok(&StatusResponse {
             conversation: session.to_string(),
             policy_digest: effective.digest(),
             admissible_targets: names(&targets),
             budget: balance.as_ref().map(budget_view),
-            open_steers: facts.open_steers,
             overlay: view(&overlay),
         })
     }
 
     async fn init_session(
         &self,
-        principal: &Principal,
+        caller: &Caller,
         request: InitSessionRequest,
     ) -> Result<ToolOutcome, SurfaceError> {
-        let session = self.session_of(principal, &request.conversation).await?;
+        let principal = caller.principal();
+        let session = self.session_of(caller, &request.conversation).await?;
         let id = self
             .store
             .bind_session(principal, &session, self.reads.now_ms());
@@ -397,12 +408,12 @@ impl<R: ControlReads> ControlSurface for ControlPlaneSurface<R> {
 
     async fn declare_intent(
         &self,
-        principal: &Principal,
+        caller: &Caller,
         request: DeclareIntentRequest,
     ) -> Result<ToolOutcome, SurfaceError> {
         let goal = require_text("goal", &request.goal)?;
         let done_when = require_text("done_when", &request.done_when)?;
-        let session = self.session_of(principal, &request.conversation).await?;
+        let session = self.session_of(caller, &request.conversation).await?;
         self.store.set_intent(
             &session,
             IntentRecord {
@@ -432,12 +443,13 @@ impl<R: ControlReads> ControlSurface for ControlPlaneSurface<R> {
 
     async fn prefer(
         &self,
-        principal: &Principal,
+        caller: &Caller,
         request: PreferRequest,
     ) -> Result<ToolOutcome, SurfaceError> {
+        let principal = caller.principal();
         let reason = require_text("reason", &request.reason)?;
         let remaining_turns = lifetime(request.scope, request.turns)?;
-        let session = self.session_of(principal, &request.conversation).await?;
+        let session = self.session_of(caller, &request.conversation).await?;
         let ceiling = self.reads.ceiling_policy(principal).await?;
         let ceiling_targets = self.reads.admissible_targets(principal, &ceiling).await?;
         let current = self.store.overlay(&session).unwrap_or_default();
@@ -480,9 +492,10 @@ impl<R: ControlReads> ControlSurface for ControlPlaneSurface<R> {
 
     async fn set_quality_floor(
         &self,
-        principal: &Principal,
+        caller: &Caller,
         request: SetQualityFloorRequest,
     ) -> Result<ToolOutcome, SurfaceError> {
+        let principal = caller.principal();
         // Refused rather than clamped: a `NaN` floor loses every comparison it
         // is part of, so a floor that silently became 0.0 would read in the
         // audit trail as an agent that asked for nothing.
@@ -494,7 +507,7 @@ impl<R: ControlReads> ControlSurface for ControlPlaneSurface<R> {
         }
         let reason = require_text("reason", &request.reason)?;
         let remaining_turns = lifetime(OverlayScope::Session, Some(request.turns))?;
-        let session = self.session_of(principal, &request.conversation).await?;
+        let session = self.session_of(caller, &request.conversation).await?;
         let ceiling = self.reads.ceiling_policy(principal).await?;
         let current = self.store.overlay(&session).unwrap_or_default();
 
@@ -528,34 +541,50 @@ impl<R: ControlReads> ControlSurface for ControlPlaneSurface<R> {
 
     async fn fetch_steer(
         &self,
-        principal: &Principal,
+        caller: &Caller,
         request: FetchSteerRequest,
     ) -> Result<ToolOutcome, SurfaceError> {
-        // The whole handler. No clock, no fleet, no judge — a read of a record
-        // committed when the steer was emitted, which is what makes a second
-        // call byte-identical and what stops a loop of calls costing anybody
+        // The whole handler. No clock, no fleet, no judge — a fold of the
+        // conversation's own log, which is what makes a second call
+        // byte-identical and what stops a loop of calls costing anybody
         // anything.
-        let record = self.store.steer_for(principal, &request.steer_id)?;
+        //
+        // The tenancy check is `session_of`, the same door every other
+        // session-scoped tool goes through: a conversation outside the caller's
+        // namespace is `ForeignConversation` and never a silent fall back to the
+        // caller's own. That replaces the principal comparison the steer-id
+        // version did for itself — one boundary, kept in one place.
+        let session = self.session_of(caller, &request.conversation).await?;
+        let facts = self.session_facts(&session).await?;
+        let guidance = facts
+            .latest_guidance
+            .ok_or_else(|| SurfaceError::NoGuidanceYet(session.to_string()))?;
         ToolOutcome::ok(&SteerResponse {
-            steer_id: record.steer_id,
-            guidance: record.guidance,
-            emitted_at_ms: record.emitted_at_ms,
+            conversation: session.to_string(),
+            guidance,
         })
     }
 
     async fn report_outcome(
         &self,
-        principal: &Principal,
+        caller: &Caller,
         request: ReportOutcomeRequest,
     ) -> Result<ToolOutcome, SurfaceError> {
-        let record = self.store.record_outcome(
+        let principal = caller.principal();
+        let session = self.session_of(caller, &request.conversation).await?;
+        // Filed, never refused: the descriptor promises that not reporting is
+        // never an error, and a store that rejected a report against a
+        // conversation nobody steered would make the tool's answer depend on a
+        // fact the agent cannot see.
+        self.store.record_outcome(
             principal,
-            &request.steer_id,
+            &session,
             request.outcome,
             request.note,
-        )?;
+            self.reads.now_ms(),
+        );
         ToolOutcome::ok(&OutcomeResponse {
-            steer_id: record.steer_id,
+            conversation: session.to_string(),
             outcome: request.outcome,
             recorded: true,
         })
@@ -563,10 +592,10 @@ impl<R: ControlReads> ControlSurface for ControlPlaneSurface<R> {
 
     async fn explain_last_route(
         &self,
-        principal: &Principal,
+        caller: &Caller,
         request: ExplainLastRouteRequest,
     ) -> Result<ToolOutcome, SurfaceError> {
-        let session = self.session_of(principal, &request.conversation).await?;
+        let session = self.session_of(caller, &request.conversation).await?;
         let facts = self.session_facts(&session).await?;
         let decision = facts
             .last_decision

@@ -57,8 +57,8 @@ use roundhouse_core::now_ms;
 
 use crate::control_config::{
     AllocationConfig, ApiKeyRecord, AuthError, ControlDirectory, ControlPlane, DirectoryMutation,
-    DirectoryView, KeyRecordScope, KeyScope, MembershipRecord, MembershipRole, PolicyConfig,
-    ProjectEntry, ProjectPatch, ProjectRecord, UserEntry, UserRecord,
+    DirectoryView, FairUseConfig, KeyRecordScope, KeyScope, MembershipRecord, MembershipRole,
+    PolicyConfig, ProjectEntry, ProjectPatch, ProjectRecord, UserEntry, UserRecord,
 };
 use crate::http::{ApiError, parse_body};
 
@@ -189,7 +189,7 @@ async fn admin_auth_layer(
     request: Request,
     next: Next,
 ) -> Response {
-    let plane = directory.plane(now_ms());
+    let plane = directory.plane(now_ms()).await;
     if matches!(plane.as_ref(), ControlPlane::Open) {
         return ApiError::from(AuthError::AdminRequiresControlPlane).into_response();
     }
@@ -228,6 +228,22 @@ struct ProjectDto {
     /// budget view, beside what it *has* spent, and a limit shown alone is the
     /// number people quote without the one that matters.
     budgeted: bool,
+    /// This project's rolling fair-use windows, echoed whole — not as a
+    /// `fair_used: bool` mirroring `budgeted` above.
+    ///
+    /// The asymmetry is the point and G14 is the record of it. `budgeted` can
+    /// be a flag because the budget *view* answers the follow-up question with
+    /// spend beside the limit. There is no fair-use view: the ledger's rolling
+    /// counters are not a balance anyone reads. So a flag here would answer
+    /// "is there a ceiling" and leave "which one" unanswerable from any
+    /// surface, which is exactly the operator's position this field exists to
+    /// end — and the `PATCH` route accepts this same block back.
+    ///
+    /// Rendered as `null` rather than omitted when there is no block, like
+    /// every other optional field on this view: "this project has no rolling
+    /// ceiling" is an answer, and a field that vanishes is one a reader cannot
+    /// tell from a field this deployment is too old to have.
+    fair_use: Option<FairUseConfig>,
 }
 
 impl From<&ProjectRecord> for ProjectDto {
@@ -239,6 +255,7 @@ impl From<&ProjectRecord> for ProjectDto {
             created_at_ms: record.created_at_ms,
             archived_at_ms: record.archived_at_ms,
             budgeted: record.entry.budget.is_some(),
+            fair_use: record.entry.fair_use.clone(),
         }
     }
 }
@@ -310,6 +327,16 @@ struct KeyDto {
     provenance: String,
     created_at_ms: Option<u64>,
     revoked_at_ms: Option<u64>,
+    /// This member's own rolling windows, the second ceiling that binds beside
+    /// the project's — `null` for a key that declares none, and always `null`
+    /// for an admin key, which pays for nothing.
+    ///
+    /// Read-only here, and only a file-declared key can carry one: the admin
+    /// plane mints a key under a membership and has no route that writes a
+    /// member window. Showing it anyway is what makes the *project* view's
+    /// answer complete — a member refused while the project has room is
+    /// otherwise a refusal no admin surface can explain.
+    fair_use: Option<FairUseConfig>,
 }
 
 impl From<&ApiKeyRecord> for KeyDto {
@@ -330,6 +357,7 @@ impl From<&ApiKeyRecord> for KeyDto {
             provenance: record.provenance.to_string(),
             created_at_ms: record.created_at_ms,
             revoked_at_ms: record.revoked_at_ms,
+            fair_use: record.fair_use.clone(),
         }
     }
 }
@@ -380,7 +408,8 @@ async fn create_project(
     let id = entry.id.clone();
     let records = state
         .directory
-        .apply(DirectoryMutation::CreateProject { entry }, now_ms())?;
+        .apply(DirectoryMutation::CreateProject { entry }, now_ms())
+        .await?;
     let created = records
         .projects
         .iter()
@@ -400,7 +429,7 @@ async fn create_project(
 /// lists would be the shape that lets an operator miss the half they cannot
 /// edit until a `PATCH` refuses them.
 async fn list_projects(State(state): State<AdminState>) -> Response {
-    let view = state.directory.view(now_ms());
+    let view = state.directory.view(now_ms()).await;
     axum::Json(ListDto {
         data: view
             .projects
@@ -415,7 +444,7 @@ async fn get_project(
     State(state): State<AdminState>,
     Path(project): Path<String>,
 ) -> Result<Response, ApiError> {
-    let view = state.directory.view(now_ms());
+    let view = state.directory.view(now_ms()).await;
     let record = find_project(&view, &project)?;
     Ok(axum::Json(ProjectDto::from(record)).into_response())
 }
@@ -437,13 +466,16 @@ async fn patch_project(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let patch: ProjectPatch = parse_body(&body)?;
-    let records = state.directory.apply(
-        DirectoryMutation::PatchProject {
-            id: project.clone(),
-            patch,
-        },
-        now_ms(),
-    )?;
+    let records = state
+        .directory
+        .apply(
+            DirectoryMutation::PatchProject {
+                id: project.clone(),
+                patch,
+            },
+            now_ms(),
+        )
+        .await?;
     let patched = records
         .projects
         .iter()
@@ -468,7 +500,8 @@ async fn archive_project(
 ) -> Result<Response, ApiError> {
     state
         .directory
-        .apply(DirectoryMutation::ArchiveProject { id: project }, now_ms())?;
+        .apply(DirectoryMutation::ArchiveProject { id: project }, now_ms())
+        .await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
@@ -489,7 +522,8 @@ async fn create_user(State(state): State<AdminState>, body: Bytes) -> Result<Res
     let id = entry.id.clone();
     let records = state
         .directory
-        .apply(DirectoryMutation::CreateUser { entry }, now_ms())?;
+        .apply(DirectoryMutation::CreateUser { entry }, now_ms())
+        .await?;
     let created = records
         .users
         .iter()
@@ -504,7 +538,7 @@ async fn create_user(State(state): State<AdminState>, body: Bytes) -> Result<Res
 }
 
 async fn list_users(State(state): State<AdminState>) -> Response {
-    let view = state.directory.view(now_ms());
+    let view = state.directory.view(now_ms()).await;
     axum::Json(ListDto {
         data: view.users.iter().map(UserDto::from).collect::<Vec<_>>(),
     })
@@ -543,16 +577,19 @@ async fn upsert_member(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let request: MembershipBody = parse_body(&body)?;
-    let records = state.directory.apply(
-        DirectoryMutation::UpsertMembership {
-            project: project.clone(),
-            user: user.clone(),
-            role: request.role,
-            allocation: request.allocation,
-            overrides: request.overrides,
-        },
-        now_ms(),
-    )?;
+    let records = state
+        .directory
+        .apply(
+            DirectoryMutation::UpsertMembership {
+                project: project.clone(),
+                user: user.clone(),
+                role: request.role,
+                allocation: request.allocation,
+                overrides: request.overrides,
+            },
+            now_ms(),
+        )
+        .await?;
     let membership = records
         .memberships
         .iter()
@@ -570,7 +607,7 @@ async fn list_members(
     State(state): State<AdminState>,
     Path(project): Path<String>,
 ) -> Result<Response, ApiError> {
-    let view = state.directory.view(now_ms());
+    let view = state.directory.view(now_ms()).await;
     find_project(&view, &project)?;
     Ok(axum::Json(ListDto {
         data: view
@@ -593,10 +630,13 @@ async fn delete_member(
     State(state): State<AdminState>,
     Path((project, user)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    state.directory.apply(
-        DirectoryMutation::DeleteMembership { project, user },
-        now_ms(),
-    )?;
+    state
+        .directory
+        .apply(
+            DirectoryMutation::DeleteMembership { project, user },
+            now_ms(),
+        )
+        .await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
@@ -614,8 +654,11 @@ async fn mint_turn_key(
     State(state): State<AdminState>,
     Path((project, user)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    let minted = state.directory.mint_turn_key(&project, &user, now_ms())?;
-    let view = state.directory.view(now_ms());
+    let minted = state
+        .directory
+        .mint_turn_key(&project, &user, now_ms())
+        .await?;
+    let view = state.directory.view(now_ms()).await;
     let record = find_key_by_hash(&view, &minted.key_sha256)?;
     Ok((
         StatusCode::CREATED,
@@ -629,8 +672,8 @@ async fn mint_turn_key(
 
 /// `POST /v1/admin/keys` — mint an admin key.
 async fn mint_admin_key(State(state): State<AdminState>) -> Result<Response, ApiError> {
-    let minted = state.directory.mint_admin_key(now_ms())?;
-    let view = state.directory.view(now_ms());
+    let minted = state.directory.mint_admin_key(now_ms()).await?;
+    let view = state.directory.view(now_ms()).await;
     let record = find_key_by_hash(&view, &minted.key_sha256)?;
     Ok((
         StatusCode::CREATED,
@@ -643,7 +686,7 @@ async fn mint_admin_key(State(state): State<AdminState>) -> Result<Response, Api
 }
 
 async fn list_keys(State(state): State<AdminState>) -> Response {
-    let view = state.directory.view(now_ms());
+    let view = state.directory.view(now_ms()).await;
     axum::Json(ListDto {
         data: view.keys.iter().map(KeyDto::from).collect::<Vec<_>>(),
     })
@@ -654,7 +697,7 @@ async fn get_key(
     State(state): State<AdminState>,
     Path(key_id): Path<String>,
 ) -> Result<Response, ApiError> {
-    let view = state.directory.view(now_ms());
+    let view = state.directory.view(now_ms()).await;
     let record = view
         .keys
         .iter()
@@ -674,7 +717,8 @@ async fn revoke_key(
 ) -> Result<Response, ApiError> {
     state
         .directory
-        .apply(DirectoryMutation::RevokeKey { id: key_id }, now_ms())?;
+        .apply(DirectoryMutation::RevokeKey { id: key_id }, now_ms())
+        .await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 

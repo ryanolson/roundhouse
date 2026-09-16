@@ -85,6 +85,17 @@ pub const DEFAULT_API_BASE: &str = "https://api.openai.com/v1";
 /// bases are separate fields rather than one with a header switch.
 pub const DEFAULT_PASS_THROUGH_BASE: &str = "https://chatgpt.com/backend-api/codex";
 
+/// Where the Responses route lives under a base URL, absent a definition
+/// saying otherwise.
+///
+/// OpenAI serves it here and so does OpenRouter
+/// (`https://openrouter.ai/api/v1/responses`, GA since 2026-07-25). A
+/// deployment addressing something else — a Dynamo frontend behind a path
+/// prefix, a `switchyard-server` — states its own path in the catalog's
+/// `providers` section rather than editing this constant, which is the whole
+/// point of routes being data.
+pub const DEFAULT_RESPONSES_PATH: &str = "/responses";
+
 /// The dialect this client serializes. Anything else is refused rather than
 /// mis-serialized — see [`FrontierError::UnsupportedDialect`].
 const SPOKEN: WireProtocol = WireProtocol::OpenAiResponses;
@@ -103,6 +114,21 @@ pub struct OpenAiResponsesClient {
     forwarding: reqwest::Client,
     api_base: String,
     pass_through_base: String,
+    /// The path under the base URL that a Responses request is POSTed to.
+    ///
+    /// Configurable since M10.1's provider registry, because the same client
+    /// now serves several origins and they do not all agree on where the route
+    /// lives — the whole content of a `providers` entry's
+    /// `routes.responses`. [`DEFAULT_RESPONSES_PATH`] is what a definition that
+    /// says nothing gets, which is what OpenAI and OpenRouter both use.
+    responses_path: String,
+    /// Static headers this provider asked for, sent on every request.
+    ///
+    /// Applied *before* the credential headers and never after — see
+    /// [`Self::route`]. A definition that could overwrite `Authorization`
+    /// would be a file that is not the credential file deciding whose money a
+    /// turn spends.
+    extra_headers: HeaderMap,
 }
 
 impl OpenAiResponsesClient {
@@ -141,7 +167,53 @@ impl OpenAiResponsesClient {
             )?,
             api_base: trim_base(api_base.into()),
             pass_through_base: trim_base(pass_through_base.into()),
+            responses_path: DEFAULT_RESPONSES_PATH.to_string(),
+            extra_headers: HeaderMap::new(),
         })
+    }
+
+    /// Serve the Responses route at a path other than
+    /// [`DEFAULT_RESPONSES_PATH`].
+    ///
+    /// A builder rather than a fifth constructor argument: every existing call
+    /// site means the default, and a parameter they all had to spell would put
+    /// the same string in a dozen places for one deployment that needs a
+    /// different one.
+    pub fn with_responses_path(mut self, path: impl Into<String>) -> Self {
+        self.responses_path = path.into();
+        self
+    }
+
+    /// Send `headers` on every request this client makes.
+    ///
+    /// Fallible because a header name or value that the HTTP stack will not
+    /// accept is a configuration mistake, and discovering it at the first
+    /// dispatch would fail one tenant's turn for a line in a file — the same
+    /// argument [`Self::new`] makes for being fallible at all. The composition
+    /// root turns this into a boot refusal.
+    ///
+    /// Values are **not** marked sensitive: these are identification headers a
+    /// gateway asks for, written in a file that is not the credential file, and
+    /// marking them would hide from diagnostics exactly the fields an operator
+    /// put there to be seen. A key does not belong here — it travels on the
+    /// quote.
+    pub fn with_extra_headers<I>(mut self, headers: I) -> Result<Self, FrontierError>
+    where
+        I: IntoIterator<Item = (String, String)>,
+    {
+        for (name, value) in headers {
+            let parsed = HeaderName::from_bytes(name.as_bytes())
+                .ok()
+                .zip(HeaderValue::from_str(&value).ok())
+                .ok_or_else(|| {
+                    FrontierError::Upstream(format!(
+                        "`{name}` is not a header this client can send; refusing to build a \
+                         transport that would drop a header a provider asked for"
+                    ))
+                })?;
+            self.extra_headers.insert(parsed.0, parsed.1);
+        }
+        Ok(self)
     }
 
     /// The request body this quote becomes.
@@ -154,7 +226,15 @@ impl OpenAiResponsesClient {
     /// to the client rather than to the dialect that currently happens to need
     /// no help. A client that skipped it would be correct today and silently
     /// unaccounted the day its catalog entry moved to Chat Completions.
-    fn body(quote: &FrontierQuote, model: &str) -> Value {
+    ///
+    /// **Fallible since M11.2a's F1**, and only for one reason: a toolbox
+    /// declared on another dialect that cannot be honestly restated in this one
+    /// is refused here, before a socket, rather than posted and 400'd. Nothing
+    /// else in this function can fail.
+    fn body(quote: &FrontierQuote, model: &str) -> Result<Value, FrontierError> {
+        // Resolved first, because it can refuse -- see
+        // [`FrontierQuote::tools_for`].
+        let (tools, tool_choice) = quote.tools_for(SPOKEN)?;
         let mut body = json!({
             "model": model,
             "stream": true,
@@ -166,14 +246,47 @@ impl OpenAiResponsesClient {
             // The whole point of the routing: providers use it to steer a
             // request to the node holding this session's prefix.
             "prompt_cache_key": quote.prompt_cache_key,
-            "max_output_tokens": quote.expected_output_tokens,
+            // The client's declared ceiling when it named one, and otherwise
+            // the router's estimate — which is the semantics this client
+            // shipped with and keeps deliberately. Unlike the Messages schema,
+            // `max_output_tokens` is optional here, so "let the model decide"
+            // would also have been expressible; it is not chosen, because a
+            // Responses turn with no ceiling at all can outrun the deadline
+            // this deployment prices and reserves against. The order matters
+            // and only the order: a declared cap outranks an estimate, never
+            // the other way round (M11.1, F1).
+            "max_output_tokens": quote.output_token_cap.or(quote.expected_output_tokens),
             // Roundhouse rebuilds every prompt from its own log, so server-side
             // conversation state would be a second history able to disagree
             // with the one the fold replays. Off, explicitly.
             "store": false,
         });
+        // **The client's own tool definitions, verbatim.** Same ruling as the
+        // Messages client's: the quote is transport, the client's bytes are the
+        // client's, and a typed re-encoding here would be a third projection
+        // that drops whatever it does not model — an `input_schema` shape this
+        // build has never seen, a server-tool `type`, a freeform tool — and
+        // leaves the model told about a smaller toolbox than the client has.
+        //
+        // Absent means no key rather than `null`. The Responses request schema
+        // is not closed the way the Messages one is, so a stray `null` would not
+        // 400 here; it is still not sent, because "the caller declared no tools"
+        // and "the caller declared no tools *very explicitly*" are the same
+        // fact, and one spelling is enough.
+        //
+        // **"Verbatim" is a property of the pairing rather than of these two
+        // lines**, since M11.2a's F1: `tools_for` above hands back the client's
+        // own bytes when the declaring surface spoke this dialect, a faithful
+        // restatement of the plain function-tool core when it did not, and a
+        // refusal for anything it cannot restate.
+        if let Some(tools) = tools {
+            body["tools"] = tools;
+        }
+        if let Some(tool_choice) = tool_choice {
+            body["tool_choice"] = tool_choice;
+        }
         quote.wire_protocol.enforce_usage_reporting(&mut body);
-        body
+        Ok(body)
     }
 
     /// The headers, the base URL and the HTTP client this credential implies.
@@ -193,7 +306,10 @@ impl OpenAiResponsesClient {
                 // out: that is the one seam that yields plaintext, and routing
                 // every read through it is what makes a grep for it complete.
                 let key = credential.require_api_key(provider)?;
-                let mut headers = HeaderMap::new();
+                // Seeded with the provider's static headers, then the
+                // credential on top: a definition cannot displace the one
+                // header that decides whose money this turn spends.
+                let mut headers = self.extra_headers.clone();
                 headers.insert(
                     reqwest::header::AUTHORIZATION,
                     sensitive(&format!("Bearer {key}")).ok_or_else(|| {
@@ -210,7 +326,7 @@ impl OpenAiResponsesClient {
                 })
             }
             TurnCredential::Forwarded(forwarded) => {
-                let mut headers = HeaderMap::new();
+                let mut headers = self.extra_headers.clone();
                 for (name, value) in forwarded.headers() {
                     // Both halves are already bounded: the name comes from the
                     // allowlist and the value passed the edge's forwardable
@@ -281,6 +397,9 @@ impl FrontierClient for OpenAiResponsesClient {
             });
         }
 
+        // Before the route is resolved, so a toolbox this client cannot restate
+        // never reaches a credential, let alone a socket.
+        let body = Self::body(quote, model)?;
         let mut route = self.route(&quote.credential, provider)?;
         for (name, value) in [
             ("session-id", &quote.session_id),
@@ -295,9 +414,9 @@ impl FrontierClient for OpenAiResponsesClient {
         }
         let response = route
             .client
-            .post(format!("{}/responses", route.base))
+            .post(format!("{}{}", route.base, self.responses_path))
             .headers(route.headers.clone())
-            .json(&Self::body(quote, model))
+            .json(&body)
             .send()
             .await
             .map_err(|source| {
@@ -305,16 +424,24 @@ impl FrontierClient for OpenAiResponsesClient {
                 // header, so there is nothing to redact here -- stated because
                 // the next person to add context to this message needs to know
                 // it is not exempt.
-                FrontierError::Upstream(format!("the request to the upstream failed: {source}"))
+                //
+                // `is_timeout` is read here and nowhere else: it is a fact the
+                // transport knows and nothing downstream can recover, and it is
+                // the difference between an attempt row that says the provider
+                // was unreachable and one that says it was slow.
+                FrontierError::Transport {
+                    timed_out: source.is_timeout(),
+                    message: source.to_string(),
+                }
             })?;
 
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            return Err(FrontierError::Upstream(format!(
-                "the upstream answered {status}: {}",
-                route.credential.redact(body)
-            )));
+            return Err(FrontierError::Status {
+                status: status.as_u16(),
+                message: route.credential.redact(body),
+            });
         }
 
         Ok(decode(
@@ -380,13 +507,25 @@ fn bytes_state(
 /// The same error with any echoed credential removed.
 ///
 /// Every error leaving this module goes through here or through
-/// [`TurnCredential::redact`] directly. Only the [`FrontierError::Upstream`]
-/// arm can carry an upstream's words; the others are this client's own
-/// sentences and have nothing to scrub.
+/// [`TurnCredential::redact`] directly. Two arms can carry an upstream's words
+/// — [`FrontierError::Upstream`] and [`FrontierError::Status`] — and both are
+/// scrubbed; the others are this client's own sentences and have nothing to
+/// scrub. The match is exhaustive rather than a wildcard so that a variant
+/// added later cannot join the list of things that carry a body without
+/// somebody deciding it should.
 fn redact_error(credential: &TurnCredential, error: FrontierError) -> FrontierError {
     match error {
         FrontierError::Upstream(message) => FrontierError::Upstream(credential.redact(message)),
-        other => other,
+        FrontierError::Status { status, message } => FrontierError::Status {
+            status,
+            message: credential.redact(message),
+        },
+        other @ (FrontierError::UnknownProvider(_)
+        | FrontierError::Credential(_)
+        | FrontierError::MalformedQuote(_)
+        | FrontierError::UntranslatableTools { .. }
+        | FrontierError::UnsupportedDialect { .. }
+        | FrontierError::Transport { .. }) => other,
     }
 }
 
@@ -425,9 +564,32 @@ mod tests {
             prompt: "how many tokens did that turn bill?".into(),
             session_id: None,
             thread_id: None,
+            // Deliberately populated even though this client ignores it -- see
+            // `the_segment_structure_does_not_reach_the_responses_wire`.
+            segment_boundaries: vec![8, 20],
             prompt_cache_key: "sess_openai".into(),
             expected_output_tokens: Some(512),
+            // No client declared a ceiling on these fixtures, which is what
+            // every internal caller looks like; see `output_token_cap`.
+            output_token_cap: None,
+            // Nor tools, so every other body assertion in this module is also a
+            // control for "a quote with none sends no `tools` key".
+            tools: None,
+            tool_choice: None,
+            // And no dialect stamp, which is the honest answer for a quote with
+            // nothing to stamp — see `FrontierQuote::tools_dialect`.
+            tools_dialect: None,
             credential,
+        }
+    }
+
+    /// A quote whose toolbox was declared in `dialect`.
+    fn declaring(dialect: WireProtocol, tools: Value, tool_choice: Option<Value>) -> FrontierQuote {
+        FrontierQuote {
+            tools: Some(tools),
+            tool_choice,
+            tools_dialect: Some(dialect),
+            ..quote(TurnCredential::Absent, SPOKEN)
         }
     }
 
@@ -473,7 +635,8 @@ mod tests {
 
     #[test]
     fn the_body_carries_the_cache_key_and_the_usage_obligation_is_wired() {
-        let body = OpenAiResponsesClient::body(&quote(TurnCredential::Absent, SPOKEN), "flagship");
+        let body = OpenAiResponsesClient::body(&quote(TurnCredential::Absent, SPOKEN), "flagship")
+            .expect("a quote with no tools cannot refuse");
         assert_eq!(body["model"], json!("flagship"));
         assert_eq!(body["stream"], json!(true));
         assert_eq!(body["prompt_cache_key"], json!("sess_openai"));
@@ -488,6 +651,273 @@ mod tests {
         // Completions it starts adding `stream_options.include_usage` rather
         // than silently reporting nothing.
         assert!(body.get("stream_options").is_none());
+    }
+
+    /// **A declared ceiling outranks the pricing estimate; absent one, the
+    /// estimate is kept.**
+    ///
+    /// The Responses half of M11.1's F1. This client's shipped semantics are
+    /// preserved on purpose — `max_output_tokens` still falls back to
+    /// `expected_output_tokens`, because a Responses turn with no ceiling at
+    /// all can outrun the deadline the deployment prices against, and no
+    /// Responses serve surface declares a cap today, so the fallback *is* the
+    /// production path. What changes is only the precedence, and the second
+    /// assertion is the one that would have been wrong before the split.
+    #[test]
+    fn a_declared_ceiling_outranks_the_pricing_estimate() {
+        let mut quote = quote(TurnCredential::Absent, SPOKEN);
+        assert_eq!(
+            OpenAiResponsesClient::body(&quote, "flagship").unwrap()["max_output_tokens"],
+            json!(512),
+            "with no declared cap this client keeps the estimate it shipped with"
+        );
+
+        quote.output_token_cap = Some(64_000);
+        assert_eq!(
+            OpenAiResponsesClient::body(&quote, "flagship").unwrap()["max_output_tokens"],
+            json!(64_000),
+            "the client asked for 64 000 tokens; a 512-token pricing estimate is \
+             not an answer to that question"
+        );
+    }
+
+    /// The client's tools ride out verbatim, and absent means no key.
+    ///
+    /// The Responses half of M11.2's tool-definition threading. Same ruling and
+    /// same reasoning as the Messages client's — the quote is transport, the
+    /// bytes are the client's — and the payload is chosen to be lossy under any
+    /// typed projection: a `freeform` tool with a grammar rather than a schema,
+    /// and a `tool_choice` naming a specific function rather than a bare string.
+    #[test]
+    fn the_clients_tools_and_tool_choice_travel_verbatim_or_not_at_all() {
+        let tools = json!([
+            {
+                "type": "function",
+                "name": "shell",
+                "parameters": { "type": "object", "properties": { "cmd": { "type": "string" } } },
+                "strict": false,
+            },
+            { "type": "custom", "name": "apply_patch", "format": { "type": "grammar" } },
+        ]);
+        let tool_choice = json!({ "type": "function", "name": "shell" });
+
+        // Declared *in this dialect*, which is what makes "verbatim" the
+        // contract here: a surface that spoke another dialect gets a faithful
+        // restatement instead, pinned by
+        // `an_anthropic_shaped_toolbox_is_restated_in_this_dialect_before_it_is_sent`.
+        let with_tools = declaring(SPOKEN, tools.clone(), Some(tool_choice.clone()));
+        let body = OpenAiResponsesClient::body(&with_tools, "flagship")
+            .expect("a same-dialect toolbox is forwarded, never examined");
+        assert_eq!(body["tools"], tools);
+        assert_eq!(body["tool_choice"], tool_choice);
+
+        // CONTROL: nothing declared, no key at all — which is what every
+        // internal caller sends and what this client sent before M11.2.
+        let bare = OpenAiResponsesClient::body(&quote(TurnCredential::Absent, SPOKEN), "flagship")
+            .expect("no tools, nothing to refuse");
+        assert!(bare.get("tools").is_none());
+        assert!(bare.get("tool_choice").is_none());
+    }
+
+    /// **F1, this client's half: a toolbox declared on the *other* dialect is
+    /// restated before it is sent, never forwarded and never thinned.**
+    ///
+    /// The scenario the review found, in its shipped form: a Claude Code turn
+    /// arrives on the Messages surface with twenty-four
+    /// `{name, description, input_schema}` declarations, and routing sends it to
+    /// one of `catalog.example.json`'s four `openai_responses` entries because
+    /// that entry is cheaper. `plan` reads no dialect, `connect` copies the
+    /// client's raw JSON onto the quote, and this client used to put whatever
+    /// `tools` held under the wire body's `"tools"` key unexamined — so the
+    /// upstream got a tool array with no `type` and no `parameters`, 400'd, and
+    /// the failover repeated it on the next Responses candidate.
+    #[test]
+    fn an_anthropic_shaped_toolbox_is_restated_in_this_dialect_before_it_is_sent() {
+        let anthropic_shaped = json!([{
+            "name": "Grep",
+            "description": "search",
+            "input_schema": { "type": "object", "properties": { "pattern": { "type": "string" } } },
+        }]);
+        let body = OpenAiResponsesClient::body(
+            &declaring(
+                WireProtocol::AnthropicMessages,
+                anthropic_shaped.clone(),
+                Some(json!({ "type": "any" })),
+            ),
+            "flagship",
+        )
+        .expect("a plain function tool restates faithfully");
+
+        assert_eq!(
+            body["tools"],
+            json!([{
+                "type": "function",
+                "name": "Grep",
+                "description": "search",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "pattern": { "type": "string" } },
+                },
+            }]),
+            "the Responses wire requires `type: function` and spells the schema \
+             `parameters`; Anthropic's spelling is a 400 on every tool-using turn"
+        );
+        assert_eq!(body["tool_choice"], json!("required"));
+        assert_ne!(
+            body["tools"], anthropic_shaped,
+            "and it is emphatically not what the client sent"
+        );
+
+        // PROBE: an Anthropic server tool, which roundhouse cannot run on
+        // OpenAI's behalf and must not silently drop -- a model told about a
+        // smaller toolbox than the client declared is the failure nobody debugs.
+        let error = OpenAiResponsesClient::body(
+            &declaring(
+                WireProtocol::AnthropicMessages,
+                json!([{ "type": "web_search_20250305", "name": "web_search", "max_uses": 5 }]),
+                None,
+            ),
+            "flagship",
+        )
+        .expect_err("a server tool has no Responses spelling");
+        assert!(
+            matches!(&error, FrontierError::UntranslatableTools { tool, from, to }
+                if tool == "web_search"
+                    && *from == "anthropic_messages"
+                    && *to == "openai_responses"),
+            "{error}"
+        );
+    }
+
+    /// **P3: the outbound body names only fields OpenRouter's schema has.**
+    ///
+    /// The same client now serves OpenAI's endpoint and OpenRouter's, and their
+    /// `ResponsesRequest` schemas are not the same set. OpenRouter's has no
+    /// `stream_options` and no `client_metadata`
+    /// (`agent-docs/research/openrouter-api-surface.md` Q1, read from
+    /// `openapi.json` on 2026-08-24), and whether it *rejects* an unknown
+    /// top-level field or ignores it is untested — the route authenticates
+    /// before it validates, so an unauthenticated probe cannot reach the
+    /// validator. Sending only what both schemas name is what makes that open
+    /// question not matter.
+    ///
+    /// A whitelist rather than a blacklist, because the failure this guards is
+    /// somebody *adding* a field: a deny-list of two names would stay green
+    /// while a third arrived.
+    #[test]
+    fn the_outbound_body_names_only_fields_both_responses_schemas_have() {
+        let body = OpenAiResponsesClient::body(&quote(TurnCredential::Absent, SPOKEN), "kimi-k3")
+            .expect("no tools, nothing to refuse");
+        let sent: Vec<&str> = body
+            .as_object()
+            .expect("the body is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        for field in &sent {
+            assert!(
+                matches!(
+                    *field,
+                    "model"
+                        | "stream"
+                        | "input"
+                        | "prompt_cache_key"
+                        | "max_output_tokens"
+                        | "store"
+                ),
+                "`{field}` is not a field OpenRouter's ResponsesRequest names; a request \
+                 carrying it may be rejected outright by a provider this client now serves"
+            );
+        }
+        // The two codex sends that OpenRouter's schema does not have, named
+        // rather than merely absent from the list above — this is the
+        // assertion a future edit has to argue with.
+        assert!(body.get("stream_options").is_none());
+        assert!(body.get("client_metadata").is_none());
+        // And the two constraints its schema states outright: `store` is
+        // `const: false`, and a non-null `previous_response_id` is a 400.
+        assert_eq!(body["store"], json!(false));
+        assert!(body.get("previous_response_id").is_none());
+    }
+
+    /// **The control for R3: the quote grew a field and this client's wire
+    /// output did not move a byte.**
+    ///
+    /// `segment_boundaries` exists for one dialect — Anthropic, which caches
+    /// nothing without an explicit breakpoint. The Responses API caches on a
+    /// steering key instead, so re-blocking the prompt here would change what
+    /// this upstream is sent for no benefit at all, and would break the one
+    /// property every other target relies on: the prompt a provider receives is
+    /// the exact string `turn_id_for` hashed. An additive field that quietly
+    /// altered an existing client's request would be the worst possible way to
+    /// discover that.
+    #[test]
+    fn the_segment_structure_does_not_reach_the_responses_wire() {
+        let mut structured = quote(TurnCredential::Absent, SPOKEN);
+        structured.segment_boundaries = vec![4, 11, 26];
+        let mut flat = structured.clone();
+        flat.segment_boundaries.clear();
+
+        assert_eq!(
+            OpenAiResponsesClient::body(&structured, "flagship").unwrap(),
+            OpenAiResponsesClient::body(&flat, "flagship").unwrap(),
+            "the Responses body must be byte-identical whether or not the quote \
+             knows its item boundaries"
+        );
+        // And it is still one flat string in one message, not a block list.
+        let body = OpenAiResponsesClient::body(&structured, "flagship").unwrap();
+        assert_eq!(body["input"][0]["content"].as_array().unwrap().len(), 1);
+        assert_eq!(body["input"][0]["content"][0]["text"], json!(flat.prompt));
+    }
+
+    #[test]
+    fn a_provider_definition_moves_the_route_and_rides_its_own_headers() {
+        // The registry's case: one client type, two origins that do not agree
+        // on where the route lives or what they want to be told about the
+        // caller.
+        let client = OpenAiResponsesClient::with_bases(
+            "https://gateway.test/openai",
+            "https://gateway.test/openai",
+        )
+        .unwrap()
+        .with_responses_path("/v1/responses")
+        .with_extra_headers([("X-OpenRouter-Title".to_string(), "roundhouse".to_string())])
+        .unwrap();
+        assert_eq!(client.responses_path, "/v1/responses");
+
+        let stored = TurnCredential::Stored(Secret::api_key("sk-or-v1-ZZZZ").unwrap());
+        let route = client.route(&stored, "openrouter").unwrap();
+        assert_eq!(route.headers["x-openrouter-title"], "roundhouse");
+        assert_eq!(
+            route.headers[reqwest::header::AUTHORIZATION],
+            "Bearer sk-or-v1-ZZZZ"
+        );
+
+        // PROBE: a definition that tries to supply its own `Authorization`.
+        // The credential is applied after the static headers, so the file
+        // cannot decide whose money a turn spends — which is the one thing a
+        // non-credential file must never be able to do.
+        let hijack = OpenAiResponsesClient::new()
+            .unwrap()
+            .with_extra_headers([(
+                "authorization".to_string(),
+                "Bearer not-the-key".to_string(),
+            )])
+            .unwrap();
+        assert_eq!(
+            hijack.route(&stored, "openrouter").unwrap().headers[reqwest::header::AUTHORIZATION],
+            "Bearer sk-or-v1-ZZZZ",
+            "the resolved credential must win over anything the catalog file says"
+        );
+
+        // A header the HTTP stack cannot carry is a boot-time refusal rather
+        // than a request that silently goes out without it.
+        assert!(
+            OpenAiResponsesClient::new()
+                .unwrap()
+                .with_extra_headers([("not a header".to_string(), "x".to_string())])
+                .is_err()
+        );
     }
 
     #[test]

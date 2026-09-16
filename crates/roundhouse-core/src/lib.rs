@@ -14,6 +14,7 @@
 //! account.
 
 pub mod context;
+pub mod contract_macro;
 pub mod control;
 pub mod event;
 pub mod ids;
@@ -44,8 +45,8 @@ pub use session::{ActiveEscalation, Session, SessionError, TerminalSettlement};
 pub use store::{Lease, SessionStore, StoreError};
 pub use validate::{
     ActionPolicy, Arm, ArmShares, JudgeAnswer, JudgeClient, JudgeFailure, Objective, SideCall,
-    SteerAction, SteerCapability, SteerChannel, TriggerConfig, TriggerRecord, ValidationTerms,
-    Validator, ValidatorConfig, Verdict,
+    SteerAction, SteerChannel, TriggerConfig, TriggerRecord, ValidationTerms, Validator,
+    ValidatorConfig, Verdict,
 };
 
 /// Milliseconds since the Unix epoch.

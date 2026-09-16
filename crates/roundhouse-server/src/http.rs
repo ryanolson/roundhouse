@@ -23,9 +23,20 @@
 //! not honor it.
 //!
 //! What a second transport needs is `pub(crate)` rather than private:
-//! [`responses_api`](crate::responses_api) follows the same log and answers the
-//! same pre-stream failures, and a second copy of the cursor or of the error
+//! [`responses_api`](crate::responses_api) and
+//! [`messages_api`](crate::messages_api) follow the same log and answer the same
+//! pre-stream failures, and a second copy of the cursor or of the error
 //! vocabulary would be a second thing to keep in agreement with this one.
+//!
+//! [`ApiError`] is the one exception and is `pub`. Not because anything outside
+//! the crate constructs one — its constructors and fields stay crate-private,
+//! so from outside it is a value you can render and nothing else — but because
+//! `messages_api`'s canonicalization is a *public pure function* that returns
+//! it. That module is public so the conformance oracle (plan R6 tier 1) can
+//! drive the projection directly from `tests/` rather than only over a socket,
+//! which is the same reason the dispatch side's wire module is public. The
+//! alternative was a second refusal type at that boundary, converted here,
+//! which is a type whose only job is to keep a `pub` off this one.
 
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
@@ -52,7 +63,9 @@ use roundhouse_core::item::{Item, Role};
 use roundhouse_core::now_ms;
 use roundhouse_core::store::{SessionStore, StoreError};
 
-use crate::control_config::{AuthError, ControlPlane, DirectoryError, PlaneSource, StoreFailure};
+use crate::control_config::{
+    Admission, AuthError, ControlPlane, DirectoryError, PlaneSource, StoreFailure,
+};
 use crate::engine::Engine;
 
 /// How long to wait before re-reading a log that had nothing new.
@@ -201,11 +214,22 @@ impl InputItem {
 /// Once a turn is admitted its failures are log events, and the stream carries
 /// them; this covers only what can go wrong first — a body we cannot read, a
 /// session that does not exist, a store that is down.
+/// Public, but only as a value: every constructor and every field below is
+/// crate-private, so the surface this exposes is `Debug` and `IntoResponse`.
+/// See the module doc for why it is public at all.
 #[derive(Debug)]
-pub(crate) struct ApiError {
+pub struct ApiError {
     status: StatusCode,
     code: &'static str,
     message: String,
+    /// Machine-readable fields merged into the error object beside `code` and
+    /// `message`.
+    ///
+    /// Empty for every refusal whose remedy is a person reading the message. It
+    /// exists for the one refusal whose remedy is a *client* acting on it: a
+    /// fair-use `429` carries a window and an earliest retry time, and an agent
+    /// that had to parse them out of English would parse them wrong.
+    detail: Option<Value>,
 }
 
 impl ApiError {
@@ -214,6 +238,7 @@ impl ApiError {
             status: StatusCode::NOT_FOUND,
             code: "session_not_found",
             message: format!("session `{session_id}` not found"),
+            detail: None,
         }
     }
 
@@ -222,6 +247,7 @@ impl ApiError {
             status: StatusCode::UNPROCESSABLE_ENTITY,
             code: "invalid_request",
             message: message.into(),
+            detail: None,
         }
     }
 
@@ -237,6 +263,7 @@ impl ApiError {
             status: StatusCode::UNPROCESSABLE_ENTITY,
             code,
             message: message.into(),
+            detail: None,
         }
     }
 
@@ -245,6 +272,7 @@ impl ApiError {
             status: StatusCode::BAD_REQUEST,
             code,
             message: message.into(),
+            detail: None,
         }
     }
 
@@ -259,6 +287,7 @@ impl ApiError {
             status: StatusCode::NOT_FOUND,
             code,
             message: message.into(),
+            detail: None,
         }
     }
 
@@ -268,6 +297,55 @@ impl ApiError {
             status: StatusCode::CONFLICT,
             code,
             message: message.into(),
+            detail: None,
+        }
+    }
+
+    /// A 409: the claimed history disagreed with, or found busy, every one of
+    /// the `attempts` generations of `key` that
+    /// [`bind_prefix`](crate::prefix_admission) probed, and it refuses rather
+    /// than searching further.
+    ///
+    /// **Prefix admission's own bound** (R13, M14.0). Admission searches a
+    /// key's generations for the one the claim continues; a caller that
+    /// disagrees with every generation the search can reach is not resending
+    /// an edited history any more — it is a loop, or a probe for how many
+    /// generations one key holds. The alternative defaults are both worse than
+    /// a loud refusal: searching without limit spends unbounded reads walking
+    /// a family one request has no business walking, and giving up silently by
+    /// guessing a generation is exactly the duplicated-prefix bug the search
+    /// exists to close (see the D1 addendum, R13).
+    ///
+    /// **`attempts` is a tally, not the bound.** It is the number of
+    /// generations this request actually read back — split into how many
+    /// disagreed and how many were busy (another writer's, M15 H4), rather
+    /// than folded into one count, because that fold is how a refusal that
+    /// probed nine busy generations once reported zero of anything. Which is
+    /// what an operator reading the log needs, and which the constant cannot
+    /// say, since the search stops early on the first free slot and walks in
+    /// two directions.
+    ///
+    /// The key and the counts are on the wire (`detail`) and not just in the
+    /// message, for [`Self::detail`]'s reason: a client — or the operator
+    /// reading its logs — needs to know *which* cache key looped, and whether
+    /// it looped disagreeing or looped busy, without parsing English out of
+    /// `message`.
+    pub(crate) fn prefix_admission_exhausted(key: &str, disagreed: u32, busy: u32) -> Self {
+        let attempts = disagreed + busy;
+        Self {
+            status: StatusCode::CONFLICT,
+            code: "prefix_admission_exhausted",
+            message: format!(
+                "the claimed history could not be admitted after probing {attempts} \
+                 generation(s) of `{key}` ({disagreed} disagreed, {busy} busy); refusing \
+                 rather than searching further within one request"
+            ),
+            detail: Some(json!({
+                "cache_key": key,
+                "attempts": attempts,
+                "disagreed": disagreed,
+                "busy": busy,
+            })),
         }
     }
 
@@ -278,6 +356,7 @@ impl ApiError {
             status: StatusCode::NOT_IMPLEMENTED,
             code,
             message: message.into(),
+            detail: None,
         }
     }
 
@@ -286,7 +365,110 @@ impl ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code,
             message: message.into(),
+            detail: None,
         }
+    }
+
+    /// A 413: the request body — a document this write would have produced —
+    /// is over a size this deployment enforces.
+    ///
+    /// Named rather than folded into [`Self::internal`] (M18, H2), for the
+    /// same reason [`StoreFailure::DocumentTooLarge`] exists rather than
+    /// reusing `Unavailable`: the request caused this, not a dependency
+    /// outage, and a client's retry logic should treat the two oppositely —
+    /// retrying a `413` unchanged only ever produces the same `413`.
+    ///
+    /// [`StoreFailure::DocumentTooLarge`]: crate::control_config::StoreFailure::DocumentTooLarge
+    pub(crate) fn payload_too_large(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            code,
+            message: message.into(),
+            detail: None,
+        }
+    }
+
+    /// A 503: a store this deployment depends on could not answer, and the
+    /// condition clears on its own.
+    ///
+    /// Named rather than folded into [`Self::internal`] because the two say
+    /// opposite things to a client. A `500` is "this request produced a
+    /// failure", which an agent's stack reasonably treats as a reason to stop
+    /// or to change what it sent; a `503` is "come back", which is the truth
+    /// when nothing about the request was wrong and our own dependency is
+    /// down. It is what the fair-use ledger's outage posture (D1 R14, R-F7)
+    /// needs to be expressible: a ceiling that cannot be read fails *closed*,
+    /// and a refusal a client will never retry is a fail-closed that never
+    /// reopens.
+    ///
+    /// The one client this product exists to serve reads it that way already:
+    /// [`messages_api`](crate::messages_api)'s `error_kind` spells a 503 —
+    /// and only a 503 — `overloaded_error`, the single string Claude Code
+    /// retries on regardless of status.
+    pub(crate) fn unavailable(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code,
+            message: message.into(),
+            detail: None,
+        }
+    }
+
+    /// A refusal at a status the named constructors above do not cover.
+    ///
+    /// Deliberately last and deliberately awkward to reach: the constructors
+    /// above are named for *what was refused* precisely so that a status is
+    /// chosen once per kind of refusal rather than per call site. This exists
+    /// for the one caller that is inverting a refusal rather than making one —
+    /// [`messages_api`](crate::messages_api)'s non-streaming path, which has a
+    /// terminal wire error in hand and a status code still available to express
+    /// it — and reaching for it anywhere a named constructor fits would be how
+    /// two spellings of one refusal start.
+    pub(crate) fn refused(
+        status: StatusCode,
+        code: &'static str,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            status,
+            code,
+            message: message.into(),
+            detail: None,
+        }
+    }
+
+    /// The three parts, for a transport that renders refusals in someone else's
+    /// envelope.
+    ///
+    /// Readers rather than public fields, and readers rather than a second
+    /// error type. [`messages_api`](crate::messages_api) answers a pre-stream
+    /// refusal in Anthropic's `{"type":"error","error":{…}}` shape, which is a
+    /// *rendering* of the same refusal this type already carries — the status,
+    /// the code and the sentence are decided once, at the seam that refused,
+    /// and each surface spells them the way its own client parses. A parallel
+    /// error type would have made every refusal in `control_config` and
+    /// `http` exist twice, and the second copy is the one that drifts: a
+    /// deployment whose fair-use ceiling refused with a window on one surface
+    /// and without it on the other would be one ceiling reported as two.
+    ///
+    /// [`Self::detail`] is what carries the fair-use `429`'s machine-readable
+    /// fields, and it is why this is three readers and not just a message: an
+    /// agent acts on `resets_at`, and a renderer that could only reach the
+    /// English would drop the one part of that refusal a client can use.
+    pub(crate) fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    pub(crate) fn code(&self) -> &'static str {
+        self.code
+    }
+
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
+
+    pub(crate) fn detail(&self) -> Option<&Value> {
+        self.detail.as_ref()
     }
 }
 
@@ -358,6 +540,14 @@ impl From<DirectoryError> for ApiError {
             DirectoryError::Store(StoreFailure::Unavailable(_)) => {
                 ApiError::internal("directory_unavailable", message)
             }
+            // 413 and its own code (M18, H2): before this the ceiling
+            // refusal rode `Unavailable` and answered `directory_unavailable`
+            // — the same 500 a dead store answers — so a document too large
+            // to write read as an outage rather than as the client-caused
+            // refusal it is.
+            DirectoryError::Store(StoreFailure::DocumentTooLarge { .. }) => {
+                ApiError::payload_too_large("directory_document_too_large", message)
+            }
             DirectoryError::Mint(_) => ApiError::internal("key_mint_failed", message),
             DirectoryError::Inconsistent { .. } => {
                 ApiError::internal("directory_inconsistent", message)
@@ -381,6 +571,7 @@ impl From<AuthError> for ApiError {
             status: error.status(),
             code: error.code(),
             message: error.to_string(),
+            detail: None,
         }
     }
 }
@@ -412,9 +603,114 @@ pub(crate) fn in_namespace(
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let body = json!({ "error": { "code": self.code, "message": self.message } });
-        (self.status, axum::Json(body)).into_response()
+        let mut error = json!({ "code": self.code, "message": self.message });
+        // Merged into the error object rather than nested under a `detail` key,
+        // so a client reads `error.retry_at_ms` beside `error.code` the way
+        // every provider's own rate-limit envelope reads. Merged rather than
+        // overwriting: a detail that could displace `code` would let a future
+        // caller change what a refusal *is* by accident.
+        if let (Some(Value::Object(fields)), Some(error)) = (self.detail, error.as_object_mut()) {
+            for (name, value) in fields {
+                error.entry(name).or_insert(value);
+            }
+        }
+        (self.status, axum::Json(json!({ "error": error }))).into_response()
     }
+}
+
+/// Refuse a turn whose membership has spent a rolling fair-use window.
+///
+/// **Here, at the transport, and not inside the engine.** Both surfaces spawn
+/// `run_turn` into a task and answer with an SSE stream, so a refusal raised
+/// inside the turn becomes a terminal log event and the client gets `200` — and
+/// a rate limit a client cannot see the status of is a rate limit it will poll.
+/// This is the last point at which a status code is still expressible, and it
+/// is also *before* the session is bound and before any grant is opened, which
+/// is what makes "a refused turn took no grant and left no hold" a property of
+/// the control flow rather than a claim.
+///
+/// One function called from both routes rather than two copies, because the
+/// second copy is the one somebody forgets to add: a ceiling enforced on the
+/// Responses surface and not on the native one is not a ceiling.
+///
+/// A ledger that cannot answer fails the request rather than waving it through,
+/// and it does so *retryably* — a `503`, not a `500` (D1 R14, pinned by M13.1
+/// as R-F7). The alternative is a fail-open on a limit, and this is the one
+/// place in the request path where refusing costs a client a retryable error
+/// rather than a turn's work: nothing about the request was wrong and the
+/// outage clears on its own, so the status has to be the one that says come
+/// back rather than the one that says stop. Its opposite number is the *draw*
+/// after the turn, which fails open and logs — see `Engine::record_fair_use_draw`
+/// for why the two halves of one seam point in opposite directions.
+pub(crate) async fn refuse_over_fair_use<S, T>(
+    engine: &Engine<S, T>,
+    admission: &Admission,
+) -> Result<(), ApiError>
+where
+    S: SessionStore,
+    T: Tokenizer + Clone + Send + Sync + 'static,
+{
+    // The message is fixed, not `error.to_string()` (M13.1 review F4): the
+    // store's own error text can be an OS error string off a Redis client --
+    // an operator's connection detail, not this tenant's business. It is not
+    // thrown away, only kept off the wire: `Engine::fair_use_refusal` already
+    // logs it server-side, once per outage, before this mapping ever sees it.
+    let refusal = engine.fair_use_refusal(admission).await.map_err(|_error| {
+        ApiError::unavailable(
+            "fair_use_unavailable",
+            "the fair-use ledger is unavailable; retry",
+        )
+    })?;
+    let Some(refusal) = refusal else {
+        return Ok(());
+    };
+    Err(ApiError {
+        status: StatusCode::TOO_MANY_REQUESTS,
+        code: "fair_use_exceeded",
+        message: format!(
+            "this {} has drawn its fair-use limit for the last {} and may retry once the \
+             window has room; the limit is on {} and no work was started for this request",
+            refusal.scope.wire_name(),
+            refusal.window.wire_name(),
+            refusal.quantity.wire_name(),
+        ),
+        // The three fields a client acts on, machine-readable. `retry_at_ms` is
+        // named "earliest" in its own doc and is not a promise: draws that land
+        // in between push it out, and a client that treats it as a deadline
+        // rather than a floor will simply be refused again with a later one.
+        //
+        // `type` and `resets_at` are the *same* two facts spelled the way the
+        // one client this product exists to serve already reads them. codex
+        // (`codex-api::api_bridge::map_api_error`, pin `6344a655` and the box's
+        // `e363b08`) recognizes exactly one machine-readable `429`:
+        // `error.type == "usage_limit_reached"` with `error.resets_at` in unix
+        // *seconds*. Anything else — including this body before G10 — becomes
+        // `CodexErr::RetryLimit` ("exceeded retry limit"), which discards the
+        // window and the time and tells the operator the wrong story about a
+        // refusal the server considers scheduled and retryable. No
+        // `Retry-After` header rides along: codex's own backoff
+        // (`codex-client::retry::backoff`) takes no server-supplied time at
+        // all, and `retry_429` is hardcoded `false` at every construction site
+        // in the pinned tree, so a header would be dead weight aimed at a
+        // client that never reads it.
+        //
+        // Only this refusal is stamped `usage_limit_reached`. Putting it on the
+        // other refusals would tell codex that a spent budget or a rejected key
+        // is a ceiling that clears on its own, and it would wait for a reset
+        // that never comes.
+        detail: Some(json!({
+            "type": "usage_limit_reached",
+            "scope": refusal.scope.wire_name(),
+            "window": refusal.window.wire_name(),
+            "quantity": refusal.quantity.wire_name(),
+            "retry_at_ms": refusal.retry_at_ms,
+            // Rounded *up* to the next whole second, never truncated: the
+            // millisecond figure is a floor ("earliest"), and truncating would
+            // hand codex a time up to 999ms before the window has room — a
+            // retry that is refused again for no reason but our own rounding.
+            "resets_at": refusal.retry_at_ms.div_ceil(1_000),
+        })),
+    })
 }
 
 /// Classify a store failure raised before streaming began.
@@ -457,7 +753,7 @@ where
     // request asks about tenancy has to be answered by one compiled plane, or a
     // session could be minted inside a namespace the very next check no longer
     // recognises.
-    let plane = state.planes.plane(now_ms());
+    let plane = state.planes.plane(now_ms()).await;
     let principal = plane.turn_principal(&headers)?;
     let request: CreateSessionBody = if body.is_empty() {
         CreateSessionBody::default()
@@ -511,9 +807,13 @@ where
     // a turn: the same key lookup answers "who pays" and "what may be routed
     // to", and resolving them once here is what makes the policy immutable for
     // the whole turn rather than something re-read mid-dispatch.
-    let plane = state.planes.plane(now_ms());
+    let plane = state.planes.plane(now_ms()).await;
     let admission = plane.turn_admission(&headers)?;
     in_namespace(&plane, &admission.principal, &session_id)?;
+    // Before the body is parsed and before the store is touched: a refused turn
+    // must cost this process a counter read and nothing else, and must leave
+    // nothing behind for a client to have to clean up.
+    refuse_over_fair_use(&*state.engine, &admission).await?;
     let request: CreateResponseBody = parse_body(&body)?;
     let input = request
         .input
@@ -576,7 +876,7 @@ where
     let session_id = SessionId::new(session_id);
     // This endpoint streams the raw log — items, routing decisions, prices —
     // so the namespace check is the whole of its authorization.
-    let plane = state.planes.plane(now_ms());
+    let plane = state.planes.plane(now_ms()).await;
     let principal = plane.turn_principal(&headers)?;
     in_namespace(&plane, &principal, &session_id)?;
     let cursor = resume_cursor(&params, &headers)?;
@@ -650,6 +950,19 @@ impl<S: SessionStore> LogTail<S> {
             session_id,
             cursor: after_seq,
         }
+    }
+
+    /// The session this cursor follows.
+    ///
+    /// Exposed so a follower that needs the id for something else — the
+    /// Messages follower writes an MCP tool-use binding against it — reads it
+    /// from the tail rather than keeping a second copy beside one (M12 review,
+    /// F11). Two fields set from one constructor argument can only ever drift
+    /// apart, and the drift is unobservable: a binding written against a
+    /// session the tail does not follow resolves a later control call to a log
+    /// this turn never touched.
+    pub(crate) fn session_id(&self) -> &SessionId {
+        &self.session_id
     }
 
     /// One batch after `after_seq`, leaving the follow cursor alone.
@@ -976,4 +1289,54 @@ fn error_frame(message: &str) -> Event {
 
 fn error_payload(message: &str) -> String {
     json!({ "type": "error", "message": message }).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **M18, H2: a size-ceiling refusal maps to its own wire refusal, not to
+    /// the same `500` a dead store answers.**
+    ///
+    /// Before `StoreFailure::DocumentTooLarge` existed, `From<DirectoryError>
+    /// for ApiError` had no arm to give it — the ceiling refusal rode
+    /// `StoreFailure::Unavailable` and answered `directory_unavailable` at
+    /// `500`, indistinguishable on the wire from a Redis that is simply down.
+    /// A unit test over the mapping (rather than a request through the admin
+    /// rig) because driving this cheaply over HTTP would mean posting a
+    /// multi-megabyte body through the whole admin stack for a fact this
+    /// `From` impl decides in one match arm; the adapter's own refusal at the
+    /// ceiling is already pinned directly against `commit`
+    /// (`control_config::directory::document::tests::
+    /// a_document_at_the_ceiling_commits_and_one_byte_over_is_refused_before_any_wire`).
+    #[test]
+    fn a_document_too_large_answers_413_with_its_own_code_not_the_generic_outage_one() {
+        let error = DirectoryError::Store(StoreFailure::DocumentTooLarge {
+            size: 9_000_000,
+            ceiling: 8 * 1024 * 1024,
+        });
+        let api_error: ApiError = error.into();
+
+        assert_eq!(api_error.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(api_error.code(), "directory_document_too_large");
+        assert_ne!(
+            api_error.code(),
+            "directory_unavailable",
+            "a size breach must not answer the same code an outage does, or a client cannot \
+             tell a refusal it caused from a dependency that is down"
+        );
+        assert!(
+            api_error.message().contains("9000000") && api_error.message().contains("8388608"),
+            "the message must still name both the size and the ceiling: {}",
+            api_error.message()
+        );
+
+        // The control: `StoreFailure::Unavailable` -- a real outage -- must
+        // still answer the generic code and a 500, or this test would only
+        // be proving that the two variants exist.
+        let outage: ApiError =
+            DirectoryError::Store(StoreFailure::Unavailable("connection refused".into())).into();
+        assert_eq!(outage.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(outage.code(), "directory_unavailable");
+    }
 }

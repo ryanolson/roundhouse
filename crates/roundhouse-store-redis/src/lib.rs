@@ -9,9 +9,22 @@
 //!
 //! | Key | Type | Holds |
 //! |---|---|---|
-//! | `rh:{<session_id>}:meta` | string | JSON `{model_policy, created_at_ms}`, written `SET NX` |
-//! | `rh:{<session_id>}:lease` | hash | holder `node_id` + fencing token, expiry enforced by Redis `PEXPIRE` |
-//! | `rh:{<session_id>}:log` | stream | one entry per event, explicit id `<seq>-0` |
+//! | `rh:v1:sess:{<session_id>}:meta` | string | JSON `{model_policy, created_at_ms}`, written `SET NX` |
+//! | `rh:v1:sess:{<session_id>}:lease` | hash | holder `node_id` + fencing token, expiry enforced by Redis `PEXPIRE` |
+//! | `rh:v1:sess:{<session_id>}:log` | stream | one entry per event, explicit id `<seq>-0` |
+//!
+//! `rh` is the default [`KeyNamespace`] (`keys`), `v1` is this family's own
+//! [`keys::KeyFamily::version`] and `sess` is its [`keys::KeyFamily::name`]
+//! — see [`keys`] for the one function every family builds its keys from
+//! (R-S3), and the table below for the other three.
+//!
+//! | Family | Version | Module |
+//! |---|---|---|
+//! | `sess` — sessions and their leases | v1 | [`crate`] (this module) |
+//! | `spend` — the committed-spend ledger | v1 | [`spend`] |
+//! | `fairuse` — the rolling fair-use windows | v1 | [`fair_use`] |
+//! | `corr` — the generation/call/thread correlation maps | v1 | [`correlation`] |
+//! | `dir` — the admin-created tenancy, as one versioned document | v1 | [`directory`] |
 //!
 //! The log's wire format is the load-bearing decision. Entries are added with
 //! *explicit* stream ids `<seq>-0`, so the entry id and the event's `seq` are
@@ -33,7 +46,7 @@
 //! durable as the Redis it lives in (AOF `appendfsync`, replication). This
 //! crate does not try to out-engineer the operator's persistence config.
 //!
-//! The write path lives in [`scripts`]: the lease is a TTL'd hash on the Redis
+//! The write path lives in `scripts`: the lease is a TTL'd hash on the Redis
 //! clock, and lease-check plus append is one atomic Lua script, which
 //! is what makes the fencing the trait promises actually hold under
 //! concurrent writers. Requires Redis ≥ 6.2 (exclusive `XRANGE` starts,
@@ -42,15 +55,31 @@
 //! The store passes the same contract suite as `MemoryStore` — instantiated
 //! by the same `store_contract_suite!` macro — and the binary selects it when
 //! `ROUNDHOUSE_REDIS_URL` is set (see `roundhouse-server`'s `main.rs`).
+//!
+//! That one variable selects every family this crate serves and nothing else
+//! selects any of them (R12, R-C4): the session log here, the spend ledger in
+//! `spend`, the fair-use buckets in `fair_use`, the three correlation maps in
+//! `correlation` (M14.1), which are what let a client's own name for a
+//! conversation reach the same session from any node, and — since M16.1 — the
+//! admin directory in [`directory`], which is what lets a project created on
+//! one node exist on the next one and survive a restart.
 
+pub mod correlation;
+pub mod directory;
+pub mod fair_use;
+pub mod keys;
 mod scripts;
 pub mod spend;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 
+pub use correlation::RedisCorrelationMaps;
+pub use directory::RedisDocumentStore;
+pub use fair_use::RedisFairUseLedger;
+pub use keys::{EmptyNamespace, KeyNamespace};
 pub use spend::RedisSpendLedger;
 
-use redis::aio::ConnectionManager;
+use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use redis::streams::StreamRangeReply;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -60,6 +89,113 @@ use roundhouse_core::ids::SessionId;
 use roundhouse_core::now_ms;
 use roundhouse_core::store::{Lease, SessionStore, StoreError};
 
+// ---------------------------------------------------------------------------
+// One `connect`, for every Redis family this crate serves
+// ---------------------------------------------------------------------------
+
+/// How long a fresh connection attempt may take before this manager gives up
+/// on it and moves to the next retry.
+///
+/// **Named because R-F7's fail-closed half accepts a latency, and a latency
+/// nobody wrote down is one nobody can hold to.** Redis-1.2.4's own default
+/// (`DEFAULT_CONNECTION_TIMEOUT`, one second) is sized for a manager that only
+/// ever reconnects in the background; ours is on the critical path of a
+/// ceiling check the M13.1 addendum promises refuses "within a couple of
+/// seconds" of an outage, so it has to be tight enough that the retry budget
+/// below still fits inside that promise even in the worst case this bounds —
+/// a peer that accepts the TCP handshake and then never answers, rather than
+/// the refused connection a closed port returns instantly.
+const CONNECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// How long a command may wait for a reply once a connection is up.
+///
+/// Reduced from the crate default's 500ms for the same reason as
+/// [`CONNECTION_TIMEOUT`]: this manager sits under a ceiling check with its
+/// own two-second budget, not under a background job that can afford to be
+/// generous.
+///
+/// **What this buys the other four families and only the other four**
+/// (M16.1 review, F6). `sess`, `spend`, `fairuse` and `corr` all move small,
+/// fixed-shape payloads — a lease hash, a counter, a stream entry — so 300ms
+/// is generous for any of them and the ceiling-check budget above is what
+/// actually constrains it. The `dir` family does not fit that shape: see
+/// [`directory::DIRECTORY_RESPONSE_TIMEOUT`], which carries it instead.
+const RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// The smallest delay between reconnect attempts, and the base the backoff
+/// grows from.
+const RECONNECT_MIN_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The delay between reconnect attempts never grows past this, so a run of
+/// retries cannot itself blow the two-second budget even before
+/// [`RECONNECT_RETRIES`] is reached.
+const RECONNECT_MAX_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Each retry's delay is `RECONNECT_MIN_DELAY * RECONNECT_BACKOFF_FACTOR^n`,
+/// clamped at [`RECONNECT_MAX_DELAY`], before jitter.
+const RECONNECT_BACKOFF_FACTOR: f32 = 2.0;
+
+/// How many times a severed connection is retried before `send_packed_command`
+/// gives up and returns the error to the caller.
+///
+/// **The number R-F7's cost is paid in.** The crate default is six, and
+/// six retries at the crate's own defaults is where the ~9.45s this bound
+/// replaces came from (M13.1 review F2) — every admission after the first
+/// during an outage waiting on the shared reconnect future those six retries
+/// walk. Three, at the tighter delays above, keeps the worst-case sum
+/// (backoff sleeps plus, if the peer black-holes rather than refuses, three
+/// connection-timeout waits) comfortably under two seconds, measured against
+/// a real severed connection by
+/// `a_ceiling_that_cannot_be_checked_refuses_within_a_bounded_time` — while
+/// still giving a connection that drops for one round trip a chance to heal
+/// without every command in that window failing.
+const RECONNECT_RETRIES: usize = 3;
+
+/// Build the `ConnectionManager` every Redis-backed store, ledger, fair-use
+/// tracker and correlation map in this crate connects through, at
+/// [`RESPONSE_TIMEOUT`].
+///
+/// One function rather than the three copies of `ConnectionManagerConfig::default()`
+/// this replaces (session store, spend ledger, fair-use ledger, each
+/// hand-rolled and each silently accepting the crate's six-retry default) —
+/// so the outage-latency bound above is a fact about the crate, verified
+/// once, rather than three unlabelled call sites that happened to agree by
+/// copy-paste and could just as easily drift apart.
+///
+/// A thin wrapper over [`connect_manager_at`] at this crate's shared timeout
+/// (M16.1 review, F6) — every family but `dir` wants exactly this, and this
+/// name is what four call sites already spell.
+async fn connect_manager(url: &str) -> Result<ConnectionManager, redis::RedisError> {
+    connect_manager_at(url, RESPONSE_TIMEOUT).await
+}
+
+/// [`connect_manager`], with the response timeout as a parameter rather than
+/// the shared constant.
+///
+/// **The sibling F6 asks for, not a widened `connect_manager` signature.**
+/// Four call sites already spell `connect_manager(url)` for a timeout sized
+/// for a small, fixed-shape payload; only [`directory::RedisDocumentStore`]
+/// needs a different number, so it is the one caller that names this function
+/// and the one that carries [`directory::DIRECTORY_RESPONSE_TIMEOUT`] in.
+/// Every other tuning knob — the connection timeout, the reconnect backoff,
+/// the retry count — stays shared, because F6 is about the one budget that
+/// scales with document size, not about this family needing a different
+/// reconnect posture too.
+async fn connect_manager_at(
+    url: &str,
+    response_timeout: std::time::Duration,
+) -> Result<ConnectionManager, redis::RedisError> {
+    let client = redis::Client::open(url)?;
+    let config = ConnectionManagerConfig::new()
+        .set_connection_timeout(Some(CONNECTION_TIMEOUT))
+        .set_response_timeout(Some(response_timeout))
+        .set_min_delay(RECONNECT_MIN_DELAY)
+        .set_max_delay(RECONNECT_MAX_DELAY)
+        .set_exponent_base(RECONNECT_BACKOFF_FACTOR)
+        .set_number_of_retries(RECONNECT_RETRIES);
+    ConnectionManager::new_with_config(client, config).await
+}
+
 /// Redis implementation of [`SessionStore`].
 ///
 /// Cheap to clone: clones share one auto-reconnecting multiplexed connection.
@@ -67,17 +203,32 @@ use roundhouse_core::store::{Lease, SessionStore, StoreError};
 pub struct RedisSessionStore {
     conn: ConnectionManager,
     scripts: std::sync::Arc<scripts::Scripts>,
+    namespace: KeyNamespace,
 }
 
 impl RedisSessionStore {
-    /// Connect and fail fast: a store that cannot reach its Redis at startup
-    /// should stop the process there, not on the first session.
+    /// Connect under the default namespace (`rh`) and fail fast: a store
+    /// that cannot reach its Redis at startup should stop the process there,
+    /// not on the first session.
+    ///
+    /// What every caller in this workspace used before R-S3 named a
+    /// namespace, and what stays true for all of them except the composition
+    /// root: see [`Self::connect_namespaced`].
     pub async fn connect(url: impl AsRef<str>) -> Result<Self, StoreError> {
-        let client = redis::Client::open(url.as_ref()).map_err(backend)?;
-        let conn = ConnectionManager::new(client).await.map_err(backend)?;
+        Self::connect_namespaced(url, KeyNamespace::default()).await
+    }
+
+    /// Connect under an explicit [`KeyNamespace`] — what the composition root
+    /// calls once it has read `ROUNDHOUSE_REDIS_NAMESPACE` (R-S3).
+    pub async fn connect_namespaced(
+        url: impl AsRef<str>,
+        namespace: KeyNamespace,
+    ) -> Result<Self, StoreError> {
+        let conn = connect_manager(url.as_ref()).await.map_err(backend)?;
         Ok(Self {
             conn,
             scripts: std::sync::Arc::new(scripts::Scripts::new()),
+            namespace,
         })
     }
 
@@ -94,26 +245,32 @@ impl RedisSessionStore {
     }
 }
 
-/// Every key this store writes starts here. A constant, not configuration:
-/// nothing selects a different prefix today, and an untested knob would be a
-/// promise nobody checked. A future prefix parameter requires an isolation
-/// test.
-const KEY_PREFIX: &str = "rh";
-
 // The braces are a Redis Cluster hash tag. Every key for one session hashes to
 // one slot, which keeps the lease-fenced append single-slot scriptable. The
 // keys are an internal storage detail. Feature-gated test helpers expose them
 // only to the external wire-format tests that write raw Redis data.
-fn meta_key(session_id: &SessionId) -> String {
-    format!("{KEY_PREFIX}:{{{session_id}}}:meta")
+fn meta_key(namespace: &KeyNamespace, session_id: &SessionId) -> String {
+    keys::build_key(
+        namespace,
+        keys::KeyFamily::Session,
+        &[&format!("{{{session_id}}}"), "meta"],
+    )
 }
 
-fn lease_key(session_id: &SessionId) -> String {
-    format!("{KEY_PREFIX}:{{{session_id}}}:lease")
+fn lease_key(namespace: &KeyNamespace, session_id: &SessionId) -> String {
+    keys::build_key(
+        namespace,
+        keys::KeyFamily::Session,
+        &[&format!("{{{session_id}}}"), "lease"],
+    )
 }
 
-fn log_key(session_id: &SessionId) -> String {
-    format!("{KEY_PREFIX}:{{{session_id}}}:log")
+fn log_key(namespace: &KeyNamespace, session_id: &SessionId) -> String {
+    keys::build_key(
+        namespace,
+        keys::KeyFamily::Session,
+        &[&format!("{{{session_id}}}"), "log"],
+    )
 }
 
 /// The value under `…:meta`.
@@ -223,7 +380,7 @@ impl SessionStore for RedisSessionStore {
         // NX both answers "did it exist" and refuses to overwrite the policy
         // an earlier creation recorded.
         let created: Option<String> = redis::cmd("SET")
-            .arg(meta_key(session_id))
+            .arg(meta_key(&self.namespace, session_id))
             .arg(meta)
             .arg("NX")
             .query_async(&mut self.conn.clone())
@@ -245,8 +402,8 @@ impl SessionStore for RedisSessionStore {
             .scripts
             .acquire(
                 &mut self.conn.clone(),
-                &meta_key(session_id),
-                &lease_key(session_id),
+                &meta_key(&self.namespace, session_id),
+                &lease_key(&self.namespace, session_id),
                 identity,
                 ttl_ms,
             )
@@ -261,8 +418,8 @@ impl SessionStore for RedisSessionStore {
             .scripts
             .renew(
                 &mut self.conn.clone(),
-                &meta_key(&lease.session_id),
-                &lease_key(&lease.session_id),
+                &meta_key(&self.namespace, &lease.session_id),
+                &lease_key(&self.namespace, &lease.session_id),
                 identity,
                 ttl_ms,
             )
@@ -282,10 +439,30 @@ impl SessionStore for RedisSessionStore {
         self.scripts
             .release(
                 &mut self.conn.clone(),
-                &lease_key(&lease.session_id),
+                &lease_key(&self.namespace, &lease.session_id),
                 identity,
             )
             .await
+    }
+
+    /// `EXISTS` on the lease key, which is the whole answer here.
+    ///
+    /// Expiry needs no arithmetic: the lease is a Redis key with a TTL, so a
+    /// tenure that stopped renewing has already stopped existing — the same
+    /// authority `acquire` runs on, rather than this process's clock compared
+    /// against a stored deadline. The session's own existence is checked
+    /// alongside it for the reason [`Self::last_seq`] checks it: a missing
+    /// session is a caller error, and answering "not leased" for one would let
+    /// it read as an ordinary idle session.
+    async fn is_leased(&self, session_id: &SessionId) -> Result<bool, StoreError> {
+        let (exists, leased): (bool, bool) = redis::pipe()
+            .exists(meta_key(&self.namespace, session_id))
+            .exists(lease_key(&self.namespace, session_id))
+            .query_async(&mut self.conn.clone())
+            .await
+            .map_err(backend)?;
+        Self::require_session(exists, session_id)?;
+        Ok(leased)
     }
 
     async fn append_events(
@@ -306,9 +483,9 @@ impl SessionStore for RedisSessionStore {
             .scripts
             .append(
                 &mut self.conn.clone(),
-                &meta_key(&lease.session_id),
-                &lease_key(&lease.session_id),
-                &log_key(&lease.session_id),
+                &meta_key(&self.namespace, &lease.session_id),
+                &lease_key(&self.namespace, &lease.session_id),
+                &log_key(&self.namespace, &lease.session_id),
                 identity,
                 &payloads,
             )
@@ -346,7 +523,7 @@ impl SessionStore for RedisSessionStore {
         after_seq: u64,
         limit: usize,
     ) -> Result<Vec<SessionEvent>, StoreError> {
-        let log_key = log_key(session_id);
+        let log_key = log_key(&self.namespace, session_id);
         // XRANGE treats COUNT 0 as unlimited. Fetch at most one entry for a
         // zero-limit request, then discard it below. The pipelined EXISTS still
         // enforces SessionNotFound without a second round trip or branch.
@@ -356,7 +533,7 @@ impl SessionStore for RedisSessionStore {
         // exactly `after_seq-0` is precisely "seq > after_seq" — with no
         // arithmetic on `after_seq` that could overflow at u64::MAX.
         let (exists, range): (bool, StreamRangeReply) = redis::pipe()
-            .exists(meta_key(session_id))
+            .exists(meta_key(&self.namespace, session_id))
             .xrange_count(&log_key, format!("({after_seq}-0"), "+", redis_limit)
             .query_async(&mut self.conn.clone())
             .await
@@ -388,9 +565,9 @@ impl SessionStore for RedisSessionStore {
     }
 
     async fn last_seq(&self, session_id: &SessionId) -> Result<u64, StoreError> {
-        let log_key = log_key(session_id);
+        let log_key = log_key(&self.namespace, session_id);
         let (exists, len, newest): (bool, u64, StreamRangeReply) = redis::pipe()
-            .exists(meta_key(session_id))
+            .exists(meta_key(&self.namespace, session_id))
             .xlen(&log_key)
             .xrevrange_count(&log_key, "+", "-", 1)
             .query_async(&mut self.conn.clone())
@@ -414,5 +591,38 @@ impl SessionStore for RedisSessionStore {
             )));
         }
         Ok(last)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every key this family builds carries the namespace, the schema
+    /// version and the family name (M14.2, R-S3) — the shape the other three
+    /// families each pin beside their own key functions.
+    #[test]
+    fn every_key_carries_the_namespace_the_version_and_the_family() {
+        let namespace = KeyNamespace::default();
+        let session = SessionId::new("acme/ada/main");
+        assert_eq!(
+            meta_key(&namespace, &session),
+            "rh:v1:sess:{acme/ada/main}:meta"
+        );
+        assert_eq!(
+            lease_key(&namespace, &session),
+            "rh:v1:sess:{acme/ada/main}:lease"
+        );
+        assert_eq!(
+            log_key(&namespace, &session),
+            "rh:v1:sess:{acme/ada/main}:log"
+        );
+
+        let other = KeyNamespace::new("acme-prod").unwrap();
+        assert_ne!(
+            meta_key(&namespace, &session),
+            meta_key(&other, &session),
+            "two namespaces must never build the same key"
+        );
     }
 }

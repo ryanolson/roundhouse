@@ -91,22 +91,24 @@ pub mod config;
 pub mod credentials;
 pub mod crosscheck;
 pub mod directory;
+pub mod fair_use;
 pub mod validate;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use axum::http::HeaderMap;
 use axum::http::header::AUTHORIZATION;
 use sha2::{Digest, Sha256};
 
 use roundhouse_core::control::{
-    BudgetCounts, BudgetTerms, PresentedCredential, Principal, TurnCredentials, TurnPolicy,
+    BudgetCounts, BudgetTerms, FairUseTerms, PresentedCredential, Principal, TurnCredentials,
+    TurnPolicy,
 };
 use roundhouse_core::ids::SessionId;
+use roundhouse_core::routing::TierRecipe;
 use roundhouse_core::validate::ValidationTerms;
-
-use crate::dialect::ClientDialect;
+use roundhouse_fleet::StaticFrontierCatalog;
 
 pub use auth::AuthError;
 pub use budget::{AllocationConfig, BudgetConfig, OnExhaustionConfig};
@@ -117,11 +119,13 @@ pub use config::{
 pub use credentials::{CredentialsConfig, ProviderCredentialConfig};
 pub use crosscheck::{CrossCheckRefusal, CrossChecks};
 pub use directory::{
-    ApiKeyRecord, ControlDirectory, DirectoryError, DirectoryMutation, DirectoryRecords,
-    DirectoryStore, DirectoryView, EntityKind, KeyFingerprint, KeyRecordScope, MembershipRecord,
-    MembershipRole, MemoryDirectoryStore, PlaneSource, ProjectPatch, ProjectRecord, Provenance,
-    StoreFailure, UserRecord,
+    ApiKeyRecord, CompiledUnder, ControlDirectory, DIRECTORY_DOCUMENT_SCHEMA, DirectoryDivergence,
+    DirectoryError, DirectoryMutation, DirectoryRecords, DirectoryStatus, DirectoryStore,
+    DirectoryView, DivergentInput, DocumentDirectoryStore, EntityKind, KeyFingerprint,
+    KeyRecordScope, MembershipRecord, MembershipRole, PlaneSource, ProjectPatch, ProjectRecord,
+    Provenance, StoreFailure, UserRecord,
 };
+pub use fair_use::{FairUseConfig, FairUseWindowConfig};
 pub use validate::{ArmSharesConfig, ValidateConfig};
 
 /// Path to a control-plane JSON file. Absent means [`ControlPlane::Open`].
@@ -146,14 +150,107 @@ pub const CONTROL_PLANE_VAR: &str = "ROUNDHOUSE_CONTROL_PLANE";
 /// The path travels with the config because every refusal names it: a `PATCH`
 /// refused because it collides with a file-declared project has to say which
 /// file, and by then the variable has long been read.
-pub fn config_from_env() -> Result<Option<(ControlPlaneConfig, String)>, ControlPlaneError> {
+pub fn config_from_env() -> Result<Option<ControlPlaneFile>, ControlPlaneError> {
     match std::env::var(CONTROL_PLANE_VAR) {
         Ok(path) if !path.trim().is_empty() => {
             let path = path.trim().to_string();
-            let config = ControlPlaneConfig::load(&path)?;
-            Ok(Some((config, path)))
+            let (config, sha256) = ControlPlaneConfig::load_fingerprinted(&path)?;
+            Ok(Some(ControlPlaneFile {
+                config,
+                path,
+                sha256,
+            }))
         }
         _ => Ok(None),
+    }
+}
+
+/// What `ROUNDHOUSE_CONTROL_PLANE` named, as one value.
+///
+/// A struct rather than the `(config, path)` tuple this used to be, because
+/// M16.1 (R-D9) added a third thing every caller of the pair also needs — the
+/// digest of the bytes the config was parsed from — and a three-tuple of two
+/// `String`s is a shape whose fields can be swapped at a call site without the
+/// compiler noticing.
+pub struct ControlPlaneFile {
+    pub config: ControlPlaneConfig,
+    /// The path as the operator wrote it, which is what every refusal names.
+    pub path: String,
+    /// SHA-256 of the file's bytes, hex — the `file` axis of a stored
+    /// directory document's [`CompiledUnder`] fingerprint.
+    pub sha256: String,
+}
+
+/// Compose the admin directory from what `shared_backend::open` handed back
+/// and what [`config_from_env`] named — `main.rs`'s whole R-D8 decision:
+/// build a [`ControlDirectory`] over the file plus whatever the store already
+/// holds when a file is configured, or an unmanaged one when it is not, and
+/// fail closed rather than fall back when the store cannot answer.
+///
+/// **Pulled out of the `[[bin]]` for the reason `shared_backend::open` was**
+/// (M14.1 review, F1, and now M16.1's own review of R-D8: a mutation that
+/// swapped this fail-closed `?` for a silent retry over a fresh in-memory
+/// store compiled and left every suite green, because nothing outside
+/// `main.rs` could call the code making the decision). `main.rs` now does
+/// nothing with the result but `map_err(boot_refusal)?` it, and
+/// `tests/directory_backend_boot.rs`'s own `boot()` helper calls this
+/// function rather than re-deriving the match — so a fallback added around
+/// either the `Some` or the `None` arm is a mutation of code a test actually
+/// runs, not a second copy of it.
+///
+/// `now_ms` is taken as a plain value rather than a clock read internally, so
+/// every test drives it with a fixed one. `catalog` is taken as a
+/// `&StaticFrontierCatalog` rather than the caller's own precomputed
+/// identities (M16.1 review, F2): this module already knows the fleet crate
+/// through [`CrossChecks`] (`crosscheck.rs` reads `FrontierModelSpec`
+/// directly), so nothing is bought by asking `main.rs` to fingerprint the
+/// catalog by hand before calling in — and a `[[bin]]`-private helper doing
+/// that fingerprinting was exactly the code no `tests/` integration suite
+/// could ever call, so a regression to it was invisible to every suite that
+/// boots a directory end to end. `StaticFrontierCatalog::identities` is the
+/// one computation now, reachable from any crate that can build a catalog.
+pub async fn boot_directory(
+    file: Option<ControlPlaneFile>,
+    directory_store: Arc<dyn roundhouse_core::control::DocumentStore>,
+    catalog: &StaticFrontierCatalog,
+    checks: CrossChecks,
+    now_ms: u64,
+) -> Result<Arc<ControlDirectory>, DirectoryError> {
+    match file {
+        Some(file) => {
+            // The writer's fingerprint (R-D9): the file's bytes, the
+            // catalog and fleet identities the caller resolved, and the TTL
+            // this file itself sets.
+            let compiled_under = CompiledUnder {
+                file_sha256: Some(file.sha256),
+                catalog: catalog.identities(),
+                fleet: checks.fingerprint(),
+                admission_cache_ttl_ms: Some(
+                    file.config
+                        .admission_cache_ttl_ms
+                        .unwrap_or(DEFAULT_ADMISSION_CACHE_TTL_MS),
+                ),
+                // M18, H3: the judge's own axis, beside the fleet's.
+                judge: checks.judge_identity(),
+            };
+            ControlDirectory::new(
+                file.config,
+                file.path,
+                Arc::new(DocumentDirectoryStore::stamped(
+                    directory_store,
+                    compiled_under,
+                )),
+                checks,
+                now_ms,
+            )
+            .await
+            .map(Arc::new)
+        }
+        // No file is no root of trust, so there is no admin plane, nothing to
+        // store and nothing a store could refuse. The document store the
+        // caller opened is simply not wired, which is honest: an open
+        // deployment has no tenancy to keep.
+        None => Ok(ControlDirectory::open()),
     }
 }
 
@@ -172,13 +269,50 @@ pub fn config_from_env() -> Result<Option<(ControlPlaneConfig, String)>, Control
 /// client shouted rather than about what it sent.
 pub const TURN_KEY_HEADER: &str = "x-roundhouse-key";
 
-/// The dialect [`ControlPlane::Open`] answers with.
+/// The value [`crate::claude_launch`] writes into a launched Claude client's
+/// `ANTHROPIC_API_KEY`.
 ///
-/// A shared value rather than one built per call, because
-/// [`ControlPlane::client_dialect`] is asked once per request and a
-/// [`ClientDialect`] owns a `String`: an unconfigured deployment should not
-/// allocate a namespace to say it is using the default one.
-static OPEN_DIALECT: LazyLock<ClientDialect> = LazyLock::new(ClientDialect::default);
+/// **Declared here rather than beside the launcher, and the direction is the
+/// reason.** Two modules need one string: the launcher, which emits it, and
+/// this one, which is the only place a caller's credential is ever captured
+/// (see [`ControlPlane::turn_admission`]) and therefore the only place that can
+/// refuse to forward it. A constant owned by the launcher and imported here
+/// would point the admission boundary at the module whose output it exists to
+/// distrust; the dependency runs the other way for [`TURN_KEY_HEADER`] already.
+///
+/// **Why a launched client needs any value in that variable.** Claude Code
+/// suppresses a subscription login whenever an `ANTHROPIC_API_KEY` resolves
+/// (`agent-docs/research/claude-code-client-surface.md` §1.3, `VV()`), and that
+/// suppression is what makes a `RoundhouseKey` launch deterministic: with the
+/// variable empty, an ambient login's OAuth token is presented to roundhouse as
+/// though the operator had chosen to forward it. It is the exact analogue of
+/// `codex_launch` writing `env_key` beside `requires_openai_auth = false`.
+///
+/// **Why it is in [`KEY_NAMESPACE`] and is deliberately not key-shaped.** In the
+/// namespace, so a copy that ends up in `Authorization` is answered as
+/// `MalformedKey` naming a value the operator can trace back to the launcher,
+/// rather than falling through as "no key was presented" and sending them to
+/// look for a header that did arrive. Not `rh_turn_…`/`rh_admin_…`-shaped, so
+/// [`has_valid_key_shape`] refuses it and it can never resolve to a membership
+/// however it is presented.
+pub const ROUNDHOUSE_API_KEY_SENTINEL: &str = "rh_sentinel_not_a_credential";
+
+/// The stem every minted secret's prefix shares: roundhouse's own key
+/// namespace.
+///
+/// The *coarser* question than [`has_valid_key_shape`], and it exists because
+/// F07 showed the two are not the same question. "Is this string in our
+/// namespace at all" separates a wrong key from somebody else's credential;
+/// "is this string well-formed" separates a wrong key from a usable one. Read
+/// together in [`ControlPlane::presented_key`], where answering the second
+/// where the first was meant is exactly the defect.
+///
+/// Not a third spelling of [`KeyKind::prefix`]: the test
+/// `every_minted_prefix_lives_in_the_key_namespace` pins that every prefix a
+/// mint can wear begins with this, so a future `rh_service_` kind is covered
+/// without an edit here and a kind spelled outside the namespace fails there
+/// rather than silently becoming unauthenticatable.
+const KEY_NAMESPACE: &str = "rh_";
 
 /// `true` for `rh_(turn|admin)_` followed by 43 base62 characters — the shape
 /// a *presented* secret must have before its hash is even looked up, so an
@@ -381,6 +515,51 @@ fn carries_a_roundhouse_secret(value: &str) -> bool {
     value.split_whitespace().any(has_valid_key_shape)
 }
 
+/// Whether a header value is one *roundhouse itself* put in the client's
+/// environment, and therefore never the caller's own credential.
+///
+/// Two shapes, one question, because the forwarding gate has one job: never put
+/// a value roundhouse generated onto an upstream request. A secret
+/// ([`carries_a_roundhouse_secret`]) is the dangerous half; the
+/// [`ROUNDHOUSE_API_KEY_SENTINEL`] is the *worthless* half, and it is refused
+/// for a different reason rather than for the same one. It authenticates
+/// nothing anywhere, so forwarding it discloses nothing — what it does is
+/// arrive at Anthropic as an `x-api-key` beside a real seat's bearer, where a
+/// rejected key is answered with a `401` an operator reads as a revoked login.
+/// A launcher that had to choose between "set the variable and risk that" and
+/// "leave it empty and let an ambient login be presented to roundhouse" would
+/// have no good answer; refusing the value here is what makes the sentinel free
+/// to set.
+///
+/// Compared whole rather than tokenized the way a secret is — a substring rule
+/// would refuse a third-party credential that happened to contain the literal —
+/// but whole *after* an optional `Bearer ` scheme is taken off, because the
+/// launcher's own environment offers two spellings of the same value and the
+/// gate must not care which one a client chose. `ANTHROPIC_API_KEY` puts the
+/// sentinel on `x-api-key` bare; `ANTHROPIC_AUTH_TOKEN` puts it in
+/// `Authorization` under the bearer scheme, where a whole-string compare against
+/// the bare literal never matches and the sentinel is captured and forwarded as
+/// if it were the caller's seat — the `401`-that-reads-as-a-revoked-login this
+/// function exists to prevent, arriving by the one route the pinned tests did
+/// not cover (F17).
+fn is_roundhouse_own_value(value: &str) -> bool {
+    carries_a_roundhouse_secret(value) || is_the_api_key_sentinel(value)
+}
+
+/// The sentinel in any spelling a client can present it, and nothing else.
+///
+/// Scheme-insensitive by ASCII case because HTTP auth schemes are, and anchored
+/// at both ends of what remains so a value that merely *starts* with the
+/// sentinel is somebody else's credential rather than ours.
+fn is_the_api_key_sentinel(value: &str) -> bool {
+    let value = value.trim();
+    let bare = value
+        .split_once(char::is_whitespace)
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("Bearer"))
+        .map_or(value, |(_, rest)| rest.trim_start());
+    bare == ROUNDHOUSE_API_KEY_SENTINEL
+}
+
 /// A turn key as the request presented it.
 ///
 /// The pair travels together because the second half is only meaningful beside
@@ -432,6 +611,8 @@ fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
 /// access, and it buys back the guarantee that both halves of an admission
 /// come from the same lookup of the same key, at the *one* type the resolver
 /// produces.
+// Keep turn admission inline to avoid an allocation on each key lookup.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum KeyScope {
     /// Pays for turns as one membership, under one policy.
@@ -484,16 +665,6 @@ pub enum ControlPlane {
         /// compiler refuses a duplicate hash across `keys` and `admin_keys`,
         /// and a tombstoned key is left out of the config it compiles from.
         refusals: HashMap<String, KeyRefusal>,
-        /// How this deployment's synthetic tool calls are spelled on the
-        /// wire, resolved once at load time from the file's optional
-        /// `"mcp_namespace"`.
-        ///
-        /// Beside the key tables rather than in an `EngineConfig` because it
-        /// is a *client-facing* name: the engine never renders a wire frame,
-        /// and this is the same question `qualify` answers for session ids —
-        /// what does this deployment call the things its clients say back to
-        /// it. See [`Self::client_dialect`].
-        dialect: ClientDialect,
         /// What this deployment hashes arm assignment against, resolved once
         /// at load time. Read by the composition root on its way into
         /// [`EngineConfig`](crate::EngineConfig) and by nothing else.
@@ -538,7 +709,11 @@ impl ControlPlane {
             users: _,
             keys: _,
             admin_keys,
-            mcp_namespace,
+            // Named and ignored because `validate` has already refused any
+            // deployment that set it (M12 review, F2): the namespace is
+            // `mcp__roundhouse` by construction, and this plane compiled no
+            // dialect from it because nothing downstream ever read one.
+            mcp_namespace: _,
             arm_salt,
             // Named and ignored: `validate` has already resolved these into
             // every `Admission` in `turn_keys`, secrets and all. Carrying the
@@ -558,14 +733,6 @@ impl ControlPlane {
             admin_keys: admin_keys.into_iter().collect(),
             refusals,
             arm_salt: arm_salt.unwrap_or_default(),
-            // An absent name is the default one rather than an absence
-            // carried forward: see [`ClientDialect::default`] on why there is
-            // no honest `None` for a surface every client of which is a
-            // Responses client.
-            dialect: match mcp_namespace {
-                Some(namespace) => ClientDialect::CodexResponses { namespace },
-                None => ClientDialect::default(),
-            },
         }
     }
 
@@ -734,18 +901,6 @@ impl ControlPlane {
         }
     }
 
-    /// How this deployment's synthetic tool calls are spelled on the wire.
-    ///
-    /// The one reader of the deployment's `"mcp_namespace"`, and the one place
-    /// [`ControlPlane::Open`]'s answer is decided — a default rather than an
-    /// absence, exactly as [`Admission::open`] is the *value* an unconfigured
-    /// deployment admits every request as rather than a flag meaning "no
-    /// admission". An open deployment still serves Codex clients, so it still
-    /// has to name the namespace they would resolve a call against.
-    ///
-    /// Deliberately not `Option`-returning: a `None` here would put a case on
-    /// the wire projection whose only possible behavior is to emit a call that
-    /// resolves against nothing.
     /// What arm assignment is hashed against.
     ///
     /// Empty in [`Self::Open`], which is the accurate answer rather than a
@@ -755,16 +910,6 @@ impl ControlPlane {
         match self {
             ControlPlane::Open => "",
             ControlPlane::Configured { arm_salt, .. } => arm_salt,
-        }
-    }
-
-    pub fn client_dialect(&self) -> &ClientDialect {
-        match self {
-            // Borrowed from a shared value rather than built per call: the
-            // projection asks once per request, and an unconfigured deployment
-            // should not allocate a namespace string to answer.
-            ControlPlane::Open => &OPEN_DIALECT,
-            ControlPlane::Configured { dialect, .. } => dialect,
         }
     }
 
@@ -854,10 +999,12 @@ impl ControlPlane {
     /// in `env_http_headers`, so "the key arrived in the dedicated header" is
     /// true of a request whose `Authorization` is also roundhouse's own key.
     /// The value is therefore checked as well as the header —
-    /// [`carries_a_roundhouse_secret`] — and a capture that would forward one
+    /// [`is_roundhouse_own_value`] — and a capture that would forward one
     /// of this deployment's own secrets is refused. The turn is still admitted;
     /// what it loses is the hosted half of its pool, which degrades to local
-    /// with a marker like any other unreachable provider.
+    /// with a marker like any other unreachable provider. The same value check
+    /// is what makes [`ROUNDHOUSE_API_KEY_SENTINEL`] safe for a launched Claude
+    /// client to carry on `x-api-key`, a header the Anthropic row admits.
     pub fn turn_admission(&self, headers: &HeaderMap) -> Result<Admission, AuthError> {
         let presented = self.presented_key(headers)?;
         let forwardable = presented.as_ref().is_some_and(|key| key.dedicated_header);
@@ -867,7 +1014,7 @@ impl ControlPlane {
                     .then(|| {
                         PresentedCredential::captured(|name| {
                             header_value(headers, name)
-                                .filter(|value| !carries_a_roundhouse_secret(value))
+                                .filter(|value| !is_roundhouse_own_value(value))
                         })
                     })
                     .flatten(),
@@ -893,6 +1040,23 @@ impl ControlPlane {
     /// [`TURN_KEY_HEADER`]: codex copies an environment variable's value into
     /// `env_http_headers` verbatim, so what arrives there is a bare
     /// `rh_turn_…`, while `Authorization` has a scheme by definition.
+    ///
+    /// **Two levels of check on the `Authorization` fallback, and they answer
+    /// different questions** (F07). The `Bearer ` check is about that header's
+    /// own grammar: a value with no scheme is a malformed `Authorization`,
+    /// and reporting it as missing would tell a client to add a header it
+    /// sent. The [`KEY_NAMESPACE`] check is about *whose* namespace the secret
+    /// is in: a well-formed bearer that is not an `rh_` value at all is not a
+    /// wrong roundhouse key, it is somebody else's credential — in
+    /// pass-through mode, precisely the upstream seat token the deployment
+    /// forwards — and it means no roundhouse key was presented. Before this
+    /// split, a codex run whose `env_http_headers` entry had been silently
+    /// dropped got `malformed_key` naming the seat token, sending the operator
+    /// to inspect a credential that was never theirs to send instead of the
+    /// environment variable that broke. A key-shaped-but-wrong value keeps
+    /// falling through to `malformed_key`/`unknown_key`, which is what makes
+    /// this a narrowing rather than a hole: the row an operator who really did
+    /// paste a bad key lands on is unchanged.
     fn presented_key<'a>(
         &self,
         headers: &'a HeaderMap,
@@ -922,20 +1086,33 @@ impl ControlPlane {
         // already sent, which is the least actionable answer in the table.
         match headers.get(AUTHORIZATION) {
             None => Ok(None),
-            Some(value) => Ok(Some(PresentedKey {
-                secret: as_str(value)?
+            Some(value) => {
+                let secret = as_str(value)?
                     .strip_prefix("Bearer ")
-                    .ok_or(AuthError::MalformedKey)?,
-                dedicated_header: false,
-            })),
+                    .ok_or(AuthError::MalformedKey)?;
+                if !secret.starts_with(KEY_NAMESPACE) {
+                    // Not a key attempt at all — see the doc above. Answered as
+                    // "nothing presented" rather than as a refusal of its own,
+                    // so the whole table keeps one row for "no roundhouse key
+                    // reached this deployment" however the request got there.
+                    return Ok(None);
+                }
+                Ok(Some(PresentedKey {
+                    secret,
+                    dedicated_header: false,
+                }))
+            }
         }
     }
 
     /// Resolve a presented secret to what it authenticates: a membership and
     /// its resolved policy, or the admin scope.
     ///
-    /// The error table (decision 3) is: no key in either header -> `MissingKey`;
-    /// present but not `rh_(turn|admin)_<43 chars>` -> `MalformedKey`;
+    /// The error table (decision 3) is: no key in either header -> `MissingKey`
+    /// (which [`Self::presented_key`] also answers for an `Authorization`
+    /// outside [`KEY_NAMESPACE`], since that is not a key this deployment was
+    /// offered); in the namespace but not `rh_(turn|admin)_<43 chars>` ->
+    /// `MalformedKey`;
     /// well-shaped but no record of its hash -> `UnknownKey`. `WrongKeyKind`
     /// is not decided here — see [`Self::turn_admission`] — because this
     /// function has no notion of which surface is asking.
@@ -958,12 +1135,9 @@ impl ControlPlane {
                 // the comment this replaces was written to catch.
                 refusals,
                 // Named and ignored rather than swept under a `..`: this arm
-                // decides who a key is; the dialect decides how a call is
-                // spelled and the salt decides which arm a session lands in,
-                // and neither bears on identity. A field added here that
-                // authentication does have to read should make this line stop
-                // compiling.
-                dialect: _,
+                // decides who a key is, and which arm a session lands in does
+                // not bear on identity. A field added here that authentication
+                // does have to read should make this line stop compiling.
                 arm_salt: _,
             } => {
                 let secret = presented.ok_or(AuthError::MissingKey)?;
@@ -1034,6 +1208,27 @@ pub struct Admission {
     /// pair it already carries: two facts resolved from the same key must
     /// travel together or a caller can read one without the other.
     pub budget: Option<BudgetTerms>,
+    /// This membership's rolling fair-use ceilings: its project's windows
+    /// paired with its own.
+    ///
+    /// **Not an `Option`, unlike `budget`, and the difference is what each
+    /// absence costs.** A `None` budget is what lets the engine skip the spend
+    /// ledger entirely — a durable counter two processes race for, whose call
+    /// is the one place a ledger outage may fail a turn. Empty fair-use terms
+    /// cost a `Vec::is_empty()` on the admission path and nothing else, so a
+    /// distinct "not configured" state would be two spellings of one thing
+    /// with no reader able to tell them apart. `FairUseTerms::is_empty` is the
+    /// question every caller actually asks.
+    ///
+    /// Two lists inside, project and member, because both bind and the narrower
+    /// refuses first — see [`FairUseTerms`].
+    ///
+    /// Behind an `Arc` for the reason `policy` is: an [`Admission`] is cloned
+    /// per request out of a table compiled at load, and two `Vec`s inline made
+    /// this struct large enough that `KeyScope::Turn` tripped
+    /// `clippy::large_enum_variant` — a real cost, since that enum is moved
+    /// through the auth path of every request on every surface.
+    pub fair_use: Arc<FairUseTerms>,
     /// Whether this membership's sessions are enrolled in the validate/steer
     /// loop, and under what arms — or `None` for the shipped posture, which is
     /// off.
@@ -1072,6 +1267,21 @@ pub struct Admission {
     /// budget, and harmless where there is not — a membership with no budget
     /// never reaches the ledger at all.
     pub budget_counts: BudgetCounts,
+    /// The two ordered candidate lists this project's turns are routed between,
+    /// or `None` where it configured none.
+    ///
+    /// **Resolved here, beside `policy`, and deliberately not folded into it.**
+    /// A policy is a *constraint* — what this principal may reach — and it is
+    /// fingerprinted onto every decision as the audit trail's account of the
+    /// limits in force. A recipe is a *preference* among targets already
+    /// reachable. Folding one into the other would move the policy digest of
+    /// every project that configured a recipe and changed no entitlement, and
+    /// would make `unkeepable_promises` — which checks a policy's promises
+    /// against the catalog — answer a second question it was never asked.
+    ///
+    /// Behind an `Arc` for the reason `policy` is: an [`Admission`] is cloned
+    /// per request out of a table compiled at load.
+    pub tiers: Option<Arc<TierRecipe>>,
 }
 
 impl Admission {
@@ -1093,6 +1303,10 @@ impl Admission {
             principal: Principal::default_open(),
             policy: Arc::new(TurnPolicy::unrestricted()),
             budget: None,
+            // No rolling ceiling, for the reason there is no budget: an open
+            // deployment has no file to write one in, and a limit nobody
+            // configured must not start refusing turns that predate it.
+            fair_use: Arc::new(FairUseTerms::default()),
             // An open deployment has no file to enable the experiment in, and
             // enrolling its traffic anyway would meter and interrupt workloads
             // that predate the control plane — the one thing turning it on
@@ -1106,6 +1320,9 @@ impl Admission {
             // which is what `TurnCredentials::unrestricted` is written out for.
             credentials: TurnCredentials::unrestricted(),
             budget_counts: BudgetCounts::default(),
+            // No file to write a recipe in, and inventing one would re-route
+            // every turn of a deployment that never asked to be tier-routed.
+            tiers: None,
         }
     }
 
@@ -1143,6 +1360,10 @@ impl Admission {
             principal: self.principal.clone(),
             policy: Arc::new(policy),
             budget: self.budget.clone(),
+            // Nor a fair-use window: a rolling ceiling is an operator's, and
+            // an agent that could narrow — or widen — its own would be
+            // deciding how much of a shared account it may take.
+            fair_use: self.fair_use.clone(),
             validation: self.validation.clone(),
             // Not an axis a narrowing may touch either: which key a turn
             // authenticates with is not something an agent's own overlay — or
@@ -1150,6 +1371,11 @@ impl Admission {
             // turn reach a provider its project cannot pay for.
             credentials: self.credentials.clone(),
             budget_counts: self.budget_counts,
+            // Nor is the recipe. An overlay narrows what a turn may *reach*;
+            // which of the reachable tiers should answer is scored from the
+            // session's own evidence, and an agent that could edit the lists
+            // would be choosing its own model by another name.
+            tiers: self.tiers.clone(),
         }
     }
 }
@@ -1418,13 +1644,169 @@ mod tests {
     /// a provider client reads: a value this returns is a value that would go
     /// on an upstream request.
     fn forwarded_authorization(plane: &ControlPlane, headers: &HeaderMap) -> Option<String> {
+        forwarded_header(plane, headers, "openai", "authorization")
+    }
+
+    /// What this request would forward to `provider` under `name`, if anything.
+    ///
+    /// The general form of [`forwarded_authorization`], added when the Anthropic
+    /// row made `x-api-key` a second credential-bearing name: a helper that
+    /// could only read `authorization` would have made the sentinel rule below
+    /// unassertable at the seam a provider client actually reads.
+    fn forwarded_header(
+        plane: &ControlPlane,
+        headers: &HeaderMap,
+        provider: &str,
+        name: &str,
+    ) -> Option<String> {
         let admission = plane.turn_admission(headers).expect("a known turn key");
-        let access = admission.credentials.access("openai")?;
+        let access = admission.credentials.access(provider)?;
         let forwarded = access.credential.forwarded()?;
         forwarded
             .headers()
-            .find(|(name, _)| *name == "authorization")
+            .find(|(header, _)| *header == name)
             .map(|(_, value)| value.to_string())
+    }
+
+    /// The turn key in its own header, plus whatever else the client sent.
+    fn headers_with(dedicated: &str, extra: &[(&str, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            TURN_KEY_HEADER,
+            dedicated.parse().expect("a valid header value"),
+        );
+        for (name, value) in extra {
+            headers.insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).expect("a header name"),
+                value.parse::<axum::http::HeaderValue>().expect("a value"),
+            );
+        }
+        headers
+    }
+
+    /// **The launcher's `ANTHROPIC_API_KEY` sentinel is inert at this
+    /// boundary**, which is what lets a `RoundhouseKey` launch set it at all.
+    ///
+    /// The variable has to hold *something* — an empty one lets an ambient login
+    /// present its OAuth token to roundhouse (§1.3), which is the failure the
+    /// sentinel exists to close — and a Claude client that resolves it sends the
+    /// value on `x-api-key`, a header the Anthropic allowlist row admits as a
+    /// credential. So without this rule the value roundhouse itself generated
+    /// would ride upstream beside a real seat, where Anthropic answers a bad
+    /// `x-api-key` next to a valid bearer with a `401` that reads exactly like a
+    /// revoked login.
+    ///
+    /// Asserted at the *value*, not at "the client would never send both": the
+    /// one-capture evidence says a subscription login nulls the API key
+    /// (§1.4, §5.7's header table), so today the two headers do not co-occur
+    /// from this client — which is precisely the kind of guarantee that belongs
+    /// to a client version rather than to roundhouse. Chained through a Relay
+    /// makes the pairing reachable without the client changing at all: Relay
+    /// forwards inbound `x-api-key` untouched
+    /// (`gateway/response.rs:59-72`, `nemo-relay-cli` 0.8.2) while injecting its
+    /// own configured `Authorization`.
+    #[test]
+    fn the_launchers_api_key_sentinel_is_never_forwarded_as_a_seat() {
+        let plane = pass_through_plane();
+        let seat = "Bearer sk-ant-oat01-a-real-subscription-seat";
+
+        // PROBE: the launched shape — the turn key in its own header, the
+        // sentinel where the client puts a resolved `ANTHROPIC_API_KEY`, beside
+        // an `Authorization` that really is somebody else's. The seat still
+        // forwards, because refusing it would be refusing pass-through itself.
+        let launched = headers_with(
+            TURN_SECRET,
+            &[
+                ("x-api-key", ROUNDHOUSE_API_KEY_SENTINEL),
+                ("authorization", seat),
+            ],
+        );
+        assert_eq!(
+            forwarded_header(&plane, &launched, "anthropic", "authorization"),
+            Some(seat.to_string()),
+            "a genuine seat beside the sentinel is still the caller's credential"
+        );
+        assert_eq!(
+            forwarded_header(&plane, &launched, "anthropic", "x-api-key"),
+            None,
+            "the sentinel roundhouse generated must never leave this process: \
+             Anthropic answers a bad `x-api-key` beside a valid bearer with a 401 \
+             that an operator reads as a revoked login"
+        );
+
+        // CONTROL, and it is what keeps the rule above from being "forward no
+        // `x-api-key`": a caller bringing its own Anthropic key is exactly the
+        // other half of the row R4 added, and it still forwards.
+        let byok = "sk-ant-api03-the-callers-own-anthropic-key";
+        let own_key = headers_with(TURN_SECRET, &[("x-api-key", byok), ("authorization", seat)]);
+        assert_eq!(
+            forwarded_header(&plane, &own_key, "anthropic", "x-api-key"),
+            Some(byok.to_string()),
+        );
+
+        // And the sentinel on its own is not a credential at all: with no
+        // `Authorization` beside it there is nothing to forward, so `anthropic`
+        // goes unreachable and the turn degrades to local with a marker — the
+        // same shape as a pass-through member who attached nothing. The turn is
+        // still *admitted* as the membership the turn key names, which is the
+        // half a "nothing is forwarded" assertion alone would not distinguish
+        // from a refusal.
+        let sentinel_only =
+            headers_with(TURN_SECRET, &[("x-api-key", ROUNDHOUSE_API_KEY_SENTINEL)]);
+        let admission = plane
+            .turn_admission(&sentinel_only)
+            .expect("the dedicated header authenticates the turn key");
+        assert_eq!(admission.principal, Principal::new("acme", "ada"));
+        assert!(
+            !admission.credentials.reaches("anthropic"),
+            "the sentinel must not make a provider reachable: it authenticates nothing"
+        );
+    }
+
+    /// F17 (M11.2b thermo-nuclear review): the sentinel is inert in *every*
+    /// spelling a client can present it, not only the bare `x-api-key` one the
+    /// pinned test above covers.
+    ///
+    /// `ANTHROPIC_API_KEY` puts the sentinel on `x-api-key` bare;
+    /// `ANTHROPIC_AUTH_TOKEN` puts the same value in `Authorization` under the
+    /// bearer scheme. A whole-string compare against the bare literal misses
+    /// the second — and the tokenized secret check does not catch it either,
+    /// because the sentinel is deliberately not key-shaped
+    /// (`claude_launch`'s `the_api_key_sentinel_is_namespaced_and_is_not_key_shaped`).
+    /// So the value roundhouse itself generated was captured and forwarded to
+    /// Anthropic as the caller's seat.
+    #[test]
+    fn bearer_scheme_sentinel_is_never_forwarded_as_a_seat() {
+        let plane = pass_through_plane();
+
+        // PROBE: the turn key in its own header, the sentinel in
+        // `Authorization` — under the bearer scheme, in either case, and bare.
+        for spelling in [
+            format!("Bearer {ROUNDHOUSE_API_KEY_SENTINEL}"),
+            format!("bearer {ROUNDHOUSE_API_KEY_SENTINEL}"),
+            ROUNDHOUSE_API_KEY_SENTINEL.to_string(),
+        ] {
+            let launched = headers_with(TURN_SECRET, &[("authorization", &spelling)]);
+            assert_eq!(
+                forwarded_header(&plane, &launched, "anthropic", "authorization"),
+                None,
+                "the sentinel roundhouse generated must never leave this process, \
+                 regardless of which scheme carries it: {spelling:?}"
+            );
+        }
+
+        // CONTROL: a value that merely *starts* with the sentinel is somebody
+        // else's credential and is forwarded. Without this the rule above is
+        // indistinguishable from a prefix match, which would silently swallow a
+        // real seat whose token happened to begin with the published literal.
+        let near_miss = format!("Bearer {ROUNDHOUSE_API_KEY_SENTINEL}X");
+        let headers = headers_with(TURN_SECRET, &[("authorization", &near_miss)]);
+        assert_eq!(
+            forwarded_header(&plane, &headers, "anthropic", "authorization"),
+            Some(near_miss),
+            "only the sentinel itself is inert; a credential that contains it is the \
+             caller's own"
+        );
     }
 
     #[test]
@@ -1477,6 +1859,97 @@ mod tests {
             forwarded_authorization(&plane, &both_headers(TURN_SECRET, seat)),
             Some(seat.to_string()),
         );
+    }
+
+    /// F07: a dropped `env_http_headers` entry is a missing key, not a
+    /// malformed one.
+    ///
+    /// Codex's `build_header_map` omits a header silently on three paths — the
+    /// named variable unset, blank, or holding a value `HeaderValue` rejects
+    /// (a trailing newline from `$(cat key)`) — and none of them raise the
+    /// loud `EnvVar` error its `env_key` sibling raises for the identical
+    /// case. In `ForwardedOpenAiLogin` mode `env_http_headers` is the *only*
+    /// carrier of [`TURN_KEY_HEADER`] (that stanza omits `env_key` on
+    /// purpose), so any of the three produces exactly the request below: no
+    /// dedicated header, `Authorization` still carrying the caller's own
+    /// forwarded upstream bearer.
+    #[test]
+    fn a_pass_through_request_that_lost_its_dedicated_header_is_not_reported_as_a_malformed_key() {
+        let plane = pass_through_plane();
+
+        // PROBE: exactly what codex sends once `env_http_headers` silently
+        // drops `TURN_KEY_HEADER` -- no dedicated header at all, and
+        // `Authorization` still carrying the caller's own forwarded upstream
+        // bearer (the whole point of `ForwardedOpenAiLogin`, not a roundhouse
+        // key attempt).
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            "Bearer eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJhZGEifQ.a-real-seat-token"
+                .parse()
+                .expect("a valid header value"),
+        );
+
+        // The operator never sent a malformed key -- codex dropped the header
+        // they configured correctly, and what's left (a real upstream bearer)
+        // only collides with the turn-key shape check by coincidence.
+        // `MalformedKey` sends them to inspect a key string that was never
+        // theirs to send.
+        assert_eq!(
+            plane.turn_admission(&headers).err(),
+            Some(AuthError::MissingKey),
+            "a lost dedicated header must not be reported as a malformed turn key"
+        );
+
+        // And the refusal has to be *actionable*, which is the whole reason the
+        // row moved: it names the header codex was supposed to fill and the
+        // mechanism that drops it, so the operator looks at the variable rather
+        // than at the seat token sitting in `Authorization`.
+        let message = AuthError::MissingKey.to_string();
+        assert!(
+            message.contains(TURN_KEY_HEADER) && message.contains("env_http_headers"),
+            "the missing-key row must name the dedicated header and how codex fills it: \
+             {message}"
+        );
+
+        // CONTROL, and it is what keeps this a narrowing rather than a hole: an
+        // operator who really did paste a bad roundhouse key still lands on the
+        // rows that tell them so. The discriminator is the namespace, not the
+        // shape — `rh_` says somebody meant a roundhouse key, however wrong.
+        for (authorization, expected) in [
+            (
+                format!("Bearer {KEY_NAMESPACE}turn_tooshort"),
+                AuthError::MalformedKey,
+            ),
+            (format!("Bearer {UNKNOWN_SECRET}"), AuthError::UnknownKey),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                AUTHORIZATION,
+                authorization.parse().expect("a valid header value"),
+            );
+            assert_eq!(
+                plane.turn_admission(&headers).err(),
+                Some(expected),
+                "`{authorization}` is in roundhouse's own key namespace, so it is a key \
+                 attempt and must be judged as one"
+            );
+        }
+    }
+
+    #[test]
+    fn every_minted_prefix_lives_in_the_key_namespace() {
+        // The coarse check `presented_key` falls back on and the fine check
+        // `has_valid_key_shape` applies must not be able to disagree about what
+        // counts as "ours": a kind whose prefix fell outside [`KEY_NAMESPACE`]
+        // would mint secrets this deployment answers `missing_key` for, which
+        // reads to the operator as a key that never arrived.
+        for kind in [KeyKind::Turn, KeyKind::Admin] {
+            assert!(
+                kind.prefix().starts_with(KEY_NAMESPACE),
+                "{kind:?} mints outside the namespace the resolver recognizes"
+            );
+        }
     }
 
     #[test]
@@ -1604,51 +2077,43 @@ mod tests {
         );
     }
 
-    /// Every deployment answers the dialect question, and the two answers come
-    /// from one place.
+    /// M12 review F2: a deployment that asks for its own MCP namespace is
+    /// refused, and the refusal names the field.
     ///
-    /// The Open arm is the half worth a test. An unconfigured deployment still
-    /// serves Codex clients, so "no control plane" must not mean "no
-    /// namespace": a projection handed an empty one would emit calls that
-    /// resolve against nothing, and the turn would look perfectly healthy from
-    /// both ends while the steer did nothing.
+    /// The replacement for `every_deployment_names_a_namespace_and_a_configured_one_may_choose_it`,
+    /// which asserted that `client_dialect()` resolved the knob correctly — it
+    /// did, and nothing downstream ever asked it. Both launchers' registrations,
+    /// the Claude signage and the validate fold read the constant, so the only
+    /// honest thing a plane can do with a configured namespace is refuse to
+    /// compile one.
     #[test]
-    fn every_deployment_names_a_namespace_and_a_configured_one_may_choose_it() {
-        assert_eq!(
-            *ControlPlane::Open.client_dialect(),
-            ClientDialect::CodexResponses {
-                namespace: crate::dialect::DEFAULT_MCP_NAMESPACE.to_string(),
-            },
-            "an open deployment renders the default rather than nothing"
+    fn a_deployment_cannot_name_its_own_mcp_namespace() {
+        let error = ControlPlaneConfig::from_json(
+            r#"{
+              "projects": [{ "id": "acme" }],
+              "users": [{ "id": "ada" }],
+              "mcp_namespace": "mcp__acme"
+            }"#,
+            "test",
+        )
+        .expect_err("the retired knob is refused at load");
+        assert!(
+            error.to_string().contains("mcp_namespace"),
+            "the refusal has to name the field an operator would go looking \
+             for: {error}"
         );
 
-        let named = ControlPlane::configured(
+        // The control: the same file without the knob compiles, so the refusal
+        // is about that one field and not about the fixture.
+        ControlPlane::configured(
             ControlPlaneConfig::from_json(
                 r#"{
                   "projects": [{ "id": "acme" }],
-                  "users": [{ "id": "ada" }],
-                  "mcp_namespace": "mcp__acme"
+                  "users": [{ "id": "ada" }]
                 }"#,
                 "test",
             )
-            .expect("the fixture validates"),
-        );
-        assert_eq!(
-            *named.client_dialect(),
-            ClientDialect::CodexResponses {
-                namespace: "mcp__acme".to_string(),
-            },
-            "and a configured one renders the name its operator wrote"
-        );
-
-        // The control: a configured deployment that named none falls back to
-        // the same default the open one uses, rather than to an empty string.
-        let unnamed = ControlPlane::configured(
-            ControlPlaneConfig::from_json(sample_config(), "test").expect("the fixture validates"),
-        );
-        assert_eq!(
-            unnamed.client_dialect(),
-            ControlPlane::Open.client_dialect()
+            .expect("a deployment that names no namespace still loads"),
         );
     }
 }

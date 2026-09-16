@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::body::{Body, Bytes};
-use axum::http::header::AUTHORIZATION;
+use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use futures::StreamExt;
 use http_body_util::BodyExt;
@@ -257,11 +257,66 @@ pub fn request(cache_key: &str, input: Vec<ResponseItem>) -> ResponsesApiRequest
     }
 }
 
+/// One `POST /v1/responses` with a codex-shaped body naming `cache_key`,
+/// draining the SSE response so the turn's tail — including whatever the
+/// caller is testing runs on completion (`Conversations::commit` inside
+/// `prefix_admission::bind_prefix`, a fair-use draw, …) — actually runs
+/// before this function returns.
+///
+/// Shared by `correlation_backend_boot.rs` and `fair_use_backend_boot.rs`,
+/// which spelled this five-line request/drain themselves before this rung —
+/// `correlation_backend_boot.rs`'s copy differed only in taking `cache_key`
+/// as a parameter where `fair_use_backend_boot.rs`'s hard-coded the literal
+/// `"cache-key"` (M14.1 review, F10).
+pub async fn post_responses_turn(app: &Router, secret: &str, cache_key: &str) -> StatusCode {
+    let body = request(cache_key, vec![user_message("count some tokens")]);
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header(CONTENT_TYPE, "application/json")
+                .header(AUTHORIZATION, format!("Bearer {secret}"))
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let _ = response.into_body().collect().await.unwrap().to_bytes();
+    status
+}
+
 pub fn user_message(text: &str) -> ResponseItem {
     ResponseItem::Message {
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputText {
+            text: text.to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    }
+}
+
+/// An assistant message as a client re-sends one, built from Codex's own type.
+///
+/// Shared here rather than redefined per suite because M10.0 gave three of them
+/// the same need: the steer is an assistant message now, so replaying "the agent
+/// carried on after being corrected" means appending one of these to the resent
+/// history — and the bytes have to be the ones a real client would send, or the
+/// prefix check is being tested against our own reconstruction.
+///
+/// `OutputText`, not `InputText`: an assistant item the client echoes back
+/// carries the output part, and canonicalization reads the role from the item
+/// rather than from the part — but a part that disagreed with the role is
+/// exactly the drift an oracle fixture exists to prevent.
+pub fn assistant_message(text: &str) -> ResponseItem {
+    ResponseItem::Message {
+        id: None,
+        role: "assistant".to_string(),
+        content: vec![ContentItem::OutputText {
             text: text.to_string(),
         }],
         phase: None,

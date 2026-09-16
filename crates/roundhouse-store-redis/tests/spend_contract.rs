@@ -20,6 +20,7 @@
 
 mod common;
 
+use common::raw_from_env;
 use roundhouse_core::control::spend::contract::{assert_usd, fresh_principal, terms};
 use roundhouse_core::control::{
     Allocation, Balance, BalanceQuery, BudgetTerms, GrantRequest, MemorySpendLedger, Principal,
@@ -38,14 +39,6 @@ async fn connect_spend_from_env() -> RedisSpendLedger {
     RedisSpendLedger::connect(url_from_env())
         .await
         .expect("Redis named by the env var must be reachable")
-}
-
-async fn raw_from_env() -> redis::aio::MultiplexedConnection {
-    redis::Client::open(url_from_env().as_str())
-        .unwrap()
-        .get_multiplexed_async_connection()
-        .await
-        .unwrap()
 }
 
 /// `fresh_principal`, `assert_usd` and `terms` are imported from the contract

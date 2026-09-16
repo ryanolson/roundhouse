@@ -38,6 +38,7 @@ fn reported(input: u64, cached: u64, output: u64) -> Usage {
     Usage {
         input_tokens: input,
         cached_input_tokens: cached,
+        cache_write_tokens: 0,
         output_tokens: output,
         reasoning_tokens: 0,
         accounting: Accounting::Reported,
@@ -103,6 +104,8 @@ fn log(calls: &[Usage]) -> Vec<SessionEvent> {
                     billing: Default::default(),
                     budget_draw: None,
                     withheld_providers: Vec::new(),
+                    declared_baseline: None,
+                    attempts: Vec::new(),
                 },
             },
         );
@@ -111,6 +114,8 @@ fn log(calls: &[Usage]) -> Vec<SessionEvent> {
             SessionEventKind::ResponseCompleted {
                 response_id,
                 usage: usage.clone(),
+                provider_reported_cost_usd: None,
+                stop_reason: None,
             },
         );
     }

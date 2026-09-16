@@ -19,7 +19,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -31,7 +31,7 @@ use roundhouse_core::control::{
 use roundhouse_core::ids::SessionId;
 use roundhouse_core::routing::{Candidate, DecisionRecord, Target};
 use roundhouse_mcp::reads::{ControlReads, SessionFacts};
-use roundhouse_mcp::surface::SurfaceError;
+use roundhouse_mcp::surface::{Correlators, SurfaceError};
 use roundhouse_mcp::{ControlPlaneSurface, ControlStore};
 
 /// A distinctive per-model price, so a rendering that leaked one is visible as
@@ -143,9 +143,41 @@ pub struct FakeDeployment {
     /// `None` for a deployment that meters nothing, which is what open mode and
     /// a project with no `"budget"` both are.
     pub balance: Option<Balance>,
-    /// The most recent session per principal.
+    /// The most recent session per principal — the deployment's `latest`
+    /// table, and nothing else.
     pub sessions: HashMap<Principal, SessionId>,
+    /// The session each emitted tool-use id was emitted into, and for whom —
+    /// the fake's stand-in for `Conversations`' call table (M12, R-M2).
+    pub tool_use_ids: HashMap<String, (Principal, SessionId)>,
+    /// The session each client thread's latest turn went to, and for whom —
+    /// the fake's stand-in for `Conversations`' thread table (M12.1 review,
+    /// R-M9).
+    ///
+    /// **Orthogonal to [`Self::conversations`] on purpose**, and that is the
+    /// state F2 is about: a codex subagent's thread id is nobody's cache key,
+    /// so it resolves through this table and through nothing else. A fixture
+    /// whose thread ids were drawn from the conversation set could only ever
+    /// re-prove the name lookup.
+    pub thread_ids: HashMap<String, (Principal, SessionId)>,
+    /// Every conversation this deployment *holds* — the fake's stand-in for
+    /// the session store, which is what a named lookup asks (M12.1 review, F7).
+    ///
+    /// **Orthogonal to [`Self::sessions`], as the deployment's two tables
+    /// are.** This used to be a `Vec` that `named_session` unioned with the
+    /// `latest` map, which made "is somebody's latest" double as "exists" and
+    /// left the one state the server's named path exists to get right —
+    /// `latest` naming a conversation the store no longer holds —
+    /// unrepresentable. [`Self::default`] seeds both for the common case; a
+    /// fixture that wants them to disagree says so.
+    pub conversations: HashSet<SessionId>,
     pub facts: HashMap<SessionId, SessionFacts>,
+    /// A backend that cannot answer, as the message it would carry.
+    ///
+    /// The fake's whole store is a `HashSet`, so without this there is no way
+    /// to ask it the one question M12.1 review F1 is about: an infrastructure
+    /// failure reaching a *correlator*, which the resolver must propagate
+    /// rather than swallow as "unknown, fall through to `latest`".
+    pub store_outage: Option<String>,
     pub now_ms: u64,
 }
 
@@ -153,6 +185,9 @@ impl Default for FakeDeployment {
     fn default() -> Self {
         let mut sessions = HashMap::new();
         sessions.insert(ada(), adas_session());
+        // Seeded in both tables, because ada's conversation is both her most
+        // recent one and one this deployment still holds — the ordinary case.
+        let conversations = HashSet::from([adas_session()]);
         Self {
             ceiling: TurnPolicy::unrestricted(),
             catalog: mixed_fleet(),
@@ -165,7 +200,11 @@ impl Default for FakeDeployment {
                 state: LedgerState::Unconstrained,
             }),
             sessions,
+            tool_use_ids: HashMap::new(),
+            thread_ids: HashMap::new(),
+            conversations,
             facts: HashMap::new(),
+            store_outage: None,
             now_ms: 1_700_000_000_000,
         }
     }
@@ -202,31 +241,69 @@ impl FakeDeployment {
 
 #[async_trait]
 impl ControlReads for FakeDeployment {
-    async fn resolve_session(
+    /// The fake supplies the three table reads and nothing else: the order,
+    /// the refusals and the one swallow between them are the provided
+    /// `resolve_session`'s, which is the same code the real `ControlPlaneReads`
+    /// runs. A fake free to re-type any of that turns the surface's tests into
+    /// tests of the fake (M12 review F4; M12.1 review F1).
+    ///
+    /// The server resolves a name through the same `bound_session` namespacing
+    /// the Responses surface uses; the fake reproduces the two properties the
+    /// surface depends on — a name outside the caller's namespace is refused
+    /// rather than silently replaced by the caller's own, and what a name is
+    /// checked against is the *store*, not the `latest` table.
+    async fn named_session(
         &self,
         principal: &Principal,
-        conversation: Option<&str>,
+        named: &str,
     ) -> Result<SessionId, SurfaceError> {
-        match conversation {
-            None => self
-                .sessions
-                .get(principal)
-                .cloned()
-                .ok_or(SurfaceError::NoSession),
-            Some(named) => {
-                // The server resolves this through the same `bound_session`
-                // namespacing the Responses surface uses; the fake reproduces
-                // the one property the surface depends on, which is that a
-                // conversation outside the caller's namespace is refused rather
-                // than silently replaced by the caller's own.
-                let qualified = format!("{}{named}", principal.namespace_prefix());
-                if self.sessions.values().any(|id| id.as_str() == qualified) {
-                    Ok(SessionId::new(qualified))
-                } else {
-                    Err(SurfaceError::ForeignConversation(named.to_string()))
-                }
-            }
+        if let Some(backend) = &self.store_outage {
+            return Err(SurfaceError::Internal(backend.clone()));
         }
+        let qualified = format!("{}{named}", principal.namespace_prefix());
+        if self.conversations.iter().any(|id| id.as_str() == qualified) {
+            Ok(SessionId::new(qualified))
+        } else {
+            Err(SurfaceError::ForeignConversation(named.to_string()))
+        }
+    }
+
+    async fn session_of_call(
+        &self,
+        principal: &Principal,
+        tool_use_id: &str,
+    ) -> Result<Option<SessionId>, SurfaceError> {
+        // The outage this double models is the *store's*, and since M14.1 the
+        // correlation tables are in it too: a double whose `named_session`
+        // could fail while its two lookups could not would let the resolver's
+        // one swallow go untested on the arms that matter (M12.1 review, F1).
+        if let Some(backend) = &self.store_outage {
+            return Err(SurfaceError::Internal(backend.clone()));
+        }
+        Ok(self
+            .tool_use_ids
+            .get(tool_use_id)
+            .filter(|(owner, _)| owner == principal)
+            .map(|(_, session)| session.clone()))
+    }
+
+    async fn session_of_thread(
+        &self,
+        principal: &Principal,
+        thread_id: &str,
+    ) -> Result<Option<SessionId>, SurfaceError> {
+        if let Some(backend) = &self.store_outage {
+            return Err(SurfaceError::Internal(backend.clone()));
+        }
+        Ok(self
+            .thread_ids
+            .get(thread_id)
+            .filter(|(owner, _)| owner == principal)
+            .map(|(_, session)| session.clone()))
+    }
+
+    async fn latest_session(&self, principal: &Principal) -> Option<SessionId> {
+        self.sessions.get(principal).cloned()
     }
 
     async fn ceiling_policy(&self, _principal: &Principal) -> Result<TurnPolicy, SurfaceError> {
@@ -307,13 +384,47 @@ impl<R> CountingReads<R> {
 
 #[async_trait]
 impl<R: ControlReads> ControlReads for CountingReads<R> {
+    async fn named_session(
+        &self,
+        principal: &Principal,
+        named: &str,
+    ) -> Result<SessionId, SurfaceError> {
+        self.inner.named_session(principal, named).await
+    }
+
+    async fn session_of_call(
+        &self,
+        principal: &Principal,
+        tool_use_id: &str,
+    ) -> Result<Option<SessionId>, SurfaceError> {
+        self.inner.session_of_call(principal, tool_use_id).await
+    }
+
+    async fn session_of_thread(
+        &self,
+        principal: &Principal,
+        thread_id: &str,
+    ) -> Result<Option<SessionId>, SurfaceError> {
+        self.inner.session_of_thread(principal, thread_id).await
+    }
+
+    async fn latest_session(&self, principal: &Principal) -> Option<SessionId> {
+        self.inner.latest_session(principal).await
+    }
+
+    /// Counted here rather than left to the trait's provided body, because the
+    /// number a caller wants is "how many times did the surface ask which
+    /// conversation this is", not how many table reads that cost.
     async fn resolve_session(
         &self,
         principal: &Principal,
         conversation: Option<&str>,
+        correlators: &Correlators,
     ) -> Result<SessionId, SurfaceError> {
         self.resolve_session_calls.fetch_add(1, Ordering::SeqCst);
-        self.inner.resolve_session(principal, conversation).await
+        self.inner
+            .resolve_session(principal, conversation, correlators)
+            .await
     }
 
     async fn ceiling_policy(&self, principal: &Principal) -> Result<TurnPolicy, SurfaceError> {
@@ -393,6 +504,8 @@ pub async fn decision() -> DecisionRecord {
             turn_policy: &ceiling,
             frontier_history: &history,
             budget: &budget,
+            signals: None,
+            tiers: None,
         })
         .await
         .expect("a three-candidate fleet under an unrestricted policy routes");
@@ -416,5 +529,7 @@ pub async fn decision() -> DecisionRecord {
         billing: Default::default(),
         budget_draw: None,
         withheld_providers: Vec::new(),
+        declared_baseline: None,
+        attempts: Vec::new(),
     }
 }

@@ -201,6 +201,75 @@ async fn a_selection_id_can_only_be_booked_once() {
     reservation.release().await.unwrap();
 }
 
+/// `register_worker` returning is not enough on its own: `upsert_worker`
+/// marks a worker schedulable in the catalog and pushes the new topology
+/// onto a `watch` channel synchronously, but the scheduler's own booking
+/// table only catches up once a background task gets scheduled to consume
+/// that channel -- see `EmbeddedFleet::wait_until_routable`. That gap is
+/// normally sub-millisecond and invisible, but wide enough under load that a
+/// `reserve` right after a `select` can be told the worker it just picked
+/// does not exist (`SequenceError::WorkerNotFound` from the pinned Dynamo
+/// rev), which is exactly what sank
+/// `end_to_end::a_local_worker_wins_and_its_reservation_settles` once under
+/// `cargo test --workspace -j 2`.
+///
+/// A single register-then-reserve pair rarely lands inside that window, so
+/// this floods many of them at once, each against its own fresh routing
+/// partition (a distinct model name) so every one forces a brand-new
+/// scheduler-monitor task to be spawned and raced against, on a
+/// two-thread runtime with far more ready work than threads. That
+/// reproduces the race deterministically without external CPU hogs: before
+/// `wait_until_routable` this failed 1-18 times per 300 runs; after, 0/300
+/// across repeated runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_worker_is_routable_immediately_after_registration_under_concurrent_load() {
+    let fleet = embedded_fleet().await;
+    let attempts = 300u64;
+    let mut handles = Vec::with_capacity(attempts as usize);
+    for i in 0..attempts {
+        let fleet = Arc::clone(&fleet);
+        handles.push(tokio::spawn(async move {
+            let model = format!("stress-model-{i}");
+            fleet
+                .register_worker(WorkerRegistration {
+                    worker_id: i,
+                    model_name: model.clone(),
+                    routing_group: "default".to_string(),
+                    endpoint: format!("http://worker-{i}:8000"),
+                    block_size: BLOCK_SIZE,
+                    kv_events_endpoints: HashMap::new(),
+                })
+                .await
+                .expect("registration should succeed");
+            let assembler = assembler_with_turns(1);
+            let query = query_from_named(&assembler, &model);
+            let quote = fleet
+                .price(&query)
+                .await
+                .expect("select should not error")
+                .expect("a worker is registered");
+            Arc::clone(&fleet).reserve(&quote).await
+        }));
+    }
+    let mut failures = Vec::new();
+    for handle in handles {
+        if let Err(error) = handle.await.expect("task should not panic") {
+            failures.push(error.to_string());
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "a worker registered via register_worker must be immediately routable, \
+         but {}/{attempts} reservations failed, e.g.: {}",
+        failures.len(),
+        failures[0]
+    );
+}
+
+fn query_from_named(assembler: &ContextAssembler<ByteTokenizer>, model: &str) -> FleetQuery {
+    FleetQuery::for_buffer(assembler.buffer(), model, "default", Some(128), None)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn growing_context_costs_more_prefill_and_the_quote_tracks_it() {
     let fleet = embedded_fleet().await;

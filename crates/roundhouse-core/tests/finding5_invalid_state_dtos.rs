@@ -50,6 +50,7 @@ fn usage(input: u64, output: u64) -> Usage {
     Usage {
         input_tokens: input,
         cached_input_tokens: 0,
+        cache_write_tokens: 0,
         output_tokens: output,
         reasoning_tokens: 0,
         accounting: Accounting::Reported,
@@ -279,7 +280,7 @@ fn shadow_pricing_resolve_never_produces_an_incoherent_correlary() {
         ("bad-declaration", 0.6, None),
     ];
     for (model, quality, shape) in cases {
-        let correlary = pricer.resolve(model, quality, shape, &observed);
+        let correlary = pricer.resolve(model, quality, shape, &observed, None);
         // Coherence is now a type-level property, so the check that remains is
         // that the value agrees with itself when priced.
         let priced = correlary.shadow_cost_usd(&usage(1_000_000, 0));
@@ -299,7 +300,9 @@ fn shadow_pricing_resolve_never_produces_an_incoherent_correlary() {
         "",
     ));
     assert!(matches!(
-        config.pricing.resolve("llama", 0.6, None, &HashMap::new()),
+        config
+            .pricing
+            .resolve("llama", 0.6, None, &HashMap::new(), None),
         Correlary::Priced { .. }
     ));
 }
