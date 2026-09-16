@@ -1,4 +1,0 @@
-interface:
-  display_name: "Onboard a Model"
-  short_description: "Wire and validate a Rhino model end to end"
-  default_prompt: "Use $onboard-model to integrate this checkpoint and reference implementation into Rhino end to end."
