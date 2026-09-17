@@ -1,0 +1,110 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
+# Plan: cache affinity, from the selector to the wire
+
+> **Status: in progress, 2026-09-17.** The ruling is `synergies/typesafe-selector-and-cache-affinity.md`. The owner accepted the order of work in its addendum of 2026-09-17. This plan holds the design brief for each rung, so that a new session can continue without a second design pass. The status table in section 1 is the first thing to read and the last thing to update.
+
+## 1. Status
+
+<!-- STATUS -->
+
+## 2. How to continue
+
+1. Read `CLAUDE.md`, then the ruling and its addendum, then this plan.
+2. Run `git fetch origin` and compare the branch in the status table with `origin`. Trust only pushed state.
+3. Take the first rung whose status is not `done`. Each rung lists its tests first. Write them, watch them fail, then write the fix.
+4. Run cargo commands one at a time. The box has four cores and one build lock. Put `timeout 300` before a targeted test command and `timeout 900` before a workspace test command.
+5. Commit before any mutation stage. Commit with `--no-gpg-sign`. Push through the `gh` credential helper.
+6. Each rung ships as its own PR from the current `main`. The commits on the working branch are separated by rung so that a cherry-pick is clean.
+
+## 3. The rungs
+
+### C1 — the dominance guard on `Efficient` picks (T4)
+
+**Finding.** With a tier recipe, `StagePolicy::choose` selects a tier from `TurnSignals` and serves the first admitted member of that tier in recipe order. It never reads a quote. A `TestsPassed` de-escalation moved a warm $0.03 target to a cold $0.12 target in the evidence test.
+
+**Rule.** When the picked tier is `Efficient`, compare the head of that tier with the admitted `Capable` pool in recipe order. If a `Capable` member quotes strictly less for the turn, serve the first such member and record the decision source `cost_guard`. The rationale names both targets and no price. Both quotes are in the `considered` list of the `DecisionRecord`. A `Capable` pick is never redirected by cost. A tie keeps the tier pick. The policy holds no session state.
+
+**Tests first.** The evidence test `a_deescalation_does_not_move_a_warm_session_onto_a_costlier_cold_target` in `routing/stage.rs` loses its ignore. Add: a tie keeps the pick, a cheaper `Capable` target that is not admitted does not fire the guard, the guard fires on a non-`TestsPassed` pick, the source and rationale name both quotes, and a severity override is never redirected.
+
+**Not in this rung.** The guard does not price the return trip to a target that goes cold. That needs the observed cache deadline (C6).
+
+### C2 — the second Anthropic breakpoint
+
+**Finding.** `AnthropicMessagesClient::body` places one `cache_control` marker on the penultimate segment. The provider examines 20 block positions back from a marker. An append of 20 or more items since the last request to the same target reads nothing from the cache. The evidence test is `a_long_append_keeps_the_previous_cache_write_inside_a_lookback_window` in `anthropic_messages.rs`.
+
+**Facts that the design rests on.**
+
+- Segments equal items. `rendered_with_boundaries` (`context.rs:251-260`) gives `n - 1` interior offsets for `n` items. `engine.rs:2736-2737` fills the dispatch quote from it.
+- The log order in one turn is: `TurnStarted` and the input `ItemAppended` events, then `Routed`, then the output items, then `ResponseCompleted` (`session.rs:1304-1400`). So the item count at dispatch equals `items.len()` at the `Routed` fold, and not at the terminal fold.
+- `PendingRouting` (`session.rs:618-627`) already carries data from `Routed` to `CacheLedger::record` (`session.rs:651-653`, `ledger.rs:385-394`).
+- The handoff note goes on the prompt after the render (`engine.rs:2765-2770`). It lands inside the last segment and moves no interior offset. It is not in the log, and it is after every marker, so it is not a cache defect.
+- The ledger is a projection of the log. The new field derives on replay. No event changes.
+
+**Steps.**
+
+1. Add `pub last_segment_count: u64` to `TargetState` (`ledger.rs:340`) with `#[serde(default)]`.
+2. Add a `segment_count` parameter to `CacheLedger::record`. The one production caller is `session.rs:651`.
+3. Add `segment_count: u64` to `PendingRouting`. Fill it in the `Routed` arm from `self.items.len()`.
+4. Add `pub previous_breakpoint: Option<usize>` to `FrontierQuote` (`frontier.rs:422`). At `engine.rs:2737` derive it as `state_for(target)` then `last_segment_count.checked_sub(2)`. The judge (`judge.rs:592`) and `main.rs:1328` pass `None`.
+5. In `body()` at `anthropic_messages.rs:397`, keep `previous` only if it is `Some(p)`, `p < segments.len() - 1`, `p != penultimate`, and `penultimate - p > 19`. If `riding + 2 <= MAX_CACHE_BREAKPOINTS`, place both markers. If only one slot is free, place the penultimate marker only. If no slot is free, place none.
+6. Extend the existing comment about the yield to client tool markers. Do not replace it.
+
+**Why the penultimate marker wins the last slot.** A lone marker at `previous` reads this turn but never moves the entry forward, so each later turn pays plain input on a longer tail. A lone penultimate marker pays one write and makes each later turn a hit.
+
+**Churn.** About 35 `FrontierQuote {` literals in 10 files. Most fleet tests use `..quote(...)`, so the helper covers them. Three production literals and a few full literals in tests need the field.
+
+**Tests first.**
+
+1. Remove the ignore from the evidence test. Its control stays live.
+2. `a_request_with_the_client_holding_four_tool_markers_still_sends_none`.
+3. `a_request_with_three_riding_markers_keeps_the_penultimate_and_drops_the_previous`.
+4. `a_short_append_adds_no_second_marker`.
+5. `the_judge_quote_still_carries_no_cache_control`.
+6. `the_ledger_records_the_item_count_the_turn_was_dispatched_with`, at the fold level in `session.rs`.
+7. `a_replayed_log_reconstructs_the_same_last_segment_count`.
+
+**Live evidence that is still necessary.** The tests prove the block arithmetic. A real session with a long append must show `cache_read_input_tokens > 0` on the next turn. Spend is capped by R9.
+
+### C3 — the Dynamo residency call becomes a decision
+
+**Finding.** `fleet.price()` is a realtime residency check. It sends block and sequence hashes and gets back `effective_prefill_tokens` and `longest_matched_tokens` (`local.rs:50-68, 150-159`). It runs on every turn when a fleet is configured (`engine.rs:2021-2038`). It runs before the tool exclusion at `engine.rs:2078-2085`, so each tool turn makes the HTTP call and then discards the answer. Its only bound is the whole-turn deadline of 120 s. A fleet error fails the turn even when the route was always a frontier target.
+
+**Steps.**
+
+1. Add a pure function `local_quote_can_matter` next to `plan` in `engine.rs`. It is true only if a fleet is configured, the turn declares no tools, and the turn policy admits some local target. Budget and cadence are not skip reasons, because a budget squeeze makes a local route more likely.
+2. Gate the `fleet.price` block on it.
+3. Add `local_quote_skipped: Option<&'static str>` to `DecisionRecord` (`routing/mod.rs:547`) with `#[serde(default)]`, the convention in `event.rs:56-79`. The dashboard must tell "not quoted" from "quoted and rejected".
+
+**Tests first.** `a_tool_declaring_turn_makes_no_fleet_call` with a counting fleet stub, `a_fleet_error_on_a_tool_turn_does_not_fail_the_turn`, `a_turn_whose_policy_admits_no_local_target_makes_no_fleet_call`, and `a_skipped_local_quote_is_named_in_the_decision_record`.
+
+**Open for the owner.** Dynamo can keep a KV cache for hours. A later form of this decision can also skip the call when the ledger shows a recent local dispatch with a full match and the fleet reports no eviction. That needs an eviction signal from Dynamo, and none is wired today.
+
+### C4 — the 1-hour TTL as one per-target setting
+
+**Rule.** Do not add a second setting. `FrontierModelSpec.cache_model` already holds `CacheModel::Deterministic { ttl_ms }` (`frontier.rs:49, 126`). Carry `cache_ttl_ms: Option<u64>` on `FrontierQuote` from the same field. `body()` calls `CacheControl::ephemeral_for("1h")` when the value is `3_600_000`. The ledger and the wire then read one field, so they cannot disagree.
+
+**The price guard.** `ProviderPricing` has one write rate, `cache_write_per_mtok_usd` (`ledger.rs:96-104`). The provider bills a 1-hour write at 2 times the input price and a 5-minute write at 1.25 times. The catalog boundary (`catalog_config.rs`) must refuse a spec that declares a 1-hour TTL without the 2 times write rate. Test: `a_one_hour_cache_model_requires_the_one_hour_write_rate`.
+
+### C5 — the local TTFT quote reads the residency answer
+
+**Steps.** Add `pub local_ttft_ms_per_prefill_token: f64` to `EngineConfig` (`engine.rs:463`) with default `0.0`, documented next to `local_base_ttft_ms`. `LocalQuote::to_candidate` (`local.rs:174-186`) returns `base + effective_prefill_tokens * per_token`, the mirror of `frontier.rs:191-193`. The call site is `engine.rs:2042-2044`.
+
+**Tests first.** `a_local_candidate_ttft_rises_with_effective_prefill_tokens` and the control `a_zero_slope_reproduces_the_flat_quote`. The default of `0.0` keeps the tests that pin the flat value green: `mcp_surface.rs:166, 192`, `budget_routing.rs:432`, `credential_gating.rs:298`, `policy_routing.rs:181`.
+
+### C6 — the observed cache deadline, and the return trip
+
+Not designed yet. The input is the time of the last dispatch to each target plus the TTL that the request asked for. The use is a term in the C1 guard for the cost of a return to a target that goes cold. Do C4 first, because the requested TTL comes from it.
+
+### C7 — the shadow classifier (T5)
+
+Blocked on the owner. It needs a ruling on T2 (the amendment to R3) and on T6 (the egress posture). No classifier call ships before both. The shadow records a tier distribution next to the `pick_tier` answer at each segment start and affects no route.
+
+## 4. Smaller findings with no rung yet
+
+- `metadata.user_id` is read for the session name and is not forwarded to Anthropic. A one-assertion test on `body()` proves it.
+- `CacheLedger::invalidate` has no production caller. A prefix hash for each target (section 6 of the ruling) removes the need for it.
+- The render into one user message sends tool calls, tool results, and thinking signatures as text. This is a function question and needs its own measurement.

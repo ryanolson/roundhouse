@@ -224,3 +224,26 @@ Claims that have no test yet: the flat local TTFT quote, the 1-hour TTL that is 
 2. **Select the form of T4.** Option A is a cost guard: a tier change moves the session only if the quoted cost for this turn is lower. Option B is a lease, the form that Router.com uses with a 5-minute window. Option C sends recipe turns through `AffinityPolicy` inside the tier pool. A and C read the quote. B is simpler and ignores it.
 3. **Accept or reject T6** as the egress posture.
 4. **Set the order of the cache work.** The proposed order is: T4, the second breakpoint, the 1-hour TTL as a per-target setting, the local TTFT quote, then the shadow classifier.
+
+## Addendum (2026-09-17): the owner accepts the order, and Dynamo residency
+
+**The order of the cache work is accepted.** The owner accepted item 4 of section 9 as proposed: T4, the second breakpoint, the 1-hour TTL as a per-target setting, the local TTFT quote, then the shadow classifier. Items 1 and 3 of section 9 stay open. R3 stands as written, and no classifier call ships before the owner rules on T2 and T6.
+
+**T4 ships as a dominance guard on `Efficient` picks.** Section 9 listed three forms. Form C orders the members inside one tier, so it cannot resist a move between tiers. The evidence test has one member in each tier, and form C does not change its result. Form B ignores the quote. Form A reads the quote, and the quote already carries the cache state, because the ledger prices each target warm or cold. The built rule is narrower than T4 as first written:
+
+- When the picked tier is `Efficient`, the policy compares the head of that tier with the admitted `Capable` pool in recipe order.
+- If a `Capable` member quotes strictly less for this turn, the policy serves the first such member. The decision records the new source `cost_guard`. The rationale names both targets and no price, because `explain_last_route` republishes the rationale to the calling model. Both quotes are in the `considered` list of the `DecisionRecord`.
+- A `Capable` pick is never redirected by cost. Escalation is for function.
+- The policy holds no session state. A tie keeps the tier pick.
+
+The reason is dominance. The `Efficient` tier exists to save cost. A `Capable` target that is also cheaper for the turn is better on function and on cost together. In practice this occurs only when the `Capable` target is warm and the `Efficient` target is cold.
+
+The guard does not price the return trip. A move that is cheaper for this turn can still make the old target go cold before the session returns to it. That cost needs the observed cache deadline from section 6, and it is carried over.
+
+**Dynamo residency is observed, not assumed.** The owner notes two facts. Dynamo can keep a KV cache much longer than 5 minutes. Dynamo can expose a realtime endpoint that reports residency. The owner also notes that the router can decide whether to make that call. This changes three things in this ruling:
+
+1. **No TTL applies to a local target.** The 5-minute and 1-hour figures in sections 4 and 5 are Anthropic figures. For a local target the only honest cache model is an observed one. The price query already returns the matched prefix (`local.rs:149-153`), so it is a residency check today.
+2. **The local TTFT quote must read the residency answer.** Gap 7 in section 5 stands. The observed matched prefix is the input that the flat 60 ms quote ignores.
+3. **The residency call becomes a routing decision.** The call is an HTTP request on the path to first token. The router makes the call only when the answer can change the decision. The skip conditions and the record that a skip leaves in `Routed` are in the carry-over plan.
+
+A warm local target that stays warm for hours also changes the arithmetic of section 4. A return to a local target after a long build costs nothing extra. A return to an Anthropic target after 5 minutes costs a full write. This asymmetry is a reason to prefer the local target for sessions with long idle periods, and the observed deadline from section 6 is the input that lets a policy see it.
