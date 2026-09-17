@@ -9,7 +9,7 @@ SPDX-License-Identifier: Apache-2.0
 
 ## 1. Status
 
-Branch: `ai/typesafe-roundhouse-routing-6016d1`, pushed to `origin`. Last update: 2026-09-17 19:50 UTC.
+Branch: `ai/typesafe-roundhouse-routing-6016d1`, pushed to `origin`. Last update: 2026-09-17 19:55 UTC.
 
 | Rung | What | Status | Commit |
 |---|---|---|---|
@@ -19,7 +19,7 @@ Branch: `ai/typesafe-roundhouse-routing-6016d1`, pushed to `origin`. Last update
 | C2 | Second Anthropic breakpoint | done, mutation-checked. Live evidence is still necessary. | `22e58ce`, `d7f69ce` |
 | C3 | The Dynamo residency call becomes a decision | done, mutation-checked | `8817db0` |
 | C4 | 1-hour TTL as one per-target setting | not started | |
-| C5 | Local TTFT quote reads the residency answer | not started | |
+| C5 | Local TTFT quote reads the residency answer | mechanism done. No loader sets the slope yet. | `6e905ba` |
 | C6 | Observed cache deadline and the return trip | not designed | |
 | C7 | Shadow classifier (T5) | blocked on the owner: T2 and T6 | |
 
@@ -29,8 +29,9 @@ Open items that belong to a finished rung:
 - **C1.** A `Dimensions` pick of the `Efficient` tier is not reachable at the shipped threshold, because `production_intensity` has a maximum of `tanh(0.5)`. The guard test for a pick that is not `TestsPassed` uses the `Ambiguous` default.
 - **C3.** Both skips shipped: `tools_declared` and `policy_admits_no_local`. A skipped quote leaves no local candidate to count, so the audit note for the tool exclusion and the `NoToolCapableTarget` refusal now read `local_withheld_by_tools`. The plan did not predict this. The test `messages_api_surface::f2_...` found it.
 - **C3.** On a turn where the call is made, a fleet error still fails the turn. That is unchanged on purpose. A sub-budget and a fail-open arm for the quote are a separate decision.
+- **C5.** `main.rs:946-961` builds `EngineConfig` from defaults and sets only `arm_salt`. So `local_ttft_ms_per_prefill_token` is `0.0` in a deployment, and the local quote is still flat there. Neither local TTFT field has a configuration loader. The next step for C5 is that loader, and the slope value must come from a measured prefill rate of the deployment. C5 ran after the workspace suite. Its gates were the `roundhouse-fleet` suite (160 passed), a workspace check with tests, and `mcp_surface` (20 passed).
 - **C2.** No live request exists yet that shows `cache_read_input_tokens > 0` after an append of 20 or more items.
-- **All.** No full `cargo test --workspace` run exists for the branch head. The per-crate suites for `roundhouse-core`, `roundhouse-fleet`, and `roundhouse-server` were green after C2.
+- **All.** The full workspace suite ran under `timeout 900` at `6ab8908` (C1 to C3): 111 test binaries, 1649 passed, 0 failed. No ignore from this work remains in `crates/`.
 
 Decisions that only the owner can make:
 
@@ -43,10 +44,17 @@ The mutation checks used `sed` to change one token, ran the suite, and used `sed
 
 1. Read `CLAUDE.md`, then the ruling and its addendum, then this plan.
 2. Run `git fetch origin` and compare the branch in the status table with `origin`. Trust only pushed state.
-3. Take the first rung whose status is not `done`. Each rung lists its tests first. Write them, watch them fail, then write the fix.
+3. The next rung is C4. After C4, the order is: the loader for C5, the seventh row for C1, the live evidence for C2, then C6. C7 waits for the owner. In general, take the first rung whose status is not `done`. Each rung lists its tests first. Write them, watch them fail, then write the fix.
 4. Run cargo commands one at a time. The box has four cores and one build lock. Put `timeout 300` before a targeted test command and `timeout 900` before a workspace test command.
 5. Commit before any mutation stage. Commit with `--no-gpg-sign`. Push through the `gh` credential helper. `~/.gitconfig` rewrites `https://github.com/` to SSH, so put `GIT_CONFIG_GLOBAL=/dev/null` before the push command when the SSH agent does not answer.
-6. Each rung ships as its own PR from the current `main`. The commits on the working branch are separated by rung so that a cherry-pick is clean.
+6. Each rung ships as its own PR from the current `main`. No PR exists yet. The commits on the working branch are separated by rung, so a cherry-pick onto a branch from `main` is clean. The split:
+   - Documents: `e48b13b`, `be2bd66`, `6ab8908`, and each later commit that changes only `agent-docs/`.
+   - C1: `35839e2` (the `stage.rs` part) and `83ac785`.
+   - C2: `35839e2` (the `anthropic_messages.rs` part), `22e58ce`, and `d7f69ce`.
+   - C3: `8817db0`.
+   - C5: `6e905ba`. It has no overlap with C1 to C3 outside `engine.rs`.
+   - C2 and C3 both add a field to literals in shared test files, so put C2 before C3 or expect small conflicts.
+7. Before a PR asks for human review, run `wills-mega-review` on it. Write the PR text with the `simple-english` skill. No PR text and no commit message names the assistant.
 
 ## 3. The rungs
 
