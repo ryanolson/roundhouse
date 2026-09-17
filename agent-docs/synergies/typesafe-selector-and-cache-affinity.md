@@ -247,3 +247,13 @@ The guard does not price the return trip. A move that is cheaper for this turn c
 3. **The residency call becomes a routing decision.** The call is an HTTP request on the path to first token. The router makes the call only when the answer can change the decision. The skip conditions and the record that a skip leaves in `Routed` are in the carry-over plan.
 
 A warm local target that stays warm for hours also changes the arithmetic of section 4. A return to a local target after a long build costs nothing extra. A return to an Anthropic target after 5 minutes costs a full write. This asymmetry is a reason to prefer the local target for sessions with long idle periods, and the observed deadline from section 6 is the input that lets a policy see it.
+
+## Addendum (2026-09-17, later): C1 to C3 are built
+
+Section 8 names two ignored claim tests. Both are live now, and both fixes are on the branch. `../PLAN-cache-affinity.md` section 1 has the commits and the mutation evidence.
+
+- **C1, the dominance guard (T4).** Built as the first addendum describes.
+- **C2, the second Anthropic breakpoint.** `body()` also marks the block that the previous request to the same target marked, when that block is 20 or more positions before the penultimate block and two marker slots are free. The count comes from the ledger, and the ledger takes it at the `Routed` fold. This is projection 1 of section 6. The evidence test now states the reach of the provider as a literal, so a wrong production constant fails the test.
+- **C3, the residency call as a decision.** The engine asks the fleet for a local quote only when the turn declares no tools and the turn policy admits a local target. `DecisionRecord.local_quote_skipped` records the reason. Before this change, a fleet error failed a tool turn that was always going to a frontier target. Four tests proved that under mutation.
+
+Gap 1 and gap 2 of section 5 are closed in code. Gap 2 still needs one live request as evidence. Gaps 3 and 7 are rungs C4 and C5 of the plan, not started.

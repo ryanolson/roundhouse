@@ -9,7 +9,35 @@ SPDX-License-Identifier: Apache-2.0
 
 ## 1. Status
 
-<!-- STATUS -->
+Branch: `ai/typesafe-roundhouse-routing-6016d1`, pushed to `origin`. Last update: 2026-09-17 19:50 UTC.
+
+| Rung | What | Status | Commit |
+|---|---|---|---|
+| Evidence | Two ignored claim tests with live controls | done | `35839e2` |
+| Documents | The TypeSafe read, the ruling, the addendum, this plan | done | `e48b13b`, `be2bd66` |
+| C1 | Dominance guard on `Efficient` picks (T4) | done, mutation-checked | `83ac785` |
+| C2 | Second Anthropic breakpoint | done, mutation-checked. Live evidence is still necessary. | `22e58ce`, `d7f69ce` |
+| C3 | The Dynamo residency call becomes a decision | done, mutation-checked | `8817db0` |
+| C4 | 1-hour TTL as one per-target setting | not started | |
+| C5 | Local TTFT quote reads the residency answer | not started | |
+| C6 | Observed cache deadline and the return trip | not designed | |
+| C7 | Shadow classifier (T5) | blocked on the owner: T2 and T6 | |
+
+Open items that belong to a finished rung:
+
+- **C1.** `crates/roundhouse-server/tests/handoff_escalation.rs:18-31` has a table of "six ways" with one test for each. A turn that the cost guard redirects is a seventh case at that seam. It needs an engine-level test and a row in that table.
+- **C1.** A `Dimensions` pick of the `Efficient` tier is not reachable at the shipped threshold, because `production_intensity` has a maximum of `tanh(0.5)`. The guard test for a pick that is not `TestsPassed` uses the `Ambiguous` default.
+- **C3.** Both skips shipped: `tools_declared` and `policy_admits_no_local`. A skipped quote leaves no local candidate to count, so the audit note for the tool exclusion and the `NoToolCapableTarget` refusal now read `local_withheld_by_tools`. The plan did not predict this. The test `messages_api_surface::f2_...` found it.
+- **C3.** On a turn where the call is made, a fleet error still fails the turn. That is unchanged on purpose. A sub-budget and a fail-open arm for the quote are a separate decision.
+- **C2.** No live request exists yet that shows `cache_read_input_tokens > 0` after an append of 20 or more items.
+- **All.** No full `cargo test --workspace` run exists for the branch head. The per-crate suites for `roundhouse-core`, `roundhouse-fleet`, and `roundhouse-server` were green after C2.
+
+Decisions that only the owner can make:
+
+1. T2: amend R3 so that a classifier can supply a signal on the turn path, or keep R3 and use the classifier offline only.
+2. T6: the egress posture for prompt content.
+
+The mutation checks used `sed` to change one token, ran the suite, and used `sed` to restore the token. `git diff --quiet crates/` confirmed each restore. C1: `<` to `<=` turned `a_tie_in_quoted_cost_keeps_the_efficient_pick_and_its_source` red. C2: `CACHE_LOOKBACK_BLOCKS` from 20 to 21 turned the evidence test red. C3: a predicate that never skips turned four of the five tests in `tests/local_quote_skip.rs` red, and the control stayed green. The C3 stage wrote its tests before the fix but did not run them before the fix, so this mutation is the evidence that they fail without it.
 
 ## 2. How to continue
 
@@ -17,7 +45,7 @@ SPDX-License-Identifier: Apache-2.0
 2. Run `git fetch origin` and compare the branch in the status table with `origin`. Trust only pushed state.
 3. Take the first rung whose status is not `done`. Each rung lists its tests first. Write them, watch them fail, then write the fix.
 4. Run cargo commands one at a time. The box has four cores and one build lock. Put `timeout 300` before a targeted test command and `timeout 900` before a workspace test command.
-5. Commit before any mutation stage. Commit with `--no-gpg-sign`. Push through the `gh` credential helper.
+5. Commit before any mutation stage. Commit with `--no-gpg-sign`. Push through the `gh` credential helper. `~/.gitconfig` rewrites `https://github.com/` to SSH, so put `GIT_CONFIG_GLOBAL=/dev/null` before the push command when the SSH agent does not answer.
 6. Each rung ships as its own PR from the current `main`. The commits on the working branch are separated by rung so that a cherry-pick is clean.
 
 ## 3. The rungs
