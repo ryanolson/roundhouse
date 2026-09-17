@@ -461,6 +461,14 @@ pub struct EngineConfig {
     pub local_quality_prior: f64,
     /// Latency floor attributed to a local worker before prefill.
     pub local_base_ttft_ms: f64,
+    /// Slope from the residency answer's `effective_prefill_tokens` to a TTFT
+    /// term, the local mirror of a frontier spec's `ttft_ms_per_uncached_token`.
+    ///
+    /// A slope is a measured property of a deployment's prefill rate --
+    /// configuration, not a guess -- so the default is `0.0`, which reproduces
+    /// the old flat `local_base_ttft_ms` quote exactly for every deployment
+    /// that has not measured one.
+    pub local_ttft_ms_per_prefill_token: f64,
     pub expected_output_tokens: u32,
     /// Bounds the model work of a single turn.
     ///
@@ -495,6 +503,7 @@ impl Default for EngineConfig {
             routing_group: "default".to_string(),
             local_quality_prior: 0.6,
             local_base_ttft_ms: 60.0,
+            local_ttft_ms_per_prefill_token: 0.0,
             expected_output_tokens: 256,
             turn_deadline_ms: 120_000,
             arm_salt: String::new(),
@@ -2065,6 +2074,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             candidates.push(quote.to_candidate(
                 self.config.local_quality_prior,
                 self.config.local_base_ttft_ms,
+                self.config.local_ttft_ms_per_prefill_token,
             ));
         }
         candidates.extend(self.frontier_catalog.quote(

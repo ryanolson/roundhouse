@@ -291,7 +291,7 @@ async fn growing_context_costs_more_prefill_and_the_quote_tracks_it() {
     );
 
     // Both project onto the shared axis the policy compares on.
-    let candidate = long_quote.to_candidate(0.6, 80.0);
+    let candidate = long_quote.to_candidate(0.6, 80.0, 0.0);
     assert_eq!(candidate.expected_cost_usd, 0.0);
     assert!(candidate.load.is_some(), "local load must be observable");
 }
