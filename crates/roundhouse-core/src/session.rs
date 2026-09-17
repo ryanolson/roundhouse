@@ -97,6 +97,15 @@ struct PendingRouting {
     /// [`DecisionRecord::budget_draw`], the last live read a settle used to
     /// make.
     budget_draw: Option<BudgetCounts>,
+    /// How many items the prompt this dispatch sent was rendered from.
+    ///
+    /// **Read at the `Routed` fold and carried, for the same reason the rate
+    /// card above is.** The log's order within one turn is `TurnStarted`, this
+    /// turn's input `ItemAppended`s, `Routed`, then the *output* items, then the
+    /// terminal event — so `items.len()` at the terminal fold counts blocks the
+    /// provider never saw, and a ledger filled from there would tell the next
+    /// request its cache entry sits further along the prompt than it does.
+    segment_count: u64,
 }
 
 /// A response that terminated, and everything needed to charge it for.
@@ -625,6 +634,11 @@ impl SessionState {
                         payer: decision.payer,
                         billing: decision.billing,
                         budget_draw: decision.budget_draw,
+                        // Taken here and not at the terminal fold; see the
+                        // field. This turn's input is already folded in and its
+                        // output is not, so this is exactly the item list the
+                        // dispatch about to happen renders.
+                        segment_count: self.items.len() as u64,
                     },
                 );
             }
@@ -649,8 +663,12 @@ impl SessionState {
                         matches!(event.kind, SessionEventKind::ResponseCompleted { .. })
                             || usage.input_tokens > 0;
                     if processed {
-                        self.ledger
-                            .record(&routing.target, event.at_ms, routing.isl_tokens);
+                        self.ledger.record(
+                            &routing.target,
+                            event.at_ms,
+                            routing.isl_tokens,
+                            routing.segment_count,
+                        );
                     }
                 }
 

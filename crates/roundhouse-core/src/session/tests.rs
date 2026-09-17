@@ -297,6 +297,124 @@ async fn the_settlement_projection_names_the_last_terminal_event_and_where_it_we
     );
 }
 
+/// The count the wire needs is the count at *dispatch*, and the log's order
+/// within a turn is what makes those two different numbers.
+///
+/// `TurnStarted`, this turn's input items, `Routed`, then the output items,
+/// then the terminal event. A ledger filled from `items.len()` at the terminal
+/// fold would count the answer the provider produced as blocks the provider was
+/// sent, and the next request's lookback marker would be placed past the end of
+/// what was actually cached.
+#[tokio::test]
+async fn the_ledger_records_the_item_count_the_turn_was_dispatched_with() {
+    let store = Arc::new(MemoryStore::new());
+    let (_, mut session) = new_session(store, "node-a").await;
+
+    let admission = session
+        .begin_turn(
+            TurnId::new("t1"),
+            vec![Item::user_text("one"), Item::user_text("two")],
+        )
+        .await
+        .unwrap();
+    let response_id = admission.response_id().clone();
+    let target = Target::Frontier {
+        provider: "anthropic".into(),
+        model: "claude".into(),
+    };
+    session
+        .record_routing(&response_id, decision_for(target.clone(), 8_192))
+        .await
+        .unwrap();
+    let at_dispatch = session.state().items.len();
+    assert_eq!(at_dispatch, 2, "the two input items and nothing else");
+
+    session
+        .complete(
+            &response_id,
+            Some("an answer"),
+            Usage::default(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        session.state().items.len(),
+        3,
+        "the answer is an item too, which is exactly the trap"
+    );
+
+    let state = session
+        .ledger()
+        .state_for(&target)
+        .expect("a completed dispatch is ledger evidence");
+    assert_eq!(
+        state.last_segment_count, at_dispatch as u64,
+        "the prompt the provider cached had {at_dispatch} blocks; recording \
+         the terminal count instead would place the next request's lookback \
+         marker past the end of that entry"
+    );
+}
+
+/// The ledger is a projection of the log, so a successor that replays it has to
+/// reach the same block count without being told.
+///
+/// This is what makes the new field derive rather than migrate: no event
+/// changed, and a node that took over mid-session would otherwise place a
+/// lookback marker the original node would not have.
+#[tokio::test]
+async fn a_replayed_log_reconstructs_the_same_last_segment_count() {
+    let store = Arc::new(MemoryStore::new());
+    let (sid, mut session) = new_session(store.clone(), "node-a").await;
+
+    let admission = session
+        .begin_turn(
+            TurnId::new("t1"),
+            vec![Item::user_text("one"), Item::user_text("two")],
+        )
+        .await
+        .unwrap();
+    let response_id = admission.response_id().clone();
+    let target = Target::Frontier {
+        provider: "anthropic".into(),
+        model: "claude".into(),
+    };
+    session
+        .record_routing(&response_id, decision_for(target.clone(), 8_192))
+        .await
+        .unwrap();
+    session
+        .complete(
+            &response_id,
+            Some("an answer"),
+            Usage::default(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let recorded = session
+        .ledger()
+        .state_for(&target)
+        .expect("a completed dispatch is ledger evidence");
+
+    drop(session);
+    store.expire_lease_now(&sid).await;
+    let successor = Session::open(store, sid, "node-b", TTL, CacheLedger::new())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        successor
+            .ledger()
+            .state_for(&target)
+            .expect("the replay folds the same dispatch")
+            .last_segment_count,
+        recorded.last_segment_count
+    );
+}
+
 #[tokio::test]
 async fn a_dispatch_that_never_terminates_leaves_the_target_cold() {
     let store = Arc::new(MemoryStore::new());

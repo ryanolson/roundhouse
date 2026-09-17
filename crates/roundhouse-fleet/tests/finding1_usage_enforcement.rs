@@ -59,6 +59,7 @@ fn quote_as_the_engine_builds_it(catalog: &StaticFrontierCatalog) -> FrontierQuo
         .expect("the catalog priced this target, so it owns its spec");
 
     FrontierQuote {
+        previous_breakpoint: None,
         wire_protocol: spec.wire_protocol,
         target: candidate.target,
         prompt: "how many tokens did that turn bill?".into(),

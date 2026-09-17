@@ -2578,6 +2578,16 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                     // saw and subtract a prefill it never did (F4).
                     conversation_tokens,
                     deadline_at,
+                    // The penultimate block of the prompt the *previous*
+                    // dispatch to this target sent — `n` items give `n`
+                    // segments, so the block it marked is `n - 2`. Read after
+                    // `record_routing` above and still the previous turn's
+                    // state, because the ledger folds a dispatch at its terminal
+                    // event and not at `Routed`.
+                    session
+                        .ledger()
+                        .state_for(&target)
+                        .and_then(|state| (state.last_segment_count as usize).checked_sub(2)),
                     declarations,
                 )
                 .await
@@ -2683,6 +2693,11 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         // worker is sent the prompt buffer alone; see the call site (F4).
         conversation_tokens: usize,
         deadline_at: Instant,
+        // The block this target's previous dispatch marked, if the ledger
+        // remembers one. Resolved by the caller rather than here: `connect`
+        // holds no session, and the value is a fact about *this* target, so the
+        // failover loop re-derives it for every attempt.
+        previous_breakpoint: Option<usize>,
         // What the client declared, for the dialects that can express it.
         //
         // **Only the frontier arm below reads it, and that is two separate
@@ -2784,6 +2799,14 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                     // the one part of this prompt that is new this turn and
                     // must not be inside the block a breakpoint caches.
                     segment_boundaries,
+                    // **Where the *previous* request to this same target left
+                    // its cache entry**, so a client whose provider only looks a
+                    // bounded distance back from a marker can still reach it
+                    // after a long append. Derived per attempt at the call site
+                    // from the ledger, because a failover target has its own
+                    // history and inheriting the first choice's would name a
+                    // block nothing ever wrote.
+                    previous_breakpoint,
                     session_id: request_context.and_then(|context| context.session_id.clone()),
                     thread_id: request_context.and_then(|context| context.thread_id.clone()),
                     prompt_cache_key: request_context

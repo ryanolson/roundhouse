@@ -607,6 +607,11 @@ impl<T: Tokenizer + Clone> FleetJudge<T> {
             // (`ContextAssembler`) is what keeps the segments a slicing of a
             // render rather than a convention each call site invents.
             segment_boundaries: Vec::new(),
+            // And no previous marker either, which follows from the line above
+            // rather than being a second decision: a judge call has no prior
+            // dispatch of *this* prompt to share a cache entry with, and the
+            // ledger it would be read from is the conversation's.
+            previous_breakpoint: None,
             // The isolation, and the one line of this file that would be
             // easiest to get subtly wrong: the *conversation's* key here would
             // cool the hit the router priced for the next real turn.

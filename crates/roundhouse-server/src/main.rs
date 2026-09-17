@@ -1333,6 +1333,7 @@ mod tests {
                 wire_protocol,
                 prompt: "hi".into(),
                 segment_boundaries: Vec::new(),
+                previous_breakpoint: None,
                 session_id: None,
                 thread_id: None,
                 prompt_cache_key: "sess".into(),

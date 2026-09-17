@@ -556,6 +556,7 @@ mod tests {
 
     fn quote(credential: TurnCredential, wire_protocol: WireProtocol) -> FrontierQuote {
         FrontierQuote {
+            previous_breakpoint: None,
             target: Target::Frontier {
                 provider: "openai".into(),
                 model: "flagship".into(),

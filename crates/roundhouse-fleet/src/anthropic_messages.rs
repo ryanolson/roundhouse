@@ -34,6 +34,10 @@
 //!    *nothing* without an explicit breakpoint, so flat-string parity with the
 //!    Responses client would zero the provider cache discount on every Anthropic
 //!    turn — against the sentence this product is built to satisfy. Ruling R3.
+//!    Up to two markers ride the blocks: the penultimate one, and — when the
+//!    turn appended enough items to put the previous request's entry outside the
+//!    provider's [`CACHE_LOOKBACK_BLOCKS`] window — one back where that entry
+//!    lives.
 //! 5. **No route here follows a redirect, the stored one included.** The
 //!    Responses client keeps an ordinary redirect-following transport for its
 //!    own key; that is safe only because a stored OpenAI key rides
@@ -202,6 +206,19 @@ pub const DEFAULT_MAX_TOKENS: u32 = 8192;
 /// the number and the reason it exists sit together; if Anthropic raises it,
 /// this is the line that moves.
 const MAX_CACHE_BREAKPOINTS: usize = 4;
+
+/// How many block positions back from a `cache_control` marker the provider
+/// looks for a cache entry, counting the marker's own block.
+///
+/// **The number that makes one breakpoint per request insufficient.** Anthropic
+/// documents this bound
+/// (platform.claude.com/docs/en/build-with-claude/prompt-caching), and it is
+/// what turns a long append into a total miss: a request whose only marker sits
+/// this far past the previous request's marker reaches nothing, even though the
+/// blocks in between are byte-identical to what was cached. A constant rather
+/// than a literal so the number and the consequence sit together; if Anthropic
+/// widens the window, this is the line that moves.
+const CACHE_LOOKBACK_BLOCKS: usize = 20;
 
 /// The dialect this client serializes. Anything else is refused rather than
 /// mis-serialized — see [`FrontierError::UnsupportedDialect`].
@@ -394,9 +411,46 @@ impl AnthropicMessagesClient {
         // re-mark on the next turn. Dropping theirs to keep ours would trade a
         // bigger discount for a smaller one; sending both is a 400 that costs
         // the turn.
+        //
+        // **And the same yield, one slot later, decides the second marker
+        // below.** With two free slots this request marks the penultimate block
+        // *and* the block the previous request to this target marked; with one,
+        // the penultimate marker takes it; with none, neither is sent.
         let breakpoint = match riding + 1 <= MAX_CACHE_BREAKPOINTS {
             true => segments.len().checked_sub(2),
             false => None,
+        };
+        // **A second marker, back where the previous request wrote its entry.**
+        //
+        // Anthropic's cache lookup examines at most
+        // [`CACHE_LOOKBACK_BLOCKS`] block positions back from a marker, counting
+        // the marker itself. A session that appends that many items between two
+        // turns therefore puts the penultimate marker out of the previous
+        // write's reach — the prefix bytes are still byte-identical and the turn
+        // still reads nothing, which is the one failure mode a breakpoint
+        // strategy exists to avoid. Marking the earlier block as well puts the
+        // old entry back inside a window, so the long tail is read rather than
+        // re-prefilled.
+        //
+        // **The penultimate marker wins the last free slot**, which is why this
+        // is derived from `breakpoint` rather than beside it. A lone marker at
+        // `previous` reads this turn's cache and then moves nothing forward, so
+        // every later turn pays plain input on an ever-longer tail; a lone
+        // penultimate marker pays one write now and makes every later turn a
+        // hit. One turn of saving against every turn after it is not a close
+        // call.
+        //
+        // Dropped rather than sent when it is not strictly earlier than the
+        // penultimate block — a previous count that is not smaller means the
+        // conversation stopped being append-only, and a marker derived from it
+        // names a block that is not the one that was written. Dropped too when
+        // the gap is inside the window, because the penultimate marker already
+        // reaches the old entry and a second one would only pay a second write.
+        let previous = match breakpoint {
+            Some(penultimate) if riding + 2 <= MAX_CACHE_BREAKPOINTS => quote
+                .previous_breakpoint
+                .filter(|p| *p < penultimate && penultimate - *p >= CACHE_LOOKBACK_BLOCKS),
+            _ => None,
         };
         // Built out of [`wire::ContentBlock`] rather than hand-written JSON,
         // because this is the one place roundhouse *originates* this wire's
@@ -410,7 +464,8 @@ impl AnthropicMessagesClient {
             .enumerate()
             .map(|(index, text)| ContentBlock::Text {
                 text: (*text).to_string(),
-                cache_control: (Some(index) == breakpoint).then(CacheControl::ephemeral),
+                cache_control: (Some(index) == breakpoint || Some(index) == previous)
+                    .then(CacheControl::ephemeral),
                 extra: Extra::new(),
             })
             .collect();
@@ -820,6 +875,9 @@ mod tests {
             wire_protocol,
             prompt: prompt(),
             segment_boundaries: boundaries(),
+            // No prior dispatch on these fixtures; the tests that need one set
+            // it, the way they set tools.
+            previous_breakpoint: None,
             session_id: None,
             thread_id: None,
             prompt_cache_key: "sess_anthropic".into(),
@@ -1558,14 +1616,28 @@ mod tests {
         (prompt, boundaries)
     }
 
-    /// The block index carrying the request's one `cache_control` marker, if
-    /// any.
+    /// The block index carrying the request's *first* `cache_control` marker,
+    /// if any.
+    ///
+    /// First and not only: since the lookback marker a request may carry two,
+    /// and the earlier of the two is the one aimed at the previous turn's write.
+    /// Assertions about which block was marked read
+    /// [`breakpoint_indices`] instead, so that a test which means "the
+    /// penultimate block" cannot pass on a marker that happens to sit first.
     fn breakpoint_index(body: &Value) -> Option<usize> {
+        breakpoint_indices(body).first().copied()
+    }
+
+    /// Every block index carrying a `cache_control` marker, in block order.
+    fn breakpoint_indices(body: &Value) -> Vec<usize> {
         body["messages"][0]["content"]
             .as_array()
             .expect("blocks")
             .iter()
-            .position(|block| block.get("cache_control").is_some())
+            .enumerate()
+            .filter(|(_, block)| block.get("cache_control").is_some())
+            .map(|(index, _)| index)
+            .collect()
     }
 
     /// `body()` places at most one
@@ -1579,9 +1651,6 @@ mod tests {
     /// entry becomes unreachable even though the prefix bytes it covers are
     /// still byte-identical.
     #[test]
-    #[ignore = "anthropic-lookback: one penultimate breakpoint per request; an append of 20+ \
-                segments puts the previous write outside the 20-block lookback and the turn \
-                reads nothing from cache"]
     fn a_long_append_keeps_the_previous_cache_write_inside_a_lookback_window() {
         let (prompt1, boundaries1) = segments_of(6);
         let quote1 = FrontierQuote {
@@ -1606,23 +1675,207 @@ mod tests {
         let quote2 = FrontierQuote {
             prompt: prompt2,
             segment_boundaries: boundaries2,
+            // The data flow under test: the ledger remembers that the previous
+            // dispatch to this target marked block `p1`, and the request built
+            // from that knowledge has to reach it.
+            previous_breakpoint: Some(p1),
             ..quote(TurnCredential::Absent, SPOKEN)
         };
         let body2 = AnthropicMessagesClient::body(&quote2, "claude-sonnet").unwrap();
-        let p2 = breakpoint_index(&body2).expect("thirty-one segments still have a stable prefix");
+        let marked = breakpoint_indices(&body2);
+        assert!(
+            !marked.is_empty(),
+            "thirty-one segments still have a stable prefix"
+        );
 
         // The previous write at block `p1` is reachable only from a breakpoint
         // in `p1..=p1+19` -- Anthropic's documented twenty-block lookback,
-        // counting the breakpoint itself.
+        // counting the breakpoint itself. Every marker is checked, not just the
+        // first: "some marker reaches it" is the claim, and reading only one of
+        // two would pass or fail on marker order rather than on reachability.
         assert!(
-            p2 as i64 - p1 as i64 <= 19,
-            "a twenty-five-segment append put the only breakpoint at block \
-             {p2}, {} positions past the previous write at block {p1} -- \
-             outside the documented twenty-block lookback, so the turn reads \
-             nothing from cache although the first six blocks are \
-             byte-identical",
-            p2 - p1
+            marked
+                .iter()
+                .any(|q| *q >= p1 && *q - p1 <= CACHE_LOOKBACK_BLOCKS - 1),
+            "a twenty-five-segment append left every breakpoint of the second \
+             request at {marked:?}, none of them inside the documented \
+             twenty-block lookback from the previous write at block {p1} -- so \
+             the turn reads nothing from cache although the first six blocks \
+             are byte-identical"
         );
+    }
+
+    /// PRESERVATION: the judge's quote shape still carries no `cache_control`.
+    ///
+    /// A side call declares no segment boundaries -- "no structure known", which
+    /// this client answers with one block -- and the lookback marker must not
+    /// change that. A single block is entirely this call's own input, so a
+    /// marker on it would write an entry nothing can read, and a marker derived
+    /// from a `previous_breakpoint` a side call cannot have would name a block
+    /// in a different prompt. `judge.rs` builds exactly this shape.
+    #[test]
+    fn the_judge_quote_still_carries_no_cache_control() {
+        for previous in [None, Some(0), Some(4), Some(40)] {
+            let quote = FrontierQuote {
+                prompt: "a system prompt\n\na brief".into(),
+                segment_boundaries: Vec::new(),
+                previous_breakpoint: previous,
+                ..quote(TurnCredential::Absent, SPOKEN)
+            };
+            let body = AnthropicMessagesClient::body(&quote, "claude-sonnet").unwrap();
+            assert_eq!(
+                breakpoint_indices(&body),
+                Vec::<usize>::new(),
+                "one block is the whole prompt, so a marker at any index -- \
+                 including one carried over from {previous:?} -- names this \
+                 call's own input"
+            );
+        }
+    }
+
+    /// The forwarded tools' allowance decides the lookback marker exactly as it
+    /// decides the penultimate one, and the yield runs the same way round.
+    ///
+    /// A client holding all four markers leaves room for neither, and a fifth
+    /// `cache_control` is a 400 that costs the whole turn -- so a long append on
+    /// such a request is a cache miss we accept rather than a request we cannot
+    /// send.
+    #[test]
+    fn a_request_with_the_client_holding_four_tool_markers_still_sends_none() {
+        let marked = |name: &str| {
+            json!({
+                "name": name,
+                "input_schema": { "type": "object" },
+                "cache_control": { "type": "ephemeral" },
+            })
+        };
+        let (prompt, boundaries) = segments_of(6 + 25);
+        let quote = FrontierQuote {
+            prompt,
+            segment_boundaries: boundaries,
+            previous_breakpoint: Some(4),
+            ..declaring(
+                SPOKEN,
+                json!([marked("A"), marked("B"), marked("C"), marked("D")]),
+                None,
+            )
+        };
+
+        let body = AnthropicMessagesClient::body(&quote, "claude-sonnet").unwrap();
+        assert_eq!(
+            breakpoint_indices(&body),
+            Vec::<usize>::new(),
+            "the allowance is spent; a second block marker is as much of a 400 \
+             as the first would be"
+        );
+    }
+
+    /// One free slot is not two, and the penultimate marker takes it.
+    ///
+    /// A lone marker back at the previous write reads this turn's cache and then
+    /// moves nothing forward, so every later turn pays plain input on a longer
+    /// tail. A lone penultimate marker pays one write now and makes every later
+    /// turn a hit.
+    #[test]
+    fn a_request_with_three_riding_markers_keeps_the_penultimate_and_drops_the_previous() {
+        let marked = |name: &str| {
+            json!({
+                "name": name,
+                "input_schema": { "type": "object" },
+                "cache_control": { "type": "ephemeral" },
+            })
+        };
+        let (prompt, boundaries) = segments_of(6 + 25);
+        let quote = FrontierQuote {
+            prompt,
+            segment_boundaries: boundaries,
+            previous_breakpoint: Some(4),
+            ..declaring(SPOKEN, json!([marked("A"), marked("B"), marked("C")]), None)
+        };
+
+        let body = AnthropicMessagesClient::body(&quote, "claude-sonnet").unwrap();
+        assert_eq!(
+            breakpoint_indices(&body),
+            vec![29],
+            "with one slot free the penultimate block takes it: 31 segments, so \
+             block 29, and not the previous write at block 4"
+        );
+    }
+
+    /// CONTROL for the two above: with no tools riding, the same fixture places
+    /// both markers -- which is what proves those two are about the allowance
+    /// and not about the lookback marker never being placed at all.
+    #[test]
+    fn a_long_append_with_a_free_allowance_places_both_markers() {
+        let (prompt, boundaries) = segments_of(6 + 25);
+        let quote = FrontierQuote {
+            prompt,
+            segment_boundaries: boundaries,
+            previous_breakpoint: Some(4),
+            ..quote(TurnCredential::Absent, SPOKEN)
+        };
+
+        let body = AnthropicMessagesClient::body(&quote, "claude-sonnet").unwrap();
+        assert_eq!(breakpoint_indices(&body), vec![4, 29]);
+    }
+
+    /// An append the penultimate marker already reaches gets no second marker.
+    ///
+    /// The lookback window is the whole justification for the second marker, so
+    /// placing one inside it would pay a cache write for a hit the request was
+    /// already going to get.
+    #[test]
+    fn a_short_append_adds_no_second_marker() {
+        let (prompt1, boundaries1) = segments_of(6);
+        let quote1 = FrontierQuote {
+            prompt: prompt1,
+            segment_boundaries: boundaries1,
+            ..quote(TurnCredential::Absent, SPOKEN)
+        };
+        let body1 = AnthropicMessagesClient::body(&quote1, "claude-sonnet").unwrap();
+        let p1 = breakpoint_index(&body1).expect("six segments have a stable prefix to mark");
+
+        let (prompt2, boundaries2) = segments_of(6 + 3);
+        let quote2 = FrontierQuote {
+            prompt: prompt2,
+            segment_boundaries: boundaries2,
+            previous_breakpoint: Some(p1),
+            ..quote(TurnCredential::Absent, SPOKEN)
+        };
+        let body2 = AnthropicMessagesClient::body(&quote2, "claude-sonnet").unwrap();
+        assert_eq!(
+            breakpoint_indices(&body2),
+            vec![7],
+            "block 7 is five positions past the previous write at block {p1}, \
+             well inside the lookback -- a second marker there buys nothing and \
+             costs a write"
+        );
+    }
+
+    /// A previous count that is not *behind* the penultimate block is not a
+    /// previous write this request can reach.
+    ///
+    /// A conversation that stopped being append-only -- a compaction, an edited
+    /// history -- leaves a remembered block index that names different bytes
+    /// now. Marking it would pay a write at a position nothing was cached at.
+    #[test]
+    fn a_previous_breakpoint_at_or_past_the_penultimate_block_is_dropped() {
+        let (prompt, boundaries) = segments_of(6);
+        for previous in [4, 5, 40] {
+            let quote = FrontierQuote {
+                prompt: prompt.clone(),
+                segment_boundaries: boundaries.clone(),
+                previous_breakpoint: Some(previous),
+                ..quote(TurnCredential::Absent, SPOKEN)
+            };
+            let body = AnthropicMessagesClient::body(&quote, "claude-sonnet").unwrap();
+            assert_eq!(
+                breakpoint_indices(&body),
+                vec![4],
+                "a previous breakpoint of {previous} against a six-segment \
+                 prompt is not behind this request's penultimate block"
+            );
+        }
     }
 
     /// CONTROL for the claim above: the same fixture and the same shared
