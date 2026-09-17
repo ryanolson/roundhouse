@@ -232,6 +232,7 @@ mod tests {
                 kind: SessionEventKind::Routed {
                     response_id: response_id.clone(),
                     decision: DecisionRecord {
+                        local_quote_skipped: None,
                         chosen: Target::Frontier {
                             provider: "anthropic".into(),
                             model: "claude".into(),

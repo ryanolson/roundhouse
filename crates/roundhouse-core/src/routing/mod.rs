@@ -98,9 +98,22 @@ impl Target {
                 model,
                 worker_id: _,
                 dp_rank: _,
-            } => format!("local/{model}"),
+            } => Self::local_policy_identity(model),
             Target::Frontier { provider, model } => format!("{provider}/{model}"),
         }
+    }
+
+    /// The identity above for a local worker nobody has picked yet.
+    ///
+    /// A router that wants to know whether a policy names its fleet at all has
+    /// to ask before a worker exists — the selector's answer is what names one
+    /// — and the answer is well defined because [`Self::policy_identity`]
+    /// deliberately drops `worker_id` and `dp_rank`. Spelled here rather than
+    /// formatted at the call site so the `local/` prefix has one definition:
+    /// two of them would let a caller's filter match a target the policy layer
+    /// spells differently.
+    pub fn local_policy_identity(model: &str) -> String {
+        format!("local/{model}")
     }
 
     /// Stable key for ledger lookups.
@@ -717,6 +730,48 @@ pub struct DecisionRecord {
     /// decision bytes it wrote before failover existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attempts: Vec<DispatchAttempt>,
+    /// Why this turn never asked the local fleet what it was holding.
+    ///
+    /// **"Not quoted" and "quoted and rejected" are different answers**, and a
+    /// dashboard that cannot tell them apart reports a fleet the router keeps
+    /// turning down when the truth is a fleet the router never asked. The
+    /// quote is a realtime residency check over HTTP on the path to first
+    /// token, so it is made only when its answer could still move the
+    /// decision; this is what that decision wrote down.
+    ///
+    /// `None` on a turn that *was* quoted, whatever the quote said, and also
+    /// on a deployment with no fleet configured — there was nothing to skip,
+    /// and a variant for it would be a second spelling of the absent fleet the
+    /// rest of the record already implies.
+    ///
+    /// Skipped on the wire when absent, and defaulted on the way in, so a log
+    /// written before this field existed still deserializes and a deployment
+    /// that always quotes writes the bytes it wrote before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_quote_skipped: Option<LocalQuoteSkip>,
+}
+
+/// Why a turn's local residency check was not made.
+///
+/// Typed rather than a message, because the consumer is a projection and not a
+/// reader: these records are persisted, replayed and folded, and a
+/// `&'static str` written by one build is a string a later one has to match on
+/// to count anything. The variants are reachability facts — the same answer on
+/// every turn of every session that looks like this one — which is why a
+/// squeezed budget and a spent cadence are deliberately absent: both make a
+/// local route *more* likely, so skipping the quote under them would skip it
+/// exactly when it mattered most.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalQuoteSkip {
+    /// The client declared a toolbox, and a local worker cannot carry one.
+    ///
+    /// The exclusion downstream in the engine is unconditional, so the quote
+    /// would have been thrown away on arrival.
+    ToolsDeclared,
+    /// This principal's policy names no local target, so a quote would have
+    /// produced a candidate the pre-`choose` filter drops.
+    PolicyAdmitsNoLocal,
 }
 
 /// One dispatch that failed and was fallen forward from.
@@ -982,6 +1037,7 @@ mod tests {
         // And a record written today round-trips its digest, or replaying a
         // log would report constraints that were never in force.
         let digested = DecisionRecord {
+            local_quote_skipped: None,
             turn_policy_digest: "0123456789abcdef".into(),
             ..record
         };
@@ -999,6 +1055,7 @@ mod tests {
         // deserializing, or an upgrade takes the deployment's routing history
         // with it.
         let record = DecisionRecord {
+            local_quote_skipped: None,
             chosen: Target::Frontier {
                 provider: "anthropic".into(),
                 model: "claude".into(),
@@ -1073,6 +1130,12 @@ mod tests {
         }"#;
         let recovered: DecisionRecord = serde_json::from_str(pre_m3).unwrap();
         assert_eq!(
+            recovered.local_quote_skipped, None,
+            "a log written before the residency call became a decision records \
+             no skip, which is the correct reading of it: every one of those \
+             turns really did ask the fleet"
+        );
+        assert_eq!(
             recovered.budget_state,
             BudgetState::Unconstrained,
             "a turn taken before budgets existed was taken under no budget, \
@@ -1130,6 +1193,7 @@ mod tests {
         // turn's absent basis, so a deployment that configures neither keeps
         // writing exactly the bytes it wrote before the two fields existed.
         let ordinary = DecisionRecord {
+            local_quote_skipped: None,
             payer: Payer::Deployment,
             budget_draw: None,
             withheld_providers: Vec::new(),

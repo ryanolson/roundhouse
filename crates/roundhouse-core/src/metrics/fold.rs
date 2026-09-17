@@ -1227,6 +1227,7 @@ pub(super) mod tests {
             self.push(SessionEventKind::Routed {
                 response_id: response_id.clone(),
                 decision: DecisionRecord {
+                    local_quote_skipped: None,
                     chosen: target,
                     rationale: "test".into(),
                     policy: "test".into(),
@@ -1270,6 +1271,7 @@ pub(super) mod tests {
             self.push(SessionEventKind::Routed {
                 response_id: response_id.clone(),
                 decision: DecisionRecord {
+                    local_quote_skipped: None,
                     chosen: target,
                     rationale: "test".into(),
                     policy: "test".into(),

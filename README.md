@@ -135,6 +135,13 @@ The **select/reserve split** is what makes cross-provider routing possible at
 all: price the local option, compare it against a frontier model, and only book
 if local wins. An abandoned quote costs nothing; the pending selection expires.
 
+Pricing the local option is itself a realtime residency check over HTTP, on the
+path to first token, so the router makes it only when the answer could still
+move the decision — not when the client declared a toolbox no local worker can
+carry, and not when the principal's policy names no local target. The decision
+record says which of those it was, so "never asked" stays distinguishable from
+"asked and turned down".
+
 The reservation lifecycle (`prefill_complete` → `release`) is **mandatory** — a
 leaked reservation permanently inflates the router's view of a worker and
 silently distorts every later decision.

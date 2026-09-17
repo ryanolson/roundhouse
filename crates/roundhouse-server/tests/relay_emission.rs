@@ -84,6 +84,7 @@ fn decision(chosen: Target) -> DecisionRecord {
         Some(HOSTED)
     };
     DecisionRecord {
+        local_quote_skipped: None,
         attempts: Vec::new(),
         declared_baseline: None,
         chosen,

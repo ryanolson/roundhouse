@@ -215,10 +215,15 @@ impl TargetFilter {
 
     /// Whether this filter names `target`.
     pub fn matches(&self, target: &Target) -> bool {
-        let identity = target.policy_identity();
+        self.matches_identity(&target.policy_identity())
+    }
+
+    /// [`Self::matches`] against an identity nothing has picked a target for
+    /// yet — see [`Target::local_policy_identity`].
+    pub fn matches_identity(&self, identity: &str) -> bool {
         self.layers
             .iter()
-            .all(|layer| layer.iter().any(|pattern| glob_match(pattern, &identity)))
+            .all(|layer| layer.iter().any(|pattern| glob_match(pattern, identity)))
     }
 
     /// Intersect with `other`: the result admits a target only if both did.
@@ -589,7 +594,21 @@ impl TurnPolicy {
     /// stood for. Naming the question is the fix; the fabricated history is
     /// what a reader had to decode.
     pub fn permits(&self, candidate: &Candidate) -> bool {
-        candidate.quality_prior >= self.min_quality && self.allow.matches(&candidate.target)
+        self.permits_identity(&candidate.target.policy_identity(), candidate.quality_prior)
+    }
+
+    /// [`Self::permits`] asked of a target that has not been quoted yet.
+    ///
+    /// Both axes this reads are known before any quote exists — a policy
+    /// identity drops the worker, and a local worker's `quality_prior` is the
+    /// engine's configured value rather than anything the selector reports —
+    /// so this is the same answer, obtained one HTTP round-trip earlier. That
+    /// is the whole of its reason to exist: the engine asks it to decide
+    /// whether pricing the local fleet can change this turn's route at all,
+    /// and a caller that had to build a `Candidate` first would have to
+    /// fabricate the very numbers the quote was going to supply.
+    pub fn permits_identity(&self, policy_identity: &str, quality_prior: f64) -> bool {
+        quality_prior >= self.min_quality && self.allow.matches_identity(policy_identity)
     }
 
     /// The highest [`Candidate::quality_prior`] this policy still permits, or

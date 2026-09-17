@@ -138,6 +138,7 @@ fn log(calls: &[Usage]) -> Vec<SessionEvent> {
             SessionEventKind::Routed {
                 response_id: response_id.clone(),
                 decision: DecisionRecord {
+                    local_quote_skipped: None,
                     chosen: frontier(),
                     rationale: "test".into(),
                     policy: "test".into(),
