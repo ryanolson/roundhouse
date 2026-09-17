@@ -1661,11 +1661,13 @@ mod tests {
         let body1 = AnthropicMessagesClient::body(&quote1, "claude-sonnet").unwrap();
         let p1 = breakpoint_index(&body1).expect("six segments have a stable prefix to mark");
 
-        // Twenty-five items later on the same target: the first six segments
+        // Twenty items later on the same target -- the smallest append the
+        // provider's window misses, so an off-by-one in the production constant
+        // turns this red. The first six segments
         // are the same bytes at the same offsets, which is the premise the
         // assertion below rests on -- checked explicitly rather than merely
         // assumed from `segments_of`'s doc comment.
-        let (prompt2, boundaries2) = segments_of(6 + 25);
+        let (prompt2, boundaries2) = segments_of(6 + 20);
         assert!(
             prompt2.starts_with(&prompt1),
             "the fixture's whole premise: the first six segments must be \
@@ -1685,7 +1687,7 @@ mod tests {
         let marked = breakpoint_indices(&body2);
         assert!(
             !marked.is_empty(),
-            "thirty-one segments still have a stable prefix"
+            "twenty-six segments still have a stable prefix"
         );
 
         // The previous write at block `p1` is reachable only from a breakpoint
@@ -1693,11 +1695,13 @@ mod tests {
         // counting the breakpoint itself. Every marker is checked, not just the
         // first: "some marker reaches it" is the claim, and reading only one of
         // two would pass or fail on marker order rather than on reachability.
+        //
+        // A literal and not `CACHE_LOOKBACK_BLOCKS`: this is the provider's
+        // number, stated independently, so that a wrong production constant
+        // fails here instead of widening the window it is checked against.
         assert!(
-            marked
-                .iter()
-                .any(|q| *q >= p1 && *q - p1 <= CACHE_LOOKBACK_BLOCKS - 1),
-            "a twenty-five-segment append left every breakpoint of the second \
+            marked.iter().any(|q| *q >= p1 && *q - p1 <= 19),
+            "a twenty-segment append left every breakpoint of the second \
              request at {marked:?}, none of them inside the documented \
              twenty-block lookback from the previous write at block {p1} -- so \
              the turn reads nothing from cache although the first six blocks \
