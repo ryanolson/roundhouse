@@ -9,7 +9,7 @@ SPDX-License-Identifier: Apache-2.0
 
 ## 1. Status
 
-Branch: `ai/typesafe-roundhouse-routing-6016d1`, pushed to `origin`. Last update: 2026-09-17 19:55 UTC.
+Branch: `ai/typesafe-roundhouse-routing-6016d1`, pushed to `origin`. Last update: 2026-09-17 20:03 UTC. The session that wrote this table ended here.
 
 | Rung | What | Status | Commit |
 |---|---|---|---|
@@ -25,7 +25,7 @@ Branch: `ai/typesafe-roundhouse-routing-6016d1`, pushed to `origin`. Last update
 
 Open items that belong to a finished rung:
 
-- **C1.** `crates/roundhouse-server/tests/handoff_escalation.rs:18-31` has a table of "six ways" with one test for each. A turn that the cost guard redirects is a seventh case at that seam. It needs an engine-level test and a row in that table.
+- **C1.** Closed in `4bffdcb`. `crates/roundhouse-server/tests/handoff_escalation.rs` had a table of six ways that a turn gets or does not get a handoff note. A turn that the cost guard redirects is the seventh way. The test `a_cost_guarded_turn_narrates_nothing` proves it through the engine with a priced catalog and a warm `Capable` target. With the guard disabled, that test goes red. This commit landed after the last full workspace run. Its gate was the `handoff_escalation` binary: 8 passed, 0 failed.
 - **C1.** A `Dimensions` pick of the `Efficient` tier is not reachable at the shipped threshold, because `production_intensity` has a maximum of `tanh(0.5)`. The guard test for a pick that is not `TestsPassed` uses the `Ambiguous` default.
 - **C3.** Both skips shipped: `tools_declared` and `policy_admits_no_local`. A skipped quote leaves no local candidate to count, so the audit note for the tool exclusion and the `NoToolCapableTarget` refusal now read `local_withheld_by_tools`. The plan did not predict this. The test `messages_api_surface::f2_...` found it.
 - **C3.** On a turn where the call is made, a fleet error still fails the turn. That is unchanged on purpose. A sub-budget and a fail-open arm for the quote are a separate decision.
@@ -44,12 +44,12 @@ The mutation checks used `sed` to change one token, ran the suite, and used `sed
 
 1. Read `CLAUDE.md`, then the ruling and its addendum, then this plan.
 2. Run `git fetch origin` and compare the branch in the status table with `origin`. Trust only pushed state.
-3. The next rung is C4. After C4, the order is: the loader for C5, the seventh row for C1, the live evidence for C2, then C6. C7 waits for the owner. In general, take the first rung whose status is not `done`. Each rung lists its tests first. Write them, watch them fail, then write the fix.
+3. The next rung is C4. After C4, the order is: the loader for C5, the live evidence for C2, then C6. C7 waits for the owner. In general, take the first rung whose status is not `done`. Each rung lists its tests first. Write them, watch them fail, then write the fix.
 4. Run cargo commands one at a time. The box has four cores and one build lock. Put `timeout 300` before a targeted test command and `timeout 900` before a workspace test command.
 5. Commit before any mutation stage. Commit with `--no-gpg-sign`. Push through the `gh` credential helper. `~/.gitconfig` rewrites `https://github.com/` to SSH, so put `GIT_CONFIG_GLOBAL=/dev/null` before the push command when the SSH agent does not answer.
 6. Each rung ships as its own PR from the current `main`. No PR exists yet. The commits on the working branch are separated by rung, so a cherry-pick onto a branch from `main` is clean. The split:
    - Documents: `e48b13b`, `be2bd66`, `6ab8908`, and each later commit that changes only `agent-docs/`.
-   - C1: `35839e2` (the `stage.rs` part) and `83ac785`.
+   - C1: `35839e2` (the `stage.rs` part), `83ac785`, and `4bffdcb`.
    - C2: `35839e2` (the `anthropic_messages.rs` part), `22e58ce`, and `d7f69ce`.
    - C3: `8817db0`.
    - C5: `6e905ba`. It has no overlap with C1 to C3 outside `engine.rs`.
