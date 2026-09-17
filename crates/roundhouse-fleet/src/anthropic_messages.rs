@@ -1529,4 +1529,132 @@ mod tests {
             "a forwarded seat must not share a connection pool with a stored key"
         );
     }
+
+    /// One labelled block. Its text depends only on its own index, which is
+    /// what lets [`segments_of`] build "the same request, but with more
+    /// segments appended" instead of a differently-worded one.
+    fn labelled_segment(index: usize) -> String {
+        format!("<|item{index}|>content for item {index} ")
+    }
+
+    /// `n` segments and the boundary list that cuts the joined text at exactly
+    /// those seams.
+    ///
+    /// **A prompt of `n` segments is a byte-prefix of one of `n' > n`
+    /// segments**, and the first `n` boundaries agree between the two, because
+    /// each segment's bytes depend only on its own index and not on how many
+    /// segments follow it. That is the shape a real session has across two
+    /// requests to the same target: the earlier turns render identically and
+    /// only the newest one is appended.
+    fn segments_of(n: usize) -> (String, Vec<usize>) {
+        let mut prompt = String::new();
+        let mut boundaries = Vec::new();
+        for index in 0..n {
+            prompt.push_str(&labelled_segment(index));
+            if index + 1 < n {
+                boundaries.push(prompt.len());
+            }
+        }
+        (prompt, boundaries)
+    }
+
+    /// The block index carrying the request's one `cache_control` marker, if
+    /// any.
+    fn breakpoint_index(body: &Value) -> Option<usize> {
+        body["messages"][0]["content"]
+            .as_array()
+            .expect("blocks")
+            .iter()
+            .position(|block| block.get("cache_control").is_some())
+    }
+
+    /// `body()` places at most one
+    /// `cache_control` breakpoint, on the penultimate segment. Anthropic's
+    /// cache lookup checks at most twenty block positions back from a
+    /// breakpoint, counting the breakpoint itself
+    /// (platform.claude.com/docs/en/build-with-claude/prompt-caching). So when
+    /// the next request to the same target has grown by twenty or more
+    /// segments, the only breakpoint this client sends lands more than twenty
+    /// blocks past where the previous request wrote its cache entry, and that
+    /// entry becomes unreachable even though the prefix bytes it covers are
+    /// still byte-identical.
+    #[test]
+    #[ignore = "anthropic-lookback: one penultimate breakpoint per request; an append of 20+ \
+                segments puts the previous write outside the 20-block lookback and the turn \
+                reads nothing from cache"]
+    fn a_long_append_keeps_the_previous_cache_write_inside_a_lookback_window() {
+        let (prompt1, boundaries1) = segments_of(6);
+        let quote1 = FrontierQuote {
+            prompt: prompt1.clone(),
+            segment_boundaries: boundaries1,
+            ..quote(TurnCredential::Absent, SPOKEN)
+        };
+        let body1 = AnthropicMessagesClient::body(&quote1, "claude-sonnet").unwrap();
+        let p1 = breakpoint_index(&body1).expect("six segments have a stable prefix to mark");
+
+        // Twenty-five items later on the same target: the first six segments
+        // are the same bytes at the same offsets, which is the premise the
+        // assertion below rests on -- checked explicitly rather than merely
+        // assumed from `segments_of`'s doc comment.
+        let (prompt2, boundaries2) = segments_of(6 + 25);
+        assert!(
+            prompt2.starts_with(&prompt1),
+            "the fixture's whole premise: the first six segments must be \
+             byte-identical between requests, or a real prefix cache could \
+             never have matched them either"
+        );
+        let quote2 = FrontierQuote {
+            prompt: prompt2,
+            segment_boundaries: boundaries2,
+            ..quote(TurnCredential::Absent, SPOKEN)
+        };
+        let body2 = AnthropicMessagesClient::body(&quote2, "claude-sonnet").unwrap();
+        let p2 = breakpoint_index(&body2).expect("thirty-one segments still have a stable prefix");
+
+        // The previous write at block `p1` is reachable only from a breakpoint
+        // in `p1..=p1+19` -- Anthropic's documented twenty-block lookback,
+        // counting the breakpoint itself.
+        assert!(
+            p2 as i64 - p1 as i64 <= 19,
+            "a twenty-five-segment append put the only breakpoint at block \
+             {p2}, {} positions past the previous write at block {p1} -- \
+             outside the documented twenty-block lookback, so the turn reads \
+             nothing from cache although the first six blocks are \
+             byte-identical",
+            p2 - p1
+        );
+    }
+
+    /// CONTROL for the claim above: the same fixture and the same shared
+    /// prefix, but the append is three segments rather than twenty-five, so
+    /// today's single penultimate breakpoint already lands inside the
+    /// lookback window. Proves the claim test's failure is about the size of
+    /// the append and not about the fixture, the segment builder, or the
+    /// assertion being unreachable in general.
+    #[test]
+    fn a_short_append_keeps_the_previous_cache_write_inside_a_lookback_window() {
+        let (prompt1, boundaries1) = segments_of(6);
+        let quote1 = FrontierQuote {
+            prompt: prompt1,
+            segment_boundaries: boundaries1,
+            ..quote(TurnCredential::Absent, SPOKEN)
+        };
+        let body1 = AnthropicMessagesClient::body(&quote1, "claude-sonnet").unwrap();
+        let p1 = breakpoint_index(&body1).expect("six segments have a stable prefix to mark");
+
+        let (prompt2, boundaries2) = segments_of(6 + 3);
+        let quote2 = FrontierQuote {
+            prompt: prompt2,
+            segment_boundaries: boundaries2,
+            ..quote(TurnCredential::Absent, SPOKEN)
+        };
+        let body2 = AnthropicMessagesClient::body(&quote2, "claude-sonnet").unwrap();
+        let p2 = breakpoint_index(&body2).expect("nine segments still have a stable prefix");
+
+        assert!(
+            p2 as i64 - p1 as i64 <= 19,
+            "a three-segment append must not push the previous write outside \
+             the lookback window: p1={p1}, p2={p2}"
+        );
+    }
 }

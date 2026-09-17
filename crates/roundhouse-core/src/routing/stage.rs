@@ -1591,4 +1591,112 @@ mod tests {
         );
         assert!(staged.fallbacks.is_empty());
     }
+
+    /// `choose` picks a tier from
+    /// `TurnSignals` alone (`pick_tier`) and then serves that tier's first
+    /// admitted candidate in recipe order (`tier_pool`, `ordered[0]`) -- it
+    /// never reads a candidate's `expected_cost_usd` or
+    /// `expected_prefill_tokens`, and the inner `AffinityPolicy` that would
+    /// have read them is bypassed whenever `ctx.tiers` is `Some`. So a hard
+    /// de-escalate (`DecisionSource::TestsPassed`, which does not consult the
+    /// scorer either) can walk a session off a warm, cheap Capable target onto
+    /// a cold Efficient one that the quote says costs *more* for this turn --
+    /// backwards for a router whose whole reason to exist is co-optimizing
+    /// cost alongside quality and latency.
+    #[tokio::test]
+    #[ignore = "cache-affinity: StagePolicy ignores the quote, so a TestsPassed de-escalation \
+                leaves a warm target for a cold one that costs more this turn"]
+    async fn a_deescalation_does_not_move_a_warm_session_onto_a_costlier_cold_target() {
+        let recipe = TierRecipe::new(
+            vec!["openai/sol".into()],
+            vec!["openai/luna".into()],
+            PickerMode::EfficientFirst,
+            DEFAULT_CONFIDENCE_THRESHOLD,
+        )
+        .unwrap();
+        // sol: Capable, warm (small prefill) and the cheap quote. luna:
+        // Efficient, cold (large prefill) and, deliberately, the pricier quote
+        // for this turn -- the inversion the claim is about.
+        let warm_capable = Candidate {
+            expected_prefill_tokens: 50.0,
+            ..hosted("sol", 0.95, 0.03)
+        };
+        let cold_efficient = Candidate {
+            expected_prefill_tokens: 5_000.0,
+            ..hosted("luna", 0.70, 0.12)
+        };
+        let candidates = vec![warm_capable, cold_efficient];
+
+        // `should_deescalate` reads only `tools`, so `turn_depth` is
+        // irrelevant here; left shallow so this fixture is not mistaken for a
+        // scored (`Dimensions`) case.
+        let deescalating = TurnSignals {
+            tools: ToolSignals {
+                tests_passed: true,
+                recent_write_count: 1,
+                severity: 0.0,
+                ..Default::default()
+            },
+            turn_depth: 1,
+        };
+        let fixture = Fixture::open()
+            .with_recipe(recipe)
+            .with_signals(deescalating);
+        let decision = stage().choose(&fixture.ctx(&candidates)).await.unwrap();
+        assert_eq!(
+            decision.target, candidates[0].target,
+            "a de-escalation must never raise the quoted cost of the turn: {}",
+            decision.rationale
+        );
+    }
+
+    /// CONTROL for the claim above: same recipe and the same de-escalating
+    /// signals, but here the Efficient-tier target really is the cheaper
+    /// quote, so moving onto it is the right call and not the defect the
+    /// claim names. Proves the claim test's failure is about the cost
+    /// *inversion* specifically, and not about `should_deescalate`, the
+    /// recipe shape, or the fixture being unable to reach `luna` at all.
+    #[tokio::test]
+    async fn a_deescalation_moves_to_a_target_that_is_genuinely_cheaper() {
+        let recipe = TierRecipe::new(
+            vec!["openai/sol".into()],
+            vec!["openai/luna".into()],
+            PickerMode::EfficientFirst,
+            DEFAULT_CONFIDENCE_THRESHOLD,
+        )
+        .unwrap();
+        // Same warm/cold shape as the claim above, but the costs are not
+        // inverted: sol is now the pricier quote and luna the cheaper one, so
+        // the tier the signals de-escalate onto is also the cheaper target.
+        let warm_capable = Candidate {
+            expected_prefill_tokens: 50.0,
+            ..hosted("sol", 0.95, 0.10)
+        };
+        let cold_efficient = Candidate {
+            expected_prefill_tokens: 5_000.0,
+            ..hosted("luna", 0.70, 0.03)
+        };
+        let candidates = vec![warm_capable, cold_efficient];
+
+        let deescalating = TurnSignals {
+            tools: ToolSignals {
+                tests_passed: true,
+                recent_write_count: 1,
+                severity: 0.0,
+                ..Default::default()
+            },
+            turn_depth: 1,
+        };
+        let fixture = Fixture::open()
+            .with_recipe(recipe)
+            .with_signals(deescalating);
+        let decision = stage().choose(&fixture.ctx(&candidates)).await.unwrap();
+        assert_eq!(
+            decision.target, candidates[1].target,
+            "luna is both the de-escalated tier's only member and the cheaper \
+             quote, so serving it is not the cost inversion the claim names: {}",
+            decision.rationale
+        );
+        assert_eq!(decision.source, Some(DecisionSource::TestsPassed));
+    }
 }
