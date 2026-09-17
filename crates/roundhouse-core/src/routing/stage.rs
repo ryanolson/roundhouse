@@ -15,6 +15,12 @@
 //! decision's fallbacks. Admission runs first and the recipe can only narrow —
 //! a tier entry the key does not admit is skipped, never resurrected.
 //!
+//! One quote-reading exception sits on that path, and it is the only one: an
+//! efficient pick whose head costs *more* for this turn than some admitted
+//! capable target yields to it, because a tier that exists to save cost has
+//! nothing left to argue when it is the expensive option. See the guard inside
+//! `choose` and [`DecisionSource::CostGuard`].
+//!
 //! # Attribution
 //!
 //! Ported from NVIDIA Switchyard (Apache-2.0), rev
@@ -56,6 +62,12 @@
 //!   `DefaultTarget` terminal stage does anyway when no classifier is
 //!   configured. Folding the arm away is what makes "routing makes no model
 //!   calls, ever" a property of the type rather than a rule someone has to obey.
+//! - The **cost guard** on efficient picks is roundhouse's and has no upstream
+//!   counterpart: Switchyard's stage selects a tier and its terminal stage
+//!   serves it, because upstream is not the component that holds the per-target
+//!   cache ledger. Here the quote already prices a warm prefix, so a tier pick
+//!   that would raise the bill is visible at this seam and is refused. See
+//!   [`DecisionSource::CostGuard`].
 //!
 //! Both trees carry the same `SPDX-FileCopyrightText` line and the same licence,
 //! so what is owed is provenance and revision. The revision is the half that
@@ -166,6 +178,8 @@ impl PickerMode {
 /// [`Self::Dimensions`]) is worth telling the capable model about, and a
 /// fall-open ([`Self::Ambiguous`]) is not — narrating one would tell a model the
 /// cheap tier had been stalling on a turn where nothing said it was.
+/// [`Self::CostGuard`] is the second non-narrating source, for the same reason:
+/// it reaches the capable tier on price, not on trouble.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DecisionSource {
@@ -177,6 +191,11 @@ pub enum DecisionSource {
     Dimensions,
     /// Nothing was decisive, so the picker's default tier took the turn.
     Ambiguous,
+    /// The picked tier was [`Tier::Efficient`] and an admitted capable target
+    /// quoted *lower* for this turn than the efficient tier's head, so the
+    /// capable one served. See [`StagePolicy::choose`] for why a cheaper
+    /// capable candidate dominates.
+    CostGuard,
 }
 
 impl DecisionSource {
@@ -186,6 +205,7 @@ impl DecisionSource {
             DecisionSource::TestsPassed => "tests_passed",
             DecisionSource::Dimensions => "dimensions",
             DecisionSource::Ambiguous => "ambiguous",
+            DecisionSource::CostGuard => "cost_guard",
         }
     }
 
@@ -195,6 +215,11 @@ impl DecisionSource {
     /// Upstream's `only_on_wrong_signal_escalation` rule, in one place so the
     /// two callers that need it cannot disagree: a note may claim the previous
     /// model was in trouble only when a *signal* said so.
+    ///
+    /// [`Self::CostGuard`] is deliberately outside the set even though it does
+    /// land a turn on the capable tier: the signals picked the *cheap* tier and
+    /// a quote redirected it, so a note claiming the previous model had been in
+    /// trouble would be telling the capable model something nothing measured.
     pub fn is_signal_driven(self) -> bool {
         matches!(self, DecisionSource::Override | DecisionSource::Dimensions)
     }
@@ -569,6 +594,11 @@ impl StagePolicy {
     /// the key does not admit is skipped and there is no code path that could
     /// put it back. Walking the recipe rather than the pool is what makes the
     /// *order* the operator's rather than the quoter's.
+    ///
+    /// The cost guard in `choose` is the one place a quote reorders anything,
+    /// and it reorders *which tier serves* rather than this list: it picks the
+    /// first capable member cheaper than the efficient head and leaves the rest
+    /// of the tier behind it exactly as this function ordered them.
     fn tier_pool<'a>(
         recipe: &TierRecipe,
         tier: Tier,
@@ -687,7 +717,7 @@ impl RoutingPolicy for StagePolicy {
         let pick = pick_tier(&signals, recipe.picker(), recipe.confidence_threshold());
 
         let picked = Self::tier_pool(recipe, pick.tier, pool);
-        let (serving, ordered) = match picked.is_empty() {
+        let (mut serving, mut ordered) = match picked.is_empty() {
             false => (pick.tier, picked),
             true => {
                 let other = Self::tier_pool(recipe, pick.tier.other(), pool);
@@ -699,6 +729,61 @@ impl RoutingPolicy for StagePolicy {
                 }
             }
         };
+        // Captured before the guard can move `serving`: an empty picked tier
+        // and a declined one are two different sentences in the rationale, and
+        // after the guard fires `serving != pick.tier` can no longer tell them
+        // apart.
+        let picked_tier_was_empty = serving != pick.tier;
+
+        let mut source = pick.source;
+        let mut displaced = None;
+        if !picked_tier_was_empty && pick.tier == Tier::Efficient {
+            // **The dominance guard, and the whole of T4.** The efficient tier
+            // exists to save cost; a capable candidate that also quotes *less*
+            // for this turn is better on function and cost at once, so serving
+            // the efficient head would be paying more for the weaker model. The
+            // only thing that produces that inversion in practice is cache
+            // affinity — a warm prefix on the capable target and a cold one on
+            // the efficient head — and the per-target ledger has already priced
+            // that into both quotes. Reading the quote is therefore how this
+            // policy sees warmth without holding a byte of session state.
+            //
+            // **Strictly less, never equal**: at equal cost nothing is
+            // dominated, so the tier pick — a statement about function — stands.
+            // **The first cheaper member in recipe order, not the tier's
+            // head**: a head that quotes higher than what it displaced would
+            // reintroduce the inversion from the other side.
+            // **Efficient picks only**: an escalation says the cheap tier
+            // cannot finish this turn, and no price makes it able to.
+            let head = ordered[0];
+            let capable = Self::tier_pool(recipe, Tier::Capable, pool);
+            if let Some(cheaper) = capable
+                .iter()
+                .position(|candidate| candidate.expected_cost_usd < head.expected_cost_usd)
+            {
+                // The prices live in the log line and never in the rationale:
+                // the rationale is republished into the calling model's own
+                // context by `explain_last_route` (see the `format!` below).
+                tracing::debug!(
+                    displaced = %head.target.policy_identity(),
+                    displaced_cost_usd = head.expected_cost_usd,
+                    serving = %capable[cheaper].target.policy_identity(),
+                    serving_cost_usd = capable[cheaper].expected_cost_usd,
+                    picked_by = pick.source.label(),
+                    "a capable target quotes lower for this turn than the efficient tier's head, \
+                     so it takes the turn on cost as well as on function"
+                );
+                displaced = Some(head.target.policy_identity());
+                source = DecisionSource::CostGuard;
+                serving = Tier::Capable;
+                // Rotated rather than truncated so the rest of the capable tier
+                // stays behind it in the recipe's order: a guarded turn's
+                // fallbacks are a capable turn's fallbacks.
+                ordered = capable;
+                let winner = ordered.remove(cheaper);
+                ordered.insert(0, winner);
+            }
+        }
 
         let winner = ordered[0];
         let fallbacks: Vec<Target> = ordered[1..]
@@ -714,7 +799,7 @@ impl RoutingPolicy for StagePolicy {
             "stage router: {} tier ({}) by {}",
             serving.label(),
             winner.target.policy_identity(),
-            pick.source.label(),
+            source.label(),
         );
         if let Some(confidence) = pick.confidence {
             rationale.push_str(&format!(
@@ -724,7 +809,18 @@ impl RoutingPolicy for StagePolicy {
                 recipe.confidence_threshold()
             ));
         }
-        if serving != pick.tier {
+        if let Some(displaced) = displaced {
+            // **No price here either**, for the reason the clause above states:
+            // the two quotes that decided this went to the `tracing` event at
+            // the guard, which no model reads. What the model's own context
+            // gets is the pair of names and the direction between them.
+            rationale.push_str(&format!(
+                "; the {} tier led with {displaced}, which quotes higher for this turn, so the \
+                 cheaper capable target took it",
+                pick.tier.label()
+            ));
+        }
+        if picked_tier_was_empty {
             // **"this turn", not "this key", and the edit is the whole of G09
             // at this seam.** An empty tier has four possible causes and this
             // policy can tell them apart from none of them: the key's own
@@ -757,7 +853,7 @@ impl RoutingPolicy for StagePolicy {
             ));
         }
 
-        Ok(admitted.decide_staged(winner.target.clone(), fallbacks, pick.source, rationale))
+        Ok(admitted.decide_staged(winner.target.clone(), fallbacks, source, rationale))
     }
 }
 
@@ -1356,6 +1452,22 @@ mod tests {
         }
     }
 
+    /// The hard de-escalate: tests passed on a turn that produced work, with
+    /// nothing broken. `should_deescalate` reads only `tools`, so `turn_depth`
+    /// stays shallow — a deep fixture would read as a scored (`Dimensions`)
+    /// case to anyone skimming it.
+    fn deescalating() -> TurnSignals {
+        TurnSignals {
+            tools: ToolSignals {
+                tests_passed: true,
+                recent_write_count: 1,
+                severity: 0.0,
+                ..Default::default()
+            },
+            turn_depth: 1,
+        }
+    }
+
     fn stage() -> StagePolicy {
         StagePolicy::new(Box::new(AffinityPolicy::new()))
     }
@@ -1592,20 +1704,19 @@ mod tests {
         assert!(staged.fallbacks.is_empty());
     }
 
-    /// `choose` picks a tier from
-    /// `TurnSignals` alone (`pick_tier`) and then serves that tier's first
-    /// admitted candidate in recipe order (`tier_pool`, `ordered[0]`) -- it
-    /// never reads a candidate's `expected_cost_usd` or
-    /// `expected_prefill_tokens`, and the inner `AffinityPolicy` that would
-    /// have read them is bypassed whenever `ctx.tiers` is `Some`. So a hard
-    /// de-escalate (`DecisionSource::TestsPassed`, which does not consult the
-    /// scorer either) can walk a session off a warm, cheap Capable target onto
-    /// a cold Efficient one that the quote says costs *more* for this turn --
-    /// backwards for a router whose whole reason to exist is co-optimizing
-    /// cost alongside quality and latency.
+    /// **The T4 claim, now closed by the cost guard.** `choose` used to pick a
+    /// tier from `TurnSignals` alone (`pick_tier`) and serve that tier's first
+    /// admitted candidate in recipe order (`tier_pool`, `ordered[0]`) without
+    /// ever reading a candidate's `expected_cost_usd` -- and the inner
+    /// `AffinityPolicy` that would have read it is bypassed whenever
+    /// `ctx.tiers` is `Some`. So a hard de-escalate
+    /// (`DecisionSource::TestsPassed`, which does not consult the scorer
+    /// either) walked a session off a warm, cheap Capable target onto a cold
+    /// Efficient one that the quote said cost *more* for this turn -- backwards
+    /// for a router whose whole reason to exist is co-optimizing cost alongside
+    /// quality and latency. The guard is what keeps this test green; the cost
+    /// inversion is the case it was written from.
     #[tokio::test]
-    #[ignore = "cache-affinity: StagePolicy ignores the quote, so a TestsPassed de-escalation \
-                leaves a warm target for a cold one that costs more this turn"]
     async fn a_deescalation_does_not_move_a_warm_session_onto_a_costlier_cold_target() {
         let recipe = TierRecipe::new(
             vec!["openai/sol".into()],
@@ -1627,21 +1738,9 @@ mod tests {
         };
         let candidates = vec![warm_capable, cold_efficient];
 
-        // `should_deescalate` reads only `tools`, so `turn_depth` is
-        // irrelevant here; left shallow so this fixture is not mistaken for a
-        // scored (`Dimensions`) case.
-        let deescalating = TurnSignals {
-            tools: ToolSignals {
-                tests_passed: true,
-                recent_write_count: 1,
-                severity: 0.0,
-                ..Default::default()
-            },
-            turn_depth: 1,
-        };
         let fixture = Fixture::open()
             .with_recipe(recipe)
-            .with_signals(deescalating);
+            .with_signals(deescalating());
         let decision = stage().choose(&fixture.ctx(&candidates)).await.unwrap();
         assert_eq!(
             decision.target, candidates[0].target,
@@ -1678,18 +1777,9 @@ mod tests {
         };
         let candidates = vec![warm_capable, cold_efficient];
 
-        let deescalating = TurnSignals {
-            tools: ToolSignals {
-                tests_passed: true,
-                recent_write_count: 1,
-                severity: 0.0,
-                ..Default::default()
-            },
-            turn_depth: 1,
-        };
         let fixture = Fixture::open()
             .with_recipe(recipe)
-            .with_signals(deescalating);
+            .with_signals(deescalating());
         let decision = stage().choose(&fixture.ctx(&candidates)).await.unwrap();
         assert_eq!(
             decision.target, candidates[1].target,
@@ -1698,5 +1788,231 @@ mod tests {
             decision.rationale
         );
         assert_eq!(decision.source, Some(DecisionSource::TestsPassed));
+    }
+
+    /// The two-entry recipe the guard is written against: capable = [sol, nova],
+    /// efficient = [luna].
+    fn guard_recipe() -> TierRecipe {
+        TierRecipe::new(
+            vec!["openai/sol".into(), "openai/nova".into()],
+            vec!["openai/luna".into()],
+            PickerMode::EfficientFirst,
+            DEFAULT_CONFIDENCE_THRESHOLD,
+        )
+        .unwrap()
+    }
+
+    /// **Strict inequality, and the tie is the boundary that proves it.** The
+    /// guard exists to stop a tier pick raising the bill; a capable target that
+    /// costs exactly what the efficient head costs raises nothing, so there is
+    /// no dominance to act on and the tier pick — which is a statement about
+    /// *function* — stands. A `<=` here would quietly convert every equal-cost
+    /// turn into a capable turn and make the efficient tier unreachable
+    /// wherever a deployment prices two tiers the same.
+    #[tokio::test]
+    async fn a_tie_in_quoted_cost_keeps_the_efficient_pick_and_its_source() {
+        let candidates = vec![
+            hosted("sol", 0.95, 0.07),
+            hosted("nova", 0.90, 0.07),
+            hosted("luna", 0.70, 0.07),
+        ];
+        let fixture = Fixture::open()
+            .with_recipe(guard_recipe())
+            .with_signals(deescalating());
+        let decision = stage().choose(&fixture.ctx(&candidates)).await.unwrap();
+        assert_eq!(
+            (decision.target, decision.source),
+            (
+                candidates[2].target.clone(),
+                Some(DecisionSource::TestsPassed)
+            ),
+            "equal quotes are not a cheaper capable target, so nothing dominates the tier pick"
+        );
+    }
+
+    /// The guard reads the *admitted* capable pool, not the recipe's capable
+    /// list. A recipe may only narrow what a key admits — [`StagePolicy::tier_pool`]
+    /// states that rule for the serving tier — and a cost guard that could
+    /// reach past the key would be the one code path in this file that widens
+    /// it, on the strength of a price.
+    #[tokio::test]
+    async fn a_cheaper_capable_target_the_key_excludes_does_not_fire_the_guard() {
+        let candidates = vec![
+            // sol is much the cheaper quote for this turn and would win the
+            // guard outright -- if the key admitted it.
+            hosted("sol", 0.95, 0.01),
+            hosted("nova", 0.90, 0.90),
+            hosted("luna", 0.70, 0.12),
+        ];
+        let confined = Fixture::open()
+            .with_recipe(guard_recipe())
+            .with_signals(deescalating())
+            .under(TurnPolicy {
+                allow: TargetFilter::parse(["openai/luna"]).unwrap(),
+                ..TurnPolicy::unrestricted()
+            });
+        let decision = stage().choose(&confined.ctx(&candidates)).await.unwrap();
+        assert_eq!(
+            (decision.target, decision.source),
+            (
+                candidates[2].target.clone(),
+                Some(DecisionSource::TestsPassed)
+            ),
+            "a capable target the key excludes is not a candidate for this turn at any price"
+        );
+
+        // CONTROL: the identical fleet with the key opened fires the guard, so
+        // the assertion above is about admission and not about the costs.
+        let open = Fixture::open()
+            .with_recipe(guard_recipe())
+            .with_signals(deescalating());
+        assert_eq!(
+            stage().choose(&open.ctx(&candidates)).await.unwrap().target,
+            candidates[0].target
+        );
+    }
+
+    /// **Every efficient pick, not just the hard de-escalate.** A turn that
+    /// fell open to the picker default reaches the cheap tier for a weaker
+    /// reason than `tests_passed` did, so if the guard applies anywhere it
+    /// applies here. `Ambiguous` rather than `Dimensions` because a *scored*
+    /// efficient pick is unreachable at the shipped threshold — the only
+    /// downward axis is `production_intensity`, which caps at `tanh(0.5)` and
+    /// lands under 0.5 (`one_signal_scores_below_half_and_two_corroborate`).
+    #[tokio::test]
+    async fn the_guard_fires_on_an_ambiguous_efficient_pick_too() {
+        let candidates = vec![
+            hosted("sol", 0.95, 0.03),
+            hosted("nova", 0.90, 0.50),
+            hosted("luna", 0.70, 0.12),
+        ];
+        // No signals at all: the first turn of a session, which scores to zero
+        // and takes the `EfficientFirst` default.
+        let quiet = Fixture::open().with_recipe(guard_recipe());
+        let decision = stage().choose(&quiet.ctx(&candidates)).await.unwrap();
+        assert_eq!(
+            (decision.target, decision.source),
+            (
+                candidates[0].target.clone(),
+                Some(DecisionSource::CostGuard)
+            ),
+            "{}",
+            decision.rationale
+        );
+    }
+
+    /// What the log of a guarded turn has to say, and what it must not.
+    ///
+    /// **Both targets, no dollars.** The rationale is republished into the
+    /// calling model's own context by `explain_last_route`, and the no-prices
+    /// rule that follows from it is stated at both `format!` sites in this file
+    /// and asserted in `roundhouse-mcp`'s tool surface tests. So the string
+    /// names what was displaced and what took the turn, and the two quotes that
+    /// decided it go to the `tracing` event at the guard instead.
+    #[tokio::test]
+    async fn a_guarded_decision_names_the_new_source_and_both_targets_without_a_price() {
+        let candidates = vec![
+            hosted("sol", 0.95, 0.03),
+            hosted("nova", 0.90, 0.50),
+            hosted("luna", 0.70, 0.12),
+        ];
+        let fixture = Fixture::open()
+            .with_recipe(guard_recipe())
+            .with_signals(deescalating());
+        let decision = stage().choose(&fixture.ctx(&candidates)).await.unwrap();
+
+        assert_eq!(decision.source, Some(DecisionSource::CostGuard));
+        for named in ["openai/sol", "openai/luna", "strong tier"] {
+            assert!(
+                decision.rationale.contains(named),
+                "a guarded turn has to say which target it left and which took it, and read as \
+                 the capable-tier turn it is -- `{named}` missing from: {}",
+                decision.rationale
+            );
+        }
+        assert!(
+            !decision.rationale.contains('$'),
+            "the rationale reaches a model's context and carries no per-model price: {}",
+            decision.rationale
+        );
+        assert!(
+            !decision.rationale.contains("admits none of it"),
+            "the efficient tier was admitted and declined on cost, not empty: {}",
+            decision.rationale
+        );
+        assert!(
+            !DecisionSource::CostGuard.is_signal_driven(),
+            "a price is not a signal: narrating this as an escalation would tell the capable \
+             model the cheap tier had been in trouble when nothing measured that"
+        );
+    }
+
+    /// The guard serves the first capable member that is *actually* cheaper,
+    /// not the capable tier's head.
+    ///
+    /// A single-member capable fixture cannot tell the two apart, and taking
+    /// the head would let the guard serve a target pricier than the one it
+    /// displaced — which is the defect it exists to prevent, arrived at from
+    /// the other side. The fallbacks stay the rest of the capable tier in the
+    /// recipe's order, so the log reads as the capable-tier turn it is.
+    #[tokio::test]
+    async fn the_guard_serves_the_first_capable_target_that_is_cheaper_not_the_tier_head() {
+        let candidates = vec![
+            // sol leads the capable tier and is the priciest thing here.
+            hosted("sol", 0.95, 0.90),
+            hosted("nova", 0.90, 0.04),
+            hosted("luna", 0.70, 0.12),
+        ];
+        let fixture = Fixture::open()
+            .with_recipe(guard_recipe())
+            .with_signals(deescalating());
+        let decision = stage().choose(&fixture.ctx(&candidates)).await.unwrap();
+        assert_eq!(
+            (decision.target, decision.source),
+            (
+                candidates[1].target.clone(),
+                Some(DecisionSource::CostGuard)
+            ),
+            "nova is the cheaper capable target; sol dominates nothing at 0.90: {}",
+            decision.rationale
+        );
+        assert_eq!(
+            decision.fallbacks,
+            vec![candidates[0].target.clone()],
+            "and the rest of the capable tier is behind it, in the recipe's order"
+        );
+    }
+
+    /// The guard is one-directional, and severity is where that matters most.
+    ///
+    /// An escalation is a statement about *function*: a critical tool result
+    /// says the cheap tier cannot finish this turn, and no price makes it able
+    /// to. Redirecting a capable pick onto a cheaper efficient candidate would
+    /// be the savings dashboard overruling the only signal in this file that
+    /// bypasses the scorer entirely.
+    #[tokio::test]
+    async fn a_capable_pick_is_never_redirected_by_a_cheaper_efficient_candidate() {
+        let candidates = vec![
+            hosted("sol", 0.95, 2.00),
+            hosted("nova", 0.90, 1.50),
+            hosted("luna", 0.70, 0.01),
+        ];
+        let critical = TurnSignals {
+            tools: ToolSignals {
+                severity: SEVERITY_CRITICAL,
+                ..Default::default()
+            },
+            turn_depth: 1,
+        };
+        let fixture = Fixture::open()
+            .with_recipe(guard_recipe())
+            .with_signals(critical);
+        let decision = stage().choose(&fixture.ctx(&candidates)).await.unwrap();
+        assert_eq!(
+            (decision.target, decision.source),
+            (candidates[0].target.clone(), Some(DecisionSource::Override)),
+            "a hard escalate serves the capable tier's head however cheap the cheap tier is: {}",
+            decision.rationale
+        );
     }
 }
