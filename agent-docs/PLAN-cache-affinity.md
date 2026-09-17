@@ -29,9 +29,9 @@ Open items that belong to a finished rung:
 - **C1.** A `Dimensions` pick of the `Efficient` tier is not reachable at the shipped threshold, because `production_intensity` has a maximum of `tanh(0.5)`. The guard test for a pick that is not `TestsPassed` uses the `Ambiguous` default.
 - **C3.** Both skips shipped: `tools_declared` and `policy_admits_no_local`. A skipped quote leaves no local candidate to count, so the audit note for the tool exclusion and the `NoToolCapableTarget` refusal now read `local_withheld_by_tools`. The plan did not predict this. The test `messages_api_surface::f2_...` found it.
 - **C3.** On a turn where the call is made, a fleet error still fails the turn. That is unchanged on purpose. A sub-budget and a fail-open arm for the quote are a separate decision.
-- **C5.** `main.rs:946-961` builds `EngineConfig` from defaults and sets only `arm_salt`. So `local_ttft_ms_per_prefill_token` is `0.0` in a deployment, and the local quote is still flat there. Neither local TTFT field has a configuration loader. The next step for C5 is that loader, and the slope value must come from a measured prefill rate of the deployment. C5 ran after the workspace suite. Its gates were the `roundhouse-fleet` suite (160 passed), a workspace check with tests, and `mcp_surface` (20 passed).
+- **C5.** `main.rs:946-961` builds `EngineConfig` from defaults and sets only `arm_salt`. So `local_ttft_ms_per_prefill_token` is `0.0` in a deployment, and the local quote is still flat there. Neither local TTFT field has a configuration loader. The next step for C5 is that loader, and the slope value must come from a measured prefill rate of the deployment.
 - **C2.** No live request exists yet that shows `cache_read_input_tokens > 0` after an append of 20 or more items.
-- **All.** The full workspace suite ran under `timeout 900` at `6ab8908` (C1 to C3): 111 test binaries, 1649 passed, 0 failed. No ignore from this work remains in `crates/`.
+- **All.** The full workspace suite ran under `timeout 900` two times. At `6ab8908` (C1 to C3): 111 test binaries, 1649 passed, 0 failed. At `6e905ba` (C5 added): 111 test binaries, 1651 passed, 0 failed. No ignore from this work remains in `crates/`.
 
 Decisions that only the owner can make:
 
