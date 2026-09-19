@@ -1127,6 +1127,7 @@ mod tests {
     use roundhouse_server::control_config::crosscheck::{
         refuse_policies_that_admit_nothing, refuse_promises_of_a_local_fallback,
     };
+    use roundhouse_server::test_support::captured_warnings;
 
     fn plane_with_policy(policy: serde_json::Value) -> ControlPlane {
         plane_with(policy, serde_json::Value::Null)
@@ -1574,75 +1575,6 @@ mod tests {
             uniform.for_provider("openrouter").unwrap(),
             uniform.for_provider("anything-at-all").unwrap()
         ));
-    }
-
-    /// Everything `tracing::warn!` wrote during one closure, as text.
-    ///
-    /// `frontier_clients` cannot refuse a provider with no key anywhere — it is
-    /// not where keys live, per its own doc comment — so a missing credential
-    /// has nowhere to go but a boot-time warning. Nothing else in this suite
-    /// reads what `tracing` emits, which is exactly why M10.1 refute's item 15
-    /// found this warning silenceable without turning a single test red: no
-    /// capture point existed. This is that point.
-    fn captured_warnings(f: impl FnOnce()) -> String {
-        use std::io;
-        use std::sync::{Arc, Mutex};
-        use tracing_subscriber::fmt::MakeWriter;
-
-        #[derive(Clone, Default)]
-        struct Buf(Arc<Mutex<Vec<u8>>>);
-        impl io::Write for Buf {
-            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> MakeWriter<'a> for Buf {
-            type Writer = Self;
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
-
-        // **One capture at a time, and not for tidiness.** `with_default`
-        // installs a *thread-local* subscriber, and installing one makes
-        // `tracing` reconsider its callsite interest cache against the global
-        // dispatcher — which in a test binary is nobody. A reconsideration that
-        // lands while another test is mid-capture can cache "nothing is
-        // interested" for the very callsite that test is asserting on, and its
-        // warning silently never arrives: the guard goes red for a reason that
-        // has nothing to do with the code under test, on one run in some
-        // hundreds. Seen for real once G15 gave this helper a second caller.
-        // The cost is microseconds of serialized test time; the alternative is
-        // an intermittently green guard, which enforces nothing and gets
-        // re-diagnosed from scratch by whoever meets it next.
-        static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
-        let _serialized = ONE_AT_A_TIME
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        let buf = Buf::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buf.clone())
-            .with_ansi(false)
-            .finish();
-        // Rebuilding the interest cache *inside* the thread-local default is
-        // the second half of the serialization above. The merge that brought
-        // more uncaptured `frontier_clients` callers into this binary made the
-        // poisoned-cache case go from one-in-hundreds to two-in-three: a
-        // concurrent test evaluating the warn callsite under the no-op global
-        // dispatcher caches "never interested", and this capture then records
-        // the info line but not the warning it exists to assert on. Rebuilding
-        // while our subscriber is the active default re-evaluates every
-        // callsite against a dispatcher that wants them.
-        tracing::subscriber::with_default(subscriber, || {
-            tracing::callsite::rebuild_interest_cache();
-            f()
-        });
-        String::from_utf8(buf.0.lock().unwrap().clone()).expect("tracing output is UTF-8")
     }
 
     /// **A provider with a definition and no key anywhere warns at boot.**

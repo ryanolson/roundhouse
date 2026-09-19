@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::test_support::captured_warnings;
 
 /// A grant of less than the estimate is a refusal, not a smaller call: the
 /// prompt is already written and its price is not negotiable downwards.
@@ -149,55 +150,6 @@ async fn unreported_usage_releases_the_hold_without_claiming_a_free_call() {
         "the hold is released, which is not the same statement as the call \
          having been free"
     );
-}
-
-/// Everything `tracing::warn!` wrote during one closure, as text.
-///
-/// A third copy of the shape `main.rs` and `engine/fair_use.rs` keep, because
-/// neither is reachable from here: `engine::fair_use` is private to `engine`,
-/// and widening a serving module so a test can read its test module trades a
-/// bigger seam for a smaller one. The serialization and the interest-cache
-/// rebuild are not tidiness — `with_default` installs a *thread-local*
-/// subscriber, and a callsite first evaluated under the no-op global
-/// dispatcher caches "never interested" and then silently drops the very line
-/// the assertion is about. See `main.rs`'s copy for the full diagnosis.
-fn captured_warnings(f: impl FnOnce()) -> String {
-    use std::io;
-    use tracing_subscriber::fmt::MakeWriter;
-
-    #[derive(Clone, Default)]
-    struct Buf(Arc<Mutex<Vec<u8>>>);
-    impl io::Write for Buf {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-    impl<'a> MakeWriter<'a> for Buf {
-        type Writer = Self;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
-    let _serialized = ONE_AT_A_TIME
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-    let buf = Buf::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(buf.clone())
-        .with_ansi(false)
-        .finish();
-    tracing::subscriber::with_default(subscriber, || {
-        tracing::callsite::rebuild_interest_cache();
-        f()
-    });
-    String::from_utf8(buf.0.lock().unwrap().clone()).expect("tracing output is UTF-8")
 }
 
 /// A settle that could not be applied says **which call** it left uncommitted.
