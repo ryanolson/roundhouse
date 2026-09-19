@@ -267,3 +267,9 @@ The owner requests a multi-armed bandit with arms that run offline and TypeSafe/
 The owner clarified that this includes both serving strategies and background evaluation arms. Offline-trained strategies can compete with online Jev for live routing. Background evaluation also belongs in the design.
 
 The design must distinguish observed serving outcomes from estimates produced by background evaluation. A background recommendation alone does not show what its proposed target would have achieved. T6 remains an independent decision. The reward, selection cadence, and promotion criteria still need a settled brief. No bandit or classifier call ships from this direction alone.
+
+## Addendum (2026-09-19, later): C4 price guard and T6 accepted
+
+The owner accepts catalog rejection for C4. A one-hour cache entry requires a write rate of twice its input rate. A warning does not satisfy this rule. The target's existing `cache_model` remains the TTL source.
+
+The owner accepts T6: hosted classification is opt-in, off by default, excluded from local-only sessions, and restricted to the bounded judge brief. This permits implementation of the Jev shadow adapter under that policy. It does not establish the quality evidence or utility weights needed to promote a serving bandit.

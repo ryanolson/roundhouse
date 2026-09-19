@@ -18,10 +18,10 @@ Branch: `ai/typesafe-roundhouse-routing-6016d1`, pushed to `origin`. Last update
 | C1 | Dominance guard on `Efficient` picks (T4) | done, mutation-checked | `83ac785` |
 | C2 | Second Anthropic breakpoint | done, mutation-checked. Live evidence is still necessary. | `22e58ce`, `d7f69ce` |
 | C3 | The Dynamo residency call becomes a decision | done, mutation-checked | `8817db0` |
-| C4 | 1-hour TTL as one per-target setting | not started | |
+| C4 | 1-hour TTL as one per-target setting | price guard accepted: reject mismatched one-hour write rate. Implementation pending. | |
 | C5 | Local TTFT quote reads the residency answer | mechanism done. No loader sets the slope yet. | `6e905ba` |
 | C6 | Observed cache deadline and the return trip | not designed | |
-| C7 | Shadow classifier (T5) | owner requests serving strategies and background evaluation arms, including online Jev. Detailed design and T6 remain open. | |
+| C7 | Shadow classifier (T5) | owner requests serving strategies and background evaluation arms, including online Jev. T6 accepted. Detailed bandit design remains open. | |
 
 Open items that belong to a finished rung:
 
@@ -37,7 +37,7 @@ Open items that belong to a finished rung:
 Decisions that only the owner can make:
 
 1. T2: the owner requests a bandit with serving strategies and background evaluation arms, including online TypeSafe/Jev. See the ruling addendum of 2026-09-19. The runtime contract still needs a settled brief before implementation.
-2. T6: the egress posture for prompt content.
+2. T6 is accepted as proposed on 2026-09-19. The remaining cache decisions are PR structure, C6 timing, and C3 fleet fail-open behavior.
 
 The mutation checks used `sed` to change one token, ran the suite, and used `sed` to restore the token. `git diff --quiet crates/` confirmed each restore. C1: `<` to `<=` turned `a_tie_in_quoted_cost_keeps_the_efficient_pick_and_its_source` red. C2: `CACHE_LOOKBACK_BLOCKS` from 20 to 21 turned the evidence test red. C3: a predicate that never skips turned four of the five tests in `tests/local_quote_skip.rs` red, and the control stayed green. The C3 stage wrote its tests before the fix but did not run them before the fix, so this mutation is the evidence that they fail without it.
 
