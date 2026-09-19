@@ -9,7 +9,7 @@ SPDX-License-Identifier: Apache-2.0
 
 ## 1. Status
 
-Branch: `ai/typesafe-roundhouse-routing-6016d1`, pushed to `origin`. Last update: 2026-09-19. The latest baseline covers `29665d8`.
+Branch: `ai/typesafe-roundhouse-routing-6016d1`, pushed to `origin`. Last update: 2026-09-19. The latest full run covers the C4 plumbing before the mixed-marker regression below.
 
 | Rung | What | Status | Commit |
 |---|---|---|---|
@@ -18,7 +18,7 @@ Branch: `ai/typesafe-roundhouse-routing-6016d1`, pushed to `origin`. Last update
 | C1 | Dominance guard on `Efficient` picks (T4) | done, mutation-checked | `83ac785` |
 | C2 | Second Anthropic breakpoint | done, mutation-checked. Live evidence is still necessary. | `22e58ce`, `d7f69ce` |
 | C3 | The Dynamo residency call becomes a decision | done, mutation-checked | `8817db0` |
-| C4 | 1-hour TTL as one per-target setting | TTL propagation and catalog guard built. Mixed tool TTL policy awaits the owner; one regression is ignored. Not complete. | checkpoint in this change |
+| C4 | 1-hour TTL as one per-target setting | TTL propagation and catalog guard built. Mixed tool TTL policy awaits the owner; one regression is ignored. Not complete. | `4405da3` |
 | C5 | Local TTFT quote reads the residency answer | mechanism and catalog loader done, mutation-checked. Measured deployment slope still needed. | `6e905ba`, `3b21e98` |
 | C6 | Observed cache deadline and the return trip | not designed | |
 | C7 | Shadow classifier (T5) | owner requests serving strategies and background evaluation arms, including online Jev. T6 accepted. Detailed bandit design remains open. | |
@@ -47,7 +47,7 @@ The mutation checks used `sed` to change one token, ran the suite, and used `sed
 
 1. Read `CLAUDE.md`, then the ruling and its addendum, then this plan.
 2. Run `git fetch origin` and compare the branch in the status table with `origin`. Trust only pushed state.
-3. The next rung is C4. After C4, the order is: the loader for C5, the live evidence for C2, then C6. C7 waits for the owner. In general, take the first rung whose status is not `done`. Each rung lists its tests first. Write them, watch them fail, then write the fix.
+3. Complete the C4 tool-marker decision and its regression first. C5's loader is complete. Live C2 evidence needs working credentials, and C6 timing awaits the owner. Independent bandit observation work can proceed under R21. Serving allocation still needs the decisions in `PLAN-routing-strategy-bandit.md`. Each implementation starts with failing tests.
 4. Run cargo commands one at a time. The box has four cores and one build lock. Put `timeout 300` before a targeted test command and `timeout 900` before a workspace test command.
 5. Commit before any mutation stage. Commit with `--no-gpg-sign`. Push through the `gh` credential helper. `~/.gitconfig` rewrites `https://github.com/` to SSH, so put `GIT_CONFIG_GLOBAL=/dev/null` before the push command when the SSH agent does not answer.
 6. The owner chose to keep PR #18 as one unit on 2026-09-19. Keep each concern in a separate commit. The earlier split inventory remains useful for reviewing the existing rungs:

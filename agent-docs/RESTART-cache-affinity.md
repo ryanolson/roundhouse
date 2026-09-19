@@ -30,18 +30,27 @@ You are continuing PR #18 in `ryanolson/roundhouse`: https://github.com/ryanolso
 - The live C2 prerequisite check failed: `openv true` reports no configured 1Password CLI account. No provider request was sent.
 - The PR is a draft. Its body is in the PR. `gh pr edit` is broken in this container. Update the body with `gh api -X PATCH repos/ryanolson/roundhouse/pulls/18 --input body.json`.
 
-## Decisions that need the owner
+## Owner decisions
 
-Ask before you act on any of these. Offer the options below. Do not assume an answer.
+Settled on 2026-09-19. Do not ask for these decisions again:
 
-1. **T2, the classifier on the turn path.** Ruling R3 in `agent-docs/PLAN-frontier-selection.md` says routing guidance is "never a runtime dependency". T2 proposes an amendment: a classifier may supply a tier distribution as data, before `choose`, under its own deadline, with fail-open to the default tier. Options: (a) accept T2 and build C7 as a shadow first, (b) keep R3 and use a classifier offline only, as a labeler that calibrates the `pick_tier` thresholds, (c) defer. Recommendation: (b) until a shadow period has numbers, because (b) needs no egress ruling.
-2. **T6, content egress.** No ruling governs sending prompt content to a third party that is not the destination model. T6 proposes: opt-in by configuration, off by default, never for a session whose policy admits local targets only, digest format equals the judge brief. Options: accept as written, narrow it further, or reject and keep classifiers local. This decision is independent of TypeSafe.
-3. **The PR split.** The branch holds documents plus four rungs. `CLAUDE.md` asks for one concern per PR. Options: (a) merge PR #18 as one unit, (b) split into per-rung PRs from `main` with the commit lists in the plan, section 2, item 6. If (b), put C2 before C3 to avoid conflicts in shared test literals.
-4. **C4, the form of the price guard.** `ProviderPricing` has one write rate. A 1-hour TTL is billed at 2 times the input price and a 5-minute TTL at 1.25 times. Options: (a) the catalog boundary refuses a spec that declares a 1-hour TTL without the 2 times write rate, (b) the catalog accepts it and logs a warning, (c) `ProviderPricing` gains a second write rate. Recommendation: (a). A wrong write rate makes the savings dashboard lie, and the dashboard is the number the product is judged by.
-5. **C6, the return-trip cost.** Not designed. The question is whether the C1 guard also prices the cost of the old target going cold before the session returns to it. This needs the observed cache deadline per target. Options: design it now, or wait for live data from C2. Recommendation: wait until C2 has one live measurement.
-6. **C3, a fail-open arm for the fleet quote.** On a turn where the call is made, a fleet error still fails the turn. That is unchanged on purpose. Ask whether a sub-budget and a fail-open arm for the quote are wanted. If yes, the judge seam (`judge.rs`, `deadline_fraction`) is the template.
+1. T2 includes both serving strategies and background evaluation arms, with online TypeSafe/Jev arms.
+2. T6 is accepted: explicit opt-in, off by default, no calls for local-only sessions, and only the bounded judge brief.
+3. PR #18 stays one unit, with separate logical commits.
+4. C4 rejects a one-hour catalog entry unless its write rate equals twice its input rate.
 
-## Work that remains, in order
+Questions already sent and still awaiting answers:
+
+1. C4 tool markers: normalize existing marker TTLs to the target setting, or preserve them and reject conflicting requests. Normalization is the recommendation. Neither answer is assumed.
+2. C6: design the return-trip cost now, or wait for live C2 cache evidence. Waiting is the recommendation.
+3. C3: retain fleet-error failure, or add a sub-budget and fail-open path to admitted frontier targets.
+4. Bandit objective: quality and latency constraints followed by cost minimization, a weighted score, or fixed allocation until evidence exists. Deployment must supply the limits.
+
+The segment boundary cases and promotion evidence also need a settled brief before serving allocation changes.
+
+## Original work inventory
+
+Use the State section for completed work and current blockers. The C5 loader is complete. C4 has a partial checkpoint at `4405da3`.
 
 Each item has its tests-first list in the plan. Write the tests, watch them fail, then write the fix. Mark nothing `#[ignore]` unless a fix is a design question that waits for the owner.
 
