@@ -106,7 +106,7 @@ Each implementation milestone needs a settled brief, failing tests before its fi
 
 | Milestone | Behavior | Required evidence |
 |---|---|---|
-| B1: observations | Attribute cost, first-output time, completion, and failures to the served decision | Replay equals incremental fold. Duplicate events cannot double-count. Missing output has no invented TTFT. |
+| B1: observations | First-output checkpoint in `765daf2`, cleanup guard in `1142348`. Completion and strategy outcome attribution remain. | First-output, replay, scope, and failure regressions pass. Independent mutations verified; full suite passes. |
 | B2: strategy records | Record eligible serving strategies, versioned allocation, and fallback | Fixed hash vectors. Replay survives configuration changes. Background-only arms cannot enter serving allocation. |
 | B3: background evaluation | Execute sampled alternatives with bounded resources and no effect on routing | A stalled worker cannot delay a turn. Cancellation releases capacity. Retry cannot duplicate charges or outcomes. |
 | B4: Jev shadow adapter | Produce tier probabilities from the approved digest under T6 | Fake-server request assertions. Malformed probabilities and timeouts fall back. Local-only and disabled egress make zero calls. |
@@ -124,6 +124,12 @@ The accumulator keeps elapsed milliseconds, sample count, and rejected timestamp
 A response that emits text and later fails still has an observed first-output latency. Book that sample on the actual routed target, independently of token billing. Superseded attempts contribute no sample. Terminal and supersession paths remove pending timing state. Duplicate events cannot add a sample twice.
 
 This step does not define a quality reward, promotion threshold, or experiment allocation. It supplies one observation needed by those later decisions.
+
+Checkpoint `765daf2` implements this interval in the metrics fold and publishes it in per-model JSON rows. The basis is `turn_start_to_first_output`. It excludes work before the start event and delivery after the delta append. The HTML dashboard does not yet display the field.
+
+Tests failed before the implementation: 10 assertions failed while absence controls passed. Two additional regressions exposed an empty model row for a silent failure and cross-session supersession when turn IDs match. Both are fixed. Supersession now uses `(SessionId, TurnId)`, which also prevents the existing loss of accounting across concurrent sessions. The final targeted gate passed 53 metrics tests. Broader checks passed 417 core tests and 404 server checks, with 5 pre-existing server ignores. Independent mutations and a new full workspace run remain necessary.
+
+**Verification update, 2026-09-19.** Six B1 mutations failed the intended tests: routing-event timing, empty deltas, overwritten aggregate counters, billing-dependent samples, backward timestamps, and cross-session supersession. Removing timing cleanup initially survived. Commit `1142348` adds the missing map-drain assertion; the same mutation then failed against that committed guard. The restored source passed all 53 metrics tests. The full workspace run at `1142348` passed 1684 tests, with 0 failures and 142 ignores. One ignore belongs to the unresolved C4 tool-marker policy.
 
 ## 6. Decisions still needed
 

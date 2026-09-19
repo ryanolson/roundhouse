@@ -9,7 +9,7 @@ SPDX-License-Identifier: Apache-2.0
 
 ## 1. Status
 
-Branch: `ai/typesafe-roundhouse-routing-6016d1`, pushed to `origin`. Last update: 2026-09-19. The latest full run covers the C4 plumbing before the mixed-marker regression below.
+Branch: `ai/typesafe-roundhouse-routing-6016d1`. Last update: 2026-09-19. The latest full run covers `1142348`: 1684 passed, 0 failed, 142 ignored, across 106 test binaries and 7 doc-test suites.
 
 | Rung | What | Status | Commit |
 |---|---|---|---|
@@ -26,6 +26,7 @@ Branch: `ai/typesafe-roundhouse-routing-6016d1`, pushed to `origin`. Last update
 Open items that belong to a finished rung:
 
 - **C4 checkpoint, 2026-09-19.** The engine carries the target TTL into `FrontierQuote`. Messages bodies select one-hour conversation markers, and the catalog rejects a mismatched write rate, including Messages gateways. Fail-first wire, catalog, and engine tests passed after the change. The full workspace run passed 1670 tests with 141 ignored across 106 test binaries and 7 doc-test suites. A later body regression failed with tool/message TTLs `[300, 3600, 3600]`. That regression is now explicitly ignored pending the owner's normalize-or-reject decision. An ignored test enforces nothing. The subsequent fleet run passed with that one additional ignore. C4 is not ready for use with shorter tool markers.
+- **C4 verification, 2026-09-19.** Independent mutations of engine TTL propagation, one-hour wire selection, the catalog guard, and gateway handling all failed their intended tests. Controls passed. Source restoration was byte-checked after each mutation. This verifies the checkpoint and does not close the ignored mixed-marker regression.
 
 - **C1.** Closed in `4bffdcb`. `crates/roundhouse-server/tests/handoff_escalation.rs` had a table of six ways that a turn gets or does not get a handoff note. A turn that the cost guard redirects is the seventh way. The test `a_cost_guarded_turn_narrates_nothing` proves it through the engine with a priced catalog and a warm `Capable` target. With the guard disabled, that test goes red. This commit landed after the last full workspace run. Its gate was the `handoff_escalation` binary: 8 passed, 0 failed.
 - **C1.** A `Dimensions` pick of the `Efficient` tier is not reachable at the shipped threshold, because `production_intensity` has a maximum of `tanh(0.5)`. The guard test for a pick that is not `TestsPassed` uses the `Ambiguous` default.
@@ -108,6 +109,12 @@ The mutation checks used `sed` to change one token, ran the suite, and used `sed
 
 **Live evidence that is still necessary.** The tests prove the block arithmetic. A real session with a long append must show `cache_read_input_tokens > 0` on the next turn. Spend is capped by R9.
 
+**Probe brief, 2026-09-19.** One shared harness drives two turns through the engine, a configured project budget, stored credentials, and the Messages client. The loop has a two-request maximum. A loopback server and the live endpoint use the same turn-driving code. The second turn appends at least 20 items. Offline tests inspect the received breakpoint positions, both usage events, and a zero-budget refusal that sends no request.
+
+The live test uses a non-default `e2e-frontier` feature and mandatory preflight. It requires the operator's catalog, pinned model, spend cap, and stored key. No model, rate card, or cap has a guessed default. The latest handoff prohibits new ignores outside owner-design questions, so this probe uses no `#[ignore]`. This supersedes R9's earlier ignore pattern for this probe.
+
+The report records `ResponseCompleted.usage.cached_input_tokens` and `cache_write_tokens` for both turns. These correspond to the provider's `cache_read_input_tokens` and `cache_creation_input_tokens`. A zero second-turn read requires investigation. A first turn that wrote no cache entry cannot test lookback reachability. The live prerequisite remains blocked because `openv` reports no configured 1Password CLI account.
+
 ### C3 — the Dynamo residency call becomes a decision
 
 **Finding.** `fleet.price()` is a realtime residency check. It sends block and sequence hashes and gets back `effective_prefill_tokens` and `longest_matched_tokens` (`local.rs:50-68, 150-159`). It runs on every turn when a fleet is configured (`engine.rs:2021-2038`). It runs before the tool exclusion at `engine.rs:2078-2085`, so each tool turn makes the HTTP call and then discards the answer. Its only bound is the whole-turn deadline of 120 s. A fleet error fails the turn even when the route was always a frontier target.
@@ -143,6 +150,8 @@ Not designed yet. The input is the time of the last dispatch to each target plus
 Blocked on the owner. It needs a ruling on T2 (the amendment to R3) and on T6 (the egress posture). No classifier call ships before both. The shadow records a tier distribution next to the `pick_tier` answer at each segment start and affects no route.
 
 **Continuation, 2026-09-19.** The owner requests serving strategies and background evaluation arms, including online Jev. `PLAN-routing-strategy-bandit.md` develops that direction into proposed contracts, delivery milestones, and tests. It distinguishes live outcomes from background estimates. T6 and the reward and promotion criteria remain open.
+
+**Later ruling, 2026-09-19.** T6 is accepted. The earlier statement that T6 remains open is superseded. Reward, promotion, and segment allocation contracts remain unsettled. A standalone shadow adapter can proceed under T6; runtime allocation must wait for its durable record contract.
 
 ## 4. Smaller findings with no rung yet
 
