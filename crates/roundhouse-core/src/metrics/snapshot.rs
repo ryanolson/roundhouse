@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::event::Usage;
 use crate::metrics::ServingMode;
-use crate::metrics::fold::{MetricsFold, Scope};
+use crate::metrics::fold::{Elapsed, MetricsFold, Scope};
 use crate::metrics::pricing::{Correlary, ReferenceModel, ShadowPricing, TokenShape};
 
 /// Token counts for one grouping, split the way a reader asks about them.
@@ -209,6 +209,54 @@ pub struct FirstOutputLatency {
     pub basis: &'static str,
 }
 
+/// What the two [`TurnElapsed`] columns measure, published beside each number.
+///
+/// The interval is the `TurnStarted` append stamp to the `ResponseCompleted` or
+/// `ResponseIncomplete` append stamp, attributed to the turn's last routed
+/// target. It includes routing and any failover in between, and excludes
+/// admission work before `TurnStarted` and delivery after the terminal append.
+///
+/// It is not provider latency, not task success, and not time to solution — it
+/// is how long this deployment took to finish with a turn, one way or another.
+pub const TURN_ELAPSED_BASIS: &str = "turn_start_to_terminal";
+
+/// The interval [`TURN_ELAPSED_BASIS`] names, for one outcome class.
+///
+/// The basis names the *interval*, which is why both columns carry the same
+/// string; the field name names the *class*. Two fields with one basis is the
+/// design rather than a copy-paste — what differs between them is how the turn
+/// ended, not what was measured.
+#[derive(Debug, Clone, Serialize)]
+pub struct TurnElapsed {
+    /// Mean milliseconds over [`Self::samples`].
+    ///
+    /// `None` when there are no samples: a class that measured nothing
+    /// publishes no number rather than a zero that reads as instant.
+    pub mean_ms: Option<f64>,
+    pub samples: u64,
+    /// Terminals refused because their stamp preceded their turn's start.
+    pub rejected: u64,
+    pub basis: &'static str,
+}
+
+impl TurnElapsed {
+    /// One class's column, or `None` when that class measured nothing.
+    ///
+    /// Published when there is either a timing or a refusal to report, which is
+    /// [`FirstOutputLatency`]'s rule and holds for its reason: a class with only
+    /// refusals keeps the column and loses the mean, because dropping it would
+    /// hide a clock that moved behind "not measured".
+    fn publish(elapsed: &Elapsed) -> Option<Self> {
+        (elapsed.samples > 0 || elapsed.rejected > 0).then(|| Self {
+            mean_ms: (elapsed.samples > 0)
+                .then(|| elapsed.ms_total as f64 / elapsed.samples as f64),
+            samples: elapsed.samples,
+            rejected: elapsed.rejected,
+            basis: TURN_ELAPSED_BASIS,
+        })
+    }
+}
+
 /// One model's row.
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelMetrics {
@@ -221,6 +269,16 @@ pub struct ModelMetrics {
     /// every row written before this column existed serializes as it did.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_output: Option<FirstOutputLatency>,
+    /// Turn start to terminal, over the turns this row completed.
+    ///
+    /// Absent on the same rule `first_output` uses, and never added to
+    /// [`Self::incomplete_turn_elapsed`]: see `Counters::completed_elapsed`
+    /// in the fold module for why one pot would reward failing faster.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_turn_elapsed: Option<TurnElapsed>,
+    /// The same interval over the turns this row did not complete.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incomplete_turn_elapsed: Option<TurnElapsed>,
     #[serde(flatten)]
     pub accounting: ModelAccounting,
 }
@@ -451,6 +509,15 @@ pub struct MetricsSnapshot {
     /// reached a provider. The dashboard prints both, and `turns` exceeding
     /// `calls` is the shape of a deployment that has been failing over.
     pub turns: u64,
+    /// Terminals with a clock and no model row to carry it.
+    ///
+    /// Marks what the two [`TurnElapsed`] columns exclude — most often a turn
+    /// refused before any dispatch, which stamps `TurnStarted` and a terminal
+    /// but never reaches routing — rather than folding a correction back into
+    /// either mean. Counts a terminal of either outcome class, whether or not
+    /// its interval was itself measurable. Scoped like every other figure
+    /// here: a tenant sees its own.
+    pub unrouted_terminals: u64,
     /// Dispatches that reached a provider and were accounted for.
     pub calls: u64,
     pub tokens: TokenBreakdown,
@@ -707,6 +774,8 @@ impl MetricsSnapshot {
                 tokens,
                 coverage,
                 first_output,
+                completed_turn_elapsed: TurnElapsed::publish(&counters.completed_elapsed),
+                incomplete_turn_elapsed: TurnElapsed::publish(&counters.incomplete_elapsed),
                 accounting,
             });
         }
@@ -759,6 +828,7 @@ impl MetricsSnapshot {
             last_event_at_ms: view.totals.last_at_ms,
             sessions: view.totals.sessions,
             turns: view.totals.turns,
+            unrouted_terminals: view.totals.unrouted_terminals,
             calls: totals.calls,
             tokens: totals.tokens,
             seat_tokens: totals.seat_tokens,

@@ -106,7 +106,7 @@ Each implementation milestone needs a settled brief, failing tests before its fi
 
 | Milestone | Behavior | Required evidence |
 |---|---|---|
-| B1: observations | First-output checkpoint in `765daf2`, cleanup guard in `1142348`. Completion and strategy outcome attribution remain. | First-output, replay, scope, and failure regressions pass. Independent mutations verified; full suite passes. |
+| B1: observations | First-output checkpoint in `765daf2`, cleanup guard in `1142348`. Terminal timing is implemented. Strategy outcome attribution remains. | First-output mutations verified. Terminal timing passes 72 core metrics tests and 6 server metrics tests. Its independent mutations remain. |
 | B2: strategy records | Record eligible serving strategies, versioned allocation, and fallback | Fixed hash vectors. Replay survives configuration changes. Background-only arms cannot enter serving allocation. |
 | B3: background evaluation | Execute sampled alternatives with bounded resources and no effect on routing | A stalled worker cannot delay a turn. Cancellation releases capacity. Retry cannot duplicate charges or outcomes. |
 | B4: Jev shadow adapter | Standalone transport and budgeted server boundary committed at `51b0fb2` under T6. B2/B3 wiring remains. | All 39 focused tests pass. Twelve independent post-commit mutations were caught. No live quality or latency evidence. |
@@ -162,6 +162,24 @@ Two draft-review claims required correction. Reqwest already bounded total durat
 Some later guard tests first ran green. The author's temporary re-breaks occurred before a commit and do not count as independent mutation evidence. The independent stage below checks committed source. No live TypeSafe call, quality evidence, learned allocation, or durable background record is claimed.
 
 **Independent verification, 2026-09-19.** Twelve mutations against `51b0fb2` failed the intended assertions. They covered opt-in, admitted frontier availability, short grants, retained usage, partial usage, shared deadlines, request size, state size, estimates, URL redaction, probability sums, and credential diagnostics. Every restored source matched the commit. The restored suites passed 14 fleet unit tests, 8 HTTP tests, and 17 server tests. The verifier used exact inverse edits instead of the prescribed `sed` commands. No reset, checkout, or stash restored files. Logs: `/tmp/roundhouse-b4-refute-*.log`.
+
+### B1 terminal timing brief, 2026-09-19
+
+The next observation measures `TurnStarted.at_ms` to the terminal event for the same response. Its basis is `turn_start_to_terminal`. Completed and incomplete responses have separate aggregates. The interval includes routing and failover between the two append stamps. It excludes work before the start event and delivery after the terminal append. It does not measure task success or time to solution.
+
+The last routed target receives the sample. Booking precedes the billing-evidence gate, so an incomplete response with empty usage can have a timing sample and zero calls. A missing start produces no timing or rejection. A terminal timestamp before the start increments the rejection count for its outcome class. Equal timestamps produce a valid zero interval.
+
+A single response clock retains the start through first output. Supersession removes the abandoned clock, scoped by session and turn. Terminal events remove the clock regardless of routing or accounting. Replay and duplicate terminal events cannot add samples.
+
+An unrouted terminal has a clock but no pending routed target. It increments a separate `unrouted_terminals` count for its principal and scope, without creating a model row. Missing-start and superseded responses do not enter this count. The count marks excluded observations without inventing target attribution.
+
+Tests must cover both outcome classes, failover, supersession, cross-session turn IDs, timestamp validity, accounting independence, scope aggregation, replay, duplicate delivery, and state cleanup. The JSON fields carry their basis, sample count, rejection count, and optional mean. The HTML dashboard remains separate work. Reward, quality, and allocation decisions remain open.
+
+**Implementation checkpoint, 2026-09-19.** The first core metrics run produced 15 failures and 58 passes before terminal booking and publishing. One failure was a missing-row lookup panic. The remaining failures compared missing or zero observations with expected values. Five new guards first ran green and require independent mutation evidence. One new test duplicated an existing silent-failure case and was removed.
+
+The existing silent-failure test now checks an incomplete timing sample beside zero calls, zero tokens, and no first-output sample. Its clock-cleanup assertion remains. This changes row presence deliberately: elapsed time is observable even without billing evidence.
+
+The restored implementation passes 72 core metrics tests and 6 server metrics tests. The broader core crate run passed 436 tests. Root repeated the focused gates. The comment pass preserved all non-comment source lines, and formatting and whitespace checks pass. No new ignore was added. Logs: `/tmp/roundhouse-b1-terminal-red-core.log`, `/tmp/roundhouse-b1-terminal-green-core-full.log`, and `/tmp/roundhouse-b1-terminal-root-*.log`. Independent post-commit mutations and a full workspace run remain.
 
 ## 6. Decisions still needed
 

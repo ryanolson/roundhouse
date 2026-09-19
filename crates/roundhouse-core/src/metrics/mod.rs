@@ -66,6 +66,9 @@ pub mod fold;
 pub mod pricing;
 pub mod snapshot;
 
+#[cfg(test)]
+mod turn_elapsed_snapshot_tests;
+
 use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
@@ -83,7 +86,7 @@ pub use pricing::{
 pub use snapshot::{
     Coverage, FIRST_OUTPUT_BASIS, FirstOutputLatency, MetricsConfig, MetricsSnapshot,
     ModelAccounting, ModelMetrics, ProviderMetrics, Rollup, Savings, ServingModeMetrics,
-    TokenBreakdown,
+    TURN_ELAPSED_BASIS, TokenBreakdown, TurnElapsed,
 };
 
 /// The provider name local targets are grouped under.
@@ -271,7 +274,7 @@ mod tests {
         output_per_mtok_usd: 15.0,
     };
 
-    fn config() -> MetricsConfig {
+    pub(super) fn config() -> MetricsConfig {
         MetricsConfig::new(
             ShadowPricing::new(vec![ReferenceModel {
                 provider: "anthropic".into(),
@@ -284,7 +287,7 @@ mod tests {
         .with_default_local_quality(0.6)
     }
 
-    fn snapshot(fold: &MetricsFold) -> MetricsSnapshot {
+    pub(super) fn snapshot(fold: &MetricsFold) -> MetricsSnapshot {
         MetricsSnapshot::build(fold, Scope::Deployment, &config(), 9_999)
     }
 

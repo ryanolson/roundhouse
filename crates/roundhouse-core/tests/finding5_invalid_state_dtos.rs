@@ -200,6 +200,8 @@ fn a_model_row_cannot_contradict_its_own_serving_mode() {
         tokens: Default::default(),
         coverage: Default::default(),
         first_output: None,
+        completed_turn_elapsed: None,
+        incomplete_turn_elapsed: None,
         accounting: local,
     };
 
@@ -216,6 +218,8 @@ fn a_model_row_cannot_contradict_its_own_serving_mode() {
         tokens: Default::default(),
         coverage: Default::default(),
         first_output: None,
+        completed_turn_elapsed: None,
+        incomplete_turn_elapsed: None,
         accounting: ModelAccounting::Frontier {
             billed_usd: 4.0,
             billed_measured_usd: 3.0,

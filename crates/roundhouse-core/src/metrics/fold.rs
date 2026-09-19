@@ -202,6 +202,19 @@ pub(super) struct Counters {
     /// deployment that measured nothing and a clock that went backwards, and a
     /// silent drop makes the second one look like the first.
     pub(super) first_output_rejected: u64,
+    /// Turn start to terminal event, over the turns this row *completed*.
+    ///
+    /// Never merged with [`Self::incomplete_elapsed`]: a fast refusal and a
+    /// slow completed answer are both terminals, and one pot would let a
+    /// deployment improve its mean by failing faster.
+    pub(super) completed_elapsed: Elapsed,
+    /// The same interval over the turns this row *did not* complete, every
+    /// [`IncompleteReason`](crate::event::IncompleteReason) in one pot.
+    ///
+    /// Undivided by reason: which failures compare against a completed turn
+    /// is a reward question this observation does not answer. The reason
+    /// stays on the event for a later pass to split.
+    pub(super) incomplete_elapsed: Elapsed,
 }
 
 /// The declared baselines one model row's turns named, collapsed.
@@ -258,6 +271,54 @@ impl DeclaredBaseline {
     }
 }
 
+/// One outcome class's turn-elapsed accumulator.
+///
+/// A total and a count rather than a mean: rows merge, sums add exactly, and
+/// a mean of means would weight a row that served three turns the same as
+/// one that served three hundred.
+///
+/// A struct rather than flat fields on `Counters`, so [`Self::absorb`] merges
+/// each class in one place instead of leaving [`Counters::absorb`] two more
+/// fields to remember.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct Elapsed {
+    pub(super) ms_total: u64,
+    pub(super) samples: u64,
+    /// Terminals stamped before their own `TurnStarted`.
+    ///
+    /// Counted rather than dropped, for the reason
+    /// [`Counters::first_output_rejected`] gives: a silent drop makes a clock
+    /// that moved look like a deployment that measured nothing.
+    pub(super) rejected: u64,
+}
+
+impl Elapsed {
+    /// Fold one terminal's interval.
+    ///
+    /// `None` is a stamp that preceded its own start, and it lands in
+    /// [`Self::rejected`] rather than as a zero: a zero is a real answer here —
+    /// a turn that started and ended inside one millisecond — so spending it on
+    /// a clock that moved would make the two indistinguishable.
+    fn observe(&mut self, elapsed_ms: Option<u64>) {
+        match elapsed_ms {
+            Some(elapsed_ms) => {
+                // Saturating for [`Usage::add`]'s reason: a wrapped total would
+                // report a near-zero mean for the busiest deployment on the
+                // fleet, which is the one where the number matters most.
+                self.ms_total = self.ms_total.saturating_add(elapsed_ms);
+                self.samples += 1;
+            }
+            None => self.rejected += 1,
+        }
+    }
+
+    fn absorb(&mut self, other: &Elapsed) {
+        self.ms_total += other.ms_total;
+        self.samples += other.samples;
+        self.rejected += other.rejected;
+    }
+}
+
 impl Counters {
     /// Every token this row measured, whoever paid for it.
     ///
@@ -307,6 +368,8 @@ impl Counters {
         self.first_output_ms_total += other.first_output_ms_total;
         self.first_output_samples += other.first_output_samples;
         self.first_output_rejected += other.first_output_rejected;
+        self.completed_elapsed.absorb(&other.completed_elapsed);
+        self.incomplete_elapsed.absorb(&other.incomplete_elapsed);
     }
 }
 
@@ -370,18 +433,44 @@ struct Pending {
     billing: Billing,
 }
 
-/// One response's clock, from its turn's start to the first text a caller
-/// could see.
+/// One open response's clock.
+///
+/// The start stamp outlives the first-output delta: two intervals share one
+/// origin, the first text a caller could see and the terminal event, and the
+/// second is decided at an event the first has long since passed. One map
+/// keyed by response ID, drained once at that event, is what keeps the two
+/// from drifting apart.
+struct TurnClock {
+    /// This response's `TurnStarted` append stamp.
+    started_at_ms: u64,
+    first_output: FirstOutputState,
+}
+
+/// How far the first-output interval has got.
 ///
 /// Three states rather than two `Option`s: the first non-empty delta decides
 /// the answer once, and a later one must not move it or replace a refusal.
-enum FirstOutput {
-    /// Started at this stamp, nothing said yet.
-    Waiting(u64),
+enum FirstOutputState {
+    /// Nothing said yet.
+    Waiting,
     /// Milliseconds from the start to the first non-empty delta.
     Measured(u64),
     /// That delta was stamped before the start, so there is nothing to fold.
     Rejected,
+}
+
+impl FirstOutputState {
+    /// This clock's contribution as `(milliseconds, samples, rejections)`.
+    ///
+    /// `None` for a response that never spoke: a turn with nothing to time
+    /// contributes no sample, and a zero here would read as an instant answer.
+    fn booking(&self) -> Option<(u64, u64, u64)> {
+        match self {
+            FirstOutputState::Measured(elapsed_ms) => Some((*elapsed_ms, 1, 0)),
+            FirstOutputState::Rejected => Some((0, 0, 1)),
+            FirstOutputState::Waiting => None,
+        }
+    }
 }
 
 /// Whose numbers a report is about.
@@ -499,10 +588,21 @@ pub struct MetricsFold {
     /// session so a concurrent turn cannot retire another session's dispatch.
     response_of_turn: HashMap<(SessionId, TurnId), ResponseId>,
     turn_of_response: HashMap<ResponseId, (SessionId, TurnId)>,
-    /// Each open response's first-output clock. Drains where `pending` does —
-    /// at the terminal event and at supersession — and leaves the same residue
-    /// for a turn abandoned and never retried.
-    first_output: HashMap<ResponseId, FirstOutput>,
+    /// Each open response's clock. Drains where `pending` does — at the
+    /// terminal event and at supersession — and leaves the same residue for a
+    /// turn abandoned and never retried.
+    clocks: HashMap<ResponseId, TurnClock>,
+    /// Terminals that had a clock and no dispatch to attribute it to, by payer.
+    ///
+    /// Marked here rather than booked onto a model row, for
+    /// [`Counters::abandoned_side_calls`]'s reason: there is no target, and a
+    /// sentinel row with no calls and no tokens would read as a free one. The
+    /// main class is a turn refused before any dispatch — a policy or budget
+    /// refusal stamps `TurnStarted` and a terminal but never reaches
+    /// `record_routing` — but a completed terminal with no prior `Routed`
+    /// counts here too, so this is not restricted to incomplete turns. A
+    /// count and not a duration: what these turns took stays in the log.
+    unrouted_terminals_of_principal: BTreeMap<PrincipalKey, u64>,
     /// Turns admitted, split by who admitted them.
     ///
     /// Per principal for the same reason the counters are: a scoped report that
@@ -538,6 +638,9 @@ pub(super) struct ScopeTotals {
     pub(super) turns: u64,
     pub(super) first_at_ms: Option<u64>,
     pub(super) last_at_ms: Option<u64>,
+    /// Terminals this scope saw that no model row could carry. See
+    /// [`MetricsFold::unrouted_terminals_of_principal`].
+    pub(super) unrouted_terminals: u64,
 }
 
 /// One scope's rows and volume figures, resolved together.
@@ -638,14 +741,19 @@ impl MetricsFold {
                 {
                     self.pending.remove(&abandoned);
                     self.turn_of_response.remove(&abandoned);
-                    self.first_output.remove(&abandoned);
+                    self.clocks.remove(&abandoned);
                 }
                 self.turn_of_response.insert(response_id.clone(), turn_key);
-                // The stamp the interval is measured from. A retry starts its
+                // The stamp both intervals are measured from. A retry starts its
                 // own clock: the abandoned response never terminates, so it
                 // books nothing.
-                self.first_output
-                    .insert(response_id.clone(), FirstOutput::Waiting(event.at_ms));
+                self.clocks.insert(
+                    response_id.clone(),
+                    TurnClock {
+                        started_at_ms: event.at_ms,
+                        first_output: FirstOutputState::Waiting,
+                    },
+                );
             }
             SessionEventKind::Routed {
                 response_id,
@@ -707,12 +815,12 @@ impl MetricsFold {
             // through to the ignored kinds below: a provider opens a block
             // before it says anything, and that stamp measures nothing.
             SessionEventKind::OutputTextDelta { response_id, text } if !text.is_empty() => {
-                if let Some(clock) = self.first_output.get_mut(response_id)
-                    && let FirstOutput::Waiting(started_at_ms) = *clock
+                if let Some(clock) = self.clocks.get_mut(response_id)
+                    && let FirstOutputState::Waiting = clock.first_output
                 {
-                    *clock = match event.at_ms.checked_sub(started_at_ms) {
-                        Some(elapsed) => FirstOutput::Measured(elapsed),
-                        None => FirstOutput::Rejected,
+                    clock.first_output = match event.at_ms.checked_sub(clock.started_at_ms) {
+                        Some(elapsed) => FirstOutputState::Measured(elapsed),
+                        None => FirstOutputState::Rejected,
                     };
                 }
             }
@@ -790,23 +898,58 @@ impl MetricsFold {
                 // and creating its row anyway would put a zero-token row on the
                 // dashboard for a response the gate below drops — which reads
                 // as a free call.
-                let clock = match self.first_output.remove(response_id) {
-                    Some(FirstOutput::Measured(elapsed_ms)) => Some((elapsed_ms, 1, 0)),
-                    Some(FirstOutput::Rejected) => Some((0, 0, 1)),
-                    Some(FirstOutput::Waiting(_)) | None => None,
-                };
-                if let Some((elapsed_ms, samples, rejected)) = clock
-                    && let Some(pending) = self.pending.get(response_id)
-                {
-                    let counters = self
-                        .by_principal
-                        .entry(payer.clone())
-                        .or_default()
-                        .entry(pending.key.clone())
-                        .or_default();
-                    counters.first_output_ms_total += elapsed_ms;
-                    counters.first_output_samples += samples;
-                    counters.first_output_rejected += rejected;
+                if let Some(clock) = self.clocks.remove(response_id) {
+                    let first_output = clock.first_output.booking();
+                    let terminal_ms = event.at_ms.checked_sub(clock.started_at_ms);
+                    let completed =
+                        matches!(event.kind, SessionEventKind::ResponseCompleted { .. });
+                    match self.pending.get(response_id) {
+                        // The two intervals this clock carries, booked to the
+                        // turn's last routed target. A turn that failed over
+                        // books its whole span there, including the time its
+                        // dead attempts burned, because there is one turn and
+                        // the caller waited once — what the abandoned targets
+                        // cost is already on their own rows as
+                        // `failed_attempts`.
+                        //
+                        // Unlike the first-output sample beside it, the
+                        // terminal interval exists for every response that
+                        // started and ended, so this branch can create a row
+                        // for a dispatch the evidence gate below drops. The
+                        // row carries `calls: 0`, which keeps it from reading
+                        // as a free call.
+                        Some(pending) => {
+                            let counters = self
+                                .by_principal
+                                .entry(payer.clone())
+                                .or_default()
+                                .entry(pending.key.clone())
+                                .or_default();
+                            if let Some((elapsed_ms, samples, rejected)) = first_output {
+                                counters.first_output_ms_total += elapsed_ms;
+                                counters.first_output_samples += samples;
+                                counters.first_output_rejected += rejected;
+                            }
+                            // Never the same pot. See `Counters::completed_elapsed`.
+                            match completed {
+                                true => counters.completed_elapsed.observe(terminal_ms),
+                                false => counters.incomplete_elapsed.observe(terminal_ms),
+                            }
+                        }
+                        // A clock with no dispatch to attribute it to: marked,
+                        // never booked. The gate is both halves — a clock that
+                        // exists and a dispatch that does not — so a
+                        // superseded response's late terminal, which has
+                        // neither, lands here; a terminal whose start this
+                        // fold never saw has only the dispatch and never
+                        // reaches this arm.
+                        None => {
+                            *self
+                                .unrouted_terminals_of_principal
+                                .entry(payer.clone())
+                                .or_default() += 1;
+                        }
+                    }
                 }
                 let Some(pending) = self.pending.remove(response_id) else {
                     return true;
@@ -955,6 +1098,7 @@ impl MetricsFold {
                     turns: self.turns_of_principal.values().sum(),
                     first_at_ms: self.window_of_principal.values().map(|(f, _)| *f).min(),
                     last_at_ms: self.window_of_principal.values().map(|(_, l)| *l).max(),
+                    unrouted_terminals: self.unrouted_terminals_of_principal.values().sum(),
                 },
             },
             // Every figure filtered through the *same* predicate the rows were,
@@ -988,6 +1132,12 @@ impl MetricsFold {
                         .filter(|(key, _)| scope.collects(key))
                         .map(|(_, (_, last))| *last)
                         .max(),
+                    unrouted_terminals: self
+                        .unrouted_terminals_of_principal
+                        .iter()
+                        .filter(|(key, _)| scope.collects(key))
+                        .map(|(_, count)| *count)
+                        .sum(),
                 },
             },
             Scope::Principal(key) => {
@@ -1010,6 +1160,11 @@ impl MetricsFold {
                         turns: self.turns_of_principal.get(key).copied().unwrap_or(0),
                         first_at_ms: window.map(|(first, _)| first),
                         last_at_ms: window.map(|(_, last)| last),
+                        unrouted_terminals: self
+                            .unrouted_terminals_of_principal
+                            .get(key)
+                            .copied()
+                            .unwrap_or(0),
                     },
                 }
             }
@@ -1148,6 +1303,9 @@ fn settle(
         counters.quoted_alternative_usd += alternative;
     }
 }
+
+#[cfg(test)]
+mod turn_elapsed_tests;
 
 #[cfg(test)]
 pub(super) mod tests {
@@ -1548,7 +1706,7 @@ pub(super) mod tests {
         }
     }
 
-    fn claude() -> ModelKey {
+    pub(crate) fn claude() -> ModelKey {
         ModelKey {
             mode: ServingMode::Frontier,
             provider: "anthropic".into(),
@@ -2321,7 +2479,7 @@ pub(super) mod tests {
     // -----------------------------------------------------------------------
 
     /// The row the deployment scope holds for `key`.
-    fn row(fold: &MetricsFold, key: &ModelKey) -> Counters {
+    pub(crate) fn row(fold: &MetricsFold, key: &ModelKey) -> Counters {
         fold.summed_rows(Scope::Deployment)[key].clone()
     }
 
@@ -2570,10 +2728,10 @@ pub(super) mod tests {
         // The abandoned response never terminates. Its clock must drain at
         // supersession, or each retry retains another unused map entry.
         assert!(
-            fold.first_output.is_empty(),
+            fold.clocks.is_empty(),
             "the fenced response's clock must be drained at supersession, not \
              left to leak: {:?}",
-            fold.first_output.keys().collect::<Vec<_>>()
+            fold.clocks.keys().collect::<Vec<_>>()
         );
     }
 
@@ -2731,14 +2889,15 @@ pub(super) mod tests {
         }
     }
 
-    /// A turn that started, dispatched and died without speaking adds no row.
+    /// A turn that started, dispatched and died without speaking books its
+    /// interval, and still books no call.
     ///
     /// The timing block runs above the evidence gate, so it is the one place
     /// that can create a serving row for a response the gate would have
     /// dropped. A zero-token row reads as a free call — the failure
     /// `failed_attempts` and `abandoned_side_calls` are both shaped to avoid.
     #[test]
-    fn a_started_turn_that_never_spoke_adds_no_row_and_drains_its_clock() {
+    fn a_started_turn_that_never_spoke_books_its_interval_without_booking_a_call() {
         let mut log = LogBuilder::new("s1");
         log.created(Some(principal("acme", "ada")));
         log.start_and_route(
@@ -2758,16 +2917,32 @@ pub(super) mod tests {
         let mut fold = MetricsFold::new();
         fold.extend(log.events());
 
-        assert!(
-            fold.summed_rows(Scope::Deployment).is_empty(),
-            "nothing was served and nothing was billed, so the dashboard must \
-             carry no row for this target: {:?}",
-            fold.summed_rows(Scope::Deployment)
-                .keys()
-                .collect::<Vec<_>>()
+        let claude = row(&fold, &claude());
+        assert_eq!(
+            claude.calls, 0,
+            "nothing reached the provider, so the row counts no call: a \
+             zero-token row that counted one would read as a free call"
+        );
+        assert_eq!(
+            claude.total_usage().total(),
+            0,
+            "and it carries no tokens to be priced"
+        );
+        assert_eq!(
+            (
+                claude.incomplete_elapsed.samples,
+                claude.incomplete_elapsed.ms_total
+            ),
+            (1, 20),
+            "the row exists because the turn ended, and when it ended is the \
+             whole of what it reports"
+        );
+        assert_eq!(
+            claude.first_output_samples, 0,
+            "the response never spoke, so no first-output sample rides along"
         );
         assert!(
-            fold.first_output.is_empty(),
+            fold.clocks.is_empty(),
             "the clock drains at the terminal event whether or not it decided"
         );
     }

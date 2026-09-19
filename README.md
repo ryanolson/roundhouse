@@ -971,6 +971,10 @@ which is what the savings argument turns on.
 
 Model rows in the metrics JSON also report `first_output`: mean milliseconds, sample count, rejected timestamp count, and basis `turn_start_to_first_output`. The interval runs from `TurnStarted` to the first nonempty durable text delta. It includes intervening routing and failover delay, but excludes work before the start event and delivery after the delta append. Missing observations produce no mean. Backward timestamps increment the rejection count. Scoped means use summed elapsed time and sample counts. The HTML dashboard does not yet display this field.
 
+The JSON fields `completed_turn_elapsed` and `incomplete_turn_elapsed` separate time to completed and incomplete responses. Both use basis `turn_start_to_terminal`, from the start append to the terminal append. Each reports a mean, sample count, and rejected timestamp count. The last routed target receives the interval, including routing and failover delay. These fields do not measure task success or time to solution.
+
+Terminal timing does not depend on billed usage. An incomplete response can have a timing sample and zero calls. A missing start produces no sample, and a backward terminal timestamp increments the rejection count. `unrouted_terminals` counts responses with a start but no routed target, within the selected scope. Those responses do not create model rows. The HTML dashboard does not yet display these fields.
+
 ### What "dollars saved" actually claims
 
 Three figures, and they are not equally solid, so the dashboard never merges

@@ -272,6 +272,48 @@ async fn the_live_numbers_match_a_cold_rebuild_from_the_log() {
         live.savings.frontier_spend_usd, rebuilt.savings.frontier_spend_usd,
         "the money must fold out of the log too"
     );
+
+    // The two turn-elapsed columns fold out of the log like everything above.
+    // Compared as a projection of every row rather than field by field, so a
+    // column added to one side of the fold and not the other is caught here
+    // rather than by whoever reads the dashboard afterwards.
+    let elapsed_columns = |snapshot: &MetricsSnapshot| {
+        snapshot
+            .models
+            .iter()
+            .map(|row| {
+                let column = |c: &Option<roundhouse_core::metrics::TurnElapsed>| {
+                    c.as_ref()
+                        .map(|c| (c.mean_ms, c.samples, c.rejected, c.basis))
+                };
+                (
+                    row.provider.clone(),
+                    row.model.clone(),
+                    column(&row.completed_turn_elapsed),
+                    column(&row.incomplete_turn_elapsed),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        elapsed_columns(&live),
+        elapsed_columns(&rebuilt),
+        "a turn's elapsed interval is two log stamps, so a rebuild must \
+         reproduce it exactly rather than approximately"
+    );
+    assert_eq!(live.unrouted_terminals, rebuilt.unrouted_terminals);
+    // Without this the equality above would hold between two absences, which is
+    // the shape a broken observation takes rather than the shape a working one
+    // takes: these turns were driven through the real engine and completed.
+    assert!(
+        live.models.iter().any(|row| row
+            .completed_turn_elapsed
+            .as_ref()
+            .is_some_and(|c| c.samples > 0)),
+        "four engine-driven turns completed, so at least one row carries a \
+         real completed interval: {:?}",
+        elapsed_columns(&live)
+    );
 }
 
 /// Local traffic with no comparable hosted model contributes no saving.
