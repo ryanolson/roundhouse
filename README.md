@@ -1115,6 +1115,10 @@ boot warning rather than a surprise found one turn at a time — the credential 
 turn actually authenticates with is still resolved per turn from the control
 plane's deployment/project/member tiers.
 
+**Local latency configuration.** The catalog accepts `local_base_ttft_ms` and `local_ttft_ms_per_prefill_token` alongside the hosted models' latency fields. They default to `60.0` ms and `0.0`. Negative values stop catalog loading.
+
+For a measured prefill rate, set the slope to `1000 / tokens_per_second`. The quote is the base plus that slope times Dynamo's effective prefill tokens. Leave the slope at zero until a measurement exists. The server loads these values into its engine configuration, but the current binary does not attach a local fleet.
+
 **Sourcing `quality_prior`.** `FrontierModelSpec::quality_prior` is
 configuration, not measurement, and `import-benchmarks` (a binary target in
 `roundhouse-fleet`, not linked into any shipped binary) is what lets that

@@ -1,15 +1,20 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Deployment configuration for the catalog, the rate card, and the correlaries.
+//! Deployment configuration for the catalog, the rate card, the correlaries,
+//! and the local latency curve they are all compared against.
 //!
-//! One file, because these three are one fact seen from three angles. The
-//! catalog is what the router may choose between; the rate card is what those
-//! choices cost; the correlaries are what our own models stand in for when
-//! they are priced. Splitting them across separate configuration would let the
-//! price the router optimizes against drift from the price the dashboard
-//! reports saving, and those two numbers disagreeing is worse than either being
-//! wrong — it is unfalsifiable.
+//! One file, because these are one fact seen from several angles. The catalog
+//! is what the router may choose between; the rate card is what those choices
+//! cost; the correlaries are what our own models stand in for when they are
+//! priced; the local TTFT curve is the fourth axis of that same comparison,
+//! and it is here because every hosted entry already carries its own
+//! `base_ttft_ms` and `ttft_ms_per_uncached_token` — a deployment that
+//! configured the local side somewhere else would be writing the two halves of
+//! one comparison in two files. Splitting them would let the price the router
+//! optimizes against drift from the price the dashboard reports saving, and
+//! those two numbers disagreeing is worse than either being wrong — it is
+//! unfalsifiable.
 //!
 //! Prices are not in source, here or anywhere: rate cards change, and a
 //! constant in a binary goes stale silently. `roundhouse-fleet`'s
@@ -29,6 +34,8 @@ use serde::Deserialize;
 
 use roundhouse_core::metrics::{DEFAULT_CAPABILITY_BAND, MetricsConfig};
 use roundhouse_fleet::{FrontierModelSpec, StaticFrontierCatalog};
+
+use crate::engine::{DEFAULT_LOCAL_BASE_TTFT_MS, EngineConfig};
 
 pub use providers::{BUILT_IN_OPENAI, ProviderAuth, ProviderConfig, ProviderRoutes};
 
@@ -76,6 +83,16 @@ pub struct CatalogConfig {
     /// How far apart two models' quality priors may be and still be compared.
     #[serde(default = "default_capability_band")]
     pub capability_band: f64,
+    /// Local latency floor in milliseconds. Uses the engine's default when omitted.
+    #[serde(default = "default_local_base_ttft_ms")]
+    pub local_base_ttft_ms: f64,
+    /// Milliseconds per effective prefill token, measured as `1000 / tokens_per_second`.
+    ///
+    /// Zero leaves the quote flat until the deployment has a prefill measurement.
+    /// Keeping local and hosted latency values here makes their comparison
+    /// inspectable in the same deployment configuration.
+    #[serde(default)]
+    pub local_ttft_ms_per_prefill_token: f64,
     /// The citation for imported `quality_prior`s, if a provenance file was
     /// found beside this catalog. Never read from the catalog JSON itself —
     /// see [`quality_prior_citation`].
@@ -220,6 +237,10 @@ fn default_local_quality() -> f64 {
 
 fn default_capability_band() -> f64 {
     DEFAULT_CAPABILITY_BAND
+}
+
+fn default_local_base_ttft_ms() -> f64 {
+    DEFAULT_LOCAL_BASE_TTFT_MS
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -392,8 +413,9 @@ impl CatalogConfig {
     /// file accepted. Making the ambiguity unrepresentable is what keeps the
     /// stated invariant true rather than merely usually true.
     ///
-    /// Every check here is about a value that changes a dollar figure or gates
-    /// a comparison. Non-finite prices are deliberately absent: JSON has no
+    /// Every check here is about a value that changes a dollar figure, gates a
+    /// comparison, or moves a route — the local latency curve is the third of
+    /// those. Non-finite prices are deliberately absent: JSON has no
     /// `NaN` literal and `serde_json` refuses a float it cannot represent, so
     /// parsing has already rejected them and a guard here would be dead code
     /// dressed as diligence.
@@ -535,6 +557,30 @@ impl CatalogConfig {
             }
         }
 
+        // The local half of the latency curve, held to the rule its hosted
+        // half is held to above. A negative floor or slope does not merely
+        // mis-quote: it makes a local worker look *faster* the more it has to
+        // prefill, so the router hands its longest cold contexts to the one
+        // target no provider bill ever arrives to contradict, and the
+        // dashboard reports every miss as a saving.
+        for (field, value) in [
+            ("local_base_ttft_ms", self.local_base_ttft_ms),
+            (
+                "local_ttft_ms_per_prefill_token",
+                self.local_ttft_ms_per_prefill_token,
+            ),
+        ] {
+            if value < 0.0 {
+                return Err(CatalogError::InvalidValue {
+                    path: path.to_string(),
+                    model: "<catalog>".to_string(),
+                    field,
+                    value,
+                    expected: "rates and latencies cannot be negative",
+                });
+            }
+        }
+
         // The gate's own inputs, on the same 0.0..=1.0 scale it compares.
         unit_interval(path, "<catalog>", "capability_band", self.capability_band)?;
         unit_interval(
@@ -610,6 +656,21 @@ pub fn from_env() -> Result<Option<CatalogConfig>, CatalogError> {
     match std::env::var(CATALOG_VAR) {
         Ok(path) if !path.trim().is_empty() => CatalogConfig::load(path.trim()).map(Some),
         _ => Ok(None),
+    }
+}
+
+/// Apply the catalog's local latency values to the engine defaults.
+///
+/// The no-catalog path uses the same defaults as an omitted field. Keeping this
+/// composition beside the loader lets tests exercise it without booting a server.
+pub fn engine_config(config: Option<&CatalogConfig>) -> EngineConfig {
+    let Some(config) = config else {
+        return EngineConfig::default();
+    };
+    EngineConfig {
+        local_base_ttft_ms: config.local_base_ttft_ms,
+        local_ttft_ms_per_prefill_token: config.local_ttft_ms_per_prefill_token,
+        ..EngineConfig::default()
     }
 }
 
@@ -717,6 +778,135 @@ mod tests {
         assert!(config.correlaries.is_empty());
         assert_eq!(config.capability_band, DEFAULT_CAPABILITY_BAND);
         assert_eq!(config.default_local_quality, 0.5);
+    }
+
+    /// One minimal entry, parameterized on whatever local section is under
+    /// test, so a refusal below is unambiguously about the local numbers.
+    fn with_local_section(local: &str) -> String {
+        format!(
+            r#"{{
+              "models": [{{
+                "provider": "openai",
+                "model": "gpt",
+                "wire_protocol": "openai_responses",
+                "cache_model": {{ "kind": "deterministic", "ttl_ms": 300000 }},
+                "pricing": {{
+                  "input_per_mtok_usd": 1.0,
+                  "cached_input_per_mtok_usd": 0.1,
+                  "cache_write_per_mtok_usd": 0.0,
+                  "output_per_mtok_usd": 4.0
+                }},
+                "quality_prior": 0.7,
+                "base_ttft_ms": 300.0,
+                "ttft_ms_per_uncached_token": 0.001
+              }}]{local}
+            }}"#
+        )
+    }
+
+    /// **CONTROL.** A file that says nothing about local latency leaves the
+    /// engine exactly where it was.
+    ///
+    /// Asserted against `EngineConfig::default` rather than against `60.0`:
+    /// the claim is that the two agree, and a literal here would pass on the
+    /// day they stopped agreeing — which is the only way this field can change
+    /// a deployment's quotes without anyone editing a file.
+    #[test]
+    fn a_catalog_with_no_local_section_quotes_the_engine_defaults() {
+        let config = CatalogConfig::from_json(&with_local_section(""), "test").unwrap();
+        assert_eq!(
+            config.local_base_ttft_ms,
+            EngineConfig::default().local_base_ttft_ms,
+        );
+        assert_eq!(
+            config.local_ttft_ms_per_prefill_token, 0.0,
+            "an unmeasured slope must quote flat rather than guess"
+        );
+
+        let engine = engine_config(Some(&config));
+        assert_eq!(
+            engine.local_base_ttft_ms,
+            EngineConfig::default().local_base_ttft_ms
+        );
+        assert_eq!(engine.local_ttft_ms_per_prefill_token, 0.0);
+    }
+
+    /// **CONTROL.** No catalog at all is the offline-stub deployment, and it
+    /// runs on the same documented defaults.
+    #[test]
+    fn no_catalog_leaves_every_engine_number_at_its_default() {
+        let engine = engine_config(None);
+        assert_eq!(
+            engine.local_base_ttft_ms,
+            EngineConfig::default().local_base_ttft_ms
+        );
+        assert_eq!(engine.local_ttft_ms_per_prefill_token, 0.0);
+    }
+
+    /// The measured numbers reach the engine config, which is the whole point
+    /// of the field existing.
+    #[test]
+    fn a_measured_local_curve_reaches_the_engine_config() {
+        let config = CatalogConfig::from_json(
+            &with_local_section(
+                r#",
+              "local_base_ttft_ms": 90.0,
+              "local_ttft_ms_per_prefill_token": 0.25"#,
+            ),
+            "test",
+        )
+        .unwrap();
+
+        let engine = engine_config(Some(&config));
+        assert_eq!(
+            engine.local_base_ttft_ms, 90.0,
+            "the deployment's measured floor, not the built-in one"
+        );
+        assert_eq!(
+            engine.local_ttft_ms_per_prefill_token, 0.25,
+            "the deployment's measured prefill rate, 1000 / tokens_per_second"
+        );
+    }
+
+    /// A negative latency is refused for the same reason a negative rate is.
+    ///
+    /// A negative slope does not merely mis-quote: it makes a local worker look
+    /// *faster* the more it has to prefill, so the router hands a long cold
+    /// context to the one target no provider bill ever contradicts, and the
+    /// dashboard reports the miss as a saving.
+    #[test]
+    fn a_negative_local_latency_is_refused_at_load() {
+        for (field, section) in [
+            (
+                "local_base_ttft_ms",
+                r#","local_base_ttft_ms": -1.0"#.to_string(),
+            ),
+            (
+                "local_ttft_ms_per_prefill_token",
+                r#","local_ttft_ms_per_prefill_token": -0.25"#.to_string(),
+            ),
+        ] {
+            let error = CatalogConfig::from_json(&with_local_section(&section), "test")
+                .expect_err("a negative latency quotes a worker as faster for being colder");
+            assert!(
+                matches!(&error, CatalogError::InvalidValue { field: named, .. }
+                    if *named == field),
+                "{field}: {error}"
+            );
+        }
+
+        // CONTROL: zero is not negative, and it is the documented default for
+        // the slope — so the refusal above is about the sign and not about the
+        // field being set at all.
+        CatalogConfig::from_json(
+            &with_local_section(
+                r#",
+              "local_base_ttft_ms": 0.0,
+              "local_ttft_ms_per_prefill_token": 0.0"#,
+            ),
+            "test",
+        )
+        .expect("a floor of zero and an unmeasured slope are both sayable");
     }
 
     #[test]

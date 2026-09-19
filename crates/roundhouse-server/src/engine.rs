@@ -446,6 +446,13 @@ impl LocalExecutor for EchoLocalExecutor {
     }
 }
 
+/// The latency floor a local worker is quoted at before prefill, in ms.
+///
+/// Named rather than written twice, because a deployment can set it — see
+/// `catalog_config` — and a config loader whose "unset" default drifted from
+/// this one would change every local quote on a file nobody edited.
+pub const DEFAULT_LOCAL_BASE_TTFT_MS: f64 = 60.0;
+
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
     /// Identity presented to the session lease.
@@ -460,6 +467,10 @@ pub struct EngineConfig {
     /// Capability of the local model relative to the frontier catalog.
     pub local_quality_prior: f64,
     /// Latency floor attributed to a local worker before prefill.
+    ///
+    /// Deployment-settable, like the slope below: the catalog carries both, so
+    /// the local curve and the hosted ones it is compared against are written
+    /// in one file. See `catalog_config::engine_config`.
     pub local_base_ttft_ms: f64,
     /// Slope from the residency answer's `effective_prefill_tokens` to a TTFT
     /// term, the local mirror of a frontier spec's `ttft_ms_per_uncached_token`.
@@ -467,7 +478,9 @@ pub struct EngineConfig {
     /// A slope is a measured property of a deployment's prefill rate --
     /// configuration, not a guess -- so the default is `0.0`, which reproduces
     /// the old flat `local_base_ttft_ms` quote exactly for every deployment
-    /// that has not measured one.
+    /// that has not measured one. A deployment that has measured one writes
+    /// `1000 / tokens_per_second` into its catalog; see
+    /// `catalog_config::engine_config`.
     pub local_ttft_ms_per_prefill_token: f64,
     pub expected_output_tokens: u32,
     /// Bounds the model work of a single turn.
@@ -502,7 +515,7 @@ impl Default for EngineConfig {
             local_model: "local".to_string(),
             routing_group: "default".to_string(),
             local_quality_prior: 0.6,
-            local_base_ttft_ms: 60.0,
+            local_base_ttft_ms: DEFAULT_LOCAL_BASE_TTFT_MS,
             local_ttft_ms_per_prefill_token: 0.0,
             expected_output_tokens: 256,
             turn_deadline_ms: 120_000,

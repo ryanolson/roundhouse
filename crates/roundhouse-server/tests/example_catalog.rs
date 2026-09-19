@@ -198,3 +198,32 @@ fn the_example_prices_are_placeholders_not_a_rate_card() {
         );
     }
 }
+
+/// The same rule as the prices above, applied to the one number in this file
+/// that is a *measurement* (C5).
+///
+/// `local_ttft_ms_per_prefill_token` is milliseconds per effective prefill
+/// token, and the only honest source for it is a prefill-rate measurement of
+/// the workers a deployment actually runs. Nobody measured this repository's
+/// example, so it ships the documented `0.0`, which quotes a local worker flat
+/// — and this test is what stops a plausible-looking slope being pasted in
+/// here later, where it would reach a real router as a real latency and cost
+/// real turns.
+///
+/// The floor beside it is pinned to the engine's own default rather than to
+/// `60.0`, so the example demonstrates the fields without asserting anything
+/// about a deployment nobody timed.
+#[test]
+fn the_example_local_latency_curve_is_a_default_not_a_measurement() {
+    let config = CatalogConfig::load(example_path()).unwrap();
+    assert_eq!(
+        config.local_ttft_ms_per_prefill_token, 0.0,
+        "the example has no prefill-rate measurement to report, and a made-up \
+         slope is a made-up latency inside a real routing decision"
+    );
+    assert_eq!(
+        config.local_base_ttft_ms,
+        roundhouse_server::EngineConfig::default().local_base_ttft_ms,
+        "the example must demonstrate the field at the built-in floor"
+    );
+}
