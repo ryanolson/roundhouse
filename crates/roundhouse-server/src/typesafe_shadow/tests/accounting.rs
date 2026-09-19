@@ -151,6 +151,135 @@ async fn unreported_usage_releases_the_hold_without_claiming_a_free_call() {
     );
 }
 
+/// Everything `tracing::warn!` wrote during one closure, as text.
+///
+/// A third copy of the shape `main.rs` and `engine/fair_use.rs` keep, because
+/// neither is reachable from here: `engine::fair_use` is private to `engine`,
+/// and widening a serving module so a test can read its test module trades a
+/// bigger seam for a smaller one. The serialization and the interest-cache
+/// rebuild are not tidiness — `with_default` installs a *thread-local*
+/// subscriber, and a callsite first evaluated under the no-op global
+/// dispatcher caches "never interested" and then silently drops the very line
+/// the assertion is about. See `main.rs`'s copy for the full diagnosis.
+fn captured_warnings(f: impl FnOnce()) -> String {
+    use std::io;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone, Default)]
+    struct Buf(Arc<Mutex<Vec<u8>>>);
+    impl io::Write for Buf {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> MakeWriter<'a> for Buf {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+    let _serialized = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let buf = Buf::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(buf.clone())
+        .with_ansi(false)
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
+        f()
+    });
+    String::from_utf8(buf.0.lock().unwrap().clone()).expect("tracing output is UTF-8")
+}
+
+/// A settle that could not be applied says **which call** it left uncommitted.
+///
+/// This warning is the whole of the record: the call was made, it was priced,
+/// and the ledger then refused the commit — and with B2's durable allocation
+/// record still unwired, nothing else in this process writes the call down. A
+/// line that carries only the ledger's own error message tells an operator that
+/// *some* shadow evaluation is unaccounted for and gives them no way to say
+/// which session or which hold, which is the same as not warning at all in a
+/// deployment making more than one of these calls.
+///
+/// Driven through `classify` rather than by calling `settle` directly, so the
+/// fields are asserted on the identity a real call actually carries.
+///
+/// A blocking test with its own current-thread runtime, because `with_default`
+/// installs a *thread-local* subscriber and a multi-threaded runtime is free to
+/// resume the future on a thread that never had one.
+#[test]
+fn a_settle_that_cannot_be_applied_names_the_call_it_left_uncommitted() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (addr, up) = rt.block_on(upstream(ANSWER));
+    let ledger = RecordingLedger::granting_but_unsettleable(1_000.0);
+    let credential = credential();
+    let pool = Pool::of(vec![frontier()]);
+
+    let mut outcome = None;
+    let warned = captured_warnings(|| {
+        outcome = Some(
+            rt.block_on(shadow(addr, config().enable(), ledger.clone()).classify(
+                call(&credential),
+                &items(),
+                Objective::Unknown,
+                Vec::new(),
+                &pool.admitted(),
+            )),
+        );
+    });
+
+    // The preconditions the warning is about: a call happened, it was priced,
+    // and the failed commit changed neither the outcome nor what was submitted.
+    let priced = (312.0 * 1.0 + 48.0 * 2.0) / 1_000_000.0;
+    assert_eq!(up.count(), 1);
+    assert!(
+        matches!(
+            outcome,
+            Some(ShadowOutcome::Answered {
+                accounting: Accounting::Measured { usd, .. },
+                ..
+            }) if usd == priced
+        ),
+        "a settle that cannot be applied is a warning and a skip, so the answer \
+         and its accounting survive it: {outcome:?}"
+    );
+    assert_eq!(ledger.settled(), vec![priced]);
+
+    assert!(
+        warned.contains("could not be committed"),
+        "the settle failure must be warned about at all:\n{warned}"
+    );
+    assert!(
+        warned.contains("sess_shadow"),
+        "the warning must name the session whose spend is uncommitted:\n{warned}"
+    );
+    assert!(
+        warned.contains("shadow_1"),
+        "and the hold key it was taken under, which is what an operator \
+         reconciles against:\n{warned}"
+    );
+    // The other half of the same rule: this line goes to a log, so it carries
+    // identity and nothing else. A transcript or a key in a warning is the
+    // egress this whole module is gated to prevent.
+    assert!(
+        !warned.contains("trailing commas") && !warned.contains("Rust repository"),
+        "the transcript must not reach the log:\n{warned}"
+    );
+    assert!(!warned.contains(KEY), "nor the deployment's key:\n{warned}");
+}
+
 /// A call that produced no envelope carries no accounting at all.
 #[tokio::test]
 async fn a_failed_call_releases_its_hold_with_no_accounting() {

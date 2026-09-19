@@ -269,6 +269,134 @@ async fn an_oversized_state_makes_no_call_and_opens_no_grant() {
     assert!(ledger.settled().is_empty());
 }
 
+/// The two bounds are about two different strings, and setting them equal does
+/// not make them one bound.
+///
+/// [`ShadowCaps::max_state_bytes`] bounds the rendered projection — how much of
+/// a transcript this deployment is willing to hand a third party.
+/// [`SystemOneLimits::max_request_bytes`] bounds the serialized body — how many
+/// bytes this client will put on a socket. The second string *contains* the
+/// first, as JSON: plus the model id, the question, its criteria, and whatever
+/// escaping the markdown needs. A deployment that sets the two to the same
+/// number has therefore made its state cap unreachable, and the honest report
+/// of that is the wire bound refusing — before a grant and before a socket,
+/// naming both numbers.
+///
+/// What this test exists to rule out is the remedy that looks obvious: a fixed
+/// envelope allowance subtracted from the request bound. The overhead is not
+/// fixed. The criteria strings are configuration, and the escaping is a
+/// function of the transcript's own bytes — so a constant would be wrong in one
+/// direction (refusing states that would have fit) or in the far worse one
+/// (quietly raising the bound a deployment wrote down).
+///
+/// The control at the end is the whole argument: widening only the *request*
+/// bound sends the identical state. The state was never the problem.
+#[tokio::test]
+async fn equal_state_and_request_bounds_refuse_before_a_grant_and_before_a_socket() {
+    let credential = credential();
+    let pool = Pool::of(vec![frontier()]);
+    // Rendered under the ordinary caps, which bound each axis of the brief and
+    // not the total -- so this is the same string either bound would see.
+    let rendered = TypeSafeShadow::new(
+        SystemOneClient::new("http://127.0.0.1:1", limits()).unwrap(),
+        config().enable(),
+        RecordingLedger::granting(1.0),
+        ByteTokenizer,
+    )
+    .state(&items(), Objective::Unknown, Vec::new())
+    .expect("the fixture transcript fits the ordinary caps");
+    // Both bounds set to exactly the state this call is about: it is *at* its
+    // own cap, which `state` admits, and the envelope around it cannot be.
+    let bound = rendered.len();
+    let config = ShadowConfig::new(
+        "jev-1.12",
+        pricing(),
+        EXPECTED_OUTPUT_TOKENS,
+        ShadowCaps {
+            max_state_bytes: bound,
+            ..caps()
+        },
+    )
+    .enable();
+
+    let (addr, up) = upstream(ANSWER).await;
+    let ledger = RecordingLedger::granting(1_000.0);
+    let outcome = TypeSafeShadow::new(
+        SystemOneClient::new(
+            format!("http://{addr}"),
+            SystemOneLimits {
+                max_request_bytes: bound,
+                ..limits()
+            },
+        )
+        .unwrap(),
+        config.clone(),
+        ledger.clone(),
+        ByteTokenizer,
+    )
+    .classify(
+        call(&credential),
+        &items(),
+        Objective::Unknown,
+        Vec::new(),
+        &pool.admitted(),
+    )
+    .await;
+
+    // Not `PayloadTooLarge`: the state cap was satisfied. The wire bound is the
+    // one that refused, and it says by how much.
+    match &outcome {
+        ShadowOutcome::NotRun(NotRun::Refused(SystemOneError::RequestTooLarge {
+            limit_bytes,
+            actual_bytes,
+        })) => {
+            assert_eq!(*limit_bytes, bound);
+            assert!(
+                *actual_bytes > bound,
+                "the envelope is what does not fit: {actual_bytes} vs {bound}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(up.count(), 0, "refused before a socket");
+    assert!(
+        ledger.requested().is_empty(),
+        "and before a grant: a hold opened for a call the transport was always \
+         going to refuse charges the evaluation ledger for nothing"
+    );
+    assert!(ledger.settled().is_empty());
+
+    // Widening only the wire bound admits the same state, byte for byte.
+    let (addr, up) = upstream(ANSWER).await;
+    let ledger = RecordingLedger::granting(1_000.0);
+    let outcome = TypeSafeShadow::new(
+        SystemOneClient::new(format!("http://{addr}"), limits()).unwrap(),
+        config,
+        ledger.clone(),
+        ByteTokenizer,
+    )
+    .classify(
+        call(&credential),
+        &items(),
+        Objective::Unknown,
+        Vec::new(),
+        &pool.admitted(),
+    )
+    .await;
+
+    assert!(
+        matches!(outcome, ShadowOutcome::Answered { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(up.count(), 1);
+    assert_eq!(
+        up.state(),
+        rendered,
+        "the state that was too large for the equal bound is the state that \
+         went out under the wider one, byte for byte"
+    );
+}
+
 /// What will not fit is refused, never cut: slicing the rendered markdown
 /// would cut the quoting a hostile transcript is contained by.
 #[test]

@@ -106,6 +106,10 @@ impl Upstream {
 struct RecordingLedger {
     /// `None` makes `open_grant` fail, standing in for a ledger that is down.
     grants: Option<f64>,
+    /// `false` makes `settle_grant` fail *after* the call was made and priced:
+    /// the one state in which this module's settle warning is the only record
+    /// that the spend exists at all.
+    settles: bool,
     requested: Mutex<Vec<f64>>,
     settled: Mutex<Vec<f64>>,
 }
@@ -114,6 +118,17 @@ impl RecordingLedger {
     fn granting(amount: f64) -> Arc<Self> {
         Arc::new(Self {
             grants: Some(amount),
+            settles: true,
+            requested: Mutex::new(Vec::new()),
+            settled: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// A ledger that funds the call and then cannot be told what it cost.
+    fn granting_but_unsettleable(amount: f64) -> Arc<Self> {
+        Arc::new(Self {
+            grants: Some(amount),
+            settles: false,
             requested: Mutex::new(Vec::new()),
             settled: Mutex::new(Vec::new()),
         })
@@ -122,6 +137,7 @@ impl RecordingLedger {
     fn unavailable() -> Arc<Self> {
         Arc::new(Self {
             grants: None,
+            settles: true,
             requested: Mutex::new(Vec::new()),
             settled: Mutex::new(Vec::new()),
         })
@@ -154,7 +170,14 @@ impl SpendLedger for RecordingLedger {
     }
 
     async fn settle_grant(&self, settlement: Settlement) -> Result<Settled, SpendError> {
+        // Recorded before the failure branch, so `settled()` still says what the
+        // module tried to commit rather than only what a ledger accepted.
         self.settled.lock().unwrap().push(settlement.actual_usd);
+        if !self.settles {
+            return Err(SpendError::Backend(anyhow::anyhow!(
+                "the settle could not be applied"
+            )));
+        }
         Ok(Settled {
             applied: true,
             released_usd: 0.0,

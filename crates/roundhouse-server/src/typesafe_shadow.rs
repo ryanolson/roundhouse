@@ -76,6 +76,10 @@ pub struct ShadowCaps {
     /// A declared objective's plan is a list the agent controls the length of.
     pub max_plan_steps: usize,
     /// The whole rendered state. Over this, the call does not happen.
+    ///
+    /// `SystemOneLimits::max_request_bytes` separately bounds serialized JSON,
+    /// including escaping, the model ID, and the question. Passing this state
+    /// limit does not guarantee that the complete request fits its wire limit.
     pub max_state_bytes: usize,
 }
 
@@ -162,9 +166,9 @@ pub enum Accounting {
     ///
     /// **Not a guarantee that it was committed.** A settle that cannot be
     /// applied is warned and skipped rather than propagated, so this says what
-    /// the call cost and what was sent to the ledger — the gap between that and
-    /// what the ledger holds is the ledger-versus-log drift every side call on
-    /// this path can produce.
+    /// the configured-rate cost submitted to the ledger, not what it accepted.
+    /// The warning identifies the session and hold. Durable evaluation records
+    /// remain part of B2 in `PLAN-routing-strategy-bandit.md`.
     Measured { usage: SystemOneUsage, usd: f64 },
     /// Usage was absent or incomplete. Releasing the hold at zero does not
     /// establish that the call was free.
@@ -462,8 +466,10 @@ impl<T: Tokenizer> TypeSafeShadow<T> {
     ///
     /// Never propagates: a settle that cannot be applied is a warning and a
     /// skip, the same rule `judge.rs` is under. What that costs is one call's
-    /// spend uncommitted and its hold left to lapse on the TTL, which is
-    /// visible as ledger-versus-log drift.
+    /// spend uncommitted and its hold left to lapse on the TTL.
+    ///
+    /// The warning identifies the session and hold so an operator can locate
+    /// the failed settlement. It excludes the transcript and credential.
     async fn settle(&self, call: &ShadowCall<'_>, actual_usd: f64) {
         if let Err(error) = self
             .spend
@@ -480,6 +486,8 @@ impl<T: Tokenizer> TypeSafeShadow<T> {
         {
             tracing::warn!(
                 %error,
+                session_id = %call.session_id,
+                hold_key = %call.hold_key,
                 "a shadow evaluation's spend could not be committed; leaving its \
                  hold to lapse rather than retrying against an unknown ceiling"
             );
