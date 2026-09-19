@@ -1264,7 +1264,7 @@ The first build clones `ai-dynamo/dynamo` to resolve the pinned Dynamo crates,
 so expect it to take a while; later builds reuse the cached checkout.
 
 That default run needs no GPUs, no worker processes, and no network: the
-selection plane runs inside the test binary. Two families are opted into
+selection plane runs inside the test binary. These families are opted into
 explicitly, because each reaches something the default run must not assume:
 
 - **Redis.** The store and spend-ledger contract suites are `#[ignore]`d. Set
@@ -1282,6 +1282,26 @@ explicitly, because each reaches something the default run must not assume:
   `ROUNDHOUSE_TEST_TOPHAM_BIN=$PWD/target/debug/topham`. That variable has no
   `PATH` fallback: `topham` is installed nowhere, so a bare name would resolve
   to whatever a developer happened to have.
+
+The cache probe also has an offline suite:
+
+```bash
+timeout 300 cargo test -p roundhouse-server --test cache_probe
+```
+
+The `e2e-frontier` feature adds a live cache probe that sends two turns to one configured Messages target. The second turn appends 20 items. The report keeps each turn's cache reads, writes, and usage provenance separate. Offline tests cover the shared driver, request markers, configured transport, and budget refusal. They do not establish provider cache behavior.
+
+To run the live probe, supply a catalog, a pinned `provider/model`, and a USD spend cap. The catalog must contain real prices and a deterministic cache model. Inject the key through `openv` into the variable named by the provider's `auth.env`. Check the pinned model's minimum cacheable prefix before the run. The fixture contains at least 8,192 words before its marker, but this is not a provider token count.
+
+```bash
+openv env ROUNDHOUSE_PROBE_CATALOG=/path/to/catalog.json \
+  ROUNDHOUSE_PROBE_MODEL='anthropic/<pinned-model-id>' \
+  ROUNDHOUSE_PROBE_LIMIT_USD='<approved-cap>' \
+  timeout 300 cargo test -p roundhouse-server --features e2e-frontier \
+    --test cache_probe live -- --nocapture
+```
+
+The live test has no `#[ignore]`. Enabling the feature includes it in an unfiltered test run. Missing configuration fails before dispatch. The project budget governs both turns, with 16 output tokens and a 30-second deadline per turn. A zero cache read remains a reported observation for investigation.
 
 ## What the tests establish
 

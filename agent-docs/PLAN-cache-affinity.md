@@ -113,7 +113,7 @@ The mutation checks used `sed` to change one token, ran the suite, and used `sed
 
 The live test uses a non-default `e2e-frontier` feature and mandatory preflight. It requires the operator's catalog, pinned model, spend cap, and stored key. No model, rate card, or cap has a guessed default. The latest handoff prohibits new ignores outside owner-design questions, so this probe uses no `#[ignore]`. This supersedes R9's earlier ignore pattern for this probe.
 
-The report records `ResponseCompleted.usage.cached_input_tokens` and `cache_write_tokens` for both turns. These correspond to the provider's `cache_read_input_tokens` and `cache_creation_input_tokens`. A zero second-turn read requires investigation. A first turn that wrote no cache entry cannot test lookback reachability. The live prerequisite remains blocked because `openv` reports no configured 1Password CLI account.
+The report records `ResponseCompleted.usage.cached_input_tokens` and `cache_write_tokens` for both turns. These correspond to the provider's `cache_read_input_tokens` and `cache_creation_input_tokens`. A zero second-turn read requires investigation. Without a first-turn read or write, a second-turn miss cannot establish a lookback failure. A second-turn read does not establish the entry's origin. The live prerequisite remains blocked because `openv` reports no configured 1Password CLI account.
 
 ### C3 — the Dynamo residency call becomes a decision
 

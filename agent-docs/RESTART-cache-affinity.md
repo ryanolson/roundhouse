@@ -47,6 +47,8 @@ Questions already sent and still awaiting answers:
 2. C6: design the return-trip cost now, or wait for live C2 cache evidence. Waiting is the recommendation.
 3. C3: retain fleet-error failure, or add a sub-budget and fail-open path to admitted frontier targets.
 4. Bandit objective: quality and latency constraints followed by cost minimization, a weighted score, or fixed allocation until evidence exists. Deployment must supply the limits.
+5. B2 cadence: one strategy per cache segment, or one selection per turn. The proposed segment boundaries are session start, fork, and current-target cache loss. Failover retains the assignment.
+6. Live C2 inputs: catalog path, pinned model, approved USD spend cap, and restored `openv` access. No live run starts without these inputs.
 
 The segment boundary cases and promotion evidence also need a settled brief before serving allocation changes.
 
