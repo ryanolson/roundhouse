@@ -106,7 +106,7 @@ Each implementation milestone needs a settled brief, failing tests before its fi
 
 | Milestone | Behavior | Required evidence |
 |---|---|---|
-| B1: observations | First-output checkpoint in `765daf2`, cleanup guard in `1142348`. Terminal timing is implemented. Strategy outcome attribution remains. | First-output mutations verified. Terminal timing passes 72 core metrics tests and 6 server metrics tests. Its independent mutations remain. |
+| B1: observations | First-output checkpoint in `765daf2`, cleanup guard in `1142348`. Terminal timing is committed at `88562f7`. Strategy outcome attribution remains. | Fourteen terminal-timing mutations were caught. The restored focused suites pass 72 core metrics tests and 6 server metrics tests. |
 | B2: strategy records | Record eligible serving strategies, versioned allocation, and fallback | Fixed hash vectors. Replay survives configuration changes. Background-only arms cannot enter serving allocation. |
 | B3: background evaluation | Execute sampled alternatives with bounded resources and no effect on routing | A stalled worker cannot delay a turn. Cancellation releases capacity. Retry cannot duplicate charges or outcomes. |
 | B4: Jev shadow adapter | Standalone transport and budgeted server boundary committed at `51b0fb2` under T6. B2/B3 wiring remains. | All 39 focused tests pass. Twelve independent post-commit mutations were caught. No live quality or latency evidence. |
@@ -180,6 +180,12 @@ Tests must cover both outcome classes, failover, supersession, cross-session tur
 The existing silent-failure test now checks an incomplete timing sample beside zero calls, zero tokens, and no first-output sample. Its clock-cleanup assertion remains. This changes row presence deliberately: elapsed time is observable even without billing evidence.
 
 The restored implementation passes 72 core metrics tests and 6 server metrics tests. The broader core crate run passed 436 tests. Root repeated the focused gates. The comment pass preserved all non-comment source lines, and formatting and whitespace checks pass. No new ignore was added. Logs: `/tmp/roundhouse-b1-terminal-red-core.log`, `/tmp/roundhouse-b1-terminal-green-core-full.log`, and `/tmp/roundhouse-b1-terminal-root-*.log`. Independent post-commit mutations and a full workspace run remain.
+
+**Independent verification, 2026-09-19.** Fourteen mutations against `88562f7` failed at runtime, and each inverse edit restored the committed source. They covered outcome separation, clock origin, billing independence, timestamp rejection, column presence, aggregation, scope, cleanup, unrouted counts, final-target attribution, and means. The wrong-target mutation caused a missing-row lookup panic. No compile failure counts as a caught mutation. The restored suites passed 72 core metrics tests and 6 server metrics tests, with formatting clean.
+
+The verifier replaced raw run logs with detailed summaries. Actual tool outputs, including all 14 failing exit codes, are retained in `/tmp/roundhouse-b1-terminal-refute-transcript-evidence.json`. Per-mutation summaries and restored-suite logs are under `/tmp/roundhouse-b1-terminal-refute-*.log`.
+
+**Workspace verification, 2026-09-19.** The local full suite at `88562f7` passed 1752 tests, with 0 failures and 142 ignores. It covered 108 test binaries and 7 doc-test suites. The C4 owner-decision ignore remains. Command: `ulimit -Sn 65536 && timeout 900 cargo test --workspace`. Log: `/tmp/roundhouse-b1-terminal-workspace.log`.
 
 ## 6. Decisions still needed
 
