@@ -24,6 +24,7 @@ You are continuing PR #18 in `ryanolson/roundhouse`: https://github.com/ryanolso
 - Built, mutation-checked, and pushed: C1 (dominance guard on `Efficient` picks), C2 (second Anthropic breakpoint), C3 (the fleet residency call runs only when its answer can matter), C5 (local TTFT slope, mechanism only).
 - The full workspace suite passed at `29665d8` on 2026-09-19: 1652 passed, 0 failed, 141 ignored. It covered 104 test binaries and 7 doc-test suites. Command: `ulimit -Sn 65536 && timeout 900 cargo test --workspace`. The inherited descriptor limit of 1024 caused `Too many open files` in `embedded_selection`. That binary passed all 7 tests with the raised limit before the full rerun.
 - The owner requests a bandit with serving strategies and background evaluation arms, including online TypeSafe/Jev. The ruling addendum of 2026-09-19 records this direction. The detailed runtime contract remains open. T6, the PR split, the C4 price guard, C6 timing, and C3 fail-open behavior still await answers.
+- `PLAN-routing-strategy-bandit.md` contains the proposed runtime contracts, measurement requirements, and six delivery milestones. The Claude ACP adapter failed before agent startup with `Internal error` in two attempts. No implementation edits resulted. Permission to substitute available coding agents for the specified Opus/Sonnet workflow is pending.
 - The PR is a draft. Its body is in the PR. `gh pr edit` is broken in this container. Update the body with `gh api -X PATCH repos/ryanolson/roundhouse/pulls/18 --input body.json`.
 
 ## Decisions that need the owner

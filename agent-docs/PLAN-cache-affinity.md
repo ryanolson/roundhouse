@@ -140,6 +140,8 @@ Not designed yet. The input is the time of the last dispatch to each target plus
 
 Blocked on the owner. It needs a ruling on T2 (the amendment to R3) and on T6 (the egress posture). No classifier call ships before both. The shadow records a tier distribution next to the `pick_tier` answer at each segment start and affects no route.
 
+**Continuation, 2026-09-19.** The owner requests serving strategies and background evaluation arms, including online Jev. `PLAN-routing-strategy-bandit.md` develops that direction into proposed contracts, delivery milestones, and tests. It distinguishes live outcomes from background estimates. T6 and the reward and promotion criteria remain open.
+
 ## 4. Smaller findings with no rung yet
 
 - `metadata.user_id` is read for the session name and is not forwarded to Anthropic. A one-assertion test on `body()` proves it.
