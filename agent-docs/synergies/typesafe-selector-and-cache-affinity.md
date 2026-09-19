@@ -273,3 +273,5 @@ The design must distinguish observed serving outcomes from estimates produced by
 The owner accepts catalog rejection for C4. A one-hour cache entry requires a write rate of twice its input rate. A warning does not satisfy this rule. The target's existing `cache_model` remains the TTL source.
 
 The owner accepts T6: hosted classification is opt-in, off by default, excluded from local-only sessions, and restricted to the bounded judge brief. This permits implementation of the Jev shadow adapter under that policy. It does not establish the quality evidence or utility weights needed to promote a serving bandit.
+
+The owner keeps PR #18 as one unit. Separate commits preserve the boundaries between concerns within that PR.

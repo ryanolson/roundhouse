@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Routing strategy bandit: serving and background evaluation
 
-> Status: proposed implementation brief, 2026-09-19. The owner requests serving strategies and background evaluation arms, including online TypeSafe/Jev. This brief develops that direction. It does not approve content egress or replace the open decisions in `PLAN-cache-affinity.md`.
+> Status: proposed implementation brief, 2026-09-19. The owner requests serving strategies and background evaluation arms, including online TypeSafe/Jev. This brief develops that direction. The owner subsequently accepted T6 in the ruling addendum. The remaining decisions are listed in `PLAN-cache-affinity.md` and section 6 below.
 
 ## 1. Outcome and scope
 
@@ -113,10 +113,10 @@ Each implementation milestone needs a settled brief, failing tests before its fi
 | B5: offline calibration | Produce a versioned artifact and report from attributable observations | Incomplete cases and unsupported policy estimates remain explicit. Serving and background evidence cannot silently merge. |
 | B6: serving bandit | Allocate eligible strategies using approved quality and utility rules | Shadow promotion evidence, deterministic replay, enforced budgets, and cache-boundary tests. |
 
-B4 requires the T6 decision. B6 requires the reward and promotion decisions. A passing unit suite alone does not satisfy either promotion gate.
+B4 can proceed under the accepted T6 policy. B6 requires the reward and promotion decisions. A passing unit suite alone does not satisfy the promotion gate.
 
 ## 6. Decisions still needed
 
-The five pending cache-affinity decisions remain: T6 egress, PR structure, C4 price guard, C6 timing, and C3 fleet fail-open behavior.
+The owner accepted T6 and the C4 catalog price guard, and keeps PR #18 as one unit. C6 timing and C3 fleet fail-open behavior remain open.
 
 For the bandit, settle the segment boundary cases, the function-quality observation, the allowed quality regression, and the cost-versus-latency tradeoff. Also decide whether background sampling remains configured or eventually learns a value-of-information policy. This brief recommends configured background sampling for the first measurable deployment.
