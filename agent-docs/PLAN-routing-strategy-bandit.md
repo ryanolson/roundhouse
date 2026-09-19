@@ -109,7 +109,7 @@ Each implementation milestone needs a settled brief, failing tests before its fi
 | B1: observations | First-output checkpoint in `765daf2`, cleanup guard in `1142348`. Completion and strategy outcome attribution remain. | First-output, replay, scope, and failure regressions pass. Independent mutations verified; full suite passes. |
 | B2: strategy records | Record eligible serving strategies, versioned allocation, and fallback | Fixed hash vectors. Replay survives configuration changes. Background-only arms cannot enter serving allocation. |
 | B3: background evaluation | Execute sampled alternatives with bounded resources and no effect on routing | A stalled worker cannot delay a turn. Cancellation releases capacity. Retry cannot duplicate charges or outcomes. |
-| B4: Jev shadow adapter | Produce tier probabilities from the approved digest under T6 | Fake-server request assertions. Malformed probabilities and timeouts fall back. Local-only and disabled egress make zero calls. |
+| B4: Jev shadow adapter | Standalone transport and budgeted server boundary implemented under T6. B2/B3 wiring remains. | Focused loopback tests pass. Independent post-commit mutations remain. No live quality or latency evidence. |
 | B5: offline calibration | Produce a versioned artifact and report from attributable observations | Incomplete cases and unsupported policy estimates remain explicit. Serving and background evidence cannot silently merge. |
 | B6: serving bandit | Allocate eligible strategies using approved quality and utility rules | Shadow promotion evidence, deterministic replay, enforced budgets, and cache-boundary tests. |
 
@@ -137,7 +137,9 @@ T6 permits a standalone adapter. The binary remains unwired until B2 and B3 prov
 
 The fleet module owns the HTTP transport and typed response. The server builds the judge brief, checks egress eligibility, and reserves evaluation spend. Both use concrete implementations and loopback tests. No mock-only trait is needed.
 
-The server accepts session items and the objective, then builds `ValidationBrief` internally. Accepting a public `ValidationBrief` value alone does not enforce a bound. Its fields include unrestricted facts and tool names. Explicit limits must bound those fields and the complete request. An oversized request produces no HTTP call. Transcript quotation and Unicode boundaries remain intact. The absence of routing metadata fields does not redact model names or prices supplied by a user.
+The server accepts session items and the objective, then builds `ValidationBrief` internally. Accepting a public `ValidationBrief` value alone does not enforce a bound. Its fields include unrestricted facts, tool names, and a variable number of objective plan steps. Explicit limits must bound those fields and the complete request.
+
+An oversized request produces no HTTP call. Transcript quotation and Unicode boundaries remain intact. The absence of routing metadata fields does not redact model names or prices supplied by a user.
 
 An enabled flag defaults to false. The call also requires an admitted frontier target after policy, cadence, budget, credential, and tool checks. This conservative condition excludes local-only sessions. A catalog identity match alone does not establish admission.
 
@@ -146,6 +148,18 @@ The shadow call requires a separate evaluation budget and ledger. A grant preced
 The transport sends one request with no retries. It bounds response bytes and the complete request duration. The response must contain the expected question and options, finite probabilities in range, a valid sum, and valid confidence. Unrelated extra fields are allowed. Confidence remains an observation, with no promotion threshold.
 
 The future caller supplies durable call identity and settlement sequence. Deterministic request bytes do not prevent repeated calls. Replay, cancellation of background work, and duplicate delivery remain B2/B3 responsibilities.
+
+### B4 implementation checkpoint, 2026-09-19
+
+The fleet library now prepares one checked System One request and sends its exact bytes once. The server library builds the brief internally, checks opt-in and admitted frontier availability, and reserves evaluation spend before dispatch. A caller must supply the separate evaluation ledger and budget. No startup path or scheduler constructs the adapter.
+
+The quote uses the complete serialized request with the configured tokenizer plus expected output. This includes framing that a quote from selected strings omits. It does not establish the service's token count or guarantee an upper bound on its bill. Reported usage determines settlement. Missing or partial usage remains unknown, and an invalid tier signal retains usable usage. A failed settlement leaves a warning and a hold that can expire.
+
+Focused tests cover received request bytes, bounded and quoted state, admission removals, zero and short grants, credential refusal before a grant, and unknown accounting. Separate regressions first exposed an incomplete quote and a configured URL in transport errors. Those regressions pass after their fixes. Synthetic credentials and loopback endpoints are the only test inputs.
+
+Two draft-review claims required correction. Reqwest already bounded total duration, so the claimed doubling of the deadline was invalid. The reproduced problem was inconsistent timeout classification across request phases. The wrong-question-type test passed against the initial parser, so its proposed reorder was rejected. These are not production latency improvements.
+
+Some later guard tests first ran green. The author's temporary re-breaks occurred before a commit and do not satisfy the required independent mutation stage. Post-commit verification remains necessary. No live TypeSafe call, quality evidence, learned allocation, or durable background record is claimed.
 
 ## 6. Decisions still needed
 

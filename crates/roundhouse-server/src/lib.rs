@@ -90,6 +90,8 @@ pub mod shared_backend;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 pub mod tokenizer;
+/// Deliberately unwired: see the module docs. B2 and B3 own what would call it.
+pub mod typesafe_shadow;
 
 pub use admin_api::admin_router;
 pub use catalog_config::{CatalogConfig, CatalogError};

@@ -20,6 +20,8 @@ pub mod anthropic_messages;
 pub mod frontier;
 pub mod local;
 pub mod openai_responses;
+/// Deliberately unwired: see the module docs. No shipped binary calls it.
+pub mod typesafe;
 pub mod usage;
 
 /// The Anthropic client's own `DEFAULT_API_BASE` and `DEFAULT_PASS_THROUGH_BASE`

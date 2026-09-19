@@ -400,7 +400,10 @@ fn truncate_objective(objective: Objective, limit: usize) -> Objective {
 /// panics, and the one input guaranteed to be arbitrary here is the transcript.
 /// The marker is inside the budget rather than added to it, so `limit` is a
 /// bound a caller can rely on when sizing a request.
-fn truncate(text: &str, limit: usize) -> String {
+///
+/// Shared with side-call adapters so additional text fields use the same
+/// character bound and truncation marker as the judge brief.
+pub fn truncate(text: &str, limit: usize) -> String {
     const MARKER: &str = "…[truncated]";
     if text.chars().count() <= limit {
         return text.to_string();

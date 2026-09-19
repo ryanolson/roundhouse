@@ -1152,6 +1152,12 @@ the catalog is named by an operator and load-or-die, while this one is
 discovered, and a discovered file must not be able to stop a deployment
 starting.
 
+**Hosted classification library.** The server library includes `TypeSafeShadow`, a disabled-by-default adapter for bounded judge briefs. An enabled adapter requires an admitted frontier target, a stored service credential, and an evaluation budget before it sends a request. The caller must supply a separate evaluation ledger. The model, prices, content limits, and deadline are explicit configuration.
+
+The adapter returns tier probabilities and confidence without changing a route. It retains reported usage when a tier signal is invalid. Missing or partial usage remains unknown. Budget estimates use the complete serialized request, and the transport sends those same checked bytes once, without retries. Request size, response size, and network duration are bounded.
+
+The binary does not construct this adapter. Durable attribution and background scheduling remain the B2/B3 work in `agent-docs/PLAN-routing-strategy-bandit.md`. Classifier confidence is not downstream answer quality. Serving allocation and promotion still require those separate decisions and measurements.
+
 ### The same numbers, in NeMo Relay's formats
 
 Roundhouse's log is a better producer of Relay's interchange formats than Relay's
