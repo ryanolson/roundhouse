@@ -16,7 +16,7 @@ Branch: `ai/typesafe-roundhouse-routing-6016d1`. Last update: 2026-09-19. The la
 | Evidence | Two ignored claim tests with live controls | done | `35839e2` |
 | Documents | The TypeSafe read, the ruling, the addendum, this plan | done | `e48b13b`, `be2bd66` |
 | C1 | Dominance guard on `Efficient` picks (T4) | done, mutation-checked | `83ac785` |
-| C2 | Second Anthropic breakpoint | done, mutation-checked. Live evidence is still necessary. | `22e58ce`, `d7f69ce` |
+| C2 | Second Anthropic breakpoint | mechanism and probe mutation-checked. Live evidence is still necessary. | `22e58ce`, `d7f69ce`, `101eb59`, `d582e62` |
 | C3 | The Dynamo residency call becomes a decision | done, mutation-checked | `8817db0` |
 | C4 | 1-hour TTL as one per-target setting | TTL propagation and catalog guard built. Mixed tool TTL policy awaits the owner; one regression is ignored. Not complete. | `4405da3` |
 | C5 | Local TTFT quote reads the residency answer | mechanism and catalog loader done, mutation-checked. Measured deployment slope still needed. | `6e905ba`, `3b21e98` |
@@ -43,6 +43,8 @@ Decisions that only the owner can make:
 2. T6 is accepted as proposed on 2026-09-19. The owner keeps PR #18 as one unit. The remaining cache decisions are C6 timing and C3 fleet fail-open behavior.
 
 The mutation checks used `sed` to change one token, ran the suite, and used `sed` to restore the token. `git diff --quiet crates/` confirmed each restore. C1: `<` to `<=` turned `a_tie_in_quoted_cost_keeps_the_efficient_pick_and_its_source` red. C2: `CACHE_LOOKBACK_BLOCKS` from 20 to 21 turned the evidence test red. C3: a predicate that never skips turned four of the five tests in `tests/local_quote_skip.rs` red, and the control stayed green. The C3 stage wrote its tests before the fix but did not run them before the fix, so this mutation is the evidence that they fail without it.
+
+**C2 probe verification, 2026-09-19.** The full workspace suite at `d582e62` passed 1694 tests, with 0 failures and 142 ignores, across 107 test binaries and 7 doc-test suites. Seven independent probe mutations failed: missing second request, short append, missing run nonce, bypassed budget, ignored route, swapped counters, and disabled cap preflight. The short-append mutation first exposed a missing assertion. Commit `d582e62` adds that guard, and the committed recheck failed on 19 received items. All mutations were restored. The probe passes 10 offline tests, and its gated live entry compiles without execution. Logs: `/tmp/roundhouse-c2-workspace-final.log` and `/tmp/roundhouse-c2-refute-*.log`. No live cache evidence is claimed.
 
 ## 2. How to continue
 

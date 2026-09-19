@@ -131,6 +131,22 @@ Tests failed before the implementation: 10 assertions failed while absence contr
 
 **Verification update, 2026-09-19.** Six B1 mutations failed the intended tests: routing-event timing, empty deltas, overwritten aggregate counters, billing-dependent samples, backward timestamps, and cross-session supersession. Removing timing cleanup initially survived. Commit `1142348` adds the missing map-drain assertion; the same mutation then failed against that committed guard. The restored source passed all 53 metrics tests. The full workspace run at `1142348` passed 1684 tests, with 0 failures and 142 ignores. One ignore belongs to the unresolved C4 tool-marker policy.
 
+### B4 implementation brief: budgeted shadow call
+
+T6 permits a standalone adapter. The binary remains unwired until B2 and B3 provide durable attribution and background execution. A passing adapter test does not authorize serving allocation.
+
+The fleet module owns the HTTP transport and typed response. The server builds the judge brief, checks egress eligibility, and reserves evaluation spend. Both use concrete implementations and loopback tests. No mock-only trait is needed.
+
+The server accepts session items and the objective, then builds `ValidationBrief` internally. Accepting a public `ValidationBrief` value alone does not enforce a bound. Its fields include unrestricted facts and tool names. Explicit limits must bound those fields and the complete request. An oversized request produces no HTTP call. Transcript quotation and Unicode boundaries remain intact. The absence of routing metadata fields does not redact model names or prices supplied by a user.
+
+An enabled flag defaults to false. The call also requires an admitted frontier target after policy, cadence, budget, credential, and tool checks. This conservative condition excludes local-only sessions. A catalog identity match alone does not establish admission.
+
+The shadow call requires a separate evaluation budget and ledger. A grant precedes HTTP, and settlement retains reported usage even when the tier signal is invalid. Unknown usage remains explicit. The configured model, rate card, deadline, and size limits have no guessed service values.
+
+The transport sends one request with no retries. It bounds response bytes and the complete request duration. The response must contain the expected question and options, finite probabilities in range, a valid sum, and valid confidence. Unrelated extra fields are allowed. Confidence remains an observation, with no promotion threshold.
+
+The future caller supplies durable call identity and settlement sequence. Deterministic request bytes do not prevent repeated calls. Replay, cancellation of background work, and duplicate delivery remain B2/B3 responsibilities.
+
 ## 6. Decisions still needed
 
 The owner accepted T6 and the C4 catalog price guard, and keeps PR #18 as one unit. C6 timing and C3 fleet fail-open behavior remain open.
