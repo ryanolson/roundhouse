@@ -1119,6 +1119,10 @@ plane's deployment/project/member tiers.
 
 For a measured prefill rate, set the slope to `1000 / tokens_per_second`. The quote is the base plus that slope times Dynamo's effective prefill tokens. Leave the slope at zero until a measurement exists. The server loads these values into its engine configuration, but the current binary does not attach a local fleet.
 
+**Cache lifetime.** For an `anthropic_messages` target, `cache_model: {"kind": "deterministic", "ttl_ms": 3600000}` selects one-hour conversation cache markers. The catalog requires `cache_write_per_mtok_usd` to equal twice the input rate for that entry. The error names the required rate. This check also applies to Messages gateways, regardless of their configured provider name.
+
+One-hour requests with shorter tool cache markers remain unsupported. The client currently preserves those tool markers, which can produce an invalid TTL order. The normalization-versus-rejection decision remains open in `agent-docs/PLAN-cache-affinity.md`.
+
 **Sourcing `quality_prior`.** `FrontierModelSpec::quality_prior` is
 configuration, not measurement, and `import-benchmarks` (a binary target in
 `roundhouse-fleet`, not linked into any shipped binary) is what lets that

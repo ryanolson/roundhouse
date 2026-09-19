@@ -1344,6 +1344,7 @@ mod tests {
                 prompt: "hi".into(),
                 segment_boundaries: Vec::new(),
                 previous_breakpoint: None,
+                cache_ttl_ms: None,
                 session_id: None,
                 thread_id: None,
                 prompt_cache_key: "sess".into(),

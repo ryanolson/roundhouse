@@ -38,7 +38,7 @@ use roundhouse_core::item::{Item, canonical_arguments};
 use roundhouse_core::metrics::MetricsRecorder;
 use roundhouse_core::now_ms;
 use roundhouse_core::routing::{
-    AttemptClass, CacheLedger, Candidate, Decision, DecisionRecord, DecisionSource,
+    AttemptClass, CacheLedger, CacheModel, Candidate, Decision, DecisionRecord, DecisionSource,
     DispatchAttempt, LocalQuoteSkip, RoutingContext, RoutingError, RoutingPolicy, Target, Tier,
     TierRecipe, TurnSignals,
 };
@@ -2866,6 +2866,12 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                     // history and inheriting the first choice's would name a
                     // block nothing ever wrote.
                     previous_breakpoint,
+                    // Use the ledger's catalog entry rather than a second TTL setting.
+                    // Automatic and observed cache models have no requested lifetime.
+                    cache_ttl_ms: match spec.cache_model {
+                        CacheModel::Deterministic { ttl_ms } => Some(ttl_ms),
+                        CacheModel::InactivityDecay { .. } | CacheModel::Observed => None,
+                    },
                     session_id: request_context.and_then(|context| context.session_id.clone()),
                     thread_id: request_context.and_then(|context| context.thread_id.clone()),
                     prompt_cache_key: request_context

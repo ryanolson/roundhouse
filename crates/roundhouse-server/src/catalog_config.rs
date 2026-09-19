@@ -33,7 +33,9 @@ use std::path::Path;
 use serde::Deserialize;
 
 use roundhouse_core::metrics::{DEFAULT_CAPABILITY_BAND, MetricsConfig};
-use roundhouse_fleet::{FrontierModelSpec, StaticFrontierCatalog};
+use roundhouse_core::routing::CacheModel;
+use roundhouse_fleet::anthropic_messages::ONE_HOUR_MS;
+use roundhouse_fleet::{FrontierModelSpec, StaticFrontierCatalog, WireProtocol};
 
 use crate::engine::{DEFAULT_LOCAL_BASE_TTFT_MS, EngineConfig};
 
@@ -271,6 +273,17 @@ pub enum CatalogError {
         provider: String,
         model: String,
     },
+    /// Carries the computed rate so the load error names the required value.
+    #[error(
+        "catalog `{path}`: `{model}` declares a one-hour cache. \
+         cache_write_per_mtok_usd must equal twice the input rate ({required}), got {declared}"
+    )]
+    OneHourWriteRate {
+        path: String,
+        model: String,
+        declared: f64,
+        required: f64,
+    },
     #[error("catalog `{path}`: `{model}` has {field} = {value}, but {expected}")]
     InvalidValue {
         path: String,
@@ -489,6 +502,25 @@ impl CatalogConfig {
                 }
             }
             unit_interval(path, &label, "quality_prior", spec.quality_prior)?;
+
+            // A single write rate must match the lifetime requested on the wire.
+            // Match the dialect so a gateway name cannot bypass this guard.
+            let one_hour_write = 2.0 * spec.pricing.input_per_mtok_usd;
+            let asks_for_an_hour = matches!(
+                spec.cache_model,
+                CacheModel::Deterministic { ttl_ms } if ttl_ms == ONE_HOUR_MS
+            );
+            if spec.wire_protocol == WireProtocol::AnthropicMessages
+                && asks_for_an_hour
+                && spec.pricing.cache_write_per_mtok_usd != one_hour_write
+            {
+                return Err(CatalogError::OneHourWriteRate {
+                    path: path.to_string(),
+                    model: label.clone(),
+                    declared: spec.pricing.cache_write_per_mtok_usd,
+                    required: one_hour_write,
+                });
+            }
         }
 
         // Every definition judged before any entry is resolved against it, so
@@ -778,6 +810,135 @@ mod tests {
         assert!(config.correlaries.is_empty());
         assert_eq!(config.capability_band, DEFAULT_CAPABILITY_BAND);
         assert_eq!(config.default_local_quality, 0.5);
+    }
+
+    /// One entry, parameterized on the four fields the cache-write guard reads.
+    ///
+    /// The provider is a parameter because the guard is scoped by dialect and
+    /// not by branding: the same Claude model is reachable as `anthropic` and
+    /// through a gateway under any name an operator picks, and a check keyed on
+    /// the name would pass the gateway spelling.
+    fn one_cached_entry(
+        provider: &str,
+        wire_protocol: &str,
+        ttl_ms: u64,
+        input: f64,
+        cache_write: f64,
+    ) -> String {
+        format!(
+            r#"{{
+              "providers": {{ "{provider}": {{
+                "base_url": "https://gateway.test/v1",
+                "routes": {{ "messages": "/messages", "responses": "/responses" }},
+                "auth": {{ "env": "GATEWAY_KEY" }}
+              }} }},
+              "models": [{{
+                "provider": "{provider}",
+                "model": "claude-sonnet",
+                "wire_protocol": "{wire_protocol}",
+                "cache_model": {{ "kind": "deterministic", "ttl_ms": {ttl_ms} }},
+                "pricing": {{
+                  "input_per_mtok_usd": {input},
+                  "cached_input_per_mtok_usd": 0.3,
+                  "cache_write_per_mtok_usd": {cache_write},
+                  "output_per_mtok_usd": 15.0
+                }},
+                "quality_prior": 0.62,
+                "base_ttft_ms": 350.0,
+                "ttft_ms_per_uncached_token": 0.002
+              }}]
+            }}"#
+        )
+    }
+
+    /// An hour-long entry priced as if it were a five-minute one is refused.
+    ///
+    /// The provider bills a one-hour write at twice the input rate and a
+    /// five-minute write at 1.25 times. Both numbers come from the same field,
+    /// so an entry that asks for the hour and carries the cheaper rate
+    /// under-reports the cost of every write it makes — and the dashboard
+    /// publishes the difference as a saving.
+    #[test]
+    fn a_one_hour_cache_model_requires_the_one_hour_write_rate() {
+        let error = CatalogConfig::from_json(
+            &one_cached_entry("anthropic", "anthropic_messages", 3_600_000, 3.0, 3.75),
+            "test",
+        )
+        .expect_err("3.75 is the five-minute rate on a three-dollar input");
+        assert!(
+            matches!(&error, CatalogError::OneHourWriteRate { declared, required, .. }
+                if *declared == 3.75 && *required == 6.0),
+            "{error}"
+        );
+        // The number to write, not just the diagnosis: an operator holding this
+        // in a boot log is deciding what to put in the file.
+        assert!(error.to_string().contains('6'), "{error}");
+
+        // CONTROL 1: the same entry at twice input loads. One field different,
+        // so the refusal is about the rate and not about the hour.
+        CatalogConfig::from_json(
+            &one_cached_entry("anthropic", "anthropic_messages", 3_600_000, 3.0, 6.0),
+            "test",
+        )
+        .expect("twice the input rate is what an hour costs");
+
+        // CONTROL 2: the five-minute entry with the same 3.75 the refusal
+        // above rejected. The guard is about the hour, not about the ratio.
+        CatalogConfig::from_json(
+            &one_cached_entry("anthropic", "anthropic_messages", 300_000, 3.0, 3.75),
+            "test",
+        )
+        .expect("a five-minute write is priced at 1.25 times and is not this check's business");
+
+        // CONTROL 3: the all-zero placeholder every example and the offline
+        // stub ship. Zero is twice zero, so a catalog nobody has priced yet
+        // still loads — this is what keeps `catalog.example.json` valid.
+        CatalogConfig::from_json(
+            &one_cached_entry("anthropic", "anthropic_messages", 3_600_000, 0.0, 0.0),
+            "test",
+        )
+        .expect("an unpriced placeholder catalog must still load");
+    }
+
+    /// The guard follows the dialect, so a gateway cannot spell its way out.
+    ///
+    /// `openrouter-messages` is the second definition the shipped example
+    /// demonstrates: one provider name, someone else's model, the same wire. A
+    /// check keyed on `provider == "anthropic"` would let exactly this entry
+    /// declare an hour at the cheaper rate.
+    #[test]
+    fn the_write_rate_guard_follows_the_dialect_rather_than_the_provider_name() {
+        let error = CatalogConfig::from_json(
+            &one_cached_entry(
+                "openrouter-messages",
+                "anthropic_messages",
+                3_600_000,
+                3.0,
+                3.75,
+            ),
+            "test",
+        )
+        .expect_err("the dialect decides, not the name above it");
+        assert!(
+            matches!(&error, CatalogError::OneHourWriteRate { model, .. }
+                if model.starts_with("openrouter-messages/")),
+            "{error}"
+        );
+    }
+
+    /// **CONTROL.** Other dialects are untouched by this rung.
+    ///
+    /// A `deterministic` hour on a Responses entry places no `cache_control`
+    /// marker anywhere — that vocabulary is this one dialect's — so pricing it
+    /// against Anthropic's multiplier would refuse a catalog for a rule its
+    /// provider never published.
+    #[test]
+    fn a_non_messages_dialect_is_not_held_to_the_one_hour_write_rate() {
+        CatalogConfig::from_json(
+            &one_cached_entry("openrouter", "openai_responses", 3_600_000, 3.0, 3.75),
+            "test",
+        )
+        .expect("another dialect's write pricing is not this check's to assert");
     }
 
     /// One minimal entry, parameterized on whatever local section is under

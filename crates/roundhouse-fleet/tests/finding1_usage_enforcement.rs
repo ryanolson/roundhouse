@@ -60,6 +60,7 @@ fn quote_as_the_engine_builds_it(catalog: &StaticFrontierCatalog) -> FrontierQuo
 
     FrontierQuote {
         previous_breakpoint: None,
+        cache_ttl_ms: None,
         wire_protocol: spec.wire_protocol,
         target: candidate.target,
         prompt: "how many tokens did that turn bill?".into(),

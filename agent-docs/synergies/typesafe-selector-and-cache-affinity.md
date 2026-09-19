@@ -275,3 +275,9 @@ The owner accepts catalog rejection for C4. A one-hour cache entry requires a wr
 The owner accepts T6: hosted classification is opt-in, off by default, excluded from local-only sessions, and restricted to the bounded judge brief. This permits implementation of the Jev shadow adapter under that policy. It does not establish the quality evidence or utility weights needed to promote a serving bandit.
 
 The owner keeps PR #18 as one unit. Separate commits preserve the boundaries between concerns within that PR.
+
+## Addendum (2026-09-19): C4 tool-marker conflict remains open
+
+The C4 checkpoint carries the target TTL into Messages conversation markers and rejects one-hour catalog entries with mismatched write rates. A body-level regression exposes a remaining conflict: preserved five-minute tool markers precede the new one-hour conversation markers. The emitted TTL order is `[300, 3600, 3600]` seconds. Anthropic requires longer lifetimes before shorter ones.
+
+Two remedies need an owner decision: normalize tool markers to the target TTL, or reject requests whose preserved markers conflict. Normalization changes the earlier verbatim-tool rule. Rejection refuses requests that the caller otherwise expects to work. The failing regression is explicitly ignored until that decision. C4 remains incomplete.

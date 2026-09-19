@@ -612,6 +612,8 @@ impl<T: Tokenizer + Clone> FleetJudge<T> {
             // dispatch of *this* prompt to share a cache entry with, and the
             // ledger it would be read from is the conversation's.
             previous_breakpoint: None,
+            // Side calls do not participate in the conversation cache ledger.
+            cache_ttl_ms: None,
             // The isolation, and the one line of this file that would be
             // easiest to get subtly wrong: the *conversation's* key here would
             // cool the hit the router priced for the next real turn.

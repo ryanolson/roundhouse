@@ -278,6 +278,7 @@ async fn handle(State(state): State<Upstream>, headers: HeaderMap, body: String)
 fn quote(credential: TurnCredential) -> FrontierQuote {
     FrontierQuote {
         previous_breakpoint: None,
+        cache_ttl_ms: None,
         target: Target::Frontier {
             provider: "anthropic".into(),
             model: "claude-x".into(),

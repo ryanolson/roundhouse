@@ -476,6 +476,16 @@ pub struct FrontierQuote {
     /// that is not the turn path means: a side call has no conversation to
     /// share a prefix with.
     pub previous_breakpoint: Option<usize>,
+    /// The cache lifetime this target's entry declares, in milliseconds.
+    ///
+    /// Carried from [`FrontierModelSpec::cache_model`] so the TTL a client asks
+    /// the provider for and the TTL the ledger predicts retention on are the
+    /// same number. A second setting for the wire could disagree with the
+    /// ledger, and the router would then price a hit it never bought.
+    ///
+    /// `None` means no explicit lifetime. Side calls leave this unset because
+    /// they do not participate in the conversation's cache ledger.
+    pub cache_ttl_ms: Option<u64>,
     /// Caller-supplied identity, independent of the cache-routing hint.
     pub session_id: Option<String>,
     pub thread_id: Option<String>,
@@ -1401,6 +1411,7 @@ mod tests {
     fn quote_with(credential: TurnCredential) -> FrontierQuote {
         FrontierQuote {
             previous_breakpoint: None,
+            cache_ttl_ms: None,
             target: Target::Frontier {
                 provider: "anthropic".into(),
                 model: "claude".into(),
