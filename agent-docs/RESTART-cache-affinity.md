@@ -20,9 +20,10 @@ You are continuing PR #18 in `ryanolson/roundhouse`: https://github.com/ryanolso
 
 ## State
 
-- `git fetch origin` first. Trust only pushed state. At the time of writing, local and `origin` are both at `a3f8d00`, 13 commits on top of `main` at `e521855`, and the tree is clean.
+- `git fetch origin` first. Trust only pushed state. The 2026-09-19 continuation started from the clean, pushed commit `29665d8`. A separate worktree holds the continuation at `/home/ryan/repos/roundhouse/.claude/worktrees/pr18-cache-affinity-continuation`, on branch `codex/pr18-cache-affinity-continuation`. The PR branch remains `ai/typesafe-roundhouse-routing-6016d1`. Check both heads before further work.
 - Built, mutation-checked, and pushed: C1 (dominance guard on `Efficient` picks), C2 (second Anthropic breakpoint), C3 (the fleet residency call runs only when its answer can matter), C5 (local TTFT slope, mechanism only).
-- The full workspace suite was green at `6e905ba`: 111 binaries, 1651 passed, 0 failed. One commit landed after that run (`4bffdcb`, an engine-level test) and was gated by its own binary only. Run the full suite again before you add code.
+- The full workspace suite passed at `29665d8` on 2026-09-19: 1652 passed, 0 failed, 141 ignored. It covered 104 test binaries and 7 doc-test suites. Command: `ulimit -Sn 65536 && timeout 900 cargo test --workspace`. The inherited descriptor limit of 1024 caused `Too many open files` in `embedded_selection`. That binary passed all 7 tests with the raised limit before the full rerun.
+- The owner requests a bandit with serving strategies and background evaluation arms, including online TypeSafe/Jev. The ruling addendum of 2026-09-19 records this direction. The detailed runtime contract remains open. T6, the PR split, the C4 price guard, C6 timing, and C3 fail-open behavior still await answers.
 - The PR is a draft. Its body is in the PR. `gh pr edit` is broken in this container. Update the body with `gh api -X PATCH repos/ryanolson/roundhouse/pulls/18 --input body.json`.
 
 ## Decisions that need the owner

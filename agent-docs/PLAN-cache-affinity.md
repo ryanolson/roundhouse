@@ -9,7 +9,7 @@ SPDX-License-Identifier: Apache-2.0
 
 ## 1. Status
 
-Branch: `ai/typesafe-roundhouse-routing-6016d1`, pushed to `origin`. Last update: 2026-09-17 20:03 UTC. The session that wrote this table ended here.
+Branch: `ai/typesafe-roundhouse-routing-6016d1`, pushed to `origin`. Last update: 2026-09-19. The latest baseline covers `29665d8`.
 
 | Rung | What | Status | Commit |
 |---|---|---|---|
@@ -21,7 +21,7 @@ Branch: `ai/typesafe-roundhouse-routing-6016d1`, pushed to `origin`. Last update
 | C4 | 1-hour TTL as one per-target setting | not started | |
 | C5 | Local TTFT quote reads the residency answer | mechanism done. No loader sets the slope yet. | `6e905ba` |
 | C6 | Observed cache deadline and the return trip | not designed | |
-| C7 | Shadow classifier (T5) | blocked on the owner: T2 and T6 | |
+| C7 | Shadow classifier (T5) | owner requests serving strategies and background evaluation arms, including online Jev. Detailed design and T6 remain open. | |
 
 Open items that belong to a finished rung:
 
@@ -32,10 +32,11 @@ Open items that belong to a finished rung:
 - **C5.** `main.rs:946-961` builds `EngineConfig` from defaults and sets only `arm_salt`. So `local_ttft_ms_per_prefill_token` is `0.0` in a deployment, and the local quote is still flat there. Neither local TTFT field has a configuration loader. The next step for C5 is that loader, and the slope value must come from a measured prefill rate of the deployment.
 - **C2.** No live request exists yet that shows `cache_read_input_tokens > 0` after an append of 20 or more items.
 - **All.** The full workspace suite ran under `timeout 900` two times. At `6ab8908` (C1 to C3): 111 test binaries, 1649 passed, 0 failed. At `6e905ba` (C5 added): 111 test binaries, 1651 passed, 0 failed. No ignore from this work remains in `crates/`.
+- **Baseline, 2026-09-19.** At `29665d8`, `ulimit -Sn 65536 && timeout 900 cargo test --workspace` passed: 1652 passed, 0 failed, 141 ignored. The run covered 104 test binaries and 7 doc-test suites. The initial run failed in `embedded_selection` with `Too many open files` at the inherited soft limit of 1024. With the raised limit, that binary passed all 7 tests before the full rerun. No source changes were necessary.
 
 Decisions that only the owner can make:
 
-1. T2: amend R3 so that a classifier can supply a signal on the turn path, or keep R3 and use the classifier offline only.
+1. T2: the owner requests a bandit with serving strategies and background evaluation arms, including online TypeSafe/Jev. See the ruling addendum of 2026-09-19. The runtime contract still needs a settled brief before implementation.
 2. T6: the egress posture for prompt content.
 
 The mutation checks used `sed` to change one token, ran the suite, and used `sed` to restore the token. `git diff --quiet crates/` confirmed each restore. C1: `<` to `<=` turned `a_tie_in_quoted_cost_keeps_the_efficient_pick_and_its_source` red. C2: `CACHE_LOOKBACK_BLOCKS` from 20 to 21 turned the evidence test red. C3: a predicate that never skips turned four of the five tests in `tests/local_quote_skip.rs` red, and the control stayed green. The C3 stage wrote its tests before the fix but did not run them before the fix, so this mutation is the evidence that they fail without it.

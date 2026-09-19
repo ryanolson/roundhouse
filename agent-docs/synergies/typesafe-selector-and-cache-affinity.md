@@ -259,3 +259,11 @@ Section 8 names two ignored claim tests. Both are live now, and both fixes are o
 - **C5, the local TTFT quote.** `LocalQuote::to_candidate` adds `effective_prefill_tokens` times a slope to the base. The slope is `EngineConfig.local_ttft_ms_per_prefill_token` and its default is `0.0`. No configuration loader sets it yet, so a deployment still quotes the flat value.
 
 Gap 1 and gap 2 of section 5 are closed in code. Gap 2 still needs one live request as evidence. Gap 7 has its mechanism and needs a loader and a measured slope. Gap 3 is rung C4 of the plan, not started. The line numbers in the table of section 8 are from `35839e2` and moved when the fixes landed. The test names did not change.
+
+## Addendum (2026-09-19): bandit direction from the owner
+
+The owner requests a multi-armed bandit with arms that run offline and TypeSafe/Jev arms that run online. This changes the direction in section 3, which selected targets as arms. The new direction does not yet settle the arm contract.
+
+The owner clarified that this includes both serving strategies and background evaluation arms. Offline-trained strategies can compete with online Jev for live routing. Background evaluation also belongs in the design.
+
+The design must distinguish observed serving outcomes from estimates produced by background evaluation. A background recommendation alone does not show what its proposed target would have achieved. T6 remains an independent decision. The reward, selection cadence, and promotion criteria still need a settled brief. No bandit or classifier call ships from this direction alone.
