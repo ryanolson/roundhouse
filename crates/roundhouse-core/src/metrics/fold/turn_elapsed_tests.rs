@@ -9,11 +9,12 @@
 //! a second copy here would make every stamp in these tests agree with the ones
 //! next door only by coincidence.
 
-use super::tests::{LogBuilder, claude, frontier, local, principal, row, usage};
+use super::tests::{LogBuilder, claude, decision_for, frontier, local, principal, row, usage};
 use super::*;
 use crate::control::{Billing, PrincipalKey, ProjectId};
 use crate::event::{IncompleteReason, SessionEventKind, Usage};
 use crate::ids::{ResponseId, TurnId};
+use crate::routing::{AttemptClass, DecisionRecord, DispatchAttempt};
 
 /// The whole B1 interval in one fixture: start, dispatch, text, terminal.
 ///
@@ -142,13 +143,20 @@ fn a_failover_books_the_whole_interval_on_the_target_that_transmitted() {
     });
     // The first dispatch, to a target that never opened a stream.
     log.route("r1", frontier("moonshot", "kimi"), 1_000, Billing::Billed);
-    // The second, to the one that did.
-    log.route(
-        "r1",
-        frontier("anthropic", "claude"),
-        1_000,
-        Billing::Billed,
-    );
+    // The second, to the one that did — carrying the attempt it fell forward
+    // from, because that is the record the engine writes: the dead dispatch
+    // rides the `Routed` of the dispatch its failure caused.
+    log.push(SessionEventKind::Routed {
+        response_id: ResponseId::new("r1"),
+        decision: DecisionRecord {
+            attempts: vec![DispatchAttempt {
+                target: frontier("moonshot", "kimi"),
+                class: AttemptClass::Transport,
+                elapsed_ms: 10,
+            }],
+            ..decision_for(frontier("anthropic", "claude"), 1_000)
+        },
+    });
     log.push(SessionEventKind::ResponseCompleted {
         response_id: ResponseId::new("r1"),
         usage: usage(1_000, 0, 100, 0),
@@ -169,11 +177,24 @@ fn a_failover_books_the_whole_interval_on_the_target_that_transmitted() {
         "measured from the turn's start, not from the surviving dispatch, so \
          the time the dead attempt burned is inside the interval"
     );
-    let abandoned = fold.summed_rows(Scope::Deployment).get(&kimi).cloned();
+    let abandoned = fold
+        .summed_rows(Scope::Deployment)
+        .get(&kimi)
+        .cloned()
+        .expect("the dead attempt rides the next dispatch's record, so kimi has a row");
     assert_eq!(
-        abandoned.map(|row| row.completed_elapsed.samples),
-        None,
-        "the target that never transmitted gets no interval and so no row"
+        abandoned.failed_attempts, 1,
+        "and what that row says about kimi is that one dispatch to it died"
+    );
+    assert_eq!(
+        (
+            abandoned.completed_elapsed,
+            abandoned.incomplete_elapsed,
+            abandoned.first_output_samples
+        ),
+        (Elapsed::default(), Elapsed::default(), 0),
+        "the target that never transmitted gets no interval, in either outcome \
+         class -- booking one there would report the fallback as the slow one"
     );
 }
 
