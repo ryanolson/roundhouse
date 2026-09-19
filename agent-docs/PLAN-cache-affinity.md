@@ -9,7 +9,7 @@ SPDX-License-Identifier: Apache-2.0
 
 ## 1. Status
 
-Branch: `ai/typesafe-roundhouse-routing-6016d1`. Last update: 2026-09-19. The latest full run covers `1142348`: 1684 passed, 0 failed, 142 ignored, across 106 test binaries and 7 doc-test suites.
+Branch: `ai/typesafe-roundhouse-routing-6016d1`. Last update: 2026-09-19. The latest local full run covers `51b0fb2`: 1733 passed, 0 failed, 142 ignored, across 108 test binaries and 7 doc-test suites.
 
 | Rung | What | Status | Commit |
 |---|---|---|---|
@@ -21,7 +21,7 @@ Branch: `ai/typesafe-roundhouse-routing-6016d1`. Last update: 2026-09-19. The la
 | C4 | 1-hour TTL as one per-target setting | TTL propagation and catalog guard built. Mixed tool TTL policy awaits the owner; one regression is ignored. Not complete. | `4405da3` |
 | C5 | Local TTFT quote reads the residency answer | mechanism and catalog loader done, mutation-checked. Measured deployment slope still needed. | `6e905ba`, `3b21e98` |
 | C6 | Observed cache deadline and the return trip | not designed | |
-| C7 | Shadow classifier (T5) | owner requests serving strategies and background evaluation arms, including online Jev. T6 accepted. Detailed bandit design remains open. | |
+| C7 | Shadow classifier (T5) | B4 standalone adapter built and mutation-checked under T6. Runtime records, scheduling, and bandit allocation remain open. | `51b0fb2` |
 
 Open items that belong to a finished rung:
 
@@ -154,6 +154,8 @@ Blocked on the owner. It needs a ruling on T2 (the amendment to R3) and on T6 (t
 **Continuation, 2026-09-19.** The owner requests serving strategies and background evaluation arms, including online Jev. `PLAN-routing-strategy-bandit.md` develops that direction into proposed contracts, delivery milestones, and tests. It distinguishes live outcomes from background estimates. T6 and the reward and promotion criteria remain open.
 
 **Later ruling, 2026-09-19.** T6 is accepted. The earlier statement that T6 remains open is superseded. Reward, promotion, and segment allocation contracts remain unsettled. A standalone shadow adapter can proceed under T6; runtime allocation must wait for its durable record contract.
+
+**B4 checkpoint, 2026-09-19.** Commit `51b0fb2` adds the standalone transport and budgeted server adapter. Twelve independent mutations were caught, and all 39 focused tests pass after restoration. The adapter is deliberately unwired. B2/B3 own durable records, scheduling, replay, and duplicate-call prevention. No live classifier evidence or serving allocation is claimed. See `PLAN-routing-strategy-bandit.md` for the contract and verification limits.
 
 ## 4. Smaller findings with no rung yet
 

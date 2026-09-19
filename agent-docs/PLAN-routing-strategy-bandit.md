@@ -109,7 +109,7 @@ Each implementation milestone needs a settled brief, failing tests before its fi
 | B1: observations | First-output checkpoint in `765daf2`, cleanup guard in `1142348`. Completion and strategy outcome attribution remain. | First-output, replay, scope, and failure regressions pass. Independent mutations verified; full suite passes. |
 | B2: strategy records | Record eligible serving strategies, versioned allocation, and fallback | Fixed hash vectors. Replay survives configuration changes. Background-only arms cannot enter serving allocation. |
 | B3: background evaluation | Execute sampled alternatives with bounded resources and no effect on routing | A stalled worker cannot delay a turn. Cancellation releases capacity. Retry cannot duplicate charges or outcomes. |
-| B4: Jev shadow adapter | Standalone transport and budgeted server boundary implemented under T6. B2/B3 wiring remains. | Focused loopback tests pass. Independent post-commit mutations remain. No live quality or latency evidence. |
+| B4: Jev shadow adapter | Standalone transport and budgeted server boundary committed at `51b0fb2` under T6. B2/B3 wiring remains. | All 39 focused tests pass. Twelve independent post-commit mutations were caught. No live quality or latency evidence. |
 | B5: offline calibration | Produce a versioned artifact and report from attributable observations | Incomplete cases and unsupported policy estimates remain explicit. Serving and background evidence cannot silently merge. |
 | B6: serving bandit | Allocate eligible strategies using approved quality and utility rules | Shadow promotion evidence, deterministic replay, enforced budgets, and cache-boundary tests. |
 
@@ -159,10 +159,14 @@ Focused tests cover received request bytes, bounded and quoted state, admission 
 
 Two draft-review claims required correction. Reqwest already bounded total duration, so the claimed doubling of the deadline was invalid. The reproduced problem was inconsistent timeout classification across request phases. The wrong-question-type test passed against the initial parser, so its proposed reorder was rejected. These are not production latency improvements.
 
-Some later guard tests first ran green. The author's temporary re-breaks occurred before a commit and do not satisfy the required independent mutation stage. Post-commit verification remains necessary. No live TypeSafe call, quality evidence, learned allocation, or durable background record is claimed.
+Some later guard tests first ran green. The author's temporary re-breaks occurred before a commit and do not count as independent mutation evidence. The independent stage below checks committed source. No live TypeSafe call, quality evidence, learned allocation, or durable background record is claimed.
+
+**Independent verification, 2026-09-19.** Twelve mutations against `51b0fb2` failed the intended assertions. They covered opt-in, admitted frontier availability, short grants, retained usage, partial usage, shared deadlines, request size, state size, estimates, URL redaction, probability sums, and credential diagnostics. Every restored source matched the commit. The restored suites passed 14 fleet unit tests, 8 HTTP tests, and 17 server tests. The verifier used exact inverse edits instead of the prescribed `sed` commands. No reset, checkout, or stash restored files. Logs: `/tmp/roundhouse-b4-refute-*.log`.
 
 ## 6. Decisions still needed
 
 The owner accepted T6 and the C4 catalog price guard, and keeps PR #18 as one unit. C6 timing and C3 fleet fail-open behavior remain open.
 
 For the bandit, settle the segment boundary cases, the function-quality observation, the allowed quality regression, and the cost-versus-latency tradeoff. Also decide whether background sampling remains configured or eventually learns a value-of-information policy. This brief recommends configured background sampling for the first measurable deployment.
+
+**Workspace verification, 2026-09-19.** The local full suite at `51b0fb2` passed 1733 tests, with 0 failures and 142 ignores. It covered 108 test binaries and 7 doc-test suites. The C4 owner-decision ignore remains. Command: `ulimit -Sn 65536 && timeout 900 cargo test --workspace`. Log: `/tmp/roundhouse-b4-workspace.log`.
