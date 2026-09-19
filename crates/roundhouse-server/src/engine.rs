@@ -38,9 +38,9 @@ use roundhouse_core::item::{Item, canonical_arguments};
 use roundhouse_core::metrics::MetricsRecorder;
 use roundhouse_core::now_ms;
 use roundhouse_core::routing::{
-    AttemptClass, CacheLedger, Candidate, Decision, DecisionRecord, DecisionSource,
-    DispatchAttempt, RoutingContext, RoutingError, RoutingPolicy, Target, Tier, TierRecipe,
-    TurnSignals,
+    AttemptClass, CacheLedger, CacheModel, Candidate, Decision, DecisionRecord, DecisionSource,
+    DispatchAttempt, LocalQuoteSkip, RoutingContext, RoutingError, RoutingPolicy, Target, Tier,
+    TierRecipe, TurnSignals,
 };
 use roundhouse_core::session::{Session, SessionError, SessionState, TurnAdmission};
 use roundhouse_core::store::SessionStore;
@@ -446,6 +446,13 @@ impl LocalExecutor for EchoLocalExecutor {
     }
 }
 
+/// The latency floor a local worker is quoted at before prefill, in ms.
+///
+/// Named rather than written twice, because a deployment can set it — see
+/// `catalog_config` — and a config loader whose "unset" default drifted from
+/// this one would change every local quote on a file nobody edited.
+pub const DEFAULT_LOCAL_BASE_TTFT_MS: f64 = 60.0;
+
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
     /// Identity presented to the session lease.
@@ -460,7 +467,21 @@ pub struct EngineConfig {
     /// Capability of the local model relative to the frontier catalog.
     pub local_quality_prior: f64,
     /// Latency floor attributed to a local worker before prefill.
+    ///
+    /// Deployment-settable, like the slope below: the catalog carries both, so
+    /// the local curve and the hosted ones it is compared against are written
+    /// in one file. See `catalog_config::engine_config`.
     pub local_base_ttft_ms: f64,
+    /// Slope from the residency answer's `effective_prefill_tokens` to a TTFT
+    /// term, the local mirror of a frontier spec's `ttft_ms_per_uncached_token`.
+    ///
+    /// A slope is a measured property of a deployment's prefill rate --
+    /// configuration, not a guess -- so the default is `0.0`, which reproduces
+    /// the old flat `local_base_ttft_ms` quote exactly for every deployment
+    /// that has not measured one. A deployment that has measured one writes
+    /// `1000 / tokens_per_second` into its catalog; see
+    /// `catalog_config::engine_config`.
+    pub local_ttft_ms_per_prefill_token: f64,
     pub expected_output_tokens: u32,
     /// Bounds the model work of a single turn.
     ///
@@ -494,7 +515,8 @@ impl Default for EngineConfig {
             local_model: "local".to_string(),
             routing_group: "default".to_string(),
             local_quality_prior: 0.6,
-            local_base_ttft_ms: 60.0,
+            local_base_ttft_ms: DEFAULT_LOCAL_BASE_TTFT_MS,
+            local_ttft_ms_per_prefill_token: 0.0,
             expected_output_tokens: 256,
             turn_deadline_ms: 120_000,
             arm_salt: String::new(),
@@ -1487,16 +1509,11 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             .await
             .map_err(Failed::before_output)?;
 
-        // One fold for both targets: a response is a stream of deltas, and each
-        // one becomes durable as it arrives rather than at the end. That is
-        // what lets a successor resume a half-written answer, and what makes
-        // TTFT a measured quantity — the first `OutputTextDelta.at_ms` in the
-        // log minus the `Routed.at_ms` before it — instead of the model's own
-        // estimate of itself. On a turn that fell forward, "the `Routed` before
-        // it" is the *last* one, which is the dispatch that answered: the right
-        // reading, since the time a dead provider took to fail is on that
-        // provider's own attempt row rather than charged to the model that
-        // eventually spoke.
+        // Durable deltas let a successor resume a partial answer and let metrics
+        // reproduce first-output latency from the log. R21 measures from turn
+        // start, so the serving target's row includes routing and failover delay.
+        // This interval excludes work before the start event and delivery after
+        // the delta append. It does not measure the provider's own service time.
         // Everything said, for the caller; and the run not yet committed as an
         // item, for the log. **Two accumulators rather than one**, because a
         // tool call commits the run ahead of it and the two questions then have
@@ -2020,8 +2037,31 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         );
 
         // --- price every option -------------------------------------------
-        let local_quote = match &self.fleet {
-            Some(fleet) => {
+        //
+        // **The local quote is a decision, not a lookup** (C3). `price` sends
+        // this turn's block and sequence hashes to the selector and waits for
+        // what it is still holding, which makes it an HTTP round-trip on the
+        // path to first token — and Dynamo can hold a KV cache for longer than
+        // any frontier TTL, so the answer is worth having whenever it can move
+        // the route. It is worth nothing when it cannot: a coding agent
+        // declares a toolbox on nearly every turn, the exclusion below drops
+        // every local candidate on exactly those turns, and a selector that is
+        // down was failing turns that were always going to a hosted model.
+        //
+        // `None` here is two different states — no fleet to ask, and a fleet
+        // deliberately not asked — so only the second is recorded; see
+        // [`DecisionRecord::local_quote_skipped`].
+        let local_quote_skipped = self.fleet.as_ref().and_then(|_| {
+            local_quote_can_matter(
+                declarations.declares_tools(),
+                &admission.policy,
+                &Target::local_policy_identity(&self.config.local_model),
+                self.config.local_quality_prior,
+            )
+            .err()
+        });
+        let local_quote = match (&self.fleet, &local_quote_skipped) {
+            (Some(fleet), None) => {
                 self.bounded(
                     deadline_at,
                     fleet.price(&FleetQuery::for_buffer(
@@ -2034,7 +2074,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                 )
                 .await?
             }
-            None => None,
+            _ => None,
         };
 
         let mut candidates: Vec<Candidate> = Vec::new();
@@ -2042,6 +2082,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             candidates.push(quote.to_candidate(
                 self.config.local_quality_prior,
                 self.config.local_base_ttft_ms,
+                self.config.local_ttft_ms_per_prefill_token,
             ));
         }
         candidates.extend(self.frontier_catalog.quote(
@@ -2085,7 +2126,16 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             }
             false => 0,
         };
-        if excluded_local > 0 && candidates.is_empty() {
+        // **A tool turn now loses its local options in one of two places**: the
+        // retain above, or (C3) the quote that was never made because the
+        // answer was always going to be discarded here. Downstream nothing can
+        // tell the difference and nothing should — the audit note, the
+        // empty-pool refusal and the exhausted-budget restatement all state the
+        // same fact — so the two spellings are folded into one answer once,
+        // rather than three sites each learning that a skip exists.
+        let local_withheld_by_tools =
+            excluded_local > 0 || local_quote_skipped == Some(LocalQuoteSkip::ToolsDeclared);
+        if local_withheld_by_tools && candidates.is_empty() {
             // Nothing hosted was quoted and local was all there was. Its own
             // error rather than `NoCandidates` or a served prose turn, because
             // the two things an operator needs are in it: that this turn
@@ -2333,8 +2383,8 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             // straight to the spend ledger — where the real answer is that this
             // deployment has no tool-capable capacity left, budget or no budget.
             // Restated rather than replaced, so both facts survive.
-            .map_err(|error| match (excluded_local, &error) {
-                (1.., EngineError::Routing(RoutingError::NoViableCandidate { budget_state })) => {
+            .map_err(|error| match (local_withheld_by_tools, &error) {
+                (true, EngineError::Routing(RoutingError::NoViableCandidate { budget_state })) => {
                     EngineError::NoToolCapableTarget {
                         tools: declared_tool_count(&declarations),
                         why: format!(
@@ -2350,7 +2400,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         // local worker" is exactly the question a decision record exists to
         // answer, and the honest answer is not "the router preferred it".
         let mut decision = decision;
-        if excluded_local > 0 {
+        if local_withheld_by_tools {
             decision
                 .rationale
                 .push_str(roundhouse_core::routing::TOOL_TURN_EXCLUDES_LOCAL);
@@ -2557,6 +2607,10 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                         // nothing earlier: see the loop's own comment on why a
                         // cumulative list would report one dead provider as four.
                         attempts: preceding.take().into_iter().collect(),
+                        // Why the local fleet was never asked, on the turns it
+                        // was not: the difference between a fleet this router
+                        // turned down and one it never consulted.
+                        local_quote_skipped,
                     },
                 )
                 .await?;
@@ -2578,6 +2632,16 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                     // saw and subtract a prefill it never did (F4).
                     conversation_tokens,
                     deadline_at,
+                    // The penultimate block of the prompt the *previous*
+                    // dispatch to this target sent — `n` items give `n`
+                    // segments, so the block it marked is `n - 2`. Read after
+                    // `record_routing` above and still the previous turn's
+                    // state, because the ledger folds a dispatch at its terminal
+                    // event and not at `Routed`.
+                    session
+                        .ledger()
+                        .state_for(&target)
+                        .and_then(|state| (state.last_segment_count as usize).checked_sub(2)),
                     declarations,
                 )
                 .await
@@ -2683,6 +2747,11 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         // worker is sent the prompt buffer alone; see the call site (F4).
         conversation_tokens: usize,
         deadline_at: Instant,
+        // The block this target's previous dispatch marked, if the ledger
+        // remembers one. Resolved by the caller rather than here: `connect`
+        // holds no session, and the value is a fact about *this* target, so the
+        // failover loop re-derives it for every attempt.
+        previous_breakpoint: Option<usize>,
         // What the client declared, for the dialects that can express it.
         //
         // **Only the frontier arm below reads it, and that is two separate
@@ -2784,6 +2853,20 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                     // the one part of this prompt that is new this turn and
                     // must not be inside the block a breakpoint caches.
                     segment_boundaries,
+                    // **Where the *previous* request to this same target left
+                    // its cache entry**, so a client whose provider only looks a
+                    // bounded distance back from a marker can still reach it
+                    // after a long append. Derived per attempt at the call site
+                    // from the ledger, because a failover target has its own
+                    // history and inheriting the first choice's would name a
+                    // block nothing ever wrote.
+                    previous_breakpoint,
+                    // Use the ledger's catalog entry rather than a second TTL setting.
+                    // Automatic and observed cache models have no requested lifetime.
+                    cache_ttl_ms: match spec.cache_model {
+                        CacheModel::Deterministic { ttl_ms } => Some(ttl_ms),
+                        CacheModel::InactivityDecay { .. } | CacheModel::Observed => None,
+                    },
                     session_id: request_context.and_then(|context| context.session_id.clone()),
                     thread_id: request_context.and_then(|context| context.thread_id.clone()),
                     prompt_cache_key: request_context
@@ -2937,6 +3020,44 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
     }
 }
 
+/// Whether pricing the local fleet can still change this turn's route.
+///
+/// `Ok(())` means ask it; `Err` names why the answer would have been thrown
+/// away, and that name is what reaches the log — see
+/// [`DecisionRecord::local_quote_skipped`]. A free function over values the
+/// call site already holds, so the decision to skip an HTTP call is testable
+/// without a session, a fleet or a clock.
+///
+/// Both refusals are *reachability* facts in the sense
+/// [`TurnPolicy::permits`] means: the same answer on every turn that looks
+/// like this one. The two knobs that are deliberately not consulted are the
+/// budget and the cadence, because both make a local route more likely — a
+/// squeezed budget is precisely when the fleet's answer decides the turn, so
+/// skipping the quote there would drop the call exactly where it earned its
+/// latency.
+///
+/// The policy asked is the one resolved at admission, before the validator's
+/// escalation narrows it. That is safe in the only direction that matters:
+/// an escalation raises the quality floor and never lowers it, so a policy
+/// that already names no local target still names none afterwards.
+fn local_quote_can_matter(
+    declares_tools: bool,
+    policy: &TurnPolicy,
+    local_policy_identity: &str,
+    local_quality_prior: f64,
+) -> Result<(), LocalQuoteSkip> {
+    if declares_tools {
+        // The exclusion below `plan`'s quote is unconditional and this
+        // predicate is its mirror: a local worker in this build cannot be told
+        // about a toolbox at all, so the quote would be discarded on arrival.
+        return Err(LocalQuoteSkip::ToolsDeclared);
+    }
+    if !policy.permits_identity(local_policy_identity, local_quality_prior) {
+        return Err(LocalQuoteSkip::PolicyAdmitsNoLocal);
+    }
+    Ok(())
+}
+
 /// Recover a completed response's text from the log.
 ///
 /// Contents, not [`Item::render`]: the render adds the `<|role|>` prefix the
@@ -2962,6 +3083,49 @@ mod tests {
     use roundhouse_core::control::{FrontierHistory, TargetFilter, TurnBudget};
     use roundhouse_core::ids::SessionId;
     use roundhouse_core::routing::{AffinityPolicy, RoutingContext};
+
+    /// The predicate that decides whether an HTTP round-trip is worth making,
+    /// asked without an engine, a session or a fleet — which is the reason it
+    /// is a free function over plain values rather than a method.
+    #[test]
+    fn local_quote_can_matter_names_why_it_cannot() {
+        let open = TurnPolicy::unrestricted();
+        let identity = Target::local_policy_identity("llama");
+
+        assert_eq!(local_quote_can_matter(false, &open, &identity, 0.6), Ok(()));
+        assert_eq!(
+            local_quote_can_matter(true, &open, &identity, 0.6),
+            Err(LocalQuoteSkip::ToolsDeclared),
+            "a toolbox makes every local candidate unreachable, so the quote \
+             would be discarded on arrival"
+        );
+
+        let hosted_only = TurnPolicy {
+            allow: TargetFilter::parse(["anthropic/*"]).unwrap(),
+            ..TurnPolicy::unrestricted()
+        };
+        assert_eq!(
+            local_quote_can_matter(false, &hosted_only, &identity, 0.6),
+            Err(LocalQuoteSkip::PolicyAdmitsNoLocal)
+        );
+
+        let discerning = TurnPolicy {
+            min_quality: 0.9,
+            ..TurnPolicy::unrestricted()
+        };
+        assert_eq!(
+            local_quote_can_matter(false, &discerning, &identity, 0.6),
+            Err(LocalQuoteSkip::PolicyAdmitsNoLocal),
+            "a floor above the configured local prior is the same refusal by \
+             the other axis: the prior is configuration, so the answer is known \
+             before the selector is asked"
+        );
+        assert_eq!(
+            local_quote_can_matter(false, &discerning, &identity, 0.95),
+            Ok(()),
+            "and a fleet that clears the floor is still asked"
+        );
+    }
 
     fn local(load: f64) -> Candidate {
         Candidate {

@@ -456,6 +456,36 @@ pub struct FrontierQuote {
     /// each on a UTF-8 character boundary; anything else is refused by
     /// [`Self::segments`] rather than sliced.
     pub segment_boundaries: Vec<usize>,
+    /// The block index this target's *previous* request marked, if the ledger
+    /// remembers one.
+    ///
+    /// **A provider looks a bounded distance back from a breakpoint, not all
+    /// the way to the start of the prompt.** Anthropic checks at most twenty
+    /// block positions back from each marker, counting the marker itself
+    /// (platform.claude.com/docs/en/build-with-claude/prompt-caching). A turn
+    /// that appended twenty or more items since the last dispatch to the same
+    /// target therefore puts its one penultimate marker out of reach of the
+    /// entry the previous turn wrote, and reads nothing from a cache whose
+    /// bytes are still byte-identical. This field is what lets a client place a
+    /// second marker back where that entry lives.
+    ///
+    /// Derived from the cache ledger's `last_segment_count`, which is the item
+    /// count the previous dispatch to this target rendered — so it is a fact
+    /// about that target and is re-derived per failover attempt rather than per
+    /// turn. `None` means no prior dispatch is remembered, which every caller
+    /// that is not the turn path means: a side call has no conversation to
+    /// share a prefix with.
+    pub previous_breakpoint: Option<usize>,
+    /// The cache lifetime this target's entry declares, in milliseconds.
+    ///
+    /// Carried from [`FrontierModelSpec::cache_model`] so the TTL a client asks
+    /// the provider for and the TTL the ledger predicts retention on are the
+    /// same number. A second setting for the wire could disagree with the
+    /// ledger, and the router would then price a hit it never bought.
+    ///
+    /// `None` means no explicit lifetime. Side calls leave this unset because
+    /// they do not participate in the conversation's cache ledger.
+    pub cache_ttl_ms: Option<u64>,
     /// Caller-supplied identity, independent of the cache-routing hint.
     pub session_id: Option<String>,
     pub thread_id: Option<String>,
@@ -1297,7 +1327,7 @@ mod tests {
 
         let cold = catalog.quote(&ledger, 0, 50_000, 500).remove(0);
 
-        ledger.record(&catalog.models()[0].target(), 0, 50_000);
+        ledger.record(&catalog.models()[0].target(), 0, 50_000, 0);
         let warm = catalog.quote(&ledger, MINUTE, 50_000, 500).remove(0);
 
         assert_eq!(warm.expected_prefill_tokens, 0.0);
@@ -1311,7 +1341,7 @@ mod tests {
         let catalog = catalog();
         let mut ledger = CacheLedger::new();
         catalog.apply_to_ledger(&mut ledger);
-        ledger.record(&catalog.models()[0].target(), 0, 50_000);
+        ledger.record(&catalog.models()[0].target(), 0, 50_000, 0);
 
         let inside = catalog.quote(&ledger, 4 * MINUTE, 50_000, 500).remove(0);
         let outside = catalog.quote(&ledger, 6 * MINUTE, 50_000, 500).remove(0);
@@ -1380,6 +1410,8 @@ mod tests {
 
     fn quote_with(credential: TurnCredential) -> FrontierQuote {
         FrontierQuote {
+            previous_breakpoint: None,
+            cache_ttl_ms: None,
             target: Target::Frontier {
                 provider: "anthropic".into(),
                 model: "claude".into(),
@@ -1401,6 +1433,7 @@ mod tests {
 
     fn segmented(prompt: &str, boundaries: Vec<usize>) -> FrontierQuote {
         FrontierQuote {
+            previous_breakpoint: None,
             prompt: prompt.to_string(),
             segment_boundaries: boundaries,
             ..quote_with(TurnCredential::Absent)
@@ -1709,6 +1742,7 @@ mod tests {
         dialect: WireProtocol,
     ) -> FrontierQuote {
         FrontierQuote {
+            previous_breakpoint: None,
             tools,
             tool_choice,
             tools_dialect: Some(dialect),

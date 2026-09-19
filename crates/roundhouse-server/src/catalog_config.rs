@@ -1,15 +1,20 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Deployment configuration for the catalog, the rate card, and the correlaries.
+//! Deployment configuration for the catalog, the rate card, the correlaries,
+//! and the local latency curve they are all compared against.
 //!
-//! One file, because these three are one fact seen from three angles. The
-//! catalog is what the router may choose between; the rate card is what those
-//! choices cost; the correlaries are what our own models stand in for when
-//! they are priced. Splitting them across separate configuration would let the
-//! price the router optimizes against drift from the price the dashboard
-//! reports saving, and those two numbers disagreeing is worse than either being
-//! wrong — it is unfalsifiable.
+//! One file, because these are one fact seen from several angles. The catalog
+//! is what the router may choose between; the rate card is what those choices
+//! cost; the correlaries are what our own models stand in for when they are
+//! priced; the local TTFT curve is the fourth axis of that same comparison,
+//! and it is here because every hosted entry already carries its own
+//! `base_ttft_ms` and `ttft_ms_per_uncached_token` — a deployment that
+//! configured the local side somewhere else would be writing the two halves of
+//! one comparison in two files. Splitting them would let the price the router
+//! optimizes against drift from the price the dashboard reports saving, and
+//! those two numbers disagreeing is worse than either being wrong — it is
+//! unfalsifiable.
 //!
 //! Prices are not in source, here or anywhere: rate cards change, and a
 //! constant in a binary goes stale silently. `roundhouse-fleet`'s
@@ -28,7 +33,11 @@ use std::path::Path;
 use serde::Deserialize;
 
 use roundhouse_core::metrics::{DEFAULT_CAPABILITY_BAND, MetricsConfig};
-use roundhouse_fleet::{FrontierModelSpec, StaticFrontierCatalog};
+use roundhouse_core::routing::CacheModel;
+use roundhouse_fleet::anthropic_messages::ONE_HOUR_MS;
+use roundhouse_fleet::{FrontierModelSpec, StaticFrontierCatalog, WireProtocol};
+
+use crate::engine::{DEFAULT_LOCAL_BASE_TTFT_MS, EngineConfig};
 
 pub use providers::{BUILT_IN_OPENAI, ProviderAuth, ProviderConfig, ProviderRoutes};
 
@@ -76,6 +85,16 @@ pub struct CatalogConfig {
     /// How far apart two models' quality priors may be and still be compared.
     #[serde(default = "default_capability_band")]
     pub capability_band: f64,
+    /// Local latency floor in milliseconds. Uses the engine's default when omitted.
+    #[serde(default = "default_local_base_ttft_ms")]
+    pub local_base_ttft_ms: f64,
+    /// Milliseconds per effective prefill token, measured as `1000 / tokens_per_second`.
+    ///
+    /// Zero leaves the quote flat until the deployment has a prefill measurement.
+    /// Keeping local and hosted latency values here makes their comparison
+    /// inspectable in the same deployment configuration.
+    #[serde(default)]
+    pub local_ttft_ms_per_prefill_token: f64,
     /// The citation for imported `quality_prior`s, if a provenance file was
     /// found beside this catalog. Never read from the catalog JSON itself —
     /// see [`quality_prior_citation`].
@@ -222,6 +241,10 @@ fn default_capability_band() -> f64 {
     DEFAULT_CAPABILITY_BAND
 }
 
+fn default_local_base_ttft_ms() -> f64 {
+    DEFAULT_LOCAL_BASE_TTFT_MS
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
     #[error("could not read catalog `{path}`: {source}")]
@@ -249,6 +272,17 @@ pub enum CatalogError {
         path: String,
         provider: String,
         model: String,
+    },
+    /// Carries the computed rate so the load error names the required value.
+    #[error(
+        "catalog `{path}`: `{model}` declares a one-hour cache. \
+         cache_write_per_mtok_usd must equal twice the input rate ({required}), got {declared}"
+    )]
+    OneHourWriteRate {
+        path: String,
+        model: String,
+        declared: f64,
+        required: f64,
     },
     #[error("catalog `{path}`: `{model}` has {field} = {value}, but {expected}")]
     InvalidValue {
@@ -392,8 +426,9 @@ impl CatalogConfig {
     /// file accepted. Making the ambiguity unrepresentable is what keeps the
     /// stated invariant true rather than merely usually true.
     ///
-    /// Every check here is about a value that changes a dollar figure or gates
-    /// a comparison. Non-finite prices are deliberately absent: JSON has no
+    /// Every check here is about a value that changes a dollar figure, gates a
+    /// comparison, or moves a route — the local latency curve is the third of
+    /// those. Non-finite prices are deliberately absent: JSON has no
     /// `NaN` literal and `serde_json` refuses a float it cannot represent, so
     /// parsing has already rejected them and a guard here would be dead code
     /// dressed as diligence.
@@ -467,6 +502,25 @@ impl CatalogConfig {
                 }
             }
             unit_interval(path, &label, "quality_prior", spec.quality_prior)?;
+
+            // A single write rate must match the lifetime requested on the wire.
+            // Match the dialect so a gateway name cannot bypass this guard.
+            let one_hour_write = 2.0 * spec.pricing.input_per_mtok_usd;
+            let asks_for_an_hour = matches!(
+                spec.cache_model,
+                CacheModel::Deterministic { ttl_ms } if ttl_ms == ONE_HOUR_MS
+            );
+            if spec.wire_protocol == WireProtocol::AnthropicMessages
+                && asks_for_an_hour
+                && spec.pricing.cache_write_per_mtok_usd != one_hour_write
+            {
+                return Err(CatalogError::OneHourWriteRate {
+                    path: path.to_string(),
+                    model: label.clone(),
+                    declared: spec.pricing.cache_write_per_mtok_usd,
+                    required: one_hour_write,
+                });
+            }
         }
 
         // Every definition judged before any entry is resolved against it, so
@@ -531,6 +585,30 @@ impl CatalogConfig {
                     local_model: correlary.local_model.clone(),
                     provider: correlary.provider.clone(),
                     model: correlary.model.clone(),
+                });
+            }
+        }
+
+        // The local half of the latency curve, held to the rule its hosted
+        // half is held to above. A negative floor or slope does not merely
+        // mis-quote: it makes a local worker look *faster* the more it has to
+        // prefill, so the router hands its longest cold contexts to the one
+        // target no provider bill ever arrives to contradict, and the
+        // dashboard reports every miss as a saving.
+        for (field, value) in [
+            ("local_base_ttft_ms", self.local_base_ttft_ms),
+            (
+                "local_ttft_ms_per_prefill_token",
+                self.local_ttft_ms_per_prefill_token,
+            ),
+        ] {
+            if value < 0.0 {
+                return Err(CatalogError::InvalidValue {
+                    path: path.to_string(),
+                    model: "<catalog>".to_string(),
+                    field,
+                    value,
+                    expected: "rates and latencies cannot be negative",
                 });
             }
         }
@@ -610,6 +688,21 @@ pub fn from_env() -> Result<Option<CatalogConfig>, CatalogError> {
     match std::env::var(CATALOG_VAR) {
         Ok(path) if !path.trim().is_empty() => CatalogConfig::load(path.trim()).map(Some),
         _ => Ok(None),
+    }
+}
+
+/// Apply the catalog's local latency values to the engine defaults.
+///
+/// The no-catalog path uses the same defaults as an omitted field. Keeping this
+/// composition beside the loader lets tests exercise it without booting a server.
+pub fn engine_config(config: Option<&CatalogConfig>) -> EngineConfig {
+    let Some(config) = config else {
+        return EngineConfig::default();
+    };
+    EngineConfig {
+        local_base_ttft_ms: config.local_base_ttft_ms,
+        local_ttft_ms_per_prefill_token: config.local_ttft_ms_per_prefill_token,
+        ..EngineConfig::default()
     }
 }
 
@@ -717,6 +810,264 @@ mod tests {
         assert!(config.correlaries.is_empty());
         assert_eq!(config.capability_band, DEFAULT_CAPABILITY_BAND);
         assert_eq!(config.default_local_quality, 0.5);
+    }
+
+    /// One entry, parameterized on the four fields the cache-write guard reads.
+    ///
+    /// The provider is a parameter because the guard is scoped by dialect and
+    /// not by branding: the same Claude model is reachable as `anthropic` and
+    /// through a gateway under any name an operator picks, and a check keyed on
+    /// the name would pass the gateway spelling.
+    fn one_cached_entry(
+        provider: &str,
+        wire_protocol: &str,
+        ttl_ms: u64,
+        input: f64,
+        cache_write: f64,
+    ) -> String {
+        format!(
+            r#"{{
+              "providers": {{ "{provider}": {{
+                "base_url": "https://gateway.test/v1",
+                "routes": {{ "messages": "/messages", "responses": "/responses" }},
+                "auth": {{ "env": "GATEWAY_KEY" }}
+              }} }},
+              "models": [{{
+                "provider": "{provider}",
+                "model": "claude-sonnet",
+                "wire_protocol": "{wire_protocol}",
+                "cache_model": {{ "kind": "deterministic", "ttl_ms": {ttl_ms} }},
+                "pricing": {{
+                  "input_per_mtok_usd": {input},
+                  "cached_input_per_mtok_usd": 0.3,
+                  "cache_write_per_mtok_usd": {cache_write},
+                  "output_per_mtok_usd": 15.0
+                }},
+                "quality_prior": 0.62,
+                "base_ttft_ms": 350.0,
+                "ttft_ms_per_uncached_token": 0.002
+              }}]
+            }}"#
+        )
+    }
+
+    /// An hour-long entry priced as if it were a five-minute one is refused.
+    ///
+    /// The provider bills a one-hour write at twice the input rate and a
+    /// five-minute write at 1.25 times. Both numbers come from the same field,
+    /// so an entry that asks for the hour and carries the cheaper rate
+    /// under-reports the cost of every write it makes — and the dashboard
+    /// publishes the difference as a saving.
+    #[test]
+    fn a_one_hour_cache_model_requires_the_one_hour_write_rate() {
+        let error = CatalogConfig::from_json(
+            &one_cached_entry("anthropic", "anthropic_messages", 3_600_000, 3.0, 3.75),
+            "test",
+        )
+        .expect_err("3.75 is the five-minute rate on a three-dollar input");
+        assert!(
+            matches!(&error, CatalogError::OneHourWriteRate { declared, required, .. }
+                if *declared == 3.75 && *required == 6.0),
+            "{error}"
+        );
+        // The number to write, not just the diagnosis: an operator holding this
+        // in a boot log is deciding what to put in the file.
+        assert!(error.to_string().contains('6'), "{error}");
+
+        // CONTROL 1: the same entry at twice input loads. One field different,
+        // so the refusal is about the rate and not about the hour.
+        CatalogConfig::from_json(
+            &one_cached_entry("anthropic", "anthropic_messages", 3_600_000, 3.0, 6.0),
+            "test",
+        )
+        .expect("twice the input rate is what an hour costs");
+
+        // CONTROL 2: the five-minute entry with the same 3.75 the refusal
+        // above rejected. The guard is about the hour, not about the ratio.
+        CatalogConfig::from_json(
+            &one_cached_entry("anthropic", "anthropic_messages", 300_000, 3.0, 3.75),
+            "test",
+        )
+        .expect("a five-minute write is priced at 1.25 times and is not this check's business");
+
+        // CONTROL 3: the all-zero placeholder every example and the offline
+        // stub ship. Zero is twice zero, so a catalog nobody has priced yet
+        // still loads — this is what keeps `catalog.example.json` valid.
+        CatalogConfig::from_json(
+            &one_cached_entry("anthropic", "anthropic_messages", 3_600_000, 0.0, 0.0),
+            "test",
+        )
+        .expect("an unpriced placeholder catalog must still load");
+    }
+
+    /// The guard follows the dialect, so a gateway cannot spell its way out.
+    ///
+    /// `openrouter-messages` is the second definition the shipped example
+    /// demonstrates: one provider name, someone else's model, the same wire. A
+    /// check keyed on `provider == "anthropic"` would let exactly this entry
+    /// declare an hour at the cheaper rate.
+    #[test]
+    fn the_write_rate_guard_follows_the_dialect_rather_than_the_provider_name() {
+        let error = CatalogConfig::from_json(
+            &one_cached_entry(
+                "openrouter-messages",
+                "anthropic_messages",
+                3_600_000,
+                3.0,
+                3.75,
+            ),
+            "test",
+        )
+        .expect_err("the dialect decides, not the name above it");
+        assert!(
+            matches!(&error, CatalogError::OneHourWriteRate { model, .. }
+                if model.starts_with("openrouter-messages/")),
+            "{error}"
+        );
+    }
+
+    /// **CONTROL.** Other dialects are untouched by this rung.
+    ///
+    /// A `deterministic` hour on a Responses entry places no `cache_control`
+    /// marker anywhere — that vocabulary is this one dialect's — so pricing it
+    /// against Anthropic's multiplier would refuse a catalog for a rule its
+    /// provider never published.
+    #[test]
+    fn a_non_messages_dialect_is_not_held_to_the_one_hour_write_rate() {
+        CatalogConfig::from_json(
+            &one_cached_entry("openrouter", "openai_responses", 3_600_000, 3.0, 3.75),
+            "test",
+        )
+        .expect("another dialect's write pricing is not this check's to assert");
+    }
+
+    /// One minimal entry, parameterized on whatever local section is under
+    /// test, so a refusal below is unambiguously about the local numbers.
+    fn with_local_section(local: &str) -> String {
+        format!(
+            r#"{{
+              "models": [{{
+                "provider": "openai",
+                "model": "gpt",
+                "wire_protocol": "openai_responses",
+                "cache_model": {{ "kind": "deterministic", "ttl_ms": 300000 }},
+                "pricing": {{
+                  "input_per_mtok_usd": 1.0,
+                  "cached_input_per_mtok_usd": 0.1,
+                  "cache_write_per_mtok_usd": 0.0,
+                  "output_per_mtok_usd": 4.0
+                }},
+                "quality_prior": 0.7,
+                "base_ttft_ms": 300.0,
+                "ttft_ms_per_uncached_token": 0.001
+              }}]{local}
+            }}"#
+        )
+    }
+
+    /// **CONTROL.** A file that says nothing about local latency leaves the
+    /// engine exactly where it was.
+    ///
+    /// Asserted against `EngineConfig::default` rather than against `60.0`:
+    /// the claim is that the two agree, and a literal here would pass on the
+    /// day they stopped agreeing — which is the only way this field can change
+    /// a deployment's quotes without anyone editing a file.
+    #[test]
+    fn a_catalog_with_no_local_section_quotes_the_engine_defaults() {
+        let config = CatalogConfig::from_json(&with_local_section(""), "test").unwrap();
+        assert_eq!(
+            config.local_base_ttft_ms,
+            EngineConfig::default().local_base_ttft_ms,
+        );
+        assert_eq!(
+            config.local_ttft_ms_per_prefill_token, 0.0,
+            "an unmeasured slope must quote flat rather than guess"
+        );
+
+        let engine = engine_config(Some(&config));
+        assert_eq!(
+            engine.local_base_ttft_ms,
+            EngineConfig::default().local_base_ttft_ms
+        );
+        assert_eq!(engine.local_ttft_ms_per_prefill_token, 0.0);
+    }
+
+    /// **CONTROL.** No catalog at all is the offline-stub deployment, and it
+    /// runs on the same documented defaults.
+    #[test]
+    fn no_catalog_leaves_every_engine_number_at_its_default() {
+        let engine = engine_config(None);
+        assert_eq!(
+            engine.local_base_ttft_ms,
+            EngineConfig::default().local_base_ttft_ms
+        );
+        assert_eq!(engine.local_ttft_ms_per_prefill_token, 0.0);
+    }
+
+    /// The measured numbers reach the engine config, which is the whole point
+    /// of the field existing.
+    #[test]
+    fn a_measured_local_curve_reaches_the_engine_config() {
+        let config = CatalogConfig::from_json(
+            &with_local_section(
+                r#",
+              "local_base_ttft_ms": 90.0,
+              "local_ttft_ms_per_prefill_token": 0.25"#,
+            ),
+            "test",
+        )
+        .unwrap();
+
+        let engine = engine_config(Some(&config));
+        assert_eq!(
+            engine.local_base_ttft_ms, 90.0,
+            "the deployment's measured floor, not the built-in one"
+        );
+        assert_eq!(
+            engine.local_ttft_ms_per_prefill_token, 0.25,
+            "the deployment's measured prefill rate, 1000 / tokens_per_second"
+        );
+    }
+
+    /// A negative latency is refused for the same reason a negative rate is.
+    ///
+    /// A negative slope does not merely mis-quote: it makes a local worker look
+    /// *faster* the more it has to prefill, so the router hands a long cold
+    /// context to the one target no provider bill ever contradicts, and the
+    /// dashboard reports the miss as a saving.
+    #[test]
+    fn a_negative_local_latency_is_refused_at_load() {
+        for (field, section) in [
+            (
+                "local_base_ttft_ms",
+                r#","local_base_ttft_ms": -1.0"#.to_string(),
+            ),
+            (
+                "local_ttft_ms_per_prefill_token",
+                r#","local_ttft_ms_per_prefill_token": -0.25"#.to_string(),
+            ),
+        ] {
+            let error = CatalogConfig::from_json(&with_local_section(&section), "test")
+                .expect_err("a negative latency quotes a worker as faster for being colder");
+            assert!(
+                matches!(&error, CatalogError::InvalidValue { field: named, .. }
+                    if *named == field),
+                "{field}: {error}"
+            );
+        }
+
+        // CONTROL: zero is not negative, and it is the documented default for
+        // the slope — so the refusal above is about the sign and not about the
+        // field being set at all.
+        CatalogConfig::from_json(
+            &with_local_section(
+                r#",
+              "local_base_ttft_ms": 0.0,
+              "local_ttft_ms_per_prefill_token": 0.0"#,
+            ),
+            "test",
+        )
+        .expect("a floor of zero and an unmeasured slope are both sayable");
     }
 
     #[test]

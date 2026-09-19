@@ -135,6 +135,13 @@ The **select/reserve split** is what makes cross-provider routing possible at
 all: price the local option, compare it against a frontier model, and only book
 if local wins. An abandoned quote costs nothing; the pending selection expires.
 
+Pricing the local option is itself a realtime residency check over HTTP, on the
+path to first token, so the router makes it only when the answer could still
+move the decision — not when the client declared a toolbox no local worker can
+carry, and not when the principal's policy names no local target. The decision
+record says which of those it was, so "never asked" stays distinguishable from
+"asked and turned down".
+
 The reservation lifecycle (`prefill_complete` → `release`) is **mandatory** — a
 leaked reservation permanently inflates the router's view of a worker and
 silently distorts every later decision.
@@ -962,6 +969,8 @@ every total, including the one billed to a client. Rows roll up twice: by
 attaches to, and by **serving mode** — local Dynamo versus a remote endpoint —
 which is what the savings argument turns on.
 
+Model rows in the metrics JSON also report `first_output`: mean milliseconds, sample count, rejected timestamp count, and basis `turn_start_to_first_output`. The interval runs from `TurnStarted` to the first nonempty durable text delta. It includes intervening routing and failover delay, but excludes work before the start event and delivery after the delta append. Missing observations produce no mean. Backward timestamps increment the rejection count. Scoped means use summed elapsed time and sample counts. The HTML dashboard does not yet display this field.
+
 ### What "dollars saved" actually claims
 
 Three figures, and they are not equally solid, so the dashboard never merges
@@ -1107,6 +1116,14 @@ is expected to arrive in, so a configured provider with no key anywhere is a
 boot warning rather than a surprise found one turn at a time — the credential a
 turn actually authenticates with is still resolved per turn from the control
 plane's deployment/project/member tiers.
+
+**Local latency configuration.** The catalog accepts `local_base_ttft_ms` and `local_ttft_ms_per_prefill_token` alongside the hosted models' latency fields. They default to `60.0` ms and `0.0`. Negative values stop catalog loading.
+
+For a measured prefill rate, set the slope to `1000 / tokens_per_second`. The quote is the base plus that slope times Dynamo's effective prefill tokens. Leave the slope at zero until a measurement exists. The server loads these values into its engine configuration, but the current binary does not attach a local fleet.
+
+**Cache lifetime.** For an `anthropic_messages` target, `cache_model: {"kind": "deterministic", "ttl_ms": 3600000}` selects one-hour conversation cache markers. The catalog requires `cache_write_per_mtok_usd` to equal twice the input rate for that entry. The error names the required rate. This check also applies to Messages gateways, regardless of their configured provider name.
+
+One-hour requests with shorter tool cache markers remain unsupported. The client currently preserves those tool markers, which can produce an invalid TTL order. The normalization-versus-rejection decision remains open in `agent-docs/PLAN-cache-affinity.md`.
 
 **Sourcing `quality_prior`.** `FrontierModelSpec::quality_prior` is
 configuration, not measurement, and `import-benchmarks` (a binary target in
@@ -1290,10 +1307,7 @@ explicitly, because each reaches something the default run must not assume:
 - **A failed turn settles** — the response terminates with an incomplete event,
   the lease comes back immediately, and the same turn id is retryable without
   waiting out a TTL.
-- **Streaming is genuine** — deltas are durable in the log before the response
-  completes, a stream that breaks halfway commits its partial (which the ledger
-  reads as prefill evidence), and TTFT is derivable from the log: first delta
-  minus the routing decision that preceded it.
+- **Streaming is genuine** — deltas are durable before the response completes. A stream that breaks halfway commits its partial, which the ledger reads as prefill evidence. The metrics fold measures the interval from the turn start to the first nonempty text delta.
 - **A turn outlives its lease** — the heartbeat renews while the turn works, so
   a model call longer than the TTL commits instead of being fenced at its own
   finish line; a displaced owner still loses, and a hung provider settles at

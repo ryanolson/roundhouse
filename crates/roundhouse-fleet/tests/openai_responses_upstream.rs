@@ -122,6 +122,8 @@ async fn handle(State(state): State<Upstream>, headers: HeaderMap, _body: String
 
 fn quote(credential: TurnCredential) -> FrontierQuote {
     FrontierQuote {
+        previous_breakpoint: None,
+        cache_ttl_ms: None,
         target: Target::Frontier {
             provider: "openai".into(),
             model: "flagship".into(),

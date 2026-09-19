@@ -90,6 +90,8 @@ async fn upstream(body: String) -> String {
 
 fn quote() -> FrontierQuote {
     FrontierQuote {
+        previous_breakpoint: None,
+        cache_ttl_ms: None,
         target: Target::Frontier {
             provider: "anthropic".into(),
             model: "claude-x".into(),

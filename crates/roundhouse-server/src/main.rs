@@ -642,6 +642,9 @@ async fn main() -> anyhow::Result<()> {
     };
     let metrics_config = Arc::new(metrics_config);
 
+    // Resolve both sides of the local/hosted latency comparison from this catalog.
+    let engine_config = catalog_config::engine_config(config.as_ref());
+
     // The registry, built here rather than inside `serve` because it is the
     // third boot cross-check and boot checks belong together: an operator
     // reading this log sees the catalog load, the providers resolve, and the
@@ -843,6 +846,7 @@ async fn main() -> anyhow::Result<()> {
                 judge,
                 reachable,
                 metrics_config,
+                engine_config,
                 listener,
             )
             .await
@@ -865,6 +869,7 @@ async fn main() -> anyhow::Result<()> {
                 judge,
                 reachable,
                 metrics_config,
+                engine_config,
                 listener,
             )
             .await
@@ -888,6 +893,9 @@ async fn main() -> anyhow::Result<()> {
 /// opposite ends of it: the surface writes an agent's overlay and the engine
 /// spends it at the start of the next turn.
 ///
+/// The catalog supplies the engine's local latency values. This function adds
+/// the control plane's experiment salt without replacing those values.
+///
 /// **The steer used to be the second half of that sentence and is not any
 /// more.** Until M10.0 the engine deposited a correction's payload here and the
 /// surface served it to `fetch_steer`; the correction is a conversation item now
@@ -906,6 +914,7 @@ async fn serve<S: SessionStore>(
     judge: Option<FrontierModelSpec>,
     reachable: Vec<Candidate>,
     metrics_config: Arc<MetricsConfig>,
+    engine_config: EngineConfig,
     listener: tokio::net::TcpListener,
 ) -> anyhow::Result<()> {
     let control = Arc::new(ControlStore::new());
@@ -957,7 +966,8 @@ async fn serve<S: SessionStore>(
             .await
             .arm_salt()
             .to_string(),
-        ..EngineConfig::default()
+        // Preserve the catalog's latency values when adding the control-plane salt.
+        ..engine_config
     };
 
     let booted_plane = directory.plane(roundhouse_core::now_ms()).await;
@@ -1333,6 +1343,8 @@ mod tests {
                 wire_protocol,
                 prompt: "hi".into(),
                 segment_boundaries: Vec::new(),
+                previous_breakpoint: None,
+                cache_ttl_ms: None,
                 session_id: None,
                 thread_id: None,
                 prompt_cache_key: "sess".into(),
