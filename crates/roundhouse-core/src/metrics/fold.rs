@@ -2567,6 +2567,14 @@ pub(super) mod tests {
             claude.first_output_ms_total, 20,
             "measured from the retry's own start, not from the abandoned one"
         );
+        // The abandoned response never terminates. Its clock must drain at
+        // supersession, or each retry retains another unused map entry.
+        assert!(
+            fold.first_output.is_empty(),
+            "the fenced response's clock must be drained at supersession, not \
+             left to leak: {:?}",
+            fold.first_output.keys().collect::<Vec<_>>()
+        );
     }
 
     /// A turn that fell forward books its interval on the target that answered.
