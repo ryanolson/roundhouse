@@ -969,6 +969,8 @@ every total, including the one billed to a client. Rows roll up twice: by
 attaches to, and by **serving mode** — local Dynamo versus a remote endpoint —
 which is what the savings argument turns on.
 
+Model rows in the metrics JSON also report `first_output`: mean milliseconds, sample count, rejected timestamp count, and basis `turn_start_to_first_output`. The interval runs from `TurnStarted` to the first nonempty durable text delta. It includes intervening routing and failover delay, but excludes work before the start event and delivery after the delta append. Missing observations produce no mean. Backward timestamps increment the rejection count. Scoped means use summed elapsed time and sample counts. The HTML dashboard does not yet display this field.
+
 ### What "dollars saved" actually claims
 
 Three figures, and they are not equally solid, so the dashboard never merges
@@ -1305,10 +1307,7 @@ explicitly, because each reaches something the default run must not assume:
 - **A failed turn settles** — the response terminates with an incomplete event,
   the lease comes back immediately, and the same turn id is retryable without
   waiting out a TTL.
-- **Streaming is genuine** — deltas are durable in the log before the response
-  completes, a stream that breaks halfway commits its partial (which the ledger
-  reads as prefill evidence), and TTFT is derivable from the log: first delta
-  minus the routing decision that preceded it.
+- **Streaming is genuine** — deltas are durable before the response completes. A stream that breaks halfway commits its partial, which the ledger reads as prefill evidence. The metrics fold measures the interval from the turn start to the first nonempty text delta.
 - **A turn outlives its lease** — the heartbeat renews while the turn works, so
   a model call longer than the TTL commits instead of being fenced at its own
   finish line; a displaced owner still loses, and a hung provider settles at

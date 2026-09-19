@@ -199,6 +199,7 @@ fn a_model_row_cannot_contradict_its_own_serving_mode() {
         calls: 3,
         tokens: Default::default(),
         coverage: Default::default(),
+        first_output: None,
         accounting: local,
     };
 
@@ -214,6 +215,7 @@ fn a_model_row_cannot_contradict_its_own_serving_mode() {
         calls: 1,
         tokens: Default::default(),
         coverage: Default::default(),
+        first_output: None,
         accounting: ModelAccounting::Frontier {
             billed_usd: 4.0,
             billed_measured_usd: 3.0,

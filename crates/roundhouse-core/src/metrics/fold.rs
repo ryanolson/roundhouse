@@ -187,6 +187,21 @@ pub(super) struct Counters {
     /// is priced. See [`DeclaredBaseline`] for why it is a three-state value
     /// rather than a set or a last-write.
     pub(super) declared_baseline: DeclaredBaseline,
+    /// Summed milliseconds from each turn's `TurnStarted` stamp to its first
+    /// non-empty `OutputTextDelta` stamp, over [`Self::first_output_samples`]
+    /// turns this row served.
+    ///
+    /// A total and a count rather than a mean, because this row is merged into
+    /// other rows: sums add exactly, and a mean of means weights a row that
+    /// served three turns like one that served three hundred.
+    pub(super) first_output_ms_total: u64,
+    pub(super) first_output_samples: u64,
+    /// Turns whose first delta was stamped before their own `TurnStarted`.
+    ///
+    /// Counted rather than dropped. The two ways a row can have no mean are a
+    /// deployment that measured nothing and a clock that went backwards, and a
+    /// silent drop makes the second one look like the first.
+    pub(super) first_output_rejected: u64,
 }
 
 /// The declared baselines one model row's turns named, collapsed.
@@ -289,6 +304,9 @@ impl Counters {
         self.provider_reported_usd += other.provider_reported_usd;
         self.provider_reported_calls += other.provider_reported_calls;
         self.declared_baseline.absorb(&other.declared_baseline);
+        self.first_output_ms_total += other.first_output_ms_total;
+        self.first_output_samples += other.first_output_samples;
+        self.first_output_rejected += other.first_output_rejected;
     }
 }
 
@@ -350,6 +368,20 @@ struct Pending {
     /// the log has already answered — the same argument the rate card travels
     /// in the log under.
     billing: Billing,
+}
+
+/// One response's clock, from its turn's start to the first text a caller
+/// could see.
+///
+/// Three states rather than two `Option`s: the first non-empty delta decides
+/// the answer once, and a later one must not move it or replace a refusal.
+enum FirstOutput {
+    /// Started at this stamp, nothing said yet.
+    Waiting(u64),
+    /// Milliseconds from the start to the first non-empty delta.
+    Measured(u64),
+    /// That delta was stamped before the start, so there is nothing to fold.
+    Rejected,
 }
 
 /// Whose numbers a report is about.
@@ -462,8 +494,15 @@ pub struct MetricsFold {
     /// Both maps drain: at a terminal event, and at supersession. What they do
     /// not cover is a turn abandoned and then never retried, which stays until
     /// the process ends.
-    response_of_turn: HashMap<TurnId, ResponseId>,
-    turn_of_response: HashMap<ResponseId, TurnId>,
+    ///
+    /// Turn IDs are session-local and can repeat across projects. Include the
+    /// session so a concurrent turn cannot retire another session's dispatch.
+    response_of_turn: HashMap<(SessionId, TurnId), ResponseId>,
+    turn_of_response: HashMap<ResponseId, (SessionId, TurnId)>,
+    /// Each open response's first-output clock. Drains where `pending` does —
+    /// at the terminal event and at supersession — and leaves the same residue
+    /// for a turn abandoned and never retried.
+    first_output: HashMap<ResponseId, FirstOutput>,
     /// Turns admitted, split by who admitted them.
     ///
     /// Per principal for the same reason the counters are: a scoped report that
@@ -592,15 +631,21 @@ impl MetricsFold {
                 *self.turns_of_principal.entry(payer).or_default() += 1;
                 // A second start for this turn means the first response will
                 // never terminate. Retire it now rather than hold it forever.
+                let turn_key = (event.session_id.clone(), turn_id.clone());
                 if let Some(abandoned) = self
                     .response_of_turn
-                    .insert(turn_id.clone(), response_id.clone())
+                    .insert(turn_key.clone(), response_id.clone())
                 {
                     self.pending.remove(&abandoned);
                     self.turn_of_response.remove(&abandoned);
+                    self.first_output.remove(&abandoned);
                 }
-                self.turn_of_response
-                    .insert(response_id.clone(), turn_id.clone());
+                self.turn_of_response.insert(response_id.clone(), turn_key);
+                // The stamp the interval is measured from. A retry starts its
+                // own clock: the abandoned response never terminates, so it
+                // books nothing.
+                self.first_output
+                    .insert(response_id.clone(), FirstOutput::Waiting(event.at_ms));
             }
             SessionEventKind::Routed {
                 response_id,
@@ -658,6 +703,19 @@ impl MetricsFold {
                     },
                 );
             }
+            // The first non-empty delta closes the interval. Empty ones fall
+            // through to the ignored kinds below: a provider opens a block
+            // before it says anything, and that stamp measures nothing.
+            SessionEventKind::OutputTextDelta { response_id, text } if !text.is_empty() => {
+                if let Some(clock) = self.first_output.get_mut(response_id)
+                    && let FirstOutput::Waiting(started_at_ms) = *clock
+                {
+                    *clock = match event.at_ms.checked_sub(started_at_ms) {
+                        Some(elapsed) => FirstOutput::Measured(elapsed),
+                        None => FirstOutput::Rejected,
+                    };
+                }
+            }
             SessionEventKind::ResponseCompleted {
                 response_id, usage, ..
             }
@@ -691,8 +749,8 @@ impl MetricsFold {
                         .failed_attempts += 1;
                 }
                 // Settled: this response is nobody's open turn any more.
-                if let Some(turn_id) = self.turn_of_response.remove(response_id) {
-                    self.response_of_turn.remove(&turn_id);
+                if let Some(turn_key) = self.turn_of_response.remove(response_id) {
+                    self.response_of_turn.remove(&turn_key);
                 }
                 // The provider's own figure for this call, accumulated on the
                 // row that made it and **never on the row's dollars**. It is
@@ -716,6 +774,39 @@ impl MetricsFold {
                         .or_default();
                     counters.provider_reported_usd += cost_usd;
                     counters.provider_reported_calls += 1;
+                }
+                // Booked on the target that served and **above the gate below**.
+                // The interval is a fact about two log stamps, so the evidence
+                // rule that keeps phantom calls out of token denominators does
+                // not bear on it: a response that spoke and billed nothing
+                // still has both stamps.
+                //
+                // Removed either way, so a superseded response whose terminal
+                // event arrives late drains rather than accumulates; with no
+                // `pending` there is no target to attribute it to.
+                //
+                // Drained on every path, but only a *decided* clock reaches a
+                // row: a turn that started and never spoke has nothing to book,
+                // and creating its row anyway would put a zero-token row on the
+                // dashboard for a response the gate below drops — which reads
+                // as a free call.
+                let clock = match self.first_output.remove(response_id) {
+                    Some(FirstOutput::Measured(elapsed_ms)) => Some((elapsed_ms, 1, 0)),
+                    Some(FirstOutput::Rejected) => Some((0, 0, 1)),
+                    Some(FirstOutput::Waiting(_)) | None => None,
+                };
+                if let Some((elapsed_ms, samples, rejected)) = clock
+                    && let Some(pending) = self.pending.get(response_id)
+                {
+                    let counters = self
+                        .by_principal
+                        .entry(payer.clone())
+                        .or_default()
+                        .entry(pending.key.clone())
+                        .or_default();
+                    counters.first_output_ms_total += elapsed_ms;
+                    counters.first_output_samples += samples;
+                    counters.first_output_rejected += rejected;
                 }
                 let Some(pending) = self.pending.remove(response_id) else {
                     return true;
@@ -1063,7 +1154,7 @@ pub(super) mod tests {
     use super::*;
     use crate::control::Principal;
     use crate::event::{Accounting, IncompleteReason};
-    use crate::routing::{Candidate, DecisionRecord, Target};
+    use crate::routing::{AttemptClass, Candidate, DecisionRecord, DispatchAttempt, Target};
     use crate::validate::SteerAction;
 
     // The fixtures live here, with the fold they build logs for, and are
@@ -1113,6 +1204,29 @@ pub(super) mod tests {
         }
     }
 
+    /// A plain decision naming one target, for fixtures that vary one field.
+    pub(crate) fn decision_for(target: Target, isl_tokens: u64) -> DecisionRecord {
+        DecisionRecord {
+            local_quote_skipped: None,
+            chosen: target,
+            rationale: "test".into(),
+            policy: "test".into(),
+            isl_tokens,
+            expected_prefill_tokens: 0.0,
+            expected_cost_usd: 0.0,
+            considered: Vec::new(),
+            turn_policy_digest: String::new(),
+            budget_state: Default::default(),
+            rate_card: None,
+            payer: Default::default(),
+            billing: Billing::Billed,
+            budget_draw: None,
+            withheld_providers: Vec::new(),
+            declared_baseline: None,
+            attempts: Vec::new(),
+        }
+    }
+
     pub(crate) fn principal(project: &str, user: &str) -> Principal {
         Principal::new(project, user)
     }
@@ -1139,10 +1253,17 @@ pub(super) mod tests {
 
         pub(crate) fn push(&mut self, kind: SessionEventKind) -> &mut Self {
             self.at_ms += 10;
+            let at_ms = self.at_ms;
+            self.push_at(at_ms, kind)
+        }
+
+        /// The same append at a stamp the caller chose, for the timings a
+        /// monotonic fixture cannot produce.
+        pub(crate) fn push_at(&mut self, at_ms: u64, kind: SessionEventKind) -> &mut Self {
             self.events.push(SessionEvent {
                 seq: self.events.len() as u64 + 1,
                 session_id: self.session.clone(),
-                at_ms: self.at_ms,
+                at_ms,
                 kind,
             });
             self
@@ -1253,6 +1374,67 @@ pub(super) mod tests {
                 stop_reason: None,
             });
             self
+        }
+
+        /// A turn that streams `deltas` between its dispatch and its
+        /// completion, one event each, ten milliseconds apart like every other
+        /// push. The first non-empty one is what a latency assertion is about.
+        pub(crate) fn turn_speaking(
+            &mut self,
+            response: &str,
+            target: Target,
+            usage: Usage,
+            deltas: &[&str],
+        ) -> &mut Self {
+            let response_id = ResponseId::new(response);
+            self.start_and_route(response, target, usage.input_tokens, Billing::Billed);
+            for text in deltas {
+                self.push(SessionEventKind::OutputTextDelta {
+                    response_id: response_id.clone(),
+                    text: (*text).to_string(),
+                });
+            }
+            self.push(SessionEventKind::ResponseCompleted {
+                response_id,
+                usage,
+                provider_reported_cost_usd: None,
+                stop_reason: None,
+            })
+        }
+
+        /// The start and dispatch half of a turn, for fixtures that write their
+        /// own middle or their own ending.
+        pub(crate) fn start_and_route(
+            &mut self,
+            response: &str,
+            target: Target,
+            isl_tokens: u64,
+            billing: Billing,
+        ) -> &mut Self {
+            let response_id = ResponseId::new(response);
+            self.push(SessionEventKind::TurnStarted {
+                turn_id: TurnId::new(format!("turn-{response}")),
+                response_id: response_id.clone(),
+            });
+            self.route(response, target, isl_tokens, billing)
+        }
+
+        /// One dispatch of an already-started turn. A turn that falls forward
+        /// writes this more than once, which is what the engine does.
+        pub(crate) fn route(
+            &mut self,
+            response: &str,
+            target: Target,
+            isl_tokens: u64,
+            billing: Billing,
+        ) -> &mut Self {
+            self.push(SessionEventKind::Routed {
+                response_id: ResponseId::new(response),
+                decision: DecisionRecord {
+                    billing,
+                    ..decision_for(target, isl_tokens)
+                },
+            })
         }
 
         /// A local turn whose client named what it thought it was talking to.
@@ -1610,6 +1792,32 @@ pub(super) mod tests {
             (claude_row.side_calls, claude_row.abandoned_side_calls),
             (1, 1)
         );
+
+        // And the latency counters, which merge as three sums for the reason
+        // every other counter here does: a mean of two rows' means would weight
+        // a tenant who served one turn like a tenant who served a thousand.
+        let mut fast = LogBuilder::new("s4");
+        fast.created(Some(principal("acme", "di")));
+        fast.turn_speaking(
+            "r4",
+            frontier("anthropic", "claude"),
+            usage(1_000, 0, 100, 0),
+            &["hi"],
+        );
+        let mut slow = LogBuilder::new("s5");
+        slow.created(Some(principal("acme", "ed")));
+        slow.turn_speaking(
+            "r5",
+            frontier("anthropic", "claude"),
+            usage(1_000, 0, 100, 0),
+            &["", "hi"],
+        );
+        fold.extend(fast.events());
+        fold.extend(slow.events());
+        let merged_claude = &fold.summed_rows(Scope::Deployment)[&claude()];
+        assert_eq!(merged_claude.first_output_samples, 2);
+        assert_eq!(merged_claude.first_output_ms_total, 20 + 30);
+        assert_eq!(merged_claude.first_output_rejected, 0);
     }
 
     /// A side call is money, and it books like money — under the model that
@@ -1803,10 +2011,21 @@ pub(super) mod tests {
         );
         let mut legacy = LogBuilder::new("s2");
         legacy.turn("r2", local("llama"), vec![], usage(1_000, 0, 100, 0));
+        // One turn that streams, so the latency counters are inside the
+        // equality below rather than trivially zero on both sides.
+        let mut speaking = LogBuilder::new("s3");
+        speaking.created(Some(principal("acme", "ada")));
+        speaking.turn_speaking(
+            "r3",
+            frontier("anthropic", "claude"),
+            usage(2_000, 0, 200, 0),
+            &["", "spoke"],
+        );
 
         let mut fold = MetricsFold::new();
         fold.extend(ada.events());
         fold.extend(legacy.events());
+        fold.extend(speaking.events());
         let by_principal = fold.by_principal.clone();
         let turns = fold.turns();
 
@@ -1814,6 +2033,7 @@ pub(super) mod tests {
         // which is the normal case for every session that takes a second turn.
         assert_eq!(fold.extend(ada.events()), 0);
         assert_eq!(fold.extend(legacy.events()), 0);
+        assert_eq!(fold.extend(speaking.events()), 0);
 
         assert_eq!(
             fold.by_principal, by_principal,
@@ -2093,6 +2313,540 @@ pub(super) mod tests {
         assert_eq!(
             fold.summed_rows(Scope::Deployment)[&key].declared_baseline,
             DeclaredBaseline::Absent
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // B1: time to first output (R21)
+    // -----------------------------------------------------------------------
+
+    /// The row the deployment scope holds for `key`.
+    fn row(fold: &MetricsFold, key: &ModelKey) -> Counters {
+        fold.summed_rows(Scope::Deployment)[key].clone()
+    }
+
+    /// The measurement R21 asks for: the `TurnStarted` stamp against the first
+    /// non-empty delta's, on the row of the target that served it.
+    #[test]
+    fn a_turns_first_text_is_measured_from_its_start_on_the_row_that_served_it() {
+        let mut log = LogBuilder::new("s1");
+        log.created(Some(principal("acme", "ada")));
+        // TurnStarted, Routed, delta: three pushes ten apart, so the first text
+        // is twenty milliseconds after the start.
+        log.turn_speaking(
+            "r1",
+            frontier("anthropic", "claude"),
+            usage(1_000, 0, 100, 0),
+            &["hello"],
+        );
+
+        let mut fold = MetricsFold::new();
+        fold.extend(log.events());
+
+        let claude = row(&fold, &claude());
+        assert_eq!(claude.first_output_samples, 1);
+        assert_eq!(claude.first_output_ms_total, 20);
+        assert_eq!(claude.first_output_rejected, 0);
+    }
+
+    /// An empty delta carries no text, so it does not close the interval.
+    ///
+    /// The provider opens a block before it says anything, and closing on the
+    /// first delta of any kind would measure to that stamp instead.
+    #[test]
+    fn an_empty_delta_does_not_stop_the_clock_and_a_later_one_does_not_move_it() {
+        let mut log = LogBuilder::new("s1");
+        log.created(Some(principal("acme", "ada")));
+        log.turn_speaking(
+            "r1",
+            frontier("anthropic", "claude"),
+            usage(1_000, 0, 100, 0),
+            &["", "first", "second"],
+        );
+
+        let mut fold = MetricsFold::new();
+        fold.extend(log.events());
+
+        let claude = row(&fold, &claude());
+        assert_eq!(claude.first_output_samples, 1, "one turn, one sample");
+        assert_eq!(
+            claude.first_output_ms_total, 30,
+            "the empty delta at +20 is skipped and the first real text at +30 \
+             is the measurement; a later delta must not move it"
+        );
+    }
+
+    /// A turn that answers with no text at all reports nothing, not zero.
+    #[test]
+    fn a_turn_that_never_speaks_leaves_no_sample_and_no_zero() {
+        let mut log = LogBuilder::new("s1");
+        log.created(Some(principal("acme", "ada")));
+        log.turn(
+            "r1",
+            frontier("anthropic", "claude"),
+            Vec::new(),
+            usage(1_000, 0, 100, 0),
+        );
+
+        let mut fold = MetricsFold::new();
+        fold.extend(log.events());
+
+        let claude = row(&fold, &claude());
+        assert_eq!(claude.calls, 1, "the turn itself still booked");
+        assert_eq!(
+            (claude.first_output_samples, claude.first_output_ms_total),
+            (0, 0),
+            "a turn with nothing to time contributes no sample, and a zero \
+             here would read as an instant answer"
+        );
+    }
+
+    /// Text whose turn never started in this fold's view is not a sample.
+    ///
+    /// There is no start to subtract, and the event's own stamp is not one: a
+    /// turn that began before this process did would otherwise report the whole
+    /// interval since the epoch.
+    #[test]
+    fn a_delta_with_no_turn_start_in_view_is_not_a_sample() {
+        let mut log = LogBuilder::new("s1");
+        log.created(Some(principal("acme", "ada")));
+        log.route(
+            "r1",
+            frontier("anthropic", "claude"),
+            1_000,
+            Billing::Billed,
+        );
+        log.push(SessionEventKind::OutputTextDelta {
+            response_id: ResponseId::new("r1"),
+            text: "hello".into(),
+        });
+        log.push(SessionEventKind::ResponseCompleted {
+            response_id: ResponseId::new("r1"),
+            usage: usage(1_000, 0, 100, 0),
+            provider_reported_cost_usd: None,
+            stop_reason: None,
+        });
+
+        let mut fold = MetricsFold::new();
+        fold.extend(log.events());
+
+        let claude = row(&fold, &claude());
+        assert_eq!(
+            (claude.first_output_samples, claude.first_output_rejected),
+            (0, 0),
+            "no start is not a rejection either; there was nothing to measure"
+        );
+    }
+
+    /// A first text stamped before its own turn started is refused and counted.
+    #[test]
+    fn a_delta_before_its_own_turn_start_is_rejected_rather_than_folded() {
+        let mut log = LogBuilder::new("s1");
+        log.created(Some(principal("acme", "ada")));
+        log.start_and_route(
+            "r1",
+            frontier("anthropic", "claude"),
+            1_000,
+            Billing::Billed,
+        );
+        // Behind the start, which is a clock that moved and not a fast answer.
+        log.push_at(
+            5,
+            SessionEventKind::OutputTextDelta {
+                response_id: ResponseId::new("r1"),
+                text: "hello".into(),
+            },
+        );
+        log.push(SessionEventKind::ResponseCompleted {
+            response_id: ResponseId::new("r1"),
+            usage: usage(1_000, 0, 100, 0),
+            provider_reported_cost_usd: None,
+            stop_reason: None,
+        });
+
+        let mut fold = MetricsFold::new();
+        fold.extend(log.events());
+
+        let claude = row(&fold, &claude());
+        assert_eq!(claude.first_output_rejected, 1);
+        assert_eq!(
+            (claude.first_output_samples, claude.first_output_ms_total),
+            (0, 0),
+            "a refused timing must not reach the mean in either term"
+        );
+    }
+
+    /// A turn that billed nothing still reports its interval.
+    ///
+    /// Both stamps exist on a response that spoke and then failed with no
+    /// reported input, so the evidence rule that keeps phantom calls out of
+    /// token denominators does not decide whether the interval is real.
+    #[test]
+    fn a_turn_that_billed_nothing_still_reports_the_wait_it_delivered() {
+        let mut log = LogBuilder::new("s1");
+        log.created(Some(principal("acme", "ada")));
+        log.start_and_route("r1", frontier("anthropic", "claude"), 0, Billing::Billed);
+        log.push(SessionEventKind::OutputTextDelta {
+            response_id: ResponseId::new("r1"),
+            text: "half an ans".into(),
+        });
+        log.push(SessionEventKind::ResponseIncomplete {
+            response_id: ResponseId::new("r1"),
+            reason: IncompleteReason::UpstreamError,
+            usage: Usage::default(),
+            terminal_attempt: None,
+        });
+
+        let mut fold = MetricsFold::new();
+        fold.extend(log.events());
+
+        let claude = row(&fold, &claude());
+        assert_eq!(
+            claude.calls, 0,
+            "nothing billed, so nothing booked as a call"
+        );
+        assert_eq!(claude.first_output_samples, 1);
+        assert_eq!(claude.first_output_ms_total, 20);
+    }
+
+    /// A retried turn's abandoned response contributes nothing.
+    ///
+    /// The first response never terminates — its owner was fenced — so its
+    /// timing is drained by the supersession rule rather than left to attach
+    /// itself to whatever terminates next.
+    #[test]
+    fn a_superseded_response_contributes_no_latency_sample() {
+        let mut log = LogBuilder::new("s1");
+        log.created(Some(principal("acme", "ada")));
+        let turn_id = TurnId::new("t1");
+        log.push(SessionEventKind::TurnStarted {
+            turn_id: turn_id.clone(),
+            response_id: ResponseId::new("r1"),
+        });
+        log.route(
+            "r1",
+            frontier("anthropic", "claude"),
+            1_000,
+            Billing::Billed,
+        );
+        log.push(SessionEventKind::OutputTextDelta {
+            response_id: ResponseId::new("r1"),
+            text: "abandoned".into(),
+        });
+        // The client retries the same turn under a fresh response.
+        log.push(SessionEventKind::TurnStarted {
+            turn_id,
+            response_id: ResponseId::new("r2"),
+        });
+        log.route(
+            "r2",
+            frontier("anthropic", "claude"),
+            1_000,
+            Billing::Billed,
+        );
+        log.push(SessionEventKind::OutputTextDelta {
+            response_id: ResponseId::new("r2"),
+            text: "served".into(),
+        });
+        log.push(SessionEventKind::ResponseCompleted {
+            response_id: ResponseId::new("r2"),
+            usage: usage(1_000, 0, 100, 0),
+            provider_reported_cost_usd: None,
+            stop_reason: None,
+        });
+
+        let mut fold = MetricsFold::new();
+        fold.extend(log.events());
+
+        let claude = row(&fold, &claude());
+        assert_eq!(
+            claude.first_output_samples, 1,
+            "only the response that finished is a sample"
+        );
+        assert_eq!(
+            claude.first_output_ms_total, 20,
+            "measured from the retry's own start, not from the abandoned one"
+        );
+    }
+
+    /// A turn that fell forward books its interval on the target that answered.
+    ///
+    /// The failover sits inside the interval, which is what the basis says;
+    /// what it must not do is land on the dead provider's row, which never
+    /// wrote a delta.
+    #[test]
+    fn a_fell_forward_turn_books_its_wait_on_the_target_that_answered() {
+        let mut log = LogBuilder::new("s1");
+        log.created(Some(principal("acme", "ada")));
+        log.start_and_route("r1", frontier("anthropic", "kimi"), 1_000, Billing::Billed);
+        // The second dispatch of the same response: the engine writes one
+        // `Routed` per attempt, and the dead one rides the decision that
+        // replaced it — which is what gives kimi a row at all.
+        log.push(SessionEventKind::Routed {
+            response_id: ResponseId::new("r1"),
+            decision: DecisionRecord {
+                attempts: vec![DispatchAttempt {
+                    target: frontier("anthropic", "kimi"),
+                    class: AttemptClass::Transport,
+                    elapsed_ms: 10,
+                }],
+                ..decision_for(frontier("anthropic", "claude"), 1_000)
+            },
+        });
+        log.push(SessionEventKind::OutputTextDelta {
+            response_id: ResponseId::new("r1"),
+            text: "hello".into(),
+        });
+        log.push(SessionEventKind::ResponseCompleted {
+            response_id: ResponseId::new("r1"),
+            usage: usage(1_000, 0, 100, 0),
+            provider_reported_cost_usd: None,
+            stop_reason: None,
+        });
+
+        let mut fold = MetricsFold::new();
+        fold.extend(log.events());
+
+        let kimi = ModelKey {
+            mode: ServingMode::Frontier,
+            provider: "anthropic".into(),
+            model: "kimi".into(),
+        };
+        assert_eq!(
+            row(&fold, &claude()).first_output_samples,
+            1,
+            "the target that spoke owns the sample"
+        );
+        assert_eq!(
+            row(&fold, &claude()).first_output_ms_total,
+            30,
+            "measured from the turn's start, so the failed attempt's time is \
+             inside it -- which is what the basis says"
+        );
+        assert_eq!(
+            row(&fold, &kimi).first_output_samples,
+            0,
+            "the target that never spoke has no latency to report"
+        );
+    }
+
+    /// Two sessions may hold one `TurnId`, and neither supersedes the other.
+    ///
+    /// A `TurnId` is a client's idempotency key *within a session* — the type's
+    /// own contract — and the server derives it by hashing the turn's rendered
+    /// items, so two sessions sending the same content hold the same key by
+    /// construction rather than by collision. Superseding across sessions drops
+    /// the first session's open dispatch: its tokens, its provider-reported
+    /// cost and its timing all leave with the `pending` entry, and the two
+    /// sessions can belong to different projects.
+    #[test]
+    fn one_turn_id_in_two_sessions_supersedes_neither() {
+        let ada = principal("acme", "ada");
+        let bo = principal("globex", "bo");
+        // One key, because both clients said the same thing.
+        let shared = TurnId::new("turn_same_content");
+
+        let mut first = LogBuilder::new("s1");
+        first.created(Some(ada.clone()));
+        first.push(SessionEventKind::TurnStarted {
+            turn_id: shared.clone(),
+            response_id: ResponseId::new("r1"),
+        });
+        first.route(
+            "r1",
+            frontier("anthropic", "claude"),
+            1_000,
+            Billing::Billed,
+        );
+        first.push(SessionEventKind::OutputTextDelta {
+            response_id: ResponseId::new("r1"),
+            text: "from s1".into(),
+        });
+
+        let mut second = LogBuilder::new("s2");
+        second.created(Some(bo.clone()));
+        second.push(SessionEventKind::TurnStarted {
+            turn_id: shared,
+            response_id: ResponseId::new("r2"),
+        });
+        second.route(
+            "r2",
+            frontier("anthropic", "claude"),
+            1_000,
+            Billing::Billed,
+        );
+        second.push(SessionEventKind::OutputTextDelta {
+            response_id: ResponseId::new("r2"),
+            text: "from s2".into(),
+        });
+        second.push(SessionEventKind::ResponseCompleted {
+            response_id: ResponseId::new("r2"),
+            usage: usage(1_000, 0, 100, 0),
+            provider_reported_cost_usd: None,
+            stop_reason: None,
+        });
+
+        // s1's terminal event arrives last, which is what makes this a real
+        // interleaving rather than two logs folded end to end.
+        let mut fold = MetricsFold::new();
+        fold.extend(first.events());
+        fold.extend(second.events());
+        first.push(SessionEventKind::ResponseCompleted {
+            response_id: ResponseId::new("r1"),
+            usage: usage(1_000, 0, 100, 0),
+            provider_reported_cost_usd: None,
+            stop_reason: None,
+        });
+        fold.extend(&first.events()[first.events().len() - 1..]);
+
+        let both = row(&fold, &claude());
+        assert_eq!(
+            both.first_output_samples, 2,
+            "both sessions spoke, so both timings are real"
+        );
+        assert_eq!(
+            both.calls, 2,
+            "and the same supersession drops the first session's usage, which \
+             is the accounting half of the same defect"
+        );
+
+        // Each principal keeps its own, or one project's traffic has been
+        // silently folded into nobody.
+        for who in [&ada, &bo] {
+            let scoped =
+                fold.summed_rows(Scope::Principal(&PrincipalKey::from(who)))[&claude()].clone();
+            assert_eq!(
+                (scoped.first_output_samples, scoped.calls),
+                (1, 1),
+                "{who:?} served exactly one turn"
+            );
+        }
+    }
+
+    /// A turn that started, dispatched and died without speaking adds no row.
+    ///
+    /// The timing block runs above the evidence gate, so it is the one place
+    /// that can create a serving row for a response the gate would have
+    /// dropped. A zero-token row reads as a free call — the failure
+    /// `failed_attempts` and `abandoned_side_calls` are both shaped to avoid.
+    #[test]
+    fn a_started_turn_that_never_spoke_adds_no_row_and_drains_its_clock() {
+        let mut log = LogBuilder::new("s1");
+        log.created(Some(principal("acme", "ada")));
+        log.start_and_route(
+            "r1",
+            frontier("anthropic", "claude"),
+            1_000,
+            Billing::Billed,
+        );
+        // The stream opened and nothing came: empty usage, no attempt to book.
+        log.push(SessionEventKind::ResponseIncomplete {
+            response_id: ResponseId::new("r1"),
+            reason: IncompleteReason::UpstreamError,
+            usage: Usage::default(),
+            terminal_attempt: None,
+        });
+
+        let mut fold = MetricsFold::new();
+        fold.extend(log.events());
+
+        assert!(
+            fold.summed_rows(Scope::Deployment).is_empty(),
+            "nothing was served and nothing was billed, so the dashboard must \
+             carry no row for this target: {:?}",
+            fold.summed_rows(Scope::Deployment)
+                .keys()
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            fold.first_output.is_empty(),
+            "the clock drains at the terminal event whether or not it decided"
+        );
+    }
+
+    /// A turn split across two replay batches measures the same as a turn
+    /// folded whole.
+    ///
+    /// `SessionState::project` feeds the fold in chunks, so a turn's start and
+    /// its first text routinely arrive in different calls — the one way this
+    /// clock differs from every counter beside it, which settle from a single
+    /// event.
+    #[test]
+    fn a_turn_folded_in_two_batches_measures_what_it_measures_whole() {
+        let mut log = LogBuilder::new("s1");
+        log.created(Some(principal("acme", "ada")));
+        log.turn_speaking(
+            "r1",
+            frontier("anthropic", "claude"),
+            usage(1_000, 0, 100, 0),
+            &["hi"],
+        );
+        let events = log.events().to_vec();
+        // Between the start and the text, which is the boundary that matters.
+        let (head, tail) = events.split_at(3);
+
+        let mut whole = MetricsFold::new();
+        whole.extend(&events);
+        let mut batched = MetricsFold::new();
+        batched.extend(head);
+        batched.extend(tail);
+
+        assert_eq!(
+            row(&batched, &claude()).first_output_samples,
+            row(&whole, &claude()).first_output_samples,
+        );
+        assert_eq!(
+            row(&batched, &claude()).first_output_ms_total,
+            row(&whole, &claude()).first_output_ms_total,
+        );
+        assert_eq!(
+            row(&batched, &claude()).first_output_ms_total,
+            20,
+            "and the shared answer is the real one, not two matching zeros"
+        );
+    }
+
+    /// A project's latency counters are the sum of its members', like its
+    /// tokens.
+    #[test]
+    fn a_project_view_sums_its_members_latency_samples() {
+        let mut ada = LogBuilder::new("s1");
+        ada.created(Some(principal("acme", "ada")));
+        ada.turn_speaking(
+            "r1",
+            frontier("anthropic", "claude"),
+            usage(1_000, 0, 100, 0),
+            &["hi"],
+        );
+        let mut bo = LogBuilder::new("s2");
+        bo.created(Some(principal("acme", "bo")));
+        bo.turn_speaking(
+            "r2",
+            frontier("anthropic", "claude"),
+            usage(1_000, 0, 100, 0),
+            &["", "hi"],
+        );
+        let mut eve = LogBuilder::new("s3");
+        eve.created(Some(principal("globex", "eve")));
+        eve.turn_speaking(
+            "r3",
+            frontier("anthropic", "claude"),
+            usage(1_000, 0, 100, 0),
+            &["hi"],
+        );
+
+        let mut fold = MetricsFold::new();
+        fold.extend(ada.events());
+        fold.extend(bo.events());
+        fold.extend(eve.events());
+
+        let acme = fold.summed_rows(Scope::Project(&ProjectId::from("acme")))[&claude()].clone();
+        assert_eq!(acme.first_output_samples, 2, "ada and bo, never eve");
+        assert_eq!(acme.first_output_ms_total, 20 + 30);
+        assert_eq!(
+            row(&fold, &claude()).first_output_samples,
+            3,
+            "the deployment sums every principal's"
         );
     }
 }

@@ -185,6 +185,30 @@ pub enum ModelAccounting {
     },
 }
 
+/// What [`FirstOutputLatency`] measures, published beside the number.
+///
+/// On the wire because the figure is unreadable without it. The interval is
+/// the `TurnStarted` append stamp to the first non-empty `OutputTextDelta`
+/// append stamp, attributed to the target that served; it includes any routing
+/// and failover in between, and excludes work before `TurnStarted` and delivery
+/// after the append. It is not the provider's service latency.
+pub const FIRST_OUTPUT_BASIS: &str = "turn_start_to_first_output";
+
+/// The interval [`FIRST_OUTPUT_BASIS`] names, per target.
+#[derive(Debug, Clone, Serialize)]
+pub struct FirstOutputLatency {
+    /// Mean milliseconds over [`Self::samples`].
+    ///
+    /// `None` when there are no samples, which is the whole point of the column
+    /// being optional twice over: a row that measured nothing publishes no
+    /// number rather than a zero that reads as instant.
+    pub mean_ms: Option<f64>,
+    pub samples: u64,
+    /// Timings refused because the first delta's stamp preceded the start's.
+    pub rejected: u64,
+    pub basis: &'static str,
+}
+
 /// One model's row.
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelMetrics {
@@ -193,6 +217,10 @@ pub struct ModelMetrics {
     pub calls: u64,
     pub tokens: TokenBreakdown,
     pub coverage: Coverage,
+    /// Absent when this row has neither a usable timing nor a refused one, so
+    /// every row written before this column existed serializes as it did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_output: Option<FirstOutputLatency>,
     #[serde(flatten)]
     pub accounting: ModelAccounting,
 }
@@ -658,12 +686,27 @@ impl MetricsSnapshot {
                 }
             };
 
+            // Published when there is either a timing or a refusal to report.
+            // A row with only refusals keeps the column and loses the mean:
+            // dropping it would hide a skewed clock behind "not measured".
+            let first_output = (counters.first_output_samples > 0
+                || counters.first_output_rejected > 0)
+                .then(|| FirstOutputLatency {
+                    mean_ms: (counters.first_output_samples > 0).then(|| {
+                        counters.first_output_ms_total as f64 / counters.first_output_samples as f64
+                    }),
+                    samples: counters.first_output_samples,
+                    rejected: counters.first_output_rejected,
+                    basis: FIRST_OUTPUT_BASIS,
+                });
+
             models.push(ModelMetrics {
                 provider: key.provider.clone(),
                 model: key.model.clone(),
                 calls: counters.calls,
                 tokens,
                 coverage,
+                first_output,
                 accounting,
             });
         }

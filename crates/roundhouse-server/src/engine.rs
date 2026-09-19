@@ -1509,16 +1509,11 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             .await
             .map_err(Failed::before_output)?;
 
-        // One fold for both targets: a response is a stream of deltas, and each
-        // one becomes durable as it arrives rather than at the end. That is
-        // what lets a successor resume a half-written answer, and what makes
-        // TTFT a measured quantity — the first `OutputTextDelta.at_ms` in the
-        // log minus the `Routed.at_ms` before it — instead of the model's own
-        // estimate of itself. On a turn that fell forward, "the `Routed` before
-        // it" is the *last* one, which is the dispatch that answered: the right
-        // reading, since the time a dead provider took to fail is on that
-        // provider's own attempt row rather than charged to the model that
-        // eventually spoke.
+        // Durable deltas let a successor resume a partial answer and let metrics
+        // reproduce first-output latency from the log. R21 measures from turn
+        // start, so the serving target's row includes routing and failover delay.
+        // This interval excludes work before the start event and delivery after
+        // the delta append. It does not measure the provider's own service time.
         // Everything said, for the caller; and the run not yet committed as an
         // item, for the log. **Two accumulators rather than one**, because a
         // tool call commits the run ahead of it and the two questions then have
