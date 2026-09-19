@@ -13,9 +13,8 @@ use roundhouse_server::{Admission, Engine, TurnInput};
 
 /// How many items turn two appends before dispatching.
 ///
-/// Twenty is the smallest append the provider's lookback window misses, so a
-/// probe that appended nineteen would pass on a client that had never placed
-/// the second marker at all.
+/// Twenty is the requested live append; the response replay also adds a
+/// block.
 const APPENDED_ITEMS: usize = 20;
 
 /// One paragraph of the first prefix.

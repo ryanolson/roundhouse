@@ -132,6 +132,17 @@ async fn the_second_request_reuses_the_old_breakpoint_over_an_unchanged_prefix()
         "the prefix the second request resends must be byte-identical, or the \
          provider could not match it however it was marked"
     );
+    // The response replay adds a block, so two markers alone do not prove
+    // that the requested twenty new items reached the provider.
+    let appended_on_the_wire = second_blocks
+        .iter()
+        .filter(|text| text.contains("appended item "))
+        .count();
+    assert!(
+        appended_on_the_wire >= 20,
+        "the probe brief requires the second turn to append at least twenty \
+         items; the wire carried {appended_on_the_wire}"
+    );
 }
 
 /// Both turns' counters come off the log, and stay apart.
