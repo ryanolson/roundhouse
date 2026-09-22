@@ -359,6 +359,8 @@ on this path, because the checker must never break the checked. What is not
 allowed is for the failure to be silent: a timed-out validator is marked, never
 free.
 
+Judge requests use a separate `{session_id}#validate` cache key. Messages requests mark the system prefix for caching and take the requested lifetime from the target's catalog entry. The brief remains outside that marker. Token estimation and transport use the same prepared prompt, including its separator. Reservations retain the configured cold-write estimate. Provider token counts can differ, and a cache marker does not guarantee a hit.
+
 **Three arms, stamped into the session at creation.** `Live` takes the action;
 `Shadow` runs the judge, logs everything and discards the action; `Placebo`
 runs no judge and intervenes anyway on deterministic timing — the control

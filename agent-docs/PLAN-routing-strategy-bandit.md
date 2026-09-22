@@ -41,6 +41,24 @@ The tests-first contract includes positive and negative interval labels, duplica
 
 The current judge action is not the reward. `map` can return `Continue` for an off-track verdict without a located divergence. Shadow execution can suppress corrections too. The integration must use an explicit frontier review result, rather than infer success from action delivery. Cache-aware review also remains to implement: the existing separate judge key does not supply Messages cache markers or interval coverage.
 
+**Cache-aware judge checkpoint, 2026-09-21.** Commit `e7bc859` supersedes the missing-marker statement. The judge prepares one prompt for token estimation and transport, marks its system prefix on Messages, and requests the target's configured TTL. The judge retains its separate cache key and does not use the conversation's cache ledger or prior breakpoint. The existing reservation already included the configured cold-write rate. Four assertions failed before implementation, with 11 passing controls. The write-premium reservation test was a passing control, not a new pricing fix.
+
+All four independent mutations failed their intended assertions: missing boundaries, missing TTL, separator removal during token counting, and omitted write premium. Source restoration matched the commit. The restored focused suites passed 15 judge tests and 11 Messages integration tests. The full workspace run passed 1793 tests, with 0 failures, 141 existing ignores, and no compiler warnings. It covered 108 test binaries and 7 doc-test suites. Logs: `/tmp/roundhouse-judge-cache-red.log`, `/tmp/roundhouse-judge-cache-refute-M{1,2,3,4}.log`, and `/tmp/roundhouse-judge-cache-workspace.log`. No live provider call was made. A system prefix can be too short for provider caching. Interval coverage and online learning remain unfinished.
+
+### Review integration brief (2026-09-21)
+
+The integration extends the existing validator and judge. It retains their destination, cadence, egress checks, reservation, and settlement paths. A separate paid review service is unnecessary. Cache-aware prompts must reserve possible Messages cache-write cost before execution. The tokenizer and transport must use the same prepared prompt, including separators.
+
+Each review identifies decisions by session ID and the sequence number of their `Routed` event. A failover has multiple decision identities within one turn. The prompt must represent text-only turns as well as tool activity. Counting tool exchanges cannot establish complete turn coverage. Target names, prices, and routing rationales remain outside the judge prompt.
+
+Turn spans use offsets relative to the history region, because replacement of leading configuration items changes absolute item indices. The captured review includes the input associated with each covered decision, even if that input precedes the prior review boundary. The current undecided turn can supply context, including results of earlier tool calls, without receiving a routing label. Advancing a boundary must retain an open turn's input for its later decision.
+
+The review also needs the configuration and objective that applied to each turn. Current instructions cannot silently replace the instructions under which an earlier response was produced. The implementation must preserve those versions or mark the affected coverage incomplete. Tests must change configuration and objective between turns, rather than only check stable history indices.
+
+The review captures its upper sequence boundary before the call. Result delivery cannot extend that boundary. Replay must reject duplicate or overlapping updates, and a later interval cannot skip an unexplained gap. Historical validation events without coverage supply no quality label. Missing context, omitted turns, truncated content, and unrepresentable content must remain explicit. No such review supplies a positive interval label.
+
+An oversized interval needs an explicit recovery policy before the boundary implementation. Retaining the interval preserves the possibility of a larger review, but can prevent further learning under a fixed budget. Recording the interval as unknown permits a new window after a frontier checkpoint, but discards that interval from online quality updates. Silently dropping the oldest turns and labeling the remaining suffix is not an acceptable substitute. This choice remains open.
+
 ### Cache prediction feedback (2026-09-21)
 
 The owner identifies lower-than-expected cache reuse as an efficiency signal, especially for destinations without retention guarantees. The observation is a prediction error. It does not establish eviction or cache pressure as its cause. Prefix changes, cache keys, elapsed time, and provider routing can also affect reuse.

@@ -11,7 +11,7 @@ SPDX-License-Identifier: Apache-2.0
 
 **Owner ruling, 2026-09-21.** Roundhouse owns cache markers and can inject, modify, or remove them under provider rules. C4 now normalizes tool markers to the target TTL, with tests and mutation evidence in `1280855`. The owner also requires per-turn local routing with asynchronous Jev classifications as sequence metadata. The dated addendum in `PLAN-routing-strategy-bandit.md` supersedes the earlier segment-allocation proposal.
 
-Branch: `ai/typesafe-roundhouse-routing-6016d1`. Last update: 2026-09-19. The latest local full run covers `9c56c18`: 1754 passed, 0 failed, 142 ignored, across 108 test binaries and 7 doc-test suites.
+Branch: `ai/typesafe-roundhouse-routing-6016d1`. Last update: 2026-09-21. The latest local full run covers `e7bc859`: 1793 passed, 0 failed, 141 existing ignores, across 108 test binaries and 7 doc-test suites.
 
 | Rung | What | Status | Commit |
 |---|---|---|---|
@@ -28,6 +28,8 @@ Branch: `ai/typesafe-roundhouse-routing-6016d1`. Last update: 2026-09-19. The la
 **Cache observations, 2026-09-21:** Commit `330cacb` adds predicted-versus-observed cache reuse to the metrics JSON. Only provider-reported counts supply observed samples, including explicit zero. Commit `a4766a1` fixes aggregation provenance and closes the local-path test gap found by mutation. The final workspace run passed 1784 tests, with 0 failures, 141 existing ignores, and no compiler warnings. Mutation evidence and restoration checks are in `PLAN-routing-strategy-bandit.md`. This does not supply live C2 evidence or complete C6/C7.
 
 Open items that belong to a finished rung:
+
+- **Judge cache checkpoint, 2026-09-21.** Commit `e7bc859` prepares one prompt for counting and transport, marks its Messages system prefix, and requests the target TTL. Four independent mutations failed their intended assertions. The restored workspace suite passed with no compiler warnings. See `PLAN-routing-strategy-bandit.md` for evidence. This supplies cache-request mechanics, not live cache-hit evidence or complete review intervals.
 
 - **C4 checkpoint, 2026-09-19.** The engine carries the target TTL into `FrontierQuote`. Messages bodies select one-hour conversation markers, and the catalog rejects a mismatched write rate, including Messages gateways. Fail-first wire, catalog, and engine tests passed after the change. The full workspace run passed 1670 tests with 141 ignored across 106 test binaries and 7 doc-test suites. A later body regression failed with tool/message TTLs `[300, 3600, 3600]`. That regression is now explicitly ignored pending the owner's normalize-or-reject decision. An ignored test enforces nothing. The subsequent fleet run passed with that one additional ignore. C4 is not ready for use with shorter tool markers.
 - **C4 verification, 2026-09-19.** Independent mutations of engine TTL propagation, one-hour wire selection, the catalog guard, and gateway handling all failed their intended tests. Controls passed. Source restoration was byte-checked after each mutation. This verifies the checkpoint and does not close the ignored mixed-marker regression.
