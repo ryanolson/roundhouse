@@ -147,6 +147,8 @@ The counter excludes hash lookup work and ordered-map comparisons. Its placement
 
 **Engine boundary checkpoint, 2026-09-22.** Commit `3315820` moves the four classifier lifecycle methods into `engine/classification.rs`. The parent compared their bodies and call lines with the previous commit and found no changes. The engine file decreases from 3633 to 3402 lines. The same 24 classification, 23 recovery, and two selection-window tests passed before and after extraction. Formatting and strict workspace Clippy passed. This resolves the scoped structure finding without a behavior change. Final workspace verification and publication remain pending. Log: `/tmp/roundhouse-engine-classification-extraction.log`.
 
+**Runtime publication validation, 2026-09-22.** The full workspace suite against runtime source `3315820` passed 2118 tests, with zero failures, 147 ignored, and no compiler warnings. It covered 123 test binaries and seven doc-test suites. Only documentation changed during the run. Command: `ulimit -Sn 65536` followed by `timeout 900 cargo test --workspace`, using the shared target directory. Log: `/tmp/roundhouse-runtime-publication-workspace.log`. The runtime remains part of draft PR #18; frontier interval feedback, learned routing, offline calibration, live measurements, and whole-PR review remain incomplete.
+
 ### Frontier review feedback (2026-09-21)
 
 Each review records its prompt snapshot and covered decision interval. The result labels that interval once. A late result cannot label newer decisions or change their recorded input features. Failed, skipped, malformed, or insufficient-context reviews remain unknown. Missing feedback is not a no-correction verdict.
