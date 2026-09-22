@@ -23,14 +23,14 @@ The final workspace run at `5fba49d` passed 1801 tests, with 0 failures, 141 exi
 
 ### Completion requirements
 
-The transport and observation checkpoints do not complete the owner's routing vision. This table reflects the committed state through `9e56a63` on 2026-09-22. Dated checkpoints below retain earlier evidence and limitations.
+The transport and observation checkpoints do not complete the owner's routing vision. This table reflects the committed state through `5be10e7` on 2026-09-22. Dated checkpoints below retain earlier evidence and limitations.
 
 | Requirement | Remaining implementation or evidence |
 |---|---|
 | Per-turn local selection | `1c14975` records selector evidence and cache predictions. `438fe2f` adds bounded classification references at the selection cutoff. Learned selection remains unfinished. |
 | Rich classification | `438fe2f` implements versioned intent, complexity, and context-dependence questions with bounded prior metadata and current-prompt capture. Live provider evidence remains absent. |
-| Evaluation accounting | `438fe2f` records separate evaluation costs and settlement recovery. Memory and Redis checks are recorded below. Full classifier recovery through Redis remains unverified. |
-| Background execution | `438fe2f` implements durable intents, bounded work, expiry, cancellation, and retained delivery. Later tests close deadline and acknowledgement gaps. Backlog acknowledgement work remains under review. |
+| Evaluation accounting | `438fe2f` records separate evaluation costs and settlement recovery. Memory and Redis checks are recorded below. Fresh-connection Redis recovery is covered below; process-crash recovery remains unverified. |
+| Background execution | `438fe2f` implements durable intents, bounded work, expiry, cancellation, and retained delivery. Later tests close deadline and acknowledgement gaps. `f62c621` removes acknowledgement backlog scans and has scoped mutation evidence. |
 | Deployment wiring | `438fe2f` implements opt-in configuration, disabled defaults, evaluation accounting, and loopback startup tests. Local-only exclusion has a mutation guard. Live deployment evidence remains absent. |
 | Frontier quality feedback | Exact interval coverage across text and tool turns, per-turn instruction versions, snapshot cutoff, unknown outcomes, and once-only learning updates. |
 | Online bandit | Local selection uses available classifications and observed outcomes under policy, quality, budget, and latency constraints. The utility tradeoff still needs an owner ruling. |
@@ -148,6 +148,8 @@ The counter excludes hash lookup work and ordered-map comparisons. Its placement
 **Engine boundary checkpoint, 2026-09-22.** Commit `3315820` moves the four classifier lifecycle methods into `engine/classification.rs`. The parent compared their bodies and call lines with the previous commit and found no changes. The engine file decreases from 3633 to 3402 lines. The same 24 classification, 23 recovery, and two selection-window tests passed before and after extraction. Formatting and strict workspace Clippy passed. This resolves the scoped structure finding without a behavior change. Final workspace verification and publication remain pending. Log: `/tmp/roundhouse-engine-classification-extraction.log`.
 
 **Runtime publication validation, 2026-09-22.** The full workspace suite against runtime source `3315820` passed 2118 tests, with zero failures, 147 ignored, and no compiler warnings. It covered 123 test binaries and seven doc-test suites. Only documentation changed during the run. Command: `ulimit -Sn 65536` followed by `timeout 900 cargo test --workspace`, using the shared target directory. Log: `/tmp/roundhouse-runtime-publication-workspace.log`. The runtime remains part of draft PR #18; frontier interval feedback, learned routing, offline calibration, live measurements, and whole-PR review remain incomplete.
+
+**Redis recovery coverage, 2026-09-22.** Commit `5be10e7` adds two gated integration cases using the engine, loopback classifier HTTP, Redis session log, and Redis evaluation ledger. One refuses settlement before application; the other applies it and returns an error. Each shuts down and drops its first backend handles, repairs through fresh connections, then reopens a third time after repair. The third connection observes one intent, one matching repair, the original charge, no held budget, and an unchanged serving ledger. The classifier receives one HTTP request. The parent independently passed all 25 recovery tests with Redis enabled, strict test-target Clippy, and formatting. Production source is unchanged. These are passing coverage additions, not reproduced defect fixes. The tests use one OS process and simulated ledger errors; actual crashes and Redis outages are not covered. The two tests are ignored by default and require `ROUNDHOUSE_TEST_REDIS_URL` with `--include-ignored`. The prior full workspace result predates these test-only additions. Logs: `/tmp/roundhouse-classification-redis-recovery.log` and `/tmp/roundhouse-classification-redis-recovery-parent.log`.
 
 ### Frontier review feedback (2026-09-21)
 
