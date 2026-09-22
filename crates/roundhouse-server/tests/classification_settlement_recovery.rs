@@ -2610,3 +2610,9 @@ async fn repair_scheduling_attempts_per_turn_under_fast_ledger_failures() {
          own scheduling loop recycle capacity within itself"
     );
 }
+
+// Real Redis: the same before-apply/after-apply claims through the real
+// backends `shared_backend::open` builds. Path-declared so this stays one
+// module and not a second auto-discovered `tests/*.rs` binary.
+#[path = "classification_settlement_recovery/redis_recovery.rs"]
+mod redis_recovery;
