@@ -331,3 +331,9 @@ Five independent mutations failed their intended assertions. Each restore matche
 Concurrent evaluation calls require separate settlement identities. A session watermark can discard an earlier call when a later call finishes first. Commit `42c9991` gives each evaluation call a per-project identity and preserves serving session watermarks. The TypeSafe adapter and frontier judge use the new mode. Memory and Redis retain completed identities across delayed replay and budget resets.
 
 An expired hold does not permit another charge for a completed call. Completed identities therefore have no expiry. This costs one retained identity per evaluation call until a safe compaction protocol exists. Background concurrency limits do not bound that history. Runtime integration must record the call identity before dispatch and preserve it during settlement replay. This change does not prevent repeated external requests. Durable dispatch and delivery remain unfinished.
+
+## Addendum (2026-09-22): current selection evidence
+
+Commit `1c14975` records local features, extractor identity, selector settings, admitted targets, and the original choice and fallback plan. The engine captures this snapshot once and copies it to each dispatch record. Failover retains the original evidence. Historical records without a snapshot remain unknown. The admitted pool describes admission's result, not its complete credential, cadence, or budget inputs.
+
+All 24 focused tests passed. Nine independent mutations failed runtime assertions, and every source restore matched the commit. The full workspace run passed 1831 tests, with 0 failures, 145 existing ignores, and no compiler warnings. Replay tests use serialized events and the session-state fold. This checkpoint does not supply classification records, background execution, complete frontier reviews, or learning updates. The bandit plan records the remaining contracts and owner questions.

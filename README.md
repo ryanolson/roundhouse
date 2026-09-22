@@ -416,8 +416,10 @@ deep the session is — scored by a port of Switchyard's coding-agent scorer.
 **No model call is involved anywhere in the decision**: it is a `tanh` over four
 numbers read out of the log the fold already holds, so an agent that starts
 looping is moved up a tier and one that just made its tests pass is moved back
-down, at no latency and no cost. (The judge that *does* call a model lives in
+down without an extra model request. (The judge that *does* call a model lives in
 the validate loop, which is a different surface.)
+
+Each routing event stores the local signals, extractor version, selector settings, admitted targets, and original fallback plan. Failover retains that selection snapshot while recording each dispatch's target separately. A later configuration change does not rewrite the stored evidence. Historical records without a snapshot remain unknown. The snapshot records admission's result, not enough information to rerun credential, cadence, and budget checks.
 
 Four properties of the lists are worth knowing before writing one:
 

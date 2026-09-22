@@ -20,9 +20,11 @@ You are continuing PR #18 in `ryanolson/roundhouse`: https://github.com/ryanolso
 
 ## State
 
+- **Selection snapshot checkpoint, 2026-09-22:** Commit `1c14975` records current local features, extractor identity, actual selector settings, admitted targets, and the original fallback plan. The engine captures the snapshot once and retains it across dispatches. Historical records remain unknown. All 24 focused tests pass, and nine independent mutations failed runtime assertions. Source restoration matched the commit. See the bandit plan for scope and evidence. Rich classification and its runtime producer are the next integration work.
+
 - **Evaluation settlement checkpoint, 2026-09-22:** Commit `42c9991` gives evaluation calls a per-project call identity, independent of serving session watermarks. Memory and Redis retain completed identities without expiry. The reversed-order adapter regression now passes, as do 21 real Redis spend tests. All five independent mutations failed runtime assertions. The restored focused suites passed 63 tests, including all 21 real Redis spend tests. Source restoration matched the commit. See the bandit plan for the storage tradeoff and focused test evidence.
 
-- **Latest full suite:** At `42c9991`, 1807 tests passed, with 0 failures, 145 ignores, and no compiler warnings. Four new Redis contract instances passed separately against real Redis. The run covered 108 test binaries and 7 doc-test suites. Log: `/tmp/roundhouse-settlement-workspace.log`.
+- **Latest full suite:** At `1c14975`, 1831 tests passed, with 0 failures, 145 existing ignores, and no compiler warnings. The run covered 111 test binaries and 7 doc-test suites. Log: `/tmp/roundhouse-routing-snapshot-workspace.log`.
 
 - **TypeSafe transport checkpoint, 2026-09-21:** Commit `5fba49d` carries multiple choice questions in one prepared request. It requires a complete valid answer set and retains reported usage when that set is unusable. The adapter still asks one tier question. Six initial assertions failed with 43 passing controls. All 49 focused tests passed after implementation. Five independent post-commit mutations failed their intended assertions, and each source restore matched the commit. See the bandit plan for evidence and background lifecycle constraints. The later settlement checkpoint above confirms and fixes the out-of-order settlement defect. Durable dispatch and background scheduling remain unfinished.
 
@@ -67,6 +69,8 @@ Remaining questions (updated 2026-09-21):
 2. C3: retain fleet-error failure, or add a sub-budget and fail-open path to admitted frontier targets.
 3. Bandit utility: the frontier correction signal is settled. The cost-versus-latency tradeoff remains to define. Background classifications supply features, not rewards.
 4. Live C2 inputs: catalog path, pinned model, approved USD spend cap, and restored `openv` access. No live run starts without these inputs.
+5. Learning scope: per-project learning or a shared selector across projects. Per-project learning was recommended but is not an accepted ruling.
+6. Oversized review intervals: retain the interval for a larger review, or mark it unknown and start a new interval after a frontier checkpoint.
 
 Per-turn cadence and Roundhouse ownership of cache markers are settled. Do not ask those questions again.
 
