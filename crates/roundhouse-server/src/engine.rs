@@ -26,6 +26,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::StreamExt;
+use roundhouse_core::classify::ClassificationWindow;
+use roundhouse_core::classify::projection::{PROJECTION_REVISION, PromptCapture};
 use roundhouse_core::context::{ContextAssembler, Tokenizer};
 use roundhouse_core::control::{
     Billing, CredentialError, FairUseError, FairUseLedger, MemoryFairUseLedger, MemorySpendLedger,
@@ -55,6 +57,7 @@ use roundhouse_mcp::ControlStore;
 use serde_json::Value;
 use tokio::time::Instant;
 
+use crate::classify_runtime::{Capacity, ClassificationRuntime};
 use crate::control_config::Admission;
 
 mod control;
@@ -895,9 +898,24 @@ pub struct Engine<S: SessionStore, T: Tokenizer + Clone> {
     /// so `fair_use_refusal` warns once per outage rather than once per
     /// refused turn. See its own doc for why (M13.1 review F4).
     fair_use_unreachable_warned: std::sync::atomic::AtomicBool,
+    /// Background turn classification, when a deployment configured it.
+    ///
+    /// **`None` is the shipped state and costs one `Option` check per turn.**
+    /// An always-present runtime with a disabled adapter would have been tidier
+    /// and would have put a semaphore, a result map and a sweep task in every
+    /// deployment that never opted in.
+    ///
+    /// The engine owns both ends of it: this turn's writer drains whatever
+    /// finished since the last one, and — once the turn has terminated — records
+    /// the intent to classify it. Nothing here is on the path to first token.
+    classifier: Option<Arc<ClassificationRuntime<T>>>,
 }
 
-impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
+/// `'static` since the classification runtime: a background worker outlives the
+/// turn that spawned it, so the tokenizer it quotes with has to outlive the
+/// borrow too. Every tokenizer this workspace has is an owned value with no
+/// borrows in it, so the bound costs nothing a caller has to satisfy.
+impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
     /// An engine whose whole catalog dispatches through one transport.
     ///
     /// The shape a test with an echo stub means, and the shape
@@ -964,6 +982,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             turn_gates: Mutex::new(HashMap::new()),
             unread_recipe: std::sync::Once::new(),
             fair_use_unreachable_warned: std::sync::atomic::AtomicBool::new(false),
+            classifier: None,
         }
     }
 
@@ -1031,6 +1050,18 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
     /// consults this field on every turn either way.
     pub fn with_interjector(mut self, interjector: Arc<dyn Interjector>) -> Self {
         self.interjector = interjector;
+        self
+    }
+
+    /// Classify turns in the background through `classifier`.
+    ///
+    /// A builder for [`Self::with_fleet`]'s reason, and the default is a real
+    /// absence rather than a disabled instance — see [`Self::classifier`].
+    /// `classify_runtime::compose` is what the composition root builds one with,
+    /// and it only ever returns `Some` for a deployment whose configuration file
+    /// says `enabled`.
+    pub fn with_classifier(mut self, classifier: Arc<ClassificationRuntime<T>>) -> Self {
+        self.classifier = Some(classifier);
         self
     }
 
@@ -1152,6 +1183,44 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                 )
                 .await?;
         }
+
+        // **Classification results land before this turn's input does**, and the
+        // ordering is the whole of "a late result joins the features of a
+        // *later* turn". Appending here puts every delivered result at a
+        // sequence below the cutoff `plan` is about to capture, so this turn can
+        // name them; a drain after the turn's own decision could not be named by
+        // it and would have to wait for the next one anyway.
+        //
+        // Before `begin_turn` also means a deduplicated turn still drains: the
+        // client's retry is not a reason to strand a result the runtime is
+        // holding capacity for.
+        self.deliver_classifications(&mut session).await;
+
+        // The repair's durable half, beside the delivery it mirrors and for the
+        // same reason: this is the writer, and a background worker must not
+        // open one of its own. What it commits is only an acknowledgement — the
+        // money moved when the worker's settle returned, which was on the
+        // executor and not here.
+        self.deliver_settlement_repairs(&mut session).await;
+
+        // What may be said about this turn, taken from the client's own items
+        // while they are still a separate thing. The committed log is one flat
+        // list, and reconstructing "what arrived on this turn" out of it
+        // afterwards would be a second answer to a question we hold right here.
+        // `None` on every deployment that configured no classifier, which is the
+        // shipped state and costs one `Option` check.
+        //
+        // Acquire capacity before copying the prompt so unavailable classification
+        // adds no payload allocation. The permit covers the serving turn, worker,
+        // and retained result. Early returns release it through drop.
+        // Long serving turns therefore occupy classification capacity too.
+        let classification = self.classifier.as_ref().and_then(|classifier| {
+            let capacity = classifier.capacity()?;
+            Some((
+                capacity,
+                PromptCapture::of(&input, &classifier.projection_caps()),
+            ))
+        });
 
         // `started`, not `admission`: the caller's [`Admission`] is who may
         // spend and on what, and this one is whether the log accepted the turn
@@ -1439,6 +1508,39 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                 }
             }
         };
+        // **The turn is over, and this is where the next turn's features are
+        // bought.** After the terminal event, so nothing here can delay an
+        // answer; before the lease is handed back, so the durable intent is
+        // written by the writer that already holds it.
+        //
+        // Only a turn that *dispatched* is classified, and the decision comes
+        // from this turn's own `Completed` rather than from the fold. A steered
+        // turn writes no `Routed`, so reading `last_decision()` here would hand
+        // it the previous turn's admitted pool and fabricate egress permission
+        // out of a decision that was never taken.
+        if let Ok((_, _, Some(decision))) = &settled
+            && let Some((capacity, capture)) = classification
+        {
+            self.request_classification(
+                &mut session,
+                &response_id,
+                admission,
+                decision,
+                capacity,
+                &capture,
+            )
+            .await;
+        }
+
+        // **Here rather than beside the delivery above, and that is the
+        // "off the serving path" rule.** Spawning costs a semaphore try and a
+        // task; the ledger round trip it starts belongs to the executor. But
+        // the ordering still matters: started after the terminal event, a
+        // repair cannot delay an answer even if the spawn itself were to
+        // become expensive. Unconditional, unlike the classification above — a
+        // turn that steered or failed still owes the ledger the same money.
+        self.repair_classification_settlements(&session).await;
+
         // Money after the log, always: the settle is priced from the terminal
         // event's own usage, so it cannot run until that event exists, and a
         // ledger that moved first would charge for turns whose commit then
@@ -1470,6 +1572,238 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             last_seq,
             deduplicated: false,
         })
+    }
+
+    /// Commit whatever the background classifier finished since the last turn.
+    ///
+    /// **The engine's writer, because it is the only one there is.** A worker
+    /// that opened a session to deliver its own result would take the lease from
+    /// whichever turn is running and fence it; `Session::open_observed` acquires
+    /// the lease, and nothing about a background result is worth that.
+    ///
+    /// Append first, acknowledge second. A result whose append fails stays with
+    /// the runtime for a later drain — still holding its admission permit, still
+    /// costing nothing further, and emphatically not re-purchased. A result whose
+    /// append succeeded and whose acknowledgement was lost is offered again and
+    /// refused here by the log's own record of it, so no path delivers twice.
+    async fn deliver_classifications(&self, session: &mut Session<S>) {
+        let Some(classifier) = &self.classifier else {
+            return;
+        };
+        let waiting = classifier.ready(session.session_id()).await;
+        if waiting.is_empty() {
+            return;
+        }
+        let mut delivered = Vec::with_capacity(waiting.len());
+        for completed in waiting {
+            let call_id = completed.record.call_id.clone();
+            if session.state().classification_settled(&call_id) {
+                // Already in the log: the append landed and the acknowledgement
+                // did not. Acknowledged now, appended never.
+                delivered.push(call_id);
+                continue;
+            }
+            match session
+                .record_classification(completed.record.clone())
+                .await
+            {
+                Ok(()) => delivered.push(call_id),
+                Err(error) => {
+                    // The usual reason is a lost lease, and the turn about to run
+                    // is the better diagnosis. Stop rather than continue: a
+                    // writer that cannot append one event will not append the
+                    // next.
+                    tracing::warn!(
+                        %error,
+                        session_id = %session.session_id(),
+                        "a classification result could not be appended; it stays with \
+                         the runtime for a later turn to deliver"
+                    );
+                    break;
+                }
+            }
+        }
+        classifier
+            .acknowledge(session.session_id(), &delivered)
+            .await;
+    }
+
+    /// Commit the acknowledgements the repair workers produced.
+    ///
+    /// Append first, acknowledge second — the same order and the same reason as
+    /// [`Self::deliver_classifications`]. An acknowledgement whose append fails
+    /// stays with the runtime, and even if it is lost entirely the log still
+    /// reads the settlement as unrepaired, so a later turn drives it again and
+    /// the ledger deduplicates. **No path here can charge twice**, and no path
+    /// here reaches the classifier at all.
+    async fn deliver_settlement_repairs(&self, session: &mut Session<S>) {
+        let Some(classifier) = &self.classifier else {
+            return;
+        };
+        let waiting = classifier.ready_repairs(session.session_id()).await;
+        if waiting.is_empty() {
+            return;
+        }
+        let mut written = Vec::with_capacity(waiting.len());
+        for answered in waiting {
+            let call_id = answered.record.call_id.clone();
+            match session
+                .record_classification_settlement_repair(answered.record.clone())
+                .await
+            {
+                Ok(()) => written.push(call_id),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        session_id = %session.session_id(),
+                        "an evaluation settlement repair could not be appended; \
+                         the settlement stays unconfirmed in the log and a later \
+                         turn will drive it again"
+                    );
+                    break;
+                }
+            }
+        }
+        classifier
+            .acknowledge_repairs(session.session_id(), &written)
+            .await;
+    }
+
+    /// Schedule a bounded batch of unconfirmed settlements.
+    ///
+    /// The durable session principal identifies the original payer. A later
+    /// turn's admission cannot substitute for a missing recorded principal.
+    /// The fixed batch bounds scheduling work even when failed workers return
+    /// permits during this loop. Runtime claims suppress duplicate attempts
+    /// through execution and acknowledgement delivery.
+    async fn repair_classification_settlements(&self, session: &Session<S>) {
+        let Some(classifier) = &self.classifier else {
+            return;
+        };
+        let unrepaired = session.state().unrepaired_settlements();
+        if unrepaired.is_empty() {
+            return;
+        }
+        let Some(principal) = session.state().principal() else {
+            tracing::warn!(
+                session_id = %session.session_id(),
+                unrepaired = unrepaired.len(),
+                "this session's log names no payer, so an unconfirmed evaluation \
+                 settlement cannot be repaired; the live turn's principal is not \
+                 evidence about who paid for a call that finished earlier"
+            );
+            return;
+        };
+        for settlement in classifier.repair_batch(unrepaired) {
+            let Some(capacity) = classifier.capacity() else {
+                // Saturated, or the runtime has stopped. The settlement stays
+                // in the log, which is exactly where a later turn finds it.
+                break;
+            };
+            classifier
+                .repair(
+                    capacity,
+                    session.session_id().clone(),
+                    principal.clone(),
+                    settlement.clone(),
+                )
+                .await;
+        }
+    }
+
+    /// Commit the intent to classify the turn that just ended, and start it.
+    ///
+    /// Best-effort throughout: every refusal here leaves the turn exactly as it
+    /// was. The order is the durability contract and is not negotiable —
+    /// capacity, then payload, then reservation, then the durable intent, and
+    /// only then a worker that may open a socket. The caller acquires capacity
+    /// before capturing the prompt. Each early return here releases that permit.
+    async fn request_classification(
+        &self,
+        session: &mut Session<S>,
+        response_id: &ResponseId,
+        admission: &Admission,
+        decision: &Decision,
+        capacity: Capacity,
+        capture: &PromptCapture,
+    ) {
+        let Some(classifier) = &self.classifier else {
+            return;
+        };
+        // **One answer per turn is structural rather than guarded here.** This
+        // is reached once per `run_turn`, and the two ways a turn could arrive
+        // twice both stop short of it: a client's retry of a completed turn
+        // returns at the dedup short-circuit above, and a re-admitted failed
+        // turn is a *different* response — `begin_turn` mints a fresh
+        // `ResponseId` — so it is a new question rather than the same one asked
+        // again. A membership check against the fold would be a guard that
+        // never fires, and one that never fires is one nothing keeps honest.
+        //
+        // **Nothing below this line awaits the evaluation ledger or the
+        // classifier.** The projection is a bounded render, `prepare` is a
+        // serialization, and the intent append is a write the turn's own writer
+        // was going to make anyway. The grant and the request both belong to the
+        // worker `spawn` starts, so a slow or unreachable evaluation ledger
+        // delays no response.
+        let projection = match classifier.projection(
+            capture,
+            session.state().classifications(),
+            session.state().prior_turns(),
+        ) {
+            Ok(projection) => projection,
+            Err(refusal) => {
+                tracing::debug!(?refusal, "no turn classification for this turn");
+                return;
+            }
+        };
+        let prepared = match classifier.prepare(
+            admission.principal.clone(),
+            session.session_id().clone(),
+            // Fresh per external attempt. A settled identity can never settle
+            // again, so reusing the turn's would collide with the turn's own
+            // hold; reusing an earlier call's would be refused by the
+            // once-per-call rule after the first.
+            ResponseId::generate(),
+            session.turn_index().saturating_sub(1),
+            response_id.clone(),
+            &projection,
+            // **The policy's own resolution, never a second one.** Asking
+            // `admissible` again here would answer a different question — with
+            // a guessed load ceiling and without the overflow valve — and record
+            // its answer as this decision's permission to send a tenant's prompt
+            // to a third party.
+            decision.admitted.as_deref(),
+            now_ms(),
+        ) {
+            Ok(prepared) => prepared,
+            Err(refusal) => {
+                tracing::debug!(?refusal, "no turn classification for this turn");
+                return;
+            }
+        };
+        match session
+            .record_classification_intent(prepared.intent.clone())
+            .await
+        {
+            // The intent is durable. Only now may anything be sent — and the
+            // grant that funds it is the worker's, so nothing this turn did
+            // touched the evaluation ledger.
+            Ok(()) => {
+                classifier
+                    .spawn(capacity, session.session_id().clone(), prepared)
+                    .await
+            }
+            Err(error) => {
+                // Nothing to hand back: no grant was opened, because opening one
+                // here is exactly what this seam no longer does.
+                tracing::warn!(
+                    %error,
+                    session_id = %session.session_id(),
+                    "a classification intent could not be committed; no call was \
+                     made and no evaluation budget was reserved"
+                );
+            }
+        }
     }
 
     /// Price every option, choose one, record the choice, and execute it.
@@ -2044,6 +2378,27 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             turn_index,
             observed_through_seq: session.last_seq(),
         };
+        // Which background classifications this decision can see, named at the
+        // same cutoff the features were taken at. A result that lands while this
+        // turn is in flight has a higher sequence and is therefore absent here —
+        // which is the no-backdating rule expressed as a filter rather than as a
+        // convention somebody has to remember.
+        //
+        // **Bounded to the window a projection would actually carry.** Naming
+        // every classification a session ever produced on every `Routed` makes
+        // the log grow with the square of the turn count; the window records how
+        // many were available beyond the ones it names, so what it leaves out is
+        // a number rather than a silence.
+        let classifications = self.classifier.as_ref().map(|classifier| {
+            ClassificationWindow::of(
+                PROJECTION_REVISION,
+                features.observed_through_seq,
+                classifier.projection_caps().max_prior_classifications,
+                session
+                    .state()
+                    .classifications_through(features.observed_through_seq),
+            )
+        });
 
         // --- price every option -------------------------------------------
         //
@@ -2152,7 +2507,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             // cannot carry them. A promptless-local tool turn is not a served
             // turn; it is a wrong answer wearing one.
             return Err(EngineError::NoToolCapableTarget {
-                tools: declared_tool_count(&declarations),
+                tools: declared_tool_count(declarations),
                 why: "every candidate this deployment quoted is a local worker".to_string(),
             }
             .into());
@@ -2395,7 +2750,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             .map_err(|error| match (local_withheld_by_tools, &error) {
                 (true, EngineError::Routing(RoutingError::NoViableCandidate { budget_state })) => {
                     EngineError::NoToolCapableTarget {
-                        tools: declared_tool_count(&declarations),
+                        tools: declared_tool_count(declarations),
                         why: format!(
                             "the local pool this turn would otherwise have degraded to cannot \
                              carry a toolbox, and the budget state is {budget_state:?}"
@@ -2418,7 +2773,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
 
         // Selection runs once. Failover records retain its original inputs and
         // fallback plan while recording their own target and attempt history.
-        let selection = SelectionSnapshot::of(&decision, features);
+        let selection = Box::new(SelectionSnapshot::of(&decision, features, classifications));
 
         // --- the handoff gate's second half (S6) ------------------------------
         //

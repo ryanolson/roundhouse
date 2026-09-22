@@ -225,6 +225,7 @@ fn a_model_row_cannot_contradict_its_own_serving_mode() {
         incomplete_turn_elapsed: None,
         cache_reuse_evidence: None,
         accounting: ModelAccounting::Frontier {
+            priced_by_catalog: true,
             billed_usd: 4.0,
             billed_measured_usd: 3.0,
             billed_estimated_usd: 1.0,

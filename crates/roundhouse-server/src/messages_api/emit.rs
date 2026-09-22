@@ -675,6 +675,12 @@ impl MessageEmission {
             | SessionEventKind::SideCallCompleted { .. }
             | SessionEventKind::SideCallAbandoned { .. }
             | SessionEventKind::ValidationDecided { .. }
+            // The three background classification kinds are the same case one
+            // step further out: they describe a turn that has already ended,
+            // and the repair describes only this deployment's accounting for it.
+            | SessionEventKind::ClassificationRequested { .. }
+            | SessionEventKind::ClassificationRecorded { .. }
+            | SessionEventKind::ClassificationSettlementRepaired { .. }
             | SessionEventKind::Error { .. } => (Vec::new(), Step::Continue),
         }
     }

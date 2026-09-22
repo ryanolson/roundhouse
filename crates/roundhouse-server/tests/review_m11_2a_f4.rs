@@ -300,7 +300,7 @@ async fn a_longer_conversation_does_change_isl_tokens_and_cost() {
             &long,
             TurnId::new("t1"),
             TurnInput {
-                items: vec![Item::user_text(&"word ".repeat(4_000))],
+                items: vec![Item::user_text("word ".repeat(4_000))],
                 ..turn_input(None)
             },
             &open,

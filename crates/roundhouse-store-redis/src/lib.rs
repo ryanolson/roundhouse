@@ -77,7 +77,7 @@ pub use correlation::RedisCorrelationMaps;
 pub use directory::RedisDocumentStore;
 pub use fair_use::RedisFairUseLedger;
 pub use keys::{EmptyNamespace, KeyNamespace};
-pub use spend::RedisSpendLedger;
+pub use spend::{RedisSpendLedger, SpendPurpose};
 
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use redis::streams::StreamRangeReply;

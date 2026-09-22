@@ -23,7 +23,13 @@
 
 pub mod fair_use;
 
-use roundhouse_core::control::{BudgetState, Principal};
+use roundhouse_core::classify::{
+    ClassificationIntent, ClassificationOutcome, ClassificationRecord,
+    ClassificationSettlementRepair, ClassifierIdentity, ContextDependence, EvaluationSpend,
+    EvaluationUsage, Graded, ReservationRecord, SettlementAck, TAXONOMY_VERSION,
+    TurnClassification, TurnComplexity, TurnIntent,
+};
+use roundhouse_core::control::{BudgetState, BudgetWindow, Principal};
 use roundhouse_core::event::CacheReadSource;
 use roundhouse_core::event::{
     Accounting, IncompleteReason, SessionEvent, SessionEventKind, SideCallAbandonReason,
@@ -31,7 +37,7 @@ use roundhouse_core::event::{
 };
 use roundhouse_core::ids::{ResponseId, SessionId, SideCallId, TurnId, ValidationId};
 use roundhouse_core::item::Item;
-use roundhouse_core::routing::{Candidate, DecisionRecord, Target};
+use roundhouse_core::routing::{Candidate, DecisionRecord, ProviderPricing, Target};
 use roundhouse_core::store::SessionStore;
 use roundhouse_core::validate::{
     Arm, Divergence, EscalationOverrides, SignalFired, SignalKind, SteerAction, TriggerRecord,
@@ -300,6 +306,79 @@ pub fn every_event_kind() -> Vec<SessionEventKind> {
                 },
             },
         },
+        SessionEventKind::ClassificationRequested {
+            record: ClassificationIntent {
+                call_id: ResponseId::new("eval_1"),
+                source_turn_index: 2,
+                source_response_id: ResponseId::new("resp_2"),
+                requested_at_ms: 1_000,
+                expires_at_ms: 61_000,
+                identity: ClassifierIdentity {
+                    model: "jev-1.12".into(),
+                    schema: "typesafe.systemone.choice.v1".into(),
+                    taxonomy_version: TAXONOMY_VERSION,
+                    projection_revision: 1,
+                    config_revision: 4,
+                },
+                reservation: ReservationRecord {
+                    rate_card: ProviderPricing::free(),
+                    estimated_input_tokens: 900,
+                    expected_output_tokens: 24,
+                    requested_usd: 0.0004,
+                    hold_ttl_ms: 65_000,
+                    budget_limit_usd: 25.0,
+                    budget_window: BudgetWindow::Monthly,
+                    member_ceiling_usd: Some(6.25),
+                    warn_at: 0.8,
+                },
+            },
+        },
+        SessionEventKind::ClassificationRecorded {
+            record: ClassificationRecord {
+                call_id: ResponseId::new("eval_1"),
+                source_turn_index: 2,
+                source_response_id: ResponseId::new("resp_2"),
+                completed_at_ms: 2_000,
+                outcome: ClassificationOutcome::Classified {
+                    classification: TurnClassification {
+                        taxonomy_version: TAXONOMY_VERSION,
+                        intent: Graded {
+                            value: TurnIntent::Implement,
+                            confidence: 0.8,
+                        },
+                        complexity: Graded {
+                            value: TurnComplexity::Involved,
+                            confidence: 0.6,
+                        },
+                        context_dependence: Graded {
+                            value: ContextDependence::Recent,
+                            confidence: 0.5,
+                        },
+                    },
+                    spend: EvaluationSpend::Measured {
+                        granted_usd: 0.0004,
+                        usage: EvaluationUsage {
+                            input_tokens: 312,
+                            output_tokens: 48,
+                        },
+                        usd: 0.0004,
+                        settled: SettlementAck::Committed,
+                    },
+                    reported_model: Some("jev-1.12-canary-2026w38".into()),
+                },
+            },
+        },
+        SessionEventKind::ClassificationSettlementRepaired {
+            record: ClassificationSettlementRepair {
+                call_id: ResponseId::new("eval_1"),
+                // `false` on purpose: the answer that says the ledger already
+                // held this call. It is the one a reader is most likely to
+                // mistake for a failure, so it is the one the durable round
+                // trip is pinned on.
+                applied: false,
+                repaired_at_ms: 9_000,
+            },
+        },
         SessionEventKind::Error {
             message: "boom".into(),
         },
@@ -312,7 +391,7 @@ pub fn every_event_kind() -> Vec<SessionEventKind> {
 /// rather than a hopeful one.
 pub fn assert_covers_every_variant(kinds: &[SessionEventKind]) {
     use SessionEventKind as K;
-    let mut covered = [false; 12];
+    let mut covered = [false; 15];
     for kind in kinds {
         covered[match kind {
             K::SessionCreated { .. } => 0,
@@ -327,6 +406,9 @@ pub fn assert_covers_every_variant(kinds: &[SessionEventKind]) {
             K::SideCallCompleted { .. } => 9,
             K::SideCallAbandoned { .. } => 10,
             K::ValidationDecided { .. } => 11,
+            K::ClassificationRequested { .. } => 12,
+            K::ClassificationRecorded { .. } => 13,
+            K::ClassificationSettlementRepaired { .. } => 14,
         }] = true;
     }
     assert!(

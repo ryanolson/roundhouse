@@ -102,6 +102,65 @@ async fn record_created_commits_session_created_with_the_principal() {
     );
 }
 
+/// **The recorded principal survives a restart, read off the log alone.**
+///
+/// A repair reads `SessionState::principal` rather than a live turn's
+/// admission — see `Engine::repair_classification_settlements`. That is only a
+/// correct source if the fold actually reconstructs it from the durable
+/// `SessionCreated` event through a fresh replay, not merely within the
+/// process that wrote it. This is the cheap companion to that claim: no
+/// classification, no ledger, just the fold surviving a process boundary.
+#[tokio::test]
+async fn principal_survives_a_restart_from_the_durable_log() {
+    let store = Arc::new(MemoryStore::new());
+    let (sid, mut session) = new_session(store.clone(), "node-a").await;
+    let principal = Principal::new("acme", "ada");
+    session
+        .record_created("affinity", &principal, None)
+        .await
+        .unwrap();
+    drop(session);
+    store.expire_lease_now(&sid).await;
+
+    let successor = Session::open(store, sid, "node-b", TTL, CacheLedger::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        successor.state().principal(),
+        Some(&principal),
+        "a fresh replay reconstructs the payer from `SessionCreated` alone"
+    );
+}
+
+/// **A log with no recorded principal folds to `None`, not to a guess.**
+///
+/// `Session::record_created` always writes `Some`, so this state is
+/// unreachable through it — but the type it writes is `Option<Principal>`,
+/// and `Engine::repair_classification_settlements` explicitly branches on
+/// finding `None` there: a log predating tenancy. This pins the fold arm
+/// directly against a raw event a real deployment's own legacy log could
+/// still hand a replay, without going through the engine to construct it.
+#[tokio::test]
+async fn a_session_created_with_no_principal_folds_to_none() {
+    let store = Arc::new(MemoryStore::new());
+    let (_, mut session) = new_session(store, "node-a").await;
+
+    session
+        .commit(vec![SessionEventKind::SessionCreated {
+            model_policy: "affinity".into(),
+            principal: None,
+            arm: None,
+        }])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        session.state().principal(),
+        None,
+        "the fold does not invent a payer for a log that never named one"
+    );
+}
+
 #[tokio::test]
 async fn a_turn_appends_items_and_advances_the_turn_index() {
     let store = Arc::new(MemoryStore::new());
@@ -2133,4 +2192,615 @@ fn a_turns_leading_configuration_run_replaces_the_sessions_at_the_head() {
         "appended as history, at the end, not lifted to the head"
     );
     assert_eq!(cursor.len(), 2, "and it did not join the configuration run");
+}
+
+// -------------------------------------------- ClassificationRecorded fold
+//
+// Contract: a delivered result is this session's answer to a call only when an
+// outstanding intent under the same `call_id` names the same
+// `source_turn_index` and the same `source_response_id`. Attribution is
+// decided before anything is consumed, so a result that fails it closes no
+// intent, claims no settlement, and files no feature -- which is exactly what
+// leaves the call's true answer still able to land.
+//
+// Every case is driven through the session's own commit methods
+// (`record_classification_intent`, `record_classification`) and then re-read
+// through `SessionState::project`, because the invariant belongs to the fold:
+// a writer that attributed one way and a successor replaying the same log the
+// other would disagree about which turn a feature describes.
+
+use crate::classify::{
+    ClassificationOutcome, ClassifierIdentity, ContextDependence, EvaluationSpend, Graded,
+    ReservationRecord, SettlementAck, TAXONOMY_VERSION, TurnClassification, TurnComplexity,
+    TurnIntent,
+};
+use crate::control::BudgetWindow;
+
+fn classify_identity() -> ClassifierIdentity {
+    ClassifierIdentity {
+        model: "jev-1.12".to_string(),
+        schema: "typesafe.systemone.choice.v1".to_string(),
+        taxonomy_version: TAXONOMY_VERSION,
+        projection_revision: 1,
+        config_revision: 1,
+    }
+}
+
+fn classify_reservation() -> ReservationRecord {
+    ReservationRecord {
+        rate_card: card(),
+        estimated_input_tokens: 100,
+        expected_output_tokens: 16,
+        requested_usd: 0.0002,
+        hold_ttl_ms: 30_000,
+        budget_limit_usd: 100.0,
+        budget_window: BudgetWindow::Total,
+        member_ceiling_usd: None,
+        warn_at: 0.8,
+    }
+}
+
+/// The intent a session actually opened: `call_id`, about `source_turn_index`
+/// / `source_response_id`.
+fn classify_intent(
+    call_id: &str,
+    source_turn_index: u64,
+    source_response_id: &str,
+) -> ClassificationIntent {
+    ClassificationIntent {
+        call_id: ResponseId::new(call_id),
+        source_turn_index,
+        source_response_id: ResponseId::new(source_response_id),
+        requested_at_ms: 0,
+        expires_at_ms: 30_000,
+        identity: classify_identity(),
+        reservation: classify_reservation(),
+    }
+}
+
+/// A usable answer, delivered under whatever `(call_id, source_turn_index,
+/// source_response_id)` the caller names, so a test can deliver one whose
+/// source disagrees with the intent it claims to settle.
+///
+/// The spend it carries is `SettlementAck::Committed` on purpose: the money
+/// half of a call settles at the evaluation ledger and is already final by the
+/// time this record exists. Whether the fold attributes the answer is a
+/// separate question, and the tests below pin that the two do not move
+/// together -- declining a feature does not un-charge anything.
+fn classify_result(
+    call_id: &str,
+    source_turn_index: u64,
+    source_response_id: &str,
+) -> ClassificationRecord {
+    ClassificationRecord {
+        call_id: ResponseId::new(call_id),
+        source_turn_index,
+        source_response_id: ResponseId::new(source_response_id),
+        completed_at_ms: 1_000,
+        outcome: ClassificationOutcome::Classified {
+            classification: TurnClassification {
+                taxonomy_version: TAXONOMY_VERSION,
+                intent: Graded {
+                    value: TurnIntent::Implement,
+                    confidence: 0.8,
+                },
+                complexity: Graded {
+                    value: TurnComplexity::Involved,
+                    confidence: 0.6,
+                },
+                context_dependence: Graded {
+                    value: ContextDependence::Recent,
+                    confidence: 0.5,
+                },
+            },
+            spend: EvaluationSpend::Unknown {
+                granted_usd: 0.0,
+                settled: SettlementAck::Committed,
+            },
+            reported_model: None,
+        },
+    }
+}
+
+/// The projection a successor would rebuild from this session's own log.
+///
+/// Every attribution case below is asserted against this as well as against
+/// the state the writer folded live. One fold serves both, so a case that held
+/// for only one of them would mean a restart disagreed with the process that
+/// wrote the log about which turns have answers.
+async fn replayed(session: &Session<MemoryStore>) -> SessionState {
+    SessionState::project(
+        session.store.as_ref(),
+        session.session_id(),
+        CacheLedger::new(),
+        None,
+    )
+    .await
+    .expect("an in-memory log replays")
+}
+
+/// Outstanding intents as `(call_id, source_turn_index, source_response_id)`,
+/// ordered.
+///
+/// The count alone would pass on a fold that dropped an intent and put a
+/// different one back; the source fields are what the invariant is about, so
+/// they are what gets compared.
+fn outstanding_sources(state: &SessionState) -> Vec<(ResponseId, u64, ResponseId)> {
+    let mut sources: Vec<_> = state
+        .outstanding_classifications()
+        .map(|intent| {
+            (
+                intent.call_id.clone(),
+                intent.source_turn_index,
+                intent.source_response_id.clone(),
+            )
+        })
+        .collect();
+    sources.sort();
+    sources
+}
+
+/// Filed features as `(call_id, source_turn_index, available_seq)`, in the
+/// order they became available.
+fn filed_features(state: &SessionState) -> Vec<(ResponseId, u64, u64)> {
+    state
+        .classifications()
+        .iter()
+        .map(|available| {
+            (
+                available.reference.call_id.clone(),
+                available.reference.source_turn_index,
+                available.reference.available_seq,
+            )
+        })
+        .collect()
+}
+
+/// **A result whose `source_turn_index` and `source_response_id` both disagree
+/// with the intent it claims to settle answers a different question, and must
+/// leave that intent open.**
+///
+/// Closing it would strand the call's true answer forever: the intent is gone,
+/// so nothing records that the turn is still unanswered, and the settlement
+/// slot the identity gets exactly once has been spent on a record about some
+/// other turn. The second half of this test is that stranding, stated as a
+/// requirement -- the correctly-sourced result still lands, exactly once, and
+/// is available only from its own sequence onward.
+#[tokio::test]
+async fn a_mismatched_source_result_must_not_close_the_intent_or_block_the_true_one() {
+    let store = Arc::new(MemoryStore::new());
+    let (_sid, mut session) = new_session(store, "node-mismatch").await;
+
+    session
+        .record_classification_intent(classify_intent("call_1", 3, "resp_3"))
+        .await
+        .unwrap();
+    assert_eq!(session.state.outstanding_classifications().count(), 1);
+
+    // The delivered record names call_1, but a different turn and a
+    // different source response than the intent it claims to settle.
+    session
+        .record_classification(classify_result("call_1", 9, "resp_9"))
+        .await
+        .unwrap();
+    let mismatch_seq = session.last_seq();
+
+    let intact = vec![(ResponseId::new("call_1"), 3, ResponseId::new("resp_3"))];
+    assert_eq!(
+        outstanding_sources(&session.state),
+        intact,
+        "a source-mismatched result must not close the intent it does not \
+         actually answer, and must leave it naming its own source"
+    );
+    assert!(
+        !session
+            .state
+            .classification_settled(&ResponseId::new("call_1")),
+        "and must not consume the one settlement slot this call_id has -- \
+         the ledger already committed this record's spend, which is a \
+         separate fact from whether the log attributes its answer"
+    );
+    assert!(
+        session.state.classifications().is_empty(),
+        "no feature may be filed under a source the intent never claimed"
+    );
+    assert_eq!(
+        outstanding_sources(&replayed(&session).await),
+        intact,
+        "and a successor replaying the log reads the same open intent"
+    );
+    assert!(replayed(&session).await.classifications().is_empty());
+
+    // The true, correctly-sourced result for the same call must still be
+    // able to land after the mismatched delivery above.
+    session
+        .record_classification(classify_result("call_1", 3, "resp_3"))
+        .await
+        .unwrap();
+    let true_seq = session.last_seq();
+
+    assert!(
+        outstanding_sources(&session.state).is_empty(),
+        "the correctly-sourced result closes the intent"
+    );
+    let expected = vec![(ResponseId::new("call_1"), 3, true_seq)];
+    assert_eq!(
+        filed_features(&session.state),
+        expected,
+        "and becomes exactly one feature, filed under the intent's own \
+         source and available from its own sequence -- not the mismatch's"
+    );
+    assert_eq!(
+        session.state.classifications_through(mismatch_seq).count(),
+        0,
+        "a decision whose cutoff predates the true result cannot name it"
+    );
+
+    let replayed = replayed(&session).await;
+    assert!(outstanding_sources(&replayed).is_empty());
+    assert_eq!(filed_features(&replayed), expected);
+    assert!(replayed.classification_settled(&ResponseId::new("call_1")));
+}
+
+/// **The same requirement, isolated to `source_turn_index`** --
+/// `source_response_id` matches the intent exactly, so a guard that compared
+/// only the response id would wrongly accept this.
+#[tokio::test]
+async fn a_result_with_only_the_turn_index_wrong_must_not_close_the_intent() {
+    let store = Arc::new(MemoryStore::new());
+    let (_sid, mut session) = new_session(store, "node-mismatch-turn").await;
+
+    session
+        .record_classification_intent(classify_intent("call_1", 3, "resp_3"))
+        .await
+        .unwrap();
+
+    // source_response_id ("resp_3") matches; source_turn_index (7, not 3)
+    // does not.
+    session
+        .record_classification(classify_result("call_1", 7, "resp_3"))
+        .await
+        .unwrap();
+
+    let intact = vec![(ResponseId::new("call_1"), 3, ResponseId::new("resp_3"))];
+    assert_eq!(
+        outstanding_sources(&session.state),
+        intact,
+        "a turn-index-only mismatch must not close the intent either"
+    );
+    assert!(
+        !session
+            .state
+            .classification_settled(&ResponseId::new("call_1"))
+    );
+    assert!(session.state.classifications().is_empty());
+
+    let replayed = replayed(&session).await;
+    assert_eq!(outstanding_sources(&replayed), intact);
+    assert!(replayed.classifications().is_empty());
+
+    // And the intent is still answerable, which is the point of leaving it.
+    session
+        .record_classification(classify_result("call_1", 3, "resp_3"))
+        .await
+        .unwrap();
+    assert_eq!(
+        filed_features(&session.state),
+        vec![(ResponseId::new("call_1"), 3, session.last_seq())],
+        "the correctly-sourced result contributes exactly once"
+    );
+}
+
+/// **The same requirement, isolated to `source_response_id`** --
+/// `source_turn_index` matches the intent exactly, so a guard that compared
+/// only the turn index would wrongly accept this.
+#[tokio::test]
+async fn a_result_with_only_the_response_id_wrong_must_not_close_the_intent() {
+    let store = Arc::new(MemoryStore::new());
+    let (_sid, mut session) = new_session(store, "node-mismatch-response").await;
+
+    session
+        .record_classification_intent(classify_intent("call_1", 3, "resp_3"))
+        .await
+        .unwrap();
+
+    // source_turn_index (3) matches; source_response_id ("resp_9", not
+    // "resp_3") does not.
+    session
+        .record_classification(classify_result("call_1", 3, "resp_9"))
+        .await
+        .unwrap();
+
+    let intact = vec![(ResponseId::new("call_1"), 3, ResponseId::new("resp_3"))];
+    assert_eq!(
+        outstanding_sources(&session.state),
+        intact,
+        "a response-id-only mismatch must not close the intent either"
+    );
+    assert!(
+        !session
+            .state
+            .classification_settled(&ResponseId::new("call_1"))
+    );
+    assert!(session.state.classifications().is_empty());
+
+    let replayed = replayed(&session).await;
+    assert_eq!(outstanding_sources(&replayed), intact);
+    assert!(replayed.classifications().is_empty());
+
+    // And the intent is still answerable, which is the point of leaving it.
+    session
+        .record_classification(classify_result("call_1", 3, "resp_3"))
+        .await
+        .unwrap();
+    assert_eq!(
+        filed_features(&session.state),
+        vec![(ResponseId::new("call_1"), 3, session.last_seq())],
+        "the correctly-sourced result contributes exactly once"
+    );
+}
+
+/// **A result naming a `call_id` this session holds no intent for is nothing
+/// this session asked for: not settled, not a feature.**
+///
+/// A hand-repaired log, a successor delivering into the wrong session, or an
+/// intent lost to a bug elsewhere all arrive here, and reading any of them as
+/// an ordinary answer would put a label on a turn nobody paid to have read.
+/// Rejecting it must also not poison the identity: if the intent shows up
+/// afterwards, its own answer still lands.
+#[tokio::test]
+async fn a_result_with_no_matching_intent_must_not_be_settled_or_filed() {
+    let store = Arc::new(MemoryStore::new());
+    let (_sid, mut session) = new_session(store, "node-orphan").await;
+
+    assert_eq!(session.state.outstanding_classifications().count(), 0);
+
+    session
+        .record_classification(classify_result("call_orphan", 2, "resp_2"))
+        .await
+        .unwrap();
+
+    assert!(
+        !session
+            .state
+            .classification_settled(&ResponseId::new("call_orphan")),
+        "a result this session never requested must not read as settled"
+    );
+    assert!(
+        session.state.classifications().is_empty(),
+        "and must not be folded into a feature"
+    );
+    let replayed = replayed(&session).await;
+    assert!(!replayed.classification_settled(&ResponseId::new("call_orphan")));
+    assert!(replayed.classifications().is_empty());
+
+    // The intent this session really did open for that call arrives late --
+    // the durable intent is written before dispatch, but a log assembled out
+    // of order is exactly the case this arm has to survive.
+    session
+        .record_classification_intent(classify_intent("call_orphan", 2, "resp_2"))
+        .await
+        .unwrap();
+    session
+        .record_classification(classify_result("call_orphan", 2, "resp_2"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        filed_features(&session.state),
+        vec![(ResponseId::new("call_orphan"), 2, session.last_seq())],
+        "the rejected delivery did not spend the identity's one answer"
+    );
+    assert!(
+        session
+            .state
+            .classification_settled(&ResponseId::new("call_orphan"))
+    );
+}
+
+/// Controls: an ordinary delayed delivery (other events land between the
+/// intent and its result) and an ordinary duplicate delivery (the same record
+/// folded twice) both behave as documented -- the delayed result lands once,
+/// and the duplicate does not double it. Kept beside the mismatch and orphan
+/// cases so the attribution guard is visibly not a rejection of ordinary
+/// out-of-order delivery.
+#[tokio::test]
+async fn a_delayed_and_then_duplicated_delivery_lands_exactly_once() {
+    let store = Arc::new(MemoryStore::new());
+    let (_sid, mut session) = new_session(store, "node-control").await;
+
+    session
+        .record_classification_intent(classify_intent("call_a", 1, "resp_1"))
+        .await
+        .unwrap();
+
+    // Time passes: an unrelated call is requested and answered before
+    // `call_a`'s own result arrives -- an ordinary delayed delivery, not a
+    // same-turn round trip.
+    session
+        .record_classification_intent(classify_intent("call_b", 2, "resp_2"))
+        .await
+        .unwrap();
+    session
+        .record_classification(classify_result("call_b", 2, "resp_2"))
+        .await
+        .unwrap();
+    let b_seq = session.last_seq();
+    assert_eq!(session.state.classifications().len(), 1);
+
+    // `call_a`'s correctly-sourced result finally lands.
+    session
+        .record_classification(classify_result("call_a", 1, "resp_1"))
+        .await
+        .unwrap();
+    let a_seq = session.last_seq();
+    let expected = vec![
+        (ResponseId::new("call_b"), 2, b_seq),
+        (ResponseId::new("call_a"), 1, a_seq),
+    ];
+    assert_eq!(
+        filed_features(&session.state),
+        expected,
+        "both land, in availability order rather than source order"
+    );
+    assert!(session.state.outstanding_classifications().next().is_none());
+
+    // A duplicate delivery of the same call -- a successor re-driving a
+    // result this session already folded.
+    session
+        .record_classification(classify_result("call_a", 1, "resp_1"))
+        .await
+        .unwrap();
+    assert_eq!(
+        filed_features(&session.state),
+        expected,
+        "a duplicate delivery must not double the feature"
+    );
+    assert_eq!(
+        session.state.classifications_through(b_seq).count(),
+        1,
+        "and the availability cutoff still separates them"
+    );
+
+    assert_eq!(filed_features(&replayed(&session).await), expected);
+}
+
+/// **Attribution survives the wire, not just the process that wrote it.**
+///
+/// The events are serialized and deserialized before a fresh `SessionState`
+/// folds them, which is what a store that persists JSON actually hands a
+/// successor. A guard that compared something the encoding dropped would pass
+/// every test above and fail here.
+#[tokio::test]
+async fn attribution_holds_across_a_serialized_replay() {
+    let store = Arc::new(MemoryStore::new());
+    let (sid, mut session) = new_session(store.clone(), "node-serde").await;
+
+    session
+        .record_classification_intent(classify_intent("call_1", 3, "resp_3"))
+        .await
+        .unwrap();
+    session
+        .record_classification(classify_result("call_1", 9, "resp_9"))
+        .await
+        .unwrap();
+    session
+        .record_classification_intent(classify_intent("call_2", 4, "resp_4"))
+        .await
+        .unwrap();
+    session
+        .record_classification(classify_result("call_2", 4, "resp_4"))
+        .await
+        .unwrap();
+
+    let logged = store.read_events(&sid, 0, 1024).await.unwrap();
+    let round_tripped: Vec<SessionEventKind> = logged
+        .iter()
+        .map(|event| {
+            let encoded = serde_json::to_string(&event.kind).expect("an event encodes");
+            serde_json::from_str(&encoded).expect("and decodes to the same kind")
+        })
+        .collect();
+
+    let successor_store = MemoryStore::new();
+    let successor = SessionId::generate();
+    successor_store
+        .create_session(&successor, "affinity")
+        .await
+        .unwrap();
+    let lease = successor_store
+        .acquire_lease(&successor, "node-serde-successor", TTL)
+        .await
+        .unwrap()
+        .expect("an unheld session");
+    successor_store
+        .append_events(&lease, round_tripped)
+        .await
+        .unwrap();
+
+    let state = SessionState::project(&successor_store, &successor, CacheLedger::new(), None)
+        .await
+        .expect("a replay of the decoded log");
+
+    assert_eq!(
+        outstanding_sources(&state),
+        vec![(ResponseId::new("call_1"), 3, ResponseId::new("resp_3"))],
+        "the mismatched delivery left call_1 open through the encoding"
+    );
+    assert!(!state.classification_settled(&ResponseId::new("call_1")));
+    assert!(state.classification_settled(&ResponseId::new("call_2")));
+
+    let filed = filed_features(&state);
+    assert_eq!(filed.len(), 1, "only the correctly-sourced answer is filed");
+    assert_eq!(filed[0].0, ResponseId::new("call_2"));
+    assert_eq!(filed[0].1, 4);
+    assert_eq!(
+        state.classifications_through(filed[0].2 - 1).count(),
+        0,
+        "and it is nameable only from the sequence it landed at"
+    );
+}
+
+// ------------------------------------------------- the availability cutoff
+
+/// **Finding the cutoff must not read the history behind it.**
+///
+/// `classifications_through` runs on every routed turn of every session, and a
+/// long session is exactly where it matters: a scan that reads all of a
+/// thousand entries to answer "how many landed by sequence N" is work that
+/// grows with the session on a path that returns four references however long
+/// the session is.
+///
+/// Counted key reads rather than a clock: [`landed_through`] takes the key
+/// reader, so this can say exactly how many entries were touched. A timing
+/// assertion would pass on a quiet machine and fail on a loaded one while
+/// saying nothing about the shape of the work.
+#[test]
+fn finding_the_cutoff_reads_a_logarithmic_number_of_entries() {
+    let seqs: Vec<u64> = (0..4_096u64).map(|index| index * 2).collect();
+    let probes = std::cell::Cell::new(0usize);
+    let counted = |seq: &u64| {
+        probes.set(probes.get() + 1);
+        *seq
+    };
+
+    let landed = landed_through(&seqs, 5_000, counted);
+
+    assert_eq!(
+        landed, 2_501,
+        "every even sequence up to and including 5,000"
+    );
+    let ceiling = seqs.len().ilog2() as usize + 2;
+    assert!(
+        probes.get() <= ceiling,
+        "the cutoff must be found without reading the history behind it: \
+         {} entries read of {}, and a logarithmic search reads at most {ceiling}",
+        probes.get(),
+        seqs.len()
+    );
+}
+
+/// The control for the search above: the answer it gives is the one a reader
+/// of every entry would give, at every boundary where an off-by-one hides.
+#[test]
+fn the_cutoff_admits_exactly_what_landed_at_or_before_it() {
+    let seqs: Vec<u64> = vec![2, 4, 6, 8];
+    let counted = |seq: &u64| *seq;
+
+    assert_eq!(landed_through(&[] as &[u64], 10, counted), 0, "empty");
+    assert_eq!(landed_through(&seqs, 1, counted), 0, "below every entry");
+    assert_eq!(landed_through(&seqs, 2, counted), 1, "the first, exactly");
+    assert_eq!(landed_through(&seqs, 3, counted), 1, "between two entries");
+    assert_eq!(landed_through(&seqs, 8, counted), 4, "the last, exactly");
+    assert_eq!(landed_through(&seqs, 9, counted), 4, "above every entry");
+
+    // And the same answers the linear reading gives, over every cutoff the
+    // slice can be asked about.
+    for cutoff in 0..12u64 {
+        assert_eq!(
+            landed_through(&seqs, cutoff, counted),
+            seqs.iter().filter(|seq| **seq <= cutoff).count(),
+            "at cutoff {cutoff}"
+        );
+    }
 }

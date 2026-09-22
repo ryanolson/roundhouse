@@ -9,10 +9,14 @@
 //! reconstructs identical state without any handoff from the process it
 //! replaced.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::classify::{
+    AvailableClassification, ClassificationIntent, ClassificationRecord, ClassificationRef,
+    ClassificationSettlementRepair, EvaluationSpend, PriorTurnMetadata, UnconfirmedSettlement,
+};
 use crate::control::{Billing, BudgetCounts, FrontierHistory, Payer, Principal};
 use crate::event::{
     ControlRecord, IncompleteReason, NotRunReason, PlaceboTiming, SessionEvent, SessionEventKind,
@@ -35,6 +39,14 @@ const REPLAY_BATCH: usize = 1024;
 /// `u64`s is also strictly less state than one conversation item, which is what
 /// makes keeping it in the projection cheaper than deriving it on demand.
 const TURN_TOKEN_WINDOW: usize = 16;
+
+/// How many turns of local metadata the projection may draw on.
+///
+/// Small on purpose and for the same reason [`TURN_TOKEN_WINDOW`] is: what a
+/// classifier can use is a description of *recent* work, and an unbounded window
+/// would make the fold grow with the session while adding nothing a reader of
+/// the newest few entries did not already have.
+const PRIOR_METADATA_WINDOW: usize = 8;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
@@ -428,6 +440,28 @@ pub struct SessionState {
     /// occupant reads as "do not validate". See
     /// [`SessionEventKind::SessionCreated`]'s `arm`.
     pub(crate) arm: Option<Arm>,
+    /// Who this session's turns are charged to, as its first event recorded it.
+    ///
+    /// **The payer of record, and the only one a replay can trust.** Everything
+    /// that needs to know whose a session is reads it from `SessionCreated`
+    /// rather than from a side table, because a replay starts at seq 0 and so
+    /// sees it before any event that costs money. The evaluation-settlement
+    /// repair is the first reader that needs it *after* the fact: it re-drives a
+    /// charge for a call that finished long ago, and the live `Admission` in
+    /// front of the turn driving the repair is not evidence about who paid for
+    /// that call.
+    ///
+    /// Reusing it is sound because a session is bound to one principal on every
+    /// supported surface: `ControlPlane::Configured` prefixes session ids with
+    /// `{project}/{user}/` and gates every turn on `contains`, and
+    /// `ControlPlane::Open` resolves one fixed principal deployment-wide. So
+    /// the session principal *is* the classification payer, and a second
+    /// durable copy of it on every intent would be a second answer to a
+    /// question this event already answers.
+    ///
+    /// `None` for a log written before the field existed. A repair refuses
+    /// rather than guessing — see `Engine::repair_classification_settlements`.
+    pub(crate) principal: Option<Principal>,
     /// Billable tokens this session's turns have reported since the last
     /// validation, or since it opened.
     ///
@@ -520,6 +554,47 @@ pub struct SessionState {
     /// Set when the decision is committed and consumed at the terminal event,
     /// which is the one place every turn passes through exactly once.
     turn_intervened: bool,
+
+    // ---- Background classification. --------------------------------------
+    /// Calls this session committed to and has no result for.
+    ///
+    /// An unanswered intent remains across replay because its request could
+    /// already have reached the provider. A result naming another source does
+    /// not answer this intent or authorize another request.
+    outstanding_classifications: HashMap<ResponseId, ClassificationIntent>,
+    /// Every call whose result this session attributed to its own intent.
+    ///
+    /// Failed and unfunded outcomes also complete an intent. A mismatched
+    /// result does not, even if its event remains in the log. This set prevents
+    /// duplicate delivery from contributing another feature.
+    settled_classifications: HashSet<ResponseId>,
+    /// Usable classifications, in the order their results landed.
+    classifications: Vec<AvailableClassification>,
+    /// Settlements the log records as unconfirmed and unresolved.
+    ///
+    /// **Drained by repair, so it is bounded by the outage rather than by the
+    /// session.** An entry appears when a result lands saying nobody
+    /// acknowledged its settle, and leaves when a
+    /// [`SessionEventKind::ClassificationSettlementRepaired`] says the ledger
+    /// answered. A deployment whose evaluation ledger is healthy never holds
+    /// one; a deployment whose ledger is down accumulates one per call, which
+    /// is the same posture the serving ledger's own repair already accepts.
+    ///
+    /// Folded here rather than re-derived at the repair site because the join
+    /// it needs is not available later: the amount is on the *result* and the
+    /// window is on the *intent*, and the intent is consumed the moment its
+    /// result arrives.
+    unrepaired_settlements: Vec<UnconfirmedSettlement>,
+    /// What this deployment's own extractor made of recent turns.
+    ///
+    /// **Bounded to [`PRIOR_METADATA_WINDOW`], oldest dropped first.** The
+    /// classifier's projection is allowed prior *metadata* as well as prior
+    /// classifications, and this is the metadata: counts and one heuristic flag,
+    /// folded out of the selection snapshot each `Routed` already carries. Held
+    /// rather than re-derived because the extractor that produced them is
+    /// versioned, and re-running today's extractor over an old turn would answer
+    /// a different question than the record does.
+    prior_turns: Vec<PriorTurnMetadata>,
 }
 
 /// A narrowing the validate loop asked for, with its remaining life.
@@ -556,6 +631,18 @@ pub struct ActiveEscalation {
 /// spaces is no more readable than one made of nothing.
 fn non_empty(text: String) -> Option<String> {
     (!text.trim().is_empty()).then_some(text)
+}
+
+/// How many of an availability-ordered slice had landed by `cutoff_seq`.
+///
+/// The key accessor lets tests count search work without timing assertions.
+/// Entries must be ordered by availability sequence, as the session fold appends them.
+pub(crate) fn landed_through<T>(
+    available: &[T],
+    cutoff_seq: u64,
+    seq_of: impl Fn(&T) -> u64,
+) -> usize {
+    available.partition_point(|entry| seq_of(entry) <= cutoff_seq)
 }
 
 impl SessionState {
@@ -623,6 +710,29 @@ impl SessionState {
                 // per-dispatch vector cost (review finding G05).
                 self.frontier_history
                     .record(&decision.chosen, self.turn_index);
+                // One entry per *turn*, not per dispatch: a failover writes
+                // several `Routed` carrying one selection, and three copies of
+                // one turn's counts would read as three turns of work.
+                if let Some(selection) = &decision.selection
+                    && self
+                        .prior_turns
+                        .last()
+                        .is_none_or(|last| last.turn_index != selection.features.turn_index)
+                {
+                    let signals = &selection.features.signals;
+                    self.prior_turns.push(PriorTurnMetadata {
+                        turn_index: selection.features.turn_index,
+                        extractor_revision: selection.features.extractor_revision,
+                        turn_depth: signals.turn_depth,
+                        edit_count: signals.tools.edit_count,
+                        read_count: signals.tools.read_count,
+                        severity: signals.tools.severity,
+                        tests_passed_heuristic: signals.tools.tests_passed,
+                    });
+                    if self.prior_turns.len() > PRIOR_METADATA_WINDOW {
+                        self.prior_turns.remove(0);
+                    }
+                }
                 self.last_decision = Some(decision.clone());
                 // Held rather than recorded; see `pending_routings`.
                 self.pending_routings.insert(
@@ -904,7 +1014,85 @@ impl SessionState {
                     }
                 }
             }
-            SessionEventKind::SessionCreated { arm, .. } => self.arm = *arm,
+            SessionEventKind::SessionCreated { arm, principal, .. } => {
+                self.arm = *arm;
+                self.principal = principal.clone();
+            }
+            SessionEventKind::ClassificationRequested { record } => {
+                // **Folded, never re-dispatched.** A replay reaches this arm
+                // and learns that a call was committed to; it does not make one.
+                // Holding the intent is what lets the engine refuse to buy a
+                // second answer for a turn that already has one outstanding, and
+                // what lets a reader say "this turn's classification, and its
+                // cost, are unknown" instead of saying nothing.
+                self.outstanding_classifications
+                    .insert(record.call_id.clone(), record.clone());
+            }
+            SessionEventKind::ClassificationRecorded { record } => {
+                // Duplicate delivery must not give one answer extra weight.
+                if self.settled_classifications.contains(&record.call_id) {
+                    return;
+                }
+                // Check attribution before consuming the intent or identity.
+                // Otherwise a mismatched result would block the valid answer
+                // that arrives later, including after replay.
+                let answers_the_intent = self
+                    .outstanding_classifications
+                    .get(&record.call_id)
+                    .is_some_and(|intent| {
+                        intent.source_turn_index == record.source_turn_index
+                            && intent.source_response_id == record.source_response_id
+                    });
+                if !answers_the_intent {
+                    return;
+                }
+                // Joined here because this is the last moment both halves are
+                // in hand: the amount is on the result and the window is on the
+                // intent, and the next line consumes the intent. A repair site
+                // that tried to re-derive this would find the intent gone.
+                let intent = self.outstanding_classifications.remove(&record.call_id);
+                if let (Some(intent), Some(usd)) = (
+                    intent,
+                    record
+                        .outcome
+                        .spend()
+                        .and_then(EvaluationSpend::unconfirmed_settlement_usd),
+                ) {
+                    self.unrepaired_settlements.push(UnconfirmedSettlement {
+                        call_id: record.call_id.clone(),
+                        usd,
+                        window: intent.reservation.budget_window,
+                    });
+                }
+                self.settled_classifications.insert(record.call_id.clone());
+                // Only a usable answer becomes a feature. An unusable, failed or
+                // unfunded call is retained above as *settled* — so it is never
+                // redelivered and never re-bought — and contributes no label,
+                // because nobody answered.
+                if let Some(classification) = record.outcome.classification() {
+                    self.classifications.push(AvailableClassification {
+                        reference: ClassificationRef {
+                            call_id: record.call_id.clone(),
+                            source_turn_index: record.source_turn_index,
+                            // This event's own sequence. A later decision may
+                            // name it; an earlier one cannot, which is the whole
+                            // no-backdating rule expressed as a number.
+                            available_seq: event.seq,
+                        },
+                        classification: *classification,
+                    });
+                }
+            }
+            SessionEventKind::ClassificationSettlementRepaired { record } => {
+                // The ledger answered, whichever way. **Both answers end the
+                // question**: `applied` means the charge is now committed, and
+                // `!applied` means it already was and only the acknowledgement
+                // had been lost. Retaining an entry on `!applied` would re-drive
+                // the same settle on every later turn forever, for a call the
+                // ledger has told us twice it already has.
+                self.unrepaired_settlements
+                    .retain(|settlement| settlement.call_id != record.call_id);
+            }
             // Money facts, folded by the metrics layer and not here. This
             // projection answers "what may this session do next", and what a
             // side call billed does not bear on that — the *decision* beside it
@@ -1046,6 +1234,76 @@ impl SessionState {
     /// accurate answer rather than an empty one.
     pub fn last_decision(&self) -> Option<&DecisionRecord> {
         self.last_decision.as_ref()
+    }
+
+    /// Classifications usable as features, oldest availability first.
+    pub fn classifications(&self) -> &[AvailableClassification] {
+        &self.classifications
+    }
+
+    /// This deployment's own read of recent turns, oldest first.
+    ///
+    /// The other half of the projection's permitted prior context — see
+    /// [`PriorTurnMetadata`]. Bounded by the fold, so a caller cannot ask for
+    /// more of a session's history than the window holds.
+    pub fn prior_turns(&self) -> &[PriorTurnMetadata] {
+        &self.prior_turns
+    }
+
+    /// Classifications that had landed by `seq`.
+    ///
+    /// **Takes a cutoff rather than answering "everything now", because a
+    /// routing decision must be explainable from what existed when it was
+    /// taken.** The engine captures its cutoff before selection; a result that
+    /// lands during the same turn therefore cannot enter that turn's evidence,
+    /// however quickly it arrives.
+    ///
+    /// The ordered prefix supports an exact count and reverse traversal without
+    /// scanning the older history to select the newest references.
+    pub fn classifications_through(
+        &self,
+        seq: u64,
+    ) -> impl DoubleEndedIterator<Item = &ClassificationRef> + ExactSizeIterator {
+        let landed = landed_through(&self.classifications, seq, |available| {
+            available.reference.available_seq
+        });
+        self.classifications[..landed]
+            .iter()
+            .map(|available| &available.reference)
+    }
+
+    /// Whether this session has accepted `call_id`'s answer.
+    ///
+    /// The delivery path uses this to avoid duplicate appends. Acceptance is
+    /// independent of ledger settlement: an unmatched result can remain in the
+    /// log without completing the intent or contributing a feature.
+    pub fn classification_settled(&self, call_id: &ResponseId) -> bool {
+        self.settled_classifications.contains(call_id)
+    }
+
+    /// Who this session's turns are charged to. See [`Self::principal`].
+    pub fn principal(&self) -> Option<&Principal> {
+        self.principal.as_ref()
+    }
+
+    /// Evaluation settlements the log says nobody has confirmed.
+    ///
+    /// Everything a repair needs and nothing it does not: the call's identity,
+    /// the amount the record holds, and the window the intent recorded. The
+    /// payer is [`Self::principal`] and is deliberately not repeated here.
+    pub fn unrepaired_settlements(&self) -> &[UnconfirmedSettlement] {
+        &self.unrepaired_settlements
+    }
+
+    /// Calls with no result, which is the same thing as unknown answers.
+    ///
+    /// **The durable half of "a crash costs knowledge, not money twice".** A
+    /// successor folding this log finds the intent here and learns that a third
+    /// party may have been paid and what it answered is unrecoverable. Nothing
+    /// iterates this to dispatch anything — that is what makes "replay never
+    /// redispatches" a property of the code's shape rather than of a check.
+    pub fn outstanding_classifications(&self) -> impl Iterator<Item = &ClassificationIntent> {
+        self.outstanding_classifications.values()
     }
 
     /// Rebuild a session's projection from its log, **taking no lease**.
@@ -1580,6 +1838,55 @@ impl<S: SessionStore> Session<S> {
     /// production default interjects on no turn, and a store round trip per
     /// turn to say so would be a cost paid by every deployment that never
     /// enables validation.
+    /// Commit the intent to classify a turn, before anything is sent.
+    ///
+    /// **The engine's own writer, under the lease it already holds.** A
+    /// background worker that opened a second writer would take the lease from
+    /// the turn that spawned it and fence a live session, so the split is
+    /// structural: the writer records the intent and the result, and the worker
+    /// only ever makes the call.
+    pub async fn record_classification_intent(
+        &mut self,
+        record: ClassificationIntent,
+    ) -> Result<(), SessionError> {
+        self.commit(vec![SessionEventKind::ClassificationRequested { record }])
+            .await?;
+        Ok(())
+    }
+
+    /// Deliver what a classifier call produced.
+    ///
+    /// Committed by whichever turn is next in the session, which is why the
+    /// record carries its own source turn: the delivering turn is not the turn
+    /// being described, and often several turns later.
+    pub async fn record_classification(
+        &mut self,
+        record: ClassificationRecord,
+    ) -> Result<(), SessionError> {
+        self.commit(vec![SessionEventKind::ClassificationRecorded { record }])
+            .await?;
+        Ok(())
+    }
+
+    /// Record that an unconfirmed evaluation settlement has been resolved.
+    ///
+    /// Committed by a later turn's writer for the same reason the result above
+    /// is: the repair runs on a background worker that holds no lease, and the
+    /// engine's own writer is the only one there is. A commit that fails leaves
+    /// the settlement unrepaired in the fold, so the next turn drives it again
+    /// — which costs one deduplicated ledger call and no classifier request at
+    /// all.
+    pub async fn record_classification_settlement_repair(
+        &mut self,
+        record: ClassificationSettlementRepair,
+    ) -> Result<(), SessionError> {
+        self.commit(vec![SessionEventKind::ClassificationSettlementRepaired {
+            record,
+        }])
+        .await?;
+        Ok(())
+    }
+
     pub async fn record_control(&mut self, record: ControlRecord) -> Result<(), SessionError> {
         if record.is_empty() {
             return Ok(());

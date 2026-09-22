@@ -1050,6 +1050,22 @@ counterfactual should land near each other; when they do not, one of the two
 models is wrong, and that disagreement is worth more than either number alone.
 It is reported beside the total, never added into it.
 
+### Classifier evaluation costs
+
+The metrics JSON and dashboard report classifier costs separately from serving costs. The `evaluation` object distinguishes measured usage, unknown usage, pending intents, and calls refused before HTTP. Its `measured_usd` uses each call's recorded rates. It is not a provider invoice, and current catalog changes do not reprice it. Classifier tokens do not enter serving counters.
+
+Cost and settlement are separate observations. An unconfirmed settlement does not erase recorded usage or cost. A later repair updates the acknowledgement without adding another call or another charge. Missing usage and unanswered intents keep evaluation cost incomplete. Replayed events and duplicate results count once per session and call identity.
+
+The `evaluation.models` rows distinguish the requested model from the service-reported model. Missing reported identity stays unknown. The existing access rules apply: admin credentials see deployment totals, while turn credentials see their principal's totals.
+
+The `observed_cost` object adds catalog-priced serving spend and recorded classifier cost, with both price bases stated. Judge side calls remain in serving spend and count once. This sum is not an invoice or a measure of local hardware costs. Forwarded subscription seats remain outside the dollar amounts. `savings.total_usd` retains its existing meaning: cache savings plus routing savings.
+
+The `covers` field identifies the included costs as `hosted_serving_and_classifier_calls`. The `serving_gaps` object reports estimated usage, hosted model rows without a reported price, and locally served calls. Local calls contribute to `serving_gaps.local_calls` because this projection does not price GPU time. These counts can overlap and must not be added together.
+
+Hosted model rows expose `priced_by_catalog` to distinguish a configured zero rate from a missing catalog entry. Missing-price counts and dashboard warnings use this field. A zero-dollar total alone does not imply missing pricing.
+
+The combined `incomplete` flag includes serving gaps and incomplete evaluation cost. Complete classifier accounting therefore cannot make an incomplete serving total appear complete. On a deployment with local traffic, this flag remains true even with fully reported token usage. Use the individual gap counts to distinguish excluded hardware costs from missing usage or pricing.
+
 ### Usage has to be asked for
 
 A streaming OpenAI-compatible request — the real OpenAI API, vLLM, SGLang,
@@ -1164,15 +1180,45 @@ the catalog is named by an operator and load-or-die, while this one is
 discovered, and a discovered file must not be able to stop a deployment
 starting.
 
-**Hosted classification library.** The server library includes `TypeSafeShadow`, a disabled-by-default adapter for bounded judge briefs. An enabled adapter requires an admitted frontier target, a stored service credential, and an evaluation budget before it sends a request. The caller must supply a separate evaluation ledger. The model, prices, content limits, and deadline are explicit configuration.
+**Background turn classification (implementation draft).** The binary reads optional JSON configuration from `ROUNDHOUSE_CLASSIFY_CONFIG`. Classification is off unless the file sets `enabled: true`. Enabled configuration specifies the model, prices, credential environment-variable name, evaluation budget, content limits, transport limits, and worker limits. The binary supplies a separate evaluation ledger.
 
-The adapter returns tier probabilities and confidence without changing a route. It retains reported usage when a tier signal is invalid. Missing or partial usage remains unknown. Budget estimates use the complete serialized request, and the transport sends those same checked bytes once, without retries. Request size, response size, and network duration are bounded.
+The configuration fields below are required unless a default is stated. An unreadable file or invalid configuration stops startup. Disabled configuration is still parsed, but its credential is not resolved.
+
+| JSON field | Meaning |
+|---|---|
+| `enabled` | Enable background classification. Defaults to `false`. |
+| `revision` | Operator-assigned configuration revision, recorded with each intent. |
+| `model` | Requested model identifier, recorded separately from the model reported by the service. |
+| `base_url` | Classifier API root. Defaults to the TypeSafe API root. |
+| `auth.env` | Name of the environment variable that supplies the deployment credential. |
+| `pricing.input_per_mtok_usd`, `pricing.output_per_mtok_usd` | Configured input and output rates in dollars per million tokens. |
+| `expected_output_tokens` | Output-token estimate used for the budget quote. |
+| `caps.max_prior_classifications` | Maximum prior classifications and maximum prior local metadata entries in the projection. |
+| `caps.max_prompt_chars`, `caps.max_total_bytes` | Current-prompt character limit and rendered-projection byte limit. |
+| `transport.max_request_bytes`, `transport.max_response_bytes`, `transport.deadline_ms` | Transport size limits and network deadline. |
+| `executor.max_in_flight`, `executor.max_http_concurrency` | Capacity covering prompt capture through result retention, and the separate limit on concurrent HTTP calls. |
+| `executor.call_ttl_ms` | One execution expiry shared by queue wait, budget grant, HTTP, and settlement. |
+| `executor.result_retention_ms`, `executor.sweep_interval_ms` | Finished-result retention and cleanup interval. |
+| `budget.limit_usd`, `budget.window`, `budget.warn_at` | Evaluation ceiling, `total` or `monthly` window, and warning fraction. |
+| `budget.member_share` | Optional member fraction. Omission uses the pooled project budget. |
+
+The projection contains bounded prior turn metadata, available classifications, and current user text. Local-only sessions are excluded through the requirement for an admitted frontier target. The adapter asks three questions: request intent, complexity, and dependence on context. These classifications describe the turn; they do not establish answer quality.
+
+The engine records a classification intent and schedules background work. Results can become available to later turns. The current selector does not use these labels to learn a routing policy. Eight API tests cover imported and rewritten histories on Messages and Responses, with user-text and tool-result endings. They inspect outbound classifier bodies and stored fork histories. Independent mutation checks, review, and live provider validation remain pending.
+
+Background settlement repair uses the original call identity, recorded amount, recorded budget-window mode, and durable session principal. It makes no classifier request. Unconfirmed acknowledgements do not establish whether the ledger applied a charge. Each turn considers at most `max_in_flight` repair candidates. Runtime capacity and identity claims remain held through execution and acknowledgement delivery, including outstanding delivery handles.
+
+The engine reserves classification capacity before it captures the current prompt. Saturated or stopped classifiers skip that capture. The permit remains held during the serving turn, background execution, and result retention. Long serving turns can therefore reduce classification throughput at a fixed capacity. Routing snapshots select the newest bounded references without collecting the full classification history.
+
+Received envelopes retain the service-reported model independently of usable classification answers. Missing or malformed model metadata stays unknown. Ending the classifier lifetime stops admission and signals cancellation to its workers. Cancellation leaves unanswered intents with unknown outcomes because a request might already have reached the service.
+
+The adapter retains reported usage when classification answers are unusable. Missing or partial usage remains unknown. Budget estimates use the complete serialized request. The transport sends those checked bytes once, without retries, under configured size and duration limits.
 
 Evaluation calls settle by call identity, so completion order does not discard charges. Memory and Redis retain one completed identity per call across budget resets. Those identities have no expiry or compaction. A new attempt needs a fresh identity, while settlement replay uses the original identity. Serving turns retain their ordered session watermarks.
 
-The transport supports multiple choice questions in one request. It requires one valid answer per requested key and rejects unexpected answer keys. An unusable answer set retains reported usage. Empty question maps are refused before HTTP. The adapter still asks its existing tier question.
+The transport supports multiple choice questions in one request. It requires one valid answer per requested key and rejects unexpected answer keys. Empty question maps are refused before HTTP.
 
-The binary does not construct this adapter. Durable attribution and background scheduling remain the B2/B3 work in `agent-docs/PLAN-routing-strategy-bandit.md`. Classifier confidence is not downstream answer quality. Serving allocation and promotion still require those separate decisions and measurements.
+The remaining work is tracked in `agent-docs/PLAN-routing-strategy-bandit.md`. Frontier review intervals, learned serving allocation, and promotion still require implementation and verification. Evaluation reporting is implemented in the draft and awaits independent verification.
 
 ### The same numbers, in NeMo Relay's formats
 

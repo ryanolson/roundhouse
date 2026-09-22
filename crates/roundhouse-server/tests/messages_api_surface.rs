@@ -4052,9 +4052,9 @@ fn the_one_recognizer_accepts_a_notice_the_length_heuristic_missed() {
         "F5: wire's tag-anchor rule does not care about length, and this is the          notice: {long_real_notice}"
     );
     assert!(
-        !is_budget_notice(&format!(
+        !is_budget_notice(
             "<env>You are an interactive agent</env>\n<total_tokens>1 left</total_tokens>"
-        )),
+        ),
         "and it still refuses the environment block that merely ends with the tag"
     );
 }

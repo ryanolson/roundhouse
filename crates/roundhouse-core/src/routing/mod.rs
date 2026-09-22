@@ -773,8 +773,13 @@ pub struct DecisionRecord {
     /// The engine records this on every routed dispatch. `None` means missing
     /// evidence, including historical records written before this field existed.
     /// Missing evidence is distinct from recorded empty local signals.
+    ///
+    /// Boxing the snapshot limits the size of every session event, including
+    /// events that carry no routing evidence. A present snapshot adds one
+    /// allocation; an absent snapshot needs none. `event_size.rs` checks sizes,
+    /// not allocation counts or throughput. Serde preserves the JSON shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub selection: Option<SelectionSnapshot>,
+    pub selection: Option<Box<SelectionSnapshot>>,
 }
 
 /// Why a turn's local residency check was not made.

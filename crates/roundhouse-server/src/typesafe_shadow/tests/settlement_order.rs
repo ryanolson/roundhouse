@@ -26,8 +26,16 @@ use roundhouse_core::control::{BalanceQuery, MemorySpendLedger};
 
 use super::*;
 
-const ANSWER_INTENT_A: &str = r#"{"model":"jev-1.12","answers":{"tier":{"type":"choice","choice":"capable","probabilities":{"capable":0.85,"efficient":0.15},"confidence":0.82}},"usage":{"input_tokens":200,"output_tokens":40}}"#;
-const ANSWER_INTENT_B: &str = r#"{"model":"jev-1.12","answers":{"tier":{"type":"choice","choice":"capable","probabilities":{"capable":0.85,"efficient":0.15},"confidence":0.82}},"usage":{"input_tokens":300,"output_tokens":60}}"#;
+const ANSWER_INTENT_A: &str = r#"{"model":"jev-1.12","answers":{
+  "intent":{"type":"choice","choice":"implement","probabilities":{"implement":0.5,"diagnose":0.2,"explain":0.1,"review":0.1,"operate":0.05,"unknown":0.05},"confidence":0.82},
+  "complexity":{"type":"choice","choice":"involved","probabilities":{"trivial":0.1,"routine":0.2,"involved":0.5,"deep":0.1,"unknown":0.1},"confidence":0.61},
+  "context_dependence":{"type":"choice","choice":"recent","probabilities":{"self_contained":0.2,"recent":0.5,"deep":0.2,"unknown":0.1},"confidence":0.55}
+},"usage":{"input_tokens":200,"output_tokens":40}}"#;
+const ANSWER_INTENT_B: &str = r#"{"model":"jev-1.12","answers":{
+  "intent":{"type":"choice","choice":"implement","probabilities":{"implement":0.5,"diagnose":0.2,"explain":0.1,"review":0.1,"operate":0.05,"unknown":0.05},"confidence":0.82},
+  "complexity":{"type":"choice","choice":"involved","probabilities":{"trivial":0.1,"routine":0.2,"involved":0.5,"deep":0.1,"unknown":0.1},"confidence":0.61},
+  "context_dependence":{"type":"choice","choice":"recent","probabilities":{"self_contained":0.2,"recent":0.5,"deep":0.2,"unknown":0.1},"confidence":0.55}
+},"usage":{"input_tokens":300,"output_tokens":60}}"#;
 
 /// One classification intent: its hold identity and the upstream usage it
 /// reports. Amounts differ per intent so a sum assertion cannot pass on two
@@ -70,13 +78,19 @@ fn shadow_on(addr: SocketAddr, ledger: Arc<MemorySpendLedger>) -> TypeSafeShadow
 }
 
 /// The `(usage, usd)` a call was priced at, or a panic naming what came back.
-fn measured(outcome: &ShadowOutcome) -> (SystemOneUsage, f64) {
-    match outcome {
-        ShadowOutcome::Answered {
-            accounting: Accounting::Measured { usage, usd },
+///
+/// Asserts the settlement acknowledgement too: a committed charge is the fact
+/// this file is about, and a rejected settle carrying the same dollars would
+/// otherwise read here as a success.
+fn measured(record: &ClassificationRecord) -> (EvaluationUsage, f64) {
+    match record.outcome.spend() {
+        Some(EvaluationSpend::Measured {
+            usage,
+            usd,
+            settled: SettlementAck::Committed,
             ..
-        } => (*usage, *usd),
-        other => panic!("expected a priced answer, got {other:?}"),
+        }) => (*usage, *usd),
+        other => panic!("expected a committed priced answer, got {other:?}"),
     }
 }
 
@@ -89,32 +103,32 @@ async fn assert_both_intents_settle(completion_order: [Intent; 2]) {
     let credential = credential();
     let principal = Principal::new("proj_settlement_order", "user_settlement_order");
     let session_id = SessionId::new("sess_settlement_order");
-    let pool = Pool::of(vec![frontier()]);
 
     for (i, intent) in completion_order.into_iter().enumerate() {
         let (addr, up) = upstream(intent.answer_body).await;
+        let now_ms = 1_000 + i as u64 * 500;
         let call = ShadowCall {
             principal: principal.clone(),
             session_id: session_id.clone(),
-            hold_key: ResponseId::new(intent.hold_key),
+            call_id: ResponseId::new(intent.hold_key),
+            source_turn_index: i as u64,
+            source_response_id: ResponseId::new(format!("resp_{i}")),
             terms: terms(),
             credential: &credential,
-            now_ms: 1_000 + i as u64 * 500,
+            now_ms,
+            expires_at_ms: now_ms + 30_000,
         };
-        let outcome = shadow_on(addr, ledger.clone())
-            .classify(
-                call,
-                &items(),
-                Objective::Unknown,
-                Vec::new(),
-                &pool.admitted(),
-            )
-            .await;
+        let shadow = shadow_on(addr, ledger.clone());
+        let projection = shadow.projection(&capture(), &[], &[]).expect("it fits");
+        let prepared = shadow
+            .prepare(call, &projection, Some(&[frontier()]))
+            .expect("prepared");
+        let record = shadow.execute(prepared, never()).await;
         assert_eq!(up.count(), 1, "{} must reach its upstream", intent.hold_key);
         assert_eq!(
-            measured(&outcome),
+            measured(&record),
             (
-                SystemOneUsage {
+                EvaluationUsage {
                     input_tokens: intent.input_tokens,
                     output_tokens: intent.output_tokens,
                 },

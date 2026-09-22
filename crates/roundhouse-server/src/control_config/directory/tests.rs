@@ -1929,7 +1929,6 @@ async fn a_membership_naming_nothing_is_refused_before_anything_compiles() {
 /// [`tokio::time::timeout`], and it is a *bound* on a stall rather than an
 /// ordering device — a test that stalls fails in a second instead of hanging
 /// the suite, which is what this repo's bounded-run rule wants of a lock test.
-
 /// M16.0 review, F1: a stale `expected_version` reaches
 /// the production store's own compare-and-set through the double, not a
 /// hand-rolled copy of it.

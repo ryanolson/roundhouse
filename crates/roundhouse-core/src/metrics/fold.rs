@@ -3,12 +3,20 @@
 
 //! Events in, counters out.
 //!
-//! The half of the metrics projection that touches no money. It answers "how
-//! many tokens went where", and deliberately stops there: prices are
-//! configuration and they change, so folding dollars in here would freeze
-//! whatever rate card happened to be loaded when a turn ran and a corrected
-//! price would require replaying every session. Tokens are facts, so tokens
-//! are what is accumulated. [`super::snapshot`] applies the rate card.
+//! The half of the metrics projection that prices no serving traffic. It
+//! answers "how many tokens went where", and deliberately stops there: prices
+//! are configuration and they change, so folding serving dollars in here would
+//! freeze whatever rate card happened to be loaded when a turn ran and a
+//! corrected price would require replaying every session. Tokens are facts, so
+//! tokens are what is accumulated. [`super::snapshot`] applies the rate card.
+//!
+//! One kind of dollar does live here, and it is here for the same reason the
+//! rest are not: an evaluation call's amount is a *fact in the log*. The
+//! classifier priced it once, under the rate card its own reservation recorded,
+//! so there is no reporting configuration for a later read to apply and
+//! repricing it from the live catalog would make the ledger and the log
+//! disagree about a finished call. Those amounts are folded in
+//! [`super::evaluation`], on their own axis, and reach no serving counter here.
 //!
 //! The seam between the two is one method — [`MetricsFold::view`] — and the
 //! [`ScopeView`] it hands back, which is itself the argument that it is a real
@@ -34,6 +42,7 @@ use crate::event::{
 };
 use crate::ids::{ResponseId, SessionId, TurnId};
 use crate::metrics::cache_evidence::CacheEvidence;
+use crate::metrics::evaluation::{EvaluationCounters, EvaluationFold};
 use crate::metrics::pricing::TokenShape;
 use crate::metrics::{ModelKey, ServingMode};
 use crate::routing::PooledUsage;
@@ -526,7 +535,7 @@ impl Scope<'_> {
     /// [`MetricsFold::by_principal`]. A second spelling is how a project's
     /// tokens and a project's turns come to be summed over two different sets
     /// of principals.
-    fn collects(&self, key: &PrincipalKey) -> bool {
+    pub(super) fn collects(&self, key: &PrincipalKey) -> bool {
         match self {
             Scope::Deployment => true,
             Scope::Principal(scope) => key == *scope,
@@ -642,6 +651,12 @@ pub struct MetricsFold {
     /// decision, and the only honest one — the judge's — would attribute the
     /// arm comparison to whichever model happened to be answering.
     validations: BTreeMap<PrincipalKey, BTreeMap<Arm, ValidationTally>>,
+    /// Classifier evaluation spend, on its own axis and beside the token
+    /// counters for [`Self::validations`]' reason: it is keyed by the
+    /// *evaluation* model, priced by an authority this module does not hold,
+    /// and must never reach a serving row. See [`super::evaluation`], which
+    /// documents its own retention.
+    evaluation: EvaluationFold,
 }
 
 /// The volume figures a snapshot carries that are not per-model.
@@ -1078,6 +1093,24 @@ impl MetricsFold {
                     }
                 }
             }
+            // **Evaluation spend is folded on its own axis and never onto a
+            // model row.** The dashboard's money columns pair a dispatch with
+            // the terminal event that priced it, and an evaluation call pairs
+            // with neither — it has its own ledger, its own ceiling and its own
+            // settlement identity. Adding its dollars to a row here would put a
+            // number the serving rate card never produced into the column the
+            // savings claim is computed from. The payer is the session's, from
+            // its `SessionCreated` above, and never anything the classifier
+            // record carries.
+            SessionEventKind::ClassificationRequested { record } => {
+                self.evaluation.requested(&event.session_id, &payer, record);
+            }
+            SessionEventKind::ClassificationRecorded { record } => {
+                self.evaluation.recorded(&event.session_id, &payer, record);
+            }
+            SessionEventKind::ClassificationSettlementRepaired { record } => {
+                self.evaluation.repaired(&event.session_id, &payer, record);
+            }
             SessionEventKind::SessionCreated { .. }
             | SessionEventKind::ItemAppended { .. }
             | SessionEventKind::OutputTextDelta { .. }
@@ -1242,6 +1275,17 @@ impl MetricsFold {
             }
         }
         total
+    }
+
+    /// What classifier evaluation came to, in one scope.
+    ///
+    /// Scoped through the same [`Scope`] the money view uses, for
+    /// [`Self::validation_tally`]'s reason. Separate from [`Self::view`] rather
+    /// than a field on [`ScopeView`]: an evaluation call has no model row to
+    /// belong to, and handing it back beside rows it must never be summed into
+    /// is how the two would eventually be summed.
+    pub(super) fn evaluation(&self, scope: Scope<'_>) -> EvaluationCounters {
+        self.evaluation.tally(scope)
     }
 
     /// Side calls made and abandoned, in one scope.

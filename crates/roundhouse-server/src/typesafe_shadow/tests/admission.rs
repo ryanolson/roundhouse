@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use roundhouse_core::control::PresentedCredential;
 
 /// Opt-in, and the type is what enforces it.
 #[test]
@@ -9,7 +10,7 @@ fn a_shadow_config_is_disabled_until_a_deployment_says_otherwise() {
     assert!(
         !config().is_enabled(),
         "a deployment that named a model and a rate card has still not agreed \
-         to send anybody's transcript to a third party"
+         to send anybody's prompt to a third party"
     );
     assert!(config().enable().is_enabled());
 }
@@ -20,19 +21,15 @@ async fn a_disabled_shadow_makes_no_call() {
     let (addr, up) = upstream(ANSWER).await;
     let ledger = RecordingLedger::granting(1_000.0);
     let credential = credential();
-    let pool = Pool::of(vec![frontier()]);
 
-    let outcome = shadow(addr, config(), ledger.clone())
-        .classify(
-            call(&credential),
-            &items(),
-            Objective::Unknown,
-            Vec::new(),
-            &pool.admitted(),
-        )
-        .await;
+    let outcome = classify(
+        &shadow(addr, config(), ledger.clone()),
+        &credential,
+        Some(&[frontier()]),
+    )
+    .await;
 
-    assert_eq!(outcome, ShadowOutcome::NotRun(NotRun::Disabled));
+    assert_eq!(outcome.err(), Some(NotRun::Disabled));
     assert_eq!(up.count(), 0);
     assert!(
         ledger.settled().is_empty(),
@@ -40,26 +37,22 @@ async fn a_disabled_shadow_makes_no_call() {
     );
 }
 
-/// A session with no admitted frontier target has no third party its content
-/// is already permitted to reach, so it makes zero calls.
+/// A session whose policy admitted no frontier target has no third party its
+/// content is already permitted to reach, so it makes zero calls.
 #[tokio::test]
 async fn a_local_only_session_makes_no_call() {
     let (addr, up) = upstream(ANSWER).await;
     let ledger = RecordingLedger::granting(1_000.0);
     let credential = credential();
-    let pool = Pool::of(vec![local()]);
 
-    let outcome = shadow(addr, config().enable(), ledger.clone())
-        .classify(
-            call(&credential),
-            &items(),
-            Objective::Unknown,
-            Vec::new(),
-            &pool.admitted(),
-        )
-        .await;
+    let outcome = classify(
+        &shadow(addr, config().enable(), ledger.clone()),
+        &credential,
+        Some(&[local()]),
+    )
+    .await;
 
-    assert_eq!(outcome, ShadowOutcome::NotRun(NotRun::NoAdmittedFrontier));
+    assert_eq!(outcome.err(), Some(NotRun::NoAdmittedFrontier));
     assert_eq!(
         up.count(),
         0,
@@ -68,125 +61,85 @@ async fn a_local_only_session_makes_no_call() {
     assert!(ledger.settled().is_empty());
 }
 
-/// Four ways admission removes the frontier while the pool still holds one.
+/// **A decision with no admission evidence cannot grant permission.**
 ///
-/// This is the case the design turns on, and a catalog- or pool-level check
-/// would pass every one of them: the frontier candidate is present throughout,
-/// and only `RoutingContext::admissible` knows it is unreachable this turn.
-/// The allow filter and the quality floor are reachability; the cadence and the
-/// budget are this-turn axes. All four must make zero calls.
+/// A policy outside the builtin set can assemble its own `Decision` and leave
+/// `admitted` as `None` — the routing snapshot records that as unknown rather
+/// than as a nearest fit. Resolving admission here instead would ask a
+/// *different* question, with a guessed load ceiling and without the overflow
+/// valve, and then record its answer as this decision's consent to send a
+/// tenant's prompt to a third party.
 #[tokio::test]
-async fn a_frontier_target_admission_removes_makes_no_call() {
-    let cases: Vec<(&str, Pool)> = vec![
-        (
-            "an allow filter that names only the local model",
-            Pool::of(vec![local(), frontier()]).under(TurnPolicy {
-                allow: TargetFilter::parse(["local/*"]).expect("a filter"),
-                ..TurnPolicy::unrestricted()
-            }),
-        ),
-        (
-            "a quality floor above the frontier candidate's prior",
-            Pool::of(vec![local(), high_quality_local(), dim_frontier()]).under(TurnPolicy {
-                min_quality: 0.7,
-                ..TurnPolicy::unrestricted()
-            }),
-        ),
-        (
-            // Written spent rather than spent for real: `FrontierHistory::record`
-            // is crate-private because the only truthful producer is the session
-            // projection. This is the admitted set a used-up ration leaves, and
-            // it is how `routing/stage.rs` expresses the same state.
-            "a cadence with no frontier dispatches left",
-            Pool::of(vec![local(), frontier()]).under(TurnPolicy {
-                frontier_cadence: Some(FrontierCadence {
-                    max_frontier: 0,
-                    per_turns: 10,
-                }),
-                ..TurnPolicy::unrestricted()
-            }),
-        ),
-        (
-            "a budget ceiling the frontier candidate does not fit under",
-            Pool::of(vec![local(), frontier()]).with_budget(TurnBudget::Granted {
-                ceiling_usd: 0.005,
-                state: BudgetState::Exhausted,
-                // Overflow disarmed, or the valve re-admits the very candidate
-                // the ceiling excluded and the test measures the valve instead.
-                on_exhaustion: Exhaustion::DegradeToLocal {
-                    overflow_when_local_saturated: false,
-                },
-            }),
-        ),
-    ];
+async fn a_decision_without_admission_evidence_makes_no_call() {
+    let (addr, up) = upstream(ANSWER).await;
+    let ledger = RecordingLedger::granting(1_000.0);
+    let credential = credential();
 
-    for (why, pool) in cases {
-        let admitted = pool.admitted();
-        // The control that makes each case about *admission*: the pool really
-        // does still carry a frontier target, so a check over the catalog or
-        // the candidate list would have called.
-        assert!(
-            pool.candidates
-                .iter()
-                .any(|candidate| !candidate.target.is_local()),
-            "{why}: the fixture must still contain a frontier candidate"
-        );
-        assert!(
-            admitted
-                .pool()
-                .iter()
-                .all(|candidate| candidate.target.is_local()),
-            "{why}: admission was expected to remove it"
-        );
+    let outcome = classify(
+        &shadow(addr, config().enable(), ledger.clone()),
+        &credential,
+        None,
+    )
+    .await;
 
-        let (addr, up) = upstream(ANSWER).await;
-        let ledger = RecordingLedger::granting(1_000.0);
-        let credential = credential();
-        let outcome = shadow(addr, config().enable(), ledger.clone())
-            .classify(
-                call(&credential),
-                &items(),
-                Objective::Unknown,
-                Vec::new(),
-                &admitted,
-            )
-            .await;
-
-        assert_eq!(
-            outcome,
-            ShadowOutcome::NotRun(NotRun::NoAdmittedFrontier),
-            "{why}"
-        );
-        assert_eq!(up.count(), 0, "{why}");
-        assert!(
-            ledger.requested().is_empty(),
-            "{why}: and no hold was opened"
-        );
-    }
+    assert_eq!(outcome.err(), Some(NotRun::AdmissionUnknown));
+    assert_eq!(up.count(), 0, "silence is not consent");
+    assert!(
+        ledger.requested().is_empty(),
+        "and no hold was opened for it"
+    );
 }
 
-/// The control for the refusals above: an enabled deployment with an
-/// admitted frontier target does call, so none is passing by never calling.
+/// An empty admitted pool is the same refusal as a local-only one: admission
+/// left nothing, so nothing is permitted.
+#[tokio::test]
+async fn an_empty_admitted_pool_makes_no_call() {
+    let (addr, up) = upstream(ANSWER).await;
+    let ledger = RecordingLedger::granting(1_000.0);
+    let credential = credential();
+
+    let outcome = classify(
+        &shadow(addr, config().enable(), ledger.clone()),
+        &credential,
+        Some(&[]),
+    )
+    .await;
+
+    assert_eq!(outcome.err(), Some(NotRun::NoAdmittedFrontier));
+    assert_eq!(up.count(), 0);
+}
+
+/// The control for the refusals above: an enabled deployment whose policy
+/// admitted a frontier target does call, so none is passing by never calling.
 #[tokio::test]
 async fn an_enabled_shadow_with_an_admitted_frontier_target_calls() {
     let (addr, up) = upstream(ANSWER).await;
     let ledger = RecordingLedger::granting(1_000.0);
     let credential = credential();
-    let pool = Pool::of(vec![local(), frontier()]);
 
-    let outcome = shadow(addr, config().enable(), ledger.clone())
-        .classify(
-            call(&credential),
-            &items(),
-            Objective::Unknown,
-            Vec::new(),
-            &pool.admitted(),
-        )
-        .await;
+    let record = classify(
+        &shadow(addr, config().enable(), ledger.clone()),
+        &credential,
+        Some(&[local(), frontier()]),
+    )
+    .await
+    .expect("prepared");
 
-    assert!(
-        matches!(&outcome, ShadowOutcome::Answered { answer, .. } if answer.choice == "capable"),
-        "{outcome:?}"
+    let classification = record
+        .outcome
+        .classification()
+        .expect("a complete answer set");
+    assert_eq!(
+        classification.intent.value,
+        roundhouse_core::classify::TurnIntent::Implement
+    );
+    assert_eq!(
+        classification.complexity.value,
+        roundhouse_core::classify::TurnComplexity::Involved
+    );
+    assert_eq!(
+        classification.context_dependence.value,
+        roundhouse_core::classify::ContextDependence::Recent
     );
     assert_eq!(up.count(), 1);
 }
@@ -218,22 +171,19 @@ async fn a_credential_this_module_may_not_spend_takes_no_hold() {
     ] {
         let (addr, up) = upstream(ANSWER).await;
         let ledger = RecordingLedger::granting(1_000.0);
-        let pool = Pool::of(vec![frontier()]);
 
-        let outcome = shadow(addr, config().enable(), ledger.clone())
-            .classify(
-                call(&credential),
-                &items(),
-                Objective::Unknown,
-                Vec::new(),
-                &pool.admitted(),
-            )
-            .await;
+        let outcome = classify(
+            &shadow(addr, config().enable(), ledger.clone()),
+            &credential,
+            Some(&[frontier()]),
+        )
+        .await;
 
         assert!(
-            matches!(outcome, ShadowOutcome::NotRun(NotRun::Refused(_))),
+            matches!(outcome.as_ref().err(), Some(NotRun::Refused(_))),
             "{why}: an ineligible credential is a refusal, not a failed call: \
-             {outcome:?}"
+             {:?}",
+            outcome.err()
         );
         assert_eq!(up.count(), 0, "{why}");
         assert!(

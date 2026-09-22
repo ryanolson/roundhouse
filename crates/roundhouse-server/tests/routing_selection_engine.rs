@@ -364,7 +364,8 @@ fn ask() -> Vec<Item> {
 fn selection_of(decision: &DecisionRecord) -> SelectionSnapshot {
     decision
         .selection
-        .clone()
+        .as_deref()
+        .cloned()
         .expect("every routing event this engine writes carries one")
 }
 
@@ -860,7 +861,7 @@ async fn a_later_turn_under_a_changed_recipe_leaves_the_earlier_record_alone() {
             .last_decision()
             .expect("two turns were routed")
             .selection
-            .as_ref(),
+            .as_deref(),
         Some(&second),
         "the fold's last decision carries the last turn's snapshot, not a \
          merge of the two"
@@ -888,7 +889,7 @@ async fn a_later_turn_under_a_changed_recipe_leaves_the_earlier_record_alone() {
             .last_decision()
             .expect("the first turn was routed")
             .selection
-            .as_ref(),
+            .as_deref(),
         Some(&first),
         "a successor that picked this session up between the two turns reads \
          the first turn's recipe and features, unchanged by what came after"

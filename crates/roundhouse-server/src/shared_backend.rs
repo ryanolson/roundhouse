@@ -52,7 +52,7 @@ use roundhouse_core::control::{
 use roundhouse_core::store::MemoryStore;
 use roundhouse_store_redis::{
     EmptyNamespace, KeyNamespace, RedisCorrelationMaps, RedisDocumentStore, RedisFairUseLedger,
-    RedisSessionStore, RedisSpendLedger,
+    RedisSessionStore, RedisSpendLedger, SpendPurpose,
 };
 
 use crate::Conversations;
@@ -173,6 +173,16 @@ pub enum Backends {
         url: String,
         store: Arc<RedisSessionStore>,
         spend: Arc<dyn SpendLedger>,
+        /// The sixth family: what this deployment's own evaluation calls spend.
+        ///
+        /// **A separate ledger, not a separate ceiling on the same one.** A
+        /// classification is this deployment's work rather than the turn's, and
+        /// the two must not be able to exhaust each other: an evaluation budget
+        /// spent down would otherwise start refusing turns, and a busy month of
+        /// serving would silently stop classification. Chosen by the same one
+        /// switch as the other five — there is no second backend policy — and
+        /// keyed under the namespace beside theirs.
+        evaluation_spend: Arc<dyn SpendLedger>,
         fair_use: Arc<dyn FairUseLedger>,
         conversations: Arc<Conversations>,
         /// The opaque document the admin directory is stored as (M16.1,
@@ -187,6 +197,7 @@ pub enum Backends {
     PerProcess {
         store: Arc<MemoryStore>,
         spend: Arc<dyn SpendLedger>,
+        evaluation_spend: Arc<dyn SpendLedger>,
         fair_use: Arc<dyn FairUseLedger>,
         conversations: Arc<Conversations>,
         directory: Arc<dyn DocumentStore>,
@@ -194,6 +205,21 @@ pub enum Backends {
 }
 
 impl Backends {
+    /// What this deployment's own evaluation calls spend, whichever arm this is.
+    ///
+    /// See [`fair_use`](Self::fair_use) for why this is an accessor, and the
+    /// field for why it is a different ledger rather than a different key on the
+    /// serving one.
+    pub fn evaluation_spend(&self) -> &Arc<dyn SpendLedger> {
+        match self {
+            Backends::Shared {
+                evaluation_spend, ..
+            }
+            | Backends::PerProcess {
+                evaluation_spend, ..
+            } => evaluation_spend,
+        }
+    }
     /// The fair-use ledger, whichever arm this is.
     ///
     /// An accessor for the families whose *type* is the same in both arms, so
@@ -281,6 +307,20 @@ pub async fn open(redis_url: Option<&str>, namespace: &KeyNamespace) -> anyhow::
                 .with_context(|| {
                     format!("opening the spend ledger in the Redis named by {REDIS_VAR}")
                 })?;
+            // The sixth family, in **this deployment's own namespace** with its
+            // own keys inside it (`SpendPurpose::Evaluation`). Deriving a
+            // namespace instead — `tenant` giving `tenant-eval` — made one
+            // deployment's evaluation ledger the same keys as a second
+            // deployment legitimately named `tenant-eval`, which is a collision
+            // between tenants and not merely an awkward name.
+            let evaluation_spend =
+                RedisSpendLedger::connect_for(url, namespace.clone(), SpendPurpose::Evaluation)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "opening the evaluation spend ledger in the Redis named by {REDIS_VAR}"
+                        )
+                    })?;
             // The fifth family (M16.1, R-D8), in the same match as the other
             // four and for the reason the module doc gives about the first
             // four: a deployment whose sessions, spend, ceilings and threads
@@ -314,6 +354,7 @@ pub async fn open(redis_url: Option<&str>, namespace: &KeyNamespace) -> anyhow::
                 url: url.to_string(),
                 store: Arc::new(store),
                 spend: Arc::new(spend),
+                evaluation_spend: Arc::new(evaluation_spend),
                 fair_use: Arc::new(fair_use),
                 conversations: Arc::new(Conversations::over(Arc::new(maps))),
                 directory: Arc::new(directory),
@@ -333,6 +374,10 @@ pub async fn open(redis_url: Option<&str>, namespace: &KeyNamespace) -> anyhow::
             Ok(Backends::PerProcess {
                 store: Arc::new(MemoryStore::new()),
                 spend: Arc::new(MemorySpendLedger::new()),
+                // A second instance, not a second handle on the first: two
+                // `Arc`s of one ledger would share its counter and let a
+                // classification spend a project's serving budget.
+                evaluation_spend: Arc::new(MemorySpendLedger::new()),
                 fair_use: Arc::new(MemoryFairUseLedger::new()),
                 conversations: Arc::new(Conversations::new()),
                 directory: Arc::new(MemoryDocumentStore::new()),
@@ -363,6 +408,52 @@ mod tests {
             }
         );
         assert_eq!(shared_backend(None), SharedBackend::PerProcess);
+    }
+
+    /// **The evaluation ledger shares the deployment's namespace and not its
+    /// keys.**
+    ///
+    /// The first draft derived `<ns>-eval`, which made deployment `tenant`'s
+    /// evaluation ledger identical to deployment `tenant-eval`'s *serving*
+    /// ledger — two tenants on one counter, and the only symptom would have been
+    /// one of them refusing turns it had budget for. This asserts the fix in the
+    /// shape the collision had: the two deployments' four key spaces are
+    /// pairwise distinct, and the serving keys are unchanged.
+    #[test]
+    fn two_deployments_named_tenant_and_tenant_eval_share_no_spend_keys() {
+        use roundhouse_core::control::ProjectId;
+        use roundhouse_store_redis::spend::{account_key_for_test, holds_key_for_test};
+
+        let project = ProjectId::new("proj_shared");
+        let tenant = KeyNamespace::new("tenant").expect("a legal namespace");
+        let tenant_eval = KeyNamespace::new("tenant-eval").expect("also a legal namespace");
+
+        let keys = |namespace: &KeyNamespace, purpose| {
+            [
+                account_key_for_test(namespace, purpose, &project),
+                holds_key_for_test(namespace, purpose, &project),
+            ]
+        };
+        let tenant_serving = keys(&tenant, SpendPurpose::Serving);
+        let tenant_evaluation = keys(&tenant, SpendPurpose::Evaluation);
+        let sibling_serving = keys(&tenant_eval, SpendPurpose::Serving);
+
+        for evaluation in &tenant_evaluation {
+            assert!(
+                !sibling_serving.contains(evaluation),
+                "`tenant`'s evaluation ledger must not write `tenant-eval`'s \
+                 serving keys: {evaluation}"
+            );
+            assert!(!tenant_serving.contains(evaluation));
+        }
+        // The serving keys are byte-identical to what this crate wrote before
+        // the purpose existed, so no deployment's committed spend moves.
+        assert_eq!(tenant_serving[0], "tenant:v1:spend:{proj_shared}:account");
+        assert_eq!(
+            tenant_evaluation[0], "tenant:v1:spend:{proj_shared}:eval:account",
+            "and the hash tag stays first, or one project's keys stop sharing a \
+             Cluster slot and the check-and-debit script stops being atomic"
+        );
     }
 
     /// **M14.2, R-S3: absent means the default, set-but-empty is refused.**

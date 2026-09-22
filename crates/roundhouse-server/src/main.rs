@@ -64,10 +64,11 @@ use roundhouse_mcp::ControlStore;
 use roundhouse_server::catalog_config::{BUILT_IN_OPENAI, ProviderConfig};
 use roundhouse_server::control_config::crosscheck::CrossChecks;
 use roundhouse_server::{
-    Backends, ControlDirectory, ControlPlane, ControlPlaneReads, Conversations, DirectoryError,
-    EchoLocalExecutor, Engine, EngineConfig, FleetJudge, JudgeConfig, REDIS_NAMESPACE_VAR,
-    REDIS_VAR, admin_api, catalog_config, control_config, http, mcp_api, messages_api, metrics_api,
-    relay_api, resolve_namespace, responses_api, shared_backend,
+    Backends, CLASSIFY_VAR, ClassifyConfig, ControlDirectory, ControlPlane, ControlPlaneReads,
+    Conversations, DirectoryError, EchoLocalExecutor, Engine, EngineConfig, FleetJudge,
+    JudgeConfig, REDIS_NAMESPACE_VAR, REDIS_VAR, admin_api, catalog_config, classify_config,
+    classify_runtime, control_config, http, mcp_api, messages_api, metrics_api, relay_api,
+    resolve_namespace, responses_api, shared_backend,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -645,6 +646,33 @@ async fn main() -> anyhow::Result<()> {
     // Resolve both sides of the local/hosted latency comparison from this catalog.
     let engine_config = catalog_config::engine_config(config.as_ref());
 
+    // Background turn classification, off unless a file says otherwise. Read
+    // beside the catalog and the control plane because it is the same kind of
+    // decision and fails the same way: a file that is named and unreadable stops
+    // the process rather than starting one that classifies nothing and says so
+    // nowhere. An *absent* variable is the shipped state and logs one line.
+    let classify = classify_config::from_env()?;
+    match &classify {
+        Some((path, config)) if config.enabled => tracing::info!(
+            path = %path,
+            model = %config.model,
+            revision = config.revision,
+            "turn classification is enabled; bounded prior metadata and the current \
+             prompt of sessions with an admitted frontier target are sent to the \
+             configured classifier, on a separate evaluation budget"
+        ),
+        Some((path, _)) => tracing::info!(
+            path = %path,
+            "a turn-classification configuration is present and not enabled; no turn \
+             content leaves this deployment"
+        ),
+        None => tracing::info!(
+            var = CLASSIFY_VAR,
+            "no turn classification configured; no turn content leaves this deployment \
+             for a classifier"
+        ),
+    }
+
     // The registry, built here rather than inside `serve` because it is the
     // third boot cross-check and boot checks belong together: an operator
     // reading this log sees the catalog load, the providers resolve, and the
@@ -831,6 +859,7 @@ async fn main() -> anyhow::Result<()> {
         Backends::Shared {
             store,
             spend,
+            evaluation_spend,
             fair_use,
             conversations,
             ..
@@ -838,6 +867,7 @@ async fn main() -> anyhow::Result<()> {
             serve(
                 store,
                 spend,
+                evaluation_spend,
                 fair_use,
                 conversations,
                 Arc::clone(&directory),
@@ -847,6 +877,7 @@ async fn main() -> anyhow::Result<()> {
                 reachable,
                 metrics_config,
                 engine_config,
+                classify,
                 listener,
             )
             .await
@@ -854,6 +885,7 @@ async fn main() -> anyhow::Result<()> {
         Backends::PerProcess {
             store,
             spend,
+            evaluation_spend,
             fair_use,
             conversations,
             ..
@@ -861,6 +893,7 @@ async fn main() -> anyhow::Result<()> {
             serve(
                 store,
                 spend,
+                evaluation_spend,
                 fair_use,
                 conversations,
                 Arc::clone(&directory),
@@ -870,6 +903,7 @@ async fn main() -> anyhow::Result<()> {
                 reachable,
                 metrics_config,
                 engine_config,
+                classify,
                 listener,
             )
             .await
@@ -906,6 +940,7 @@ async fn main() -> anyhow::Result<()> {
 async fn serve<S: SessionStore>(
     store: Arc<S>,
     spend: Arc<dyn SpendLedger>,
+    evaluation_spend: Arc<dyn SpendLedger>,
     fair_use: Arc<dyn FairUseLedger>,
     conversations: Arc<Conversations>,
     directory: Arc<ControlDirectory>,
@@ -915,6 +950,7 @@ async fn serve<S: SessionStore>(
     reachable: Vec<Candidate>,
     metrics_config: Arc<MetricsConfig>,
     engine_config: EngineConfig,
+    classify: Option<(String, ClassifyConfig)>,
     listener: tokio::net::TcpListener,
 ) -> anyhow::Result<()> {
     let control = Arc::new(ControlStore::new());
@@ -1001,6 +1037,31 @@ async fn serve<S: SessionStore>(
     // the same decision.
     .with_fair_use_ledger(fair_use)
     .with_control_store(Arc::clone(&control));
+
+    // Background classification, over the *evaluation* ledger and never the
+    // serving one. The decision of whether there is a runtime at all is
+    // `classify_runtime::compose`'s, in the library, for the reason
+    // `shared_backend::open` gives about wiring inside a `[[bin]]`: this site
+    // wires what it returns and re-derives no part of the choice.
+    //
+    // The supervisor is this deployment's classification lifetime, held for the
+    // life of `serve`. Dropping it is what ends the runtime: the sweep stops,
+    // admission closes, and any worker still on the wire is cancelled. Nothing
+    // here calls it — serving can end at more than one place, and a guarantee
+    // spelled as a call is one that can be forgotten at the others.
+    let mut _classification_supervisor = None;
+    if let Some((path, config)) = &classify
+        && let Some(runtime) = classify_runtime::compose(
+            path,
+            config,
+            Arc::clone(&evaluation_spend),
+            ByteTokenizer,
+            &process_env,
+        )?
+    {
+        _classification_supervisor = Some(runtime.supervise());
+        engine = engine.with_classifier(runtime);
+    }
 
     // The validator is installed only where there is a judge to install it
     // around, and the boot check above has already refused the configuration

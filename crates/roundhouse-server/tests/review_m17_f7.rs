@@ -242,7 +242,7 @@ async fn a_namespaced_tool_call_on_the_messages_surface_does_not_fork() {
     // the finding names, and it must not be stored.
     let stored_first = store
         .read_events(
-            &roundhouse_core::ids::SessionId::new(&named(session)),
+            &roundhouse_core::ids::SessionId::new(named(session)),
             0,
             1024,
         )

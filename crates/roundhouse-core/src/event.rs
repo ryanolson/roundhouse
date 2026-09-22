@@ -12,6 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::classify::{ClassificationIntent, ClassificationRecord, ClassificationSettlementRepair};
 use crate::control::Principal;
 use crate::ids::{ResponseId, SessionId, SideCallId, TurnId, ValidationId};
 use crate::item::Item;
@@ -494,6 +495,45 @@ pub enum SessionEventKind {
         arm: Arm,
         outcome: ValidationOutcome,
     },
+    /// A classifier call this deployment has committed to making.
+    ///
+    /// **Written before any HTTP, and never replayed into a second call.** The
+    /// intent is what makes a crash mid-call recoverable as *knowledge* rather
+    /// than as silence: a successor folding this log finds an intent with no
+    /// result and records that the answer, and its cost, are unknown. Buying the
+    /// answer again would be a second charge for a question already paid for.
+    ///
+    /// Carries no `response_id` on purpose, like the three validate-loop kinds:
+    /// nobody asked for this call, it emits no item, and a client's stream must
+    /// not carry this deployment's own bookkeeping.
+    ClassificationRequested {
+        record: ClassificationIntent,
+    },
+    /// What a classifier call produced, delivered by a later turn's writer.
+    ///
+    /// **The sequence this lands at is the availability time.** A classification
+    /// of turn 3 that arrives during turn 9 becomes a feature at turn 9 and can
+    /// never reach turn 5's decision record, which is what stops a late answer
+    /// being backdated into evidence that was frozen before it existed.
+    ClassificationRecorded {
+        record: ClassificationRecord,
+    },
+    /// An evaluation settlement nobody had confirmed, resolved against the
+    /// ledger.
+    ///
+    /// **The event that makes a lost acknowledgement recoverable rather than
+    /// permanent.** A classifier call whose settle failed leaves a result
+    /// saying the charge is unconfirmed and a hold that will lapse; without
+    /// this, every replay of that log reaches the same conclusion forever and
+    /// the money is simply gone. With it, a successor re-drives the exact
+    /// settlement the log describes and records that it got an answer.
+    ///
+    /// **It resolves, it does not re-classify.** The [`ClassificationRecord`]
+    /// it names is untouched, no new classification becomes available, and no
+    /// decision's features move — see [`ClassificationSettlementRepair`].
+    ClassificationSettlementRepaired {
+        record: ClassificationSettlementRepair,
+    },
     Error {
         message: String,
     },
@@ -778,6 +818,15 @@ impl SessionEvent {
             | SessionEventKind::SideCallCompleted { .. }
             | SessionEventKind::SideCallAbandoned { .. }
             | SessionEventKind::ValidationDecided { .. }
+            // The three classification kinds answer `None` for the same reason
+            // the three above them do, and with one extra: a classification is
+            // *about* a turn that has already terminated, so claiming its
+            // response id would reopen a finished stream on every surface. A
+            // repair is further out still — it is about this deployment's
+            // accounting rather than about any turn.
+            | SessionEventKind::ClassificationRequested { .. }
+            | SessionEventKind::ClassificationRecorded { .. }
+            | SessionEventKind::ClassificationSettlementRepaired { .. }
             | SessionEventKind::Error { .. } => None,
         }
     }

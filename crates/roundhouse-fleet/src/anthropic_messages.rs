@@ -441,7 +441,7 @@ impl AnthropicMessagesClient {
         // below.** With two free slots this request marks the penultimate block
         // *and* the block the previous request to this target marked; with one,
         // the penultimate marker takes it; with none, neither is sent.
-        let breakpoint = match riding + 1 <= MAX_CACHE_BREAKPOINTS {
+        let breakpoint = match riding < MAX_CACHE_BREAKPOINTS {
             true => segments.len().checked_sub(2),
             false => None,
         };

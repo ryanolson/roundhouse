@@ -126,7 +126,7 @@ async fn local_candidate(config: &CatalogConfig) -> Candidate {
             &session_id,
             TurnId::new("t1"),
             TurnInput {
-                items: vec![Item::user_text(&"cache affinity ".repeat(200))],
+                items: vec![Item::user_text("cache affinity ".repeat(200))],
                 declared_baseline: None,
                 output_token_cap: None,
                 tools: None,

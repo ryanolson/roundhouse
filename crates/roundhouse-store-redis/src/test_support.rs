@@ -68,7 +68,11 @@ pub fn log_key(session_id: &SessionId) -> String {
 /// the key format it pins is already pinned by
 /// `the_project_and_member_keys_share_one_hash_tag` beside the real functions.
 pub fn spend_holds_key(project: &ProjectId) -> String {
-    spend_holds_key_impl(&default_namespace(), project)
+    spend_holds_key_impl(
+        &default_namespace(),
+        crate::spend::SpendPurpose::Serving,
+        project,
+    )
 }
 
 /// The two raw hashes one draw touches, for the tests that assert on the

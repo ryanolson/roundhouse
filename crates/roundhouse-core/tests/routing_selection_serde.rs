@@ -11,7 +11,9 @@
 //! reader that had to recompute any of them would be reading the configuration
 //! of whatever build is doing the reading.
 
+use roundhouse_core::classify::{ClassificationRef, ClassificationWindow};
 use roundhouse_core::control::{Billing, BudgetState, Payer};
+use roundhouse_core::ids::ResponseId;
 use roundhouse_core::routing::{
     AffinityEvidence, Candidate, Decision, DecisionRecord, DecisionSource, LocalFeatures, Pick,
     PickerMode, SelectionSnapshot, SelectorBranch, SelectorSnapshot, StageEvidence, StageOutcome,
@@ -71,6 +73,24 @@ fn snapshot() -> SelectionSnapshot {
         source: Some(DecisionSource::CostGuard),
         admitted: Some(vec![hosted("sol"), hosted("luna"), hosted("terra")]),
         selector: Some(stage_snapshot()),
+        classifications: Some(ClassificationWindow {
+            revision: 1,
+            cutoff_seq: 37,
+            window: 2,
+            available: 5,
+            named: vec![
+                ClassificationRef {
+                    call_id: ResponseId::new("eval_a"),
+                    source_turn_index: 2,
+                    available_seq: 31,
+                },
+                ClassificationRef {
+                    call_id: ResponseId::new("eval_b"),
+                    source_turn_index: 4,
+                    available_seq: 36,
+                },
+            ],
+        }),
     }
 }
 
@@ -95,7 +115,7 @@ fn record(selection: Option<SelectionSnapshot>) -> DecisionRecord {
         declared_baseline: None,
         attempts: Vec::new(),
         local_quote_skipped: None,
-        selection,
+        selection: selection.map(Box::new),
     }
 }
 
@@ -124,6 +144,69 @@ fn a_record_without_a_selection_deserializes_as_unknown() {
          record older than the field, and a default-constructed one would be \
          indistinguishable from a first turn with no tool traffic"
     );
+}
+
+/// **The claim.** A snapshot written before background classification existed
+/// reads back naming no classifications, and one that names some writes them.
+///
+/// The one field this type has gained since the snapshot shipped, and the
+/// `skip_serializing_if` on it means an empty vector is *no bytes* — so a
+/// round trip of an empty one would pass on a build that had dropped the field
+/// entirely. The non-empty case is the one that pins it.
+#[test]
+fn classification_references_survive_a_round_trip_and_an_absent_one_reads_empty() {
+    let historical = serde_json::json!({
+        "features": {
+            "extractor_revision": 1,
+            "dialect": "claude_messages",
+            "signals": serde_json::to_value(features().signals).expect("signals serialize"),
+            "turn_index": 5,
+            "observed_through_seq": 37,
+        },
+        "selected": { "kind": "frontier", "provider": "openai", "model": "sol" },
+    });
+    let decoded: SelectionSnapshot =
+        serde_json::from_value(historical).expect("a pre-classification snapshot still reads");
+    assert!(
+        decoded.classifications.is_none(),
+        "a snapshot older than the field names no window at all, which is not \
+         the same statement as a window that named nothing"
+    );
+
+    // And a snapshot that names two writes two, through the record that
+    // persists it.
+    let original = record(Some(snapshot()));
+    let json = serde_json::to_string(&original).expect("a record serializes");
+    assert!(json.contains("eval_a") && json.contains("eval_b"), "{json}");
+    let round: DecisionRecord = serde_json::from_str(&json).expect("and reads back");
+    let window = round
+        .selection
+        .expect("kept")
+        .classifications
+        .expect("a window");
+    assert_eq!(window.named.len(), 2);
+    assert_eq!(window.named[0].call_id, ResponseId::new("eval_a"));
+    assert_eq!(window.named[0].source_turn_index, 2);
+    assert_eq!(
+        window.named[1].available_seq, 36,
+        "the availability sequence is what makes backdating impossible, so it \
+         is the field a round trip must not lose"
+    );
+    assert_eq!(
+        (window.window, window.available),
+        (2, 5),
+        "and the bound survives beside what it left out: three more had landed, \
+         which a reader of two references could not otherwise know"
+    );
+
+    // Absent still writes no key, which is what keeps a deployment that
+    // classifies nothing writing the bytes it wrote before.
+    let none = SelectionSnapshot {
+        classifications: None,
+        ..snapshot()
+    };
+    let encoded = serde_json::to_value(&none).expect("serializes");
+    assert!(encoded.get("classifications").is_none(), "{encoded}");
 }
 
 /// **The claim.** A record that carries no snapshot writes the bytes it wrote
@@ -245,7 +328,7 @@ fn a_hand_built_decision_records_unknown_evidence() {
         selector: None,
     };
 
-    let selection = SelectionSnapshot::of(&custom, features());
+    let selection = SelectionSnapshot::of(&custom, features(), None);
     assert_eq!(
         selection.admitted, None,
         "unknown, because no `Admitted` resolution produced this decision"
@@ -270,7 +353,7 @@ fn a_hand_built_decision_records_unknown_evidence() {
         selector: Some(stage_snapshot()),
         ..custom
     };
-    let selection = SelectionSnapshot::of(&builtin, features());
+    let selection = SelectionSnapshot::of(&builtin, features(), None);
     assert!(selection.admitted.is_some());
     assert!(selection.selector.is_some());
 }

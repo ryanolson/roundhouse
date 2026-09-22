@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use super::stage::{DecisionSource, Pick, PickerMode, Tier, TurnSignals};
 use super::{Decision, Target};
+use crate::classify::ClassificationWindow;
 use crate::validate::ControlCallDialect;
 
 /// The revision of the local feature extractor whose output [`LocalFeatures`]
@@ -215,12 +216,43 @@ pub struct SelectionSnapshot {
     pub admitted: Option<Vec<Target>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selector: Option<SelectorSnapshot>,
+    /// The background classifications that had landed by this decision's
+    /// cutoff, bounded and named rather than copied.
+    ///
+    /// **References, not labels.** The records themselves are immutable events
+    /// in this same log, so copying their contents here would put a second copy
+    /// beside the first, and reading them back out of mutable history during a
+    /// replay would let a later build re-interpret what an earlier decision saw.
+    ///
+    /// **Bounded, because the unbounded version is quadratic** — see
+    /// [`ClassificationWindow`], which also carries how many were available
+    /// beyond the ones it names, so an omission is a number rather than a
+    /// silence.
+    ///
+    /// **Available, not consumed.** No routing policy shipping today reads a
+    /// classification; this records what a later learner would need in order to
+    /// reconstruct the feature set, and says nothing about the choice that was
+    /// made.
+    ///
+    /// `None` means one of three things and deliberately does not distinguish
+    /// them: no classifier is configured, this deployment never opted in, or the
+    /// record predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classifications: Option<ClassificationWindow>,
 }
 
 impl SelectionSnapshot {
     /// Copy the returned decision evidence alongside captured local features.
-    /// The caller must capture those features before selection.
-    pub fn of(decision: &Decision, features: LocalFeatures) -> Self {
+    ///
+    /// The caller must capture both the features and the classification
+    /// references before selection — a reference gathered afterwards could name
+    /// a result that landed during this very turn, which is exactly the
+    /// backdating [`ClassificationRef::available_seq`] exists to make impossible.
+    pub fn of(
+        decision: &Decision,
+        features: LocalFeatures,
+        classifications: Option<ClassificationWindow>,
+    ) -> Self {
         Self {
             features,
             selected: decision.target.clone(),
@@ -228,6 +260,7 @@ impl SelectionSnapshot {
             source: decision.source,
             admitted: decision.admitted.clone(),
             selector: decision.selector.clone(),
+            classifications,
         }
     }
 }

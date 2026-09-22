@@ -16,11 +16,11 @@
 //! one HTTP call. This does not guarantee identical answers, cost, or latency
 //! compared with separate calls. Only `choice` has a caller here.
 //!
-//! **Nothing in the shipped binary calls this.** Its only consumer is
-//! `roundhouse_server::typesafe_shadow`, which is itself unwired: B2 owns the
-//! durable allocation record that would name a call, and B3 owns the background
-//! execution that would make one. Neither exists, so there is no scheduler and
-//! no strategy selection here to find.
+//! Its one consumer is `roundhouse_server::typesafe_shadow`, which is what
+//! decides whether a call may happen at all, and whose background runtime is
+//! what makes one. **No scheduling, no strategy selection and no routing
+//! decision lives here** — this half serializes a checked request, sends it
+//! once, and validates what comes back.
 //!
 //! ## This is the low-level half, deliberately
 //!
@@ -64,10 +64,11 @@
 //! ## One shot
 //!
 //! The docs advise retrying 429 and 529 with backoff. This client does not.
-//! A shadow classification has no routing effect, so a retry buys a later
-//! answer to a question nobody is waiting on, at a second charge — and
-//! replay/exactly-once for these calls is B2/B3 work, not something a
-//! deterministic body makes true here.
+//! A background classification has no routing effect, so a retry buys a later
+//! answer to a question nobody is waiting on, at a second charge. Exactly-once
+//! is the caller's, not a property a deterministic body could give this module:
+//! a fresh attempt needs a fresh call identity and a fresh durable intent, both
+//! of which live one layer up.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -192,6 +193,10 @@ pub struct ChoiceAnswer {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SystemOneReply {
     pub usage: Option<SystemOneUsage>,
+    /// The model reported by the service, which can differ from the requested
+    /// identity. Missing or malformed metadata stays unknown; it does not
+    /// discard valid answers or usage.
+    pub reported_model: Option<String>,
     /// Every question's answer, or the first reason the batch is unusable.
     ///
     /// A partial set supplies no classification. Usage remains independent, so
@@ -430,6 +435,10 @@ impl SystemOneClient {
             headers,
             questions,
         } = prepared;
+        // Read before the headers move onto the request: the reply's reported
+        // identity is checked against the key this call was made with, and
+        // this is the only scope that holds it.
+        let sent_key = bearer_key(&headers);
         let url = format!("{}{}", self.base, SYSTEM_ONE_PATH);
 
         // One instant for the whole call rather than a fresh budget per phase,
@@ -464,7 +473,20 @@ impl SystemOneClient {
         let raw = tokio::time::timeout_at(until, self.drain(sent))
             .await
             .map_err(|_| SystemOneError::DeadlineExceeded)??;
-        Self::reply(&raw, &questions)
+        let mut reply = Self::reply(&raw, &questions)?;
+        // A service that reflects request metadata -- a bug, or a hostile
+        // answer -- can name this deployment's own key as the model that
+        // served the call, and the caller writes that field into a durable
+        // log. `Debug` elision and `without_url` close the two ways a key
+        // reaches a log from the request side; this closes the reply side.
+        // Substring rather than equality, so a `Bearer `-prefixed echo is
+        // caught by the same check as a bare one.
+        if let (Some(key), Some(model)) = (&sent_key, &reply.reported_model)
+            && model.contains(key.as_str())
+        {
+            reply.reported_model = None;
+        }
+        Ok(reply)
     }
 
     /// Buffer the body, refusing past the configured bound.
@@ -518,10 +540,13 @@ impl SystemOneClient {
         }
     }
 
-    /// The envelope, split into its accounting and its signal.
+    /// The envelope, split into its accounting, its identity and its signal.
     ///
     /// The usage is read *first* and independently of the answers, which is the
     /// whole of "a reported spend survives an unusable signal".
+    ///
+    /// [`Self::send`] suppresses credential echoes before returning the reply.
+    /// This parser has no credential and cannot perform that check.
     pub fn reply(
         raw: &[u8],
         questions: &BTreeMap<String, ChoiceQuestion>,
@@ -541,8 +566,17 @@ impl SystemOneClient {
                 input_tokens: usage.input_tokens,
                 output_tokens: usage.output_tokens,
             });
+        // Read the same lenient way, and for the same reason: the identity is
+        // metadata about the call, so a `model` of the wrong JSON shape must
+        // not fail the envelope and take the answers and the accounting with
+        // it. A non-string is no identity, not a malformed reply.
+        let reported_model = match envelope.model {
+            Some(Value::String(model)) => Some(model),
+            _ => None,
+        };
         Ok(SystemOneReply {
             usage,
+            reported_model,
             answers: Self::signal(&envelope.answers, questions),
         })
     }
@@ -627,6 +661,20 @@ impl SystemOneClient {
     }
 }
 
+/// The bare key out of an `Authorization: Bearer …` header.
+///
+/// The send path needs this temporary copy to suppress credential echoes in
+/// reported metadata. Empty keys are excluded because every string contains
+/// the empty string.
+fn bearer_key(headers: &HeaderMap) -> Option<String> {
+    let value = headers.get(AUTHORIZATION)?.to_str().ok()?;
+    let key = value.trim_start_matches("Bearer ").trim();
+    match key.is_empty() {
+        true => None,
+        false => Some(key.to_string()),
+    }
+}
+
 /// The response envelope. Unknown fields are ignored, which is `serde`'s
 /// default and is load-bearing: the service is free to add a field and a client
 /// that refused one would break on a deployment nobody touched.
@@ -636,6 +684,10 @@ struct Envelope {
     answers: BTreeMap<String, Value>,
     #[serde(default)]
     usage: Option<Value>,
+    /// Held as a `Value` for the reason `usage` is: a wrong-shaped one is an
+    /// absent identity, and never a reason to discard the reply it came on.
+    #[serde(default)]
+    model: Option<Value>,
 }
 
 /// Both axes required: a default on either turns silence about one into a

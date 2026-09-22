@@ -309,7 +309,18 @@ impl SessionReplay {
                 // client's stream, so it appears in no trajectory either; what
                 // it *spent* is the metrics fold's business and is reported on
                 // the dashboard, not here.
-                SessionEventKind::SideCallCompleted { .. }
+                // A background classification is the same kind of fact one step
+                // further out: it is *about* a turn rather than part of one, it
+                // reached no client, and it describes this deployment's own
+                // feature production rather than the trajectory a consumer of
+                // these formats is reading.
+                // A settlement repair is further out again: it is about this
+                // deployment's own accounting for a call that is already over,
+                // and it changes no answer any consumer of these formats reads.
+                SessionEventKind::ClassificationRequested { .. }
+                | SessionEventKind::ClassificationRecorded { .. }
+                | SessionEventKind::ClassificationSettlementRepaired { .. }
+                | SessionEventKind::SideCallCompleted { .. }
                 | SessionEventKind::SideCallAbandoned { .. }
                 | SessionEventKind::TurnDeduplicated { .. }
                 | SessionEventKind::Error { .. } => {}

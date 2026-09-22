@@ -197,7 +197,11 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
-    use roundhouse_core::control::BudgetState;
+    use roundhouse_core::classify::{
+        ClassificationIntent, ClassificationOutcome, ClassificationRecord, ClassifierIdentity,
+        EvaluationSpend, EvaluationUsage, ReservationRecord, SettlementAck,
+    };
+    use roundhouse_core::control::{BudgetState, BudgetWindow};
     use roundhouse_core::event::{SessionEvent, SessionEventKind, Usage};
     use roundhouse_core::ids::{ResponseId, SessionId};
     use roundhouse_core::metrics::{ReferenceModel, ShadowPricing};
@@ -271,6 +275,85 @@ mod tests {
                     },
                     provider_reported_cost_usd: None,
                     stop_reason: None,
+                },
+            },
+        ]);
+        recorder
+    }
+
+    /// The same recorder, having also classified that turn.
+    ///
+    /// A classifier call in the fixture is what keeps the correspondence test
+    /// below from comparing a page against an empty document: a `models` array
+    /// with nothing in it would let a row field the dashboard reads go missing
+    /// unnoticed.
+    fn recorder_with_a_classifier_call() -> Arc<MetricsRecorder> {
+        let recorder = recorder_with_one_call();
+        let session_id = SessionId::new("s1");
+        let call_id = ResponseId::new("cls_1");
+        let source = ResponseId::new("r1");
+        recorder.record(&[
+            SessionEvent {
+                seq: 3,
+                session_id: session_id.clone(),
+                at_ms: 1_200,
+                kind: SessionEventKind::ClassificationRequested {
+                    record: ClassificationIntent {
+                        call_id: call_id.clone(),
+                        source_turn_index: 1,
+                        source_response_id: source.clone(),
+                        requested_at_ms: 1_200,
+                        expires_at_ms: 61_200,
+                        identity: ClassifierIdentity {
+                            model: "haiku".into(),
+                            schema: "json_schema".into(),
+                            taxonomy_version: 1,
+                            projection_revision: 1,
+                            config_revision: 1,
+                        },
+                        reservation: ReservationRecord {
+                            rate_card: ProviderPricing {
+                                input_per_mtok_usd: 0.8,
+                                cached_input_per_mtok_usd: 0.08,
+                                cache_write_per_mtok_usd: 1.0,
+                                output_per_mtok_usd: 4.0,
+                            },
+                            estimated_input_tokens: 900,
+                            expected_output_tokens: 64,
+                            requested_usd: 2.0,
+                            hold_ttl_ms: 60_000,
+                            budget_limit_usd: 100.0,
+                            budget_window: BudgetWindow::Monthly,
+                            member_ceiling_usd: None,
+                            warn_at: 0.8,
+                        },
+                    },
+                },
+            },
+            SessionEvent {
+                seq: 4,
+                session_id,
+                at_ms: 1_300,
+                kind: SessionEventKind::ClassificationRecorded {
+                    record: ClassificationRecord {
+                        call_id,
+                        source_turn_index: 1,
+                        source_response_id: source,
+                        completed_at_ms: 1_300,
+                        outcome: ClassificationOutcome::Unusable {
+                            reason: "schema_violation".into(),
+                            spend: EvaluationSpend::Measured {
+                                usage: EvaluationUsage {
+                                    input_tokens: 900,
+                                    output_tokens: 60,
+                                },
+                                usd: 0.25,
+                                granted_usd: 2.0,
+                                settled: SettlementAck::Unconfirmed,
+                            },
+                            reported_model: Some("claude-haiku-4.5".into()),
+                        },
+                    },
                 },
             },
         ]);
@@ -363,6 +446,154 @@ mod tests {
         assert!(
             row.get("shadow_usd").is_none(),
             "a hosted row must not carry a shadow price, not even a zero one"
+        );
+    }
+
+    /// Every `data.…` field path the page reads, in source order.
+    ///
+    /// Hand-scanned rather than matched with a regular expression because the
+    /// shape is trivial and the dependency is not: a path is `data.` followed by
+    /// lower-case identifiers and dots. The page is written so that every such
+    /// occurrence is a pure field access — a method call on one is bound to a
+    /// local first — which is what lets the whole captured path be resolved
+    /// against the document rather than a prefix of it.
+    fn field_paths(page: &str, root: &str) -> Vec<String> {
+        let needle = format!("data.{root}.");
+        let mut found = Vec::new();
+        let mut rest = page;
+        while let Some(at) = rest.find(&needle) {
+            rest = &rest[at + needle.len()..];
+            let end = rest
+                .find(|c: char| {
+                    !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '.')
+                })
+                .unwrap_or(rest.len());
+            let path = rest[..end].trim_end_matches('.').to_string();
+            if !path.is_empty() && !found.contains(&path) {
+                found.push(path);
+            }
+        }
+        found
+    }
+
+    /// The page reads only fields the document publishes, under those names.
+    ///
+    /// The one failure this catches is silent in both directions: a renamed JSON
+    /// field leaves the dashboard printing `undefined` where a dollar figure
+    /// used to be, and a column added to the page against a field nobody
+    /// publishes reads as a permanent zero. Neither is a build error and neither
+    /// looks wrong — a metrics page is most convincing exactly when it is empty.
+    #[tokio::test]
+    async fn the_dashboard_reads_the_fields_the_document_publishes() {
+        let app = metrics_router(
+            ControlPlane::open(),
+            recorder_with_a_classifier_call(),
+            config(),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let mut checked = 0;
+        for root in ["evaluation", "observed_cost"] {
+            let paths = field_paths(DASHBOARD_HTML, root);
+            assert!(
+                paths.len() >= 5,
+                "the page reads only {} `data.{root}` fields, which is too few for \
+                 this test to be checking anything: {paths:?}",
+                paths.len()
+            );
+            for path in &paths {
+                let mut cursor = &json[root];
+                for step in path.split('.') {
+                    cursor = cursor.get(step).unwrap_or_else(|| {
+                        panic!("the dashboard reads `data.{root}.{path}`, which the document does not publish")
+                    });
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked >= 12, "only {checked} field paths were checked");
+
+        // The model rows are read off a bound local rather than through
+        // `data.`, so their fields are named here instead of scanned.
+        let row = &json["evaluation"]["models"][0];
+        assert!(
+            row.is_object(),
+            "the fixture classified a turn, so there is a row to check against"
+        );
+        for field in [
+            "requested_model",
+            "reported_model",
+            "calls",
+            "measured_calls",
+            "measured_usd",
+            "unknown_usage_calls",
+            "refused_calls",
+            "tokens",
+        ] {
+            assert!(
+                DASHBOARD_HTML.contains(&format!("m.{field}")),
+                "the evaluation table publishes `{field}` and does not render it"
+            );
+            assert!(row.get(field).is_some(), "the row lost `{field}`: {row}");
+        }
+
+        // A serving row states whether the catalog priced it, and the page
+        // reads that rather than inferring it from a zero. Both halves are
+        // needed: a renamed field leaves `m.priced_by_catalog === false`
+        // reading `undefined === false`, which is never true, so the rate-card
+        // alert would stop firing without a single thing going red — and an
+        // alert that reads the dollars again would call an explicit `$0` rate
+        // card a missing one.
+        let serving = &json["models"][0];
+        assert_eq!(
+            serving["mode"], "frontier",
+            "the fixture serves one hosted turn, so there is a hosted row here: {serving}"
+        );
+        assert!(
+            serving["priced_by_catalog"].is_boolean(),
+            "a hosted row must say whether a rate card covered it: {serving}"
+        );
+        assert!(
+            DASHBOARD_HTML.contains("m.priced_by_catalog"),
+            "the page must read pricing availability off the document"
+        );
+        assert!(
+            !DASHBOARD_HTML.contains("m.billed_usd === 0"),
+            "a hosted row that billed zero is not the same fact as one the \
+             catalog holds no rate for"
+        );
+
+        // Every basis and scope string the page prints is the document's own,
+        // not a second copy on the page that could come to disagree with it.
+        for served in [
+            "rate_card_recorded_with_each_call",
+            "current_catalog_rate_card",
+            "hosted_serving_and_classifier_calls",
+        ] {
+            assert!(
+                !DASHBOARD_HTML.contains(served),
+                "the page must render `{served}` as it was served, never as a literal of its own"
+            );
+        }
+        assert_eq!(
+            json["evaluation"]["price_basis"], "rate_card_recorded_with_each_call",
+            "and the served basis is the one the core publishes"
+        );
+        assert_eq!(
+            json["observed_cost"]["covers"], "hosted_serving_and_classifier_calls",
+            "the combined total names what it is a total of"
         );
     }
 

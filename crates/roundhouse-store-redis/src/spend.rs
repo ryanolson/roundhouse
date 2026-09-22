@@ -62,39 +62,120 @@ use roundhouse_core::control::{
 
 use crate::keys::{self, KeyNamespace};
 
-// The braces are a Redis Cluster hash tag, on the *project* id. All three
-// keys for one project hash to one slot, which is what lets `open_grant` and
-// `settle_grant` check-and-debit both the project and member ceilings in one
-// atomic script — see the module doc.
-pub(crate) fn account_key(namespace: &KeyNamespace, project: &ProjectId) -> String {
+/// Which pool of money a ledger handle counts.
+///
+/// **A segment inside the spend family, not a second namespace.** Deriving an
+/// evaluation namespace by decorating the deployment's own — `tenant` giving
+/// `tenant-eval` — made one deployment's evaluation ledger the *same keys* as a
+/// second deployment legitimately named `tenant-eval`: two tenants sharing one
+/// counter, discovered only by the one whose turns started being refused.
+/// Reserving the decorated name would have been a rule no operator could find
+/// out about. The purpose belongs inside the namespace it is a purpose of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SpendPurpose {
+    /// What turns spend. Writes the keys this crate has always written.
+    #[default]
+    Serving,
+    /// What this deployment's own evaluation calls spend.
+    Evaluation,
+}
+
+impl SpendPurpose {
+    /// The segment this purpose adds, after the hash tag and before the leaf.
+    ///
+    /// **Empty for [`Self::Serving`], and that is the compatibility promise**:
+    /// every key a serving ledger builds is byte-identical to the key it built
+    /// before this type existed, so no deployment's committed spend moves.
+    fn segments(self) -> &'static [&'static str] {
+        match self {
+            Self::Serving => &[],
+            Self::Evaluation => &["eval"],
+        }
+    }
+}
+
+/// Shared key parts. Each key function calls [`keys::build_key`] directly,
+/// as required by the key-builder convention.
+///
+/// The hash tag stays **first**, ahead of the purpose segment: Redis Cluster
+/// hashes a key on its first `{...}` pair, and a purpose written ahead of the
+/// tag would put one project's four keys on different slots and break the
+/// check-and-debit script's atomicity.
+fn spend_key_parts<'a>(tag: &'a str, purpose: SpendPurpose, leaf: &'a str) -> Vec<&'a str> {
+    let mut parts: Vec<&str> = vec![tag];
+    parts.extend_from_slice(purpose.segments());
+    parts.push(leaf);
+    parts
+}
+
+/// [`account_key`] for a caller outside this crate that needs to assert the key
+/// layout — the composition root's own test that two deployments do not collide.
+pub fn account_key_for_test(
+    namespace: &KeyNamespace,
+    purpose: SpendPurpose,
+    project: &ProjectId,
+) -> String {
+    account_key(namespace, purpose, project)
+}
+
+/// [`holds_key`], for the same reason.
+pub fn holds_key_for_test(
+    namespace: &KeyNamespace,
+    purpose: SpendPurpose,
+    project: &ProjectId,
+) -> String {
+    holds_key(namespace, purpose, project)
+}
+
+pub(crate) fn account_key(
+    namespace: &KeyNamespace,
+    purpose: SpendPurpose,
+    project: &ProjectId,
+) -> String {
+    let tag = format!("{{{project}}}");
     keys::build_key(
         namespace,
         keys::KeyFamily::Spend,
-        &[&format!("{{{project}}}"), "account"],
+        &spend_key_parts(&tag, purpose, "account"),
     )
 }
 
-pub(crate) fn holds_key(namespace: &KeyNamespace, project: &ProjectId) -> String {
+pub(crate) fn holds_key(
+    namespace: &KeyNamespace,
+    purpose: SpendPurpose,
+    project: &ProjectId,
+) -> String {
+    let tag = format!("{{{project}}}");
     keys::build_key(
         namespace,
         keys::KeyFamily::Spend,
-        &[&format!("{{{project}}}"), "holds"],
+        &spend_key_parts(&tag, purpose, "holds"),
     )
 }
 
-pub(crate) fn watermarks_key(namespace: &KeyNamespace, project: &ProjectId) -> String {
+pub(crate) fn watermarks_key(
+    namespace: &KeyNamespace,
+    purpose: SpendPurpose,
+    project: &ProjectId,
+) -> String {
+    let tag = format!("{{{project}}}");
     keys::build_key(
         namespace,
         keys::KeyFamily::Spend,
-        &[&format!("{{{project}}}"), "watermarks"],
+        &spend_key_parts(&tag, purpose, "watermarks"),
     )
 }
 
-pub(crate) fn settled_calls_key(namespace: &KeyNamespace, project: &ProjectId) -> String {
+pub(crate) fn settled_calls_key(
+    namespace: &KeyNamespace,
+    purpose: SpendPurpose,
+    project: &ProjectId,
+) -> String {
+    let tag = format!("{{{project}}}");
     keys::build_key(
         namespace,
         keys::KeyFamily::Spend,
-        &[&format!("{{{project}}}"), "settled_calls"],
+        &spend_key_parts(&tag, purpose, "settled_calls"),
     )
 }
 
@@ -128,6 +209,7 @@ pub struct RedisSpendLedger {
     conn: ConnectionManager,
     scripts: Arc<scripts::Scripts>,
     namespace: KeyNamespace,
+    purpose: SpendPurpose,
 }
 
 impl RedisSpendLedger {
@@ -148,6 +230,19 @@ impl RedisSpendLedger {
         url: impl AsRef<str>,
         namespace: KeyNamespace,
     ) -> Result<Self, SpendError> {
+        Self::connect_for(url, namespace, SpendPurpose::Serving).await
+    }
+
+    /// Connect under an explicit namespace *and* purpose.
+    ///
+    /// The evaluation ledger is this, with [`SpendPurpose::Evaluation`]: the
+    /// same deployment namespace as everything else, and its own keys inside it.
+    /// See [`SpendPurpose`] for what deriving a namespace instead collided with.
+    pub async fn connect_for(
+        url: impl AsRef<str>,
+        namespace: KeyNamespace,
+        purpose: SpendPurpose,
+    ) -> Result<Self, SpendError> {
         let conn = crate::connect_manager(url.as_ref())
             .await
             .map_err(backend)?;
@@ -155,6 +250,7 @@ impl RedisSpendLedger {
             conn,
             scripts: Arc::new(scripts::Scripts::new()),
             namespace,
+            purpose,
         })
     }
 }
@@ -166,8 +262,8 @@ impl SpendLedger for RedisSpendLedger {
         SpendError::check_amount("limit_usd", request.terms.budget.limit_usd)?;
 
         let member_ceiling = member_ceiling_arg(&request.terms);
-        let account = account_key(&self.namespace, &request.principal.project);
-        let holds = holds_key(&self.namespace, &request.principal.project);
+        let account = account_key(&self.namespace, self.purpose, &request.principal.project);
+        let holds = holds_key(&self.namespace, self.purpose, &request.principal.project);
         let outcome = self
             .scripts
             .open_grant(
@@ -196,10 +292,12 @@ impl SpendLedger for RedisSpendLedger {
     async fn settle_grant(&self, settlement: Settlement) -> Result<Settled, SpendError> {
         SpendError::check_amount("actual_usd", settlement.actual_usd)?;
 
-        let account = account_key(&self.namespace, &settlement.principal.project);
-        let holds = holds_key(&self.namespace, &settlement.principal.project);
-        let watermarks = watermarks_key(&self.namespace, &settlement.principal.project);
-        let settled_calls = settled_calls_key(&self.namespace, &settlement.principal.project);
+        let account = account_key(&self.namespace, self.purpose, &settlement.principal.project);
+        let holds = holds_key(&self.namespace, self.purpose, &settlement.principal.project);
+        let watermarks =
+            watermarks_key(&self.namespace, self.purpose, &settlement.principal.project);
+        let settled_calls =
+            settled_calls_key(&self.namespace, self.purpose, &settlement.principal.project);
         // One script for both modes, the unused half of the key travelling as a
         // sentinel: a second script would be a second copy of the window roll,
         // the hold release and the commit, which are identical either way.
@@ -250,8 +348,8 @@ impl SpendLedger for RedisSpendLedger {
         SpendError::check_amount("limit_usd", query.terms.budget.limit_usd)?;
 
         let member_ceiling = member_ceiling_arg(&query.terms);
-        let account = account_key(&self.namespace, &query.principal.project);
-        let holds = holds_key(&self.namespace, &query.principal.project);
+        let account = account_key(&self.namespace, self.purpose, &query.principal.project);
+        let holds = holds_key(&self.namespace, self.purpose, &query.principal.project);
         let outcome = self
             .scripts
             .balance(
@@ -302,10 +400,10 @@ mod tests {
 
         let namespace = KeyNamespace::default();
         let project = ProjectId::new("acme");
-        let account = account_key(&namespace, &project);
-        let holds = holds_key(&namespace, &project);
-        let watermarks = watermarks_key(&namespace, &project);
-        let settled_calls = settled_calls_key(&namespace, &project);
+        let account = account_key(&namespace, SpendPurpose::Serving, &project);
+        let holds = holds_key(&namespace, SpendPurpose::Serving, &project);
+        let watermarks = watermarks_key(&namespace, SpendPurpose::Serving, &project);
+        let settled_calls = settled_calls_key(&namespace, SpendPurpose::Serving, &project);
 
         let tag = hash_tag(&account);
         assert_eq!(tag, "acme", "the tag is the project id, unadorned");
@@ -316,7 +414,10 @@ mod tests {
         // The control: two different projects must land on two different
         // tags, or every project would collide onto one Redis Cluster slot.
         let other = ProjectId::new("other-project");
-        assert_ne!(hash_tag(&account_key(&namespace, &other)), tag);
+        assert_ne!(
+            hash_tag(&account_key(&namespace, SpendPurpose::Serving, &other)),
+            tag
+        );
     }
 
     /// Every family's keys carry the namespace, the schema version and the
@@ -327,23 +428,26 @@ mod tests {
         let namespace = KeyNamespace::default();
         let project = ProjectId::new("acme");
         assert_eq!(
-            account_key(&namespace, &project),
+            account_key(&namespace, SpendPurpose::Serving, &project),
             "rh:v1:spend:{acme}:account"
         );
-        assert_eq!(holds_key(&namespace, &project), "rh:v1:spend:{acme}:holds");
         assert_eq!(
-            watermarks_key(&namespace, &project),
+            holds_key(&namespace, SpendPurpose::Serving, &project),
+            "rh:v1:spend:{acme}:holds"
+        );
+        assert_eq!(
+            watermarks_key(&namespace, SpendPurpose::Serving, &project),
             "rh:v1:spend:{acme}:watermarks"
         );
         assert_eq!(
-            settled_calls_key(&namespace, &project),
+            settled_calls_key(&namespace, SpendPurpose::Serving, &project),
             "rh:v1:spend:{acme}:settled_calls"
         );
 
         let other = KeyNamespace::new("acme-prod").unwrap();
         assert_ne!(
-            account_key(&namespace, &project),
-            account_key(&other, &project),
+            account_key(&namespace, SpendPurpose::Serving, &project),
+            account_key(&other, SpendPurpose::Serving, &project),
             "two namespaces must never build the same key"
         );
     }

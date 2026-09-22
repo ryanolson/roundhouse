@@ -17,21 +17,22 @@ use axum::extract::State;
 use axum::response::Response;
 use axum::routing::post;
 
+use roundhouse_core::classify::projection::PromptCapture;
 use roundhouse_core::context::ByteTokenizer;
 use roundhouse_core::control::{
-    Allocation, Budget, BudgetState, BudgetWindow, Exhaustion, FrontierCadence, FrontierHistory,
-    Grant, LedgerState, PresentedCredential, Secret, Settled, SpendError, TargetFilter, TurnBudget,
-    TurnPolicy,
+    Allocation, Budget, BudgetWindow, Exhaustion, Grant, GrantRequest, LedgerState, Secret,
+    Settled, SpendError,
 };
-use roundhouse_core::item::{Item, ItemContent, Role};
-use roundhouse_core::routing::{CacheLedger, Candidate, RoutingContext, Target};
+use roundhouse_core::item::Item;
 use roundhouse_fleet::typesafe::SystemOneLimits;
 
 use super::*;
 
 mod accounting;
 mod admission;
-mod brief;
+mod ledger_deadline;
+mod model_identity;
+mod projection;
 mod question;
 mod settlement_order;
 
@@ -56,11 +57,32 @@ async fn handle(State(state): State<Upstream>, body: String) -> Response {
     Response::new(Body::from(state.body))
 }
 
-const ANSWER: &str = r#"{"model":"jev-1.12","answers":{"tier":{"type":"choice","choice":"capable","probabilities":{"capable":0.85,"efficient":0.15},"confidence":0.82}},"usage":{"input_tokens":312,"output_tokens":48}}"#;
-/// A usable answer whose accounting is only half reported.
-const ANSWER_PARTIAL_USAGE: &str = r#"{"model":"jev-1.12","answers":{"tier":{"type":"choice","choice":"capable","probabilities":{"capable":0.85,"efficient":0.15},"confidence":0.82}},"usage":{"output_tokens":48}}"#;
-/// An unusable distribution, fully billed.
-const ANSWER_UNUSABLE: &str = r#"{"model":"jev-1.12","answers":{"tier":{"type":"choice","choice":"capable","probabilities":{"capable":0.4,"efficient":0.2},"confidence":0.8}},"usage":{"input_tokens":312,"output_tokens":48}}"#;
+/// A complete, valid answer set across all three axes.
+pub(crate) const ANSWER: &str = r#"{"model":"jev-1.12","answers":{
+  "intent":{"type":"choice","choice":"implement","probabilities":{"implement":0.5,"diagnose":0.2,"explain":0.1,"review":0.1,"operate":0.05,"unknown":0.05},"confidence":0.82},
+  "complexity":{"type":"choice","choice":"involved","probabilities":{"trivial":0.1,"routine":0.2,"involved":0.5,"deep":0.1,"unknown":0.1},"confidence":0.61},
+  "context_dependence":{"type":"choice","choice":"recent","probabilities":{"self_contained":0.2,"recent":0.5,"deep":0.2,"unknown":0.1},"confidence":0.55}
+},"usage":{"input_tokens":312,"output_tokens":48}}"#;
+
+/// The same answers, with only half the accounting reported.
+const ANSWER_PARTIAL_USAGE: &str = r#"{"model":"jev-1.12","answers":{
+  "intent":{"type":"choice","choice":"implement","probabilities":{"implement":0.5,"diagnose":0.2,"explain":0.1,"review":0.1,"operate":0.05,"unknown":0.05},"confidence":0.82},
+  "complexity":{"type":"choice","choice":"involved","probabilities":{"trivial":0.1,"routine":0.2,"involved":0.5,"deep":0.1,"unknown":0.1},"confidence":0.61},
+  "context_dependence":{"type":"choice","choice":"recent","probabilities":{"self_contained":0.2,"recent":0.5,"deep":0.2,"unknown":0.1},"confidence":0.55}
+},"usage":{"output_tokens":48}}"#;
+
+/// Two good axes and one whose distribution does not sum to one. Fully billed.
+const ANSWER_UNUSABLE: &str = r#"{"model":"jev-1.12","answers":{
+  "intent":{"type":"choice","choice":"implement","probabilities":{"implement":0.5,"diagnose":0.2,"explain":0.1,"review":0.1,"operate":0.05,"unknown":0.05},"confidence":0.82},
+  "complexity":{"type":"choice","choice":"involved","probabilities":{"trivial":0.1,"routine":0.2,"involved":0.1,"deep":0.1,"unknown":0.1},"confidence":0.61},
+  "context_dependence":{"type":"choice","choice":"recent","probabilities":{"self_contained":0.2,"recent":0.5,"deep":0.2,"unknown":0.1},"confidence":0.55}
+},"usage":{"input_tokens":312,"output_tokens":48}}"#;
+
+/// One axis missing. A partial taxonomy supplies no classification at all.
+const ANSWER_PARTIAL_TAXONOMY: &str = r#"{"model":"jev-1.12","answers":{
+  "intent":{"type":"choice","choice":"implement","probabilities":{"implement":0.5,"diagnose":0.2,"explain":0.1,"review":0.1,"operate":0.05,"unknown":0.05},"confidence":0.82},
+  "complexity":{"type":"choice","choice":"involved","probabilities":{"trivial":0.1,"routine":0.2,"involved":0.5,"deep":0.1,"unknown":0.1},"confidence":0.61}
+},"usage":{"input_tokens":312,"output_tokens":48}}"#;
 
 async fn upstream(body: &'static str) -> (SocketAddr, Upstream) {
     let state = Upstream {
@@ -109,7 +131,7 @@ struct RecordingLedger {
     /// `None` makes `open_grant` fail, standing in for a ledger that is down.
     grants: Option<f64>,
     /// `false` makes `settle_grant` fail *after* the call was made and priced:
-    /// the one state in which this module's settle warning is the only record
+    /// the one state in which the settlement acknowledgement is the only record
     /// that the spend exists at all.
     settles: bool,
     requested: Mutex<Vec<f64>>,
@@ -197,14 +219,11 @@ impl SpendLedger for RecordingLedger {
 
 // ------------------------------------------------------------------ set-up
 
-fn caps() -> ShadowCaps {
-    ShadowCaps {
-        brief: BriefConfig::default(),
-        max_tool_name_chars: 64,
-        max_facts: 8,
-        max_fact_chars: 200,
-        max_plan_steps: 8,
-        max_state_bytes: 8 * 1024,
+pub(crate) fn caps() -> ProjectionCaps {
+    ProjectionCaps {
+        max_prior_classifications: 4,
+        max_prompt_chars: 2_000,
+        max_total_bytes: 8 * 1024,
     }
 }
 
@@ -213,7 +232,7 @@ fn caps() -> ShadowCaps {
 ///
 /// Both axes are non-zero and different, so a quote that dropped either one is
 /// visible in the number rather than hidden by a zero rate.
-fn pricing() -> ProviderPricing {
+pub(crate) fn pricing() -> ProviderPricing {
     ProviderPricing {
         input_per_mtok_usd: 1.0,
         cached_input_per_mtok_usd: 0.0,
@@ -227,13 +246,23 @@ fn quote_usd(input_tokens: usize) -> f64 {
     (input_tokens as f64 * 1.0 + EXPECTED_OUTPUT_TOKENS as f64 * 2.0) / 1_000_000.0
 }
 
-const EXPECTED_OUTPUT_TOKENS: u64 = 16;
+/// What a reported usage of 312 input and 48 output tokens is priced at.
+const REPORTED_USD: f64 = (312.0 * 1.0 + 48.0 * 2.0) / 1_000_000.0;
 
-fn config() -> ShadowConfig {
-    ShadowConfig::new("jev-1.12", pricing(), EXPECTED_OUTPUT_TOKENS, caps())
+pub(crate) const EXPECTED_OUTPUT_TOKENS: u64 = 16;
+pub(crate) const CONFIG_REVISION: u32 = 7;
+
+pub(crate) fn config() -> ShadowConfig {
+    ShadowConfig::new(
+        "jev-1.12",
+        pricing(),
+        EXPECTED_OUTPUT_TOKENS,
+        caps(),
+        CONFIG_REVISION,
+    )
 }
 
-fn limits() -> SystemOneLimits {
+pub(crate) fn limits() -> SystemOneLimits {
     SystemOneLimits {
         max_request_bytes: 64 * 1024,
         max_response_bytes: 16 * 1024,
@@ -250,12 +279,12 @@ fn shadow(
     TypeSafeShadow::new(client, config, ledger, ByteTokenizer)
 }
 
-fn terms() -> BudgetTerms {
+pub(crate) fn terms() -> BudgetTerms {
     BudgetTerms {
         budget: Budget {
             limit_usd: 1_000.0,
             window: BudgetWindow::Total,
-            on_exhaustion: Exhaustion::degrade_with_overflow(),
+            on_exhaustion: Exhaustion::Refuse,
             warn_at: 0.8,
         },
         allocation: Allocation::Pooled,
@@ -266,120 +295,76 @@ fn credential() -> TurnCredential {
     TurnCredential::Stored(Secret::api_key(KEY).unwrap())
 }
 
+const NOW_MS: u64 = 1_000;
+const EXPIRES_MS: u64 = 31_000;
+
 fn call(credential: &TurnCredential) -> ShadowCall<'_> {
     ShadowCall {
         principal: Principal::new("proj_shadow", "user_shadow"),
         session_id: SessionId::new("sess_shadow"),
-        hold_key: ResponseId::new("shadow_1"),
+        call_id: ResponseId::new("shadow_1"),
+        source_turn_index: 3,
+        source_response_id: ResponseId::new("resp_3"),
         terms: terms(),
         credential,
-        now_ms: 1_000,
+        now_ms: NOW_MS,
+        expires_at_ms: EXPIRES_MS,
     }
 }
 
-fn candidate(target: Target) -> Candidate {
-    Candidate {
-        target,
-        expected_prefill_tokens: 1_000.0,
-        matched_prefix_tokens: 0,
-        expected_ttft_ms: 100.0,
-        expected_cost_usd: 0.01,
-        quality_prior: 0.8,
-        load: None,
-    }
-}
-
-fn frontier() -> Candidate {
-    candidate(Target::Frontier {
+/// A frontier target this session's policy admitted.
+fn frontier() -> Target {
+    Target::Frontier {
         provider: "anthropic".into(),
         model: "claude-opus-4".into(),
-    })
-}
-
-/// Below the quality floor the relevant case sets.
-fn dim_frontier() -> Candidate {
-    Candidate {
-        quality_prior: 0.1,
-        ..frontier()
     }
 }
 
-/// Above that floor, so the quality case leaves a non-empty admitted pool and
-/// exercises the local-only branch rather than an admission error.
-fn high_quality_local() -> Candidate {
-    Candidate {
-        quality_prior: 0.9,
-        ..local()
+fn local() -> Target {
+    Target::Local {
+        worker_id: 7,
+        dp_rank: 0,
+        model: "llama-3.1-8b".into(),
     }
 }
 
-/// Free, so a budget ceiling that excludes the frontier candidate still leaves
-/// this one admissible — otherwise `admissible` returns an error rather than a
-/// local-only pool, and the case under test never arises.
-fn local() -> Candidate {
-    Candidate {
-        expected_cost_usd: 0.0,
-        ..candidate(Target::Local {
-            worker_id: 7,
-            dp_rank: 0,
-            model: "llama-3.1-8b".into(),
-        })
-    }
-}
-
-/// Everything `RoutingContext::admissible` needs, owned so the borrow lives.
-struct Pool {
-    session_id: SessionId,
-    candidates: Vec<Candidate>,
-    ledger: CacheLedger,
-    policy: TurnPolicy,
-    history: FrontierHistory,
-    budget: TurnBudget,
-}
-
-impl Pool {
-    fn of(candidates: Vec<Candidate>) -> Self {
-        Self {
-            session_id: SessionId::new("sess_shadow"),
-            candidates,
-            ledger: CacheLedger::default(),
-            policy: TurnPolicy::unrestricted(),
-            history: FrontierHistory::default(),
-            budget: TurnBudget::Unlimited,
-        }
-    }
-
-    fn under(mut self, policy: TurnPolicy) -> Self {
-        self.policy = policy;
-        self
-    }
-
-    fn with_budget(mut self, budget: TurnBudget) -> Self {
-        self.budget = budget;
-        self
-    }
-
-    fn admitted(&self) -> roundhouse_core::routing::Admitted<'_> {
-        RoutingContext {
-            session_id: &self.session_id,
-            turn_index: 0,
-            isl_tokens: 1_000,
-            candidates: &self.candidates,
-            ledger: &self.ledger,
-            turn_policy: &self.policy,
-            frontier_history: &self.history,
-            budget: &self.budget,
-            signals: None,
-            tiers: None,
-        }
-        .admissible(None)
-        .expect("the fixture pool is admissible")
-    }
-}
-
+/// This turn's input, as the client sent it.
 fn items() -> Vec<Item> {
     vec![
         Item::system_text("You are working in a Rust repository."),
         Item::user_text("the parser drops trailing commas; fix it and prove it"),
     ]
+}
+
+fn capture() -> PromptCapture {
+    PromptCapture::of(&items(), &caps())
+}
+
+/// A deadline far enough away that nothing in these tests reaches it.
+///
+/// Expiry has its own tests in the runtime; here it must not be what a case is
+/// measuring.
+fn never() -> tokio::time::Instant {
+    tokio::time::Instant::now() + std::time::Duration::from_secs(3_600)
+}
+
+/// Project, prepare and execute one call, the way the engine and its worker do
+/// between them.
+///
+/// The three steps stay separate in the source because the engine writes a
+/// durable record between the second and the third, and because only the third
+/// touches a ledger or a socket; a test that only ever wanted the end state
+/// would otherwise re-type the sequence in every file.
+///
+/// `Err` is a refusal taken **before** an intent would exist. Everything a
+/// ledger can refuse comes back as an `Ok` record carrying
+/// [`ClassificationOutcome::Unfunded`], because by then the intent is durable.
+async fn classify(
+    shadow: &TypeSafeShadow<ByteTokenizer>,
+    credential: &TurnCredential,
+    admitted: Option<&[Target]>,
+) -> Result<ClassificationRecord, NotRun> {
+    let projection = shadow.projection(&capture(), &[], &[])?;
+    let prepared = shadow.prepare(call(credential), &projection, admitted)?;
+    Ok(shadow.execute(prepared, never()).await)
 }

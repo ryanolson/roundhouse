@@ -611,27 +611,31 @@ fn a_terminal_of_either_kind_drains_the_state_it_opened() {
 /// `absorb` under-reports silently and only at the scope nobody tests directly.
 #[test]
 fn absorbing_a_row_adds_both_classes_in_every_term() {
-    let mut left = Counters::default();
-    left.completed_elapsed = Elapsed {
-        ms_total: 30,
-        samples: 1,
-        rejected: 2,
+    let mut left = Counters {
+        completed_elapsed: Elapsed {
+            ms_total: 30,
+            samples: 1,
+            rejected: 2,
+        },
+        incomplete_elapsed: Elapsed {
+            ms_total: 5,
+            samples: 1,
+            rejected: 0,
+        },
+        ..Counters::default()
     };
-    left.incomplete_elapsed = Elapsed {
-        ms_total: 5,
-        samples: 1,
-        rejected: 0,
-    };
-    let mut right = Counters::default();
-    right.completed_elapsed = Elapsed {
-        ms_total: 70,
-        samples: 3,
-        rejected: 1,
-    };
-    right.incomplete_elapsed = Elapsed {
-        ms_total: 15,
-        samples: 2,
-        rejected: 4,
+    let right = Counters {
+        completed_elapsed: Elapsed {
+            ms_total: 70,
+            samples: 3,
+            rejected: 1,
+        },
+        incomplete_elapsed: Elapsed {
+            ms_total: 15,
+            samples: 2,
+            rejected: 4,
+        },
+        ..Counters::default()
     };
 
     left.absorb(&right);
