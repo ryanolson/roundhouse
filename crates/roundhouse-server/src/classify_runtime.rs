@@ -460,16 +460,16 @@ impl<T: Tokenizer + Send + Sync + 'static> ClassificationRuntime<T> {
         });
     }
 
-    /// Select a bounded prefix without copying or scanning the backlog.
-    ///
-    /// Failed workers can return permits while the engine schedules repairs.
-    /// A fixed candidate set bounds work per turn independently of that timing.
-    /// Retain the backlog order so later turns advance after acknowledgements.
-    pub(crate) fn repair_batch<'a>(
+    /// Select a borrowed, oldest-first prefix without collecting or scanning the backlog.
+    /// The fixed limit bounds scheduling even when failed workers return permits during the loop.
+    pub(crate) fn repair_batch<'a, I>(
         &self,
-        unrepaired: &'a [UnconfirmedSettlement],
-    ) -> &'a [UnconfirmedSettlement] {
-        &unrepaired[..unrepaired.len().min(self.limits.max_in_flight)]
+        unrepaired: I,
+    ) -> impl Iterator<Item = &'a UnconfirmedSettlement> + use<'a, I, T>
+    where
+        I: IntoIterator<Item = &'a UnconfirmedSettlement>,
+    {
+        unrepaired.into_iter().take(self.limits.max_in_flight)
     }
 
     /// Take the claim on one repair identity, or answer that another attempt

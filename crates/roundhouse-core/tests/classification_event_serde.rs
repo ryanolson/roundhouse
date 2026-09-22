@@ -325,9 +325,13 @@ async fn a_repair_resolves_its_settlement_and_creates_no_feature() {
         1,
         "an unconfirmed settle is something a successor can find and re-drive"
     );
-    assert_eq!(before.unrepaired_settlements()[0].usd, 0.000_017);
+    let unconfirmed = before
+        .unrepaired_settlements()
+        .next()
+        .expect("the settle the fold held");
+    assert_eq!(unconfirmed.usd, 0.000_017);
     assert_eq!(
-        before.unrepaired_settlements()[0].window,
+        unconfirmed.window,
         BudgetWindow::Monthly,
         "the window comes off the intent, which is the only place it exists"
     );
@@ -356,7 +360,7 @@ async fn a_repair_resolves_its_settlement_and_creates_no_feature() {
         .await
         .expect("the log replays");
     assert!(
-        after.unrepaired_settlements().is_empty(),
+        after.unrepaired_settlements().len() == 0,
         "`applied: false` is the ledger saying it already had this call, which \
          ends the question -- retaining it would re-drive the same settle on \
          every later turn forever"

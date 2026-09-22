@@ -2609,11 +2609,26 @@ fn backlog(size: usize) -> Vec<UnconfirmedSettlement> {
         .collect()
 }
 
-fn call_ids(batch: &[UnconfirmedSettlement]) -> Vec<String> {
+fn call_ids<'a>(batch: impl IntoIterator<Item = &'a UnconfirmedSettlement>) -> Vec<String> {
     batch
-        .iter()
+        .into_iter()
         .map(|settlement| settlement.call_id.to_string())
         .collect()
+}
+
+/// Count iterator pulls to distinguish bounded traversal from collecting the whole backlog.
+struct CountingBacklog<'a> {
+    entries: std::slice::Iter<'a, UnconfirmedSettlement>,
+    pulled: &'a std::cell::Cell<usize>,
+}
+
+impl<'a> Iterator for CountingBacklog<'a> {
+    type Item = &'a UnconfirmedSettlement;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.pulled.set(self.pulled.get() + 1);
+        self.entries.next()
+    }
 }
 
 /// **One turn considers at most `max_in_flight` settlements, whatever the
@@ -2648,7 +2663,7 @@ async fn a_turn_considers_at_most_max_in_flight_settlements_however_large_the_ba
 
     for size in [20, 2_000] {
         let backlog = backlog(size);
-        let batch = runtime.repair_batch(&backlog);
+        let batch = call_ids(runtime.repair_batch(&backlog));
         assert_eq!(
             batch.len(),
             MAX_IN_FLIGHT,
@@ -2658,7 +2673,7 @@ async fn a_turn_considers_at_most_max_in_flight_settlements_however_large_the_ba
             batch.len()
         );
         assert_eq!(
-            call_ids(batch),
+            batch,
             vec![
                 "eval_backlog_1".to_string(),
                 "eval_backlog_2".to_string(),
@@ -2687,7 +2702,7 @@ async fn a_backlog_within_the_ceiling_is_offered_whole_and_in_order() {
 
     for size in [1, 2, MAX_IN_FLIGHT] {
         let backlog = backlog(size);
-        let batch = runtime.repair_batch(&backlog);
+        let batch = call_ids(runtime.repair_batch(&backlog));
         assert_eq!(
             batch.len(),
             size,
@@ -2695,7 +2710,7 @@ async fn a_backlog_within_the_ceiling_is_offered_whole_and_in_order() {
              nothing may be held back from this turn"
         );
         assert_eq!(
-            call_ids(batch),
+            batch,
             call_ids(&backlog),
             "and the log's order is the batch's order, backlog={size}"
         );
@@ -2709,8 +2724,39 @@ async fn an_empty_backlog_offers_no_candidates() {
     let addr = upstream(Duration::ZERO).await;
     let runtime = runtime(addr, limits(3));
 
+    let empty = backlog(0);
     assert!(
-        runtime.repair_batch(&[]).is_empty(),
+        call_ids(runtime.repair_batch(&empty)).is_empty(),
         "a session with nothing unrepaired has nothing to schedule"
+    );
+}
+
+/// Selecting a bounded batch must not first traverse the entire source.
+#[tokio::test]
+async fn a_turn_pulls_no_more_candidates_than_it_takes() {
+    const MAX_IN_FLIGHT: usize = 3;
+
+    let addr = upstream(Duration::ZERO).await;
+    let runtime = runtime(addr, limits(MAX_IN_FLIGHT));
+
+    let backlog = backlog(2_000);
+    let pulled = std::cell::Cell::new(0);
+    let batch = call_ids(runtime.repair_batch(CountingBacklog {
+        entries: backlog.iter(),
+        pulled: &pulled,
+    }));
+
+    assert_eq!(
+        batch.len(),
+        MAX_IN_FLIGHT,
+        "the ceiling still decides what the turn keeps"
+    );
+    assert_eq!(
+        pulled.get(),
+        MAX_IN_FLIGHT,
+        "and the turn must reach no further into a 2,000-entry backlog than \
+         the {MAX_IN_FLIGHT} candidates it keeps -- the rest cost this turn \
+         nothing, which is what lets a recovering deployment carry the whole \
+         outage in the fold"
     );
 }

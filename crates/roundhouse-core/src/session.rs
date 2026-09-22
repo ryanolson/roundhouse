@@ -28,6 +28,10 @@ use crate::routing::{CacheLedger, DecisionRecord, DispatchAttempt, ProviderPrici
 use crate::store::{Lease, SessionStore, StoreError};
 use crate::validate::{Arm, EscalationOverrides, SteerAction};
 
+mod unrepaired;
+
+use unrepaired::UnrepairedSettlements;
+
 /// How many events to pull per replay batch.
 const REPLAY_BATCH: usize = 1024;
 
@@ -584,7 +588,7 @@ pub struct SessionState {
     /// it needs is not available later: the amount is on the *result* and the
     /// window is on the *intent*, and the intent is consumed the moment its
     /// result arrives.
-    unrepaired_settlements: Vec<UnconfirmedSettlement>,
+    unrepaired_settlements: UnrepairedSettlements,
     /// What this deployment's own extractor made of recent turns.
     ///
     /// **Bounded to [`PRIOR_METADATA_WINDOW`], oldest dropped first.** The
@@ -1090,8 +1094,7 @@ impl SessionState {
                 // had been lost. Retaining an entry on `!applied` would re-drive
                 // the same settle on every later turn forever, for a call the
                 // ledger has told us twice it already has.
-                self.unrepaired_settlements
-                    .retain(|settlement| settlement.call_id != record.call_id);
+                self.unrepaired_settlements.remove(&record.call_id);
             }
             // Money facts, folded by the metrics layer and not here. This
             // projection answers "what may this session do next", and what a
@@ -1291,8 +1294,17 @@ impl SessionState {
     /// Everything a repair needs and nothing it does not: the call's identity,
     /// the amount the record holds, and the window the intent recorded. The
     /// payer is [`Self::principal`] and is deliberately not repeated here.
-    pub fn unrepaired_settlements(&self) -> &[UnconfirmedSettlement] {
-        &self.unrepaired_settlements
+    ///
+    /// Borrowed and in arrival order, so a repair path that takes a bounded
+    /// prefix copies nothing it did not select and touches nothing it did not
+    /// take.
+    pub fn unrepaired_settlements(&self) -> impl ExactSizeIterator<Item = &UnconfirmedSettlement> {
+        self.unrepaired_settlements.iter()
+    }
+
+    /// Settlements visited during acknowledgement removal, excluding map lookup comparisons.
+    pub fn unrepaired_settlements_examined(&self) -> u64 {
+        self.unrepaired_settlements.examined()
     }
 
     /// Calls with no result, which is the same thing as unknown answers.

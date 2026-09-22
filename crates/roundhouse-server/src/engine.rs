@@ -1681,7 +1681,7 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
             return;
         };
         let unrepaired = session.state().unrepaired_settlements();
-        if unrepaired.is_empty() {
+        if unrepaired.len() == 0 {
             return;
         }
         let Some(principal) = session.state().principal() else {

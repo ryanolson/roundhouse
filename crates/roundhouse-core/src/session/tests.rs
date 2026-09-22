@@ -2210,8 +2210,8 @@ fn a_turns_leading_configuration_run_replaces_the_sessions_at_the_head() {
 // other would disagree about which turn a feature describes.
 
 use crate::classify::{
-    ClassificationOutcome, ClassifierIdentity, ContextDependence, EvaluationSpend, Graded,
-    ReservationRecord, SettlementAck, TAXONOMY_VERSION, TurnClassification, TurnComplexity,
+    ClassificationOutcome, ClassifierIdentity, ContextDependence, EvaluationSpend, EvaluationUsage,
+    Graded, ReservationRecord, SettlementAck, TAXONOMY_VERSION, TurnClassification, TurnComplexity,
     TurnIntent,
 };
 use crate::control::BudgetWindow;
@@ -2803,4 +2803,236 @@ fn the_cutoff_admits_exactly_what_landed_at_or_before_it() {
             "at cutoff {cutoff}"
         );
     }
+}
+
+// --------------------------------------- the acknowledgement removal bound
+//
+// Contract: an *outage* sizes the unrepaired backlog, and an acknowledgement
+// must not walk it. `ClassificationRuntime::repair_batch` bounds how many
+// settlements one turn *schedules*; that is a different quantity from how much
+// work the fold does when their answers come back, and only the second is
+// pinned here. The engine writes one `ClassificationSettlementRepaired` per
+// answered repair, so a turn that acknowledges a batch of K against a backlog
+// of N decides whether a recovering deployment pays K or K*N.
+//
+// Counted entries rather than a clock, on the `landed_through` precedent
+// above: a wall-clock threshold passes on a quiet box and fails on a loaded
+// one, and a constant nobody observed passes over any implementation at all.
+
+/// The call id the `index`-th entry of a synthetic backlog was committed
+/// under.
+fn backlog_call(index: usize) -> String {
+    format!("eval_backlog_{index}")
+}
+
+/// A result that says the evaluation ledger never acknowledged this call's
+/// charge, which is the one outcome the fold holds for a later turn to
+/// re-drive.
+///
+/// `Unusable` rather than `Classified`: an envelope arrived and its answers
+/// could not be used, so the accounting survives with nothing to say about the
+/// turn — which keeps these entries out of `classifications()` and makes the
+/// feature-count controls below unambiguous.
+fn unconfirmed_result(
+    call_id: &str,
+    source_turn_index: u64,
+    source_response_id: &str,
+    usd: f64,
+) -> ClassificationRecord {
+    ClassificationRecord {
+        call_id: ResponseId::new(call_id),
+        source_turn_index,
+        source_response_id: ResponseId::new(source_response_id),
+        completed_at_ms: 1_000,
+        outcome: ClassificationOutcome::Unusable {
+            reason: "schema".to_string(),
+            spend: EvaluationSpend::Measured {
+                granted_usd: 0.0002,
+                usage: EvaluationUsage {
+                    input_tokens: 100,
+                    output_tokens: 16,
+                },
+                usd,
+                settled: SettlementAck::Unconfirmed,
+            },
+            reported_model: None,
+        },
+    }
+}
+
+/// Build a backlog through the intent/result join; distinct costs expose reordering.
+async fn session_with_backlog(node: &str, size: usize) -> Session<MemoryStore> {
+    let store = Arc::new(MemoryStore::new());
+    let (_sid, mut session) = new_session(store, node).await;
+    for index in 1..=size {
+        let call = backlog_call(index);
+        let turn = index as u64;
+        let response = format!("resp_{index}");
+        session
+            .record_classification_intent(classify_intent(&call, turn, &response))
+            .await
+            .unwrap();
+        session
+            .record_classification(unconfirmed_result(&call, turn, &response, index as f64))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        session.state.unrepaired_settlements().len(),
+        size,
+        "the fixture must actually build a backlog: an attribution mismatch \
+         here would leave nothing unrepaired and every bound below would hold \
+         vacuously"
+    );
+    session
+}
+
+/// The backlog as `(call_id, usd)`, in the order the fold offers it.
+fn backlog_order(state: &SessionState) -> Vec<(String, f64)> {
+    state
+        .unrepaired_settlements()
+        .map(|settlement| (settlement.call_id.to_string(), settlement.usd))
+        .collect()
+}
+
+/// One acknowledgement, as the engine commits it after a repair worker answers.
+fn acknowledgement(call_id: &str, applied: bool) -> ClassificationSettlementRepair {
+    ClassificationSettlementRepair {
+        call_id: ResponseId::new(call_id),
+        applied,
+        repaired_at_ms: 9_000,
+    }
+}
+
+/// Count settlement visits for a fixed acknowledgement batch at two backlog sizes.
+/// Map lookup comparisons are excluded; this guards against a full scan, not logarithmic lookup.
+#[tokio::test]
+async fn acknowledging_a_batch_examines_entries_for_the_batch_and_not_the_backlog() {
+    const ACKNOWLEDGED: usize = 4;
+    const SIZES: [usize; 2] = [16, 1_024];
+
+    let mut examined = Vec::new();
+    for size in SIZES {
+        let mut session = session_with_backlog(&format!("node-bound-{size}"), size).await;
+        let before = session.state.unrepaired_settlements_examined();
+        for index in 1..=ACKNOWLEDGED {
+            session
+                .record_classification_settlement_repair(acknowledgement(
+                    &backlog_call(index),
+                    true,
+                ))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            session.state.unrepaired_settlements().len(),
+            size - ACKNOWLEDGED,
+            "and each acknowledgement must actually drain its entry, or the \
+             count below would be cheap because it did nothing, backlog={size}"
+        );
+        examined.push(session.state.unrepaired_settlements_examined() - before);
+    }
+
+    assert_eq!(
+        examined[0], examined[1],
+        "acknowledging {ACKNOWLEDGED} settlements examined {} backlog entries \
+         under a backlog of {} and {} under a backlog of {} -- work that grows \
+         with the outage is what a recovering deployment cannot afford",
+        examined[0], SIZES[0], examined[1], SIZES[1]
+    );
+    assert_eq!(
+        examined[0], ACKNOWLEDGED as u64,
+        "one entry per acknowledgement and no others: an equal-but-large count \
+         would mean both backlogs were walked equally badly"
+    );
+}
+
+/// Missing acknowledgements must leave the backlog unchanged without scanning its entries.
+#[tokio::test]
+async fn an_acknowledgement_naming_nothing_in_the_backlog_examines_nothing() {
+    let mut session = session_with_backlog("node-missing", 32).await;
+    let before = backlog_order(&session.state);
+    let examined_before = session.state.unrepaired_settlements_examined();
+
+    session
+        .record_classification_settlement_repair(acknowledgement("eval_never_seen", true))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        backlog_order(&session.state),
+        before,
+        "an acknowledgement for a call this session never settled must leave \
+         the backlog exactly as it was"
+    );
+    assert_eq!(
+        session.state.unrepaired_settlements_examined(),
+        examined_before,
+        "and must not pay to discover that"
+    );
+}
+
+/// A repeated acknowledgement must not scan or remove another settlement.
+#[tokio::test]
+async fn a_repeated_acknowledgement_examines_nothing_and_drains_nothing_twice() {
+    let mut session = session_with_backlog("node-duplicate", 32).await;
+
+    session
+        .record_classification_settlement_repair(acknowledgement(&backlog_call(7), true))
+        .await
+        .unwrap();
+    let after_first = backlog_order(&session.state);
+    let examined_after_first = session.state.unrepaired_settlements_examined();
+    assert_eq!(
+        after_first.len(),
+        31,
+        "the first acknowledgement drains exactly its own entry"
+    );
+
+    session
+        .record_classification_settlement_repair(acknowledgement(&backlog_call(7), false))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        backlog_order(&session.state),
+        after_first,
+        "a repeated acknowledgement must not drain a second entry -- the \
+         identity it names is already gone"
+    );
+    assert_eq!(
+        session.state.unrepaired_settlements_examined(),
+        examined_after_first,
+        "and must not scan the backlog to find that out"
+    );
+}
+
+/// Interior removals must preserve arrival order in both live state and replay.
+#[tokio::test]
+async fn interior_removal_keeps_the_backlog_oldest_first_through_replay() {
+    let mut session = session_with_backlog("node-order", 8).await;
+
+    for (index, applied) in [(3usize, true), (6, false)] {
+        session
+            .record_classification_settlement_repair(acknowledgement(&backlog_call(index), applied))
+            .await
+            .unwrap();
+    }
+
+    let expected: Vec<(String, f64)> = [1usize, 2, 4, 5, 7, 8]
+        .into_iter()
+        .map(|index| (backlog_call(index), index as f64))
+        .collect();
+    assert_eq!(
+        backlog_order(&session.state),
+        expected,
+        "the survivors stay in arrival order, and `applied: false` drains its \
+         entry exactly as `applied: true` does -- both are the ledger ending \
+         the question"
+    );
+    assert_eq!(
+        backlog_order(&replayed(&session).await),
+        expected,
+        "and a successor replaying this log repairs them in the same order"
+    );
 }
