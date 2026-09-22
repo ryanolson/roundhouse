@@ -171,11 +171,9 @@ impl Usage {
     /// `u64::MAX` would report a near-zero total for the busiest deployment on
     /// the fleet, which is the one case where the number matters most.
     pub fn add(&mut self, other: &Usage) {
-        // An accumulator with no input of its own has no cache count to
-        // protect, so it adopts rather than degrades. Without this a fresh
-        // `Usage::default()` — which starts at the weakest source — would drag
-        // every total it collected down to `Unreported`.
-        let empty = self.input_tokens == 0;
+        // Only a default accumulator can adopt provenance. A zero input count
+        // can still accompany unreported cache tokens.
+        let empty = *self == Self::default();
         self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
         self.cached_input_tokens = self
             .cached_input_tokens
@@ -905,6 +903,51 @@ mod tests {
         };
         saturating.add(&written);
         assert_eq!(saturating.cache_write_tokens, u64::MAX);
+    }
+
+    /// A cache count with no `input_tokens` still degrades a later add: the
+    /// `empty` gate compares the whole accumulator against `Self::default()`,
+    /// not just `input_tokens`, so this addend is not mistaken for a fresh one.
+    #[test]
+    fn an_unreported_cache_count_with_no_input_tokens_still_taints_the_total() {
+        let mut total = Usage::default();
+        total.add(&Usage {
+            cached_input_tokens: 10,
+            cache_read_source: CacheReadSource::Unreported,
+            ..Usage::default()
+        });
+        total.add(&Usage {
+            input_tokens: 100,
+            cache_read_source: CacheReadSource::Provider,
+            ..Usage::default()
+        });
+        assert_eq!(total.cached_input_tokens, 10);
+        assert_ne!(
+            total.cache_read_source,
+            CacheReadSource::Provider,
+            "10 cached tokens arrived under Unreported; the total must not read \
+             as a provider measurement"
+        );
+    }
+
+    /// Control for the test above: two ordinary provider-measured calls still
+    /// merge to `Provider`, so the gate above is not simply broken end to end.
+    #[test]
+    fn an_all_provider_aggregate_keeps_provider_provenance() {
+        let mut total = Usage::default();
+        total.add(&Usage {
+            input_tokens: 100,
+            cached_input_tokens: 10,
+            cache_read_source: CacheReadSource::Provider,
+            ..Usage::default()
+        });
+        total.add(&Usage {
+            input_tokens: 100,
+            cached_input_tokens: 20,
+            cache_read_source: CacheReadSource::Provider,
+            ..Usage::default()
+        });
+        assert_eq!(total.cache_read_source, CacheReadSource::Provider);
     }
 
     #[test]

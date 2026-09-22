@@ -23,13 +23,14 @@ use roundhouse_core::metrics::{
 };
 use roundhouse_core::store::{MemoryStore, SessionStore};
 use roundhouse_fleet::{
-    EchoFrontierClient, FrontierChunk, FrontierClient, FrontierError, FrontierQuote, FrontierStream,
+    EchoFrontierClient, FrontierChunk, FrontierClient, FrontierError, FrontierQuote,
+    FrontierStream, LocalFleet,
 };
 use roundhouse_server::test_support::engine_over_echo;
-use roundhouse_server::{Admission, Engine, EngineConfig};
+use roundhouse_server::{Admission, Engine};
 
 mod common;
-use common::{config, frontier_catalog};
+use common::{LOCAL_MODEL, config, embedded_fleet, frontier_catalog};
 
 /// The catalog's own prices, so the dashboard and the router agree by
 /// construction rather than by a second copy kept in step by hand.
@@ -394,24 +395,25 @@ async fn the_live_numbers_match_a_cold_rebuild_from_the_log() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_traffic_with_no_correlary_is_reported_unpriced() {
     let store = Arc::new(MemoryStore::new());
+    // A registered fleet, not just a local-model name: without one the router
+    // never has a local candidate to consider, and every turn below would
+    // silently route to the frontier client instead.
     let engine = engine_over_echo(
         Arc::clone(&store),
         frontier_catalog(),
         Arc::new(EchoFrontierClient::new("frontier answer")),
-        EngineConfig {
-            local_model: "tiny-7b".to_string(),
-            ..config()
-        },
-    );
+        config(),
+    )
+    .with_fleet(embedded_fleet().await as Arc<dyn LocalFleet>);
     let session = SessionId::new("s-unpriced");
     run_turns(&engine, &session, 1).await;
 
-    // The catalog's only hosted model is far above a 7B's capability, so
-    // nothing passes the gate.
+    // The catalog's only hosted model is far above the local model's
+    // capability, so nothing passes the gate.
     let config = MetricsConfig::new(ShadowPricing::new(
         frontier_catalog().shadow_pricing().references().to_vec(),
     ))
-    .with_local_quality("tiny-7b", 0.30);
+    .with_local_quality(LOCAL_MODEL, 0.30);
     let snapshot = engine.metrics().snapshot(&config, 0);
 
     let local: Vec<_> = snapshot
@@ -419,11 +421,32 @@ async fn local_traffic_with_no_correlary_is_reported_unpriced() {
         .iter()
         .filter(|m| m.mode() == ServingMode::Local)
         .collect();
+    assert!(
+        !local.is_empty(),
+        "the turn above routed to the local model; an empty row set would \
+         make every assertion below vacuous"
+    );
     for model in local {
         assert_eq!(
             model.shadow_usd(),
             0.0,
             "a model with no defensible stand-in must not be shadow-priced"
+        );
+        assert!(model.calls > 0, "the turn above must have reached this row");
+        // `Engine::local_stream` tags its credit `CacheReadSource::Derived`,
+        // which is priceable but never a provider measurement — this is the
+        // real engine path exercising that, not a hand-built `Usage`.
+        let evidence = model
+            .cache_reuse_evidence
+            .as_ref()
+            .expect("a local row observed the terminal and must publish evidence");
+        assert_eq!(
+            evidence.samples, 0,
+            "a local row's credit is the router's own quote, so it must never pair"
+        );
+        assert!(
+            evidence.unverifiable_cache_read > 0,
+            "a Derived credit must count as unverifiable, not measured"
         );
     }
 }
