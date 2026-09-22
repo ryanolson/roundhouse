@@ -49,6 +49,12 @@ The initial observation compares the routed prediction with reported usage for t
 
 The serving bandit still needs durable per-turn features, review-window attribution, and a learning update. Cache observations are one input to that work, not a substitute for it.
 
+**Observation checkpoint, 2026-09-21.** Commit `330cacb` adds cache-reuse observations to the metrics JSON. `Usage.cache_read_source` distinguishes provider reports, locally derived counts, and counts without provenance. Explicit provider zeros supply samples. Missing reports and historical records without provenance do not. The metrics pair the final routed prediction with terminal usage and report both token bases, coverage counters, and mean signed error. Existing numeric accounting remains unchanged.
+
+Two decoder assertions failed before the provenance change. Independent mutations caught missing-data relabeling, bypassed measurement checks, and an incorrect provenance merge. A local-path mutation survived the original integration tests. The added assertion exposed an empty fixture: the purported local test had no attached fleet. Commit `a4766a1` attaches the fleet and requires actual local observations. It also fixes a separately reproduced aggregation defect: zero input tokens did not imply an empty accumulator. Only a default accumulator can now adopt provenance.
+
+Post-commit mutations reproduced both defects and failed their intended assertions. All source was restored. The final workspace run at `a4766a1` passed 1784 tests, with 0 failures, 141 existing ignores, and no compiler warnings. Logs: `/tmp/roundhouse-cachepred-provenance-red-decoders.log`, `/tmp/roundhouse-cachepred-refute-{M1,M2,M3,M4,gap}.log`, `/tmp/roundhouse-cachepred-postfix-{M3,aggregate}.log`, and `/tmp/roundhouse-cachepred-final-workspace.log`. No live provider measurement or routing update is claimed.
+
 ### Integration constraints from the current source
 
 `Session::open_observed` acquires the session lease. A background classifier must not open another writer and fence an active turn. `SessionState::project` supports reads without a lease. Result delivery must leave session writes with the engine and retain source-turn identity across delays.

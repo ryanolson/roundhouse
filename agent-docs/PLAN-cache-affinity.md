@@ -25,6 +25,8 @@ Branch: `ai/typesafe-roundhouse-routing-6016d1`. Last update: 2026-09-19. The la
 | C6 | Observed cache deadline and the return trip | not designed | |
 | C7 | Shadow classifier (T5) | B4 standalone adapter built and mutation-checked under T6. Runtime records, scheduling, and bandit allocation remain open. | `51b0fb2` |
 
+**Cache observations, 2026-09-21:** Commit `330cacb` adds predicted-versus-observed cache reuse to the metrics JSON. Only provider-reported counts supply observed samples, including explicit zero. Commit `a4766a1` fixes aggregation provenance and closes the local-path test gap found by mutation. The final workspace run passed 1784 tests, with 0 failures, 141 existing ignores, and no compiler warnings. Mutation evidence and restoration checks are in `PLAN-routing-strategy-bandit.md`. This does not supply live C2 evidence or complete C6/C7.
+
 Open items that belong to a finished rung:
 
 - **C4 checkpoint, 2026-09-19.** The engine carries the target TTL into `FrontierQuote`. Messages bodies select one-hour conversation markers, and the catalog rejects a mismatched write rate, including Messages gateways. Fail-first wire, catalog, and engine tests passed after the change. The full workspace run passed 1670 tests with 141 ignored across 106 test binaries and 7 doc-test suites. A later body regression failed with tool/message TTLs `[300, 3600, 3600]`. That regression is now explicitly ignored pending the owner's normalize-or-reject decision. An ignored test enforces nothing. The subsequent fleet run passed with that one additional ignore. C4 is not ready for use with shorter tool markers.
