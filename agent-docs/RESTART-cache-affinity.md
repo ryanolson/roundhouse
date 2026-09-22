@@ -67,7 +67,7 @@ You are continuing PR #18 in `ryanolson/roundhouse`: https://github.com/ryanolso
 Settled on 2026-09-19. Do not ask for these decisions again:
 
 1. T2 includes both serving strategies and background evaluation arms, with online TypeSafe/Jev arms.
-2. T6 requires explicit opt-in, disabled defaults, and no local-only session egress. The later owner clarification permits bounded prior metadata/classifications plus the current prompt. The current adapter still projects a judge brief. The broader projection remains to implement.
+2. T6 requires explicit opt-in, disabled defaults, and no local-only session egress. The later owner clarification permits bounded prior metadata/classifications plus the current prompt. Commit `438fe2f` implements that projection; it is no longer an open design question.
 3. PR #18 stays one unit, with separate logical commits.
 4. C4 rejects a one-hour catalog entry unless its write rate equals twice its input rate.
 
