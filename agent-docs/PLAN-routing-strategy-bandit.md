@@ -33,6 +33,14 @@ The owner also authorizes Roundhouse to inject, modify, or remove cache markers 
 
 The remaining learning decision is the outcome signal and its quality, cost, and latency tradeoff. Classification history alone does not establish that reward. The implementation brief must define the bounded classification schema and sampling configuration. The owner has not authorized a synchronous Jev selector by this clarification.
 
+### Integration constraints from the current source
+
+`Session::open_observed` acquires the session lease. A background classifier must not open another writer and fence an active turn. `SessionState::project` supports reads without a lease. Result delivery must leave session writes with the engine and retain source-turn identity across delays.
+
+`SessionEvent::response_id` excludes internal side-call events from the response stream. Classification records need the same separation. `DecisionRecord` already persists candidates, the chosen target, policy, and pricing. Its classification inputs must name the exact available records, rather than consult mutable history during replay.
+
+`ToolSignals` supplies local activity counts, error severity, and a heuristic `tests_passed` field. `Verdict` supplies a separate judge assessment of task progress. Neither establishes an approved bandit reward. The first observation tests must distinguish missing classifications, late classifications, duplicate results, and unsupported quality outcomes.
+
 ## 1. Outcome and scope
 
 Roundhouse selects a routing strategy under the session policy. Strategies include rules calibrated offline and an online Jev classifier. Background arms evaluate alternatives without changing the live response. Their evidence informs later strategy versions and promotion decisions.

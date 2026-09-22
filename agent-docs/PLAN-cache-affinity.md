@@ -9,7 +9,7 @@ SPDX-License-Identifier: Apache-2.0
 
 ## 1. Status
 
-**Owner ruling, 2026-09-21.** Roundhouse owns cache markers and can inject, modify, or remove them under provider rules. C4 will normalize tool markers to the target TTL. The earlier owner-decision gate is closed, but implementation and verification remain. The owner also requires per-turn local routing with asynchronous Jev classifications as sequence metadata. The dated addendum in `PLAN-routing-strategy-bandit.md` supersedes the earlier segment-allocation proposal.
+**Owner ruling, 2026-09-21.** Roundhouse owns cache markers and can inject, modify, or remove them under provider rules. C4 now normalizes tool markers to the target TTL, with tests and mutation evidence in `1280855`. The owner also requires per-turn local routing with asynchronous Jev classifications as sequence metadata. The dated addendum in `PLAN-routing-strategy-bandit.md` supersedes the earlier segment-allocation proposal.
 
 Branch: `ai/typesafe-roundhouse-routing-6016d1`. Last update: 2026-09-19. The latest local full run covers `9c56c18`: 1754 passed, 0 failed, 142 ignored, across 108 test binaries and 7 doc-test suites.
 
@@ -20,7 +20,7 @@ Branch: `ai/typesafe-roundhouse-routing-6016d1`. Last update: 2026-09-19. The la
 | C1 | Dominance guard on `Efficient` picks (T4) | done, mutation-checked | `83ac785` |
 | C2 | Second Anthropic breakpoint | mechanism and probe mutation-checked. Live evidence is still necessary. | `22e58ce`, `d7f69ce`, `101eb59`, `d582e62` |
 | C3 | The Dynamo residency call becomes a decision | done, mutation-checked | `8817db0` |
-| C4 | 1-hour TTL as one per-target setting | TTL propagation and catalog guard built. Tool normalization now passes focused tests with no C4 ignore. Independent verification remains. | `4405da3`, continuation below |
+| C4 | 1-hour TTL as one per-target setting | Built and mutation-checked, including tool TTL normalization. The owner-decision ignore is removed. | `4405da3`, `1280855` |
 | C5 | Local TTFT quote reads the residency answer | mechanism and catalog loader done, mutation-checked. Measured deployment slope still needed. | `6e905ba`, `3b21e98` |
 | C6 | Observed cache deadline and the return trip | not designed | |
 | C7 | Shadow classifier (T5) | B4 standalone adapter built and mutation-checked under T6. Runtime records, scheduling, and bandit allocation remain open. | `51b0fb2` |
