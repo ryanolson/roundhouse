@@ -1767,6 +1767,22 @@ async fn a_failed_repair_acknowledgement_append_stays_retryable() {
         "the one classification this log holds"
     );
 
+    // Wait for the background repair before recording the ledger call count.
+    for _ in 0..200 {
+        if deployment.runtime.retained_repairs(&session).await > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let settle_calls_before = ledger.settle_calls();
+    let repaired_at_before = deployment
+        .runtime
+        .ready_repairs(&session)
+        .await
+        .first()
+        .map(|delivery| delivery.record.repaired_at_ms)
+        .expect("the repair parked before any refusing turn ran");
+
     // Further turns while the store is still refusing must not re-drive the
     // ledger (it already applied) or buy another call.
     deployment.turn(&session, "t2", "keep going").await;
@@ -1776,6 +1792,31 @@ async fn a_failed_repair_acknowledgement_append_stays_retryable() {
         "the delivery path must actually have attempted the append and been \
          refused -- an empty log is otherwise equally what a deployment that \
          never tried would leave"
+    );
+    // Allow a background retry to reach the ledger before comparing counts.
+    let mut settle_calls_after = ledger.settle_calls();
+    for _ in 0..50 {
+        if settle_calls_after != settle_calls_before {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        settle_calls_after = ledger.settle_calls();
+    }
+    assert_eq!(
+        settle_calls_after, settle_calls_before,
+        "a refused append must not read back as an eviction that re-drives \
+         the ledger for a settlement it already answered"
+    );
+    assert_eq!(
+        deployment
+            .runtime
+            .ready_repairs(&session)
+            .await
+            .first()
+            .map(|delivery| delivery.record.repaired_at_ms),
+        Some(repaired_at_before),
+        "the same parked acknowledgement across both refusing turns, not one \
+         lost and silently recreated"
     );
     assert_eq!(
         ledger.committed_usd(&principal, &terms).await,
