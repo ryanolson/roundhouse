@@ -11,7 +11,7 @@ SPDX-License-Identifier: Apache-2.0
 
 **Owner ruling, 2026-09-21.** Roundhouse owns cache markers and can inject, modify, or remove them under provider rules. C4 now normalizes tool markers to the target TTL, with tests and mutation evidence in `1280855`. The owner also requires per-turn local routing with asynchronous Jev classifications as sequence metadata. The dated addendum in `PLAN-routing-strategy-bandit.md` supersedes the earlier segment-allocation proposal.
 
-Branch: `ai/typesafe-roundhouse-routing-6016d1`. Last update: 2026-09-22. The latest local full run covers `1c14975`: 1831 passed, 0 failed, 145 existing ignores, across 111 test binaries and 7 doc-test suites. The four Redis contract instances added in `42c9991` passed separately against real Redis. No compiler warnings were emitted.
+Branch: `ai/typesafe-roundhouse-routing-6016d1`. Last update: 2026-09-22. The classifier runtime draft at `438fe2f` passed the latest local full run: 2109 passed, 0 failed, and 147 ignored, across 123 test binaries and seven doc-test suites. No compiler warnings were emitted. Strict workspace Clippy also passed. Logs: `/tmp/roundhouse-runtime-parent-final-workspace.log` and `/tmp/roundhouse-runtime-parent-final-clippy.log`. Mutation checks, review, and publication remain pending. The last published selection foundation is `1c14975`, with its documentation checkpoint at `1638783`.
 
 | Rung | What | Status | Commit |
 |---|---|---|---|

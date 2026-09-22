@@ -115,3 +115,11 @@ What the benchmark is, stated precisely:
 - **Sample size.** "Perfect accuracy on 32 unique scored cases does not establish production accuracy."
 
 The benchmark shows that Jev is a fast, injection-resistant classifier of short requests, and that its confidence drops on adversarial and ambiguous inputs. It does not show that routing by that classification improves any of function, cost, or time to solution.
+
+## API metadata check (2026-09-22)
+
+An authenticated `GET /v1/models` returned HTTP 200 and advertised `jev-latest` and `jev-preview`. It did not advertise the cookbook's `jev-1.12`. This confirms credential access to model discovery, not availability of that versioned model. No inference request was made.
+
+The [parallel-questions cookbook](https://docs.typesafe.ai/cookbooks/parallel_questions.md) still names `jev-1.12` and prices input at $0.042 per million tokens, with free output. The [launch announcement](https://typesafe.ai/blog/introducing-system-one-models-and-jev) gives the same rates. These are published prices checked on this date, not measurements from this account or defaults for deployment configuration.
+
+The [public OpenAPI schema](https://api.typesafe.ai/openapi.json) includes `SystemOneResponse.model`, which identifies the answering model and can differ from the requested alias. Classification records need both identities. A missing reported identity must remain unknown. At `1638783`, the transport discards this response field. The runtime integration must preserve it through the durable result.
