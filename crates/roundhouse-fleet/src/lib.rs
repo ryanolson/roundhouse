@@ -20,7 +20,7 @@ pub mod anthropic_messages;
 pub mod frontier;
 pub mod local;
 pub mod openai_responses;
-/// Deliberately unwired: see the module docs. No shipped binary calls it.
+/// TypeSafe transport for the server's opt-in background classification runtime.
 pub mod typesafe;
 pub mod usage;
 
