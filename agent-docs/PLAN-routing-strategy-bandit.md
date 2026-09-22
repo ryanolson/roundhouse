@@ -41,6 +41,14 @@ The tests-first contract includes positive and negative interval labels, duplica
 
 The current judge action is not the reward. `map` can return `Continue` for an off-track verdict without a located divergence. Shadow execution can suppress corrections too. The integration must use an explicit frontier review result, rather than infer success from action delivery. Cache-aware review also remains to implement: the existing separate judge key does not supply Messages cache markers or interval coverage.
 
+### Cache prediction feedback (2026-09-21)
+
+The owner identifies lower-than-expected cache reuse as an efficiency signal, especially for destinations without retention guarantees. The observation is a prediction error. It does not establish eviction or cache pressure as its cause. Prefix changes, cache keys, elapsed time, and provider routing can also affect reuse.
+
+The initial observation compares the routed prediction with reported usage for that dispatch. Predicted reuse uses the router's token basis. Observed reuse uses the provider's input-token basis. Their ratios and sample provenance must remain explicit. Missing cache reports and estimated usage must not become measured misses. Cache cost and latency remain separate measurements, so learning must not count a cache miss as an additional independent cost penalty.
+
+The serving bandit still needs durable per-turn features, review-window attribution, and a learning update. Cache observations are one input to that work, not a substitute for it.
+
 ### Integration constraints from the current source
 
 `Session::open_observed` acquires the session lease. A background classifier must not open another writer and fence an active turn. `SessionState::project` supports reads without a lease. Result delivery must leave session writes with the engine and retain source-turn identity across delays.
