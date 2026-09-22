@@ -281,3 +281,15 @@ The owner keeps PR #18 as one unit. Separate commits preserve the boundaries bet
 The C4 checkpoint carries the target TTL into Messages conversation markers and rejects one-hour catalog entries with mismatched write rates. A body-level regression exposes a remaining conflict: preserved five-minute tool markers precede the new one-hour conversation markers. The emitted TTL order is `[300, 3600, 3600]` seconds. Anthropic requires longer lifetimes before shorter ones.
 
 Two remedies need an owner decision: normalize tool markers to the target TTL, or reject requests whose preserved markers conflict. Normalization changes the earlier verbatim-tool rule. Rejection refuses requests that the caller otherwise expects to work. The failing regression is explicitly ignored until that decision. C4 remains incomplete.
+
+## Addendum (2026-09-21): per-turn routing, background classification, and cache ownership
+
+The owner requires model selection on every turn. Inputs include cache state at each eligible destination, current request complexity, and context complexity. Cache segments do not lock model selection or selector assignment.
+
+Fast local logic selects the live route. Jev classifies turns outside the routing path. Those classifications enrich the sequence metadata that the online bandit uses on later turns. Jev does not delay the current route. This supersedes the proposed segment allocation and the interpretation of Jev as a competing synchronous selector for this implementation.
+
+The owner proposes bounded turn history through metadata and classifications, together with the current user prompt. This avoids transmission of full contexts. T6 still applies: explicit opt-in, disabled by default, no local-only sessions, and bounded content. The classification schema and history projection need an implementation brief. The existing capable-versus-efficient adapter does not yet supply this richer metadata.
+
+Classification results are features, not observed rewards. A result must identify its source turn, classifier version, and availability time. A later classification cannot change a recorded earlier decision. Failed or missing classifications remain explicit. Learning still needs a defined outcome signal and a cost-versus-latency policy.
+
+The owner gives Roundhouse control over cache markers. Provider adapters can inject, modify, or remove markers as the situation requires. Each adapter must obey its provider's marker rules. For C4, existing tool markers adopt the target TTL, which is already the source for conversation markers and catalog pricing. Tool definitions and schema contents remain unchanged. This supersedes the normalize-or-reject gate and permits removal of its test ignore.

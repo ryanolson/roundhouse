@@ -20,6 +20,9 @@ You are continuing PR #18 in `ryanolson/roundhouse`: https://github.com/ryanolso
 
 ## State
 
+- **Current direction, 2026-09-21:** The owner requires local model selection each turn, with destination cache state, request complexity, and sequence metadata as inputs. Jev classifies turns asynchronously. Its results enrich later features for the online bandit. They are not rewards. This supersedes segment allocation and synchronous Jev selection in the earlier brief. The richer classification schema and reward policy remain to implement and settle, respectively.
+- **C4 ruling, 2026-09-21:** Roundhouse owns provider cache markers and can inject, modify, or remove them under provider rules. Existing tool markers adopt the target TTL. The normalize-or-reject question is settled. Implementation and verification must remove the ignored regression before C4 is complete.
+
 - `git fetch origin` first. Trust only pushed state. The 2026-09-19 continuation started from the clean, pushed commit `29665d8`. A separate worktree holds the continuation at `/home/ryan/repos/roundhouse/.claude/worktrees/pr18-cache-affinity-continuation`, on branch `codex/pr18-cache-affinity-continuation`. The PR branch remains `ai/typesafe-roundhouse-routing-6016d1`. Check both heads before further work.
 - Built, mutation-checked, and pushed: C1 (dominance guard on `Efficient` picks), C2 (second Anthropic breakpoint), C3 (the fleet residency call runs only when its answer can matter), C5 (local TTFT slope, mechanism only).
 - The full workspace suite passed at `29665d8` on 2026-09-19: 1652 passed, 0 failed, 141 ignored. It covered 104 test binaries and 7 doc-test suites. Command: `ulimit -Sn 65536 && timeout 900 cargo test --workspace`. The inherited descriptor limit of 1024 caused `Too many open files` in `embedded_selection`. That binary passed all 7 tests with the raised limit before the full rerun.
@@ -46,16 +49,14 @@ Settled on 2026-09-19. Do not ask for these decisions again:
 3. PR #18 stays one unit, with separate logical commits.
 4. C4 rejects a one-hour catalog entry unless its write rate equals twice its input rate.
 
-Questions already sent and still awaiting answers:
+Remaining questions (updated 2026-09-21):
 
-1. C4 tool markers: normalize existing marker TTLs to the target setting, or preserve them and reject conflicting requests. Normalization is the recommendation. Neither answer is assumed.
-2. C6: design the return-trip cost now, or wait for live C2 cache evidence. Waiting is the recommendation.
-3. C3: retain fleet-error failure, or add a sub-budget and fail-open path to admitted frontier targets.
-4. Bandit objective: quality and latency constraints followed by cost minimization, a weighted score, or fixed allocation until evidence exists. Deployment must supply the limits.
-5. B2 cadence: one strategy per cache segment, or one selection per turn. The proposed segment boundaries are session start, fork, and current-target cache loss. Failover retains the assignment.
-6. Live C2 inputs: catalog path, pinned model, approved USD spend cap, and restored `openv` access. No live run starts without these inputs.
+1. C6: design the return-trip cost now, or wait for live C2 cache evidence. Waiting is the recommendation.
+2. C3: retain fleet-error failure, or add a sub-budget and fail-open path to admitted frontier targets.
+3. Bandit reward: define the quality outcome and the cost-versus-latency tradeoff. Background classifications supply features, not this reward.
+4. Live C2 inputs: catalog path, pinned model, approved USD spend cap, and restored `openv` access. No live run starts without these inputs.
 
-The segment boundary cases and promotion evidence also need a settled brief before serving allocation changes.
+Per-turn cadence and Roundhouse ownership of cache markers are settled. Do not ask those questions again.
 
 ## Original work inventory
 

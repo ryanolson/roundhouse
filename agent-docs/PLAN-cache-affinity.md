@@ -9,6 +9,8 @@ SPDX-License-Identifier: Apache-2.0
 
 ## 1. Status
 
+**Owner ruling, 2026-09-21.** Roundhouse owns cache markers and can inject, modify, or remove them under provider rules. C4 will normalize tool markers to the target TTL. The earlier owner-decision gate is closed, but implementation and verification remain. The owner also requires per-turn local routing with asynchronous Jev classifications as sequence metadata. The dated addendum in `PLAN-routing-strategy-bandit.md` supersedes the earlier segment-allocation proposal.
+
 Branch: `ai/typesafe-roundhouse-routing-6016d1`. Last update: 2026-09-19. The latest local full run covers `9c56c18`: 1754 passed, 0 failed, 142 ignored, across 108 test binaries and 7 doc-test suites.
 
 | Rung | What | Status | Commit |

@@ -5,7 +5,33 @@ SPDX-License-Identifier: Apache-2.0
 
 # Routing strategy bandit: serving and background evaluation
 
-> Status: proposed implementation brief, 2026-09-19. The owner requests serving strategies and background evaluation arms, including online TypeSafe/Jev. This brief develops that direction. The owner subsequently accepted T6 in the ruling addendum. The remaining decisions are listed in `PLAN-cache-affinity.md` and section 6 below.
+> Status: revised direction, 2026-09-21. The owner requires per-turn local routing and asynchronous Jev classification. The following addendum supersedes conflicting proposals in sections 1 through 6. Those sections retain the earlier reasoning and verification evidence.
+
+## Current direction (2026-09-21)
+
+The live selector runs on every turn. Its inputs include the current request, context complexity, prior turn metadata, and cache state at eligible destinations. Jev supplies background classifications that enrich metadata for subsequent turns. It does not choose the current route or add a dependency to the turn path.
+
+The online bandit learns from the classification sequence and observed serving outcomes. Classification is an input feature, not a reward or proof of target quality. The current binary capable-versus-efficient adapter is a transport foundation. Rich turn classification requires a new typed contract.
+
+```mermaid
+flowchart TD
+    T[Current turn] --> F[Available metadata and destination cache state]
+    F --> L[Local model selection each turn]
+    L --> D[Dispatch and observed outcome]
+    T --> Q[Bounded background classification queue]
+    Q --> J[Jev under accepted egress policy]
+    J --> H[Versioned turn classifications]
+    H --> N[Features for subsequent turns]
+    N --> F
+    D --> U[Bandit update with observed reward]
+    U --> L
+```
+
+The implementation order is durable per-turn records, bounded background execution, rich classification, feature projection, and online learning. Each decision records the features available at selection time. Replay uses that record, even when later classifications become available. Background work retains source-turn identity, classifier version, and availability order. Retries cannot duplicate outcomes or charges.
+
+The owner also authorizes Roundhouse to inject, modify, or remove cache markers under provider rules. C4 normalizes existing tool markers to the configured target TTL. The earlier cache-marker and segment-cadence questions are settled.
+
+The remaining learning decision is the outcome signal and its quality, cost, and latency tradeoff. Classification history alone does not establish that reward. The implementation brief must define the bounded classification schema and sampling configuration. The owner has not authorized a synchronous Jev selector by this clarification.
 
 ## 1. Outcome and scope
 
