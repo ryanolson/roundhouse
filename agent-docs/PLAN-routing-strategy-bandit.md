@@ -31,7 +31,15 @@ The implementation order is durable per-turn records, bounded background executi
 
 The owner also authorizes Roundhouse to inject, modify, or remove cache markers under provider rules. C4 normalizes existing tool markers to the configured target TTL. The earlier cache-marker and segment-cadence questions are settled.
 
-The remaining learning decision is the outcome signal and its quality, cost, and latency tradeoff. Classification history alone does not establish that reward. The implementation brief must define the bounded classification schema and sampling configuration. The owner has not authorized a synchronous Jev selector by this clarification.
+The later 2026-09-21 ruling defines the quality signal: frontier corrections give negative feedback, and a successful review without corrections gives positive feedback. The feedback applies to routing decisions in the reviewed interval since the previous frontier review boundary. Jev classifications supply features, not that reward. The implementation brief must define the bounded classification schema, sampling configuration, learning update, and cost-versus-latency policy. The owner has not authorized a synchronous Jev selector by this clarification.
+
+### Frontier review feedback (2026-09-21)
+
+Each review records its prompt snapshot and covered decision interval. The result labels that interval once. A late result cannot label newer decisions or change their recorded input features. Failed, skipped, malformed, or insufficient-context reviews remain unknown. Missing feedback is not a no-correction verdict.
+
+The tests-first contract includes positive and negative interval labels, duplicate review delivery, replay, late results, missing reviews, and incomplete coverage. The fixture must include several routed turns and a later turn outside the review snapshot. A negative review labels the covered choices together. It does not invent independent evidence that every selected model caused a correction.
+
+The current judge action is not the reward. `map` can return `Continue` for an off-track verdict without a located divergence. Shadow execution can suppress corrections too. The integration must use an explicit frontier review result, rather than infer success from action delivery. Cache-aware review also remains to implement: the existing separate judge key does not supply Messages cache markers or interval coverage.
 
 ### Integration constraints from the current source
 
@@ -39,7 +47,7 @@ The remaining learning decision is the outcome signal and its quality, cost, and
 
 `SessionEvent::response_id` excludes internal side-call events from the response stream. Classification records need the same separation. `DecisionRecord` already persists candidates, the chosen target, policy, and pricing. Its classification inputs must name the exact available records, rather than consult mutable history during replay.
 
-`ToolSignals` supplies local activity counts, error severity, and a heuristic `tests_passed` field. `Verdict` supplies a separate judge assessment of task progress. Neither establishes an approved bandit reward. The first observation tests must distinguish missing classifications, late classifications, duplicate results, and unsupported quality outcomes.
+`ToolSignals` supplies local activity counts, error severity, and a heuristic `tests_passed` field. These are features. The owner now selects the frontier review result as the quality signal. The current `Verdict` needs explicit interval coverage before it can supply that signal. The first observation tests must distinguish missing classifications, late classifications, duplicate results, and unsupported quality outcomes.
 
 ## 1. Outcome and scope
 

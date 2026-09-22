@@ -20,6 +20,8 @@ You are continuing PR #18 in `ryanolson/roundhouse`: https://github.com/ryanolso
 
 ## State
 
+- **Quality ruling, 2026-09-21:** A successful frontier review without corrections gives positive feedback to routing decisions since the previous frontier review boundary. Corrections give negative feedback to that interval. Failed or skipped reviews supply no label. The interval needs explicit coverage and exactly-once learning updates. The current judge action `Continue` is not sufficient evidence of approval. See the latest ruling addendum. Do not ask for the quality-signal source again.
+
 - **Current direction, 2026-09-21:** The owner requires local model selection each turn, with destination cache state, request complexity, and sequence metadata as inputs. Jev classifies turns asynchronously. Its results enrich later features for the online bandit. They are not rewards. This supersedes segment allocation and synchronous Jev selection in the earlier brief. The richer classification schema and reward policy remain to implement and settle, respectively.
 - **C4 completion, 2026-09-21:** Commit `1280855` normalizes existing Messages tool markers to the target TTL. The owner-decision ignore is removed. Five assertions failed before the fix, with 69 passing controls. The restored Messages suite passed 74 tests. Three independent mutations were caught and restored. The full workspace suite passed 1760 tests, with 0 failures and 141 ignores, across 108 test binaries and 7 doc-test suites. Log: `/tmp/roundhouse-c4-normalization-workspace.log`. Later commits in this checkpoint update documentation only.
 
@@ -53,7 +55,7 @@ Remaining questions (updated 2026-09-21):
 
 1. C6: design the return-trip cost now, or wait for live C2 cache evidence. Waiting is the recommendation.
 2. C3: retain fleet-error failure, or add a sub-budget and fail-open path to admitted frontier targets.
-3. Bandit reward: define the quality outcome and the cost-versus-latency tradeoff. Background classifications supply features, not this reward.
+3. Bandit utility: the frontier correction signal is settled. The cost-versus-latency tradeoff remains to define. Background classifications supply features, not rewards.
 4. Live C2 inputs: catalog path, pinned model, approved USD spend cap, and restored `openv` access. No live run starts without these inputs.
 
 Per-turn cadence and Roundhouse ownership of cache markers are settled. Do not ask those questions again.
