@@ -76,6 +76,7 @@
 
 use async_trait::async_trait;
 
+use crate::routing::selection::{SelectorSnapshot, StageEvidence, StageOutcome};
 use crate::routing::{
     Admitted, Candidate, Decision, RoutingContext, RoutingError, RoutingPolicy, Target,
 };
@@ -230,7 +231,10 @@ impl DecisionSource {
 /// [`ToolSignals`] plus the one field the port refused, computed the way this
 /// tree can honestly compute it. Bundled rather than passed as two arguments so
 /// that a caller cannot pair one session's tool traffic with another's depth.
-#[derive(Debug, Clone, Default, PartialEq)]
+/// Serialized for the reason [`ToolSignals`] is: a decision records the exact
+/// signals `choose` was handed, rather than a later build's reading of the log
+/// they came from.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TurnSignals {
     pub tools: ToolSignals,
     /// How many *task* exchanges this session holds — roundhouse's own
@@ -294,7 +298,11 @@ pub struct ScoreResult {
 ///
 /// Always resolved — see the module attribution on the missing
 /// `ConsultClassifier` arm.
-#[derive(Debug, Clone, Copy, PartialEq)]
+///
+/// Serialized so `routing::selection::StageEvidence` can carry the scorer's own
+/// answer verbatim. The four fields are recorded rather than a reader re-running
+/// `pick_tier`, which would score an old turn against the current thresholds.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Pick {
     pub tier: Tier,
     pub source: DecisionSource,
@@ -643,6 +651,7 @@ impl StagePolicy {
     /// had been honoured when it was bypassed.
     fn degrade_past_the_recipe(
         recipe: &TierRecipe,
+        pick: Pick,
         admitted: &Admitted<'_>,
     ) -> Result<Decision, RoutingError> {
         let Some(degrade) = admitted
@@ -666,18 +675,37 @@ impl StagePolicy {
             );
             return Err(admitted.refuse_no_viable());
         };
-        Ok(admitted.decide(
-            degrade.target.clone(),
-            // **No price in this string**, the same rule the staged rationale
-            // below states at length: a rationale is republished into the
-            // calling model's own context by `explain_last_route`.
-            format!(
-                "stage router: no target this project's tier recipe names is admissible on this \
-                 turn, so the turn degrades to {} -- a spent allowance promises local service and \
-                 a recipe does not override it",
-                degrade.target.policy_identity()
-            ),
-        ))
+        Ok(Decision {
+            // The recipe is still the recipe this turn ran under, and the pick
+            // is still what the scorer answered — both are recorded even though
+            // neither decided the target, because "which recipe failed to place
+            // this turn" is the question an operator reading a degrade asks.
+            // `StageOutcome::DegradedPastRecipe` is what says no tier served,
+            // which is the same thing the `None` source says to the handoff
+            // gate.
+            selector: Some(SelectorSnapshot::stage(StageEvidence {
+                capable: recipe.list(Tier::Capable).to_vec(),
+                efficient: recipe.list(Tier::Efficient).to_vec(),
+                picker: recipe.picker(),
+                confidence_threshold: recipe.confidence_threshold(),
+                pick,
+                outcome: StageOutcome::DegradedPastRecipe {
+                    degraded_to: degrade.target.policy_identity(),
+                },
+            })),
+            ..admitted.decide(
+                degrade.target.clone(),
+                // **No price in this string**, the same rule the staged rationale
+                // below states at length: a rationale is republished into the
+                // calling model's own context by `explain_last_route`.
+                format!(
+                    "stage router: no target this project's tier recipe names is admissible on \
+                     this turn, so the turn degrades to {} -- a spent allowance promises local \
+                     service and a recipe does not override it",
+                    degrade.target.policy_identity()
+                ),
+            )
+        })
     }
 }
 
@@ -725,7 +753,7 @@ impl RoutingPolicy for StagePolicy {
                     false => (pick.tier.other(), other),
                     // The recipe named targets and the pool holds none of them.
                     // Whether that is a failure depends on what admission left.
-                    true => return Self::degrade_past_the_recipe(recipe, &admitted),
+                    true => return Self::degrade_past_the_recipe(recipe, pick, &admitted),
                 }
             }
         };
@@ -809,7 +837,7 @@ impl RoutingPolicy for StagePolicy {
                 recipe.confidence_threshold()
             ));
         }
-        if let Some(displaced) = displaced {
+        if let Some(displaced) = &displaced {
             // **No price here either**, for the reason the clause above states:
             // the two quotes that decided this went to the `tracing` event at
             // the guard, which no model reads. What the model's own context
@@ -853,7 +881,36 @@ impl RoutingPolicy for StagePolicy {
             ));
         }
 
-        Ok(admitted.decide_staged(winner.target.clone(), fallbacks, source, rationale))
+        // **Three branches, one arm each, and the guard's arm outranks the
+        // empty-tier one because the two cannot both have fired**: the guard
+        // only runs when the picked tier was *not* empty. `displaced` is
+        // therefore the discriminator and not a flag beside one.
+        let outcome = match (&displaced, picked_tier_was_empty) {
+            (Some(displaced), _) => StageOutcome::CostGuard {
+                served: serving,
+                displaced: displaced.clone(),
+            },
+            (None, true) => StageOutcome::PickedTierEmpty { served: serving },
+            (None, false) => StageOutcome::Served { tier: serving },
+        };
+
+        Ok(Decision {
+            // The operator's own lists, in the operator's own order, beside the
+            // scorer's own answer. A digest would tell a reader that two turns
+            // ran under different recipes and never which — and `pick` is
+            // carried rather than recomputed because `pick_tier` is pure over
+            // *this build's* thresholds, which is exactly the substitution a
+            // replay must not make.
+            selector: Some(SelectorSnapshot::stage(StageEvidence {
+                capable: recipe.list(Tier::Capable).to_vec(),
+                efficient: recipe.list(Tier::Efficient).to_vec(),
+                picker: recipe.picker(),
+                confidence_threshold: recipe.confidence_threshold(),
+                pick,
+                outcome,
+            })),
+            ..admitted.decide_staged(winner.target.clone(), fallbacks, source, rationale)
+        })
     }
 }
 

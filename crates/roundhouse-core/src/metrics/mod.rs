@@ -546,6 +546,7 @@ mod tests {
         log.push(SessionEventKind::Routed {
             response_id: response_id.clone(),
             decision: DecisionRecord {
+                selection: None,
                 local_quote_skipped: None,
                 chosen: frontier("anthropic", "claude"),
                 rationale: "test".into(),
@@ -597,6 +598,7 @@ mod tests {
         log.push(SessionEventKind::Routed {
             response_id: response_id.clone(),
             decision: DecisionRecord {
+                selection: None,
                 local_quote_skipped: None,
                 chosen: frontier("anthropic", "claude"),
                 rationale: "test".into(),

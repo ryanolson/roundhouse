@@ -112,7 +112,13 @@ pub fn flat_control_call_name(tool: &str) -> String {
 /// namespace is never dropped, so a bare `status` in that log is provably not
 /// ours, and accepting it silently exempted a client's own tool from every
 /// signal the trigger computes while `turn_depth` went on counting it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Serialized because it is a *parameter of the extractor*, not a detail of it:
+/// `routing::selection::LocalFeatures` records which spelling the signals were
+/// taken under, since the same exchanges counted under the other dialect are a
+/// different turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ControlCallDialect {
     /// Codex over the OpenAI Responses API: the namespace rides its own wire
     /// field, and since M17 the log keeps it there — a bare `status` in `name`

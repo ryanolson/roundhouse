@@ -114,6 +114,7 @@ fn one_frontier_call(usage: Usage) -> Vec<SessionEvent> {
             kind: SessionEventKind::Routed {
                 response_id: response.clone(),
                 decision: DecisionRecord {
+                    selection: None,
                     local_quote_skipped: None,
                     chosen: target(),
                     rationale: "test".into(),

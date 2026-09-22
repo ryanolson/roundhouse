@@ -1399,6 +1399,7 @@ pub(super) mod tests {
     /// A plain decision naming one target, for fixtures that vary one field.
     pub(crate) fn decision_for(target: Target, isl_tokens: u64) -> DecisionRecord {
         DecisionRecord {
+            selection: None,
             local_quote_skipped: None,
             chosen: target,
             rationale: "test".into(),
@@ -1540,6 +1541,7 @@ pub(super) mod tests {
             self.push(SessionEventKind::Routed {
                 response_id: response_id.clone(),
                 decision: DecisionRecord {
+                    selection: None,
                     local_quote_skipped: None,
                     chosen: target,
                     rationale: "test".into(),
@@ -1645,6 +1647,7 @@ pub(super) mod tests {
             self.push(SessionEventKind::Routed {
                 response_id: response_id.clone(),
                 decision: DecisionRecord {
+                    selection: None,
                     local_quote_skipped: None,
                     chosen: target,
                     rationale: "test".into(),

@@ -33,12 +33,17 @@
 
 pub mod ledger;
 pub mod policy;
+pub mod selection;
 pub mod stage;
 
 pub use ledger::{CacheLedger, CacheModel, LedgerEntry, PooledUsage, ProviderPricing};
 pub use policy::{AffinityPolicy, EscalationPolicy};
+pub use selection::{
+    AffinityEvidence, FEATURE_EXTRACTOR_REVISION, LocalFeatures, SelectionSnapshot, SelectorBranch,
+    SelectorSnapshot, StageEvidence, StageOutcome,
+};
 pub use stage::{
-    DecisionSource, PickerMode, StagePolicy, Tier, TierRecipe, TierRecipeError, TurnSignals,
+    DecisionSource, Pick, PickerMode, StagePolicy, Tier, TierRecipe, TierRecipeError, TurnSignals,
 };
 
 use async_trait::async_trait;
@@ -207,20 +212,12 @@ pub struct RoutingContext<'a> {
     /// passes [`TurnBudget::Unlimited`], which is the value that makes the
     /// budget axis a no-op rather than a ceiling that happens to be large.
     pub budget: &'a TurnBudget,
-    /// What the session's recent tool traffic says, computed once per turn from
-    /// the fold the engine already holds.
+    /// Local signals computed from committed exchanges for this turn.
     ///
-    /// **Derived data, not new state.** The extractor runs over the committed
-    /// exchanges, so a successor picking this session up computes the same
-    /// numbers from the same log; nothing is stored and nothing is asked of a
-    /// model. `None` is the first turn of a session — no exchanges, nothing to
-    /// read — and it scores exactly as an empty [`TurnSignals`] does, through
-    /// the ordinary arithmetic rather than through a special case.
-    ///
-    /// Turn-resolved like [`Self::budget`] and deliberately not
-    /// admission-resolved like [`Self::turn_policy`]: the signals change on
-    /// every exchange, and a value fixed for the session would score the tenth
-    /// turn on the first one's evidence.
+    /// The engine supplies and records the exact values, including an empty
+    /// set on the first turn. `None` means a caller supplied no signals, in
+    /// which case the stage policy uses an empty set. Each subsequent turn
+    /// computes new signals; replay preserves earlier selection snapshots.
     pub signals: Option<&'a TurnSignals>,
     /// This project's tier recipe, or `None` where it configured none.
     ///
@@ -304,6 +301,13 @@ impl<'a> Admitted<'a> {
     /// holds borrows into the caller's candidate slice — and the engine's own
     /// `UnresolvableTarget` is where that is already caught, against the
     /// authoritative set.
+    ///
+    /// **[`Decision::admitted`] is stamped here** for the same reason the budget
+    /// state is: this is where the resolution happened, and it is the only place
+    /// that still holds it. A reader asking `admissible` again would have to
+    /// invent a `max_load` — the calling policy's own tuning, which this type
+    /// has already applied and does not carry — and would miss the overflow
+    /// valve's pool entirely.
     pub fn decide(&self, target: Target, rationale: String) -> Decision {
         Decision {
             target,
@@ -311,6 +315,8 @@ impl<'a> Admitted<'a> {
             budget_state: self.budget_state,
             fallbacks: Vec::new(),
             source: None,
+            admitted: Some(self.pool.iter().map(|c| c.target.clone()).collect()),
+            selector: None,
         }
     }
 
@@ -550,6 +556,19 @@ pub struct Decision {
     /// scoring and audit policies pick a *candidate*, not a tier.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<DecisionSource>,
+    /// The pool returned by this policy's admission call.
+    ///
+    /// Policies can use different load ceilings, and admission can reopen the
+    /// pool through budget overflow. The engine copies this result rather than
+    /// repeating admission. `None` means that evidence was not recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admitted: Option<Vec<Target>>,
+    /// Which builtin selector branch ran, and under what configuration.
+    ///
+    /// `None` where the branch is not one this module can name — see
+    /// [`SelectorSnapshot`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<SelectorSnapshot>,
 }
 
 /// The persisted form of a decision, written into the session event log.
@@ -749,6 +768,13 @@ pub struct DecisionRecord {
     /// that always quotes writes the bytes it wrote before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_quote_skipped: Option<LocalQuoteSkip>,
+    /// The inputs, configuration, and original choice captured before dispatch.
+    ///
+    /// The engine records this on every routed dispatch. `None` means missing
+    /// evidence, including historical records written before this field existed.
+    /// Missing evidence is distinct from recorded empty local signals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<SelectionSnapshot>,
 }
 
 /// Why a turn's local residency check was not made.
@@ -1055,6 +1081,7 @@ mod tests {
         // deserializing, or an upgrade takes the deployment's routing history
         // with it.
         let record = DecisionRecord {
+            selection: None,
             local_quote_skipped: None,
             chosen: Target::Frontier {
                 provider: "anthropic".into(),

@@ -457,6 +457,7 @@ mod tests {
             model: "llama-3.1-8b".into(),
         };
         let decision = DecisionRecord {
+            selection: None,
             local_quote_skipped: None,
             chosen: chosen.clone(),
             rationale: "cheapest warm option above the floor".into(),

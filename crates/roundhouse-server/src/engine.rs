@@ -41,8 +41,8 @@ use roundhouse_core::metrics::MetricsRecorder;
 use roundhouse_core::now_ms;
 use roundhouse_core::routing::{
     AttemptClass, CacheLedger, Candidate, Decision, DecisionRecord, DecisionSource,
-    DispatchAttempt, LocalQuoteSkip, RoutingContext, RoutingError, RoutingPolicy, Target, Tier,
-    TierRecipe, TurnSignals,
+    DispatchAttempt, FEATURE_EXTRACTOR_REVISION, LocalFeatures, LocalQuoteSkip, RoutingContext,
+    RoutingError, RoutingPolicy, SelectionSnapshot, Target, Tier, TierRecipe, TurnSignals,
 };
 use roundhouse_core::session::{Session, SessionError, SessionState, TurnAdmission};
 use roundhouse_core::store::SessionStore;
@@ -2029,25 +2029,21 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             ) as usize;
         let turn_index = session.turn_index().saturating_sub(1);
 
-        // What the session's own tools have been doing, for the tier scorer.
-        //
-        // **Derived here rather than carried in state**, and that is the whole
-        // of S1: the extractor runs over the committed exchanges, which is the
-        // same projection `Evidence::of` hands the validate loop, so a
-        // successor that picks this session up scores the turn identically.
-        // Nothing is stored, nothing is asked of a model, and a deployment with
-        // no recipe pays one walk of the fold's item list for a value no policy
-        // reads.
-        //
-        // Computed unconditionally rather than behind `admission.tiers.is_some()`
-        // so there is one code path: an empty session yields the default
-        // signals, the scorer returns zero, and the picker's default takes the
-        // turn — which is exactly what `None` would have done, through the
-        // arithmetic instead of through a branch.
-        let signals = TurnSignals::from_exchanges(
-            &exchanges(&session.state().items),
-            ControlCallDialect::of_session_key(session.session_id().as_str()),
-        );
+        // Compute once from committed input and retain the values in the route
+        // record. Later turns can use a changed extractor without rewriting this
+        // turn's evidence. No model call is required.
+        let dialect = ControlCallDialect::of_session_key(session.session_id().as_str());
+        let signals = TurnSignals::from_exchanges(&exchanges(&session.state().items), dialect);
+
+        // Capture the cutoff with the features. Recomputing it during failover
+        // would include the preceding dispatch in a later attempt's snapshot.
+        let features = LocalFeatures {
+            extractor_revision: FEATURE_EXTRACTOR_REVISION,
+            dialect,
+            signals: signals.clone(),
+            turn_index,
+            observed_through_seq: session.last_seq(),
+        };
 
         // --- price every option -------------------------------------------
         //
@@ -2420,6 +2416,10 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         }
         let decision = decision;
 
+        // Selection runs once. Failover records retain its original inputs and
+        // fallback plan while recording their own target and attempt history.
+        let selection = SelectionSnapshot::of(&decision, features);
+
         // --- the handoff gate's second half (S6) ------------------------------
         //
         // **Bound here, before the dispatch loop, and that placement is
@@ -2624,6 +2624,13 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                         // was not: the difference between a fleet this router
                         // turned down and one it never consulted.
                         local_quote_skipped,
+                        // The same snapshot on every record of this turn. The
+                        // inputs, the plan, the admitted pool and the branch are
+                        // facts about the *selection*, which happened once —
+                        // they do not become new facts because a provider was
+                        // down. The three fields above it are the ones that
+                        // describe this dispatch and they stay per-record.
+                        selection: Some(selection.clone()),
                     },
                 )
                 .await?;

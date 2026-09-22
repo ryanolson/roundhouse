@@ -39,6 +39,7 @@ fn hosted() -> Target {
 
 fn decision(chosen: Target) -> DecisionRecord {
     DecisionRecord {
+        selection: None,
         local_quote_skipped: None,
         chosen: chosen.clone(),
         rationale: "cheapest viable".into(),
