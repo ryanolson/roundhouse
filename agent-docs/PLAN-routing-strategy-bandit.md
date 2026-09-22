@@ -151,6 +151,16 @@ The counter excludes hash lookup work and ordered-map comparisons. Its placement
 
 **Redis recovery coverage, 2026-09-22.** Commit `5be10e7` adds two gated integration cases using the engine, loopback classifier HTTP, Redis session log, and Redis evaluation ledger. One refuses settlement before application; the other applies it and returns an error. Each shuts down and drops its first backend handles, repairs through fresh connections, then reopens a third time after repair. The third connection observes one intent, one matching repair, the original charge, no held budget, and an unchanged serving ledger. The classifier receives one HTTP request. The parent independently passed all 25 recovery tests with Redis enabled, strict test-target Clippy, and formatting. Production source is unchanged. These are passing coverage additions, not reproduced defect fixes. The tests use one OS process and simulated ledger errors; actual crashes and Redis outages are not covered. The two tests are ignored by default and require `ROUNDHOUSE_TEST_REDIS_URL` with `--include-ignored`. The prior full workspace result predates these test-only additions. Logs: `/tmp/roundhouse-classification-redis-recovery.log` and `/tmp/roundhouse-classification-redis-recovery-parent.log`.
 
+### Owner decisions accepted (2026-09-22)
+
+The owner accepted all three recommendations. These decisions supersede the open utility, learning-scope, and oversized-review questions below.
+
+- After satisfying the quality requirement, the selector minimizes cost within a configurable latency limit. This ruling supplies no deployment-specific latency value.
+- Learning stays within each project. Observations from one project must not update another project's learned routing preferences.
+- An oversized review interval receives an unknown quality outcome. A new interval starts after a frontier checkpoint. Truncating an interval cannot produce positive feedback for its suffix.
+
+Frontier interval attribution is the next implementation stage. The accepted policy does not establish that a checkpoint occurred or that a review covered an interval.
+
 ### Frontier review feedback (2026-09-21)
 
 Each review records its prompt snapshot and covered decision interval. The result labels that interval once. A late result cannot label newer decisions or change their recorded input features. Failed, skipped, malformed, or insufficient-context reviews remain unknown. Missing feedback is not a no-correction verdict.

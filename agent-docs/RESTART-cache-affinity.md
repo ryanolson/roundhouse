@@ -71,14 +71,13 @@ Settled on 2026-09-19. Do not ask for these decisions again:
 3. PR #18 stays one unit, with separate logical commits.
 4. C4 rejects a one-hour catalog entry unless its write rate equals twice its input rate.
 
-Remaining questions (updated 2026-09-21):
+Accepted on 2026-09-22: minimize cost within a configurable latency limit after satisfying quality requirements, learn separately per project, and mark oversized intervals unknown. A new review interval starts after a frontier checkpoint. See the dated owner-decision addendum in `PLAN-routing-strategy-bandit.md`.
+
+Remaining questions (updated 2026-09-22):
 
 1. C6: design the return-trip cost now, or wait for live C2 cache evidence. Waiting is the recommendation.
 2. C3: retain fleet-error failure, or add a sub-budget and fail-open path to admitted frontier targets.
-3. Bandit utility: the frontier correction signal is settled. The cost-versus-latency tradeoff remains to define. Background classifications supply features, not rewards.
-4. Live C2 inputs: catalog path, pinned model, approved USD spend cap, and restored `openv` access. No live run starts without these inputs.
-5. Learning scope: per-project learning or a shared selector across projects. Per-project learning was recommended but is not an accepted ruling.
-6. Oversized review intervals: retain the interval for a larger review, or mark it unknown and start a new interval after a frontier checkpoint.
+3. Live C2 inputs: catalog path, pinned model, approved USD spend cap, and restored `openv` access. No live run starts without these inputs.
 
 Per-turn cadence and Roundhouse ownership of cache markers are settled. Do not ask those questions again.
 
