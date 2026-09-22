@@ -715,26 +715,13 @@ fn runtime_with_ledger(
     ))
 }
 
-/// **The queue wait and the HTTP send are bound by one deadline, not two.**
-///
-/// The occupant is admitted first and holds the runtime's only HTTP permit,
-/// on a request this test controls the release of directly -- not a guessed
-/// sleep -- so the subject's wait for a permit is genuinely nonzero and its
-/// length is exactly what this test chooses. Once the occupant's gate opens
-/// and the subject acquires the permit, only a fraction of its original
-/// 300ms life remains. Its own request is gated and never released at all,
-/// so the only thing that can end its wait is `deadline` -- computed once,
-/// at submission, from `call_ttl_ms` -- and not a fresh window granted
-/// because the semaphore happened to free up. A version that (re)computed a
-/// fresh transport deadline when the HTTP permit was finally acquired would
-/// let this call proceed indefinitely against a request that is, deliberately,
-/// never going to answer; this test would then hang against its outer
-/// `tokio::time::timeout` rather than pass, so a regression here fails loudly.
+/// A stalled send eventually times out after waiting for the HTTP permit.
+/// This test checks timeout delivery and capacity release. The next test
+/// distinguishes the original deadline from a fresh timeout after queueing.
 #[tokio::test]
 async fn the_absolute_deadline_binds_the_queue_wait_and_the_send_as_one() {
     let occupant_gate = Gate::new();
-    // Never opened. If the subject's send were bound by anything other than
-    // its own original deadline, this test would hang rather than pass.
+    // The server never answers, so completion must come from the deadline.
     let subject_gate = Gate::new();
     let addr = gated_upstream(vec![Arc::clone(&occupant_gate), Arc::clone(&subject_gate)]).await;
 
@@ -845,6 +832,103 @@ async fn the_absolute_deadline_binds_the_queue_wait_and_the_send_as_one() {
         "capacity is fully reclaimed once delivered and acknowledged, the \
          same as any other completed call"
     );
+}
+
+/// Queue time consumes the call's deadline rather than starting a new allowance.
+/// A 1000ms queue wait leaves 500ms of the 1500ms lifetime. The assertion allows
+/// 500ms of scheduling delay but rejects the extra 1000ms a reset would grant.
+/// This uses real time and can fail if scheduling delays exceed that tolerance.
+#[tokio::test]
+async fn a_reset_deadline_after_the_queue_wait_is_not_the_calls_own() {
+    const CALL_TTL_MS: u64 = 1_500;
+    const QUEUE_WAIT_MS: u64 = 1_000;
+    const COMPLETION_SLACK_MS: u64 = 500;
+
+    let occupant_gate = Gate::new();
+    // Never opened, for the same reason as the sibling test: whatever ends
+    // the subject's send is a deadline, not an answer.
+    let subject_gate = Gate::new();
+    let addr = gated_upstream(vec![Arc::clone(&occupant_gate), Arc::clone(&subject_gate)]).await;
+
+    let runtime = runtime(
+        addr,
+        RuntimeLimits {
+            max_http_concurrency: 1,
+            call_ttl_ms: CALL_TTL_MS,
+            ..limits(2)
+        },
+    );
+
+    let (occupant_capacity, occupant_call) = fund(&runtime, "occupant").await;
+    runtime
+        .spawn(occupant_capacity, session(), occupant_call)
+        .await;
+    tokio::time::timeout(Duration::from_secs(5), occupant_gate.entered.notified())
+        .await
+        .expect("the occupant must actually reach the upstream for this test to be about anything");
+
+    let (subject_capacity, subject_call) = fund(&runtime, "subject").await;
+    let subject_expires_at_ms = subject_call.expires_at_ms();
+    runtime
+        .spawn(subject_capacity, session(), subject_call)
+        .await;
+
+    tokio::time::sleep(Duration::from_millis(QUEUE_WAIT_MS)).await;
+    assert!(
+        roundhouse_core::now_ms() < subject_expires_at_ms,
+        "the subject must not already be expired before the occupant releases \
+         the HTTP permit -- the send's own deadline is what this test is \
+         about, not a queue wait that outran the call's whole life"
+    );
+    occupant_gate.open();
+
+    // Polls past both candidate completion times (the call's own deadline and
+    // a reset one) rather than reusing `await_ready`'s shorter, fixed window,
+    // which is sized for this suite's near-instant calls and would time out
+    // on the reset deadline before this test's own assertion ever ran.
+    let poll_bound_ms = CALL_TTL_MS + QUEUE_WAIT_MS + COMPLETION_SLACK_MS + 2_000;
+    let ready = tokio::time::timeout(Duration::from_millis(poll_bound_ms), async {
+        loop {
+            let ready = runtime.ready(&session()).await;
+            if ready.len() >= 2 {
+                return ready;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("both calls must resolve well inside the outer bound");
+
+    let subject_record = ready
+        .iter()
+        .find(|delivery| delivery.record.call_id == ResponseId::new("subject"))
+        .expect("the subject parked its result");
+    assert!(
+        matches!(
+            subject_record.record.outcome,
+            ClassificationOutcome::Failed { .. }
+        ),
+        "expected the subject's send to time out, got {:?}",
+        subject_record.record.outcome
+    );
+
+    let ceiling_ms = subject_expires_at_ms + COMPLETION_SLACK_MS;
+    assert!(
+        subject_record.record.completed_at_ms <= ceiling_ms,
+        "the send must be cut off by the call's ORIGINAL absolute deadline \
+         ({subject_expires_at_ms}ms), not by a fresh {CALL_TTL_MS}ms budget \
+         started once the HTTP permit freed -- completed at {}ms, expected \
+         at or before {ceiling_ms}ms",
+        subject_record.record.completed_at_ms
+    );
+
+    drop(ready);
+    runtime
+        .acknowledge(
+            &session(),
+            &[ResponseId::new("occupant"), ResponseId::new("subject")],
+        )
+        .await;
 }
 
 /// An evaluation ledger whose `open_grant` can be held open indefinitely, so
