@@ -43,13 +43,12 @@
 //!
 //! This path was once a read, for a reason worth recording because it is the
 //! constraint the shape here answers. The ledger's holds are keyed by
-//! [`ResponseId`] and its settles by a log sequence number, and a side call
-//! opens no response and writes no terminal event, so a hold it could take and
-//! could not close would strand a turn's worth of a project's money for a TTL
-//! on *every* validation. Both halves of that key now arrive on the
-//! [`SideCall`]: the hold is keyed by the check's own [`SideCallId`], which
-//! cannot collide with any turn's, and the settle by the log position the check
-//! was decided at, which rises with every turn of the session. And it is closed
+//! [`ResponseId`], and a side call opens no response and writes no terminal
+//! event, so a hold it could take and could not close would strand a turn's
+//! worth of a project's money for a TTL on *every* validation. That key now
+//! arrives on the [`SideCall`]: the hold is keyed by the check's own
+//! [`SideCallId`], which cannot collide with any turn's, and the settle names
+//! the same id — once, whatever else happens to that session. And it is closed
 //! on every path out of [`FleetJudge::consult`] — the answer, the provider
 //! error, the deadline — because there is exactly one exit after the grant.
 //!
@@ -87,7 +86,7 @@ use futures::StreamExt;
 
 use roundhouse_core::context::Tokenizer;
 use roundhouse_core::control::{
-    BudgetTerms, GrantRequest, Settlement, SpendLedger, TurnCredential,
+    BudgetTerms, GrantRequest, Settlement, SettlementKey, SpendLedger, TurnCredential,
 };
 use roundhouse_core::event::{Accounting, CacheReadSource, SideCallAbandonReason, Usage};
 use roundhouse_core::ids::{ResponseId, SessionId};
@@ -295,17 +294,16 @@ impl<T: Tokenizer + Clone> FleetJudge<T> {
         ResponseId::new(side_call.id.as_str())
     }
 
-    /// The session a check's settle is idempotent under.
+    /// The session a check's hold is recorded under.
     ///
-    /// **The side call's own line in the ledger, for the reason it has its own
-    /// cache key.** A settle is idempotent by `(session, seq)` through a
-    /// per-session watermark that only moves forward, and the checked session's
-    /// watermark belongs to its turns: a check settling on that line would
-    /// interleave its log positions with the terminal events' and make the two
-    /// sequences one invariant nobody states. One extra watermark row per
-    /// checked session buys both sequences their own monotonicity, and the
-    /// suffix is the same constant the cache isolation is named by, so the
-    /// isolation is one string rather than two spellings of one idea.
+    /// **The side call's own line, for the reason it has its own cache key**: a
+    /// check is not one of the checked session's turns. The suffix is the same
+    /// constant the cache isolation is named by, so the isolation is one string
+    /// rather than two spellings of one idea.
+    ///
+    /// Not an idempotency key — a check settles under
+    /// [`SettlementKey::OncePerCall`], which names the call and not a session
+    /// position. See [`Self::settle`].
     fn ledger_session(side_call: &SideCall<'_>) -> SessionId {
         SessionId::new(format!("{}{VALIDATE_CACHE_SUFFIX}", side_call.session_id))
     }
@@ -381,8 +379,13 @@ impl<T: Tokenizer + Clone> FleetJudge<T> {
         if let Err(error) = spend
             .settle_grant(Settlement {
                 principal: side_call.principal.clone(),
-                session_id: Self::ledger_session(side_call),
-                seq: side_call.at_seq,
+                // A check is dispatched beside the turn it is checking and
+                // shares no order with the other calls under that session, so
+                // its own hold is its identity. That id is minted fresh per
+                // dispatch, which is what lets a check refused for budget
+                // release its hold at zero without closing out a later
+                // attempt's identity.
+                key: SettlementKey::OncePerCall,
                 response_id: Self::hold_key(side_call),
                 actual_usd,
                 window: terms.budget.window,
@@ -1102,17 +1105,16 @@ mod tests {
     /// What one validated turn of a session hands the judge, owned so a test
     /// can lend it out.
     ///
-    /// `n` is which validated turn of the session this is, and it moves both
-    /// fields a repeat has to move: a fresh id, so two checks cannot share a
-    /// hold, and a log position that rises, so the second check's settle is not
-    /// mistaken for a replay of the first. A fixture that reused one `Check`
-    /// across several consults would be modelling a single turn checked many
-    /// times, which no engine does.
+    /// `n` is which validated turn of the session this is, and it moves the one
+    /// field a repeat has to move: a fresh id, so two checks can neither share a
+    /// hold nor have the second's settle deduplicated as a repeat of the first.
+    /// A fixture that reused one `Check` across several consults would be
+    /// modelling a single turn checked many times, which no engine does — and
+    /// would now be silently dropping every settle after the first.
     struct Check {
         session_id: SessionId,
         principal: Principal,
         id: SideCallId,
-        at_seq: u64,
     }
 
     impl Check {
@@ -1121,7 +1123,6 @@ mod tests {
                 session_id: SessionId::new("acme/ada/main"),
                 principal: Principal::new("acme", "ada"),
                 id: SideCallId::new(format!("sc_{n}")),
-                at_seq: n + 1,
             }
         }
 
@@ -1129,7 +1130,6 @@ mod tests {
             SideCall {
                 session_id: &self.session_id,
                 id: &self.id,
-                at_seq: self.at_seq,
                 principal: &self.principal,
                 budget,
             }

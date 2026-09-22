@@ -211,7 +211,6 @@ async fn consider(enrolled: &Enrolled, state: &SessionState, policy: &TurnPolicy
             side_call: SideCall {
                 session_id: &session_id,
                 id: &side_call_id,
-                at_seq: state.last_seq,
                 principal: &principal,
                 budget: None,
             },

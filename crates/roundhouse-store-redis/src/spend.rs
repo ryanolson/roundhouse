@@ -3,7 +3,7 @@
 
 //! Redis-backed [`SpendLedger`].
 //!
-//! One project maps to three keys, all sharing a Redis Cluster hash tag on
+//! One project maps to four keys, all sharing a Redis Cluster hash tag on
 //! the *project id* (not the session id [`crate`]'s own three keys share) —
 //! the colocation is what makes "both ceilings bind" an atomic property
 //! rather than an optimization: a project ceiling and a member ceiling that
@@ -17,6 +17,16 @@
 //! | `rh:v1:spend:{<project_id>}:account` | hash | `committed` (project, current window), `member:<user_id>` per member, `window_start_ms` |
 //! | `rh:v1:spend:{<project_id>}:holds` | hash | `response_id` → packed `user`/`amount`/`expires_at_ms`, one field per live grant |
 //! | `rh:v1:spend:{<project_id>}:watermarks` | hash | `session_id` → highest settled `seq` |
+//! | `rh:v1:spend:{<project_id>}:settled_calls` | set | `response_id` of every evaluation call that has settled |
+//!
+//! **`settled_calls` is the durable copy of once-only settlement's storage
+//! cost** — the memory backend's equivalent set dies with its process, this one
+//! does not. One member per settled evaluation call, never expired and never
+//! swept, because any expiry is a window in which a duplicate charges a project
+//! twice; `SettlementKey::OncePerCall` states the tradeoff and this is where
+//! the bytes live. The script asks the set for membership and never reads it
+//! back, so the cost is memory on the Redis until there is a compaction
+//! protocol that can prove an identity will never be re-settled.
 //!
 //! `rh:v1:spend` is this family's [`crate::keys::build_key`] prefix under the
 //! default namespace — see [`crate`]'s module doc for the table of every
@@ -47,7 +57,7 @@ use redis::aio::ConnectionManager;
 
 use roundhouse_core::control::{
     Balance, BalanceQuery, BudgetTerms, BudgetWindow, Grant, GrantRequest, ProjectId, Settled,
-    Settlement, SpendError, SpendLedger,
+    Settlement, SettlementKey, SpendError, SpendLedger,
 };
 
 use crate::keys::{self, KeyNamespace};
@@ -77,6 +87,14 @@ pub(crate) fn watermarks_key(namespace: &KeyNamespace, project: &ProjectId) -> S
         namespace,
         keys::KeyFamily::Spend,
         &[&format!("{{{project}}}"), "watermarks"],
+    )
+}
+
+pub(crate) fn settled_calls_key(namespace: &KeyNamespace, project: &ProjectId) -> String {
+    keys::build_key(
+        namespace,
+        keys::KeyFamily::Spend,
+        &[&format!("{{{project}}}"), "settled_calls"],
     )
 }
 
@@ -181,6 +199,16 @@ impl SpendLedger for RedisSpendLedger {
         let account = account_key(&self.namespace, &settlement.principal.project);
         let holds = holds_key(&self.namespace, &settlement.principal.project);
         let watermarks = watermarks_key(&self.namespace, &settlement.principal.project);
+        let settled_calls = settled_calls_key(&self.namespace, &settlement.principal.project);
+        // One script for both modes, the unused half of the key travelling as a
+        // sentinel: a second script would be a second copy of the window roll,
+        // the hold release and the commit, which are identical either way.
+        let (key_mode, session_id, seq) = match &settlement.key {
+            SettlementKey::SessionWatermark { session_id, seq } => {
+                ("watermark", session_id.as_str(), *seq)
+            }
+            SettlementKey::OncePerCall => ("call", "", 0),
+        };
         let outcome = self
             .scripts
             .settle_grant(
@@ -189,9 +217,11 @@ impl SpendLedger for RedisSpendLedger {
                     account_key: &account,
                     holds_key: &holds,
                     watermarks_key: &watermarks,
+                    settled_calls_key: &settled_calls,
                     user: settlement.principal.user.as_str(),
-                    session_id: settlement.session_id.as_str(),
-                    seq: settlement.seq,
+                    key_mode,
+                    session_id,
+                    seq,
                     response_id: settlement.response_id.as_str(),
                     actual_usd: settlement.actual_usd,
                     now_ms: settlement.now_ms,
@@ -256,13 +286,14 @@ mod tests {
     #[test]
     fn the_project_and_member_keys_share_one_hash_tag() {
         // The property the module doc claims is load-bearing, not
-        // decorative: extract the `{...}` hash tag from each of the three
+        // decorative: extract the `{...}` hash tag from each of the four
         // keys and check they are the same slot-selecting substring, which
         // is what a real Redis Cluster deployment hashes on. If any of the
-        // three ever drifted to a different tag, `OPEN_GRANT`/`SETTLE_GRANT`
+        // four ever drifted to a different tag, `OPEN_GRANT`/`SETTLE_GRANT`
         // would refuse to run at all on a clustered deployment (Lua scripts
         // reject multi-slot key sets) — this test catches that at build
-        // time instead of at first boot against a cluster.
+        // time instead of at first boot against a cluster. `SETTLE_GRANT`
+        // names all four at once, so it is the script this binds hardest.
         fn hash_tag(key: &str) -> &str {
             let start = key.find('{').expect("every budget key carries a hash tag");
             let end = key.find('}').expect("the hash tag is closed");
@@ -274,11 +305,13 @@ mod tests {
         let account = account_key(&namespace, &project);
         let holds = holds_key(&namespace, &project);
         let watermarks = watermarks_key(&namespace, &project);
+        let settled_calls = settled_calls_key(&namespace, &project);
 
         let tag = hash_tag(&account);
         assert_eq!(tag, "acme", "the tag is the project id, unadorned");
         assert_eq!(hash_tag(&holds), tag);
         assert_eq!(hash_tag(&watermarks), tag);
+        assert_eq!(hash_tag(&settled_calls), tag);
 
         // The control: two different projects must land on two different
         // tags, or every project would collide onto one Redis Cluster slot.
@@ -301,6 +334,10 @@ mod tests {
         assert_eq!(
             watermarks_key(&namespace, &project),
             "rh:v1:spend:{acme}:watermarks"
+        );
+        assert_eq!(
+            settled_calls_key(&namespace, &project),
+            "rh:v1:spend:{acme}:settled_calls"
         );
 
         let other = KeyNamespace::new("acme-prod").unwrap();

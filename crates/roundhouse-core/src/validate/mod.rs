@@ -179,16 +179,6 @@ pub struct SideCall<'a> {
     /// because the money question is asked *first* — a hold has to be keyed
     /// before there is an answer to key it by.
     pub id: &'a SideCallId,
-    /// Where in the checked session's log this check is being made.
-    ///
-    /// The turn's own position, read after its `TurnStarted` and before
-    /// anything a check could cause — so it rises with every turn of the
-    /// session and is the same number a replay would compute. That makes it the
-    /// idempotency key a settle needs: a ledger keyed on `(session, seq)`
-    /// requires one that only goes up, and a wall clock or a process-local
-    /// counter would either regress across nodes or reset on restart, silently
-    /// dropping a settle in both cases.
-    pub at_seq: u64,
     pub principal: &'a Principal,
     /// The payer's ceiling, or `None` when the membership has no budget.
     ///
@@ -223,8 +213,10 @@ pub struct SideCall<'a> {
 ///   can refuse, that refusing costs the turn nothing, and that what a check
 ///   spends reaches the ledger afterwards: a budget that is only ever *read*
 ///   answers the same way on the first check and the thousandth, so it is not
-///   a ceiling. [`SideCall::id`] and [`SideCall::at_seq`] are what an
-///   implementation keys the hold and its settle by.
+///   a ceiling. [`SideCall::id`] is what an implementation keys the hold by and
+///   the identity its settle is deduplicated under — a check shares no ordering
+///   with the other calls under its session, so a settle keyed by log position
+///   would read one of them as a replay of another.
 /// - **Never the cache ledger.** A judge prompt is not a prefix of the
 ///   conversation, and feeding it to the ledger would falsely warm that target
 ///   for the next real turn.

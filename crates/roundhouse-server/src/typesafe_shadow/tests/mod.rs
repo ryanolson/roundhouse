@@ -33,6 +33,7 @@ mod accounting;
 mod admission;
 mod brief;
 mod question;
+mod settlement_order;
 
 const KEY: &str = "sk-ZZZQQQ-typesafe-deployment-key";
 
@@ -270,7 +271,6 @@ fn call(credential: &TurnCredential) -> ShadowCall<'_> {
         principal: Principal::new("proj_shadow", "user_shadow"),
         session_id: SessionId::new("sess_shadow"),
         hold_key: ResponseId::new("shadow_1"),
-        at_seq: 7,
         terms: terms(),
         credential,
         now_ms: 1_000,

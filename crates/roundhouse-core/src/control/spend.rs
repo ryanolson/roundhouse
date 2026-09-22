@@ -26,11 +26,9 @@
 //!   multi-node problem deferred until multi-node.
 //!   `concurrent_grants_cannot_jointly_exceed_the_limit` in
 //!   [`contract`] is the proof.
-//! - **A settle is idempotent by `(session_id, seq)`**, through a per-session
-//!   watermark — the same rule [`MetricsFold`](crate::metrics::MetricsFold)
-//!   states for itself, and for the same reason: a session replays its own log
-//!   on every open, so a settle that were not idempotent would be applied again
-//!   on every turn of the session that produced it.
+//! - **A settle is idempotent under a key the caller names**, because there are
+//!   two kinds of caller and one rule cannot serve both. [`SettlementKey`] is
+//!   that choice, and its doc is where the two live.
 //!
 //! ## The crash story, and what it does not cover
 //!
@@ -47,7 +45,15 @@
 //! dashboard line is a bug report; a quiet wrong number is the failure mode this
 //! repo exists to avoid.
 //!
-//! ## Two honest limitations
+//! ## Three honest limitations
+//!
+//! **Once-only settlement retains one identity per settled evaluation call,
+//! never expired, never swept, never cleared at a window boundary.** That is
+//! the price of the guarantee rather than an oversight: any expiry is a window
+//! in which a duplicate charges twice. Nothing else bounds the set — a
+//! concurrent-job limit bounds calls *in flight*, which is the holds hash — so
+//! it grows with evaluation-call volume until a compaction protocol can prove
+//! an identity will never be re-settled. There is no such protocol yet.
 //!
 //! **A grant is an admission ceiling, not a bound on realized spend.** It is
 //! computed from `expected_output_tokens`, so a reasoning-heavy turn can settle
@@ -67,7 +73,7 @@
 #[cfg(any(test, feature = "test-support"))]
 pub mod contract;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -191,15 +197,67 @@ impl Grant {
     }
 }
 
+/// What makes two calls to [`SpendLedger::settle_grant`] the same settlement.
+///
+/// **One ledger serves two kinds of caller, and a single idempotency rule
+/// cannot fit both.** A serving turn belongs to a session that replays its own
+/// log from the beginning on every open, so its settles arrive repeatedly, in
+/// ascending log order, and the cheap correct test is a high-water mark. An
+/// evaluation call — a classification, anything dispatched beside a turn rather
+/// than as one — has no such order: several are in flight under one session at
+/// once and they finish in whatever order their upstreams answer.
+///
+/// Reading the second through the first is the defect this enum exists to make
+/// unrepresentable. Under a watermark, the call that finishes *second* but was
+/// issued *first* carries the lower seq, so its settle is indistinguishable
+/// from a replay and is silently dropped — the project is billed for one of two
+/// calls and the loser's hold sits until its TTL lapses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettlementKey {
+    /// A serving turn, identified by where it sits in its session's log.
+    ///
+    /// Idempotent by `(session_id, seq)` through a per-session watermark — the
+    /// same rule [`MetricsFold`](crate::metrics::MetricsFold) states for
+    /// itself, and for the same reason: a session replays its own log on every
+    /// open, so a settle that were not idempotent would be applied again on
+    /// every turn of the session that produced it. A seq at or below the mark
+    /// has already been applied, which is what makes a replay walking the log
+    /// forward from zero cost nothing.
+    ///
+    /// Sound only where the seqs under one session arrive in ascending order.
+    /// Turns are serialized per session and each settles before the next is
+    /// admitted, so they do.
+    SessionWatermark { session_id: SessionId, seq: u64 },
+    /// One call settled once, identified by its own hold.
+    ///
+    /// Idempotent by [`Settlement::response_id`] alone — the key the hold was
+    /// opened under, so a call's identity is one string rather than a pair whose
+    /// second half would have to be ordered against its siblings. A repeat
+    /// neither charges again nor touches a hold, including the holds of the
+    /// calls running beside it.
+    ///
+    /// **The record is immutable and never expires.** A settled call stays
+    /// settled after an arbitrary delay, after its hold has lapsed, and across a
+    /// budget-window reset; identity is the whole key, so a duplicate carrying a
+    /// different amount or a different log position is still the same call. An
+    /// expiry would be a window in which a duplicate charges twice, which is why
+    /// there is no retention knob — see this module's limitations for the cost.
+    ///
+    /// **A re-grant under a settled identity is not a second chance.** Nothing
+    /// consults this record on the grant path, so a fresh hold opens, cannot be
+    /// settled, and lapses on its TTL. Callers mint a fresh identity per
+    /// attempt.
+    OncePerCall,
+}
+
 /// What a turn actually spent.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settlement {
     pub principal: Principal,
-    pub session_id: SessionId,
-    /// The log sequence number of the terminal event this settles. The other
-    /// half of the idempotency key: a settle at or below the session's
-    /// watermark has already been applied and does nothing.
-    pub seq: u64,
+    /// What a repeat of this settle is recognized by. See [`SettlementKey`].
+    pub key: SettlementKey,
+    /// The hold this releases, and — under
+    /// [`SettlementKey::OncePerCall`] — the identity it is deduplicated by.
     pub response_id: ResponseId,
     /// Priced from the terminal [`Usage`](crate::event::Usage). Zero for a
     /// local dispatch, and zero for a dispatch that never reached a provider —
@@ -222,9 +280,11 @@ pub struct Settlement {
 /// The outcome of applying one settlement.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Settled {
-    /// `false` when `(session_id, seq)` was at or below the watermark — the
-    /// settle had already been applied and this call changed nothing. The
-    /// ordinary answer on a replay.
+    /// `false` when this settlement's [`SettlementKey`] says it has already
+    /// been applied and this call changed nothing. **Not an error**: it is the
+    /// ordinary answer on a session replay and on a repeated call settle
+    /// alike, so a caller that treated it as a failure would be retrying
+    /// against a ledger that is already correct.
     pub applied: bool,
     /// Hold returned to the pool: `hold - actual`, floored at zero. Zero when
     /// the turn settled above its hold, which overcommits rather than capping.
@@ -324,8 +384,10 @@ pub trait SpendLedger: Send + Sync + 'static {
 
     /// Release the hold and apply what was actually spent.
     ///
-    /// Idempotent by `(session_id, seq)`: a settlement at or below the
-    /// session's watermark is a no-op and reports itself as one.
+    /// Idempotent under the settlement's own [`SettlementKey`], which is also
+    /// the only thing the two modes differ in: a repeat is a no-op that reports
+    /// itself as one through [`Settled::applied`], and it must leave every
+    /// other call's hold exactly where it found it.
     async fn settle_grant(&self, settlement: Settlement) -> Result<Settled, SpendError>;
 
     /// Read one membership's position, project and member ceilings both.
@@ -408,13 +470,23 @@ struct ProjectAccount {
     committed_usd: f64,
     member_committed_usd: HashMap<UserId, f64>,
     holds: HashMap<ResponseId, Hold>,
-    /// Highest settled `seq` per session. The idempotency key's other half.
+    /// Highest settled `seq` per session, for
+    /// [`SettlementKey::SessionWatermark`].
     ///
     /// Deliberately *not* cleared at a window boundary: a window bounds what a
     /// project may spend, not which settles it has already seen, and clearing
     /// these would double-charge every session that replayed across a month
     /// boundary.
     watermarks: HashMap<SessionId, u64>,
+    /// Every call that has already settled, for [`SettlementKey::OncePerCall`],
+    /// keyed by the hold the call was opened under.
+    ///
+    /// Not cleared at a window boundary, for the same reason the watermarks are
+    /// not — and, unlike the holds beside it, not expired either. A set because
+    /// the only question asked of it is membership: no path here enumerates the
+    /// settled history. It is the piece of ledger state that grows with call
+    /// *traffic*, and this module's limitations say what that costs.
+    settled_calls: HashSet<ResponseId>,
     /// Which window `committed_usd` belongs to, so a reset can be evaluated
     /// lazily on the next access instead of by a background task.
     window_started_ms: u64,
@@ -452,6 +524,28 @@ impl ProjectAccount {
 
     fn member_committed(&self, user: &UserId) -> f64 {
         self.member_committed_usd.get(user).copied().unwrap_or(0.0)
+    }
+
+    /// Whether this settlement has already been applied, claiming it if not.
+    ///
+    /// The two idempotency rules in one place, because "have I seen this
+    /// settle" is one question the trait asks once and the two answers must not
+    /// drift into two call sites. Both arms are keyed lookups: neither reads
+    /// back the history it is claiming against, which is what the Redis backend
+    /// has to match for a shared contract to mean anything.
+    fn already_settled(&mut self, key: &SettlementKey, response_id: &ResponseId) -> bool {
+        match key {
+            SettlementKey::SessionWatermark { session_id, seq } => {
+                if *seq <= self.watermarks.get(session_id).copied().unwrap_or(0) {
+                    return true;
+                }
+                self.watermarks.insert(session_id.clone(), *seq);
+                false
+            }
+            // `insert` reports whether the value was *new*, so the test and the
+            // claim cannot come apart the way a `contains` then an `insert` can.
+            SettlementKey::OncePerCall => !self.settled_calls.insert(response_id.clone()),
+        }
     }
 }
 
@@ -614,23 +708,16 @@ impl SpendLedger for MemorySpendLedger {
             settlement.now_ms,
         );
 
-        let watermark = account
-            .watermarks
-            .get(&settlement.session_id)
-            .copied()
-            .unwrap_or(0);
-        if settlement.seq <= watermark {
-            // The replay case, and the ordinary one: every open of a session
-            // re-drives its terminal events through here.
+        if account.already_settled(&settlement.key, &settlement.response_id) {
+            // The replay case, and the ordinary one. Nothing changes — in
+            // particular no hold is touched, because the hold standing under
+            // this id may belong to a re-grant rather than to the settled call.
             return Ok(Settled {
                 applied: false,
                 released_usd: 0.0,
                 committed_usd: account.committed_usd,
             });
         }
-        account
-            .watermarks
-            .insert(settlement.session_id.clone(), settlement.seq);
 
         let hold = account.holds.remove(&settlement.response_id);
         let held = hold.as_ref().map_or(0.0, |hold| hold.amount_usd);

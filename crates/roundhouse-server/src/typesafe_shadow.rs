@@ -47,7 +47,7 @@ use std::sync::Arc;
 
 use roundhouse_core::context::Tokenizer;
 use roundhouse_core::control::{
-    BudgetTerms, GrantRequest, Principal, Settlement, SpendLedger, TurnCredential,
+    BudgetTerms, GrantRequest, Principal, Settlement, SettlementKey, SpendLedger, TurnCredential,
 };
 use roundhouse_core::event::Usage;
 use roundhouse_core::ids::{ResponseId, SessionId};
@@ -209,10 +209,10 @@ pub enum ShadowOutcome {
 pub struct ShadowCall<'a> {
     pub principal: Principal,
     pub session_id: SessionId,
-    /// The ledger key this call's hold is taken under. Distinct from any turn's.
+    /// The ledger key this call's hold is taken under, and the identity its
+    /// settle is deduplicated by. Distinct from any turn's, and distinct per
+    /// attempt: a settled identity can never settle again.
     pub hold_key: ResponseId,
-    /// The log position the settle is idempotent under.
-    pub at_seq: u64,
     pub terms: BudgetTerms,
     pub credential: &'a TurnCredential,
     pub now_ms: u64,
@@ -494,8 +494,12 @@ impl<T: Tokenizer> TypeSafeShadow<T> {
             .spend
             .settle_grant(Settlement {
                 principal: call.principal.clone(),
-                session_id: call.session_id.clone(),
-                seq: call.at_seq,
+                // **Not the session's watermark.** Several of these are in
+                // flight under one session and finish in whatever order their
+                // upstreams answer, so a settle keyed by log position would
+                // read the call that finished last but was issued first as a
+                // replay — dropping its charge and stranding its hold.
+                key: SettlementKey::OncePerCall,
                 response_id: call.hold_key.clone(),
                 actual_usd,
                 window: call.terms.budget.window,

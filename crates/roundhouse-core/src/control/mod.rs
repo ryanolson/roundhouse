@@ -107,7 +107,7 @@ pub use policy::{
 };
 pub use spend::{
     Balance, BalanceQuery, BudgetTerms, Grant, GrantRequest, LedgerState, MemorySpendLedger,
-    Settled, Settlement, SpendError, SpendLedger, window_start_ms,
+    Settled, Settlement, SettlementKey, SpendError, SpendLedger, window_start_ms,
 };
 
 use crate::ids::string_id;

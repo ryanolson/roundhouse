@@ -1233,14 +1233,13 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                 // turn, spent or not, is the cheapest possible way to make the
                 // ledger row and the log row name one string — and a turn that
                 // never checks simply never uses it.
+                //
+                // Fresh on every pass, which the settle depends on: a check
+                // settles once per id and forever, so a re-admitted turn gets a
+                // new identity rather than one the ledger has already closed.
                 side_call: SideCall {
                     session_id,
                     id: &side_call_id,
-                    // The log position this turn is being checked at: after its
-                    // own `TurnStarted` and before anything the check can
-                    // cause, so it rises with every turn and a replay computes
-                    // the same number. It is the settle's idempotency key.
-                    at_seq: session.last_seq(),
                     principal: &admission.principal,
                     budget: admission.budget.as_ref(),
                 },
