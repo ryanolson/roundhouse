@@ -20,7 +20,7 @@ Branch: `ai/typesafe-roundhouse-routing-6016d1`. Last update: 2026-09-19. The la
 | C1 | Dominance guard on `Efficient` picks (T4) | done, mutation-checked | `83ac785` |
 | C2 | Second Anthropic breakpoint | mechanism and probe mutation-checked. Live evidence is still necessary. | `22e58ce`, `d7f69ce`, `101eb59`, `d582e62` |
 | C3 | The Dynamo residency call becomes a decision | done, mutation-checked | `8817db0` |
-| C4 | 1-hour TTL as one per-target setting | TTL propagation and catalog guard built. Mixed tool TTL policy awaits the owner; one regression is ignored. Not complete. | `4405da3` |
+| C4 | 1-hour TTL as one per-target setting | TTL propagation and catalog guard built. Tool normalization now passes focused tests with no C4 ignore. Independent verification remains. | `4405da3`, continuation below |
 | C5 | Local TTFT quote reads the residency answer | mechanism and catalog loader done, mutation-checked. Measured deployment slope still needed. | `6e905ba`, `3b21e98` |
 | C6 | Observed cache deadline and the return trip | not designed | |
 | C7 | Shadow classifier (T5) | B4 standalone adapter built and mutation-checked under T6. Runtime records, scheduling, and bandit allocation remain open. | `51b0fb2` |

@@ -378,13 +378,25 @@ impl AnthropicMessagesClient {
         // resolving it first is what keeps the refusal ahead of the work rather
         // than beside it.
         let (tools, tool_choice) = quote.tools_for(SPOKEN)?;
+        // Tools and conversation markers share the target's cache lifetime.
+        let lifetime = match quote.cache_ttl_ms {
+            Some(ONE_HOUR_MS) => Some(ONE_HOUR),
+            _ => None,
+        };
+        // Tools precede messages, so shorter tool markers would violate the
+        // provider's TTL order. Matching the target also keeps its quoted
+        // lifetime consistent with the request.
+        let tools = tools.map(|mut tools| {
+            normalize_marker_lifetimes(&mut tools, lifetime);
+            tools
+        });
         // **How many `cache_control` breakpoints are already riding this
         // request before roundhouse adds its own.**
         //
         // Anthropic caps a request at four cache breakpoints and answers a
         // fifth with a 400 — and the tools are the one part of this body
         // roundhouse forwards rather than originates, so the client's own
-        // breakpoints ride along untouched. Claude Code sets one on its last
+        // breakpoint positions remain unchanged. Claude Code sets one on its last
         // tool; a client that sets four has spent the whole allowance, and the
         // block breakpoint below would be the fifth. Counting rather than
         // assuming, because "the client sends at most one" is a fact about one
@@ -472,17 +484,13 @@ impl AnthropicMessagesClient {
         // `"type": "text"` that the module's pinning tests do not cover, and it
         // would keep spelling it after an upstream rename that turned those
         // tests red.
-        // **One lifetime for both markers**, from the target's own catalog
-        // entry. They cache two stretches of one prefix for one target, so a
-        // longer lifetime on one of them would leave the router pricing warmth
-        // the other marker had already let expire.
-        //
-        // An hour is spelled; anything else omits the field. Omitting it is
-        // what asks for the default, so spelling `"5m"` would add a property to
-        // every ordinary turn that changes nothing about what it gets.
-        let control = || match quote.cache_ttl_ms {
-            Some(ONE_HOUR_MS) => CacheControl::ephemeral_for(ONE_HOUR),
-            _ => CacheControl::ephemeral(),
+        // Both block markers take the lifetime decided above, from the target's
+        // own catalog entry. They cache two stretches of one prefix for one
+        // target, so a longer lifetime on one of them would leave the router
+        // pricing warmth the other marker had already let expire.
+        let control = || match lifetime {
+            Some(ttl) => CacheControl::ephemeral_for(ttl),
+            None => CacheControl::ephemeral(),
         };
         let content: Vec<ContentBlock> = segments
             .iter()
@@ -519,7 +527,8 @@ impl AnthropicMessagesClient {
             // to it byte-exactly.
             "messages": [{ "role": "user", "content": content }],
         });
-        // **The client's tool definitions, verbatim and untouched.**
+        // **The client's tool definitions, verbatim but for the marker
+        // lifetimes normalized above.**
         //
         // This is the one part of a Messages request roundhouse forwards rather
         // than originates, and the asymmetry with the blocks above is the whole
@@ -862,6 +871,37 @@ fn breakpoints_in(tools: Option<&Value>) -> usize {
                 .count()
         })
         .unwrap_or(0)
+}
+
+/// Rewrite every forwarded tool marker to the target's own cache lifetime.
+///
+/// **The lifetime only.** The marker's `type`, any field this build has never
+/// named, the definition around it and the marker's position all stay as the
+/// client sent them — so [`breakpoints_in`] counts the same before and after
+/// and the block allowance is unmoved.
+///
+/// Top level only, the bound [`breakpoints_in`] counts on: a property inside an
+/// `input_schema` that a client happened to name `cache_control` is that tool's
+/// own argument vocabulary, and rewriting it would edit the toolbox.
+///
+/// A marker this build cannot restate — a `null`, a string, a missing `type` —
+/// is left exactly as sent: it is a 400 at the provider whatever lifetime is
+/// written into it, and filling in the missing parts would be roundhouse
+/// authoring a breakpoint the client did not.
+fn normalize_marker_lifetimes(tools: &mut Value, lifetime: Option<&str>) {
+    let Some(entries) = tools.as_array_mut() else {
+        return;
+    };
+    for marker in entries
+        .iter_mut()
+        .filter_map(|entry| entry.get_mut("cache_control"))
+    {
+        let Ok(mut control) = serde_json::from_value::<CacheControl>(marker.clone()) else {
+            continue;
+        };
+        control.ttl = lifetime.map(str::to_string);
+        *marker = serde_json::to_value(control).expect("a cache breakpoint serializes");
+    }
 }
 
 /// A base URL with any trailing slash removed, so `{base}/v1/messages` is one
@@ -1780,6 +1820,26 @@ mod tests {
             .collect()
     }
 
+    /// Every tool index carrying a `cache_control` marker, in tools order.
+    ///
+    /// The count and the positions are the client's own declaration, and
+    /// normalizing a lifetime must move neither: a marker that appeared, moved
+    /// or vanished would change which stretch of the request is cached and how
+    /// many of the four slots are spent.
+    fn tool_marker_indices(body: &Value) -> Vec<usize> {
+        body.get("tools")
+            .and_then(Value::as_array)
+            .map(|tools| {
+                tools
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, tool)| tool.get("cache_control").is_some())
+                    .map(|(index, _)| index)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Every marker's `ttl` on the forwarded tools, in tools order — mirrors
     /// [`marker_ttls`] for the other array a breakpoint can land in.
     fn tool_marker_ttls(body: &Value) -> Vec<Option<String>> {
@@ -1883,30 +1943,30 @@ mod tests {
 
     /// Anthropic requires every `1h` marker to precede every shorter one, and
     /// `tools` serializes ahead of `messages` — so a one-hour target that
-    /// upgrades this client's own block markers while forwarding the
-    /// client's default-ttl tool marker untouched emits the order the API
-    /// forbids. Normalizing versus refusing is undecided (C4 in
-    /// `agent-docs/PLAN-cache-affinity.md`); the assertion accepts either.
+    /// upgrades this client's own block markers while forwarding the client's
+    /// default-ttl tool marker untouched emits the order the API forbids.
+    ///
+    /// Roundhouse owns the markers in the requests it builds, so the forwarded
+    /// marker adopts the target's lifetime rather than the turn being refused.
+    /// The lifetime is *all* that moves: the definition, its schema, and the
+    /// marker's position are the client's declaration and stay its own.
     #[test]
-    #[ignore = "C4: tool TTL normalization versus conflict rejection awaits owner"]
-    fn a_shorter_tool_marker_ahead_of_an_hour_long_block_marker_is_unorderable() {
+    fn an_hour_long_target_lifts_a_shorter_tool_marker_to_the_hour() {
         let tool = json!({
             "name": "A",
-            "input_schema": { "type": "object" },
+            "description": "search",
+            "input_schema": { "type": "object", "properties": { "q": { "type": "string" } } },
             // Omitted ttl: a real client's default marker, never spelled "5m".
             "cache_control": { "type": "ephemeral" },
         });
         let quote = FrontierQuote {
             tools: Some(json!([tool])),
             tools_dialect: Some(SPOKEN),
-            ..quote_at_ttl(Some(3_600_000))
+            ..quote_at_ttl(Some(ONE_HOUR_MS))
         };
 
-        let body = match AnthropicMessagesClient::body(&quote, "claude-sonnet") {
-            // A refusal also satisfies the invariant.
-            Err(_) => return,
-            Ok(body) => body,
-        };
+        let body = AnthropicMessagesClient::body(&quote, "claude-sonnet")
+            .expect("a marker roundhouse can normalize is never a refusal");
 
         let tool_ttls = tool_marker_ttls(&body);
         let block_ttls = marker_ttls(&body);
@@ -1915,6 +1975,14 @@ mod tests {
             "the fixture must place both a tool marker and a block marker, or \
              this asserts nothing about their relative order: tools={tool_ttls:?} \
              blocks={block_ttls:?}"
+        );
+        assert!(
+            tool_ttls
+                .iter()
+                .chain(block_ttls.iter())
+                .all(|ttl| ttl.as_deref() == Some(ONE_HOUR)),
+            "one lifetime per request, the forwarded markers included: \
+             tools={tool_ttls:?} blocks={block_ttls:?}"
         );
 
         let seconds: Vec<u32> = tool_ttls
@@ -1927,6 +1995,204 @@ mod tests {
             "provider order is tools then message content, and Anthropic \
              requires ttl to never increase across that sequence: tools={tool_ttls:?} \
              blocks={block_ttls:?} (seconds {seconds:?})"
+        );
+
+        assert_eq!(
+            tool_marker_indices(&body),
+            vec![0],
+            "normalizing a lifetime neither adds a marker nor moves one"
+        );
+        assert_eq!(
+            body["tools"],
+            json!([{
+                "name": "A",
+                "description": "search",
+                "input_schema": { "type": "object", "properties": { "q": { "type": "string" } } },
+                "cache_control": { "type": "ephemeral", "ttl": "1h" },
+            }]),
+            "the ttl is the only field of the client's toolbox that moved"
+        );
+    }
+
+    /// The other direction: an hour the client asked for comes *down* to a
+    /// five-minute target's default.
+    ///
+    /// Not an ordering question — `tools` serialize first, so an hour ahead of
+    /// five minutes is already the order the API wants. It is a pricing one. The
+    /// catalog boundary holds a one-hour entry to the hour's write rate, twice
+    /// the input rate, precisely because a five-minute entry records 1.25 times;
+    /// a request that writes an hour-long entry against a five-minute entry is
+    /// billed at a rate the ledger never charges and the router never quoted.
+    /// The request asks for the lifetime its own price came from.
+    #[test]
+    fn a_five_minute_target_brings_an_hour_long_tool_marker_down_to_the_default() {
+        let quote = FrontierQuote {
+            tools: Some(json!([{
+                "name": "A",
+                "input_schema": { "type": "object" },
+                "cache_control": { "type": "ephemeral", "ttl": "1h" },
+            }])),
+            tools_dialect: Some(SPOKEN),
+            ..quote_at_ttl(Some(300_000))
+        };
+
+        let body = AnthropicMessagesClient::body(&quote, "claude-sonnet").unwrap();
+
+        assert_eq!(tool_marker_indices(&body), vec![0]);
+        assert_eq!(
+            tool_marker_ttls(&body),
+            vec![None],
+            "five minutes is the field omitted, never the string `5m`"
+        );
+        assert_eq!(
+            body["tools"][0]["cache_control"],
+            json!({ "type": "ephemeral" }),
+            "the marker keeps its type and loses only the lifetime"
+        );
+    }
+
+    /// An absent target TTL uses the provider default for tool markers too.
+    #[test]
+    fn a_target_with_no_declared_lifetime_strips_a_tool_markers_hour() {
+        let quote = FrontierQuote {
+            tools: Some(json!([{
+                "name": "A",
+                "input_schema": { "type": "object" },
+                "cache_control": { "type": "ephemeral", "ttl": "1h" },
+            }])),
+            tools_dialect: Some(SPOKEN),
+            ..quote_at_ttl(None)
+        };
+
+        let body = AnthropicMessagesClient::body(&quote, "claude-sonnet").unwrap();
+
+        assert_eq!(tool_marker_indices(&body), vec![0]);
+        assert_eq!(tool_marker_ttls(&body), vec![None]);
+        assert!(
+            marker_ttls(&body).iter().all(Option::is_none),
+            "and the blocks this client originates carry the same default"
+        );
+    }
+
+    /// **The slot-accounting guard.** Normalizing a lifetime changes no marker
+    /// count, so the allowance arithmetic decides exactly what it decided
+    /// before.
+    ///
+    /// Three riding markers is the discriminating case: one slot free, which the
+    /// penultimate block takes and the lookback marker does not. A normalizer
+    /// that added, dropped or doubled a marker would move this to `[4, 29]` or
+    /// to `[]` while the lifetimes still looked right.
+    #[test]
+    fn normalizing_three_riding_markers_leaves_the_block_allowance_unchanged() {
+        let marked = |name: &str| {
+            json!({
+                "name": name,
+                "input_schema": { "type": "object" },
+                "cache_control": { "type": "ephemeral" },
+            })
+        };
+        let quote = FrontierQuote {
+            tools: Some(json!([marked("A"), marked("B"), marked("C")])),
+            tools_dialect: Some(SPOKEN),
+            ..quote_at_ttl(Some(ONE_HOUR_MS))
+        };
+
+        let body = AnthropicMessagesClient::body(&quote, "claude-sonnet").unwrap();
+
+        assert_eq!(
+            tool_marker_ttls(&body),
+            vec![
+                Some(ONE_HOUR.to_string()),
+                Some(ONE_HOUR.to_string()),
+                Some(ONE_HOUR.to_string())
+            ],
+            "every forwarded marker adopts the target's hour"
+        );
+        assert_eq!(tool_marker_indices(&body), vec![0, 1, 2]);
+        assert_eq!(
+            breakpoint_indices(&body),
+            vec![29],
+            "three riding markers still leave exactly one slot, and the \
+             penultimate block still takes it"
+        );
+    }
+
+    /// The same at the saturated boundary: four riding markers spend the
+    /// allowance whatever lifetime they carry, and this client still sends none
+    /// of its own.
+    #[test]
+    fn normalizing_four_riding_markers_still_spends_the_whole_allowance() {
+        let marked = |name: &str| {
+            json!({
+                "name": name,
+                "input_schema": { "type": "object" },
+                "cache_control": { "type": "ephemeral" },
+            })
+        };
+        let quote = FrontierQuote {
+            tools: Some(json!([marked("A"), marked("B"), marked("C"), marked("D")])),
+            tools_dialect: Some(SPOKEN),
+            ..quote_at_ttl(Some(ONE_HOUR_MS))
+        };
+
+        let body = AnthropicMessagesClient::body(&quote, "claude-sonnet").unwrap();
+
+        assert_eq!(tool_marker_indices(&body), vec![0, 1, 2, 3]);
+        assert!(
+            tool_marker_ttls(&body)
+                .iter()
+                .all(|ttl| ttl.as_deref() == Some(ONE_HOUR)),
+            "{:?}",
+            tool_marker_ttls(&body)
+        );
+        assert_eq!(
+            breakpoint_indices(&body),
+            Vec::<usize>::new(),
+            "the allowance is spent; a fifth marker is a 400 whatever its \
+             lifetime"
+        );
+    }
+
+    /// **CONTROL.** A property a client happened to name `cache_control` inside
+    /// a tool's own argument schema is not a breakpoint, and normalization does
+    /// not descend into one.
+    ///
+    /// The same reasoning as [`breakpoints_in`]: only the array's top level is
+    /// where the wire puts a marker. Rewriting a `ttl` inside `input_schema`
+    /// would change what the client's tool accepts — a toolbox edit, which is
+    /// the one thing forwarding exists to avoid.
+    #[test]
+    fn a_schema_property_named_cache_control_is_neither_counted_nor_rewritten() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "cache_control": { "type": "object", "ttl": "1h" },
+            },
+        });
+        let quote = FrontierQuote {
+            tools: Some(json!([{
+                "name": "A",
+                "input_schema": schema.clone(),
+            }])),
+            tools_dialect: Some(SPOKEN),
+            ..quote_at_ttl(Some(ONE_HOUR_MS))
+        };
+
+        let body = AnthropicMessagesClient::body(&quote, "claude-sonnet").unwrap();
+
+        assert_eq!(
+            body["tools"][0]["input_schema"], schema,
+            "a schema is the tool's own argument vocabulary, never a marker"
+        );
+        assert_eq!(
+            tool_marker_indices(&body),
+            Vec::<usize>::new(),
+            "and it spends none of the request's four slots"
+        );
+        assert_eq!(
+            breakpoint_indices(&body),
+            vec![4, 29],
+            "so both of this client's own markers are still placed"
         );
     }
 

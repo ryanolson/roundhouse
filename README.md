@@ -1127,7 +1127,7 @@ For a measured prefill rate, set the slope to `1000 / tokens_per_second`. The qu
 
 **Cache lifetime.** For an `anthropic_messages` target, `cache_model: {"kind": "deterministic", "ttl_ms": 3600000}` selects one-hour conversation cache markers. The catalog requires `cache_write_per_mtok_usd` to equal twice the input rate for that entry. The error names the required rate. This check also applies to Messages gateways, regardless of their configured provider name.
 
-One-hour requests with shorter tool cache markers remain unsupported. The client currently preserves those tool markers, which can produce an invalid TTL order. The normalization-versus-rejection decision remains open in `agent-docs/PLAN-cache-affinity.md`.
+Roundhouse sets existing tool cache markers to the same lifetime as its conversation markers. A one-hour target requests `1h`. Other targets omit the TTL field for the five-minute default. This prevents shorter tool markers from preceding longer conversation markers. Tool definitions, schema contents, marker positions, and the four-marker allowance remain unchanged.
 
 **Sourcing `quality_prior`.** `FrontierModelSpec::quality_prior` is
 configuration, not measurement, and `import-benchmarks` (a binary target in
