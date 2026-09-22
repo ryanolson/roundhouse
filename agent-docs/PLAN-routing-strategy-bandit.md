@@ -23,15 +23,15 @@ The final workspace run at `5fba49d` passed 1801 tests, with 0 failures, 141 exi
 
 ### Completion requirements
 
-The transport and observation checkpoints do not complete the owner's routing vision. Completion requires the following evidence:
+The transport and observation checkpoints do not complete the owner's routing vision. This table reflects the committed state through `9e56a63` on 2026-09-22. Dated checkpoints below retain earlier evidence and limitations.
 
 | Requirement | Remaining implementation or evidence |
 |---|---|
-| Per-turn local selection | Current local signals, selector settings, admission results, and the selection cutoff persist in `1c14975`. Candidate records carry cache predictions. Classification references and learned selection remain unfinished. |
-| Rich classification | Versioned turn questions and a bounded projection of prior metadata plus the current prompt. Multiple-question transport alone is insufficient. |
-| Evaluation accounting | Distinct calls settle once in either completion order. Memory and Redis contracts preserve budgets, hold release, and ordinary serving replay. |
-| Background execution | Durable intent before HTTP, bounded queued/running/undelivered work, global expiry, cancellation, safe delivery, and no replayed provider call. |
-| Deployment wiring | Explicit opt-in, disabled defaults, required model/rates/limits, separate evaluation accounting, and startup tests. Local-only sessions send no classifier request. |
+| Per-turn local selection | `1c14975` records selector evidence and cache predictions. `438fe2f` adds bounded classification references at the selection cutoff. Learned selection remains unfinished. |
+| Rich classification | `438fe2f` implements versioned intent, complexity, and context-dependence questions with bounded prior metadata and current-prompt capture. Live provider evidence remains absent. |
+| Evaluation accounting | `438fe2f` records separate evaluation costs and settlement recovery. Memory and Redis checks are recorded below. Full classifier recovery through Redis remains unverified. |
+| Background execution | `438fe2f` implements durable intents, bounded work, expiry, cancellation, and retained delivery. Later tests close deadline and acknowledgement gaps. Backlog acknowledgement work remains under review. |
+| Deployment wiring | `438fe2f` implements opt-in configuration, disabled defaults, evaluation accounting, and loopback startup tests. Local-only exclusion has a mutation guard. Live deployment evidence remains absent. |
 | Frontier quality feedback | Exact interval coverage across text and tool turns, per-turn instruction versions, snapshot cutoff, unknown outcomes, and once-only learning updates. |
 | Online bandit | Local selection uses available classifications and observed outcomes under policy, quality, budget, and latency constraints. The utility tradeoff still needs an owner ruling. |
 | Offline learning | Versioned calibration artifacts, reproducible evaluation, and promotion evidence. Background estimates remain distinct from observed serving outcomes. |
