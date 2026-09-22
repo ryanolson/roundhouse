@@ -21,6 +21,24 @@ All five independent mutations against `5fba49d` failed their intended assertion
 
 The final workspace run at `5fba49d` passed 1801 tests, with 0 failures, 141 existing ignores, and no compiler warnings. It covered 108 test binaries and 7 doc-test suites. Log: `/tmp/roundhouse-typesafe-multi-workspace.log`.
 
+### Completion requirements
+
+The transport and observation checkpoints do not complete the owner's routing vision. Completion requires the following evidence:
+
+| Requirement | Remaining implementation or evidence |
+|---|---|
+| Per-turn local selection | A decision records its exact available features, extractor version, destination cache predictions, and eligible choices. Late classifications cannot rewrite it. |
+| Rich classification | Versioned turn questions and a bounded projection of prior metadata plus the current prompt. Multiple-question transport alone is insufficient. |
+| Evaluation accounting | Distinct calls settle once in either completion order. Memory and Redis contracts preserve budgets, hold release, and ordinary serving replay. |
+| Background execution | Durable intent before HTTP, bounded queued/running/undelivered work, global expiry, cancellation, safe delivery, and no replayed provider call. |
+| Deployment wiring | Explicit opt-in, disabled defaults, required model/rates/limits, separate evaluation accounting, and startup tests. Local-only sessions send no classifier request. |
+| Frontier quality feedback | Exact interval coverage across text and tool turns, per-turn instruction versions, snapshot cutoff, unknown outcomes, and once-only learning updates. |
+| Online bandit | Local selection uses available classifications and observed outcomes under policy, quality, budget, and latency constraints. The utility tradeoff still needs an owner ruling. |
+| Offline learning | Versioned calibration artifacts, reproducible evaluation, and promotion evidence. Background estimates remain distinct from observed serving outcomes. |
+| Cache feedback | Prediction error informs destination reuse estimates without inventing cache-pressure causes or counting measured costs twice. C6 return-trip timing remains open. |
+| Deployment measurements | C2 live cache evidence, measured local prefill slope, and a production local-fleet attachment. Unit and loopback tests do not prove these. |
+| Release verification | Complete documentation, required workspace and backend tests, full PR review cadence, and verified publication. PR #18 remains draft until these requirements are met. |
+
 ```mermaid
 flowchart TD
     T[Current turn] --> F[Available metadata and destination cache state]
@@ -88,6 +106,18 @@ Post-commit mutations reproduced both defects and failed their intended assertio
 The intent records an absolute expiry and the model, schema, projection, and configuration versions. Queue wait and HTTP execution must obey that expiry. Replay never dispatches an intent again. An expired intent without a durable result remains unknown, including its cost. A failed append must not discard a pending result before a later drain can retry its delivery. Delivery retries do not repeat HTTP.
 
 The review identified a settlement-order hypothesis that needs a failing test before runtime wiring. `SpendLedger` uses a per-project, per-session sequence watermark. Out-of-order classification completions can therefore lose an earlier settlement, even with a separate evaluation ledger. Separating evaluation from serving accounting is necessary but does not by itself solve ordering between classifications. A result must distinguish observed provider usage from successful ledger settlement. No implementation may treat a rejected settlement as committed spend.
+
+**Settlement regression, 2026-09-21.** The hypothesis is confirmed through `TypeSafeShadow::classify`, loopback HTTP, and a separate real `MemorySpendLedger`. Two calls have the same source session and payer, distinct holds, and intent sequences 10 and 20. Both report usage. In-order completion commits their combined $0.00070 and releases both holds. Reversed completion commits only the newer call's $0.00042. The expected-sum assertion fails, while the in-order control passes. The reversed-order hold assertion follows that failure and therefore does not yet prove a hold leak. Log: `/tmp/roundhouse-classification-settlement-order-red.log`.
+
+This test models completion order with sequential calls carrying reversed intent sequences. It does not test concurrent scheduling. The fix must preserve both charges exactly once regardless of completion order, preserve project and member ceilings, and retain serving-session replay behavior. Warning about a rejected settlement does not correct the missing spend. Runtime wiring remains gated on this regression.
+
+**Settlement identity ruling, 2026-09-21.** Evaluation calls need an explicit call identity independent of the serving session's ordered watermark. An elapsed hold TTL cannot make a completed call chargeable again. The proposed time-limited deduplication was rejected because it permits duplicate charges after expiry. Completed-call identities must survive delayed replay and budget-window resets. The storage cost is one retained identity per completed evaluation call until a durable compaction protocol can prove deletion safe. Runtime concurrency bounds do not bound this history. Membership checks must not scan the accumulated identities.
+
+**Settlement implementation, 2026-09-22.** Commit `42c9991` adds `SettlementKey::SessionWatermark`, which retains serving replay behavior. `OncePerCall` deduplicates evaluation settlements by project and call identity, without expiry. Memory and Redis retain those identities across monthly resets. The TypeSafe adapter and frontier judge use per-call settlement. Their unused settlement-sequence fields are removed. Each external attempt needs a fresh call identity. Replay must reuse the original identity.
+
+The adapter regression now commits both calls' combined $0.00070 and releases both holds in either order. The focused runs passed 19 core spend tests, 23 TypeSafe tests, 21 judge/spend tests, 14 budget-routing tests, and 76 validation/interjection tests. The real Redis spend suite passed all 21 tests. Redis unit tests passed 31 tests, with two unrelated integration tests ignored. Logs: `/tmp/roundhouse-evaluation-settlement-green.log` and `/tmp/roundhouse-evaluation-settlement-redis.log`. No provider request was made.
+
+All five independent post-commit mutations failed runtime assertions: lost Memory deduplication, cleared Memory identities at reset, a session-watermark adapter, lost Redis deduplication, and cleared Redis identities at reset. Each inverse edit restored source identical to `42c9991`. The restored suites passed 19 core spend tests, 23 TypeSafe tests, and all 21 real Redis spend tests. The adapter mutation used a fixed sequence and failed both ordering cases. It verifies the key choice without reproducing every detail of the original defect. Redis reset tests advance ledger time, not Redis wall-clock expiry. Logs: `/tmp/roundhouse-settlement-refute-M{1,2,3,4,5}.log` and `/tmp/roundhouse-settlement-refute-restored.log`. The full workspace run at `42c9991` passed 1807 tests, with 0 failures, 145 ignores, and no compiler warnings. It covered 108 test binaries and 7 doc-test suites. Four new Redis contract instances are ignored in the workspace run and passed in the separate real Redis run. Log: `/tmp/roundhouse-settlement-workspace.log`.
 
 Exact feature identities and extractor versions remain necessary for reproducibility. The review's claim that a later append can acquire a sequence below an earlier cutoff is rejected: log sequence numbers are monotonic. The real concern is a projection that indexes results by source intent rather than settlement availability, or an extractor that changes its interpretation. Tests must exercise those mechanisms.
 
@@ -241,7 +271,7 @@ The shadow call requires a separate evaluation budget and ledger. A grant preced
 
 The transport sends one request with no retries. It bounds response bytes and the complete request duration. The response must contain the expected question and options, finite probabilities in range, a valid sum, and valid confidence. Unrelated extra fields are allowed. Confidence remains an observation, with no promotion threshold.
 
-The future caller supplies durable call identity and settlement sequence. Deterministic request bytes do not prevent repeated calls. Replay, cancellation of background work, and duplicate delivery remain B2/B3 responsibilities.
+The future caller supplies a durable call identity. The 2026-09-21 settlement ruling replaces the proposed settlement sequence with per-call deduplication. Deterministic request bytes do not prevent repeated calls. Replay, cancellation of background work, and duplicate delivery remain B2/B3 responsibilities.
 
 ### B4 implementation checkpoint, 2026-09-19
 

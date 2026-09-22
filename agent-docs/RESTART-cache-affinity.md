@@ -20,9 +20,11 @@ You are continuing PR #18 in `ryanolson/roundhouse`: https://github.com/ryanolso
 
 ## State
 
-- **Latest full suite:** At `5fba49d`, 1801 tests passed, with 0 failures, 141 existing ignores, and no compiler warnings. The run covered 108 test binaries and 7 doc-test suites. Log: `/tmp/roundhouse-typesafe-multi-workspace.log`.
+- **Evaluation settlement checkpoint, 2026-09-22:** Commit `42c9991` gives evaluation calls a per-project call identity, independent of serving session watermarks. Memory and Redis retain completed identities without expiry. The reversed-order adapter regression now passes, as do 21 real Redis spend tests. All five independent mutations failed runtime assertions. The restored focused suites passed 63 tests, including all 21 real Redis spend tests. Source restoration matched the commit. See the bandit plan for the storage tradeoff and focused test evidence.
 
-- **TypeSafe transport checkpoint, 2026-09-21:** Commit `5fba49d` carries multiple choice questions in one prepared request. It requires a complete valid answer set and retains reported usage when that set is unusable. The adapter still asks one tier question. Six initial assertions failed with 43 passing controls. All 49 focused tests passed after implementation. Five independent post-commit mutations failed their intended assertions, and each source restore matched the commit. See the bandit plan for evidence and background lifecycle constraints. Before runtime wiring, reproduce the out-of-order settlement hypothesis with the real `MemorySpendLedger`. A separate evaluation ledger alone does not establish ordering between concurrent classifications.
+- **Latest full suite:** At `42c9991`, 1807 tests passed, with 0 failures, 145 ignores, and no compiler warnings. Four new Redis contract instances passed separately against real Redis. The run covered 108 test binaries and 7 doc-test suites. Log: `/tmp/roundhouse-settlement-workspace.log`.
+
+- **TypeSafe transport checkpoint, 2026-09-21:** Commit `5fba49d` carries multiple choice questions in one prepared request. It requires a complete valid answer set and retains reported usage when that set is unusable. The adapter still asks one tier question. Six initial assertions failed with 43 passing controls. All 49 focused tests passed after implementation. Five independent post-commit mutations failed their intended assertions, and each source restore matched the commit. See the bandit plan for evidence and background lifecycle constraints. The later settlement checkpoint above confirms and fixes the out-of-order settlement defect. Durable dispatch and background scheduling remain unfinished.
 
 - **Judge cache checkpoint, 2026-09-21:** Commit `e7bc859` prepares one prompt for counting and transport, marks its Messages system prefix, and requests the target TTL. The separate validation cache key remains. Four independent mutations failed their intended assertions, and source restoration matched the commit. The full workspace suite passed 1793 tests, with 0 failures, 141 existing ignores, and no compiler warnings. Log: `/tmp/roundhouse-judge-cache-workspace.log`. The bandit plan contains the review integration brief and mutation evidence. Exact interval coverage, rich background classification, and online learning remain unfinished.
 
@@ -55,7 +57,7 @@ You are continuing PR #18 in `ryanolson/roundhouse`: https://github.com/ryanolso
 Settled on 2026-09-19. Do not ask for these decisions again:
 
 1. T2 includes both serving strategies and background evaluation arms, with online TypeSafe/Jev arms.
-2. T6 is accepted: explicit opt-in, off by default, no calls for local-only sessions, and only the bounded judge brief.
+2. T6 requires explicit opt-in, disabled defaults, and no local-only session egress. The later owner clarification permits bounded prior metadata/classifications plus the current prompt. The current adapter still projects a judge brief. The broader projection remains to implement.
 3. PR #18 stays one unit, with separate logical commits.
 4. C4 rejects a one-hour catalog entry unless its write rate equals twice its input rate.
 

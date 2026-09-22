@@ -325,3 +325,9 @@ Four independent mutations failed the intended assertions, and source restoratio
 The TypeSafe API reference was read again on 2026-09-21. It defines a question map and matching answer keys. Commit `5fba49d` extends the transport to carry several choice questions in one prepared request. The transport requires a complete valid answer set and retains reported usage when the set is unusable. Unknown envelope fields remain allowed. The adapter retains its existing tier question. This change does not implement the richer taxonomy, metadata projection, or runtime scheduler.
 
 Five independent mutations failed their intended assertions. Each restore matched the commit, and all 49 focused tests passed afterward. The bandit plan records the tests and logs. No live provider call or batching performance measurement was made.
+
+## Addendum (2026-09-22): evaluation settlement identity
+
+Concurrent evaluation calls require separate settlement identities. A session watermark can discard an earlier call when a later call finishes first. Commit `42c9991` gives each evaluation call a per-project identity and preserves serving session watermarks. The TypeSafe adapter and frontier judge use the new mode. Memory and Redis retain completed identities across delayed replay and budget resets.
+
+An expired hold does not permit another charge for a completed call. Completed identities therefore have no expiry. This costs one retained identity per evaluation call until a safe compaction protocol exists. Background concurrency limits do not bound that history. Runtime integration must record the call identity before dispatch and preserve it during settlement replay. This change does not prevent repeated external requests. Durable dispatch and delivery remain unfinished.
