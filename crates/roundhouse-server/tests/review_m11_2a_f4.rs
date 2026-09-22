@@ -61,6 +61,7 @@ use roundhouse_core::control::{
     Allocation, BalanceQuery, Budget, BudgetTerms, BudgetWindow, DEFAULT_WARN_AT, Exhaustion,
     MemorySpendLedger, Principal, SpendLedger,
 };
+use roundhouse_core::event::CacheReadSource;
 use roundhouse_core::event::SessionEventKind;
 use roundhouse_core::ids::{SessionId, TurnId};
 use roundhouse_core::item::Item;
@@ -166,6 +167,7 @@ impl FrontierClient for HonestBillingClient {
             self.reply.clone(),
             true_input_tokens,
             0,
+            CacheReadSource::Provider,
             self.reply.len() as u64,
             0,
         ))

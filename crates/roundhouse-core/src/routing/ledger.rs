@@ -459,7 +459,7 @@ impl CacheLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::Accounting;
+    use crate::event::{Accounting, CacheReadSource};
 
     const MINUTE: u64 = 60_000;
 
@@ -500,6 +500,7 @@ mod tests {
             output_tokens: 0,
             reasoning_tokens: 0,
             accounting: Accounting::Reported,
+            cache_read_source: CacheReadSource::Unreported,
         };
         // 0.1 M * 3.75 + 0.6 M * 0.3 + 0.3 M * 3.0 = 0.375 + 0.18 + 0.90
         assert!((CLAUDE.price(&measured) - 1.455).abs() < 1e-9);
@@ -531,6 +532,7 @@ mod tests {
             output_tokens: 0,
             reasoning_tokens: 0,
             accounting: Accounting::Reported,
+            cache_read_source: CacheReadSource::Unreported,
         };
         // 0.4 M * 3.75 + 0.6 M * 0.3 — unchanged from before M11.0.
         assert!((CLAUDE.price(&unmeasured) - 1.68).abs() < 1e-9);
@@ -568,6 +570,7 @@ mod tests {
             output_tokens: 0,
             reasoning_tokens: 0,
             accounting: Accounting::Reported,
+            cache_read_source: CacheReadSource::Unreported,
         };
         let price = CLAUDE.price(&broken);
         assert!(price > 0.0, "a call cannot cost less than nothing: {price}");
@@ -595,6 +598,7 @@ mod tests {
             output_tokens: 0,
             reasoning_tokens: 0,
             accounting: Accounting::Reported,
+            cache_read_source: CacheReadSource::Unreported,
         };
         // A short prompt under the cacheable minimum (nothing measured), a long
         // one written whole, and one that was partly written — all three

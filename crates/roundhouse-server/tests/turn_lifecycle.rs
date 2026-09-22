@@ -41,6 +41,7 @@ use tokio::sync::mpsc;
 
 mod common;
 use common::{config, embedded_fleet, frontier_catalog};
+use roundhouse_core::event::CacheReadSource;
 
 /// An engine with a live local option, so a slow executor is on the hot path.
 fn engine_with_fleet(
@@ -510,6 +511,7 @@ async fn deltas_are_durable_before_the_response_completes() {
         .send(Ok(FrontierChunk::Done {
             input_tokens: 40,
             cached_input_tokens: 0,
+            cache_read_source: CacheReadSource::Provider,
             // Non-zero and distinct from every other count here, so the
             // assertion below is about *this* field arriving rather than about
             // a default that would have matched anyway.
@@ -721,6 +723,7 @@ async fn a_tool_calling_turn_commits_its_items_in_the_order_it_produced_them() {
         FrontierChunk::Done {
             input_tokens: 12,
             cached_input_tokens: 0,
+            cache_read_source: CacheReadSource::Provider,
             cache_write_tokens: 0,
             output_tokens: 20,
             reasoning_tokens: 0,
@@ -873,6 +876,7 @@ async fn a_call_only_turn_commits_no_empty_trailing_item() {
         Ok(FrontierChunk::Done {
             input_tokens: 4,
             cached_input_tokens: 0,
+            cache_read_source: CacheReadSource::Provider,
             cache_write_tokens: 0,
             output_tokens: 4,
             reasoning_tokens: 0,

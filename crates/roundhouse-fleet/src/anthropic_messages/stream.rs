@@ -66,6 +66,8 @@ use std::collections::{BTreeMap, VecDeque};
 
 use serde_json::Value;
 
+use roundhouse_core::event::CacheReadSource;
+
 use crate::frontier::{FrontierChunk, FrontierError};
 
 use super::wire::{ApiError, BlockDelta, ContentBlock, Message, StreamEvent, Usage};
@@ -116,6 +118,9 @@ struct InputSide {
     /// Tokens neither read from nor written to the cache.
     fresh: u64,
     read: u64,
+    /// Whether any frame actually named the cache read, so a defaulted zero is
+    /// not published as a cold prefix.
+    read_source: CacheReadSource,
     written: u64,
 }
 
@@ -139,8 +144,16 @@ impl InputSide {
         if usage.input_tokens > 0 {
             self.fresh = usage.input_tokens;
         }
-        if usage.cache_read_input_tokens > 0 {
-            self.read = usage.cache_read_input_tokens;
+        // The cache read carries provenance as well as a count: a frame that
+        // names the field has spoken for it, a stated zero included. The `> 0`
+        // condition is still here for the merge above's reason — a later frame
+        // must not retract a read an earlier one reported — so an explicit zero
+        // only lands while nothing positive has.
+        if let Some(read) = usage.cache_read_input_tokens
+            && (read > 0 || self.read == 0)
+        {
+            self.read = read;
+            self.read_source = CacheReadSource::Provider;
         }
         if usage.cache_creation_input_tokens > 0 {
             self.written = usage.cache_creation_input_tokens;
@@ -756,6 +769,7 @@ impl SseDecoder {
             // a 200 000-token cached prompt as the 12 tokens that were new.
             input_tokens: self.input.total(),
             cached_input_tokens: self.input.read,
+            cache_read_source: self.input.read_source,
             cache_write_tokens: self.input.written,
             output_tokens: self.output_tokens,
             // Thinking is billed as ordinary output here and reported by no
@@ -877,9 +891,10 @@ fn describe(error: Result<ApiError, FrontierError>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use roundhouse_core::event::CacheReadSource;
 
     /// Drive the decoder over `pieces` and collect what it yields.
-    fn decode(pieces: &[&str]) -> Result<Vec<FrontierChunk>, FrontierError> {
+    pub(super) fn decode(pieces: &[&str]) -> Result<Vec<FrontierChunk>, FrontierError> {
         let mut decoder = SseDecoder::default();
         let mut chunks = Vec::new();
         for piece in pieces {
@@ -985,6 +1000,7 @@ mod tests {
                     // counters are disjoint; roundhouse's input is the total.
                     input_tokens: 9_512,
                     cached_input_tokens: 9_000,
+                    cache_read_source: CacheReadSource::Provider,
                     cache_write_tokens: 500,
                     output_tokens: 64,
                     reasoning_tokens: 0,
@@ -1047,6 +1063,7 @@ mod tests {
             vec![FrontierChunk::Done {
                 input_tokens: 1,
                 cached_input_tokens: 0,
+                cache_read_source: CacheReadSource::Unreported,
                 cache_write_tokens: 0,
                 output_tokens: 64,
                 reasoning_tokens: 0,
@@ -1274,6 +1291,7 @@ mod tests {
                 FrontierChunk::Done {
                     input_tokens: 9_512,
                     cached_input_tokens: 9_000,
+                    cache_read_source: CacheReadSource::Provider,
                     cache_write_tokens: 500,
                     output_tokens: 64,
                     reasoning_tokens: 0,
@@ -1524,6 +1542,7 @@ mod tests {
                 FrontierChunk::Done {
                     input_tokens: 9_512,
                     cached_input_tokens: 9_000,
+                    cache_read_source: CacheReadSource::Provider,
                     cache_write_tokens: 500,
                     output_tokens: 64,
                     reasoning_tokens: 0,
@@ -1693,6 +1712,7 @@ mod tests {
             FrontierChunk::Done {
                 input_tokens: 40,
                 cached_input_tokens: 0,
+                cache_read_source: CacheReadSource::Unreported,
                 cache_write_tokens: 0,
                 output_tokens: 2,
                 reasoning_tokens: 0,
@@ -1729,6 +1749,7 @@ mod tests {
             FrontierChunk::Done {
                 input_tokens: 9_512,
                 cached_input_tokens: 9_000,
+                cache_read_source: CacheReadSource::Provider,
                 cache_write_tokens: 500,
                 // Cumulative counts only ever grow, so the later frame wins.
                 output_tokens: 70,
@@ -1938,6 +1959,7 @@ mod tests {
                     FrontierChunk::Done {
                         input_tokens: 9_512,
                         cached_input_tokens: 9_000,
+                        cache_read_source: CacheReadSource::Provider,
                         cache_write_tokens: 500,
                         output_tokens: 64,
                         reasoning_tokens: 0,
@@ -1995,5 +2017,88 @@ mod tests {
         let chunks = decode(&[START, DELTA, STOP, &text(0, "afterthought")]).unwrap();
         assert_eq!(chunks.len(), 1);
         assert!(matches!(chunks[0], FrontierChunk::Done { .. }));
+    }
+}
+
+#[cfg(test)]
+mod cache_read_tests {
+    use super::tests::decode;
+    use crate::frontier::FrontierChunk;
+    use roundhouse_core::event::CacheReadSource;
+
+    const TEXT: &str = concat!(
+        "event: content_block_delta\n",
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#,
+        "\n\n"
+    );
+    /// The closing frames, which carry the output count and nothing about a
+    /// cache.
+    const STOP: &str = concat!(
+        "event: message_delta\n",
+        r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":64}}"#,
+        "\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+    );
+
+    fn cache_read(chunks: &[FrontierChunk]) -> (u64, CacheReadSource) {
+        chunks
+            .iter()
+            .find_map(|chunk| match chunk {
+                FrontierChunk::Done {
+                    cached_input_tokens,
+                    cache_read_source,
+                    ..
+                } => Some((*cached_input_tokens, *cache_read_source)),
+                _ => None,
+            })
+            .expect("the stream carried an accounting frame")
+    }
+
+    fn stream(usage: &str) -> Vec<FrontierChunk> {
+        let start = format!(
+            "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":\
+             {{\"type\":\"message\",\"content\":[],\"usage\":{usage}}}}}\n\n"
+        );
+        decode(&[&start, TEXT, STOP]).expect("the stream decodes")
+    }
+
+    /// `#[serde(default)]` plus an assembler that only overwrote on a positive
+    /// value collapsed an explicit zero into an absent field.
+    #[test]
+    fn an_explicit_cache_zero_is_distinguishable_from_an_omitted_count() {
+        let explicit_zero = stream(r#"{"input_tokens":120,"cache_read_input_tokens":0}"#);
+        let omitted = stream(r#"{"input_tokens":120}"#);
+
+        assert_eq!(cache_read(&explicit_zero), (0, CacheReadSource::Provider));
+        assert_eq!(cache_read(&omitted), (0, CacheReadSource::Unreported));
+        assert_ne!(cache_read(&explicit_zero), cache_read(&omitted));
+    }
+
+    /// An explicit `null` is silence, like an omitted field.
+    #[test]
+    fn a_null_cache_count_is_unreported_rather_than_zero() {
+        assert_eq!(
+            cache_read(&stream(
+                r#"{"input_tokens":120,"cache_read_input_tokens":null}"#
+            )),
+            (0, CacheReadSource::Unreported)
+        );
+    }
+
+    /// A sparse `message_delta` must not retract what the prelude reported.
+    ///
+    /// The accounting arrives in two frames and only the first says anything
+    /// about a cache. A merge that reset the provenance per frame would
+    /// downgrade every real read to silence at the last event of every stream.
+    #[test]
+    fn a_sparse_update_keeps_the_provenance_the_prelude_reported() {
+        assert_eq!(
+            cache_read(&stream(
+                r#"{"input_tokens":12,"cache_read_input_tokens":9000}"#
+            )),
+            (9_000, CacheReadSource::Provider),
+            "the prelude reported the read; a later silent frame does not \
+             unreport it"
+        );
     }
 }

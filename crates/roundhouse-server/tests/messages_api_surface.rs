@@ -86,6 +86,7 @@ use common::{
     MINUTE, Scripted, ScriptedFrontierClient, ScriptedTurns, ToolCallingFrontierClient, config,
     embedded_fleet, frontier_catalog, key, sha256_hex,
 };
+use roundhouse_core::event::CacheReadSource;
 
 /// What the echo provider answers with, and therefore what a turn says.
 const ANSWER: &str = "frontier answer";
@@ -536,6 +537,7 @@ impl FrontierClient for PartialThenFailClient {
             Ok(FrontierChunk::Done {
                 input_tokens: quote.prompt.len() as u64,
                 cached_input_tokens: 0,
+                cache_read_source: CacheReadSource::Provider,
                 cache_write_tokens: 0,
                 output_tokens: CONTINUATION.len() as u64,
                 reasoning_tokens: 0,
@@ -611,6 +613,7 @@ impl FrontierClient for ToolCallThenTextClient {
                 Ok(FrontierChunk::Done {
                     input_tokens: quote.prompt.len() as u64,
                     cached_input_tokens: 0,
+                    cache_read_source: CacheReadSource::Provider,
                     cache_write_tokens: 0,
                     output_tokens: 8,
                     reasoning_tokens: 0,
@@ -625,6 +628,7 @@ impl FrontierClient for ToolCallThenTextClient {
             Ok(FrontierChunk::Done {
                 input_tokens: quote.prompt.len() as u64,
                 cached_input_tokens: 0,
+                cache_read_source: CacheReadSource::Provider,
                 cache_write_tokens: 0,
                 output_tokens: F3_RETRY_REPLY.len() as u64,
                 reasoning_tokens: 0,
@@ -1062,6 +1066,7 @@ impl FrontierClient for CacheReportingFrontierClient {
             Ok(FrontierChunk::Done {
                 input_tokens: 12_345,
                 cached_input_tokens: 9_000,
+                cache_read_source: CacheReadSource::Provider,
                 cache_write_tokens: 500,
                 output_tokens: 7,
                 reasoning_tokens: 0,

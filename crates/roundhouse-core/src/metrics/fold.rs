@@ -33,6 +33,7 @@ use crate::event::{
     ValidationOutcome,
 };
 use crate::ids::{ResponseId, SessionId, TurnId};
+use crate::metrics::cache_evidence::CacheEvidence;
 use crate::metrics::pricing::TokenShape;
 use crate::metrics::{ModelKey, ServingMode};
 use crate::routing::PooledUsage;
@@ -215,6 +216,9 @@ pub(super) struct Counters {
     /// is a reward question this observation does not answer. The reason
     /// stays on the event for a later pass to split.
     pub(super) incomplete_elapsed: Elapsed,
+    /// What this row's decisions predicted about cache reuse, and what evidence
+    /// about the answer the log actually holds.
+    pub(super) cache_reuse: CacheEvidence,
 }
 
 /// The declared baselines one model row's turns named, collapsed.
@@ -370,6 +374,7 @@ impl Counters {
         self.first_output_rejected += other.first_output_rejected;
         self.completed_elapsed.absorb(&other.completed_elapsed);
         self.incomplete_elapsed.absorb(&other.incomplete_elapsed);
+        self.cache_reuse.absorb(&other.cache_reuse);
     }
 }
 
@@ -431,6 +436,18 @@ struct Pending {
     /// the log has already answered — the same argument the rate card travels
     /// in the log under.
     billing: Billing,
+    /// The prompt size this decision was made over, in our own tokenizer's
+    /// count, and the prefill it expected to pay for out of that.
+    ///
+    /// Carried here for [`Self::billing`]'s reason — the prediction is made at
+    /// the `Routed` event and the measurement arrives at the terminal one — and
+    /// with one consequence worth naming. A second `Routed` replaces this whole
+    /// entry, so a turn that fell forward is checked against the prediction of
+    /// the target that actually served it. That is the only prediction it could
+    /// have been right or wrong about: the abandoned dispatch made its claim
+    /// about a cache this turn never touched.
+    isl_tokens: u64,
+    expected_prefill_tokens: f64,
 }
 
 /// One open response's clock.
@@ -808,6 +825,8 @@ impl MetricsFold {
                         // copy learned about a new candidate kind.
                         best_frontier_alternative_usd: decision.quoted_frontier_alternative_usd(),
                         billing: decision.billing,
+                        isl_tokens: decision.isl_tokens,
+                        expected_prefill_tokens: decision.expected_prefill_tokens,
                     },
                 );
             }
@@ -967,15 +986,27 @@ impl MetricsFold {
                     return true;
                 }
 
+                let counters = self
+                    .by_principal
+                    .entry(payer)
+                    .or_default()
+                    .entry(pending.key)
+                    .or_default();
                 settle(
-                    self.by_principal
-                        .entry(payer)
-                        .or_default()
-                        .entry(pending.key)
-                        .or_default(),
+                    counters,
                     usage,
                     pending.best_frontier_alternative_usd,
                     pending.billing,
+                );
+                // What the decision expected of the cache against what the
+                // provider reported, booked behind the same evidence gate the
+                // call itself is: a dispatch that reached nobody observed
+                // nothing, and counting it among the unmeasurable would make an
+                // outage read as a cache-accounting problem.
+                counters.cache_reuse.observe(
+                    pending.isl_tokens,
+                    pending.expected_prefill_tokens,
+                    usage,
                 );
             }
             // Money this deployment spent on its own behalf, booked under the
@@ -1313,7 +1344,7 @@ mod turn_elapsed_tests;
 pub(super) mod tests {
     use super::*;
     use crate::control::Principal;
-    use crate::event::{Accounting, IncompleteReason};
+    use crate::event::{Accounting, CacheReadSource, IncompleteReason};
     use crate::routing::{Candidate, DecisionRecord, Target};
     use crate::validate::SteerAction;
 
@@ -1361,6 +1392,7 @@ pub(super) mod tests {
             output_tokens: output,
             reasoning_tokens: reasoning,
             accounting: Accounting::Reported,
+            cache_read_source: CacheReadSource::Unreported,
         }
     }
 

@@ -20,6 +20,7 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use roundhouse_core::control::TurnCredential;
+use roundhouse_core::event::CacheReadSource;
 use roundhouse_core::routing::{CacheLedger, CacheModel, ProviderPricing, Target};
 use roundhouse_fleet::{
     FrontierChunk, FrontierClient, FrontierError, FrontierModelSpec, FrontierQuote, FrontierStream,
@@ -130,7 +131,14 @@ impl FrontierClient for SerializingFrontierClient {
         }
 
         *self.last_body.lock().unwrap() = Some(body);
-        Ok(FrontierChunk::whole_response("ok".into(), 0, 0, 0, 0))
+        Ok(FrontierChunk::whole_response(
+            "ok".into(),
+            0,
+            0,
+            CacheReadSource::Unreported,
+            0,
+            0,
+        ))
     }
 }
 

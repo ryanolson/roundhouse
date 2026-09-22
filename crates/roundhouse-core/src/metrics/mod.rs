@@ -62,10 +62,13 @@
 //! module keeps only the vocabulary all three share and the live recorder that
 //! drives them, and re-exports the rest so callers see one surface.
 
+pub(crate) mod cache_evidence;
 pub mod fold;
 pub mod pricing;
 pub mod snapshot;
 
+#[cfg(test)]
+mod cache_reuse_evidence_tests;
 #[cfg(test)]
 mod turn_elapsed_snapshot_tests;
 
@@ -84,9 +87,10 @@ pub use pricing::{
     ShadowPricing, TokenShape,
 };
 pub use snapshot::{
-    Coverage, FIRST_OUTPUT_BASIS, FirstOutputLatency, MetricsConfig, MetricsSnapshot,
-    ModelAccounting, ModelMetrics, ProviderMetrics, Rollup, Savings, ServingModeMetrics,
-    TURN_ELAPSED_BASIS, TokenBreakdown, TurnElapsed,
+    CacheReuseEvidence, Coverage, FIRST_OUTPUT_BASIS, FirstOutputLatency, MetricsConfig,
+    MetricsSnapshot, ModelAccounting, ModelMetrics, OBSERVED_CACHE_BASIS, PREDICTED_CACHE_BASIS,
+    ProviderMetrics, Rollup, Savings, ServingModeMetrics, TURN_ELAPSED_BASIS, TokenBreakdown,
+    TurnElapsed,
 };
 
 /// The provider name local targets are grouped under.

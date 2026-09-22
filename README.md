@@ -975,6 +975,10 @@ The JSON fields `completed_turn_elapsed` and `incomplete_turn_elapsed` separate 
 
 Terminal timing does not depend on billed usage. An incomplete response can have a timing sample and zero calls. A missing start produces no sample, and a backward terminal timestamp increments the rejection count. `unrouted_terminals` counts responses with a start but no routed target, within the selected scope. Those responses do not create model rows. The HTML dashboard does not yet display these fields.
 
+Model rows also report `cache_reuse_evidence` in the metrics JSON. This compares predicted and observed cache-reuse ratios for the same dispatches. The prediction uses the router's token count. The observation uses the provider's token count. Each row reports both bases, paired sample count, and mean observed-minus-predicted error. Negative error means that the router expected more reuse than the provider reported.
+
+Only explicit provider cache counts supply observations, including a reported zero. Missing counts, historical records without cache provenance, and locally derived counts supply no measured sample. Coverage counters distinguish these cases from invalid usage and unusable predictions. The last routed target receives the observation after failover. These observations do not establish cache pressure or answer quality. They do not yet update routing, and the HTML dashboard does not display them.
+
 ### What "dollars saved" actually claims
 
 Three figures, and they are not equally solid, so the dashboard never merges

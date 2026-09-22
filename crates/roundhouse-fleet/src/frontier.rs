@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use roundhouse_core::control::{CredentialError, TurnCredential};
+use roundhouse_core::event::CacheReadSource;
 use roundhouse_core::metrics::{ReferenceModel, ShadowPricing};
 use roundhouse_core::routing::{
     AttemptClass, CacheLedger, CacheModel, Candidate, ProviderPricing, Target,
@@ -291,6 +292,13 @@ pub enum FrontierChunk {
     Done {
         input_tokens: u64,
         cached_input_tokens: u64,
+        /// Where `cached_input_tokens` came from.
+        ///
+        /// Both wire decoders fill the count with a zero when the provider
+        /// omits the field, so the number alone cannot tell a cold prefix from
+        /// a silent upstream. Carried from the decoder rather than re-derived
+        /// downstream, because this is the only layer that saw the wire.
+        cache_read_source: CacheReadSource,
         /// Prompt tokens the provider wrote into its cache on this call.
         ///
         /// A *component* of `input_tokens`, exactly as `cached_input_tokens` is:
@@ -382,6 +390,7 @@ impl FrontierChunk {
         text: String,
         input_tokens: u64,
         cached_input_tokens: u64,
+        cache_read_source: CacheReadSource,
         output_tokens: u64,
         reasoning_tokens: u64,
     ) -> FrontierStream {
@@ -390,6 +399,10 @@ impl FrontierChunk {
             Ok(FrontierChunk::Done {
                 input_tokens,
                 cached_input_tokens,
+                // A parameter, unlike `cache_write_tokens` below: the callers
+                // that adapt a non-streaming backend do know whether the count
+                // they were handed came from a provider or from us.
+                cache_read_source,
                 // Not a parameter, so that the dozen call sites that adapt a
                 // non-streaming backend do not each have to answer a question
                 // none of them can: a backend handed token counts by its caller
@@ -1192,6 +1205,9 @@ impl FrontierClient for EchoFrontierClient {
             self.reply.clone(),
             quote.prompt.len() as u64,
             0,
+            // This double states its counts, the cache read included, so its
+            // zero is a stated zero rather than a silence.
+            CacheReadSource::Provider,
             self.reply.len() as u64,
             0,
         ))

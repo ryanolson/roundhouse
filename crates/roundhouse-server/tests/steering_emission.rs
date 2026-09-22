@@ -80,6 +80,7 @@ use roundhouse_core::control::{
     Balance, BalanceQuery, Grant, GrantRequest, MemorySpendLedger, Settled, Settlement, SpendError,
     SpendLedger,
 };
+use roundhouse_core::event::CacheReadSource;
 use roundhouse_core::event::{
     Accounting, ControlRecord, SessionEventKind, Usage, ValidationOutcome,
 };
@@ -181,6 +182,7 @@ fn steer_usage() -> Usage {
     Usage {
         input_tokens: 96,
         cached_input_tokens: 32,
+        cache_read_source: CacheReadSource::Provider,
         // The exception to "non-zero on every axis": an interjection is
         // answered without dispatching, so nothing was written into any
         // provider's cache and a non-zero count here would be fiction.

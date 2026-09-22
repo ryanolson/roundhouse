@@ -52,6 +52,7 @@
 //! `PooledUsage` and `price_pooled` as the fix; nothing was widened merely to
 //! make these tests possible.
 
+use roundhouse_core::event::CacheReadSource;
 use roundhouse_core::event::{Accounting, SessionEvent, SessionEventKind, Usage};
 use roundhouse_core::ids::{ResponseId, SessionId, TurnId};
 use roundhouse_core::metrics::pricing::{ReferenceModel, ShadowPricing};
@@ -94,6 +95,7 @@ fn call(uncached: u64, write: u64) -> Usage {
         output_tokens: 0,
         reasoning_tokens: 0,
         accounting: Accounting::Reported,
+        cache_read_source: CacheReadSource::Unreported,
     }
 }
 

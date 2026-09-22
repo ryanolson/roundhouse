@@ -24,6 +24,7 @@
 pub mod fair_use;
 
 use roundhouse_core::control::{BudgetState, Principal};
+use roundhouse_core::event::CacheReadSource;
 use roundhouse_core::event::{
     Accounting, IncompleteReason, SessionEvent, SessionEventKind, SideCallAbandonReason,
     SideCallPurpose, Usage, ValidationOutcome,
@@ -231,6 +232,7 @@ pub fn every_event_kind() -> Vec<SessionEventKind> {
                 // newest counter would still pass a round trip whose fixture
                 // left it at its default.
                 cache_write_tokens: 9,
+                cache_read_source: CacheReadSource::Provider,
                 output_tokens: 5,
                 reasoning_tokens: 2,
                 accounting: Accounting::Reported,

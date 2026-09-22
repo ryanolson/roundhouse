@@ -42,6 +42,8 @@ use roundhouse_core::store::SessionStore;
 
 use crate::control_config::Admission;
 use crate::engine::{Engine, EngineError};
+#[cfg(test)]
+use roundhouse_core::event::CacheReadSource;
 
 /// How long a grant's hold outlives the turn that took it.
 ///
@@ -320,6 +322,7 @@ mod tests {
         Usage {
             input_tokens: 0,
             cached_input_tokens: 0,
+            cache_read_source: CacheReadSource::Provider,
             cache_write_tokens: 0,
             output_tokens: 1_000_000,
             reasoning_tokens: 0,
@@ -516,6 +519,7 @@ mod the_live_admission_cannot_move_a_finished_turns_charge {
         Usage {
             input_tokens: 0,
             cached_input_tokens: 0,
+            cache_read_source: CacheReadSource::Provider,
             cache_write_tokens: 0,
             output_tokens: 1_000_000,
             reasoning_tokens: 0,

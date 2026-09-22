@@ -40,6 +40,8 @@ use std::collections::VecDeque;
 
 use serde_json::Value;
 
+use roundhouse_core::event::CacheReadSource;
+
 use crate::frontier::{FrontierChunk, FrontierError};
 
 /// How much of a single SSE event this will buffer before giving up.
@@ -337,9 +339,20 @@ fn function_call(item: Option<&Value>) -> Option<FrontierChunk> {
 /// unaccounted call. The unaccounted case never reaches this function at all.
 fn usage_chunk(usage: &Value, response: Option<&Value>) -> FrontierChunk {
     let count = |value: Option<&Value>| value.and_then(Value::as_u64).unwrap_or(0);
+    // The one field where absent and zero are different answers, so the
+    // `unwrap_or` above is not allowed to spend the distinction. A count that
+    // is missing, null, or not a `u64` is silence; anything `as_u64` accepts,
+    // zero included, is the provider speaking.
+    let cache_read = usage
+        .pointer("/input_tokens_details/cached_tokens")
+        .and_then(Value::as_u64);
     FrontierChunk::Done {
         input_tokens: count(usage.get("input_tokens")),
-        cached_input_tokens: count(usage.pointer("/input_tokens_details/cached_tokens")),
+        cached_input_tokens: cache_read.unwrap_or(0),
+        cache_read_source: match cache_read {
+            Some(_) => CacheReadSource::Provider,
+            None => CacheReadSource::Unreported,
+        },
         // Zero and not a read of `input_tokens_details.cache_write_tokens`,
         // because no such field exists on this wire: the Responses API bills a
         // cache write as ordinary uncached input and reports no separate count.
@@ -404,6 +417,7 @@ fn error_message(error: Option<&Value>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use roundhouse_core::event::CacheReadSource;
 
     /// M17 review F5: this file's `function_call` doc (stream.rs:302-304)
     /// reads an absent `namespace` as "this tool has no server" — a
@@ -472,7 +486,7 @@ mod tests {
     }
 
     /// Drive the decoder over `pieces` and collect what it yields.
-    fn decode(pieces: &[&str]) -> Result<Vec<FrontierChunk>, FrontierError> {
+    pub(super) fn decode(pieces: &[&str]) -> Result<Vec<FrontierChunk>, FrontierError> {
         let mut decoder = SseDecoder::default();
         let mut chunks = Vec::new();
         for piece in pieces {
@@ -514,6 +528,7 @@ mod tests {
                 FrontierChunk::Done {
                     input_tokens: 120,
                     cached_input_tokens: 100,
+                    cache_read_source: CacheReadSource::Provider,
                     cache_write_tokens: 0,
                     output_tokens: 30,
                     reasoning_tokens: 12,
@@ -598,6 +613,7 @@ mod tests {
                     FrontierChunk::Done {
                         input_tokens: 120,
                         cached_input_tokens: 100,
+                        cache_read_source: CacheReadSource::Provider,
                         cache_write_tokens: 0,
                         output_tokens: 30,
                         reasoning_tokens: 12,
@@ -705,6 +721,7 @@ mod tests {
                 FrontierChunk::Done {
                     input_tokens: 1200,
                     cached_input_tokens: 900,
+                    cache_read_source: CacheReadSource::Provider,
                     cache_write_tokens: 0,
                     output_tokens: 64,
                     reasoning_tokens: 8,
@@ -734,6 +751,7 @@ mod tests {
             vec![FrontierChunk::Done {
                 input_tokens: 120,
                 cached_input_tokens: 100,
+                cache_read_source: CacheReadSource::Provider,
                 cache_write_tokens: 0,
                 output_tokens: 30,
                 reasoning_tokens: 12,
@@ -793,6 +811,7 @@ mod tests {
                 FrontierChunk::Done {
                     input_tokens: 120,
                     cached_input_tokens: 100,
+                    cache_read_source: CacheReadSource::Provider,
                     cache_write_tokens: 0,
                     output_tokens: 30,
                     reasoning_tokens: 12,
@@ -966,5 +985,81 @@ mod tests {
         )])
         .unwrap();
         assert_eq!(chunks, vec![FrontierChunk::OutputText(big)]);
+    }
+}
+
+#[cfg(test)]
+mod cache_read_tests {
+    use super::tests::decode;
+    use crate::frontier::FrontierChunk;
+    use roundhouse_core::event::CacheReadSource;
+
+    /// The cache-read half of the accounting frame.
+    fn cache_read(chunks: &[FrontierChunk]) -> (u64, CacheReadSource) {
+        chunks
+            .iter()
+            .find_map(|chunk| match chunk {
+                FrontierChunk::Done {
+                    cached_input_tokens,
+                    cache_read_source,
+                    ..
+                } => Some((*cached_input_tokens, *cache_read_source)),
+                _ => None,
+            })
+            .expect("the stream carried an accounting frame")
+    }
+
+    fn completed(usage: &str) -> Vec<FrontierChunk> {
+        decode(&[&format!(
+            "event: response.completed\ndata: {{\"type\":\"response.completed\",\
+             \"response\":{{\"usage\":{usage}}}}}\n\n"
+        )])
+        .expect("the frame decodes")
+    }
+
+    /// An explicit zero and an absent details object are different answers.
+    ///
+    /// Before this the count came through an `unwrap_or(0)` that spent the
+    /// distinction, so a silent upstream divided as a measured miss.
+    #[test]
+    fn an_explicit_cache_zero_is_distinguishable_from_an_omitted_count() {
+        let explicit_zero = completed(
+            r#"{"input_tokens":120,"input_tokens_details":{"cached_tokens":0},"output_tokens":30}"#,
+        );
+        let omitted = completed(r#"{"input_tokens":120,"output_tokens":30}"#);
+
+        assert_eq!(cache_read(&explicit_zero), (0, CacheReadSource::Provider));
+        assert_eq!(cache_read(&omitted), (0, CacheReadSource::Unreported));
+        assert_ne!(cache_read(&explicit_zero), cache_read(&omitted));
+    }
+
+    /// A null or unparseable count is silence rather than zero.
+    ///
+    /// The shapes a gateway produces when it rewrites a body it does not fully
+    /// understand. `as_u64` refuses each, and the refusal has to reach the
+    /// chunk.
+    #[test]
+    fn a_null_or_malformed_cache_count_is_unreported_rather_than_zero() {
+        for usage in [
+            r#"{"input_tokens":120,"input_tokens_details":null,"output_tokens":30}"#,
+            r#"{"input_tokens":120,"input_tokens_details":{"cached_tokens":null},"output_tokens":30}"#,
+            r#"{"input_tokens":120,"input_tokens_details":{"cached_tokens":"100"},"output_tokens":30}"#,
+            r#"{"input_tokens":120,"input_tokens_details":{"cached_tokens":-5},"output_tokens":30}"#,
+        ] {
+            assert_eq!(
+                cache_read(&completed(usage)),
+                (0, CacheReadSource::Unreported),
+                "a count that will not parse is not a zero: {usage}"
+            );
+        }
+    }
+
+    /// The control: a real count is still read, and still a provider report.
+    #[test]
+    fn a_nonzero_cache_read_is_still_a_provider_report() {
+        let chunks = completed(
+            r#"{"input_tokens":120,"input_tokens_details":{"cached_tokens":100},"output_tokens":30}"#,
+        );
+        assert_eq!(cache_read(&chunks), (100, CacheReadSource::Provider));
     }
 }

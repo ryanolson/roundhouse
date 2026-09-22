@@ -301,6 +301,76 @@ async fn the_live_numbers_match_a_cold_rebuild_from_the_log() {
         "a turn's elapsed interval is two log stamps, so a rebuild must \
          reproduce it exactly rather than approximately"
     );
+    // Replay must preserve cache evidence and coverage. Compare the ratios
+    // with a tolerance because aggregation order can affect floating-point sums.
+    let cache_counts = |snapshot: &MetricsSnapshot| {
+        snapshot
+            .models
+            .iter()
+            .map(|row| {
+                (
+                    row.provider.clone(),
+                    row.model.clone(),
+                    row.cache_reuse_evidence.as_ref().map(|c| {
+                        (
+                            c.samples,
+                            c.predictions,
+                            c.unusable_prediction,
+                            c.measured_cache_reads,
+                            c.unverifiable_cache_read,
+                            c.invalid_usage,
+                            c.unusable_usage,
+                            c.predicted_basis,
+                            c.observed_basis,
+                        )
+                    }),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        cache_counts(&live),
+        cache_counts(&rebuilt),
+        "the prediction is on the `Routed` record and the evidence census is on \
+         the terminal usage, so a replay of both must reach the same answer"
+    );
+    for (live_row, rebuilt_row) in live.models.iter().zip(rebuilt.models.iter()) {
+        let means = |row: &roundhouse_core::metrics::ModelMetrics| {
+            row.cache_reuse_evidence.as_ref().map(|c| {
+                [
+                    c.predicted_mean_ratio,
+                    c.observed_mean_ratio,
+                    c.mean_signed_error,
+                ]
+            })
+        };
+        for (a, b) in means(live_row)
+            .unwrap_or_default()
+            .iter()
+            .zip(means(rebuilt_row).unwrap_or_default().iter())
+        {
+            match (a, b) {
+                (Some(a), Some(b)) => assert!(
+                    (a - b).abs() < 1e-12,
+                    "{} differs between a live fold and a rebuild: {a} vs {b}",
+                    live_row.model
+                ),
+                (a, b) => assert_eq!(a, b, "{}", live_row.model),
+            }
+        }
+    }
+    // The same non-vacuity guard the intervals get: these turns went through
+    // the real engine, so at least one row carries a real prediction. Without
+    // this the equality above would hold between two absences.
+    assert!(
+        live.models.iter().any(|row| row
+            .cache_reuse_evidence
+            .as_ref()
+            .is_some_and(|c| c.samples > 0)),
+        "the echo double states its cache read, so four engine-driven turns \
+         pair a prediction with a stated count: {:?}",
+        cache_counts(&live)
+    );
     assert_eq!(live.unrouted_terminals, rebuilt.unrouted_terminals);
     // Without this the equality above would hold between two absences, which is
     // the shape a broken observation takes rather than the shape a working one

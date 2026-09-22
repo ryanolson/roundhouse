@@ -516,8 +516,14 @@ pub struct Usage {
     #[serde(default, deserialize_with = "count")]
     pub cache_creation_input_tokens: u64,
     /// Tokens served from the cache. The quantity the whole system maximizes.
-    #[serde(default, deserialize_with = "count")]
-    pub cache_read_input_tokens: u64,
+    ///
+    /// `Option` rather than a defaulted count, and that is the one field here
+    /// where absent and zero are different answers: a defaulted zero makes a
+    /// provider that said nothing about its cache indistinguishable from one
+    /// reporting a cold prefix. `None` covers both an omitted field and an
+    /// explicit `null`.
+    #[serde(default)]
+    pub cache_read_input_tokens: Option<u64>,
     /// The 5m/1h split of `cache_creation_input_tokens`.
     ///
     /// Typed here and carried nowhere downstream yet, deliberately: roundhouse's
@@ -541,7 +547,7 @@ impl Usage {
     /// difference decides whether a `Done` is emitted at all.
     pub fn reported_any_input(&self) -> bool {
         self.input_tokens > 0
-            || self.cache_read_input_tokens > 0
+            || self.cache_read_input_tokens.unwrap_or(0) > 0
             || self.cache_creation_input_tokens > 0
     }
 }
@@ -915,7 +921,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(usage.input_tokens, 12);
-        assert_eq!(usage.cache_read_input_tokens, 9_000);
+        assert_eq!(usage.cache_read_input_tokens, Some(9_000));
         assert_eq!(usage.cache_creation_input_tokens, 500);
         let breakdown = usage.cache_creation.clone().expect("the breakdown parsed");
         assert_eq!(breakdown.ephemeral_5m_input_tokens, 200);

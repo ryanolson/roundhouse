@@ -31,7 +31,9 @@ use roundhouse_core::control::{
     Billing, CredentialError, FairUseError, FairUseLedger, MemoryFairUseLedger, MemorySpendLedger,
     SpendError, SpendLedger, TurnCredential, TurnPolicy,
 };
-use roundhouse_core::event::{Accounting, IncompleteReason, SessionObserver, Usage};
+use roundhouse_core::event::{
+    Accounting, CacheReadSource, IncompleteReason, SessionObserver, Usage,
+};
 use roundhouse_core::ids::{ResponseId, SessionId, SideCallId, TurnId};
 use roundhouse_core::interject::{Interjection, InterjectionContext, Interjector};
 use roundhouse_core::item::{Item, canonical_arguments};
@@ -649,6 +651,8 @@ impl Failed {
             Usage {
                 input_tokens: isl_tokens,
                 cached_input_tokens: 0,
+                // Inferred, so nothing here is a cache observation either.
+                cache_read_source: CacheReadSource::Unreported,
                 cache_write_tokens: 0,
                 output_tokens: 0,
                 reasoning_tokens: 0,
@@ -1675,6 +1679,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                 FrontierChunk::Done {
                     input_tokens,
                     cached_input_tokens,
+                    cache_read_source,
                     cache_write_tokens,
                     output_tokens,
                     reasoning_tokens,
@@ -1707,6 +1712,10 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                         output_tokens,
                         reasoning_tokens,
                         accounting: Accounting::Reported,
+                        // A reported call can still say nothing about its
+                        // cache, so this rides in from the decoder rather than
+                        // being inferred from `accounting`.
+                        cache_read_source,
                     });
                     // Non-retracting, matching the dispatch decoders' own rule:
                     // a later frame that names no reason cannot erase one an
@@ -1922,6 +1931,8 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             // one: a cached count invented here would understate what the next
             // turn has to prefill.
             cached_input_tokens: 0,
+            // No provider spoke, so the zero above is an absence.
+            cache_read_source: CacheReadSource::Unreported,
             // And nothing was written into one either, for the same reason:
             // there was no provider call to write it.
             cache_write_tokens: 0,
@@ -1969,6 +1980,9 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         Usage {
             input_tokens: isl_tokens as u64,
             cached_input_tokens: 0,
+            // Nothing local bears on what a remote cache did, so this zero is
+            // an absence rather than a measured miss.
+            cache_read_source: CacheReadSource::Unreported,
             cache_write_tokens: 0,
             output_tokens: self.tokenizer.encode(text).len() as u64 + tool_call_output_tokens,
             // Thinking is not recoverable from the visible text: a provider
@@ -2998,6 +3012,11 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             outcome.text,
             isl_tokens as u64,
             cached as u64,
+            // `Derived`, not `Provider`: this count is the router's own
+            // `effective_prefill_tokens` subtracted from its own ISL, so it
+            // prices correctly and measures nothing. Checking it against the
+            // quote it came from would be checking a number against itself.
+            CacheReadSource::Derived,
             outcome.output_tokens,
             outcome.reasoning_tokens,
         ))

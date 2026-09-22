@@ -43,6 +43,7 @@ use roundhouse_server::{Admission, EchoLocalExecutor, Engine, LocalExecutor, Tur
 
 mod common;
 use common::{MINUTE, config};
+use roundhouse_core::event::CacheReadSource;
 
 /// A transport that answers with its own name and counts what it was asked to
 /// serve.
@@ -77,6 +78,7 @@ impl FrontierClient for Recorder {
             self.name.to_string(),
             quote.prompt.len() as u64,
             0,
+            CacheReadSource::Provider,
             self.name.len() as u64,
             0,
         ))
@@ -505,6 +507,7 @@ impl FrontierClient for DialectRecorder {
             self.name.to_string(),
             quote.prompt.len() as u64,
             0,
+            CacheReadSource::Provider,
             self.name.len() as u64,
             0,
         ))

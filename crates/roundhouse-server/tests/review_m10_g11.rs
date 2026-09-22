@@ -32,6 +32,7 @@ use tokio::sync::mpsc;
 
 mod common;
 use common::{config, frontier_catalog};
+use roundhouse_core::event::CacheReadSource;
 
 /// A [`FrontierClient`] whose stream the test feeds one chunk at a time —
 /// copied from `turn_lifecycle.rs::PacedFrontierClient` rather than shared,
@@ -122,6 +123,7 @@ async fn a_provider_reported_price_survives_the_turn_that_earned_it() {
         .send(Ok(FrontierChunk::Done {
             input_tokens: 40,
             cached_input_tokens: 0,
+            cache_read_source: CacheReadSource::Provider,
             cache_write_tokens: 0,
             output_tokens: 3,
             reasoning_tokens: 0,
@@ -226,6 +228,7 @@ async fn a_silent_provider_records_no_price_rather_than_zero() {
         .send(Ok(FrontierChunk::Done {
             input_tokens: 40,
             cached_input_tokens: 0,
+            cache_read_source: CacheReadSource::Provider,
             cache_write_tokens: 0,
             output_tokens: 3,
             reasoning_tokens: 0,

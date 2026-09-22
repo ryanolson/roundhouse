@@ -59,6 +59,8 @@ use roundhouse_core::event::{IncompleteReason, SessionEventKind, Usage};
 use roundhouse_core::ids::{ResponseId, TurnId};
 use roundhouse_core::item::{Item, ItemContent};
 
+#[cfg(test)]
+use roundhouse_core::event::CacheReadSource;
 use roundhouse_fleet::anthropic_messages::wire::{
     ApiError as WireError, BlockDelta, ContentBlock, Extra, MESSAGE_TYPE, Message,
     MessageDeltaBody, StopReason, StreamEvent, Usage as WireUsage,
@@ -289,7 +291,11 @@ fn wire_usage(usage: &Usage, output_tokens: u64) -> WireUsage {
             .input_tokens
             .saturating_sub(read)
             .saturating_sub(written),
-        cache_read_input_tokens: read,
+        // `Some` even when our own provenance is `Unreported`, so the bytes
+        // this surface emits are exactly what they were. What roundhouse should
+        // tell its own client when it never learned the count is a separate
+        // question from what it may measure internally.
+        cache_read_input_tokens: Some(read),
         cache_creation_input_tokens: written,
         output_tokens,
         // The 5m/1h split behind `extended-cache-ttl-2025-04-11`. Roundhouse's
@@ -1127,6 +1133,7 @@ mod tests {
         let usage = Usage {
             input_tokens: 9_512,
             cached_input_tokens: 9_000,
+            cache_read_source: CacheReadSource::Provider,
             cache_write_tokens: 500,
             output_tokens: 64,
             reasoning_tokens: 0,

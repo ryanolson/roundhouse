@@ -24,7 +24,7 @@
 use async_trait::async_trait;
 
 use crate::control::Principal;
-use crate::event::{Accounting, SessionEvent, SessionEventKind, Usage};
+use crate::event::{Accounting, CacheReadSource, SessionEvent, SessionEventKind, Usage};
 use crate::ids::{ResponseId, SessionId, TurnId};
 use crate::store::{Lease, MemoryStore, SessionStore, StoreError};
 
@@ -388,6 +388,9 @@ pub async fn read_events_pages_oldest_first_and_reproduces_the_append<S: Session
                 output_tokens: 3,
                 reasoning_tokens: 1,
                 accounting: Accounting::Estimated,
+                // Non-default for the reason the cache write is: a backend that
+                // dropped the newest field would still pass at its default.
+                cache_read_source: CacheReadSource::Provider,
             },
             provider_reported_cost_usd: None,
             // Populated for the same reason the counters above are: a backend

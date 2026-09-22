@@ -83,7 +83,7 @@ use roundhouse_core::context::Tokenizer;
 use roundhouse_core::control::{
     BudgetTerms, GrantRequest, Settlement, SpendLedger, TurnCredential,
 };
-use roundhouse_core::event::{Accounting, SideCallAbandonReason, Usage};
+use roundhouse_core::event::{Accounting, CacheReadSource, SideCallAbandonReason, Usage};
 use roundhouse_core::ids::{ResponseId, SessionId};
 use roundhouse_core::now_ms;
 use roundhouse_core::routing::Target;
@@ -222,6 +222,8 @@ impl<T: Tokenizer + Clone> FleetJudge<T> {
         self.spec.pricing.price(&Usage {
             input_tokens,
             cached_input_tokens: 0,
+            // A quote, not an observation: nothing has been sent yet.
+            cache_read_source: CacheReadSource::Unreported,
             // Zero for the same reason the cached count is: this is what the
             // call is *about to* cost, and nothing observable before a request
             // is sent says what a remote cache will do with it.
@@ -405,6 +407,7 @@ impl<T: Tokenizer + Clone> FleetJudge<T> {
                 Ok(Some(Ok(FrontierChunk::Done {
                     input_tokens,
                     cached_input_tokens,
+                    cache_read_source,
                     cache_write_tokens,
                     output_tokens,
                     reasoning_tokens,
@@ -434,6 +437,7 @@ impl<T: Tokenizer + Clone> FleetJudge<T> {
                         output_tokens,
                         reasoning_tokens,
                         accounting: Accounting::Reported,
+                        cache_read_source,
                     });
                 }
                 Ok(Some(Err(error))) => return Err(self.abandoned(&error)),
@@ -465,6 +469,8 @@ impl<T: Tokenizer + Clone> FleetJudge<T> {
             usage: reported.unwrap_or_else(|| Usage {
                 input_tokens,
                 cached_input_tokens: 0,
+                // The provider withheld its accounting, so it withheld this.
+                cache_read_source: CacheReadSource::Unreported,
                 // Zero, not back-derived: a provider that withheld its
                 // accounting withheld this too, and a cache-write count
                 // invented here would be a pricing convention wearing the name
@@ -754,6 +760,7 @@ mod tests {
                         .to_string(),
                     900,
                     0,
+                    CacheReadSource::Provider,
                     40,
                     0,
                 )),
@@ -966,6 +973,7 @@ mod tests {
         spec().pricing.price(&Usage {
             input_tokens: 900,
             cached_input_tokens: 0,
+            cache_read_source: CacheReadSource::Provider,
             // `whole_response` reports none, which is what an adapted
             // non-streaming backend knows about a remote cache write.
             cache_write_tokens: 0,

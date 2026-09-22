@@ -15,6 +15,7 @@
 //! recomputation of the fixture's own arithmetic.
 
 use roundhouse_core::control::{Billing, BudgetState, Payer, Principal};
+use roundhouse_core::event::CacheReadSource;
 use roundhouse_core::event::{Accounting, IncompleteReason, SessionEvent, SessionEventKind, Usage};
 use roundhouse_core::ids::{ResponseId, SessionId, TurnId};
 use roundhouse_core::item::Item;
@@ -59,6 +60,7 @@ pub fn usage(input: u64, cached: u64, output: u64) -> Usage {
         output_tokens: output,
         reasoning_tokens: 0,
         accounting: Accounting::Reported,
+        cache_read_source: CacheReadSource::Unreported,
     }
 }
 

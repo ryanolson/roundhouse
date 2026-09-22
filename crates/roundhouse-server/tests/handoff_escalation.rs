@@ -41,6 +41,7 @@ use async_trait::async_trait;
 
 use roundhouse_core::context::ByteTokenizer;
 use roundhouse_core::control::{TargetFilter, TurnPolicy};
+use roundhouse_core::event::CacheReadSource;
 use roundhouse_core::ids::{SessionId, TurnId};
 use roundhouse_core::item::{Item, ItemContent, Role};
 use roundhouse_core::routing::{
@@ -182,6 +183,7 @@ impl FrontierClient for Recording {
                 "answered".into(),
                 quote.prompt.len() as u64,
                 0,
+                CacheReadSource::Provider,
                 8,
                 0,
             )),

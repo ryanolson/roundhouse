@@ -78,6 +78,50 @@ pub struct Usage {
     /// broken. Marking the call keeps that gap visible as a gap.
     #[serde(default)]
     pub accounting: Accounting,
+    /// Where [`Self::cached_input_tokens`] came from.
+    ///
+    /// Separate from [`Self::accounting`] because a provider can report usage
+    /// and say nothing about its cache: both wire decoders fill the count in
+    /// with a zero when the field is absent, so the number alone cannot tell a
+    /// cold prefix from a silent upstream. Anything that divides it needs this
+    /// to know which it has.
+    ///
+    /// `#[serde(default)]` to [`CacheReadSource::Unreported`], which is the
+    /// right reading of every log written before this field existed rather than
+    /// a placeholder: those counts really did come through an `unwrap_or(0)`.
+    /// It loses real measurements on historical logs, which is the conservative
+    /// direction — absent evidence, never invented evidence.
+    #[serde(default)]
+    pub cache_read_source: CacheReadSource,
+}
+
+/// Where a [`Usage::cached_input_tokens`] count came from.
+///
+/// Ordered weakest to strongest, which is what [`Usage::add`] merges on: a
+/// total is only a provider measurement if every call in it was.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheReadSource {
+    /// No independent cache measurement is recorded. This includes historical
+    /// records whose counts have no provenance, even when those counts are positive.
+    #[default]
+    Unreported,
+    /// Roundhouse computed the count itself.
+    ///
+    /// The local path, whose cache credit is the router's own expected prefill
+    /// handed back by the engine. Real enough to price, and not an independent
+    /// observation of anything — an error term against the quote it came from
+    /// is zero by construction.
+    Derived,
+    /// The provider stated the count, a stated zero included.
+    Provider,
+}
+
+impl CacheReadSource {
+    /// Whether this count can be read as a measurement of a provider's cache.
+    pub fn is_measured(&self) -> bool {
+        matches!(self, CacheReadSource::Provider)
+    }
 }
 
 /// Where a [`Usage`]'s counts came from.
@@ -127,6 +171,11 @@ impl Usage {
     /// `u64::MAX` would report a near-zero total for the busiest deployment on
     /// the fleet, which is the one case where the number matters most.
     pub fn add(&mut self, other: &Usage) {
+        // An accumulator with no input of its own has no cache count to
+        // protect, so it adopts rather than degrades. Without this a fresh
+        // `Usage::default()` — which starts at the weakest source — would drag
+        // every total it collected down to `Unreported`.
+        let empty = self.input_tokens == 0;
         self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
         self.cached_input_tokens = self
             .cached_input_tokens
@@ -142,6 +191,12 @@ impl Usage {
         if other.accounting == Accounting::Estimated {
             self.accounting = Accounting::Estimated;
         }
+        // The same degradation, on the same argument: a total whose cache count
+        // is part measurement and part fill-in is not a measurement.
+        self.cache_read_source = match empty {
+            true => other.cache_read_source,
+            false => self.cache_read_source.min(other.cache_read_source),
+        };
     }
 }
 

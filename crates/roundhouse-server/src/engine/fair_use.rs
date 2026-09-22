@@ -86,6 +86,8 @@
 
 use roundhouse_core::context::Tokenizer;
 use roundhouse_core::control::FairUseRefusal;
+#[cfg(test)]
+use roundhouse_core::event::CacheReadSource;
 use roundhouse_core::ids::ResponseId;
 use roundhouse_core::now_ms;
 use roundhouse_core::session::Session;
@@ -399,6 +401,7 @@ mod tests {
                 Usage {
                     input_tokens: tokens,
                     cached_input_tokens: 0,
+                    cache_read_source: CacheReadSource::Provider,
                     cache_write_tokens: 0,
                     output_tokens: 0,
                     reasoning_tokens: 0,

@@ -35,6 +35,7 @@ use axum::routing::post;
 use futures::StreamExt;
 
 use roundhouse_core::control::{PresentedCredential, Secret, TurnCredential};
+use roundhouse_core::event::CacheReadSource;
 use roundhouse_core::routing::Target;
 use roundhouse_fleet::anthropic_messages::AnthropicMessagesClient;
 use roundhouse_fleet::{FrontierChunk, FrontierClient, FrontierError, FrontierQuote, WireProtocol};
@@ -397,6 +398,7 @@ async fn a_stored_key_arrives_bare_in_x_api_key_and_never_as_a_bearer() {
             FrontierChunk::Done {
                 input_tokens: 9_512,
                 cached_input_tokens: 9_000,
+                cache_read_source: CacheReadSource::Provider,
                 cache_write_tokens: 500,
                 output_tokens: 64,
                 reasoning_tokens: 0,
@@ -475,6 +477,7 @@ async fn a_tool_using_turn_sends_the_clients_tools_and_yields_one_completed_call
             FrontierChunk::Done {
                 input_tokens: 9_512,
                 cached_input_tokens: 9_000,
+                cache_read_source: CacheReadSource::Provider,
                 cache_write_tokens: 500,
                 output_tokens: 64,
                 reasoning_tokens: 0,

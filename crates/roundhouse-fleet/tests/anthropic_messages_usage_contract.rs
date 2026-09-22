@@ -37,6 +37,7 @@ use futures::StreamExt;
 use serde_json::json;
 
 use roundhouse_core::control::{Secret, TurnCredential};
+use roundhouse_core::event::CacheReadSource;
 use roundhouse_core::routing::Target;
 use roundhouse_fleet::anthropic_messages::AnthropicMessagesClient;
 use roundhouse_fleet::{FrontierChunk, FrontierClient, FrontierQuote, WireProtocol};
@@ -200,6 +201,7 @@ async fn the_accounting_is_whole_only_when_both_usage_events_are_folded() {
         Some(&FrontierChunk::Done {
             input_tokens: 9_512,
             cached_input_tokens: 9_000,
+            cache_read_source: CacheReadSource::Provider,
             cache_write_tokens: 500,
             output_tokens: 64,
             reasoning_tokens: 0,

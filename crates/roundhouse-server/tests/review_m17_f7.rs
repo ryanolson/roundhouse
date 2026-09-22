@@ -80,6 +80,7 @@ use roundhouse_server::{ControlPlane, Conversations, messages_router};
 mod common;
 use common::anthropic::audit;
 use common::{config, frontier_catalog};
+use roundhouse_core::event::CacheReadSource;
 
 /// The namespace an upstream names an MCP call under, per R-N6 — the same
 /// literal `review_m17_f3.rs` and `steering_emission.rs` use.
@@ -108,6 +109,7 @@ impl FrontierClient for NamespacedThenText {
                 Ok(FrontierChunk::Done {
                     input_tokens: quote.prompt.len() as u64,
                     cached_input_tokens: 0,
+                    cache_read_source: CacheReadSource::Provider,
                     cache_write_tokens: 0,
                     output_tokens: 4,
                     reasoning_tokens: 0,
@@ -127,6 +129,7 @@ impl FrontierClient for NamespacedThenText {
             Ok(FrontierChunk::Done {
                 input_tokens: quote.prompt.len() as u64,
                 cached_input_tokens: 0,
+                cache_read_source: CacheReadSource::Provider,
                 cache_write_tokens: 0,
                 output_tokens: self.arguments.len() as u64,
                 reasoning_tokens: 0,
