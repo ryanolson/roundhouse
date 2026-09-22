@@ -319,3 +319,9 @@ Commits `330cacb` and `a4766a1` add the observation layer. The metrics pair each
 Commit `e7bc859` supersedes the earlier statement that judge requests lack Messages breakpoints and a requested TTL. The judge marks its system prefix and uses the target's catalog lifetime. Token estimation and transport share one prepared prompt, including the separator. The judge retains its separate validation key. Its boundaries do not use the conversation cache ledger. The existing reservation retains the configured cold-write rate.
 
 Four independent mutations failed the intended assertions, and source restoration matched the commit. The full workspace suite passed 1793 tests, with 0 failures and 141 existing ignores. No live provider request was made. Cache markers do not prove reuse, and a short system prefix can remain below the provider's caching minimum. These mechanics do not establish complete review coverage or supply quality labels. The bandit plan defines the remaining interval contract.
+
+## Addendum (2026-09-21): multiple classification questions per request
+
+The TypeSafe API reference was read again on 2026-09-21. It defines a question map and matching answer keys. Commit `5fba49d` extends the transport to carry several choice questions in one prepared request. The transport requires a complete valid answer set and retains reported usage when the set is unusable. Unknown envelope fields remain allowed. The adapter retains its existing tier question. This change does not implement the richer taxonomy, metadata projection, or runtime scheduler.
+
+Five independent mutations failed their intended assertions. Each restore matched the commit, and all 49 focused tests passed afterward. The bandit plan records the tests and logs. No live provider call or batching performance measurement was made.

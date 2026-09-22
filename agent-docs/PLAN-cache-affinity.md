@@ -11,7 +11,7 @@ SPDX-License-Identifier: Apache-2.0
 
 **Owner ruling, 2026-09-21.** Roundhouse owns cache markers and can inject, modify, or remove them under provider rules. C4 now normalizes tool markers to the target TTL, with tests and mutation evidence in `1280855`. The owner also requires per-turn local routing with asynchronous Jev classifications as sequence metadata. The dated addendum in `PLAN-routing-strategy-bandit.md` supersedes the earlier segment-allocation proposal.
 
-Branch: `ai/typesafe-roundhouse-routing-6016d1`. Last update: 2026-09-21. The latest local full run covers `e7bc859`: 1793 passed, 0 failed, 141 existing ignores, across 108 test binaries and 7 doc-test suites.
+Branch: `ai/typesafe-roundhouse-routing-6016d1`. Last update: 2026-09-21. The latest local full run covers `5fba49d`: 1801 passed, 0 failed, 141 existing ignores, across 108 test binaries and 7 doc-test suites.
 
 | Rung | What | Status | Commit |
 |---|---|---|---|
@@ -23,7 +23,7 @@ Branch: `ai/typesafe-roundhouse-routing-6016d1`. Last update: 2026-09-21. The la
 | C4 | 1-hour TTL as one per-target setting | Built and mutation-checked, including tool TTL normalization. The owner-decision ignore is removed. | `4405da3`, `1280855` |
 | C5 | Local TTFT quote reads the residency answer | mechanism and catalog loader done, mutation-checked. Measured deployment slope still needed. | `6e905ba`, `3b21e98` |
 | C6 | Observed cache deadline and the return trip | not designed | |
-| C7 | Shadow classifier (T5) | B4 standalone adapter built and mutation-checked under T6. Runtime records, scheduling, and bandit allocation remain open. | `51b0fb2` |
+| C7 | Shadow classifier (T5) | B4 standalone adapter and multiple-question transport built and mutation-checked under T6. Rich classification, runtime records, scheduling, and bandit allocation remain open. | `51b0fb2`, `5fba49d` |
 
 **Cache observations, 2026-09-21:** Commit `330cacb` adds predicted-versus-observed cache reuse to the metrics JSON. Only provider-reported counts supply observed samples, including explicit zero. Commit `a4766a1` fixes aggregation provenance and closes the local-path test gap found by mutation. The final workspace run passed 1784 tests, with 0 failures, 141 existing ignores, and no compiler warnings. Mutation evidence and restoration checks are in `PLAN-routing-strategy-bandit.md`. This does not supply live C2 evidence or complete C6/C7.
 

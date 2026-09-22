@@ -1166,6 +1166,8 @@ starting.
 
 The adapter returns tier probabilities and confidence without changing a route. It retains reported usage when a tier signal is invalid. Missing or partial usage remains unknown. Budget estimates use the complete serialized request, and the transport sends those same checked bytes once, without retries. Request size, response size, and network duration are bounded.
 
+The transport supports multiple choice questions in one request. It requires one valid answer per requested key and rejects unexpected answer keys. An unusable answer set retains reported usage. Empty question maps are refused before HTTP. The adapter still asks its existing tier question.
+
 The binary does not construct this adapter. Durable attribution and background scheduling remain the B2/B3 work in `agent-docs/PLAN-routing-strategy-bandit.md`. Classifier confidence is not downstream answer quality. Serving allocation and promotion still require those separate decisions and measurements.
 
 ### The same numbers, in NeMo Relay's formats

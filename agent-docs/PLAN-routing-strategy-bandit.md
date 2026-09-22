@@ -13,6 +13,14 @@ The live selector runs on every turn. Its inputs include the current request, co
 
 The online bandit learns from the classification sequence and observed serving outcomes. Classification is an input feature, not a reward or proof of target quality. The current binary capable-versus-efficient adapter is a transport foundation. Rich turn classification requires a new typed contract.
 
+**Transport checkpoint, 2026-09-21.** Commit `5fba49d` carries a map of choice questions through one prepared TypeSafe request. Each answer is checked against its question's options. Missing or unexpected answer keys and malformed distributions make the answer set unusable. Reported usage remains available for accounting. Empty question maps are refused before credentials, serialization, grants, or HTTP. The server adapter retains its existing tier question. Rich taxonomy, metadata projection, background scheduling, and runtime configuration remain unfinished.
+
+The staged interface retained first-question-only behavior for the initial red run. Six assertions failed, with 43 passing controls. The implementation passed 18 fleet unit tests, 10 HTTP tests, and 21 server adapter tests. The workspace check passed for all targets. Logs: `/tmp/roundhouse-typesafe-multi-red.log` and `/tmp/roundhouse-typesafe-multi-green.log`. The author's pre-commit self-mutations do not satisfy the required independent gate.
+
+All five independent mutations against `5fba49d` failed their intended assertions: omitted questions, incomplete answer validation, unexpected answer keys, empty requests, and discarded usage. Each source restore matched the commit. The restored focused suites passed all 49 tests. Logs: `/tmp/roundhouse-typesafe-multi-refute-M{1,2,3,4,5}.log` and `/tmp/roundhouse-typesafe-multi-refute-restored.log`. No live provider request was made.
+
+The final workspace run at `5fba49d` passed 1801 tests, with 0 failures, 141 existing ignores, and no compiler warnings. It covered 108 test binaries and 7 doc-test suites. Log: `/tmp/roundhouse-typesafe-multi-workspace.log`.
+
 ```mermaid
 flowchart TD
     T[Current turn] --> F[Available metadata and destination cache state]
@@ -74,6 +82,18 @@ Two decoder assertions failed before the provenance change. Independent mutation
 Post-commit mutations reproduced both defects and failed their intended assertions. All source was restored. The final workspace run at `a4766a1` passed 1784 tests, with 0 failures, 141 existing ignores, and no compiler warnings. Logs: `/tmp/roundhouse-cachepred-provenance-red-decoders.log`, `/tmp/roundhouse-cachepred-refute-{M1,M2,M3,M4,gap}.log`, `/tmp/roundhouse-cachepred-postfix-{M3,aggregate}.log`, and `/tmp/roundhouse-cachepred-final-workspace.log`. No live provider measurement or routing update is claimed.
 
 ### Integration constraints from the current source
+
+**Background lifecycle review, 2026-09-21.** The bounded executor needs one admission permit across queued, running, and completed-but-undelivered states. A separate concurrency limit bounds HTTP calls. Completion must not release the admission permit before delivery or expiry. Global expiry must reclaim results from idle sessions. Completed task handles also need collection, so a bounded result map cannot hide an unbounded `JoinSet`.
+
+The intent records an absolute expiry and the model, schema, projection, and configuration versions. Queue wait and HTTP execution must obey that expiry. Replay never dispatches an intent again. An expired intent without a durable result remains unknown, including its cost. A failed append must not discard a pending result before a later drain can retry its delivery. Delivery retries do not repeat HTTP.
+
+The review identified a settlement-order hypothesis that needs a failing test before runtime wiring. `SpendLedger` uses a per-project, per-session sequence watermark. Out-of-order classification completions can therefore lose an earlier settlement, even with a separate evaluation ledger. Separating evaluation from serving accounting is necessary but does not by itself solve ordering between classifications. A result must distinguish observed provider usage from successful ledger settlement. No implementation may treat a rejected settlement as committed spend.
+
+Exact feature identities and extractor versions remain necessary for reproducibility. The review's claim that a later append can acquire a sequence below an earlier cutoff is rejected: log sequence numbers are monotonic. The real concern is a projection that indexes results by source intent rather than settlement availability, or an extractor that changes its interpretation. Tests must exercise those mechanisms.
+
+The owner's later direction permits bounded prior-turn metadata and classifications together with the current prompt. This supersedes the earlier judge-brief-only projection proposal while retaining explicit opt-in, disabled defaults, and no local-only egress. A second approval for that same direction is unnecessary. The implementation must specify and test the exact content and byte limits before using this projection.
+
+Rich classification does not require every TypeSafe primitive. Multiple choice questions can represent intent, reasoning complexity, and context dependence. The initial transport change therefore supports a map of choice questions with a complete validated answer set. Partial or malformed sets retain usage but supply no classification. Boolean and score primitives remain outside scope until a concrete feature needs them. Taxonomy and prompt versions must be explicit, and missing context must remain distinguishable from low complexity.
 
 `Session::open_observed` acquires the session lease. A background classifier must not open another writer and fence an active turn. `SessionState::project` supports reads without a lease. Result delivery must leave session writes with the engine and retain source-turn identity across delays.
 
