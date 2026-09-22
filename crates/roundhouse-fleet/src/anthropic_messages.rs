@@ -1776,16 +1776,9 @@ mod tests {
         );
     }
 
-    /// PRESERVATION: the judge's quote shape still carries no `cache_control`.
-    ///
-    /// A side call declares no segment boundaries -- "no structure known", which
-    /// this client answers with one block -- and the lookback marker must not
-    /// change that. A single block is entirely this call's own input, so a
-    /// marker on it would write an entry nothing can read, and a marker derived
-    /// from a `previous_breakpoint` a side call cannot have would name a block
-    /// in a different prompt. `judge.rs` builds exactly this shape.
+    /// Without declared boundaries, the adapter must not invent a cache marker.
     #[test]
-    fn the_judge_quote_still_carries_no_cache_control() {
+    fn a_quote_with_no_known_structure_carries_no_cache_control() {
         for previous in [None, Some(0), Some(4), Some(40)] {
             let quote = FrontierQuote {
                 prompt: "a system prompt\n\na brief".into(),
@@ -1802,6 +1795,30 @@ mod tests {
                  call's own input"
             );
         }
+    }
+
+    /// A two-segment judge quote marks the system prefix and leaves the brief unmarked.
+    #[test]
+    fn a_side_calls_two_segment_quote_marks_its_stable_prefix() {
+        const PREFIX: &str = "a system prompt\n\n";
+        let quote = FrontierQuote {
+            prompt: format!("{PREFIX}a brief"),
+            segment_boundaries: vec![PREFIX.len()],
+            previous_breakpoint: None,
+            ..quote(TurnCredential::Absent, SPOKEN)
+        };
+
+        let body = AnthropicMessagesClient::body(&quote, "claude-sonnet").unwrap();
+        assert_eq!(
+            breakpoint_indices(&body),
+            vec![0],
+            "the stable half is block zero and the brief is block one"
+        );
+        assert_eq!(
+            body["messages"][0]["content"][0]["text"],
+            json!(PREFIX),
+            "and the marked block is the prefix itself, separator included"
+        );
     }
 
     /// Every marker's `ttl`, in block order. `None` is the field omitted.
@@ -1927,10 +1944,10 @@ mod tests {
         assert!(ttls.iter().all(Option::is_none), "{ttls:?}");
     }
 
-    /// An hour on the target does not conjure a marker onto a side call: no
-    /// segment boundaries means no breakpoint to carry a lifetime.
+    /// An hour on the target does not conjure a marker onto a structureless
+    /// quote: no segment boundaries means no breakpoint to carry a lifetime.
     #[test]
-    fn a_one_hour_lifetime_places_no_marker_on_a_judge_shaped_quote() {
+    fn a_one_hour_lifetime_places_no_marker_on_a_structureless_quote() {
         let quote = FrontierQuote {
             prompt: "a system prompt\n\na brief".into(),
             segment_boundaries: Vec::new(),
@@ -1939,6 +1956,28 @@ mod tests {
         };
         let body = AnthropicMessagesClient::body(&quote, "claude-sonnet").unwrap();
         assert_eq!(breakpoint_indices(&body), Vec::<usize>::new());
+    }
+
+    /// A side call to an hour-long target asks for the hour on the one marker
+    /// it places -- the lifetime is the target's, not the call's kind.
+    #[test]
+    fn a_side_calls_marker_carries_its_targets_lifetime() {
+        const PREFIX: &str = "a system prompt\n\n";
+        for (ttl_ms, expected) in [
+            (Some(3_600_000), vec![Some("1h".to_string())]),
+            // The five-minute default is the field omitted, never `"5m"`.
+            (Some(300_000), vec![None]),
+            (None, vec![None]),
+        ] {
+            let quote = FrontierQuote {
+                prompt: format!("{PREFIX}a brief"),
+                segment_boundaries: vec![PREFIX.len()],
+                cache_ttl_ms: ttl_ms,
+                ..quote(TurnCredential::Absent, SPOKEN)
+            };
+            let body = AnthropicMessagesClient::body(&quote, "claude-sonnet").unwrap();
+            assert_eq!(marker_ttls(&body), expected, "{ttl_ms:?}");
+        }
     }
 
     /// Anthropic requires every `1h` marker to precede every shorter one, and

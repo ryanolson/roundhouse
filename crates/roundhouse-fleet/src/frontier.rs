@@ -64,6 +64,15 @@ impl FrontierModelSpec {
             model: self.model.clone(),
         }
     }
+
+    /// Shared TTL source for turns and judge calls. Automatic and observed
+    /// cache models do not request a provider lifetime.
+    pub fn requested_cache_ttl_ms(&self) -> Option<u64> {
+        match self.cache_model {
+            CacheModel::Deterministic { ttl_ms } => Some(ttl_ms),
+            CacheModel::InactivityDecay { .. } | CacheModel::Observed => None,
+        }
+    }
 }
 
 /// The set of frontier models available to a session.
