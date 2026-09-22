@@ -131,6 +131,10 @@ Follow-up checks caught changed snapshot cutoffs across failover and a second cl
 
 Lifecycle mutation checks are now in progress for deadlines, retained capacity, repair claims, candidate limits, acknowledgement delivery, and historical settlement identity. These gates, broader review, and publication remain outstanding. Attribution checks do not establish live provider behavior or complete the learning system.
 
+**Lifecycle checks and deadline guard, 2026-09-22.** The initial deadline mutation granted a fresh full lifetime after queue acquisition and survived the existing test. An hour-long deadline failed, which established an eventual bound but not the original deadline. Commit `8269e47` adds a completion ceiling relative to the recorded expiry. The original mutation then failed: completion was 1002ms late against 500ms of tolerance. Restored production passed all 33 runtime tests independently. The test uses real time and retains scheduling sensitivity. Formatting passed. Logs: `/tmp/roundhouse-runtime-lifecycle-refute.log` and `/tmp/roundhouse-runtime-deadline-parent.log`.
+
+Other mutations caught premature capacity release, collision between independent repair calls, removal of the direct candidate limit, loss of classification results after append failure, and replacement of historical settlement amounts. The scheduling integration test did not catch removal of the candidate limit; the direct production batch test did. Two repair-acknowledgement mutations also survived their integration test. Classification-result retention is a separate path and does not close that evidence gap. The parent rejects the worker's blanket six-of-six claim. Remaining lifecycle evidence, broader review, and publication stay open. Production files were restored before the test-only commit.
+
 ### Frontier review feedback (2026-09-21)
 
 Each review records its prompt snapshot and covered decision interval. The result labels that interval once. A late result cannot label newer decisions or change their recorded input features. Failed, skipped, malformed, or insufficient-context reviews remain unknown. Missing feedback is not a no-correction verdict.
