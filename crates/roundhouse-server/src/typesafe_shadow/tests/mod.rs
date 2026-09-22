@@ -32,6 +32,7 @@ use super::*;
 mod accounting;
 mod admission;
 mod brief;
+mod question;
 
 const KEY: &str = "sk-ZZZQQQ-typesafe-deployment-key";
 

@@ -12,9 +12,8 @@ use roundhouse_core::control::Secret;
 const STATE: &str = "ZZZQQQ-transcript-the-user-asked-about-parser-commas";
 const KEY: &str = "sk-ZZZQQQ-typesafe-deployment-key";
 
-pub(super) fn question() -> ChoiceQuestion {
+fn tier() -> ChoiceQuestion {
     ChoiceQuestion {
-        key: "tier".into(),
         instructions: "Which kind of model should answer this?".into(),
         criteria: BTreeMap::from([
             ("capable".to_string(), "Hard, multi-step work".to_string()),
@@ -26,11 +25,17 @@ pub(super) fn question() -> ChoiceQuestion {
     }
 }
 
+/// The one-question batch, which is what every assertion about a single
+/// question's guards is written against.
+fn one() -> BTreeMap<String, ChoiceQuestion> {
+    BTreeMap::from([("tier".to_string(), tier())])
+}
+
 fn request() -> SystemOneRequest {
     SystemOneRequest {
         model: "jev-1.12".into(),
         state: STATE.into(),
-        question: question(),
+        questions: one(),
     }
 }
 
@@ -49,7 +54,7 @@ fn the_body_is_one_keyed_choice_question_with_its_criteria() {
     let asked = &body["questions"]["tier"];
     assert_eq!(
         asked["type"], "choice",
-        "one `choice` question is the whole of what this client asks: {body}"
+        "`choice` is the one question type this client asks: {body}"
     );
     assert_eq!(
         asked["instructions"],
@@ -185,7 +190,7 @@ mod signal {
     /// with it. The control every rejection below is measured against.
     #[test]
     fn a_published_shaped_answer_parses_with_its_usage() {
-        let reply = SystemOneClient::reply(&envelope(valid(), USAGE), &question()).unwrap();
+        let reply = SystemOneClient::reply(&envelope(valid(), USAGE), &one()).unwrap();
         assert_eq!(
             reply.usage,
             Some(SystemOneUsage {
@@ -193,7 +198,9 @@ mod signal {
                 output_tokens: 48
             })
         );
-        let answer = reply.answer.expect("the published shape is usable");
+        let answers = reply.answers.expect("the published shape is usable");
+        assert_eq!(answers.len(), 1, "one question asked, one answer back");
+        let answer = &answers["tier"];
         assert_eq!(answer.choice, "capable");
         assert_eq!(answer.confidence, 0.82);
         assert_eq!(answer.probabilities["efficient"], 0.15);
@@ -208,8 +215,8 @@ mod signal {
         let raw = format!(
             r#"{{"model":"jev-1.12","request_id":"req_1","answers":{{"tier":{generous}}},"usage":{{"input_tokens":312,"output_tokens":48,"cached":7}}}}"#
         );
-        let reply = SystemOneClient::reply(raw.as_bytes(), &question()).unwrap();
-        assert!(reply.answer.is_ok(), "{:?}", reply.answer);
+        let reply = SystemOneClient::reply(raw.as_bytes(), &one()).unwrap();
+        assert!(reply.answers.is_ok(), "{:?}", reply.answers);
         assert_eq!(
             reply.usage.unwrap().input_tokens,
             312,
@@ -252,16 +259,16 @@ mod signal {
                 SignalError::ConfidenceOutOfRange,
             ),
         ] {
-            let reply = SystemOneClient::reply(&envelope(answer, USAGE), &question())
+            let reply = SystemOneClient::reply(&envelope(answer, USAGE), &one())
                 .unwrap_or_else(|error| panic!("{why}: the envelope parses: {error}"));
-            assert_eq!(reply.answer, Err(expected), "{why}: {reply:?}");
+            assert_eq!(reply.answers, Err(expected), "{why}: {reply:?}");
         }
 
         // No answer at all under the key we asked under.
         let empty =
             br#"{"model":"jev-1.12","answers":{},"usage":{"input_tokens":1,"output_tokens":1}}"#;
         assert_eq!(
-            SystemOneClient::reply(empty, &question()).unwrap().answer,
+            SystemOneClient::reply(empty, &one()).unwrap().answers,
             Err(SignalError::MissingAnswer)
         );
     }
@@ -274,7 +281,7 @@ mod signal {
     fn a_probability_that_overflows_f64_fails_the_envelope() {
         let overflowing = r#"{"type":"choice","choice":"capable","probabilities":{"capable":1e400,"efficient":0.15},"confidence":0.8}"#;
         assert_eq!(
-            SystemOneClient::reply(&envelope(overflowing, USAGE), &question()),
+            SystemOneClient::reply(&envelope(overflowing, USAGE), &one()),
             Err(SystemOneError::Malformed)
         );
     }
@@ -299,8 +306,8 @@ mod signal {
                 r#"{"type":"score","score":2.0,"choice":"capable","probabilities":{"capable":0.85,"efficient":0.15},"confidence":0.82}"#,
             ),
         ] {
-            let reply = SystemOneClient::reply(&envelope(answer, USAGE), &question()).unwrap();
-            assert_eq!(reply.answer, Err(SignalError::NotAChoice), "{why}");
+            let reply = SystemOneClient::reply(&envelope(answer, USAGE), &one()).unwrap();
+            assert_eq!(reply.answers, Err(SignalError::NotAChoice), "{why}");
         }
     }
 
@@ -310,8 +317,8 @@ mod signal {
     #[test]
     fn usage_is_retained_when_the_signal_is_unusable() {
         let unusable = r#"{"type":"choice","choice":"capable","probabilities":{"capable":0.4,"efficient":0.2},"confidence":0.8}"#;
-        let reply = SystemOneClient::reply(&envelope(unusable, USAGE), &question()).unwrap();
-        assert_eq!(reply.answer, Err(SignalError::SumIsNotOne));
+        let reply = SystemOneClient::reply(&envelope(unusable, USAGE), &one()).unwrap();
+        assert_eq!(reply.answers, Err(SignalError::SumIsNotOne));
         assert_eq!(
             reply.usage,
             Some(SystemOneUsage {
@@ -354,7 +361,7 @@ mod signal {
                 None => format!(r#"{{"model":"jev-1.12","answers":{{"tier":{}}}}}"#, valid())
                     .into_bytes(),
             };
-            let reply = SystemOneClient::reply(&raw, &question())
+            let reply = SystemOneClient::reply(&raw, &one())
                 .unwrap_or_else(|error| panic!("{why}: the envelope must still parse: {error}"));
             assert_eq!(
                 reply.usage, None,
@@ -362,10 +369,10 @@ mod signal {
                  zero here books a billed call as free"
             );
             assert!(
-                reply.answer.is_ok(),
+                reply.answers.is_ok(),
                 "{why}: an unpriceable call still answered, and discarding the \
                  signal would lose the one thing that did arrive: {:?}",
-                reply.answer
+                reply.answers
             );
         }
     }
@@ -375,7 +382,7 @@ mod signal {
     #[test]
     fn a_body_that_is_not_an_envelope_is_an_error() {
         assert_eq!(
-            SystemOneClient::reply(b"<html>502</html>", &question()),
+            SystemOneClient::reply(b"<html>502</html>", &one()),
             Err(SystemOneError::Malformed)
         );
     }
@@ -385,11 +392,250 @@ mod signal {
     fn a_rounded_distribution_is_within_tolerance() {
         let rounded = r#"{"type":"choice","choice":"capable","probabilities":{"capable":0.5005,"efficient":0.4996},"confidence":0.5}"#;
         assert!(
-            SystemOneClient::reply(&envelope(rounded, USAGE), &question())
+            SystemOneClient::reply(&envelope(rounded, USAGE), &one())
                 .unwrap()
-                .answer
+                .answers
                 .is_ok(),
             "rounding is not a malformed distribution"
         );
+    }
+}
+
+/// Many questions in one request, and the join between them and their answers.
+mod batch {
+    use super::*;
+
+    /// Two questions that differ on every axis the join could confuse: the key,
+    /// the instructions, the option names and the option *count*.
+    ///
+    /// The keys are chosen so `z_complexity` sorts **after** `a_tier`. That is
+    /// load-bearing rather than decorative: a client that carried only the
+    /// first question of a map would satisfy every assertion below about
+    /// `a_tier`, so the question that is omitted, made unanswerable or
+    /// malformed is always the second one.
+    fn questions() -> BTreeMap<String, ChoiceQuestion> {
+        BTreeMap::from([
+            ("a_tier".to_string(), tier()),
+            (
+                "z_complexity".to_string(),
+                ChoiceQuestion {
+                    instructions: "How involved is the work this turn asks for?".into(),
+                    criteria: BTreeMap::from([
+                        ("low".to_string(), "One edit in one file".to_string()),
+                        ("medium".to_string(), "A few files, one seam".to_string()),
+                        ("high".to_string(), "A change across modules".to_string()),
+                    ]),
+                },
+            ),
+        ])
+    }
+
+    fn request() -> SystemOneRequest {
+        SystemOneRequest {
+            model: "jev-1.12".into(),
+            state: STATE.into(),
+            questions: questions(),
+        }
+    }
+
+    const USAGE: &str = r#"{"input_tokens":312,"output_tokens":48}"#;
+    const TIER_OK: &str = r#"{"type":"choice","choice":"capable","probabilities":{"capable":0.85,"efficient":0.15},"confidence":0.82}"#;
+    const COMPLEXITY_OK: &str = r#"{"type":"choice","choice":"high","probabilities":{"low":0.1,"medium":0.3,"high":0.6},"confidence":0.71}"#;
+
+    fn envelope(answers: &str) -> Vec<u8> {
+        format!(r#"{{"model":"jev-1.12","answers":{answers},"usage":{USAGE}}}"#).into_bytes()
+    }
+
+    fn billed() -> Option<SystemOneUsage> {
+        Some(SystemOneUsage {
+            input_tokens: 312,
+            output_tokens: 48,
+        })
+    }
+
+    /// Every question is serialized under its own id, with its own
+    /// instructions and its own options, in **one** body.
+    #[test]
+    fn every_question_is_serialized_under_its_own_id() {
+        let body = SystemOneClient::body(&request());
+
+        let asked = body["questions"]
+            .as_object()
+            .unwrap_or_else(|| panic!("a `questions` map: {body}"));
+        assert_eq!(
+            asked.len(),
+            2,
+            "both questions travel in one request, which is the whole point of \
+             the map: {body}"
+        );
+        assert_eq!(body["questions"]["a_tier"]["type"], "choice");
+        assert_eq!(body["questions"]["z_complexity"]["type"], "choice");
+        assert_eq!(
+            body["questions"]["z_complexity"]["instructions"],
+            "How involved is the work this turn asks for?",
+            "each question carries its own instructions: {body}"
+        );
+        assert_eq!(
+            body["questions"]["z_complexity"]["criteria"]["high"],
+            "A change across modules"
+        );
+        // The option *sets* are per question and never pooled: a body that
+        // merged them would give each question five options.
+        assert_eq!(
+            body["questions"]["a_tier"]["criteria"]
+                .as_object()
+                .map(|map| map.len()),
+            Some(2),
+            "{body}"
+        );
+        assert_eq!(
+            body["questions"]["z_complexity"]["criteria"]
+                .as_object()
+                .map(|map| map.len()),
+            Some(3),
+            "{body}"
+        );
+        // One state for the batch, not one per question — the saving the batch
+        // exists for.
+        assert_eq!(body["state"], STATE);
+
+        // Byte-stable for identical inputs, so a recorded request can be
+        // compared against a replayed one. The mechanism is the workspace's
+        // `serde_json` pin rather than anything here — `preserve_order` is off,
+        // so every `Value` renders in sorted key order — which is why the
+        // assertion is that two builds agree and not that some order is the
+        // right one.
+        assert_eq!(
+            serde_json::to_string(&body).unwrap(),
+            serde_json::to_string(&SystemOneClient::body(&request())).unwrap()
+        );
+        // The keys really are sorted, which is the property that claim rests
+        // on: `z_complexity` was inserted second and prints second, and would
+        // still print second from a map that had been built the other way.
+        assert_eq!(
+            asked.keys().collect::<Vec<_>>(),
+            ["a_tier", "z_complexity"],
+            "{body}"
+        );
+    }
+
+    /// Each answer is filed under the id its question was asked under, whatever
+    /// order the service chose to print them in.
+    #[test]
+    fn answers_are_filed_under_their_own_ids_whatever_order_they_arrive_in() {
+        // `z_complexity` first on the wire, which is neither the request's
+        // order nor the sorted one.
+        let raw = envelope(&format!(
+            r#"{{"z_complexity":{COMPLEXITY_OK},"a_tier":{TIER_OK}}}"#
+        ));
+        let reply = SystemOneClient::reply(&raw, &questions()).unwrap();
+
+        let answers = reply
+            .answers
+            .unwrap_or_else(|error| panic!("both answers are well formed: {error}"));
+        assert_eq!(answers.len(), 2, "one answer per question: {answers:?}");
+        assert_eq!(answers["a_tier"].choice, "capable");
+        assert_eq!(answers["z_complexity"].choice, "high");
+        // The values, not just the ids: an implementation that paired answers
+        // to questions by position rather than by id would swap these two, and
+        // the distributions are the only thing that shows it.
+        assert_eq!(answers["z_complexity"].probabilities["medium"], 0.3);
+        assert_eq!(answers["z_complexity"].confidence, 0.71);
+        assert_eq!(answers["a_tier"].probabilities["efficient"], 0.15);
+        assert_eq!(answers["a_tier"].confidence, 0.82);
+    }
+
+    /// Each answer is validated against **its own** question's options.
+    ///
+    /// The failure this rules out is a client that checks every answer against
+    /// the union of every question's options, which would accept a complexity
+    /// answer given in tiers.
+    #[test]
+    fn an_answer_is_checked_against_the_options_its_own_question_offered() {
+        let crossed = envelope(&format!(
+            r#"{{"a_tier":{TIER_OK},"z_complexity":{TIER_OK}}}"#
+        ));
+        let reply = SystemOneClient::reply(&crossed, &questions()).unwrap();
+        assert_eq!(
+            reply.answers,
+            Err(SignalError::OptionsDisagree),
+            "a complexity answer given over the tier options is an answer to a \
+             different question: {reply:?}"
+        );
+
+        // The control: the same two answers, each over its own options, is the
+        // usable reply — so the rejection above is about the crossing and not
+        // about the second question being rejected on sight.
+        assert!(
+            SystemOneClient::reply(
+                &envelope(&format!(
+                    r#"{{"a_tier":{TIER_OK},"z_complexity":{COMPLEXITY_OK}}}"#
+                )),
+                &questions(),
+            )
+            .unwrap()
+            .answers
+            .is_ok()
+        );
+    }
+
+    /// A reply that is not exactly the questions asked is refused **whole**,
+    /// and the spend survives every one of those refusals.
+    ///
+    /// All-or-nothing because a caller asks for the features it needs to decide
+    /// with: four answers out of five is not four-fifths of a decision.
+    #[test]
+    fn a_reply_that_is_not_the_questions_asked_is_refused_whole_with_its_usage() {
+        for (why, answers, expected) in [
+            (
+                "no answer for the second question",
+                format!(r#"{{"a_tier":{TIER_OK}}}"#),
+                SignalError::MissingAnswer,
+            ),
+            (
+                "an answer under an id nothing asked",
+                format!(
+                    r#"{{"a_tier":{TIER_OK},"z_complexity":{COMPLEXITY_OK},"unasked":{TIER_OK}}}"#
+                ),
+                SignalError::UnexpectedAnswer,
+            ),
+            (
+                // Both directions wrong at once, which pins the order: the
+                // missing id is roundhouse's own string and the unasked one is
+                // the service's, so the one that can be named leads.
+                "one id missing and another unasked",
+                format!(r#"{{"a_tier":{TIER_OK},"c_other":{COMPLEXITY_OK}}}"#),
+                SignalError::MissingAnswer,
+            ),
+            (
+                "one malformed distribution among well-formed ones",
+                format!(
+                    r#"{{"a_tier":{TIER_OK},"z_complexity":{{"type":"choice","choice":"high","probabilities":{{"low":0.1,"medium":0.3,"high":0.2}},"confidence":0.71}}}}"#
+                ),
+                SignalError::SumIsNotOne,
+            ),
+            (
+                "one answer of the wrong question type among well-formed ones",
+                format!(
+                    r#"{{"a_tier":{TIER_OK},"z_complexity":{{"type":"score","score":2.0,"choice":"high","probabilities":{{"low":0.1,"medium":0.3,"high":0.6}},"confidence":0.71}}}}"#
+                ),
+                SignalError::NotAChoice,
+            ),
+        ] {
+            let reply = SystemOneClient::reply(&envelope(&answers), &questions())
+                .unwrap_or_else(|error| panic!("{why}: the envelope parses: {error}"));
+            assert_eq!(
+                reply.answers,
+                Err(expected),
+                "{why}: one unusable answer makes the batch unusable, and no \
+                 caller should have to decide whether a partial set is enough"
+            );
+            assert_eq!(
+                reply.usage,
+                billed(),
+                "{why}: the service scored and charged for the whole batch, and \
+                 a rejected signal must not settle that at zero"
+            );
+        }
     }
 }

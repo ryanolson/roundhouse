@@ -1,15 +1,20 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The TypeSafe System One transport: one typed `choice` question, one answer.
+//! The TypeSafe System One transport: a map of typed `choice` questions, one
+//! answer each, in one request.
 //!
-//! Schema re-read from `docs.typesafe.ai/api` and `docs.typesafe.ai/primitives/choice`
-//! on 2026-09-19: `POST {base}/systemone`, bearer auth, a body of `state`,
+//! Schema re-read from `docs.typesafe.ai/api`
+//! on 2026-09-21: `POST {base}/systemone`, bearer auth, a body of `state`,
 //! `model` and a `questions` map keyed by names the caller chooses, answering
 //! under the same keys with `choice`, `probabilities` and `confidence`, plus a
 //! top-level `usage` of `input_tokens` and `output_tokens`. The evidence is
 //! `agent-docs/research/typesafe-jev-primary-read.md`; the design this serves is
 //! `agent-docs/PLAN-routing-strategy-bandit.md` B4.
+//!
+//! A question map lets several classifications share one transmitted state and
+//! one HTTP call. This does not guarantee identical answers, cost, or latency
+//! compared with separate calls. Only `choice` has a caller here.
 //!
 //! **Nothing in the shipped binary calls this.** Its only consumer is
 //! `roundhouse_server::typesafe_shadow`, which is itself unwired: B2 owns the
@@ -28,11 +33,16 @@
 //! ## Three outcomes, not two
 //!
 //! A service call can end in a way the ordinary `Result` shape cannot say:
-//! **the answer arrived, the accounting arrived, and the signal is unusable.**
+//! **the answers arrived, the accounting arrived, and the signal is unusable.**
 //! Collapsing that into an error would book a real spend at zero, so the usage
-//! sits *outside* the answer's `Result` — see [`SystemOneReply`]. Only a call
+//! sits *outside* the answers' `Result` — see [`SystemOneReply`]. Only a call
 //! that produced no envelope at all yields a [`SystemOneError`], and that one
 //! genuinely has unknown accounting.
+//!
+//! Batching does not change that and does not subdivide it. The service prices
+//! and answers a batch as one call, so one bad answer among five leaves a
+//! reported spend and no usable signal — the same middle outcome, reached with
+//! more questions in it.
 //!
 //! ## What an error may carry
 //!
@@ -93,13 +103,14 @@ pub const PROBABILITY_SUM_TOLERANCE: f64 = 1e-3;
 /// One `choice` question: what is asked, and the options it may be answered
 /// with.
 ///
+/// The key in [`SystemOneRequest::questions`] supplies its identity, so a second
+/// key inside the question cannot disagree with it.
+///
 /// `criteria` is a [`BTreeMap`] so the serialized body is byte-identical for
 /// identical inputs. Not a cache argument — this service publishes no prefix
 /// cache — but so a recorded request can be compared against a replayed one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChoiceQuestion {
-    /// The key the answer comes back under. The caller's choice of name.
-    pub key: String,
     pub instructions: String,
     /// Option name to its rubric description.
     pub criteria: BTreeMap<String, String>,
@@ -111,9 +122,22 @@ pub struct SystemOneRequest {
     /// The pinned model id. No default anywhere in this crate: `jev-latest`
     /// re-ranks itself underneath a deployment that never changed a line.
     pub model: String,
-    /// What the question is asked about.
+    /// What every question is asked about. One state, scored once per question.
     pub state: String,
-    pub question: ChoiceQuestion,
+    /// Question id to the question asked under it. Answers come back under the
+    /// same ids.
+    ///
+    /// A [`BTreeMap`] for the ordering, but not for the *bytes*: this
+    /// workspace pins `serde_json` with `preserve_order` off (see the note on
+    /// the dependency in the root `Cargo.toml`), so a `Value` renders in sorted
+    /// key order whatever map built it. What the ordering buys is the
+    /// validation pass — questions are checked in one fixed order, so the fault
+    /// reported for a batch with two bad answers in it is the same fault every
+    /// time, and a replayed request diagnoses the way the recorded one did.
+    ///
+    /// An empty map is refused by [`SystemOneClient::prepare`] rather than
+    /// sent.
+    pub questions: BTreeMap<String, ChoiceQuestion>,
 }
 
 /// Elides `state`: a `Debug` that printed it would put a transcript into
@@ -127,7 +151,7 @@ impl fmt::Debug for SystemOneRequest {
                 "state",
                 &format_args!("<{} bytes elided>", self.state.len()),
             )
-            .field("question", &self.question)
+            .field("questions", &self.questions)
             .finish()
     }
 }
@@ -162,24 +186,29 @@ pub struct ChoiceAnswer {
 
 /// What one call produced.
 ///
-/// The usage sits beside the answer rather than inside it so that a reported
+/// The usage sits beside the answers rather than inside them so that a reported
 /// spend survives an unusable signal. `None` is unknown accounting — a service
 /// that answered and said nothing priceable about cost — and never a free call.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SystemOneReply {
     pub usage: Option<SystemOneUsage>,
-    pub answer: Result<ChoiceAnswer, SignalError>,
+    /// Every question's answer, or the first reason the batch is unusable.
+    ///
+    /// A partial set supplies no classification. Usage remains independent, so
+    /// an unusable answer set does not discard reported spend.
+    pub answers: Result<BTreeMap<String, ChoiceAnswer>, SignalError>,
 }
 
-/// An answer that arrived and cannot be used.
+/// A batch of answers that arrived and cannot be used.
 ///
-/// Unit variants: the useful fact is *which* invariant broke, and the values
-/// that broke it are third-party output this client has just decided not to
-/// trust.
+/// Unit variants keep untrusted response keys and values out of diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum SignalError {
-    #[error("no answer came back under the key the question was asked under")]
+    #[error("no answer came back under a key some question was asked under")]
     MissingAnswer,
+    /// Answer ids must match the request. Unrelated envelope fields remain allowed.
+    #[error("an answer came back under a key no question was asked under")]
+    UnexpectedAnswer,
     #[error("the answer is not a `choice`")]
     NotAChoice,
     #[error("the probability map's options are not the options the question offered")]
@@ -208,6 +237,9 @@ pub enum SystemOneError {
     /// party is the egress failure this whole path is gated to prevent.
     #[error("a forwarded credential is not this service's to spend; refusing to send it")]
     ForwardedCredentialRefused,
+    /// Refused before credentials or serialization because it requests no signal.
+    #[error("a request must carry at least one question")]
+    NoQuestions,
     /// Refused before a socket. `actual_bytes` is a length, never content.
     #[error(
         "the request body is {actual_bytes} bytes, over the configured {limit_bytes}-byte bound"
@@ -252,9 +284,9 @@ pub struct SystemOneLimits {
 pub struct PreparedRequest {
     body: String,
     headers: HeaderMap,
-    /// Kept so the answer is validated against the question that was asked
-    /// rather than against one the caller supplies later.
-    question: ChoiceQuestion,
+    /// Kept so every answer is validated against the question it was asked
+    /// under rather than against a set the caller supplies later.
+    questions: BTreeMap<String, ChoiceQuestion>,
 }
 
 impl PreparedRequest {
@@ -273,12 +305,12 @@ impl fmt::Debug for PreparedRequest {
         f.debug_struct("PreparedRequest")
             .field("body", &format_args!("<{} bytes elided>", self.body.len()))
             .field("headers", &format_args!("<{} elided>", self.headers.len()))
-            .field("question", &self.question)
+            .field("questions", &self.questions)
             .finish()
     }
 }
 
-/// Executes one `choice` question against a System One upstream.
+/// Executes one batch of `choice` questions against a System One upstream.
 ///
 /// Concrete, and there is no trait beside it: the thing worth testing is what
 /// arrives at a socket, and a trait introduced so a test could avoid one would
@@ -324,17 +356,28 @@ impl SystemOneClient {
     }
 
     /// The request body, as JSON.
+    ///
+    /// One `state` for however many questions, which is the saving: the state
+    /// is most of the body, and it is sent once.
     pub fn body(request: &SystemOneRequest) -> Value {
+        let questions: serde_json::Map<String, Value> = request
+            .questions
+            .iter()
+            .map(|(key, question)| {
+                (
+                    key.clone(),
+                    json!({
+                        "type": "choice",
+                        "instructions": question.instructions,
+                        "criteria": question.criteria,
+                    }),
+                )
+            })
+            .collect();
         json!({
             "model": request.model,
             "state": request.state,
-            "questions": {
-                &request.question.key: {
-                    "type": "choice",
-                    "instructions": request.question.instructions,
-                    "criteria": request.question.criteria,
-                },
-            },
+            "questions": questions,
         })
     }
 
@@ -357,6 +400,13 @@ impl SystemOneClient {
         request: &SystemOneRequest,
         credential: &TurnCredential,
     ) -> Result<PreparedRequest, SystemOneError> {
+        // First, ahead of both the credential and the size bound: a request
+        // with nothing to ask is not one this deployment could pay for or
+        // shrink into range, and all three refusals reach the policy boundary
+        // as one arm where the variant is the whole diagnosis.
+        if request.questions.is_empty() {
+            return Err(SystemOneError::NoQuestions);
+        }
         let headers = Self::headers(credential)?;
         let body =
             serde_json::to_string(&Self::body(request)).map_err(|_| SystemOneError::Malformed)?;
@@ -369,7 +419,7 @@ impl SystemOneClient {
         Ok(PreparedRequest {
             body,
             headers,
-            question: request.question.clone(),
+            questions: request.questions.clone(),
         })
     }
 
@@ -378,7 +428,7 @@ impl SystemOneClient {
         let PreparedRequest {
             body,
             headers,
-            question,
+            questions,
         } = prepared;
         let url = format!("{}{}", self.base, SYSTEM_ONE_PATH);
 
@@ -414,7 +464,7 @@ impl SystemOneClient {
         let raw = tokio::time::timeout_at(until, self.drain(sent))
             .await
             .map_err(|_| SystemOneError::DeadlineExceeded)??;
-        Self::reply(&raw, &question)
+        Self::reply(&raw, &questions)
     }
 
     /// Buffer the body, refusing past the configured bound.
@@ -470,9 +520,12 @@ impl SystemOneClient {
 
     /// The envelope, split into its accounting and its signal.
     ///
-    /// The usage is read *first* and independently of the answer, which is the
+    /// The usage is read *first* and independently of the answers, which is the
     /// whole of "a reported spend survives an unusable signal".
-    pub fn reply(raw: &[u8], question: &ChoiceQuestion) -> Result<SystemOneReply, SystemOneError> {
+    pub fn reply(
+        raw: &[u8],
+        questions: &BTreeMap<String, ChoiceQuestion>,
+    ) -> Result<SystemOneReply, SystemOneError> {
         let envelope: Envelope =
             serde_json::from_slice(raw).map_err(|_| SystemOneError::Malformed)?;
         // Read through a `Value` and discarded on any mismatch, so a usage
@@ -490,18 +543,45 @@ impl SystemOneClient {
             });
         Ok(SystemOneReply {
             usage,
-            answer: Self::signal(&envelope.answers, question),
+            answers: Self::signal(&envelope.answers, questions),
         })
     }
 
-    /// Validate one answer against the question that was asked.
+    /// Validate every answer against the question it was asked under.
+    ///
+    /// **All or nothing.** The first fault ends the batch, so a caller never
+    /// sees a partial answer set it would have to decide the sufficiency of.
     fn signal(
         answers: &BTreeMap<String, Value>,
-        question: &ChoiceQuestion,
-    ) -> Result<ChoiceAnswer, SignalError> {
-        let raw = answers
-            .get(&question.key)
-            .ok_or(SignalError::MissingAnswer)?;
+        questions: &BTreeMap<String, ChoiceQuestion>,
+    ) -> Result<BTreeMap<String, ChoiceAnswer>, SignalError> {
+        // The id set first, for the same reason [`Self::answer`] checks a
+        // question's options before its distribution: a reply whose ids are not
+        // this request's ids is not this request's reply, and reporting a bad
+        // distribution inside one would name the wrong fault.
+        //
+        // Missing leads deliberately, so a reply that is wrong in both
+        // directions reports the direction whose id roundhouse chose itself.
+        if questions.keys().any(|key| !answers.contains_key(key)) {
+            return Err(SignalError::MissingAnswer);
+        }
+        if answers.keys().any(|key| !questions.contains_key(key)) {
+            return Err(SignalError::UnexpectedAnswer);
+        }
+        questions
+            .iter()
+            .map(|(key, question)| {
+                // Present: the id check above established it for every key
+                // here. Spelled as a lookup rather than an index because no
+                // third party's reply should be able to panic a caller.
+                let raw = answers.get(key).ok_or(SignalError::MissingAnswer)?;
+                Self::answer(raw, question).map(|answer| (key.clone(), answer))
+            })
+            .collect()
+    }
+
+    /// Validate one answer against the question that was asked.
+    fn answer(raw: &Value, question: &ChoiceQuestion) -> Result<ChoiceAnswer, SignalError> {
         let wire: WireChoice =
             serde_json::from_value(raw.clone()).map_err(|_| SignalError::NotAChoice)?;
         if wire.kind != "choice" {

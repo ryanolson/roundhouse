@@ -34,6 +34,9 @@ const DEADLINE_MS: u64 = 400;
 #[derive(Clone, Copy)]
 enum Behaviour {
     Answer,
+    /// One answer per question of the two-question batch, printed in an order
+    /// that is neither the request's nor the sorted one.
+    AnswerBatch,
     /// Headers after `0`, then the body after another `1`, as fractions of the
     /// deadline. Together they exceed one deadline but neither alone does.
     SlowHeadersThenSlowBody,
@@ -55,6 +58,10 @@ fn answer_body() -> &'static str {
     r#"{"model":"jev-1.12","answers":{"tier":{"type":"choice","choice":"capable","probabilities":{"capable":0.85,"efficient":0.15},"confidence":0.82}},"usage":{"input_tokens":312,"output_tokens":48}}"#
 }
 
+fn batch_answer_body() -> &'static str {
+    r#"{"model":"jev-1.12","answers":{"z_complexity":{"type":"choice","choice":"high","probabilities":{"low":0.1,"medium":0.3,"high":0.6},"confidence":0.71},"tier":{"type":"choice","choice":"capable","probabilities":{"capable":0.85,"efficient":0.15},"confidence":0.82}},"usage":{"input_tokens":512,"output_tokens":72}}"#
+}
+
 async fn handle(State(state): State<Upstream>, headers: HeaderMap, body: String) -> Response {
     state.calls.fetch_add(1, Ordering::SeqCst);
     let parsed = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
@@ -62,6 +69,7 @@ async fn handle(State(state): State<Upstream>, headers: HeaderMap, body: String)
     let deadline = Duration::from_millis(DEADLINE_MS);
     match state.behaviour {
         Behaviour::Answer => Response::new(Body::from(answer_body())),
+        Behaviour::AnswerBatch => Response::new(Body::from(batch_answer_body())),
         Behaviour::Status(code) => Response::builder()
             .status(StatusCode::from_u16(code).unwrap())
             .body(Body::from(r#"{"error":"invalid"}"#))
@@ -110,9 +118,8 @@ fn limits() -> SystemOneLimits {
     }
 }
 
-fn question() -> ChoiceQuestion {
+fn tier() -> ChoiceQuestion {
     ChoiceQuestion {
-        key: "tier".into(),
         instructions: "Which kind of model should answer this?".into(),
         criteria: BTreeMap::from([
             ("capable".to_string(), "Hard, multi-step work".to_string()),
@@ -124,11 +131,34 @@ fn question() -> ChoiceQuestion {
     }
 }
 
+fn complexity() -> ChoiceQuestion {
+    ChoiceQuestion {
+        instructions: "How involved is the work this turn asks for?".into(),
+        criteria: BTreeMap::from([
+            ("low".to_string(), "One edit in one file".to_string()),
+            ("medium".to_string(), "A few files, one seam".to_string()),
+            ("high".to_string(), "A change across modules".to_string()),
+        ]),
+    }
+}
+
 fn request(state: &str) -> SystemOneRequest {
     SystemOneRequest {
         model: "jev-1.12".into(),
         state: state.into(),
-        question: question(),
+        questions: BTreeMap::from([("tier".to_string(), tier())]),
+    }
+}
+
+/// The same call with a second question added, which is the only difference
+/// between it and [`request`].
+fn batch_request(state: &str) -> SystemOneRequest {
+    SystemOneRequest {
+        questions: BTreeMap::from([
+            ("tier".to_string(), tier()),
+            ("z_complexity".to_string(), complexity()),
+        ]),
+        ..request(state)
     }
 }
 
@@ -229,6 +259,131 @@ async fn the_bearer_and_the_keyed_question_arrive() {
         body["questions"]["tier"]["criteria"]["capable"],
         "Hard, multi-step work"
     );
+}
+
+/// Every question travels in **one** request, and every answer comes back
+/// joined to the question it was asked under.
+///
+/// The unit tests build a body and parse an envelope separately; this is the
+/// only place the two meet through `prepare` and `send`, which is where the
+/// question set is carried from one to the other. A client that sent the batch
+/// and then validated the reply against a different set would pass both halves
+/// on its own and fail here.
+#[tokio::test]
+async fn one_request_carries_every_question_and_comes_back_joined_to_them() {
+    let (addr, state) = upstream(Behaviour::AnswerBatch).await;
+    let client = SystemOneClient::new(format!("http://{addr}"), limits()).unwrap();
+
+    let reply = ask(
+        &client,
+        &batch_request("the parser drops commas"),
+        &stored(),
+    )
+    .await
+    .expect("the loopback upstream answers");
+
+    let answers = reply
+        .answers
+        .unwrap_or_else(|error| panic!("both answers are well formed: {error}"));
+    assert_eq!(answers.len(), 2, "{answers:?}");
+    // Answered in the opposite order to the request, so a join by position
+    // would put the complexity answer under `tier`.
+    assert_eq!(answers["tier"].choice, "capable");
+    assert_eq!(answers["z_complexity"].choice, "high");
+    assert_eq!(answers["z_complexity"].probabilities["medium"], 0.3);
+    assert_eq!(
+        reply.usage.map(|usage| usage.input_tokens),
+        Some(512),
+        "the batch's own accounting, not the single question's"
+    );
+
+    let seen = state.seen.lock().await;
+    let (_, body) = seen.first().expect("exactly one request arrived");
+    assert_eq!(
+        seen.len(),
+        1,
+        "two questions cost one round trip, which is the reason to batch them"
+    );
+    assert_eq!(
+        body["questions"].as_object().map(|map| map.len()),
+        Some(2),
+        "both questions reached the socket: {body}"
+    );
+    assert_eq!(
+        body["questions"]["z_complexity"]["criteria"]["high"],
+        "A change across modules"
+    );
+    assert_eq!(
+        body["state"], "the parser drops commas",
+        "one state for the batch: {body}"
+    );
+}
+
+/// A request that asks nothing is refused before a socket, and ahead of every
+/// other refusal `prepare` can take.
+///
+/// There is no answer such a call could return, so sending it would spend the
+/// deployment's key and a hold on the evaluation budget to be told `422`.
+///
+/// The orderings are asserted rather than assumed because all three refusals
+/// reach the policy boundary as one `NotRun::Refused` arm, where the variant is
+/// the whole diagnosis: "asked nothing", "cannot pay for it" and "too big to
+/// send" are three different bugs, and whichever check runs first is the one an
+/// operator is told about.
+#[tokio::test]
+async fn a_request_that_asks_nothing_makes_no_http_call() {
+    let (addr, state) = upstream(Behaviour::Answer).await;
+    let client = SystemOneClient::new(format!("http://{addr}"), limits()).unwrap();
+    let empty = SystemOneRequest {
+        questions: BTreeMap::new(),
+        ..request("z")
+    };
+
+    assert_eq!(
+        ask(&client, &empty, &stored()).await,
+        Err(SystemOneError::NoQuestions)
+    );
+    assert_eq!(
+        state.calls.load(Ordering::SeqCst),
+        0,
+        "a call with no question in it has no answer to buy"
+    );
+    // The same refusal comes out of `prepare`, which is what lets the policy
+    // boundary decide before it holds any budget.
+    assert_eq!(
+        client.prepare(&empty, &stored()).unwrap_err(),
+        SystemOneError::NoQuestions
+    );
+    assert_eq!(
+        client.prepare(&empty, &TurnCredential::Absent).unwrap_err(),
+        SystemOneError::NoQuestions,
+        "the request is judged unsendable before any credential is resolved, so \
+         the empty batch is reported rather than the missing key"
+    );
+    // And ahead of the size bound, which is the other refusal `prepare` takes.
+    // A body of nothing but an over-cap state is over the cap *and* asks
+    // nothing; reporting it as too large would send an operator looking for a
+    // projection to shrink when the request had no question in it.
+    let empty_and_huge = SystemOneRequest {
+        questions: BTreeMap::new(),
+        ..request(&"a".repeat(limits().max_request_bytes + 1))
+    };
+    assert_eq!(
+        client.prepare(&empty_and_huge, &stored()).unwrap_err(),
+        SystemOneError::NoQuestions
+    );
+    // The controls, one per ordering above: with a question in it, the same
+    // oversized state *is* reported as too large, and the same credential and
+    // state go through. So each assertion above is about which refusal leads,
+    // not about a `prepare` that refuses everything.
+    assert!(matches!(
+        client.prepare(
+            &request(&"a".repeat(limits().max_request_bytes + 1)),
+            &stored()
+        ),
+        Err(SystemOneError::RequestTooLarge { .. })
+    ));
+    assert!(ask(&client, &request("z"), &stored()).await.is_ok());
 }
 
 /// D2. One deadline covers the whole call, and names the same failure whichever

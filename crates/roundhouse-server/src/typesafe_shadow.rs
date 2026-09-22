@@ -42,6 +42,7 @@
 //! [`Accounting::Unknown`], never as a measured zero. Releasing a hold and
 //! claiming a free call are different statements, and only the first is true.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use roundhouse_core::context::Tokenizer;
@@ -60,6 +61,9 @@ use roundhouse_fleet::typesafe::{
 };
 
 use crate::engine::spend::GRANT_TTL_SLACK_MS;
+
+/// Shared by request construction and answer lookup so the keys cannot drift.
+pub const TIER_KEY: &str = "tier";
 
 /// The bounds this module puts on a brief, over and above [`BriefConfig`].
 ///
@@ -244,29 +248,34 @@ impl<T: Tokenizer> TypeSafeShadow<T> {
         }
     }
 
-    /// The one question this module asks.
+    /// The questions this module asks: one, under [`TIER_KEY`].
+    ///
+    /// This adapter retains its tier question. Rich turn classifications remain
+    /// separate work in `PLAN-routing-strategy-bandit.md`.
     ///
     /// Two options and no model names. The labels are *tiers*, so the answer
     /// maps to an admitted target through the existing routing code rather than
     /// naming one — the same rule `validate::brief` holds: the judge answers a
     /// task question and code takes the routing decision.
-    pub fn tier_question() -> ChoiceQuestion {
-        ChoiceQuestion {
-            key: "tier".into(),
-            instructions: "Which kind of model should answer this?".into(),
-            criteria: [
-                (
-                    "capable".to_string(),
-                    "Hard, multi-step work where a mistake is expensive".to_string(),
-                ),
-                (
-                    "efficient".to_string(),
-                    "Routine work whose result is cheap to check".to_string(),
-                ),
-            ]
-            .into_iter()
-            .collect(),
-        }
+    pub fn questions() -> BTreeMap<String, ChoiceQuestion> {
+        BTreeMap::from([(
+            TIER_KEY.to_string(),
+            ChoiceQuestion {
+                instructions: "Which kind of model should answer this?".into(),
+                criteria: [
+                    (
+                        "capable".to_string(),
+                        "Hard, multi-step work where a mistake is expensive".to_string(),
+                    ),
+                    (
+                        "efficient".to_string(),
+                        "Routine work whose result is cheap to check".to_string(),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            },
+        )])
     }
 
     /// The bounded projection, rendered, or why it cannot be sent.
@@ -352,7 +361,7 @@ impl<T: Tokenizer> TypeSafeShadow<T> {
         let request = SystemOneRequest {
             model: self.config.model.clone(),
             state,
-            question: Self::tier_question(),
+            questions: Self::questions(),
         };
         // Before the grant, not after. Everything the transport can refuse
         // without a socket is an eligibility question, and answering it with a
@@ -396,8 +405,18 @@ impl<T: Tokenizer> TypeSafeShadow<T> {
                     },
                 )
                 .await;
-                match reply.answer {
-                    Ok(answer) => ShadowOutcome::Answered { answer, accounting },
+                match reply.answers {
+                    // `remove` rather than a borrow-and-clone: this is the last
+                    // read of the batch, and the answer is owned from here on.
+                    Ok(mut answers) => match answers.remove(TIER_KEY) {
+                        Some(answer) => ShadowOutcome::Answered { answer, accounting },
+                        // The transport checks this key; retain a non-panicking
+                        // failure if that contract changes.
+                        None => ShadowOutcome::Unusable {
+                            signal: SignalError::MissingAnswer,
+                            accounting,
+                        },
+                    },
                     Err(signal) => ShadowOutcome::Unusable { signal, accounting },
                 }
             }
