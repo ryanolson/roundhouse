@@ -188,11 +188,11 @@ impl RedisSpendLedger {
     /// namespace as everything else, and its own keys inside it. See
     /// [`SpendPurpose`] for what deriving a namespace instead collided with.
     ///
-    /// One entry point rather than a `connect_namespaced` that only ever
-    /// forwarded here with `SpendPurpose::Serving` filled in — every other
-    /// family in this crate has one `connect_namespaced` because it has no
-    /// purpose to default; this family's default is spelled at the call
-    /// site instead.
+    /// One entry point: every other family in this crate keeps a
+    /// `connect_namespaced` because it has no purpose to default, but this
+    /// family's default purpose ([`SpendPurpose::Serving`]) is spelled at the
+    /// call site instead, so there is nothing left for a second entry point
+    /// to forward to.
     pub async fn connect_for(
         url: impl AsRef<str>,
         namespace: KeyNamespace,
@@ -208,6 +208,13 @@ impl RedisSpendLedger {
             purpose,
         })
     }
+
+    /// This ledger's own namespace and purpose, applied to `leaf` — every
+    /// trait method below builds its keys through this rather than repeating
+    /// `&self.namespace, self.purpose` at each call.
+    fn key(&self, project: &ProjectId, leaf: SpendLeaf) -> String {
+        spend_key(&self.namespace, self.purpose, project, leaf)
+    }
 }
 
 #[async_trait]
@@ -217,18 +224,8 @@ impl SpendLedger for RedisSpendLedger {
         SpendError::check_amount("limit_usd", request.terms.budget.limit_usd)?;
 
         let member_ceiling = member_ceiling_arg(&request.terms);
-        let account = spend_key(
-            &self.namespace,
-            self.purpose,
-            &request.principal.project,
-            SpendLeaf::Account,
-        );
-        let holds = spend_key(
-            &self.namespace,
-            self.purpose,
-            &request.principal.project,
-            SpendLeaf::Holds,
-        );
+        let account = self.key(&request.principal.project, SpendLeaf::Account);
+        let holds = self.key(&request.principal.project, SpendLeaf::Holds);
         let outcome = self
             .scripts
             .open_grant(
@@ -257,30 +254,10 @@ impl SpendLedger for RedisSpendLedger {
     async fn settle_grant(&self, settlement: Settlement) -> Result<Settled, SpendError> {
         SpendError::check_amount("actual_usd", settlement.actual_usd)?;
 
-        let account = spend_key(
-            &self.namespace,
-            self.purpose,
-            &settlement.principal.project,
-            SpendLeaf::Account,
-        );
-        let holds = spend_key(
-            &self.namespace,
-            self.purpose,
-            &settlement.principal.project,
-            SpendLeaf::Holds,
-        );
-        let watermarks = spend_key(
-            &self.namespace,
-            self.purpose,
-            &settlement.principal.project,
-            SpendLeaf::Watermarks,
-        );
-        let settled_calls = spend_key(
-            &self.namespace,
-            self.purpose,
-            &settlement.principal.project,
-            SpendLeaf::SettledCalls,
-        );
+        let account = self.key(&settlement.principal.project, SpendLeaf::Account);
+        let holds = self.key(&settlement.principal.project, SpendLeaf::Holds);
+        let watermarks = self.key(&settlement.principal.project, SpendLeaf::Watermarks);
+        let settled_calls = self.key(&settlement.principal.project, SpendLeaf::SettledCalls);
         let outcome = self
             .scripts
             .settle_grant(
@@ -320,18 +297,8 @@ impl SpendLedger for RedisSpendLedger {
         SpendError::check_amount("limit_usd", query.terms.budget.limit_usd)?;
 
         let member_ceiling = member_ceiling_arg(&query.terms);
-        let account = spend_key(
-            &self.namespace,
-            self.purpose,
-            &query.principal.project,
-            SpendLeaf::Account,
-        );
-        let holds = spend_key(
-            &self.namespace,
-            self.purpose,
-            &query.principal.project,
-            SpendLeaf::Holds,
-        );
+        let account = self.key(&query.principal.project, SpendLeaf::Account);
+        let holds = self.key(&query.principal.project, SpendLeaf::Holds);
         let outcome = self
             .scripts
             .balance(
@@ -494,11 +461,10 @@ mod tests {
     /// fix in the shape the collision had: the two deployments' four key
     /// spaces are pairwise distinct, and the serving keys are unchanged.
     ///
-    /// Moved here from `roundhouse-server`'s `shared_backend.rs` (fleet-
-    /// redis-4): the property under test is the store's own key layout, and
-    /// `pub(crate)` visibility of [`spend_key`] is enough to reach it from
-    /// inside this crate, which is what made the two `*_for_test` exports it
-    /// used to need an untested, ungated production surface.
+    /// Lives here rather than in `roundhouse-server`: the property under test
+    /// is the store's own key layout, and `pub(crate)` visibility of
+    /// [`spend_key`] is enough to reach it from inside this crate, so no
+    /// test-only production export is needed to assert it.
     #[test]
     fn two_deployments_named_tenant_and_tenant_eval_share_no_spend_keys() {
         let project = ProjectId::new("proj_shared");

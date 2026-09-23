@@ -17,7 +17,12 @@ const COMPLETE: &str = r#"{
   "auth": { "env": "TYPESAFE_API_KEY" },
   "pricing": { "input_per_mtok_usd": 0.042, "output_per_mtok_usd": 0.084 },
   "expected_output_tokens": 24,
-  "caps": { "max_prior_classifications": 6, "max_prompt_chars": 2000, "max_total_bytes": 8192 },
+  "caps": {
+    "max_prior_classifications": 6,
+    "max_prior_turns": 6,
+    "max_prompt_chars": 2000,
+    "max_total_bytes": 8192
+  },
   "transport": { "max_request_bytes": 65536, "max_response_bytes": 16384, "deadline_ms": 4000 },
   "executor": {
     "max_in_flight": 16,
@@ -96,27 +101,30 @@ fn an_enabled_configuration_with_its_key_composes_a_runtime() {
     assert_eq!(runtime.limits().max_in_flight, 16);
     assert_eq!(runtime.limits().max_http_concurrency, 4);
     assert_eq!(runtime.projection_caps().max_prior_classifications, 6);
-    // `COMPLETE` predates the `max_prior_turns` split and names no opinion of
-    // its own, so an existing deployment's configuration must keep bounding
-    // local metadata exactly as `max_prior_classifications` always did.
+    // Read literally and distinctly from `max_prior_classifications` — the
+    // two caps bound unrelated lists, and an operator may size them
+    // differently.
     assert_eq!(runtime.projection_caps().max_prior_turns, 6);
 }
 
-/// A file that has taken an opinion on `max_prior_turns` is read literally,
-/// and distinctly from `max_prior_classifications` — the two caps bound
-/// unrelated lists and an operator may size them differently.
+/// **No fallback.** [`ProjectionCaps`]'s own doc says a deployment that has
+/// not chosen `max_prior_turns` has not decided, so a file that omits it is
+/// refused at load rather than silently bounded by
+/// `max_prior_classifications` on the operator's behalf — the file format
+/// has never shipped without this field, so there is no existing deployment
+/// for a fallback to protect.
 #[test]
-fn an_explicit_max_prior_turns_overrides_the_fallback() {
-    let config = ClassifyConfig::from_json(
-        &with(
-            "\"max_prior_classifications\": 6",
-            "\"max_prior_classifications\": 6, \"max_prior_turns\": 2",
-        ),
-        "<test>",
-    )
-    .expect("a valid file");
-    assert_eq!(config.caps().max_prior_classifications, 6);
-    assert_eq!(config.caps().max_prior_turns, 2);
+fn a_configuration_missing_max_prior_turns_is_refused() {
+    let missing = COMPLETE.replace("\"max_prior_turns\": 6,\n    ", "");
+    assert!(
+        missing.contains("\"max_prior_classifications\": 6"),
+        "the fixture must still be well-formed apart from the removed field"
+    );
+    let error = ClassifyConfig::from_json(&missing, "<test>").expect_err("the field is required");
+    assert!(
+        matches!(error, ClassifyConfigError::Parse { .. }),
+        "{error}"
+    );
 }
 
 /// **An enabled classifier with no key stops the process.**

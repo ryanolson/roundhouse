@@ -102,6 +102,13 @@ fn env(name: &str) -> Option<String> {
 }
 
 /// A loopback classifier that records every body it was sent, verbatim.
+///
+/// A near-copy of `test_support::classification::ClassifierUpstream`, kept
+/// separate rather than merged onto it: that type bumps its count *before*
+/// capturing the body, and `await_calls` below depends on the reverse —
+/// count published only once the body is already in `seen` — so a mechanical
+/// swap would add exactly the race this file's own doc on
+/// [`handle_classify`] explains why it does not have.
 #[derive(Clone, Default)]
 struct Classifier {
     calls: Arc<AtomicUsize>,

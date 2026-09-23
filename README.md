@@ -1203,7 +1203,8 @@ The configuration fields below are required unless a default is stated. An unrea
 | `auth.env` | Name of the environment variable that supplies the deployment credential. |
 | `pricing.input_per_mtok_usd`, `pricing.output_per_mtok_usd` | Configured input and output rates in dollars per million tokens. |
 | `expected_output_tokens` | Output-token estimate used for the budget quote. |
-| `caps.max_prior_classifications` | Maximum prior classifications and maximum prior local metadata entries in the projection. |
+| `caps.max_prior_classifications` | Maximum prior classifications carried in the projection. |
+| `caps.max_prior_turns` | Maximum prior local metadata entries carried in the projection. A cap of its own, sized independently of `caps.max_prior_classifications`. |
 | `caps.max_prompt_chars`, `caps.max_total_bytes` | Current-prompt character limit and rendered-projection byte limit. |
 | `transport.max_request_bytes`, `transport.max_response_bytes`, `transport.deadline_ms` | Transport size limits and network deadline. |
 | `executor.max_in_flight`, `executor.max_http_concurrency` | Capacity covering prompt capture through result retention, and the separate limit on concurrent HTTP calls. |

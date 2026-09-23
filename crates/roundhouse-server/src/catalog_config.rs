@@ -33,9 +33,8 @@ use std::path::Path;
 use serde::Deserialize;
 
 use roundhouse_core::metrics::{DEFAULT_CAPABILITY_BAND, MetricsConfig};
-use roundhouse_core::routing::CacheModel;
-use roundhouse_fleet::anthropic_messages::{CacheLifetime, ONE_HOUR_MS};
-use roundhouse_fleet::{FrontierModelSpec, StaticFrontierCatalog, WireProtocol};
+use roundhouse_fleet::anthropic_messages::CacheLifetime;
+use roundhouse_fleet::{FrontierError, FrontierModelSpec, StaticFrontierCatalog};
 
 use crate::engine::{DEFAULT_LOCAL_BASE_TTFT_MS, EngineConfig};
 
@@ -523,31 +522,37 @@ impl CatalogConfig {
             }
             unit_interval(path, &label, "quality_prior", spec.quality_prior)?;
 
-            // The wire has exactly two deterministic lifetimes (fleet-redis-2).
-            // Scoped to the dialect for the same reason the write-rate guard
-            // below is: a gateway entry speaking `anthropic_messages` under
-            // any provider name is held to the wire it actually speaks, and
-            // every other dialect's own TTL semantics are untouched.
-            if spec.wire_protocol == WireProtocol::AnthropicMessages
-                && let CacheModel::Deterministic { ttl_ms } = spec.cache_model
-                && CacheLifetime::from_ttl_ms(ttl_ms).is_none()
-            {
-                return Err(CatalogError::UnsupportedCacheLifetime {
-                    path: path.to_string(),
-                    model: label.clone(),
-                    ttl_ms,
-                });
-            }
+            // `requested_cache_lifetime` is the one place "which deterministic
+            // TTLs Anthropic's wire can spell" is decided — its own doc says a
+            // variant added to either `WireProtocol` or `CacheModel` fails to
+            // compile there until someone decides what it means. Calling it
+            // here, rather than re-deriving the same rule by hand, is what
+            // keeps that compile-time protection real: a hand-written `==`
+            // copy would not fail to compile on a new variant, it would
+            // silently accept it (fleet-redis-r2-2 / server-r2-1).
+            let lifetime = spec
+                .requested_cache_lifetime()
+                .map_err(|error| match error {
+                    FrontierError::UnsupportedCacheLifetime { ttl_ms, .. } => {
+                        CatalogError::UnsupportedCacheLifetime {
+                            path: path.to_string(),
+                            model: label.clone(),
+                            ttl_ms,
+                        }
+                    }
+                    other => unreachable!(
+                        "requested_cache_lifetime only refuses an unspellable ttl on \
+                     anthropic_messages; every other arm returns Ok: {other}"
+                    ),
+                })?;
 
-            // A single write rate must match the lifetime requested on the wire.
-            // Match the dialect so a gateway name cannot bypass this guard.
+            // A single write rate must match the lifetime requested on the
+            // wire. Only `anthropic_messages` plus `Deterministic{ONE_HOUR_MS}`
+            // resolves to `OneHour` (see `requested_cache_lifetime`'s match),
+            // so testing the resolved lifetime already scopes this to the
+            // dialect that has an hour to ask for.
             let one_hour_write = 2.0 * spec.pricing.input_per_mtok_usd;
-            let asks_for_an_hour = matches!(
-                spec.cache_model,
-                CacheModel::Deterministic { ttl_ms } if ttl_ms == ONE_HOUR_MS
-            );
-            if spec.wire_protocol == WireProtocol::AnthropicMessages
-                && asks_for_an_hour
+            if lifetime == CacheLifetime::OneHour
                 && spec.pricing.cache_write_per_mtok_usd != one_hour_write
             {
                 return Err(CatalogError::OneHourWriteRate {

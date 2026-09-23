@@ -50,6 +50,17 @@ const REPORTED_USD: f64 = (312.0 * 1.0 + 48.0 * 2.0) / 1_000_000.0;
 
 /// A loopback upstream that answers after `delay`, so a shutdown or an expiry
 /// has something in flight to act on.
+///
+/// Not `test_support::classification::ClassifierUpstream`: this module's
+/// callers need a caller-chosen delay on most calls (a shutdown, an expiry,
+/// and every timing test in `deadline`/`deadline_timing` all depend on the
+/// answer arriving late), and the shared type has no delayed constructor —
+/// its one candidate, `delayed`, had zero callers anywhere in the workspace
+/// and was deleted rather than kept alive for this file alone to call.
+/// Returns a `SocketAddr` rather than a base URL because [`runtime`] and
+/// [`runtime_with_ledger`] below take one directly, and changing that would
+/// ripple through every call site in this module's five files for a
+/// fixture-only refactor.
 async fn upstream(delay: Duration) -> SocketAddr {
     use axum::Router;
     use axum::body::Body;
@@ -232,6 +243,14 @@ mod repair_claims;
 
 /// A counting upstream that records every request it received, for a test
 /// that must prove a *count*, not merely peak concurrency.
+///
+/// Semantically this is `ClassifierUpstream::start()` plus `count()` — but
+/// that type hands back a `base_url: String` and this module's `runtime`/
+/// `runtime_with_ledger` take a `SocketAddr` throughout, as [`upstream`]'s
+/// own doc explains; adopting the shared type here alone would still need
+/// either a parsed-back address (a fallible step this fixture has no reason
+/// to risk) or a signature change reaching every one of this module's other
+/// call sites for a fixture three tests use.
 async fn counted_upstream() -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
     use axum::Router;
     use axum::body::Body;

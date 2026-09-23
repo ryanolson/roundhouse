@@ -79,6 +79,7 @@
 
 use serde_json::Value;
 
+use super::CacheLifetime;
 use super::wire::CacheControl;
 
 /// **Anthropic's documented cap, and a hard 400 on the fifth.** It matters
@@ -206,7 +207,7 @@ pub(super) fn breakpoints_in(tools: Option<&Value>) -> usize {
 /// is left exactly as sent: it is a 400 at the provider whatever lifetime is
 /// written into it, and filling in the missing parts would be roundhouse
 /// authoring a breakpoint the client did not.
-pub(super) fn normalize_marker_lifetimes(tools: &mut Value, lifetime: Option<&str>) {
+pub(super) fn normalize_marker_lifetimes(tools: &mut Value, lifetime: CacheLifetime) {
     let Some(entries) = tools.as_array_mut() else {
         return;
     };
@@ -217,7 +218,7 @@ pub(super) fn normalize_marker_lifetimes(tools: &mut Value, lifetime: Option<&st
         let Ok(mut control) = serde_json::from_value::<CacheControl>(marker.clone()) else {
             continue;
         };
-        control.ttl = lifetime.map(str::to_string);
+        control.ttl = lifetime.wire().map(str::to_string);
         *marker = serde_json::to_value(control).expect("a cache breakpoint serializes");
     }
 }

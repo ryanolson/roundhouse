@@ -34,24 +34,6 @@ pub(super) struct SelectionInputs {
     pub classifications: Option<ClassificationWindow>,
 }
 
-/// The local quote's own skip reason, if this turn has one, and whether the
-/// local candidate pool ended up withheld for that reason once quoting and
-/// filtering are done.
-pub(super) struct LocalQuotePlan {
-    /// `None` here is two different states — no fleet to ask, and a fleet
-    /// deliberately not asked — so only the second is recorded; see
-    /// [`roundhouse_core::routing::DecisionRecord::local_quote_skipped`].
-    pub skipped: Option<LocalQuoteSkip>,
-    /// **A tool turn loses its local options in one of two places**: the
-    /// retain `plan` applies after quoting, or the quote that was never made
-    /// because the answer was always going to be discarded. Downstream
-    /// nothing can tell the difference and nothing should — the audit note,
-    /// the empty-pool refusal and the exhausted-budget restatement all state
-    /// the same fact — so the two spellings are folded into this one answer
-    /// once, rather than three sites each learning that a skip exists.
-    pub withheld_by_tools: bool,
-}
-
 impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
     /// Capture the cutoff with the features. Recomputing it during failover
     /// would include the preceding dispatch in a later attempt's snapshot.
@@ -141,19 +123,26 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
     }
 }
 
+/// Whether the local candidate pool ended up withheld because this turn
+/// declared tools, once quoting and filtering are done.
+///
+/// **A tool turn loses its local options in one of two places**: the retain
+/// `plan` applies after quoting, or the quote that was never made because the
+/// answer was always going to be discarded. Downstream nothing can tell the
+/// difference and nothing should — the audit note, the empty-pool refusal and
+/// the exhausted-budget restatement all state the same fact — so the two
+/// spellings are folded into this one answer once, rather than three sites
+/// each learning that a skip exists.
+///
 /// `skipped` is whatever [`Engine::local_quote_skip`] decided before pricing;
 /// `excluded_local` is how many candidates `plan`'s own retain dropped after
 /// pricing — a fact that does not exist until candidates have been quoted and
 /// filtered, so it is taken here rather than re-derived.
-pub(super) fn local_quote_plan(
+pub(super) fn local_withheld_by_tools(
     skipped: Option<LocalQuoteSkip>,
     excluded_local: usize,
-) -> LocalQuotePlan {
-    let withheld_by_tools = excluded_local > 0 || skipped == Some(LocalQuoteSkip::ToolsDeclared);
-    LocalQuotePlan {
-        skipped,
-        withheld_by_tools,
-    }
+) -> bool {
+    excluded_local > 0 || skipped == Some(LocalQuoteSkip::ToolsDeclared)
 }
 
 /// Whether pricing the local fleet can still change this turn's route.
@@ -241,21 +230,21 @@ mod tests {
         );
     }
 
-    /// `withheld_by_tools` is true from either source, and from neither
-    /// alone unless it applies.
+    /// `local_withheld_by_tools` is true from either source, and from
+    /// neither alone unless it applies.
     #[test]
-    fn local_quote_plan_folds_the_two_ways_local_is_withheld_into_one_answer() {
-        assert!(!local_quote_plan(None, 0).withheld_by_tools);
+    fn local_withheld_by_tools_folds_the_two_ways_local_is_withheld_into_one_answer() {
+        assert!(!local_withheld_by_tools(None, 0));
         assert!(
-            local_quote_plan(Some(LocalQuoteSkip::ToolsDeclared), 0).withheld_by_tools,
+            local_withheld_by_tools(Some(LocalQuoteSkip::ToolsDeclared), 0),
             "skipped before pricing because tools were declared"
         );
         assert!(
-            !local_quote_plan(Some(LocalQuoteSkip::PolicyAdmitsNoLocal), 0).withheld_by_tools,
+            !local_withheld_by_tools(Some(LocalQuoteSkip::PolicyAdmitsNoLocal), 0),
             "skipped for a reason that has nothing to do with tools"
         );
         assert!(
-            local_quote_plan(None, 2).withheld_by_tools,
+            local_withheld_by_tools(None, 2),
             "quoted, but the post-pricing retain excluded it anyway"
         );
     }

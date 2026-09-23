@@ -87,6 +87,7 @@ pub fn classify_config_json(
           "expected_output_tokens": 24,
           "caps": {{
             "max_prior_classifications": 4,
+            "max_prior_turns": 4,
             "max_prompt_chars": 2000,
             "max_total_bytes": 8192
           }},
@@ -134,16 +135,24 @@ struct Behavior {
 /// A loopback `/systemone` service, for `ClassificationRuntime`'s own HTTP
 /// client to call against instead of a real provider.
 ///
-/// Three shapes needed this before it was one type: recording every request
-/// body sent and deriving each one's `state` field
-/// (`tests/classification_runtime.rs`, `tests/classification_prefix_admission.rs`),
-/// answering a caller-chosen fixed body while only counting calls
-/// (`tests/classification_settlement_recovery.rs`), and answering after a
-/// fixed delay so a deadline has something in flight to act on
-/// (`classify_runtime`'s own unit tests). [`Self::start`] covers the first
-/// with the shared [`ANSWER`]; [`Self::answering`] and [`Self::delayed`]
-/// cover the rest. Every shape still counts calls and captures bodies — doing
-/// so costs nothing a caller that does not read them notices.
+/// [`Self::start`] answers the shared [`ANSWER`], for
+/// `tests/classification_runtime.rs`; [`Self::answering`] takes a
+/// caller-chosen fixed body, for `tests/classification_settlement_recovery.rs`.
+/// Every shape still counts calls and captures bodies, and derives each
+/// body's own `state` field through [`Self::states`] — doing so costs nothing
+/// a caller that does not read them notices.
+///
+/// **Not the only loopback fixture in this crate**, and deliberately so:
+/// `classify_runtime`'s own unit tests keep a local `upstream`/`counted_upstream`
+/// pair because several of their callers need an answer *delayed* by a caller-
+/// chosen [`Duration`] — a shape this type does not offer, and adding it back
+/// would only relocate the dead constructor a round of review already found
+/// zero callers for. `tests/classification_prefix_admission.rs` keeps its own
+/// `Classifier` because it deliberately bumps its call count *after* the body
+/// is captured — the reverse of [`handle`]'s order below — so its
+/// `await_calls` can wait on the count and then read the body it counted
+/// without racing the write; see [`handle`]'s own doc for why this type's
+/// order is safe for its own callers instead.
 pub struct ClassifierUpstream {
     pub base_url: String,
     calls: Arc<AtomicUsize>,
@@ -157,6 +166,16 @@ struct AppState {
     bodies: Arc<Mutex<Vec<String>>>,
 }
 
+/// Bumps the count before the body is captured. Safe for every caller in
+/// this crate today: none of them waits on [`ClassifierUpstream::count`]
+/// reaching a value and then immediately reads [`ClassifierUpstream::bodies`]
+/// expecting that request's body to already be there — the classify_runtime
+/// suites that read the count wait on the mailbox's own `await_parked`
+/// instead, which only resolves once this handler has returned. A caller
+/// that did want "count `N` implies body `N` is captured" — as
+/// `tests/classification_prefix_admission.rs`'s own loopback does — needs
+/// the reverse order; see [`ClassifierUpstream`]'s own doc for why that copy
+/// stays separate rather than swapping this one.
 async fn handle(
     axum::extract::State(state): axum::extract::State<AppState>,
     body: String,
@@ -184,15 +203,6 @@ impl ClassifierUpstream {
         Self::configured(Behavior {
             body,
             delay: Duration::ZERO,
-        })
-        .await
-    }
-
-    /// Answers the shared [`ANSWER`] after `delay`.
-    pub async fn delayed(delay: Duration) -> Self {
-        Self::configured(Behavior {
-            body: ANSWER,
-            delay,
         })
         .await
     }

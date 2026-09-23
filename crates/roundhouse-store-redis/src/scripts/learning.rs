@@ -46,9 +46,9 @@ use crate::keys::{self, KeyNamespace};
 /// Lua shared by every script that reads or writes a stored mark, including
 /// the canonical session write path's marked append in the parent module —
 /// `pub(super)` so `scripts.rs` can splice it into `APPEND`'s prelude beside
-/// `LAST_EXACT_SEQ`, which lives there now (fleet-redis-5): the range guard
-/// it names belongs to the append every write path takes, marked or not, not
-/// to this deliberately unwired feature module.
+/// `LAST_EXACT_SEQ`: the range guard it names belongs to the append every
+/// write path takes, marked or not, not to this deliberately unwired feature
+/// module.
 ///
 /// `covers` compares canonical decimal strings digit by digit rather than
 /// through `tonumber`, so a confirmed watermark anywhere in the `u64` range —
@@ -141,31 +141,44 @@ pub(crate) struct LearningScripts {
 }
 
 /// The three learning-index keys of one namespace, owned rather than
-/// borrowed: the old shape was an owning `LearningKeys` in `lib.rs` plus this
-/// borrowing struct plus a positional `[&str; 3]` in `MarkArgs` — three
-/// spellings of one triple. One owning struct, built directly with
-/// [`keys::build_key`] as the key-builder convention requires, is what every
-/// caller now holds.
+/// borrowed. One owning struct is what every caller holds; the fields are
+/// built by the three `fn *_key` functions below so the key-builder
+/// convention scan (`key_builder_convention.rs`) covers this family the same
+/// way it covers every other — an owning struct whose constructor inlined
+/// `build_key` calls directly is invisible to a scan that looks for named
+/// `fn ..._key` functions, which is exactly the gap fleet-redis-r2-1 named.
 pub(crate) struct IndexKeys {
     pub(crate) marks: String,
     pub(crate) marked: String,
     pub(crate) pending: String,
 }
 
+/// The learning index is one set of keys per namespace, not per session, so
+/// none of these carry a hash tag: they cannot share a Cluster slot with any
+/// session's keys. The fourth segment is never `{`-prefixed, which is what
+/// keeps these from colliding with a session's keys.
+fn marks_key(namespace: &KeyNamespace) -> String {
+    keys::build_key(namespace, keys::KeyFamily::Session, &["learning", "marks"])
+}
+
+fn marked_key(namespace: &KeyNamespace) -> String {
+    keys::build_key(namespace, keys::KeyFamily::Session, &["learning", "marked"])
+}
+
+fn pending_key(namespace: &KeyNamespace) -> String {
+    keys::build_key(
+        namespace,
+        keys::KeyFamily::Session,
+        &["learning", "pending"],
+    )
+}
+
 impl IndexKeys {
-    /// The learning index is one set of keys per namespace, not per session,
-    /// so it carries no hash tag: it cannot share a Cluster slot with every
-    /// session's keys at once. The fourth segment is never `{`-prefixed,
-    /// which is what keeps these from colliding with any session's keys.
     pub(crate) fn new(namespace: &KeyNamespace) -> Self {
         Self {
-            marks: keys::build_key(namespace, keys::KeyFamily::Session, &["learning", "marks"]),
-            marked: keys::build_key(namespace, keys::KeyFamily::Session, &["learning", "marked"]),
-            pending: keys::build_key(
-                namespace,
-                keys::KeyFamily::Session,
-                &["learning", "pending"],
-            ),
+            marks: marks_key(namespace),
+            marked: marked_key(namespace),
+            pending: pending_key(namespace),
         }
     }
 }

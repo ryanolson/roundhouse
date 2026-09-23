@@ -86,13 +86,12 @@ pub struct PricingConfig {
 pub struct CapsConfig {
     pub max_prior_classifications: usize,
     /// Prior-turn local metadata records to carry — see
-    /// [`ProjectionCaps::max_prior_turns`]. Absent in a file written before
-    /// this cap split from `max_prior_classifications`
-    /// ([`ClassifyConfig::caps`]), so an operator's existing configuration
-    /// keeps bounding local metadata exactly as `max_prior_classifications`
-    /// did rather than failing to parse.
-    #[serde(default)]
-    pub max_prior_turns: Option<usize>,
+    /// [`ProjectionCaps::max_prior_turns`]. No default: that type's own doc
+    /// says a deployment that has not chosen this has not decided, and the
+    /// two lists are unrelated context with unrelated sizes, so a file that
+    /// omits it is refused rather than silently bounded by
+    /// `max_prior_classifications` on its behalf.
+    pub max_prior_turns: usize,
     pub max_prompt_chars: usize,
     pub max_total_bytes: usize,
 }
@@ -251,13 +250,7 @@ impl ClassifyConfig {
     pub fn caps(&self) -> ProjectionCaps {
         ProjectionCaps {
             max_prior_classifications: self.caps.max_prior_classifications,
-            // Today's behaviour, literally: a file that predates the split
-            // has no opinion of its own, so local metadata is bounded by the
-            // same number the classifications list always was.
-            max_prior_turns: self
-                .caps
-                .max_prior_turns
-                .unwrap_or(self.caps.max_prior_classifications),
+            max_prior_turns: self.caps.max_prior_turns,
             max_prompt_chars: self.caps.max_prompt_chars,
             max_total_bytes: self.caps.max_total_bytes,
         }

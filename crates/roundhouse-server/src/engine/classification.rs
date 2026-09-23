@@ -22,14 +22,20 @@ use crate::control_config::Admission;
 use crate::engine::Engine;
 
 /// What [`Engine::classification_before_turn`] took for this turn's own
-/// classification, carried to [`Engine::classification_after_turn`].
+/// classification, carried to [`Engine::classification_after_turn`] and on
+/// into [`Engine::request_classification`] whole.
 ///
 /// A plain pair rather than two separate `Option`s threaded through
 /// `run_turn`: the capacity and the capture it bounds are taken together and
 /// used together, and two options would let a caller pass one without the
 /// other, which the runtime's `prepare` would then have nothing sound to do
 /// with.
-pub(super) struct TurnClassification {
+///
+/// Named `ClassificationTicket` rather than `TurnClassification`: this
+/// crate's `typesafe_shadow` imports `roundhouse_core::classify::TurnClassification`,
+/// the classifier's *answer* type — this one holds no classification at all,
+/// only a reservation for one.
+pub(super) struct ClassificationTicket {
     capacity: Capacity,
     capture: PromptCapture,
 }
@@ -60,11 +66,11 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
         &self,
         session: &mut Session<S>,
         input: &[Item],
-    ) -> Option<TurnClassification> {
+    ) -> Option<ClassificationTicket> {
         let classifier = self.classifier.as_ref()?;
         self.deliver_classifier_output(session, classifier).await;
         let capacity = classifier.capacity()?;
-        Some(TurnClassification {
+        Some(ClassificationTicket {
             capacity,
             capture: PromptCapture::of(input, &classifier.projection_caps()),
         })
@@ -88,7 +94,7 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
         session: &mut Session<S>,
         response_id: &ResponseId,
         admission: &Admission,
-        background: Option<TurnClassification>,
+        background: Option<ClassificationTicket>,
         settled_decision: Option<&Decision>,
     ) {
         let Some(classifier) = self.classifier.as_ref() else {
@@ -99,17 +105,14 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
         // steered turn writes no `Routed`, so reading `last_decision()` here
         // would hand it the previous turn's admitted pool and fabricate
         // egress permission out of a decision that was never taken.
-        if let (Some(decision), Some(TurnClassification { capacity, capture })) =
-            (settled_decision, background)
-        {
+        if let (Some(decision), Some(ticket)) = (settled_decision, background) {
             self.request_classification(
                 session,
                 response_id,
                 admission,
                 classifier,
                 decision,
-                capacity,
-                &capture,
+                ticket,
             )
             .await;
         }
@@ -275,7 +278,6 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
     /// capacity, then payload, then reservation, then the durable intent, and
     /// only then a worker that may open a socket. The caller acquires capacity
     /// before capturing the prompt. Each early return here releases that permit.
-    #[allow(clippy::too_many_arguments)]
     async fn request_classification(
         &self,
         session: &mut Session<S>,
@@ -283,9 +285,9 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
         admission: &Admission,
         classifier: &Arc<ClassificationRuntime<T>>,
         decision: &Decision,
-        capacity: Capacity,
-        capture: &PromptCapture,
+        ticket: ClassificationTicket,
     ) {
+        let ClassificationTicket { capacity, capture } = ticket;
         // **One answer per turn is structural rather than guarded here.** This
         // is reached once per `run_turn`, and the two ways a turn could arrive
         // twice both stop short of it: a client's retry of a completed turn
@@ -313,7 +315,7 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
                 source_turn_index: session.turn_index().saturating_sub(1),
                 source_response_id: response_id.clone(),
             },
-            capture,
+            &capture,
             session.state().classifications(),
             session.state().prior_turns(),
             // **The policy's own resolution, never a second one.** Asking

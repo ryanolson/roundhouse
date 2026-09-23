@@ -3,7 +3,8 @@
 
 //! Classification admission, content limits, and evaluation accounting.
 //!
-//! Calls require explicit opt-in and an admitted frontier target.
+//! Calls require an admitted frontier target; the opt-in gate itself lives in
+//! `classify_runtime::compose`, the one place a runtime is composed at all.
 //! [`TypeSafeShadow::projection`] limits the content, and
 //! [`TypeSafeShadow::prepare`] serializes the request and records its quote.
 //! Preparation performs no ledger or HTTP request. The engine writes the
@@ -731,7 +732,7 @@ impl<T: Tokenizer> TypeSafeShadow<T> {
     /// reporting the charge as committed.
     ///
     /// **Bounded by the call's own `deadline`, and running out of time answers
-    /// the same `Rejected`.** A settle abandoned at the deadline is one this
+    /// the same [`SettlementAck::Unconfirmed`].** A settle abandoned at the deadline is one this
     /// process never got an acknowledgement for; it is not one this process
     /// knows the backend did not apply, and the record must not be read as
     /// saying otherwise. Giving this its own later deadline — the hold's TTL,
@@ -824,7 +825,12 @@ impl<T: Tokenizer> TypeSafeShadow<T> {
 
 /// Why [`TypeSafeShadow::settle_once`] could not confirm a settlement.
 enum SettleFailure {
-    /// The ledger answered, and refused.
+    /// The ledger call failed; whether it applied is unknown.
+    ///
+    /// [`SpendError::Backend`] covers both an unreachable ledger and a reply
+    /// lost after the write landed — the same "may well have been applied"
+    /// case [`SettlementAck::Unconfirmed`]'s own doc names, and why this
+    /// settle stays unrepaired rather than refused.
     Backend(SpendError),
     /// The call's own deadline passed before the ledger answered at all —
     /// unknown, not refused: whether the backend applied this settlement is

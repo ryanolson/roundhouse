@@ -504,19 +504,15 @@ impl SessionStore for RedisSessionStore {
             })
             .collect();
         // Built only for a marked append: the unmarked one is the turn path
-        // and never touches the index.
-        let index = mark
-            .as_ref()
-            .map(|_| scripts::learning::IndexKeys::new(&self.namespace));
-        let mark_args = mark
-            .as_ref()
-            .zip(index.as_ref())
-            .map(|(mark, index)| scripts::MarkArgs {
-                index_keys: index,
-                session_id: lease.session_id.as_str(),
-                event_index: mark.event_index(),
-                project: mark.project().as_str(),
-            });
+        // and never touches the index. `MarkArgs` owns its `IndexKeys` so
+        // this is one `map` over `mark.as_ref()` rather than a second
+        // `Option` zipped against it.
+        let mark_args = mark.as_ref().map(|mark| scripts::MarkArgs {
+            index_keys: scripts::learning::IndexKeys::new(&self.namespace),
+            session_id: lease.session_id.as_str(),
+            event_index: mark.event_index(),
+            project: mark.project().as_str(),
+        });
 
         let outcome = self
             .scripts

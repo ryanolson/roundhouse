@@ -64,7 +64,7 @@ mod fair_use;
 mod selection;
 pub(crate) mod spend;
 
-use selection::{SelectionInputs, local_quote_plan};
+use selection::{SelectionInputs, local_withheld_by_tools};
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -1191,12 +1191,8 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
                 .await?;
         }
 
-        // **Classification results land before this turn's input does**, and
-        // this turn's own capacity is taken before `input` is moved into
-        // `begin_turn` below — see `Engine::classification_before_turn` for
-        // both reasons in full. A deduplicated turn still drains both halves,
-        // and still takes and drops its own capacity: the client's retry is
-        // not a reason to strand output the runtime is holding capacity for.
+        // Before `input` is moved into `begin_turn` below — see
+        // `Engine::classification_before_turn` for why.
         let classification = self.classification_before_turn(&mut session, &input).await;
 
         // `started`, not `admission`: the caller's [`Admission`] is who may
@@ -2176,11 +2172,10 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
             }
             false => 0,
         };
-        // See `LocalQuotePlan::withheld_by_tools`: the retain above and the
+        // See `selection::local_withheld_by_tools`: the retain above and the
         // quote that was never made are the same fact from two sources, and
         // this is where both are finally known together.
-        let quote_plan = local_quote_plan(local_quote_skipped, excluded_local);
-        let local_withheld_by_tools = quote_plan.withheld_by_tools;
+        let local_withheld_by_tools = local_withheld_by_tools(local_quote_skipped, excluded_local);
         if local_withheld_by_tools && candidates.is_empty() {
             // Nothing hosted was quoted and local was all there was. Its own
             // error rather than `NoCandidates` or a served prose turn, because
@@ -2665,7 +2660,7 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
                         // Why the local fleet was never asked, on the turns it
                         // was not: the difference between a fleet this router
                         // turned down and one it never consulted.
-                        local_quote_skipped: quote_plan.skipped,
+                        local_quote_skipped,
                         // The same snapshot on every record of this turn. The
                         // inputs, the plan, the admitted pool and the branch are
                         // facts about the *selection*, which happened once —
