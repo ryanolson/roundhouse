@@ -7,6 +7,7 @@
 //! released around a turn -- before dispatch, and back whatever the turn's
 //! own outcome.
 
+use super::settlement_repair::SettleOnceFailingLedger;
 use super::*;
 
 /// **server-2 control: a turn that drains nothing pays no store round trip
@@ -184,6 +185,109 @@ async fn a_turn_with_several_parked_results_pays_one_store_append_before_routing
         1,
         "the three parked results are drained in one batched commit, not \
          three separate ones"
+    );
+}
+
+/// **server-2: a parked result and a parked repair drain in one commit
+/// together, not one each.** The test above only ever has results waiting; a
+/// regression that split `deliver_classifier_output`'s batch back into "one
+/// append for results, one for repairs" would still pass it, because a run
+/// with no repair in flight cannot see the second append. `SettleOnceFailingLedger`
+/// (`settlement_repair.rs`) is what makes a repair exist to wait alongside a
+/// result: it fails a call's settle once and succeeds on retry, so every
+/// classification here is `Unconfirmed` until something repairs it.
+#[tokio::test]
+async fn a_turn_that_drains_a_result_and_a_repair_together_pays_one_store_append_before_routing() {
+    let (base_url, _upstream) = classifier_upstream().await;
+    let classify = config(&base_url, true);
+    let ledger = SettleOnceFailingLedger::new();
+    let runtime = compose(
+        "<test>",
+        &classify,
+        ledger.clone() as Arc<dyn roundhouse_core::control::SpendLedger>,
+        ByteTokenizer,
+        &env,
+    )
+    .expect("it composes")
+    .expect("and is present");
+    let store = Arc::new(InstrumentedStore::new());
+    let engine = engine_over(
+        Arc::clone(&store),
+        Arc::new(Answering) as Arc<dyn FrontierClient>,
+        Arc::clone(&runtime),
+    );
+    let session = SessionId::new("sess_result_and_repair_batched");
+    engine.create_session(&session).await.unwrap();
+
+    let turn = |id: &'static str, text: &'static str| {
+        let engine = Arc::clone(&engine);
+        let session = session.clone();
+        async move {
+            engine
+                .run_turn(
+                    &session,
+                    TurnId::new(id),
+                    vec![Item::user_text(text)],
+                    &Admission::open(),
+                )
+                .await
+        }
+    };
+
+    // t1's call settles unconfirmed -- the ledger fails its first attempt for
+    // every call id -- and parks as a ready result.
+    turn("t1", "fix the parser")
+        .await
+        .expect("this fleet always answers");
+    for _ in 0..300 {
+        if !runtime.ready(&session).await.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        runtime.ready(&session).await.len(),
+        1,
+        "t1's classification completed and parked"
+    );
+
+    // t2 drains t1's result into the log, which starts a background repair
+    // for it, and dispatches a classification of its own -- which will also
+    // settle unconfirmed on the first attempt and park undrained. Poll for
+    // both: they are two independent background workers, racing each other.
+    turn("t2", "add a test")
+        .await
+        .expect("this fleet always answers");
+    for _ in 0..300 {
+        if !runtime.ready(&session).await.is_empty()
+            && !runtime.ready_repairs(&session).await.is_empty()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        runtime.ready(&session).await.len(),
+        1,
+        "t2's own classification parked, undrained"
+    );
+    assert_eq!(
+        runtime.ready_repairs(&session).await.len(),
+        1,
+        "t1's repair settled and parked"
+    );
+
+    // t3 drains both together.
+    store.reset_calls();
+    turn("t3", "one more")
+        .await
+        .expect("this fleet always answers");
+
+    assert_eq!(
+        store.calls_before_turn_started(),
+        1,
+        "a parked result and a parked repair are drained in one batched \
+         commit together, not one append each"
     );
 }
 

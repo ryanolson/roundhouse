@@ -139,3 +139,55 @@ impl TurnClock {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **`observe` saturates instead of wrapping.** The doc on the call site
+    /// names this deliberate: a wrapped total would report a near-zero mean
+    /// for the busiest deployment on the fleet, the one where the number
+    /// matters most. `u64::MAX` milliseconds is a stamp the log's own `u64`
+    /// timestamps can produce -- a terminal stamped near it against a turn
+    /// started at zero -- so this is a reachable total, not a hypothetical
+    /// one.
+    #[test]
+    fn observe_saturates_a_total_that_would_otherwise_wrap() {
+        let mut elapsed = Elapsed::default();
+        elapsed.observe(Some(u64::MAX));
+        elapsed.observe(Some(1));
+
+        assert_eq!(
+            elapsed.ms_total,
+            u64::MAX,
+            "a second interval pushes the total past u64::MAX, which must \
+             clamp rather than wrap back down near zero"
+        );
+        assert_eq!(elapsed.samples, 2, "both intervals are still counted");
+    }
+
+    /// **`absorb` saturates by the same rule `observe` does**, so a row that
+    /// saturated in one scope does not wrap the moment it is merged into a
+    /// wider one. The two write paths drifted onto different overflow rules
+    /// once already (core-metrics-2); this pins the rule now that both paths
+    /// share it.
+    #[test]
+    fn absorb_saturates_a_total_that_would_otherwise_wrap() {
+        let mut a = Elapsed {
+            ms_total: u64::MAX,
+            samples: 1,
+            rejected: 0,
+        };
+        let b = a;
+
+        a.absorb(&b);
+
+        assert_eq!(
+            a.ms_total,
+            u64::MAX,
+            "merging a saturated total into another must clamp rather than \
+             wrap back down near zero"
+        );
+        assert_eq!(a.samples, 2, "both sides' samples are still counted");
+    }
+}

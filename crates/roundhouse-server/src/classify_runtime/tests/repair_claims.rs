@@ -99,6 +99,82 @@ async fn a_parked_repair_acknowledgement_retains_its_admission_permit() {
     );
 }
 
+/// **A repair's retention clock starts at the ledger's answer, not at the
+/// worker's own start.**
+///
+/// [`Parked::retain_until_ms`]'s doc says retention for a repair is counted
+/// "from the ledger's answer", the repair half of the same rule
+/// `deadline_timing::a_slow_calls_retention_clock_starts_at_completion_not_at_submission`
+/// pins for an ordinary result. Nothing exercised it: every other repair test
+/// in this file runs over a ledger that answers immediately, where a clock
+/// started at dispatch and one started at the answer land within a
+/// millisecond of each other and the difference is invisible. This holds
+/// `settle_grant` open for 300ms against a 100ms retention, so the two clocks
+/// are 300ms apart and a result parked under the wrong one would already have
+/// lapsed.
+#[tokio::test]
+async fn a_slow_repairs_retention_clock_starts_at_the_ledgers_answer_not_at_the_workers_start() {
+    let addr = upstream(Duration::from_millis(0)).await;
+    let ledger = OneCallGatedLedger::new("eval_repair_slow");
+    let runtime = runtime_with_ledger(
+        addr,
+        RuntimeLimits {
+            result_retention_ms: 100,
+            ..limits(1)
+        },
+        Arc::clone(&ledger) as Arc<dyn SpendLedger>,
+    );
+
+    let capacity = runtime.capacity().expect("a free slot");
+    let started_ms = roundhouse_core::now_ms();
+    runtime
+        .repair(
+            capacity,
+            session(),
+            Principal::default_open(),
+            unconfirmed_call("eval_repair_slow", REPORTED_USD),
+        )
+        .await;
+    for _ in 0..300 {
+        if ledger.entered() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        ledger.entered(),
+        1,
+        "the premise: the worker is genuinely inside the ledger's settle_grant"
+    );
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    ledger.release();
+
+    let mut parked = Vec::new();
+    for _ in 0..300 {
+        parked = runtime.ready_repairs(&session()).await;
+        if !parked.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(parked.len(), 1, "the repair settled and parked");
+    let repaired_at_ms = parked[0].record.repaired_at_ms;
+    let retain_until_ms = parked[0].retain_until_ms();
+
+    assert!(
+        retain_until_ms >= repaired_at_ms + 100,
+        "a repair is held for its full retention interval, counted from when \
+         the ledger answered: {retain_until_ms} vs {repaired_at_ms}"
+    );
+    assert!(
+        retain_until_ms > started_ms + 300,
+        "retention counted from the worker's own start would already have \
+         lapsed by the time the ledger answered 300ms later: {retain_until_ms} \
+         vs a start at {started_ms}"
+    );
+}
+
 /// **The bound is the process's, not the session's: idle sessions holding
 /// acknowledgements exhaust it together.**
 ///

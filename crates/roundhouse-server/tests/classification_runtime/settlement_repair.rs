@@ -167,7 +167,11 @@ async fn a_failed_append_retains_the_result_for_a_later_turn() {
 /// So the original call's settle always fails and a repair's always succeeds,
 /// which is what makes the test below about *whether anything retries* rather
 /// than about the double.
-struct SettleOnceFailingLedger {
+///
+/// `pub(crate)`: `capacity.rs`'s batching test reuses it too, to park a
+/// result and a repair for the same session at once -- the one shape that
+/// needs a call whose settle fails on arrival and succeeds on retry.
+pub(crate) struct SettleOnceFailingLedger {
     inner: MemorySpendLedger,
     settle_calls: AtomicUsize,
     failed_once: std::sync::Mutex<std::collections::HashSet<String>>,
@@ -182,7 +186,7 @@ struct SettleOnceFailingLedger {
 }
 
 impl SettleOnceFailingLedger {
-    fn new() -> Arc<Self> {
+    pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             inner: MemorySpendLedger::new(),
             settle_calls: AtomicUsize::new(0),

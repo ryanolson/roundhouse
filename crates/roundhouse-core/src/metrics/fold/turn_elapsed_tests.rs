@@ -538,15 +538,17 @@ fn a_refusal_with_no_dispatch_is_counted_as_unrouted_and_makes_no_row() {
     assert!(fold.clocks.is_empty(), "and the clock drains anyway");
 }
 
-/// A dispatch with no clock, no reported cost and no consumption mints no
-/// row either — the other half of core-metrics-3's unified guard from the
-/// test above, which covers a clock with no dispatch.
+/// A dispatch with no clock and no consumption mints no row either — the
+/// other half of core-metrics-3's unified guard from the test above, which
+/// covers a clock with no dispatch.
 ///
 /// `Routed` with no preceding `TurnStarted` is not a shape the engine writes
-/// today, but the fold must not invent a zero-call row for it: the guard is
-/// stated once, over `provider_cost`, `clock` and `consumed` together, and
-/// this is the one combination where all three are absent while `pending`
-/// is not.
+/// today, but the fold must not invent a zero-call row for it: the guard
+/// reads `clock` and `consumed` together, and this is the one combination
+/// where both are absent while `pending` is not. `provider_cost` needs no
+/// third term in the guard: it is `Some` only on `ResponseCompleted`, which
+/// is exactly what makes `consumed` true, so a dispatch this guard drops
+/// never had a provider cost to lose either.
 #[test]
 fn a_dispatch_with_no_clock_and_no_consumption_makes_no_row() {
     let mut log = LogBuilder::new("s1");
@@ -569,8 +571,7 @@ fn a_dispatch_with_no_clock_and_no_consumption_makes_no_row() {
 
     assert!(
         fold.summed_rows(Scope::Deployment).is_empty(),
-        "no clock, no reported cost and no consumed usage: nothing to book, \
-         so no row: {:?}",
+        "no clock and no consumed usage: nothing to book, so no row: {:?}",
         fold.summed_rows(Scope::Deployment)
             .keys()
             .collect::<Vec<_>>()

@@ -2123,4 +2123,43 @@ mod tests {
             decision.rationale
         );
     }
+
+    /// **The guard is gated on `!picked_tier_was_empty`, and this is the case
+    /// that gate exists for.** The comment above the guard in `StagePolicy::resolve`
+    /// says the guard and an empty-tier fallthrough "exclude each other by
+    /// construction" -- but the construction is exactly that `!` check, so a
+    /// pick that reached the capable tier only because the efficient one
+    /// admitted nothing must not be treated as a *comparison* the efficient
+    /// tier lost. `guard_recipe()`'s only efficient member (`luna`) is absent
+    /// from the pool here, so the default `EfficientFirst` pick still names
+    /// `Tier::Efficient`, but `resolve` falls through to the capable tier
+    /// before the guard runs. The capable tier is ordered `[sol, nova]` by
+    /// `guard_recipe()`, with `nova` the cheaper of the two -- exactly the
+    /// shape that fires the guard if the `!` is ever dropped.
+    #[tokio::test]
+    async fn the_guard_does_not_run_on_a_pick_that_fell_through_an_empty_efficient_tier() {
+        let candidates = vec![
+            // No `luna`: the efficient tier admits nothing, so this is a
+            // fallthrough and not a guarded comparison.
+            hosted("sol", 0.95, 0.90),
+            hosted("nova", 0.90, 0.04),
+        ];
+        // No signals at all: the first turn of a session, which scores to
+        // zero and takes the `EfficientFirst` default.
+        let quiet = Fixture::open().with_recipe(guard_recipe());
+        let decision = stage().choose(&quiet.ctx(&candidates)).await.unwrap();
+
+        assert_eq!(
+            (decision.target, decision.source),
+            (
+                candidates[0].target.clone(),
+                Some(DecisionSource::Ambiguous)
+            ),
+            "the capable tier's head is served in recipe order under the \
+             tier's own fallthrough source; nova's lower cost must not \
+             displace it on a guard that never had an efficient quote to \
+             compare it against: {}",
+            decision.rationale
+        );
+    }
 }

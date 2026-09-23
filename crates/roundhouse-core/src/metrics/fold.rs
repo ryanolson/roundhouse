@@ -829,13 +829,17 @@ impl MetricsFold {
                 // to the denominator of every rate on the dashboard.
                 let consumed = completed || usage.input_tokens > 0;
 
-                // A row exists for this dispatch only if one of the three has
-                // something to book onto it — the one rule, stated once, that
-                // used to be spread across three `or_default()` calls: a
-                // dispatch with no reported cost, no clock and no consumption
-                // mints no row, which keeps a phantom dispatch off the
-                // dashboard as a free call.
-                if provider_cost.is_none() && clock.is_none() && !consumed {
+                // A row exists for this dispatch only if there is a clock or
+                // consumption to book onto it — the one rule, stated once,
+                // that used to be spread across three `or_default()` calls: a
+                // dispatch with no clock and no consumption mints no row,
+                // which keeps a phantom dispatch off the dashboard as a free
+                // call. `provider_cost` is not a third term here: it is
+                // `Some` only on `ResponseCompleted` (above), which is
+                // exactly what makes `completed`, and so `consumed`, true —
+                // a reported cost without consumption is not a state this
+                // fold can reach, so checking `!consumed` already covers it.
+                if clock.is_none() && !consumed {
                     return true;
                 }
                 let counters = self
