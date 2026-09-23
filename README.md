@@ -1192,7 +1192,7 @@ starting.
 
 **Background turn classification (implementation draft).** The binary reads optional JSON configuration from `ROUNDHOUSE_CLASSIFY_CONFIG`. Classification is off unless the file sets `enabled: true`. Enabled configuration specifies the model, prices, credential environment-variable name, evaluation budget, content limits, transport limits, and worker limits. The binary supplies a separate evaluation ledger.
 
-The configuration fields below are required unless a default is stated. An unreadable file or invalid configuration stops startup. Disabled configuration is still parsed, but its credential is not resolved.
+The configuration fields below are required unless a default is stated. An unreadable file or invalid configuration stops startup, including an unknown key at any depth — a misspelled field is refused rather than silently dropped. Disabled configuration is still parsed, but its credential is not resolved.
 
 | JSON field | Meaning |
 |---|---|
