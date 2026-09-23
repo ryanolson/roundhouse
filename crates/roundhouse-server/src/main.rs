@@ -64,11 +64,11 @@ use roundhouse_mcp::ControlStore;
 use roundhouse_server::catalog_config::{BUILT_IN_OPENAI, ProviderConfig};
 use roundhouse_server::control_config::crosscheck::CrossChecks;
 use roundhouse_server::{
-    Backends, CLASSIFY_VAR, ClassifyConfig, ControlDirectory, ControlPlane, ControlPlaneReads,
-    Conversations, DirectoryError, EchoLocalExecutor, Engine, EngineConfig, FleetJudge,
-    JudgeConfig, REDIS_NAMESPACE_VAR, REDIS_VAR, admin_api, catalog_config, classify_config,
-    classify_runtime, control_config, http, mcp_api, messages_api, metrics_api, relay_api,
-    resolve_namespace, responses_api, shared_backend,
+    Backends, CLASSIFY_VAR, ControlDirectory, ControlPlane, ControlPlaneReads, Conversations,
+    DirectoryError, EchoLocalExecutor, Engine, EngineConfig, FleetJudge, JudgeConfig,
+    REDIS_NAMESPACE_VAR, REDIS_VAR, admin_api, catalog_config, classify_config, classify_runtime,
+    control_config, http, mcp_api, messages_api, metrics_api, relay_api, resolve_namespace,
+    responses_api, shared_backend,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -650,28 +650,12 @@ async fn main() -> anyhow::Result<()> {
     // beside the catalog and the control plane because it is the same kind of
     // decision and fails the same way: a file that is named and unreadable stops
     // the process rather than starting one that classifies nothing and says so
-    // nowhere. An *absent* variable is the shipped state and logs one line.
+    // nowhere. An *absent* variable is the shipped state.
+    //
+    // Composed and logged later, after `shared_backend::open` and before the
+    // bind — see the composition below for why "read the file" and "compose
+    // the runtime" are two different moments now.
     let classify = classify_config::from_env()?;
-    match &classify {
-        Some((path, config)) if config.enabled => tracing::info!(
-            path = %path,
-            model = %config.model,
-            revision = config.revision,
-            "turn classification is enabled; bounded prior metadata and the current \
-             prompt of sessions with an admitted frontier target are sent to the \
-             configured classifier, on a separate evaluation budget"
-        ),
-        Some((path, _)) => tracing::info!(
-            path = %path,
-            "a turn-classification configuration is present and not enabled; no turn \
-             content leaves this deployment"
-        ),
-        None => tracing::info!(
-            var = CLASSIFY_VAR,
-            "no turn classification configured; no turn content leaves this deployment \
-             for a classifier"
-        ),
-    }
 
     // The registry, built here rather than inside `serve` because it is the
     // third boot cross-check and boot checks belong together: an operator
@@ -841,6 +825,65 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("fair-use windows are configured; rolling ceilings are enforced");
     }
 
+    // Background classification, over the *evaluation* ledger and never the
+    // serving one. The decision of whether there is a runtime at all is
+    // `classify_runtime::compose`'s, in the library, for the reason
+    // `shared_backend::open` gives about wiring inside a `[[bin]]`: this site
+    // wires what it returns and re-derives no part of the choice.
+    //
+    // **Composed here, before the bind — not inside `serve`, where it used to
+    // run after "roundhouse listening" had already been logged.** An enabled
+    // file with no credential is a configuration error the same way an
+    // unreadable catalog or control-plane file is, and every other boot
+    // refusal in this function stops the process before it opens a socket.
+    // `compose`'s own doc used to claim the same posture without having it;
+    // this is what makes the claim true.
+    let classifier: Option<Arc<classify_runtime::ClassificationRuntime<ByteTokenizer>>> = classify
+        .as_ref()
+        .map(|(path, config)| {
+            classify_runtime::compose(
+                path,
+                config,
+                Arc::clone(backends.evaluation_spend()),
+                ByteTokenizer,
+                &process_env,
+            )
+        })
+        .transpose()?
+        .flatten();
+    // The supervisor is this deployment's classification lifetime, held for
+    // the life of `main` (`serve` is the rest of this function's body, awaited
+    // below). Dropping it is what ends the runtime: the sweep stops,
+    // admission closes, and any worker still on the wire is cancelled.
+    // Nothing here calls it — serving can end at more than one place, and a
+    // guarantee spelled as a call is one that can be forgotten at the others.
+    // Bound to a real name and not `_`: the latter drops the value at the end
+    // of this statement, which would stop the runtime before a single turn
+    // used it.
+    let _supervisor = classifier.as_ref().map(|runtime| runtime.supervise());
+    // Logged from `compose`'s own result rather than from `config.enabled`
+    // directly, so this line can only ever claim what actually composed.
+    match (&classify, classifier.is_some()) {
+        (Some((path, config)), true) => tracing::info!(
+            path = %path,
+            model = %config.model,
+            revision = config.revision,
+            "turn classification is enabled; bounded prior metadata and the current \
+             prompt of sessions with an admitted frontier target are sent to the \
+             configured classifier, on a separate evaluation budget"
+        ),
+        (Some((path, _)), false) => tracing::info!(
+            path = %path,
+            "a turn-classification configuration is present and not enabled; no turn \
+             content leaves this deployment"
+        ),
+        (None, _) => tracing::info!(
+            var = CLASSIFY_VAR,
+            "no turn classification configured; no turn content leaves this deployment \
+             for a classifier"
+        ),
+    }
+
     let addr: SocketAddr = std::env::var(ADDR_VAR)
         .unwrap_or_else(|_| DEFAULT_ADDR.to_string())
         .parse()?;
@@ -859,7 +902,6 @@ async fn main() -> anyhow::Result<()> {
         Backends::Shared {
             store,
             spend,
-            evaluation_spend,
             fair_use,
             conversations,
             ..
@@ -867,7 +909,6 @@ async fn main() -> anyhow::Result<()> {
             serve(
                 store,
                 spend,
-                evaluation_spend,
                 fair_use,
                 conversations,
                 Arc::clone(&directory),
@@ -877,7 +918,7 @@ async fn main() -> anyhow::Result<()> {
                 reachable,
                 metrics_config,
                 engine_config,
-                classify,
+                classifier,
                 listener,
             )
             .await
@@ -885,7 +926,6 @@ async fn main() -> anyhow::Result<()> {
         Backends::PerProcess {
             store,
             spend,
-            evaluation_spend,
             fair_use,
             conversations,
             ..
@@ -893,7 +933,6 @@ async fn main() -> anyhow::Result<()> {
             serve(
                 store,
                 spend,
-                evaluation_spend,
                 fair_use,
                 conversations,
                 Arc::clone(&directory),
@@ -903,7 +942,7 @@ async fn main() -> anyhow::Result<()> {
                 reachable,
                 metrics_config,
                 engine_config,
-                classify,
+                classifier,
                 listener,
             )
             .await
@@ -940,7 +979,6 @@ async fn main() -> anyhow::Result<()> {
 async fn serve<S: SessionStore>(
     store: Arc<S>,
     spend: Arc<dyn SpendLedger>,
-    evaluation_spend: Arc<dyn SpendLedger>,
     fair_use: Arc<dyn FairUseLedger>,
     conversations: Arc<Conversations>,
     directory: Arc<ControlDirectory>,
@@ -950,7 +988,7 @@ async fn serve<S: SessionStore>(
     reachable: Vec<Candidate>,
     metrics_config: Arc<MetricsConfig>,
     engine_config: EngineConfig,
-    classify: Option<(String, ClassifyConfig)>,
+    classifier: Option<Arc<classify_runtime::ClassificationRuntime<ByteTokenizer>>>,
     listener: tokio::net::TcpListener,
 ) -> anyhow::Result<()> {
     let control = Arc::new(ControlStore::new());
@@ -1038,29 +1076,11 @@ async fn serve<S: SessionStore>(
     .with_fair_use_ledger(fair_use)
     .with_control_store(Arc::clone(&control));
 
-    // Background classification, over the *evaluation* ledger and never the
-    // serving one. The decision of whether there is a runtime at all is
-    // `classify_runtime::compose`'s, in the library, for the reason
-    // `shared_backend::open` gives about wiring inside a `[[bin]]`: this site
-    // wires what it returns and re-derives no part of the choice.
-    //
-    // The supervisor is this deployment's classification lifetime, held for the
-    // life of `serve`. Dropping it is what ends the runtime: the sweep stops,
-    // admission closes, and any worker still on the wire is cancelled. Nothing
-    // here calls it — serving can end at more than one place, and a guarantee
-    // spelled as a call is one that can be forgotten at the others.
-    let mut _classification_supervisor = None;
-    if let Some((path, config)) = &classify
-        && let Some(runtime) = classify_runtime::compose(
-            path,
-            config,
-            Arc::clone(&evaluation_spend),
-            ByteTokenizer,
-            &process_env,
-        )?
-    {
-        _classification_supervisor = Some(runtime.supervise());
-        engine = engine.with_classifier(runtime);
+    // Composed and its supervisor taken in `main`, before the bind — see the
+    // composition site for why. This is just wiring what the caller already
+    // decided, the same posture the catalog and the control plane take.
+    if let Some(classifier) = classifier {
+        engine = engine.with_classifier(classifier);
     }
 
     // The validator is installed only where there is a judge to install it

@@ -1553,6 +1553,147 @@ async fn an_unconfirmed_settlement_is_repaired_by_a_later_turn_without_a_second_
     );
 }
 
+/// **server-3 red: a turn cancelled between a repair's durable append and its
+/// acknowledgement must not re-append that repair on the next turn.**
+///
+/// `deliver_classifications` already guards results against exactly this
+/// shape of crash: `classification_settled` is checked before any append
+/// (`engine/classification.rs`, the `deliver_classifications` loop).
+/// `deliver_settlement_repairs` applies no equivalent guard. A turn cancelled
+/// after `record_classification_settlement_repair` commits but before
+/// `acknowledge_repairs` runs leaves the runtime still holding the handle, so
+/// the next turn's drain finds it "ready" again and appends a second
+/// `ClassificationSettlementRepaired` for a settlement the log already
+/// records as repaired.
+#[tokio::test]
+async fn a_turn_cancelled_after_a_repairs_append_does_not_re_append_it_next_turn() {
+    let (base_url, _upstream) = classifier_upstream().await;
+    let classify = config(&base_url, true);
+    let ledger = SettleOnceFailingLedger::new();
+    let runtime = compose(
+        "<test>",
+        &classify,
+        ledger.clone() as Arc<dyn roundhouse_core::control::SpendLedger>,
+        ByteTokenizer,
+        &env,
+    )
+    .expect("it composes")
+    .expect("and is present");
+    let store = Arc::new(InstrumentedStore::new());
+    let engine = engine_over(
+        Arc::clone(&store),
+        Arc::new(Answering) as Arc<dyn FrontierClient>,
+        Arc::clone(&runtime),
+    );
+    let session = SessionId::new("sess_repair_cancel");
+    engine.create_session(&session).await.unwrap();
+
+    let turn = |id: &'static str, text: &'static str| {
+        let engine = Arc::clone(&engine);
+        let session = session.clone();
+        async move {
+            engine
+                .run_turn(
+                    &session,
+                    TurnId::new(id),
+                    vec![Item::user_text(text)],
+                    &Admission::open(),
+                )
+                .await
+        }
+    };
+
+    // t1's call settles unconfirmed: the ledger fails its first attempt.
+    turn("t1", "fix the parser")
+        .await
+        .expect("this fleet always answers");
+    for _ in 0..300 {
+        if !runtime.ready(&session).await.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        runtime.ready(&session).await.len(),
+        1,
+        "the classification completed and parked"
+    );
+
+    // t2 drains the result into the log and, at its tail, starts the repair —
+    // which succeeds this time, since the ledger only fails once.
+    turn("t2", "add a test")
+        .await
+        .expect("this fleet always answers");
+    for _ in 0..300 {
+        if !runtime.ready_repairs(&session).await.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let parked_repairs = runtime.ready_repairs(&session).await;
+    assert_eq!(parked_repairs.len(), 1, "the repair settled and parked");
+    let repair_call_id = parked_repairs[0].record.call_id.to_string();
+    drop(parked_repairs);
+
+    // t3 drains the repair — its append lands durably — and is cancelled
+    // right there, before `acknowledge_repairs` can run.
+    store.stall_next_repair_append();
+    tokio::select! {
+        _ = store.repair_appended.notified() => {}
+        result = turn("t3", "one more") => {
+            panic!("t3 must stall on its repair append, not complete: {result:?}");
+        }
+    }
+
+    // The cancelled turn's `Session` was dropped holding the lease; nothing
+    // released it, so the next turn must not find it still held.
+    store.inner.expire_lease_now(&session).await;
+
+    assert_eq!(
+        repair_events_for(&*store, &session, &repair_call_id).await,
+        1,
+        "red-test control: the append that landed before cancellation is the \
+         only one so far"
+    );
+    assert_eq!(
+        runtime.retained_repairs(&session).await,
+        1,
+        "the runtime still holds the un-acknowledged handle -- acknowledge_repairs \
+         never ran"
+    );
+
+    // t4 is an ordinary turn. Its drain sees the same repair still "ready" —
+    // acknowledge_repairs never ran — and must not append it a second time
+    // merely because the log already recorded it.
+    turn("t4", "final")
+        .await
+        .expect("this fleet always answers");
+
+    assert_eq!(
+        repair_events_for(&*store, &session, &repair_call_id).await,
+        1,
+        "a settlement already repaired in the log must not be repaired twice \
+         merely because a cancelled turn lost the acknowledgement that would \
+         have released it"
+    );
+}
+
+async fn repair_events_for(store: &impl SessionStore, session: &SessionId, call_id: &str) -> usize {
+    store
+        .read_events(session, 0, 1_000)
+        .await
+        .expect("a log reads")
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                &event.kind,
+                SessionEventKind::ClassificationSettlementRepaired { record }
+                    if record.call_id.to_string() == call_id
+            )
+        })
+        .count()
+}
+
 // ------------------------------------------------- production lifetime (H6)
 
 /// The production lifetime guard (`Supervisor`, returned by
@@ -2116,6 +2257,354 @@ async fn intents_in(store: &impl SessionStore, session: &SessionId) -> Vec<Class
             _ => None,
         })
         .collect()
+}
+
+// -------------------------------------------------- instrumented store (F2, F3)
+
+/// A `MemoryStore` wrapper instrumented for two review-fix regressions: how
+/// many `append_events` calls a turn makes before its own `TurnStarted`
+/// commit (server-2's batching claim), and stalling the first repair
+/// acknowledgement's append after it has already landed durably, so a test
+/// can cancel the turn between that append and the runtime acknowledgement
+/// that was supposed to follow it (server-3's re-append claim). One wrapper
+/// rather than two, because both are "watch what `append_events` does" and a
+/// second near-identical double would be exactly the duplication this
+/// milestone's own review is about.
+struct InstrumentedStore {
+    inner: MemoryStore,
+    /// Every `append_events` call, in order: whether its batch contained a
+    /// `TurnStarted` event. Position of the first `true` is how many calls
+    /// landed before the turn's own commit.
+    calls: std::sync::Mutex<Vec<bool>>,
+    /// Armed by [`Self::stall_next_repair_append`]; disarmed (and consumed)
+    /// the first time a batch containing `ClassificationSettlementRepaired`
+    /// is appended. Off by default: only the cancellation test ever needs the
+    /// store to fail to return.
+    stall_next_repair: AtomicBool,
+    /// Fires the instant a stalled append has landed in the inner store,
+    /// before this call parks forever — what a test synchronizes a
+    /// cancellation on, rather than guessing with a sleep.
+    repair_appended: tokio::sync::Notify,
+}
+
+impl InstrumentedStore {
+    fn new() -> Self {
+        Self {
+            inner: MemoryStore::new(),
+            calls: std::sync::Mutex::new(Vec::new()),
+            stall_next_repair: AtomicBool::new(false),
+            repair_appended: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// How many `append_events` calls landed before the first one whose batch
+    /// contained a `TurnStarted` event.
+    fn calls_before_turn_started(&self) -> usize {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .position(|&has_turn_started| has_turn_started)
+            .expect("a TurnStarted call")
+    }
+
+    /// Forget every call observed so far, so a later measurement is not
+    /// polluted by an earlier turn's own `SessionCreated` or `TurnStarted`
+    /// commit.
+    fn reset_calls(&self) {
+        self.calls.lock().unwrap().clear();
+    }
+
+    /// The next batch containing a repair acknowledgement lands, and then
+    /// this call never returns.
+    fn stall_next_repair_append(&self) {
+        self.stall_next_repair.store(true, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl SessionStore for InstrumentedStore {
+    async fn create_session(
+        &self,
+        session_id: &SessionId,
+        model_policy: &str,
+    ) -> Result<bool, StoreError> {
+        self.inner.create_session(session_id, model_policy).await
+    }
+
+    async fn acquire_lease(
+        &self,
+        session_id: &SessionId,
+        node_id: &str,
+        ttl_ms: u64,
+    ) -> Result<Option<Lease>, StoreError> {
+        self.inner.acquire_lease(session_id, node_id, ttl_ms).await
+    }
+
+    async fn renew_lease(&self, lease: &Lease, ttl_ms: u64) -> Result<Option<Lease>, StoreError> {
+        self.inner.renew_lease(lease, ttl_ms).await
+    }
+
+    async fn release_lease(&self, lease: &Lease) -> Result<(), StoreError> {
+        self.inner.release_lease(lease).await
+    }
+
+    async fn is_leased(&self, session_id: &SessionId) -> Result<bool, StoreError> {
+        self.inner.is_leased(session_id).await
+    }
+
+    async fn append_events(
+        &self,
+        lease: &Lease,
+        kinds: Vec<SessionEventKind>,
+        mark: Option<roundhouse_core::store::LearningMark>,
+    ) -> Result<Vec<SessionEvent>, StoreError> {
+        let has_turn_started = kinds
+            .iter()
+            .any(|kind| matches!(kind, SessionEventKind::TurnStarted { .. }));
+        let has_repair = kinds.iter().any(|kind| {
+            matches!(
+                kind,
+                SessionEventKind::ClassificationSettlementRepaired { .. }
+            )
+        });
+        let result = self.inner.append_events(lease, kinds, mark).await;
+        self.calls.lock().unwrap().push(has_turn_started);
+        if has_repair && self.stall_next_repair.swap(false, Ordering::SeqCst) {
+            self.repair_appended.notify_one();
+            // The append already landed in `self.inner` above; this future
+            // simply never resolves, which is what leaves the caller
+            // suspended between the append and whatever it does next.
+            std::future::pending::<()>().await;
+        }
+        result
+    }
+
+    async fn read_events(
+        &self,
+        session_id: &SessionId,
+        after_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<SessionEvent>, StoreError> {
+        self.inner.read_events(session_id, after_seq, limit).await
+    }
+
+    async fn last_seq(&self, session_id: &SessionId) -> Result<u64, StoreError> {
+        self.inner.last_seq(session_id).await
+    }
+
+    async fn clear_learning_mark(
+        &self,
+        session_id: &SessionId,
+        confirmed_through: u64,
+    ) -> Result<roundhouse_core::store::ClearOutcome, StoreError> {
+        self.inner
+            .clear_learning_mark(session_id, confirmed_through)
+            .await
+    }
+
+    async fn requeue_learning(
+        &self,
+        session_id: &SessionId,
+        mark_seq: u64,
+    ) -> Result<roundhouse_core::store::RequeueOutcome, StoreError> {
+        self.inner.requeue_learning(session_id, mark_seq).await
+    }
+
+    async fn pending_learning(
+        &self,
+        after: Option<&roundhouse_core::store::LearningCursor>,
+        idle_for_ms: u64,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<roundhouse_core::store::LearningPage, StoreError> {
+        self.inner.pending_learning(after, idle_for_ms, limit).await
+    }
+
+    async fn learning_sessions(
+        &self,
+        after: Option<&roundhouse_core::store::LearningCursor>,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<roundhouse_core::store::LearningPage, StoreError> {
+        self.inner.learning_sessions(after, limit).await
+    }
+}
+
+/// **server-2 control: a turn that drains nothing pays no store round trip
+/// for the drain at all.** The batched commit is skipped entirely rather than
+/// called with an empty batch, so the count of appends before `TurnStarted`
+/// is zero whether or not this deployment ever classifies anything.
+#[tokio::test]
+async fn a_turn_with_nothing_parked_pays_no_store_append_before_routing() {
+    let (base_url, _upstream) = classifier_upstream().await;
+    let runtime = runtime_with(&config(&base_url, true));
+    let store = Arc::new(InstrumentedStore::new());
+    let registry = FrontierClients::keyed(
+        [(
+            PROVIDER.to_string(),
+            Arc::new(Answering) as Arc<dyn FrontierClient>,
+        )]
+        .into_iter()
+        .collect(),
+    );
+    let session = SessionId::new("sess_nothing_parked");
+
+    // A warm-up turn over an engine with **no classifier attached**, so the
+    // session exists (no `SessionCreated` commit ahead of the measured turn's
+    // own `TurnStarted`) and, unlike a dispatched turn under the classifier
+    // below, requests no classification of its own to race against the
+    // measurement -- every dispatched turn requests one, so a warm-up under
+    // the same classifier would leave a result parked exactly when this test
+    // needs there to be none.
+    let warm_up = Engine::with_provider_clients(
+        Arc::clone(&store),
+        ByteTokenizer,
+        Arc::new(EchoLocalExecutor::new("local")) as Arc<dyn LocalExecutor>,
+        catalog(),
+        Arc::new(registry),
+        Arc::new(AffinityPolicy::new()),
+        EngineConfig {
+            turn_deadline_ms: 5_000,
+            ..EngineConfig::default()
+        },
+    );
+    warm_up.create_session(&session).await.unwrap();
+    warm_up
+        .run_turn(
+            &session,
+            TurnId::new("t0"),
+            vec![Item::user_text("warm up")],
+            &Admission::open(),
+        )
+        .await
+        .expect("this fleet always answers");
+    store.reset_calls();
+
+    let engine = engine_over(
+        Arc::clone(&store),
+        Arc::new(Answering) as Arc<dyn FrontierClient>,
+        Arc::clone(&runtime),
+    );
+    engine
+        .run_turn(
+            &session,
+            TurnId::new("t1"),
+            vec![Item::user_text("fix the parser")],
+            &Admission::open(),
+        )
+        .await
+        .expect("this fleet always answers");
+
+    assert_eq!(
+        store.calls_before_turn_started(),
+        0,
+        "nothing was parked, so the drain must not touch the store at all"
+    );
+}
+
+/// **server-2: several parked results cost one store round trip, not one
+/// each.** `deliver_classifier_output` used to call `record_classification`
+/// once per drained result -- `k` sequential appends for `k` parked results,
+/// every one of them before this turn's own `TurnStarted` commit, on the
+/// path to first token. Three classifications are held in flight together
+/// (their ledger call gated open) so none can complete -- and be drained one
+/// at a time by the turns that requested them -- before all three exist
+/// simultaneously; only then are they released to park, and only then does a
+/// fresh turn drain them.
+#[tokio::test]
+async fn a_turn_with_several_parked_results_pays_one_store_append_before_routing() {
+    let (base_url, _upstream) = classifier_upstream().await;
+    let mut classify = config(&base_url, true);
+    classify.executor.max_in_flight = 3;
+    // Three workers must reach `open_grant` independently of one another; the
+    // default concurrency of 2 would strand the third behind the HTTP
+    // semaphore, which nothing below ever releases before the ledger gate
+    // does -- a deadlock this test would otherwise sit in until its own
+    // timeout.
+    classify.executor.max_http_concurrency = 3;
+    let ledger = StallingLedger::new();
+    let runtime = compose(
+        "<test>",
+        &classify,
+        ledger.clone() as Arc<dyn roundhouse_core::control::SpendLedger>,
+        ByteTokenizer,
+        &env,
+    )
+    .expect("it composes")
+    .expect("and is present");
+    let store = Arc::new(InstrumentedStore::new());
+    let engine = engine_over(
+        Arc::clone(&store),
+        Arc::new(Answering) as Arc<dyn FrontierClient>,
+        Arc::clone(&runtime),
+    );
+    let session = SessionId::new("sess_batched_drain");
+    engine.create_session(&session).await.unwrap();
+
+    let turn = |id: &'static str, text: &'static str| {
+        let engine = Arc::clone(&engine);
+        let session = session.clone();
+        async move {
+            engine
+                .run_turn(
+                    &session,
+                    TurnId::new(id),
+                    vec![Item::user_text(text)],
+                    &Admission::open(),
+                )
+                .await
+        }
+    };
+
+    // Each turn requests its own classification; none can finish yet, since
+    // every worker parks in the ledger's `open_grant` before it ever reaches
+    // the classifier upstream.
+    for id in ["t1", "t2", "t3"] {
+        turn(id, "fix the parser")
+            .await
+            .expect("this fleet always answers");
+    }
+    for _ in 0..300 {
+        if ledger.open_grant_calls.load(Ordering::SeqCst) >= 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        ledger.open_grant_calls.load(Ordering::SeqCst),
+        3,
+        "all three calls are parked in the ledger together, so none has \
+         completed and drained on its own turn"
+    );
+    ledger.release_open_grant();
+    ledger.release_settle();
+
+    for _ in 0..300 {
+        if runtime.ready(&session).await.len() >= 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        runtime.ready(&session).await.len(),
+        3,
+        "three results parked, undrained"
+    );
+
+    // Reset here, not only at the start: `t1`'s own `SessionCreated` and
+    // `TurnStarted` commits, plus `t2` and `t3`'s own `TurnStarted` commits,
+    // would otherwise be the first `true` this scan finds -- this test is
+    // about `t4`'s drain, not about them.
+    store.reset_calls();
+    turn("t4", "add a test")
+        .await
+        .expect("this fleet always answers");
+
+    assert_eq!(
+        store.calls_before_turn_started(),
+        1,
+        "the three parked results are drained in one batched commit, not \
+         three separate ones"
+    );
 }
 
 /// **The permit is taken before the payload, and held for it.**

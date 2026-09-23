@@ -74,7 +74,7 @@ fn expected_usd(input_tokens: u64, output_tokens: u64) -> f64 {
 
 fn shadow_on(addr: SocketAddr, ledger: Arc<MemorySpendLedger>) -> TypeSafeShadow<ByteTokenizer> {
     let client = SystemOneClient::new(format!("http://{addr}"), limits()).unwrap();
-    TypeSafeShadow::new(client, config().enable(), ledger, ByteTokenizer)
+    TypeSafeShadow::new(client, config(), ledger, ByteTokenizer)
 }
 
 /// The `(usage, usd)` a call was priced at, or a panic naming what came back.

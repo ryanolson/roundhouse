@@ -22,7 +22,7 @@ async fn a_short_or_zero_grant_makes_no_call_and_says_so_durably() {
         let credential = credential();
 
         let record = classify(
-            &shadow(addr, config().enable(), ledger.clone()),
+            &shadow(addr, config(), ledger.clone()),
             &credential,
             Some(&[frontier()]),
         )
@@ -57,7 +57,7 @@ async fn an_unavailable_ledger_makes_no_call() {
     let credential = credential();
 
     let record = classify(
-        &shadow(addr, config().enable(), ledger.clone()),
+        &shadow(addr, config(), ledger.clone()),
         &credential,
         Some(&[frontier()]),
     )
@@ -88,7 +88,7 @@ async fn the_hold_is_asked_for_what_the_sent_bytes_are_worth() {
     let (addr, up) = upstream(ANSWER).await;
     let ledger = RecordingLedger::granting(1_000.0);
     let credential = credential();
-    let shadow = shadow(addr, config().enable(), ledger.clone());
+    let shadow = shadow(addr, config(), ledger.clone());
 
     let projection = shadow.projection(&capture(), &[], &[]).unwrap();
     let prepared = shadow
@@ -127,7 +127,7 @@ async fn an_unusable_answer_settles_the_usage_that_was_reported() {
     let credential = credential();
 
     let record = classify(
-        &shadow(addr, config().enable(), ledger.clone()),
+        &shadow(addr, config(), ledger.clone()),
         &credential,
         Some(&[frontier()]),
     )
@@ -173,7 +173,7 @@ async fn a_missing_axis_supplies_no_classification_at_all() {
     let credential = credential();
 
     let record = classify(
-        &shadow(addr, config().enable(), ledger.clone()),
+        &shadow(addr, config(), ledger.clone()),
         &credential,
         Some(&[frontier()]),
     )
@@ -204,7 +204,7 @@ async fn unreported_usage_releases_the_hold_without_claiming_a_free_call() {
     let credential = credential();
 
     let record = classify(
-        &shadow(addr, config().enable(), ledger.clone()),
+        &shadow(addr, config(), ledger.clone()),
         &credential,
         Some(&[frontier()]),
     )
@@ -273,7 +273,7 @@ fn a_rejected_settle_is_recorded_as_rejected_and_names_the_call() {
     let warned = captured_warnings(|| {
         record = Some(
             rt.block_on(classify(
-                &shadow(addr, config().enable(), ledger.clone()),
+                &shadow(addr, config(), ledger.clone()),
                 &credential,
                 Some(&[frontier()]),
             ))
@@ -344,7 +344,7 @@ async fn a_failed_call_releases_its_hold_with_unknown_accounting() {
     let credential = credential();
 
     let record = classify(
-        &shadow(addr, config().enable(), ledger.clone()),
+        &shadow(addr, config(), ledger.clone()),
         &credential,
         Some(&[frontier()]),
     )
@@ -375,7 +375,7 @@ async fn a_prepared_call_that_is_dropped_touches_no_ledger() {
     let (addr, up) = upstream(ANSWER).await;
     let ledger = RecordingLedger::granting(1_000.0);
     let credential = credential();
-    let shadow = shadow(addr, config().enable(), ledger.clone());
+    let shadow = shadow(addr, config(), ledger.clone());
 
     let projection = shadow.projection(&capture(), &[], &[]).unwrap();
     let prepared = shadow
@@ -400,7 +400,7 @@ async fn the_intent_records_the_reservation_in_numbers() {
     let (addr, _up) = upstream(ANSWER).await;
     let ledger = RecordingLedger::granting(1_000.0);
     let credential = credential();
-    let shadow = shadow(addr, config().enable(), ledger.clone());
+    let shadow = shadow(addr, config(), ledger.clone());
 
     let projection = shadow.projection(&capture(), &[], &[]).unwrap();
     let prepared = shadow

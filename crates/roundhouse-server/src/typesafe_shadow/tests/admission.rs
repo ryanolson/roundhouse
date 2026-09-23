@@ -4,39 +4,6 @@
 use super::*;
 use roundhouse_core::control::PresentedCredential;
 
-/// Opt-in, and the type is what enforces it.
-#[test]
-fn a_shadow_config_is_disabled_until_a_deployment_says_otherwise() {
-    assert!(
-        !config().is_enabled(),
-        "a deployment that named a model and a rate card has still not agreed \
-         to send anybody's prompt to a third party"
-    );
-    assert!(config().enable().is_enabled());
-}
-
-/// The default config makes no call at all.
-#[tokio::test]
-async fn a_disabled_shadow_makes_no_call() {
-    let (addr, up) = upstream(ANSWER).await;
-    let ledger = RecordingLedger::granting(1_000.0);
-    let credential = credential();
-
-    let outcome = classify(
-        &shadow(addr, config(), ledger.clone()),
-        &credential,
-        Some(&[frontier()]),
-    )
-    .await;
-
-    assert_eq!(outcome.err(), Some(NotRun::Disabled));
-    assert_eq!(up.count(), 0);
-    assert!(
-        ledger.settled().is_empty(),
-        "nothing was held, so nothing is released"
-    );
-}
-
 /// A session whose policy admitted no frontier target has no third party its
 /// content is already permitted to reach, so it makes zero calls.
 #[tokio::test]
@@ -46,7 +13,7 @@ async fn a_local_only_session_makes_no_call() {
     let credential = credential();
 
     let outcome = classify(
-        &shadow(addr, config().enable(), ledger.clone()),
+        &shadow(addr, config(), ledger.clone()),
         &credential,
         Some(&[local()]),
     )
@@ -75,12 +42,7 @@ async fn a_decision_without_admission_evidence_makes_no_call() {
     let ledger = RecordingLedger::granting(1_000.0);
     let credential = credential();
 
-    let outcome = classify(
-        &shadow(addr, config().enable(), ledger.clone()),
-        &credential,
-        None,
-    )
-    .await;
+    let outcome = classify(&shadow(addr, config(), ledger.clone()), &credential, None).await;
 
     assert_eq!(outcome.err(), Some(NotRun::AdmissionUnknown));
     assert_eq!(up.count(), 0, "silence is not consent");
@@ -99,7 +61,7 @@ async fn an_empty_admitted_pool_makes_no_call() {
     let credential = credential();
 
     let outcome = classify(
-        &shadow(addr, config().enable(), ledger.clone()),
+        &shadow(addr, config(), ledger.clone()),
         &credential,
         Some(&[]),
     )
@@ -118,7 +80,7 @@ async fn an_enabled_shadow_with_an_admitted_frontier_target_calls() {
     let credential = credential();
 
     let record = classify(
-        &shadow(addr, config().enable(), ledger.clone()),
+        &shadow(addr, config(), ledger.clone()),
         &credential,
         Some(&[local(), frontier()]),
     )
@@ -173,7 +135,7 @@ async fn a_credential_this_module_may_not_spend_takes_no_hold() {
         let ledger = RecordingLedger::granting(1_000.0);
 
         let outcome = classify(
-            &shadow(addr, config().enable(), ledger.clone()),
+            &shadow(addr, config(), ledger.clone()),
             &credential,
             Some(&[frontier()]),
         )

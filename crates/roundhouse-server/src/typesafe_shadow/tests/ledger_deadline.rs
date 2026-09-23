@@ -111,7 +111,7 @@ impl SpendLedger for StallingLedger {
 
 fn stalling_shadow(addr: SocketAddr, ledger: Arc<StallingLedger>) -> TypeSafeShadow<ByteTokenizer> {
     let client = SystemOneClient::new(format!("http://{addr}"), limits()).unwrap();
-    TypeSafeShadow::new(client, config().enable(), ledger, ByteTokenizer)
+    TypeSafeShadow::new(client, config(), ledger, ByteTokenizer)
 }
 
 /// A deadline close enough to be reached inside a test, and far enough that the

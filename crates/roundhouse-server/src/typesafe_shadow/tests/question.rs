@@ -66,7 +66,7 @@ async fn the_answers_are_recovered_under_the_ids_they_were_asked_under() {
     let credential = credential();
 
     let record = classify(
-        &shadow(addr, config().enable(), ledger),
+        &shadow(addr, config(), ledger),
         &credential,
         Some(&[frontier()]),
     )

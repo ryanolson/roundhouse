@@ -33,7 +33,7 @@ fn find_json_key<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a serd
 async fn the_requested_model_identity_is_already_durable_on_the_intent() {
     let (addr, _up) = upstream(ANSWER).await;
     let credential = credential();
-    let shadow = shadow(addr, config().enable(), RecordingLedger::granting(1.0));
+    let shadow = shadow(addr, config(), RecordingLedger::granting(1.0));
 
     let projection = shadow.projection(&capture(), &[], &[]).expect("it fits");
     let prepared = shadow
@@ -65,7 +65,7 @@ async fn the_service_reported_model_identity_must_survive_into_the_durable_recor
     assert_ne!(config().model, REPORTED_MODEL);
 
     let record = classify(
-        &shadow(addr, config().enable(), RecordingLedger::granting(1.0)),
+        &shadow(addr, config(), RecordingLedger::granting(1.0)),
         &credential,
         Some(&[frontier()]),
     )
@@ -95,7 +95,7 @@ async fn missing_model_metadata_invents_no_identity_and_keeps_reported_usage() {
     let credential = credential();
 
     let record = classify(
-        &shadow(addr, config().enable(), RecordingLedger::granting(1.0)),
+        &shadow(addr, config(), RecordingLedger::granting(1.0)),
         &credential,
         Some(&[frontier()]),
     )
@@ -138,7 +138,7 @@ async fn malformed_model_metadata_does_not_discard_reported_usage() {
     let credential = credential();
 
     let record = classify(
-        &shadow(addr, config().enable(), RecordingLedger::granting(1.0)),
+        &shadow(addr, config(), RecordingLedger::granting(1.0)),
         &credential,
         Some(&[frontier()]),
     )
@@ -175,7 +175,7 @@ async fn an_echoed_synthetic_credential_never_reaches_the_durable_record() {
     let credential = credential();
 
     let record = classify(
-        &shadow(addr, config().enable(), RecordingLedger::granting(1.0)),
+        &shadow(addr, config(), RecordingLedger::granting(1.0)),
         &credential,
         Some(&[frontier()]),
     )

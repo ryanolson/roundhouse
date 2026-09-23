@@ -1204,6 +1204,15 @@ impl SessionState {
         self.classification.unrepaired()
     }
 
+    /// Whether `call_id`'s settlement is still recorded as unrepaired.
+    ///
+    /// The repair delivery path uses this to avoid re-appending a
+    /// `ClassificationSettlementRepaired` the log already holds, the same way
+    /// [`Self::classification_settled`] guards a result.
+    pub fn is_settlement_unrepaired(&self, call_id: &ResponseId) -> bool {
+        self.classification.is_unrepaired(call_id)
+    }
+
     /// Settlements visited during acknowledgement removal, excluding map
     /// lookup comparisons. Test-only: a self-reported counter costs a
     /// production field for a guard nothing outside this crate's own tests
@@ -1827,6 +1836,48 @@ impl<S: SessionStore> Session<S> {
         }])
         .await?;
         Ok(())
+    }
+
+    /// Deliver a whole turn's drain of background-classifier output in one
+    /// append: every result and every settlement-repair acknowledgement the
+    /// runtime is holding for this session, committed together.
+    ///
+    /// **One store round trip for the batch, not one per record.** A session
+    /// with several parked results or repairs used to pay one
+    /// [`Self::record_classification`] or
+    /// [`Self::record_classification_settlement_repair`] call each — on the
+    /// path to first token, before every turn's own `TurnStarted` — and nothing
+    /// about that work needs to be serialized: the store assigns every event in
+    /// one `commit` contiguous sequence numbers atomically, exactly as
+    /// [`Self::begin_turn`] already relies on for a turn's own input items.
+    ///
+    /// **Typed parameters, not a raw `Vec<SessionEventKind>`.** `commit` is
+    /// private precisely so every public method states what it can append;
+    /// a public method accepting arbitrary kinds would be the first way to
+    /// append a `TurnStarted` from outside [`Self::begin_turn`]. Results are
+    /// committed ahead of repairs, deterministically, regardless of the order
+    /// the caller drained them in.
+    ///
+    /// An empty call commits nothing: the caller is expected to skip this
+    /// entirely when both lists are empty, and an empty batch would otherwise
+    /// still cost a store round trip for zero events.
+    pub async fn record_background_classification(
+        &mut self,
+        results: Vec<ClassificationRecord>,
+        repairs: Vec<ClassificationSettlementRepair>,
+    ) -> Result<Vec<SessionEvent>, SessionError> {
+        let mut kinds = Vec::with_capacity(results.len() + repairs.len());
+        kinds.extend(
+            results
+                .into_iter()
+                .map(|record| SessionEventKind::ClassificationRecorded { record }),
+        );
+        kinds.extend(
+            repairs
+                .into_iter()
+                .map(|record| SessionEventKind::ClassificationSettlementRepaired { record }),
+        );
+        self.commit(kinds).await
     }
 
     /// Commit facts an interjector produced for a turn that then proceeds.

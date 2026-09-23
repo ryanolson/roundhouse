@@ -49,7 +49,6 @@ fn env(name: &str) -> Option<String> {
 fn a_complete_configuration_is_disabled_unless_it_says_enabled() {
     let config = ClassifyConfig::from_json(COMPLETE, "<test>").expect("a valid file");
     assert!(!config.enabled);
-    assert!(!config.shadow_config().is_enabled());
 
     let on = ClassifyConfig::from_json(
         &COMPLETE.replace("\"revision\": 3,", "\"revision\": 3, \"enabled\": true,"),
@@ -57,7 +56,6 @@ fn a_complete_configuration_is_disabled_unless_it_says_enabled() {
     )
     .expect("a valid file");
     assert!(on.enabled);
-    assert!(on.shadow_config().is_enabled());
 }
 
 /// **A disabled file composes no runtime**, so the code path of a deployment
@@ -95,7 +93,6 @@ fn an_enabled_configuration_with_its_key_composes_a_runtime() {
     .expect("it composes")
     .expect("and it is present");
 
-    assert!(runtime.is_enabled());
     assert_eq!(runtime.limits().max_in_flight, 16);
     assert_eq!(runtime.limits().max_http_concurrency, 4);
     assert_eq!(runtime.projection_caps().max_prior_classifications, 6);

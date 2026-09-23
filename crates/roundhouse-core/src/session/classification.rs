@@ -250,6 +250,18 @@ impl ClassificationFold {
         self.unrepaired.iter()
     }
 
+    /// Whether `call_id`'s settlement is still recorded as unrepaired.
+    ///
+    /// The delivery path uses this to avoid re-appending a
+    /// `ClassificationSettlementRepaired` the log already holds — the same
+    /// duplicate-append guard [`Self::settled`] gives results, extended to
+    /// repairs. O(1) rather than a scan over [`Self::unrepaired`], which
+    /// matters here: this is checked once per parked repair on the path to
+    /// first token, and a scan would cost backlog × batch.
+    pub(crate) fn is_unrepaired(&self, call_id: &ResponseId) -> bool {
+        self.unrepaired.contains(call_id)
+    }
+
     /// Settlements visited during acknowledgement removal, excluding map
     /// lookup comparisons. Test-only; see
     /// [`UnrepairedSettlements`]'s own field doc.

@@ -43,8 +43,8 @@ use roundhouse_core::classify::{
 };
 use roundhouse_core::context::Tokenizer;
 use roundhouse_core::control::{
-    BudgetTerms, BudgetWindow, GrantRequest, Principal, Settlement, SettlementKey, SpendLedger,
-    TurnCredential,
+    BudgetTerms, BudgetWindow, GrantRequest, Principal, Settled, Settlement, SettlementKey,
+    SpendError, SpendLedger, TurnCredential,
 };
 use roundhouse_core::event::Usage;
 use roundhouse_core::ids::{ResponseId, SessionId};
@@ -66,12 +66,15 @@ pub const REQUEST_SCHEMA: &str = "typesafe.systemone.choice.v1";
 
 /// What one deployment decided about turn classification.
 ///
-/// No [`Default`], and `enabled` is private: the only way to get an enabled
-/// config is to name a model, a rate card, a configuration revision and every
-/// cap, and then say so.
+/// No [`Default`]: the only way to get one is to name a model, a rate card, a
+/// configuration revision and every cap. No `enabled` flag either — every
+/// `ShadowConfig` that exists is one a caller chose to build, and the one
+/// production caller ([`crate::classify_config::ClassifyConfig::shadow_config`])
+/// is reached only after `compose` has already refused a file that said
+/// `enabled: false`. A second off-switch here would let a reader wonder
+/// whether some path builds a disabled one; none does.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ShadowConfig {
-    enabled: bool,
     /// The pinned model id. Never defaulted — `jev-latest` re-ranks itself
     /// underneath a deployment that never changed a line.
     pub model: String,
@@ -91,7 +94,6 @@ pub struct ShadowConfig {
 }
 
 impl ShadowConfig {
-    /// Disabled, whatever else is configured.
     pub fn new(
         model: impl Into<String>,
         pricing: ProviderPricing,
@@ -100,23 +102,12 @@ impl ShadowConfig {
         config_revision: u32,
     ) -> Self {
         Self {
-            enabled: false,
             model: model.into(),
             pricing,
             expected_output_tokens,
             caps,
             config_revision,
         }
-    }
-
-    /// Opt in. The one way `enabled` becomes true.
-    pub fn enable(mut self) -> Self {
-        self.enabled = true;
-        self
-    }
-
-    pub fn is_enabled(&self) -> bool {
-        self.enabled
     }
 
     pub fn identity(&self) -> ClassifierIdentity {
@@ -135,8 +126,6 @@ impl ShadowConfig {
 /// nothing to be uncertain about later.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NotRun {
-    /// No deployment opted in. The default.
-    Disabled,
     /// The decision's admitted pool held no frontier target, so this session's
     /// content has no third party it is already permitted to reach.
     /// Conservative on purpose: a local-only session makes zero calls.
@@ -214,10 +203,6 @@ pub struct PreparedCall {
 }
 
 impl PreparedCall {
-    pub fn call_id(&self) -> &ResponseId {
-        &self.intent.call_id
-    }
-
     pub fn expires_at_ms(&self) -> u64 {
         self.intent.expires_at_ms
     }
@@ -318,9 +303,6 @@ impl<T: Tokenizer> TypeSafeShadow<T> {
         projection: &TurnProjection,
         admitted: Option<&[Target]>,
     ) -> Result<PreparedCall, NotRun> {
-        if !self.config.enabled {
-            return Err(NotRun::Disabled);
-        }
         let Some(admitted) = admitted else {
             return Err(NotRun::AdmissionUnknown);
         };
@@ -579,29 +561,27 @@ impl<T: Tokenizer> TypeSafeShadow<T> {
         settlement: &UnconfirmedSettlement,
         deadline: tokio::time::Instant,
     ) -> Option<bool> {
-        let settled = tokio::time::timeout_at(
-            deadline,
-            self.spend.settle_grant(Settlement {
-                principal: principal.clone(),
+        match self
+            .settle_once(
+                principal,
                 // The same key the original settle used, so this *is* that
                 // settle rather than a second one. Under a watermark it would
                 // be dropped as a replay and the drop would look like success.
-                key: SettlementKey::OncePerCall,
-                response_id: settlement.call_id.clone(),
-                actual_usd: settlement.usd,
-                window: settlement.window,
+                &settlement.call_id,
+                settlement.usd,
+                settlement.window,
                 // The operation clock, not the original call's. A settle
                 // applies a realized amount at the moment it is applied, so a
                 // first charge recovered after a window reset lands in the
                 // window that is open now — which is the existing contract and
                 // not a historical bucket this path invents.
-                now_ms: roundhouse_core::now_ms(),
-            }),
-        )
-        .await;
-        match settled {
-            Ok(Ok(settled)) => Some(settled.applied),
-            Ok(Err(error)) => {
+                roundhouse_core::now_ms(),
+                deadline,
+            )
+            .await
+        {
+            Ok(settled) => Some(settled.applied),
+            Err(SettleFailure::Backend(error)) => {
                 tracing::warn!(
                     %error,
                     session_id = %session_id,
@@ -611,7 +591,7 @@ impl<T: Tokenizer> TypeSafeShadow<T> {
                 );
                 None
             }
-            Err(_) => {
+            Err(SettleFailure::TimedOut) => {
                 tracing::warn!(
                     session_id = %session_id,
                     call_id = %settlement.call_id,
@@ -768,26 +748,19 @@ impl<T: Tokenizer> TypeSafeShadow<T> {
         now_ms: u64,
         deadline: tokio::time::Instant,
     ) -> SettlementAck {
-        let settled = tokio::time::timeout_at(
-            deadline,
-            self.spend.settle_grant(Settlement {
-                principal: settle.principal.clone(),
-                // **Not the session's watermark.** Several of these are in
-                // flight under one session and finish in whatever order their
-                // upstreams answer, so a settle keyed by log position would
-                // read the call that finished last but was issued first as a
-                // replay — dropping its charge and stranding its hold.
-                key: SettlementKey::OncePerCall,
-                response_id: settle.call_id.clone(),
+        match self
+            .settle_once(
+                &settle.principal,
+                &settle.call_id,
                 actual_usd,
-                window: settle.window,
+                settle.window,
                 now_ms,
-            }),
-        )
-        .await;
-        match settled {
-            Ok(Ok(_)) => SettlementAck::Committed,
-            Ok(Err(error)) => {
+                deadline,
+            )
+            .await
+        {
+            Ok(_) => SettlementAck::Committed,
+            Err(SettleFailure::Backend(error)) => {
                 tracing::warn!(
                     %error,
                     session_id = %settle.session_id,
@@ -797,7 +770,7 @@ impl<T: Tokenizer> TypeSafeShadow<T> {
                 );
                 SettlementAck::Unconfirmed
             }
-            Err(_) => {
+            Err(SettleFailure::TimedOut) => {
                 tracing::warn!(
                     session_id = %settle.session_id,
                     call_id = %settle.call_id,
@@ -809,6 +782,54 @@ impl<T: Tokenizer> TypeSafeShadow<T> {
             }
         }
     }
+
+    /// The one ledger round trip both settlement paths make, with the answer
+    /// left untranslated: `settle` and `repair_settlement` each warn in their
+    /// own vocabulary and map to their own return type, because a shared log
+    /// line would say "settlement" for a call and a repair alike, and a reader
+    /// grepping for one would find the other.
+    ///
+    /// **Not the session's watermark for `key`.** Several calls are in flight
+    /// under one session and finish in whatever order their upstreams answer,
+    /// so a settle keyed by log position would read the call that finished
+    /// last but was issued first as a replay — dropping its charge and
+    /// stranding its hold. [`SettlementKey::OncePerCall`] is keyed by the call
+    /// itself instead, which is what lets a repair reuse this same key and be
+    /// *that* settle rather than a second one.
+    async fn settle_once(
+        &self,
+        principal: &Principal,
+        call_id: &ResponseId,
+        actual_usd: f64,
+        window: BudgetWindow,
+        now_ms: u64,
+        deadline: tokio::time::Instant,
+    ) -> Result<Settled, SettleFailure> {
+        tokio::time::timeout_at(
+            deadline,
+            self.spend.settle_grant(Settlement {
+                principal: principal.clone(),
+                key: SettlementKey::OncePerCall,
+                response_id: call_id.clone(),
+                actual_usd,
+                window,
+                now_ms,
+            }),
+        )
+        .await
+        .map_err(|_| SettleFailure::TimedOut)?
+        .map_err(SettleFailure::Backend)
+    }
+}
+
+/// Why [`TypeSafeShadow::settle_once`] could not confirm a settlement.
+enum SettleFailure {
+    /// The ledger answered, and refused.
+    Backend(SpendError),
+    /// The call's own deadline passed before the ledger answered at all —
+    /// unknown, not refused: whether the backend applied this settlement is
+    /// exactly the question a later repair exists to resolve.
+    TimedOut,
 }
 
 /// A stable short token for a transport failure.

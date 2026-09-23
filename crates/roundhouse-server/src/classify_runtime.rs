@@ -27,9 +27,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use roundhouse_core::classify::projection::{PromptCapture, TurnProjection};
+use roundhouse_core::classify::projection::PromptCapture;
 use roundhouse_core::classify::{
     AvailableClassification, ClassificationOutcome, ClassificationRecord,
     ClassificationSettlementRepair, FundingRefusal, PriorTurnMetadata, UnconfirmedSettlement,
@@ -65,34 +66,24 @@ pub struct RuntimeLimits {
     pub sweep_interval_ms: u64,
 }
 
+/// Everything about the turn being classified that [`ClassificationRuntime::prepare`]
+/// needs and cannot derive from the projection or the decision.
+///
+/// `call_id` is the caller's to mint rather than the runtime's, because the
+/// two callers want different things from it: the engine generates a fresh
+/// id per external attempt — a settled identity can never settle again, so
+/// reusing the turn's own would collide with its hold — while a test names
+/// one explicitly to assert against later.
+pub struct ClassificationSource {
+    pub principal: Principal,
+    pub session_id: SessionId,
+    pub call_id: ResponseId,
+    pub source_turn_index: u64,
+    pub source_response_id: ResponseId,
+}
+
 /// An admission permit transferred from the caller to its worker and result.
 pub struct Capacity(OwnedSemaphorePermit);
-
-/// A classification that finished and has not been delivered.
-///
-/// **The permit is a field.** That is the whole of "a completed-but-undelivered
-/// result still occupies capacity": the result is reachable through an `Arc`, so
-/// the map and every delivery handle share one permit, and capacity returns only
-/// when the last of them is dropped.
-pub struct CompletedCall {
-    pub record: ClassificationRecord,
-    /// When the sweep may reclaim this, counted from *completion* and not from
-    /// the call's own expiry. See [`ClassificationRuntime::park`].
-    retain_until_ms: u64,
-    _permit: OwnedSemaphorePermit,
-}
-
-impl CompletedCall {
-    /// When this result stops being held for delivery.
-    pub fn retain_until_ms(&self) -> u64 {
-        self.retain_until_ms
-    }
-}
-
-/// A handle on one completed classification.
-///
-/// Cloning it is cheap and — deliberately — does not release anything.
-pub type Delivery = Arc<CompletedCall>;
 
 /// One repair attempt's identity: the session whose log holds the settlement,
 /// and the original call that settlement belongs to.
@@ -123,34 +114,173 @@ impl Drop for RepairClaim {
     }
 }
 
-/// A settlement repair the ledger answered and no turn has committed yet.
-///
-/// **The permit and the claim are both fields**, for the reason
-/// [`CompletedCall`] holds a permit: an acknowledgement nobody has written yet
-/// is outstanding work by the same definition an undelivered result is, so it
-/// occupies `max_in_flight` until it is delivered or swept — and the identity
-/// stays claimed for exactly as long, so the turn that still reads the
-/// settlement as unrepaired in the log does not start a second attempt at a
-/// question that is already answered.
-pub struct CompletedRepair {
-    pub record: ClassificationSettlementRepair,
-    /// When the sweep may reclaim this, counted from the ledger's answer.
-    retain_until_ms: u64,
-    _permit: OwnedSemaphorePermit,
-    _claim: RepairClaim,
+/// What a [`Mailbox`] needs from its record to acknowledge one by identity.
+pub(crate) trait ParkedRecord {
+    fn call_id(&self) -> &ResponseId;
 }
 
-impl CompletedRepair {
-    /// When this acknowledgement stops being held for delivery.
+impl ParkedRecord for ClassificationRecord {
+    fn call_id(&self) -> &ResponseId {
+        &self.call_id
+    }
+}
+
+impl ParkedRecord for ClassificationSettlementRepair {
+    fn call_id(&self) -> &ResponseId {
+        &self.call_id
+    }
+}
+
+/// One piece of background work, complete and held for a turn's writer to
+/// deliver — a classification result or a settlement-repair acknowledgement,
+/// the same shape either way.
+///
+/// **The permit is a field.** That is the whole of "a completed-but-undelivered
+/// record still occupies capacity": the record is reachable through an `Arc`,
+/// so the map and every delivery handle share one permit, and capacity returns
+/// only when the last of them is dropped.
+///
+/// **`_claim` is `Some` only for a repair.** An acknowledgement nobody has
+/// written yet is outstanding work by the same definition an undelivered
+/// result is, so it occupies `max_in_flight` until it is delivered or swept —
+/// and, uniquely to a repair, the settlement's identity stays claimed for
+/// exactly as long, so the turn that still reads it as unrepaired in the log
+/// does not start a second attempt at a question that is already answered. A
+/// result protects no identity from a second attempt: a classification call
+/// is never retried once it has an answer.
+pub struct Parked<R> {
+    pub record: R,
+    /// When the sweep may reclaim this, counted from *completion* (or, for a
+    /// repair, from the ledger's answer) and not from the call's own expiry.
+    /// See [`Mailbox::park`].
+    retain_until_ms: u64,
+    _permit: OwnedSemaphorePermit,
+    _claim: Option<RepairClaim>,
+}
+
+impl<R> Parked<R> {
+    /// When this record stops being held for delivery. No production reader:
+    /// the sweep compares the field directly, and this accessor exists so a
+    /// test can assert the same clock without reaching into the struct.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn retain_until_ms(&self) -> u64 {
         self.retain_until_ms
     }
 }
 
-/// A handle on one answered repair, with [`Delivery`]'s ownership rule: the
-/// permit and the claim live until the last handle drops, so an entry the
-/// sweep evicted while a turn was writing it still bounds admission.
-pub type RepairDelivery = Arc<CompletedRepair>;
+/// A handle on one parked record.
+///
+/// Cloning it is cheap and — deliberately — does not release anything: the
+/// permit and (for a repair) the claim live until the last handle drops, so
+/// an entry the sweep evicted while a turn was writing it still bounds
+/// admission.
+pub type Delivered<R> = Arc<Parked<R>>;
+
+/// Completed background work, held per session until a turn's writer takes
+/// it or the sweep reclaims it.
+///
+/// **One mailbox type for results and for repairs**, in place of two
+/// hand-duplicated maps: append-then-acknowledge, retention from completion,
+/// and eviction-safe permits are one idea, not two. The two instances the
+/// runtime holds ([`ClassificationRuntime::results`] and
+/// [`ClassificationRuntime::repairs`]) differ only in what `R` is and in
+/// whether a park carries a [`RepairClaim`].
+struct Mailbox<R> {
+    parked: Mutex<HashMap<SessionId, Vec<Delivered<R>>>>,
+}
+
+impl<R: ParkedRecord> Mailbox<R> {
+    fn new() -> Self {
+        Self {
+            parked: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Hold a finished record until a turn with a writer takes it.
+    ///
+    /// **Retention is its own clock, starting at `retain_until_ms`.** It used
+    /// to be the call's absolute expiry, and that was a defect the
+    /// hypothesis list named: a call that finished in the last second of its
+    /// life was swept before any turn could drain it, so every
+    /// slow-but-successful classification was thrown away. The call expiry
+    /// bounds *making* the call; this bounds *holding* its answer.
+    async fn park(
+        &self,
+        session_id: SessionId,
+        record: R,
+        retain_until_ms: u64,
+        permit: OwnedSemaphorePermit,
+        claim: Option<RepairClaim>,
+    ) {
+        let entry = Arc::new(Parked {
+            record,
+            retain_until_ms,
+            _permit: permit,
+            _claim: claim,
+        });
+        self.parked
+            .lock()
+            .await
+            .entry(session_id)
+            .or_default()
+            .push(entry);
+    }
+
+    /// What this session has waiting, without giving it up.
+    ///
+    /// **Cloned handles, and the entries stay.** Removing them here would lose
+    /// every record whose append then failed; the caller acknowledges what it
+    /// committed, and the log's own record of a delivered call is what stops a
+    /// re-offer becoming a duplicate.
+    async fn ready(&self, session_id: &SessionId) -> Vec<Delivered<R>> {
+        self.parked
+            .lock()
+            .await
+            .get(session_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Drop what a writer committed.
+    async fn acknowledge(&self, session_id: &SessionId, ids: &[ResponseId]) {
+        if ids.is_empty() {
+            return;
+        }
+        let mut parked = self.parked.lock().await;
+        let Some(waiting) = parked.get_mut(session_id) else {
+            return;
+        };
+        waiting.retain(|entry| !ids.contains(entry.record.call_id()));
+        if waiting.is_empty() {
+            parked.remove(session_id);
+        }
+    }
+
+    /// How many records this session is holding. Reads the length rather
+    /// than taking handles, so a test can watch retention without moving a
+    /// side-effecting counter (like [`ClassificationRuntime::repair_handles_issued`])
+    /// by looking.
+    #[cfg(any(test, feature = "test-support"))]
+    async fn retained(&self, session_id: &SessionId) -> usize {
+        self.parked.lock().await.get(session_id).map_or(0, Vec::len)
+    }
+
+    /// Reclaim records nobody came back for. Returns how many it dropped.
+    async fn sweep(&self, now_ms: u64) -> usize {
+        let mut dropped = 0;
+        self.parked.lock().await.retain(|_, waiting| {
+            let before = waiting.len();
+            waiting.retain(|entry| entry.retain_until_ms > now_ms);
+            dropped += before - waiting.len();
+            !waiting.is_empty()
+        });
+        dropped
+    }
+
+    async fn clear(&self) {
+        self.parked.lock().await.clear();
+    }
+}
 
 /// The background executor, and the policy boundary it drives.
 pub struct ClassificationRuntime<T: Tokenizer> {
@@ -163,20 +293,20 @@ pub struct ClassificationRuntime<T: Tokenizer> {
     limits: RuntimeLimits,
     admission: Arc<Semaphore>,
     http: Arc<Semaphore>,
-    /// Completed results by session, awaiting a turn with a writer.
-    ready: Mutex<HashMap<SessionId, Vec<Delivery>>>,
+    /// Completed classifications by session, awaiting a turn with a writer.
+    results: Mailbox<ClassificationRecord>,
     /// Settlement repairs the ledger has answered, awaiting the same writer.
     ///
-    /// Separate from `ready` only because the two carry different records:
-    /// both hold the admission permit their work was admitted under until a
-    /// turn takes them, so a session with no next turn cannot accumulate
-    /// either beyond `max_in_flight`. Swept on the same retention clock, and
-    /// **dropping one is safe rather than merely cheap**: the log still records
-    /// the settlement as unrepaired, so a later turn re-drives it, the ledger
-    /// deduplicates, and the acknowledgement is written then. What a sweep
-    /// costs is one redundant ledger call, never a second charge and never a
-    /// classifier request.
-    repaired: Mutex<HashMap<SessionId, Vec<RepairDelivery>>>,
+    /// A second [`Mailbox`] rather than a shared one, because the two carry
+    /// different record types: both hold the admission permit their work was
+    /// admitted under until a turn takes them, so a session with no next turn
+    /// cannot accumulate either beyond `max_in_flight`. Swept on the same
+    /// retention clock, and **dropping one is safe rather than merely
+    /// cheap**: the log still records the settlement as unrepaired, so a
+    /// later turn re-drives it, the ledger deduplicates, and the
+    /// acknowledgement is written then. What a sweep costs is one redundant
+    /// ledger call, never a second charge and never a classifier request.
+    repairs: Mailbox<ClassificationSettlementRepair>,
     /// Repair identities some attempt is holding — running, or answered and
     /// not yet committed. See [`RepairClaim`].
     ///
@@ -192,9 +322,9 @@ pub struct ClassificationRuntime<T: Tokenizer> {
     /// that copies retained repair state onto a serving turn, so this is what
     /// a test measures per-turn work against. Counting here rather than timing
     /// it is what keeps that test about the bound instead of about the box.
+    #[cfg(any(test, feature = "test-support"))]
     repair_handles_issued: AtomicUsize,
     workers: Mutex<JoinSet<()>>,
-    stopped: AtomicBool,
     /// Raised once, when this runtime's lifetime ends.
     ///
     /// **A signal a worker selects on, rather than a join.** The only thing
@@ -219,7 +349,6 @@ impl<T: Tokenizer> ClassificationRuntime<T> {
     /// [`ClassificationOutcome::Unfunded`] result would say the opposite — that
     /// this deployment knows the call cost nothing.
     pub fn stop(&self) {
-        self.stopped.store(true, Ordering::SeqCst);
         self.cancel.send_replace(true);
     }
 }
@@ -238,18 +367,19 @@ impl<T: Tokenizer + Send + Sync + 'static> ClassificationRuntime<T> {
             limits,
             admission: Arc::new(Semaphore::new(limits.max_in_flight)),
             http: Arc::new(Semaphore::new(limits.max_http_concurrency)),
-            ready: Mutex::new(HashMap::new()),
-            repaired: Mutex::new(HashMap::new()),
+            results: Mailbox::new(),
+            repairs: Mailbox::new(),
             repair_claims: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            #[cfg(any(test, feature = "test-support"))]
             repair_handles_issued: AtomicUsize::new(0),
             workers: Mutex::new(JoinSet::new()),
-            stopped: AtomicBool::new(false),
             // The receiver is taken per worker through `subscribe`, so the one
             // the channel hands back here has nobody to read it.
             cancel: tokio::sync::watch::channel(false).0,
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn limits(&self) -> RuntimeLimits {
         self.limits
     }
@@ -258,10 +388,6 @@ impl<T: Tokenizer + Send + Sync + 'static> ClassificationRuntime<T> {
     /// capture at the moment it holds the items rather than afterwards.
     pub fn projection_caps(&self) -> roundhouse_core::classify::ProjectionCaps {
         self.shadow.config().caps
-    }
-
-    pub fn is_enabled(&self) -> bool {
-        self.shadow.config().is_enabled()
     }
 
     /// Room for one more, or nothing. **Never blocks.**
@@ -273,7 +399,7 @@ impl<T: Tokenizer + Send + Sync + 'static> ClassificationRuntime<T> {
     /// asked for first and carried to [`Self::spawn`] rather than taken again
     /// once the payload exists.
     pub fn capacity(&self) -> Option<Capacity> {
-        if self.stopped.load(Ordering::SeqCst) {
+        if *self.cancel.borrow() {
             return None;
         }
         Arc::clone(&self.admission)
@@ -282,49 +408,45 @@ impl<T: Tokenizer + Send + Sync + 'static> ClassificationRuntime<T> {
             .map(Capacity)
     }
 
-    /// Permits available right now. For tests and for an operator's gauge.
+    /// Permits available right now. No production caller: an operator's gauge
+    /// would read this, but none is wired up yet, and the only readers today
+    /// are tests asserting a permit was taken or given back.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn available_capacity(&self) -> usize {
         self.admission.available_permits()
     }
 
-    /// The bounded projection, or why this turn cannot be classified.
-    pub fn projection(
+    /// Render the bounded projection and prepare the request over it, or
+    /// answer why this turn cannot be classified.
+    ///
+    /// **One call rather than two.** `projection` and `prepare` used to be
+    /// separate pass-throughs to [`TypeSafeShadow`], and the engine's only
+    /// caller always ran them back to back — the projection has no other use
+    /// than feeding straight into `prepare`, so the seam bought nothing but a
+    /// second place for the ordering to be gotten wrong.
+    pub fn prepare(
         &self,
+        source: ClassificationSource,
         capture: &PromptCapture,
         prior: &[AvailableClassification],
         local: &[PriorTurnMetadata],
-    ) -> Result<TurnProjection, NotRun> {
-        self.shadow.projection(capture, prior, local)
-    }
-
-    /// Prepare a request and its quote without ledger or HTTP I/O.
-    /// The caller records the intent before the worker obtains a budget hold,
-    /// so evaluation-ledger latency stays off the serving path.
-    #[allow(clippy::too_many_arguments)]
-    pub fn prepare(
-        &self,
-        principal: Principal,
-        session_id: SessionId,
-        call_id: ResponseId,
-        source_turn_index: u64,
-        source_response_id: ResponseId,
-        projection: &TurnProjection,
         admitted: Option<&[Target]>,
         now_ms: u64,
     ) -> Result<PreparedCall, NotRun> {
+        let projection = self.shadow.projection(capture, prior, local)?;
         self.shadow.prepare(
             ShadowCall {
-                principal,
-                session_id,
-                call_id,
-                source_turn_index,
-                source_response_id,
+                principal: source.principal,
+                session_id: source.session_id,
+                call_id: source.call_id,
+                source_turn_index: source.source_turn_index,
+                source_response_id: source.source_response_id,
                 terms: self.terms.clone(),
                 credential: &self.credential,
                 now_ms,
                 expires_at_ms: now_ms.saturating_add(self.limits.call_ttl_ms),
             },
-            projection,
+            &projection,
             admitted,
         )
     }
@@ -347,26 +469,12 @@ impl<T: Tokenizer + Send + Sync + 'static> ClassificationRuntime<T> {
         session_id: SessionId,
         call: PreparedCall,
     ) {
-        if self.stopped.load(Ordering::SeqCst) {
+        if *self.cancel.borrow() {
             return;
         }
         let runtime = Arc::clone(self);
-        // Subscribed here rather than inside the task, so a `stop` landing
-        // between this line and the task's first poll is still seen: `wait_for`
-        // answers on the value the receiver already holds and not only on a
-        // later change.
-        let mut cancelled = self.cancel.subscribe();
-        self.workers.lock().await.spawn(async move {
-            tokio::select! {
-                // The cancel arm first, so a worker that starts after the
-                // lifetime ended does no work before it sees that.
-                biased;
-                _ = cancelled.wait_for(|stopped| *stopped) => {}
-                // Dropped when the arm above wins, which is what hands the
-                // admission permit back: it is owned by this future.
-                () = runtime.run(capacity, session_id, call) => {}
-            }
-        });
+        self.spawn_cancellable(async move { runtime.run(capacity, session_id, call).await })
+            .await;
     }
 
     /// The worker body. Holds no session lease and opens no writer.
@@ -384,8 +492,7 @@ impl<T: Tokenizer + Send + Sync + 'static> ClassificationRuntime<T> {
         // an uncontended permit — the ordinary case — resolves immediately and a
         // call whose life had already run out would be sent anyway. The timeout
         // bounds the *wait*; this bounds the call.
-        let expired =
-            roundhouse_core::now_ms() >= expires_at_ms || self.stopped.load(Ordering::SeqCst);
+        let expired = roundhouse_core::now_ms() >= expires_at_ms || *self.cancel.borrow();
         let Ok(Ok(_http)) = http else {
             self.park_unfunded(session_id, call, FundingRefusal::Expired, capacity)
                 .await;
@@ -443,19 +550,45 @@ impl<T: Tokenizer + Send + Sync + 'static> ClassificationRuntime<T> {
         principal: Principal,
         settlement: UnconfirmedSettlement,
     ) {
-        if self.stopped.load(Ordering::SeqCst) {
+        if *self.cancel.borrow() {
             return;
         }
         let Some(claim) = self.claim_repair(&session_id, &settlement.call_id) else {
             return;
         };
         let runtime = Arc::clone(self);
+        self.spawn_cancellable(async move {
+            runtime
+                .run_repair(capacity, claim, session_id, principal, settlement)
+                .await
+        })
+        .await;
+    }
+
+    /// Spawn `work` on the executor, cancelled the instant this runtime's
+    /// lifetime ends.
+    ///
+    /// **The `subscribe` + `select!` pattern, owned once.** [`Self::spawn`]
+    /// and [`Self::repair`] each used to repeat it, and a copy that drifted
+    /// would be a worker that either raced its own cancellation check or
+    /// missed it. Subscribed here, before the task exists, so a `stop`
+    /// landing between this call and the task's first poll is still seen:
+    /// `wait_for` answers on the value the receiver already holds and not
+    /// only on a later change.
+    async fn spawn_cancellable(
+        self: &Arc<Self>,
+        work: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
         let mut cancelled = self.cancel.subscribe();
         self.workers.lock().await.spawn(async move {
             tokio::select! {
+                // The cancel arm first, so a worker that starts after the
+                // lifetime ended does no work before it sees that.
                 biased;
                 _ = cancelled.wait_for(|stopped| *stopped) => {}
-                () = runtime.run_repair(capacity, claim, session_id, principal, settlement) => {}
+                // Dropped when the arm above wins, which is what hands the
+                // admission permit back: it is owned by this future.
+                () = work => {}
             }
         });
     }
@@ -514,39 +647,24 @@ impl<T: Tokenizer + Send + Sync + 'static> ClassificationRuntime<T> {
         // it occupies admission, and the settlement it answers still reads as
         // unrepaired in the log until then, so its identity stays claimed.
         let now_ms = roundhouse_core::now_ms();
-        let answered = Arc::new(CompletedRepair {
-            record: ClassificationSettlementRepair {
-                call_id: settlement.call_id,
-                applied,
-                repaired_at_ms: now_ms,
-            },
-            retain_until_ms: now_ms.saturating_add(self.limits.result_retention_ms),
-            _permit: capacity.0,
-            _claim: claim,
-        });
-        self.repaired
-            .lock()
-            .await
-            .entry(session_id)
-            .or_default()
-            .push(answered);
+        let record = ClassificationSettlementRepair {
+            call_id: settlement.call_id,
+            applied,
+            repaired_at_ms: now_ms,
+        };
+        let retain_until_ms = now_ms.saturating_add(self.limits.result_retention_ms);
+        self.repairs
+            .park(session_id, record, retain_until_ms, capacity.0, Some(claim))
+            .await;
     }
 
     /// Repair acknowledgements this session has waiting, without giving them up.
-    ///
-    /// Handles, and the entries stay — the same append-then-acknowledge rule
-    /// [`Self::ready`] is under, for the same reason: an acknowledgement whose
-    /// append failed must survive to be written by a later turn. A handle a
-    /// turn is still holding keeps its permit and its claim even if the sweep
-    /// evicts the map entry underneath it.
-    pub async fn ready_repairs(&self, session_id: &SessionId) -> Vec<RepairDelivery> {
-        let waiting: Vec<RepairDelivery> = self
-            .repaired
-            .lock()
-            .await
-            .get(session_id)
-            .cloned()
-            .unwrap_or_default();
+    pub async fn ready_repairs(
+        &self,
+        session_id: &SessionId,
+    ) -> Vec<Delivered<ClassificationSettlementRepair>> {
+        let waiting = self.repairs.ready(session_id).await;
+        #[cfg(any(test, feature = "test-support"))]
         self.repair_handles_issued
             .fetch_add(waiting.len(), Ordering::Relaxed);
         waiting
@@ -556,15 +674,13 @@ impl<T: Tokenizer + Send + Sync + 'static> ClassificationRuntime<T> {
     ///
     /// Reads the length rather than taking handles, so a test can watch
     /// retention without moving [`Self::repair_handles_issued`] by looking.
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn retained_repairs(&self, session_id: &SessionId) -> usize {
-        self.repaired
-            .lock()
-            .await
-            .get(session_id)
-            .map_or(0, Vec::len)
+        self.repairs.retained(session_id).await
     }
 
     /// Retained acknowledgements handed to a turn since this runtime started.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn repair_handles_issued(&self) -> usize {
         self.repair_handles_issued.load(Ordering::Relaxed)
     }
@@ -587,17 +703,7 @@ impl<T: Tokenizer + Send + Sync + 'static> ClassificationRuntime<T> {
     /// Drop the repair acknowledgements a writer committed, releasing the
     /// permit and the identity claim each was holding.
     pub async fn acknowledge_repairs(&self, session_id: &SessionId, written: &[ResponseId]) {
-        if written.is_empty() {
-            return;
-        }
-        let mut repaired = self.repaired.lock().await;
-        let Some(waiting) = repaired.get_mut(session_id) else {
-            return;
-        };
-        waiting.retain(|answered| !written.contains(&answered.record.call_id));
-        if waiting.is_empty() {
-            repaired.remove(session_id);
-        }
+        self.repairs.acknowledge(session_id, written).await;
     }
 
     /// Record that a call expired before anything was sent.
@@ -632,86 +738,36 @@ impl<T: Tokenizer + Send + Sync + 'static> ClassificationRuntime<T> {
     }
 
     /// Hold a finished result until a turn with a writer takes it.
-    /// **Retention is its own clock, starting now.** It was the call's absolute
-    /// expiry, and that was a defect the hypothesis list named: a call that
-    /// finished in the last second of its life was swept before any turn could
-    /// drain it, so every slow-but-successful classification was thrown away.
-    /// The call expiry bounds *making* the call; this bounds *holding* its
-    /// answer.
     async fn park(&self, session_id: SessionId, record: ClassificationRecord, capacity: Capacity) {
-        let completed = Arc::new(CompletedCall {
-            record,
-            retain_until_ms: roundhouse_core::now_ms()
-                .saturating_add(self.limits.result_retention_ms),
-            _permit: capacity.0,
-        });
-        self.ready
-            .lock()
-            .await
-            .entry(session_id)
-            .or_default()
-            .push(completed);
+        let retain_until_ms =
+            roundhouse_core::now_ms().saturating_add(self.limits.result_retention_ms);
+        self.results
+            .park(session_id, record, retain_until_ms, capacity.0, None)
+            .await;
     }
 
     /// What this session has waiting, without giving it up.
-    ///
-    /// **Cloned handles, and the entries stay.** Removing them here would lose
-    /// every result whose append then failed; the caller acknowledges what it
-    /// committed, and the log's own record of a delivered call is what stops a
-    /// re-offer becoming a duplicate.
-    pub async fn ready(&self, session_id: &SessionId) -> Vec<Delivery> {
-        self.ready
-            .lock()
-            .await
-            .get(session_id)
-            .cloned()
-            .unwrap_or_default()
+    pub async fn ready(&self, session_id: &SessionId) -> Vec<Delivered<ClassificationRecord>> {
+        self.results.ready(session_id).await
     }
 
     /// Drop what a writer committed.
     pub async fn acknowledge(&self, session_id: &SessionId, delivered: &[ResponseId]) {
-        if delivered.is_empty() {
-            return;
-        }
-        let mut ready = self.ready.lock().await;
-        let Some(waiting) = ready.get_mut(session_id) else {
-            return;
-        };
-        waiting.retain(|completed| !delivered.contains(&completed.record.call_id));
-        if waiting.is_empty() {
-            ready.remove(session_id);
-        }
+        self.results.acknowledge(session_id, delivered).await;
     }
 
-    /// Reclaim results nobody came back for, and join finished workers.
+    /// Reclaim results and repair acknowledgements nobody came back for, and
+    /// join finished workers.
     ///
-    /// Returns how many results it dropped, so a test can assert that an idle
-    /// session is reclaimed without reaching into the map.
+    /// Returns how many *results* it dropped, so a test can assert that an
+    /// idle session is reclaimed without reaching into the map. A dropped
+    /// repair acknowledgement is not counted in that: losing one costs a
+    /// redundant deduplicated ledger call on a later turn and nothing else,
+    /// while losing a result loses an answer that was paid for — the two are
+    /// not the same kind of loss, so they are not the same number.
     pub async fn sweep(&self, now_ms: u64) -> usize {
-        let mut dropped = 0;
-        {
-            let mut ready = self.ready.lock().await;
-            ready.retain(|_, waiting| {
-                let before = waiting.len();
-                waiting.retain(|completed| completed.retain_until_ms > now_ms);
-                dropped += before - waiting.len();
-                !waiting.is_empty()
-            });
-        }
-        {
-            // Repair acknowledgements nobody came back for. Not counted in
-            // `dropped`, which is about results: losing one of these costs a
-            // redundant deduplicated ledger call on a later turn and nothing
-            // else, while losing a result loses an answer that was paid for.
-            // Evicting one returns its permit and frees its identity for a
-            // later turn to drive again — unless a turn is holding a handle,
-            // which keeps both until it is done writing.
-            let mut repaired = self.repaired.lock().await;
-            repaired.retain(|_, waiting| {
-                waiting.retain(|answered| answered.retain_until_ms > now_ms);
-                !waiting.is_empty()
-            });
-        }
+        let dropped = self.results.sweep(now_ms).await;
+        self.repairs.sweep(now_ms).await;
         // A bounded result map over an unbounded `JoinSet` is not bounded.
         let mut workers = self.workers.lock().await;
         while workers.try_join_next().is_some() {}
@@ -731,11 +787,11 @@ impl<T: Tokenizer + Send + Sync + 'static> ClassificationRuntime<T> {
     pub async fn shutdown(&self) {
         self.stop();
         self.workers.lock().await.shutdown().await;
-        self.ready.lock().await.clear();
+        self.results.clear().await;
         // Safe to drop for the reason the sweep may drop them: the log still
         // says these settlements are unrepaired, so the next process re-drives
         // them and the ledger deduplicates.
-        self.repaired.lock().await.clear();
+        self.repairs.clear().await;
     }
 
     /// Start the supervisor that sweeps and reaps on its own clock, and take

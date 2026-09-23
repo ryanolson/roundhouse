@@ -31,7 +31,7 @@ async fn the_sent_state_carries_the_prompt_and_nothing_the_ruling_excludes() {
     let (addr, up) = upstream(ANSWER).await;
     let ledger = RecordingLedger::granting(1_000.0);
     let credential = credential();
-    let shadow = shadow(addr, config().enable(), ledger);
+    let shadow = shadow(addr, config(), ledger);
 
     let input = vec![
         Item::system_text("You are working in /srv/secret-project with credentials in .env."),
@@ -69,7 +69,7 @@ async fn a_tool_continuation_is_stated_on_the_wire() {
     let (addr, up) = upstream(ANSWER).await;
     let ledger = RecordingLedger::granting(1_000.0);
     let credential = credential();
-    let shadow = shadow(addr, config().enable(), ledger);
+    let shadow = shadow(addr, config(), ledger);
 
     let input = vec![tool_result("call_1", "3 tests passed")];
     let projection = shadow
@@ -106,8 +106,7 @@ async fn an_oversized_projection_makes_no_call_and_takes_no_hold() {
             max_total_bytes: 200,
         },
         CONFIG_REVISION,
-    )
-    .enable();
+    );
     let shadow = shadow(addr, tight, ledger.clone());
 
     let input = vec![Item::user_text("x".repeat(4_000))];
@@ -146,8 +145,7 @@ async fn a_body_over_the_transport_bound_is_refused_before_the_hold() {
             max_total_bytes: 64 * 1024,
         },
         CONFIG_REVISION,
-    )
-    .enable();
+    );
     let client = SystemOneClient::new(
         format!("http://{addr}"),
         SystemOneLimits {
@@ -194,7 +192,7 @@ async fn prior_classifications_reach_the_service_as_metadata() {
     let (addr, up) = upstream(ANSWER).await;
     let ledger = RecordingLedger::granting(1_000.0);
     let credential = credential();
-    let shadow = shadow(addr, config().enable(), ledger);
+    let shadow = shadow(addr, config(), ledger);
 
     let prior = vec![AvailableClassification {
         reference: ClassificationRef {

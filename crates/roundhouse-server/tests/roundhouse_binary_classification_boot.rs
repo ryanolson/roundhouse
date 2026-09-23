@@ -224,6 +224,76 @@ fn strip_ansi(line: &str) -> String {
     out
 }
 
+/// A stream's lines, collected live by a reader thread as the child writes
+/// them, so a caller can inspect what has arrived so far without waiting for
+/// the process to exit.
+type CollectedLines = Arc<Mutex<Vec<String>>>;
+
+/// Spawn the real binary as [`spawn_roundhouse`] does, but also capture
+/// stderr: the `#[tokio::main]` termination handler prints a boot `Err`'s
+/// `Debug` there, while `tracing_subscriber::fmt()` prints every log line —
+/// including "roundhouse listening" — to stdout. server-6's claim is about
+/// the *order* of those two streams' content, so a test for it needs both.
+fn spawn_roundhouse_capturing_both(
+    vars: &[(&str, &str)],
+) -> (ChildGuard, CollectedLines, CollectedLines) {
+    let bin = env!("CARGO_BIN_EXE_roundhouse");
+    let mut command = Command::new(bin);
+    command.env_clear();
+    command.env("RUST_LOG", "info");
+    command.env("ROUNDHOUSE_ADDR", "127.0.0.1:0");
+    command.env("PATH", "/usr/bin:/bin");
+    for (name, value) in vars {
+        command.env(name, value);
+    }
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    let mut child = command.spawn().expect("the built roundhouse binary spawns");
+    let stdout: ChildStdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+
+    let stdout_lines = Arc::new(Mutex::new(Vec::new()));
+    let collected = Arc::clone(&stdout_lines);
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            collected.lock().unwrap().push(strip_ansi(&line));
+        }
+    });
+    let stderr_lines = Arc::new(Mutex::new(Vec::new()));
+    let collected = Arc::clone(&stderr_lines);
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            collected.lock().unwrap().push(strip_ansi(&line));
+        }
+    });
+    (ChildGuard(child), stdout_lines, stderr_lines)
+}
+
+/// Bounded: a binary that serves instead of refusing to boot is killed rather
+/// than hung on, which turns "the fix regressed and the child now runs
+/// forever" into a timeout with a clear message instead of a stalled suite.
+fn wait_for_exit(guard: &mut ChildGuard, timeout: Duration) -> std::process::ExitStatus {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = guard
+            .0
+            .try_wait()
+            .expect("polling the child's status does not itself error")
+        {
+            return status;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "the roundhouse binary did not exit within {timeout:?}; an enabled \
+                 classifier with no credential should refuse to boot rather than serve"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// Wait for the "roundhouse listening" line and parse the address it names.
 ///
 /// Bounded: a binary that never becomes ready fails the test with whatever it
@@ -619,6 +689,66 @@ fn disabled_configuration_makes_no_call_and_reads_no_credential() {
     assert!(intents(&events).is_empty());
     assert!(results(&events).is_empty());
     assert_eq!(classifier.count(), 0);
+
+    drop(guard);
+}
+
+/// **server-6: an enabled classifier with no credential must refuse to boot
+/// before the process ever announces it is listening.**
+///
+/// `compose` has refused a credential-less enabled file since M14.1; what
+/// this proves is *when* the process learns that, relative to opening its
+/// listening socket and telling an operator it did. Composing inside `serve`,
+/// after the bind, meant "roundhouse listening" — the line an operator or a
+/// supervisor greps for to know traffic can be sent — could appear before the
+/// boot refusal that immediately follows it, the same shape every other boot
+/// check in `main` (the catalog, the control plane, the directory) avoids by
+/// running ahead of the bind.
+#[test]
+fn an_enabled_classifier_with_no_credential_refuses_to_boot_before_listening() {
+    let classifier = ClassifierDouble::start();
+    let dir = scratch("missing-credential");
+    // A reachable base URL, deliberately never contacted: the refusal this
+    // test is about happens before any HTTP client for it is even built.
+    let config_path = write_classify_config(&dir, &format!("http://{}", classifier.addr), true);
+
+    // AUTH_ENV_NAME is enabled-classifier's own credential variable, and it
+    // is not in this list: env_clear() plus an omission is what makes it
+    // genuinely absent from the child's environment.
+    let (mut guard, stdout, stderr) = spawn_roundhouse_capturing_both(&[(
+        "ROUNDHOUSE_CLASSIFY_CONFIG",
+        config_path.to_str().expect("a utf-8 path"),
+    )]);
+
+    let status = wait_for_exit(&mut guard, Duration::from_secs(10));
+
+    assert!(
+        !status.success(),
+        "a refused boot must exit non-zero, not zero: {status:?}"
+    );
+    let stdout = stdout.lock().unwrap();
+    let stderr = stderr.lock().unwrap();
+    assert!(
+        !stdout
+            .iter()
+            .any(|line| line.contains("roundhouse listening")),
+        "the process must never announce it is listening when it is about to \
+         refuse to boot; stdout:\n{}",
+        stdout.join("\n")
+    );
+    assert!(
+        stderr.iter().any(|line| line.contains(AUTH_ENV_NAME)),
+        "the refusal must name the missing credential variable, so a boot \
+         failure for an unrelated reason cannot pass this test by accident; \
+         stderr:\n{}",
+        stderr.join("\n")
+    );
+
+    assert_eq!(
+        classifier.count(),
+        0,
+        "never reached, since it never composed"
+    );
 
     drop(guard);
 }

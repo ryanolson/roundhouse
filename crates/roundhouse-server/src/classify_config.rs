@@ -295,19 +295,21 @@ impl ClassifyConfig {
         }
     }
 
-    /// The adapter's configuration, opted in only if this file said so.
+    /// The adapter's configuration.
+    ///
+    /// Called only from [`crate::classify_runtime::compose`], and only after it
+    /// has already refused a file that said `enabled: false` — so every
+    /// `ShadowConfig` this builds is for a deployment that opted in. `enabled`
+    /// gates whether this method is reached at all; `ShadowConfig` itself has
+    /// no second copy of that switch to fall out of step with this one.
     pub fn shadow_config(&self) -> ShadowConfig {
-        let config = ShadowConfig::new(
+        ShadowConfig::new(
             self.model.trim(),
             self.pricing(),
             self.expected_output_tokens,
             self.caps(),
             self.revision,
-        );
-        match self.enabled {
-            true => config.enable(),
-            false => config,
-        }
+        )
     }
 
     /// The ceiling every evaluation call is held against.

@@ -26,8 +26,6 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::StreamExt;
-use roundhouse_core::classify::ClassificationWindow;
-use roundhouse_core::classify::projection::{PROJECTION_REVISION, PromptCapture};
 use roundhouse_core::context::{ContextAssembler, Tokenizer};
 use roundhouse_core::control::{
     Billing, CredentialError, FairUseError, FairUseLedger, MemoryFairUseLedger, MemorySpendLedger,
@@ -43,14 +41,12 @@ use roundhouse_core::metrics::MetricsRecorder;
 use roundhouse_core::now_ms;
 use roundhouse_core::routing::{
     AttemptClass, CacheLedger, Candidate, Decision, DecisionRecord, DecisionSource,
-    DispatchAttempt, FEATURE_EXTRACTOR_REVISION, LocalFeatures, LocalQuoteSkip, RoutingContext,
-    RoutingError, RoutingPolicy, SelectionSnapshot, Target, Tier, TierRecipe, TurnSignals,
+    DispatchAttempt, RoutingContext, RoutingError, RoutingPolicy, SelectionSnapshot, Target, Tier,
+    TierRecipe,
 };
 use roundhouse_core::session::{Session, SessionError, SessionState, TurnAdmission};
 use roundhouse_core::store::SessionStore;
-use roundhouse_core::validate::{
-    ControlCallDialect, Objective, ObjectiveVersion, SideCall, exchanges,
-};
+use roundhouse_core::validate::{ControlCallDialect, SideCall};
 use roundhouse_fleet::{
     FleetError, FleetQuery, FrontierChunk, FrontierClient, FrontierClients, FrontierError,
     FrontierQuote, FrontierStream, LocalFleet, LocalQuote, StaticFrontierCatalog, WireProtocol,
@@ -65,7 +61,10 @@ use crate::control_config::Admission;
 mod classification;
 mod control;
 mod fair_use;
+mod selection;
 pub(crate) mod spend;
+
+use selection::{SelectionInputs, local_quote_plan};
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -910,7 +909,12 @@ pub struct Engine<S: SessionStore, T: Tokenizer + Clone> {
     ///
     /// The engine owns both ends of it: this turn's writer drains whatever
     /// finished since the last one, and — once the turn has terminated — records
-    /// the intent to classify it. Nothing here is on the path to first token.
+    /// the intent to classify it. The drain is on the path to first token, but
+    /// costs at most one store round trip whatever it finds — see
+    /// [`Engine::deliver_classifier_output`], which batches every result and
+    /// repair a turn drains into one commit rather than paying for each
+    /// separately. Recording the intent to classify is not: it runs after
+    /// the terminal event, ahead of the lease being handed back.
     classifier: Option<Arc<ClassificationRuntime<T>>>,
 }
 
@@ -1187,43 +1191,13 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
                 .await?;
         }
 
-        // **Classification results land before this turn's input does**, and the
-        // ordering is the whole of "a late result joins the features of a
-        // *later* turn". Appending here puts every delivered result at a
-        // sequence below the cutoff `plan` is about to capture, so this turn can
-        // name them; a drain after the turn's own decision could not be named by
-        // it and would have to wait for the next one anyway.
-        //
-        // Before `begin_turn` also means a deduplicated turn still drains: the
-        // client's retry is not a reason to strand a result the runtime is
-        // holding capacity for.
-        self.deliver_classifications(&mut session).await;
-
-        // The repair's durable half, beside the delivery it mirrors and for the
-        // same reason: this is the writer, and a background worker must not
-        // open one of its own. What it commits is only an acknowledgement — the
-        // money moved when the worker's settle returned, which was on the
-        // executor and not here.
-        self.deliver_settlement_repairs(&mut session).await;
-
-        // What may be said about this turn, taken from the client's own items
-        // while they are still a separate thing. The committed log is one flat
-        // list, and reconstructing "what arrived on this turn" out of it
-        // afterwards would be a second answer to a question we hold right here.
-        // `None` on every deployment that configured no classifier, which is the
-        // shipped state and costs one `Option` check.
-        //
-        // Acquire capacity before copying the prompt so unavailable classification
-        // adds no payload allocation. The permit covers the serving turn, worker,
-        // and retained result. Early returns release it through drop.
-        // Long serving turns therefore occupy classification capacity too.
-        let classification = self.classifier.as_ref().and_then(|classifier| {
-            let capacity = classifier.capacity()?;
-            Some((
-                capacity,
-                PromptCapture::of(&input, &classifier.projection_caps()),
-            ))
-        });
+        // **Classification results land before this turn's input does**, and
+        // this turn's own capacity is taken before `input` is moved into
+        // `begin_turn` below — see `Engine::classification_before_turn` for
+        // both reasons in full. A deduplicated turn still drains both halves,
+        // and still takes and drops its own capacity: the client's retry is
+        // not a reason to strand output the runtime is holding capacity for.
+        let classification = self.classification_before_turn(&mut session, &input).await;
 
         // `started`, not `admission`: the caller's [`Admission`] is who may
         // spend and on what, and this one is whether the log accepted the turn
@@ -1514,35 +1488,22 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
         // **The turn is over, and this is where the next turn's features are
         // bought.** After the terminal event, so nothing here can delay an
         // answer; before the lease is handed back, so the durable intent is
-        // written by the writer that already holds it.
-        //
-        // Only a turn that *dispatched* is classified, and the decision comes
-        // from this turn's own `Completed` rather than from the fold. A steered
-        // turn writes no `Routed`, so reading `last_decision()` here would hand
-        // it the previous turn's admitted pool and fabricate egress permission
-        // out of a decision that was never taken.
-        if let Ok((_, _, Some(decision))) = &settled
-            && let Some((capacity, capture)) = classification
-        {
-            self.request_classification(
-                &mut session,
-                &response_id,
-                admission,
-                decision,
-                capacity,
-                &capture,
-            )
-            .await;
-        }
-
-        // **Here rather than beside the delivery above, and that is the
-        // "off the serving path" rule.** Spawning costs a semaphore try and a
-        // task; the ledger round trip it starts belongs to the executor. But
-        // the ordering still matters: started after the terminal event, a
-        // repair cannot delay an answer even if the spawn itself were to
-        // become expensive. Unconditional, unlike the classification above — a
-        // turn that steered or failed still owes the ledger the same money.
-        self.repair_classification_settlements(&session).await;
+        // written by the writer that already holds it. See
+        // `Engine::classification_after_turn` for why the request is
+        // conditional on this turn's own decision and the repair scheduling
+        // beside it is not.
+        let settled_decision = match &settled {
+            Ok((_, _, Some(decision))) => Some(decision),
+            _ => None,
+        };
+        self.classification_after_turn(
+            &mut session,
+            &response_id,
+            admission,
+            classification,
+            settled_decision,
+        )
+        .await;
 
         // Money after the log, always: the settle is priced from the terminal
         // event's own usage, so it cannot run until that event exists, and a
@@ -2134,76 +2095,21 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
             ) as usize;
         let turn_index = session.turn_index().saturating_sub(1);
 
-        // Compute once from committed input and retain the values in the route
-        // record. Later turns can use a changed extractor without rewriting this
-        // turn's evidence. No model call is required.
-        let dialect = ControlCallDialect::of_session_key(session.session_id().as_str());
-        let signals = TurnSignals::from_exchanges(&exchanges(&session.state().items), dialect);
-
-        // Capture the cutoff with the features. Recomputing it during failover
-        // would include the preceding dispatch in a later attempt's snapshot.
-        let features = LocalFeatures {
-            extractor_revision: FEATURE_EXTRACTOR_REVISION,
-            dialect,
-            signals: signals.clone(),
-            turn_index,
-            observed_through_seq: session.last_seq(),
-        };
-        // The objective this turn is decided under, read the way the
-        // validator's brief reads it, so a later review can show that it
-        // applied. An undeclared objective stamps as undeclared without copying
-        // the request that stands in for it.
-        let objective = ObjectiveVersion::of(
-            &self
-                .declared_objective(session.session_id())
-                .unwrap_or(Objective::Unknown),
-        );
-        // Which background classifications this decision can see, named at the
-        // same cutoff the features were taken at. A result that lands while this
-        // turn is in flight has a higher sequence and is therefore absent here —
-        // which is the no-backdating rule expressed as a filter rather than as a
-        // convention somebody has to remember.
-        //
-        // **Bounded to the window a projection would actually carry.** Naming
-        // every classification a session ever produced on every `Routed` makes
-        // the log grow with the square of the turn count; the window records how
-        // many were available beyond the ones it names, so what it leaves out is
-        // a number rather than a silence.
-        let classifications = self.classifier.as_ref().map(|classifier| {
-            ClassificationWindow::of(
-                PROJECTION_REVISION,
-                features.observed_through_seq,
-                classifier.projection_caps().max_prior_classifications,
-                session
-                    .state()
-                    .classifications_through(features.observed_through_seq),
-            )
-        });
+        // What may be said about this turn, and the objective and
+        // classification window it is decided under — see
+        // `Engine::selection_inputs`. None of it depends on a candidate, a
+        // quote or a dispatch.
+        let SelectionInputs {
+            features,
+            objective,
+            classifications,
+        } = self.selection_inputs(session, turn_index);
 
         // --- price every option -------------------------------------------
         //
-        // **The local quote is a decision, not a lookup** (C3). `price` sends
-        // this turn's block and sequence hashes to the selector and waits for
-        // what it is still holding, which makes it an HTTP round-trip on the
-        // path to first token — and Dynamo can hold a KV cache for longer than
-        // any frontier TTL, so the answer is worth having whenever it can move
-        // the route. It is worth nothing when it cannot: a coding agent
-        // declares a toolbox on nearly every turn, the exclusion below drops
-        // every local candidate on exactly those turns, and a selector that is
-        // down was failing turns that were always going to a hosted model.
-        //
-        // `None` here is two different states — no fleet to ask, and a fleet
-        // deliberately not asked — so only the second is recorded; see
-        // [`DecisionRecord::local_quote_skipped`].
-        let local_quote_skipped = self.fleet.as_ref().and_then(|_| {
-            local_quote_can_matter(
-                declarations.declares_tools(),
-                &admission.policy,
-                &Target::local_policy_identity(&self.config.local_model),
-                self.config.local_quality_prior,
-            )
-            .err()
-        });
+        // See `Engine::local_quote_skip` for why an HTTP round trip is worth
+        // making or is not.
+        let local_quote_skipped = self.local_quote_skip(declarations, admission);
         let local_quote = match (&self.fleet, &local_quote_skipped) {
             (Some(fleet), None) => {
                 self.bounded(
@@ -2270,15 +2176,11 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
             }
             false => 0,
         };
-        // **A tool turn now loses its local options in one of two places**: the
-        // retain above, or (C3) the quote that was never made because the
-        // answer was always going to be discarded here. Downstream nothing can
-        // tell the difference and nothing should — the audit note, the
-        // empty-pool refusal and the exhausted-budget restatement all state the
-        // same fact — so the two spellings are folded into one answer once,
-        // rather than three sites each learning that a skip exists.
-        let local_withheld_by_tools =
-            excluded_local > 0 || local_quote_skipped == Some(LocalQuoteSkip::ToolsDeclared);
+        // See `LocalQuotePlan::withheld_by_tools`: the retain above and the
+        // quote that was never made are the same fact from two sources, and
+        // this is where both are finally known together.
+        let quote_plan = local_quote_plan(local_quote_skipped, excluded_local);
+        let local_withheld_by_tools = quote_plan.withheld_by_tools;
         if local_withheld_by_tools && candidates.is_empty() {
             // Nothing hosted was quoted and local was all there was. Its own
             // error rather than `NoCandidates` or a served prose turn, because
@@ -2512,7 +2414,7 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
                     budget: &budget,
                     // Derived above from the committed log. `Some` on every
                     // turn including the first, whose signals are simply empty.
-                    signals: Some(&signals),
+                    signals: Some(&features.signals),
                     // The project's recipe, resolved at admission beside the
                     // policy. `None` on every project that configured none,
                     // which is what makes the stage router a no-op for them.
@@ -2763,7 +2665,7 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
                         // Why the local fleet was never asked, on the turns it
                         // was not: the difference between a fleet this router
                         // turned down and one it never consulted.
-                        local_quote_skipped,
+                        local_quote_skipped: quote_plan.skipped,
                         // The same snapshot on every record of this turn. The
                         // inputs, the plan, the admitted pool and the branch are
                         // facts about the *selection*, which happened once —
@@ -3197,44 +3099,6 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
     }
 }
 
-/// Whether pricing the local fleet can still change this turn's route.
-///
-/// `Ok(())` means ask it; `Err` names why the answer would have been thrown
-/// away, and that name is what reaches the log — see
-/// [`DecisionRecord::local_quote_skipped`]. A free function over values the
-/// call site already holds, so the decision to skip an HTTP call is testable
-/// without a session, a fleet or a clock.
-///
-/// Both refusals are *reachability* facts in the sense
-/// [`TurnPolicy::permits`] means: the same answer on every turn that looks
-/// like this one. The two knobs that are deliberately not consulted are the
-/// budget and the cadence, because both make a local route more likely — a
-/// squeezed budget is precisely when the fleet's answer decides the turn, so
-/// skipping the quote there would drop the call exactly where it earned its
-/// latency.
-///
-/// The policy asked is the one resolved at admission, before the validator's
-/// escalation narrows it. That is safe in the only direction that matters:
-/// an escalation raises the quality floor and never lowers it, so a policy
-/// that already names no local target still names none afterwards.
-fn local_quote_can_matter(
-    declares_tools: bool,
-    policy: &TurnPolicy,
-    local_policy_identity: &str,
-    local_quality_prior: f64,
-) -> Result<(), LocalQuoteSkip> {
-    if declares_tools {
-        // The exclusion below `plan`'s quote is unconditional and this
-        // predicate is its mirror: a local worker in this build cannot be told
-        // about a toolbox at all, so the quote would be discarded on arrival.
-        return Err(LocalQuoteSkip::ToolsDeclared);
-    }
-    if !policy.permits_identity(local_policy_identity, local_quality_prior) {
-        return Err(LocalQuoteSkip::PolicyAdmitsNoLocal);
-    }
-    Ok(())
-}
-
 /// Recover a completed response's text from the log.
 ///
 /// Contents, not [`Item::render`]: the render adds the `<|role|>` prefix the
@@ -3260,49 +3124,6 @@ mod tests {
     use roundhouse_core::control::{FrontierHistory, TargetFilter, TurnBudget};
     use roundhouse_core::ids::SessionId;
     use roundhouse_core::routing::{AffinityPolicy, RoutingContext};
-
-    /// The predicate that decides whether an HTTP round-trip is worth making,
-    /// asked without an engine, a session or a fleet — which is the reason it
-    /// is a free function over plain values rather than a method.
-    #[test]
-    fn local_quote_can_matter_names_why_it_cannot() {
-        let open = TurnPolicy::unrestricted();
-        let identity = Target::local_policy_identity("llama");
-
-        assert_eq!(local_quote_can_matter(false, &open, &identity, 0.6), Ok(()));
-        assert_eq!(
-            local_quote_can_matter(true, &open, &identity, 0.6),
-            Err(LocalQuoteSkip::ToolsDeclared),
-            "a toolbox makes every local candidate unreachable, so the quote \
-             would be discarded on arrival"
-        );
-
-        let hosted_only = TurnPolicy {
-            allow: TargetFilter::parse(["anthropic/*"]).unwrap(),
-            ..TurnPolicy::unrestricted()
-        };
-        assert_eq!(
-            local_quote_can_matter(false, &hosted_only, &identity, 0.6),
-            Err(LocalQuoteSkip::PolicyAdmitsNoLocal)
-        );
-
-        let discerning = TurnPolicy {
-            min_quality: 0.9,
-            ..TurnPolicy::unrestricted()
-        };
-        assert_eq!(
-            local_quote_can_matter(false, &discerning, &identity, 0.6),
-            Err(LocalQuoteSkip::PolicyAdmitsNoLocal),
-            "a floor above the configured local prior is the same refusal by \
-             the other axis: the prior is configuration, so the answer is known \
-             before the selector is asked"
-        );
-        assert_eq!(
-            local_quote_can_matter(false, &discerning, &identity, 0.95),
-            Ok(()),
-            "and a fleet that clears the floor is still asked"
-        );
-    }
 
     fn local(load: f64) -> Candidate {
         Candidate {

@@ -1,109 +1,223 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+//! The classification feature's two seams into a turn: one hook before it is
+//! admitted, one after it terminates. `Engine::classifier` is read exactly
+//! once by each, in the hook itself, rather than once per helper — every
+//! helper below takes the runtime as a parameter instead of re-deriving it.
+
+use std::sync::Arc;
+
 use roundhouse_core::classify::projection::PromptCapture;
 use roundhouse_core::context::Tokenizer;
+use roundhouse_core::event::SessionEventKind;
 use roundhouse_core::ids::ResponseId;
+use roundhouse_core::item::Item;
 use roundhouse_core::now_ms;
 use roundhouse_core::routing::Decision;
 use roundhouse_core::session::Session;
 use roundhouse_core::store::SessionStore;
 
-use crate::classify_runtime::Capacity;
+use crate::classify_runtime::{Capacity, ClassificationRuntime, ClassificationSource};
 use crate::control_config::Admission;
 use crate::engine::Engine;
 
+/// What [`Engine::classification_before_turn`] took for this turn's own
+/// classification, carried to [`Engine::classification_after_turn`].
+///
+/// A plain pair rather than two separate `Option`s threaded through
+/// `run_turn`: the capacity and the capture it bounds are taken together and
+/// used together, and two options would let a caller pass one without the
+/// other, which the runtime's `prepare` would then have nothing sound to do
+/// with.
+pub(super) struct TurnClassification {
+    capacity: Capacity,
+    capture: PromptCapture,
+}
+
 impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
-    /// Commit whatever the background classifier finished since the last turn.
+    /// Drain whatever the classifier finished since the last turn, and take
+    /// capacity plus a bounded prompt capture for this turn's own
+    /// classification, if there is room.
     ///
-    /// **The engine's writer, because it is the only one there is.** A worker
-    /// that opened a session to deliver its own result would take the lease from
-    /// whichever turn is running and fence it; `Session::open_observed` acquires
-    /// the lease, and nothing about a background result is worth that.
+    /// **Before `begin_turn`, on both halves.** The drain puts every
+    /// delivered result at a sequence below the cutoff `plan` is about to
+    /// capture, so this turn can name them; a drain after the turn's own
+    /// decision could not be named by it. The capacity check is here for the
+    /// same reason: acquired before the prompt is copied, so unavailable
+    /// classification adds no payload allocation, and before `begin_turn`
+    /// moves `input` — this is the last moment the client's own items are
+    /// still separate from the committed log. A deduplicated turn still
+    /// drains: the client's retry is not a reason to strand output the
+    /// runtime is holding capacity for. It also still takes and then drops
+    /// this turn's own capacity, through the ordinary `Capacity` drop path,
+    /// because nothing downstream of the dedup short-circuit ever reaches
+    /// [`Engine::classification_after_turn`] to spend it.
     ///
-    /// Append first, acknowledge second. A result whose append fails stays with
-    /// the runtime for a later drain — still holding its admission permit, still
-    /// costing nothing further, and emphatically not re-purchased. A result whose
-    /// append succeeded and whose acknowledgement was lost is offered again and
-    /// refused here by the log's own record of it, so no path delivers twice.
-    pub(super) async fn deliver_classifications(&self, session: &mut Session<S>) {
-        let Some(classifier) = &self.classifier else {
+    /// `None` on every deployment that configured no classifier — the
+    /// shipped state — and on a saturated queue, which costs one `Option`
+    /// check either way.
+    pub(super) async fn classification_before_turn(
+        &self,
+        session: &mut Session<S>,
+        input: &[Item],
+    ) -> Option<TurnClassification> {
+        let classifier = self.classifier.as_ref()?;
+        self.deliver_classifier_output(session, classifier).await;
+        let capacity = classifier.capacity()?;
+        Some(TurnClassification {
+            capacity,
+            capture: PromptCapture::of(input, &classifier.projection_caps()),
+        })
+    }
+
+    /// Request classification for the turn that just ended, if it dispatched
+    /// and took capacity for it, and schedule the bounded repair batch.
+    ///
+    /// **Gated on `self.classifier`, not on `background`.** A turn that took
+    /// no capacity — a saturated queue, most often — still owes the ledger
+    /// whatever repair work is outstanding; the two questions ("can this
+    /// turn buy a new classification" and "does this deployment have one
+    /// configured at all") are unrelated; only the second gates this method
+    /// running at all.
+    ///
+    /// **After the terminal event, before the lease is handed back**, so the
+    /// durable intent is written by the writer that already holds it, and
+    /// nothing here can delay an answer.
+    pub(super) async fn classification_after_turn(
+        &self,
+        session: &mut Session<S>,
+        response_id: &ResponseId,
+        admission: &Admission,
+        background: Option<TurnClassification>,
+        settled_decision: Option<&Decision>,
+    ) {
+        let Some(classifier) = self.classifier.as_ref() else {
             return;
         };
-        let waiting = classifier.ready(session.session_id()).await;
-        if waiting.is_empty() {
+        // Only a turn that *dispatched* is classified, and the decision comes
+        // from this turn's own `Completed` rather than from the fold. A
+        // steered turn writes no `Routed`, so reading `last_decision()` here
+        // would hand it the previous turn's admitted pool and fabricate
+        // egress permission out of a decision that was never taken.
+        if let (Some(decision), Some(TurnClassification { capacity, capture })) =
+            (settled_decision, background)
+        {
+            self.request_classification(
+                session,
+                response_id,
+                admission,
+                classifier,
+                decision,
+                capacity,
+                &capture,
+            )
+            .await;
+        }
+        // **Unconditional, unlike the request above** — a turn that steered
+        // or failed still owes the ledger the same money. Spawning costs a
+        // semaphore try and a task; the ledger round trip it starts belongs
+        // to the executor, which is the "off the serving path" rule this
+        // site is under.
+        self.repair_classification_settlements(session, classifier)
+            .await;
+    }
+
+    /// Commit whatever the background classifier finished since the last
+    /// turn: results and settlement-repair acknowledgements together.
+    ///
+    /// **The engine's writer, because it is the only one there is.** A worker
+    /// that opened a session to deliver its own output would take the lease
+    /// from whichever turn is running and fence it; `Session::open_observed`
+    /// acquires the lease, and nothing about background output is worth that.
+    ///
+    /// **One batched commit, not one append per record.** A session with k
+    /// parked results and j parked repairs used to pay k + j sequential store
+    /// round trips here, every one of them before this turn's own
+    /// `TurnStarted` — on the path to first token, on every turn that follows
+    /// a classified one. Gathering both drains into one
+    /// [`Session::record_background_classification`] call turns that into at
+    /// most one; an empty drain costs none at all.
+    ///
+    /// Append first, acknowledge second, still. A kind already in the log —
+    /// its append landed on an earlier turn, its acknowledgement lost to that
+    /// turn's own crash or cancellation — is acknowledged here without being
+    /// appended again; that check is what lets the batch commit run
+    /// unconditionally on everything else. A batch that fails to commit
+    /// leaves every kind in it with the runtime, still holding whatever
+    /// capacity or claim it held, for a later turn to drain: all-or-nothing,
+    /// so no path here can deliver — or charge — twice.
+    async fn deliver_classifier_output(
+        &self,
+        session: &mut Session<S>,
+        classifier: &Arc<ClassificationRuntime<T>>,
+    ) {
+        let waiting_results = classifier.ready(session.session_id()).await;
+        let waiting_repairs = classifier.ready_repairs(session.session_id()).await;
+        if waiting_results.is_empty() && waiting_repairs.is_empty() {
             return;
         }
-        let mut delivered = Vec::with_capacity(waiting.len());
-        for completed in waiting {
+
+        let mut delivered = Vec::new();
+        let mut results = Vec::new();
+        for completed in waiting_results {
             let call_id = completed.record.call_id.clone();
             if session.state().classification_settled(&call_id) {
-                // Already in the log: the append landed and the acknowledgement
-                // did not. Acknowledged now, appended never.
                 delivered.push(call_id);
-                continue;
+            } else {
+                results.push(completed.record.clone());
             }
+        }
+        let mut written = Vec::new();
+        let mut repairs = Vec::new();
+        for answered in waiting_repairs {
+            let call_id = answered.record.call_id.clone();
+            if !session.state().is_settlement_unrepaired(&call_id) {
+                written.push(call_id);
+            } else {
+                repairs.push(answered.record.clone());
+            }
+        }
+
+        if !results.is_empty() || !repairs.is_empty() {
             match session
-                .record_classification(completed.record.clone())
+                .record_background_classification(results, repairs)
                 .await
             {
-                Ok(()) => delivered.push(call_id),
+                Ok(events) => {
+                    for event in events {
+                        match event.kind {
+                            SessionEventKind::ClassificationRecorded { record } => {
+                                delivered.push(record.call_id)
+                            }
+                            SessionEventKind::ClassificationSettlementRepaired { record } => {
+                                written.push(record.call_id)
+                            }
+                            other => unreachable!(
+                                "record_background_classification commits only \
+                                 ClassificationRecorded and ClassificationSettlementRepaired, \
+                                 not {other:?}"
+                            ),
+                        }
+                    }
+                }
                 Err(error) => {
-                    // The usual reason is a lost lease, and the turn about to run
-                    // is the better diagnosis. Stop rather than continue: a
-                    // writer that cannot append one event will not append the
-                    // next.
+                    // The usual reason is a lost lease, and the turn about to
+                    // run is the better diagnosis. Neither list above gains
+                    // an entry: nothing in this batch landed, so nothing in
+                    // it may be acknowledged.
                     tracing::warn!(
                         %error,
                         session_id = %session.session_id(),
-                        "a classification result could not be appended; it stays with \
-                         the runtime for a later turn to deliver"
+                        "background classifier output could not be appended; it stays \
+                         with the runtime for a later turn to deliver"
                     );
-                    break;
                 }
             }
         }
         classifier
             .acknowledge(session.session_id(), &delivered)
             .await;
-    }
-
-    /// Commit the acknowledgements the repair workers produced.
-    ///
-    /// Append first, acknowledge second — the same order and the same reason as
-    /// [`Self::deliver_classifications`]. An acknowledgement whose append fails
-    /// stays with the runtime, and even if it is lost entirely the log still
-    /// reads the settlement as unrepaired, so a later turn drives it again and
-    /// the ledger deduplicates. **No path here can charge twice**, and no path
-    /// here reaches the classifier at all.
-    pub(super) async fn deliver_settlement_repairs(&self, session: &mut Session<S>) {
-        let Some(classifier) = &self.classifier else {
-            return;
-        };
-        let waiting = classifier.ready_repairs(session.session_id()).await;
-        if waiting.is_empty() {
-            return;
-        }
-        let mut written = Vec::with_capacity(waiting.len());
-        for answered in waiting {
-            let call_id = answered.record.call_id.clone();
-            match session
-                .record_classification_settlement_repair(answered.record.clone())
-                .await
-            {
-                Ok(()) => written.push(call_id),
-                Err(error) => {
-                    tracing::warn!(
-                        %error,
-                        session_id = %session.session_id(),
-                        "an evaluation settlement repair could not be appended; \
-                         the settlement stays unconfirmed in the log and a later \
-                         turn will drive it again"
-                    );
-                    break;
-                }
-            }
-        }
         classifier
             .acknowledge_repairs(session.session_id(), &written)
             .await;
@@ -116,10 +230,11 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
     /// The fixed batch bounds scheduling work even when failed workers return
     /// permits during this loop. Runtime claims suppress duplicate attempts
     /// through execution and acknowledgement delivery.
-    pub(super) async fn repair_classification_settlements(&self, session: &Session<S>) {
-        let Some(classifier) = &self.classifier else {
-            return;
-        };
+    async fn repair_classification_settlements(
+        &self,
+        session: &Session<S>,
+        classifier: &Arc<ClassificationRuntime<T>>,
+    ) {
         let unrepaired = session.state().unrepaired_settlements();
         if unrepaired.len() == 0 {
             return;
@@ -158,18 +273,17 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
     /// capacity, then payload, then reservation, then the durable intent, and
     /// only then a worker that may open a socket. The caller acquires capacity
     /// before capturing the prompt. Each early return here releases that permit.
-    pub(super) async fn request_classification(
+    #[allow(clippy::too_many_arguments)]
+    async fn request_classification(
         &self,
         session: &mut Session<S>,
         response_id: &ResponseId,
         admission: &Admission,
+        classifier: &Arc<ClassificationRuntime<T>>,
         decision: &Decision,
         capacity: Capacity,
         capture: &PromptCapture,
     ) {
-        let Some(classifier) = &self.classifier else {
-            return;
-        };
         // **One answer per turn is structural rather than guarded here.** This
         // is reached once per `run_turn`, and the two ways a turn could arrive
         // twice both stop short of it: a client's retry of a completed turn
@@ -185,28 +299,21 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
         // was going to make anyway. The grant and the request both belong to the
         // worker `spawn` starts, so a slow or unreachable evaluation ledger
         // delays no response.
-        let projection = match classifier.projection(
+        let prepared = match classifier.prepare(
+            ClassificationSource {
+                principal: admission.principal.clone(),
+                session_id: session.session_id().clone(),
+                // Fresh per external attempt. A settled identity can never
+                // settle again, so reusing the turn's would collide with the
+                // turn's own hold; reusing an earlier call's would be refused
+                // by the once-per-call rule after the first.
+                call_id: ResponseId::generate(),
+                source_turn_index: session.turn_index().saturating_sub(1),
+                source_response_id: response_id.clone(),
+            },
             capture,
             session.state().classifications(),
             session.state().prior_turns(),
-        ) {
-            Ok(projection) => projection,
-            Err(refusal) => {
-                tracing::debug!(?refusal, "no turn classification for this turn");
-                return;
-            }
-        };
-        let prepared = match classifier.prepare(
-            admission.principal.clone(),
-            session.session_id().clone(),
-            // Fresh per external attempt. A settled identity can never settle
-            // again, so reusing the turn's would collide with the turn's own
-            // hold; reusing an earlier call's would be refused by the
-            // once-per-call rule after the first.
-            ResponseId::generate(),
-            session.turn_index().saturating_sub(1),
-            response_id.clone(),
-            &projection,
             // **The policy's own resolution, never a second one.** Asking
             // `admissible` again here would answer a different question — with
             // a guessed load ceiling and without the overflow valve — and record

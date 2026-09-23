@@ -62,6 +62,13 @@ impl UnrepairedSettlements {
         self.entries.values()
     }
 
+    /// Whether `call_id` is still recorded as unrepaired. The same index
+    /// `remove` uses, so a delivery path checking one call before appending
+    /// its repair costs a lookup and not a scan of the backlog.
+    pub(super) fn contains(&self, call_id: &ResponseId) -> bool {
+        self.index.contains_key(call_id)
+    }
+
     /// See [`Self::examined`].
     #[cfg(test)]
     pub(super) fn examined(&self) -> u64 {

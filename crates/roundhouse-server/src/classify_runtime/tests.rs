@@ -10,6 +10,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use roundhouse_core::classify::projection::PromptCapture;
@@ -154,8 +155,7 @@ fn runtime(addr: SocketAddr, limits: RuntimeLimits) -> Arc<ClassificationRuntime
                 max_total_bytes: 8 * 1024,
             },
             1,
-        )
-        .enable(),
+        ),
         Arc::new(MemorySpendLedger::new()),
         ByteTokenizer,
     );
@@ -188,15 +188,18 @@ async fn fund(
         &[Item::user_text("fix the parser")],
         &runtime.projection_caps(),
     );
-    let projection = runtime.projection(&capture, &[], &[]).expect("it fits");
     let prepared = runtime
         .prepare(
-            Principal::new("proj_runtime", "user_runtime"),
-            session(),
-            ResponseId::new(call_id),
-            1,
-            ResponseId::new("resp_1"),
-            &projection,
+            ClassificationSource {
+                principal: Principal::new("proj_runtime", "user_runtime"),
+                session_id: session(),
+                call_id: ResponseId::new(call_id),
+                source_turn_index: 1,
+                source_response_id: ResponseId::new("resp_1"),
+            },
+            &capture,
+            &[],
+            &[],
             Some(&[frontier()]),
             roundhouse_core::now_ms(),
         )
@@ -208,7 +211,7 @@ async fn fund(
 async fn await_ready(
     runtime: &Arc<ClassificationRuntime<ByteTokenizer>>,
     count: usize,
-) -> Vec<Delivery> {
+) -> Vec<Delivered<ClassificationRecord>> {
     for _ in 0..200 {
         let ready = runtime.ready(&session()).await;
         if ready.len() >= count {
@@ -704,8 +707,7 @@ fn runtime_with_ledger(
                 max_total_bytes: 8 * 1024,
             },
             1,
-        )
-        .enable(),
+        ),
         ledger,
         ByteTokenizer,
     );
@@ -1820,7 +1822,7 @@ async fn park_repair(
     runtime: &Arc<ClassificationRuntime<ByteTokenizer>>,
     session_id: &SessionId,
     call_id: &str,
-) -> Vec<RepairDelivery> {
+) -> Vec<Delivered<ClassificationSettlementRepair>> {
     let capacity = runtime.capacity().expect("a free slot");
     runtime
         .repair(
