@@ -32,16 +32,12 @@
 //! actually forked, so the rewrite cases read the original and forked
 //! generations back out and assert they hold distinct content.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::State;
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{Request, StatusCode};
-use axum::response::Response;
-use axum::routing::post;
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -55,7 +51,7 @@ use roundhouse_core::store::{MemoryStore, SessionStore};
 use roundhouse_fleet::{EchoFrontierClient, FrontierClient, WireProtocol};
 use roundhouse_server::classify_config::ClassifyConfig;
 use roundhouse_server::classify_runtime::compose;
-use roundhouse_server::test_support::classification::ANSWER as CLASSIFIER_ANSWER;
+use roundhouse_server::test_support::classification::ClassifierUpstream;
 use roundhouse_server::test_support::classification::classify_config as shared_classify_config;
 use roundhouse_server::test_support::{engine_over_echo, frontier_spec, single_model_catalog};
 use roundhouse_server::{
@@ -99,91 +95,6 @@ fn env(name: &str) -> Option<String> {
         "CLASSIFY_PREFIX_TEST_KEY" => Some("sk-classification-prefix-test".to_string()),
         _ => None,
     }
-}
-
-/// A loopback classifier that records every body it was sent, verbatim.
-///
-/// A near-copy of `test_support::classification::ClassifierUpstream`, kept
-/// separate rather than merged onto it: that type bumps its count *before*
-/// capturing the body, and `await_calls` below depends on the reverse —
-/// count published only once the body is already in `seen` — so a mechanical
-/// swap would add exactly the race this file's own doc on
-/// [`handle_classify`] explains why it does not have.
-#[derive(Clone, Default)]
-struct Classifier {
-    calls: Arc<AtomicUsize>,
-    seen: Arc<Mutex<Vec<String>>>,
-}
-
-/// The body is captured before the count is published, not after. A std
-/// `Mutex` unlock is a release operation and the `SeqCst` store that follows
-/// it is what makes the body visible to any thread that later observes the
-/// count through `Classifier::count`'s `SeqCst` load: `await_calls` below
-/// waits on the count precisely so it can assume the corresponding body is
-/// already in `seen`, and that assumption only holds in this order.
-async fn handle_classify(State(state): State<Classifier>, body: String) -> Response {
-    state.seen.lock().unwrap().push(body);
-    state.calls.fetch_add(1, Ordering::SeqCst);
-    Response::new(Body::from(CLASSIFIER_ANSWER))
-}
-
-async fn classifier_upstream() -> (String, Classifier) {
-    let state = Classifier::default();
-    let app = Router::new()
-        .route("/systemone", post(handle_classify))
-        .with_state(state.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-    (format!("http://{addr}"), state)
-}
-
-impl Classifier {
-    fn count(&self) -> usize {
-        self.calls.load(Ordering::SeqCst)
-    }
-
-    /// Every captured body's own `state` field -- the rendered projection
-    /// actually sent -- in arrival order.
-    fn states(&self) -> Vec<String> {
-        self.seen
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|body| {
-                let sent: Value = serde_json::from_str(body).expect("a JSON body arrived");
-                sent["state"]
-                    .as_str()
-                    .expect("`state` is a string")
-                    .to_string()
-            })
-            .collect()
-    }
-
-    /// Every captured body verbatim, in arrival order.
-    ///
-    /// Sentinel exclusion is checked against this, not against `states()`: a
-    /// leak into `model` or into a `questions` entry would be invisible to a
-    /// check that only parsed out `state`, and the egress ruling this suite
-    /// exists to hold (T6) is about the whole wire body, not one field of it.
-    fn bodies(&self) -> Vec<String> {
-        self.seen.lock().unwrap().clone()
-    }
-}
-
-async fn await_calls(classifier: &Classifier, count: usize) {
-    for _ in 0..300 {
-        if classifier.count() >= count {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    panic!(
-        "the classifier never reached {count} call(s); it saw {}",
-        classifier.count()
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -425,9 +336,9 @@ fn named(session: &str) -> String {
 /// `Search::Fresh`, handing the engine the *whole* claimed array as `input`.
 #[tokio::test]
 async fn messages_import_ending_in_user_text_sends_only_the_new_prompt() {
-    let (base_url, classifier) = classifier_upstream().await;
+    let classifier = ClassifierUpstream::start().await;
     let store = Arc::new(MemoryStore::new());
-    let app = messages_surface(&store, &base_url);
+    let app = messages_surface(&store, &classifier.base_url);
     let headers = [("x-claude-code-session-id", "sess-msg-import-user")];
 
     let imported = messages_body(
@@ -443,7 +354,7 @@ async fn messages_import_ending_in_user_text_sends_only_the_new_prompt() {
         StatusCode::OK
     );
 
-    await_calls(&classifier, 1).await;
+    classifier.await_calls(1).await;
     assert_eq!(
         classifier.count(),
         1,
@@ -483,9 +394,9 @@ async fn messages_import_ending_in_user_text_sends_only_the_new_prompt() {
 /// the system instructions.
 #[tokio::test]
 async fn messages_import_ending_in_tool_continuation_sends_no_prompt_text() {
-    let (base_url, classifier) = classifier_upstream().await;
+    let classifier = ClassifierUpstream::start().await;
     let store = Arc::new(MemoryStore::new());
-    let app = messages_surface(&store, &base_url);
+    let app = messages_surface(&store, &classifier.base_url);
     let headers = [("x-claude-code-session-id", "sess-msg-import-tool")];
 
     let imported = messages_body(
@@ -501,7 +412,7 @@ async fn messages_import_ending_in_tool_continuation_sends_no_prompt_text() {
         StatusCode::OK
     );
 
-    await_calls(&classifier, 1).await;
+    classifier.await_calls(1).await;
     assert_eq!(
         classifier.count(),
         1,
@@ -549,9 +460,9 @@ async fn messages_import_ending_in_tool_continuation_sends_no_prompt_text() {
 /// starts empty rather than inheriting.
 #[tokio::test]
 async fn messages_rewrite_ending_in_user_text_forks_and_sends_only_the_new_prompt() {
-    let (base_url, classifier) = classifier_upstream().await;
+    let classifier = ClassifierUpstream::start().await;
     let store = Arc::new(MemoryStore::new());
-    let app = messages_surface(&store, &base_url);
+    let app = messages_surface(&store, &classifier.base_url);
     let headers = [("x-claude-code-session-id", "sess-msg-rewrite-user")];
 
     let priming = messages_body(SYSTEM_SENTINEL, vec![user(PRIMING_TURN_TEXT)]);
@@ -559,7 +470,7 @@ async fn messages_rewrite_ending_in_user_text_forks_and_sends_only_the_new_promp
         post_messages(&app, &headers, &priming).await,
         StatusCode::OK
     );
-    await_calls(&classifier, 1).await;
+    classifier.await_calls(1).await;
 
     // The client edited its own history out from under us: the same session
     // name, a first message that disagrees with what is stored.
@@ -575,7 +486,7 @@ async fn messages_rewrite_ending_in_user_text_forks_and_sends_only_the_new_promp
         post_messages(&app, &headers, &divergent).await,
         StatusCode::OK
     );
-    await_calls(&classifier, 2).await;
+    classifier.await_calls(2).await;
     assert_eq!(
         classifier.count(),
         2,
@@ -631,9 +542,9 @@ async fn messages_rewrite_ending_in_user_text_forks_and_sends_only_the_new_promp
 /// continuation rather than new user text.
 #[tokio::test]
 async fn messages_rewrite_ending_in_tool_continuation_forks_and_sends_no_prompt_text() {
-    let (base_url, classifier) = classifier_upstream().await;
+    let classifier = ClassifierUpstream::start().await;
     let store = Arc::new(MemoryStore::new());
-    let app = messages_surface(&store, &base_url);
+    let app = messages_surface(&store, &classifier.base_url);
     let headers = [("x-claude-code-session-id", "sess-msg-rewrite-tool")];
 
     let priming = messages_body(SYSTEM_SENTINEL, vec![user(PRIMING_TURN_TEXT)]);
@@ -641,7 +552,7 @@ async fn messages_rewrite_ending_in_tool_continuation_forks_and_sends_no_prompt_
         post_messages(&app, &headers, &priming).await,
         StatusCode::OK
     );
-    await_calls(&classifier, 1).await;
+    classifier.await_calls(1).await;
 
     let divergent = messages_body(
         SYSTEM_SENTINEL,
@@ -655,7 +566,7 @@ async fn messages_rewrite_ending_in_tool_continuation_forks_and_sends_no_prompt_
         post_messages(&app, &headers, &divergent).await,
         StatusCode::OK
     );
-    await_calls(&classifier, 2).await;
+    classifier.await_calls(2).await;
     assert_eq!(
         classifier.count(),
         2,
@@ -723,9 +634,9 @@ async fn messages_rewrite_ending_in_tool_continuation_forks_and_sends_no_prompt_
 /// dialect canonicalizes its own way.
 #[tokio::test]
 async fn responses_import_ending_in_user_text_sends_only_the_new_prompt() {
-    let (base_url, classifier) = classifier_upstream().await;
+    let classifier = ClassifierUpstream::start().await;
     let store = Arc::new(MemoryStore::new());
-    let app = responses_surface(&store, &base_url);
+    let app = responses_surface(&store, &classifier.base_url);
 
     let imported = responses_body(
         SYSTEM_SENTINEL,
@@ -738,7 +649,7 @@ async fn responses_import_ending_in_user_text_sends_only_the_new_prompt() {
     );
     assert_eq!(post_responses(&app, &imported).await, StatusCode::OK);
 
-    await_calls(&classifier, 1).await;
+    classifier.await_calls(1).await;
     assert_eq!(
         classifier.count(),
         1,
@@ -780,9 +691,9 @@ async fn responses_import_ending_in_user_text_sends_only_the_new_prompt() {
 /// `messages_import_ending_in_tool_continuation_sends_no_prompt_text`.
 #[tokio::test]
 async fn responses_import_ending_in_tool_continuation_sends_no_prompt_text() {
-    let (base_url, classifier) = classifier_upstream().await;
+    let classifier = ClassifierUpstream::start().await;
     let store = Arc::new(MemoryStore::new());
-    let app = responses_surface(&store, &base_url);
+    let app = responses_surface(&store, &classifier.base_url);
 
     let imported = responses_body(
         SYSTEM_SENTINEL,
@@ -795,7 +706,7 @@ async fn responses_import_ending_in_tool_continuation_sends_no_prompt_text() {
     );
     assert_eq!(post_responses(&app, &imported).await, StatusCode::OK);
 
-    await_calls(&classifier, 1).await;
+    classifier.await_calls(1).await;
     assert_eq!(
         classifier.count(),
         1,
@@ -842,9 +753,9 @@ async fn responses_import_ending_in_tool_continuation_sends_no_prompt_text() {
 /// under -- `bound_session(cache_key, 1)` is `"{cache_key}#g1"`.
 #[tokio::test]
 async fn responses_rewrite_ending_in_user_text_forks_and_sends_only_the_new_prompt() {
-    let (base_url, classifier) = classifier_upstream().await;
+    let classifier = ClassifierUpstream::start().await;
     let store = Arc::new(MemoryStore::new());
-    let app = responses_surface(&store, &base_url);
+    let app = responses_surface(&store, &classifier.base_url);
     let cache_key = "resp-rewrite-user";
 
     let priming = responses_body(
@@ -853,7 +764,7 @@ async fn responses_rewrite_ending_in_user_text_forks_and_sends_only_the_new_prom
         vec![resp_user(PRIMING_TURN_TEXT)],
     );
     assert_eq!(post_responses(&app, &priming).await, StatusCode::OK);
-    await_calls(&classifier, 1).await;
+    classifier.await_calls(1).await;
 
     let divergent = responses_body(
         SYSTEM_SENTINEL,
@@ -865,7 +776,7 @@ async fn responses_rewrite_ending_in_user_text_forks_and_sends_only_the_new_prom
         ],
     );
     assert_eq!(post_responses(&app, &divergent).await, StatusCode::OK);
-    await_calls(&classifier, 2).await;
+    classifier.await_calls(2).await;
     assert_eq!(
         classifier.count(),
         2,
@@ -921,9 +832,9 @@ async fn responses_rewrite_ending_in_user_text_forks_and_sends_only_the_new_prom
 /// `messages_rewrite_ending_in_tool_continuation_forks_and_sends_no_prompt_text`.
 #[tokio::test]
 async fn responses_rewrite_ending_in_tool_continuation_forks_and_sends_no_prompt_text() {
-    let (base_url, classifier) = classifier_upstream().await;
+    let classifier = ClassifierUpstream::start().await;
     let store = Arc::new(MemoryStore::new());
-    let app = responses_surface(&store, &base_url);
+    let app = responses_surface(&store, &classifier.base_url);
     let cache_key = "resp-rewrite-tool";
 
     let priming = responses_body(
@@ -932,7 +843,7 @@ async fn responses_rewrite_ending_in_tool_continuation_forks_and_sends_no_prompt
         vec![resp_user(PRIMING_TURN_TEXT)],
     );
     assert_eq!(post_responses(&app, &priming).await, StatusCode::OK);
-    await_calls(&classifier, 1).await;
+    classifier.await_calls(1).await;
 
     let divergent = responses_body(
         SYSTEM_SENTINEL,
@@ -944,7 +855,7 @@ async fn responses_rewrite_ending_in_tool_continuation_forks_and_sends_no_prompt
         ],
     );
     assert_eq!(post_responses(&app, &divergent).await, StatusCode::OK);
-    await_calls(&classifier, 2).await;
+    classifier.await_calls(2).await;
     assert_eq!(
         classifier.count(),
         2,

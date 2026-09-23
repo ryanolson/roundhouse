@@ -277,6 +277,9 @@ impl<R: ParkedRecord> Mailbox<R> {
         dropped
     }
 
+    /// Drop everything parked. [`ClassificationRuntime::shutdown`]'s own
+    /// gate covers this: no production path calls it either.
+    #[cfg(any(test, feature = "test-support"))]
     async fn clear(&self) {
         self.parked.lock().await.clear();
     }
@@ -784,6 +787,13 @@ impl<T: Tokenizer + Send + Sync + 'static> ClassificationRuntime<T> {
     /// An aborted call's hold is not settled here and lapses on its TTL: the
     /// worker was cancelled mid-flight, so whether the service billed is exactly
     /// what this process does not know.
+    ///
+    /// **Test-only.** No production path calls it: the production lifetime is
+    /// [`Supervisor`]'s `Drop`, which calls [`Self::stop`] and returns
+    /// immediately rather than waiting for it. This exists so a recovery test
+    /// can simulate a clean process restart deterministically — waiting for
+    /// the runtime to go quiet rather than racing its own teardown.
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn shutdown(&self) {
         self.stop();
         self.workers.lock().await.shutdown().await;

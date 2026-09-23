@@ -287,6 +287,74 @@ fn a_deterministic_ttl_the_wire_has_no_spelling_for_is_refused() {
     .expect("a non-Messages dialect may declare whatever TTL its own cache model means");
 }
 
+/// One entry with an `inactivity_decay` cache model, parameterized on the
+/// dialect and the decay ceiling, so a refusal below is unambiguously about
+/// the ceiling and not about an unrelated field.
+fn one_decayed_entry(wire_protocol: &str, max_ttl_ms: u64) -> String {
+    format!(
+        r#"{{
+          "providers": {{ "anthropic": {{
+            "base_url": "https://gateway.test/v1",
+            "routes": {{ "messages": "/messages", "responses": "/responses" }},
+            "auth": {{ "env": "GATEWAY_KEY" }}
+          }} }},
+          "models": [{{
+            "provider": "anthropic",
+            "model": "claude-sonnet",
+            "wire_protocol": "{wire_protocol}",
+            "cache_model": {{
+              "kind": "inactivity_decay",
+              "half_life_ms": 300000,
+              "max_ttl_ms": {max_ttl_ms},
+              "min_prefix_tokens": 1024
+            }},
+            "pricing": {{
+              "input_per_mtok_usd": 3.0,
+              "cached_input_per_mtok_usd": 0.3,
+              "cache_write_per_mtok_usd": 3.75,
+              "output_per_mtok_usd": 15.0
+            }},
+            "quality_prior": 0.62,
+            "base_ttft_ms": 350.0,
+            "ttft_ms_per_uncached_token": 0.002
+          }}]
+        }}"#
+    )
+}
+
+/// **CORRECTNESS (fleet-redis-r3-1).** Anthropic's Messages cache is
+/// deterministic, not automatic: past the wire's own silent five-minute
+/// default, its only lever is the explicit `1h` marker, not a decay curve.
+/// An `inactivity_decay` entry modelling retention past that default passed
+/// this boundary today -- the resolver mapped it to `CacheLifetime::Default`
+/// the same as a well-behaved one -- so the ledger kept predicting a hit for
+/// a stretch no marker ever asked the provider to hold.
+#[test]
+fn an_automatic_cache_retained_past_the_wire_default_is_refused_on_messages() {
+    let error =
+        CatalogConfig::from_json(&one_decayed_entry("anthropic_messages", 3_600_000), "test")
+            .expect_err(
+                "a one-hour decay ceiling models retention the wire's undeclared five-minute \
+         default never grants",
+            );
+    assert!(
+        matches!(&error, CatalogError::UndeclaredCacheDecay { max_ttl_ms, default_ttl_ms, .. }
+            if *max_ttl_ms == 3_600_000 && *default_ttl_ms == 300_000),
+        "{error}"
+    );
+
+    // CONTROL: a ceiling at or under the wire's own undeclared default is
+    // close enough to that schedule to price -- this is the shape every
+    // catalog example ships when a dialect other than Messages is used.
+    CatalogConfig::from_json(&one_decayed_entry("anthropic_messages", 300_000), "test")
+        .expect("a decay ceiling at or under the wire's own default is not this guard's business");
+
+    // CONTROL: another dialect's automatic cache is not held to a
+    // deterministic rule -- it has no `cache_control` vocabulary at all.
+    CatalogConfig::from_json(&one_decayed_entry("openai_responses", 3_600_000), "test")
+        .expect("a non-Messages dialect's automatic cache is not this guard's business");
+}
+
 /// One minimal entry, parameterized on whatever local section is under
 /// test, so a refusal below is unambiguously about the local numbers.
 fn with_local_section(local: &str) -> String {

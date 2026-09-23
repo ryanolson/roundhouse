@@ -218,6 +218,45 @@ fn an_unknown_field_is_refused() {
     assert!(ClassifyConfig::from_json(&typo, "<test>").is_err());
 }
 
+/// **CORRECTNESS (server-r3-2).** `deny_unknown_fields` on the top-level
+/// `ClassifyConfig` does not reach its nested structs -- serde applies it per
+/// container, not by inheritance -- so a typo inside `budget` or `pricing`
+/// parsed and was silently dropped rather than refused. `member_share` is the
+/// sharpest case: a misspelled `member_shares` leaves the real field at its
+/// `#[serde(default)]` of `None`, which pools the whole evaluation ceiling to
+/// one member instead of capping their share of it.
+#[test]
+fn a_misspelled_nested_field_is_refused() {
+    let typo = with(
+        "\"budget\": { \"limit_usd\": 25.0, \"window\": \"monthly\", \"warn_at\": 0.8 }",
+        "\"budget\": { \"limit_usd\": 25.0, \"window\": \"monthly\", \"warn_at\": 0.8, \
+         \"member_shares\": 0.25 }",
+    );
+    let error = ClassifyConfig::from_json(&typo, "<test>")
+        .expect_err("a nested typo must not parse as an unset optional field");
+    assert!(
+        matches!(&error, ClassifyConfigError::Parse { .. })
+            && error.to_string().contains("member_shares"),
+        "{error}"
+    );
+
+    let typo = with(
+        "\"pricing\": { \"input_per_mtok_usd\": 0.042, \"output_per_mtok_usd\": 0.084 }",
+        "\"pricing\": { \"input_per_mtok_usd\": 0.042, \"output_per_mtok_usd\": 0.084, \
+         \"cache_write_per_mtok_usd\": 1.0 }",
+    );
+    let error = ClassifyConfig::from_json(&typo, "<test>")
+        .expect_err("a rate axis this service does not report must not parse silently");
+    assert!(
+        matches!(&error, ClassifyConfigError::Parse { .. })
+            && error.to_string().contains("cache_write_per_mtok_usd"),
+        "{error}"
+    );
+
+    // CONTROL: the same file with no nested typo still parses.
+    ClassifyConfig::from_json(COMPLETE, "<test>").expect("the unmodified fixture is valid");
+}
+
 /// The rate card reaches the adapter with its two cache axes at zero, because
 /// this service reports no cache term. A field for either would invite somebody
 /// to fill one in.

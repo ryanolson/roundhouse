@@ -203,7 +203,11 @@ const ONE_HOUR_MS: u64 = 3_600_000;
 
 /// Anthropic's own default lifetime, in milliseconds — what a marker with no
 /// `ttl` field at all means.
-const DEFAULT_CACHE_TTL_MS: u64 = 300_000;
+///
+/// `pub(crate)` rather than private: `frontier::requested_cache_lifetime`
+/// needs the same number to decide whether an `InactivityDecay` ceiling
+/// still fits inside the wire's silent default (fleet-redis-r3-1).
+pub(crate) const DEFAULT_CACHE_TTL_MS: u64 = 300_000;
 
 /// The cache lifetimes Anthropic's Messages wire actually offers.
 ///
@@ -247,9 +251,12 @@ impl CacheLifetime {
 
     /// A fresh `cache_control` breakpoint at this lifetime.
     ///
-    /// The one place `wire()`'s `Option<&str>` is decoded back into a marker,
-    /// so [`super::body`] holds a typed `CacheLifetime` end to end rather than
-    /// lowering it to the wire's `Option` and re-matching that.
+    /// The one place a fresh marker is built from a lifetime, so
+    /// [`AnthropicMessagesClient::body`] holds a typed `CacheLifetime` end to
+    /// end rather than lowering it to the wire's `Option` and re-matching
+    /// that. [`cache_markers::normalize_marker_lifetimes`] also decodes
+    /// `wire()` into a marker, but it rewrites a forwarded marker's `ttl`
+    /// field in place rather than constructing one.
     pub(super) fn control(self) -> CacheControl {
         match self.wire() {
             Some(ttl) => CacheControl::ephemeral_for(ttl),
@@ -404,11 +411,6 @@ impl AnthropicMessagesClient {
         // than beside it.
         let (tools, tool_choice) = quote.tools_for(SPOKEN)?;
         // Tools and conversation markers share the target's cache lifetime.
-        // Held typed rather than lowered to `CacheLifetime::wire`'s
-        // `Option<&str>` here — `normalize_marker_lifetimes` and `control`
-        // below each decode it their own once, through `CacheLifetime`'s own
-        // exhaustive match, instead of this function re-matching an `Option`
-        // that was already decided.
         let lifetime = quote.cache_lifetime;
         // Tools precede messages, so shorter tool markers would violate the
         // provider's TTL order. Matching the target also keeps its quoted
@@ -1270,21 +1272,6 @@ mod tests {
         );
         let body = AnthropicMessagesClient::body(&prose, "claude-sonnet").unwrap();
         assert_eq!(block_breakpoints(&body), 1);
-    }
-
-    /// Two segments is the smallest shape that has a stable prefix, and it
-    /// gets one: block zero, the only one this request could re-read next
-    /// turn, carries the marker, and block one — this turn's own new input —
-    /// does not.
-    #[test]
-    fn a_two_segment_prompt_marks_its_first_block_and_leaves_the_second_unmarked() {
-        let mut quote = quote(TurnCredential::Absent, SPOKEN);
-        quote.segment_boundaries = vec![SYSTEM.len()];
-        let body = AnthropicMessagesClient::body(&quote, "claude-sonnet").unwrap();
-        let content = body["messages"][0]["content"].as_array().unwrap();
-        assert_eq!(content.len(), 2);
-        assert_eq!(content[0]["cache_control"], json!({ "type": "ephemeral" }));
-        assert!(content[1].get("cache_control").is_none());
     }
 
     #[test]

@@ -298,10 +298,13 @@ fn wire_usage(usage: &Usage, output_tokens: u64) -> WireUsage {
         cache_read_input_tokens: Some(read),
         cache_creation_input_tokens: written,
         output_tokens,
-        // The 5m/1h split behind `extended-cache-ttl-2025-04-11`. Roundhouse's
-        // `Usage` does not carry the lifetime a write was made under, so the
-        // breakdown would have to be invented; absent is the reading that says
-        // "not measured" rather than "measured as zero on both".
+        // The `ephemeral_5m_input_tokens`/`ephemeral_1h_input_tokens` split of
+        // `cache_creation_input_tokens`, spelled by the `ttl` on the
+        // `cache_control` marker that wrote it -- see `CacheControl`'s doc.
+        // Roundhouse's `Usage` does not carry the lifetime a write was made
+        // under, so the breakdown would have to be invented; absent is the
+        // reading that says "not measured" rather than "measured as zero on
+        // both".
         cache_creation: None,
         extra: Extra::new(),
     }

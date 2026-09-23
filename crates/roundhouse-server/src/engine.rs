@@ -41,8 +41,8 @@ use roundhouse_core::metrics::MetricsRecorder;
 use roundhouse_core::now_ms;
 use roundhouse_core::routing::{
     AttemptClass, CacheLedger, Candidate, Decision, DecisionRecord, DecisionSource,
-    DispatchAttempt, RoutingContext, RoutingError, RoutingPolicy, SelectionSnapshot, Target, Tier,
-    TierRecipe,
+    DispatchAttempt, LocalQuoteSkip, RoutingContext, RoutingError, RoutingPolicy,
+    SelectionSnapshot, Target, Tier, TierRecipe,
 };
 use roundhouse_core::session::{Session, SessionError, SessionState, TurnAdmission};
 use roundhouse_core::store::SessionStore;
@@ -64,7 +64,7 @@ mod fair_use;
 mod selection;
 pub(crate) mod spend;
 
-use selection::{SelectionInputs, local_withheld_by_tools};
+use selection::SelectionInputs;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -2140,42 +2140,24 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
 
         // --- a tool-declaring turn cannot go to a local worker ---------------
         //
-        // **M11.2a's F2, and it is a routing fact rather than a dispatch one.**
-        // [`LocalExecutor::execute`] takes prompt token ids and an output cap
-        // and nothing else — this build has no way to tell a locally served
-        // model about a toolbox at all — and [`LocalExecution::text`] is a plain
-        // `String`, structurally incapable of carrying a call back. So a turn
-        // that declares tools and lands local is answered in prose, reports
-        // `end_turn` as if it had finished normally, and signals the loss
-        // nowhere: the client's agent loop simply stops working, which is the
-        // one failure shape this codebase treats as worse than an error.
-        //
-        // Excluded *here*, before the policy filter, and that placement is the
-        // same argument the credential filter makes twenty lines down: a
-        // candidate that could never have served this turn must not sit in
-        // `considered` either, or the dashboard prices a counterfactual saving
-        // against a target the turn could not have used. It is a *reachability*
-        // exclusion in the sense `TurnPolicy::permits` means — the same answer
-        // on every tool-declaring turn of every session — not a this-turn one.
-        //
-        // The alternative deliberately not taken: rendering a textual toolbox
-        // into the local prompt and parsing calls back out of the model's prose.
-        // That is a real design with a real cost — a second, weaker tool
-        // protocol whose failures look like bad answers — and it belongs to
-        // whichever milestone decides local models should be agentic, not to a
-        // review fix.
-        let excluded_local = match declarations.declares_tools() {
-            true => {
-                let before = candidates.len();
-                candidates.retain(|candidate| !candidate.target.is_local());
-                before - candidates.len()
-            }
-            false => 0,
-        };
-        // See `selection::local_withheld_by_tools`: the retain above and the
-        // quote that was never made are the same fact from two sources, and
-        // this is where both are finally known together.
-        let local_withheld_by_tools = local_withheld_by_tools(local_quote_skipped, excluded_local);
+        // The exclusion itself lives in `local_quote_can_matter` (M11.2a's
+        // F2): its tool arm is checked before its policy arm, so `local_quote`
+        // above is never fetched when this turn declares tools and no local
+        // candidate ever reaches `candidates` for a turn like this one — see
+        // that function's doc for why the order is load-bearing and not just
+        // tidy. `debug_assert!` rather than a retain: a retain here would be
+        // filtering a set that server-r3-1 found is already structurally
+        // empty, which gives a reader false comfort that a second line of
+        // defence exists.
+        debug_assert!(
+            !declarations.declares_tools()
+                || candidates
+                    .iter()
+                    .all(|candidate| !candidate.target.is_local()),
+            "a tool-declaring turn must never carry a local candidate -- \
+             local_quote_skip's tool arm is checked before its policy arm"
+        );
+        let local_withheld_by_tools = local_quote_skipped == Some(LocalQuoteSkip::ToolsDeclared);
         if local_withheld_by_tools && candidates.is_empty() {
             // Nothing hosted was quoted and local was all there was. Its own
             // error rather than `NoCandidates` or a served prose turn, because
@@ -2864,14 +2846,19 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
                 let spec = self.frontier_catalog.spec_for(target).ok_or_else(|| {
                     ConnectFailure::terminal(EngineError::UnresolvableTarget(target.clone()))
                 })?;
-                // Resolved before the quote is built: a catalog TTL the wire
-                // cannot spell is a configuration mistake `CatalogConfig`
-                // already refuses at boot for a real deployment, so this is a
-                // terminal, not-worth-a-failover mistake exactly like an
-                // unresolvable target above.
-                let cache_lifetime = spec
-                    .requested_cache_lifetime()
-                    .map_err(|error| ConnectFailure::terminal(EngineError::Frontier(error)))?;
+                // Resolved before the quote is built: a catalog TTL or decay
+                // ceiling the wire cannot honor is a configuration mistake
+                // `CatalogConfig` already refuses at boot for a real
+                // deployment, so this is a terminal, not-worth-a-failover
+                // mistake exactly like an unresolvable target above.
+                // `EngineError::Frontier` wants the wide `FrontierError`, so
+                // the resolver's narrower refusal is restated through
+                // `cache_lifetime_error` first.
+                let cache_lifetime = spec.requested_cache_lifetime().map_err(|error| {
+                    ConnectFailure::terminal(EngineError::Frontier(
+                        spec.cache_lifetime_error(error),
+                    ))
+                })?;
                 // One call, so the offsets and the string they index into are
                 // the same render rather than two that could disagree.
                 let (rendered, segment_boundaries) = assembler.rendered_with_boundaries();

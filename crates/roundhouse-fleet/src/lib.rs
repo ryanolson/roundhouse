@@ -33,8 +33,8 @@ pub use anthropic_messages::{
     ANTHROPIC_VERSION, AnthropicMessagesClient, DEFAULT_MAX_TOKENS, DEFAULT_MESSAGES_PATH,
 };
 pub use frontier::{
-    EchoFrontierClient, FrontierChunk, FrontierClient, FrontierClients, FrontierError,
-    FrontierModelSpec, FrontierQuote, FrontierStream, StaticFrontierCatalog,
+    CacheLifetimeError, EchoFrontierClient, FrontierChunk, FrontierClient, FrontierClients,
+    FrontierError, FrontierModelSpec, FrontierQuote, FrontierStream, StaticFrontierCatalog,
 };
 pub use local::{
     EmbeddedFleet, FleetError, FleetQuery, LocalFleet, LocalQuote, Reservation, WorkerRegistration,

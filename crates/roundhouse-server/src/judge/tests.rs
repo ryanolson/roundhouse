@@ -195,9 +195,13 @@ async fn a_check_asks_for_its_targets_declared_cache_lifetime() {
         ),
         (CacheModel::Observed, CacheLifetime::Default),
         (
+            // At or under the wire's own undeclared five-minute default, a
+            // decay curve and that schedule agree closely enough to price
+            // (fleet-redis-r3-1); past it, `requested_cache_lifetime`
+            // refuses rather than pricing warmth no marker asked for.
             CacheModel::InactivityDecay {
                 half_life_ms: 60_000,
-                max_ttl_ms: 600_000,
+                max_ttl_ms: 300_000,
                 min_prefix_tokens: 1_024,
             },
             CacheLifetime::Default,

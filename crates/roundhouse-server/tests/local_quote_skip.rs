@@ -284,3 +284,28 @@ async fn a_skipped_local_quote_is_named_in_the_decision_record() {
         "a turn that was quoted records no skip, whatever the quote said"
     );
 }
+
+/// **ORDERING (server-r3-1).** Tools must win over policy.
+///
+/// A turn that declares tools under a policy that also excludes every local
+/// target is a shape where the two refusals in `local_quote_can_matter`
+/// could both apply, and the tool one must be checked first: it is what
+/// `plan` reads to refuse a starved tool turn with `NoToolCapableTarget` and
+/// to annotate a served one with `TOOL_TURN_EXCLUDES_LOCAL`, and a turn
+/// this restrictive is exactly the shape that would otherwise surface
+/// `PolicyAdmitsNoLocal` instead and lose that note.
+#[tokio::test]
+async fn a_tool_declaring_turn_under_a_local_excluding_policy_skips_for_tools_not_policy() {
+    let rig = rig(false).await;
+    let session_id = run(&rig, turn_input(Some(tools())), &frontier_only()).await;
+    assert_eq!(
+        decision(&rig.store, &session_id).await.local_quote_skipped,
+        Some(LocalQuoteSkip::ToolsDeclared),
+        "the tool exclusion must be named even under a policy that would also refuse local"
+    );
+    assert_eq!(
+        rig.fleet.calls(),
+        0,
+        "neither reason for skipping the quote asks the fleet"
+    );
+}

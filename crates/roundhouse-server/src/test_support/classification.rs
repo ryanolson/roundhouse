@@ -37,7 +37,7 @@ use crate::test_support::frontier_spec;
 /// deployment's classifier answers with, byte-for-byte, on the ordinary path.
 ///
 /// Retyped identically in `typesafe_shadow/tests/mod.rs`,
-/// `classify_runtime/tests.rs`, `tests/classification_runtime.rs`,
+/// `classify_runtime/tests/mod.rs`, `tests/classification_runtime.rs`,
 /// `tests/classification_settlement_recovery.rs` and
 /// `tests/roundhouse_binary_classification_boot.rs`
 /// (`tests/classification_prefix_admission.rs` carried it too, under the name
@@ -126,33 +126,23 @@ pub fn classify_config(
 // The loopback classifier
 // ---------------------------------------------------------------------------
 
-/// What the loopback service answers with, and after how long.
-struct Behavior {
-    body: &'static str,
-    delay: Duration,
-}
-
 /// A loopback `/systemone` service, for `ClassificationRuntime`'s own HTTP
 /// client to call against instead of a real provider.
 ///
 /// [`Self::start`] answers the shared [`ANSWER`], for
 /// `tests/classification_runtime.rs`; [`Self::answering`] takes a
-/// caller-chosen fixed body, for `tests/classification_settlement_recovery.rs`.
-/// Every shape still counts calls and captures bodies, and derives each
-/// body's own `state` field through [`Self::states`] — doing so costs nothing
-/// a caller that does not read them notices.
+/// caller-chosen fixed body, for `tests/classification_settlement_recovery.rs`
+/// and `tests/classification_prefix_admission.rs`. Every shape still counts
+/// calls and captures bodies, and derives each body's own `state` field
+/// through [`Self::states`] — doing so costs nothing a caller that does not
+/// read them notices.
 ///
 /// **Not the only loopback fixture in this crate**, and deliberately so:
 /// `classify_runtime`'s own unit tests keep a local `upstream`/`counted_upstream`
 /// pair because several of their callers need an answer *delayed* by a caller-
 /// chosen [`Duration`] — a shape this type does not offer, and adding it back
 /// would only relocate the dead constructor a round of review already found
-/// zero callers for. `tests/classification_prefix_admission.rs` keeps its own
-/// `Classifier` because it deliberately bumps its call count *after* the body
-/// is captured — the reverse of [`handle`]'s order below — so its
-/// `await_calls` can wait on the count and then read the body it counted
-/// without racing the write; see [`handle`]'s own doc for why this type's
-/// order is safe for its own callers instead.
+/// zero callers for (server-r2-5).
 pub struct ClassifierUpstream {
     pub base_url: String,
     calls: Arc<AtomicUsize>,
@@ -161,57 +151,45 @@ pub struct ClassifierUpstream {
 
 #[derive(Clone)]
 struct AppState {
-    behavior: Arc<Behavior>,
+    body: &'static str,
     calls: Arc<AtomicUsize>,
     bodies: Arc<Mutex<Vec<String>>>,
 }
 
-/// Bumps the count before the body is captured. Safe for every caller in
-/// this crate today: none of them waits on [`ClassifierUpstream::count`]
-/// reaching a value and then immediately reads [`ClassifierUpstream::bodies`]
-/// expecting that request's body to already be there — the classify_runtime
-/// suites that read the count wait on the mailbox's own `await_parked`
-/// instead, which only resolves once this handler has returned. A caller
-/// that did want "count `N` implies body `N` is captured" — as
-/// `tests/classification_prefix_admission.rs`'s own loopback does — needs
-/// the reverse order; see [`ClassifierUpstream`]'s own doc for why that copy
-/// stays separate rather than swapping this one.
+/// The body is captured before the count is published, not after. A std
+/// `Mutex` unlock is a release operation and the `SeqCst` store that follows
+/// it is what makes the body visible to any thread that later observes the
+/// count through [`ClassifierUpstream::count`]'s `SeqCst` load:
+/// [`ClassifierUpstream::await_calls`] waits on the count precisely so it can
+/// assume the corresponding body is already captured, and that assumption
+/// only holds in this order (server-r2-5 -- the shared fixture used to bump
+/// the count first, which every caller here happened not to depend on, but
+/// which made this type unusable for the one caller that does).
 async fn handle(
     axum::extract::State(state): axum::extract::State<AppState>,
     body: String,
 ) -> axum::response::Response {
-    state.calls.fetch_add(1, Ordering::SeqCst);
     state.bodies.lock().unwrap().push(body);
-    if !state.behavior.delay.is_zero() {
-        tokio::time::sleep(state.behavior.delay).await;
-    }
-    axum::response::Response::new(axum::body::Body::from(state.behavior.body))
+    state.calls.fetch_add(1, Ordering::SeqCst);
+    axum::response::Response::new(axum::body::Body::from(state.body))
 }
 
 impl ClassifierUpstream {
     /// Answers the shared [`ANSWER`] immediately.
     pub async fn start() -> Self {
-        Self::configured(Behavior {
-            body: ANSWER,
-            delay: Duration::ZERO,
-        })
-        .await
+        Self::configured(ANSWER).await
     }
 
     /// Answers `body` immediately.
     pub async fn answering(body: &'static str) -> Self {
-        Self::configured(Behavior {
-            body,
-            delay: Duration::ZERO,
-        })
-        .await
+        Self::configured(body).await
     }
 
-    async fn configured(behavior: Behavior) -> Self {
+    async fn configured(body: &'static str) -> Self {
         let calls = Arc::new(AtomicUsize::new(0));
         let bodies = Arc::new(Mutex::new(Vec::new()));
         let state = AppState {
-            behavior: Arc::new(behavior),
+            body,
             calls: Arc::clone(&calls),
             bodies: Arc::clone(&bodies),
         };
@@ -232,6 +210,23 @@ impl ClassifierUpstream {
 
     pub fn count(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
+    }
+
+    /// Poll until at least `count` calls have arrived, or panic.
+    ///
+    /// Depends on [`handle`]'s capture-then-publish order: once this returns,
+    /// every body through index `count - 1` is already in [`Self::bodies`].
+    pub async fn await_calls(&self, count: usize) {
+        for _ in 0..300 {
+            if self.count() >= count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "the classifier never reached {count} call(s); it saw {}",
+            self.count()
+        );
     }
 
     /// Every request body received, verbatim, in arrival order.

@@ -45,10 +45,7 @@ use crate::keys::{self, KeyNamespace};
 
 /// Lua shared by every script that reads or writes a stored mark, including
 /// the canonical session write path's marked append in the parent module —
-/// `pub(super)` so `scripts.rs` can splice it into `APPEND`'s prelude beside
-/// `LAST_EXACT_SEQ`: the range guard it names belongs to the append every
-/// write path takes, marked or not, not to this deliberately unwired feature
-/// module.
+/// `pub(super)` so `scripts.rs` can splice it into the append's prelude.
 ///
 /// `covers` compares canonical decimal strings digit by digit rather than
 /// through `tonumber`, so a confirmed watermark anywhere in the `u64` range —

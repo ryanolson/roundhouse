@@ -70,12 +70,14 @@ pub enum ClassifyConfigError {
 
 /// Where the classifier's key is read from. A variable name, never a key.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthConfig {
     pub env: String,
 }
 
 /// The rate card, as the operator copied it from the service's price list.
 #[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PricingConfig {
     pub input_per_mtok_usd: f64,
     pub output_per_mtok_usd: f64,
@@ -83,6 +85,7 @@ pub struct PricingConfig {
 
 /// What this deployment is willing to send.
 #[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CapsConfig {
     pub max_prior_classifications: usize,
     /// Prior-turn local metadata records to carry — see
@@ -98,6 +101,7 @@ pub struct CapsConfig {
 
 /// The transport's own bounds.
 #[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TransportConfig {
     pub max_request_bytes: usize,
     pub max_response_bytes: usize,
@@ -106,6 +110,7 @@ pub struct TransportConfig {
 
 /// What the background executor may hold.
 #[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExecutorConfig {
     pub max_in_flight: usize,
     pub max_http_concurrency: usize,
@@ -122,6 +127,7 @@ pub struct ExecutorConfig {
 /// a ledger of its own: a classification must not be able to spend a project's
 /// serving budget, and an evaluation overspend must not refuse a turn.
 #[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvaluationBudgetConfig {
     pub limit_usd: f64,
     pub window: BudgetWindow,

@@ -34,7 +34,7 @@ use serde::Deserialize;
 
 use roundhouse_core::metrics::{DEFAULT_CAPABILITY_BAND, MetricsConfig};
 use roundhouse_fleet::anthropic_messages::CacheLifetime;
-use roundhouse_fleet::{FrontierError, FrontierModelSpec, StaticFrontierCatalog};
+use roundhouse_fleet::{CacheLifetimeError, FrontierModelSpec, StaticFrontierCatalog};
 
 use crate::engine::{DEFAULT_LOCAL_BASE_TTFT_MS, EngineConfig};
 
@@ -303,6 +303,28 @@ pub enum CatalogError {
         model: String,
         ttl_ms: u64,
     },
+    /// An `inactivity_decay` entry on `anthropic_messages` models retention
+    /// past what the wire's own undeclared default grants.
+    ///
+    /// Anthropic's Messages cache is deterministic, not automatic: past the
+    /// silent five-minute default, the dialect's only lever is the explicit
+    /// `1h` marker `CacheModel::Deterministic` spells, not a decay curve.
+    /// A `max_ttl_ms` past the default therefore prices warmth this wire was
+    /// never asked to grant, for the same reason a `deterministic` TTL it
+    /// cannot spell is refused above (fleet-redis-r3-1).
+    #[error(
+        "catalog `{path}`: `{model}` models an automatic cache retained up to \
+         {max_ttl_ms}ms on `anthropic_messages`, past the {default_ttl_ms}ms the wire \
+         grants with no marker to ask for more. This dialect's cache is deterministic, \
+         not automatic -- use `cache_model.kind: \"deterministic\"` with an explicit \
+         `ttl_ms`, or lower `max_ttl_ms` to {default_ttl_ms} or below"
+    )]
+    UndeclaredCacheDecay {
+        path: String,
+        model: String,
+        max_ttl_ms: u64,
+        default_ttl_ms: u64,
+    },
     #[error("catalog `{path}`: `{model}` has {field} = {value}, but {expected}")]
     InvalidValue {
         path: String,
@@ -523,27 +545,37 @@ impl CatalogConfig {
             unit_interval(path, &label, "quality_prior", spec.quality_prior)?;
 
             // `requested_cache_lifetime` is the one place "which deterministic
-            // TTLs Anthropic's wire can spell" is decided — its own doc says a
-            // variant added to either `WireProtocol` or `CacheModel` fails to
-            // compile there until someone decides what it means. Calling it
-            // here, rather than re-deriving the same rule by hand, is what
-            // keeps that compile-time protection real: a hand-written `==`
-            // copy would not fail to compile on a new variant, it would
-            // silently accept it (fleet-redis-r2-2 / server-r2-1).
+            // TTLs Anthropic's wire can spell, and how far an automatic decay
+            // may model retention" is decided — its own doc says a variant
+            // added to either `WireProtocol` or `CacheModel` fails to compile
+            // there until someone decides what it means. Calling it here,
+            // rather than re-deriving the same rule by hand, is what keeps
+            // that compile-time protection real: a hand-written `==` copy
+            // would not fail to compile on a new variant, it would silently
+            // accept it (fleet-redis-r2-2 / server-r2-1). The match below is
+            // over `CacheLifetimeError`'s own two variants rather than the
+            // wide `FrontierError`, so it too is exhaustive -- a third
+            // refusal the resolver grows fails to compile here instead of
+            // panicking at boot through a wildcard arm (fleet-redis-r3-1).
             let lifetime = spec
                 .requested_cache_lifetime()
                 .map_err(|error| match error {
-                    FrontierError::UnsupportedCacheLifetime { ttl_ms, .. } => {
+                    CacheLifetimeError::UnspellableTtl { ttl_ms } => {
                         CatalogError::UnsupportedCacheLifetime {
                             path: path.to_string(),
                             model: label.clone(),
                             ttl_ms,
                         }
                     }
-                    other => unreachable!(
-                        "requested_cache_lifetime only refuses an unspellable ttl on \
-                     anthropic_messages; every other arm returns Ok: {other}"
-                    ),
+                    CacheLifetimeError::UndeclaredDecay {
+                        max_ttl_ms,
+                        default_ttl_ms,
+                    } => CatalogError::UndeclaredCacheDecay {
+                        path: path.to_string(),
+                        model: label.clone(),
+                        max_ttl_ms,
+                        default_ttl_ms,
+                    },
                 })?;
 
             // A single write rate must match the lifetime requested on the

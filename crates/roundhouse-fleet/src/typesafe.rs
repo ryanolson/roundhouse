@@ -356,15 +356,11 @@ impl SystemOneClient {
         })
     }
 
-    pub fn limits(&self) -> SystemOneLimits {
-        self.limits
-    }
-
     /// The request body, as JSON.
     ///
     /// One `state` for however many questions, which is the saving: the state
     /// is most of the body, and it is sent once.
-    pub fn body(request: &SystemOneRequest) -> Value {
+    fn body(request: &SystemOneRequest) -> Value {
         let questions: serde_json::Map<String, Value> = request
             .questions
             .iter()
@@ -413,8 +409,13 @@ impl SystemOneClient {
             return Err(SystemOneError::NoQuestions);
         }
         let headers = Self::headers(credential)?;
+        // `expect` and not a `?`: `Self::body` builds its `Value` from owned
+        // `String`s and a fixed shape, so the only way `to_string` fails is a
+        // serde bug. `SystemOneError::Malformed` already means "the response
+        // envelope did not parse" -- routing a request-side failure through it
+        // would put two meanings on one arm.
         let body =
-            serde_json::to_string(&Self::body(request)).map_err(|_| SystemOneError::Malformed)?;
+            serde_json::to_string(&Self::body(request)).expect("a serde_json::Value serializes");
         if body.len() > self.limits.max_request_bytes {
             return Err(SystemOneError::RequestTooLarge {
                 limit_bytes: self.limits.max_request_bytes,
@@ -510,7 +511,7 @@ impl SystemOneClient {
     }
 
     /// The headers this credential implies.
-    pub(crate) fn headers(credential: &TurnCredential) -> Result<HeaderMap, SystemOneError> {
+    fn headers(credential: &TurnCredential) -> Result<HeaderMap, SystemOneError> {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         match credential {
@@ -544,10 +545,7 @@ impl SystemOneClient {
     ///
     /// The usage is read *first* and independently of the answers, which is the
     /// whole of "a reported spend survives an unusable signal".
-    ///
-    /// [`Self::send`] suppresses credential echoes before returning the reply.
-    /// This parser has no credential and cannot perform that check.
-    pub fn reply(
+    fn reply(
         raw: &[u8],
         questions: &BTreeMap<String, ChoiceQuestion>,
     ) -> Result<SystemOneReply, SystemOneError> {

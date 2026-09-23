@@ -103,9 +103,10 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
     /// first token — and Dynamo can hold a KV cache for longer than any
     /// frontier TTL, so the answer is worth having whenever it can move the
     /// route. It is worth nothing when it cannot: a coding agent declares a
-    /// toolbox on nearly every turn, `plan`'s exclusion drops every local
-    /// candidate on exactly those turns, and a selector that is down was
-    /// failing turns that were always going to a hosted model.
+    /// toolbox on nearly every turn, this function's tool arm excludes local
+    /// on exactly those turns before a quote is ever asked for, and a
+    /// selector that is down was failing turns that were always going to a
+    /// hosted model.
     pub(super) fn local_quote_skip(
         &self,
         declarations: &ClientDeclarations,
@@ -123,34 +124,16 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
     }
 }
 
-/// Whether the local candidate pool ended up withheld because this turn
-/// declared tools, once quoting and filtering are done.
-///
-/// **A tool turn loses its local options in one of two places**: the retain
-/// `plan` applies after quoting, or the quote that was never made because the
-/// answer was always going to be discarded. Downstream nothing can tell the
-/// difference and nothing should — the audit note, the empty-pool refusal and
-/// the exhausted-budget restatement all state the same fact — so the two
-/// spellings are folded into this one answer once, rather than three sites
-/// each learning that a skip exists.
-///
-/// `skipped` is whatever [`Engine::local_quote_skip`] decided before pricing;
-/// `excluded_local` is how many candidates `plan`'s own retain dropped after
-/// pricing — a fact that does not exist until candidates have been quoted and
-/// filtered, so it is taken here rather than re-derived.
-pub(super) fn local_withheld_by_tools(
-    skipped: Option<LocalQuoteSkip>,
-    excluded_local: usize,
-) -> bool {
-    excluded_local > 0 || skipped == Some(LocalQuoteSkip::ToolsDeclared)
-}
-
 /// Whether pricing the local fleet can still change this turn's route.
 ///
 /// `Ok(())` means ask it; `Err` names why the answer would have been thrown
-/// away — see [`Engine::local_quote_skip`]. A free function over values the
-/// call site already holds, so the decision to skip an HTTP call is testable
-/// without a session, a fleet or a clock.
+/// away — see [`Engine::local_quote_skip`]. `plan` reads this `Err` directly
+/// as `local_quote_skipped`, and a tool-declaring turn is withheld from local
+/// exactly when it is `Some(LocalQuoteSkip::ToolsDeclared)`: no local
+/// candidate is ever quoted for one, so there is nothing downstream left to
+/// filter back out (server-r3-1). A free function over values the call site
+/// already holds, so the decision to skip an HTTP call is testable without a
+/// session, a fleet or a clock.
 ///
 /// Both refusals are *reachability* facts in the sense
 /// [`TurnPolicy::permits`] means: the same answer on every turn that looks
@@ -170,10 +153,32 @@ fn local_quote_can_matter(
     local_policy_identity: &str,
     local_quality_prior: f64,
 ) -> Result<(), LocalQuoteSkip> {
+    // **M11.2a's F2, and it is a routing fact rather than a dispatch one.**
+    // [`LocalExecutor::execute`] takes prompt token ids and an output cap and
+    // nothing else — this build has no way to tell a locally served model
+    // about a toolbox at all — and [`LocalExecution::text`] is a plain
+    // `String`, structurally incapable of carrying a call back. So a turn
+    // that declares tools and lands local is answered in prose, reports
+    // `end_turn` as if it had finished normally, and signals the loss
+    // nowhere: the client's agent loop simply stops working, which is the
+    // one failure shape this codebase treats as worse than an error.
+    //
+    // **Checked before the policy arm below, and the order is load-bearing,
+    // not tidy** (server-r3-1). A candidate that could never have served this
+    // turn must not sit in `considered` either, or the dashboard prices a
+    // counterfactual saving against a target the turn could not have used —
+    // checking policy first would report `PolicyAdmitsNoLocal` for a
+    // tool-declaring turn a hosted-only policy also excludes, and `plan`
+    // would then annotate the decision as a policy exclusion, dropping
+    // `TOOL_TURN_EXCLUDES_LOCAL` from a record it belongs on.
+    //
+    // The alternative deliberately not taken: rendering a textual toolbox
+    // into the local prompt and parsing calls back out of the model's prose.
+    // That is a real design with a real cost — a second, weaker tool
+    // protocol whose failures look like bad answers — and it belongs to
+    // whichever milestone decides local models should be agentic, not to a
+    // review fix.
     if declares_tools {
-        // The exclusion below `plan`'s quote is unconditional and this
-        // predicate is its mirror: a local worker in this build cannot be told
-        // about a toolbox at all, so the quote would be discarded on arrival.
         return Err(LocalQuoteSkip::ToolsDeclared);
     }
     if !policy.permits_identity(local_policy_identity, local_quality_prior) {
@@ -211,6 +216,16 @@ mod tests {
             local_quote_can_matter(false, &hosted_only, &identity, 0.6),
             Err(LocalQuoteSkip::PolicyAdmitsNoLocal)
         );
+        // **ORDERING (server-r3-1).** Tools must win over policy: a
+        // tool-declaring turn under a policy that also excludes every local
+        // target still has to name the tool reason, because that is the name
+        // `plan` reads to refuse or annotate the turn — a policy reason here
+        // would drop `TOOL_TURN_EXCLUDES_LOCAL` from a decision it belongs on.
+        assert_eq!(
+            local_quote_can_matter(true, &hosted_only, &identity, 0.6),
+            Err(LocalQuoteSkip::ToolsDeclared),
+            "the tool arm must be checked before the policy arm"
+        );
 
         let discerning = TurnPolicy {
             min_quality: 0.9,
@@ -227,25 +242,6 @@ mod tests {
             local_quote_can_matter(false, &discerning, &identity, 0.95),
             Ok(()),
             "and a fleet that clears the floor is still asked"
-        );
-    }
-
-    /// `local_withheld_by_tools` is true from either source, and from
-    /// neither alone unless it applies.
-    #[test]
-    fn local_withheld_by_tools_folds_the_two_ways_local_is_withheld_into_one_answer() {
-        assert!(!local_withheld_by_tools(None, 0));
-        assert!(
-            local_withheld_by_tools(Some(LocalQuoteSkip::ToolsDeclared), 0),
-            "skipped before pricing because tools were declared"
-        );
-        assert!(
-            !local_withheld_by_tools(Some(LocalQuoteSkip::PolicyAdmitsNoLocal), 0),
-            "skipped for a reason that has nothing to do with tools"
-        );
-        assert!(
-            local_withheld_by_tools(None, 2),
-            "quoted, but the post-pricing retain excluded it anyway"
         );
     }
 }

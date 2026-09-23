@@ -634,14 +634,17 @@ impl<T: Tokenizer + Clone> FleetJudge<T> {
         prepared: PreparedPrompt,
     ) -> Result<JudgeAnswer, JudgeFailure> {
         let deadline = tokio::time::Instant::now() + Duration::from_millis(self.deadline_ms());
-        // Resolved before the quote is built, so an unspellable catalog TTL
-        // abandons the check the same way an unreachable provider does,
-        // rather than reaching `body()` and mispricing the check that never
-        // happened.
+        // Resolved before the quote is built, so a catalog TTL the resolver
+        // refuses abandons the check the same way an unreachable provider
+        // does, rather than reaching `body()` and mispricing the check that
+        // never happened. `abandoned` matches on `FrontierError`, the wide
+        // dispatch-error space, so the resolver's narrower refusal is
+        // restated through `cache_lifetime_error` before it reaches that
+        // match.
         let cache_lifetime = self
             .spec
             .requested_cache_lifetime()
-            .map_err(|error| self.abandoned(&error))?;
+            .map_err(|error| self.abandoned(&self.spec.cache_lifetime_error(error)))?;
         let quote = FrontierQuote {
             target: self.target(),
             wire_protocol: self.spec.wire_protocol,

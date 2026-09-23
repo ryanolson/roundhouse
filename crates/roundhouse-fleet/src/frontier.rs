@@ -29,7 +29,7 @@ use roundhouse_core::routing::{
     AttemptClass, CacheLedger, CacheModel, Candidate, ProviderPricing, Target,
 };
 
-use crate::anthropic_messages::CacheLifetime;
+use crate::anthropic_messages::{CacheLifetime, DEFAULT_CACHE_TTL_MS};
 use crate::usage::WireProtocol;
 
 /// A frontier model we may route to.
@@ -58,6 +58,46 @@ pub struct FrontierModelSpec {
     pub ttft_ms_per_uncached_token: f64,
 }
 
+/// Why [`FrontierModelSpec::requested_cache_lifetime`] could not name a
+/// lifetime.
+///
+/// Its own small enum rather than the resolver returning [`FrontierError`]
+/// directly: a caller that matches *this* type is exhaustive by
+/// construction, so `catalog_config`'s boot-time mapping can refuse a third
+/// variant at compile time instead of falling through an `unreachable!` that
+/// only starts panicking once the resolver actually grows one
+/// (fleet-redis-r2-2's caveat, closed by fleet-redis-r3-1). A dispatch caller
+/// that needs the wide error space restates this through
+/// [`FrontierModelSpec::cache_lifetime_error`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum CacheLifetimeError {
+    /// A `Deterministic` TTL neither of the wire's two spellings means.
+    #[error(
+        "a {ttl_ms}ms cache lifetime, and Anthropic's Messages API has no spelling for it \
+         -- only the five-minute default (300000) and the explicit one-hour marker \
+         (3600000) exist"
+    )]
+    UnspellableTtl { ttl_ms: u64 },
+    /// An `InactivityDecay` ceiling past the wire's own undeclared default.
+    ///
+    /// Anthropic's Messages cache is deterministic, not automatic: the only
+    /// lever this dialect offers past the silent five-minute default is the
+    /// explicit `1h` marker `CacheModel::Deterministic` spells, not a decay
+    /// curve that keeps predicting warmth the longer a prefix goes unused.
+    /// A `max_ttl_ms` at or under the default is close enough to the wire's
+    /// own schedule to price; past it, the model keeps predicting a hit for
+    /// a stretch no marker asked the provider to hold.
+    #[error(
+        "an automatic cache retained up to {max_ttl_ms}ms, longer than the {default_ttl_ms}ms \
+         Anthropic's Messages API grants with no marker to ask for more -- this dialect's \
+         cache is deterministic, not automatic"
+    )]
+    UndeclaredDecay {
+        max_ttl_ms: u64,
+        default_ttl_ms: u64,
+    },
+}
+
 impl FrontierModelSpec {
     pub fn target(&self) -> Target {
         Target::Frontier {
@@ -72,16 +112,19 @@ impl FrontierModelSpec {
     /// Every other wire this catalog can name has no per-breakpoint lifetime
     /// at all, so its quote carries [`CacheLifetime::Default`] too — the
     /// honest answer to "what TTL does this wire ask for" on a dialect the
-    /// field means nothing to, and the same answer automatic and observed
-    /// cache models give on any dialect, deterministic or not.
+    /// field means nothing to. On Messages itself, `Default` also covers
+    /// `Observed` and an `InactivityDecay` ceiling that fits inside the
+    /// wire's own undeclared five minutes; one deeper than that, or a
+    /// `Deterministic` TTL neither wire spelling means, is refused rather
+    /// than downgraded to it — see [`CacheLifetimeError`].
     ///
     /// Fallible only in theory for a spec built outside the server's
     /// `catalog_config` validation — that boundary refuses an
-    /// `anthropic_messages` entry whose deterministic TTL is not one of the
-    /// two the wire offers, so a spec that reaches a real dispatch has
-    /// already had this succeed once. A hand-built spec that skipped
-    /// validation is refused here rather than silently priced at the
-    /// default, which is exactly the failure this type exists to close.
+    /// `anthropic_messages` entry this resolver would refuse, so a spec
+    /// that reaches a real dispatch has already had this succeed once. A
+    /// hand-built spec that skipped validation is refused here rather than
+    /// silently priced at the default, which is exactly the failure this
+    /// type exists to close.
     ///
     /// **Both matches are spelled out, neither ends in a wildcard.** A
     /// `WireProtocol` this crate cannot spell a `cache_control` for and a
@@ -89,27 +132,67 @@ impl FrontierModelSpec {
     /// straight to `Default` — silently, the same failure this type exists
     /// to close, just moved one match up. A variant added to either enum
     /// fails to compile here until someone decides what it means.
-    pub fn requested_cache_lifetime(&self) -> Result<CacheLifetime, FrontierError> {
+    pub fn requested_cache_lifetime(&self) -> Result<CacheLifetime, CacheLifetimeError> {
         match self.wire_protocol {
             WireProtocol::AnthropicMessages => match self.cache_model {
                 CacheModel::Deterministic { ttl_ms } => CacheLifetime::from_ttl_ms(ttl_ms)
-                    .ok_or_else(|| FrontierError::UnsupportedCacheLifetime {
-                        provider: self.provider.clone(),
-                        model: self.model.clone(),
-                        ttl_ms,
-                    }),
-                // No per-breakpoint wire signal either model can name: an
-                // automatic cache expires on its own schedule that no marker
-                // controls.
-                CacheModel::InactivityDecay { .. } | CacheModel::Observed => {
+                    .ok_or(CacheLifetimeError::UnspellableTtl { ttl_ms }),
+                // Within the wire's own undeclared five minutes, a decay
+                // curve and the silent default agree closely enough to
+                // price. Past it, this dialect has no marker left to ask
+                // for more -- its cache is deterministic, not automatic --
+                // so a deeper ceiling keeps predicting a hit for a stretch
+                // nothing asked the provider to hold (fleet-redis-r3-1).
+                CacheModel::InactivityDecay { max_ttl_ms, .. }
+                    if max_ttl_ms <= DEFAULT_CACHE_TTL_MS =>
+                {
                     Ok(CacheLifetime::Default)
                 }
+                CacheModel::InactivityDecay { max_ttl_ms, .. } => {
+                    Err(CacheLifetimeError::UndeclaredDecay {
+                        max_ttl_ms,
+                        default_ttl_ms: DEFAULT_CACHE_TTL_MS,
+                    })
+                }
+                // Never guessed at -- the router uses the target's reported
+                // overlap instead -- so there is no retention claim here for
+                // the wire's silent default to contradict.
+                CacheModel::Observed => Ok(CacheLifetime::Default),
             },
             // Neither dialect has `cache_control` vocabulary at all, so every
             // cache model reads the same on them: no explicit lifetime.
             WireProtocol::OpenAiChatCompletions | WireProtocol::OpenAiResponses => {
                 Ok(CacheLifetime::Default)
             }
+        }
+    }
+
+    /// [`Self::requested_cache_lifetime`]'s refusal, restated in the wide
+    /// dispatch-error space a `FrontierClient` call returns.
+    ///
+    /// A dispatch caller (`engine.rs`, `judge.rs`) needs `FrontierError`
+    /// because that is what failover and `JudgeFailure::Abandoned` already
+    /// match on; `catalog_config`'s boot-time boundary does not; it maps
+    /// [`CacheLifetimeError`] directly so its match stays exhaustive. This
+    /// is the seam between the two: it carries the identity the narrower
+    /// type does not.
+    pub fn cache_lifetime_error(&self, error: CacheLifetimeError) -> FrontierError {
+        FrontierError::UnsupportedCacheLifetime {
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+            ttl_ms: error.ttl_ms(),
+        }
+    }
+}
+
+impl CacheLifetimeError {
+    /// The TTL, in milliseconds, this refusal is about — the deterministic
+    /// value the wire cannot spell, or the decay ceiling past what the wire
+    /// silently grants.
+    pub fn ttl_ms(&self) -> u64 {
+        match *self {
+            CacheLifetimeError::UnspellableTtl { ttl_ms } => ttl_ms,
+            CacheLifetimeError::UndeclaredDecay { max_ttl_ms, .. } => max_ttl_ms,
         }
     }
 }
@@ -1445,10 +1528,7 @@ mod tests {
         );
         assert!(matches!(
             messages(CacheModel::Deterministic { ttl_ms: 600_000 }).requested_cache_lifetime(),
-            Err(FrontierError::UnsupportedCacheLifetime {
-                ttl_ms: 600_000,
-                ..
-            })
+            Err(CacheLifetimeError::UnspellableTtl { ttl_ms: 600_000 })
         ));
         assert_eq!(
             messages(CacheModel::Observed)
@@ -1456,16 +1536,35 @@ mod tests {
                 .unwrap(),
             CacheLifetime::Default
         );
+        // A decay ceiling at or under the wire's own undeclared five minutes
+        // is close enough to that schedule to price.
         assert_eq!(
             messages(CacheModel::InactivityDecay {
                 half_life_ms: 60_000,
-                max_ttl_ms: 600_000,
+                max_ttl_ms: 300_000,
                 min_prefix_tokens: 1_024,
             })
             .requested_cache_lifetime()
             .unwrap(),
             CacheLifetime::Default
         );
+        // **CORRECTNESS (fleet-redis-r3-1).** Past that default, Messages has
+        // no marker left to ask for more retention -- its cache is
+        // deterministic, not automatic -- so a deeper ceiling is refused
+        // rather than priced at the default the wire was never asked to
+        // extend.
+        assert!(matches!(
+            messages(CacheModel::InactivityDecay {
+                half_life_ms: 60_000,
+                max_ttl_ms: 600_000,
+                min_prefix_tokens: 1_024,
+            })
+            .requested_cache_lifetime(),
+            Err(CacheLifetimeError::UndeclaredDecay {
+                max_ttl_ms: 600_000,
+                default_ttl_ms: 300_000,
+            })
+        ));
 
         // A dialect with no `cache_control` vocabulary at all reads the same
         // lifetime regardless of what its cache model names -- 600000ms would

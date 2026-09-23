@@ -188,10 +188,9 @@ pub(crate) struct AppendBatch<'a> {
 /// member they are keyed by, where the marked event sits in the batch, and
 /// the project it is marked for.
 ///
-/// `index_keys` owned rather than borrowed: a borrow would need a binding
-/// beside the `Option` this struct itself sits in at the one call site
-/// ([`crate::RedisSessionStore::append_events`]), so `Option::map` could not
-/// build both from one `mark.as_ref()` — see that call site's own doc.
+/// `index_keys` owned rather than borrowed, so the one call site
+/// ([`crate::RedisSessionStore::append_events`]) can build this from a single
+/// `mark.as_ref().map(..)`.
 pub(crate) struct MarkArgs<'a> {
     pub(crate) index_keys: learning::IndexKeys,
     pub(crate) session_id: &'a str,
