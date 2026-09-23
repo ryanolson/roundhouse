@@ -23,7 +23,7 @@ The final workspace run at `5fba49d` passed 1801 tests, with 0 failures, 141 exi
 
 ### Completion requirements
 
-The transport and observation checkpoints do not complete the owner's routing vision. This table reflects the committed state through `5be10e7` on 2026-09-22. Dated checkpoints below retain earlier evidence and limitations.
+The transport and observation checkpoints do not complete the owner's routing vision. This table includes interval source `1658633` on 2026-09-22. Eight independent mutations were caught, and the full workspace suite passed 2173 tests with 149 existing ignores. See `REVIEW-frontier-interval-feedback.md` for evidence and limits. Dated checkpoints below retain earlier results.
 
 | Requirement | Remaining implementation or evidence |
 |---|---|
@@ -32,7 +32,7 @@ The transport and observation checkpoints do not complete the owner's routing vi
 | Evaluation accounting | `438fe2f` records separate evaluation costs and settlement recovery. Memory and Redis checks are recorded below. Fresh-connection Redis recovery is covered below; process-crash recovery remains unverified. |
 | Background execution | `438fe2f` implements durable intents, bounded work, expiry, cancellation, and retained delivery. Later tests close deadline and acknowledgement gaps. `f62c621` removes acknowledgement backlog scans and has scoped mutation evidence. |
 | Deployment wiring | `438fe2f` implements opt-in configuration, disabled defaults, evaluation accounting, and loopback startup tests. Local-only exclusion has a mutation guard. Live deployment evidence remains absent. |
-| Frontier quality feedback | Exact interval coverage across text and tool turns, per-turn instruction versions, snapshot cutoff, unknown outcomes, and once-only learning updates. |
+| Frontier quality feedback | `1658633` implements interval coverage across text and tool turns, configuration/objective checks, snapshot cutoff, and unknown outcomes. Mutation and workspace checks pass. A durable learning consumer remains unfinished. |
 | Online bandit | Local selection must use available classifications and observed outcomes. The accepted policy minimizes cost within a configurable latency limit after satisfying quality requirements. Per-project learning and its durable updates remain unfinished. |
 | Offline learning | Versioned calibration artifacts, reproducible evaluation, and promotion evidence. Background estimates remain distinct from observed serving outcomes. |
 | Cache feedback | Prediction error informs destination reuse estimates without inventing cache-pressure causes or counting measured costs twice. C6 return-trip timing remains open. |

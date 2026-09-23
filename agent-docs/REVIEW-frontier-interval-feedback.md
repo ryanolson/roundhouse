@@ -35,8 +35,24 @@ Evidence logs: `/tmp/roundhouse-frontier-interval-red-core.log`, `/tmp/roundhous
 
 ## Remaining gates and limits
 
-Independent post-commit mutation checks and full workspace validation remain pending. This is not a full-PR approval. No live provider, Redis outage, process-crash, or deployment evidence is claimed.
+The workspace and mutation results below complete this stage's validation. This is not a full-PR approval. No live provider, Redis outage, process-crash, or deployment evidence is claimed.
 
 Control tools such as `declare_intent` can make an interval unknown. The filter does not remove routing details that an agent repeats in ordinary text. Some scans still depend on transcript size. These limits must remain visible when evaluating learning coverage and performance.
 
 The full goal still requires learned per-project selection, once-only durable learning updates, offline calibration and promotion, cache prediction updates, and deployment measurements. The accepted cost, latency, project-scope, and oversized-interval decisions remain in `PLAN-routing-strategy-bandit.md`.
+
+## Independent mutation checks, 2026-09-22
+
+All eight mutations against `1658633` compiled and failed their intended runtime assertions. They exercised complete-prompt control filtering, withheld-content gaps, prefix-call resolution, allocation order, exact decision membership, interval continuity, missing-context labels, and late-review checkpoints.
+
+The gap mutation retained both prompt filtering and section omission. Its false positive therefore isolated the missing coverage declaration. The continuity mutation failed on a gapped review; other checks still rejected duplicates and overlaps. The late-review mutation failed the checkpoint assertion before reaching the pending-decision assertion. No separate mutation failure is claimed for that later assertion.
+
+Each mutation restored the exact original source bytes. The parent inspected all diffs and assertion logs and confirmed that `crates/` matched the commit. The restored run passed 42 core tests and 12 engine tests, including two shared wire controls. Formatting passed. No permanent source or test changes were needed.
+
+Evidence: `/tmp/roundhouse-interval-refute-report.md`, `/tmp/roundhouse-interval-mutation-results.json`, `/tmp/roundhouse-interval-mutation-01-classic-control.diff` through the corresponding `08-late-checkpoint` artifacts, and `/tmp/roundhouse-interval-restored-{core,server,fmt}.log`.
+
+## Workspace validation, 2026-09-22
+
+The full suite against source `1658633` passed 2173 tests, with zero failures and 149 existing ignores. It covered 130 test binaries and seven doc-test suites, with no compiler warnings. Only documentation changed during the run. The parent confirmed that `crates/` still matched the committed source afterward.
+
+Command: `ulimit -n 65536`, then `timeout 900 cargo test --workspace`, using the shared target directory. Log: `/tmp/roundhouse-frontier-interval-workspace.log`. The default run does not execute Redis-gated or other ignored tests.
