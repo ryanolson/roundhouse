@@ -23,13 +23,17 @@ use crate::event::{
     SessionObserver, Usage, ValidationOutcome,
 };
 use crate::ids::{ResponseId, SessionId, TurnId};
-use crate::item::{Item, Role};
+use crate::item::{Item, ItemContent, Role};
 use crate::routing::{CacheLedger, DecisionRecord, DispatchAttempt, ProviderPricing, Target};
 use crate::store::{Lease, SessionStore, StoreError};
 use crate::validate::{Arm, EscalationOverrides, SteerAction};
 
+mod review;
 mod unrepaired;
 
+use review::ReviewTracker;
+pub(crate) use review::{IntervalFacts, TurnEnd, TurnState};
+pub use review::{MAX_REVIEW_DECISIONS, MAX_REVIEW_TURNS, REVIEW_OUTCOME_WINDOW, ReviewOutcome};
 use unrepaired::UnrepairedSettlements;
 
 /// How many events to pull per replay batch.
@@ -252,6 +256,16 @@ pub struct TerminalSettlement {
 /// emitted, and no emitted item is ever a client's configuration.
 pub fn is_turn_configuration(item: &Item) -> bool {
     item.role == Role::Developer && item.response_id.is_none()
+}
+
+/// Whether `item` is a request somebody typed: user text that is not blank.
+///
+/// The same test [`trailing_user_request`](crate::validate::trailing_user_request)
+/// applies, so the review's stand-in objective is the request a brief would
+/// name.
+pub(crate) fn is_user_request(item: &Item) -> bool {
+    item.role == Role::User
+        && matches!(&item.content, ItemContent::Text { text } if !text.trim().is_empty())
 }
 
 /// How many leading items of `items` are turn configuration.
@@ -599,6 +613,11 @@ pub struct SessionState {
     /// versioned, and re-running today's extractor over an old turn would answer
     /// a different question than the record does.
     prior_turns: Vec<PriorTurnMetadata>,
+
+    // ---- Frontier review intervals. --------------------------------------
+    /// The decisions no accepted review has covered yet, and the checkpoint
+    /// the next review must start from. See [`review`].
+    review: ReviewTracker,
 }
 
 /// A narrowing the validate loop asked for, with its remaining life.
@@ -689,12 +708,25 @@ impl SessionState {
                 // one thing that is *not* plain append order here: a turn's
                 // leading configuration run replaces the session's, at the
                 // head. See [`ConfigurationCursor`].
+                match is_turn_configuration(item) {
+                    true => self.review.configuration_appended(),
+                    false => self.review.history_appended(
+                        self.items.len() - self.configuration.len(),
+                        is_user_request(item),
+                    ),
+                }
                 self.configuration.append(&mut self.items, item.clone());
             }
             SessionEventKind::TurnStarted {
                 turn_id,
                 response_id,
             } => {
+                self.review.turn_started(
+                    event.seq,
+                    self.turn_index,
+                    response_id,
+                    self.items.len() - self.configuration.len(),
+                );
                 self.turn_index += 1;
                 self.open_turns.insert(turn_id.clone(), response_id.clone());
                 // The configuration run is per turn: the items about to be
@@ -714,6 +746,15 @@ impl SessionState {
                 // per-dispatch vector cost (review finding G05).
                 self.frontier_history
                     .record(&decision.chosen, self.turn_index);
+                self.review.routed(
+                    event.seq,
+                    response_id,
+                    decision
+                        .selection
+                        .as_ref()
+                        .and_then(|selection| selection.objective.as_ref()),
+                    &self.items[..self.configuration.len()],
+                );
                 // One entry per *turn*, not per dispatch: a failover writes
                 // several `Routed` carrying one selection, and three copies of
                 // one turn's counts would read as three turns of work.
@@ -766,6 +807,14 @@ impl SessionState {
                 // provider stopped holding the prompt, which is what the TTL
                 // runs from — and only under the evidence rule documented on
                 // `pending_routings`.
+                self.review.ended(
+                    event.seq,
+                    response_id,
+                    match &event.kind {
+                        SessionEventKind::ResponseCompleted { .. } => TurnEnd::Completed,
+                        _ => TurnEnd::Incomplete,
+                    },
+                );
                 let routing = self.pending_routings.remove(response_id);
                 // Whether this response ever reached a provider, which is the
                 // same question `last_settlement` keys "owes nobody anything"
@@ -890,6 +939,14 @@ impl SessionState {
                 });
             }
             SessionEventKind::ValidationDecided { arm, outcome, .. } => {
+                // Only a parsed verdict is a frontier checkpoint. Failures and
+                // the placebo arm asked nobody, so the interval stays open.
+                if let ValidationOutcome::Judged {
+                    verdict, interval, ..
+                } = outcome
+                {
+                    self.review.judged(event.seq, verdict, interval.as_deref());
+                }
                 // **The cooldown is spent by every decision; the cap and the
                 // budget are spent only by a decision that bought something.**
                 //
@@ -1020,6 +1077,8 @@ impl SessionState {
             }
             SessionEventKind::SessionCreated { arm, principal, .. } => {
                 self.arm = *arm;
+                self.review
+                    .enable(arm.is_some_and(|arm| arm.consults_judge()));
                 self.principal = principal.clone();
             }
             SessionEventKind::ClassificationRequested { record } => {
@@ -1305,6 +1364,38 @@ impl SessionState {
     /// Settlements visited during acknowledgement removal, excluding map lookup comparisons.
     pub fn unrepaired_settlements_examined(&self) -> u64 {
         self.unrepaired_settlements.examined()
+    }
+
+    /// Where the next review's interval starts: the `through_seq` of the last
+    /// accepted review, or `0` before any.
+    pub fn review_checkpoint(&self) -> u64 {
+        self.review.checkpoint()
+    }
+
+    /// Reviews whose coverage the fold accepted.
+    pub fn accepted_reviews(&self) -> u64 {
+        self.review.accepted()
+    }
+
+    /// Reviews whose coverage failed validation and moved nothing.
+    pub fn rejected_reviews(&self) -> u64 {
+        self.review.rejected()
+    }
+
+    /// The most recently accepted reviews, oldest first, bounded.
+    pub fn review_outcomes(&self) -> &[ReviewOutcome] {
+        self.review.outcomes()
+    }
+
+    /// `Routed` sequences no accepted review has covered, oldest first.
+    pub fn pending_review_decisions(&self) -> impl Iterator<Item = u64> + '_ {
+        self.review.pending()
+    }
+
+    /// The open interval as a review captured now would see it.
+    pub(crate) fn review_interval(&self) -> IntervalFacts<'_> {
+        self.review
+            .facts(&self.items[self.configuration.len()..], self.last_seq)
     }
 
     /// Calls with no result, which is the same thing as unknown answers.

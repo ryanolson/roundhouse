@@ -17,7 +17,7 @@ use crate::control::Principal;
 use crate::ids::{ResponseId, SessionId, SideCallId, TurnId, ValidationId};
 use crate::item::Item;
 use crate::routing::{DecisionRecord, DispatchAttempt, Target};
-use crate::validate::{Arm, SteerAction, TriggerRecord, Verdict};
+use crate::validate::{Arm, IntervalReview, SteerAction, TriggerRecord, Verdict};
 
 /// Token accounting for one completed model call.
 ///
@@ -596,6 +596,15 @@ pub enum ValidationOutcome {
         /// which happened. A log that recorded only taken actions could not
         /// answer the counterfactual the Shadow arm exists to measure.
         action: SteerAction,
+        /// The decisions this review covered and the label it gives them.
+        ///
+        /// `None` on every judged outcome written before interval coverage
+        /// existed. Such a review still moves the checkpoint, and labels
+        /// nothing: what it saw was never recorded.
+        ///
+        /// Boxed so the common absent case costs one pointer on every event.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        interval: Option<Box<IntervalReview>>,
     },
 }
 

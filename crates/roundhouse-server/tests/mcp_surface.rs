@@ -235,6 +235,7 @@ fn steer_record(directive: &str) -> ControlRecord {
             action: SteerAction::Steer {
                 directive: directive.to_string(),
             },
+            interval: None,
         },
     );
     record

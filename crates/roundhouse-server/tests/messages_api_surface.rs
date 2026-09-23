@@ -62,7 +62,7 @@ use roundhouse_core::ids::SessionId;
 use roundhouse_core::item::{Item, ItemContent, Role};
 use roundhouse_core::routing::{CacheModel, ProviderPricing};
 use roundhouse_core::store::{Lease, MemoryStore, SessionStore, StoreError};
-use roundhouse_core::validate::{BriefConfig, Objective, ValidationBrief};
+use roundhouse_core::validate::{BriefConfig, ControlCallDialect, Objective, ValidationBrief};
 use roundhouse_fleet::{
     EchoFrontierClient, FrontierChunk, FrontierClient, FrontierError, FrontierModelSpec,
     FrontierQuote, FrontierStream, LocalFleet, StaticFrontierCatalog, WireProtocol,
@@ -4189,8 +4189,8 @@ per_line_tests!(fn f4_control_the_captured_body_carries_a_real_system_prompt_pas
 ///
 /// Driven through the real `wire::canonicalize` on each line's real captured
 /// body and the real `ValidationBrief::build`, matching
-/// `validate::mod::consult`'s call shape exactly (same items, same
-/// `Objective::from_items`, same `BriefConfig::default()`), because the
+/// `validate::mod::consult`'s call shape exactly (same items, the Messages
+/// dialect, same `Objective::from_items`, same `BriefConfig::default()`), because the
 /// finding was about those two functions meeting.
 fn f4_the_judge_is_briefed_on_the_whole_leading_instruction_run(line: &CapturedLine) {
     let items =
@@ -4198,6 +4198,7 @@ fn f4_the_judge_is_briefed_on_the_whole_leading_instruction_run(line: &CapturedL
 
     let brief = ValidationBrief::build(
         &items,
+        ControlCallDialect::ClaudeMessages,
         Objective::from_items(&items),
         Vec::new(),
         BriefConfig::default(),

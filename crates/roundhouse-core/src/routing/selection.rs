@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use super::stage::{DecisionSource, Pick, PickerMode, Tier, TurnSignals};
 use super::{Decision, Target};
 use crate::classify::ClassificationWindow;
-use crate::validate::ControlCallDialect;
+use crate::validate::{ControlCallDialect, ObjectiveVersion};
 
 /// The revision of the local feature extractor whose output [`LocalFeatures`]
 /// carries.
@@ -239,6 +239,13 @@ pub struct SelectionSnapshot {
     /// record predates the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub classifications: Option<ClassificationWindow>,
+    /// The objective this turn was decided under, for frontier review coverage.
+    ///
+    /// `None` on records written before the field and on hand-built decisions.
+    /// A review covering such a decision cannot show that it applied the same
+    /// objective, so it records the gap instead of a label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objective: Option<ObjectiveVersion>,
 }
 
 impl SelectionSnapshot {
@@ -252,6 +259,7 @@ impl SelectionSnapshot {
         decision: &Decision,
         features: LocalFeatures,
         classifications: Option<ClassificationWindow>,
+        objective: Option<ObjectiveVersion>,
     ) -> Self {
         Self {
             features,
@@ -261,6 +269,7 @@ impl SelectionSnapshot {
             admitted: decision.admitted.clone(),
             selector: decision.selector.clone(),
             classifications,
+            objective,
         }
     }
 }

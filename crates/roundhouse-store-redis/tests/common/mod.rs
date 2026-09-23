@@ -304,6 +304,7 @@ pub fn every_event_kind() -> Vec<SessionEventKind> {
                     turns: 3,
                     overrides: EscalationOverrides { min_quality: 0.8 },
                 },
+                interval: None,
             },
         },
         SessionEventKind::ClassificationRequested {

@@ -361,6 +361,19 @@ free.
 
 Judge requests use a separate `{session_id}#validate` cache key. Messages requests mark the system prefix for caching and take the requested lifetime from the target's catalog entry. The brief remains outside that marker. Token estimation and transport use the same prepared prompt, including its separator. Reservations retain the configured cold-write estimate. Provider token counts can differ, and a cache marker does not guarantee a hit.
 
+**Each parsed review records the routing decisions it covered.** The interval ends when the validator captures the brief, before it calls the judge. Every failover dispatch is a separate decision. A bounded `## Reviewed turns` section shows the interval's turns, instructions, and objective. A complete on-track verdict gives positive feedback. A complete off-track verdict gives negative feedback, regardless of the delivered action. The label is unknown, and the validator leaves out the whole section, in these cases:
+
+- The section is larger than `ValidatorConfig::interval_section_bytes` (64 KiB by default).
+- The section holds content that it cannot show.
+- The interval holds a call to one of roundhouse's own control tools, or the result of one.
+- The instructions or objectives changed, or the log did not record them.
+- A covered turn never ended.
+- The tracking bound of the session overflowed.
+
+The brief withholds control-call arguments and results because they can contain routing details. In "Recent steps", a control call keeps its number and shows only its name. This filter does not remove an agent's restatement of those details in ordinary text.
+
+A judge that reports missing context also produces an unknown label. A parsed review starts a new interval even when its label is unknown. Failed, skipped, refused and placebo reviews leave the interval open. Replay checks interval continuity and decision membership within the tracking bounds. It trusts the validator's content-gap declarations; it does not reconstruct the original prompt. See `validate/interval.rs` and `session/review.rs`.
+
 **Three arms, stamped into the session at creation.** `Live` takes the action;
 `Shadow` runs the judge, logs everything and discards the action; `Placebo`
 runs no judge and intervenes anyway on deterministic timing — the control

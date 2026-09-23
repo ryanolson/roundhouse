@@ -92,7 +92,9 @@ use roundhouse_core::event::{Accounting, CacheReadSource, SideCallAbandonReason,
 use roundhouse_core::ids::{ResponseId, SessionId};
 use roundhouse_core::now_ms;
 use roundhouse_core::routing::Target;
-use roundhouse_core::validate::{JudgeAnswer, JudgeClient, JudgeFailure, SideCall};
+use roundhouse_core::validate::{
+    JudgeAnswer, JudgeClient, JudgeFailure, PROMPT_SEPARATOR, SideCall,
+};
 
 use crate::engine::spend::GRANT_TTL_SLACK_MS;
 use roundhouse_fleet::{
@@ -106,9 +108,6 @@ use roundhouse_fleet::{
 /// *not* the conversation's key and *is* the same on every validation. Both
 /// halves are asserted against this name.
 pub const VALIDATE_CACHE_SUFFIX: &str = "#validate";
-
-/// What joins the two prompts into the one string the transport takes.
-const PROMPT_SEPARATOR: &str = "\n\n";
 
 /// One prompt shared by token estimation and transport. Tokenizing its parts
 /// separately can miss separators and tokens that span the join.
@@ -672,7 +671,8 @@ impl<T: Tokenizer + Clone> FleetJudge<T> {
             // makes for keeping prices and target names out. What the brief's
             // "Recent steps" section does show is narrower and different: the
             // *name* of a tool the turn actually called, plus a hash of its
-            // arguments, never the schema that told the model the call was
+            // arguments (none for roundhouse's own control calls), never the
+            // schema that told the model the call was
             // available in the first place. A judge that has never seen the
             // toolbox cannot be steered by a tool description crafted to read
             // well to it.

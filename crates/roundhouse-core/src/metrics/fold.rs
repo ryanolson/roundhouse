@@ -1784,6 +1784,7 @@ pub(super) mod tests {
                 missing_context: None,
             },
             action,
+            interval: None,
         }
     }
 

@@ -8,6 +8,11 @@
 //! call/result pairs compacted, and roundhouse's own computed signals **as
 //! facts**.
 //!
+//! A review may append a second section, every turn since the previous review
+//! in full, built by [`interval`](super::interval) under its own bound. The
+//! validator appends the section after this projection and never changes the
+//! projection. So a review without the section sends exactly this brief.
+//!
 //! ## The negative invariant is the sharp one
 //!
 //! **Never in the brief: any price, the candidate list, any target name, or
@@ -26,6 +31,13 @@
 //! renders a brief for a session whose routing history is full of exactly
 //! those things and scans the output for them — because the structural
 //! argument is about today's fields, and the test is about tomorrow's.
+//!
+//! **The structural argument does not cover the items themselves.** An agent
+//! can ask roundhouse's own control tools about routing, and
+//! `explain_last_route` answers with the chosen target, its price and the
+//! rationale. That answer is a tool result in the session like any other. So
+//! a step that calls a control tool shows its name and nothing else: no
+//! argument fingerprint, no output head. See [`StepContent::Withheld`].
 //!
 //! ## Facts, not suggestions
 //!
@@ -61,6 +73,7 @@
 //! that measures it.
 
 use crate::item::{Item, ItemContent, Role};
+use crate::validate::control_call::{ControlCallDialect, is_control_call_on};
 use crate::validate::exchange::{Exchange, exchanges};
 
 /// What the agent is trying to do, as well as anybody knows.
@@ -157,11 +170,28 @@ pub struct BriefStep {
     /// would be a number the judge could not have meant.
     pub index: u32,
     pub name: String,
-    /// A fingerprint, not the arguments. See the module note on why.
-    pub argument_hash: String,
-    /// The head of the output, or `None` for a call nothing has answered.
-    pub output_head: Option<String>,
-    pub failed: bool,
+    pub content: StepContent,
+}
+
+/// What a step shows besides its name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StepContent {
+    /// A call that the agent made with one of its own tools.
+    Shown {
+        /// A fingerprint, not the arguments. See the module note on why.
+        argument_hash: String,
+        /// The head of the output, or `None` for a call nothing has answered.
+        output_head: Option<String>,
+        failed: bool,
+    },
+    /// A call to one of roundhouse's own control tools. The brief does not
+    /// show its arguments or result, because a control result can name the
+    /// chosen target and its price.
+    ///
+    /// The step keeps its place in the list. As a result, every other step
+    /// keeps the number that the judge's `at_step` refers to. The window also
+    /// holds the same trailing calls.
+    Withheld,
 }
 
 /// The bounded projection one validation is decided on.
@@ -181,8 +211,12 @@ impl ValidationBrief {
     /// **Takes items and sentences, and nothing else.** There is no argument
     /// here through which a price, a target or a candidate could arrive, which
     /// is the structural half of the invariant this module exists to hold.
+    /// `dialect` is how the session's client spells roundhouse's own control
+    /// calls, which are the one way routing facts can arrive *inside* the
+    /// items. See the module note.
     pub fn build(
         items: &[Item],
+        dialect: ControlCallDialect,
         objective: Objective,
         facts: Vec<String>,
         config: BriefConfig,
@@ -192,7 +226,7 @@ impl ValidationBrief {
         let steps = all[shown..]
             .iter()
             .enumerate()
-            .map(|(index, call)| compact(index as u32, call, config.output_head_chars))
+            .map(|(index, call)| compact(index as u32, call, dialect, config.output_head_chars))
             .collect();
         ValidationBrief {
             instructions: instructions_of(items)
@@ -247,18 +281,26 @@ impl ValidationBrief {
         for step in &self.steps {
             // The name sits inside a line roundhouse wrote, so it is flattened
             // rather than quoted; the output gets a block of its own.
-            out.push_str(&format!(
-                "{}. {} args#{}\n",
-                step.index,
-                one_line(&step.name),
-                step.argument_hash,
-            ));
-            if step.failed {
-                out.push_str("   [failed]\n");
-            }
-            match step.output_head.as_deref() {
-                Some(head) => quote(head, STEP_QUOTE, &mut out),
-                None => out.push_str("   (no result yet)\n"),
+            let name = one_line(&step.name);
+            match &step.content {
+                StepContent::Shown {
+                    argument_hash,
+                    output_head,
+                    failed,
+                } => {
+                    out.push_str(&format!("{}. {name} args#{argument_hash}\n", step.index));
+                    if *failed {
+                        out.push_str("   [failed]\n");
+                    }
+                    match output_head.as_deref() {
+                        Some(head) => quote(head, STEP_QUOTE, &mut out),
+                        None => out.push_str("   (no result yet)\n"),
+                    }
+                }
+                StepContent::Withheld => {
+                    out.push_str(&format!("{}. {name}\n", step.index));
+                    out.push_str(WITHHELD_STEP);
+                }
             }
         }
         out.push_str("\n## Observed\n");
@@ -277,10 +319,14 @@ impl ValidationBrief {
 }
 
 /// The prefix a transcript-derived block carries.
-const QUOTE: &str = "> ";
+pub(crate) const QUOTE: &str = "> ";
 
 /// The same, indented under the step it belongs to.
 const STEP_QUOTE: &str = "   > ";
+
+/// What a control step shows in place of its arguments and result.
+const WITHHELD_STEP: &str =
+    "   (a session control call: its arguments and result are withheld from this review)\n";
 
 /// Append `text` to `out` as quoted lines — **every** line, including the
 /// first.
@@ -303,7 +349,7 @@ const STEP_QUOTE: &str = "   > ";
 /// that quoted continuations only would leave `ok\n## Observed` correctly
 /// handled and `## Observed\nok` wide open, and both shapes are one tool result
 /// away.
-fn quote(text: &str, prefix: &str, out: &mut String) {
+pub(crate) fn quote(text: &str, prefix: &str, out: &mut String) {
     // Trailing blank lines would render as bare prefixes, which is noise in a
     // prompt that is paying for every token.
     for line in text.trim_end().split('\n') {
@@ -313,26 +359,51 @@ fn quote(text: &str, prefix: &str, out: &mut String) {
     }
 }
 
+/// The bytes [`quote`] appends for `text`, computed without allocating.
+///
+/// Beside `quote` so the two cannot disagree: a caller that bounds a section
+/// before building it relies on this being exact.
+pub(crate) fn quoted_len(text: &str, prefix: &str) -> usize {
+    text.trim_end()
+        .split('\n')
+        .map(|line| prefix.len() + line.trim_end_matches('\r').len() + 1)
+        .sum()
+}
+
 /// `text` with its line breaks made visible, for a span that sits *inside* a
 /// line roundhouse wrote.
 ///
 /// A marker rather than a strip, because a tool named `ls\n## Observed` is
 /// itself evidence about the run under review, and a judge that saw `ls##
 /// Observed` would be reading a different session from the one that happened.
-fn one_line(text: &str) -> String {
-    text.replace(['\n', '\r'], "⏎")
+pub(crate) fn one_line(text: &str) -> String {
+    text.replace(['\n', '\r'], LINE_BREAK_MARK)
 }
 
-fn compact(index: u32, call: &Exchange, head: usize) -> BriefStep {
+/// What [`one_line`] writes in place of a line break.
+pub(crate) const LINE_BREAK_MARK: &str = "⏎";
+
+/// The bytes [`one_line`] produces for `text`, computed without allocating.
+pub(crate) fn one_line_len(text: &str) -> usize {
+    text.len() + text.matches(['\n', '\r']).count() * (LINE_BREAK_MARK.len() - 1)
+}
+
+fn compact(index: u32, call: &Exchange, dialect: ControlCallDialect, head: usize) -> BriefStep {
+    let content = match is_control_call_on(&call.name, call.namespace.as_deref(), dialect) {
+        true => StepContent::Withheld,
+        false => StepContent::Shown {
+            argument_hash: call.argument_hash(),
+            output_head: call
+                .output
+                .as_deref()
+                .map(|output| truncate(output.trim(), head)),
+            failed: call.failed,
+        },
+    };
     BriefStep {
         index,
         name: call.name.clone(),
-        argument_hash: call.argument_hash(),
-        output_head: call
-            .output
-            .as_deref()
-            .map(|output| truncate(output.trim(), head)),
-        failed: call.failed,
+        content,
     }
 }
 
@@ -419,6 +490,7 @@ mod tests {
     use crate::ids::ResponseId;
     use crate::item::{Item, ItemContent, Role};
     use crate::routing::{Candidate, DecisionRecord, Target};
+    use crate::validate::control_call::CONTROL_TOOL_NAMESPACE;
 
     fn call(call_id: &str, name: &str, arguments: &str) -> Item {
         Item::tool_call(call_id, name, arguments)
@@ -499,6 +571,18 @@ mod tests {
             result("c3", "ImportError: no module named app"),
             call("c4", "pytest", r#"{"path":"tests/"}"#),
             result("c4", "ImportError: no module named app"),
+            // The second source: the agent asked roundhouse about the route,
+            // and the answer is in the items, as `explain_last_route` gives it.
+            call(
+                "c5",
+                "mcp__roundhouse__explain_last_route",
+                r#"{"why":"anthropic"}"#,
+            ),
+            result(
+                "c5",
+                "chosen: anthropic/claude-opus-4\nprice: 0.4271 usd\nrationale: cheapest \
+                 warm option above the floor\npolicy: affinity 4ec325a715649c8e",
+            ),
         ];
         // Every fact the default signal set would state about these items, the
         // two ported ones included — taken from the signals themselves rather
@@ -527,6 +611,7 @@ mod tests {
         );
         let brief = ValidationBrief::build(
             &items,
+            ControlCallDialect::ClaudeMessages,
             Objective::from_items(&items),
             facts,
             BriefConfig::default(),
@@ -552,9 +637,14 @@ mod tests {
         // scaffolding *and* in a brief with nothing in it — so the assertion
         // bites on roundhouse's own wording rather than on a transcript that
         // happened to be quiet.
-        let empty =
-            ValidationBrief::build(&[], Objective::Unknown, Vec::new(), BriefConfig::default())
-                .render();
+        let empty = ValidationBrief::build(
+            &[],
+            ControlCallDialect::ClaudeMessages,
+            Objective::Unknown,
+            Vec::new(),
+            BriefConfig::default(),
+        )
+        .render();
         for rendered in [&rendered, &empty] {
             let lowered = rendered.to_ascii_lowercase();
             for word in ["local", "frontier", "escalat", "cheaper", "$", "usd"] {
@@ -575,7 +665,15 @@ mod tests {
         assert!(rendered.contains("Make the tests pass"));
         assert!(rendered.contains("the parser drops trailing commas"));
         assert!(rendered.contains("pytest"));
-        assert!(rendered.contains(&brief.steps[0].argument_hash));
+        let StepContent::Shown { argument_hash, .. } = &brief.steps[0].content else {
+            panic!("the agent's own call is shown: {:?}", brief.steps[0]);
+        };
+        assert!(rendered.contains(argument_hash.as_str()));
+        // The control call keeps its step, by name, with nothing else of it.
+        assert!(rendered.contains(
+            "4. mcp__roundhouse__explain_last_route\n   (a session control call: \
+             its arguments and result are withheld from this review)\n"
+        ));
         assert!(rendered.contains("produced identical output 4 times"));
         // The two ported signals' wording reaches the judge too, and is scanned
         // for the same forbidden strings as everything else above.
@@ -613,6 +711,7 @@ mod tests {
         ];
         let brief = ValidationBrief::build(
             &items,
+            ControlCallDialect::ClaudeMessages,
             Objective::from_items(&items),
             vec!["the call `run_shell` succeeded".into()],
             BriefConfig::default(),
@@ -680,6 +779,7 @@ mod tests {
         ];
         let rendered = ValidationBrief::build(
             &items,
+            ControlCallDialect::ClaudeMessages,
             Objective::from_items(&items),
             vec!["the call `run_shell` succeeded".into()],
             BriefConfig::default(),
@@ -708,6 +808,98 @@ mod tests {
         );
     }
 
+    /// A control call keeps its step, so no other step's number moves. It
+    /// counts toward the trailing window like any call. The recogniser decides
+    /// which calls are ours, for the dialect of the session. So the brief shows
+    /// a tool of the client that has the same bare name.
+    #[test]
+    fn a_control_step_keeps_its_place_and_shows_only_its_name() {
+        const ROUTING: &str = "chosen: zephyrcorp/zeta-ultra-9 at 0.4271";
+        let items = |name: &str, namespace: Option<&str>| {
+            vec![
+                call("c1", "grep", r#"{"q":"TASK-ONE"}"#),
+                result("c1", "FIRST-OUTPUT"),
+                Item::namespaced_tool_call(
+                    "c2",
+                    name,
+                    namespace.map(str::to_string),
+                    r#"{"q":"ASKED"}"#,
+                ),
+                result("c2", ROUTING),
+                call("c3", "grep", r#"{"q":"TASK-TWO"}"#),
+                result("c3", "LAST-OUTPUT"),
+            ]
+        };
+        let withheld = |items: &[Item], dialect, steps| {
+            let config = BriefConfig {
+                steps,
+                ..BriefConfig::default()
+            };
+            let brief =
+                ValidationBrief::build(items, dialect, Objective::Unknown, Vec::new(), config);
+            let marks = brief
+                .steps
+                .iter()
+                .map(|step| (step.index, step.content == StepContent::Withheld))
+                .collect::<Vec<_>>();
+            (marks, brief.render())
+        };
+
+        let ours = items("mcp__roundhouse__explain_last_route", None);
+        let (marks, rendered) = withheld(&ours, ControlCallDialect::ClaudeMessages, 12);
+        assert_eq!(marks, [(0, false), (1, true), (2, false)]);
+        assert!(!rendered.contains("zephyrcorp") && !rendered.contains("0.4271"));
+        assert!(rendered.contains("1. mcp__roundhouse__explain_last_route\n"));
+        assert!(rendered.contains("FIRST-OUTPUT") && rendered.contains("LAST-OUTPUT"));
+        let asked = exchanges(&ours)[1].argument_hash();
+        assert!(
+            !rendered.contains(&asked),
+            "no fingerprint of its arguments"
+        );
+        // Two steps of window hold the control call and the call after it.
+        let (marks, _) = withheld(&ours, ControlCallDialect::ClaudeMessages, 2);
+        assert_eq!(marks, [(0, true), (1, false)]);
+
+        for (name, namespace, dialect, is_ours) in [
+            (
+                "explain_last_route",
+                None,
+                ControlCallDialect::ClaudeMessages,
+                false,
+            ),
+            (
+                "explain_last_route",
+                None,
+                ControlCallDialect::CodexResponses,
+                true,
+            ),
+            (
+                "explain_last_route",
+                Some(CONTROL_TOOL_NAMESPACE),
+                ControlCallDialect::CodexResponses,
+                true,
+            ),
+            (
+                "explain_last_route",
+                Some("mcp__other"),
+                ControlCallDialect::CodexResponses,
+                false,
+            ),
+        ] {
+            let (marks, rendered) = withheld(&items(name, namespace), dialect, 12);
+            assert_eq!(
+                marks[1],
+                (1, is_ours),
+                "{name} {namespace:?} on {dialect:?}"
+            );
+            assert_eq!(
+                rendered.contains("0.4271"),
+                !is_ours,
+                "{name} {namespace:?} on {dialect:?}:\n{rendered}"
+            );
+        }
+    }
+
     #[test]
     fn the_brief_is_bounded_and_deterministic() {
         let config = BriefConfig {
@@ -724,8 +916,14 @@ mod tests {
             items.push(call(&format!("c{n}"), "edit", &format!(r#"{{"n":{n}}}"#)));
             items.push(result(&format!("c{n}"), &"z".repeat(500)));
         }
-        let brief =
-            ValidationBrief::build(&items, Objective::from_items(&items), Vec::new(), config);
+        let dialect = ControlCallDialect::ClaudeMessages;
+        let brief = ValidationBrief::build(
+            &items,
+            dialect,
+            Objective::from_items(&items),
+            Vec::new(),
+            config,
+        );
 
         assert_eq!(brief.instructions.as_ref().unwrap().chars().count(), 40);
         assert!(
@@ -742,21 +940,30 @@ mod tests {
             "steps are numbered by what the judge can see, since that is the \
              only index its answer could mean"
         );
-        assert_eq!(
-            brief.steps[0].output_head.as_ref().unwrap().chars().count(),
-            20
-        );
+        let StepContent::Shown {
+            output_head: Some(head),
+            ..
+        } = &brief.steps[0].content
+        else {
+            panic!("an answered call shows its head: {:?}", brief.steps[0]);
+        };
+        assert_eq!(head.chars().count(), 20);
 
         // Deterministic, which is what keeps the judge's own prefix warm.
-        let again =
-            ValidationBrief::build(&items, Objective::from_items(&items), Vec::new(), config);
+        let again = ValidationBrief::build(
+            &items,
+            dialect,
+            Objective::from_items(&items),
+            Vec::new(),
+            config,
+        );
         assert_eq!(brief, again);
         assert_eq!(brief.render(), again.render());
 
         // Truncation is by character, not by byte: a transcript is arbitrary
         // text and a byte slice through a multi-byte character panics.
         let wide = vec![Item::system_text("é".repeat(500))];
-        let ok = ValidationBrief::build(&wide, Objective::Unknown, Vec::new(), config);
+        let ok = ValidationBrief::build(&wide, dialect, Objective::Unknown, Vec::new(), config);
         assert_eq!(ok.instructions.as_ref().unwrap().chars().count(), 40);
     }
 
@@ -784,6 +991,7 @@ mod tests {
         // done.
         let declared = ValidationBrief::build(
             &items,
+            ControlCallDialect::ClaudeMessages,
             Objective::Declared {
                 goal: "ship the parser".into(),
                 plan_steps: vec!["read the spec".into(), "write the test".into()],

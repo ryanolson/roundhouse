@@ -91,6 +91,7 @@ fn snapshot() -> SelectionSnapshot {
                 },
             ],
         }),
+        objective: None,
     }
 }
 
@@ -328,7 +329,7 @@ fn a_hand_built_decision_records_unknown_evidence() {
         selector: None,
     };
 
-    let selection = SelectionSnapshot::of(&custom, features(), None);
+    let selection = SelectionSnapshot::of(&custom, features(), None, None);
     assert_eq!(
         selection.admitted, None,
         "unknown, because no `Admitted` resolution produced this decision"
@@ -353,7 +354,7 @@ fn a_hand_built_decision_records_unknown_evidence() {
         selector: Some(stage_snapshot()),
         ..custom
     };
-    let selection = SelectionSnapshot::of(&builtin, features(), None);
+    let selection = SelectionSnapshot::of(&builtin, features(), None, None);
     assert!(selection.admitted.is_some());
     assert!(selection.selector.is_some());
 }

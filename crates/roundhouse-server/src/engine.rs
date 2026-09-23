@@ -48,7 +48,9 @@ use roundhouse_core::routing::{
 };
 use roundhouse_core::session::{Session, SessionError, SessionState, TurnAdmission};
 use roundhouse_core::store::SessionStore;
-use roundhouse_core::validate::{ControlCallDialect, SideCall, exchanges};
+use roundhouse_core::validate::{
+    ControlCallDialect, Objective, ObjectiveVersion, SideCall, exchanges,
+};
 use roundhouse_fleet::{
     FleetError, FleetQuery, FrontierChunk, FrontierClient, FrontierClients, FrontierError,
     FrontierQuote, FrontierStream, LocalFleet, LocalQuote, StaticFrontierCatalog, WireProtocol,
@@ -2147,6 +2149,15 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
             turn_index,
             observed_through_seq: session.last_seq(),
         };
+        // The objective this turn is decided under, read the way the
+        // validator's brief reads it, so a later review can show that it
+        // applied. An undeclared objective stamps as undeclared without copying
+        // the request that stands in for it.
+        let objective = ObjectiveVersion::of(
+            &self
+                .declared_objective(session.session_id())
+                .unwrap_or(Objective::Unknown),
+        );
         // Which background classifications this decision can see, named at the
         // same cutoff the features were taken at. A result that lands while this
         // turn is in flight has a higher sequence and is therefore absent here —
@@ -2542,7 +2553,12 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
 
         // Selection runs once. Failover records retain its original inputs and
         // fallback plan while recording their own target and attempt history.
-        let selection = Box::new(SelectionSnapshot::of(&decision, features, classifications));
+        let selection = Box::new(SelectionSnapshot::of(
+            &decision,
+            features,
+            classifications,
+            Some(objective),
+        ));
 
         // --- the handoff gate's second half (S6) ------------------------------
         //

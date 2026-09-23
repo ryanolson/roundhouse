@@ -1266,6 +1266,7 @@ fn judged_continue() -> crate::event::ValidationOutcome {
             missing_context: None,
         },
         action: SteerAction::Continue,
+        interval: None,
     }
 }
 
@@ -1340,6 +1341,7 @@ async fn the_trigger_reads_projections_of_the_log_and_not_counters_beside_it() {
                 turns: 2,
                 overrides: EscalationOverrides { min_quality: 0.9 },
             },
+            interval: None,
         },
     );
     let ledger_before = format!("{:?}", session.ledger());
@@ -1531,6 +1533,7 @@ async fn a_placebo_intervention_leaves_no_guidance_to_re_read() {
             action: SteerAction::Halt {
                 reason: "stopping here; the last four steps repeated".to_string(),
             },
+            interval: None,
         },
     );
     session
@@ -1582,6 +1585,7 @@ async fn steered_turn(session: &mut Session<MemoryStore>, turn: &str, directive:
             action: SteerAction::Steer {
                 directive: directive.to_string(),
             },
+            interval: None,
         },
     );
     session
@@ -1656,6 +1660,7 @@ async fn only_the_turn_an_escalation_was_decided_on_reads_as_its_first() {
                 turns: 3,
                 overrides: EscalationOverrides { min_quality: 0.9 },
             },
+            interval: None,
         },
     );
     session.record_control(record).await.unwrap();
@@ -1825,6 +1830,7 @@ async fn a_halt_leaves_the_next_turn_judgeable() {
             action: SteerAction::Halt {
                 reason: "stopping here".into(),
             },
+            interval: None,
         },
     );
     session
@@ -1890,6 +1896,7 @@ async fn a_shadow_arms_steer_suppresses_nothing() {
             action: SteerAction::Steer {
                 directive: "would have said this".into(),
             },
+            interval: None,
         },
     );
     session.record_control(record).await.unwrap();
