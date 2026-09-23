@@ -21,7 +21,7 @@ The design obeys these settled rules from `PLAN-routing-strategy-bandit.md`:
 - Each decision keeps the features that existed at its cutoff. Late classifications and late reviews do not rewrite them.
 - After the quality requirement is satisfied, the selector minimizes cost within a configurable latency limit. Learning is isolated by project.
 - An oversized interval is Unknown. A new interval starts only after a parsed frontier checkpoint.
-- Cache-marker ownership, opt-in egress that is off by default, local-only exclusion, and PR #18 as one unit are settled.
+- Cache-marker ownership, opt-in egress that is off by default, and local-only exclusion are settled. PR #18 was one unit until 2026-09-23. It now ships its implemented scope, and this learner lands in follow-up PRs.
 
 The bandit plan (sections 1 to 3) selects strategies, not unrestricted model identities. Later rulings removed the synchronous Jev strategy and the segment cadence. They did not replace strategy arms with target arms. This brief keeps strategy arms.
 

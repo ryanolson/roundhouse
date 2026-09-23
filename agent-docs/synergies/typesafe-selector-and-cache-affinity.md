@@ -337,3 +337,9 @@ An expired hold does not permit another charge for a completed call. Completed i
 Commit `1c14975` records local features, extractor identity, selector settings, admitted targets, and the original choice and fallback plan. The engine captures this snapshot once and copies it to each dispatch record. Failover retains the original evidence. Historical records without a snapshot remain unknown. The admitted pool describes admission's result, not its complete credential, cadence, or budget inputs.
 
 All 24 focused tests passed. Nine independent mutations failed runtime assertions, and every source restore matched the commit. The full workspace run passed 1831 tests, with 0 failures, 145 existing ignores, and no compiler warnings. Replay tests use serialized events and the session-state fold. This checkpoint does not supply classification records, background execution, complete frontier reviews, or learning updates. The bandit plan records the remaining contracts and owner questions.
+
+## Addendum (2026-09-23): PR #18 ships its implemented scope
+
+The owner replaces the one-unit decision of 2026-09-19. PR #18 now ships the work it already contains: C1 to C5, the B1 observations, the B4 adapter, durable background classification, settlement recovery, evaluation accounting, selection snapshots, frontier interval feedback, and the learning source index. The source index stays deliberately unwired; `Session::commit` still supplies no mark.
+
+The remaining learning work moves to follow-up PRs cut from `main`: event projection and automatic marking, the learner store, learned per-turn selection, interval consumption, offline calibration and evaluation, live C2 cache evidence, and a real local executor. The rulings above still govern that work. The two cold-start and exploration questions in `PAUSE-pr18-2026-09-22.md` remain open and block learned selection, not this PR.

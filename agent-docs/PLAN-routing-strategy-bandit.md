@@ -23,6 +23,8 @@ The final workspace run at `5fba49d` passed 1801 tests, with 0 failures, 141 exi
 
 ### Completion requirements
 
+**Re-scope, 2026-09-23.** PR #18 ships the implemented rows below. The unfinished rows are follow-up PRs from `main`. See the dated addendum in `synergies/typesafe-selector-and-cache-affinity.md`.
+
 The transport and observation checkpoints do not complete the owner's routing vision. This table includes interval source `1658633` on 2026-09-22. Eight independent mutations were caught, and the full workspace suite passed 2173 tests with 149 existing ignores. See `REVIEW-frontier-interval-feedback.md` for evidence and limits. Dated checkpoints below retain earlier results.
 
 | Requirement | Remaining implementation or evidence |

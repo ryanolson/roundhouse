@@ -46,7 +46,7 @@ Open items that belong to a finished rung:
 Decisions that only the owner can make:
 
 1. T2: the owner requests a bandit with serving strategies and background evaluation arms, including online TypeSafe/Jev. See the ruling addendum of 2026-09-19. The runtime contract still needs a settled brief before implementation.
-2. T6 is accepted as proposed on 2026-09-19. The owner keeps PR #18 as one unit. The remaining cache decisions are C6 timing and C3 fleet fail-open behavior.
+2. T6 is accepted as proposed on 2026-09-19. The owner kept PR #18 as one unit until 2026-09-23, then re-scoped it to its implemented work (see the ruling addendum). The remaining cache decisions are C6 timing and C3 fleet fail-open behavior.
 
 The mutation checks used `sed` to change one token, ran the suite, and used `sed` to restore the token. `git diff --quiet crates/` confirmed each restore. C1: `<` to `<=` turned `a_tie_in_quoted_cost_keeps_the_efficient_pick_and_its_source` red. C2: `CACHE_LOOKBACK_BLOCKS` from 20 to 21 turned the evidence test red. C3: a predicate that never skips turned four of the five tests in `tests/local_quote_skip.rs` red, and the control stayed green. The C3 stage wrote its tests before the fix but did not run them before the fix, so this mutation is the evidence that they fail without it.
 
@@ -59,7 +59,7 @@ The mutation checks used `sed` to change one token, ran the suite, and used `sed
 3. Complete the C4 tool-marker decision and its regression first. C5's loader is complete. Live C2 evidence needs working credentials, and C6 timing awaits the owner. Independent bandit observation work can proceed under R21. Serving allocation still needs the decisions in `PLAN-routing-strategy-bandit.md`. Each implementation starts with failing tests.
 4. Run cargo commands one at a time. The box has four cores and one build lock. Put `timeout 300` before a targeted test command and `timeout 900` before a workspace test command.
 5. Commit before any mutation stage. Commit with `--no-gpg-sign`. Push through the `gh` credential helper. `~/.gitconfig` rewrites `https://github.com/` to SSH, so put `GIT_CONFIG_GLOBAL=/dev/null` before the push command when the SSH agent does not answer.
-6. The owner chose to keep PR #18 as one unit on 2026-09-19. Keep each concern in a separate commit. The earlier split inventory remains useful for reviewing the existing rungs:
+6. The owner chose to keep PR #18 as one unit on 2026-09-19. On 2026-09-23 the owner re-scoped it to its implemented work; the learning work follows in separate PRs. Keep each concern in a separate commit. The earlier split inventory remains useful for reviewing the existing rungs:
    - Documents: `e48b13b`, `be2bd66`, `6ab8908`, and each later commit that changes only `agent-docs/`.
    - C1: `35839e2` (the `stage.rs` part), `83ac785`, and `4bffdcb`.
    - C2: `35839e2` (the `anthropic_messages.rs` part), `22e58ce`, and `d7f69ce`.
