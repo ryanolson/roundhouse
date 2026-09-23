@@ -41,18 +41,20 @@ use roundhouse_core::store::{
 };
 
 use super::{int_at, str_at, tag_of, unexpected};
+use crate::keys::{self, KeyNamespace};
 
-/// The largest sequence the append script writes exactly. Lua's `..` renders
-/// numbers with `%.14g`, so `10^14` would come out as `1e+14`.
-pub(crate) const LAST_EXACT_SEQ: u64 = 99_999_999_999_999;
-
-/// Lua shared by every script that reads or writes a stored mark.
+/// Lua shared by every script that reads or writes a stored mark, including
+/// the canonical session write path's marked append in the parent module —
+/// `pub(super)` so `scripts.rs` can splice it into `APPEND`'s prelude beside
+/// `LAST_EXACT_SEQ`, which lives there now (fleet-redis-5): the range guard
+/// it names belongs to the append every write path takes, marked or not, not
+/// to this deliberately unwired feature module.
 ///
 /// `covers` compares canonical decimal strings digit by digit rather than
 /// through `tonumber`, so a confirmed watermark anywhere in the `u64` range —
 /// including values a double cannot hold exactly — compares exactly against a
 /// stored sequence.
-const MARK_FUNCTIONS: &str = r"
+pub(super) const MARK_FUNCTIONS: &str = r"
 local function parse_mark(value)
   return string.match(value, '^([1-9]%d*):(%d+):(.*)$')
 end
@@ -69,11 +71,6 @@ local function is_type_or_absent(key, want)
   return found == want or found == 'none'
 end
 ";
-
-/// The prelude every learning-aware script starts with.
-pub(super) fn mark_prelude() -> String {
-    format!("local LAST_EXACT_SEQ = {LAST_EXACT_SEQ}\n{MARK_FUNCTIONS}")
-}
 
 /// Drop pending membership if the confirmed watermark covers the current
 /// mark. KEYS: marks, pending. ARGV: session id, confirmed watermark.
@@ -143,11 +140,34 @@ pub(crate) struct LearningScripts {
     page: redis::Script,
 }
 
-/// The index keys a learning script call needs, built once by the caller.
-pub(crate) struct IndexKeys<'a> {
-    pub(crate) marks: &'a str,
-    pub(crate) marked: &'a str,
-    pub(crate) pending: &'a str,
+/// The three learning-index keys of one namespace, owned rather than
+/// borrowed: the old shape was an owning `LearningKeys` in `lib.rs` plus this
+/// borrowing struct plus a positional `[&str; 3]` in `MarkArgs` — three
+/// spellings of one triple. One owning struct, built directly with
+/// [`keys::build_key`] as the key-builder convention requires, is what every
+/// caller now holds.
+pub(crate) struct IndexKeys {
+    pub(crate) marks: String,
+    pub(crate) marked: String,
+    pub(crate) pending: String,
+}
+
+impl IndexKeys {
+    /// The learning index is one set of keys per namespace, not per session,
+    /// so it carries no hash tag: it cannot share a Cluster slot with every
+    /// session's keys at once. The fourth segment is never `{`-prefixed,
+    /// which is what keeps these from colliding with any session's keys.
+    pub(crate) fn new(namespace: &KeyNamespace) -> Self {
+        Self {
+            marks: keys::build_key(namespace, keys::KeyFamily::Session, &["learning", "marks"]),
+            marked: keys::build_key(namespace, keys::KeyFamily::Session, &["learning", "marked"]),
+            pending: keys::build_key(
+                namespace,
+                keys::KeyFamily::Session,
+                &["learning", "pending"],
+            ),
+        }
+    }
 }
 
 /// Which membership set a page walks.
@@ -160,25 +180,24 @@ pub(crate) enum PageOf {
 
 impl LearningScripts {
     pub(super) fn new() -> Self {
-        let prelude = mark_prelude();
         Self {
-            clear: redis::Script::new(&format!("{prelude}\n{CLEAR_BODY}")),
-            requeue: redis::Script::new(&format!("{prelude}\n{REQUEUE_BODY}")),
-            page: redis::Script::new(&format!("{prelude}\n{PAGE_BODY}")),
+            clear: redis::Script::new(&format!("{MARK_FUNCTIONS}\n{CLEAR_BODY}")),
+            requeue: redis::Script::new(&format!("{MARK_FUNCTIONS}\n{REQUEUE_BODY}")),
+            page: redis::Script::new(&format!("{MARK_FUNCTIONS}\n{PAGE_BODY}")),
         }
     }
 
     pub(crate) async fn clear(
         &self,
         conn: &mut ConnectionManager,
-        keys: &IndexKeys<'_>,
+        keys: &IndexKeys,
         session_id: &SessionId,
         confirmed_through: u64,
     ) -> Result<ClearOutcome, StoreError> {
         let reply: Vec<Value> = self
             .clear
-            .key(keys.marks)
-            .key(keys.pending)
+            .key(keys.marks.as_str())
+            .key(keys.pending.as_str())
             .arg(session_id.as_str())
             .arg(confirmed_through.to_string())
             .invoke_async(conn)
@@ -198,14 +217,14 @@ impl LearningScripts {
     pub(crate) async fn requeue(
         &self,
         conn: &mut ConnectionManager,
-        keys: &IndexKeys<'_>,
+        keys: &IndexKeys,
         session_id: &SessionId,
         mark_seq: u64,
     ) -> Result<RequeueOutcome, StoreError> {
         let reply: Vec<Value> = self
             .requeue
-            .key(keys.marks)
-            .key(keys.pending)
+            .key(keys.marks.as_str())
+            .key(keys.pending.as_str())
             .arg(session_id.as_str())
             .arg(mark_seq.to_string())
             .invoke_async(conn)
@@ -225,14 +244,14 @@ impl LearningScripts {
     pub(crate) async fn page(
         &self,
         conn: &mut ConnectionManager,
-        keys: &IndexKeys<'_>,
+        keys: &IndexKeys,
         of: PageOf,
         after: Option<&LearningCursor>,
         limit: NonZeroUsize,
     ) -> Result<LearningPage, StoreError> {
         let (set, idle) = match of {
-            PageOf::Marked => (keys.marked, String::new()),
-            PageOf::Pending { idle_for_ms } => (keys.pending, idle_for_ms.to_string()),
+            PageOf::Marked => (keys.marked.as_str(), String::new()),
+            PageOf::Pending { idle_for_ms } => (keys.pending.as_str(), idle_for_ms.to_string()),
         };
         let start = after.map_or_else(
             || "-".to_string(),
@@ -240,7 +259,7 @@ impl LearningScripts {
         );
         let reply: Vec<Value> = self
             .page
-            .key(keys.marks)
+            .key(keys.marks.as_str())
             .key(set)
             .arg(start)
             .arg(limit.get())

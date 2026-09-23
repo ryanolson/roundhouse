@@ -46,7 +46,7 @@
 use redis::Value;
 use redis::aio::ConnectionManager;
 
-use roundhouse_core::control::{LedgerState, SpendError};
+use roundhouse_core::control::{LedgerState, SettlementKey, SpendError};
 
 /// Lua helpers shared by all three scripts: truncating integer division (the
 /// civil-calendar algorithm assumes Rust's `/` on `i64`, which truncates
@@ -437,13 +437,13 @@ pub(crate) struct SettleGrantArgs<'a> {
     pub(crate) watermarks_key: &'a str,
     pub(crate) settled_calls_key: &'a str,
     pub(crate) user: &'a str,
-    /// `watermark` or `call`, from the settlement's own
-    /// [`SettlementKey`](roundhouse_core::control::SettlementKey). The two
-    /// fields below belong to `watermark` and are sent as `""`/`0` under
-    /// `call`, which the script never reads.
-    pub(crate) key_mode: &'a str,
-    pub(crate) session_id: &'a str,
-    pub(crate) seq: u64,
+    /// The typed idempotency key, encoded into the wire's `(mode,
+    /// session_id, seq)` triple only at the `.arg()` call site in
+    /// [`Scripts::settle_grant`] — the one place that speaks the script's
+    /// own contract. Carrying the encoded form here instead would make
+    /// `("call", "sess", 7)` and `("watermark", "", 0)` representable,
+    /// which nothing on the Rust side means to send.
+    pub(crate) key: &'a SettlementKey,
     pub(crate) response_id: &'a str,
     pub(crate) actual_usd: f64,
     pub(crate) now_ms: u64,
@@ -513,6 +513,17 @@ impl Scripts {
         conn: &mut ConnectionManager,
         args: SettleGrantArgs<'_>,
     ) -> Result<SettleOutcome, SpendError> {
+        // One script for both modes, the unused half of the key travelling
+        // as a sentinel: a second script would be a second copy of the
+        // window roll, the hold release and the commit, which are identical
+        // either way. Encoded here, at the one place that speaks the
+        // script's wire contract, rather than carried pre-encoded on `args`.
+        let (key_mode, session_id, seq) = match args.key {
+            SettlementKey::SessionWatermark { session_id, seq } => {
+                ("watermark", session_id.as_str(), *seq)
+            }
+            SettlementKey::OncePerCall => ("call", "", 0),
+        };
         let reply: Vec<Value> = self
             .settle_grant
             .key(args.account_key)
@@ -520,9 +531,9 @@ impl Scripts {
             .key(args.watermarks_key)
             .key(args.settled_calls_key)
             .arg(args.user)
-            .arg(args.key_mode)
-            .arg(args.session_id)
-            .arg(args.seq)
+            .arg(key_mode)
+            .arg(session_id)
+            .arg(seq)
             .arg(args.response_id)
             .arg(args.actual_usd)
             .arg(args.now_ms)

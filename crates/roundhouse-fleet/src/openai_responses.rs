@@ -525,6 +525,7 @@ fn redact_error(credential: &TurnCredential, error: FrontierError) -> FrontierEr
         | FrontierError::MalformedQuote(_)
         | FrontierError::UntranslatableTools { .. }
         | FrontierError::UnsupportedDialect { .. }
+        | FrontierError::UnsupportedCacheLifetime { .. }
         | FrontierError::Transport { .. }) => other,
     }
 }
@@ -556,8 +557,8 @@ mod tests {
 
     fn quote(credential: TurnCredential, wire_protocol: WireProtocol) -> FrontierQuote {
         FrontierQuote {
-            previous_breakpoint: None,
-            cache_ttl_ms: None,
+            previous_segment_count: None,
+            cache_lifetime: crate::anthropic_messages::CacheLifetime::Default,
             target: Target::Frontier {
                 provider: "openai".into(),
                 model: "flagship".into(),

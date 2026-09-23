@@ -36,8 +36,9 @@
 //!    turn — against the sentence this product is built to satisfy. Ruling R3.
 //!    Up to two markers ride the blocks: the penultimate one, and — when the
 //!    turn appended enough items to put the previous request's entry outside the
-//!    provider's [`CACHE_LOOKBACK_BLOCKS`] window — one back where that entry
-//!    lives.
+//!    provider's [`cache_markers::CACHE_LOOKBACK_BLOCKS`] window — one back
+//!    where that entry lives. See [`cache_markers`] for the placement policy
+//!    itself.
 //! 5. **No route here follows a redirect, the stored one included.** The
 //!    Responses client keeps an ordinary redirect-following transport for its
 //!    own key; that is safe only because a stored OpenAI key rides
@@ -49,6 +50,7 @@
 //! first, and outbound credential headers are marked sensitive so `hyper` will
 //! not print them in its own diagnostics.
 
+mod cache_markers;
 mod stream;
 pub mod wire;
 
@@ -195,31 +197,6 @@ impl StoredAuthStyle {
 /// roughly a paragraph.
 pub const DEFAULT_MAX_TOKENS: u32 = 8192;
 
-/// How many `cache_control` breakpoints one Messages request may carry.
-///
-/// **Anthropic's documented cap, and a hard 400 on the fifth.** It matters here
-/// because roundhouse is not the only author of this request: the tool
-/// definitions are forwarded from the client with their own breakpoints intact
-/// — Claude Code marks its last tool, which is how it caches a
-/// twenty-four-entry preamble — and the block breakpoint this client adds is
-/// therefore never the request's only one. A constant rather than a literal so
-/// the number and the reason it exists sit together; if Anthropic raises it,
-/// this is the line that moves.
-const MAX_CACHE_BREAKPOINTS: usize = 4;
-
-/// How many block positions back from a `cache_control` marker the provider
-/// looks for a cache entry, counting the marker's own block.
-///
-/// **The number that makes one breakpoint per request insufficient.** Anthropic
-/// documents this bound
-/// (platform.claude.com/docs/en/build-with-claude/prompt-caching), and it is
-/// what turns a long append into a total miss: a request whose only marker sits
-/// this far past the previous request's marker reaches nothing, even though the
-/// blocks in between are byte-identical to what was cached. A constant rather
-/// than a literal so the number and the consequence sit together; if Anthropic
-/// widens the window, this is the line that moves.
-const CACHE_LOOKBACK_BLOCKS: usize = 20;
-
 /// The cache lifetime a `1h` marker asks for, in milliseconds.
 ///
 /// Public because the catalog boundary reads it too: an entry declaring this
@@ -229,9 +206,53 @@ const CACHE_LOOKBACK_BLOCKS: usize = 20;
 /// offers is the default, which is the field omitted.
 pub const ONE_HOUR_MS: u64 = 3_600_000;
 
-/// How [`ONE_HOUR_MS`] is spelled on the wire. Beside it, so the duration and
-/// its spelling cannot drift apart.
-const ONE_HOUR: &str = "1h";
+/// Anthropic's own default lifetime, in milliseconds — what a marker with no
+/// `ttl` field at all means. Public for the same reason [`ONE_HOUR_MS`] is:
+/// [`CacheLifetime::from_ttl_ms`] is the catalog boundary's one source of
+/// truth for which deterministic TTLs the wire can honor, and both numbers it
+/// compares against have to live where that comparison is made.
+pub const DEFAULT_CACHE_TTL_MS: u64 = 300_000;
+
+/// The cache lifetimes Anthropic's Messages wire actually offers.
+///
+/// **Typed rather than a raw millisecond count**, so a catalog entry that
+/// declares a TTL neither spelling means is refused at the boundary instead
+/// of silently downgraded to the default the provider assumes when `ttl` is
+/// missing — see [`Self::from_ttl_ms`] and the catalog's
+/// `UnsupportedCacheLifetime` refusal. Every reader of
+/// [`FrontierQuote::cache_lifetime`](crate::frontier::FrontierQuote::cache_lifetime)
+/// matches both variants exhaustively, so a third lifetime this wire ever
+/// grew would fail to compile here rather than fall through a wildcard arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheLifetime {
+    /// No `ttl` field at all — Anthropic's own five-minute default.
+    Default,
+    /// An explicit `1h` marker.
+    OneHour,
+}
+
+impl CacheLifetime {
+    /// The wire's own spelling, or `None` for the field omitted.
+    pub fn wire(self) -> Option<&'static str> {
+        match self {
+            CacheLifetime::Default => None,
+            CacheLifetime::OneHour => Some(wire::CACHE_TTL_1H),
+        }
+    }
+
+    /// Resolve a catalog's millisecond TTL into the wire's own vocabulary.
+    ///
+    /// `None` for any value neither spelling means — the catalog boundary
+    /// refuses that at load (`catalog_config.rs`'s `UnsupportedCacheLifetime`),
+    /// so a target that reaches a dispatch has already had this succeed once.
+    pub fn from_ttl_ms(ttl_ms: u64) -> Option<Self> {
+        match ttl_ms {
+            DEFAULT_CACHE_TTL_MS => Some(CacheLifetime::Default),
+            ONE_HOUR_MS => Some(CacheLifetime::OneHour),
+            _ => None,
+        }
+    }
+}
 
 /// The dialect this client serializes. Anything else is refused rather than
 /// mis-serialized — see [`FrontierError::UnsupportedDialect`].
@@ -379,15 +400,14 @@ impl AnthropicMessagesClient {
         // than beside it.
         let (tools, tool_choice) = quote.tools_for(SPOKEN)?;
         // Tools and conversation markers share the target's cache lifetime.
-        let lifetime = match quote.cache_ttl_ms {
-            Some(ONE_HOUR_MS) => Some(ONE_HOUR),
-            _ => None,
-        };
+        // `CacheLifetime::wire` is the exhaustive match; nothing here decides
+        // which spelling a lifetime gets.
+        let lifetime = quote.cache_lifetime.wire();
         // Tools precede messages, so shorter tool markers would violate the
         // provider's TTL order. Matching the target also keeps its quoted
         // lifetime consistent with the request.
         let tools = tools.map(|mut tools| {
-            normalize_marker_lifetimes(&mut tools, lifetime);
+            cache_markers::normalize_marker_lifetimes(&mut tools, lifetime);
             tools
         });
         // **How many `cache_control` breakpoints are already riding this
@@ -406,77 +426,13 @@ impl AnthropicMessagesClient {
         // surface strips those, since roundhouse rebuilds every prompt from its
         // own log and a breakpoint from a different rendering names nothing in
         // this one.
-        let riding = breakpoints_in(tools.as_ref());
-        // **The breakpoint goes on the penultimate block, and nowhere else.**
-        //
-        // Anthropic caches nothing without an explicit `cache_control` marker —
-        // unlike the Responses API, where `prompt_cache_key` steers a request to
-        // a node that caches on its own. So a client that sent no breakpoint
-        // would get a 0% hit rate on every turn, and the router would keep
-        // pricing this target on a `CacheModel::Deterministic` prediction that
-        // nothing could fulfil. Routing on a predicted cache hit and then
-        // prompting in a way that defeats it is the failure this module's
-        // sibling doc names first.
-        //
-        // Penultimate rather than last, because a breakpoint caches everything
-        // *up to and including* the block it sits on. The final segment is this
-        // turn's new input — the part that by construction was not in the prefix
-        // last turn — so marking it would write a cache entry that the next turn
-        // cannot read, paying the write premium for nothing. Marking the one
-        // before it caches exactly the stable prefix.
-        //
-        // Fewer than two segments means there is no stable prefix to name yet:
-        // one block is the whole prompt, which is entirely this turn's input.
-        //
-        // And no breakpoint at all when the forwarded tools have already spent
-        // the request's allowance. **Yielding is the right way round**: the
-        // tools' own breakpoint caches the client's twenty-four-tool preamble,
-        // which is the largest stable block in the request and is warm on the
-        // provider's side either way, while ours caches a prefix we could
-        // re-mark on the next turn. Dropping theirs to keep ours would trade a
-        // bigger discount for a smaller one; sending both is a 400 that costs
-        // the turn.
-        //
-        // **And the same yield, one slot later, decides the second marker
-        // below.** With two free slots this request marks the penultimate block
-        // *and* the block the previous request to this target marked; with one,
-        // the penultimate marker takes it; with none, neither is sent.
-        let breakpoint = match riding < MAX_CACHE_BREAKPOINTS {
-            true => segments.len().checked_sub(2),
-            false => None,
-        };
-        // **A second marker, back where the previous request wrote its entry.**
-        //
-        // Anthropic's cache lookup examines at most
-        // [`CACHE_LOOKBACK_BLOCKS`] block positions back from a marker, counting
-        // the marker itself. A session that appends that many items between two
-        // turns therefore puts the penultimate marker out of the previous
-        // write's reach — the prefix bytes are still byte-identical and the turn
-        // still reads nothing, which is the one failure mode a breakpoint
-        // strategy exists to avoid. Marking the earlier block as well puts the
-        // old entry back inside a window, so the long tail is read rather than
-        // re-prefilled.
-        //
-        // **The penultimate marker wins the last free slot**, which is why this
-        // is derived from `breakpoint` rather than beside it. A lone marker at
-        // `previous` reads this turn's cache and then moves nothing forward, so
-        // every later turn pays plain input on an ever-longer tail; a lone
-        // penultimate marker pays one write now and makes every later turn a
-        // hit. One turn of saving against every turn after it is not a close
-        // call.
-        //
-        // Dropped rather than sent when it is not strictly earlier than the
-        // penultimate block — a previous count that is not smaller means the
-        // conversation stopped being append-only, and a marker derived from it
-        // names a block that is not the one that was written. Dropped too when
-        // the gap is inside the window, because the penultimate marker already
-        // reaches the old entry and a second one would only pay a second write.
-        let previous = match breakpoint {
-            Some(penultimate) if riding + 2 <= MAX_CACHE_BREAKPOINTS => quote
-                .previous_breakpoint
-                .filter(|p| *p < penultimate && penultimate - *p >= CACHE_LOOKBACK_BLOCKS),
-            _ => None,
-        };
+        let riding = cache_markers::breakpoints_in(tools.as_ref());
+        // Where this request's own markers go — the whole placement policy,
+        // and why it is what it is, lives in `cache_markers` now: `plan()`
+        // takes the same four scalars the essay there is about, and its own
+        // tests are the table that used to be scattered across this file as
+        // a JSON-scraping test per row.
+        let plan = cache_markers::plan(segments.len(), riding, quote.previous_segment_count);
         // Built out of [`wire::ContentBlock`] rather than hand-written JSON,
         // because this is the one place roundhouse *originates* this wire's
         // vocabulary and R1's rule is "typed where roundhouse reads or
@@ -497,7 +453,7 @@ impl AnthropicMessagesClient {
             .enumerate()
             .map(|(index, text)| ContentBlock::Text {
                 text: (*text).to_string(),
-                cache_control: (Some(index) == breakpoint || Some(index) == previous).then(control),
+                cache_control: plan.contains(index).then(control),
                 extra: Extra::new(),
             })
             .collect();
@@ -835,6 +791,7 @@ fn redact_error(credential: &TurnCredential, error: FrontierError) -> FrontierEr
         | FrontierError::MalformedQuote(_)
         | FrontierError::UntranslatableTools { .. }
         | FrontierError::UnsupportedDialect { .. }
+        | FrontierError::UnsupportedCacheLifetime { .. }
         | FrontierError::Transport { .. }) => other,
     }
 }
@@ -844,64 +801,6 @@ fn sensitive(value: &str) -> Option<HeaderValue> {
     let mut value = HeaderValue::from_str(value).ok()?;
     value.set_sensitive(true);
     Some(value)
-}
-
-/// How many `cache_control` breakpoints the forwarded tools already carry.
-///
-/// **Counted structurally rather than by scanning the JSON text**, because a
-/// tool whose *description* mentions `cache_control` is an ordinary tool and a
-/// text scan would read it as a breakpoint and silently drop roundhouse's own —
-/// costing the prefix discount on every turn for a substring in a doc string.
-///
-/// Only the array's top level is counted, which is where the wire puts them: a
-/// tool definition's `input_schema` is the tool's own argument schema and
-/// nothing inside it is a cache breakpoint, so descending would count a
-/// property a client happened to name `cache_control`.
-fn breakpoints_in(tools: Option<&Value>) -> usize {
-    tools
-        .and_then(Value::as_array)
-        .map(|entries| {
-            entries
-                .iter()
-                .filter(|entry| {
-                    entry
-                        .get("cache_control")
-                        .is_some_and(|control| !control.is_null())
-                })
-                .count()
-        })
-        .unwrap_or(0)
-}
-
-/// Rewrite every forwarded tool marker to the target's own cache lifetime.
-///
-/// **The lifetime only.** The marker's `type`, any field this build has never
-/// named, the definition around it and the marker's position all stay as the
-/// client sent them — so [`breakpoints_in`] counts the same before and after
-/// and the block allowance is unmoved.
-///
-/// Top level only, the bound [`breakpoints_in`] counts on: a property inside an
-/// `input_schema` that a client happened to name `cache_control` is that tool's
-/// own argument vocabulary, and rewriting it would edit the toolbox.
-///
-/// A marker this build cannot restate — a `null`, a string, a missing `type` —
-/// is left exactly as sent: it is a 400 at the provider whatever lifetime is
-/// written into it, and filling in the missing parts would be roundhouse
-/// authoring a breakpoint the client did not.
-fn normalize_marker_lifetimes(tools: &mut Value, lifetime: Option<&str>) {
-    let Some(entries) = tools.as_array_mut() else {
-        return;
-    };
-    for marker in entries
-        .iter_mut()
-        .filter_map(|entry| entry.get_mut("cache_control"))
-    {
-        let Ok(mut control) = serde_json::from_value::<CacheControl>(marker.clone()) else {
-            continue;
-        };
-        control.ttl = lifetime.map(str::to_string);
-        *marker = serde_json::to_value(control).expect("a cache breakpoint serializes");
-    }
 }
 
 /// A base URL with any trailing slash removed, so `{base}/v1/messages` is one
@@ -941,10 +840,10 @@ mod tests {
             segment_boundaries: boundaries(),
             // No prior dispatch on these fixtures; the tests that need one set
             // it, the way they set tools.
-            previous_breakpoint: None,
+            previous_segment_count: None,
             // And no declared lifetime: the TTL tests set it, so a marker
             // carrying one is never an accident of the fixture.
-            cache_ttl_ms: None,
+            cache_lifetime: CacheLifetime::Default,
             session_id: None,
             thread_id: None,
             prompt_cache_key: "sess_anthropic".into(),
@@ -1744,10 +1643,11 @@ mod tests {
         let quote2 = FrontierQuote {
             prompt: prompt2,
             segment_boundaries: boundaries2,
-            // The data flow under test: the ledger remembers that the previous
-            // dispatch to this target marked block `p1`, and the request built
-            // from that knowledge has to reach it.
-            previous_breakpoint: Some(p1),
+            // The data flow under test: the ledger remembers that the
+            // previous dispatch to this target rendered six segments (and
+            // therefore marked block `p1 == cache_markers::penultimate(6)`),
+            // and the request built from that knowledge has to reach it.
+            previous_segment_count: Some(6),
             ..quote(TurnCredential::Absent, SPOKEN)
         };
         let body2 = AnthropicMessagesClient::body(&quote2, "claude-sonnet").unwrap();
@@ -1783,7 +1683,7 @@ mod tests {
             let quote = FrontierQuote {
                 prompt: "a system prompt\n\na brief".into(),
                 segment_boundaries: Vec::new(),
-                previous_breakpoint: previous,
+                previous_segment_count: previous,
                 ..quote(TurnCredential::Absent, SPOKEN)
             };
             let body = AnthropicMessagesClient::body(&quote, "claude-sonnet").unwrap();
@@ -1804,7 +1704,7 @@ mod tests {
         let quote = FrontierQuote {
             prompt: format!("{PREFIX}a brief"),
             segment_boundaries: vec![PREFIX.len()],
-            previous_breakpoint: None,
+            previous_segment_count: None,
             ..quote(TurnCredential::Absent, SPOKEN)
         };
 
@@ -1886,14 +1786,18 @@ mod tests {
         }
     }
 
-    /// A quote long enough that both breakpoints are placed, at `ttl_ms`.
-    fn quote_at_ttl(ttl_ms: Option<u64>) -> FrontierQuote {
+    /// A quote long enough that both breakpoints are placed, at `lifetime`.
+    ///
+    /// `previous_segment_count: Some(6)` names a previous dispatch of six
+    /// segments -- `cache_markers::penultimate(6) == Some(4)`, well inside
+    /// the lookback window from this quote's own 29.
+    fn quote_at_ttl(lifetime: CacheLifetime) -> FrontierQuote {
         let (prompt, boundaries) = segments_of(6 + 25);
         FrontierQuote {
             prompt,
             segment_boundaries: boundaries,
-            previous_breakpoint: Some(4),
-            cache_ttl_ms: ttl_ms,
+            previous_segment_count: Some(6),
+            cache_lifetime: lifetime,
             ..quote(TurnCredential::Absent, SPOKEN)
         }
     }
@@ -1904,7 +1808,8 @@ mod tests {
     #[test]
     fn a_one_hour_cache_model_requests_the_one_hour_ttl() {
         let body =
-            AnthropicMessagesClient::body(&quote_at_ttl(Some(3_600_000)), "claude-sonnet").unwrap();
+            AnthropicMessagesClient::body(&quote_at_ttl(CacheLifetime::OneHour), "claude-sonnet")
+                .unwrap();
 
         let ttls = marker_ttls(&body);
         assert_eq!(
@@ -1920,11 +1825,15 @@ mod tests {
     }
 
     /// **CONTROL.** Five minutes is the field *omitted*, never `"5m"` — the
-    /// default a request gets with no `cache_ttl_ms` configured.
+    /// default a request gets, whether a target's catalog entry names it
+    /// explicitly or declares no lifetime at all. The two are one value,
+    /// [`CacheLifetime::Default`]: a marker with no `ttl` field is the wire's
+    /// own answer to both.
     #[test]
     fn a_five_minute_cache_model_keeps_the_default_marker() {
         let body =
-            AnthropicMessagesClient::body(&quote_at_ttl(Some(300_000)), "claude-sonnet").unwrap();
+            AnthropicMessagesClient::body(&quote_at_ttl(CacheLifetime::Default), "claude-sonnet")
+                .unwrap();
 
         let ttls = marker_ttls(&body);
         assert_eq!(ttls.len(), 2, "the fixture must place both markers");
@@ -1934,14 +1843,28 @@ mod tests {
         );
     }
 
-    /// **CONTROL.** A target with no declared lifetime omits the ttl field.
+    /// **Ties `CacheLifetime` to the pinned wire vocabulary.** A third TTL
+    /// this dialect ever grew would land in `wire::SPEC_CACHE_CONTROL_TTLS`
+    /// first (the spec-pin test in `wire.rs` sees to that) and would have to
+    /// gain a `CacheLifetime` variant before anything could route on it --
+    /// this is the test that goes red the day those two sets disagree.
     #[test]
-    fn a_target_with_no_declared_lifetime_omits_the_ttl_field() {
-        let body = AnthropicMessagesClient::body(&quote_at_ttl(None), "claude-sonnet").unwrap();
-
-        let ttls = marker_ttls(&body);
-        assert_eq!(ttls.len(), 2, "the fixture must place both markers");
-        assert!(ttls.iter().all(Option::is_none), "{ttls:?}");
+    fn every_cache_lifetime_speaks_a_spelling_the_spec_pins() {
+        use std::collections::HashSet;
+        // `Default`'s spelling is the field *omitted*, which is exactly what
+        // `wire::CACHE_TTL_5M` documents that omission as meaning -- so it is
+        // named here rather than read off `CacheLifetime::wire`, which
+        // answers `None` for it on purpose.
+        let ours: HashSet<&str> = [wire::CACHE_TTL_5M, CacheLifetime::OneHour.wire().unwrap()]
+            .into_iter()
+            .collect();
+        let spec: HashSet<&str> = wire::SPEC_CACHE_CONTROL_TTLS.into_iter().collect();
+        assert_eq!(
+            ours, spec,
+            "a lifetime this wire offers with no CacheLifetime variant would be silently \
+             unreachable; one this type claims that the wire does not offer would be \
+             refused by every catalog entry that names it"
+        );
     }
 
     /// An hour on the target does not conjure a marker onto a structureless
@@ -1951,7 +1874,7 @@ mod tests {
         let quote = FrontierQuote {
             prompt: "a system prompt\n\na brief".into(),
             segment_boundaries: Vec::new(),
-            cache_ttl_ms: Some(3_600_000),
+            cache_lifetime: CacheLifetime::OneHour,
             ..quote(TurnCredential::Absent, SPOKEN)
         };
         let body = AnthropicMessagesClient::body(&quote, "claude-sonnet").unwrap();
@@ -1963,20 +1886,19 @@ mod tests {
     #[test]
     fn a_side_calls_marker_carries_its_targets_lifetime() {
         const PREFIX: &str = "a system prompt\n\n";
-        for (ttl_ms, expected) in [
-            (Some(3_600_000), vec![Some("1h".to_string())]),
+        for (lifetime, expected) in [
+            (CacheLifetime::OneHour, vec![Some("1h".to_string())]),
             // The five-minute default is the field omitted, never `"5m"`.
-            (Some(300_000), vec![None]),
-            (None, vec![None]),
+            (CacheLifetime::Default, vec![None]),
         ] {
             let quote = FrontierQuote {
                 prompt: format!("{PREFIX}a brief"),
                 segment_boundaries: vec![PREFIX.len()],
-                cache_ttl_ms: ttl_ms,
+                cache_lifetime: lifetime,
                 ..quote(TurnCredential::Absent, SPOKEN)
             };
             let body = AnthropicMessagesClient::body(&quote, "claude-sonnet").unwrap();
-            assert_eq!(marker_ttls(&body), expected, "{ttl_ms:?}");
+            assert_eq!(marker_ttls(&body), expected, "{lifetime:?}");
         }
     }
 
@@ -2001,7 +1923,7 @@ mod tests {
         let quote = FrontierQuote {
             tools: Some(json!([tool])),
             tools_dialect: Some(SPOKEN),
-            ..quote_at_ttl(Some(ONE_HOUR_MS))
+            ..quote_at_ttl(CacheLifetime::OneHour)
         };
 
         let body = AnthropicMessagesClient::body(&quote, "claude-sonnet")
@@ -2019,7 +1941,7 @@ mod tests {
             tool_ttls
                 .iter()
                 .chain(block_ttls.iter())
-                .all(|ttl| ttl.as_deref() == Some(ONE_HOUR)),
+                .all(|ttl| ttl.as_deref() == Some(wire::CACHE_TTL_1H)),
             "one lifetime per request, the forwarded markers included: \
              tools={tool_ttls:?} blocks={block_ttls:?}"
         );
@@ -2072,7 +1994,7 @@ mod tests {
                 "cache_control": { "type": "ephemeral", "ttl": "1h" },
             }])),
             tools_dialect: Some(SPOKEN),
-            ..quote_at_ttl(Some(300_000))
+            ..quote_at_ttl(CacheLifetime::Default)
         };
 
         let body = AnthropicMessagesClient::body(&quote, "claude-sonnet").unwrap();
@@ -2100,7 +2022,7 @@ mod tests {
                 "cache_control": { "type": "ephemeral", "ttl": "1h" },
             }])),
             tools_dialect: Some(SPOKEN),
-            ..quote_at_ttl(None)
+            ..quote_at_ttl(CacheLifetime::Default)
         };
 
         let body = AnthropicMessagesClient::body(&quote, "claude-sonnet").unwrap();
@@ -2133,7 +2055,7 @@ mod tests {
         let quote = FrontierQuote {
             tools: Some(json!([marked("A"), marked("B"), marked("C")])),
             tools_dialect: Some(SPOKEN),
-            ..quote_at_ttl(Some(ONE_HOUR_MS))
+            ..quote_at_ttl(CacheLifetime::OneHour)
         };
 
         let body = AnthropicMessagesClient::body(&quote, "claude-sonnet").unwrap();
@@ -2141,9 +2063,9 @@ mod tests {
         assert_eq!(
             tool_marker_ttls(&body),
             vec![
-                Some(ONE_HOUR.to_string()),
-                Some(ONE_HOUR.to_string()),
-                Some(ONE_HOUR.to_string())
+                Some(wire::CACHE_TTL_1H.to_string()),
+                Some(wire::CACHE_TTL_1H.to_string()),
+                Some(wire::CACHE_TTL_1H.to_string())
             ],
             "every forwarded marker adopts the target's hour"
         );
@@ -2171,7 +2093,7 @@ mod tests {
         let quote = FrontierQuote {
             tools: Some(json!([marked("A"), marked("B"), marked("C"), marked("D")])),
             tools_dialect: Some(SPOKEN),
-            ..quote_at_ttl(Some(ONE_HOUR_MS))
+            ..quote_at_ttl(CacheLifetime::OneHour)
         };
 
         let body = AnthropicMessagesClient::body(&quote, "claude-sonnet").unwrap();
@@ -2180,7 +2102,7 @@ mod tests {
         assert!(
             tool_marker_ttls(&body)
                 .iter()
-                .all(|ttl| ttl.as_deref() == Some(ONE_HOUR)),
+                .all(|ttl| ttl.as_deref() == Some(wire::CACHE_TTL_1H)),
             "{:?}",
             tool_marker_ttls(&body)
         );
@@ -2214,7 +2136,7 @@ mod tests {
                 "input_schema": schema.clone(),
             }])),
             tools_dialect: Some(SPOKEN),
-            ..quote_at_ttl(Some(ONE_HOUR_MS))
+            ..quote_at_ttl(CacheLifetime::OneHour)
         };
 
         let body = AnthropicMessagesClient::body(&quote, "claude-sonnet").unwrap();
@@ -2255,7 +2177,7 @@ mod tests {
         let quote = FrontierQuote {
             prompt,
             segment_boundaries: boundaries,
-            previous_breakpoint: Some(4),
+            previous_segment_count: Some(6),
             ..declaring(
                 SPOKEN,
                 json!([marked("A"), marked("B"), marked("C"), marked("D")]),
@@ -2272,14 +2194,63 @@ mod tests {
         );
     }
 
-    /// One free slot is not two, and the penultimate marker takes it.
-    ///
-    /// A lone marker back at the previous write reads this turn's cache and then
-    /// moves nothing forward, so every later turn pays plain input on a longer
-    /// tail. A lone penultimate marker pays one write now and makes every later
-    /// turn a hit.
+    /// **CONTROL (fleet-redis-3), live.** Riding zero tool markers, a
+    /// six-segment dispatch marks its own penultimate block (index 4) -- the
+    /// ground truth the *next* request's `previous_segment_count` is supposed
+    /// to describe. `engine.rs` passes `last_segment_count` (6) straight
+    /// through, and `cache_markers::plan` derives the same block index from
+    /// it via `penultimate`, so the following long-append quote correctly
+    /// reaches back for it.
     #[test]
-    fn a_request_with_three_riding_markers_keeps_the_penultimate_and_drops_the_previous() {
+    fn a_history_with_no_riding_markers_marks_its_own_penultimate_block() {
+        let (prompt, boundaries) = segments_of(6);
+        let history = FrontierQuote {
+            prompt,
+            segment_boundaries: boundaries,
+            ..quote(TurnCredential::Absent, SPOKEN)
+        };
+        let body = AnthropicMessagesClient::body(&history, "claude-sonnet").unwrap();
+        assert_eq!(
+            breakpoint_indices(&body),
+            vec![4],
+            "six segments, no riding markers: the penultimate block is marked"
+        );
+
+        let (prompt, boundaries) = segments_of(6 + 25);
+        let following = FrontierQuote {
+            prompt,
+            segment_boundaries: boundaries,
+            previous_segment_count: Some(6),
+            ..quote(TurnCredential::Absent, SPOKEN)
+        };
+        let body = AnthropicMessagesClient::body(&following, "claude-sonnet").unwrap();
+        assert_eq!(
+            breakpoint_indices(&body),
+            vec![4, 29],
+            "the reach-back marker at 4 is correct: the history above wrote it"
+        );
+    }
+
+    /// **DEFECT (fleet-redis-3), CORRECTNESS, currently red -- ignored.**
+    ///
+    /// Riding four tool markers, the *same* six-segment dispatch places no
+    /// block marker at all -- the allowance is already spent (the four-marker
+    /// case `a_request_with_the_client_holding_four_tool_markers_still_sends_none`
+    /// pins above). But `engine.rs` passes `last_segment_count` (6) to the
+    /// next request exactly as it does for the control above, and
+    /// `cache_markers::plan` has no way to learn from that count alone
+    /// whether a marker was actually placed there. The following quote is
+    /// therefore byte-identical to the control's, and reaches back for a
+    /// write that was never made.
+    #[test]
+    #[ignore = "fleet-redis-3: cache_markers::plan derives the previous block from a segment \
+                count alone; the ledger (`TargetState`, roundhouse-core) records no fact \
+                about whether the previous dispatch actually placed a block marker, so \
+                this history and the control above are indistinguishable to it. Fixing \
+                this needs a new ledger fact and is outside this crate set -- see the PR's \
+                fleet-redis-3 ruling"]
+    fn a_history_with_four_riding_markers_places_no_block_marker_the_next_quote_can_reach_back_for()
+    {
         let marked = |name: &str| {
             json!({
                 "name": name,
@@ -2287,129 +2258,39 @@ mod tests {
                 "cache_control": { "type": "ephemeral" },
             })
         };
-        let (prompt, boundaries) = segments_of(6 + 25);
-        let quote = FrontierQuote {
+        let (prompt, boundaries) = segments_of(6);
+        let history = FrontierQuote {
             prompt,
             segment_boundaries: boundaries,
-            previous_breakpoint: Some(4),
-            ..declaring(SPOKEN, json!([marked("A"), marked("B"), marked("C")]), None)
+            ..declaring(
+                SPOKEN,
+                json!([marked("A"), marked("B"), marked("C"), marked("D")]),
+                None,
+            )
         };
+        let body = AnthropicMessagesClient::body(&history, "claude-sonnet").unwrap();
+        assert_eq!(
+            breakpoint_indices(&body),
+            Vec::<usize>::new(),
+            "four riding markers already spent the allowance: nothing is written at block 4"
+        );
 
-        let body = AnthropicMessagesClient::body(&quote, "claude-sonnet").unwrap();
+        // Byte-identical to the control's following quote: `plan` cannot
+        // tell these two histories apart, because `previous_segment_count`
+        // is 6 either way.
+        let (prompt, boundaries) = segments_of(6 + 25);
+        let following = FrontierQuote {
+            prompt,
+            segment_boundaries: boundaries,
+            previous_segment_count: Some(6),
+            ..quote(TurnCredential::Absent, SPOKEN)
+        };
+        let body = AnthropicMessagesClient::body(&following, "claude-sonnet").unwrap();
         assert_eq!(
             breakpoint_indices(&body),
             vec![29],
-            "with one slot free the penultimate block takes it: 31 segments, so \
-             block 29, and not the previous write at block 4"
-        );
-    }
-
-    /// CONTROL for the two above: with no tools riding, the same fixture places
-    /// both markers -- which is what proves those two are about the allowance
-    /// and not about the lookback marker never being placed at all.
-    #[test]
-    fn a_long_append_with_a_free_allowance_places_both_markers() {
-        let (prompt, boundaries) = segments_of(6 + 25);
-        let quote = FrontierQuote {
-            prompt,
-            segment_boundaries: boundaries,
-            previous_breakpoint: Some(4),
-            ..quote(TurnCredential::Absent, SPOKEN)
-        };
-
-        let body = AnthropicMessagesClient::body(&quote, "claude-sonnet").unwrap();
-        assert_eq!(breakpoint_indices(&body), vec![4, 29]);
-    }
-
-    /// An append the penultimate marker already reaches gets no second marker.
-    ///
-    /// The lookback window is the whole justification for the second marker, so
-    /// placing one inside it would pay a cache write for a hit the request was
-    /// already going to get.
-    #[test]
-    fn a_short_append_adds_no_second_marker() {
-        let (prompt1, boundaries1) = segments_of(6);
-        let quote1 = FrontierQuote {
-            prompt: prompt1,
-            segment_boundaries: boundaries1,
-            ..quote(TurnCredential::Absent, SPOKEN)
-        };
-        let body1 = AnthropicMessagesClient::body(&quote1, "claude-sonnet").unwrap();
-        let p1 = breakpoint_index(&body1).expect("six segments have a stable prefix to mark");
-
-        let (prompt2, boundaries2) = segments_of(6 + 3);
-        let quote2 = FrontierQuote {
-            prompt: prompt2,
-            segment_boundaries: boundaries2,
-            previous_breakpoint: Some(p1),
-            ..quote(TurnCredential::Absent, SPOKEN)
-        };
-        let body2 = AnthropicMessagesClient::body(&quote2, "claude-sonnet").unwrap();
-        assert_eq!(
-            breakpoint_indices(&body2),
-            vec![7],
-            "block 7 is five positions past the previous write at block {p1}, \
-             well inside the lookback -- a second marker there buys nothing and \
-             costs a write"
-        );
-    }
-
-    /// A previous count that is not *behind* the penultimate block is not a
-    /// previous write this request can reach.
-    ///
-    /// A conversation that stopped being append-only -- a compaction, an edited
-    /// history -- leaves a remembered block index that names different bytes
-    /// now. Marking it would pay a write at a position nothing was cached at.
-    #[test]
-    fn a_previous_breakpoint_at_or_past_the_penultimate_block_is_dropped() {
-        let (prompt, boundaries) = segments_of(6);
-        for previous in [4, 5, 40] {
-            let quote = FrontierQuote {
-                prompt: prompt.clone(),
-                segment_boundaries: boundaries.clone(),
-                previous_breakpoint: Some(previous),
-                ..quote(TurnCredential::Absent, SPOKEN)
-            };
-            let body = AnthropicMessagesClient::body(&quote, "claude-sonnet").unwrap();
-            assert_eq!(
-                breakpoint_indices(&body),
-                vec![4],
-                "a previous breakpoint of {previous} against a six-segment \
-                 prompt is not behind this request's penultimate block"
-            );
-        }
-    }
-
-    /// CONTROL for the claim above: the same fixture and the same shared
-    /// prefix, but the append is three segments rather than twenty-five, so
-    /// today's single penultimate breakpoint already lands inside the
-    /// lookback window. Proves the claim test's failure is about the size of
-    /// the append and not about the fixture, the segment builder, or the
-    /// assertion being unreachable in general.
-    #[test]
-    fn a_short_append_keeps_the_previous_cache_write_inside_a_lookback_window() {
-        let (prompt1, boundaries1) = segments_of(6);
-        let quote1 = FrontierQuote {
-            prompt: prompt1,
-            segment_boundaries: boundaries1,
-            ..quote(TurnCredential::Absent, SPOKEN)
-        };
-        let body1 = AnthropicMessagesClient::body(&quote1, "claude-sonnet").unwrap();
-        let p1 = breakpoint_index(&body1).expect("six segments have a stable prefix to mark");
-
-        let (prompt2, boundaries2) = segments_of(6 + 3);
-        let quote2 = FrontierQuote {
-            prompt: prompt2,
-            segment_boundaries: boundaries2,
-            ..quote(TurnCredential::Absent, SPOKEN)
-        };
-        let body2 = AnthropicMessagesClient::body(&quote2, "claude-sonnet").unwrap();
-        let p2 = breakpoint_index(&body2).expect("nine segments still have a stable prefix");
-
-        assert!(
-            p2 as i64 - p1 as i64 <= 19,
-            "a three-segment append must not push the previous write outside \
-             the lookback window: p1={p1}, p2={p2}"
+            "block 4 was never written by the history above; the following quote \
+             must not reach back for a cache entry that does not exist"
         );
     }
 }

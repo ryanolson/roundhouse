@@ -16,7 +16,7 @@ use crate::correlation::thread_key as correlation_thread_key_impl;
 use crate::fair_use::{
     bucket_fields, bucket_index, member_scope_key, project_scope_key, window_sum_fields,
 };
-use crate::spend::holds_key as spend_holds_key_impl;
+use crate::spend::{SpendLeaf, spend_key};
 use crate::{RedisSessionStore, lease_key as store_lease_key, log_key as store_log_key};
 
 /// The namespace every helper in this module builds a key under.
@@ -72,11 +72,8 @@ pub async fn connect_in(namespace: KeyNamespace) -> RedisSessionStore {
 /// hash, the permanent membership set, and the pending set — for the tests
 /// that sabotage their types or assert no write reached them.
 pub fn learning_index_keys(namespace: &KeyNamespace) -> [String; 3] {
-    [
-        crate::learning_marks_key(namespace),
-        crate::learning_marked_key(namespace),
-        crate::learning_pending_key(namespace),
-    ]
+    let keys = crate::scripts::learning::IndexKeys::new(namespace);
+    [keys.marks, keys.marked, keys.pending]
 }
 
 /// The raw log key under `namespace`, for the test that seeds a log near the
@@ -104,10 +101,11 @@ pub fn log_key(session_id: &SessionId) -> String {
 /// the key format it pins is already pinned by
 /// `the_project_and_member_keys_share_one_hash_tag` beside the real functions.
 pub fn spend_holds_key(project: &ProjectId) -> String {
-    spend_holds_key_impl(
+    spend_key(
         &default_namespace(),
         crate::spend::SpendPurpose::Serving,
         project,
+        SpendLeaf::Holds,
     )
 }
 

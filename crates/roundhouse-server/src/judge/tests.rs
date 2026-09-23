@@ -12,6 +12,7 @@ use roundhouse_core::control::{
 use roundhouse_core::ids::{SessionId, SideCallId};
 use roundhouse_core::routing::{CacheModel, ProviderPricing};
 use roundhouse_fleet::WireProtocol;
+use roundhouse_fleet::anthropic_messages::CacheLifetime;
 use std::sync::Mutex;
 
 /// A client that records the quote it was handed and answers from a script.
@@ -50,6 +51,15 @@ impl FrontierClient for RecordingClient {
                     to,
                 })
             }
+            Some(FrontierError::UnsupportedCacheLifetime {
+                provider,
+                model,
+                ttl_ms,
+            }) => Err(FrontierError::UnsupportedCacheLifetime {
+                provider: provider.clone(),
+                model: model.clone(),
+                ttl_ms: *ttl_ms,
+            }),
             Some(FrontierError::Transport { message, timed_out }) => {
                 Err(FrontierError::Transport {
                     message: message.clone(),
@@ -175,19 +185,22 @@ async fn a_check_names_its_stable_system_prefix_as_one_segment() {
 #[tokio::test]
 async fn a_check_asks_for_its_targets_declared_cache_lifetime() {
     for (cache_model, requested) in [
-        (CacheModel::Deterministic { ttl_ms: 300_000 }, Some(300_000)),
+        (
+            CacheModel::Deterministic { ttl_ms: 300_000 },
+            CacheLifetime::Default,
+        ),
         (
             CacheModel::Deterministic { ttl_ms: 3_600_000 },
-            Some(3_600_000),
+            CacheLifetime::OneHour,
         ),
-        (CacheModel::Observed, None),
+        (CacheModel::Observed, CacheLifetime::Default),
         (
             CacheModel::InactivityDecay {
                 half_life_ms: 60_000,
                 max_ttl_ms: 600_000,
                 min_prefix_tokens: 1_024,
             },
-            None,
+            CacheLifetime::Default,
         ),
     ] {
         let (client, judge) = recording_judge(FrontierModelSpec {
@@ -195,13 +208,13 @@ async fn a_check_asks_for_its_targets_declared_cache_lifetime() {
             ..spec()
         });
         let quote = quote_of(&client, &judge, "system", "brief").await;
-        assert_eq!(quote.cache_ttl_ms, requested, "{cache_model:?}");
+        assert_eq!(quote.cache_lifetime, requested, "{cache_model:?}");
     }
 }
 
 /// **CONTROL.** The isolations a cache-aware check must not trade away: a
-/// key of its own, and no block index borrowed from the conversation's
-/// ledger, which names a block in a different prompt.
+/// key of its own, and no segment history borrowed from the conversation's
+/// ledger, which names blocks in a different prompt.
 #[tokio::test]
 async fn a_check_keeps_its_own_key_and_borrows_no_conversation_breakpoint() {
     let (client, judge) = recording_judge(spec());
@@ -209,8 +222,8 @@ async fn a_check_keeps_its_own_key_and_borrows_no_conversation_breakpoint() {
 
     assert_eq!(quote.prompt_cache_key, "acme/ada/main#validate");
     assert_eq!(
-        quote.previous_breakpoint, None,
-        "the conversation breakpoint does not belong to the judge prompt"
+        quote.previous_segment_count, None,
+        "the conversation's segment history does not belong to the judge prompt"
     );
     assert_eq!(
         quote.output_token_cap,
@@ -530,6 +543,47 @@ async fn a_provider_that_refuses_is_abandoned_against_its_own_target() {
         }),
         "a provider that answered and refused is not a provider nobody \
          could reach, and the two send an operator to different places"
+    );
+}
+
+/// **CORRECTNESS (fleet-redis-2, dispatch-time).** A target whose catalog
+/// entry declares a TTL the wire has no spelling for is abandoned before a
+/// quote is ever built -- `call` resolves the lifetime first, so this is
+/// caught inside this process rather than sent at the provider's own
+/// five-minute default.
+#[tokio::test]
+async fn an_unspellable_cache_lifetime_is_abandoned_before_a_quote_is_built() {
+    let client = Arc::new(RecordingClient {
+        seen: Mutex::new(Vec::new()),
+        fail: None,
+    });
+    let unspellable = FrontierModelSpec {
+        cache_model: CacheModel::Deterministic { ttl_ms: 600_000 },
+        ..spec()
+    };
+    let judge = FleetJudge::new(
+        Arc::clone(&client) as Arc<dyn FrontierClient>,
+        unspellable.clone(),
+        ByteTokenizer,
+        120_000,
+        JudgeConfig::default(),
+    );
+
+    let failed = judge
+        .consult(&Check::nth(0).under(None), "system", "brief")
+        .await;
+    assert_eq!(
+        failed,
+        Err(JudgeFailure::Abandoned {
+            target: unspellable.target(),
+            reason: SideCallAbandonReason::Unreachable,
+        }),
+        "an unspellable catalog TTL is caught inside this process, before a socket -- the \
+         same class of mistake as a dialect the client cannot serialize"
+    );
+    assert!(
+        client.seen.lock().expect("recording").is_empty(),
+        "the client must never see a quote built from an unresolved lifetime"
     );
 }
 

@@ -34,7 +34,7 @@ use serde::Deserialize;
 
 use roundhouse_core::metrics::{DEFAULT_CAPABILITY_BAND, MetricsConfig};
 use roundhouse_core::routing::CacheModel;
-use roundhouse_fleet::anthropic_messages::ONE_HOUR_MS;
+use roundhouse_fleet::anthropic_messages::{CacheLifetime, ONE_HOUR_MS};
 use roundhouse_fleet::{FrontierModelSpec, StaticFrontierCatalog, WireProtocol};
 
 use crate::engine::{DEFAULT_LOCAL_BASE_TTFT_MS, EngineConfig};
@@ -284,6 +284,26 @@ pub enum CatalogError {
         declared: f64,
         required: f64,
     },
+    /// A `deterministic` entry on `anthropic_messages` declares a TTL the wire
+    /// has no spelling for.
+    ///
+    /// Anthropic offers exactly two lifetimes: the five-minute default (no
+    /// `ttl` field) and an explicit one-hour marker. Anything else passed
+    /// this boundary silently: `AnthropicMessagesClient::body` fell back to
+    /// the default with no `ttl` at all, while `CacheLedger` kept modelling
+    /// the target as warm for the number the catalog declared — the router
+    /// pricing a cache hit the wire was never asked to grant.
+    #[error(
+        "catalog `{path}`: `{model}` declares a deterministic cache lifetime of {ttl_ms}ms on \
+         `anthropic_messages`, which has no spelling for it on the wire -- only the \
+         five-minute default (300000) and the explicit one-hour marker (3600000) exist. \
+         Routing on this entry would price a cache hit the wire is never asked to grant"
+    )]
+    UnsupportedCacheLifetime {
+        path: String,
+        model: String,
+        ttl_ms: u64,
+    },
     #[error("catalog `{path}`: `{model}` has {field} = {value}, but {expected}")]
     InvalidValue {
         path: String,
@@ -502,6 +522,22 @@ impl CatalogConfig {
                 }
             }
             unit_interval(path, &label, "quality_prior", spec.quality_prior)?;
+
+            // The wire has exactly two deterministic lifetimes (fleet-redis-2).
+            // Scoped to the dialect for the same reason the write-rate guard
+            // below is: a gateway entry speaking `anthropic_messages` under
+            // any provider name is held to the wire it actually speaks, and
+            // every other dialect's own TTL semantics are untouched.
+            if spec.wire_protocol == WireProtocol::AnthropicMessages
+                && let CacheModel::Deterministic { ttl_ms } = spec.cache_model
+                && CacheLifetime::from_ttl_ms(ttl_ms).is_none()
+            {
+                return Err(CatalogError::UnsupportedCacheLifetime {
+                    path: path.to_string(),
+                    model: label.clone(),
+                    ttl_ms,
+                });
+            }
 
             // A single write rate must match the lifetime requested on the wire.
             // Match the dialect so a gateway name cannot bypass this guard.

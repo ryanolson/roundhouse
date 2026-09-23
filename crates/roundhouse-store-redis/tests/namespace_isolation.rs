@@ -27,7 +27,7 @@ use roundhouse_core::store::SessionStore;
 use roundhouse_store_redis::test_support::url_from_env;
 use roundhouse_store_redis::{
     KeyNamespace, RedisCorrelationMaps, RedisDocumentStore, RedisFairUseLedger, RedisSessionStore,
-    RedisSpendLedger,
+    RedisSpendLedger, SpendPurpose,
 };
 
 fn namespace(raw: &str) -> KeyNamespace {
@@ -80,10 +80,10 @@ async fn a_session_created_under_one_namespace_does_not_exist_under_another() {
 #[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
 async fn a_grant_opened_under_one_namespace_is_invisible_under_another() {
     let url = url_from_env();
-    let a = RedisSpendLedger::connect_namespaced(&url, namespace("a"))
+    let a = RedisSpendLedger::connect_for(&url, namespace("a"), SpendPurpose::Serving)
         .await
         .expect("the test Redis must be reachable");
-    let b = RedisSpendLedger::connect_namespaced(&url, namespace("b"))
+    let b = RedisSpendLedger::connect_for(&url, namespace("b"), SpendPurpose::Serving)
         .await
         .expect("the test Redis must be reachable");
 

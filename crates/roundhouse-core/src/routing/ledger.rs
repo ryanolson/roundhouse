@@ -351,7 +351,7 @@ pub struct TargetState {
     /// a much longer prompt names a position the previous write cannot be
     /// reached from — a miss on bytes that are still identical. The count is
     /// what a later request needs to work out where that write landed, and it
-    /// reaches the wire as `FrontierQuote::previous_breakpoint`.
+    /// reaches the wire as `FrontierQuote::previous_segment_count`.
     ///
     /// `#[serde(default)]` so a ledger snapshot written before this field
     /// existed still loads, and reads as "no block structure known" — which

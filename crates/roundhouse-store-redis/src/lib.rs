@@ -294,26 +294,6 @@ fn log_key(namespace: &KeyNamespace, session_id: &SessionId) -> String {
     )
 }
 
-// The learning index is one set of keys per namespace, not per session, so it
-// carries no hash tag: it cannot share a Cluster slot with every session's
-// keys at once. The fourth segment is never `{`-prefixed, so these cannot
-// collide with any session's keys.
-fn learning_marks_key(namespace: &KeyNamespace) -> String {
-    keys::build_key(namespace, keys::KeyFamily::Session, &["learning", "marks"])
-}
-
-fn learning_marked_key(namespace: &KeyNamespace) -> String {
-    keys::build_key(namespace, keys::KeyFamily::Session, &["learning", "marked"])
-}
-
-fn learning_pending_key(namespace: &KeyNamespace) -> String {
-    keys::build_key(
-        namespace,
-        keys::KeyFamily::Session,
-        &["learning", "pending"],
-    )
-}
-
 /// The value under `…:meta`.
 ///
 /// `created_at_ms` is informational only — nothing orders on it. Lease expiry
@@ -525,12 +505,14 @@ impl SessionStore for RedisSessionStore {
             .collect();
         // Built only for a marked append: the unmarked one is the turn path
         // and never touches the index.
-        let index = mark.as_ref().map(|_| LearningKeys::new(&self.namespace));
+        let index = mark
+            .as_ref()
+            .map(|_| scripts::learning::IndexKeys::new(&self.namespace));
         let mark_args = mark
             .as_ref()
             .zip(index.as_ref())
             .map(|(mark, index)| scripts::MarkArgs {
-                index_keys: [&index.marks, &index.marked, &index.pending],
+                index_keys: index,
                 session_id: lease.session_id.as_str(),
                 event_index: mark.event_index(),
                 project: mark.project().as_str(),
@@ -667,12 +649,12 @@ impl SessionStore for RedisSessionStore {
         session_id: &SessionId,
         confirmed_through: u64,
     ) -> Result<ClearOutcome, StoreError> {
-        let index = LearningKeys::new(&self.namespace);
+        let index = scripts::learning::IndexKeys::new(&self.namespace);
         self.scripts
             .learning
             .clear(
                 &mut self.conn.clone(),
-                &index.as_script_keys(),
+                &index,
                 session_id,
                 confirmed_through,
             )
@@ -684,15 +666,10 @@ impl SessionStore for RedisSessionStore {
         session_id: &SessionId,
         mark_seq: u64,
     ) -> Result<RequeueOutcome, StoreError> {
-        let index = LearningKeys::new(&self.namespace);
+        let index = scripts::learning::IndexKeys::new(&self.namespace);
         self.scripts
             .learning
-            .requeue(
-                &mut self.conn.clone(),
-                &index.as_script_keys(),
-                session_id,
-                mark_seq,
-            )
+            .requeue(&mut self.conn.clone(), &index, session_id, mark_seq)
             .await
     }
 
@@ -702,12 +679,12 @@ impl SessionStore for RedisSessionStore {
         idle_for_ms: u64,
         limit: NonZeroUsize,
     ) -> Result<LearningPage, StoreError> {
-        let index = LearningKeys::new(&self.namespace);
+        let index = scripts::learning::IndexKeys::new(&self.namespace);
         self.scripts
             .learning
             .page(
                 &mut self.conn.clone(),
-                &index.as_script_keys(),
+                &index,
                 scripts::learning::PageOf::Pending { idle_for_ms },
                 after,
                 limit,
@@ -720,42 +697,17 @@ impl SessionStore for RedisSessionStore {
         after: Option<&LearningCursor>,
         limit: NonZeroUsize,
     ) -> Result<LearningPage, StoreError> {
-        let index = LearningKeys::new(&self.namespace);
+        let index = scripts::learning::IndexKeys::new(&self.namespace);
         self.scripts
             .learning
             .page(
                 &mut self.conn.clone(),
-                &index.as_script_keys(),
+                &index,
                 scripts::learning::PageOf::Marked,
                 after,
                 limit,
             )
             .await
-    }
-}
-
-/// The three learning-index keys of one namespace, built once per call.
-struct LearningKeys {
-    marks: String,
-    marked: String,
-    pending: String,
-}
-
-impl LearningKeys {
-    fn new(namespace: &KeyNamespace) -> Self {
-        Self {
-            marks: learning_marks_key(namespace),
-            marked: learning_marked_key(namespace),
-            pending: learning_pending_key(namespace),
-        }
-    }
-
-    fn as_script_keys(&self) -> scripts::learning::IndexKeys<'_> {
-        scripts::learning::IndexKeys {
-            marks: &self.marks,
-            marked: &self.marked,
-            pending: &self.pending,
-        }
     }
 }
 

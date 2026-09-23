@@ -25,7 +25,7 @@
 //!
 //! Messages requests mark the system prefix for caching. The target's catalog
 //! entry supplies the requested lifetime through
-//! [`FrontierModelSpec::requested_cache_ttl_ms`]. The reservation uses the
+//! [`FrontierModelSpec::requested_cache_lifetime`]. The reservation uses the
 //! configured cold-write price. A marker does not establish a cache hit:
 //! provider eligibility and retention rules still apply.
 //!
@@ -555,11 +555,16 @@ impl<T: Tokenizer + Clone> FleetJudge<T> {
                 // whole match is spelled out, and it is *structurally*
                 // unreachable from here besides: a judge declares no tools, so
                 // its quote has nothing to translate.
+                // And a catalog TTL the wire has no spelling for joins them
+                // too — a spec `requested_cache_lifetime` refused before this
+                // call ever built a quote, reachable only from a spec that
+                // bypassed `CatalogConfig`'s own boot-time refusal of it.
                 FrontierError::UnknownProvider(_)
                 | FrontierError::Credential(_)
                 | FrontierError::MalformedQuote(_)
                 | FrontierError::UntranslatableTools { .. }
                 | FrontierError::UnsupportedDialect { .. }
+                | FrontierError::UnsupportedCacheLifetime { .. }
                 | FrontierError::Transport { .. } => SideCallAbandonReason::Unreachable,
                 // The provider answered. A 503 and an unparseable body are both
                 // an answer this deployment could not use, which is what
@@ -629,6 +634,14 @@ impl<T: Tokenizer + Clone> FleetJudge<T> {
         prepared: PreparedPrompt,
     ) -> Result<JudgeAnswer, JudgeFailure> {
         let deadline = tokio::time::Instant::now() + Duration::from_millis(self.deadline_ms());
+        // Resolved before the quote is built, so an unspellable catalog TTL
+        // abandons the check the same way an unreachable provider does,
+        // rather than reaching `body()` and mispricing the check that never
+        // happened.
+        let cache_lifetime = self
+            .spec
+            .requested_cache_lifetime()
+            .map_err(|error| self.abandoned(&error))?;
         let quote = FrontierQuote {
             target: self.target(),
             wire_protocol: self.spec.wire_protocol,
@@ -636,10 +649,10 @@ impl<T: Tokenizer + Clone> FleetJudge<T> {
             prompt: prepared.text,
             // Messages can mark the system prefix without marking the brief.
             segment_boundaries: prepared.boundaries,
-            // The conversation's stored breakpoint belongs to a different prompt.
-            previous_breakpoint: None,
-            // The judge and turn path use the same target TTL source.
-            cache_ttl_ms: self.spec.requested_cache_ttl_ms(),
+            // The conversation's own segment history belongs to a different prompt.
+            previous_segment_count: None,
+            // The judge and turn path use the same target lifetime source.
+            cache_lifetime,
             // The isolation, and the one line of this file that would be
             // easiest to get subtly wrong: the *conversation's* key here would
             // cool the hit the router priced for the next real turn.

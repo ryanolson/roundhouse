@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use roundhouse_core::control::TurnCredential;
 use roundhouse_core::event::CacheReadSource;
 use roundhouse_core::routing::{CacheLedger, CacheModel, ProviderPricing, Target};
+use roundhouse_fleet::anthropic_messages::CacheLifetime;
 use roundhouse_fleet::{
     FrontierChunk, FrontierClient, FrontierError, FrontierModelSpec, FrontierQuote, FrontierStream,
     StaticFrontierCatalog, WireProtocol,
@@ -60,8 +61,8 @@ fn quote_as_the_engine_builds_it(catalog: &StaticFrontierCatalog) -> FrontierQuo
         .expect("the catalog priced this target, so it owns its spec");
 
     FrontierQuote {
-        previous_breakpoint: None,
-        cache_ttl_ms: None,
+        previous_segment_count: None,
+        cache_lifetime: CacheLifetime::Default,
         wire_protocol: spec.wire_protocol,
         target: candidate.target,
         prompt: "how many tokens did that turn bill?".into(),

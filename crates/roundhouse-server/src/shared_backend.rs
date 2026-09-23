@@ -302,11 +302,12 @@ pub async fn open(redis_url: Option<&str>, namespace: &KeyNamespace) -> anyhow::
             let store = RedisSessionStore::connect_namespaced(url, namespace.clone())
                 .await
                 .with_context(|| format!("connecting to the Redis named by {REDIS_VAR}"))?;
-            let spend = RedisSpendLedger::connect_namespaced(url, namespace.clone())
-                .await
-                .with_context(|| {
-                    format!("opening the spend ledger in the Redis named by {REDIS_VAR}")
-                })?;
+            let spend =
+                RedisSpendLedger::connect_for(url, namespace.clone(), SpendPurpose::Serving)
+                    .await
+                    .with_context(|| {
+                        format!("opening the spend ledger in the Redis named by {REDIS_VAR}")
+                    })?;
             // The sixth family, in **this deployment's own namespace** with its
             // own keys inside it (`SpendPurpose::Evaluation`). Deriving a
             // namespace instead — `tenant` giving `tenant-eval` — made one
@@ -408,52 +409,6 @@ mod tests {
             }
         );
         assert_eq!(shared_backend(None), SharedBackend::PerProcess);
-    }
-
-    /// **The evaluation ledger shares the deployment's namespace and not its
-    /// keys.**
-    ///
-    /// The first draft derived `<ns>-eval`, which made deployment `tenant`'s
-    /// evaluation ledger identical to deployment `tenant-eval`'s *serving*
-    /// ledger — two tenants on one counter, and the only symptom would have been
-    /// one of them refusing turns it had budget for. This asserts the fix in the
-    /// shape the collision had: the two deployments' four key spaces are
-    /// pairwise distinct, and the serving keys are unchanged.
-    #[test]
-    fn two_deployments_named_tenant_and_tenant_eval_share_no_spend_keys() {
-        use roundhouse_core::control::ProjectId;
-        use roundhouse_store_redis::spend::{account_key_for_test, holds_key_for_test};
-
-        let project = ProjectId::new("proj_shared");
-        let tenant = KeyNamespace::new("tenant").expect("a legal namespace");
-        let tenant_eval = KeyNamespace::new("tenant-eval").expect("also a legal namespace");
-
-        let keys = |namespace: &KeyNamespace, purpose| {
-            [
-                account_key_for_test(namespace, purpose, &project),
-                holds_key_for_test(namespace, purpose, &project),
-            ]
-        };
-        let tenant_serving = keys(&tenant, SpendPurpose::Serving);
-        let tenant_evaluation = keys(&tenant, SpendPurpose::Evaluation);
-        let sibling_serving = keys(&tenant_eval, SpendPurpose::Serving);
-
-        for evaluation in &tenant_evaluation {
-            assert!(
-                !sibling_serving.contains(evaluation),
-                "`tenant`'s evaluation ledger must not write `tenant-eval`'s \
-                 serving keys: {evaluation}"
-            );
-            assert!(!tenant_serving.contains(evaluation));
-        }
-        // The serving keys are byte-identical to what this crate wrote before
-        // the purpose existed, so no deployment's committed spend moves.
-        assert_eq!(tenant_serving[0], "tenant:v1:spend:{proj_shared}:account");
-        assert_eq!(
-            tenant_evaluation[0], "tenant:v1:spend:{proj_shared}:eval:account",
-            "and the hash tag stays first, or one project's keys stop sharing a \
-             Cluster slot and the check-and-debit script stops being atomic"
-        );
     }
 
     /// **M14.2, R-S3: absent means the default, set-but-empty is refused.**

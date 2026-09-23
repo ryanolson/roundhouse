@@ -21,13 +21,14 @@ use roundhouse_core::ids::{SessionId, TurnId};
 use roundhouse_core::item::Item;
 use roundhouse_core::routing::{AffinityPolicy, CacheModel};
 use roundhouse_core::store::MemoryStore;
+use roundhouse_fleet::anthropic_messages::CacheLifetime;
 use roundhouse_fleet::{
     EchoFrontierClient, FrontierClient, FrontierClients, FrontierError, FrontierQuote,
     FrontierStream, StaticFrontierCatalog, WireProtocol,
 };
 use roundhouse_server::test_support::frontier_spec;
 use roundhouse_server::{
-    Admission, EchoLocalExecutor, Engine, EngineConfig, LocalExecutor, TurnInput,
+    Admission, EchoLocalExecutor, Engine, EngineConfig, EngineError, LocalExecutor, TurnInput,
 };
 
 /// A client that keeps the quote it was handed and then answers normally.
@@ -120,7 +121,7 @@ async fn a_one_hour_catalog_entry_puts_an_hour_on_the_quote() {
     )
     .await;
 
-    assert_eq!(quote.cache_ttl_ms, Some(3_600_000));
+    assert_eq!(quote.cache_lifetime, CacheLifetime::OneHour);
 }
 
 /// **CONTROL.** The five-minute entry every catalog ships today.
@@ -133,8 +134,8 @@ async fn a_five_minute_catalog_entry_puts_five_minutes_on_the_quote() {
     .await;
 
     assert_eq!(
-        quote.cache_ttl_ms,
-        Some(300_000),
+        quote.cache_lifetime,
+        CacheLifetime::Default,
         "the ledger predicts retention on this number, so the request must ask \
          for the same one"
     );
@@ -157,5 +158,81 @@ async fn an_automatic_cache_model_puts_no_lifetime_on_the_quote() {
     )
     .await;
 
-    assert_eq!(quote.cache_ttl_ms, None);
+    assert_eq!(quote.cache_lifetime, CacheLifetime::Default);
+}
+
+/// **CORRECTNESS (fleet-redis-2, dispatch-time).** A spec that skipped
+/// `CatalogConfig`'s own boot refusal of an unspellable Messages TTL still
+/// must not reach a socket -- `connect` resolves the lifetime before it
+/// builds the quote, and a turn that cannot resolve one is refused, not
+/// dispatched at the wire's own five-minute default.
+#[tokio::test]
+async fn an_unspellable_messages_ttl_dispatches_nothing_and_fails_the_turn() {
+    let mut spec = frontier_spec("anthropic", "claude", WireProtocol::AnthropicMessages);
+    spec.cache_model = CacheModel::Deterministic { ttl_ms: 600_000 };
+    let recorder = Arc::new(RecordingClient {
+        inner: EchoFrontierClient::new("frontier answer"),
+        seen: Mutex::new(Vec::new()),
+    });
+    let clients = FrontierClients::keyed(
+        [(
+            "anthropic".to_string(),
+            Arc::clone(&recorder) as Arc<dyn FrontierClient>,
+        )]
+        .into_iter()
+        .collect(),
+    );
+    let engine = Engine::with_provider_clients(
+        Arc::new(MemoryStore::new()),
+        ByteTokenizer,
+        Arc::new(EchoLocalExecutor::new("local answer")) as Arc<dyn LocalExecutor>,
+        StaticFrontierCatalog::new(vec![spec]),
+        Arc::new(clients),
+        Arc::new(AffinityPolicy::new()),
+        EngineConfig {
+            turn_deadline_ms: 5_000,
+            ..EngineConfig::default()
+        },
+    );
+
+    let session_id = SessionId::generate();
+    engine
+        .create_session(&session_id)
+        .await
+        .expect("the session opens");
+    let error = engine
+        .run_turn(
+            &session_id,
+            TurnId::new("t1"),
+            TurnInput {
+                items: vec![Item::user_text("hi")],
+                declared_baseline: None,
+                output_token_cap: None,
+                tools: None,
+                tool_choice: None,
+                tools_dialect: Some(WireProtocol::AnthropicMessages),
+            },
+            &Admission::open(),
+        )
+        .await
+        .expect_err("an unspellable cache lifetime must fail the turn rather than dispatch it");
+
+    assert!(
+        matches!(
+            &error,
+            EngineError::Frontier(FrontierError::UnsupportedCacheLifetime {
+                ttl_ms: 600_000,
+                ..
+            })
+        ),
+        "expected the resolver's own refusal, got {error}"
+    );
+    assert!(
+        recorder
+            .seen
+            .lock()
+            .expect("no panic holds this")
+            .is_empty(),
+        "the client must never see a request built from an unresolved lifetime"
+    );
 }

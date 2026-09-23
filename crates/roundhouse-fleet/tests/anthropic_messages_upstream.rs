@@ -37,7 +37,7 @@ use futures::StreamExt;
 use roundhouse_core::control::{PresentedCredential, Secret, TurnCredential};
 use roundhouse_core::event::CacheReadSource;
 use roundhouse_core::routing::Target;
-use roundhouse_fleet::anthropic_messages::AnthropicMessagesClient;
+use roundhouse_fleet::anthropic_messages::{AnthropicMessagesClient, CacheLifetime};
 use roundhouse_fleet::{FrontierChunk, FrontierClient, FrontierError, FrontierQuote, WireProtocol};
 
 /// A Claude Code subscription seat's OAuth bearer. Shaped like the real thing
@@ -278,8 +278,8 @@ async fn handle(State(state): State<Upstream>, headers: HeaderMap, body: String)
 
 fn quote(credential: TurnCredential) -> FrontierQuote {
     FrontierQuote {
-        previous_breakpoint: None,
-        cache_ttl_ms: None,
+        previous_segment_count: None,
+        cache_lifetime: CacheLifetime::Default,
         target: Target::Frontier {
             provider: "anthropic".into(),
             model: "claude-x".into(),

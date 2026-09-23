@@ -57,7 +57,7 @@ use redis::aio::ConnectionManager;
 
 use roundhouse_core::control::{
     Balance, BalanceQuery, BudgetTerms, BudgetWindow, Grant, GrantRequest, ProjectId, Settled,
-    Settlement, SettlementKey, SpendError, SpendLedger,
+    Settlement, SpendError, SpendLedger,
 };
 
 use crate::keys::{self, KeyNamespace};
@@ -94,89 +94,46 @@ impl SpendPurpose {
     }
 }
 
-/// Shared key parts. Each key function calls [`keys::build_key`] directly,
-/// as required by the key-builder convention.
+/// Which of the family's four keys a call needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpendLeaf {
+    Account,
+    Holds,
+    Watermarks,
+    SettledCalls,
+}
+
+impl SpendLeaf {
+    fn as_str(self) -> &'static str {
+        match self {
+            SpendLeaf::Account => "account",
+            SpendLeaf::Holds => "holds",
+            SpendLeaf::Watermarks => "watermarks",
+            SpendLeaf::SettledCalls => "settled_calls",
+        }
+    }
+}
+
+/// The one key builder every trait method calls, parameterized on which leaf
+/// it needs rather than building all four whether or not a call reads them —
+/// `open_grant` and `balance` want two of the four, and a `SpendKeys` struct
+/// built eagerly would still allocate the other two strings on every call.
 ///
 /// The hash tag stays **first**, ahead of the purpose segment: Redis Cluster
 /// hashes a key on its first `{...}` pair, and a purpose written ahead of the
 /// tag would put one project's four keys on different slots and break the
 /// check-and-debit script's atomicity.
-fn spend_key_parts<'a>(tag: &'a str, purpose: SpendPurpose, leaf: &'a str) -> Vec<&'a str> {
-    let mut parts: Vec<&str> = vec![tag];
+pub(crate) fn spend_key(
+    namespace: &KeyNamespace,
+    purpose: SpendPurpose,
+    project: &ProjectId,
+    leaf: SpendLeaf,
+) -> String {
+    let tag = format!("{{{project}}}");
+    let mut parts: Vec<&str> = vec![&tag];
     parts.extend_from_slice(purpose.segments());
-    parts.push(leaf);
-    parts
-}
-
-/// [`account_key`] for a caller outside this crate that needs to assert the key
-/// layout — the composition root's own test that two deployments do not collide.
-pub fn account_key_for_test(
-    namespace: &KeyNamespace,
-    purpose: SpendPurpose,
-    project: &ProjectId,
-) -> String {
-    account_key(namespace, purpose, project)
-}
-
-/// [`holds_key`], for the same reason.
-pub fn holds_key_for_test(
-    namespace: &KeyNamespace,
-    purpose: SpendPurpose,
-    project: &ProjectId,
-) -> String {
-    holds_key(namespace, purpose, project)
-}
-
-pub(crate) fn account_key(
-    namespace: &KeyNamespace,
-    purpose: SpendPurpose,
-    project: &ProjectId,
-) -> String {
-    let tag = format!("{{{project}}}");
-    keys::build_key(
-        namespace,
-        keys::KeyFamily::Spend,
-        &spend_key_parts(&tag, purpose, "account"),
-    )
-}
-
-pub(crate) fn holds_key(
-    namespace: &KeyNamespace,
-    purpose: SpendPurpose,
-    project: &ProjectId,
-) -> String {
-    let tag = format!("{{{project}}}");
-    keys::build_key(
-        namespace,
-        keys::KeyFamily::Spend,
-        &spend_key_parts(&tag, purpose, "holds"),
-    )
-}
-
-pub(crate) fn watermarks_key(
-    namespace: &KeyNamespace,
-    purpose: SpendPurpose,
-    project: &ProjectId,
-) -> String {
-    let tag = format!("{{{project}}}");
-    keys::build_key(
-        namespace,
-        keys::KeyFamily::Spend,
-        &spend_key_parts(&tag, purpose, "watermarks"),
-    )
-}
-
-pub(crate) fn settled_calls_key(
-    namespace: &KeyNamespace,
-    purpose: SpendPurpose,
-    project: &ProjectId,
-) -> String {
-    let tag = format!("{{{project}}}");
-    keys::build_key(
-        namespace,
-        keys::KeyFamily::Spend,
-        &spend_key_parts(&tag, purpose, "settled_calls"),
-    )
+    parts.push(leaf.as_str());
+    keys::build_key(namespace, keys::KeyFamily::Spend, &parts)
 }
 
 fn window_mode(window: BudgetWindow) -> &'static str {
@@ -221,23 +178,21 @@ impl RedisSpendLedger {
     /// `ConnectionManagerConfig::default()` — see its doc for the outage
     /// latency this crate's one `connect` bounds (M13.1 review F2).
     pub async fn connect(url: impl AsRef<str>) -> Result<Self, SpendError> {
-        Self::connect_namespaced(url, KeyNamespace::default()).await
+        Self::connect_for(url, KeyNamespace::default(), SpendPurpose::Serving).await
     }
 
-    /// Connect under an explicit [`KeyNamespace`] — what the composition
-    /// root calls once it has read `ROUNDHOUSE_REDIS_NAMESPACE` (R-S3).
-    pub async fn connect_namespaced(
-        url: impl AsRef<str>,
-        namespace: KeyNamespace,
-    ) -> Result<Self, SpendError> {
-        Self::connect_for(url, namespace, SpendPurpose::Serving).await
-    }
-
-    /// Connect under an explicit namespace *and* purpose.
+    /// Connect under an explicit namespace *and* purpose — what the
+    /// composition root calls once it has read `ROUNDHOUSE_REDIS_NAMESPACE`
+    /// (R-S3), for both the serving ledger and, with
+    /// [`SpendPurpose::Evaluation`], the evaluation one: the same deployment
+    /// namespace as everything else, and its own keys inside it. See
+    /// [`SpendPurpose`] for what deriving a namespace instead collided with.
     ///
-    /// The evaluation ledger is this, with [`SpendPurpose::Evaluation`]: the
-    /// same deployment namespace as everything else, and its own keys inside it.
-    /// See [`SpendPurpose`] for what deriving a namespace instead collided with.
+    /// One entry point rather than a `connect_namespaced` that only ever
+    /// forwarded here with `SpendPurpose::Serving` filled in — every other
+    /// family in this crate has one `connect_namespaced` because it has no
+    /// purpose to default; this family's default is spelled at the call
+    /// site instead.
     pub async fn connect_for(
         url: impl AsRef<str>,
         namespace: KeyNamespace,
@@ -262,8 +217,18 @@ impl SpendLedger for RedisSpendLedger {
         SpendError::check_amount("limit_usd", request.terms.budget.limit_usd)?;
 
         let member_ceiling = member_ceiling_arg(&request.terms);
-        let account = account_key(&self.namespace, self.purpose, &request.principal.project);
-        let holds = holds_key(&self.namespace, self.purpose, &request.principal.project);
+        let account = spend_key(
+            &self.namespace,
+            self.purpose,
+            &request.principal.project,
+            SpendLeaf::Account,
+        );
+        let holds = spend_key(
+            &self.namespace,
+            self.purpose,
+            &request.principal.project,
+            SpendLeaf::Holds,
+        );
         let outcome = self
             .scripts
             .open_grant(
@@ -292,21 +257,30 @@ impl SpendLedger for RedisSpendLedger {
     async fn settle_grant(&self, settlement: Settlement) -> Result<Settled, SpendError> {
         SpendError::check_amount("actual_usd", settlement.actual_usd)?;
 
-        let account = account_key(&self.namespace, self.purpose, &settlement.principal.project);
-        let holds = holds_key(&self.namespace, self.purpose, &settlement.principal.project);
-        let watermarks =
-            watermarks_key(&self.namespace, self.purpose, &settlement.principal.project);
-        let settled_calls =
-            settled_calls_key(&self.namespace, self.purpose, &settlement.principal.project);
-        // One script for both modes, the unused half of the key travelling as a
-        // sentinel: a second script would be a second copy of the window roll,
-        // the hold release and the commit, which are identical either way.
-        let (key_mode, session_id, seq) = match &settlement.key {
-            SettlementKey::SessionWatermark { session_id, seq } => {
-                ("watermark", session_id.as_str(), *seq)
-            }
-            SettlementKey::OncePerCall => ("call", "", 0),
-        };
+        let account = spend_key(
+            &self.namespace,
+            self.purpose,
+            &settlement.principal.project,
+            SpendLeaf::Account,
+        );
+        let holds = spend_key(
+            &self.namespace,
+            self.purpose,
+            &settlement.principal.project,
+            SpendLeaf::Holds,
+        );
+        let watermarks = spend_key(
+            &self.namespace,
+            self.purpose,
+            &settlement.principal.project,
+            SpendLeaf::Watermarks,
+        );
+        let settled_calls = spend_key(
+            &self.namespace,
+            self.purpose,
+            &settlement.principal.project,
+            SpendLeaf::SettledCalls,
+        );
         let outcome = self
             .scripts
             .settle_grant(
@@ -317,9 +291,7 @@ impl SpendLedger for RedisSpendLedger {
                     watermarks_key: &watermarks,
                     settled_calls_key: &settled_calls,
                     user: settlement.principal.user.as_str(),
-                    key_mode,
-                    session_id,
-                    seq,
+                    key: &settlement.key,
                     response_id: settlement.response_id.as_str(),
                     actual_usd: settlement.actual_usd,
                     now_ms: settlement.now_ms,
@@ -348,8 +320,18 @@ impl SpendLedger for RedisSpendLedger {
         SpendError::check_amount("limit_usd", query.terms.budget.limit_usd)?;
 
         let member_ceiling = member_ceiling_arg(&query.terms);
-        let account = account_key(&self.namespace, self.purpose, &query.principal.project);
-        let holds = holds_key(&self.namespace, self.purpose, &query.principal.project);
+        let account = spend_key(
+            &self.namespace,
+            self.purpose,
+            &query.principal.project,
+            SpendLeaf::Account,
+        );
+        let holds = spend_key(
+            &self.namespace,
+            self.purpose,
+            &query.principal.project,
+            SpendLeaf::Holds,
+        );
         let outcome = self
             .scripts
             .balance(
@@ -400,10 +382,30 @@ mod tests {
 
         let namespace = KeyNamespace::default();
         let project = ProjectId::new("acme");
-        let account = account_key(&namespace, SpendPurpose::Serving, &project);
-        let holds = holds_key(&namespace, SpendPurpose::Serving, &project);
-        let watermarks = watermarks_key(&namespace, SpendPurpose::Serving, &project);
-        let settled_calls = settled_calls_key(&namespace, SpendPurpose::Serving, &project);
+        let account = spend_key(
+            &namespace,
+            SpendPurpose::Serving,
+            &project,
+            SpendLeaf::Account,
+        );
+        let holds = spend_key(
+            &namespace,
+            SpendPurpose::Serving,
+            &project,
+            SpendLeaf::Holds,
+        );
+        let watermarks = spend_key(
+            &namespace,
+            SpendPurpose::Serving,
+            &project,
+            SpendLeaf::Watermarks,
+        );
+        let settled_calls = spend_key(
+            &namespace,
+            SpendPurpose::Serving,
+            &project,
+            SpendLeaf::SettledCalls,
+        );
 
         let tag = hash_tag(&account);
         assert_eq!(tag, "acme", "the tag is the project id, unadorned");
@@ -415,7 +417,12 @@ mod tests {
         // tags, or every project would collide onto one Redis Cluster slot.
         let other = ProjectId::new("other-project");
         assert_ne!(
-            hash_tag(&account_key(&namespace, SpendPurpose::Serving, &other)),
+            hash_tag(&spend_key(
+                &namespace,
+                SpendPurpose::Serving,
+                &other,
+                SpendLeaf::Account
+            )),
             tag
         );
     }
@@ -428,27 +435,101 @@ mod tests {
         let namespace = KeyNamespace::default();
         let project = ProjectId::new("acme");
         assert_eq!(
-            account_key(&namespace, SpendPurpose::Serving, &project),
+            spend_key(
+                &namespace,
+                SpendPurpose::Serving,
+                &project,
+                SpendLeaf::Account
+            ),
             "rh:v1:spend:{acme}:account"
         );
         assert_eq!(
-            holds_key(&namespace, SpendPurpose::Serving, &project),
+            spend_key(
+                &namespace,
+                SpendPurpose::Serving,
+                &project,
+                SpendLeaf::Holds
+            ),
             "rh:v1:spend:{acme}:holds"
         );
         assert_eq!(
-            watermarks_key(&namespace, SpendPurpose::Serving, &project),
+            spend_key(
+                &namespace,
+                SpendPurpose::Serving,
+                &project,
+                SpendLeaf::Watermarks
+            ),
             "rh:v1:spend:{acme}:watermarks"
         );
         assert_eq!(
-            settled_calls_key(&namespace, SpendPurpose::Serving, &project),
+            spend_key(
+                &namespace,
+                SpendPurpose::Serving,
+                &project,
+                SpendLeaf::SettledCalls
+            ),
             "rh:v1:spend:{acme}:settled_calls"
         );
 
         let other = KeyNamespace::new("acme-prod").unwrap();
         assert_ne!(
-            account_key(&namespace, SpendPurpose::Serving, &project),
-            account_key(&other, SpendPurpose::Serving, &project),
+            spend_key(
+                &namespace,
+                SpendPurpose::Serving,
+                &project,
+                SpendLeaf::Account
+            ),
+            spend_key(&other, SpendPurpose::Serving, &project, SpendLeaf::Account),
             "two namespaces must never build the same key"
+        );
+    }
+
+    /// **The evaluation ledger shares the deployment's namespace and not its
+    /// keys.**
+    ///
+    /// The first draft derived `<ns>-eval`, which made deployment `tenant`'s
+    /// evaluation ledger identical to deployment `tenant-eval`'s *serving*
+    /// ledger — two tenants on one counter, and the only symptom would have
+    /// been one of them refusing turns it had budget for. This asserts the
+    /// fix in the shape the collision had: the two deployments' four key
+    /// spaces are pairwise distinct, and the serving keys are unchanged.
+    ///
+    /// Moved here from `roundhouse-server`'s `shared_backend.rs` (fleet-
+    /// redis-4): the property under test is the store's own key layout, and
+    /// `pub(crate)` visibility of [`spend_key`] is enough to reach it from
+    /// inside this crate, which is what made the two `*_for_test` exports it
+    /// used to need an untested, ungated production surface.
+    #[test]
+    fn two_deployments_named_tenant_and_tenant_eval_share_no_spend_keys() {
+        let project = ProjectId::new("proj_shared");
+        let tenant = KeyNamespace::new("tenant").expect("a legal namespace");
+        let tenant_eval = KeyNamespace::new("tenant-eval").expect("also a legal namespace");
+
+        let keys = |namespace: &KeyNamespace, purpose| {
+            [
+                spend_key(namespace, purpose, &project, SpendLeaf::Account),
+                spend_key(namespace, purpose, &project, SpendLeaf::Holds),
+            ]
+        };
+        let tenant_serving = keys(&tenant, SpendPurpose::Serving);
+        let tenant_evaluation = keys(&tenant, SpendPurpose::Evaluation);
+        let sibling_serving = keys(&tenant_eval, SpendPurpose::Serving);
+
+        for evaluation in &tenant_evaluation {
+            assert!(
+                !sibling_serving.contains(evaluation),
+                "`tenant`'s evaluation ledger must not write `tenant-eval`'s \
+                 serving keys: {evaluation}"
+            );
+            assert!(!tenant_serving.contains(evaluation));
+        }
+        // The serving keys are byte-identical to what this crate wrote before
+        // the purpose existed, so no deployment's committed spend moves.
+        assert_eq!(tenant_serving[0], "tenant:v1:spend:{proj_shared}:account");
+        assert_eq!(
+            tenant_evaluation[0], "tenant:v1:spend:{proj_shared}:eval:account",
+            "and the hash tag stays first, or one project's keys stop sharing a \
+             Cluster slot and the check-and-debit script stops being atomic"
         );
     }
 

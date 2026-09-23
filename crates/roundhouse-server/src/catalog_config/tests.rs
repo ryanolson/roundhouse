@@ -236,6 +236,57 @@ fn a_non_messages_dialect_is_not_held_to_the_one_hour_write_rate() {
     .expect("another dialect's write pricing is not this check's to assert");
 }
 
+/// **CORRECTNESS (fleet-redis-2).** Anthropic's wire has exactly two cache
+/// lifetimes: the five-minute default and an explicit one-hour marker. A
+/// `deterministic` entry at any other TTL passed this boundary today,
+/// `body()` fell silently back to the five-minute default (no `ttl` field at
+/// all), and the ledger kept modelling the target as warm for the number the
+/// catalog declared -- pricing a cache hit the wire was never asked to grant.
+#[test]
+fn a_deterministic_ttl_the_wire_has_no_spelling_for_is_refused() {
+    let error = CatalogConfig::from_json(
+        &one_cached_entry("anthropic", "anthropic_messages", 600_000, 3.0, 3.75),
+        "test",
+    )
+    .expect_err(
+        "600000ms is neither Anthropic's five-minute default nor its one-hour marker, \
+         so the wire can never honor it",
+    );
+    assert!(
+        matches!(&error, CatalogError::UnsupportedCacheLifetime { ttl_ms, .. } if *ttl_ms == 600_000),
+        "{error}"
+    );
+
+    // CONTROL: the guard follows the dialect, not the provider name -- a
+    // gateway entry speaking `anthropic_messages` under any name is held to
+    // the same rule the write-rate guard above is.
+    let error = CatalogConfig::from_json(
+        &one_cached_entry(
+            "openrouter-messages",
+            "anthropic_messages",
+            600_000,
+            3.0,
+            3.75,
+        ),
+        "test",
+    )
+    .expect_err("the dialect decides, not the name above it");
+    assert!(
+        matches!(&error, CatalogError::UnsupportedCacheLifetime { model, .. }
+            if model.starts_with("openrouter-messages/")),
+        "{error}"
+    );
+
+    // CONTROL: another dialect's own TTL semantics are not this check's
+    // business -- an `openai_responses` entry has no `cache_control`
+    // vocabulary to be held to at all.
+    CatalogConfig::from_json(
+        &one_cached_entry("openrouter", "openai_responses", 600_000, 3.0, 3.75),
+        "test",
+    )
+    .expect("a non-Messages dialect may declare whatever TTL its own cache model means");
+}
+
 /// One minimal entry, parameterized on whatever local section is under
 /// test, so a refusal below is unambiguously about the local numbers.
 fn with_local_section(local: &str) -> String {

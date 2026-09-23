@@ -28,6 +28,7 @@ use futures::StreamExt;
 use roundhouse_core::control::{PresentedCredential, Secret, TurnCredential};
 use roundhouse_core::event::CacheReadSource;
 use roundhouse_core::routing::Target;
+use roundhouse_fleet::anthropic_messages::CacheLifetime;
 use roundhouse_fleet::{
     FrontierChunk, FrontierClient, FrontierError, FrontierQuote, OpenAiResponsesClient,
     WireProtocol,
@@ -123,8 +124,8 @@ async fn handle(State(state): State<Upstream>, headers: HeaderMap, _body: String
 
 fn quote(credential: TurnCredential) -> FrontierQuote {
     FrontierQuote {
-        previous_breakpoint: None,
-        cache_ttl_ms: None,
+        previous_segment_count: None,
+        cache_lifetime: CacheLifetime::Default,
         target: Target::Frontier {
             provider: "openai".into(),
             model: "flagship".into(),

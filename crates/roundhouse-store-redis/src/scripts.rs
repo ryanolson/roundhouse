@@ -67,6 +67,16 @@ end
 return {'OK'}
 ";
 
+/// The largest sequence the append script writes exactly. Lua's `..` renders
+/// numbers with `%.14g`, so `10^14` would come out as `1e+14`.
+///
+/// Lives here rather than in `learning` (fleet-redis-5): the range guard it
+/// names belongs to `APPEND_BODY`, which every write path takes whether or
+/// not the batch carries a mark, and the canonical session write path should
+/// not depend on the deliberately unwired feature module for a fact about
+/// its own log.
+const LAST_EXACT_SEQ: u64 = 99_999_999_999_999;
+
 /// The fenced append, and the reason this module exists.
 ///
 /// Fence check, seq assignment, and the `XADD`s are one atomic step, so the
@@ -76,7 +86,7 @@ return {'OK'}
 /// guessing, because appending after a foreign entry would launder it into a
 /// log that otherwise proves its own integrity.
 ///
-/// **Seqs are exact only through [`learning::LAST_EXACT_SEQ`].** Lua numbers
+/// **Seqs are exact only through [`LAST_EXACT_SEQ`].** Lua numbers
 /// are doubles, but `..` renders them with `%.14g`, so the id for seq
 /// `10^14` would be written `1e+14-0` and its `XADD` would fail. Seqs count
 /// events per conversation and sit nowhere near that, but a batch that would
@@ -178,7 +188,7 @@ pub(crate) struct AppendBatch<'a> {
 /// member they are keyed by, where the marked event sits in the batch, and
 /// the project it is marked for.
 pub(crate) struct MarkArgs<'a> {
-    pub(crate) index_keys: [&'a str; 3],
+    pub(crate) index_keys: &'a learning::IndexKeys,
     pub(crate) session_id: &'a str,
     /// Zero-based, already checked against the batch.
     pub(crate) event_index: usize,
@@ -222,7 +232,14 @@ impl Scripts {
             acquire: redis::Script::new(ACQUIRE),
             renew: redis::Script::new(RENEW),
             release: redis::Script::new(RELEASE),
-            append: redis::Script::new(&format!("{}\n{APPEND_BODY}", learning::mark_prelude())),
+            // The append is the only script that needs `LAST_EXACT_SEQ`, so
+            // it is the only prelude that carries it — the three learning
+            // scripts share `learning::MARK_FUNCTIONS` alone, none of them
+            // reading a seq range at all.
+            append: redis::Script::new(&format!(
+                "local LAST_EXACT_SEQ = {LAST_EXACT_SEQ}\n{}\n{APPEND_BODY}",
+                learning::MARK_FUNCTIONS
+            )),
             learning: learning::LearningScripts::new(),
         }
     }
@@ -304,7 +321,17 @@ impl Scripts {
             .arg(identity.fencing_token);
         match &batch.mark {
             Some(mark) => {
-                for key in mark.index_keys {
+                // Positional and load-bearing: `APPEND_BODY` reads `KEYS[4]`
+                // as the marks hash and `KEYS[5]`/`KEYS[6]` as the marked and
+                // pending zsets by index, so this order must agree with
+                // `IndexKeys`' field order exactly — the marked and pending
+                // zsets carry the same type, so a swap here would pass the
+                // Lua type check and corrupt the wrong set silently.
+                for key in [
+                    mark.index_keys.marks.as_str(),
+                    mark.index_keys.marked.as_str(),
+                    mark.index_keys.pending.as_str(),
+                ] {
                     invocation.key(key);
                 }
                 invocation
@@ -352,10 +379,9 @@ impl Scripts {
                 str_at(&reply, 1).unwrap_or("<unreadable>")
             ))),
             (Some("RANGE"), Some(last), _) => Err(StoreError::Backend(anyhow::anyhow!(
-                "log `{log_key}` is at seq {last}; this batch would pass seq {}, the \
-                 last one the append script writes exactly, so the append is refused \
-                 before writing any event",
-                learning::LAST_EXACT_SEQ
+                "log `{log_key}` is at seq {last}; this batch would pass seq {LAST_EXACT_SEQ}, \
+                 the last one the append script writes exactly, so the append is refused \
+                 before writing any event"
             ))),
             _ => Err(unexpected(&reply)),
         }
