@@ -61,6 +61,8 @@
 //! trips its records through the same JSON envelope a deployment writes to
 //! Redis.
 
+pub mod classification;
+
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 

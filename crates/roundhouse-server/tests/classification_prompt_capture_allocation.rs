@@ -150,36 +150,17 @@ fn one_slot_classify_config(
     max_prompt_chars: usize,
     enabled: bool,
 ) -> ClassifyConfig {
-    let json = format!(
-        r#"{{
-          "enabled": {enabled},
-          "revision": 1,
-          "model": "jev-1.12",
-          "base_url": "{base_url}",
-          "auth": {{ "env": "CLASSIFY_CAPTURE_ALLOC_TEST_KEY" }},
-          "pricing": {{ "input_per_mtok_usd": 0.042, "output_per_mtok_usd": 0.084 }},
-          "expected_output_tokens": 24,
-          "caps": {{
-            "max_prior_classifications": 4,
-            "max_prompt_chars": {max_prompt_chars},
-            "max_total_bytes": 400000
-          }},
-          "transport": {{
-            "max_request_bytes": 400000,
-            "max_response_bytes": 16384,
-            "deadline_ms": 4000
-          }},
-          "executor": {{
-            "max_in_flight": 1,
-            "max_http_concurrency": 1,
-            "call_ttl_ms": 60000,
-            "result_retention_ms": 900000,
-            "sweep_interval_ms": 50000
-          }},
-          "budget": {{ "limit_usd": 25.0, "window": "total", "warn_at": 0.8 }}
-        }}"#
-    );
-    ClassifyConfig::from_json(&json, "<test>").expect("a valid configuration")
+    roundhouse_server::test_support::classification::classify_config(base_url, |value| {
+        value["enabled"] = serde_json::json!(enabled);
+        value["revision"] = serde_json::json!(1);
+        value["auth"]["env"] = serde_json::json!("CLASSIFY_CAPTURE_ALLOC_TEST_KEY");
+        value["caps"]["max_prompt_chars"] = serde_json::json!(max_prompt_chars);
+        value["caps"]["max_total_bytes"] = serde_json::json!(400_000);
+        value["transport"]["max_request_bytes"] = serde_json::json!(400_000);
+        value["executor"]["max_in_flight"] = serde_json::json!(1);
+        value["executor"]["max_http_concurrency"] = serde_json::json!(1);
+        value["executor"]["sweep_interval_ms"] = serde_json::json!(50000);
+    })
 }
 
 fn catalog() -> roundhouse_fleet::StaticFrontierCatalog {

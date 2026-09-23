@@ -55,6 +55,8 @@ use roundhouse_core::store::{MemoryStore, SessionStore};
 use roundhouse_fleet::{EchoFrontierClient, FrontierClient, WireProtocol};
 use roundhouse_server::classify_config::ClassifyConfig;
 use roundhouse_server::classify_runtime::compose;
+use roundhouse_server::test_support::classification::ANSWER as CLASSIFIER_ANSWER;
+use roundhouse_server::test_support::classification::classify_config as shared_classify_config;
 use roundhouse_server::test_support::{engine_over_echo, frontier_spec, single_model_catalog};
 use roundhouse_server::{
     ControlPlane, Conversations, Engine, EngineConfig, messages_router, responses_router,
@@ -62,12 +64,6 @@ use roundhouse_server::{
 
 const ANSWER: &str = "frontier answer";
 const PROVIDER: &str = "prefix-classify";
-
-const CLASSIFIER_ANSWER: &str = r#"{"model":"jev-1.12","answers":{
-  "intent":{"type":"choice","choice":"implement","probabilities":{"implement":0.5,"diagnose":0.2,"explain":0.1,"review":0.1,"operate":0.05,"unknown":0.05},"confidence":0.82},
-  "complexity":{"type":"choice","choice":"involved","probabilities":{"trivial":0.1,"routine":0.2,"involved":0.5,"deep":0.1,"unknown":0.1},"confidence":0.61},
-  "context_dependence":{"type":"choice","choice":"recent","probabilities":{"self_contained":0.2,"recent":0.5,"deep":0.2,"unknown":0.1},"confidence":0.55}
-},"usage":{"input_tokens":312,"output_tokens":48}}"#;
 
 // ---------------------------------------------------------------------------
 // Shared sentinels
@@ -93,36 +89,9 @@ const NEW_QUESTION: &str = "NEW_QUESTION_only_me";
 const PRIMING_TURN_TEXT: &str = "FIRST_TURN_unrelated_priming_text";
 
 fn classify_config(base_url: &str) -> ClassifyConfig {
-    let json = format!(
-        r#"{{
-          "enabled": true,
-          "revision": 4,
-          "model": "jev-1.12",
-          "base_url": "{base_url}",
-          "auth": {{ "env": "CLASSIFY_PREFIX_TEST_KEY" }},
-          "pricing": {{ "input_per_mtok_usd": 0.042, "output_per_mtok_usd": 0.084 }},
-          "expected_output_tokens": 24,
-          "caps": {{
-            "max_prior_classifications": 4,
-            "max_prompt_chars": 2000,
-            "max_total_bytes": 8192
-          }},
-          "transport": {{
-            "max_request_bytes": 65536,
-            "max_response_bytes": 16384,
-            "deadline_ms": 4000
-          }},
-          "executor": {{
-            "max_in_flight": 8,
-            "max_http_concurrency": 2,
-            "call_ttl_ms": 60000,
-            "result_retention_ms": 900000,
-            "sweep_interval_ms": 50
-          }},
-          "budget": {{ "limit_usd": 25.0, "window": "total", "warn_at": 0.8 }}
-        }}"#
-    );
-    ClassifyConfig::from_json(&json, "<test>").expect("a valid configuration")
+    shared_classify_config(base_url, |value| {
+        value["auth"]["env"] = serde_json::json!("CLASSIFY_PREFIX_TEST_KEY");
+    })
 }
 
 fn env(name: &str) -> Option<String> {

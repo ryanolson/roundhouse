@@ -36,12 +36,7 @@ use std::time::{Duration, Instant};
 
 use roundhouse_core::classify::{ClassificationIntent, ClassificationRecord};
 use roundhouse_core::event::{SessionEvent, SessionEventKind};
-
-const ANSWER: &str = r#"{"model":"jev-1.12","answers":{
-  "intent":{"type":"choice","choice":"implement","probabilities":{"implement":0.5,"diagnose":0.2,"explain":0.1,"review":0.1,"operate":0.05,"unknown":0.05},"confidence":0.82},
-  "complexity":{"type":"choice","choice":"involved","probabilities":{"trivial":0.1,"routine":0.2,"involved":0.5,"deep":0.1,"unknown":0.1},"confidence":0.61},
-  "context_dependence":{"type":"choice","choice":"recent","probabilities":{"self_contained":0.2,"recent":0.5,"deep":0.2,"unknown":0.1},"confidence":0.55}
-},"usage":{"input_tokens":312,"output_tokens":48}}"#;
+use roundhouse_server::test_support::classification::ANSWER;
 
 const AUTH_ENV_NAME: &str = "ROUNDHOUSE_BINARY_BOOT_TEST_KEY";
 const AUTH_ENV_VALUE: &str = "sk-roundhouse-binary-boot-test-synthetic";
@@ -125,35 +120,12 @@ fn scratch(tag: &str) -> PathBuf {
 /// accepts, pointed at `base_url`.
 fn write_classify_config(dir: &Path, base_url: &str, enabled: bool) -> PathBuf {
     let path = dir.join("classify.json");
-    let json = format!(
-        r#"{{
-          "enabled": {enabled},
-          "revision": 1,
-          "model": "jev-1.12",
-          "base_url": "{base_url}",
-          "auth": {{ "env": "{AUTH_ENV_NAME}" }},
-          "pricing": {{ "input_per_mtok_usd": 0.042, "output_per_mtok_usd": 0.084 }},
-          "expected_output_tokens": 24,
-          "caps": {{
-            "max_prior_classifications": 4,
-            "max_prompt_chars": 2000,
-            "max_total_bytes": 8192
-          }},
-          "transport": {{
-            "max_request_bytes": 65536,
-            "max_response_bytes": 16384,
-            "deadline_ms": 4000
-          }},
-          "executor": {{
-            "max_in_flight": 8,
-            "max_http_concurrency": 2,
-            "call_ttl_ms": 60000,
-            "result_retention_ms": 900000,
-            "sweep_interval_ms": 50
-          }},
-          "budget": {{ "limit_usd": 25.0, "window": "total", "warn_at": 0.8 }}
-        }}"#
-    );
+    let json =
+        roundhouse_server::test_support::classification::classify_config_json(base_url, |value| {
+            value["enabled"] = serde_json::json!(enabled);
+            value["revision"] = serde_json::json!(1);
+            value["auth"]["env"] = serde_json::json!(AUTH_ENV_NAME);
+        });
     std::fs::write(&path, json).expect("the config file writes");
     path
 }

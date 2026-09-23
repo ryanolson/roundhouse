@@ -58,11 +58,13 @@ async fn handle(State(state): State<Upstream>, body: String) -> Response {
 }
 
 /// A complete, valid answer set across all three axes.
-pub(crate) const ANSWER: &str = r#"{"model":"jev-1.12","answers":{
-  "intent":{"type":"choice","choice":"implement","probabilities":{"implement":0.5,"diagnose":0.2,"explain":0.1,"review":0.1,"operate":0.05,"unknown":0.05},"confidence":0.82},
-  "complexity":{"type":"choice","choice":"involved","probabilities":{"trivial":0.1,"routine":0.2,"involved":0.5,"deep":0.1,"unknown":0.1},"confidence":0.61},
-  "context_dependence":{"type":"choice","choice":"recent","probabilities":{"self_contained":0.2,"recent":0.5,"deep":0.2,"unknown":0.1},"confidence":0.55}
-},"usage":{"input_tokens":312,"output_tokens":48}}"#;
+///
+/// Re-exported under this module's own name so `accounting.rs`, `admission.rs`
+/// and the rest of this suite's `use super::*` keep reaching it unchanged; the
+/// byte content now lives once, in `test_support::classification`, which
+/// `classify_runtime::tests` and every classification integration binary
+/// share the same way.
+pub(crate) use crate::test_support::classification::ANSWER;
 
 /// The same answers, with only half the accounting reported.
 const ANSWER_PARTIAL_USAGE: &str = r#"{"model":"jev-1.12","answers":{

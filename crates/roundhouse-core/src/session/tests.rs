@@ -938,31 +938,17 @@ impl BatchRecordingStore {
     }
 }
 
+// `Delegating`, not `use`d in this module: `store.create_session(..)` below
+// calls through `SessionStore` on the concrete double, and importing
+// `Delegating` alongside it would make that call ambiguous between the two
+// traits' same-named methods (E0034). Fully qualifying the trait here avoids
+// that without needing every call site in this file to disambiguate instead.
 #[async_trait]
-impl SessionStore for BatchRecordingStore {
-    async fn create_session(
-        &self,
-        session_id: &SessionId,
-        model_policy: &str,
-    ) -> Result<bool, StoreError> {
-        self.inner.create_session(session_id, model_policy).await
-    }
+impl crate::store::doubles::Delegating for BatchRecordingStore {
+    type Backend = MemoryStore;
 
-    async fn acquire_lease(
-        &self,
-        session_id: &SessionId,
-        node_id: &str,
-        ttl_ms: u64,
-    ) -> Result<Option<Lease>, StoreError> {
-        self.inner.acquire_lease(session_id, node_id, ttl_ms).await
-    }
-
-    async fn renew_lease(&self, lease: &Lease, ttl_ms: u64) -> Result<Option<Lease>, StoreError> {
-        self.inner.renew_lease(lease, ttl_ms).await
-    }
-
-    async fn release_lease(&self, lease: &Lease) -> Result<(), StoreError> {
-        self.inner.release_lease(lease).await
+    fn backend(&self) -> &MemoryStore {
+        &self.inner
     }
 
     async fn append_events(
@@ -979,54 +965,6 @@ impl SessionStore for BatchRecordingStore {
             .expect("batch record poisoned")
             .push(appended.iter().map(|event| event.kind.clone()).collect());
         Ok(appended)
-    }
-
-    async fn read_events(
-        &self,
-        session_id: &SessionId,
-        after_seq: u64,
-        limit: usize,
-    ) -> Result<Vec<SessionEvent>, StoreError> {
-        self.inner.read_events(session_id, after_seq, limit).await
-    }
-
-    async fn last_seq(&self, session_id: &SessionId) -> Result<u64, StoreError> {
-        self.inner.last_seq(session_id).await
-    }
-
-    async fn clear_learning_mark(
-        &self,
-        session_id: &SessionId,
-        confirmed_through: u64,
-    ) -> Result<crate::store::ClearOutcome, StoreError> {
-        self.inner
-            .clear_learning_mark(session_id, confirmed_through)
-            .await
-    }
-
-    async fn requeue_learning(
-        &self,
-        session_id: &SessionId,
-        mark_seq: u64,
-    ) -> Result<crate::store::RequeueOutcome, StoreError> {
-        self.inner.requeue_learning(session_id, mark_seq).await
-    }
-
-    async fn pending_learning(
-        &self,
-        after: Option<&crate::store::LearningCursor>,
-        idle_for_ms: u64,
-        limit: std::num::NonZeroUsize,
-    ) -> Result<crate::store::LearningPage, StoreError> {
-        self.inner.pending_learning(after, idle_for_ms, limit).await
-    }
-
-    async fn learning_sessions(
-        &self,
-        after: Option<&crate::store::LearningCursor>,
-        limit: std::num::NonZeroUsize,
-    ) -> Result<crate::store::LearningPage, StoreError> {
-        self.inner.learning_sessions(after, limit).await
     }
 }
 

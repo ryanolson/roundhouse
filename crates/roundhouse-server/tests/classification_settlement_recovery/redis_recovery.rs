@@ -59,7 +59,7 @@ async fn reopened_after_recovery(
     namespace: &KeyNamespace,
     config: &ClassifyConfig,
     call: RecoveredCall<'_>,
-    upstream: &Classifier,
+    upstream: &ClassifierUpstream,
 ) {
     let backends = open(Some(url), namespace)
         .await

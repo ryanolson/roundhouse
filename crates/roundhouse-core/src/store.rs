@@ -15,6 +15,13 @@
 //! the trait's guarantees as a generic test suite, and every backend —
 //! including the memory one — is judged by that identical suite.
 //!
+//! `store::doubles` is the other side of the same coin: not a backend the
+//! contract suite judges, but the shared shapes every test-only
+//! [`SessionStore`] fixture across the workspace is built from — a read-only
+//! replay over a fixed log, and a `Delegating` trait a sabotaging double
+//! implements so that forwarding the methods it does not sabotage is
+//! inherited rather than retyped.
+//!
 //! The store also keeps the source half of learning discovery (`learning`):
 //! an append may carry a [`LearningMark`], and the same atomic, fenced step
 //! that writes the events records it. That index is deliberately unwired —
@@ -25,6 +32,8 @@
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod contract;
+#[cfg(any(test, feature = "test-support"))]
+pub mod doubles;
 mod learning;
 
 pub use learning::{

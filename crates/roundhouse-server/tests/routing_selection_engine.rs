@@ -34,7 +34,8 @@ use roundhouse_core::routing::{
     TierRecipe, TurnSignals,
 };
 use roundhouse_core::session::SessionState;
-use roundhouse_core::store::{Lease, MemoryStore, SessionStore, StoreError};
+use roundhouse_core::store::doubles::ReplayLog;
+use roundhouse_core::store::{MemoryStore, SessionStore};
 use roundhouse_core::validate::ControlCallDialect;
 use roundhouse_fleet::{
     FrontierChunk, FrontierClient, FrontierClients, FrontierError, FrontierModelSpec,
@@ -245,108 +246,6 @@ impl Rig {
                 _ => None,
             })
             .collect()
-    }
-}
-
-/// A read-only [`SessionStore`] over a fixed log.
-///
-/// [`SessionState::project`] reads its events through the store rather than
-/// taking a slice, so replaying a log that has been through the wire — or a
-/// *prefix* of one, which is what a successor picking a session up mid-history
-/// sees — needs a reader over exactly those events. The writing half is
-/// unreachable by construction: nothing here ever acquires a lease.
-struct ReplayLog {
-    events: Vec<SessionEvent>,
-}
-
-impl ReplayLog {
-    fn new(events: Vec<SessionEvent>) -> Self {
-        Self { events }
-    }
-}
-
-#[async_trait]
-impl SessionStore for ReplayLog {
-    async fn create_session(&self, _: &SessionId, _: &str) -> Result<bool, StoreError> {
-        unreachable!("a replay log is never written to")
-    }
-
-    async fn acquire_lease(
-        &self,
-        _: &SessionId,
-        _: &str,
-        _: u64,
-    ) -> Result<Option<Lease>, StoreError> {
-        unreachable!("a replay log is never written to")
-    }
-
-    async fn renew_lease(&self, _: &Lease, _: u64) -> Result<Option<Lease>, StoreError> {
-        unreachable!("a replay log is never written to")
-    }
-
-    async fn release_lease(&self, _: &Lease) -> Result<(), StoreError> {
-        unreachable!("a replay log is never written to")
-    }
-
-    async fn append_events(
-        &self,
-        _: &Lease,
-        _: Vec<SessionEventKind>,
-        _: Option<roundhouse_core::store::LearningMark>,
-    ) -> Result<Vec<SessionEvent>, StoreError> {
-        unreachable!("a replay log is never written to")
-    }
-
-    async fn read_events(
-        &self,
-        _: &SessionId,
-        after_seq: u64,
-        limit: usize,
-    ) -> Result<Vec<SessionEvent>, StoreError> {
-        Ok(self
-            .events
-            .iter()
-            .filter(|event| event.seq > after_seq)
-            .take(limit)
-            .cloned()
-            .collect())
-    }
-
-    async fn last_seq(&self, _: &SessionId) -> Result<u64, StoreError> {
-        Ok(self.events.last().map_or(0, |event| event.seq))
-    }
-
-    async fn clear_learning_mark(
-        &self,
-        _: &SessionId,
-        _: u64,
-    ) -> Result<roundhouse_core::store::ClearOutcome, StoreError> {
-        unreachable!("a replay log has no learning index")
-    }
-
-    async fn requeue_learning(
-        &self,
-        _: &SessionId,
-        _: u64,
-    ) -> Result<roundhouse_core::store::RequeueOutcome, StoreError> {
-        unreachable!("a replay log has no learning index")
-    }
-
-    async fn pending_learning(
-        &self,
-        _: Option<&roundhouse_core::store::LearningCursor>,
-        _: u64,
-        _: std::num::NonZeroUsize,
-    ) -> Result<roundhouse_core::store::LearningPage, StoreError> {
-        unreachable!("a replay log has no learning index")
-    }
-
-    async fn learning_sessions(
-        &self,
-        _: Option<&roundhouse_core::store::LearningCursor>,
-        _: std::num::NonZeroUsize,
-    ) -> Result<roundhouse_core::store::LearningPage, StoreError> {
-        unreachable!("a replay log has no learning index")
     }
 }
 

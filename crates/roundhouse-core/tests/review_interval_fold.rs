@@ -11,8 +11,6 @@
 
 mod review_support;
 
-use async_trait::async_trait;
-
 use roundhouse_core::event::{
     ControlRecord, NotRunReason, PlaceboTiming, SessionEvent, SessionEventKind, ValidationOutcome,
 };
@@ -20,7 +18,7 @@ use roundhouse_core::ids::{ResponseId, SessionId, SideCallId, ValidationId};
 use roundhouse_core::item::Item;
 use roundhouse_core::routing::CacheLedger;
 use roundhouse_core::session::{MAX_REVIEW_TURNS, SessionState};
-use roundhouse_core::store::{Lease, SessionStore, StoreError};
+use roundhouse_core::store::doubles::ReplayLog;
 use roundhouse_core::validate::{
     Arm, CoverageGap, IntervalLabel, IntervalReview, ObjectiveVersion, REVIEW_RULE_REVISION,
     ReviewedDecision, SteerAction, TriggerRecord, Verdict,
@@ -703,99 +701,11 @@ async fn replay_is_deterministic_across_serialization_and_prefixes() {
 
 async fn project(events: Vec<SessionEvent>) -> SessionState {
     SessionState::project(
-        &ReplayLog(events),
+        &ReplayLog::new(events),
         &SessionId::new("acme/ada/review"),
         CacheLedger::new(),
         None,
     )
     .await
     .unwrap()
-}
-
-/// A read-only store over a fixed log.
-struct ReplayLog(Vec<SessionEvent>);
-
-#[async_trait]
-impl SessionStore for ReplayLog {
-    async fn create_session(&self, _: &SessionId, _: &str) -> Result<bool, StoreError> {
-        unreachable!("never written")
-    }
-
-    async fn acquire_lease(
-        &self,
-        _: &SessionId,
-        _: &str,
-        _: u64,
-    ) -> Result<Option<Lease>, StoreError> {
-        unreachable!("never written")
-    }
-
-    async fn renew_lease(&self, _: &Lease, _: u64) -> Result<Option<Lease>, StoreError> {
-        unreachable!("never written")
-    }
-
-    async fn release_lease(&self, _: &Lease) -> Result<(), StoreError> {
-        unreachable!("never written")
-    }
-
-    async fn append_events(
-        &self,
-        _: &Lease,
-        _: Vec<SessionEventKind>,
-        _: Option<roundhouse_core::store::LearningMark>,
-    ) -> Result<Vec<SessionEvent>, StoreError> {
-        unreachable!("never written")
-    }
-
-    async fn read_events(
-        &self,
-        _: &SessionId,
-        after_seq: u64,
-        limit: usize,
-    ) -> Result<Vec<SessionEvent>, StoreError> {
-        Ok(self
-            .0
-            .iter()
-            .filter(|event| event.seq > after_seq)
-            .take(limit)
-            .cloned()
-            .collect())
-    }
-
-    async fn last_seq(&self, _: &SessionId) -> Result<u64, StoreError> {
-        Ok(self.0.last().map_or(0, |event| event.seq))
-    }
-
-    async fn clear_learning_mark(
-        &self,
-        _: &SessionId,
-        _: u64,
-    ) -> Result<roundhouse_core::store::ClearOutcome, StoreError> {
-        unreachable!("never read")
-    }
-
-    async fn requeue_learning(
-        &self,
-        _: &SessionId,
-        _: u64,
-    ) -> Result<roundhouse_core::store::RequeueOutcome, StoreError> {
-        unreachable!("never read")
-    }
-
-    async fn pending_learning(
-        &self,
-        _: Option<&roundhouse_core::store::LearningCursor>,
-        _: u64,
-        _: std::num::NonZeroUsize,
-    ) -> Result<roundhouse_core::store::LearningPage, StoreError> {
-        unreachable!("never read")
-    }
-
-    async fn learning_sessions(
-        &self,
-        _: Option<&roundhouse_core::store::LearningCursor>,
-        _: std::num::NonZeroUsize,
-    ) -> Result<roundhouse_core::store::LearningPage, StoreError> {
-        unreachable!("never read")
-    }
 }

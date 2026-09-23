@@ -19,7 +19,7 @@ use roundhouse_core::context::ByteTokenizer;
 use roundhouse_core::event::SessionEvent;
 use roundhouse_core::ids::TurnId;
 use roundhouse_core::item::{ItemContent, Role};
-use roundhouse_core::store::{Lease, MemoryStore, StoreError};
+use roundhouse_core::store::{MemoryStore, StoreError};
 use roundhouse_fleet::{EchoFrontierClient, StaticFrontierCatalog, WireProtocol};
 
 use crate::engine::EngineConfig;
@@ -1170,8 +1170,23 @@ impl CountingStore {
     }
 }
 
+// `Delegating` is deliberately not `use`d in this file: fixtures throughout
+// call methods directly on a concrete double (`store.create_session(..)`),
+// and having both traits' same-named methods in scope at once would make
+// those calls ambiguous (E0034). Fully qualifying the trait here avoids that
+// without pushing disambiguation onto every call site instead.
 #[async_trait::async_trait]
-impl SessionStore for CountingStore {
+impl roundhouse_core::store::doubles::Delegating for CountingStore {
+    type Backend = MemoryStore;
+
+    fn backend(&self) -> &MemoryStore {
+        &self.inner
+    }
+
+    async fn is_leased(&self, session_id: &SessionId) -> Result<bool, StoreError> {
+        self.inner.is_leased(session_id).await
+    }
+
     async fn create_session(
         &self,
         session_id: &SessionId,
@@ -1179,36 +1194,6 @@ impl SessionStore for CountingStore {
     ) -> Result<bool, StoreError> {
         self.create_session_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.create_session(session_id, model_policy).await
-    }
-
-    async fn acquire_lease(
-        &self,
-        session_id: &SessionId,
-        node_id: &str,
-        ttl_ms: u64,
-    ) -> Result<Option<Lease>, StoreError> {
-        self.inner.acquire_lease(session_id, node_id, ttl_ms).await
-    }
-
-    async fn renew_lease(&self, lease: &Lease, ttl_ms: u64) -> Result<Option<Lease>, StoreError> {
-        self.inner.renew_lease(lease, ttl_ms).await
-    }
-
-    async fn release_lease(&self, lease: &Lease) -> Result<(), StoreError> {
-        self.inner.release_lease(lease).await
-    }
-
-    async fn is_leased(&self, session_id: &SessionId) -> Result<bool, StoreError> {
-        self.inner.is_leased(session_id).await
-    }
-
-    async fn append_events(
-        &self,
-        lease: &Lease,
-        kinds: Vec<SessionEventKind>,
-        mark: Option<roundhouse_core::store::LearningMark>,
-    ) -> Result<Vec<SessionEvent>, StoreError> {
-        self.inner.append_events(lease, kinds, mark).await
     }
 
     async fn read_events(
@@ -1219,45 +1204,6 @@ impl SessionStore for CountingStore {
     ) -> Result<Vec<SessionEvent>, StoreError> {
         self.read_events_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.read_events(session_id, after_seq, limit).await
-    }
-
-    async fn last_seq(&self, session_id: &SessionId) -> Result<u64, StoreError> {
-        self.inner.last_seq(session_id).await
-    }
-
-    async fn clear_learning_mark(
-        &self,
-        session_id: &SessionId,
-        confirmed_through: u64,
-    ) -> Result<roundhouse_core::store::ClearOutcome, StoreError> {
-        self.inner
-            .clear_learning_mark(session_id, confirmed_through)
-            .await
-    }
-
-    async fn requeue_learning(
-        &self,
-        session_id: &SessionId,
-        mark_seq: u64,
-    ) -> Result<roundhouse_core::store::RequeueOutcome, StoreError> {
-        self.inner.requeue_learning(session_id, mark_seq).await
-    }
-
-    async fn pending_learning(
-        &self,
-        after: Option<&roundhouse_core::store::LearningCursor>,
-        idle_for_ms: u64,
-        limit: std::num::NonZeroUsize,
-    ) -> Result<roundhouse_core::store::LearningPage, StoreError> {
-        self.inner.pending_learning(after, idle_for_ms, limit).await
-    }
-
-    async fn learning_sessions(
-        &self,
-        after: Option<&roundhouse_core::store::LearningCursor>,
-        limit: std::num::NonZeroUsize,
-    ) -> Result<roundhouse_core::store::LearningPage, StoreError> {
-        self.inner.learning_sessions(after, limit).await
     }
 }
 
